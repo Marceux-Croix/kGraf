@@ -3873,7 +3873,7 @@ dependencies = [
  "kgraf-tools",
  "libc",
  "log",
- "miniz_oxide 0.8.9",
+ "miniz_oxide 0.9.1",
  "png",
  "pollster 1.0.1",
  "reqwest 0.12.28",
