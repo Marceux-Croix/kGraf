@@ -179,6 +179,12 @@ fn notice_line(n: &Notice) -> String {
             "deps       the offline dependency check could not decide, so nothing was fetched: \
              {why}"
         ),
+        Notice::GateCommands(commands) if commands.is_empty() => {
+            "gates      none: no test command was configured or found, so the run has no quality \
+             gate"
+                .to_owned()
+        }
+        Notice::GateCommands(commands) => format!("gates      {}", commands.join("; ")),
         Notice::GraphEmpty { root, files_seen } => format!(
             "graph      empty after indexing {} ({files_seen} file(s) seen): no graph slices \
              for this run, likely no supported language in the tree",
@@ -416,13 +422,51 @@ pub fn run(root: &Path, args: OrchestrateArgs) -> Result<()> {
     if open != 0 {
         println!("{open} call(s) with unaccounted spend; run `kgraf unreconciled`");
     }
-    Ok(())
+    // The report and housekeeping are out; now the exit code says how it went.
+    ensure_completed(&outcome.report)
+}
+
+/// A run that did not complete is an error, so the exit code and a caller such
+/// as `schedule run-now` see a blocked or stopped run as the failure it is.
+pub(crate) fn ensure_completed(report: &kgraf_orchestrator::RunReport) -> Result<()> {
+    use kgraf_orchestrator::RunStatus;
+    match &report.status {
+        RunStatus::Completed => Ok(()),
+        RunStatus::Blocked { reason } => bail!("run {} is blocked: {reason}", report.run),
+        RunStatus::Stopped => bail!(
+            "run {} was stopped before it completed; `--resume {}` continues it",
+            report.run,
+            report.run
+        ),
+        RunStatus::Running => bail!("run {} ended while still marked running", report.run),
+    }
 }
 
 /// `kgraf clean <worktree>`: remove a worktree on the owner's word (see
 /// `kgraf_host::clean`).
 pub fn clean(root: &Path, name: &str, force: bool) -> Result<PathBuf> {
     Ok(kgraf_host::clean(root, name, force)?)
+}
+
+/// A run report with the given status and nothing else set, for tests here and
+/// in `schedule_cmd`.
+#[cfg(test)]
+pub(crate) fn test_report(status: kgraf_orchestrator::RunStatus) -> kgraf_orchestrator::RunReport {
+    kgraf_orchestrator::RunReport {
+        run: RunId::new("r9"),
+        status,
+        verified: Vec::new(),
+        held: Vec::new(),
+        counters: Default::default(),
+        serialized_fraction: 0.0,
+        spent: kgraf_core::Money::ZERO,
+        budget_admitted: 0,
+        contracts: Default::default(),
+        contract_checks: Default::default(),
+        analytics_error: None,
+        warnings: Vec::new(),
+        notices: Vec::new(),
+    }
 }
 
 /// The run report as printed. A failure of the run analytics (the demand
@@ -467,10 +511,10 @@ fn report_lines(report: &kgraf_orchestrator::RunReport) -> Vec<String> {
     }
     out.push(format!("spent      {}", report.spent));
     for w in &report.warnings {
-        out.push(format!("warning    {w}"));
+        out.push(format!("warning    {}", plain(w)));
     }
     for n in &report.notices {
-        out.push(format!("notice     {n}"));
+        out.push(format!("notice     {}", plain(n)));
     }
     if let Some(e) = &report.analytics_error {
         out.push(format!(
@@ -478,6 +522,15 @@ fn report_lines(report: &kgraf_orchestrator::RunReport) -> Vec<String> {
         ));
     }
     out
+}
+
+/// `text` with control characters replaced by `?`: warnings and notices can
+/// carry a file name a worker created, and a terminal acts on an escape
+/// sequence in one.
+fn plain(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
 }
 
 /// stdin as a message port: `?` starts a status question, anything else is a
@@ -595,6 +648,17 @@ mod tests {
                 .any(|l| l == "notice     the check generated Cargo.lock"),
             "notices are printed"
         );
+        // A worker-made file name with an escape sequence never reaches the
+        // terminal as one.
+        let mut hostile = report.clone();
+        hostile.notices = vec!["made \u{1b}[2Jx\ny.txt".into()];
+        hostile.warnings = vec!["w\u{7}".into()];
+        let printed = report_lines(&hostile);
+        assert!(
+            printed.iter().any(|l| l == "notice     made ?[2Jx?y.txt"),
+            "{printed:?}"
+        );
+        assert!(printed.iter().any(|l| l == "warning    w?"), "{printed:?}");
         report.analytics_error = Some("graph: database is locked".into());
         let lines = report_lines(&report);
         assert!(
@@ -603,6 +667,26 @@ mod tests {
                 .any(|l| l.starts_with("analytics  FAILED: graph: database is locked")),
             "{lines:?}"
         );
+    }
+
+    fn report_with(status: kgraf_orchestrator::RunStatus) -> kgraf_orchestrator::RunReport {
+        test_report(status)
+    }
+
+    /// Only a completed run exits zero; blocked and stopped runs are errors that
+    /// name the run and, for a stop, how to resume it.
+    #[test]
+    fn only_a_completed_run_is_a_success() {
+        use kgraf_orchestrator::RunStatus;
+        assert!(ensure_completed(&report_with(RunStatus::Completed)).is_ok());
+        let blocked = ensure_completed(&report_with(RunStatus::Blocked {
+            reason: "needs the user".into(),
+        }))
+        .expect_err("blocked");
+        assert!(blocked.to_string().contains("needs the user"), "{blocked}");
+        let stopped = ensure_completed(&report_with(RunStatus::Stopped)).expect_err("stopped");
+        assert!(stopped.to_string().contains("--resume r9"), "{stopped}");
+        assert!(ensure_completed(&report_with(RunStatus::Running)).is_err());
     }
 
     struct SeedAsker;
@@ -920,6 +1004,19 @@ mod tests {
         );
         assert!(shape.routes.iter().all(|r| r.max_output_tokens == 1_000));
         assert_eq!(shape.integration, "kgraf/same");
+    }
+
+    /// The run says which quality gates it uses, or that it has none.
+    #[test]
+    fn the_gate_commands_are_reported() {
+        assert_eq!(
+            notice_line(&Notice::GateCommands(vec![
+                "cargo test --workspace".into(),
+                "python3 -m pytest".into()
+            ])),
+            "gates      cargo test --workspace; python3 -m pytest"
+        );
+        assert!(notice_line(&Notice::GateCommands(Vec::new())).contains("no quality gate"));
     }
 
     /// The notices print as the command always printed them.

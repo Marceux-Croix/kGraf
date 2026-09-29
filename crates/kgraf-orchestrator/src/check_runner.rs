@@ -31,7 +31,7 @@
 //! run's hold file has no holder, and only then is the leader reaped, so a
 //! group id is never signaled after it could be reused. The hold file is
 //! outside the check's writable root, so a check cannot delete and recreate it
-//! to hide a holder (N1). Output goes to files the parent opened, never pipes, so a descendant
+//! to hide a holder. Output goes to files the parent opened, never pipes, so a descendant
 //! holding stdout cannot stall the reader; only the last [`DEFAULT_TAIL_BYTES`] are
 //! read back. Before exec, `RLIMIT_FSIZE` bounds every file (the output files
 //! included) and `RLIMIT_CPU` bounds CPU per process.
@@ -45,7 +45,7 @@
 //! run rather than as a quiet tree.
 //!
 //! **What an escaped descendant can still do**, stated rather than hidden
-//! (N2): it is not killed. It runs on, inside the same sandbox, until it exits
+//!: it is not killed. It runs on, inside the same sandbox, until it exits
 //! by itself or `RLIMIT_CPU` stops it, with write access to the run's
 //! directory only. Cleanup removes that directory when the run ends, and the
 //! descendant can race it: files it writes after the removal are left in the
@@ -510,17 +510,16 @@ impl SandboxRunner {
         // Never `with_ancestor_reads`: the tree is a copy under a scratch root
         // (`/tmp/kgraf-checks` first) whose parents are not the owner's,
         // and another user could plant a `.cargo/config.toml` there whose
-        // `runner` would run as the owner and forge a pass (security review
-        // C1). A `.cargo/config.toml` the repository tracks is in the copy
+        // `runner` would run as the owner and forge a pass. A `.cargo/config.toml` the repository tracks is in the copy
         // already; a cargo file above the tree makes cargo fail loud instead.
         let mut policy = SandboxPolicy::new(vec![run_dir.to_path_buf()], Network::Deny)
             .with_tmp_dir(run_dir.join("tmp"))
             .accept_partial_isolation(self.accept_partial);
         // Every process of the check holds this file shared until it exits,
-        // so its absence of holders proves the tree is gone (M5). It lies
+        // so its absence of holders proves the tree is gone. It lies
         // outside the check's only writable root, beside `.out` and `.err`, as
         // a worktree's hold lies outside the worktree: a check that could
-        // delete and recreate it would free an escaped descendant's lock (N1).
+        // delete and recreate it would free an escaped descendant's lock.
         #[cfg(unix)]
         {
             policy = policy.holding(hold_of(run_dir));
@@ -576,7 +575,7 @@ impl SandboxRunner {
             });
         }
         // RLIMIT_CPU: shared with the gate runner (`kgraf_sandbox::lifecycle`),
-        // so the bound and its rationale are set in one place (N2 in this
+        // so the bound and its rationale are set in one place (see this
         // module's doc comment).
         // SAFETY: forwarded from `limit_cpu_seconds`'s own contract.
         unsafe {
@@ -588,7 +587,7 @@ impl SandboxRunner {
             .map_err(|e| match e.kind() {
                 // Linux execs the program itself after confining the child:
                 // absent, or not executable under the policy, is a missing
-                // program, not a sandbox failure and not a verdict (H4).
+                // program, not a sandbox failure and not a verdict.
                 std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied => {
                     CheckError::ProgramMissing {
                         program: program.clone(),

@@ -38,8 +38,11 @@ pub fn discover_validation_commands(root: &Path, configured: &[String]) -> Resul
             found.push("npm test".to_owned());
         }
     }
-    if root.join("pyproject.toml").is_file() {
-        found.push("python -m pytest".to_owned());
+    // A pyproject.toml alone is also what a Rust or Node project keeps its
+    // tooling in (a formatter, a docs build): the pytest gate needs Python
+    // tests, or a pytest configuration, to be plausible.
+    if has_python_tests(root) {
+        found.push("python3 -m pytest".to_owned());
     }
     for name in ["Makefile", "makefile", "GNUmakefile"] {
         let path = root.join(name);
@@ -53,6 +56,51 @@ pub fn discover_validation_commands(root: &Path, configured: &[String]) -> Resul
         }
     }
     Ok(found)
+}
+
+/// Whether the project at `root` has Python tests: a `tests` or `test` folder
+/// holding a `test_*.py` or `*_test.py` file (searched a few levels down), or
+/// a pytest configuration (`pytest.ini`, `[tool.pytest` in `pyproject.toml`,
+/// `[tool:pytest]` in `setup.cfg`, `[pytest]` in `tox.ini`).
+fn has_python_tests(root: &Path) -> bool {
+    let configured = |file: &str, marker: &str| {
+        std::fs::read_to_string(root.join(file)).is_ok_and(|t| t.contains(marker))
+    };
+    if root.join("pytest.ini").is_file()
+        || configured("pyproject.toml", "[tool.pytest")
+        || configured("setup.cfg", "[tool:pytest]")
+        || configured("tox.ini", "[pytest]")
+    {
+        return true;
+    }
+    // Only when the project is Python at all.
+    root.join("pyproject.toml").is_file()
+        && ["tests", "test"]
+            .iter()
+            .any(|d| dir_has_python_test(&root.join(d), 3))
+}
+
+fn dir_has_python_test(dir: &Path, depth: usize) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if kind.is_file()
+            && name.ends_with(".py")
+            && (name.starts_with("test_") || name.ends_with("_test.py"))
+        {
+            return true;
+        }
+        // `file_type` does not follow links: a link to a folder is not entered.
+        if kind.is_dir() && depth > 0 && dir_has_python_test(&entry.path(), depth - 1) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Output a gate keeps from its commands, from the end (where failures are).

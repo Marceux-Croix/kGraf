@@ -393,7 +393,7 @@ pub fn decide(
         GateDecision::Waive => {
             g.status = GateStatus::Waived {
                 by: by.to_owned(),
-                // The user's text, stored and shown (decision 0071, H2).
+                // The user's text, stored and shown.
                 reason: kgraf_secrets::scrub_persist_owned(note.to_owned()),
                 at_ms: now_ms,
             };
@@ -491,11 +491,16 @@ pub fn record_verdict(
             return None;
         }
         Ok(v) => (v.by, v.output),
-        // A runner that could not run is a failed gate.
-        Err(e) => (
-            "the gate runner".to_owned(),
-            UntrustedText::new(format!("the gate could not run: {e}")),
-        ),
+        // A runner that could not run (an error, or a panic) says nothing
+        // about the code: no remediation is opened for it, and none is spent.
+        // The gate is held with the runner's error for the user to decide
+        // (retry once the environment is fixed, or waive).
+        Err(e) => {
+            g.status = GateStatus::Held {
+                reason: format!("the gate could not run: {e}"),
+            };
+            return None;
+        }
     };
     if g.remediations.len() as u32 >= max_remediations + g.allowance {
         g.status = GateStatus::Held {
@@ -520,7 +525,7 @@ pub fn record_verdict(
         g.id,
         output.quote_as_data("gate_output", &[("gate", &g.id)])
     );
-    // The gate's output is taken in here (decision 0071, H2): stored scrubbed,
+    // The gate's output is taken in here: stored scrubbed,
     // and the remediation worker's brief reads its model copy.
     let mut c = OpenContract::planned(
         id.clone(),
@@ -671,6 +676,34 @@ mod tests {
         );
     }
 
+    /// A runner that could not run (an error or a panic) holds the gate with the
+    /// runner's error: no remediation contract is opened for code that was
+    /// never judged, none is counted, and the allowance is untouched.
+    #[test]
+    fn a_runner_error_holds_the_gate_and_opens_no_remediation() {
+        let contracts = vec![contract("a", &[], "a.rs")];
+        let mut gates = plan_gates(&contracts, &BTreeMap::new());
+        let fix = record_verdict(
+            &mut gates,
+            ROOT_GATE,
+            Err("the gate panicked: boom".into()),
+            None,
+            5,
+            2,
+            "r",
+            &|_| true,
+        );
+        assert!(fix.is_none(), "no remediation for a runner that failed");
+        assert!(gates[0].remediations.is_empty());
+        assert_eq!(gates[0].allowance, 0);
+        match &gates[0].status {
+            GateStatus::Held { reason } => {
+                assert!(reason.contains("the gate panicked: boom"), "{reason}")
+            }
+            other => panic!("expected Held, got {other:?}"),
+        }
+    }
+
     #[test]
     fn a_failure_opens_a_remediation_with_the_output_as_data_then_holds() {
         let contracts = vec![contract("a", &[], "a.rs")];
@@ -718,7 +751,7 @@ mod tests {
         let fix2 = record_verdict(&mut gates, ROOT_GATE, fail(), None, 6, 2, "r", &|_| true)
             .expect("second");
         open_remediation(&mut gates, ROOT_GATE, &fix2.contract);
-        // A runner error is a failure, not a pass; past the limit the gate holds.
+        // A runner error is not a pass, and opens no remediation: the gate holds.
         let none = record_verdict(
             &mut gates,
             ROOT_GATE,

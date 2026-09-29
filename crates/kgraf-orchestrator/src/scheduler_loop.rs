@@ -37,7 +37,7 @@
 //!   longer than the window): `RunOnceOnWake` still fires (its whole purpose);
 //!   `Skip` drops it.
 //!
-//! ## Steady state is atomic with the claim (C3, M5)
+//! ## Steady state is atomic with the claim
 //!
 //! `ScheduleStore::tick_schedule` reads `last_seen`, lets this module decide what (if
 //! anything) is due, and - only if it decided to act - advances `last_seen` to
@@ -47,10 +47,10 @@
 //! claimed it, but `last_seen` already said it was accounted for) with no path back
 //! to it, and left `claim_occurrence`'s own lease-expiry reclaim logic unreachable,
 //! since nothing ever asked to claim that occurrence again. See `tick_schedule`'s own
-//! doc for the full argument, including the boundary race (M5) this same transaction
+//! doc for the full argument, including the boundary race this same transaction
 //! closes.
 //!
-//! ## H1: a schedule's first-ever evaluation is not "nothing missed"
+//! ## A schedule's first-ever evaluation is not "nothing missed"
 //!
 //! `Schedule::resolve_wake`'s `None` branch ("never evaluated, nothing missed") is
 //! right for a schedule that has genuinely never had an occurrence. It is wrong for
@@ -85,7 +85,7 @@ use crate::starter::ScheduledRuns;
 pub struct TrackedSchedule {
     pub schedule: Schedule,
     pub enabled: bool,
-    /// When this schedule was added (H1). Used as the fallback baseline for
+    /// When this schedule was added. Used as the fallback baseline for
     /// `last_seen` on this schedule's first-ever evaluation; see the module doc.
     pub created_at: DateTime<Utc>,
 }
@@ -110,7 +110,7 @@ pub enum TickEvent {
         due_at: DateTime<Utc>,
     },
     /// An occurrence whose previous claimant's lease had expired (a crash or a hang)
-    /// was reclaimed and is running again (C3: "each tick reclaim claimed rows whose
+    /// was reclaimed and is running again ("each tick reclaim claimed rows whose
     /// lease expired, emitting a visible abandoned event" - this is that event,
     /// distinct from `Started` so a repeated reclaim of the same occurrence is
     /// noticeable, not indistinguishable from ordinary firings).
@@ -137,7 +137,7 @@ pub enum TickEvent {
     /// the stored disable reason, shown as-is (never a generic message).
     Disabled { schedule_id: String, reason: String },
     /// `last_seen` was found ahead of `now` (a forward system-clock jump, later
-    /// corrected, or a hand-edited claim table) and was clamped back to `now` (M4).
+    /// corrected, or a hand-edited claim table) and was clamped back to `now`.
     /// Visible rather than silently absorbed, because a clock anomaly is itself worth
     /// knowing about even though this loop recovers from it on its own.
     ClockAnomaly { schedule_id: String, detail: String },
@@ -212,7 +212,7 @@ pub enum TickEvent {
 pub const DEFAULT_LEASE: Duration = Duration::from_secs(15 * 60);
 
 /// How close to real time a tick must be for its occurrence to count as "on time"
-/// (C1) rather than "missed" - generous relative to any sane tick cadence (the
+/// rather than "missed" - generous relative to any sane tick cadence (the
 /// desktop shell ticks every 20s; a caller with a coarser cadence should call
 /// [`SchedulerLoop::with_on_time_window`] with its own interval plus grace).
 pub const DEFAULT_ON_TIME_WINDOW: TimeDelta = TimeDelta::minutes(2);
@@ -278,7 +278,7 @@ impl SchedulerLoop {
         self
     }
 
-    /// Sets the on-time window (C1). A caller ticking on a real interval should pass
+    /// Sets the on-time window. A caller ticking on a real interval should pass
     /// that interval plus some grace (a slow tick, GC pause, or similar must not be
     /// misread as "the app was closed").
     pub fn with_on_time_window(mut self, window: TimeDelta) -> Self {
@@ -298,7 +298,7 @@ impl SchedulerLoop {
     ///
     /// Never returns an error: a failure evaluating or starting *one* schedule (a
     /// pathological recurrence rule, a transient store error) becomes that
-    /// schedule's own `TickEvent::Failed` and the tick continues with the rest (C2).
+    /// schedule's own `TickEvent::Failed` and the tick continues with the rest.
     /// The previous version used `?` throughout the per-schedule loop body, so one
     /// bad schedule - a `croner` pattern whose backward search failed, a stale
     /// pattern imported from an old format - silently starved every other schedule
@@ -311,7 +311,7 @@ impl SchedulerLoop {
     ) -> Vec<TickEvent> {
         let mut events = self.drain_finished();
 
-        // N2/D1: heartbeat every still-pending run's lease before it can expire. A
+        // Heartbeat every still-pending run's lease before it can expire. A
         // run that takes longer than `DEFAULT_LEASE` (a real worker round can) must
         // never look abandoned to `expired_claims` just because nobody told the claim
         // table it was still alive - and if the lease had already lapsed by the time
@@ -321,9 +321,9 @@ impl SchedulerLoop {
         // out from under itself.
         events.extend(self.renew_pending_leases(now));
 
-        // H2: a process-wide readiness check, before any schedule is even looked at.
+        // A process-wide readiness check, before any schedule is even looked at.
         // A schedule is never claimed, and so never disabled, for a fact that is true
-        // of the whole build and not of it in particular. N3 splits this
+        // of the whole build and not of it in particular. A separate check splits this
         // (`configured`) from the per-schedule check `start_run` runs internally
         // (`ready(schedule_id)`) - see `OrchestratorFactory`'s own doc.
         if let Err(failure) = self.starter.configured().await {
@@ -368,7 +368,7 @@ impl SchedulerLoop {
         events
     }
 
-    /// One schedule's share of a tick. Isolated by `tick`'s `match` above (C2): any
+    /// One schedule's share of a tick. Isolated by `tick`'s `match` above: any
     /// `?` in here only ever aborts *this* schedule's own turn.
     async fn tick_one(
         &mut self,
@@ -387,7 +387,7 @@ impl SchedulerLoop {
             return Ok(events);
         }
 
-        // M4: a `last_seen` ahead of `now` (a forward clock jump, later corrected)
+        // A `last_seen` ahead of `now` (a forward clock jump, later corrected)
         // would otherwise wedge this schedule - `latest_occurrence_since` never finds
         // anything past a baseline that is itself in the future. Corrected, visibly,
         // before the normal decision below (which then sees the corrected value:
@@ -403,10 +403,10 @@ impl SchedulerLoop {
             });
         }
 
-        // N2: reclaim occurrences whose lease already expired *before* evaluating
+        // Reclaim occurrences whose lease already expired *before* evaluating
         // what is newly due. This must be a separate scan, not folded into
         // `decide` below: once `tick_schedule` commits a claim, `last_seen` already
-        // names that occurrence (C3's own atomicity), so `latest_occurrence_since`
+        // names that occurrence (the claim's own atomicity), so `latest_occurrence_since`
         // can never propose it again to `decide` - there is no occurrence *later*
         // than `last_seen` to find. `expired_claims` looks at the claim table's
         // per-occurrence status directly, independent of `last_seen`.
@@ -448,7 +448,7 @@ impl SchedulerLoop {
             );
         }
 
-        // N1: on-time is judged from the occurrence's own due time, not from when
+        // On-time is judged from the occurrence's own due time, not from when
         // this schedule was last ticked - a heartbeat-based measure (an earlier
         // version of this module) reported "on time" for an occurrence that was
         // actually missed by hours, as long as the loop itself had ticked recently.
@@ -510,7 +510,7 @@ impl SchedulerLoop {
             RunStartOutcome::Started => {
                 let mut events = Vec::new();
                 let run_id = ScheduledRuns::run_id(schedule_id, due);
-                // N6: attach the run id this claim actually started, so a caller
+                // Attach the run id this claim actually started, so a caller
                 // (the CLI's `schedule list`) can look up its spend by exact run id
                 // instead of guessing one from `schedule_id` and `due` itself. The
                 // run above has already started either way, so a failure to record
@@ -561,7 +561,7 @@ impl SchedulerLoop {
                 });
                 Ok(events)
             }
-            // N7/D3: a capacity refusal never finalizes the occurrence through
+            // A capacity refusal never finalizes the occurrence through
             // `record_outcome` (which would count it toward the pause threshold like
             // any other failure) while it is still worth retrying. `decide_deferral`
             // answers, from this schedule's own policy and timing - not a fixed tick
@@ -663,7 +663,7 @@ impl SchedulerLoop {
         }
     }
 
-    /// Renews the lease on every occurrence still in `self.pending` (N2): a run that
+    /// Renews the lease on every occurrence still in `self.pending`: a run that
     /// is genuinely still executing must never look abandoned to `expired_claims`.
     /// `renew_lease` is itself fenced (claimant and generation must still match).
     ///
@@ -791,7 +791,7 @@ impl SchedulerLoop {
     /// records each outcome in the claim table, fenced by the `(claimant,
     /// generation)` pair recorded when it was claimed.
     ///
-    /// One run's settlement failing to record (M1: a store error here used to drop
+    /// One run's settlement failing to record (a store error here used to drop
     /// every *other* finished run still waiting in the same batch, via `?`) is now
     /// its own visible `TickEvent::Failed` and the loop moves on to the rest.
     fn drain_finished(&mut self) -> Vec<TickEvent> {

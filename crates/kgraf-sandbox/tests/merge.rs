@@ -674,7 +674,7 @@ fn refusal_of(out: FinishOutcome) -> Vec<RefusalReason> {
     }
 }
 
-/// Finding 1 and 2: a filter named by worker-written `.gitattributes` must
+/// A filter named by worker-written `.gitattributes` must
 /// never run on the host, not while staging, not while hashing the tree.
 #[test]
 fn worker_attributes_never_run_a_filter_on_the_host() {
@@ -716,7 +716,7 @@ fn worker_attributes_never_run_a_filter_on_the_host() {
     assert_eq!(tip(&e.f.repo), before);
 }
 
-/// Finding 2: paths that steer git are refused, never merged; the worktree
+/// Paths that steer git are refused, never merged; the worktree
 /// is kept for inspection and nothing reaches the branch.
 #[test]
 fn attempts_touching_git_control_files_are_refused() {
@@ -815,7 +815,7 @@ fn attempts_writing_a_state_directory_are_refused() {
     mb.discard(&mut a).unwrap();
 }
 
-/// Finding 3: a nested repository would become a gitlink to an unreachable
+/// A nested repository would become a gitlink to an unreachable
 /// commit and its files would vanish under outcome Merged.
 #[test]
 fn a_nested_repository_is_refused_naming_its_path() {
@@ -859,7 +859,7 @@ fn a_nested_repository_is_refused_naming_its_path() {
     assert_eq!(tip(&e.f.repo), before);
 }
 
-/// Finding 3, second form: a `.git` file in a subdirectory.
+/// A `.git` file in a subdirectory.
 #[test]
 fn a_gitlink_file_in_a_subdirectory_does_not_merge_silently() {
     let e = env();
@@ -887,7 +887,7 @@ fn a_gitlink_file_in_a_subdirectory_does_not_merge_silently() {
     assert_eq!(tip(&e.f.repo), before);
 }
 
-/// Finding 4: paths differing only by case merge cleanly in git but collide
+/// Paths differing only by case merge cleanly in git but collide
 /// on macOS and Windows file systems.
 #[test]
 fn case_only_collisions_are_a_conflict() {
@@ -922,7 +922,7 @@ fn case_only_collisions_are_a_conflict() {
     );
 }
 
-/// Finding 4, Unicode form: NFC and NFD spellings of one name.
+/// NFC and NFD spellings of one name.
 #[test]
 fn normalization_only_collisions_are_a_conflict() {
     let e = env();
@@ -966,7 +966,7 @@ fn delete_and_file_directory_conflicts_are_typed() {
     assert_eq!(show(&e.f.repo, &format!("{BRANCH}:d")), "file");
 }
 
-/// Finding 8: a FIFO is reported, not skipped silently.
+/// A FIFO is reported, not skipped silently.
 #[cfg(unix)]
 #[test]
 fn a_fifo_is_reported_not_skipped() {
@@ -989,7 +989,7 @@ fn a_fifo_is_reported_not_skipped() {
     );
 }
 
-/// Finding 6: oversized files refuse the attempt before staging; ignored
+/// Oversized files refuse the attempt before staging; ignored
 /// files are not counted.
 #[test]
 fn oversized_files_are_refused_and_ignored_ones_are_not_counted() {
@@ -1070,7 +1070,7 @@ fn an_attempt_over_the_total_byte_limit_is_refused_naming_its_largest_files() {
     );
 }
 
-/// Finding 6: every git child is bounded in time.
+/// Every git child is bounded in time.
 #[cfg(unix)]
 #[test]
 fn a_hung_git_is_killed_at_the_timeout() {
@@ -1102,7 +1102,7 @@ fn a_hung_git_is_killed_at_the_timeout() {
     assert!(matches!(a.state(), AttemptState::Working));
 }
 
-/// Finding 7: an attempt name must form a valid ref.
+/// An attempt name must form a valid ref.
 #[test]
 fn attempt_names_that_are_not_valid_refs_are_refused() {
     let e = env();
@@ -1125,7 +1125,7 @@ fn attempt_names_that_are_not_valid_refs_are_refused() {
     }
 }
 
-/// Finding 5: the winner is committed before any loser is discarded, and a
+/// The winner is committed before any loser is discarded, and a
 /// failure returns every attempt not yet discarded.
 #[test]
 fn select_commits_the_winner_before_discarding_losers() {
@@ -1419,6 +1419,67 @@ fn two_paths_the_file_system_folds_as_one_are_refused() {
         "{reasons:?}"
     );
     assert_eq!(tip(&e.f.repo), before);
+}
+
+/// A new path that folds onto a path already in the base tree is refused at
+/// commit, although only the new path is in the change list: in an APFS or
+/// NTFS checkout it would overwrite the existing file. The long s, a new
+/// directory beside an existing one, and a plain case twin are all caught.
+#[test]
+fn a_new_path_that_folds_onto_a_base_path_is_refused() {
+    let e = env();
+    let mb = merger(&e);
+    let mut seed = attempt(&e, "seed");
+    write(&seed, "Twin.rs", "one\n");
+    write(&seed, "sample.rs", "two\n");
+    write(&seed, "Dir/a.rs", "three\n");
+    assert!(matches!(
+        mb.finish(&mut seed, "seed", &["Twin.rs", "sample.rs", "Dir/a.rs"])
+            .unwrap(),
+        FinishOutcome::Merged { .. }
+    ));
+    let before = tip(&e.f.repo);
+    for (existing, twin) in [
+        ("Twin.rs", "twin.rs"),
+        ("sample.rs", "\u{17F}ample.rs"),
+        ("Dir", "dir"),
+    ] {
+        let new_path = if twin == "dir" { "dir/b.rs" } else { twin };
+        let name = format!("twin-{}", existing.len());
+        let mut a = attempt(&e, &name);
+        let root = a.workspace().root().to_path_buf();
+        write(&a, "unrelated.txt", "x\n");
+        // On disk too, or staging everything would drop the index entry as
+        // deleted (a folding volume resolves the name to the existing file).
+        write(&a, new_path, "x\n");
+        let blob = git(&root, &["hash-object", "-w", "unrelated.txt"]);
+        // In the index whatever the file system folds (`ignorecase` off, or
+        // git itself would fold the new name onto the existing entry).
+        git(
+            &root,
+            &[
+                "-c",
+                "core.ignorecase=false",
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("100644,{blob},{new_path}"),
+            ],
+        );
+        let reasons = refusal_of(
+            mb.finish(&mut a, &name, &["unrelated.txt", new_path])
+                .unwrap(),
+        );
+        assert!(
+            reasons.iter().any(|r| matches!(
+                r,
+                RefusalReason::PathCollision { paths }
+                    if paths.iter().any(|p| p == existing) && paths.iter().any(|p| p == twin)
+            )),
+            "{existing} / {twin}: {reasons:?}"
+        );
+        assert_eq!(tip(&e.f.repo), before);
+    }
 }
 
 /// Merge itself holds the scope, whatever the caller checked: an attempt

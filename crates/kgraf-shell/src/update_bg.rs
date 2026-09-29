@@ -67,6 +67,7 @@ enum Command {
 pub struct UpdateHandle {
     state: Arc<Mutex<UpdateState>>,
     tx: std::sync::mpsc::Sender<Command>,
+    wake: Wake,
     stop: Arc<AtomicBool>,
     join: Option<std::thread::JoinHandle<()>>,
 }
@@ -120,6 +121,7 @@ impl UpdateHandle {
         let (tx, rx) = std::sync::mpsc::channel::<Command>();
         let stop = Arc::new(AtomicBool::new(false));
         let (state_t, stop_t) = (state.clone(), stop.clone());
+        let wake_handle = wake.clone();
         let join = std::thread::Builder::new()
             .name("kgraf-update".to_owned())
             .spawn(move || {
@@ -134,6 +136,10 @@ impl UpdateHandle {
                     .timeout(Duration::from_secs(30))
                     .build()
                     .unwrap_or_default();
+                let download_client = update_check::download_client(
+                    update_check::DOWNLOAD_CONNECT_TIMEOUT,
+                    update_check::DOWNLOAD_IDLE_TIMEOUT,
+                );
                 if check_on_start {
                     runtime.block_on(run_check(
                         &state_t,
@@ -160,7 +166,7 @@ impl UpdateHandle {
                         Ok(Command::Install(candidate)) => {
                             runtime.block_on(run_install(
                                 &state_t,
-                                &client,
+                                &download_client,
                                 &candidate,
                                 launcher.as_ref(),
                                 &wake,
@@ -175,6 +181,7 @@ impl UpdateHandle {
         Self {
             state,
             tx,
+            wake: wake_handle,
             stop,
             join,
         }
@@ -194,8 +201,26 @@ impl UpdateHandle {
     /// The consent gate. Call this only from the notice's own "Yes, download and
     /// install" action (see this module's own doc comment); nothing else in this
     /// crate may call it.
+    ///
+    /// Idempotent: the state moves to [`UpdateState::Downloading`] here, before the
+    /// command is queued, so a second call while a download is in flight (a double
+    /// click) returns without queueing another download.
     pub fn accept_and_install(&self, candidate: UpdateCandidate) {
-        let _ = self.tx.send(Command::Install(candidate));
+        {
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            if *state == UpdateState::Downloading {
+                return;
+            }
+            *state = UpdateState::Downloading;
+        }
+        (self.wake)();
+        if self.tx.send(Command::Install(candidate)).is_err() {
+            set_state(
+                &self.state,
+                &self.wake,
+                UpdateState::Failed("the update thread is not running".to_owned()),
+            );
+        }
     }
 }
 
@@ -419,6 +444,71 @@ mod tests {
             launcher.calls.lock().unwrap().len(),
             1,
             "the launcher runs exactly once, only after explicit consent"
+        );
+    }
+
+    /// A double click queues one download, not two: the second call sees
+    /// `Downloading` and returns. Mechanism: count the asset requests the server
+    /// saw and the launcher calls.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_second_accept_while_downloading_queues_nothing() {
+        let server = MockServer::start().await;
+        let name = asset_name();
+        let body = b"installer bytes";
+        let hex: String = {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(body)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        };
+        Mock::given(method("GET"))
+            .and(path_matcher(format!("/{name}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(body.to_vec())
+                    .set_delay(Duration::from_millis(500)),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_matcher(format!("/{name}.sha256")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!("{hex}  {name}\n")))
+            .mount(&server)
+            .await;
+        let candidate = UpdateCandidate {
+            version: semver::Version::new(999, 0, 0),
+            tag_name: "v999.0.0-double-click".to_owned(),
+            asset_name: name.clone(),
+            download_url: format!("{}/{name}", server.uri()),
+            checksum_name: format!("{name}.sha256"),
+            checksum_url: format!("{}/{name}.sha256", server.uri()),
+        };
+        let launcher = Arc::new(RecordingLauncher::default());
+        let (wake, _woke) = wake_counter();
+        let handle = UpdateHandle::spawn_full(false, false, wake, launcher.clone(), server.uri());
+
+        handle.accept_and_install(candidate.clone());
+        assert_eq!(
+            handle.state(),
+            UpdateState::Downloading,
+            "the state changes before the command is queued"
+        );
+        handle.accept_and_install(candidate);
+        wait_until(|| matches!(handle.state(), UpdateState::Ready { .. }));
+        // Time for a wrongly queued second download to run.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        let asset_requests = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path() == format!("/{name}"))
+            .count();
+        assert_eq!(asset_requests, 1, "the installer was downloaded twice");
+        assert_eq!(launcher.calls.lock().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(
+            std::env::temp_dir().join("kgraf-update/v999.0.0-double-click"),
         );
     }
 

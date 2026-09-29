@@ -157,7 +157,7 @@ async fn a_real_stdio_mcp_server_lists_and_serves_its_tools() {
     assert!(failed.starts_with("ERROR"), "{failed}");
     assert!(failed.contains("the tool refused"));
 
-    // The construction-required attribution sink (main-session ruling on 0051)
+    // The construction-required attribution sink (decision 0051)
     // recorded the connect, the list, and every call above.
     let events = sink.events();
     assert!(events.iter().any(|e| e.kind == McpCallKind::Connect));

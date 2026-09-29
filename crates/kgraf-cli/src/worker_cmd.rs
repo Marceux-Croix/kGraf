@@ -140,7 +140,9 @@ pub fn run(root: &Path, args: WorkerArgs) -> Result<()> {
     // a graph is refused, never dropped.
     let graph_path = state.join("graph.db");
     let graph = if graph_path.exists() {
-        let store = GraphStore::open(&graph_path, root).context("cannot open the graph")?;
+        // Never rebuilt from here: only `kgraf index` rebuilds an index.
+        let store = GraphStore::open_existing_for_facts(&graph_path, root)
+            .context("cannot open the graph")?;
         (store.node_count()? > 0).then_some(store)
     } else {
         None
@@ -151,16 +153,15 @@ pub fn run(root: &Path, args: WorkerArgs) -> Result<()> {
                 .slices
                 .iter()
                 .map(|symbol| {
-                    store
-                        .resolve_symbol(symbol)
-                        .with_context(|| format!("resolving `{symbol}`"))?
-                        .into_iter()
-                        .next()
+                    // An ambiguous name is refused with its candidates, never
+                    // resolved to whichever node sorts first.
+                    kgraf_graph::slice::resolve_unambiguous(&store, symbol)
                         .map(|n| NodeId::new(n.id))
-                        .with_context(|| format!("no symbol `{symbol}` in the graph"))
+                        .with_context(|| format!("resolving --slice `{symbol}`"))
                 })
                 .collect::<Result<Vec<_>>>()?;
-            let tool = GraphStore::open(&graph_path, root).context("cannot open the graph")?;
+            let tool = GraphStore::open_existing_for_facts(&graph_path, root)
+                .context("cannot open the graph")?;
             (
                 Some(GraphParts {
                     slices: store,

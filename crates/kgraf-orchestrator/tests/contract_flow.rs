@@ -413,7 +413,7 @@ async fn a_sound_contract_is_checked_once_then_both_parties_dispatch() {
 
 /// A lander the process dies inside: it records that the land began and
 /// never returns, so the run is killed with `ChecksPassed` persisted and no
-/// `StubLanded` (0081 hardening, H2).
+/// `StubLanded`.
 struct DiesInsideTheLand(Arc<std::sync::atomic::AtomicBool>);
 
 #[async_trait::async_trait]
@@ -424,7 +424,7 @@ impl StubLander for DiesInsideTheLand {
     }
 }
 
-/// 0081 hardening, H2: `ChecksPassed` is persisted before the land. A
+/// `ChecksPassed` is persisted before the land. A
 /// process killed inside that window resumes with the interface checked and
 /// no stub landed; the resume must land it before any party dispatches, not
 /// skip it because the interface reads as checked.
@@ -1186,7 +1186,7 @@ async fn a_supersede_withdraws_running_parties_and_holds_them_individually() {
     }
 }
 
-/// M2: a running worker's challenges are budgeted, and a lineage with a
+/// A running worker's challenges are budgeted, and a lineage with a
 /// challenge still open (a recompute running) cannot open another on the same
 /// interface.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1228,7 +1228,7 @@ async fn worker_challenges_are_budgeted_and_one_lineage_has_one_open_at_a_time()
         recompute.await.expect("join"),
         ContractReply::Resolved(_)
     ));
-    // The budget counts a challenge when it is taken (N3): the recompute and
+    // The budget counts a challenge when it is taken: the recompute and
     // the one refused as still open are two of the three already.
     assert_eq!(kgraf_orchestrator::DEFAULT_MAX_CHALLENGES_PER_WORKER, 3);
     assert!(matches!(
@@ -1440,7 +1440,7 @@ async fn an_interface_the_decomposition_writes_is_registered_checked_and_replaye
     assert_eq!(registrations, 1, "the resume planned nothing again");
 }
 
-/// H3: the check setting is the run's. A run started with checks and resumed
+/// The check setting is the run's. A run started with checks and resumed
 /// without them (or the reverse) is refused before anything is written, naming
 /// both settings; resumed with the same setting it goes on.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1514,7 +1514,7 @@ async fn an_interface_naming_a_contract_the_plan_lacks_is_refused() {
         worker_requests(&rig.parts).is_empty(),
         "no worker was spent"
     );
-    // M1: refused before the plan's progress was saved, so a resume plans
+    // Refused before the plan's progress was saved, so a resume plans
     // afresh (a new decomposition call) instead of replaying the refusal.
     let _ = rig.trace().await;
     let record = kgraf_orchestrator::RunStore::new(rig.parts.graph.clone())
@@ -1534,12 +1534,12 @@ async fn an_interface_naming_a_contract_the_plan_lacks_is_refused() {
     );
     assert_eq!(
         rig.parts.planner.prompts().len(),
-        calls + 1,
-        "planned afresh"
+        calls + 3,
+        "planned afresh: one ask, and two more after each refusal"
     );
 }
 
-/// M3: a quote is checked against the commit the checks ran on, not the
+/// A quote is checked against the commit the checks ran on, not the
 /// checkout. Text added to the checkout afterwards is not in the artifact, and
 /// a file that exists only in the checkout is refused.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1621,7 +1621,7 @@ impl kgraf_orchestrator::Handshaker for RouteRecorder {
     }
 }
 
-/// M7: each party's handshake is asked on the route its first attempt then
+/// Each party's handshake is asked on the route its first attempt then
 /// runs on, so the model that stated the assumptions works to them (0030).
 /// Three parties on two routes: without the recorded handshake route, the
 /// rotation at dispatch would put the first party on the other route.
@@ -1672,8 +1672,8 @@ async fn each_partys_first_attempt_runs_on_the_route_of_its_handshake() {
     }
 }
 
-/// N5: an interface a split writes may bind a contract outside the split. The
-/// name is resolved against the whole plan, as before M1, and the split's
+/// An interface a split writes may bind a contract outside the split. The
+/// name is resolved against the whole plan, as before, and the split's
 /// own parties are renamed to the children.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_splits_interface_may_bind_a_contract_outside_the_split() {
@@ -1734,7 +1734,7 @@ async fn a_splits_interface_may_bind_a_contract_outside_the_split() {
     );
 }
 
-/// M1: an interface with no parties binds nothing, so it is refused.
+/// An interface with no parties binds nothing, so it is refused.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_interface_with_no_parties_is_refused() {
     let dir = tempfile::tempdir().expect("dir");
@@ -2009,9 +2009,8 @@ impl ConsumerTestWriter for FixedConsumerTest {
 
     fn cost_basis(&self) -> CostBasis {
         // `PLAN_MODEL`: the only model `prices()` registers besides the two
-        // worker fakes, so the reservation this writer's call makes prices
-        // successfully (an unpriced model refuses the reservation
-        // rather than dispatch for free).
+        // worker fakes, so the reservation this writer's call makes is
+        // priced.
         CostBasis {
             model: PLAN_MODEL.into(),
             max_output_tokens: 100,

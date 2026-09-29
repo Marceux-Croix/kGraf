@@ -2,8 +2,9 @@
 // at e72da2b53805894878023d01949a25a082e0a5cb, Apache-2.0.
 // Changes: the `update_file_mode` parameter was dropped. Upstream branches on it
 // only to widen the end-of-file search window for `PreserveLineEndings`; kGraf
-// only ever normalizes to LF (see `apply_patch::replace`'s doc comment for why),
-// so the `NormalizeToLf` arm is the only behavior kept.
+// matches on LF lines (`apply_patch::replace` strips and restores a CRLF file's
+// carriage returns around the edit), so the `NormalizeToLf` arm is the only
+// behavior kept.
 
 /// Attempt to find the sequence of `pattern` lines within `lines` beginning at or after `start`.
 /// Returns the starting index of the match or `None` if not found. Matches are attempted with
@@ -116,6 +117,23 @@ pub(crate) fn seek_sequence(
     None
 }
 
+/// The longest a file line or a pattern line is echoed back in a hint, in
+/// characters. A minified or generated file can hold a line of megabytes, and
+/// the hint goes into a tool result the model reads.
+const ECHO_LIMIT: usize = 160;
+
+/// `line` cut to [`ECHO_LIMIT`] characters at a character boundary, with a
+/// marker saying how much was left out.
+fn clip(line: &str) -> String {
+    match line.char_indices().nth(ECHO_LIMIT) {
+        None => line.to_owned(),
+        Some((cut, _)) => {
+            let left_out = line[cut..].chars().count();
+            format!("{}... [{left_out} more characters]", &line[..cut])
+        }
+    }
+}
+
 /// Builds a diagnostic for a [`seek_sequence`] call that returned `None`,
 /// naming the nearest candidate region in `lines` and the first point where
 /// it disagrees with `pattern`, plus a hint when `pattern`'s one line reads
@@ -150,8 +168,12 @@ pub(crate) fn describe_mismatch(lines: &[String], pattern: &[String], start: usi
             && let Some((idx, hit)) = lines
                 .iter()
                 .enumerate()
+                // From where the search began, as `seek_sequence` looked: a
+                // line before `start` could never have matched.
+                .skip(start)
                 .find(|(_, line)| line.as_str() != pattern[0].as_str() && line.contains(needle))
         {
+            let hit = clip(hit);
             return format!(
                 "Line {} contains this text but is not an exact line match: '{hit}'. \
                  A `@@` context line must equal one whole line of the file, not part of \
@@ -162,16 +184,17 @@ pub(crate) fn describe_mismatch(lines: &[String], pattern: &[String], start: usi
         }
         if looks_like_unified_diff_hunk_header(needle) {
             return format!(
-                "'{needle}' reads like a unified-diff hunk header (`@@ -a,b +c,d @@`), which \
+                "'{}' reads like a unified-diff hunk header (`@@ -a,b +c,d @@`), which \
                  this format does not use. A `@@` line here takes a plain source line (e.g. a \
-                 function signature) copied verbatim from the file, or nothing at all."
+                 function signature) copied verbatim from the file, or nothing at all.",
+                clip(needle)
             );
         }
     } else if looks_like_unified_diff_hunk_header(pattern[0].trim()) {
         return format!(
             "'{}' reads like a unified-diff hunk header (`@@ -a,b +c,d @@`), which this format \
              does not use.",
-            pattern[0].trim()
+            clip(pattern[0].trim())
         );
     }
 
@@ -206,8 +229,8 @@ pub(crate) fn describe_mismatch(lines: &[String], pattern: &[String], start: usi
         pattern.len(),
         mismatch_offset + 1,
         pattern.len(),
-        pattern[mismatch_offset],
-        lines[best_start + mismatch_offset],
+        clip(&pattern[mismatch_offset]),
+        clip(&lines[best_start + mismatch_offset]),
     )
 }
 
@@ -279,6 +302,28 @@ mod tests {
 
     fn to_vec(strings: &[&str]) -> Vec<String> {
         strings.iter().map(ToString::to_string).collect()
+    }
+
+    /// A hint echoes a file line and a pattern line cut to a bound, at a
+    /// character boundary, and looks for a partial-line hit only from where
+    /// the search began.
+    #[test]
+    fn hints_clip_long_lines_and_scan_from_the_start_index() {
+        let long = format!("needle {}", "\u{e9}".repeat(100_000));
+        let lines = vec![long.clone(), "other".to_string(), "tail".to_string()];
+        let hint = describe_mismatch(&lines, &to_vec(&["needle"]), 0);
+        assert!(hint.len() < 1000, "{} bytes", hint.len());
+        assert!(hint.contains("more characters]"), "{hint}");
+        // The same partial hit before the start index is not offered.
+        let hint = describe_mismatch(&lines, &to_vec(&["needle"]), 1);
+        assert!(!hint.contains("contains this text"), "{hint}");
+        // Multi-line: the disagreeing lines are clipped too.
+        let lines = vec![long.clone(), long.clone()];
+        let hint = describe_mismatch(&lines, &to_vec(&["x", "y"]), 0);
+        assert!(hint.len() < 1000, "{} bytes", hint.len());
+        // Short lines are echoed whole.
+        let hint = describe_mismatch(&to_vec(&["pub fn foo(x: i32) {"]), &to_vec(&["fn foo"]), 0);
+        assert!(hint.contains("'pub fn foo(x: i32) {'"), "{hint}");
     }
 
     #[test]

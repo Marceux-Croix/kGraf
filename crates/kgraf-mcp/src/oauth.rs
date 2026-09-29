@@ -385,7 +385,7 @@ impl CredentialStore for KeyringCredentialStore {
 /// holds no long-lived state beyond what [`KeyringCredentialStore`] persists.
 ///
 /// Takes an attribution sink at construction, the same as [`crate::client::RmcpCaller`]
-/// (main-session ruling on decision 0051: OAuth discovery, registration and token
+/// (decision 0051: OAuth discovery, registration and token
 /// exchange are MCP traffic too, and are attributed the same way).
 pub struct OAuthConnector {
     server: String,

@@ -409,7 +409,7 @@ impl RouteLimiter {
                     ));
                 };
                 match store
-                    .check_bounded(&self.route, key, self.limit, SystemTime::now(), budget)
+                    .check_bounded(&self.route, key, self.limit, SystemTime::now, budget)
                     .await
                 {
                     Ok(crate::crosslimit::Admission::Admitted) => CheckOutcome::Admitted,
@@ -527,8 +527,7 @@ impl RateLimited {
         // constant, which several routes can share), recorded while the row
         // is still in flight, before the rate-limit check, so a refused
         // call still carries its route (harmless: `route_round_stats` reads
-        // whatever rows exist for a route, refused or not, exactly as it
-        // already did by adapter before this fix). A failure to record it
+        // only settled, counted rows, so a refused call never skews it). A failure to record it
         // is logged, never fatal: a route this crate cannot yet resolve is
         // reported as "unmeasured" downstream, not as a broken call.
         if let Err(e) = token.record_route_async(self.limiter.route()).await {

@@ -159,7 +159,10 @@ fn gaps(c: LinuxConfinement) -> String {
         gaps.push("signals to other processes of the same user are not scoped");
     }
     if !(c.namespaces && c.fresh_proc) {
-        gaps.push("/proc lists host processes and their command lines");
+        gaps.push(
+            "/proc lists host processes: the command lines and environments of processes \
+             of the same user are readable, and an environment can hold secrets",
+        );
     }
     gaps.push(
         "unix-domain sockets cannot be created at all, even in the workspace \
@@ -214,7 +217,18 @@ const HOME_READS: &[&str] = &[
     ".nvm",
     ".pyenv",
     ".gitconfig",
-    ".config/git",
+    // Not `~/.config/git` itself: the credential-store file lives there, and
+    // the allow list cannot carve a file out of a directory it grants. The
+    // three files git reads from it are granted one by one.
+    ".config/git/config",
+    ".config/git/ignore",
+    ".config/git/attributes",
+    // Not `~/.local` itself: it holds keyrings, shell histories and other
+    // per-user data (`.local/share`). Only the places tools install to.
+    ".local/bin",
+    ".local/lib",
+    ".local/share/uv",
+    ".local/share/pnpm",
 ];
 
 // Files cargo reads in every ancestor of the directory it runs in, relative
@@ -681,7 +695,7 @@ fn fd_meta(fd: &OwnedFd) -> std::io::Result<std::fs::Metadata> {
 enum Presence {
     /// A system or toolchain path this machine may not have, or may not let
     /// this user reach: absent, not reachable through a non-directory, or
-    /// not permitted are all "grants nothing" (review L1: a regular-file
+    /// not permitted are all "grants nothing" (a regular-file
     /// `~/.config` made every sandboxed command fail on `~/.config/git`).
     Optional,
     /// A path the caller named (a writable or readable root): any failure
@@ -841,6 +855,46 @@ mod tests {
         (base, b)
     }
 
+    /// The home grants are narrow: git's credential-store file and the
+    /// per-user data under `~/.local/share` are unreadable, while the files
+    /// git reads and the install directories stay readable. Fake fixtures
+    /// under a temp HOME only. Needs Landlock ABI v3 or later.
+    #[test]
+    fn home_grants_exclude_git_credentials_and_local_share_data() {
+        let (_base, b) = canonical_tempdir();
+        let home = b.join("home");
+        let work = b.join("work");
+        std::fs::create_dir_all(home.join(".config/git")).unwrap();
+        std::fs::create_dir_all(home.join(".local/share/keyrings")).unwrap();
+        std::fs::create_dir_all(home.join(".local/share/uv")).unwrap();
+        std::fs::create_dir_all(home.join(".local/bin")).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(home.join(".config/git/credentials"), "FAKE-TOKEN").unwrap();
+        std::fs::write(home.join(".config/git/config"), "[user]\n").unwrap();
+        std::fs::write(home.join(".local/share/keyrings/login"), "FAKE-KEYRING").unwrap();
+        std::fs::write(home.join(".local/share/uv/tool"), "ok").unwrap();
+        std::fs::write(home.join(".local/bin/tool"), "ok").unwrap();
+        let policy = policy(&work, Some(&home), Network::Deny);
+        assert_refused(&policy, &home.join(".config/git/credentials"));
+        assert_refused(&policy, &home.join(".local/share/keyrings/login"));
+        assert_read(&policy, &home.join(".config/git/config"), "[user]\n");
+        assert_read(&policy, &home.join(".local/share/uv/tool"), "ok");
+        assert_read(&policy, &home.join(".local/bin/tool"), "ok");
+        // Never granted, so unreadable on this backend by construction.
+        for rel in [
+            ".vault-token",
+            ".pgpass",
+            ".terraform.d/c",
+            ".gem/credentials",
+            ".codex/auth.json",
+        ] {
+            let path = home.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "FAKE").unwrap();
+            assert_refused(&policy, &path);
+        }
+    }
+
     /// Needs a Linux kernel with Landlock ABI v3 or later.
     #[test]
     fn cargo_credentials_are_unreadable_but_the_registry_is_readable() {
@@ -934,7 +988,7 @@ mod tests {
         unsafe { libc::geteuid() == 0 }
     }
 
-    /// Review C1 (3) and M2: a cargo file someone else could change is not
+    /// A cargo file someone else could change is not
     /// read, though it lies between the root and the limit (an other-writable
     /// `.cargo`, an other-writable manifest, and, as root, where a file can be
     /// given away, a manifest owned by another user), and each refusal names

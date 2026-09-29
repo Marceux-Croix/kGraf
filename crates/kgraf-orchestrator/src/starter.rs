@@ -35,7 +35,7 @@ use std::sync::{Arc, Mutex};
 ///   scheduled work at all (are routes even set up)? A caller (`SchedulerLoop`)
 ///   checks this once per tick, before claiming anything, so a build with nothing
 ///   configured never claims an occurrence just to disable it for a fact true of the
-///   whole process and not of that schedule (H2).
+///   whole process and not of that schedule.
 /// - [`ready`](Self::ready) is per-schedule: given this schedule's id, is *its*
 ///   credential present, is *its* MCP server reachable? `start_run` checks this
 ///   after a claim already succeeded, and its failure is what disables *that*
@@ -45,10 +45,10 @@ use std::sync::{Arc, Mutex};
 ///   readiness fact does not need to add anything to keep building.
 #[async_trait::async_trait]
 pub trait OrchestratorFactory: Send + Sync {
-    /// Whole-process readiness (H2): routes configured, credential plumbing present
+    /// Whole-process readiness: routes configured, credential plumbing present
     /// at all. Never attributed to one schedule.
     async fn configured(&self) -> Result<(), ReadinessFailure>;
-    /// This schedule's own readiness (N3): its credential, its MCP servers. Checked
+    /// This schedule's own readiness: its credential, its MCP servers. Checked
     /// inside `start_run`, after a claim already succeeded.
     async fn ready(&self, schedule_id: &str) -> Result<(), ReadinessFailure> {
         let _ = schedule_id;
@@ -67,7 +67,7 @@ pub struct ScheduledRuns {
     factory: Arc<dyn OrchestratorFactory>,
     /// Schedule id to the instruction it runs, verbatim. A `Mutex`, not a plain
     /// field: [`set_instructions`](Self::set_instructions) lets a caller whose
-    /// schedule definitions can change over time (H2 regression) replace this after
+    /// schedule definitions can change over time replace this after
     /// construction, instead of the map being frozen at whatever it held the moment
     /// this `ScheduledRuns` was built.
     instructions: Mutex<BTreeMap<String, String>>,
@@ -117,7 +117,7 @@ impl ScheduledRuns {
     /// decide *not to claim in the first place* when the whole build cannot run work - a desktop
     /// shell with no route configuration yet, say - rather than claiming every due occurrence and
     /// then disabling each schedule one at a time for a fact that has nothing to do with any one of
-    /// them. See [`OrchestratorFactory::configured`] and [`OrchestratorFactory::ready`] for the N3
+    /// them. See [`OrchestratorFactory::configured`] and [`OrchestratorFactory::ready`] for the
     /// split this and `start_run`'s own check now respect.
     pub async fn configured(&self) -> Result<(), ReadinessFailure> {
         self.factory.configured().await
@@ -154,7 +154,7 @@ impl RunStarter for ScheduledRuns {
                 },
             )));
         };
-        // N3: per-schedule readiness (this schedule's own credential), not the
+        // Per-schedule readiness (this schedule's own credential), not the
         // whole-process `configured()` check `SchedulerLoop` already ran before ever
         // claiming this occurrence. A failure here is what disables *this* schedule.
         if let Err(failure) = self.factory.ready(schedule_id).await {

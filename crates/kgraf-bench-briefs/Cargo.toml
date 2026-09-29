@@ -38,3 +38,7 @@ tempfile.workspace = true
 # Closest price-catalog keys for an unpriced model. MIT; already in the
 # lockfile through clap.
 strsim = "0.11.1"
+
+# Group kill of a timed-out check (unix only, as in kgraf-host's gates).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.185"

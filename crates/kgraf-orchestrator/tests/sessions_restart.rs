@@ -1,4 +1,4 @@
-//! Decision 0067 review, M2 and M3, across a process restart: "a kill
+//! Decision 0067, across a process restart: "a kill
 //! between persisting and injecting delivers exactly once after resume", a
 //! kill between the transcript append and the inbox mark sends nothing
 //! twice, and a stopped session stays held across a restart until
@@ -96,7 +96,7 @@ fn resume(dir: &std::path::Path) -> kgraf_orchestrator::RunReport {
         .expect("resume")
 }
 
-/// M2, the spec test: the note is persisted and acknowledged while the worker
+/// The spec test: the note is persisted and acknowledged while the worker
 /// is parked mid-round (it reaches no boundary), then the process is killed.
 /// The resumed worker gets it at its first boundary: exactly one `Injected`
 /// in the transcript, and the inbox row marked at that sequence.
@@ -147,7 +147,7 @@ fn a_kill_between_persisting_and_injecting_delivers_exactly_once_after_resume() 
     );
 }
 
-/// M2: a kill after the `Injected` event reached the transcript but before
+/// A kill after the `Injected` event reached the transcript but before
 /// its inbox row was marked (simulated by clearing the mark, which is exactly
 /// the state such a kill leaves). The resume reads
 /// `WorkerHandle::already_delivered()` and marks the row at the recorded
@@ -228,7 +228,7 @@ fn a_kill_after_the_transcript_append_marks_the_row_and_sends_nothing_twice() {
     );
 }
 
-/// M3: stop a session, stop the process, start it again and press play: the
+/// Stop a session, stop the process, start it again and press play: the
 /// stopped session stays held, the run waits on its live loop, and only
 /// `resume_session` continues it (from its transcript, no round repeated).
 #[test]

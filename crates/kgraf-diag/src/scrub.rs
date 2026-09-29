@@ -26,7 +26,7 @@
 //! (`https://user:token@host/...`), an API key embedded in a JSON error body,
 //! or a registered exact credential can all reach an error's context string,
 //! and none of those are paths this module's regex looks for.
-//! [`redact_secrets`] hands the already-path-scrubbed text to
+//! [`redact_secrets`] runs before the path pass and hands the raw text to
 //! `kgraf_secrets::scrub_persist` (decision 0071): the *persist* path, not
 //! the model-facing one, because this diagnostics file is written to disk and
 //! read back later, never sent to a model.
@@ -79,8 +79,7 @@ fn hash_path_with_key(path: &Path, key: &[u8; crate::key::KEY_LEN]) -> String {
 /// The per-install key (`key.rs`), loaded once per process. Falls back to a
 /// random, process-local key when there is nowhere to persist one: no home
 /// directory, or diagnostics is disabled or redirected
-/// (`kgraf_diag::resolve_path`, not `default_path` -- review finding,
-/// 2026-09-27: scrubbing used the real per-user path unconditionally, so a
+/// (`kgraf_diag::resolve_path`, not `default_path`: scrubbing used the real per-user path unconditionally, so a
 /// process that set `KGRAF_DIAG_DISABLE` to keep a test off the owner's real
 /// file still silently created `diagnostics.key` there the first time it
 /// scrubbed any text). A fallback key is still keyed, just not stable across
@@ -138,6 +137,12 @@ fn path_pattern() -> &'static Regex {
             // scheme so `scrub_path` sees a normal absolute path.
             r#"file://(?P<file_url>/[^\s"'`\[\]\(\)\{\}<>]*)"#,
             r#"|"#,
+            // Any other URL (`https://host/a/b`): matched whole, so its path
+            // is not mistaken for a file path, and left as it is. A
+            // credential inside it is [`redact_secrets`]'s job, which runs
+            // first.
+            r#"(?P<url>[A-Za-z][A-Za-z0-9+.\-]*://[^\s"'`\[\]\(\)\{\}<>]*)"#,
+            r#"|"#,
             // Windows drive path. Spaces are allowed inside it (a Windows
             // path routinely has one, e.g. "Marco Cross"); it still stops at
             // a quote, bracket or newline.
@@ -155,10 +160,15 @@ fn path_pattern() -> &'static Regex {
 /// Scrub every path-looking span in free text (an error's `Display` chain,
 /// typically): a regex match, not a parser, so it cannot tell a path from a
 /// URL that happens to contain one (a `file://` URL is deliberately treated
-/// as a path; an `https://` URL is not, and is [`redact_secrets`]'s job).
-/// Also runs [`redact_secrets`] and caps the result at [`MAX_CONTEXT_BYTES`].
+/// as a path; an `https://` URL is left as it is). Runs [`redact_secrets`]
+/// first, then the path pass, and caps the result at [`MAX_CONTEXT_BYTES`].
 pub fn scrub_text(text: &str, project_root: Option<&Path>) -> String {
-    let path_scrubbed = path_pattern().replace_all(text, |caps: &regex::Captures| {
+    // Secrets first, then paths. A secret can contain `/` (base64) or sit
+    // inside a URL; path scrubbing first would cut it at the first `/` and
+    // leave its prefix in the file. The redaction marker holds no path, so
+    // the path pass cannot damage it.
+    let secret_scrubbed = redact_secrets(text);
+    let path_scrubbed = path_pattern().replace_all(&secret_scrubbed, |caps: &regex::Captures| {
         if let Some(m) = caps.name("file_url") {
             format!("file://{}", scrub_path(Path::new(m.as_str()), project_root))
         } else if let Some(m) = caps.name("win") {
@@ -169,8 +179,7 @@ pub fn scrub_text(text: &str, project_root: Option<&Path>) -> String {
             caps[0].to_string()
         }
     });
-    let secret_scrubbed = redact_secrets(&path_scrubbed);
-    truncate_bytes(&secret_scrubbed, MAX_CONTEXT_BYTES)
+    truncate_bytes(&path_scrubbed, MAX_CONTEXT_BYTES)
 }
 
 /// Redacts a registered exact credential (`kgraf_secrets::register_exact_secret`,
@@ -347,10 +356,6 @@ mod tests {
         let exact = "my-unique-fake-provider-key-9f3a7c21";
         kgraf_secrets::register_exact_secret("test-fixture-provider-key", exact);
         let ghp = format!("ghp_{}", "B".repeat(36));
-        // Neither secret is inside anything the path regex would already
-        // intercept first (a leading `/`): this isolates what
-        // kgraf_secrets::scrub_persist itself catches from what scrub_path
-        // already would.
         let raw_context = format!("provider call failed: key={exact} token={ghp}");
         let scrubbed = scrub_text(&raw_context, None);
         assert!(!scrubbed.contains(exact), "{scrubbed}");
@@ -380,6 +385,38 @@ mod tests {
         );
         let records = crate::store::read_all(&path).unwrap();
         assert_eq!(records.len(), 1);
+    }
+
+    /// A secret that contains `/` is redacted whole. With the path pass first
+    /// it was cut at the slash and its prefix stayed in the file.
+    #[test]
+    fn a_registered_secret_with_a_slash_is_redacted_whole() {
+        let exact = "Qz8LmXv3Rt7/Kp2Wd9YcB4nH6sJ";
+        kgraf_secrets::register_exact_secret("test-fixture-slash-key", exact);
+        let out = scrub_text(&format!("auth failed with {exact} today"), None);
+        assert!(!out.contains("Qz8LmXv3Rt7"), "{out}");
+        assert!(!out.contains("Kp2Wd9Yc"), "{out}");
+        assert!(out.contains("redacted"), "{out}");
+    }
+
+    /// A URL keeps its path; it is not rewritten as a file path.
+    #[test]
+    fn a_url_is_not_rewritten_as_a_path() {
+        let out = scrub_text("fetch https://example.test/api/v1/items failed", None);
+        assert_eq!(out, "fetch https://example.test/api/v1/items failed");
+    }
+
+    /// A credentialed URL loses the credential and nothing leaks from before
+    /// the first slash.
+    #[test]
+    fn a_credentialed_url_is_redacted_and_a_path_beside_it_is_hashed() {
+        let out = scrub_text(
+            "clone https://user:Zq8LmXv3Rt7Kp2Wd@example.test/o/r.git from /home/marco/x",
+            None,
+        );
+        assert!(!out.contains("Zq8LmXv3Rt7Kp2Wd"), "{out}");
+        assert!(!out.contains("/home/marco"), "{out}");
+        assert!(out.contains("h:"), "{out}");
     }
 
     #[test]

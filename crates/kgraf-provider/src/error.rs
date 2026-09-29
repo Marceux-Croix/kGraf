@@ -94,6 +94,22 @@ pub enum ProviderError {
     )]
     StreamTruncated { adapter: &'static str },
 
+    /// The provider ended the turn with a stop reason whose content is not an
+    /// answer (a refusal, or a context window exceeded mid-turn).
+    ///
+    /// The call was billed and its usage is recorded as an ordinary settled
+    /// call; only the turn is unusable. Raised so the run fails with the
+    /// provider's own reason instead of an unmodeled stop reason that names
+    /// nothing.
+    #[error(
+        "`{adapter}` ended the turn with stop_reason `{stop_reason}`; the call was billed and \
+         recorded, and the turn produced no usable answer"
+    )]
+    TurnNotUsable {
+        adapter: &'static str,
+        stop_reason: String,
+    },
+
     /// Usage arrived but could not be normalized.
     #[error("cannot normalize usage from `{adapter}`")]
     Usage {
@@ -173,6 +189,7 @@ impl kgraf_diag::DiagCode for ProviderError {
             ProviderError::RateLimited { .. } => "KG-0303",
             ProviderError::ModelUnsupported { .. } => "KG-0304",
             ProviderError::UsageMissing { .. } => "KG-0305",
+            ProviderError::TurnNotUsable { .. } => "KG-0306",
             _ => kgraf_diag::catch_all_for("kgraf-provider").code,
         }
     }
@@ -203,6 +220,15 @@ impl ProviderError {
     /// A 4xx other than 408 is a rejection before generation. A 408, a 5xx, a
     /// transport error after the connection was made, an undecodable body and a
     /// substituted model all arrive after the provider may have generated.
+    ///
+    /// No status in the 5xx range is classified as not billed. The vendors'
+    /// error references recorded for this project describe 500, 502, 503 and
+    /// Anthropic's 529 (overloaded) as failures, and none states that such a
+    /// request is not billed; a 5xx can also follow work the provider already
+    /// did. Guessing "not billed" would understate spend, so these stay open.
+    /// A row left open this way is closed by hand from the provider's own
+    /// invoice with `kgraf unreconciled resolve`, which records either the
+    /// billed usage or `--no-charge` when the provider confirms none.
     pub fn billing(&self) -> Billing {
         match self {
             ProviderError::ModelUnsupported { .. }
@@ -259,6 +285,10 @@ mod tests {
                 available: String::new(),
             },
             ProviderError::UsageMissing { adapter: "t" },
+            ProviderError::TurnNotUsable {
+                adapter: "t",
+                stop_reason: "refusal".into(),
+            },
             // Not named in `diag_code`'s match: exercises the catch-all arm.
             ProviderError::ModelSubstituted {
                 requested: "a".into(),
@@ -267,6 +297,13 @@ mod tests {
         ];
         for e in instances {
             let code = e.diag_code();
+            if !matches!(e, ProviderError::ModelSubstituted { .. }) {
+                assert_ne!(
+                    code,
+                    kgraf_diag::catch_all_for("kgraf-provider").code,
+                    "{e:?} falls to the catch-all"
+                );
+            }
             assert!(
                 kgraf_diag::GLOSSARY.iter().any(|spec| spec.code == code),
                 "{e:?} names code {code}, which is not in kgraf_diag::GLOSSARY"

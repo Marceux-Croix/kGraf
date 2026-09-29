@@ -135,6 +135,11 @@ impl OpenAiAdapter {
         self
     }
 
+    /// The reasoning dialect this adapter reads usage under.
+    pub fn reasoning_dialect(&self) -> ReasoningDialect {
+        self.reasoning_dialect
+    }
+
     /// Refuse a request that sets both temperature and reasoning effort.
     ///
     /// For vendors whose reasoning models reject sampling parameters at any effort
@@ -365,7 +370,15 @@ impl OpenAiAdapter {
             .or_else(|| raw.get("cache_write_tokens"))
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
-        crate::chat::warn_on_unrecognized_cache_key(ADAPTER, raw)?;
+        crate::chat::warn_on_unrecognized_cache_key(
+            ADAPTER,
+            raw,
+            &[
+                "input_tokens_details.cached_tokens",
+                "input_tokens_details.cache_write_tokens",
+                "cache_write_tokens",
+            ],
+        )?;
         let output = field("output_tokens");
         let reasoning = raw
             .get("output_tokens_details")
@@ -464,10 +477,16 @@ impl OpenAiAdapter {
                     }
                     Some("function_call") => {
                         stop_reason = StopReason::ToolUse;
+                        // Arguments arrive as a JSON string. One that will not parse
+                        // is kept verbatim, as the Chat Completions adapter does, so
+                        // a worker sees what the model emitted rather than `null`.
                         let arguments = item
                             .get("arguments")
                             .and_then(|a| a.as_str())
-                            .and_then(|a| serde_json::from_str(a).ok())
+                            .map(|a| {
+                                serde_json::from_str(a)
+                                    .unwrap_or(serde_json::Value::String(a.to_owned()))
+                            })
                             .unwrap_or(serde_json::Value::Null);
                         content.push(Content::ToolUse {
                             id: item
@@ -626,8 +645,13 @@ impl kgraf_provider::Provider for OpenAiAdapter {
                 Ok(response)
             }
             Err(error) => {
+                // Usage the body already carries is kept on the open row, not
+                // dropped with the parse error.
+                let carried = parsed.get("usage").and_then(|u| {
+                    Self::normalize_usage(self.config.protocol, self.reasoning_dialect, u).ok()
+                });
                 token
-                    .leave_unreconciled_async(request_id.as_deref())
+                    .leave_unreconciled_with_async(carried.as_ref(), request_id.as_deref())
                     .await?;
                 Err(error)
             }
@@ -814,6 +838,17 @@ impl Streaming for OpenAiAdapter {
                             request_id: stream_request_id.clone(),
                         });
                         started = true;
+                    }
+                    // Usage first: a parse error (a model echo mismatch, say) must
+                    // not drop the figure the event already carries.
+                    if let Some(usage_raw) = object.get("usage").filter(|u| !u.is_null())
+                        && let Ok(usage) = Self::normalize_usage(
+                            self.config.protocol,
+                            self.reasoning_dialect,
+                            usage_raw,
+                        )
+                    {
+                        guard.record_usage(&usage);
                     }
                     let response = self.parse_response(&request.model, &object)?;
                     guard.record_usage(&response.usage);
@@ -1290,6 +1325,22 @@ mod tests {
         assert_eq!(ledger.unreconciled().expect("query").len(), 1);
     }
 
+    #[test]
+    fn unparseable_tool_arguments_are_kept_as_the_raw_text() {
+        let adapter = OpenAiAdapter::new(config("https://example.invalid")).expect("adapter");
+        let mut response = body("model-x");
+        response["output"] = json!([
+            {"type": "function_call", "call_id": "c1", "name": "read",
+             "arguments": "{\"path\": \"a.rs\""},
+            {"type": "function_call", "call_id": "c2", "name": "list",
+             "arguments": "{\"dir\": \".\"}"}
+        ]);
+        let parsed = adapter.parse_response("model-x", &response).expect("parse");
+        let calls = parsed.tool_uses();
+        assert_eq!(calls[0].2, &json!("{\"path\": \"a.rs\""));
+        assert_eq!(calls[1].2, &json!({"dir": "."}));
+    }
+
     #[tokio::test]
     async fn a_substituted_model_raises() {
         let server = MockServer::start().await;
@@ -1307,7 +1358,38 @@ mod tests {
             .await
             .expect_err("must raise");
         assert!(matches!(err, ProviderError::ModelSubstituted { .. }));
-        assert_eq!(ledger.unreconciled().expect("query").len(), 1);
+        let open = ledger.unreconciled().expect("query");
+        assert_eq!(open.len(), 1);
+        // The body's usage is kept on the open row, not dropped with the error.
+        assert_eq!(open[0].usage.total_input(), 1050);
+    }
+
+    #[tokio::test]
+    async fn a_substituted_model_on_the_terminal_stream_event_keeps_its_usage() {
+        let server = MockServer::start().await;
+        let completed = format!(
+            "data: {{\"type\":\"response.completed\",\"response\":{}}}\n\n",
+            body("some-other-model")
+        );
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(completed))
+            .mount(&server)
+            .await;
+        let adapter = OpenAiAdapter::new(config(&server.uri())).expect("adapter");
+        let ledger = Ledger::open_in_memory().expect("ledger");
+        let token = ledger
+            .begin(ADAPTER, Protocol::Inclusive, "model-x", "a", "t")
+            .expect("begin");
+        let err = run_stream(&adapter, &token).await.expect_err("must raise");
+        assert!(
+            matches!(err, ProviderError::ModelSubstituted { .. }),
+            "{err:?}"
+        );
+        drop(token);
+        let open = ledger.unreconciled().expect("query");
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].usage.total_input(), 1050);
     }
 
     #[test]

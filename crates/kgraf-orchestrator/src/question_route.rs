@@ -41,7 +41,7 @@
 //! and recorded on the graph (`put_work`'s own change-log row; no second
 //! surface repeats it).
 //!
-//! **Scrubbing (decision 0071, H2).** This module only ever sees the text its
+//! **Scrubbing.** This module only ever sees the text its
 //! caller hands it; it does not scrub. The caller (`kgraf-shell`'s
 //! `orchestrator_host.rs`) takes the question through `kgraf_secrets::intake`
 //! at the door and stores and shows that scrubbed copy everywhere (the offer,
@@ -284,7 +284,7 @@ fn item_id(prefix: &str, now_ms: i64, text: &str) -> String {
 /// Records a directly answered question (step 2) as a closed item under the
 /// standalone "Questions" node, with no agent dispatched (so this route
 /// leaves a trace on the graph). `question` and
-/// `answer` are the caller's already-scrubbed copies (decision 0071, H2): this
+/// `answer` are the caller's already-scrubbed copies: this
 /// module stores exactly what it is given. Returns the item's id.
 pub fn record_answered(
     graph: &GraphStore,

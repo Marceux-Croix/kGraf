@@ -77,6 +77,15 @@ CREATE TABLE IF NOT EXISTS manual_runs (
     run_id      TEXT NOT NULL,
     PRIMARY KEY (schedule_id, run_id)
 );
+
+-- The lock a manual run holds on its schedule while it runs, so the scheduler loop
+-- does not start the same schedule beside it. A lease, renewed by the holder: a
+-- holder that died stops blocking the loop when the lease passes.
+CREATE TABLE IF NOT EXISTS manual_locks (
+    schedule_id             TEXT PRIMARY KEY,
+    holder                  TEXT NOT NULL,
+    lease_expires_at_millis INTEGER NOT NULL
+);
 ";
 
 fn to_millis(t: DateTime<Utc>) -> i64 {
@@ -139,6 +148,19 @@ pub enum ClaimOutcome {
     /// Someone else already holds an unexpired claim, the schedule is disabled, or
     /// `due_at` has not arrived yet.
     NotClaimed,
+}
+
+/// The result of [`ScheduleStore::claim_manual_run`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManualClaim {
+    /// This caller holds the schedule's manual lock until `lease_expires_at`.
+    Claimed { lease_expires_at: DateTime<Utc> },
+    /// The schedule is disabled (by the user or by repeated failures) and the
+    /// caller did not force the run.
+    Disabled { reason: String },
+    /// A scheduled occurrence or another manual run holds a live claim on the
+    /// schedule; `holder` names it.
+    Busy { holder: String },
 }
 
 /// What [`ScheduleStore::tick_schedule`] decided and did, atomically.
@@ -320,6 +342,26 @@ impl ScheduleStore {
         let lease_expires_at = now + lease_duration;
         let lease_expires_millis = to_millis(lease_expires_at);
 
+        // A manual run holds this schedule: the occurrence must not start beside
+        // it. A pending occurrence is moved to `claimed` with a lease that has
+        // already passed, so the next tick's `expired_claims` scan finds it and
+        // tries again once the manual run ends. Left `pending` it would be found
+        // by nothing, because `last_seen` has already moved past it.
+        if self.manual_lock_holder(schedule_id, now_millis)?.is_some() {
+            self.conn.execute(
+                "UPDATE occurrences
+                 SET status = 'claimed', claimant = 'held-for-manual-run',
+                     claimed_at_millis = ?1, lease_expires_at_millis = ?1 - 1
+                 WHERE schedule_id = ?2 AND due_at_millis = ?3 AND ?3 <= ?1
+                   AND status = 'pending'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM schedules s WHERE s.schedule_id = ?2 AND s.disabled = 1
+                   )",
+                params![now_millis, schedule_id, due_millis],
+            )?;
+            return Ok(ClaimOutcome::NotClaimed);
+        }
+
         // One statement makes the claim atomic, and folds in every precondition
         // (claimable status, not disabled, not early) so there is no gap between
         // checking a precondition and acting on it. `RETURNING generation` hands back
@@ -357,6 +399,114 @@ impl ScheduleStore {
             }),
             None => Ok(ClaimOutcome::NotClaimed),
         }
+    }
+
+    /// The holder of a live manual lock on `schedule_id`, if any.
+    fn manual_lock_holder(
+        &self,
+        schedule_id: &str,
+        now_millis: i64,
+    ) -> Result<Option<String>, ScheduleError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT holder FROM manual_locks
+                 WHERE schedule_id = ?1 AND lease_expires_at_millis >= ?2",
+                params![schedule_id, now_millis],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Take the lock a manual run (`schedule run-now`) holds on its schedule, so
+    /// the scheduler loop's claims wait for it ([`ScheduleStore::claim_occurrence`]).
+    /// One transaction: a disabled schedule is refused unless `force`, and a
+    /// schedule with a live scheduled claim or another manual lock is `Busy`.
+    /// The lock is a lease; renew it with [`ScheduleStore::renew_manual_run`] and
+    /// end it with [`ScheduleStore::release_manual_run`].
+    pub fn claim_manual_run(
+        &self,
+        schedule_id: &str,
+        holder: &str,
+        now: DateTime<Utc>,
+        lease: Duration,
+        force: bool,
+    ) -> Result<ManualClaim, ScheduleError> {
+        let lease_expires_at = now + to_chrono_duration(lease, "manual run lease")?;
+        self.register_schedule(schedule_id)?;
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let outcome = (|| -> Result<ManualClaim, ScheduleError> {
+            let status = self.schedule_status(schedule_id)?;
+            if let Some(reason) = status.disabled_reason
+                && !force
+            {
+                return Ok(ManualClaim::Disabled { reason });
+            }
+            let now_millis = to_millis(now);
+            if let Some(held) = self.manual_lock_holder(schedule_id, now_millis)? {
+                return Ok(ManualClaim::Busy { holder: held });
+            }
+            let live: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT COALESCE(claimant, '') FROM occurrences
+                     WHERE schedule_id = ?1 AND status = 'claimed'
+                       AND lease_expires_at_millis >= ?2
+                     LIMIT 1",
+                    params![schedule_id, now_millis],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(claimant) = live {
+                return Ok(ManualClaim::Busy {
+                    holder: format!("scheduled occurrence claimed by `{claimant}`"),
+                });
+            }
+            self.conn.execute(
+                "INSERT INTO manual_locks (schedule_id, holder, lease_expires_at_millis)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(schedule_id) DO UPDATE SET
+                     holder = excluded.holder,
+                     lease_expires_at_millis = excluded.lease_expires_at_millis",
+                params![schedule_id, holder, to_millis(lease_expires_at)],
+            )?;
+            Ok(ManualClaim::Claimed { lease_expires_at })
+        })();
+        match &outcome {
+            Ok(_) => self.conn.execute_batch("COMMIT")?,
+            Err(_) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+            }
+        }
+        outcome
+    }
+
+    /// Extend a manual run's lock. `false` when `holder` no longer holds it (the
+    /// lease lapsed and another claim took over, or the row is gone).
+    pub fn renew_manual_run(
+        &self,
+        schedule_id: &str,
+        holder: &str,
+        now: DateTime<Utc>,
+        lease: Duration,
+    ) -> Result<bool, ScheduleError> {
+        let expires = now + to_chrono_duration(lease, "manual run lease")?;
+        let updated = self.conn.execute(
+            "UPDATE manual_locks SET lease_expires_at_millis = ?1
+             WHERE schedule_id = ?2 AND holder = ?3",
+            params![to_millis(expires), schedule_id, holder],
+        )?;
+        Ok(updated == 1)
+    }
+
+    /// End a manual run's lock. A holder that is no longer the holder leaves the
+    /// current one in place.
+    pub fn release_manual_run(&self, schedule_id: &str, holder: &str) -> Result<(), ScheduleError> {
+        self.conn.execute(
+            "DELETE FROM manual_locks WHERE schedule_id = ?1 AND holder = ?2",
+            params![schedule_id, holder],
+        )?;
+        Ok(())
     }
 
     /// Extend a still-valid claim's lease (a heartbeat, per big-AGI/LibreChat's
@@ -588,6 +738,10 @@ impl ScheduleStore {
     pub fn remove_schedule(&self, schedule_id: &str) -> Result<(), ScheduleError> {
         self.conn.execute(
             "DELETE FROM occurrences WHERE schedule_id = ?1",
+            params![schedule_id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM manual_locks WHERE schedule_id = ?1",
             params![schedule_id],
         )?;
         self.conn.execute(
@@ -2286,6 +2440,136 @@ mod tests {
         assert!(
             rw.peek_status("unseen").expect("peek").is_none(),
             "the read registered nothing"
+        );
+    }
+
+    const LEASE: Duration = Duration::from_secs(60);
+
+    #[test]
+    fn a_manual_run_is_refused_on_a_disabled_schedule_unless_forced() {
+        let store = ScheduleStore::open_in_memory().expect("store");
+        store.register_schedule("s").expect("register");
+        store
+            .conn
+            .execute(
+                "UPDATE schedules SET disabled = 1, disabled_reason = 'too many failures'
+                 WHERE schedule_id = 's'",
+                [],
+            )
+            .expect("disable");
+        let now = t(9, 0, 0);
+        match store
+            .claim_manual_run("s", "run-now:1", now, LEASE, false)
+            .expect("claim")
+        {
+            ManualClaim::Disabled { reason } => assert_eq!(reason, "too many failures"),
+            other => panic!("expected Disabled, got {other:?}"),
+        }
+        assert!(matches!(
+            store
+                .claim_manual_run("s", "run-now:1", now, LEASE, true)
+                .expect("forced"),
+            ManualClaim::Claimed { .. }
+        ));
+    }
+
+    #[test]
+    fn a_manual_run_is_busy_beside_a_live_claim_or_another_manual_run() {
+        let store = ScheduleStore::open_in_memory().expect("store");
+        let now = t(9, 0, 0);
+        claim(&store, "s", t(8, 59, 0), "loop-a", now, LEASE);
+        match store
+            .claim_manual_run("s", "run-now:1", now, LEASE, false)
+            .expect("claim")
+        {
+            ManualClaim::Busy { holder } => assert!(holder.contains("loop-a"), "{holder}"),
+            other => panic!("expected Busy, got {other:?}"),
+        }
+        // Once the occurrence's lease has passed, the manual run may proceed, and
+        // then a second one is refused.
+        let later = now + chrono::Duration::seconds(120);
+        assert!(matches!(
+            store
+                .claim_manual_run("s", "run-now:1", later, LEASE, false)
+                .expect("claim"),
+            ManualClaim::Claimed { .. }
+        ));
+        match store
+            .claim_manual_run("s", "run-now:2", later, LEASE, false)
+            .expect("claim")
+        {
+            ManualClaim::Busy { holder } => assert_eq!(holder, "run-now:1"),
+            other => panic!("expected Busy, got {other:?}"),
+        }
+        store.release_manual_run("s", "run-now:1").expect("release");
+        assert!(matches!(
+            store
+                .claim_manual_run("s", "run-now:2", later, LEASE, false)
+                .expect("claim"),
+            ManualClaim::Claimed { .. }
+        ));
+    }
+
+    /// The scheduler loop's claim waits for a manual run, and the occurrence it
+    /// could not claim is not lost: it stays reachable through `expired_claims`.
+    #[test]
+    fn the_loop_cannot_claim_beside_a_manual_run_and_the_occurrence_is_kept() {
+        let store = ScheduleStore::open_in_memory().expect("store");
+        let due = t(9, 0, 0);
+        let now = t(9, 0, 5);
+        store
+            .claim_manual_run("s", "run-now:1", now, LEASE, false)
+            .expect("manual");
+        assert_eq!(
+            store
+                .claim_occurrence("s", due, "loop-a", now, LEASE)
+                .expect("claim"),
+            ClaimOutcome::NotClaimed
+        );
+        // Still held on the next tick, still not lost.
+        let next = now + chrono::Duration::seconds(20);
+        assert!(
+            store
+                .renew_manual_run("s", "run-now:1", next, LEASE)
+                .expect("renew")
+        );
+        let waiting = store.expired_claims("s", next).expect("scan");
+        assert_eq!(waiting.len(), 1, "the occurrence must stay findable");
+        assert_eq!(
+            store
+                .claim_occurrence("s", waiting[0].due_at, "loop-a", next, LEASE)
+                .expect("claim"),
+            ClaimOutcome::NotClaimed
+        );
+
+        store.release_manual_run("s", "run-now:1").expect("release");
+        let after = next + chrono::Duration::seconds(1);
+        assert!(matches!(
+            store
+                .claim_occurrence("s", waiting[0].due_at, "loop-a", after, LEASE)
+                .expect("claim"),
+            ClaimOutcome::Claimed { .. }
+        ));
+    }
+
+    #[test]
+    fn a_manual_lock_whose_holder_died_stops_blocking_when_its_lease_passes() {
+        let store = ScheduleStore::open_in_memory().expect("store");
+        let now = t(9, 0, 0);
+        store
+            .claim_manual_run("s", "run-now:1", now, LEASE, false)
+            .expect("manual");
+        let later = now + chrono::Duration::seconds(61);
+        assert!(matches!(
+            store
+                .claim_occurrence("s", t(9, 0, 30), "loop-a", later, LEASE)
+                .expect("claim"),
+            ClaimOutcome::Claimed { .. }
+        ));
+        assert!(
+            !store
+                .renew_manual_run("s", "someone-else", later, LEASE)
+                .expect("renew")
         );
     }
 }

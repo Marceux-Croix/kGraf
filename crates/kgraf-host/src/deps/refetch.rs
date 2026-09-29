@@ -76,6 +76,13 @@ impl HostRefetch {
         self.inner.refetch(worktree, &self.inner.stop.child())
     }
 
+    /// Tests: holds the lock a running check or fetch holds, so a test can
+    /// queue a call behind it.
+    #[cfg(test)]
+    pub(super) fn hold_for_test(&self) -> impl Sized + '_ {
+        self.inner.counts.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     /// End of the run: a fetch still running is killed, and every later
     /// request is refused.
     pub fn stop(&self) {
@@ -150,6 +157,13 @@ impl Inner {
             checkout: self.checkout.clone(),
         };
         let mut counts = self.counts.lock().unwrap_or_else(|p| p.into_inner());
+        // Waiting for the lock can outlast the call: the run may have ended
+        // while another worker's fetch held it.
+        if stop.is_stopped() {
+            return RefetchOutcome::Failed {
+                reason: "the run has ended".into(),
+            };
+        }
         // The bounds come first: once reached, no cargo process runs at all.
         if counts.fetches >= MAX_WORKER_FETCHES {
             return RefetchOutcome::Failed {
@@ -170,7 +184,7 @@ impl Inner {
         counts.checks += 1;
         // The build's words matched a dependency failure; the offline check
         // says whether a fetch could help before any network is used.
-        match self.tool.check(&site) {
+        match self.tool.check_watched(&site, stop) {
             Readiness::Missing(_) => {}
             Readiness::Ready | Readiness::NotApplicable => {
                 return RefetchOutcome::Failed {

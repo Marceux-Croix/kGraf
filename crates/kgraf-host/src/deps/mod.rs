@@ -302,6 +302,12 @@ pub trait DependencyTool: Send + Sync {
     fn applies(&self, site: &FetchSite) -> bool;
     /// The offline check. Never contacts the network.
     fn check(&self, site: &FetchSite) -> Readiness;
+    /// [`Self::check`] that gives up when `stop` is set: a check the run
+    /// ended or the build cancelled must not run on to its timeout. A tool
+    /// whose check cannot be interrupted keeps this default.
+    fn check_watched(&self, site: &FetchSite, _stop: &Stop) -> Readiness {
+        self.check(site)
+    }
     /// Download and unpack the dependencies, with the network, on the host.
     /// A fetch still running when `stop` is set is killed and fails.
     fn fetch(&self, site: &FetchSite, stop: &Stop) -> Result<FetchReport, DepsError>;
@@ -405,14 +411,27 @@ pub struct ConsentQuestion {
     pub detail: String,
 }
 
+/// What a consent covers beyond the run's own start, in one sentence for
+/// every place that asks or reports it (the desktop card, the terminal, `kgraf
+/// deps allow`): a worker that adds a dependency during a run has the host
+/// fetch it, up to [`MAX_WORKER_FETCHES`] times per run. The names of the
+/// crates a worker adds are sent to the registry.
+pub fn worker_fetch_scope(registry: Registry) -> String {
+    format!(
+        "This consent also lets workers fetch crates they add during the run, from {registry}, \
+         up to {MAX_WORKER_FETCHES} fetches per run; the names of those crates go to the registry."
+    )
+}
+
 impl ConsentQuestion {
     pub fn text(&self) -> String {
         format!(
             "Fetch this project's dependencies from {}? They are not in the local cache, and \
              workers build with the network off. kGraf would run `{}` on this machine, outside \
-             the workers' sandbox; it downloads and unpacks, and runs no build script.",
+             the workers' sandbox; it downloads and unpacks, and runs no build script. {}",
             self.registry,
-            self.registry.manual_command()
+            self.registry.manual_command(),
+            worker_fetch_scope(self.registry)
         )
     }
 }
@@ -556,9 +575,15 @@ pub fn fetch_and_confirm(
     let result = tool.fetch(site, stop);
     record_fetch(registry, trigger, &result);
     let report = result?;
-    match tool.check(site) {
+    match tool.check_watched(site, stop) {
         Readiness::Missing(detail) => Err(DepsError::StillMissing { registry, detail }),
-        _ => Ok(report),
+        // A check that could not decide confirms nothing: after a fetch that
+        // is a failure to confirm, said with its reason, never a success.
+        Readiness::Unchecked(why) => Err(DepsError::StillMissing {
+            registry,
+            detail: format!("the check after the fetch could not confirm it: {why}"),
+        }),
+        Readiness::Ready | Readiness::NotApplicable => Ok(report),
     }
 }
 

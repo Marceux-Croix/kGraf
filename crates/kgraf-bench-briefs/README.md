@@ -14,10 +14,41 @@ route and brief, one worker runs through kGraf's normal worker path
 (`kgraf_host::worker`: the same assembly and `run_segment` `kgraf worker`
 uses, a real git repository, a real worktree, the real tool set, the real
 ledger) against a fresh copy of the fixture. Whatever it commits is checked
-**mechanically**: a `cargo test` run that must pass, a script whose stdout
-and exit status must match exactly, or a doc file whose required facts and
-word cap the check reads directly. There is no model judge anywhere in this
-crate; a judge model would just be a second guess, not a measurement.
+**mechanically**: a `cargo test` run that must pass and run at least the
+fixture's tests, a script whose stdout and exit status must match exactly, or
+a doc file whose required facts and word cap the check reads directly. There
+is no model judge anywhere in this crate; a judge model would just be a
+second guess, not a measurement.
+
+The check is strict in four ways:
+
+- A named test must have run: cargo exits 0 when no test matches, so the
+  output must show `test <name> ... ok` and exactly one passed test. A
+  `tests`-kind brief also carries mutations (a deliberately broken copy of the
+  function under test); the new test must fail on each one, so a test that
+  asserts nothing does not pass.
+- Each brief lists `protected` paths (the tests and sources its instruction
+  says not to change). A commit that differs from the fixture on any of them
+  is unsatisfied.
+- A changelog entry is read structurally: the version and date as whole
+  tokens on one line, and the required word on that line or a later one.
+- The worker's code (its tests, any `build.rs`, its scripts) is untrusted, so
+  the check runs it through `kgraf-sandbox`: network off, writes limited to
+  the attempt's directory and a scratch directory, an environment cleared to
+  `PATH`, `HOME`, `CARGO_HOME`, `RUSTUP_HOME`, `CARGO_TARGET_DIR` and
+  `CARGO_NET_OFFLINE`, a 300 second wall-clock limit, and a kill of the whole
+  process group at the limit.
+
+A provider or harness error (an outage, a failed ledger write, a worker that
+could not run) is printed as `ERROR (not tallied)` and never recorded: only an
+attempt that measured the model is a tally.
+
+Tallies are kept per suite version. The store at `--state-dir` holds the
+current suite's bench tallies, and `bench_suite.json` beside it names the
+suite. When the suite hash changes, the first recorded attempt copies the old
+store to `model_profiles.<hash>.json` and starts the bench tallies from zero
+(live tallies stay). The printed table names any set-aside suite instead of
+mixing it in.
 
 Every priced attempt's `(model, vendor, kind, satisfied, cost)` is recorded
 into the `ProfileStore` at `--state-dir` with `Source::Bench` (see "Prices"

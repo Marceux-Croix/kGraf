@@ -24,13 +24,17 @@ unchanged content is, not whether it changed.
 
 1. An empty attempt is refused, not passed, when a declared write target still holds nothing
    but a placeholder body: every function body in the file, once comments and surrounding
-   whitespace are stripped, is a single call to a standard "not implemented yet" marker.
-   Only Rust source files are recognized today. A file with no function bodies, or with even
+   whitespace are stripped, is exactly one call to `todo!` or `unimplemented!`, with nothing
+   after it. `unreachable!` is not a marker: it states an invariant, and a mock of methods
+   the code under test never calls is legitimately made of it. A signature is read to its
+   body, so a `;` inside an array type does not end it. Only Rust source files are
+   recognized today. A file with no function bodies, or with even
    one real one, is never flagged, so a legitimately unchanged file is never mistaken for an
    abandoned placeholder.
 2. Every attempt accepted with no change now carries a notice saying so, alongside anything
    its check itself reported. This uses the run's existing notice path, so it reaches the same
    output a run's other notices already reach.
+   The notice names the contract, so several empty attempts in one run are each shown.
 
 ## Consequences
 
@@ -39,8 +43,9 @@ unchanged content is, not whether it changed.
   clears it.
 - A legitimately unchanged, non-placeholder write target still passes exactly as before, now
   with a notice that nothing changed.
-- Not covered: a placeholder left untouched inside an attempt that changed some of a
-  contract's other declared files. Only a fully unchanged attempt is checked by this decision.
+- An attempt with a commit is refused too when a declared write target it left untouched held
+  only a placeholder at dispatch. The dispatch content is the target's blob at the base
+  commit, read from the repository, never from the worker's tree.
 - Only Rust is recognized; a placeholder in another language is not covered by this decision.
 
 ## Alternatives considered

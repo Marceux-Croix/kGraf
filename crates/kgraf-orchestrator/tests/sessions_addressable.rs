@@ -258,7 +258,7 @@ async fn a_note_to_a_non_addressable_session_is_refused() {
             "hello".into(),
         )
         .await
-        .expect_err("a non-addressable session refuses a note (request 17 addendum)");
+        .expect_err("a non-addressable session refuses a note (decision 0073)");
     assert!(matches!(err, SessionError::Refused(_)), "{err:?}");
     let stop_err = handle
         .stop_session(worker.clone())
@@ -305,7 +305,7 @@ impl QuestionAnswerer for FakeAnswerer {
     }
 }
 
-/// **Mutation target 3 (the orchestrator-first branch, owner answer Q1).**
+/// **Mutation target 3: the orchestrator-first branch.**
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_question_the_orchestrator_can_answer_never_reaches_the_user() {
     let dir = tempfile::tempdir().expect("dir");
@@ -839,6 +839,67 @@ async fn a_stopped_attempt_stays_held_and_resume_repeats_no_paid_round() {
         .expect("known");
     assert_eq!(ended.map(|(o, _)| o), Some(SessionOutcome::Completed));
     assert_eq!(paused, None, "resume clears the paused fact");
+}
+
+/// A worker attempt stopped by the user is charged for its calls when it
+/// finishes. Resumed in the same process, its next result lists those calls
+/// again (a resumed worker carries its earlier calls): only the calls made
+/// after the resume may add to the run's spend.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resumed_attempt_is_not_charged_again_for_its_earlier_calls() {
+    let dir = tempfile::tempdir().expect("dir");
+    let plan = plan_json(&[c("a", "make a HANG", "src/a.rs", &[])]);
+    let p = Parts::open(
+        dir.path(),
+        move |_| plan.clone(),
+        |_| SERVES.into(),
+        Duration::from_millis(5),
+    );
+    p.alpha.hang.store(true, Ordering::SeqCst);
+    p.beta.hang.store(true, Ordering::SeqCst);
+    let o = Orchestrator::new(config(), p.services(WINDOW)).expect("orchestrator");
+    let handle = o.handle();
+    let run = tokio::spawn(o.start(RunId::new("r1"), "make a".into()));
+    wait_hang(&p.alpha, &p.beta).await;
+    let worker = AgentId::new("r1-a-r0-a0");
+    handle.stop_session(worker.clone()).await.expect("stop");
+    while !handle
+        .status()
+        .await
+        .expect("the loop answers")
+        .in_flight
+        .is_empty()
+    {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let spent_at_stop = p.admission.budget().spent_run("r1");
+    let before = p.ledger.calls().expect("calls");
+    assert!(
+        before.iter().any(|c| c.agent_id == worker.as_str()
+            && c.settlement == kgraf_provider::Settlement::Counted),
+        "the worker made a counted call before the stop"
+    );
+    let seen: std::collections::BTreeSet<_> = before.into_iter().map(|c| c.id).collect();
+
+    p.alpha.hang.store(false, Ordering::SeqCst);
+    p.beta.hang.store(false, Ordering::SeqCst);
+    handle.resume_session(worker.clone()).await.expect("resume");
+    let report = run.await.expect("join").expect("run");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    let prices = prices();
+    let added: kgraf_core::Money = p
+        .ledger
+        .calls()
+        .expect("calls")
+        .iter()
+        .filter(|c| !seen.contains(&c.id) && c.settlement == kgraf_provider::Settlement::Counted)
+        .map(|c| prices.cost(&c.model, &c.usage).expect("priced"))
+        .sum();
+    assert_eq!(
+        p.admission.budget().spent_run("r1"),
+        spent_at_stop + added,
+        "only the calls made after the resume are added to the spend"
+    );
 }
 
 // -------------------------------------------------------- undelivered notes

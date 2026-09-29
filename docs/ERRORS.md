@@ -28,7 +28,7 @@ Every error kGraf's local diagnostics file records carries one of these `KG-nnnn
 
 ### KG-0101 Price Missing
 
-**Meaning:** A model has no entry in the price table, so spend cannot be reserved for it.
+**Meaning:** A model has no entry in the price table, so its cost is unknown. The call is still made and ledgered; its spend is reported as unpriced.
 
 **Likely cause:** A new or renamed model used before the price table was updated.
 
@@ -131,6 +131,38 @@ Every error kGraf's local diagnostics file records carries one of these `KG-nnnn
 **Likely cause:** The graph was built by an older or newer kGraf version.
 
 **What to do:** Delete and rebuild the graph database with `kgraf index`.
+
+### KG-0205 No Index
+
+**Meaning:** A command that only reads the graph found no index file at the project's index path.
+
+**Likely cause:** The project was never indexed, or the index path points somewhere else.
+
+**What to do:** Run `kgraf index` in the project first.
+
+### KG-0206 Ambiguous Symbol
+
+**Meaning:** A symbol name matches more than one node and none is an exact qualified-name match.
+
+**Likely cause:** The short name is defined in several files or scopes.
+
+**What to do:** Retry with a qualified name from the candidate list in the message.
+
+### KG-0207 Stale File
+
+**Meaning:** A node's file changed after it was indexed, so its recorded lines may name other text.
+
+**Likely cause:** The file was edited since the last `kgraf index`, and the change has not been indexed.
+
+**What to do:** Run `kgraf index`, then retry.
+
+### KG-0208 WAL Residue Pending
+
+**Meaning:** A removed project record may still be in the index's write-ahead log: a reader held an older snapshot for the whole retry window, so the log could not be truncated.
+
+**Likely cause:** A long-lived read transaction on the index, such as a viewer or a stuck process.
+
+**What to do:** Close the reader. The log is truncated at the next checkpoint, at the end of a run, or when the last connection closes.
 
 ### KG-0299 Graph (Other)
 
@@ -321,6 +353,14 @@ Every error kGraf's local diagnostics file records carries one of these `KG-nnnn
 **Likely cause:** A provider API change, or a non-standard response from a self-hosted endpoint.
 
 **What to do:** Report this: every token must be attributed to the ledger, so this must be fixed, not ignored.
+
+### KG-0306 Turn Not Usable
+
+**Meaning:** The provider ended the turn with a stop reason that is not an answer, such as a refusal or an exceeded context window. The call was billed and recorded.
+
+**Likely cause:** The model refused the request, or the conversation no longer fits its context window.
+
+**What to do:** Read the stop reason in the message; shorten the context or rephrase the task, then retry.
 
 ### KG-0399 Provider (Other)
 

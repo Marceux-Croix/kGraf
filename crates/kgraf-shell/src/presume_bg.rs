@@ -70,7 +70,7 @@ pub const RECHECK: Duration = Duration::from_secs(1);
 /// How long a failed read backs off before it is retried, regardless of
 /// whether the roadmap changed again meanwhile: a transient failure (a lock
 /// held by a concurrent `kgraf index`) is not a content change, so the normal
-/// signature check would never see it and would never retry (H1).
+/// signature check would never see it and would never retry.
 /// Escalates on repeated failure, then holds at its last step.
 const BACKOFF: &[Duration] = &[
     Duration::from_secs(5),
@@ -82,7 +82,7 @@ const BACKOFF: &[Duration] = &[
 /// only) inode, `None` when it cannot be `stat`-ed (itself a change, worth a
 /// fresh presume that reports it). mtime alone missed a rewrite that happened
 /// to land on the same second on a coarse file system and kept the same size
-/// by coincidence; size and inode narrow that (L1) without claiming to
+/// by coincidence; size and inode narrow that without claiming to
 /// close it completely - a content-identical rewrite is still invisible, as it
 /// is to `kgraf index`'s own change detection.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -130,7 +130,7 @@ pub struct PresumeNotice {
 }
 
 /// Said when the project has no `.kgraf/graph.db` at all: this module never
-/// creates one (C2), so there is nothing to presume into yet.
+/// creates one, so there is nothing to presume into yet.
 const NOT_INDEXED: &str =
     "not indexed; presumed work waits for `kgraf index` (or opening it from a corpus reading)";
 
@@ -215,7 +215,7 @@ pub struct PresumeWatcher {
     /// A notice waiting to be shown; drained by the caller once shown.
     notice: Option<PresumeNotice>,
     /// Set when a read failed; cleared on a clean one. Backs a read off
-    /// (H1) regardless of whether the roadmap changed again meanwhile.
+    /// regardless of whether the roadmap changed again meanwhile.
     retry_after: Option<Instant>,
     retry_step: usize,
     /// The text of the last error notice shown, kept so a forced retry that
@@ -290,7 +290,7 @@ impl PresumeWatcher {
                     Ok(Outcome::Unchanged)
                 } else {
                     // Never two reads of one root's graph at once, even across
-                    // two `PresumeWatcher`s (M1): a project closed and
+                    // two `PresumeWatcher`s: a project closed and
                     // reopened before its first read finished must not race a
                     // second one opening `graph.db` for writing.
                     let lock = root_lock(&root);
@@ -368,7 +368,7 @@ impl PresumeWatcher {
     }
 
     /// A notice from a failed read, shown only when its text differs from the
-    /// last one shown: a forced retry (H1) that fails the same way
+    /// last one shown: a forced retry that fails the same way
     /// again must not restate it, or it repeats every backoff step forever
     /// (about 30 times an hour at the 120 s step - the bug this fixes).
     fn note_error(&mut self, n: PresumeNotice) {
@@ -442,7 +442,7 @@ fn now_ms() -> i64 {
 /// the background thread [`PresumeWatcher::spawn`] starts, under that root's
 /// lock; never on the UI thread.
 ///
-/// **Never creates, never rebuilds** (C1, C2). A missing `graph.db`
+/// **Never creates, never rebuilds**. A missing `graph.db`
 /// means the folder has never been indexed: nothing is written, not even
 /// `.kgraf/` itself, and [`Outcome::NotIndexed`] is returned so the caller can
 /// say so. An existing one is opened with
@@ -469,7 +469,7 @@ mod tests {
     /// Opens (and thereby creates) a project's graph, as `kgraf index` does,
     /// then drops it: the fixture for "an already-indexed project" that every
     /// test below except the not-indexed and schema-mismatch ones needs, now
-    /// that this module refuses to create one itself (C2).
+    /// that this module refuses to create one itself.
     fn index(root: &Path) {
         let path = kgraf_graph::snapshot::graph_db_path(root);
         std::fs::create_dir_all(path.parent().expect("state dir")).expect("mkdir");
@@ -511,7 +511,7 @@ mod tests {
         settle(w);
     }
 
-    /// C1/C2: a folder with no `graph.db` is left exactly as it is (no
+    /// A folder with no `graph.db` is left exactly as it is (no
     /// `.kgraf`, no `graph.db`), and the notice says the project is not
     /// indexed, even when a roadmap document is sitting right there.
     #[test]
@@ -529,7 +529,7 @@ mod tests {
         );
     }
 
-    /// C1: an index of another schema version is refused, not rebuilt - its
+    /// An index of another schema version is refused, not rebuilt - its
     /// `files` row (derived data a rebuild would drop) is read back afterward,
     /// unchanged, through a read-only connection that itself never migrates.
     #[test]
@@ -738,7 +738,7 @@ mod tests {
         );
     }
 
-    /// H1: a failed read (here, a schema mismatch that the fix keeps failing
+    /// A failed read (here, a schema mismatch that the fix keeps failing
     /// forever on its own) is retried with backoff, not latched. This double
     /// checks the mechanism directly rather than waiting out the real 5 s step.
     #[test]
@@ -748,7 +748,7 @@ mod tests {
         // No graph.db yet: the first read is clean (`NotIndexed`), so force a
         // failing condition by making a `graph.db` that is not a database at
         // all, which every open of it (including retries) keeps failing on -
-        // exactly the "still broken, must still retry" shape H1 asks for.
+        // exactly the "still broken, must still retry" shape the forced retry needs.
         let path = kgraf_graph::snapshot::graph_db_path(dir.path());
         std::fs::create_dir_all(path.parent().expect("state dir")).expect("mkdir");
         std::fs::write(&path, b"not a sqlite file").expect("write");
@@ -846,7 +846,7 @@ mod tests {
         assert!(again.is_error, "{again:?}");
     }
 
-    /// M2: a read-count hook proves a mutation that starts a second read while
+    /// A read-count hook proves a mutation that starts a second read while
     /// one is pending would be caught. One change gives exactly one read, even
     /// under many rapid `tick()` calls made while the (deliberately slowed)
     /// read is still in flight.
@@ -889,7 +889,7 @@ mod tests {
         assert_eq!(probe.reads.load(Ordering::SeqCst), 1);
     }
 
-    /// M1: a project closed and reopened quickly (two watchers over the same
+    /// A project closed and reopened quickly (two watchers over the same
     /// root, each starting a slow read) never runs two reads of that root's
     /// graph at once - the process-wide root lock serializes them.
     #[test]

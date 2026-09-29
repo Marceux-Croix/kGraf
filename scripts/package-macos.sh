@@ -284,7 +284,7 @@ else
   echo "        survive Gatekeeper's quarantine check on a machine that downloaded it." >&2
 fi
 
-echo "==> Verifying LICENSE and THIRD_PARTY_NOTICES.md are staged in the bundle (C3)"
+echo "==> Verifying LICENSE and THIRD_PARTY_NOTICES.md are staged in the bundle"
 for f in LICENSE.txt THIRD_PARTY_NOTICES.md; do
   [[ -f "$APP_DIR/Contents/Resources/$f" ]] || {
     echo "$APP_DIR/Contents/Resources/$f is missing" >&2

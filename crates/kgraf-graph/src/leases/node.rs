@@ -739,7 +739,6 @@ mod tests {
             language: None,
             line_count: 1,
         };
-        store.upsert_file(&file).expect("file");
         let node = |id: &str, parent: Option<&str>| NodeRecord {
             id: id.to_owned(),
             file_id: file.id.clone(),
@@ -756,7 +755,7 @@ mod tests {
             identity_stable: true,
         };
         store
-            .replace_file_nodes(&file.id, &[node("P", None), node("C", Some("P"))], &[], &[])
+            .replace_file_nodes(&file, &[node("P", None), node("C", Some("P"))], &[], &[])
             .expect("initial nodes");
 
         let registry = LeaseRegistry::new(&store).with_ttl_ms(10_000);
@@ -774,7 +773,7 @@ mod tests {
         // the case decision 0050 requires never rebind a lease.
         store
             .replace_file_nodes(
-                &file.id,
+                &file,
                 &[node("P", None), node("C2", Some("P")), node("C", None)],
                 &[],
                 &[],
@@ -823,7 +822,6 @@ mod tests {
             language: None,
             line_count: 1,
         };
-        store.upsert_file(&file).expect("file");
         let node = |id: &str| NodeRecord {
             id: id.to_owned(),
             file_id: file.id.clone(),
@@ -840,7 +838,7 @@ mod tests {
             identity_stable: true,
         };
         store
-            .replace_file_nodes(&file.id, &[node("unchanged"), node("edited")], &[], &[])
+            .replace_file_nodes(&file, &[node("unchanged"), node("edited")], &[], &[])
             .expect("initial nodes");
         let registry = LeaseRegistry::new(&store).with_ttl_ms(10_000);
         registry
@@ -851,7 +849,7 @@ mod tests {
         // "edited2" takes its place, and "unchanged" comes back with the identical id
         // because nothing about it changed.
         store
-            .replace_file_nodes(&file.id, &[node("unchanged"), node("edited2")], &[], &[])
+            .replace_file_nodes(&file, &[node("unchanged"), node("edited2")], &[], &[])
             .expect("reindex");
 
         assert_eq!(

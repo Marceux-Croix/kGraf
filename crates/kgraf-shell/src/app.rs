@@ -340,7 +340,7 @@ pub struct ShellApp {
     /// Chrome state: which overlays and menus are open (not persisted, except
     /// the guide's open state, which is configuration).
     pub(crate) chrome: ChromeState,
-    /// Hosted runs being stopped because the window is quitting (N5).
+    /// Hosted runs being stopped because the window is quitting.
     shutdown: Option<Receiver<bool>>,
     /// When the user last gave input (D3: attendance needs recent input).
     last_input: Option<Instant>,
@@ -380,7 +380,7 @@ pub struct ShellApp {
     /// The parallelism value last pushed to `machine_gate` (idempotency
     /// guard, same pattern `Interaction::applied_caps` uses): avoids taking
     /// `MachineGate`'s locks every frame when nothing changed.
-    applied_parallelism: Option<u32>,
+    applied_parallelism: Option<kgraf_core::ParallelismLimits>,
     /// The update-check thread, when one was started.
     /// Spawned by the caller before `ShellApp::new`, same rule `capacity`'s own doc
     /// comment states (a headless test creating a `ShellApp` must never start a
@@ -487,11 +487,13 @@ impl ShellApp {
     /// core this delegates to, and its own tests) for the fix and the
     /// regression test.
     pub(crate) fn sync_parallelism(&mut self) {
-        let computed_max = self.capacity_breakdown().map(|c| c.max_agents);
+        let computed = self
+            .capacity_breakdown()
+            .map(|c| (c.max_agents, c.max_writers, c.exec_slots));
         apply_parallelism(
             &mut self.settings.parallelism,
             &self.machine_gate,
-            computed_max,
+            computed,
             &mut self.applied_parallelism,
         );
     }
@@ -526,7 +528,7 @@ impl ShellApp {
 
     /// Shows the schedule boards' line on the tray: one project's line as is,
     /// several as `name: line`, joined. The schedulers wake the UI when a board
-    /// changes (N1), so this runs on those frames, with no timer;
+    /// changes, so this runs on those frames, with no timer;
     /// `Tray::update_schedule_summary` skips the OS menu rebuild when the text is
     /// the same.
     fn refresh_tray_schedules(&mut self) {
@@ -1056,7 +1058,7 @@ impl ShellApp {
     }
 }
 
-/// One receiver that answers when every one of `pending` has (N5 with several
+/// One receiver that answers when every one of `pending` has (with several
 /// projects): `true` only if every run stopped in time. `None` when nothing is
 /// pending.
 fn join_all(pending: Vec<Receiver<bool>>) -> Option<Receiver<bool>> {
@@ -1086,37 +1088,43 @@ fn join_all(pending: Vec<Receiver<bool>>) -> Option<Receiver<bool>> {
 /// a direct, fast regression test, with no real background thread or
 /// machine measurement involved.
 ///
-/// `computed_max` is `kgraf-capacity`'s own measured maximum
-/// (`CapacityHandle::latest().map(|c| c.max_agents)`), `None` before the
-/// first reading. It drives [`crate::settings::ParallelismSlider::update_max`]
+/// **The one writer of the gate's limits.** The re-measure thread only
+/// publishes its reading (`capacity_bg`'s module doc); this function writes
+/// `max_agents` from the slider (the user's pinned value, or the measured
+/// maximum while it follows) and the writer and execution limits from the
+/// measurement. With two writers, a reading accepted by the thread overwrote
+/// a pinned value, and this function, seeing its own value unchanged, never
+/// wrote it back.
+///
+/// `computed` is `kgraf-capacity`'s own measured `(max_agents, max_writers,
+/// exec_slots)` (`CapacityHandle::latest`), `None` before the first reading.
+/// Its `max_agents` drives [`crate::settings::ParallelismSlider::update_max`]
 /// **only**; `gate`'s own `limits().max_agents` (the *effective* limit
-/// already in force, whether from a following slider's last push or the
-/// user's own pinned choice) is read only to preserve `max_writers` and
-/// `exec_slots` when pushing a new `max_agents`, and is never fed back into
-/// the slider's maximum. Feeding it back is exactly the bug this exists to
-/// prevent: a user who lowers the slider would see the gate's next-reported
-/// effective limit as the new maximum, collapsing the slider's own ceiling
-/// to whatever they last chose and leaving no way to raise it again.
+/// already in force) is never fed back into the slider's maximum. Feeding it
+/// back is the bug this exists to prevent: a user who lowers the slider
+/// would see the gate's next-reported effective limit as the new maximum,
+/// collapsing the slider's own ceiling to whatever they last chose and
+/// leaving no way to raise it again. Before the first reading, the writer
+/// and execution limits already in the gate are kept.
 fn apply_parallelism(
     slider: &mut crate::settings::ParallelismSlider,
     gate: &kgraf_orchestrator::MachineGate,
-    computed_max: Option<u32>,
-    applied: &mut Option<u32>,
+    computed: Option<(u32, u32, u32)>,
+    applied: &mut Option<kgraf_core::ParallelismLimits>,
 ) {
-    if let Some(max) = computed_max {
+    if let Some((max, _, _)) = computed {
         slider.update_max(max);
     }
-    let effective = slider.effective();
-    if *applied == Some(effective) {
+    let current = gate.limits();
+    let (writers, exec) = computed
+        .map(|(_, w, e)| (w, e))
+        .unwrap_or((current.max_writers, current.exec_slots));
+    let want = kgraf_core::ParallelismLimits::derive(slider.effective(), writers, exec);
+    if *applied == Some(want) && current == want {
         return;
     }
-    let current = gate.limits();
-    gate.set_limits(kgraf_core::ParallelismLimits::derive(
-        effective,
-        current.max_writers,
-        current.exec_slots,
-    ));
-    *applied = Some(effective);
+    gate.set_limits(want);
+    *applied = Some(want);
 }
 
 /// Turns a tray command into viewport commands. Returns `true` when the app is quitting.
@@ -1180,7 +1188,7 @@ pub fn attended_until(showing: bool, last_input: Option<Instant>) -> Option<Inst
 /// How often a closing window checks whether its hosted run has stopped.
 const SHUTDOWN_POLL: Duration = Duration::from_millis(100);
 
-/// Quitting with a hosted run (N5): the window hides at once and the process
+/// Quitting with a hosted run: the window hides at once and the process
 /// exits when the run has stopped (or the stop wait timed out), without blocking
 /// the UI thread. A close that was not intercepted to the tray asks `start` for a
 /// shutdown receiver; while one is pending, further closes are cancelled and the
@@ -1230,7 +1238,7 @@ impl eframe::App for ShellApp {
         // In `logic`, which runs on every wake: a covered window gets no `ui`
         // pass, and the capture must still time out and say so.
         self.handle_screenshot(ctx, false);
-        // No timer repaint (N1): the scheduler wakes the UI when its board
+        // No timer repaint: the scheduler wakes the UI when its board
         // changes, and a hidden window still runs `logic` on that wake.
         self.refresh_tray_schedules();
         // A scheduled run's ask reaches the box only while a person is at the
@@ -1381,12 +1389,12 @@ mod tests {
         let gate = MachineGate::new(kgraf_core::ParallelismLimits::derive(16, 16, 16));
         let mut applied = None;
 
-        apply_parallelism(&mut slider, &gate, Some(16), &mut applied);
+        apply_parallelism(&mut slider, &gate, Some((16, 16, 16)), &mut applied);
         assert_eq!(gate.limits().max_agents, 16);
         assert_eq!(slider.max(), 16);
 
         slider.set_by_user(3);
-        apply_parallelism(&mut slider, &gate, Some(16), &mut applied);
+        apply_parallelism(&mut slider, &gate, Some((16, 16, 16)), &mut applied);
         assert_eq!(
             gate.limits().max_agents,
             3,
@@ -1397,7 +1405,7 @@ mod tests {
         // gate's now-3 effective limit back into `update_max`, collapsing
         // the slider's maximum to 3 here.
         for _ in 0..5 {
-            apply_parallelism(&mut slider, &gate, Some(16), &mut applied);
+            apply_parallelism(&mut slider, &gate, Some((16, 16, 16)), &mut applied);
         }
         assert_eq!(
             slider.max(),
@@ -1406,7 +1414,7 @@ mod tests {
         );
 
         slider.set_by_user(10);
-        apply_parallelism(&mut slider, &gate, Some(16), &mut applied);
+        apply_parallelism(&mut slider, &gate, Some((16, 16, 16)), &mut applied);
         assert_eq!(
             gate.limits().max_agents,
             10,
@@ -1423,16 +1431,42 @@ mod tests {
         let mut slider = ParallelismSlider::new(4);
         let gate = MachineGate::new(kgraf_core::ParallelismLimits::derive(4, 4, 4));
         let mut applied = None;
-        apply_parallelism(&mut slider, &gate, Some(4), &mut applied);
+        apply_parallelism(&mut slider, &gate, Some((4, 4, 4)), &mut applied);
         assert_eq!(gate.limits().max_agents, 4);
 
-        apply_parallelism(&mut slider, &gate, Some(20), &mut applied);
+        apply_parallelism(&mut slider, &gate, Some((20, 4, 4)), &mut applied);
         assert_eq!(slider.max(), 20);
         assert_eq!(
             gate.limits().max_agents,
             20,
             "a following slider pushes the new maximum through"
         );
+    }
+
+    /// A pinned slider of 3, and the re-measure thread accepts a reading of
+    /// 12: after one frame the gate reads 3, not 12, and the writer and
+    /// execution limits come from the reading. The thread holds no gate, so
+    /// the frame is the only writer.
+    #[test]
+    fn a_pinned_slider_wins_over_a_new_measurement_after_one_frame() {
+        let mut slider = ParallelismSlider::new(8);
+        let gate = MachineGate::new(kgraf_core::ParallelismLimits::derive(8, 8, 8));
+        let mut applied = None;
+        apply_parallelism(&mut slider, &gate, Some((8, 8, 8)), &mut applied);
+        slider.set_by_user(3);
+        apply_parallelism(&mut slider, &gate, Some((8, 8, 8)), &mut applied);
+        assert_eq!(gate.limits().max_agents, 3);
+        // The thread accepted 12 (writers 6, exec 5); one frame.
+        apply_parallelism(&mut slider, &gate, Some((12, 6, 5)), &mut applied);
+        let limits = gate.limits();
+        assert_eq!(limits.max_agents, 3, "the pin holds");
+        assert_eq!((limits.max_writers, limits.exec_slots), (6, 5));
+        assert_eq!(slider.max(), 12, "the measurement is the slider's maximum");
+        // Something else wrote the gate (it must not, but if it did): the
+        // next frame puts the pin back.
+        gate.set_limits(kgraf_core::ParallelismLimits::derive(12, 6, 5));
+        apply_parallelism(&mut slider, &gate, Some((12, 6, 5)), &mut applied);
+        assert_eq!(gate.limits().max_agents, 3, "the frame restores the pin");
     }
 
     /// Runs one logic pass and returns the root viewport commands egui hands to the
@@ -1488,7 +1522,7 @@ mod tests {
         assert!(is_user_input(&egui::Event::Zoom(1.1)), "a pinch is input");
     }
 
-    /// N5: quitting with a hosted run hides the window at once and quits only when
+    /// Quitting with a hosted run hides the window at once and quits only when
     /// the run's stop answers; nothing blocks the frame.
     #[test]
     fn quitting_with_a_run_hides_at_once_and_quits_when_it_has_stopped() {

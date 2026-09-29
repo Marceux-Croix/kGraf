@@ -91,3 +91,23 @@ returns its output so far.
 - **Setting `RUSTUP_TOOLCHAIN` and isolating cargo's configuration from the host.** It would
   also override a project's own pinned toolchain and configuration.
 - **Network access for builds.** Worker-written build scripts and tests would get the network.
+
+## Amendments (2026-09-29)
+
+- **Fetching is superseded by decision 0087.** The sentence "kGraf does not fetch dependencies"
+  in item 5 no longer holds: with the user's per-project consent the host fetches crates.io
+  dependencies outside the sandbox. The sandbox itself still has no network and never fetches.
+- **Reads.** A worker may read repository text files such as `.gitmodules`. Only the `.git`
+  directory and kGraf's own state are refused, with the reason, and NTFS short names and
+  alternate streams of those paths are refused too.
+- **More home credential files are denied**: git's credential-store file under `~/.config/git`,
+  RubyGems credentials, and other command-line tool logins. A symlinked credential directory
+  is denied at its target. On Linux the home grants are narrower. Known gap, stated by the
+  sandbox itself: without PID namespaces and a fresh `/proc`, `/proc` lists the command lines
+  and environments of the user's other processes, and an environment can hold secrets.
+- **Shell output is bounded as it is read**, so a chatty command cannot grow host memory, and
+  the command's process group is killed after a normal exit.
+- **`apply_patch` refuses a patch that names one path in two hunks**, because the second hunk
+  would silently replace the first. It keeps CRLF line endings and the final-newline state.
+- **Path names fold the way the volume does** when the tool guard and the overlap check
+  compare them.

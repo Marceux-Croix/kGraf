@@ -30,7 +30,7 @@ use kgraf_core::session::ReasoningVisibility;
 use kgraf_provider::{Provider, ProviderConfig, ProviderError};
 use kgraf_provider_anthropic::AnthropicAdapter;
 use kgraf_provider_openai::{
-    ChatCompletionsAdapter, OpenAiAdapter, StreamedUsageLocation, UsageDialect,
+    ChatCompletionsAdapter, OpenAiAdapter, ReasoningDialect, StreamedUsageLocation, UsageDialect,
 };
 
 /// Which wire protocol an endpoint speaks.
@@ -145,6 +145,11 @@ pub struct Entry {
     /// [`ReasoningVisibility::Unknown`] (checked in `check_catalog`): a route
     /// nobody has run is not the place to assert what it returns.
     pub reasoning_visibility: ReasoningVisibility,
+    /// Whether the route's completion count includes the reasoning share
+    /// ([`ReasoningDialect::Inclusive`], OpenAI's own shape and the default) or
+    /// reports it as a separate count ([`ReasoningDialect::Additive`]). Read on
+    /// the OpenAI-family wires; the Anthropic wire has its own convention.
+    pub reasoning_dialect: ReasoningDialect,
     /// What a reader needs to know before choosing this route. Kept short and factual.
     pub note: &'static str,
 }
@@ -188,16 +193,14 @@ pub const CATALOG: &[Entry] = &[
         confidence: Confidence::Verified,
         streamed_usage: None,
         reasoning_visibility: ReasoningVisibility::None,
+        reasoning_dialect: ReasoningDialect::Inclusive,
         note: "The additive reference. Input excludes cache reads and writes, so the \
                true input is the sum of all three. Reasoning is billed inside output \
-               and not reported separately. A first live check against \
-               api.anthropic.com itself was attempted 2026-09-28 and did \
-               not run: the configured KGRAF_ANTHROPIC_API_KEY was rejected with \
-               401 authentication_error, confirmed independent of this adapter by a \
-               raw curl to /v1/models. See \
-               the recorded live check of 2026-09-28; confidence \
-               stays Verified on the pre-existing documented basis, not yet raised \
-               by a live call.",
+               and not reported separately. Verified live against \
+               api.anthropic.com on 2026-09-28: a plain call, a streaming call, a \
+               tool round trip, prompt caching (cold write, then warm read), the \
+               rate-limit headers and a steer note after tool results all passed \
+               (6 of 6).",
     },
     Entry {
         id: "openai",
@@ -213,6 +216,7 @@ pub const CATALOG: &[Entry] = &[
         confidence: Confidence::Verified,
         streamed_usage: None,
         reasoning_visibility: ReasoningVisibility::Summary,
+        reasoning_dialect: ReasoningDialect::Inclusive,
         note: "Responses, not Chat Completions: on the current flagship the chat \
                surface requires reasoning effort set to none for function calling, so \
                it gives tools or reasoning but never both (decision 0006). Caching is \
@@ -242,6 +246,7 @@ pub const CATALOG: &[Entry] = &[
         confidence: Confidence::Documented,
         streamed_usage: None,
         reasoning_visibility: ReasoningVisibility::None,
+        reasoning_dialect: ReasoningDialect::Inclusive,
         note: "The same API key against this route and Kimi's native route gives \
                OPPOSITE usage conventions: additive here, inclusive there. This is the \
                case decision 0006 cites for keying accounting on protocol rather than \
@@ -271,6 +276,7 @@ pub const CATALOG: &[Entry] = &[
         // the adapter dedupes that repeat rather than double-recording it.
         streamed_usage: Some((StreamedUsageLocation::InChoice, Confidence::Verified)),
         reasoning_visibility: ReasoningVisibility::Full,
+        reasoning_dialect: ReasoningDialect::Inclusive,
         note: "Kimi's native route, for platform keys. Inclusive, against its own \
                Anthropic route's additive. Pick one per worker and let the catalog \
                carry the difference. Kimi Code subscription keys (sk-kimi-) are \
@@ -296,6 +302,7 @@ pub const CATALOG: &[Entry] = &[
         confidence: Confidence::Unverified,
         streamed_usage: Some((StreamedUsageLocation::TopLevelChunk, Confidence::Unverified)),
         reasoning_visibility: ReasoningVisibility::Unknown,
+        reasoning_dialect: ReasoningDialect::Inclusive,
         note: "The Kimi Code subscription route, for sk-kimi- keys only; a platform \
                key does not work here, and a subscription key returns 401 on the \
                platform route. It serves its own small model catalog, separate from \
@@ -317,6 +324,7 @@ pub const CATALOG: &[Entry] = &[
         confidence: Confidence::Verified,
         streamed_usage: Some((StreamedUsageLocation::TopLevelChunk, Confidence::Unverified)),
         reasoning_visibility: ReasoningVisibility::Full,
+        reasoning_dialect: ReasoningDialect::Inclusive,
         note: "The hit-and-miss usage dialect decision 0006 requires as a third usage \
                adapter. WARNING, confirmed from its own documentation: an unsupported \
                model name is SILENTLY REMAPPED to a cheap model and returns HTTP 200. \
@@ -337,6 +345,7 @@ pub const CATALOG: &[Entry] = &[
         confidence: Confidence::Unverified,
         streamed_usage: Some((StreamedUsageLocation::TopLevelChunk, Confidence::Unverified)),
         reasoning_visibility: ReasoningVisibility::Unknown,
+        reasoning_dialect: ReasoningDialect::Inclusive,
         note: "Reached over Chat Completions, which is the surface z.ai's models are \
                compatible with. An Anthropic-shaped route also exists at \
                api.z.ai/api/anthropic but is documented only inside a Claude Code \
@@ -358,6 +367,7 @@ pub const CATALOG: &[Entry] = &[
         confidence: Confidence::Unverified,
         streamed_usage: Some((StreamedUsageLocation::TopLevelChunk, Confidence::Unverified)),
         reasoning_visibility: ReasoningVisibility::Unknown,
+        reasoning_dialect: ReasoningDialect::Inclusive,
         note: "DashScope's OpenAI-compatible mode. The international and mainland \
                endpoints differ; override base_url for the mainland one. Usage shape \
                unverified.",
@@ -376,6 +386,7 @@ pub const CATALOG: &[Entry] = &[
         confidence: Confidence::Documented,
         streamed_usage: None,
         reasoning_visibility: ReasoningVisibility::None,
+        reasoning_dialect: ReasoningDialect::Inclusive,
         note: "Responses, deliberately. xAI's Anthropic-shaped route is FULLY \
                DEPRECATED and has no cache_control field anywhere in its schema, so \
                breakpoints there are dropped without comment (decision 0006). If this \
@@ -395,6 +406,7 @@ pub const CATALOG: &[Entry] = &[
         confidence: Confidence::Unverified,
         streamed_usage: Some((StreamedUsageLocation::TopLevelChunk, Confidence::Unverified)),
         reasoning_visibility: ReasoningVisibility::Unknown,
+        reasoning_dialect: ReasoningDialect::Inclusive,
         note: "Chat Completions fallback for xAI, since which surfaces it serves has \
                moved more than once.",
     },
@@ -412,6 +424,7 @@ pub const CATALOG: &[Entry] = &[
         confidence: Confidence::Documented,
         streamed_usage: Some((StreamedUsageLocation::TopLevelChunk, Confidence::Unverified)),
         reasoning_visibility: ReasoningVisibility::None,
+        reasoning_dialect: ReasoningDialect::Inclusive,
         note: "Gemini's OpenAI-compatibility layer. WARNING, confirmed: it IGNORES \
                unsupported parameters rather than rejecting them, so a configuration \
                that looks applied can be inert. Treat any capability here as not \
@@ -431,6 +444,7 @@ pub const CATALOG: &[Entry] = &[
         confidence: Confidence::Unverified,
         streamed_usage: None,
         reasoning_visibility: ReasoningVisibility::Unknown,
+        reasoning_dialect: ReasoningDialect::Inclusive,
         note: "Meta's own first-party API for its Muse models, over the Responses \
                dialect. Reported by big-AGI (2026-09-02), unverified here: unknown \
                top-level parameters are rejected, tool_choice accepts only auto, and \
@@ -452,6 +466,7 @@ pub const CATALOG: &[Entry] = &[
         confidence: Confidence::Unverified,
         streamed_usage: Some((StreamedUsageLocation::TopLevelChunk, Confidence::Unverified)),
         reasoning_visibility: ReasoningVisibility::Unknown,
+        reasoning_dialect: ReasoningDialect::Inclusive,
         note: "One route to Meta's open-weight Llama models; Meta's own API serves \
                its Muse models instead (the meta entry). \
                Groq, Fireworks and any other Chat Completions host work the same way; \
@@ -471,6 +486,7 @@ pub const CATALOG: &[Entry] = &[
         confidence: Confidence::Documented,
         streamed_usage: Some((StreamedUsageLocation::TopLevelChunk, Confidence::Unverified)),
         reasoning_visibility: ReasoningVisibility::None,
+        reasoning_dialect: ReasoningDialect::Inclusive,
         note: "Self-hosted, no credential. Reports prompt and completion tokens with \
                no cache split, which is correct rather than missing: there is no \
                server-side prompt cache to report. Cost derives to zero only if the \
@@ -490,6 +506,7 @@ pub const CATALOG: &[Entry] = &[
         confidence: Confidence::Documented,
         streamed_usage: Some((StreamedUsageLocation::TopLevelChunk, Confidence::Unverified)),
         reasoning_visibility: ReasoningVisibility::None,
+        reasoning_dialect: ReasoningDialect::Inclusive,
         note: "Self-hosted, no credential. vLLM, LM Studio and text-generation-webui \
                all serve the same surface on different ports; override base_url.",
     },
@@ -612,26 +629,54 @@ pub fn build(
     };
     Ok(match entry.wire {
         Wire::AnthropicMessages => Box::new(AnthropicAdapter::new(config).map_err(wrap)?),
-        Wire::OpenAiResponses => {
-            let adapter = OpenAiAdapter::new(config).map_err(wrap)?;
-            Box::new(if entry.refuses_temperature_with_reasoning {
-                adapter.refusing_temperature_with_reasoning()
-            } else {
-                adapter
-            })
-        }
-        Wire::OpenAiChat(dialect) => {
-            let mut adapter = ChatCompletionsAdapter::new(config, dialect).map_err(wrap)?;
-            if let Some((location, _confidence)) = entry.streamed_usage {
-                adapter = adapter.streaming_usage_from(location);
-            }
-            Box::new(if entry.reports_reasoning_tokens {
-                adapter.reporting_reasoning_tokens()
-            } else {
-                adapter
-            })
-        }
+        Wire::OpenAiResponses => Box::new(responses_adapter(entry, config).map_err(wrap)?),
+        Wire::OpenAiChat(dialect) => Box::new(chat_adapter(entry, config, dialect).map_err(wrap)?),
     })
+}
+
+/// The Responses adapter for `entry`, with the route's declared flags applied.
+fn responses_adapter(
+    entry: &Entry,
+    config: ProviderConfig,
+) -> Result<OpenAiAdapter, ProviderError> {
+    let adapter = OpenAiAdapter::new(config)?.with_reasoning_dialect(entry.reasoning_dialect);
+    Ok(if entry.refuses_temperature_with_reasoning {
+        adapter.refusing_temperature_with_reasoning()
+    } else {
+        adapter
+    })
+}
+
+/// The Chat Completions adapter for `entry`, with the route's declared flags applied.
+fn chat_adapter(
+    entry: &Entry,
+    config: ProviderConfig,
+    dialect: UsageDialect,
+) -> Result<ChatCompletionsAdapter, ProviderError> {
+    let mut adapter = ChatCompletionsAdapter::new(config, dialect)?
+        .with_reasoning_dialect(entry.reasoning_dialect);
+    if let Some((location, _confidence)) = entry.streamed_usage {
+        adapter = adapter.streaming_usage_from(location);
+    }
+    Ok(if entry.reports_reasoning_tokens {
+        adapter.reporting_reasoning_tokens()
+    } else {
+        adapter
+    })
+}
+
+/// The litellm provider prefix under which a route's models are priced, where
+/// the route's vendor is known to match one. `None` means the provider is not
+/// known and no prefixed price is ever tried for the route.
+///
+/// Only the platform routes of a vendor litellm prices under its own prefix
+/// are listed. The Kimi Code subscription route is not: its billing is not the
+/// platform's per-token price.
+pub fn litellm_provider(route_id: &str) -> Option<&'static str> {
+    match route_id {
+        "kimi" | "kimi-anthropic" => Some("moonshot"),
+        _ => None,
+    }
 }
 
 impl Wire {
@@ -1041,6 +1086,52 @@ mod tests {
             if let Some(other) = route.shares_credential_with {
                 entry(other).unwrap_or_else(|e| panic!("{}: {e}", route.id));
             }
+        }
+    }
+
+    #[test]
+    fn a_route_can_select_the_additive_reasoning_dialect_and_the_default_is_inclusive() {
+        for route in CATALOG {
+            assert_eq!(route.reasoning_dialect, ReasoningDialect::Inclusive);
+        }
+        let chat = *CATALOG
+            .iter()
+            .find(|e| matches!(e.wire, Wire::OpenAiChat(_)))
+            .expect("a chat route");
+        let Wire::OpenAiChat(dialect) = chat.wire else {
+            unreachable!()
+        };
+        let config = || configure(&chat, "placeholder-key-value", vec!["m".to_owned()]);
+        let default = chat_adapter(&chat, config().expect("config"), dialect).expect("adapter");
+        assert_eq!(default.reasoning_dialect(), ReasoningDialect::Inclusive);
+        let additive = Entry {
+            reasoning_dialect: ReasoningDialect::Additive,
+            ..chat
+        };
+        let adapter = chat_adapter(&additive, config().expect("config"), dialect).expect("adapter");
+        assert_eq!(adapter.reasoning_dialect(), ReasoningDialect::Additive);
+
+        let responses = *CATALOG
+            .iter()
+            .find(|e| e.wire == Wire::OpenAiResponses)
+            .expect("a responses route");
+        let additive = Entry {
+            reasoning_dialect: ReasoningDialect::Additive,
+            ..responses
+        };
+        let config = configure(&additive, "placeholder-key-value", vec!["m".to_owned()]);
+        let adapter = responses_adapter(&additive, config.expect("config")).expect("adapter");
+        assert_eq!(adapter.reasoning_dialect(), ReasoningDialect::Additive);
+    }
+
+    #[test]
+    fn a_litellm_provider_is_named_only_for_routes_in_the_catalog() {
+        assert_eq!(litellm_provider("kimi"), Some("moonshot"));
+        assert_eq!(litellm_provider("kimi-anthropic"), Some("moonshot"));
+        assert_eq!(litellm_provider("kimi-code"), None);
+        assert_eq!(litellm_provider("nonexistent"), None);
+        for id in ["kimi", "kimi-anthropic"] {
+            entry(id).expect("a mapped route exists in the catalog");
         }
     }
 

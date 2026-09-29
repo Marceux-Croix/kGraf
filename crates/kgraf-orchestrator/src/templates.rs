@@ -764,7 +764,7 @@ mod tests {
         }
     }
 
-    /// N3: the same structure with unrelated step text is not a reuse, so the
+    /// The same structure with unrelated step text is not a reuse, so the
     /// template is neither credited nor demoted by that run.
     #[test]
     fn a_plan_with_the_template_structure_but_unrelated_text_is_not_a_reuse() {
@@ -880,7 +880,7 @@ mod tests {
         }
     }
 
-    /// N4: a verified template stored without a `terms` fact is backfilled and
+    /// A verified template stored without a `terms` fact is backfilled and
     /// offered, not silently skipped forever.
     #[test]
     fn a_template_without_a_terms_fact_is_backfilled_and_offered() {

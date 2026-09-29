@@ -27,7 +27,7 @@
 //!
 //! **Attribution is required, not optional.** Every constructor takes an
 //! `Arc<dyn McpAttributionSink>`; there is no code path that builds an `RmcpCaller`
-//! without one (main-session ruling on decision 0051; see [`crate::attribution`]).
+//! without one (decision 0051; see [`crate::attribution`]).
 //!
 //! **A stdio server's environment is not inherited wholesale.** The child starts
 //! with a cleared environment plus a small allowlist
@@ -266,7 +266,7 @@ enum Peer {
 
 impl RmcpCaller {
     /// Connect to a stdio server: spawn its command and speak MCP over its stdin
-    /// and stdout. `sink` is required (see the crate's attribution ruling); every
+    /// and stdout. `sink` is required (see [`crate::attribution`]); every
     /// call this connection makes is recorded through it.
     pub async fn connect_stdio(
         config: &McpServerConfig,

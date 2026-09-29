@@ -184,3 +184,89 @@ async fn a_gate_that_panics_ends_blocked_and_releases_admission() {
         "the panicked gate's admission slot was released"
     );
 }
+
+/// [`AttemptEnvs`] that makes one model call as the worker (a settled ledger
+/// row under its agent id and task), then panics: an attempt that spent
+/// before it died.
+struct SpendThenPanic {
+    ledger: Arc<kgraf_provider::Ledger>,
+}
+
+#[async_trait::async_trait]
+impl AttemptEnvs for SpendThenPanic {
+    async fn build(
+        &self,
+        _route: &Route,
+        _workspace: &Path,
+        worker: &AgentId,
+        task: &TaskId,
+    ) -> Result<AttemptEnv, String> {
+        let usage = kgraf_core::TokenUsage {
+            uncached_input: 100_000,
+            text_output: 10_000,
+            ..Default::default()
+        };
+        self.ledger
+            .begin(
+                "fake",
+                kgraf_core::Protocol::Additive,
+                ALPHA_MODEL,
+                worker.as_str(),
+                task.as_str(),
+            )
+            .expect("begin")
+            .settle(&usage, None)
+            .expect("settle");
+        panic!("the attempt panicked after a model call, on purpose");
+    }
+}
+
+/// A panicked attempt's model calls are attributed to it: the run's spend is
+/// the ledger's, not short by the attempt's calls (which were once settled as
+/// a known zero because the panic path carried no call ids).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_panicked_attempts_calls_are_attributed_and_counted() {
+    let dir = tempfile::tempdir().expect("dir");
+    let plan = plan_json(&[c("a", "make a", "src/a.rs", &[])]);
+    let p = Parts::open(
+        dir.path(),
+        move |_| plan.clone(),
+        |_| SERVES.into(),
+        Duration::from_millis(5),
+    );
+    let mut cfg = config();
+    cfg.max_retries = 0;
+    let report = tokio::time::timeout(
+        Duration::from_secs(30),
+        Orchestrator::new(cfg, p.services(WINDOW))
+            .expect("orchestrator")
+            .with_attempt_envs(Arc::new(SpendThenPanic {
+                ledger: p.ledger.clone(),
+            }))
+            .start(RunId::new("r1"), "make a".into()),
+    )
+    .await
+    .expect("the run ended in time")
+    .expect("run");
+    assert!(
+        matches!(report.status, RunStatus::Blocked { .. }),
+        "{report:?}"
+    );
+    let (ledger_total, unpriced) = p.ledger.total_cost(&prices()).expect("total");
+    assert!(unpriced.is_empty());
+    let attempt_cost = prices()
+        .cost(
+            ALPHA_MODEL,
+            &kgraf_core::TokenUsage {
+                uncached_input: 100_000,
+                text_output: 10_000,
+                ..Default::default()
+            },
+        )
+        .expect("priced");
+    assert!(ledger_total >= attempt_cost);
+    assert_eq!(
+        report.spent, ledger_total,
+        "the run's spend includes the panicked attempt's call"
+    );
+}

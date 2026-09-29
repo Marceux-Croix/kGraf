@@ -20,7 +20,7 @@ pub enum TrayCommand {
     Quit,
 }
 
-/// H5: the tray is a second place to look the
+/// The tray is a second place to look the
 /// moment it lists individual schedules, since the graph and `kgraf schedule
 /// list` already do. It shows process presence plus exactly one aggregate line
 /// (`kgraf_shell::scheduler_bg::ScheduleSummary::line`, e.g. "3 schedules, 1
@@ -87,7 +87,7 @@ impl Tray {
         self.commands.try_iter().collect()
     }
 
-    /// Rebuilds the menu with the current schedule summary line (H5) below
+    /// Rebuilds the menu with the current schedule summary line below
     /// Show/Quit, but only when `summary` actually differs from what is already
     /// shown - a native menu rebuild is an OS call on every platform this crate
     /// supports, not worth paying every poll for an unchanged string.

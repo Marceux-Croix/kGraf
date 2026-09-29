@@ -150,17 +150,15 @@ fn seeded_store(n: usize, root: &std::path::Path) -> kgraf_graph::GraphStore {
             };
             let path = format!("{dir}/f{file_no}.rs");
             let file_id = format!("file{file_no}");
-            store
-                .upsert_file(&FileRecord {
-                    id: file_id.clone(),
-                    path: path.clone(),
-                    content_hash: file_id.clone(),
-                    size_bytes: 0,
-                    mtime_ns: 0,
-                    language: None,
-                    line_count: 20,
-                })
-                .expect("file");
+            let file = FileRecord {
+                id: file_id.clone(),
+                path: path.clone(),
+                content_hash: file_id.clone(),
+                size_bytes: 0,
+                mtime_ns: 0,
+                language: None,
+                line_count: 20,
+            };
             let nodes: Vec<NodeRecord> = chunk
                 .iter()
                 .map(|&i| NodeRecord {
@@ -191,7 +189,7 @@ fn seeded_store(n: usize, root: &std::path::Path) -> kgraf_graph::GraphStore {
                 }
             }
             store
-                .replace_file_nodes(&file_id, &nodes, &edges, &[])
+                .replace_file_nodes(&file, &nodes, &edges, &[])
                 .expect("rows");
             file_no += 1;
         }

@@ -953,7 +953,7 @@ impl Workspace {
 
     /// Closes project `i`, unless it works: a run hosted here, a scheduled run or
     /// any work its admission has in flight, or a run lease a live process holds
-    /// (H2). Stop the work first; its record stays resumable.
+    ///. Stop the work first; its record stays resumable.
     ///
     /// With a scheduler, the close pauses it across the check and the removal,
     /// so no scheduled run is admitted between "idle" and the drop. Taking the
@@ -1582,7 +1582,7 @@ mod tests {
     /// Opens (and thereby creates) a project's graph, as `kgraf index` does,
     /// then drops it: the fixture for "an already-indexed project" every test
     /// below needs except the two that are specifically about an unindexed
-    /// one - `presume_bg` never creates `graph.db` itself (C1, C2).
+    /// one - `presume_bg` never creates `graph.db` itself.
     fn index(root: &Path) {
         let path = kgraf_graph::snapshot::graph_db_path(root);
         std::fs::create_dir_all(path.parent().expect("state dir")).expect("mkdir");
@@ -1726,7 +1726,7 @@ mod tests {
         assert!(items[0].gone, "{items:?}");
     }
 
-    /// A never-indexed project (C1, C2) shows the "not indexed" notice
+    /// A never-indexed project shows the "not indexed" notice
     /// and is left exactly as it is: no `.kgraf`, no `graph.db`, whether or
     /// not a roadmap document happens to be sitting there.
     #[test]

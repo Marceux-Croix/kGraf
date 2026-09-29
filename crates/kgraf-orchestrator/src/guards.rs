@@ -207,10 +207,10 @@ pub fn check(
             source_contract: request.source_contract.to_owned(),
         });
     }
-    // Guard 4. Compared in the stored form (decision 0071, H2): the trace's
+    // Guard 4. Compared in the stored form: the trace's
     // tasks are stored persist-scrubbed and `task` arrives raw, so a secret
     // in it would otherwise hide a cycle. Scrubbing a stored task again
-    // leaves it unchanged, and intake tags (review 4, M-2) are dropped so two
+    // leaves it unchanged, and intake tags are dropped so two
     // intakes of one task compare equal.
     let stored_form = |t: &str| {
         normalize_task(&kgraf_secrets::without_tags(&kgraf_secrets::scrub_persist(
@@ -277,7 +277,7 @@ mod tests {
         }
     }
 
-    /// Decision 0071, H2: the trace's tasks are stored scrubbed, and a
+    /// The trace's tasks are stored scrubbed, and a
     /// handoff item arrives raw. A secret in the task must not hide a cycle.
     #[test]
     fn a_cycle_is_found_when_the_task_holds_a_secret() {

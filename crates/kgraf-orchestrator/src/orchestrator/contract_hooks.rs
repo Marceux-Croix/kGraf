@@ -362,7 +362,7 @@ impl RunLoop {
 
     /// Hold every party that is planned and not running. Returns their ids.
     fn hold_parties(&mut self, ic: &InterfaceContract, reason: &str) -> Vec<String> {
-        // Can quote a check's output: stored and shown, so scrubbed (review 4, H-2).
+        // Can quote a check's output: stored and shown, so scrubbed.
         let text = kgraf_secrets::scrub_persist_owned(format!("{} {reason}", hold_prefix(ic)));
         let mut held = Vec::new();
         for p in &ic.parties {
@@ -549,7 +549,7 @@ impl RunLoop {
             };
             let blocked = match &state {
                 InterfaceState::Active if checked => {
-                    // 0081 hardening, H2: `ChecksPassed` is persisted before
+                    // `ChecksPassed` is persisted before
                     // the land, so a resume inside that window finds the
                     // interface checked with no stub landed. Land it now,
                     // before any party dispatches, never skip it; the
@@ -675,7 +675,7 @@ impl RunLoop {
     /// `false` when the land was refused or failed; the interface is then
     /// failed through `check_failed`, which holds its parties naming why.
     ///
-    /// The scope (hardening M1) is the producer's declared write targets
+    /// The scope is the producer's declared write targets
     /// (`consumer_tests::producer_of`: the party whose writes hold every
     /// stub path) and the paths earlier versions of this interface landed.
     /// No producer means an empty scope, which the lander refuses naming
@@ -732,9 +732,9 @@ impl RunLoop {
     /// interface. Every path is fail-loud: an unrunnable
     /// gate, an unconfigured route or a missing contract record is recorded as
     /// [`ConsumerTestOutcome::NotRun`] and traced, never a silent `continue`.
-    /// Decision 0080 removed every spend cap, so a reservation itself no
-    /// longer refuses; `reserve_call` still fails when the model is unpriced,
-    /// which propagates as a genuine error rather than a recorded `NotRun`.
+    /// A reservation never refuses (decision 0080 removed every spend cap),
+    /// and a model with no price is held at zero and reported as unpriced
+    /// (decision 0075).
     async fn run_consumer_tests(
         &mut self,
         ic: &InterfaceContract,
@@ -789,7 +789,7 @@ impl RunLoop {
                 symbols: ic.symbols.clone(),
             };
             let input = estimate_tokens(&request.brief) + 600;
-            let reservation = self.reserve_call(&basis, input)?;
+            let reservation = self.reserve_call(&basis, input);
             let (test, calls) = match writer.write(&request).await {
                 Ok((test, call)) => {
                     let calls: Vec<CallId> = call.into_iter().collect();
@@ -982,10 +982,7 @@ impl RunLoop {
                     .collect(),
             };
             let input = estimate_tokens(&request.brief) + 600;
-            let reservation = match self.reserve_call(&basis, input) {
-                Ok(r) => r,
-                Err(e) => return Ok(Err(format!("the handshake call was not reserved: {e}"))),
-            };
+            let reservation = self.reserve_call(&basis, input);
             match handshaker.state(&request).await {
                 Ok((statement, call)) => {
                     let calls: Vec<CallId> = call.into_iter().collect();
@@ -1049,7 +1046,7 @@ impl RunLoop {
                 Some(challenger) => {
                     // Counted when taken, whatever becomes of it: a refusal, a
                     // recompute that cannot run, one refused as still open
-                    // (N3). Kept in the record, so a restart does not refill
+                    //. Kept in the record, so a restart does not refill
                     // the budget; saved below with the rest of the answer.
                     *self
                         .record
@@ -1216,6 +1213,8 @@ impl RunLoop {
         if let Some(oc) = self.record.contract_mut(contract) {
             oc.handshake_route = Some(route.clone());
         }
+        // The pick is recorded, so it is used: the next one starts one along.
+        self.commit_route_pick();
         Some(route)
     }
 
@@ -1448,7 +1447,7 @@ impl RunLoop {
             )));
         }
         // Artifacts are read as of the check runner's base: the commit the
-        // contract was checked against (M3).
+        // contract was checked against.
         let looked_up = match desk.runner.artifacts() {
             crate::check_runner::Artifacts::Commit(at) => resolve_by_lookup(&desk.book, &c, &at),
             crate::check_runner::Artifacts::Directory(dir) => {
@@ -1570,10 +1569,7 @@ impl RunLoop {
             + estimate_tokens(quote)
             + estimate_tokens(&c.claim)
             + 600;
-        let reservation = match self.reserve_call(&basis, input) {
-            Ok(r) => r,
-            Err(e) => return Ok(Err(format!("the review call was not reserved: {e}"))),
-        };
+        let reservation = self.reserve_call(&basis, input);
         let verdict = match reviewer.review(&request).await {
             Ok(v) => v,
             Err(e) => {
@@ -1596,7 +1592,7 @@ impl RunLoop {
                 && let Some(mut escalation) = escalate
             {
                 // A re-raise whose paid review found a contradiction that no
-                // verbatim passage settles: the user decides (M2).
+                // verbatim passage settles: the user decides.
                 escalation.rebuttal = format!(
                     "{}; the paid review found a contradiction with `{artifact}` it could not \
                      settle by quote: {}",

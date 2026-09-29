@@ -128,8 +128,11 @@ enum Command {
         #[arg(long)]
         prices: Option<PathBuf>,
     },
-    /// List calls whose spend is unaccounted for.
-    Unreconciled,
+    /// List calls whose spend is unaccounted for, or close one with `resolve`.
+    Unreconciled {
+        #[command(subcommand)]
+        action: Option<UnreconciledAction>,
+    },
     /// Induced demand: whether runs offered workflow templates started more
     /// work than runs without, with decomposition spend and spend per verified
     /// task for each. Reports directions only; claims no saving.
@@ -561,9 +564,14 @@ enum ScheduleAction {
         max_tokens: u32,
         #[arg(long, default_value_t = 128_000)]
         window: u64,
-        /// The acceptance command run in each worker's worktree.
-        #[arg(long, default_value = "cargo test --workspace")]
-        verify: String,
+        /// The acceptance command run in each worker's worktree. Without it,
+        /// the first test command the project's build files declare (Cargo,
+        /// npm `test`, pyproject, a Makefile `test` target).
+        #[arg(long)]
+        verify: Option<String>,
+        /// Run although the claim table has this schedule disabled.
+        #[arg(long)]
+        force: bool,
         /// Seconds one worker shell command may run before its process group
         /// is killed (its output so far is kept). Overrides the worker
         /// configuration's `shell_timeout_secs`; without either, 600.
@@ -597,6 +605,34 @@ enum DepsAction {
     Reset,
     /// Fetch now, once (`cargo fetch` outside the workers' sandbox).
     Fetch,
+}
+
+#[derive(Subcommand)]
+enum UnreconciledAction {
+    /// Close one open call with the usage the provider's own invoice or console
+    /// shows for it. Counts in the call's own protocol: for an inclusive route
+    /// `--input` is the prompt total, for an additive route it excludes cache
+    /// reads and writes. Use `--no-charge` when the provider confirms it billed
+    /// nothing. A call is resolved once; the event is chained like any settle.
+    Resolve {
+        /// The ledger call id, as printed by `kgraf unreconciled`.
+        call_id: String,
+        /// The provider confirms this call was not billed.
+        #[arg(long, conflicts_with_all = ["input", "cache_read", "cache_write", "output", "reasoning"])]
+        no_charge: bool,
+        /// Input tokens, as the provider reports them for this route's protocol.
+        #[arg(long)]
+        input: Option<u64>,
+        #[arg(long)]
+        cache_read: Option<u64>,
+        #[arg(long)]
+        cache_write: Option<u64>,
+        /// Text output tokens (reasoning excluded).
+        #[arg(long)]
+        output: Option<u64>,
+        #[arg(long)]
+        reasoning: Option<u64>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -645,7 +681,7 @@ fn feature_name(command: &Command) -> &'static str {
         Command::Cochange { .. } => "cochange",
         Command::Partners { .. } => "partners",
         Command::Spend { .. } => "spend",
-        Command::Unreconciled => "unreconciled",
+        Command::Unreconciled { .. } => "unreconciled",
         Command::Demand => "demand",
         Command::Ledger { .. } => "ledger",
         Command::Call { .. } => "call",
@@ -745,7 +781,7 @@ fn main() -> Result<()> {
             from_roadmap,
             sources,
         } => {
-            let store = open_graph(&root)?;
+            let store = open_graph_writer(&root)?;
             if from_roadmap {
                 plan_cmd::from_roadmap(&store, &sources)
             } else {
@@ -766,7 +802,31 @@ fn main() -> Result<()> {
             limit,
         } => partners(&root, &path, min_count, max_commit_size, limit),
         Command::Spend { prices } => spend(&root, prices.as_deref()),
-        Command::Unreconciled => unreconciled(&root),
+        Command::Unreconciled { action: None } => unreconciled(&root),
+        Command::Unreconciled {
+            action:
+                Some(UnreconciledAction::Resolve {
+                    call_id,
+                    no_charge,
+                    input,
+                    cache_read,
+                    cache_write,
+                    output,
+                    reasoning,
+                }),
+        } => {
+            let ledger = open_ledger(&root)?;
+            let usage = ResolvedUsage {
+                no_charge,
+                input,
+                cache_read,
+                cache_write,
+                output,
+                reasoning,
+            };
+            println!("{}", resolve_unreconciled(&ledger, &call_id, usage)?);
+            Ok(())
+        }
         Command::Demand => demand(&root),
         Command::Ledger { action } => ledger_command(&root, action),
         Command::Providers { verified_only } => providers(verified_only),
@@ -974,6 +1034,7 @@ fn main() -> Result<()> {
                 max_tokens,
                 window,
                 verify,
+                force,
                 shell_timeout,
                 fetch_deps,
                 no_fetch_deps,
@@ -990,6 +1051,7 @@ fn main() -> Result<()> {
                     max_tokens,
                     window,
                     verify,
+                    force,
                     shell_timeout: shell_timeout.map(std::time::Duration::from_secs),
                     fetch_deps: fetch_choice(fetch_deps, no_fetch_deps),
                 },
@@ -1398,9 +1460,40 @@ fn state_dir(root: &Path) -> Result<PathBuf> {
     Ok(kgraf_host::state_dir(root)?)
 }
 
-fn open_graph(root: &Path) -> Result<GraphStore> {
+/// The index for `kgraf index` alone: created when missing and rebuilt when its
+/// schema version is another. Every other command opens an existing index and
+/// refuses one it cannot use, naming `kgraf index`.
+fn open_graph_for_index(root: &Path) -> Result<GraphStore> {
     let path = state_dir(root)?.join("graph.db");
     GraphStore::open(&path, root).with_context(|| format!("cannot open {}", path.display()))
+}
+
+/// An existing index, read-only: a reader can neither create nor rebuild it.
+fn open_graph_read(root: &Path) -> Result<GraphStore> {
+    let path = state_dir(root)?.join("graph.db");
+    GraphStore::open_read_only_checked(&path, root)
+        .with_context(|| format!("cannot open {}", path.display()))
+}
+
+/// An existing index that the command records facts in (schedules): never
+/// created and never rebuilt.
+fn open_graph_facts(root: &Path) -> Result<GraphStore> {
+    let path = state_dir(root)?.join("graph.db");
+    GraphStore::open_existing_for_facts(&path, root)
+        .with_context(|| format!("cannot open {}", path.display()))
+}
+
+/// The index for a command that writes facts and may start a project's first
+/// (`plan --from-roadmap`, `cochange`): an existing one is opened without a
+/// rebuild, and a missing one is created empty at this build's schema, which
+/// leaves nothing to rebuild.
+fn open_graph_writer(root: &Path) -> Result<GraphStore> {
+    let path = state_dir(root)?.join("graph.db");
+    if path.is_file() {
+        open_graph_facts(root)
+    } else {
+        open_graph_for_index(root)
+    }
 }
 
 fn open_ledger(root: &Path) -> Result<Ledger> {
@@ -1412,7 +1505,7 @@ fn index(root: &Path, dry_run: bool, include_nested: bool, no_presume: bool) -> 
     let store = if dry_run {
         GraphStore::open_in_memory(root).context("cannot open a scratch index")?
     } else {
-        open_graph(root)?
+        open_graph_for_index(root)?
     };
     let report = Indexer::new(&store)
         .with_nested_repositories(include_nested)
@@ -1430,6 +1523,20 @@ fn index(root: &Path, dry_run: bool, include_nested: bool, no_presume: bool) -> 
     println!("  unchanged      {}", report.files_unchanged);
     println!("  removed        {}", report.files_removed);
     println!("  not utf-8      {}", report.skipped_not_utf8);
+    for path in &report.non_utf8_removed {
+        println!("    removed {path}: its bytes changed to something that is not UTF-8");
+    }
+    println!("  too large      {}", report.skipped_too_large);
+    println!("  excluded dirs  {}", report.excluded_dirs_skipped.len());
+    for dir in &report.excluded_dirs_skipped {
+        println!("    skipped excluded directory {dir}");
+    }
+    for path in &report.metadata_errors {
+        println!("  kept, metadata unreadable: {path} (its rows were not touched)");
+    }
+    for path in &report.symlinks_kept {
+        println!("  kept, symbolic link: {path} (not followed; its rows were not touched)");
+    }
     println!(
         "  left to the bus {} (conversation files, docs/agent-comms)",
         report.bus_owned_skipped
@@ -1463,7 +1570,7 @@ fn index(root: &Path, dry_run: bool, include_nested: bool, no_presume: bool) -> 
 }
 
 fn symbol(root: &Path, name: &str) -> Result<()> {
-    let store = open_graph(root)?;
+    let store = open_graph_read(root)?;
     let found = store
         .resolve_symbol(name)
         .with_context(|| format!("resolving `{name}`"))?;
@@ -1485,7 +1592,7 @@ fn symbol(root: &Path, name: &str) -> Result<()> {
 }
 
 fn print_slice(root: &Path, name: &str, budget: u64) -> Result<()> {
-    let store = open_graph(root)?;
+    let store = open_graph_read(root)?;
     if store.node_count().context("cannot read the graph")? == 0 {
         anyhow::bail!("the graph has no nodes yet; run `kgraf index` first");
     }
@@ -1503,7 +1610,7 @@ fn print_slice(root: &Path, name: &str, budget: u64) -> Result<()> {
 }
 
 fn query(root: &Path, pattern: &str, limit: usize) -> Result<()> {
-    let store = open_graph(root)?;
+    let store = open_graph_read(root)?;
     let parsed = Pattern::parse(pattern).context("the query could not be parsed")?;
     let matches = parsed.run(&store, limit).context("the query failed")?;
     for found in &matches {
@@ -1530,7 +1637,7 @@ fn query(root: &Path, pattern: &str, limit: usize) -> Result<()> {
 }
 
 fn build_cochange(root: &Path, commits: u32, oversize_cap: u32) -> Result<()> {
-    let store = open_graph(root)?;
+    let store = open_graph_writer(root)?;
     let history =
         cochange::read_git_history(root, commits).context("cannot read version history")?;
     let stats = cochange::build_from_commits(&store, &history, oversize_cap)
@@ -1560,7 +1667,7 @@ fn partners(
     max_commit_size: Option<u32>,
     limit: usize,
 ) -> Result<()> {
-    let store = open_graph(root)?;
+    let store = open_graph_read(root)?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -1598,7 +1705,7 @@ fn partners(
 
 fn demand(root: &Path) -> Result<()> {
     use kgraf_orchestrator::demand::{DemandRecord, render, summarize};
-    let graph = open_graph(root)?;
+    let graph = open_graph_read(root)?;
     let records = DemandRecord::load_all(&graph).context("cannot read demand records")?;
     if records.is_empty() {
         println!("no finished orchestrator runs are recorded yet");
@@ -1630,7 +1737,10 @@ fn spend(root: &Path, prices: Option<&Path>) -> Result<()> {
         let table: kgraf_core::cost::PriceTable =
             serde_json::from_str(&text).context("the price table is not valid JSON")?;
         let (total, unpriced) = ledger.total_cost(&table).context("cannot derive cost")?;
-        println!("\ntotal {total}");
+        println!(
+            "\n{}",
+            total_line(&total.to_string(), by_model.len(), unpriced.len())
+        );
         if !unpriced.is_empty() {
             // Not costed at zero. An unpriced model is reported so the total is
             // known to be incomplete.
@@ -1651,6 +1761,17 @@ fn spend(root: &Path, prices: Option<&Path>) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// The `kgraf spend` total line. When every recorded model is unpriced the
+/// sum is not zero dollars, it is unknown, so the line says `unpriced` and
+/// never a zero amount.
+fn total_line(total: &str, models: usize, unpriced: usize) -> String {
+    if models > 0 && unpriced >= models {
+        "total unpriced (no recorded model has a price)".to_owned()
+    } else {
+        format!("total {total}")
+    }
 }
 
 fn unreconciled(root: &Path) -> Result<()> {
@@ -1676,6 +1797,60 @@ fn unreconciled(root: &Path) -> Result<()> {
         open.len()
     );
     Ok(())
+}
+
+/// The usage figures given to `kgraf unreconciled resolve`.
+struct ResolvedUsage {
+    no_charge: bool,
+    input: Option<u64>,
+    cache_read: Option<u64>,
+    cache_write: Option<u64>,
+    output: Option<u64>,
+    reasoning: Option<u64>,
+}
+
+/// Close one open call with a stated usage, in the call's own protocol.
+///
+/// Refuses a call that is not open (a settled call is never rewritten) and a
+/// request that states nothing: a resolve with no figure and no `--no-charge`
+/// would record zero by omission, which is the silent understatement the open
+/// row exists to prevent.
+fn resolve_unreconciled(ledger: &Ledger, call_id: &str, given: ResolvedUsage) -> Result<String> {
+    let stated = given.input.is_some()
+        || given.cache_read.is_some()
+        || given.cache_write.is_some()
+        || given.output.is_some()
+        || given.reasoning.is_some();
+    if !given.no_charge && !stated {
+        bail!("state the usage (--input, --output, ...) or pass --no-charge");
+    }
+    let open = ledger.unreconciled().context("cannot read the ledger")?;
+    let call = open
+        .iter()
+        .find(|c| c.id.as_str() == call_id)
+        .with_context(|| format!("`{call_id}` is not an open call; see `kgraf unreconciled`"))?;
+    let usage = kgraf_core::TokenUsage::normalize(
+        call.protocol,
+        given.input.unwrap_or(0),
+        given.cache_read.unwrap_or(0),
+        given.cache_write.unwrap_or(0),
+        given.output.unwrap_or(0),
+        given.reasoning.unwrap_or(0),
+        None,
+    )
+    .context("the stated usage is inconsistent for this route's protocol")?;
+    ledger
+        .reconcile(&call.id, &usage)
+        .with_context(|| format!("cannot resolve call `{call_id}`"))?;
+    Ok(format!(
+        "resolved {call_id} ({}): input {} cache r {} w {} output {} reasoning {}",
+        call.model,
+        usage.uncached_input,
+        usage.cache_read,
+        usage.cache_write,
+        usage.text_output,
+        usage.reasoning_output
+    ))
 }
 
 fn ledger_command(root: &Path, action: LedgerAction) -> Result<()> {
@@ -1869,5 +2044,92 @@ mod tests {
             std::time::Duration::from_secs(gate_timeout),
             d::gate_timeout()
         );
+    }
+
+    #[test]
+    fn the_spend_total_says_unpriced_when_no_model_has_a_price() {
+        assert_eq!(
+            total_line("$0.000000", 2, 2),
+            "total unpriced (no recorded model has a price)"
+        );
+        // Partly priced: the total stands and the unpriced models are listed
+        // beneath it by the caller.
+        assert_eq!(total_line("$1.500000", 2, 1), "total $1.500000");
+        assert_eq!(total_line("$0.000000", 0, 0), "total $0.000000");
+    }
+
+    fn open_call(ledger: &Ledger, protocol: kgraf_core::Protocol) -> String {
+        let token = ledger
+            .begin("t", protocol, "model-a", "agent", "task")
+            .expect("begin");
+        let id = token.id().as_str().to_owned();
+        token.leave_unreconciled(None).expect("leave open");
+        id
+    }
+
+    fn stated(input: Option<u64>, output: Option<u64>, no_charge: bool) -> ResolvedUsage {
+        ResolvedUsage {
+            no_charge,
+            input,
+            cache_read: None,
+            cache_write: None,
+            output,
+            reasoning: None,
+        }
+    }
+
+    /// `kgraf unreconciled resolve` closes an open call with the stated usage,
+    /// once, in the call's own protocol, and refuses an empty statement.
+    #[test]
+    fn resolve_closes_an_open_call_once_with_the_stated_usage() {
+        let ledger = Ledger::open_in_memory().expect("ledger");
+        let id = open_call(&ledger, kgraf_core::Protocol::Additive);
+        assert_eq!(ledger.unreconciled().expect("open").len(), 1);
+
+        // An id that is not open is refused while another call is open, and
+        // the open call is untouched.
+        assert!(resolve_unreconciled(&ledger, "nope", stated(Some(1), None, false)).is_err());
+        assert_eq!(ledger.unreconciled().expect("open").len(), 1);
+
+        // Nothing stated and no --no-charge: refused, the call stays open.
+        assert!(resolve_unreconciled(&ledger, &id, stated(None, None, false)).is_err());
+        assert_eq!(ledger.unreconciled().expect("open").len(), 1);
+
+        let line = resolve_unreconciled(&ledger, &id, stated(Some(120), Some(30), false))
+            .expect("resolve");
+        assert!(line.contains("input 120"), "{line}");
+        assert!(ledger.unreconciled().expect("open").is_empty());
+        let record = ledger
+            .call(&kgraf_core::CallId::new(id.clone()))
+            .expect("read")
+            .expect("present");
+        assert_eq!(record.usage.uncached_input, 120);
+        assert_eq!(record.usage.text_output, 30);
+        ledger.verify().expect("chain still verifies");
+
+        // A resolved call is no longer open, so a second resolve is refused.
+        assert!(resolve_unreconciled(&ledger, &id, stated(Some(1), None, false)).is_err());
+        // An unknown id is refused.
+        assert!(resolve_unreconciled(&ledger, "nope", stated(None, None, true)).is_err());
+    }
+
+    #[test]
+    fn resolve_with_no_charge_records_zero_and_an_inclusive_underflow_is_refused() {
+        let ledger = Ledger::open_in_memory().expect("ledger");
+        let free = open_call(&ledger, kgraf_core::Protocol::Inclusive);
+        resolve_unreconciled(&ledger, &free, stated(None, None, true)).expect("no charge");
+        let record = ledger
+            .call(&kgraf_core::CallId::new(free))
+            .expect("read")
+            .expect("present");
+        assert_eq!(record.usage.total_input(), 0);
+
+        let other = open_call(&ledger, kgraf_core::Protocol::Inclusive);
+        let bad = ResolvedUsage {
+            cache_read: Some(50),
+            ..stated(Some(10), None, false)
+        };
+        assert!(resolve_unreconciled(&ledger, &other, bad).is_err());
+        assert_eq!(ledger.unreconciled().expect("open").len(), 1);
     }
 }

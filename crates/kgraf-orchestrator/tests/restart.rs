@@ -400,3 +400,67 @@ fn a_kill_mid_decomposition_does_not_repeat_the_calls_that_answered() {
         vec!["h.p1".to_owned(), "h.p2".to_owned(), "z".to_owned()]
     );
 }
+
+/// A kill mid-append leaves a torn last line in a worker's transcript and in
+/// the run's trace. The resume repairs both, as the host's own worker does,
+/// instead of refusing: the re-adopted worker continues from its last whole
+/// event, the run completes, and what was dropped is in the trace.
+#[test]
+fn a_torn_transcript_and_trace_tail_are_repaired_on_resume_and_said() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().expect("dir");
+    run_and_kill(dir.path());
+    let tear = |path: &std::path::Path| {
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .expect("open");
+        f.write_all(br#"{"seq":999,"event":{"type":"mod"#)
+            .expect("tear");
+    };
+    tear(&dir.path().join("runs/r1/workers/r1-b-r0-a0.jsonl"));
+    tear(&dir.path().join("runs/r1/trace.jsonl"));
+
+    let second = runtime();
+    let p2 = Parts::open_with(
+        dir.path(),
+        |_| panic!("the resumed run must not decompose again"),
+        |_| SERVES.into(),
+        Duration::from_millis(5),
+        true,
+    );
+    let report = second
+        .block_on(async {
+            Orchestrator::new(cfg(), p2.services(WINDOW))
+                .expect("orchestrator")
+                .resume(RunId::new("r1"))
+                .await
+        })
+        .expect("resume past the torn tails");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    assert_eq!(report.verified, vec!["a".to_owned(), "b".to_owned()]);
+    // The same worker continued from its transcript: only its interrupted
+    // round was asked again, not a fresh attempt from round 0.
+    let requests = p2.stats.requests();
+    assert!(
+        requests.len() == 1 && requests[0].2 >= 1,
+        "b continued from its repaired transcript: {requests:?}"
+    );
+    let events = second
+        .block_on(async {
+            kgraf_orchestrator::TraceLog::open(&dir.path().join("runs/r1/trace.jsonl"))
+                .await
+                .expect("the repaired trace opens strictly")
+                .load()
+                .await
+        })
+        .expect("load");
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            kgraf_orchestrator::TraceEvent::Notice { detail, .. }
+                if detail.contains("torn line")
+        )),
+        "the dropped trace tail is said"
+    );
+}

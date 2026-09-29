@@ -77,7 +77,7 @@ fn scheduled_runs_with(factory: Arc<Factory>, pairs: &[(&str, &str)]) -> Arc<Sch
     Arc::new(ScheduledRuns::new(factory, instructions, 4))
 }
 
-/// Like `scheduled_runs`, with an explicit concurrency cap (N7: low enough to force a
+/// Like `scheduled_runs`, with an explicit concurrency cap (low enough to force a
 /// capacity refusal deterministically, rather than one this test would otherwise
 /// never actually exercise).
 fn scheduled_runs_capped(
@@ -220,7 +220,7 @@ fn tm(h: u32, m: u32, s: u32) -> chrono::DateTime<Utc> {
         .expect("time")
 }
 
-/// C1: a `Skip`-policy schedule, ticked steadily right across its own due time, must
+/// A `Skip`-policy schedule, ticked steadily right across its own due time, must
 /// still fire exactly once - the defect this replaces treated every tick as a "wake"
 /// evaluation, under which `Skip` (which only ever catches up on a real gap) never
 /// fired an on-time occurrence at all.
@@ -258,7 +258,7 @@ async fn a_skip_policy_schedule_ticked_across_its_due_time_fires_exactly_once() 
     );
 }
 
-/// C2: one schedule failing to progress (here, a claim it cannot win) must not stop
+/// One schedule failing to progress (here, a claim it cannot win) must not stop
 /// another schedule in the same tick from firing. The exact reviewer-cited defect - a
 /// cron pattern that constructs but whose backward search fails - is now refused at
 /// construction instead (see `kgraf_schedule::recurrence`'s own regression test),
@@ -364,7 +364,7 @@ async fn a_capacity_refusal_defers_visibly_and_never_counts_toward_the_pause_thr
     let events = loop_.tick(&schedules, next_tick).await;
     // A deferral retry that succeeds is reported as a start after
     // deferral, never `Reclaimed` - "second" was never abandoned, only
-    // capacity-limited - and never `Deferred`, which means not started (H4 M1).
+    // capacity-limited - and never `Deferred`, which means not started.
     assert!(
         events.iter().any(|e| matches!(
             e,
@@ -391,7 +391,7 @@ async fn a_capacity_refusal_defers_visibly_and_never_counts_toward_the_pause_thr
     );
 }
 
-/// M6: a `false` `enabled` flag must be a real gate, proven against a control that
+/// A `false` `enabled` flag must be a real gate, proven against a control that
 /// really would fire if enabled - not merely "the disabled one did nothing", which a
 /// broken gate that skipped every schedule would also satisfy.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -430,7 +430,7 @@ async fn a_disabled_in_definition_schedule_never_fires_while_its_enabled_twin_do
 /// Acceptance: "a recurring schedule fires on time" and "a crash between claim and
 /// run does not fire the occurrence twice" - two independent `SchedulerLoop`s (two
 /// app instances) racing for real, concurrently, on the same on-disk claim table.
-/// M6: the previous version of this test ran the two ticks strictly sequentially (A
+/// The previous version of this test ran the two ticks strictly sequentially (A
 /// then B), so B's own tick always saw A's already-advanced `last_seen` and never
 /// even attempted `claim_occurrence` - the test would have passed with fencing
 /// removed entirely. A `tokio::sync::Barrier` now forces both into their claim
@@ -502,7 +502,7 @@ async fn a_schedule_fires_once_across_two_app_instances() {
     );
 }
 
-/// C3: a claim whose lease expired (the claimant crashed or hung) is reclaimed by a
+/// A claim whose lease expired (the claimant crashed or hung) is reclaimed by a
 /// live loop on a later tick, and the reclaim is visible as its own event - not
 /// indistinguishable from an ordinary fresh firing, and not permanently stranded (the
 /// defect the review found: `advance_last_seen` running ahead of the claim meant a
@@ -546,7 +546,7 @@ async fn a_crashed_claimants_occurrence_is_reclaimed_and_visibly_marked() {
     );
 }
 
-/// H1: a one-shot due ten seconds after it was created must fire once a tick reaches
+/// A one-shot due ten seconds after it was created must fire once a tick reaches
 /// it, even though it was never "missed" in the `resolve_wake` sense (nothing had
 /// ever been claimed for it before). Without `created_at` as the fallback baseline,
 /// `latest_occurrence_since(None, now)` compares against `last_seen == None`, and the
@@ -581,7 +581,7 @@ async fn a_one_shot_ten_seconds_out_fires_on_a_twenty_second_tick() {
     );
 }
 
-/// H1: a daily schedule added while the app is closed must fire once the app opens,
+/// A daily schedule added while the app is closed must fire once the app opens,
 /// even though the app's *first-ever* evaluation of it happens well after its first
 /// intended occurrence.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -698,7 +698,7 @@ impl OrchestratorFactory for NotRunnable {
     }
 }
 
-/// H2: a whole-process readiness failure (no routes configured at all, say) must
+/// A whole-process readiness failure (no routes configured at all, say) must
 /// never claim an occurrence, and so must never disable any schedule - the previous
 /// behavior claimed every due schedule and let each one's own `record_outcome` call
 /// disable it individually for a fact that was true of the whole build, not of any
@@ -756,11 +756,11 @@ impl OrchestratorFactory for NoCredential {
     }
 }
 
-/// N3 (port of probe P3): a per-schedule credential failure - `configured()` still
+/// A per-schedule credential failure - `configured()` still
 /// succeeds (the process as a whole is set up), but `ready(schedule_id)` fails - must
 /// still disable *that* schedule with the reason shown (acceptance item 3: "a
 /// schedule whose credential is removed disables itself"). This is the behavior the
-/// H2 whole-process pre-check must never swallow: N3 splits `configured` from
+/// whole-process pre-check must never swallow: the fix splits `configured` from
 /// `ready` precisely so this path stays reachable.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_per_schedule_credential_failure_disables_that_schedule() {
@@ -871,7 +871,7 @@ async fn a_failed_run_is_visible_and_counted() {
 /// 00:50 to 04:30) must drop the missed occurrence and never fire it, on the tick
 /// that first sees it *or* any later one - not "drop on the first tick after wake,
 /// then fire it on the second because last_seen never advanced" (the exact defect a
-/// heartbeat-based on-time measure produced: N1's fix computes on-time from `now -
+/// heartbeat-based on-time measure produced: the fix computes on-time from `now -
 /// due`, so a missed occurrence stays "not on time" no matter how many ticks pass).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn probe_p1_skip_after_wake_never_fires_the_missed_occurrence() {
@@ -904,7 +904,7 @@ async fn probe_p1_skip_after_wake_never_fires_the_missed_occurrence() {
 /// `tick_schedule` itself (not a hand-seeded claim row), so `last_seen` and the claim
 /// really do commit together the way a live loop's first tick would leave them. A
 /// second loop, waking fifty minutes later (the 30s lease long expired), must reclaim
-/// it and report `TickEvent::Reclaimed` - the defect N2 fixes: with the claim table's
+/// it and report `TickEvent::Reclaimed` - the defect the lease renewal fixes: with the claim table's
 /// old behavior, `last_seen` already named `due`, so nothing ever proposed it again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn probe_p2_a_claim_committed_by_tick_schedule_then_crash_is_reclaimed() {
@@ -931,7 +931,7 @@ async fn probe_p2_a_claim_committed_by_tick_schedule_then_crash_is_reclaimed() {
     );
 }
 
-/// N2: a run that is genuinely still executing longer than the default lease must
+/// A run that is genuinely still executing longer than the default lease must
 /// never be reclaimed out from under itself - the lease heartbeat
 /// (`renew_pending_leases`) is what this test proves exists.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -973,7 +973,7 @@ async fn a_long_live_run_is_never_reclaimed_out_from_under_itself() {
 /// Releasing pending occurrences (a
 /// graceful shutdown) makes each one reclaimable on the very next tick rather than
 /// waiting out the whole lease. D2 corrected what that release actually does: the
-/// first version set status back to `pending`, which the N2 `expired_claims` scan -
+/// first version set status back to `pending`, which the `expired_claims` scan -
 /// the only scan that ever looks for an abandoned-looking occurrence - never
 /// selects; a released occurrence was findable by no future tick at all. Status now
 /// stays `claimed` with an already-expired lease, so the same scan a crashed

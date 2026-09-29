@@ -18,7 +18,7 @@
 //! its callers, then its siblings. A budget large enough for the symbol alone
 //! yields the symbol alone rather than three arbitrary neighbors.
 
-use crate::error::Result;
+use crate::error::{GraphError, Result};
 use crate::store::{EdgeKind, GraphStore, NodeRecord};
 use kgraf_core::budget::{TokenBudget, estimate_tokens};
 
@@ -79,6 +79,11 @@ pub struct ContextSlice {
     /// change it is making may be one of the cross-cutting ones slices are bad
     /// at, and that a justified whole-file read is the right fallback.
     pub omitted: Vec<(NodeRecord, SliceReason)>,
+    /// Neighbors whose source could not be read, because the file changed after
+    /// it was indexed or is gone, with the reason. Kept apart from
+    /// [`ContextSlice::omitted`]: these did not fail the budget, they failed the
+    /// read. A requested node that fails is an error, never listed here.
+    pub unreadable: Vec<(NodeRecord, SliceReason, String)>,
     /// The budget after the slice was assembled.
     pub budget: TokenBudget,
 }
@@ -123,8 +128,49 @@ impl ContextSlice {
                     .join(", ")
             ));
         }
+        if !self.unreadable.is_empty() {
+            out.push_str(&format!(
+                "// {} neighbor(s) unreadable, not sliced: {}\n",
+                self.unreadable.len(),
+                self.unreadable
+                    .iter()
+                    .map(|(node, reason, why)| format!(
+                        "{} ({}): {why}",
+                        node.qualified_name,
+                        reason.as_str()
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
         out
     }
+}
+
+/// Resolve a symbol name to exactly one node. An exact qualified-name match wins
+/// when it is the only one; otherwise more than one candidate is an error that
+/// lists them all, never a silent pick of the first.
+pub fn resolve_unambiguous(store: &GraphStore, symbol: &str) -> Result<NodeRecord> {
+    let mut candidates = store.resolve_symbol(symbol)?;
+    let exact: Vec<usize> = candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| n.qualified_name == symbol)
+        .map(|(i, _)| i)
+        .collect();
+    if let [only] = exact.as_slice() {
+        return Ok(candidates.swap_remove(*only));
+    }
+    if candidates.len() == 1 {
+        return Ok(candidates.remove(0));
+    }
+    Err(GraphError::AmbiguousSymbol {
+        name: symbol.to_owned(),
+        candidates: candidates
+            .iter()
+            .map(|n| format!("{} ({}:{})", n.qualified_name, n.path, n.start_line))
+            .collect(),
+    })
 }
 
 /// Build a context slice for a symbol.
@@ -136,11 +182,9 @@ pub fn slice_for_symbol(
     symbol: &str,
     budget_tokens: u64,
 ) -> Result<ContextSlice> {
-    // `resolve_symbol` returns every candidate rather than guessing. The slice
-    // takes the best-ranked one, which is an exact qualified-name match where one
-    // exists, and the ambiguity is visible to a caller that asked directly.
-    let candidates = store.resolve_symbol(symbol)?;
-    let requested = candidates[0].clone();
+    // An ambiguous name is refused with its candidates rather than resolved to
+    // the first: the caller names the node it means (`slice_for_node`).
+    let requested = resolve_unambiguous(store, symbol)?;
     slice_for_node(store, &requested, budget_tokens)
 }
 
@@ -194,14 +238,17 @@ pub fn slice_for_node(
     let mut budget = TokenBudget::new(budget_tokens);
     let mut members = Vec::new();
     let mut omitted = Vec::new();
+    let mut unreadable = Vec::new();
     for (node, reason) in candidates {
-        // A node whose file has moved on is skipped with its reason recorded,
-        // rather than aborting the whole slice: one stale span should not deny a
-        // worker its context.
+        // The requested node failing is the slice failing: an empty slice that
+        // exits 0 would read as "nothing to know". A neighbor whose file has
+        // moved on is listed as unreadable with the cause (not as a budget
+        // omission), so one stale neighbor does not deny a worker its context.
         let source = match store.source_of(&node) {
             Ok(source) => source,
-            Err(_) => {
-                omitted.push((node, reason));
+            Err(error) if reason == SliceReason::Requested => return Err(error),
+            Err(error) => {
+                unreadable.push((node, reason, error.to_string()));
                 continue;
             }
         };
@@ -222,6 +269,7 @@ pub fn slice_for_node(
         requested: requested.qualified_name.clone(),
         members,
         omitted,
+        unreadable,
         budget,
     })
 }
@@ -354,23 +402,99 @@ pub fn unrelated() {
     }
 
     #[test]
-    fn the_slice_reads_current_source_from_disk() {
+    fn the_slice_reads_current_source_from_disk_after_a_reindex() {
         let (dir, store) = fixture();
         let before = slice_for_symbol(&store, "unrelated", 10_000).expect("slice");
         assert!(before.render().contains("let _ = 2;"));
 
-        // Rewrite the file, keeping `unrelated` at the same lines, without
-        // reindexing. The index holds a location, so the slice must pick up the
-        // new bytes.
+        // Rewrite the file, keeping `unrelated` at the same lines. Until the
+        // index catches up the slice refuses; afterward it serves the new bytes.
         let path = dir.path().join("src/lib.rs");
         let text = fs::read_to_string(&path).expect("read");
         fs::write(&path, text.replace("let _ = 2;", "let _ = 99;")).expect("write");
+        assert!(slice_for_symbol(&store, "unrelated", 10_000).is_err());
+        Indexer::new(&store).index().expect("reindex");
         let after = slice_for_symbol(&store, "unrelated", 10_000).expect("slice");
         assert!(
             after.render().contains("let _ = 99;"),
             "slice served stale source: {}",
             after.render()
         );
+    }
+
+    #[test]
+    fn a_requested_node_in_an_edited_file_is_an_error_not_an_empty_slice() {
+        let (dir, store) = fixture();
+        // A line is inserted above every span, so the old spans now name
+        // other text although they still fit inside the file.
+        let path = dir.path().join("src/lib.rs");
+        let text = fs::read_to_string(&path).expect("read");
+        fs::write(&path, format!("// added\n{text}")).expect("write");
+        let error = slice_for_symbol(&store, "unrelated", 10_000).expect_err("must refuse");
+        assert!(matches!(error, GraphError::StaleFile { .. }), "{error:?}");
+        assert!(error.to_string().contains("kgraf index"), "{error}");
+    }
+
+    #[test]
+    fn a_stale_neighbor_is_unreadable_and_not_a_budget_omission() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let write = |rel: &str, body: &str| {
+            fs::create_dir_all(dir.path().join("src")).expect("mkdir");
+            fs::write(dir.path().join(rel), body).expect("write");
+        };
+        write("src/a.rs", "pub fn entry() {\n    helper();\n}\n");
+        write("src/b.rs", "pub fn helper() {\n    let _ = 1;\n}\n");
+        let store = GraphStore::open_in_memory(dir.path()).expect("store");
+        Indexer::new(&store).index().expect("index");
+        write(
+            "src/b.rs",
+            "// moved\npub fn helper() {\n    let _ = 1;\n}\n",
+        );
+
+        let slice = slice_for_symbol(&store, "entry", 10_000).expect("slice");
+        assert!(slice.omitted.is_empty(), "{:?}", slice.omitted);
+        assert_eq!(slice.unreadable.len(), 1);
+        assert_eq!(slice.unreadable[0].0.name, "helper");
+        let rendered = slice.render();
+        assert!(rendered.contains("unreadable"), "{rendered}");
+        assert!(!rendered.contains("omitted for budget"), "{rendered}");
+    }
+
+    #[test]
+    fn an_ambiguous_name_is_refused_with_every_candidate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::create_dir_all(dir.path().join("src")).expect("mkdir");
+        fs::write(dir.path().join("src/a.rs"), "pub fn twin() {}\n").expect("write");
+        fs::write(dir.path().join("src/b.rs"), "pub fn twin() {}\n").expect("write");
+        let store = GraphStore::open_in_memory(dir.path()).expect("store");
+        Indexer::new(&store).index().expect("index");
+        let error = slice_for_symbol(&store, "twin", 1_000).expect_err("ambiguous");
+        match &error {
+            GraphError::AmbiguousSymbol { candidates, .. } => {
+                assert_eq!(candidates.len(), 2, "{candidates:?}");
+                assert!(candidates.iter().any(|c| c.contains("src/a.rs")));
+                assert!(candidates.iter().any(|c| c.contains("src/b.rs")));
+            }
+            other => panic!("expected AmbiguousSymbol, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_exact_qualified_name_resolves_among_same_named_nodes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::create_dir_all(dir.path().join("src")).expect("mkdir");
+        fs::write(
+            dir.path().join("src/a.rs"),
+            "pub struct S;\nimpl S {\n    pub fn go(&self) {}\n}\npub fn go() {}\n",
+        )
+        .expect("write");
+        let store = GraphStore::open_in_memory(dir.path()).expect("store");
+        Indexer::new(&store).index().expect("index");
+        let found = store.resolve_symbol("go").expect("resolve");
+        assert!(found.len() >= 2, "{found:?}");
+        // The bare name matches the free function's qualified name exactly.
+        let node = resolve_unambiguous(&store, "go").expect("exact wins");
+        assert_eq!(node.qualified_name, "go");
     }
 
     #[test]

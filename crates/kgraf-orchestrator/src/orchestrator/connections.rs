@@ -458,22 +458,7 @@ impl RunLoop {
             .map(|r| (r.reason.len() as u64).div_ceil(4) + 30)
             .sum::<u64>()
             + 200;
-        let reservation = match self.reserve_call(&answerer.cost_basis(), input) {
-            Ok(r) => r,
-            Err(e) => {
-                let reason = format!("the judgment call was not reserved: {e}");
-                self.session_notice(
-                    "",
-                    "",
-                    format!(
-                        "{} connection request(s) were refused unjudged: {reason}",
-                        requests.len()
-                    ),
-                );
-                self.resolve_all(waiters, &reason);
-                return;
-            }
-        };
+        let reservation = self.reserve_call(&answerer.cost_basis(), input);
         let mut agents: Vec<(SessionId, String)> = Vec::new();
         for r in &requests {
             for s in [&r.pair.0, &r.pair.1] {
@@ -498,15 +483,13 @@ impl RunLoop {
             requests,
             agents,
         };
-        let tx = self.tx.clone();
-        let task = tokio::spawn(async move {
-            let result = answerer.judge_connections(&request).await;
-            let _ = tx
-                .send(LoopMsg::Session(Box::new(
-                    super::sessions::SessionWork::Judged(result),
-                )))
-                .await;
-        });
+        let task = super::sessions::spawn_session_call(
+            self.tx.clone(),
+            self.sessions_rt.call_timeout,
+            "connection judgment",
+            async move { answerer.judge_connections(&request).await },
+            super::sessions::SessionWork::Judged,
+        );
         self.sessions_rt.judge.judging = Some(Judging {
             reservation: Some(reservation),
             waiters,
@@ -649,13 +632,20 @@ impl RunLoop {
         let conn = connection_id(from, to);
         let now = self.now();
         let source = InboxSource::Agent { id: from.clone() };
-        let last_pending = store
+        let pending = store
             .undelivered(to)
-            .map_err(|e| SessionError::NotPersisted(e.to_string()))?
-            .into_iter()
+            .map_err(|e| SessionError::NotPersisted(e.to_string()))?;
+        let last_pending = pending
+            .iter()
             .filter(|i| i.source == source)
             .map(|i| i.not_before_ms)
             .max();
+        // An earlier row that is due but not delivered yet (its injector was
+        // not ready, or its paced time passed since the last re-check): this
+        // message must not overtake it.
+        let earlier_due = pending
+            .iter()
+            .any(|i| injectable(i.kind) && i.not_before_ms <= now);
         let paced = self
             .sessions_rt
             .pacer
@@ -706,6 +696,12 @@ impl RunLoop {
             // failed record save is said, not returned as its failure.
             if let Err(e) = self.save() {
                 eprintln!("kgraf-orchestrator: a pacing notice could not be saved: {e}");
+            }
+        } else if earlier_due {
+            // Delivered with the rows before it, in inbox order.
+            self.sessions_rt.recheck.mark(to);
+            if let Err(e) = self.recheck_inbox() {
+                eprintln!("kgraf-orchestrator: the inbox of {to} could not be delivered: {e}");
             }
         } else {
             self.inject_now_or_later(to, &item);

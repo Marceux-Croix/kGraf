@@ -43,6 +43,9 @@ use std::path::Path;
 /// history size.
 pub(crate) const SCHEMA_VERSION: i64 = 4;
 
+/// How long a statement waits for another connection's lock before it fails.
+const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(5_000);
+
 /// What one edge means.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
@@ -129,7 +132,16 @@ pub struct GraphStore {
     conn: Connection,
     /// The working-tree root every stored path is relative to.
     root: std::path::PathBuf,
+    /// Set while a background pass is retrying the checkpoint a reader blocked
+    /// after [`GraphStore::clear_meta`]. See [`GraphStore::schedule_wal_scrub`].
+    wal_scrub_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
+
+/// How long the background pass keeps retrying a blocked checkpoint, and how
+/// often. A viewer's read transaction lasts a frame or a query, so a minute is
+/// far past any healthy reader; a reader held longer is reported.
+const WAL_SCRUB_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
+const WAL_SCRUB_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// Whether opening may rebuild the derived tables of an index of another schema
 /// version.
@@ -159,11 +171,26 @@ impl GraphStore {
             db_path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
-        conn.busy_timeout(std::time::Duration::from_millis(5_000))?;
+        conn.busy_timeout(BUSY_TIMEOUT)?;
         Ok(Self {
             conn,
             root: root.to_path_buf(),
+            wal_scrub_pending: Default::default(),
         })
+    }
+
+    /// [`GraphStore::open_read_only`] for a command that reads the index and
+    /// nothing else: a missing file is [`GraphError::NoIndex`] and an index of
+    /// another schema version is [`GraphError::SchemaMismatch`], both naming
+    /// `kgraf index`, so a reader never meets an opaque "no such table".
+    pub fn open_read_only_checked(db_path: &Path, root: &Path) -> Result<Self> {
+        require_index_file(db_path)?;
+        let store = Self::open_read_only(db_path, root)?;
+        let found = store.schema_version()?;
+        if found != Some(SCHEMA_VERSION) {
+            return Err(store.mismatch(found));
+        }
+        Ok(store)
     }
 
     /// Open an existing index to record facts (schedules and their run history)
@@ -174,6 +201,7 @@ impl GraphStore {
     /// [`GraphStore::open`] does. The desktop shell's scheduler uses this, so a
     /// background tick can never empty a project's code index.
     pub fn open_existing_for_facts(db_path: &Path, root: &Path) -> Result<Self> {
+        require_index_file(db_path)?;
         let conn = Connection::open_with_flags(
             db_path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -209,7 +237,7 @@ impl GraphStore {
         // instead of failing instantly: it waits up to this long for the other
         // transaction to finish rather than surfacing a spurious contention error
         // that the lease registry's own conflict reporting was supposed to own.
-        conn.busy_timeout(std::time::Duration::from_millis(5_000))?;
+        conn.busy_timeout(BUSY_TIMEOUT)?;
         // Every transaction on this connection takes its write lock at BEGIN rather
         // than at the first write. A DEFERRED transaction that reads a lease table
         // then writes it can be forced to upgrade mid-transaction and lose the race
@@ -222,6 +250,7 @@ impl GraphStore {
         let store = Self {
             conn,
             root: root.to_path_buf(),
+            wal_scrub_pending: Default::default(),
         };
         store.migrate(rebuild)?;
         Ok(store)
@@ -386,22 +415,105 @@ impl GraphStore {
         })
     }
 
-    /// Remove a project-level fact, and fold the WAL into the file so the
+    /// Remove a project-level fact, and try to fold the WAL into the file so the
     /// removed value's old page images leave the WAL too (decision 0071).
+    ///
+    /// The checkpoint does not wait ([`GraphStore::checkpoint_wal_nowait`]): a
+    /// reader holding an older snapshot makes it give up at once, and a waiting
+    /// checkpoint here held every writer for the full busy timeout whenever a
+    /// viewer was reading. When a reader does block it, a background thread
+    /// keeps retrying without waiting on the writer lock, up to a bound
+    /// ([`GraphStore::schedule_wal_scrub`]), so the removed value does not stay
+    /// in the WAL until the last connection closes; a reader that outlasts the
+    /// bound is recorded in the diagnostics file (KG-0208).
     pub fn clear_meta(&self, key: &str) -> Result<()> {
         self.secure_delete(|conn| conn.execute("DELETE FROM meta WHERE key = ?1", params![key]))?;
-        self.checkpoint_wal()
+        if !self.checkpoint_wal_nowait()? {
+            self.schedule_wal_scrub(WAL_SCRUB_BOUND, WAL_SCRUB_INTERVAL);
+        }
+        Ok(())
+    }
+
+    /// Retry a checkpoint a reader blocked, on a thread of its own, until it
+    /// completes or `bound` passes. Each attempt is a non-waiting
+    /// `wal_checkpoint(TRUNCATE)` on a second connection, so no attempt holds
+    /// the writer lock while it waits for the reader: writers never stall. At
+    /// most one pass runs per store; a second request while one runs is covered
+    /// by it, because the attempt that succeeds folds in every frame present
+    /// then. Returns the thread's handle (`true` when the WAL was truncated,
+    /// `false` when the bound passed), or `None` for an in-memory index or a
+    /// pass already running.
+    pub(crate) fn schedule_wal_scrub(
+        &self,
+        bound: std::time::Duration,
+        interval: std::time::Duration,
+    ) -> Option<std::thread::JoinHandle<bool>> {
+        use std::sync::atomic::Ordering;
+        let path = self.conn.path().filter(|p| !p.is_empty())?.to_owned();
+        if self
+            .wal_scrub_pending
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return None;
+        }
+        let pending = self.wal_scrub_pending.clone();
+        let spawned = std::thread::Builder::new()
+            .name("kgraf-wal-scrub".to_owned())
+            .spawn(move || {
+                let done = retry_truncate_checkpoint(std::path::Path::new(&path), bound, interval);
+                pending.store(false, Ordering::Release);
+                if !done {
+                    kgraf_diag::record(kgraf_diag::DiagEvent::error(
+                        "KG-0208",
+                        "kgraf-graph",
+                        format!(
+                            "a cleared record may still be in the WAL: a reader held an older \
+                             snapshot for {} s",
+                            bound.as_secs()
+                        ),
+                    ));
+                }
+                done
+            });
+        match spawned {
+            Ok(handle) => Some(handle),
+            Err(_) => {
+                self.wal_scrub_pending.store(false, Ordering::Release);
+                None
+            }
+        }
     }
 
     /// `PRAGMA wal_checkpoint(TRUNCATE)`: copy every WAL frame into the
     /// database and truncate the WAL file, so old page images (a run record's
-    /// earlier text) do not stay in it until the last connection closes. A
-    /// reader holding an older snapshot makes it return busy without an
-    /// error; the frames then go at the next checkpoint.
+    /// earlier text) do not stay in it until the last connection closes. It
+    /// waits for readers, up to the connection's busy timeout; a reader holding
+    /// an older snapshot past that makes it return busy without an error, and
+    /// the frames then go at the next checkpoint. For a caller that expects no
+    /// readers (the end of a run); routine writes use
+    /// [`GraphStore::checkpoint_wal_nowait`].
     pub fn checkpoint_wal(&self) -> Result<()> {
         self.conn
             .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
         Ok(())
+    }
+
+    /// The same checkpoint without waiting: the busy timeout is zero for this
+    /// one call, so a reader in the way makes it return `false` at once instead
+    /// of holding the caller. `true` when the WAL was fully folded in and
+    /// truncated.
+    pub fn checkpoint_wal_nowait(&self) -> Result<bool> {
+        self.conn.busy_timeout(std::time::Duration::ZERO)?;
+        let outcome = self
+            .conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                row.get::<_, i64>(0)
+            });
+        let restored = self.conn.busy_timeout(BUSY_TIMEOUT);
+        let busy = outcome?;
+        restored?;
+        Ok(busy == 0)
     }
 
     /// Run one `meta` write with `secure_delete = ON`, then return to FAST
@@ -552,9 +664,16 @@ impl GraphStore {
         )? as u64)
     }
 
-    /// Insert or update a file row.
+    /// Insert or update a file row on its own. An indexer must not use this
+    /// ahead of writing the file's nodes: the row carries the content hash, and
+    /// a hash committed before its nodes makes the file read as unchanged.
+    /// [`GraphStore::replace_file_nodes`] writes the row and the nodes together.
     pub fn upsert_file(&self, file: &FileRecord) -> Result<()> {
-        self.conn.execute(
+        Self::upsert_file_on(&self.conn, file)
+    }
+
+    fn upsert_file_on(conn: &Connection, file: &FileRecord) -> Result<()> {
+        conn.execute(
             "INSERT INTO files(id, path, content_hash, size_bytes, mtime_ns, language, line_count)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(id) DO UPDATE SET
@@ -576,6 +695,51 @@ impl GraphStore {
         Ok(())
     }
 
+    fn set_source_root_on(
+        conn: &Connection,
+        file_id: &str,
+        source_root: Option<&Path>,
+    ) -> Result<()> {
+        match source_root {
+            Some(root) => conn.execute(
+                "INSERT INTO file_source_roots(file_id, root) VALUES (?1, ?2)
+                 ON CONFLICT(file_id) DO UPDATE SET root = excluded.root",
+                params![file_id, root.to_string_lossy()],
+            )?,
+            None => conn.execute(
+                "DELETE FROM file_source_roots WHERE file_id = ?1",
+                params![file_id],
+            )?,
+        };
+        Ok(())
+    }
+
+    /// Forget the recorded source root of the file at `path`, so its lines are
+    /// read from the store's root again. Used when the store's root is found to
+    /// hold the content already indexed.
+    pub fn clear_file_source_root(&self, path: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM file_source_roots WHERE file_id IN (SELECT id FROM files WHERE path = ?1)",
+            params![path],
+        )?;
+        Ok(())
+    }
+
+    /// The root recorded for the file at `path`, if it was indexed from a tree
+    /// other than the store's root.
+    pub fn file_source_root(&self, path: &str) -> Result<Option<std::path::PathBuf>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT r.root FROM file_source_roots r JOIN files f ON f.id = r.file_id
+                 WHERE f.path = ?1",
+                params![path],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(std::path::PathBuf::from))
+    }
+
     /// Remove a file and, by cascade, its nodes and their edges.
     ///
     /// Any node lease on one of this file's nodes is purged in the same transaction
@@ -592,18 +756,42 @@ impl GraphStore {
         Ok(())
     }
 
-    /// Replace every node and edge belonging to one file.
+    /// Write one file's row and replace every node and edge belonging to it,
+    /// in one transaction.
     ///
     /// This is the unit of incremental reindexing: one changed file, one
-    /// replaced subgraph, and the change log records exactly that.
+    /// replaced subgraph, and the change log records exactly that. The file row
+    /// holds the content hash the change detector compares. It commits with the
+    /// nodes or not at all, so a failure between the two can never leave a file
+    /// that reads as unchanged with stale or missing nodes.
     pub fn replace_file_nodes(
         &self,
-        file_id: &str,
+        file: &FileRecord,
         nodes: &[NodeRecord],
         edges: &[(String, String, EdgeKind, i64)],
         call_sites: &[(String, String)],
     ) -> Result<()> {
+        self.replace_file_nodes_from(file, nodes, edges, call_sites, None)
+    }
+
+    /// [`GraphStore::replace_file_nodes`] for a file read from `source_root`
+    /// instead of the store's root (a worktree holding a merge the checkout has
+    /// not received yet). The root is recorded in the same transaction as the
+    /// file's hash, so [`GraphStore::source_of`] reads the tree the hash
+    /// describes. `None` clears any recorded root: the file was read from the
+    /// store's root.
+    pub fn replace_file_nodes_from(
+        &self,
+        file: &FileRecord,
+        nodes: &[NodeRecord],
+        edges: &[(String, String, EdgeKind, i64)],
+        call_sites: &[(String, String)],
+        source_root: Option<&Path>,
+    ) -> Result<()> {
+        let file_id = file.id.as_str();
         let tx = unsafe { self.unchecked_tx() }?;
+        Self::upsert_file_on(&tx, file)?;
+        Self::set_source_root_on(&tx, file_id, source_root)?;
         // Deleting the file's nodes cascades to their layout rows. Capture the
         // cached positions first, so a node whose identity survives the rewrite
         // keeps its place (call depth and cluster scale included) instead of
@@ -843,15 +1031,51 @@ impl GraphStore {
 
     /// Read a node's source from disk.
     ///
-    /// The index holds no text, so this is the only way to get it, and it is
-    /// therefore impossible for the graph to serve a stale copy. A span that no
-    /// longer fits the file raises [`GraphError::StaleSpan`] rather than
-    /// returning the wrong lines.
+    /// The index holds no text, so this is the only way to get it. The bytes
+    /// are read from the file's recorded source root when it has one (a file
+    /// indexed from a worktree that holds a merge the checkout has not received
+    /// yet), else from the store's root. A recorded root that no longer holds the
+    /// indexed content (removed, or edited) falls back to the store's root. In
+    /// every case the content hash of the bytes read is compared with the indexed
+    /// one first: a file edited since it was indexed raises
+    /// [`GraphError::StaleFile`], because a span that still fits the shorter or
+    /// longer file would return the wrong lines. A span that no longer fits the
+    /// file raises [`GraphError::StaleSpan`].
     pub fn source_of(&self, node: &NodeRecord) -> Result<String> {
-        let full = self.root.join(&node.path);
-        let text = std::fs::read_to_string(&full).map_err(|source| GraphError::Io {
+        let indexed: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT content_hash FROM files WHERE id = ?1",
+                params![node.file_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let recorded = self.file_source_root(&node.path)?;
+        let matches = |bytes: &[u8]| {
+            indexed.as_deref() == Some(blake3::hash(bytes).to_hex().to_string().as_str())
+        };
+        let from_recorded = recorded
+            .and_then(|root| std::fs::read(root.join(&node.path)).ok())
+            .filter(|bytes| matches(bytes));
+        let bytes = match from_recorded {
+            Some(bytes) => bytes,
+            None => {
+                let full = self.root.join(&node.path);
+                let bytes = std::fs::read(&full).map_err(|source| GraphError::Io {
+                    path: node.path.clone(),
+                    source,
+                })?;
+                if !matches(&bytes) {
+                    return Err(GraphError::StaleFile {
+                        node: node.id.clone(),
+                        path: node.path.clone(),
+                    });
+                }
+                bytes
+            }
+        };
+        let text = String::from_utf8(bytes).map_err(|_| GraphError::NotUtf8 {
             path: node.path.clone(),
-            source,
         })?;
         let lines: Vec<&str> = text.lines().collect();
         let start = node.start_line.saturating_sub(1) as usize;
@@ -877,6 +1101,49 @@ impl GraphStore {
             .query_row("SELECT COALESCE(MAX(seq), 0) FROM change_log", [], |row| {
                 row.get(0)
             })?)
+    }
+}
+
+/// Attempt `wal_checkpoint(TRUNCATE)` on a fresh connection every `interval`
+/// until one completes (`true`) or `bound` has passed, or the database cannot
+/// be opened (`false`). The busy timeout is zero, so an attempt returns at once
+/// when a reader is in the way instead of holding the writer lock.
+fn retry_truncate_checkpoint(
+    path: &Path,
+    bound: std::time::Duration,
+    interval: std::time::Duration,
+) -> bool {
+    let Ok(conn) = Connection::open(path) else {
+        return false;
+    };
+    if conn.busy_timeout(std::time::Duration::ZERO).is_err() {
+        return false;
+    }
+    let deadline = std::time::Instant::now() + bound;
+    loop {
+        let busy = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            row.get::<_, i64>(0)
+        });
+        match busy {
+            Ok(0) => return true,
+            Ok(_) => {}
+            Err(_) => return false,
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(interval);
+    }
+}
+
+/// A read or facts open never creates the database file.
+fn require_index_file(db_path: &Path) -> Result<()> {
+    if db_path.is_file() {
+        Ok(())
+    } else {
+        Err(GraphError::NoIndex {
+            path: db_path.display().to_string(),
+        })
     }
 }
 
@@ -997,6 +1264,14 @@ CREATE TABLE IF NOT EXISTS files (
     mtime_ns     INTEGER NOT NULL,
     language     TEXT,
     line_count   INTEGER NOT NULL
+);
+
+-- Where a file's indexed content lives when that is not the store's root: a
+-- worktree holding a merge the checkout has not received yet. Absent for a
+-- file indexed from the store's root. `source_of` still verifies the hash.
+CREATE TABLE IF NOT EXISTS file_source_roots (
+    file_id TEXT PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+    root    TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS nodes (
@@ -1550,3 +1825,72 @@ CREATE TRIGGER IF NOT EXISTS edges_ad AFTER DELETE ON edges BEGIN
             json_object('src', OLD.src, 'dst', OLD.dst, 'kind', OLD.kind));
 END;
 "#;
+
+#[cfg(test)]
+mod wal_scrub_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn pinned(path: &Path) -> Connection {
+        let reader = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("reader");
+        reader
+            .execute_batch("BEGIN; SELECT COUNT(*) FROM meta;")
+            .expect("pin a snapshot");
+        reader
+    }
+
+    /// A reader that outlasts the bound makes the pass report failure; one
+    /// pass runs per store; the pass never holds the writer lock while it
+    /// waits, so a write during it succeeds at once.
+    #[test]
+    fn a_reader_that_outlasts_the_bound_is_reported_and_writers_are_never_held() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("graph.db");
+        let store = GraphStore::open(&path, dir.path()).expect("open");
+        store.set_meta("k", &"v".repeat(20_000)).expect("set");
+        let reader = pinned(&path);
+        store.set_meta("k", "small").expect("overwrite");
+
+        let long = store
+            .schedule_wal_scrub(Duration::from_secs(30), Duration::from_millis(10))
+            .expect("the first request starts a pass");
+        assert!(
+            store
+                .schedule_wal_scrub(Duration::from_secs(30), Duration::from_millis(10))
+                .is_none(),
+            "a second request while one pass runs starts no second thread"
+        );
+        let started = std::time::Instant::now();
+        store
+            .set_meta("other", "value")
+            .expect("write during the pass");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a write waited on the background pass"
+        );
+        // Releasing the reader lets the long pass finish and succeed.
+        reader.execute_batch("COMMIT;").expect("release");
+        assert!(long.join().expect("join"), "the pass completed once freed");
+
+        // Held past a short bound: the pass gives up and says so.
+        let reader = pinned(&path);
+        store.set_meta("k", &"w".repeat(20_000)).expect("set");
+        store.set_meta("k", "tiny").expect("overwrite");
+        let short = store
+            .schedule_wal_scrub(Duration::from_millis(100), Duration::from_millis(10))
+            .expect("a pass can start again after one ends");
+        assert!(!short.join().expect("join"), "the bound passed");
+        drop(reader);
+    }
+
+    #[test]
+    fn an_in_memory_index_has_no_pass() {
+        let store = GraphStore::open_in_memory(Path::new(".")).expect("open");
+        assert!(
+            store
+                .schedule_wal_scrub(Duration::from_secs(1), Duration::from_millis(10))
+                .is_none()
+        );
+    }
+}

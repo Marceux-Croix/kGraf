@@ -395,6 +395,29 @@ impl RunConfig {
                 }
             }
         }
+        // An empty command runs as a no-op shell and passes, so an empty
+        // acceptance or gate command would accept everything.
+        if self.verify.trim().is_empty() {
+            return Err(Error::Invalid(
+                "--verify must not be empty: an empty acceptance command passes every attempt"
+                    .into(),
+            ));
+        }
+        if self.gate_commands.iter().any(|c| c.trim().is_empty()) {
+            return Err(Error::Invalid(
+                "--gate-command must not be empty: an empty gate command passes without \
+                 checking anything"
+                    .into(),
+            ));
+        }
+        // The gate timeout also bounds the acceptance command: zero kills both.
+        if self.gate_timeout.is_zero() {
+            return Err(Error::Invalid(
+                "--gate-timeout must be at least one second: every gate and acceptance command \
+                 would be killed"
+                    .into(),
+            ));
+        }
         // Decision 0084: a zero shell timeout would kill every worker command.
         if self.shell_timeout.is_some_and(|t| t.is_zero()) {
             return Err(Error::Invalid(
@@ -748,6 +771,28 @@ mod tests {
         ));
         c.shell_timeout = Some(Duration::from_secs(1));
         assert_eq!(c.check_configured_with_store(store_path), Ok(()));
+
+        // An empty acceptance or gate command passes everything; a zero gate
+        // timeout kills everything.
+        let original = c.clone();
+        c.verify = "  ".into();
+        assert!(matches!(
+            c.check_configured_with_store(store_path),
+            Err(NotReady::Invalid(m)) if m.contains("--verify")
+        ));
+        c = original.clone();
+        c.gate_commands = vec!["cargo test".into(), String::new()];
+        assert!(matches!(
+            c.check_configured_with_store(store_path),
+            Err(NotReady::Invalid(m)) if m.contains("--gate-command")
+        ));
+        c = original.clone();
+        c.gate_timeout = Duration::ZERO;
+        assert!(matches!(
+            c.check_configured_with_store(store_path),
+            Err(NotReady::Invalid(m)) if m.contains("--gate-timeout")
+        ));
+        assert_eq!(original.check_configured_with_store(store_path), Ok(()));
     }
 
     /// Decision 0084: `shell_timeout` in a run file is seconds, absent is

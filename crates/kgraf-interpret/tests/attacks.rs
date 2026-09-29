@@ -495,13 +495,15 @@ async fn an_omitted_section_edit_then_a_reread_is_approvable_with_no_model_call(
     .expect("the new reading is approvable");
 }
 
-/// Directories the index skips by name are skipped by
-/// path, and named, not silently absent.
+/// Directories the index skips are skipped by path, and named, not silently
+/// absent. A bare name like `build` is excluded at the root only: `docs/build`
+/// is documentation the index walks and the corpus reads.
 #[test]
 fn excluded_directories_are_named_not_silently_absent() {
     let dir = tempfile::tempdir().expect("dir");
     let db = tempfile::tempdir().expect("db");
     write(dir.path(), "README.md", "# T\n");
+    write(dir.path(), "build/README.md", "# Built output\n");
     write(dir.path(), "docs/build/README.md", "# Built docs\n");
     write(
         dir.path(),
@@ -511,11 +513,11 @@ fn excluded_directories_are_named_not_silently_absent() {
     let store = store(dir.path(), db.path());
     let c = kgraf_interpret::corpus::gather(&store, &GatherOptions::default()).expect("gather");
     let stats = c.stats();
-    assert_eq!(stats.excluded_directories, ["docs/build", "node_modules"]);
+    assert_eq!(stats.excluded_directories, ["build", "node_modules"]);
     let docs: Vec<String> = c
         .documents
         .iter()
         .map(|d| d.path.display().to_string())
         .collect();
-    assert_eq!(docs, ["README.md"]);
+    assert_eq!(docs, ["README.md", "docs/build/README.md"]);
 }

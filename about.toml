@@ -47,7 +47,7 @@ private = { ignore = true }
 
 # Grammar crates whose package ships no LICENSE file: cargo-about otherwise prints
 # the SPDX MIT template with "<year> <copyright holders>", which is not the notice
-# MIT requires (review M4, 2026-09-27). Each clarification reads the upstream
+# MIT requires. Each clarification reads the upstream
 # LICENSE at the commit the crate was published from (its .cargo_vcs_info.json),
 # pinned by checksum. The copyright lines, checked 2026-09-27: java "2017 Ayman
 # Nadeem", cpp "2014 Max Brunsfeld", ruby "2016 Rob Rix", markdown "2021 Matthias

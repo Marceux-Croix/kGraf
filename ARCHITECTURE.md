@@ -139,6 +139,8 @@ the codebase.
 and size.** Comparing only time and size misses a change that preserves
 both, and rapid agent writes are precisely that workload.
 
+**An index write is one transaction, and a read never builds an index.** A file's content hash commits with its nodes, so a failure between the two cannot leave a file that reads as unchanged with stale or missing nodes. Only `kgraf index` creates or rebuilds the database. Every other command, and the host, opens an existing one, and stops with a message naming `kgraf index` when it is missing or was written by another schema version. A slice reads each node's lines from the file, compares the file's hash with the indexed one, and refuses an edited file. The store records a source root for each file, so code merged from a worker's worktree can be sliced before it reaches the checkout.
+
 **Call resolution is name-based, scoped by proximity, and bounded in
 fan-out.** An edge per same-named definition, with no bound, produced 6.8
 million edges on a 1.39-million-line repository; an edge set that wide
@@ -328,7 +330,9 @@ curve; a call that would wait past its limit fails immediately and its
 ledger row closes as failed. The limiter is shared across every kGraf
 process on one machine (decision 0072): its state is one SQLite file per
 user, keyed by route and a hash of the credential, checked inside atomic
-transactions, never a hand-rolled cross-process lock. If the shared store
+transactions, never a hand-rolled cross-process lock. The shared clock is read
+inside the transaction: a read taken before the write lock let a clock reset
+erase a newer reservation and admit too many calls. If the shared store
 cannot be opened, the run refuses to start; there is no silent fallback to a
 process-local limit.
 
@@ -359,7 +363,9 @@ transcript. Provider caches key on an exact prefix rather than on a
 conversation, which is what makes the sharing possible; one worker-specific
 byte before the breakpoint removes the effect entirely. Selective reading
 beyond the pool happens the way it already does: the worker asks the graph,
-and that read is charged to it alone.
+and that read is charged to it alone. The Anthropic adapter also marks the
+last block of the last message as a cache breakpoint, so the growing history is
+cached and not only the system prompt.
 
 **Tools come from three places:**
 
@@ -402,6 +408,8 @@ scrubbed and bounded); `kgraf-session` holds the resumable transcript,
 observation masking, and persisted allow rules. An unattended worker is
 denied an MCP tool until an explicit allow rule is recorded. **Not built
 yet:** the deferred tool-search tool and the per-call intent argument.
+
+**Loop behavior worth knowing.** A successful write starts a new stall count, so edit and test cycles, and re-reads after a change, do not end a run as stalled. Observation masking keeps the last N rounds of tool results, every block of a round together. A resume replays only calls that succeeded. A paused turn fails loud. A stop at the output ceiling gets one counted continuation round, then fails. `apply_patch` refuses a patch that names one path in two hunks, and its mismatch hints name the nearest match. A shell command's output is bounded as it is read, so a chatty command cannot grow host memory, and the command's process group is killed after a normal exit so background children do not hold the worktree.
 
 **Transcript secret scrubbing (decision 0071).** Every event that can carry a
 tool's or a model's free-form text is scrubbed on two independent paths.
@@ -997,7 +1005,12 @@ the sandbox, only with the project's consent, checked at every run start
 before anything is built (decision 0087). An attempt that changed no file is
 refused when a declared Rust write target holds only placeholder bodies, and
 every accepted empty attempt carries a notice (decision 0086). A retry of an
-unpinned contract does not repeat the route that just failed (decision 0085).
+unpinned contract does not repeat the route that just failed (decision 0085). A
+model with no price entry is never refused (decision 0075): the ledger keeps
+every call, and reports show its spend as unpriced. A planner answer that is not
+the JSON asked for, or a plan that breaks a rule, is asked for again, at most
+twice, each ask on the ledger. A run that ends blocked or stopped makes the
+command exit non-zero.
 
 **User interrupt.** The input box is always live. The user can stop the run,
 which cancels every worker mid-stream and leaves the record resumable; send

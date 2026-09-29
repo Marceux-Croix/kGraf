@@ -705,7 +705,7 @@ async fn a_report_reaches_dependents_as_data_and_readers_by_subscription_and_is_
     p.beta = WorkerFake::new("beta", p.stats.clone(), Duration::from_millis(600));
     let watermark = {
         let g = p.graph.lock().expect("lock");
-        // Review L4: an indexed Markdown file under a stale extractor stamp. The
+        // An indexed Markdown file under a stale extractor stamp. The
         // bus's named-path pass finds it and the run's trace says so.
         std::fs::write(dir.path().join("NOTES.md"), "# Notes\n").expect("notes");
         kgraf_graph::Indexer::new(&g)

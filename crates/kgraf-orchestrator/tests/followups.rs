@@ -919,7 +919,7 @@ async fn a_permanently_refused_reopen_is_retried_with_a_fresh_worker_that_verifi
     assert_eq!(report.counters.environment_failures, 1);
 }
 
-/// Fourth review: a worktree in use (an orphan still runs in it) is not a
+/// A worktree in use (an orphan still runs in it) is not a
 /// refusal that repeats. The same worker waits in the backoff and then
 /// continues in its own worktree, so its unmerged work is kept.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

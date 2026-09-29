@@ -503,12 +503,31 @@ async fn steer_through(wire: SteerWire) -> Vec<Value> {
         .collect()
 }
 
+/// A copy of `value` without any `cache_control` marker. The Anthropic adapter
+/// moves its history breakpoint to the newest block each round; the marker is
+/// not part of the cached bytes, so a conversation extends the previous one
+/// whatever the markers say.
+fn without_cache_control(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .filter(|(k, _)| k.as_str() != "cache_control")
+                .map(|(k, v)| (k.clone(), without_cache_control(v)))
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(without_cache_control).collect()),
+        other => other.clone(),
+    }
+}
+
 /// The second request's conversation extends the first's byte for byte, and
 /// everything around the conversation is unchanged.
 fn assert_extends(wire: SteerWire, bodies: &[Value]) {
     let conversation = wire.conversation();
-    let first = serde_json::to_string(&bodies[0][conversation]).expect("encode");
-    let second = serde_json::to_string(&bodies[1][conversation]).expect("encode");
+    let first =
+        serde_json::to_string(&without_cache_control(&bodies[0][conversation])).expect("encode");
+    let second =
+        serde_json::to_string(&without_cache_control(&bodies[1][conversation])).expect("encode");
     assert!(
         second.starts_with(&first[..first.len() - 1]),
         "{wire:?}: request 2 must extend request 1\n1: {first}\n2: {second}"
@@ -535,7 +554,10 @@ async fn anthropic_wire_puts_the_note_after_the_tool_result_blocks_and_extends_t
     assert_eq!(turn["role"], "user");
     assert_eq!(turn["content"][0]["type"], "tool_result");
     assert_eq!(turn["content"][0]["tool_use_id"], "toolu_1");
-    assert_eq!(turn["content"][1], json!({"type": "text", "text": NOTE}));
+    assert_eq!(
+        without_cache_control(&turn["content"][1]),
+        json!({"type": "text", "text": NOTE})
+    );
     assert_eq!(turn["content"].as_array().map(Vec::len), Some(2));
 }
 

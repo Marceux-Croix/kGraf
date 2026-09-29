@@ -170,6 +170,12 @@ impl CargoDeps {
         cmd.args(["--config", "net.git-fetch-with-cli=true"])
             .args(args)
             .env("GIT_ALLOW_PROTOCOL", "none")
+            // The consent covers crates, not a Rust toolchain. Without this,
+            // the rustup `cargo` shim downloads the toolchain a project's
+            // `rust-toolchain.toml` names before any consent is asked. Set,
+            // the shim stops with "toolchain is not installed" instead. A
+            // rustup older than 1.28 ignores the variable.
+            .env("RUSTUP_AUTO_INSTALL", "0")
             .current_dir(mirror)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -252,6 +258,10 @@ impl DependencyTool for CargoDeps {
     }
 
     fn check(&self, site: &FetchSite) -> Readiness {
+        self.check_watched(site, &Stop::default())
+    }
+
+    fn check_watched(&self, site: &FetchSite, stop: &Stop) -> Readiness {
         let mirror = match Mirror::build(site) {
             Ok(m) => m,
             Err(e) => return Readiness::Unchecked(e.to_string()),
@@ -268,7 +278,10 @@ impl DependencyTool for CargoDeps {
             mirror.path(),
             &["metadata", "--offline", "--format-version", "1"],
             self.check_timeout,
-            Watch::default(),
+            Watch {
+                stop: Some(stop),
+                max_downloads: None,
+            },
         ) {
             Ok(out) => out,
             Err(e) => return Readiness::Unchecked(format!("cargo metadata: {e}")),
@@ -325,6 +338,14 @@ struct Output {
 fn classify(out: &Output) -> Readiness {
     if out.ok {
         Readiness::Ready
+    } else if out.stderr.contains("toolchain") && out.stderr.contains("is not installed") {
+        // rustup's refusal to download it (`RUSTUP_AUTO_INSTALL=0`): nothing
+        // a dependency fetch can fix.
+        Readiness::Unchecked(format!(
+            "the project's Rust toolchain is not installed, and kGraf never downloads one: run \
+             `rustup toolchain install` in the project yourself. cargo said: {}",
+            tail(&out.stderr)
+        ))
     } else if NOT_READY.iter().any(|p| out.stderr.contains(p)) {
         Readiness::Missing(tail(&out.stderr))
     } else {
@@ -687,18 +708,80 @@ fn copy_manifests(source: &Dir, to: &Path) -> Result<Findings, DepsError> {
 
 /// Keys whose string values (or arrays of strings) are paths cargo resolves
 /// from a manifest's folder: a dependency's or patch's `path`, a package's
-/// `workspace`, and a workspace's member lists.
-const PATH_KEYS: [&str; 5] = ["path", "workspace", "members", "default-members", "exclude"];
+/// `workspace`, and a workspace's member lists. `exclude` is one only in the
+/// `[workspace]` table ([`is_path_key`]).
+const PATH_KEYS: [&str; 4] = ["path", "workspace", "members", "default-members"];
+
+/// Whether `key`, in the table at `at`, holds paths. `exclude` lists paths in
+/// `[workspace]` only: `package.exclude` is a list of gitignore-style
+/// patterns (`*.tmp`, `/target`, `../x`), never resolved as a path.
+fn is_path_key(key: &str, at: &str) -> bool {
+    PATH_KEYS.contains(&key) || (key == "exclude" && at == "workspace")
+}
 
 /// Keys that name a source other than crates.io: a git repository (any URL,
 /// `file://` included) or another registry.
 const SOURCE_KEYS: [&str; 3] = ["git", "registry", "registry-index"];
 
+/// Where a table sits in a manifest, as far as it decides whether
+/// [`SOURCE_KEYS`] mean a source. A key named `git` is a source only inside a
+/// dependency specification; as a feature name, or as the name of a
+/// dependency (`git = "0.3"`), it is not.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Place {
+    Root,
+    /// `[workspace]`.
+    Workspace,
+    /// `[target]`: each entry is one `cfg` or triple.
+    Target,
+    /// `[target.<cfg>]`.
+    TargetCfg,
+    /// `[patch]`: one table per source.
+    Patch,
+    /// A table whose entries are dependency specifications: `[dependencies]`,
+    /// `[dev-dependencies]`, `[build-dependencies]`, `[workspace.dependencies]`,
+    /// a target's, `[patch.<source>]` and `[replace]`.
+    Deps,
+    /// One dependency's specification, as a table or an inline table.
+    Spec,
+    Other,
+}
+
+impl Place {
+    fn child(self, key: &str) -> Place {
+        let deps = matches!(
+            key,
+            "dependencies"
+                | "dev-dependencies"
+                | "build-dependencies"
+                | "dev_dependencies"
+                | "build_dependencies"
+        );
+        match self {
+            Place::Root => match key {
+                _ if deps => Place::Deps,
+                "workspace" => Place::Workspace,
+                "target" => Place::Target,
+                "patch" => Place::Patch,
+                "replace" => Place::Deps,
+                _ => Place::Other,
+            },
+            Place::Workspace if key == "dependencies" => Place::Deps,
+            Place::Target => Place::TargetCfg,
+            Place::TargetCfg if deps => Place::Deps,
+            Place::Patch => Place::Deps,
+            Place::Deps => Place::Spec,
+            _ => Place::Other,
+        }
+    }
+}
+
 /// What the manifest at `rel` (its folder, relative to the project root)
 /// names that the fetch refuses: paths that leave the project, and
-/// [`SOURCE_KEYS`]. Conservative: every such key anywhere but under the
-/// `package`, `project` and `workspace` `metadata` tables counts, target paths included. A manifest
-/// that does not parse is left to cargo, which refuses it.
+/// [`SOURCE_KEYS`] inside a dependency specification. Conservative: every
+/// path key anywhere but under the `package`, `project` and `workspace`
+/// `metadata` tables counts, target paths included. A manifest that does not
+/// parse is left to cargo, which refuses it.
 fn manifest_findings(rel: &Path, manifest: &str) -> Findings {
     let mut found = Findings::default();
     let Ok(doc) = manifest.parse::<toml::Table>() else {
@@ -709,8 +792,8 @@ fn manifest_findings(rel: &Path, manifest: &str) -> Findings {
         .filter(|c| matches!(c, std::path::Component::Normal(_)))
         .count() as i32;
     let file = rel.join("Cargo.toml");
-    let mut stack: Vec<(&toml::Table, String)> = vec![(&doc, String::new())];
-    while let Some((table, at)) = stack.pop() {
+    let mut stack: Vec<(&toml::Table, String, Place)> = vec![(&doc, String::new(), Place::Root)];
+    while let Some((table, at, place)) = stack.pop() {
         for (key, value) in table {
             let here = if at.is_empty() {
                 key.clone()
@@ -725,14 +808,15 @@ fn manifest_findings(rel: &Path, manifest: &str) -> Findings {
             }
             // Any value at all: `git = true` is not valid, but cargo is the
             // judge of that, and refusing costs nothing.
-            if SOURCE_KEYS.contains(&key.as_str()) {
+            if place == Place::Spec && SOURCE_KEYS.contains(&key.as_str()) {
                 found
                     .sources
                     .push(format!("{here} = {value} in {}", file.display()));
             }
+            let path_key = is_path_key(key, &at);
             let strings: Vec<&str> = match value {
-                toml::Value::String(v) if PATH_KEYS.contains(&key.as_str()) => vec![v.as_str()],
-                toml::Value::Array(items) if PATH_KEYS.contains(&key.as_str()) => {
+                toml::Value::String(v) if path_key => vec![v.as_str()],
+                toml::Value::Array(items) if path_key => {
                     items.iter().filter_map(toml::Value::as_str).collect()
                 }
                 _ => Vec::new(),
@@ -744,11 +828,12 @@ fn manifest_findings(rel: &Path, manifest: &str) -> Findings {
                         .push(format!("{here} = {v:?} in {}", file.display()));
                 }
             }
+            let inner = place.child(key);
             match value {
-                toml::Value::Table(t) => stack.push((t, here)),
+                toml::Value::Table(t) => stack.push((t, here, inner)),
                 toml::Value::Array(items) => {
                     for t in items.iter().filter_map(toml::Value::as_table) {
-                        stack.push((t, here.clone()));
+                        stack.push((t, here.clone(), inner));
                     }
                 }
                 _ => {}
@@ -991,10 +1076,12 @@ mod tests {
         assert_eq!(found.escapes.len(), 2, "{found:?}");
     }
 
-    /// Every `git`, `registry` and `registry-index` key outside `metadata`,
-    /// in any table of any manifest, is a source the fetch refuses.
+    /// Every `git`, `registry` and `registry-index` key in a dependency
+    /// specification of any manifest (any dependency table, a target's, a
+    /// patch, a replace), and none under `metadata`, is a source the fetch
+    /// refuses.
     #[test]
-    fn source_keys_are_found_in_every_table_but_metadata() {
+    fn source_keys_are_found_in_every_dependency_table_but_metadata() {
         let found = manifest_findings(
             Path::new("vendor/x"),
             "[dependencies]\na = { git = \"file:///srv/repo\" }\n\
@@ -1017,6 +1104,56 @@ mod tests {
                 .any(|s| s.contains("dependencies.a.git") && s.contains("file:///srv/repo")),
             "{found:?}"
         );
+    }
+
+    /// `package.exclude` is a list of gitignore-style patterns, not paths:
+    /// `../x` or `/tmp` there escapes nothing. `workspace.exclude` is a list
+    /// of paths and still counts.
+    #[test]
+    fn exclude_is_a_path_key_in_the_workspace_table_only() {
+        let package = manifest_findings(
+            Path::new("crates/a"),
+            "[package]\nname = \"a\"\nexclude = [\"../x\", \"/tmp\", \"*.tmp\"]\n",
+        );
+        assert_eq!(package, Findings::default());
+        let workspace = manifest_findings(
+            Path::new("crates/a"),
+            "[workspace]\nexclude = [\"../../../x\"]\n",
+        );
+        assert_eq!(workspace.escapes.len(), 1, "{workspace:?}");
+        let inside = manifest_findings(Path::new("."), "[workspace]\nexclude = [\"old\"]\n");
+        assert_eq!(inside, Findings::default());
+    }
+
+    /// A feature or a dependency that is merely named `git`, `registry` or
+    /// `registry-index` is not a source; the same keys inside a dependency
+    /// specification are.
+    #[test]
+    fn a_feature_or_a_dependency_named_git_is_not_a_source() {
+        let named = manifest_findings(
+            Path::new("."),
+            "[features]\ngit = []\nregistry = [\"dep:x\"]\nregistry-index = []\n\
+             [dependencies]\ngit = \"0.3\"\nregistry = { version = \"1\" }\n\
+             registry-index = { version = \"2\", optional = true }\n\
+             [dev-dependencies]\ngit = \"0.3\"\n\
+             [target.'cfg(unix)'.dependencies]\ngit = \"0.3\"\n\
+             [workspace.dependencies]\ngit = \"0.3\"\n",
+        );
+        assert!(named.sources.is_empty(), "{named:?}");
+        // A dependency named `git` that does name a source is still found.
+        for manifest in [
+            "[dependencies]\ngit = { git = \"https://example.invalid/g\" }\n",
+            "[dependencies.git]\ngit = \"https://example.invalid/g\"\n",
+            "[dependencies]\nx = { registry = \"corp\" }\n",
+            "[build-dependencies]\nx = { git = \"file:///r\" }\n",
+            "[target.'cfg(unix)'.build-dependencies.x]\nregistry-index = \"https://e.invalid\"\n",
+            "[patch.\"https://example.invalid/i\"]\nx = { git = \"file:///r\" }\n",
+            "[workspace.dependencies]\nx = { git = \"file:///r\" }\n",
+            "[replace]\n\"x:1.0.0\" = { git = \"file:///r\" }\n",
+        ] {
+            let found = manifest_findings(Path::new("."), manifest);
+            assert_eq!(found.sources.len(), 1, "{manifest}: {found:?}");
+        }
     }
 
     /// Cargo ignores `metadata` only as `package.metadata`,
@@ -1584,6 +1721,43 @@ mod tests {
             offline_only: true,
             ..CargoDeps::default()
         }
+    }
+
+    /// The host's cargo never lets rustup download a toolchain (the consent
+    /// covers crates). A script stands in for the rustup shim: with
+    /// `RUSTUP_AUTO_INSTALL=0` it refuses as rustup does; without it, it
+    /// "downloads" (writes a marker). Both the check and the fetch must meet
+    /// the refusal, and the marker must never appear.
+    #[cfg(unix)]
+    #[test]
+    fn rustup_never_downloads_a_toolchain_for_the_check_or_the_fetch() {
+        use std::os::unix::fs::PermissionsExt;
+        let tools = tempfile::tempdir().unwrap();
+        let marker = tools.path().join("DOWNLOADED");
+        let path = tools.path().join("shim.sh");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nif [ \"$RUSTUP_AUTO_INSTALL\" = 0 ]; then\n  echo \"error: toolchain \
+                 '1.2.3-x' is not installed\" >&2\n  exit 1\nfi\necho downloaded >> '{}'\n\
+                 echo '{{\"packages\":[]}}'\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cargo = CargoDeps {
+            cargo: path,
+            offline_only: true,
+            ..CargoDeps::default()
+        };
+        let project = small_project();
+        let site = FetchSite::project(project.path());
+        assert!(matches!(cargo.check(&site), Readiness::Unchecked(why)
+                if why.contains("never downloads") && why.contains("rustup toolchain install")),);
+        let err = cargo.fetch(&site, &Stop::default()).expect_err("refused");
+        assert!(err.to_string().contains("is not installed"), "{err}");
+        assert!(!marker.exists(), "the shim was allowed to download");
     }
 
     fn small_project() -> tempfile::TempDir {

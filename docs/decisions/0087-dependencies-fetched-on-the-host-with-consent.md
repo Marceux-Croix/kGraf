@@ -24,7 +24,7 @@ removed unpacked sources.
 3. **At every run start, before anything of the run is built** (the command, scheduled and
    tray-fired runs, the desktop), the host checks offline whether the dependencies are
    ready. When one is missing: allowed runs `cargo fetch` on the host, outside the sandbox,
-   then checks again (still missing fails); unset stops the run with the exact instruction,
+   then checks again (still missing, or a check that cannot decide, fails); unset stops the run with the exact instruction,
    and a terminal or the desktop asks once, then starts again; refused stops the run with the
    instruction. Unattended with no answer always fails loud: never a silent skip, never a
    silent fetch. A project with no root `Cargo.toml` is not checked; when one exists below
@@ -40,7 +40,8 @@ removed unpacked sources.
    read as placeholders, also in percent-encoded form; a URL's user and password as
    `<redacted>`), and the tool result is
    secret-scrubbed after the answer is added. So a worker can add a crates.io dependency when
-   the project allows it.
+   the project allows it. The consent prompt says so: allowing also lets workers fetch crates they add during the
+   run, and the names of those crates go to the registry.
 5. **The fetch never runs on the project's or the worktree's own files.** It runs in a private
    mirror of every `Cargo.toml` (and the root `Cargo.lock`), each with an empty `src/lib.rs`
    beside it. The mirror is read through a directory capability that cannot leave the source,
@@ -50,7 +51,8 @@ removed unpacked sources.
    (measured). A manifest path that leaves the project (a `path`, `workspace` or member entry
    that is absolute or climbs above the root) would make cargo read a manifest elsewhere on
    the host, so with any, cargo is not run: the check says it could not decide, and the fetch
-   is refused naming them. The copy of the root manifest is made a workspace root (an empty
+   is refused naming them. `exclude` counts as a path only in the `[workspace]` table;
+   `package.exclude` is a list of gitignore-style patterns. The copy of the root manifest is made a workspace root (an empty
    `[workspace]` is appended when it has none and names none), because cargo otherwise reads
    the checkout's own root manifest, which is not mirrored, as its workspace.
 6. **The mirror lives under the checkout's state directory** (`.kgraf/deps-mirror`), never in
@@ -61,15 +63,20 @@ removed unpacked sources.
    directory, which the workers' sandbox can neither read nor write, and then the checkout, so
    cargo and rustup see the checkout's own settings as they would in the project, relative
    paths in them included.
-7. **Only crates.io:** a `git`, `registry` or `registry-index` key in any table (outside
-   `package.metadata`, `project.metadata` and `workspace.metadata`, the only `metadata`
-   tables cargo ignores) of any manifest, member or not, refuses the fetch and names it: cargo reads
+7. **Only crates.io:** a `git`, `registry` or `registry-index` key in a dependency
+   specification (a table or an inline table under `dependencies`, `dev-dependencies`,
+   `build-dependencies`, `workspace.dependencies`, a target's dependency tables, `patch` or
+   `replace`; a feature or a dependency merely named `git` is not one) of any manifest, member
+   or not, refuses the fetch and names it: cargo reads
    manifests that are not members (a `[patch]` path into an excluded folder, a path
    dependency there, a workspace root named by `package.workspace`). Cargo's own listing of
    the members' sources is a second reading. As a further defense every cargo command runs
    with `net.git-fetch-with-cli` and `GIT_ALLOW_PROTOCOL=none`, so `git` refuses every
    transport: no git source is ever cloned into the cargo home, which workers can read (a
    `file://` source would copy a local repository there).
+   Every cargo command runs with `RUSTUP_AUTO_INSTALL=0`, so the rustup shim never downloads
+   a toolchain before consent: a missing toolchain stops the check with a message to install
+   it by hand (rustup 1.28 or later).
 8. **Never invisible:** each fetch is a record in the local diagnostics file (registry,
    trigger, ok, packages downloaded) that `kgraf diag show` counts as a network event with no
    tokens, and a notice naming every "Updating" line cargo printed, index or not.
@@ -81,7 +88,7 @@ removed unpacked sources.
     names such as `CARGO~1` and `RUST-T~1.TOM`), and tells the model to leave them and say so in its result. Merged, such a
     file would apply to the host's cargo and every later build. Decision 0084's check already
     refuses builds in a worktree whose configuration changed; this keeps the change out of the
-    checkout.
+    checkout. Plan intake and a stub path refuse the same paths.
 
 Decision 0051 is amended by consent: permitted egress now also covers the package registry of
 a project whose user allowed it, for dependency downloads only.

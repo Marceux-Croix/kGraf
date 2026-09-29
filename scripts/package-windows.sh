@@ -197,7 +197,7 @@ case "$(file -b "$APP_EXE")" in
     ;;
 esac
 
-# --- verify: neither binary imports the dynamic MSVC CRT (C1) --------------------------
+# --- verify: neither binary imports the dynamic MSVC CRT --------------------------
 # .cargo/config.toml sets `-C target-feature=+crt-static` for this target, so the CRT is
 # linked in statically; nothing in this repository ships VCRUNTIME140.dll/MSVCP140.dll,
 # so a dynamic import of either would mean the packaged .exe fails to launch on a bare
@@ -216,7 +216,6 @@ for exe in "$CLI_EXE" "$APP_EXE"; do
 done
 
 # --- verify: the icon, manifest and version resource, by resource TYPE not raw bytes
-# (M8) ------------------------------------------------------------------------------
 # llvm-readobj --coff-resources parses the PE resource directory structurally and
 # reports each entry's RT_* type; asserting on ICON/GROUP_ICON/VERSIONINFO/MANIFEST
 # being present is a real structural check, unlike grepping the file for a PNG
@@ -331,7 +330,7 @@ if [[ "$HAVE_WIXL" -eq 1 ]]; then
   # identity (for repair/uninstall) keys off its own Guid. Regenerating them on every
   # run, or on the next release, would make every future installer unable to
   # recognize or upgrade this one. ShortcutComponent's Guid was deliberately
-  # regenerated once already (M6, same review round): its key-path registry value
+  # regenerated once already: its key-path registry value
   # moved from HKCU to HKLM, which changes what the component actually represents; a
   # new Guid was the correct response to that, not the previous Guid kept
   # unchanged -- nothing had shipped yet under the old one, so nothing needed the old

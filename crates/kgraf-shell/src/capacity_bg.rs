@@ -8,12 +8,18 @@
 //! module does not need to know which concrete factory type a project
 //! uses), overlays the learned (429-adjusted) rate on top, runs the result
 //! through [`kgraf_capacity::Hysteresis`] so the slider's shown maximum does
-//! not jitter, and calls [`MachineGate::set_limits`] on every accepted
-//! reading. **One thread for the whole process**, not one per project: the
-//! gate itself is process-wide (decision 0067: the slider binds
-//! this app process), so measuring it once and driving the one shared gate
-//! is both correct and cheaper than one thread per open project converging
-//! on the same number.
+//! not jitter, and publishes every accepted reading ([`CapacityHandle::latest`])
+//! and wakes the UI. **One thread for the whole process**, not one per
+//! project: the gate is process-wide (decision 0067: the slider binds this
+//! app process), so measuring once is both correct and cheaper than one
+//! thread per open project converging on the same number.
+//!
+//! **This thread never writes the gate.** The UI's `apply_parallelism` is the
+//! one writer of `MachineGate::set_limits`: it takes `max_agents` from the
+//! user's pinned slider value or, when the slider follows, from this
+//! measurement, and the writer and execution limits from this measurement.
+//! Two writers raced: a reading accepted here overwrote the user's pinned
+//! value, and the UI, seeing its own value unchanged, did not write it back.
 //!
 //! **Off the UI thread**, same reasoning as `presume_bg.rs`'s own doc
 //! comment: `kgraf_capacity::measure_machine` walks every open project's
@@ -42,7 +48,7 @@
 //! simplification.
 
 use kgraf_capacity::{Capacity, Hysteresis, LearnedRate, LimitSource, RouteInputs};
-use kgraf_orchestrator::{MachineGate, Wake};
+use kgraf_orchestrator::Wake;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -171,14 +177,14 @@ pub struct CapacityHandle {
 }
 
 impl CapacityHandle {
-    /// Spawns the thread. `gate` is set through [`MachineGate::set_limits`]
-    /// on every accepted (Hysteresis-passed) reading; `wake` runs then too,
-    /// so the shell repaints Settings if it is open. Never called from
-    /// `ShellApp::new` itself (a headless test creating a `ShellApp` must
-    /// never start a background thread, same rule `AppParts`'s own doc
-    /// comment states for the scheduler): the real app entry point calls
-    /// this once.
-    pub fn spawn(gate: Arc<MachineGate>, volumes: Volumes, wake: Wake) -> Self {
+    /// Spawns the thread. Every accepted (Hysteresis-passed) reading is
+    /// stored for [`CapacityHandle::latest`] and `wake` runs, so the shell's
+    /// next frame applies it to the gate (see the module doc: the UI is the
+    /// gate's one writer). Never called from `ShellApp::new` itself (a
+    /// headless test creating a `ShellApp` must never start a background
+    /// thread, same rule `AppParts`'s own doc comment states for the
+    /// scheduler): the real app entry point calls this once.
+    pub fn spawn(volumes: Volumes, wake: Wake) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let latest = Arc::new(Mutex::new(None));
         let projects = Projects::default();
@@ -190,7 +196,7 @@ impl CapacityHandle {
         );
         let join = std::thread::Builder::new()
             .name("kgraf-capacity".to_owned())
-            .spawn(move || run_forever(&stop_t, &gate, &volumes_t, &projects_t, &latest_t, &wake))
+            .spawn(move || run_forever(&stop_t, &volumes_t, &projects_t, &latest_t, &wake))
             .ok();
         Self {
             stop,
@@ -253,7 +259,6 @@ fn now_ms() -> i64 {
 
 fn run_forever(
     stop: &AtomicBool,
-    gate: &MachineGate,
     volumes: &Volumes,
     projects: &Projects,
     latest: &Mutex<Option<Capacity>>,
@@ -278,11 +283,6 @@ fn run_forever(
                 );
                 let capacity = kgraf_capacity::compute(&route_inputs, &machine);
                 if let Some(accepted) = hysteresis.observe(&capacity) {
-                    gate.set_limits(kgraf_core::ParallelismLimits::derive(
-                        accepted.max_agents,
-                        accepted.max_writers,
-                        accepted.exec_slots,
-                    ));
                     *latest.lock().unwrap_or_else(|p| p.into_inner()) = Some(accepted);
                     wake();
                 }
@@ -305,10 +305,7 @@ mod tests {
 
     /// Spawns the thread and blocks until its first accepted reading has
     /// been stored and announced through the wake callback.
-    fn spawn_and_wait(
-        gate: Arc<MachineGate>,
-        volumes: Volumes,
-    ) -> (CapacityHandle, Arc<AtomicBool>) {
+    fn spawn_and_wait(volumes: Volumes) -> (CapacityHandle, Arc<AtomicBool>) {
         let (tx, rx) = std::sync::mpsc::channel::<()>();
         let woke = Arc::new(AtomicBool::new(false));
         let woke_t = woke.clone();
@@ -316,22 +313,21 @@ mod tests {
             woke_t.store(true, Ordering::SeqCst);
             let _ = tx.send(());
         });
-        let handle = CapacityHandle::spawn(gate, volumes, wake);
+        let handle = CapacityHandle::spawn(volumes, wake);
         rx.recv_timeout(FIRST_READING_BOUND)
             .expect("the thread accepted a first reading");
         (handle, woke)
     }
 
-    /// The mechanism: a fresh `MachineGate` gets `set_limits` called on it
-    /// from the background thread, without the test waiting a real 60 s
-    /// (the loop's very first check runs at once, `waited` starts primed to
-    /// the interval).
+    /// The mechanism: the thread publishes a real measurement and wakes the
+    /// UI, without the test waiting a real 60 s (the loop's very first check
+    /// runs at once, `waited` starts primed to the interval). It holds no
+    /// gate to write: the UI's `apply_parallelism` is the gate's one writer.
     #[test]
-    fn the_thread_sets_the_gates_limits_from_a_real_measurement() {
-        let gate = MachineGate::new(kgraf_core::ParallelismLimits::derive(1, 1, 1));
-        let (handle, woke) = spawn_and_wait(gate.clone(), Volumes::default());
+    fn the_thread_publishes_a_real_measurement_and_wakes_the_ui() {
+        let (handle, woke) = spawn_and_wait(Volumes::default());
         let capacity = handle.latest().expect("a reading was accepted");
-        assert_eq!(gate.limits().max_agents, capacity.max_agents);
+        assert!(capacity.max_agents >= 1);
         assert!(woke.load(Ordering::SeqCst), "the wake callback ran");
     }
 
@@ -344,16 +340,14 @@ mod tests {
         volumes.set(vec![PathBuf::from(
             "/definitely/not/a/real/path/for/this/test",
         )]);
-        let gate = MachineGate::new(kgraf_core::ParallelismLimits::derive(1, 1, 1));
-        let (handle, _woke) = spawn_and_wait(gate, volumes);
+        let (handle, _woke) = spawn_and_wait(volumes);
         assert!(handle.latest().is_some());
     }
 
     /// Dropping the handle stops the thread promptly, not by leaking it.
     #[test]
     fn dropping_the_handle_stops_the_thread() {
-        let gate = MachineGate::new(kgraf_core::ParallelismLimits::derive(1, 1, 1));
-        let (handle, _woke) = spawn_and_wait(gate, Volumes::default());
+        let (handle, _woke) = spawn_and_wait(Volumes::default());
         let start = std::time::Instant::now();
         drop(handle);
         assert!(

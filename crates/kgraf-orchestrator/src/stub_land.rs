@@ -45,17 +45,17 @@
 //! symbolic links a worker committed (merge-back's prescan skips links, then
 //! `add -A` records them). So before any byte is written: every component of
 //! every stub path is inspected without following links and a link anywhere
-//! on the way, or at the leaf, is refused naming it (H1); the write itself
+//! on the way, or at the leaf, is refused naming it; the write itself
 //! goes through `kgraf_sandbox::write_confined`, the descriptor-relative,
 //! no-follow writer the contract checks already use, never `root.join` plus
 //! `std::fs::write`. A stub may only touch its producer's declared write
 //! targets, and may replace a file that already exists at the tip only when
 //! the contract declares it (`InterfaceContract::replaces`) or an earlier
-//! version of the same interface landed it (M1). A tip that already holds
+//! version of the same interface landed it. A tip that already holds
 //! exactly the stub is recorded as landed at that tip, not refused as an
-//! empty attempt (M2). Every worktree a refused or failed land leaves is kept
+//! empty attempt. Every worktree a refused or failed land leaves is kept
 //! for inspection and removed by [`GitStubLander::sweep`] at the end of the
-//! run (L1).
+//! run.
 
 use crate::checks::{CheckStage, FileOverlay, InterfaceContract};
 use kgraf_sandbox::{
@@ -65,7 +65,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-/// What a stub may touch (0081 hardening, M1), decided by the orchestrator
+/// What a stub may touch, decided by the orchestrator
 /// from the run record and checked by the lander against the tip.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StubScope {
@@ -115,7 +115,7 @@ pub struct GitStubLander {
     manager: Arc<WorkspaceManager>,
     merge_back: Arc<MergeBack>,
     /// Every stub worktree name this lander created, for the end-of-run
-    /// attempt-ref sweep (L1).
+    /// attempt-ref sweep.
     touched: Arc<Mutex<BTreeSet<String>>>,
     leftovers: Arc<Mutex<Vec<Leftover>>>,
 }
@@ -158,7 +158,7 @@ impl GitStubLander {
         format!("stub-{id}-v{}", ic.version)
     }
 
-    /// At the end of a run (L1): discard every worktree and attempt ref a
+    /// At the end of a run: discard every worktree and attempt ref a
     /// refused, conflicted or failed land kept for inspection, then sweep the
     /// attempt refs of every stub worktree name this lander created (a crash
     /// between commit and merge leaves one). Returns what was removed. Every
@@ -250,7 +250,7 @@ impl GitStubLander {
             Ok(v) => v,
             Err(e) => return Err(self.keep(Leftover::Workspace(workspace), &name, &root, e)),
         };
-        // M2: the tip already holds exactly this stub (a crash after the
+        // The tip already holds exactly this stub (a crash after the
         // merge but before `StubLanded` was recorded, or a revision whose stub
         // did not change). Landing it again would be an empty attempt; the
         // stub is on the branch, so the tip is the landed commit.
@@ -263,7 +263,7 @@ impl GitStubLander {
             })?;
             return Ok(tip);
         }
-        // M1: an existing file is replaced only when declared.
+        // An existing file is replaced only when declared.
         let clobbered: Vec<&str> = ic
             .stub
             .iter()
@@ -306,7 +306,7 @@ impl GitStubLander {
         let empty = matches!(outcome, Ok(FinishOutcome::Empty));
         let err = match outcome {
             Ok(FinishOutcome::Merged { merge_commit, .. }) => return Ok(merge_commit),
-            // Unreachable after the M2 check above unless the tree changed
+            // Unreachable after the check above unless the tree changed
             // between the inspection and the commit: said, never guessed.
             Ok(FinishOutcome::Empty) => format!(
                 "the stub of {} produced no change against the integration tip {tip}, though \
@@ -366,7 +366,7 @@ fn land_error(label: &str, e: MergeError) -> String {
     format!("cannot land the stub of {label}: {e}")
 }
 
-/// M1: every stub path is one of the producer's declared write targets.
+/// Every stub path is one of the producer's declared write targets.
 /// Exact comparison, as `consumer_tests::producer_of` compares them.
 fn check_scope(ic: &InterfaceContract, scope: &StubScope) -> Result<(), String> {
     let outside: Vec<&str> = ic
@@ -393,7 +393,7 @@ fn check_scope(ic: &InterfaceContract, scope: &StubScope) -> Result<(), String> 
     }
 }
 
-/// H1: how each stub path stands under `root` (a worktree at the tip),
+/// How each stub path stands under `root` (a worktree at the tip),
 /// inspected without following any link. A symbolic link at any component,
 /// the leaf included, is refused naming it: the tip may carry links a worker
 /// committed, and a write through `gen -> /elsewhere` would land outside the
@@ -407,7 +407,7 @@ fn check_scope(ic: &InterfaceContract, scope: &StubScope) -> Result<(), String> 
 /// into the throwaway worktree, so a link on stub path 3 of 5 never leaves
 /// 1 and 2 written into a workspace that is about to be discarded and kept
 /// for inspection (a cleaner leftover to read); and it names the link with
-/// the H1 wording ("is a symbolic link at the integration tip") the tests
+/// the symbolic-link wording ("is a symbolic link at the integration tip") the tests
 /// pin, which is this call's own contract independent of whatever message
 /// `write_confined` chooses. The write that follows still goes through
 /// `write_confined`, so a link planted after this inspection (a second
@@ -550,9 +550,11 @@ pub fn stub_left_in_place_failure(
 ///
 /// **Placeholder, defined.** A file is a placeholder only when every
 /// function body in it, once line comments and surrounding whitespace are
-/// stripped, is nothing but one call to `todo!`, `unimplemented!` or
-/// `unreachable!` -- the bodies a worker's own dispatched brief, or the
-/// project it was handed, leaves for work not yet done. Only `.rs` files are
+/// stripped, is exactly one call to `todo!` or `unimplemented!` -- the
+/// bodies a worker's own dispatched brief, or the project it was handed,
+/// leaves for work not yet done. `unreachable!` is not one (a mock of
+/// methods the code under test never calls is made of it), and a body of a
+/// placeholder call followed by anything else is real work. Only `.rs` files are
 /// recognized today, kGraf's own implementation language (decision 0054); a
 /// file with no function bodies, or with even one real one, is never
 /// flagged. Legitimately unchanged content cannot take this shape: a
@@ -582,19 +584,78 @@ fn strip_line_comments(s: &str) -> String {
         .join("\n")
 }
 
+/// The macros a placeholder body is one call to. `unreachable!` is not one:
+/// it states an invariant, and a mock or a trait impl of a method the code
+/// under test never calls legitimately consists of nothing else.
+const PLACEHOLDER_MACROS: [&str; 2] = ["todo!", "unimplemented!"];
+
+/// True when the body is exactly one call to a [`PLACEHOLDER_MACROS`] macro,
+/// with an optional trailing `;` and nothing else: `todo!(); real()` is real
+/// work after a placeholder call, not a placeholder.
 fn is_placeholder_body(body: &str) -> bool {
     let stripped = strip_line_comments(body);
     let t = stripped.trim();
     let t = t.strip_suffix(';').map_or(t, str::trim_end);
-    for name in ["todo!", "unimplemented!", "unreachable!"] {
-        if let Some(rest) = t.strip_prefix(name) {
-            let rest = rest.trim();
-            if rest.starts_with('(') && rest.ends_with(')') {
-                return true;
+    PLACEHOLDER_MACROS.iter().any(|name| {
+        t.strip_prefix(name)
+            .map(str::trim_start)
+            .is_some_and(|rest| rest.starts_with('(') && closes_at_end(rest))
+    })
+}
+
+/// True when the `(` that starts `text` is closed by the last character of
+/// `text` and by no earlier one. String literals (with escapes) are skipped so
+/// a `)` inside a message does not count.
+fn closes_at_end(text: &str) -> bool {
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut escaped = false;
+    for (i, c) in text.char_indices() {
+        if in_str {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => in_str = false,
+                _ => {}
             }
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return i + c.len_utf8() == text.len();
+                }
+            }
+            _ => {}
         }
     }
     false
+}
+
+/// The end of a function signature that starts at `from`: the byte of the
+/// `{` that opens its body, or of the `;` that ends a declaration. A `;` or
+/// `{` inside `(..)`, `[..]` or `<..>` (an array type `[u8; 4]`, a const
+/// generic) belongs to the signature. `->` and `=>` do not close an angle.
+fn signature_end(content: &str, from: usize) -> Option<usize> {
+    let bytes = content.as_bytes();
+    let mut nest = 0usize;
+    let mut angle = 0usize;
+    for (k, &b) in bytes.iter().enumerate().skip(from) {
+        match b {
+            b'(' | b'[' => nest += 1,
+            b')' | b']' => nest = nest.saturating_sub(1),
+            b'<' if nest == 0 => angle += 1,
+            b'>' if nest == 0 && k > 0 && !matches!(bytes[k - 1], b'-' | b'=') => {
+                angle = angle.saturating_sub(1)
+            }
+            b'{' | b';' if nest == 0 && angle == 0 => return Some(k),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Every top-level `fn ... { ... }` body in a Rust source file, found by a
@@ -617,10 +678,9 @@ fn rust_fn_bodies(content: &str) -> Vec<String> {
                 continue;
             }
         }
-        let Some(brace_rel) = content[start..].find(['{', ';']) else {
+        let Some(marker) = signature_end(content, start + 3) else {
             break;
         };
-        let marker = start + brace_rel;
         if bytes[marker] == b';' {
             i = marker + 1;
             continue;
@@ -858,7 +918,7 @@ mod tests {
             )],
         );
         // The path exists at the tip now, put there by v1's own stub: the
-        // book's `landed_paths` lets the revision replace it (M1).
+        // book's `landed_paths` lets the revision replace it.
         let v2_scope = StubScope {
             landed_before: ["src/config.rs".to_owned()].into(),
             ..scope(&v2)
@@ -898,7 +958,30 @@ mod tests {
         assert_eq!(tip, base, "a refused stub must never reach the branch");
     }
 
-    /// H1: the tip holds a directory link `gen -> <outside>` and a leaf link
+    /// Cargo's and rustup's configuration is refused as a stub path before any
+    /// worktree exists: it would land on the integration tip, where the
+    /// host's own cargo reads it.
+    #[tokio::test]
+    async fn a_stub_writing_build_configuration_is_refused_and_never_lands() {
+        for path in [".cargo/config.toml", "rust-toolchain.toml"] {
+            let f = fixture();
+            let lander = GitStubLander::new(f.manager.clone(), f.merge_back.clone());
+            let contract = ic(
+                "cfg",
+                1,
+                vec![FileOverlay::new(path, "[build]\nrustc-wrapper = \"x\"\n")],
+            );
+            let err = lander
+                .land(&contract, &scope(&contract))
+                .await
+                .expect_err("refused");
+            assert!(err.contains(path), "{err}");
+            let tip = git_out(&f.root, &["rev-parse", "kgraf/r-1"]);
+            assert_eq!(tip, git_out(&f.root, &["rev-parse", "main"]), "{path}");
+        }
+    }
+
+    /// The tip holds a directory link `gen -> <outside>` and a leaf link
     /// `src/leaf.rs -> <outside>/leaf.rs`, as a worker's merged commit can.
     /// A stub through either is refused naming the link, and nothing is
     /// written outside the worktree.
@@ -939,7 +1022,7 @@ mod tests {
         assert_eq!(tip(&f), base(&f), "a refused stub never reaches the branch");
     }
 
-    /// M1: a stub path the producer did not declare is refused, even one
+    /// A stub path the producer did not declare is refused, even one
     /// that is new at the tip.
     #[tokio::test]
     async fn a_stub_path_outside_the_producers_writes_is_refused() {
@@ -965,7 +1048,7 @@ mod tests {
         assert_eq!(tip(&f), base(&f));
     }
 
-    /// M1: a stub path that already exists at the tip is refused unless the
+    /// A stub path that already exists at the tip is refused unless the
     /// contract declares it in `replaces`; declared, it lands.
     #[tokio::test]
     async fn a_stub_replacing_an_existing_file_is_refused_unless_declared() {
@@ -1001,7 +1084,7 @@ mod tests {
         );
     }
 
-    /// M2, crash window: the merge happened but `StubLanded` was never
+    /// Crash window: the merge happened but `StubLanded` was never
     /// recorded, so a resume lands the same version again. The tip already
     /// holds exactly the stub: the tip is returned, never an empty-attempt
     /// failure, and nothing new is committed.
@@ -1107,7 +1190,7 @@ mod tests {
             )],
         );
         // The file exists at the stale tip this stub is written against, so
-        // the M1 clobber check must be told the stub is allowed to replace it.
+        // the clobber check must be told the stub is allowed to replace it.
         contract.replaces = vec!["src/shared.rs".into()];
         let scope = scope(&contract);
 
@@ -1131,7 +1214,7 @@ mod tests {
         );
     }
 
-    /// M2, revision: a revised version whose stub bytes did not change is
+    /// Revision: a revised version whose stub bytes did not change is
     /// landed at the tip that already holds them.
     #[tokio::test]
     async fn a_revision_with_identical_stub_content_is_landed_at_the_tip() {
@@ -1149,7 +1232,7 @@ mod tests {
         assert_eq!(tip(&f), first);
     }
 
-    /// L1: a refused land keeps its worktree for inspection; the end-of-run
+    /// A refused land keeps its worktree for inspection; the end-of-run
     /// sweep removes it and names it.
     #[tokio::test]
     async fn a_refused_land_keeps_its_worktree_until_the_end_of_run_sweep() {
@@ -1179,7 +1262,7 @@ mod tests {
         );
     }
 
-    /// L1: an attempt ref a stub land left (a crash between commit and
+    /// An attempt ref a stub land left (a crash between commit and
     /// merge) is removed by the end-of-run sweep. A real conflict needs the
     /// branch to move between `create` and `merge`, which a test cannot
     /// place deterministically; the refused test above covers a kept
@@ -1280,11 +1363,70 @@ mod tests {
     }
 
     #[test]
-    fn unimplemented_and_unreachable_are_placeholders_too() {
+    fn unimplemented_is_a_placeholder_too() {
         assert!(is_placeholder_source(
             "src/lib.rs",
-            "fn a() { unimplemented!() }\nfn b() { unreachable!(\"never\") }\n"
+            "fn a() { unimplemented!() }\nfn b() { todo!(\"later\"); }\n"
         ));
+    }
+
+    #[test]
+    fn a_mock_made_of_unreachable_bodies_is_not_a_placeholder() {
+        assert!(!is_placeholder_source(
+            "src/lib.rs",
+            "fn a() { unreachable!() }\nfn b() { unreachable!(\"never\") }\n"
+        ));
+    }
+
+    #[test]
+    fn a_placeholder_call_followed_by_real_work_is_not_a_placeholder() {
+        for body in [
+            "todo!(); real()",
+            "unimplemented!(); real_work()",
+            "todo!() + 1",
+            "todo!(\"a\"); todo!(\"b\")",
+            "todo!(x)(y)",
+        ] {
+            assert!(
+                !is_placeholder_source("src/lib.rs", &format!("fn f() {{ {body} }}\n")),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_paren_inside_a_message_does_not_end_the_call() {
+        assert!(is_placeholder_source(
+            "src/lib.rs",
+            "fn f() { todo!(\"a) b ( \\\" c\") }\n"
+        ));
+    }
+
+    /// `;` inside an array type is part of the signature, not its end: the
+    /// body is found (a real one clears the file) and a declaration is
+    /// still skipped.
+    #[test]
+    fn an_array_type_in_a_signature_does_not_end_it() {
+        // False refuse before: the scan stopped at `;` in `[u8; 4]`, took the
+        // rest for the next fn, and never saw the real body.
+        assert!(!is_placeholder_source(
+            "src/lib.rs",
+            "fn a() { todo!() }\nfn f(x: [u8; 4]) -> u8 { x[0] }\n"
+        ));
+        // False miss before: the stub with the array parameter was skipped as a
+        // declaration, so a file of only that stub was "no bodies".
+        assert!(is_placeholder_source(
+            "src/lib.rs",
+            "fn f(x: [u8; 4]) -> [u8; 2] { todo!() }\n"
+        ));
+        assert!(is_placeholder_source(
+            "src/lib.rs",
+            "fn f<T: Into<[u8; 4]>>(x: T) where T: Copy { todo!() }\n"
+        ));
+        assert_eq!(
+            rust_fn_bodies("trait T { fn d(x: [u8; 4]); fn e(&self) -> u8 { 1 } }").len(),
+            1
+        );
     }
 
     #[test]

@@ -236,7 +236,7 @@ pub struct OrchestratorHost {
 }
 
 /// An offer waiting on the user (step 3): its question (already scrubbed,
-/// decision 0071, H2) and, when `record_offer_made` succeeded, the graph
+/// decision 0071) and, when `record_offer_made` succeeded, the graph
 /// item's own id, which its resolution (`accept`/`decline`) updates in place.
 struct PendingOffer {
     id: u64,
@@ -247,7 +247,7 @@ struct PendingOffer {
 /// What question routing decided, once acted on (steps 1 and 2) or
 /// ready for the user (step 3). Sent back from the spawned routing task.
 /// `question` (and, for step 2, `answer`) are already the scrubbed copies
-/// (fix, 2026-09-28: decision 0071, H2), what is stored and shown
+/// (decision 0071), what is stored and shown
 /// from here on. `method` is which of the cheap match and the classifier
 /// decided (fix: recorded on the graph and shown to the user).
 enum RoutingResult {
@@ -422,6 +422,8 @@ impl OrchestratorHost {
         self.begin(id, |rt, factory, wake| {
             Box::pin(InteractiveRun::resume(rt, factory, run, wake))
         })?;
+        // A question left open for another start is stale now.
+        self.fetch_prompt = None;
         self.starting_restart = Some(restart);
         Ok(())
     }
@@ -435,34 +437,68 @@ impl OrchestratorHost {
         self.begin(id, move |rt, factory, wake| {
             Box::pin(InteractiveRun::start(rt, factory, run, instruction, wake))
         })?;
+        // A question left open for another start is stale now.
+        self.fetch_prompt = None;
         self.starting_restart = Some(restart);
         Ok(())
     }
 
     /// Decision 0087: the person's answer to the dependency question, then
     /// the held start again (a new run id for a start, the same for a resume).
+    ///
+    /// The question is taken only once the answer has been spent: every step
+    /// that can fail (the host, a window that cannot start a run, storing the
+    /// answer) runs first and leaves the question open, and a start that fails
+    /// after the answer was applied puts the question back, so the person can
+    /// answer again.
     fn answer_fetch_prompt(&mut self, answer: AskAnswer) -> Result<(), String> {
-        use crate::dependency_prompt::{Restart, apply, choice_of, not_now_line};
+        use crate::dependency_prompt::{FetchChoice, Restart, apply, choice_of, not_now_line};
         let prompt = self
             .fetch_prompt
-            .take()
+            .as_ref()
             .ok_or_else(|| "no dependency question is open".to_owned())?;
         let host = self
             .project_host()
             .ok_or_else(|| "the project's host is not open".to_owned())?;
+        let choice = choice_of(&answer);
+        if choice != FetchChoice::NotNow {
+            // Before the answer is applied: a grant must not be spent on a
+            // run that cannot start.
+            self.can_begin()?;
+        }
         let run = match &prompt.restart {
             Restart::Start(_) => RunId::new(format!("box-{}", now_ms())),
             Restart::Resume(run) => run.clone(),
         };
-        if !apply(&host, &run, &prompt.question, choice_of(&answer))? {
+        let go = apply(&host, &run, &prompt.question, choice)?;
+        let prompt = self
+            .fetch_prompt
+            .take()
+            .ok_or_else(|| "no dependency question is open".to_owned())?;
+        if !go {
             self.events
                 .push(BackendEvent::Notice(not_now_line(&prompt.question)));
             return Ok(());
         }
-        match prompt.restart {
-            Restart::Start(instruction) => self.start_as(run, &instruction),
-            Restart::Resume(run) => self.resume(run),
+        let started = match &prompt.restart {
+            Restart::Start(instruction) => self.start_as(run, instruction),
+            Restart::Resume(run) => self.resume(run.clone()),
+        };
+        if started.is_err() {
+            self.fetch_prompt = Some(prompt);
         }
+        started
+    }
+
+    /// Whether this window can begin a run now.
+    fn can_begin(&self) -> Result<(), String> {
+        if !matches!(self.slot, Slot::Idle) {
+            return Err("a run is already in this window".to_owned());
+        }
+        if self.parts.is_none() || self.runtime.is_none() {
+            return Err(NO_HOST.to_owned());
+        }
+        Ok(())
     }
 
     /// A run the box starts or resumes: its asks go to the desk.
@@ -502,9 +538,7 @@ impl OrchestratorHost {
             Box<dyn std::future::Future<Output = Result<InteractiveRun, HostError>> + Send>,
         >,
     ) -> Result<(), String> {
-        if !matches!(self.slot, Slot::Idle) {
-            return Err("a run is already in this window".to_owned());
-        }
+        self.can_begin()?;
         let (Some(parts), Some(runtime)) = (&self.parts, &self.runtime) else {
             return Err(NO_HOST.to_owned());
         };
@@ -598,7 +632,7 @@ impl OrchestratorHost {
 /// UI thread (`OrchestratorHost::start`, the same path `/run` uses), so this
 /// never spawns a run on its own.
 ///
-/// Scrubbing (decision 0071, H2): `question_text`
+/// Scrubbing: `question_text`
 /// arrives raw from the box. It is scrubbed once, at the door, into
 /// `scrubbed`, which is what every `RoutingResult` variant carries onward -
 /// stored and shown from here on. The model calls read `model_copy` of it
@@ -1076,7 +1110,7 @@ impl BoxBackend for OrchestratorHost {
 pub const STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl OrchestratorHost {
-    /// Begins stopping the hosted run off the calling thread (N5: quitting must
+    /// Begins stopping the hosted run off the calling thread (quitting must
     /// not block the UI). Returns a receiver that yields whether the run ended
     /// within [`STOP_WAIT`], or `None` when no run is hosted. The window can close
     /// at once and exit when the receiver answers.
@@ -1118,8 +1152,8 @@ impl OrchestratorHost {
 
 impl Drop for OrchestratorHost {
     /// A hosted run still here is stopped for real (its workers cancelled, its
-    /// record saved as stopped) within [`STOP_WAIT`] (L4); only then are open asks
-    /// denied (N4: the desk closes after the workers stop, so no worker is told
+    /// record saved as stopped) within [`STOP_WAIT`]; only then are open asks
+    /// denied (the desk closes after the workers stop, so no worker is told
     /// "denied" for a close that also cancels it), and the runtime shut down. The
     /// window's own quit uses [`OrchestratorHost::start_shutdown`] instead, so this
     /// wait runs on the UI thread only on paths that bypass it (macOS Cmd+Q).
@@ -1170,5 +1204,144 @@ mod tests {
             host.status_from_record().as_deref(),
             Some("run r1 (running)")
         );
+    }
+
+    /// The dependency question's lifecycle, over a real project host whose
+    /// model refuses every call (these tests are about the start, not the run).
+    mod fetch_prompt {
+        use super::*;
+        use crate::dependency_prompt::{FETCH_PROMPT_ID, FetchPrompt, Restart};
+        use crate::scheduler_bg::ProjectFactory;
+        use kgraf_host::RunConfig;
+        use kgraf_host::deps::{ConsentQuestion, Registry};
+        use kgraf_orchestrator::AskDesk;
+        use std::path::Path;
+
+        struct NoModel;
+
+        #[async_trait::async_trait]
+        impl kgraf_provider::Provider for NoModel {
+            fn adapter(&self) -> &'static str {
+                "fake"
+            }
+            fn protocol(&self) -> kgraf_core::Protocol {
+                kgraf_core::Protocol::Additive
+            }
+            async fn complete(
+                &self,
+                request: &kgraf_provider::Request,
+                _token: &kgraf_provider::CallToken,
+            ) -> Result<kgraf_provider::Response, kgraf_provider::ProviderError> {
+                Err(kgraf_provider::ProviderError::ModelUnsupported {
+                    adapter: "fake",
+                    model: request.model.clone(),
+                    available: "none".into(),
+                })
+            }
+        }
+
+        fn git(dir: &Path, args: &[&str]) {
+            let out = std::process::Command::new("git")
+                .current_dir(dir)
+                .args(["-c", "core.hooksPath=/dev/null"])
+                .args(args)
+                .output()
+                .expect("git");
+            assert!(out.status.success(), "{args:?}: {out:?}");
+        }
+
+        fn window() -> (tempfile::TempDir, Arc<kgraf_host::Host>, OrchestratorHost) {
+            let dir = tempfile::tempdir().expect("dir");
+            let root = dir.path().join("repo");
+            std::fs::create_dir_all(&root).expect("mkdir");
+            git(&root, &["init", "-q", "-b", "main"]);
+            git(&root, &["config", "user.name", "t"]);
+            git(&root, &["config", "user.email", "t@t"]);
+            std::fs::write(root.join("README.md"), "# t\n").expect("write");
+            std::fs::write(root.join(".gitignore"), ".kgraf/\n").expect("write");
+            git(&root, &["add", "."]);
+            git(&root, &["commit", "-q", "-m", "init"]);
+            let prices = dir.path().join("prices.json");
+            std::fs::write(
+                &prices,
+                r#"{"m": {"uncached_input": 1, "cache_read": 1, "cache_write": 1, "output": 1, "reasoning": 1}}"#,
+            )
+            .expect("prices");
+            let host = Arc::new(
+                kgraf_host::Host::open(RunConfig::new(&root, vec!["fake:m".into()], &prices))
+                    .expect("open")
+                    .with_route_provider("fake", Arc::new(NoModel))
+                    .expect("route"),
+            );
+            let factory = Arc::new(ProjectFactory::with_host(host.clone()));
+            let parts = HostParts {
+                factory: factory.clone(),
+                housekeeping: factory,
+                desk: Arc::new(AskDesk::new(None, Arc::new(|| {}))),
+                router: None,
+            };
+            let window = OrchestratorHost::new(Some(parts), Arc::new(|| {})).expect("window");
+            (dir, host, window)
+        }
+
+        fn prompt(restart: Restart) -> FetchPrompt {
+            FetchPrompt {
+                question: ConsentQuestion {
+                    registry: Registry::CratesIo,
+                    project: "/p".into(),
+                    detail: "no matching package named `itoa`".into(),
+                },
+                restart,
+            }
+        }
+
+        fn asked(w: &OrchestratorHost) -> bool {
+            w.pending_asks().iter().any(|a| a.id == FETCH_PROMPT_ID)
+        }
+
+        /// No host to apply the answer to: the answer fails and the question
+        /// stays open, where it used to be lost.
+        #[test]
+        fn an_answer_that_cannot_be_applied_keeps_the_question() {
+            let mut w = OrchestratorHost::idle(Arc::new(|| {}));
+            w.fetch_prompt = Some(prompt(Restart::Start("x".into())));
+            assert!(w.answer(FETCH_PROMPT_ID, AskAnswer::AllowOnce).is_err());
+            assert!(asked(&w), "the question was lost with the failed answer");
+        }
+
+        /// A window that already has a run refuses the restart before the
+        /// answer is applied: no grant is spent, and the question stays.
+        #[test]
+        fn a_start_that_cannot_begin_keeps_the_question_and_spends_no_grant() {
+            let (_dir, host, mut w) = window();
+            w.start("first").expect("start");
+            w.fetch_prompt = Some(prompt(Restart::Start("second".into())));
+            let err = w
+                .answer(FETCH_PROMPT_ID, AskAnswer::AllowAlways)
+                .expect_err("a run is already here");
+            assert!(err.contains("already"), "{err}");
+            assert!(asked(&w));
+            assert_eq!(
+                host.dependency_consents()
+                    .get(Registry::CratesIo)
+                    .expect("read"),
+                kgraf_host::deps::Consent::Unset,
+                "the answer was stored though nothing started"
+            );
+        }
+
+        /// Starting or resuming another run drops a question left open.
+        #[test]
+        fn starting_another_run_clears_a_stale_question() {
+            let (_dir, _host, mut w) = window();
+            w.fetch_prompt = Some(prompt(Restart::Start("old".into())));
+            w.start("new").expect("start");
+            assert!(!asked(&w), "a stale question stayed open");
+
+            let (_dir, _host, mut w) = window();
+            w.fetch_prompt = Some(prompt(Restart::Start("old".into())));
+            w.resume(RunId::new("box-1")).expect("resume begins");
+            assert!(!asked(&w), "a stale question stayed open after a resume");
+        }
     }
 }

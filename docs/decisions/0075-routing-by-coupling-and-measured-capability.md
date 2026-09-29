@@ -75,3 +75,12 @@ permanently ranked behind an established one it never gets a chance to compete a
 - **Make fitness routing the default immediately.** Rejected for now: it has not yet been
   measured in live use, and an existing rotation-based experiment depends on rotation's
   behavior staying unchanged.
+
+**Addendum, 2026-09-29: the run itself never refuses an unpriced model.** Ranking already
+treated an unpriced route this way, but a run still refused a model with no price entry when it
+took in a plan, checked readiness and dispatched. Those refusals are gone: the ledger keeps
+every call, and reports name the spend as unpriced, or as local, unpriced. The spend total
+says `total unpriced` when no recorded model has a price, never zero dollars. The rotation
+cursor advances only when a route is used, a route that lacks a contract's required tool is
+skipped, and an infrastructure failure (a provider outage, a rate limit) is not counted against
+a route's live satisfaction tally.

@@ -96,7 +96,7 @@ pub struct InterfaceContract {
     #[serde(default)]
     pub consulted: Vec<String>,
     /// Stub paths the contract declares may replace a file that already
-    /// exists at the integration tip (0081 security hardening, M1). A stub
+    /// exists at the integration tip (0081 security hardening). A stub
     /// is landed onto the integration branch with no scope check of its own,
     /// so without this declaration a stub path that already exists there
     /// (`Cargo.toml`, `build.rs`, a CI workflow) is refused rather than
@@ -1308,7 +1308,7 @@ mod tests {
         }
     }
 
-    /// M7: each party's statement comes from its own route's model, through
+    /// Each party's statement comes from its own route's model, through
     /// the ledger; a route with no caller is refused, never answered by
     /// another model.
     #[tokio::test]

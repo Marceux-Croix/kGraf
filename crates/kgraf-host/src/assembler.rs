@@ -92,8 +92,10 @@ impl AttemptAssembler {
             .ok_or_else(|| Error::Invalid(format!("route `{route}` is not configured")))?;
         let graph = if self.indexed {
             Some(GraphParts {
-                slices: GraphStore::open(&self.graph_path, &self.root).lift()?,
-                tool: GraphStore::open(&self.graph_path, &self.root).lift()?,
+                // The run's own indexing pass is the writer that may rebuild;
+                // an attempt only opens what it left.
+                slices: GraphStore::open_existing_for_facts(&self.graph_path, &self.root).lift()?,
+                tool: GraphStore::open_existing_for_facts(&self.graph_path, &self.root).lift()?,
             })
         } else {
             None

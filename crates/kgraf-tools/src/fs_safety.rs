@@ -112,8 +112,12 @@ fn write_create_nonblocking() -> OpenOptions {
     opts
 }
 
-/// A `.git` or `.kgraf` path component, at any depth and in any case
-/// (`.GIT`, `.kGraf`, ...). Refused everywhere in this module: an
+/// A protected path component (`kgraf_core::paths::is_protected_name`), at
+/// any depth: `.git` and the other names that steer git, and kGraf's state
+/// directory, however the file system may spell them (case, Unicode
+/// normalization, the long s, zero-width characters, trailing dots, NTFS short
+/// names and streams; `.GIT`, `.kGraf`, `GIT~1`, ...). Refused everywhere in
+/// this module: an
 /// unsandboxed tool rewriting `.git` (the gitlink, `.git/config`, a hook) can
 /// change what a later, approval-free read-only `git` command does -- a
 /// reproduction planted `core.fsmonitor` this
@@ -123,12 +127,32 @@ fn write_create_nonblocking() -> OpenOptions {
 /// there that later execution trusts.
 fn touches_git_or_kgraf(rel: &Path) -> bool {
     rel.components().any(|c| {
-        let Some(name) = c.as_os_str().to_str() else {
-            return false;
-        };
-        let lower = name.to_ascii_lowercase();
-        lower == ".git" || lower == ".kgraf"
+        // A name that is not UTF-8 cannot fold to a protected one: the lossy
+        // form holds U+FFFD, which no protected name contains.
+        kgraf_core::paths::is_protected_name(&c.as_os_str().to_string_lossy())
     })
+}
+
+fn reads_git_dir_or_kgraf(rel: &Path) -> bool {
+    rel.components()
+        .any(|c| kgraf_core::paths::is_unreadable_name(&c.as_os_str().to_string_lossy()))
+}
+
+/// The read-side guard: the `.git` directory and kGraf's state are refused;
+/// repository text files such as `.gitmodules` stay readable.
+pub(crate) fn refuses_git_dir_or_kgraf(tool: &str, rel: &Path) -> Result<(), ToolError> {
+    if reads_git_dir_or_kgraf(rel) {
+        return Err(ToolError::Access {
+            tool: tool.into(),
+            source: crate::AccessError::Escapes {
+                path: format!(
+                    "{}: is inside the `.git` directory or kGraf's own state, always refused",
+                    rel.display()
+                ),
+            },
+        });
+    }
+    Ok(())
 }
 
 pub(crate) fn refuses_git_or_kgraf(tool: &str, rel: &Path) -> Result<(), ToolError> {
@@ -136,7 +160,11 @@ pub(crate) fn refuses_git_or_kgraf(tool: &str, rel: &Path) -> Result<(), ToolErr
         return Err(ToolError::Access {
             tool: tool.into(),
             source: crate::AccessError::Escapes {
-                path: format!("{}: touches .git or .kgraf, always refused", rel.display()),
+                path: format!(
+                    "{}: touches repository metadata that steers git, or kGraf's own state, \
+                     always refused",
+                    rel.display()
+                ),
             },
         });
     }
@@ -293,7 +321,7 @@ pub(crate) fn check_readable(
     rel: &Path,
     allow_hard_link: bool,
 ) -> Result<(), ToolError> {
-    refuses_git_or_kgraf(tool, rel)?;
+    refuses_git_dir_or_kgraf(tool, rel)?;
     let file = dir
         .open_with(rel, &read_only_nonblocking())
         .map_err(|e| open_error(tool, rel, e))?;
@@ -318,7 +346,7 @@ pub(crate) fn read_capped(
     max_bytes: u64,
     allow_hard_link: bool,
 ) -> Result<Vec<u8>, ToolError> {
-    refuses_git_or_kgraf(tool, rel)?;
+    refuses_git_dir_or_kgraf(tool, rel)?;
     let file = dir
         .open_with(rel, &read_only_nonblocking())
         .map_err(|e| open_error(tool, rel, e))?;
@@ -370,7 +398,7 @@ pub(crate) fn open_dir_confined(
     dir: &cap_std::fs::Dir,
     rel: &Path,
 ) -> Result<cap_std::fs::Dir, ToolError> {
-    refuses_git_or_kgraf(tool, rel)?;
+    refuses_git_dir_or_kgraf(tool, rel)?;
     dir.open_dir(rel).map_err(|e| open_error(tool, rel, e))
 }
 
@@ -381,7 +409,7 @@ pub(crate) fn metadata_if_exists(
     dir: &Dir,
     rel: &Path,
 ) -> Result<Option<cap_std::fs::Metadata>, ToolError> {
-    refuses_git_or_kgraf(tool, rel)?;
+    refuses_git_dir_or_kgraf(tool, rel)?;
     match dir.metadata(rel) {
         Ok(meta) => Ok(Some(meta)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -470,6 +498,75 @@ pub(crate) fn file_identity(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The tool guard folds names as the volume does, so a spelling that
+    /// reaches `.git` or `.kgraf` on some file system is refused, not only the
+    /// ASCII forms. Ordinary dot files stay open.
+    #[test]
+    fn the_guard_matches_every_spelling_of_a_protected_name() {
+        for bad in [
+            ".git/config",
+            ".GIT/config",
+            "a/.Git",
+            ".haustoria/x",
+            ".kgraf/x",
+            ".git./config",
+            ".git /config",
+            "GIT~1/config",
+            ".g\u{200B}it/config",
+            ".git\u{FEFF}/config",
+            ".gitmodule\u{17F}",
+            ".git::$INDEX_ALLOCATION/config",
+            ".\u{FF27}\u{FF29}\u{FF34}/config",
+        ] {
+            assert!(touches_git_or_kgraf(Path::new(bad)), "{bad:?}");
+            assert!(
+                refuses_git_or_kgraf("t", Path::new(bad)).is_err(),
+                "{bad:?}"
+            );
+        }
+        for ok in [
+            "src/lib.rs",
+            ".gitignore",
+            ".gitlab-ci.yml",
+            ".github/workflows/ci.yml",
+            "git.rs",
+            "kgraf.rs",
+        ] {
+            assert!(!touches_git_or_kgraf(Path::new(ok)), "{ok:?}");
+        }
+    }
+
+    #[test]
+    fn repository_text_files_are_readable_but_never_writable() {
+        for readable in [
+            ".gitmodules",
+            ".gitattributes",
+            ".gitconfig",
+            "sub/.gitattributes",
+        ] {
+            assert!(
+                refuses_git_dir_or_kgraf("t", Path::new(readable)).is_ok(),
+                "{readable:?}"
+            );
+            assert!(
+                refuses_git_or_kgraf("t", Path::new(readable)).is_err(),
+                "{readable:?}"
+            );
+        }
+        for unreadable in [
+            ".git/config",
+            ".GIT/HEAD",
+            "GIT~1/config",
+            ".kgraf/ledger.db",
+            ".g\u{200B}it/config",
+        ] {
+            assert!(
+                refuses_git_dir_or_kgraf("t", Path::new(unreadable)).is_err(),
+                "{unreadable:?}"
+            );
+        }
+    }
 
     fn workspace() -> (tempfile::TempDir, Dir) {
         let dir = tempfile::tempdir().expect("tempdir");

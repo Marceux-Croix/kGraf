@@ -20,6 +20,12 @@ fn credential_paths_are_unreadable_and_secrets_are_scrubbed() {
         ".gnupg/private-keys-v1.d/k.key",
         ".config/gh/hosts.yml",
         ".netrc",
+        ".config/git/credentials",
+        ".vault-token",
+        ".pgpass",
+        ".terraform.d/credentials.tfrc.json",
+        ".gem/credentials",
+        ".codex/auth.json",
         ".docker/config.json",
         "Library/Keychains/login.keychain-db",
         "Library/Application Support/Google/Chrome/Default/Cookies",
@@ -87,6 +93,12 @@ fn credential_paths_are_unreadable_and_secrets_are_scrubbed() {
         assert!(!out.status.success(), "other spelling readable");
         assert!(!String::from_utf8_lossy(&out.stdout).contains(FAKE));
     }
+    // Control: the rest of `~/.config/git` stays readable, or git would abort
+    // on a config file it may not read.
+    let git_config = home.path().join(".config/git/config");
+    std::fs::write(&git_config, "[user]\n").unwrap();
+    let out = cat(&git_config);
+    assert!(out.status.success(), "{out:?}");
     // Control: an ordinary file in the same HOME stays readable.
     let out = cat(&home.path().join("notes.txt"));
     assert!(out.status.success(), "{out:?}");

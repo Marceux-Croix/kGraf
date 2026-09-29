@@ -73,13 +73,13 @@ fn default_settings_path() -> Result<PathBuf> {
 }
 
 fn main() -> Result<()> {
-    // L1: absolute first, before diag::init below, so cold-start numbers include the
+    // Absolute first, before diag::init below, so cold-start numbers include the
     // console/log-redirect setup too, not just argument parsing.
     let process_start = Instant::now();
 
     // Parsing itself does no I/O (clap only prints once told to, via e.exit() below or
     // our own code after this), so it happens before any stdout/stderr decision is
-    // made -- that decision (H3) needs to know whether this is a diagnostic invocation
+    // made -- that decision needs to know whether this is a diagnostic invocation
     // (--probe, --measure, -h/--help, --version, or a usage error), and clap is the
     // only thing that reliably knows the last three of those.
     let parse_result = Args::try_parse();

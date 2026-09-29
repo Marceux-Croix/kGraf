@@ -113,7 +113,7 @@ fn blend_over(fg: Color32, alpha: f32, bg: Color32) -> Color32 {
 /// A badge fill tinted with `meaning` (the vision-remapped color it will hold
 /// text of), at the largest alpha up to `max_alpha` that still keeps `need`:1
 /// contrast between `meaning` and the tinted fill (bisection: 24 halvings is
-/// far past sRGB's 8-bit precision). Decision 0070, H1: a fixed alpha
+/// far past sRGB's 8-bit precision). Decision 0070: a fixed alpha
 /// (`--danger-bg`'s style guide value, `.16`) was only ever measured against
 /// the one danger orange the style guide ships; a badge tinted with whatever
 /// color a color-blind mode remapped danger to needs its own room checked,
@@ -656,7 +656,7 @@ pub fn visuals(p: &Palette) -> egui::Visuals {
     v.selection.bg_fill = p.suggested;
     // Text selection is the `Selection` meaning (COL-4: "the current
     // selection"), so it follows the vision-remapped semantic color, not the
-    // fixed `primary` action color (audit note, decision 0070 M1: `primary`
+    // fixed `primary` action color (audit note, decision 0070: `primary`
     // is reserved for the primary-action role from here on).
     v.selection.stroke = egui::Stroke::new(1.0, p.indicator(Indicator::Selection));
     let r = CornerRadius::same(8);
@@ -821,10 +821,10 @@ mod tests {
 
     /// Every style guide 14.1 pair that involves a color-blind-remapped
     /// meaning still meets its AA floor, on every vision mode: the badge fill
-    /// (H1: derived from the remapped danger, not the fixed standard orange),
+    /// (derived from the remapped danger, not the fixed standard orange),
     /// the confirm prompt on a card (danger on `base` + `additive`), degraded
     /// state text on a menu (danger on `menu`), and the selection ring on the
-    /// page (`semantic.selection`, which M1 decoupled from the fixed
+    /// page (`semantic.selection`, which was decoupled from the fixed
     /// `primary` action color). `kgraf-core`'s own `vision_modes_meet_wcag_aa`
     /// covers the plain-page and plain-stage pairs; this one covers the
     /// composited surfaces that only exist here, in the shell's tokens.
@@ -873,7 +873,7 @@ mod tests {
         }
     }
 
-    /// H1 follow-up: `safe_tint` is necessary in general, even
+    /// `safe_tint` is necessary in general, even
     /// though every color this branch currently ships happens to carry
     /// enough contrast margin that a fixed `.16` tint of the *standard*
     /// orange still passes `vision_modes_extended_wcag_pairs` today (a
@@ -910,8 +910,8 @@ mod tests {
 
     /// A color vision mode chosen in settings applies live: [`Palette::current`]
     /// and [`stage_indicator`] read whatever [`set_vision`] last wrote to the
-    /// context, with no restart and no other state to invalidate (owner
-    /// request, decision 0070).
+    /// context, with no restart and no other state to invalidate (decision
+    /// 0070).
     #[test]
     fn color_vision_applies_live_with_no_restart() {
         let ctx = egui::Context::default();

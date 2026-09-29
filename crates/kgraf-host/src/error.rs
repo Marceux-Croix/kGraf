@@ -247,9 +247,6 @@ pub enum NotReady {
     /// The price table cannot be read, or is not a price table.
     #[error("the price table {} cannot be used: {detail}", path.display())]
     PricesUnreadable { path: PathBuf, detail: String },
-    /// Models the price table does not price: spend cannot be reserved.
-    #[error("the price table has no price for {}", models.join(", "))]
-    MissingPrices { models: Vec<String> },
 }
 
 impl kgraf_diag::DiagCode for NotReady {
@@ -258,7 +255,7 @@ impl kgraf_diag::DiagCode for NotReady {
             NotReady::NoRoutes => "KG-0401",
             NotReady::UnknownRoute { .. } => "KG-0501",
             NotReady::MissingCredential { .. } => "KG-0501",
-            NotReady::PricesUnreadable { .. } | NotReady::MissingPrices { .. } => "KG-0501",
+            NotReady::PricesUnreadable { .. } => "KG-0501",
             NotReady::Invalid(_) => kgraf_diag::catch_all_for("kgraf-host").code,
         }
     }
@@ -307,9 +304,6 @@ mod tests {
             NotReady::PricesUnreadable {
                 path: "x".into(),
                 detail: "x".into(),
-            },
-            NotReady::MissingPrices {
-                models: vec!["x".into()],
             },
             // Not named in `NotReady::diag_code`'s match: the catch-all arm.
             NotReady::Invalid("x".into()),
@@ -373,9 +367,6 @@ mod tests {
         ));
         for n in [
             NotReady::NoRoutes,
-            NotReady::MissingPrices {
-                models: vec!["m".into()],
-            },
             NotReady::UnknownRoute {
                 route: "x".into(),
                 detail: "unknown".into(),

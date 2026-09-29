@@ -8,7 +8,19 @@ use std::fmt::Write as _;
 /// marked "bench" and carrying `suite_hash` so a reader can tell which
 /// version of the suite produced it.
 pub fn render(store: &ProfileStore, suite_hash: &str) -> String {
+    render_with_stale(store, suite_hash, None)
+}
+
+/// [`render`], plus a line naming tallies from another suite version that were
+/// left out (`stale`: that suite's hash, or "unknown"; see `suite_store`).
+pub fn render_with_stale(store: &ProfileStore, suite_hash: &str, stale: Option<&str>) -> String {
     let mut out = String::new();
+    if let Some(old) = stale {
+        let _ = writeln!(
+            out,
+            "note: bench tallies recorded under suite {old} are not shown; they measured different briefs"
+        );
+    }
     let _ = writeln!(
         out,
         "kgraf-bench-briefs  suite {suite_hash}  (source: bench)"
@@ -84,6 +96,14 @@ mod tests {
         assert!(text.contains("docs"));
         assert!(text.contains("$0.000400"));
         assert!(!text.contains("$0.000999"));
+    }
+
+    #[test]
+    fn another_suites_tallies_are_named_not_shown() {
+        let text = render_with_stale(&ProfileStore::default(), "abc123", Some("old999"));
+        assert!(text.contains("old999"), "{text}");
+        assert!(text.contains("not shown"), "{text}");
+        assert!(text.contains("no bench tallies"), "{text}");
     }
 
     #[test]

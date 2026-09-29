@@ -354,7 +354,7 @@ impl BoxModel {
                     self.send(backend, InboundKind::Note, &composed)
                 }
                 // A plain line still never blindly starts a paid run as its own
-                // instruction (M4); with no run in this window it is routed
+                // instruction; with no run in this window it is routed
                 // instead: a roadmap feature node
                 // first, the orchestrator's own answer second, an offer to
                 // start a new project third. `/run` remains the one explicit
@@ -1278,7 +1278,7 @@ pub(crate) mod tests {
             }),
             ..Recorder::default()
         };
-        // A plain line still never starts a run as its own instruction (M4);
+        // A plain line still never starts a run as its own instruction;
         // with no run in this window it is routed instead.
         submit(&mut m, &mut b, "port the parser", None);
         assert!(b.started.is_empty() && b.sent.is_empty());

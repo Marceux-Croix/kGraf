@@ -47,10 +47,12 @@
 //! end, because cancelling them would let the parent's attempt be verified
 //! without their work; the stop waits for them.
 //!
-//! Admission: a child takes one work-item and one agent slot through
-//! `AdmissionGate::try_admit(1)`, the gate every dispatch uses. The gate has
-//! no agent-only admission, so a read-only child also counts as a work
-//! item. The depth limit comes from
+//! Admission: a writer child takes one work item and one agent slot through
+//! `AdmissionGate::try_admit(1)`, the gate every dispatch uses. A read-only
+//! child takes only an agent slot (`AdmissionGate::try_admit_agents(1)`): it
+//! writes nothing and shares its parent's worktree, so it is part of its
+//! parent's work item, and a busy run does not refuse it. The live-agent
+//! ceilings bind both. The depth limit comes from
 //! [`ParallelismLimits::derive`] of the gate's live-agent ceiling (the
 //! slider), and so does the soft notice on children per parent.
 
@@ -85,6 +87,9 @@ pub(super) struct ChildDone {
     result: WorkerResult,
     /// The child never ran: its environment or worktree was not provided.
     env_failure: Option<String>,
+    /// Its merge, already known without running it: a result recorded
+    /// before the process stopped and merged again (`recover_child_merge`).
+    recovered: Option<ChildMerge>,
 }
 
 /// The durable spawn, kept in the parent contract's `worktrees` map under
@@ -335,7 +340,7 @@ fn session_facts(
         reasoning: ReasoningVisibility::Unknown,
         started_ms,
         // A subagent, a worker and the orchestrator are addressable; only a
-        // merge-conflict resolver is not (request 17 addendum).
+        // merge-conflict resolver is not (decision 0073).
         addressable: true,
     }
 }
@@ -453,7 +458,7 @@ impl RunLoop {
         };
         let store = self.sessions();
         // A failed read must refuse, not guess: an id reused while an
-        // earlier child's refs remain would apply that child's work (H1).
+        // earlier child's refs remain would apply that child's work.
         let stored: Vec<String> = blocking(|| store.children(parent))
             .map(|v| v.into_iter().map(|f| f.id.to_string()).collect())
             .map_err(|e| format!("the children of `{parent}` could not be read: {e}"))?;
@@ -542,7 +547,7 @@ impl RunLoop {
     /// for a handoff child the session that handed back. A resolver contract
     /// (decision 0073) gets `SessionKind::Resolver` and
     /// `addressable: false` instead: the one exception to "every worker is
-    /// addressable" (request 17 addendum).
+    /// addressable".
     fn record_worker_row(
         &mut self,
         contract: &OpenContract,
@@ -752,6 +757,7 @@ impl RunLoop {
                     child: child.clone(),
                     result: self.unstarted_result(&child),
                     env_failure: Some("its parent ended before it ran again".into()),
+                    recovered: None,
                 };
                 self.settle_child(done).await?;
             }
@@ -1020,12 +1026,15 @@ impl RunLoop {
             }
         };
         // Pre-flight: the slot, then the money, before anything exists.
-        let admitted = self
-            .s
-            .admission
-            .gate()
-            .try_admit(1)
-            .map_err(SpawnRefusal::NoSlot)?;
+        let admitted = {
+            let mut gate = self.s.admission.gate();
+            if request.read_only {
+                gate.try_admit_agents(1)
+            } else {
+                gate.try_admit(1)
+            }
+        }
+        .map_err(SpawnRefusal::NoSlot)?;
         let now = self.now();
         let run = self.run_id();
         let reservation =
@@ -1148,6 +1157,7 @@ impl RunLoop {
                     child: child.clone(),
                     result,
                     env_failure: Some(e.clone()),
+                    recovered: None,
                 })
                 .await;
             return Err(SpawnRefusal::Workspace(e));
@@ -1365,6 +1375,7 @@ impl RunLoop {
                         child: panic_child,
                         result,
                         env_failure,
+                        recovered: None,
                     },
                 )))))
                 .await;
@@ -1409,7 +1420,14 @@ impl RunLoop {
             // stops what already runs, and waiting here could wait on the
             // very slot its parked parent holds. Counted when a slot is free;
             // run uncounted, with a notice, when none is.
-            let tried = self.s.admission.gate().try_admit(1);
+            let tried = {
+                let mut gate = self.s.admission.gate();
+                if read_only {
+                    gate.try_admit_agents(1)
+                } else {
+                    gate.try_admit(1)
+                }
+            };
             let admitted = match tried {
                 Ok(a) => Some(a),
                 Err(refusal) => {
@@ -1484,6 +1502,7 @@ impl RunLoop {
                             child: id.clone(),
                             result,
                             env_failure: Some(error),
+                            recovered: None,
                         })
                         .await?;
                     }
@@ -1493,6 +1512,44 @@ impl RunLoop {
                     release(self, admitted);
                     self.s.admission.budget().release(reservation);
                     self.subagents.restart.remove(&id);
+                    // A kill after the merge removed the child's worktree and
+                    // before its record was settled: the files are in the
+                    // parent's worktree, and the report must say so.
+                    if !read_only {
+                        let writes = self
+                            .subagents
+                            .live
+                            .get(&id)
+                            .map(|c| c.facts.writes.clone())
+                            .unwrap_or_default();
+                        match self
+                            .s
+                            .workspaces
+                            .recover_child_merge(&parent_ws, &id, &writes)
+                            .await
+                        {
+                            Ok(Some(merge)) => {
+                                let mut result = self.unstarted_result(&id);
+                                result.outcome = WorkerOutcome::Completed;
+                                result.answer = "(merged before the process stopped; its \
+                                                 answer is in its transcript)"
+                                    .into();
+                                self.settle_child(ChildDone {
+                                    child: id.clone(),
+                                    result,
+                                    env_failure: None,
+                                    recovered: Some(merge),
+                                })
+                                .await?;
+                                continue;
+                            }
+                            Ok(None) => {}
+                            Err(detail) => self.subagents.errors.push(format!(
+                                "the recorded result of subagent `{id}` could not be merged \
+                                 again: {detail}"
+                            )),
+                        }
+                    }
                     let mut result = self.unstarted_result(&id);
                     let error = format!("its worktree could not be reopened: {e}");
                     result.outcome = WorkerOutcome::Failed {
@@ -1502,6 +1559,7 @@ impl RunLoop {
                         child: id.clone(),
                         result,
                         env_failure: Some(error),
+                        recovered: None,
                     })
                     .await?;
                     continue;
@@ -1526,6 +1584,7 @@ impl RunLoop {
                     child: id.clone(),
                     result,
                     env_failure: Some(e),
+                    recovered: None,
                 })
                 .await?;
             }
@@ -1585,30 +1644,13 @@ impl RunLoop {
         if let Some(a) = admitted {
             self.s.admission.gate().release(a);
         }
-        let held = reservation
-            .as_ref()
-            .map(Reservation::amount)
-            .unwrap_or(Money::ZERO);
-        let spend = self.spend_of(&d.result.calls, held)?;
-        let (now, run) = (self.now(), self.run_id());
-        let overrun = {
-            let mut budget = self.s.admission.budget();
-            match reservation {
-                Some(r) => budget.settle(r, &run, task.as_str(), spend, now),
-                None => {
-                    budget.record_spend(&run, task.as_str(), spend, now);
-                    None
-                }
-            }
-        };
-        if let Some(o) = overrun {
-            self.on_overrun(o).await?;
-        }
+        self.charge_child(&id, &task, reservation, &d.result.calls)
+            .await;
         Box::pin(self.end_children(&id, true)).await?;
         // A `resume_session` that arrived while this cancel was still in
-        // flight (`resume_child`, review: subagent resume race) is applied
-        // now that the pause it was waiting for is confirmed: restart at
-        // once instead of leaving it paused for a resume already asked for.
+        // flight (see `resume_child`) is applied now that the pause it was
+        // waiting for is confirmed: restart at once instead of leaving the
+        // child paused for a resume already asked for.
         if let Some(c) = self.subagents.live.get_mut(&id)
             && c.resume_after_stop
         {
@@ -1617,6 +1659,26 @@ impl RunLoop {
             self.subagents.restart.insert(id);
         }
         Ok(())
+    }
+
+    /// The run loop failed: cancel every running child and return its slot
+    /// and hold. Its spawn record stays unsettled, so a resume adopts it
+    /// again; its fence on the parent is lifted with the parent's run.
+    pub(super) fn release_subagents_on_error(&mut self) {
+        for (_, mut c) in std::mem::take(&mut self.subagents.live) {
+            if c.running {
+                c.cancel.notify_one();
+            }
+            if let Some(a) = c.admitted.take() {
+                self.s.admission.gate().release(a);
+            }
+            if let Some(r) = c.reservation.take() {
+                self.s.admission.budget().release(r);
+            }
+            drop(c.parent_guard.take());
+        }
+        self.subagents.restart.clear();
+        self.subagents.parked.clear();
     }
 
     // ------------------------------------------------------------- sessions
@@ -1710,59 +1772,78 @@ impl RunLoop {
         self.subagents.restart.remove(&id);
         let parent = AgentId::new(c.facts.parent.clone());
         let now = self.now();
-        let run = self.run_id();
         if let Some(a) = c.admitted.take() {
             self.s.admission.gate().release(a);
         }
-        let held = c
-            .reservation
-            .as_ref()
-            .map(Reservation::amount)
-            .unwrap_or(Money::ZERO);
-        let spend = self.spend_of(&d.result.calls, held)?;
-        let overrun = {
-            let mut budget = self.s.admission.budget();
-            match c.reservation.take() {
-                Some(r) => budget.settle(r, &run, c.task.as_str(), spend, now),
-                None => {
-                    budget.record_spend(&run, c.task.as_str(), spend, now);
-                    None
-                }
-            }
-        };
-        if let Some(o) = overrun {
-            self.on_overrun(o).await?;
-        }
+        // From here to `release_parked` nothing returns early on an error:
+        // the child is already out of `live`, so an early return would skip
+        // its merge, its report and its settled mark, and leave its parent's
+        // finish parked for good. A failure is kept in `errors` and traced on
+        // the next tick instead.
+        let spend = self
+            .charge_child(&id, &c.task, c.reservation.take(), &d.result.calls)
+            .await;
         let model = self
             .route(&c.facts.route)
             .map(|r| r.model().to_owned())
             .unwrap_or_default();
-        self.trace(TraceEvent::WorkerFinished {
-            at_ms: now,
-            contract: c.contract.clone(),
-            worker: id.to_string(),
-            route: c.facts.route.clone(),
-            model,
-            outcome: outcome_name(&d.result.outcome).to_owned(),
-            steps: d.result.steps,
-            peak_context_tokens: 0,
-            projected_tokens: 0,
-            stop_tokens: 0,
-            sizing_miss: false,
-            calls: d.result.calls.iter().map(|c| c.to_string()).collect(),
-            spend_micros: spend.micros(),
-        })
-        .await?;
+        let traced = self
+            .trace(TraceEvent::WorkerFinished {
+                at_ms: now,
+                contract: c.contract.clone(),
+                worker: id.to_string(),
+                route: c.facts.route.clone(),
+                model,
+                outcome: outcome_name(&d.result.outcome).to_owned(),
+                steps: d.result.steps,
+                peak_context_tokens: 0,
+                projected_tokens: 0,
+                stop_tokens: 0,
+                sizing_miss: false,
+                calls: d.result.calls.iter().map(|c| c.to_string()).collect(),
+                spend_micros: spend.micros(),
+            })
+            .await;
+        if let Err(e) = traced {
+            self.subagents.errors.push(format!(
+                "the end of subagent `{id}` could not be traced: {e}"
+            ));
+        }
         let outcome = d.result.outcome.clone();
         if c.ended_parent == Some(true) && matches!(outcome, WorkerOutcome::Cancelled) {
-            // Stopped with its parent: the record and the row stay open, and
-            // the next dispatch of the parent adopts it again.
-            drop(c.parent_guard.take());
+            // Stopped with its parent: the record and the row stay open.
+            let old_guard = c.parent_guard.take();
+            if let Some(p) = self.parent_view(&parent) {
+                // The parent is running again already: a quick resume beat
+                // this cancel, and its adoption skipped this child because
+                // it was still live. Adopt it now, fenced on the parent's
+                // current fence before the old guard lifts, so the parent
+                // never writes its paths in between.
+                c.parent_guard = (!c.facts.read_only).then(|| p.fence.fence(&c.facts.writes));
+                drop(old_guard);
+                c.parent_workspace = p.workspace.clone();
+                c.workspace = p.workspace;
+                c.cancel = Arc::new(Notify::new());
+                c.injector = Arc::new(OnceLock::new());
+                c.running = false;
+                c.ended_parent = None;
+                c.busy_tries = 0;
+                c.retry_at_ms = 0;
+                c.user_stopped = false;
+                c.resume_after_stop = false;
+                self.subagents.live.insert(id.clone(), c);
+                self.subagents.restart.insert(id);
+                return Ok(());
+            }
+            // Otherwise the parent's next start adopts it.
+            drop(old_guard);
             self.release_parked(&parent);
             return Ok(());
         }
         let finished = is_finished_work(&outcome) && d.env_failure.is_none();
-        let merge = if c.facts.read_only {
+        let merge = if let Some(merge) = d.recovered.clone() {
+            merge
+        } else if c.facts.read_only {
             ChildMerge::ReadOnly
         } else if !finished {
             ChildMerge::NotMerged {
@@ -1786,6 +1867,15 @@ impl RunLoop {
                 },
             }
         };
+        if let ChildMerge::Merged {
+            warning: Some(w), ..
+        }
+        | ChildMerge::Empty {
+            warning: Some(w), ..
+        } = &merge
+        {
+            self.subagents.errors.push(w.clone());
+        }
         // The fence lifts only now: the child's work is in the parent's
         // worktree (or reported as not), and the parent may write again.
         drop(c.parent_guard.take());
@@ -1821,16 +1911,76 @@ impl RunLoop {
             .ok()
             .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(str::to_owned))
             .unwrap_or_default();
-        self.trace(TraceEvent::Integration {
-            at_ms: now,
-            contract: c.contract.clone(),
-            outcome: format!("subagent_{status}"),
-            detail: format!("{id} into {parent}"),
-        })
-        .await?;
-        self.deliver_wakes().await?;
+        let traced = self
+            .trace(TraceEvent::Integration {
+                at_ms: now,
+                contract: c.contract.clone(),
+                outcome: format!("subagent_{status}"),
+                detail: format!("{id} into {parent}"),
+            })
+            .await;
+        if let Err(e) = traced {
+            self.subagents.errors.push(format!(
+                "the merge of subagent `{id}` could not be traced: {e}"
+            ));
+        }
+        if let Err(e) = self.deliver_wakes().await {
+            self.subagents.errors.push(format!(
+                "the report of subagent `{id}` could not be delivered: {e}"
+            ));
+        }
         self.release_parked(&parent);
         Ok(())
+    }
+
+    /// Settle a child's hold against what its calls cost and record the
+    /// spend. Never fails: a ledger read that fails charges the hold
+    /// instead, and an overrun that cannot be traced is kept in `errors`.
+    /// The calls are then marked charged (`seeded`), so a paused or
+    /// re-adopted child, whose next result lists these calls again (a
+    /// resumed worker carries its earlier calls), is not charged for them a
+    /// second time.
+    async fn charge_child(
+        &mut self,
+        id: &AgentId,
+        task: &TaskId,
+        reservation: Option<Reservation>,
+        calls: &[CallId],
+    ) -> Money {
+        let held = reservation
+            .as_ref()
+            .map(Reservation::amount)
+            .unwrap_or(Money::ZERO);
+        let spend = match self.spend_of(calls, held) {
+            Ok(s) => s,
+            Err(e) => {
+                self.subagents.errors.push(format!(
+                    "the spend of subagent `{id}` could not be read; its hold of {held} is \
+                     charged instead: {e}"
+                ));
+                held
+            }
+        };
+        let (now, run) = (self.now(), self.run_id());
+        let overrun = {
+            let mut budget = self.s.admission.budget();
+            match reservation {
+                Some(r) => budget.settle(r, &run, task.as_str(), spend, now),
+                None => {
+                    budget.record_spend(&run, task.as_str(), spend, now);
+                    None
+                }
+            }
+        };
+        self.seeded.extend(calls.iter().cloned());
+        if let Some(o) = overrun
+            && let Err(e) = self.on_overrun(o).await
+        {
+            self.subagents.errors.push(format!(
+                "the overrun of subagent `{id}` could not be recorded: {e}"
+            ));
+        }
+        spend
     }
 
     fn push_report(&mut self, parent: &AgentId, child: &AgentId, report: &SubagentReport) {
@@ -1839,10 +1989,14 @@ impl RunLoop {
     }
 
     /// A notice about `child` to its parent's inbox (and transcript): the
-    /// place the parent and the session view read, unlike the trace. One per
-    /// child and `what`.
+    /// place the parent and the session view read, unlike the trace. Each
+    /// notice has its own id (the time and a counter): the same `what` can
+    /// happen again (a child resumed over the limit twice), and a reused id
+    /// would be refused by the inbox store and by the runtime as a duplicate,
+    /// so the second notice would never arrive.
     fn notify_parent(&mut self, parent: &AgentId, child: &AgentId, what: &str, text: &str) {
-        let id = format!("{SUBAGENT_NOTICE_PREFIX}{child}:{what}");
+        let (now, n) = (self.now(), self.sessions_rt.next_id());
+        let id = format!("{SUBAGENT_NOTICE_PREFIX}{child}:{what}:{now}-{n}");
         self.push_to_parent(parent, child, id, InboxKind::Notice, text.to_owned());
         self.subagents.errors.push(text.to_owned());
     }

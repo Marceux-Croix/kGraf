@@ -48,7 +48,7 @@ mod tests {
 
     #[test]
     fn an_ordinary_identifier_falls_well_short_of_the_generic_api_key_floor() {
-        // The exact false positive from the security review: an assignment
+        // A known false positive: an assignment
         // whose value is a plain, low-entropy identifier.
         assert!(
             shannon_entropy("code_spent") < 3.5,

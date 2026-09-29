@@ -141,7 +141,7 @@ pub fn agent_notes(
 
 /// The largest number of parallel attempts among the shown runs' open
 /// contracts, and the contract that has it: a live-agent ceiling below it can
-/// never admit that contract (M6).
+/// never admit that contract.
 pub fn max_attempts(runs: &[StoredRun]) -> Option<(usize, String)> {
     shown_runs(runs)
         .into_iter()
@@ -296,7 +296,7 @@ pub fn plan_nodes(
                 ),
                 (ContractStatus::Planned, _) => (WorkState::Planned, Vec::new(), String::new()),
             };
-            // M6: a contract whose parallel attempts exceed the live-agent ceiling
+            // A contract whose parallel attempts exceed the live-agent ceiling
             // is refused admission on every round, forever. Said on the node,
             // never left as a silent hold.
             let (state, detail) = match live_agent_ceiling {
@@ -591,7 +591,7 @@ pub(crate) mod tests {
         assert_eq!(handoff_parent("a"), None);
     }
 
-    /// `PlanNode::asks` on every kind of node the record draws (M5): a verified
+    /// `PlanNode::asks` on every kind of node the record draws: a verified
     /// contract, a split contract and a gate each count the asks whose task is their
     /// key. Setting any of them to 0 in `plan_nodes` fails this.
     #[test]

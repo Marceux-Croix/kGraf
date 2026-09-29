@@ -121,6 +121,9 @@
 //! the size of that jump. A check treats a stored `tat` more than one
 //! `tau + period` ahead of the current call's `now` as a clock anomaly, not a
 //! real future reservation, and resets it to `now` rather than honoring it.
+//! `now` is read after the write lock is held: a value read before waiting
+//! for the lock could predate a reservation committed meanwhile, and the
+//! reset would erase it.
 //! A clock before the Unix epoch is a distinct, loud error
 //! ([`CrossLimitError::ClockBeforeEpoch`]), never silently treated as
 //! [`std::time::Duration::ZERO`] (`unwrap_or` would make a broken clock look
@@ -619,7 +622,7 @@ impl SharedLimiterStore {
         let remaining = deadline
             .saturating_duration_since(Instant::now())
             .max(Duration::from_millis(1));
-        Self::run_check(&conn, &self.path, route, key, limit, now, remaining)
+        Self::run_check(&conn, &self.path, route, key, limit, &|| now, remaining)
     }
 
     /// [`Self::check`], but bounds the in-process wait for the route's
@@ -633,12 +636,15 @@ impl SharedLimiterStore {
     /// connection, the remaining budget (what `budget` had left after that
     /// wait) is what bounds SQLite's own `busy_timeout`, inside
     /// [`tokio::task::spawn_blocking`].
+    ///
+    /// `clock` is read only after the write lock is held (see
+    /// [`Self::run_check`]), never before waiting for it.
     pub(crate) async fn check_bounded(
         &self,
         route: &str,
         key: &str,
         limit: crate::RateLimit,
-        now: SystemTime,
+        clock: impl Fn() -> SystemTime + Send + 'static,
         budget: Duration,
     ) -> Result<Admission, CrossLimitError> {
         let conn_arc = self.connection_for(route)?;
@@ -663,7 +669,7 @@ impl SharedLimiterStore {
                 &route_owned,
                 &key_owned,
                 limit,
-                now,
+                &clock,
                 remaining,
             )
         })
@@ -687,16 +693,10 @@ impl SharedLimiterStore {
         route: &str,
         key: &str,
         limit: crate::RateLimit,
-        now: SystemTime,
+        clock: &dyn Fn() -> SystemTime,
         budget: Duration,
     ) -> Result<Admission, CrossLimitError> {
         let row_key = format!("{route}:{key}");
-        let now_us = now
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| CrossLimitError::ClockBeforeEpoch {
-                route: route.to_owned(),
-            })?
-            .as_micros() as i64;
         let wrap = |source| CrossLimitError::Sqlite {
             path: path.to_path_buf(),
             source,
@@ -722,6 +722,21 @@ impl SharedLimiterStore {
             }
             Err(source) => return Err(wrap(source)),
         }
+
+        // The clock is read here, with the write lock held, and not before
+        // waiting for it. A `now` read before the wait can be older than a
+        // reservation another caller committed meanwhile; the anomaly reset
+        // below would then read that newer reservation as a clock jump and
+        // erase it, admitting more calls than the burst allows.
+        let now_us = match clock().duration_since(UNIX_EPOCH) {
+            Ok(d) => d.as_micros() as i64,
+            Err(_) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(CrossLimitError::ClockBeforeEpoch {
+                    route: route.to_owned(),
+                });
+            }
+        };
 
         let outcome = (|| -> rusqlite::Result<Admission> {
             let stored: Option<(i64, u32, u32)> = conn
@@ -1148,5 +1163,63 @@ mod tests {
             limit("600"),
             "the already-newer registration must still win"
         );
+    }
+
+    /// The clock is read after the write lock is held, never before the wait
+    /// for it. A `now` read earlier can predate a reservation another caller
+    /// committed meanwhile, and the anomaly reset would then erase that
+    /// reservation and over-admit.
+    #[tokio::test]
+    async fn the_clock_is_read_with_the_write_lock_held() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("shared.sqlite3");
+        let store = SharedLimiterStore::open(&path).expect("open");
+        let probe_path = path.clone();
+        let held_at_read = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = held_at_read.clone();
+        let clock = move || {
+            // A second connection cannot take the write lock while the
+            // checking transaction is open.
+            let probe = Connection::open(&probe_path).expect("probe");
+            probe.busy_timeout(Duration::ZERO).expect("timeout");
+            let busy = probe.execute_batch("BEGIN IMMEDIATE").is_err();
+            flag.store(busy, std::sync::atomic::Ordering::SeqCst);
+            SystemTime::now()
+        };
+        store
+            .check_bounded("route", "key", limit("60"), clock, BUDGET)
+            .await
+            .expect("check");
+        assert!(
+            held_at_read.load(std::sync::atomic::Ordering::SeqCst),
+            "the clock must be read inside the write transaction"
+        );
+    }
+
+    /// A full bucket answers `Wait` when the clock is read after the lock, so
+    /// concurrent callers cannot exceed the burst.
+    #[tokio::test]
+    async fn concurrent_callers_never_exceed_the_burst() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = std::sync::Arc::new(
+            SharedLimiterStore::open(&dir.path().join("shared.sqlite3")).expect("open"),
+        );
+        let mut tasks = Vec::new();
+        for _ in 0..10 {
+            let store = store.clone();
+            tasks.push(tokio::spawn(async move {
+                store
+                    .check_bounded("route", "key", limit("6/5"), SystemTime::now, BUDGET)
+                    .await
+                    .expect("check")
+            }));
+        }
+        let mut admitted = 0;
+        for t in tasks {
+            if t.await.expect("join") == Admission::Admitted {
+                admitted += 1;
+            }
+        }
+        assert_eq!(admitted, 5);
     }
 }

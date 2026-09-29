@@ -163,7 +163,7 @@ async fn a_verified_decomposition_is_offered_to_the_next_similar_run_and_measure
     }
 }
 
-/// L7: the blocked path through the loop. A run that reuses a template and ends
+/// The blocked path through the loop. A run that reuses a template and ends
 /// blocked closes the template's `verified` standing, and the template is no
 /// longer offered.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -206,7 +206,7 @@ async fn a_blocked_reuse_marks_the_template_failed_and_it_is_no_longer_offered()
     assert!(g.meta("frugality/plan/r2").expect("meta").is_some());
 }
 
-/// M5(b): a run whose decomposition fails is measured too, with the failed call
+/// A run whose decomposition fails is measured too, with the failed call
 /// counted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_run_that_never_gets_a_plan_still_writes_a_demand_record() {
@@ -226,7 +226,10 @@ async fn a_run_that_never_gets_a_plan_still_writes_a_demand_record() {
     let records = records(&p);
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].status, "plan_failed");
-    assert_eq!(records[0].decomposition_calls, 1, "the failed call counts");
+    assert_eq!(
+        records[0].decomposition_calls, 3,
+        "the failed calls count: the first ask and two more"
+    );
     assert_eq!(records[0].units_started, 0);
 }
 
@@ -270,7 +273,7 @@ impl Provider for BillsPrompt {
     }
 }
 
-/// M4: the decomposition's hold covers the offered templates, so a large
+/// The decomposition's hold covers the offered templates, so a large
 /// template does not make the call overrun its hold.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_decomposition_hold_covers_a_large_offered_template() {
@@ -319,7 +322,7 @@ async fn the_decomposition_hold_covers_a_large_offered_template() {
     assert_eq!(report.status, RunStatus::Completed, "{report:?}");
 }
 
-/// M7: live occupancy is in the status reply text, not only the structured
+/// Live occupancy is in the status reply text, not only the structured
 /// field (a channel shows only the text).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_status_reply_text_carries_live_context_occupancy() {
@@ -369,7 +372,7 @@ async fn the_status_reply_text_carries_live_context_occupancy() {
     let _ = running.await;
 }
 
-/// N1 (the second reviewer's probe, ported): resuming a completed run is refused,
+/// Resuming a completed run is refused,
 /// and its demand record is left exactly as the run wrote it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn probe_resume_of_a_completed_run_keeps_its_demand_record() {
@@ -444,7 +447,7 @@ async fn a_same_process_resume_does_not_charge_the_runs_spend_again() {
     );
 }
 
-/// N3 through the loop: a run offered a template whose plan has the same
+/// Through the loop: a run offered a template whose plan has the same
 /// structure but unrelated step text, and which ends blocked, does not demote
 /// the template (nor would its success credit it).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -485,7 +488,7 @@ async fn an_unrelated_plan_of_the_same_structure_does_not_demote_the_template() 
     assert_eq!(r2.template_matched, None);
 }
 
-/// N2: an analytics failure at the end of a run is reported with the run and
+/// An analytics failure at the end of a run is reported with the run and
 /// recorded in its trace; the run still completes and is not left active.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_analytics_failure_is_traced_and_reported_not_raised() {
@@ -660,7 +663,8 @@ async fn a_failed_decomposition_is_charged_its_ledger_cost_not_its_hold() {
     let p = Parts::open(
         dir.path(),
         move |_| {
-            if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+            // Bad on the first ask and both re-asks, so the run fails.
+            if counter.fetch_add(1, Ordering::SeqCst) < 3 {
                 "this is not a plan".into()
             } else {
                 plan.clone()
@@ -676,7 +680,7 @@ async fn a_failed_decomposition_is_charged_its_ledger_cost_not_its_hold() {
             "add a config parser module with tests".into(),
         )
         .await;
-    assert!(failed.is_err(), "the first answer is not a plan");
+    assert!(failed.is_err(), "no answer of the first three is a plan");
     let charged = p.admission.budget().spent_run("r1");
     let billed = ledger_spend(&p, "r1");
     assert!(billed.micros() > 0, "the bad answer was billed");

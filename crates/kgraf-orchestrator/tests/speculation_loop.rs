@@ -196,3 +196,74 @@ async fn a_round_considers_at_most_the_cap_gives_its_slot_back_and_records_its_c
     assert!(!events.iter().any(|(o, _)| o == "skipped"), "{events:?}");
     assert_eq!(p.admission.gate().in_flight(), (0, 0), "no slot leaked");
 }
+
+/// [`Recording`], except that taking a snapshot panics: a real panic in the
+/// code a speculative round's spawned task runs.
+struct PanicSnapshot(Arc<Recording>);
+
+#[async_trait::async_trait]
+impl Workspaces for PanicSnapshot {
+    async fn prepare(
+        &self,
+        contract: &OpenContract,
+        worker: &kgraf_core::AgentId,
+    ) -> Result<PathBuf, PrepareFailure> {
+        self.0.prepare(contract, worker).await
+    }
+    async fn release(&self, workspace: &Path, keep: bool) {
+        self.0.release(workspace, keep).await
+    }
+    async fn integration_tip(&self) -> Result<Option<String>, String> {
+        self.0.integration_tip().await
+    }
+    async fn snapshot(&self, _workspace: &Path) -> Result<Option<String>, String> {
+        panic!("the snapshot panicked, on purpose");
+    }
+    async fn trial_merge(&self, commits: &[String]) -> Result<Option<Trial>, String> {
+        self.0.trial_merge(commits).await
+    }
+}
+
+/// A round that panics reaches the loop as a refused round, gives its slot
+/// back, and does not stop later rounds: the round's spawn is supervised like
+/// the attempt and verification spawns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_speculative_round_that_panics_is_a_refusal_and_gives_its_slot_back() {
+    let dir = tempfile::tempdir().expect("dir");
+    let plan = plan_json(&[
+        c("a", "edit a", "a.txt", &[]),
+        c("b", "edit b", "b.txt", &[]),
+    ]);
+    let mut p = Parts::open(
+        dir.path(),
+        move |_| plan.clone(),
+        |_| SERVES.into(),
+        Duration::from_millis(300),
+    );
+    p.admission = admission(Limits::new(4, 8).expect("limits"));
+    let mut services = p.services(WINDOW);
+    services.workspaces = Arc::new(PanicSnapshot(recording(dir.path())));
+    let report = tokio::time::timeout(
+        Duration::from_secs(30),
+        Orchestrator::new(config(), services)
+            .expect("orchestrator")
+            .start(RunId::new("r1"), "edits".into()),
+    )
+    .await
+    .expect("the run ended in time")
+    .expect("run");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    let events = speculation_events(&p).await;
+    assert!(
+        events
+            .iter()
+            .any(|(o, d)| o == "refused" && d.contains("panicked")),
+        "{events:?}"
+    );
+    let record = RunStore::new(p.graph.clone())
+        .load(&RunId::new("r1"))
+        .expect("load")
+        .expect("record");
+    assert!(record.coordination.speculation.refused >= 1);
+    assert_eq!(p.admission.gate().in_flight(), (0, 0), "no slot leaked");
+}

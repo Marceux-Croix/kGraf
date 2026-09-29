@@ -36,9 +36,13 @@ pub mod gitutil;
 pub mod prices;
 pub mod report;
 pub mod runner;
+pub mod structure;
+pub mod suite_store;
 
-pub use brief::{Brief, Check, ScriptCase, suite, suite_hash};
-pub use prices::{apply_override, closest_keys, default_price_table, unpriced_warning};
+pub use brief::{Brief, Check, DocFact, Mutation, ScriptCase, suite, suite_hash};
+pub use prices::{
+    apply_override, closest_keys, default_price_table, default_price_table_for, unpriced_warning,
+};
 pub use runner::{
     AttemptOutcome, BenchOptions, PlannedAttempt, RouteHandle, WorkerBudget, plan_attempts,
     run_bench,

@@ -754,24 +754,166 @@ async fn empty_graph_lookups_and_spend_are_traced() {
     )));
 }
 
+/// A planner that answers badly once is asked again with the refusal as a
+/// note; the run completes, and both asks are in the ledger.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn construction_refuses_an_unpriced_route_model() {
+async fn a_bad_plan_is_asked_for_again_with_the_refusal_as_a_note() {
+    let dir = tempfile::tempdir().expect("dir");
+    let good = plan_json(&[c("a", "make a", "src/a.rs", &[])]);
+    let asked = Arc::new(Mutex::new(Vec::<String>::new()));
+    let seen = asked.clone();
+    let p = Parts::open(
+        dir.path(),
+        move |prompt| {
+            let mut s = seen.lock().expect("lock");
+            s.push(prompt.to_owned());
+            if s.len() == 1 {
+                "this is not a plan".into()
+            } else {
+                good.clone()
+            }
+        },
+        |_| SERVES.into(),
+        Duration::from_millis(5),
+    );
+    let o = Orchestrator::new(config(), p.services(WINDOW)).expect("orchestrator");
+    let report = o
+        .start(RunId::new("r1"), "make a".into())
+        .await
+        .expect("run");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    assert_eq!(p.planner.calls(), 2, "asked twice");
+    let asked = asked.lock().expect("lock");
+    assert!(!asked[0].contains("plan_refused"), "{}", asked[0]);
+    assert!(asked[1].contains("plan_refused"), "{}", asked[1]);
+    let planner_calls = p
+        .ledger
+        .calls()
+        .expect("calls")
+        .iter()
+        .filter(|c| c.agent_id == "orchestrator:r1")
+        .count();
+    assert!(planner_calls >= 2, "each ask is in the ledger");
+}
+
+/// A planner that never answers well is asked three times (the first ask and
+/// two more), then the run fails with the refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_plan_still_bad_after_two_more_asks_fails_the_run() {
     let dir = tempfile::tempdir().expect("dir");
     let p = Parts::open(
         dir.path(),
-        |_| String::new(),
+        |_| "never a plan".into(),
         |_| SERVES.into(),
-        Duration::ZERO,
+        Duration::from_millis(5),
     );
-    let mut s = p.services(WINDOW);
-    s.prices = kgraf_core::PriceTable::new();
-    assert!(matches!(
-        Orchestrator::new(config(), s),
-        Err(kgraf_orchestrator::OrchestratorError::Unpriced { .. })
-    ));
+    let o = Orchestrator::new(config(), p.services(WINDOW)).expect("orchestrator");
+    let err = o
+        .start(RunId::new("r1"), "make a".into())
+        .await
+        .expect_err("fails loud");
+    assert!(
+        matches!(err, kgraf_orchestrator::OrchestratorError::Plan(_)),
+        "{err:?}"
+    );
+    assert_eq!(p.planner.calls(), 3, "one ask and two more");
 }
 
-/// Decision 0071, C2: the worker transcripts the orchestrator writes hold each
+/// Decision 0075: a route whose model has no price entry is not refused. A run
+/// with one priced route and one local unpriced route starts, dispatches to
+/// both, makes every call through the ledger, and reports the unpriced model as
+/// "local, unpriced" instead of a cost of `$0`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_with_a_priced_and_a_local_unpriced_route_starts_and_uses_both() {
+    let dir = tempfile::tempdir().expect("dir");
+    let plan = plan_json(&[
+        c("a", "make a", "src/a.rs", &[]),
+        c("b", "make b", "src/b.rs", &[]),
+        c("c", "make c", "src/c.rs", &[]),
+        c("d", "wire them", "src/d.rs", &["a", "b", "c"]),
+    ]);
+    let p = Parts::open(
+        dir.path(),
+        move |_| plan.clone(),
+        |_| SERVES.into(),
+        Duration::from_millis(40),
+    );
+    let mut s = p.services(WINDOW);
+    s.prices = prices_without(BETA_MODEL);
+    for r in &mut s.routes {
+        r.local = r.model() == BETA_MODEL;
+    }
+    let o = Orchestrator::new(config(), s).expect("an unpriced route is not refused");
+    let report = o
+        .start(RunId::new("r1"), "build a, b, c and wire them".into())
+        .await
+        .expect("run");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    assert_eq!(
+        p.stats.vendors(),
+        ["alpha".to_owned(), "beta".to_owned()].into(),
+        "both routes served workers"
+    );
+    // Every worker call is in the ledger, the unpriced route's included.
+    let calls = p.ledger.calls().expect("calls");
+    assert!(calls.iter().any(|c| c.model == BETA_MODEL), "beta's calls");
+    assert!(
+        calls.iter().any(|c| c.model == ALPHA_MODEL),
+        "alpha's calls"
+    );
+    // The unpriced spend is named, not counted as a known `$0`.
+    assert!(
+        report
+            .notices
+            .iter()
+            .any(|n| n.contains(BETA_MODEL) && n.contains("local, unpriced")),
+        "{:?}",
+        report.notices
+    );
+    assert!(
+        report
+            .notices
+            .iter()
+            .any(|n| n.contains("not in the total") && n.contains("beta-model (local, unpriced)")),
+        "{:?}",
+        report.notices
+    );
+    assert!(
+        report.spent > Money::ZERO,
+        "the priced route's spend is counted"
+    );
+}
+
+/// The planner and grounder models may be unpriced too: the run is not refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unpriced_planner_model_is_not_refused() {
+    let dir = tempfile::tempdir().expect("dir");
+    let plan = plan_json(&[c("a", "make a", "src/a.rs", &[])]);
+    let p = Parts::open(
+        dir.path(),
+        move |_| plan.clone(),
+        |_| SERVES.into(),
+        Duration::from_millis(5),
+    );
+    let mut s = p.services(WINDOW);
+    s.prices = prices_without(PLAN_MODEL);
+    let o = Orchestrator::new(config(), s).expect("orchestrator");
+    let report = o
+        .start(RunId::new("r1"), "make a".into())
+        .await
+        .expect("run");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    assert!(
+        report
+            .notices
+            .iter()
+            .any(|n| n.contains(PLAN_MODEL) && n.contains("(unpriced)")),
+        "{:?}",
+        report.notices
+    );
+}
+
+/// The worker transcripts the orchestrator writes hold each
 /// settled round as one `assistant_message`, never its streamed deltas, so a
 /// secret the provider split across two deltas never reaches the file.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -804,7 +946,7 @@ async fn worker_transcripts_hold_settled_rounds_not_deltas() {
     assert!(read > 0, "no worker transcript was written");
 }
 
-/// Decision 0071, owner's H2 ruling: text that is both model input and stored
+/// Decision 0071: text that is both model input and stored
 /// is kept as two copies. The run record (stored, shown, searched) holds the
 /// persist-scrubbed copy; the model is shown the registry-only copy while this
 /// process holds it. Checked for the instruction, a contract brief and a note.
@@ -858,7 +1000,7 @@ async fn stored_text_is_scrubbed_at_intake_and_the_model_sees_its_own_copy() {
             .any(|g| g.contains(&format!("rotate {token} after"))),
         "the note"
     );
-    // Review 4, L-1: a completed run forgets its model copies.
+    // A completed run forgets its model copies.
     assert_eq!(
         kgraf_secrets::model_copy(&record.original_instruction),
         record.original_instruction,
@@ -868,7 +1010,7 @@ async fn stored_text_is_scrubbed_at_intake_and_the_model_sees_its_own_copy() {
     assert_eq!(kgraf_secrets::model_copy(brief), *brief);
 }
 
-/// Security review 4, H-2 (the reviewer's probe): a re-grounding verdict that
+/// A re-grounding verdict that
 /// quotes a token holds the contract. Neither the held reason nor the run's
 /// `Blocked` status, both stored and shown, may carry the token.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -924,7 +1066,8 @@ async fn a_plan_naming_a_tool_no_route_offers_is_refused_at_intake_not_held_at_d
         let calls = calls.clone();
         move |_: &str| {
             let n = calls.fetch_add(1, Ordering::SeqCst);
-            if n == 0 {
+            // Bad on the first ask and both re-asks, so the run fails.
+            if n < 3 {
                 // No configured route (`support::route_with`) registers
                 // `shell`: a made-up tool, not an environment gap.
                 serde_json::json!({"contracts":[{
@@ -951,6 +1094,7 @@ async fn a_plan_naming_a_tool_no_route_offers_is_refused_at_intake_not_held_at_d
         .start(RunId::new("r1"), "make a".into())
         .await
         .expect_err("a made-up tool is refused before any contract is dispatched");
+    assert_eq!(p.planner.calls(), 3, "the planner was asked again twice");
     assert!(err.to_string().contains("names tool `shell`"), "{err}");
     assert!(
         err.to_string().contains("no configured route offers"),

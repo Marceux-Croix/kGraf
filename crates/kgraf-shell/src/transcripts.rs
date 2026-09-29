@@ -208,7 +208,7 @@ fn event_turn(event: WorkerEvent, turns: &mut Vec<Turn>) {
         WorkerEvent::RoundAbandoned { phase, reason } => turns.push(Turn::Event(format!(
             "{ABANDONED}{phase:?}: {reason}"
         ))),
-        // Kinds and counts only (decision 0071, M5): says that text was
+        // Kinds and counts only: says that text was
         // redacted and what kind, never any of it.
         WorkerEvent::Redacted { counts } => turns.push(Turn::Event(format!(
             "redacted before writing: {}",
@@ -466,7 +466,7 @@ pub fn scan(runs_dir: &Path, corpus: &mut Corpus) -> bool {
             }
         };
         // Left out, unchanged, and still no room: not read again. When room has
-        // freed (a held transcript went away), it comes back (N6).
+        // freed (a held transcript went away), it comes back.
         if corpus.left_out.get(&key) == Some(&stamp) && held + stamp.len > MAX_CORPUS_BYTES {
             continue;
         }
@@ -722,7 +722,7 @@ mod tests {
         assert_eq!(reasoning, 1, "{out:#?}");
     }
 
-    /// M5: a redaction is visible in the text surface and search as kinds
+    /// A redaction is visible in the text surface and search as kinds
     /// and counts.
     #[test]
     fn a_redaction_record_is_shown_as_kinds_and_counts() {
@@ -789,7 +789,7 @@ mod tests {
         );
     }
 
-    /// H1: past the bound, left-out transcripts are remembered by file stamp and
+    /// Past the bound, left-out transcripts are remembered by file stamp and
     /// never read again while unchanged. Two 40 MB transcripts: one is kept, one
     /// is left out; repeated scans report no change and read no byte.
     #[test]
@@ -830,14 +830,14 @@ mod tests {
         assert_eq!(corpus.bytes_read, read, "no byte read again");
         assert_eq!(corpus.left_out_count(), 1);
 
-        // N6: the kept transcript goes; the left-out one comes back into the room.
+        // The kept transcript goes; the left-out one comes back into the room.
         std::fs::remove_file(workers.join("r1-b-r0-a0.jsonl")).expect("rm");
         assert!(scan(dir.path(), &mut corpus));
         assert_eq!(corpus.left_out_count(), 0);
         assert!(corpus.get("r1", "r1-a-r0-a0").is_some(), "brought back");
     }
 
-    /// L6: a UTF-8 character split across two appends is decoded whole.
+    /// A UTF-8 character split across two appends is decoded whole.
     #[test]
     fn a_character_split_across_appends_is_not_corrupted() {
         let dir = tempfile::tempdir().expect("dir");

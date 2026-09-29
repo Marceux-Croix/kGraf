@@ -179,7 +179,7 @@ fn path_to_text(p: &Option<PathBuf>) -> Option<String> {
 }
 
 /// Whether `agent_sessions` has the `addressable` column (a table created
-/// before decision 0067's request 17 addendum does not).
+/// before decision 0073's resolver sessions does not).
 pub(crate) fn has_addressable_column(conn: &rusqlite::Connection) -> Result<bool> {
     Ok(conn.query_row(
         "SELECT COUNT(*) FROM pragma_table_info('agent_sessions') WHERE name = 'addressable'",

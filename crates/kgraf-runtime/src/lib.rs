@@ -54,6 +54,7 @@ mod stall;
 mod step;
 mod thresholds;
 mod worker;
+mod worktree;
 
 pub use bridge::{StreamPump, StreamSink, stream_bridge};
 pub use brief::{
@@ -86,6 +87,7 @@ pub use thresholds::{
     MAX_COMPACTION_POINT_PERCENT, MIN_COMPACTION_POINT_PERCENT, PointSource, ThresholdError,
 };
 pub use worker::{
-    AskResolver, CallMode, LoopSettings, STEER_ABANDON_REASON, STEER_INTERRUPTED, STEER_NOT_RUN,
+    AskResolver, CallMode, LoopSettings, OUTPUT_LIMIT_ABANDON_REASON, OUTPUT_LIMIT_NOTICE,
+    STEER_ABANDON_BEFORE_SEND_REASON, STEER_ABANDON_REASON, STEER_INTERRUPTED, STEER_NOT_RUN,
     SpawnOptions, WorkerEnv, WorkerError, blocking, spawn_worker,
 };

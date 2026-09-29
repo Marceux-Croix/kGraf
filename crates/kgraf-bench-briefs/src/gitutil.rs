@@ -37,10 +37,11 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
 }
 
 /// Copy `fixture`'s files into `root` (created if absent) and commit them as
-/// a fresh git repository on branch `main`.
-pub fn init_fixture_repo(fixture: &Path, root: &Path) -> Result<()> {
+/// a fresh git repository on branch `main`. Returns the fixture commit's id,
+/// the base a protected-file diff is taken from.
+pub fn init_fixture_repo(fixture: &Path, root: &Path) -> Result<String> {
     std::fs::create_dir_all(root).with_context(|| format!("cannot create {}", root.display()))?;
-    copy_tree(fixture, root)?;
+    copy_tree(fixture, root, &[])?;
     git(root, &["init", "-q", "-b", "main"])?;
     git(root, &["config", "user.name", "kgraf-bench-briefs"])?;
     git(
@@ -49,20 +50,43 @@ pub fn init_fixture_repo(fixture: &Path, root: &Path) -> Result<()> {
     )?;
     git(root, &["add", "."])?;
     git(root, &["commit", "-q", "-m", "fixture"])?;
-    Ok(())
+    git(root, &["rev-parse", "HEAD"])
 }
 
-fn copy_tree(from: &Path, to: &Path) -> Result<()> {
+/// The paths among `protected` (git pathspecs, relative to the repository
+/// root) that differ between `base` and `commit`: added, changed, deleted or
+/// renamed. Empty means the attempt left every protected path alone.
+pub fn changed_protected(
+    root: &Path,
+    base: &str,
+    commit: &str,
+    protected: &[&str],
+) -> Result<Vec<String>> {
+    if protected.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut args = vec!["diff", "--name-only", "--no-renames", base, commit, "--"];
+    args.extend_from_slice(protected);
+    Ok(git(root, &args)?.lines().map(str::to_owned).collect())
+}
+
+/// Copy the directory `from` into `to`. Entries directly under `from` whose
+/// name is in `skip_top` are left out (a mutation copy must not carry a
+/// `target/`).
+pub(crate) fn copy_tree(from: &Path, to: &Path, skip_top: &[&str]) -> Result<()> {
     for entry in
         std::fs::read_dir(from).with_context(|| format!("cannot read {}", from.display()))?
     {
         let entry = entry?;
+        if skip_top.iter().any(|s| entry.file_name() == *s) {
+            continue;
+        }
         let dest = to.join(entry.file_name());
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
             std::fs::create_dir_all(&dest)
                 .with_context(|| format!("cannot create {}", dest.display()))?;
-            copy_tree(&entry.path(), &dest)?;
+            copy_tree(&entry.path(), &dest, &[])?;
         } else if file_type.is_file() {
             std::fs::copy(entry.path(), &dest)
                 .with_context(|| format!("cannot copy to {}", dest.display()))?;
@@ -73,25 +97,48 @@ fn copy_tree(from: &Path, to: &Path) -> Result<()> {
 
 /// Extract `commit`'s tree from the repository at `root` into `dest`
 /// (created if absent, must be empty), through `git archive | tar -x`: no
-/// second worktree to register or remove.
+/// second worktree to register or remove. Both `git archive` and `tar` must
+/// exit 0: a failed archive can leave tar with an empty stream that it
+/// accepts, and an empty tree would then read as a model failure.
 pub fn checkout_commit(root: &Path, commit: &str, dest: &Path) -> Result<()> {
     std::fs::create_dir_all(dest).with_context(|| format!("cannot create {}", dest.display()))?;
-    let archive = Command::new("git")
+    let mut archive = Command::new("git")
         .arg("-C")
         .arg(root)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
         .args(["archive", "--format=tar", commit])
         .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .with_context(|| format!("cannot run `git archive` in {}", root.display()))?;
-    let status = Command::new("tar")
+    let Some(stdout) = archive.stdout.take() else {
+        let _ = archive.kill();
+        let _ = archive.wait();
+        bail!("git archive gave no stdout pipe");
+    };
+    let tar_status = Command::new("tar")
         .arg("-x")
         .arg("-C")
         .arg(dest)
-        .stdin(archive.stdout.context("git archive gave no stdout pipe")?)
-        .status()
-        .context("cannot run tar -x")?;
-    if !status.success() {
-        bail!("tar -x into {} failed: {status}", dest.display());
+        .stdin(stdout)
+        .status();
+    // Always wait for git (no zombie) and read its verdict first.
+    let archived = archive
+        .wait_with_output()
+        .context("cannot wait for `git archive`")?;
+    if !archived.status.success() {
+        bail!(
+            "git archive {commit} in {} failed: {} {}",
+            root.display(),
+            archived.status,
+            String::from_utf8_lossy(&archived.stderr).trim()
+        );
+    }
+    let tar_status = tar_status.context("cannot run tar -x")?;
+    if !tar_status.success() {
+        bail!("tar -x into {} failed: {tar_status}", dest.display());
     }
     Ok(())
 }
@@ -99,6 +146,10 @@ pub fn checkout_commit(root: &Path, commit: &str, dest: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn head(repo: &Path) -> String {
+        git(repo, &["rev-parse", "HEAD"]).expect("head")
+    }
 
     #[test]
     fn a_fixture_is_committed_and_a_commit_round_trips_through_archive() {
@@ -108,11 +159,11 @@ mod tests {
         std::fs::write(src.path().join("sub/b.txt"), "world").expect("write");
 
         let repo = tempfile::tempdir().expect("repo");
-        init_fixture_repo(src.path(), repo.path()).expect("init");
-        let head = git(repo.path(), &["rev-parse", "HEAD"]).expect("head");
+        let base = init_fixture_repo(src.path(), repo.path()).expect("init");
+        assert_eq!(base, head(repo.path()), "the fixture commit is returned");
 
         let dest = tempfile::tempdir().expect("dest");
-        checkout_commit(repo.path(), &head, dest.path()).expect("checkout");
+        checkout_commit(repo.path(), &base, dest.path()).expect("checkout");
         assert_eq!(
             std::fs::read_to_string(dest.path().join("a.txt")).expect("a.txt"),
             "hello"
@@ -120,6 +171,67 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dest.path().join("sub/b.txt")).expect("b.txt"),
             "world"
+        );
+    }
+
+    #[test]
+    fn a_failed_git_archive_is_an_error_not_an_empty_tree() {
+        let src = tempfile::tempdir().expect("src");
+        std::fs::write(src.path().join("a.txt"), "hello").expect("write");
+        let repo = tempfile::tempdir().expect("repo");
+        init_fixture_repo(src.path(), repo.path()).expect("init");
+        let dest = tempfile::tempdir().expect("dest");
+        let err = checkout_commit(repo.path(), "no-such-commit-0000", dest.path())
+            .expect_err("a commit that does not exist must not check out");
+        assert!(format!("{err:#}").contains("git archive"), "{err:#}");
+        assert!(
+            !dest.path().join("a.txt").exists(),
+            "nothing may be extracted"
+        );
+    }
+
+    #[test]
+    fn changed_protected_reports_edits_additions_and_deletions_only_in_scope() {
+        let src = tempfile::tempdir().expect("src");
+        std::fs::create_dir_all(src.path().join("tests")).expect("dir");
+        std::fs::write(src.path().join("tests/consumer.rs"), "a").expect("write");
+        std::fs::write(src.path().join("lib.rs"), "l").expect("write");
+        let repo = tempfile::tempdir().expect("repo");
+        let base = init_fixture_repo(src.path(), repo.path()).expect("init");
+        let protected = ["tests/consumer.rs", "keep.txt"];
+
+        // An unprotected change reports nothing.
+        std::fs::write(repo.path().join("lib.rs"), "l2").expect("write");
+        git(repo.path(), &["commit", "-qam", "edit lib"]).expect("commit");
+        assert!(
+            changed_protected(repo.path(), &base, &head(repo.path()), &protected)
+                .expect("diff")
+                .is_empty()
+        );
+
+        // An edit and an addition each show up.
+        std::fs::write(repo.path().join("tests/consumer.rs"), "b").expect("write");
+        std::fs::write(repo.path().join("keep.txt"), "new").expect("write");
+        git(repo.path(), &["add", "."]).expect("add");
+        git(repo.path(), &["commit", "-qm", "touch protected"]).expect("commit");
+        let mut changed =
+            changed_protected(repo.path(), &base, &head(repo.path()), &protected).expect("diff");
+        changed.sort();
+        assert_eq!(changed, ["keep.txt", "tests/consumer.rs"]);
+
+        // A deletion counts.
+        let after_edit = head(repo.path());
+        std::fs::remove_file(repo.path().join("tests/consumer.rs")).expect("rm");
+        git(repo.path(), &["commit", "-qam", "delete"]).expect("commit");
+        assert_eq!(
+            changed_protected(
+                repo.path(),
+                &after_edit,
+                &head(repo.path()),
+                &["tests/consumer.rs"]
+            )
+            .expect("diff"),
+            ["tests/consumer.rs"]
         );
     }
 }

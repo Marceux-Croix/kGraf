@@ -5,14 +5,14 @@
 //! schedule`. This module adds what only the shell does:
 //!
 //! - [`open`] opens the project's existing `graph.db` for writing facts
-//!   (`GraphStore::open_existing_for_facts`: never creates it (M2), and never
+//!   (`GraphStore::open_existing_for_facts`: never creates it, and never
 //!   rebuilds an index of another schema version, so a background tick cannot empty
 //!   the code index), and moves any schedule still in the old graph-meta layout onto
 //!   a work node;
 //! - [`HistoryRecorder`] turns the scheduler loop's `TickEvent`s into history rows
 //!   on each schedule's node (claimed and started, the outcome, the spend by run id,
 //!   a disable with its reason), keeps any row it could not write and retries it on
-//!   the next tick, and rebuilds lost outcome rows from the claim table (M2);
+//!   the next tick, and rebuilds lost outcome rows from the claim table;
 //! - [`plan_nodes`] turns the schedules' views into work nodes for the galaxy's plan
 //!   overlay, so the schedule, its last run and a disable reason are on the node's
 //!   label (no new panel; the tray keeps its one summary line). Whether a
@@ -48,7 +48,7 @@ fn config_err(context: &str, e: &(dyn std::error::Error + 'static)) -> ShellErro
 
 /// The project's graph, opened for writing facts, with old meta-stored schedules
 /// moved onto work nodes. `None` when the project has no `graph.db`: this never
-/// creates one (M2), and no graph means no schedules.
+/// creates one, and no graph means no schedules.
 pub fn open(project: &Path) -> Result<Option<(GraphStore, Vec<Migration>)>, ShellError> {
     let path = project
         .join(kgraf_graph::snapshot::STATE_DIR)
@@ -72,7 +72,7 @@ pub fn load_all(graph: &GraphStore) -> Result<Vec<node_store::NodeSchedule>, She
 /// detail. A process-wide condition (`NotRunnable`) and a clock anomaly are not run
 /// history; the tray line and the log carry those. A deferral is recorded once per
 /// occurrence (its first), not once per tick while it waits; a deferred occurrence
-/// that starts is a start (M1).
+/// that starts is a start.
 fn run_record(event: &TickEvent) -> Option<(EventKind, &str, Option<DateTime<Utc>>, String)> {
     Some(match event {
         TickEvent::Started {
@@ -229,8 +229,7 @@ pub fn records_of(
 /// restores their outcomes.
 pub const MAX_PENDING: usize = 10_000;
 
-/// What one [`HistoryRecorder::record_tick`] did, for the tray line (counts only,
-/// L8) and the log (detail).
+/// What one [`HistoryRecorder::record_tick`] did, for the tray line (counts only) and the log (detail).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct TickRecord {
     /// Rows written this tick, retried ones included.
@@ -258,7 +257,7 @@ impl TickRecord {
     }
 }
 
-/// Records run history on each schedule's node across ticks (M2). A row
+/// Records run history on each schedule's node across ticks. A row
 /// whose write fails (the graph busy past its timeout, say) is kept in memory and
 /// retried first on the next tick. Each tick then compares the claim table's
 /// settled occurrences with the history and rebuilds any lost outcome row, which
@@ -279,7 +278,7 @@ pub struct HistoryRecorder {
     max_pending: usize,
     reconciler: node_store::Reconciler,
     /// Old meta rows already reported as not movable, so each is said once per
-    /// process, not once per tick (L4).
+    /// process, not once per tick.
     refused_reported: BTreeSet<String>,
 }
 
@@ -468,7 +467,7 @@ pub fn node_key(node_id: &str) -> String {
     format!("work:{node_id}")
 }
 
-/// Longest label part, in characters (L3); a longer one is cut with `...`.
+/// Longest label part, in characters; a longer one is cut with `...`.
 pub const MAX_LABEL_PART: usize = 120;
 
 pub(crate) fn cut(text: &str) -> String {
@@ -508,7 +507,7 @@ fn state_of(v: &ScheduleView, disabled: Option<&str>) -> WorkState {
 }
 
 /// One schedule's part of its node's label. A failed run's detail is left out when
-/// the schedule is disabled: the reason already leads the label (L3).
+/// the schedule is disabled: the reason already leads the label.
 fn schedule_part(v: &ScheduleView, disabled: Option<&str>) -> String {
     let mut text = format!("schedule {}: {}", v.schedule_id, v.when);
     match &v.last_run {
@@ -543,7 +542,7 @@ fn rank(state: WorkState) -> u8 {
 
 /// The scheduled work nodes for the plan overlay: one per node, however many
 /// schedules it has. `disabled` answers, from the claim table, why a schedule is
-/// disabled now (M3); history is only the timeline. The label leads with the
+/// disabled now; history is only the timeline. The label leads with the
 /// node's state and any reason, so a cut label still says why (decision 0052:
 /// "disables the schedule and says why", on its node).
 pub fn plan_nodes(
@@ -680,7 +679,7 @@ mod tests {
         assert!(open(dir.path()).expect("open").is_none());
         assert!(
             !dir.path().join(".kgraf").exists(),
-            "M2: the shell never creates a project's graph"
+            "the shell never creates a project's graph"
         );
     }
 
@@ -711,7 +710,7 @@ mod tests {
         assert!(recorder.migrations_to_report(&again).is_empty());
     }
 
-    /// H4 acceptance: a scheduled run's start, outcome and spend land on its node,
+    /// Acceptance: a scheduled run's start, outcome and spend land on its node,
     /// and show on the node's label.
     #[test]
     fn a_runs_history_lands_on_the_node_and_its_label() {
@@ -774,7 +773,7 @@ mod tests {
         );
     }
 
-    /// Acceptance item 3, with the claim table deciding (M3): the reason
+    /// Acceptance item 3, with the claim table deciding: the reason
     /// leads the label once, the state is the distinct disabled state, and the
     /// failed run's detail (the same reason) is not repeated.
     #[test]

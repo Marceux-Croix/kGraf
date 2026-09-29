@@ -411,7 +411,7 @@ fn a_second_repository_cannot_open_or_clean_the_same_base() {
     let r1_mgr = WorkspaceManager::open(&f.repo, &f.base).unwrap();
     let live = r1_mgr.create(&spec("w1")).unwrap();
 
-    // The security review's scenario: r2's startup deleted r1's live worktree.
+    // The scenario: r2's startup deleted r1's live worktree.
     let err = WorkspaceManager::open(&r2, &f.base).err().unwrap();
     assert!(matches!(err, WorkspaceError::UnsafeBaseDir { .. }), "{err}");
     assert!(live.root().join("README").is_file());

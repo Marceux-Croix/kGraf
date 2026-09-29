@@ -104,6 +104,11 @@ pub struct OpenContract {
     /// landing on the same route that had just failed it, no matter the
     /// routing policy (found live in the 2026-09-28 distributed-efficacy
     /// benchmark's `gate_remediation_exhausted` runs).
+    ///
+    /// A record written before this field existed reads `false`. On resume, a
+    /// planned contract with a `route` that never dispatched (and is not a
+    /// resolver) is taken as pinned, since only the plan could have set it;
+    /// one that dispatched before keeps reading as an assignment.
     #[serde(default)]
     pub route_pinned: bool,
     /// Parallel attempts for the verifier to select among (0009).
@@ -221,11 +226,11 @@ impl OpenContract {
         acceptance: impl Into<String>,
     ) -> Self {
         let contract = contract.into();
-        // Already the stored copy (decision 0071, H2): every caller passes
+        // Already the stored copy: every caller passes
         // text taken in through `kgraf_secrets::intake` (`sanitize_plan`, a
         // handoff item, a gate remediation) or kGraf's own words. Not taken in
-        // again here: a second intake would drop the text's model copy
-        // (review 4, M-2), which `brief_text` reads.
+        // again here: a second intake would drop the text's model copy,
+        // which `brief_text` reads.
         let instruction = instruction.into();
         let acceptance = acceptance.into();
         debug_assert!(
@@ -541,7 +546,7 @@ pub enum RunStateError {
 
 impl RunStateRecord {
     /// Drop the in-memory model copy of every stored text in this record
-    /// (decision 0071, review 4 L-1), for a run that has ended for good.
+    /// (decision 0071), for a run that has ended for good.
     pub fn forget_model_copies(&self) {
         let forget = kgraf_secrets::forget_model_copy;
         forget(&self.original_instruction);
@@ -578,7 +583,7 @@ impl RunStateRecord {
         Self {
             schema_version: RUN_STATE_SCHEMA_VERSION,
             run,
-            // Scrubbed at intake (decision 0071, H2); a model reads
+            // Scrubbed at intake; a model reads
             // `kgraf_secrets::model_copy` of it.
             original_instruction: kgraf_secrets::intake(&original_instruction.into()),
             open_contracts: Vec::new(),
@@ -845,7 +850,7 @@ mod tests {
         ));
     }
 
-    /// Review fix (0076): consumer test outcomes persist in the run record
+    /// Consumer test outcomes persist in the run record
     /// itself, not only in the Desk's in-memory copy, and round-trip through
     /// storage with every outcome kind.
     #[test]
@@ -939,7 +944,7 @@ mod tests {
         assert_eq!(child.lease_holder(), "c1");
     }
 
-    /// Decision 0071, H2: a new record and a planned contract store the
+    /// A new record and a planned contract store the
     /// persist-scrubbed copy, and the model copy maps back from it.
     #[test]
     fn intake_scrubs_the_instruction_and_a_brief_and_keeps_the_model_copy() {
@@ -965,7 +970,7 @@ mod tests {
         }
     }
 
-    /// Final review: `planned` refuses raw text in a debug build.
+    /// `planned` refuses raw text in a debug build.
     #[test]
     #[should_panic(expected = "did not go through intake")]
     #[cfg(debug_assertions)]

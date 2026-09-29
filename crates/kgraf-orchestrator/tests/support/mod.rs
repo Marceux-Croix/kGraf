@@ -618,6 +618,16 @@ pub fn prices() -> PriceTable {
     p
 }
 
+/// [`prices`] without `model`: the model has no price entry.
+pub fn prices_without(model: &str) -> PriceTable {
+    let all = prices();
+    let mut p = PriceTable::new();
+    for m in all.models().filter(|m| *m != model) {
+        p.set(m, *all.get(m).expect("priced"));
+    }
+    p
+}
+
 pub fn route(
     name: &str,
     vendor: &str,

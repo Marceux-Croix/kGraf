@@ -182,15 +182,39 @@ fn is_meaningful_usage(value: &serde_json::Value) -> bool {
     }
 }
 
-/// The cache-related field names both OpenAI-family adapters read by name.
-/// Anything else in a usage object whose name contains "cache" is a field
-/// neither adapter was written against.
-const RECOGNIZED_CACHE_FIELDS: &[&str] = &[
+/// The cache-related fields, by dotted path from the usage object, that the
+/// Chat Completions adapter reads under the details dialect. Anything else at
+/// any other path whose name contains "cache" is a field this adapter was not
+/// written against. Recognition is by path, not by bare name: a
+/// `cached_tokens` at a place nothing reads would otherwise pass unread.
+///
+/// The top-level `cached_tokens` is Moonshot's documented shape. It is read
+/// as a fallback when `prompt_tokens_details.cached_tokens` is absent.
+pub(crate) const CHAT_DETAILS_CACHE_PATHS: &[&str] = &[
     "cached_tokens",
-    "cache_write_tokens",
+    "prompt_tokens_details.cached_tokens",
+    "prompt_tokens_details.cache_write_tokens",
+];
+
+/// The same, under the hit-and-miss dialect. `prompt_tokens_details.
+/// cached_tokens` is recognized because vendors of this dialect repeat the hit
+/// count there; it equals `prompt_cache_hit_tokens` and is not read twice.
+pub(crate) const CHAT_HIT_AND_MISS_CACHE_PATHS: &[&str] = &[
     "prompt_cache_hit_tokens",
     "prompt_cache_miss_tokens",
+    "prompt_tokens_details.cached_tokens",
 ];
+
+/// Whether a JSON value is, or contains, a nonzero number. Null, strings and
+/// booleans carry no count and are zero-equivalent.
+fn has_nonzero_number(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Number(n) => n.as_f64().map(|f| f != 0.0).unwrap_or(true),
+        serde_json::Value::Object(map) => map.values().any(has_nonzero_number),
+        serde_json::Value::Array(items) => items.iter().any(has_nonzero_number),
+        _ => false,
+    }
+}
 
 /// Raise on a usage object carrying a cache-named field neither adapter
 /// recognizes, if it reports a nonzero amount.
@@ -208,32 +232,70 @@ const RECOGNIZED_CACHE_FIELDS: &[&str] = &[
 pub(crate) fn warn_on_unrecognized_cache_key(
     adapter: &'static str,
     raw: &serde_json::Value,
+    recognized_paths: &[&str],
 ) -> Result<(), ProviderError> {
-    fn scan(adapter: &'static str, value: &serde_json::Value) -> Result<(), ProviderError> {
+    fn scan(
+        adapter: &'static str,
+        value: &serde_json::Value,
+        path: &str,
+        recognized_paths: &[&str],
+    ) -> Result<(), ProviderError> {
         let Some(object) = value.as_object() else {
             return Ok(());
         };
         for (key, field_value) in object {
+            let full_path = if path.is_empty() {
+                key.clone()
+            } else {
+                format!("{path}.{key}")
+            };
             let is_cache_named = key.to_ascii_lowercase().contains("cache");
-            let is_recognized = RECOGNIZED_CACHE_FIELDS.contains(&key.as_str());
+            let is_recognized = recognized_paths.contains(&full_path.as_str());
             if is_cache_named && !is_recognized {
-                let nonzero = field_value.as_u64().map(|n| n != 0).unwrap_or(true);
+                // A null, a string or a boolean carries no count and reads as
+                // zero. A number, or an object holding one, must be nonzero
+                // to raise.
+                let nonzero = has_nonzero_number(field_value);
                 if nonzero {
                     return Err(ProviderError::Decode {
                         adapter,
                         reason: format!(
-                            "usage object has an unrecognized cache-related field `{key}` \
+                            "usage object has an unrecognized cache-related field `{full_path}` \
                              with value {field_value}; treating it as absent would silently \
                              drop those tokens from cache accounting"
                         ),
                     });
                 }
             }
-            scan(adapter, field_value)?;
+            scan(adapter, field_value, &full_path, recognized_paths)?;
         }
         Ok(())
     }
-    scan(adapter, raw)
+    scan(adapter, raw, "", recognized_paths)
+}
+
+fn is_tool_use(content: &Content) -> bool {
+    matches!(content, Content::ToolUse { .. })
+}
+
+/// Map a `finish_reason` onto kGraf's stop reasons.
+///
+/// A vendor may report `stop` on a turn that carries tool calls (Gemini's
+/// compatible endpoint and older Ollama builds do). The presence of tool calls
+/// is what decides the caller's next step, so `stop` with tool calls is
+/// [`StopReason::ToolUse`]. The mapping is adapter-side: the core keeps one
+/// meaning per stop reason.
+fn stop_reason_for(reason: &str, has_tool_calls: bool) -> StopReason {
+    match reason {
+        "stop" if has_tool_calls => StopReason::ToolUse,
+        "stop" => StopReason::EndTurn,
+        "length" => StopReason::MaxTokens,
+        "tool_calls" | "function_call" => StopReason::ToolUse,
+        // Anything else, including a content filter or a vendor-specific
+        // reason, is carried as `Other` rather than mapped onto `EndTurn`, so
+        // an unmodeled terminal state is visible.
+        _ => StopReason::Other,
+    }
 }
 
 /// A Chat Completions client.
@@ -327,6 +389,11 @@ impl ChatCompletionsAdapter {
     pub fn with_reasoning_dialect(mut self, dialect: ReasoningDialect) -> Self {
         self.reasoning_dialect = dialect;
         self
+    }
+
+    /// The reasoning dialect this adapter reads usage under.
+    pub fn reasoning_dialect(&self) -> ReasoningDialect {
+        self.reasoning_dialect
     }
 
     /// The configuration this adapter was built with.
@@ -528,7 +595,14 @@ impl ChatCompletionsAdapter {
         if raw.get("prompt_tokens").is_none() && raw.get("completion_tokens").is_none() {
             return Err(ProviderError::UsageMissing { adapter: ADAPTER });
         }
-        warn_on_unrecognized_cache_key(ADAPTER, raw)?;
+        warn_on_unrecognized_cache_key(
+            ADAPTER,
+            raw,
+            match dialect {
+                UsageDialect::Details => CHAT_DETAILS_CACHE_PATHS,
+                UsageDialect::HitAndMiss => CHAT_HIT_AND_MISS_CACHE_PATHS,
+            },
+        )?;
         let prompt = field("prompt_tokens");
         let completion = field("completion_tokens");
         let reasoning = raw
@@ -538,10 +612,15 @@ impl ChatCompletionsAdapter {
             .unwrap_or(0);
 
         let cache_read = match dialect {
+            // Moonshot reports the count at the top level of `usage`
+            // (`cached_tokens`), not in the details object. Read the details
+            // field first and fall back to the top-level one only when the
+            // details field is absent.
             UsageDialect::Details => raw
                 .get("prompt_tokens_details")
                 .and_then(|d| d.get("cached_tokens"))
                 .and_then(|v| v.as_u64())
+                .or_else(|| raw.get("cached_tokens").and_then(|v| v.as_u64()))
                 .unwrap_or(0),
             UsageDialect::HitAndMiss => {
                 let hit = field("prompt_cache_hit_tokens");
@@ -707,18 +786,14 @@ impl ChatCompletionsAdapter {
             }
         }
 
+        let stop_reason = match choice.get("finish_reason").and_then(|f| f.as_str()) {
+            Some(reason) => stop_reason_for(reason, content.iter().any(is_tool_use)),
+            None => StopReason::Other,
+        };
         Ok(Response {
             model: returned_model.to_owned(),
             content,
-            stop_reason: match choice.get("finish_reason").and_then(|f| f.as_str()) {
-                Some("stop") => StopReason::EndTurn,
-                Some("length") => StopReason::MaxTokens,
-                Some("tool_calls") | Some("function_call") => StopReason::ToolUse,
-                // Anything else, including a content filter or a vendor-specific
-                // reason, is carried as `Other` rather than mapped onto `EndTurn`, so
-                // an unmodeled terminal state is visible.
-                _ => StopReason::Other,
-            },
+            stop_reason,
             usage,
             request_id: body.get("id").and_then(|i| i.as_str()).map(str::to_owned),
         })
@@ -840,9 +915,19 @@ impl kgraf_provider::Provider for ChatCompletionsAdapter {
             }
             Err(error) => {
                 // The call billed even though its response was wrong or undecodable,
-                // so the row stays open for reconciliation.
+                // so the row stays open for reconciliation. Usage the body already
+                // carries is kept on the open row, not dropped with the parse error.
+                let carried = parsed.get("usage").and_then(|u| {
+                    Self::normalize_usage(
+                        self.config.protocol,
+                        self.dialect,
+                        self.reasoning_dialect,
+                        u,
+                    )
+                    .ok()
+                });
                 token
-                    .leave_unreconciled_async(request_id.as_deref())
+                    .leave_unreconciled_with_async(carried.as_ref(), request_id.as_deref())
                     .await?;
                 Err(error)
             }
@@ -1234,12 +1319,7 @@ impl Streaming for ChatCompletionsAdapter {
                     .filter(|r| !r.is_empty())
                 {
                     saw_finish_reason = true;
-                    stop_reason = match reason {
-                        "stop" => StopReason::EndTurn,
-                        "length" => StopReason::MaxTokens,
-                        "tool_calls" | "function_call" => StopReason::ToolUse,
-                        _ => StopReason::Other,
-                    };
+                    stop_reason = stop_reason_for(reason, !tool_calls.is_empty());
                     sink(StreamEvent::Finished { stop_reason });
                 }
             }
@@ -1282,6 +1362,10 @@ impl Streaming for ChatCompletionsAdapter {
         }
         if !text.is_empty() {
             content.push(Content::text(text));
+        }
+        // Tool calls that arrived after a `stop` finish chunk still decide it.
+        if stop_reason == StopReason::EndTurn && !tool_calls.is_empty() {
+            stop_reason = StopReason::ToolUse;
         }
         for (_, call) in tool_calls {
             content.push(call.finish());
@@ -1350,6 +1434,32 @@ mod tests {
                 "completion_tokens_details": {"reasoning_tokens": 10}
             }
         })
+    }
+
+    /// A model echo mismatch is a parse error, but the body still carries the
+    /// usage the provider billed. The open row keeps that figure.
+    #[tokio::test]
+    async fn a_parse_failure_keeps_the_usage_the_body_already_carried() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(details_body("cheaper-model")))
+            .mount(&server)
+            .await;
+        let adapter = ChatCompletionsAdapter::new(config(&server.uri()), UsageDialect::Details)
+            .expect("adapter");
+        let ledger = Ledger::open_in_memory().expect("ledger");
+        let token = ledger
+            .begin(ADAPTER, Protocol::Inclusive, "compatible-model", "w", "t")
+            .expect("begin");
+        let err = adapter
+            .complete(&Request::new("compatible-model", "hi", 100), &token)
+            .await
+            .expect_err("must raise");
+        assert!(matches!(err, ProviderError::ModelSubstituted { .. }));
+        let open = ledger.unreconciled().expect("query");
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].usage.total_input(), 1050);
+        assert_eq!(open[0].usage.cache_read, 900);
     }
 
     #[tokio::test]
@@ -1571,11 +1681,11 @@ mod tests {
 
     #[test]
     fn the_wrong_dialect_does_not_silently_report_everything_as_uncached() {
-        // A hit-and-miss vendor read with the Details dialect finds no
-        // `prompt_tokens_details`, so it attributes the whole prompt to uncached
-        // input. That is a real cost error, and the test exists to state that the
-        // dialect is a configuration decision with consequences rather than a
-        // formality. Read with the right dialect, the same body is correct.
+        // A hit-and-miss vendor read with the Details dialect would find no
+        // `prompt_tokens_details` and attribute the whole prompt to uncached
+        // input, a real cost error. The nonzero hit count sits at a path the
+        // Details dialect does not read, so it raises instead. Read with the
+        // right dialect, the same body is correct.
         let raw = json!({
             "prompt_tokens": 1050,
             "prompt_cache_hit_tokens": 900,
@@ -1588,9 +1698,8 @@ mod tests {
             ReasoningDialect::Inclusive,
             &raw,
         )
-        .expect("parses, wrongly");
-        assert_eq!(wrong.cache_read, 0);
-        assert_eq!(wrong.uncached_input, 1050);
+        .expect_err("the hit count is at a path this dialect does not read");
+        assert!(matches!(wrong, ProviderError::Decode { .. }), "{wrong:?}");
 
         let right = ChatCompletionsAdapter::normalize_usage(
             Protocol::Inclusive,
@@ -1600,9 +1709,94 @@ mod tests {
         )
         .expect("usage");
         assert_eq!(right.cache_read, 900);
-        // Same true total either way; only the billed split differs, which is exactly
-        // why it cannot be guessed from the URL.
-        assert_eq!(wrong.total_input(), right.total_input());
+        assert_eq!(right.total_input(), 1050);
+    }
+
+    #[test]
+    fn a_top_level_cached_tokens_is_read_as_the_cache_read_in_the_details_dialect() {
+        // Moonshot reports the hit count at the top level of `usage`.
+        let raw = json!({
+            "prompt_tokens": 1000,
+            "completion_tokens": 10,
+            "cached_tokens": 800
+        });
+        let usage = ChatCompletionsAdapter::normalize_usage(
+            Protocol::Inclusive,
+            UsageDialect::Details,
+            ReasoningDialect::Inclusive,
+            &raw,
+        )
+        .expect("usage");
+        assert_eq!(usage.cache_read, 800);
+        assert_eq!(usage.uncached_input, 200);
+        // The details field wins when both are present.
+        let both = json!({
+            "prompt_tokens": 1000,
+            "completion_tokens": 10,
+            "cached_tokens": 800,
+            "prompt_tokens_details": {"cached_tokens": 600}
+        });
+        let usage = ChatCompletionsAdapter::normalize_usage(
+            Protocol::Inclusive,
+            UsageDialect::Details,
+            ReasoningDialect::Inclusive,
+            &both,
+        )
+        .expect("usage");
+        assert_eq!(usage.cache_read, 600);
+        // Under the hit-and-miss dialect nothing reads it, so it raises.
+        let raw = json!({
+            "prompt_tokens": 1000,
+            "completion_tokens": 10,
+            "prompt_cache_hit_tokens": 0,
+            "prompt_cache_miss_tokens": 1000,
+            "cached_tokens": 800
+        });
+        ChatCompletionsAdapter::normalize_usage(
+            Protocol::Inclusive,
+            UsageDialect::HitAndMiss,
+            ReasoningDialect::Inclusive,
+            &raw,
+        )
+        .expect_err("an unread nonzero cached_tokens must raise");
+    }
+
+    #[test]
+    fn a_cache_named_key_with_a_non_count_value_reads_as_zero() {
+        for value in [
+            json!(null),
+            json!("n/a"),
+            json!(false),
+            json!({"note": "none", "count": 0}),
+        ] {
+            let raw = json!({
+                "prompt_tokens": 100,
+                "completion_tokens": 10,
+                "cache_status": value
+            });
+            ChatCompletionsAdapter::normalize_usage(
+                Protocol::Inclusive,
+                UsageDialect::Details,
+                ReasoningDialect::Inclusive,
+                &raw,
+            )
+            .unwrap_or_else(|e| panic!("{value} must not raise: {e:?}"));
+        }
+        // A nonzero number, or an object holding one, still raises.
+        for value in [json!(3), json!({"hit": {"tokens": 3}})] {
+            let raw = json!({
+                "prompt_tokens": 100,
+                "completion_tokens": 10,
+                "cache_status": value
+            });
+            ChatCompletionsAdapter::normalize_usage(
+                Protocol::Inclusive,
+                UsageDialect::Details,
+                ReasoningDialect::Inclusive,
+                &raw,
+            )
+            .expect_err("a nonzero unrecognized count must raise");
+        }
     }
 
     #[test]
@@ -2002,6 +2196,35 @@ mod tests {
     }
 
     #[test]
+    fn a_stop_finish_reason_with_tool_calls_is_a_tool_use() {
+        let adapter =
+            ChatCompletionsAdapter::new(config("https://example.invalid"), UsageDialect::Details)
+                .expect("adapter");
+        let mut body = details_body("compatible-model");
+        body["choices"][0]["message"] = json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{
+                "id": "call_1", "type": "function",
+                "function": {"name": "read", "arguments": "{}"}
+            }]
+        });
+        // finish_reason stays "stop", as a Gemini-compatible endpoint sends it.
+        assert_eq!(body["choices"][0]["finish_reason"], "stop");
+        let response = adapter
+            .parse_response("compatible-model", &body)
+            .expect("parse");
+        assert_eq!(response.stop_reason, StopReason::ToolUse);
+
+        // Without tool calls, stop stays a clean end of turn.
+        let plain = adapter
+            .parse_response("compatible-model", &details_body("compatible-model"))
+            .expect("parse");
+        assert_eq!(plain.stop_reason, StopReason::EndTurn);
+        assert_eq!(stop_reason_for("length", true), StopReason::MaxTokens);
+    }
+
+    #[test]
     fn an_unmodeled_finish_reason_is_not_mapped_onto_a_clean_end_turn() {
         let adapter =
             ChatCompletionsAdapter::new(config("https://example.invalid"), UsageDialect::Details)
@@ -2323,6 +2546,41 @@ mod tests {
         assert_eq!(response.usage.total_input(), 10);
         assert_eq!(response.usage.total_output(), 5);
         assert_eq!(settlement, Settlement::Counted);
+    }
+
+    #[tokio::test]
+    async fn a_streamed_stop_with_tool_calls_is_a_tool_use() {
+        let sse = concat!(
+            "data: {\"id\":\"c\",\"model\":\"compatible-model\",\"choices\":\
+             [{\"index\":0,\"delta\":{\"tool_calls\":[{\"id\":\"a\",\"type\":\"function\",\
+             \"function\":{\"name\":\"f\",\"arguments\":\"{}\"}}]}}]}\n\n",
+            "data: {\"id\":\"c\",\"model\":\"compatible-model\",\"choices\":\
+             [{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\
+             \"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n",
+        );
+        let (r, _, events) = probe(sse).await;
+        let response = r.expect("stream");
+        assert_eq!(response.stop_reason, StopReason::ToolUse);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            StreamEvent::Finished {
+                stop_reason: StopReason::ToolUse
+            }
+        )));
+    }
+
+    #[tokio::test]
+    async fn tool_calls_after_a_stop_chunk_still_make_the_turn_a_tool_use() {
+        let sse = concat!(
+            "data: {\"id\":\"c\",\"model\":\"compatible-model\",\"choices\":\
+             [{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"id\":\"c\",\"model\":\"compatible-model\",\"choices\":\
+             [{\"index\":0,\"delta\":{\"tool_calls\":[{\"id\":\"a\",\"type\":\"function\",\
+             \"function\":{\"name\":\"f\",\"arguments\":\"{}\"}}]}}],\
+             \"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n",
+        );
+        let (r, _, _) = probe(sse).await;
+        assert_eq!(r.expect("stream").stop_reason, StopReason::ToolUse);
     }
 
     #[tokio::test]

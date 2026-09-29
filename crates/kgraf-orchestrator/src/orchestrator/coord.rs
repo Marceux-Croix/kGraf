@@ -282,6 +282,11 @@ impl RunLoop {
     /// directly needs no extra checkout, mirroring the message bus's own
     /// `with_source_root` reindex just above ([`Self::write_comms`]).
     ///
+    /// The graph records that worktree as each file's source root, so a slice of
+    /// the merged code reads it from there (hash verified) until the change
+    /// reaches the checkout the store describes; a walk of the checkout then
+    /// clears the record.
+    ///
     /// Paths in a language [`kgraf_graph::Language::from_path`] does not
     /// recognize (docs, config, generated files) are left to the next full
     /// `kgraf index` walk, exactly as everywhere else the incremental indexer
@@ -388,8 +393,12 @@ impl RunLoop {
                 .collect();
         }
         c.tools = contract.tools.clone();
+        // The route is read for the resolver's sake, but only a genuine pin
+        // carries over as one: `route` is also set by the dispatch of an
+        // unpinned contract, and treating that assignment as a pin would tie
+        // the resolver (and a retry) to the route the contract was handed.
         c.route = contract.route.clone();
-        c.route_pinned = contract.route.is_some();
+        c.route_pinned = contract.route_pinned;
         c.base = Some(tip.to_owned());
         c.resolver_for = Some(contract.contract.clone());
         c.resolver_source = Some(source);

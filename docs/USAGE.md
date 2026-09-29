@@ -73,6 +73,19 @@ cargo run -p kgraf-cli -- partners ROADMAP.md
 
 `-C <dir>` points any command at another repository.
 
+Only `kgraf index` creates or rebuilds the index. `symbol`, `slice`, `query`, `partners` and
+`demand` open it read-only, and every other command opens an existing index without
+rebuilding it. Where there is no index, or it was written by another schema version, they
+stop and say to run `kgraf index`. A slice reads each node's lines from the file, and it
+stops with an error when the file changed after it was indexed; run `kgraf index` first. A
+name that matches more than one node is refused with the candidates listed (an exact
+qualified name still picks its one node).
+
+An index pass skips `target`, `node_modules`, `.git` and similar tool output at any depth,
+and `build`, `dist`, `venv` and the like only at the top level, so `src/build/` is indexed.
+It prints the excluded directories, files over 2 MiB, files whose bytes are not UTF-8, and
+any symbolic link or unreadable file whose indexed rows it kept.
+
 The graph chunks Rust, Python, TypeScript, TSX, JavaScript and Markdown with kGraf's own
 rules, and Go, Java, C, C++, Ruby, C# and PHP from each tree-sitter grammar's own tags
 query (the tags tier; a slice marks those members as resolved by name only). A call links
@@ -107,12 +120,17 @@ cargo run -p kgraf-cli -- providers
 cargo run -p kgraf-cli -- call --provider kimi --model <model-id> --record kimi.json
 cargo run -p kgraf-cli -- spend --prices prices.json
 cargo run -p kgraf-cli -- unreconciled
+cargo run -p kgraf-cli -- unreconciled resolve <call-id> --input 120 --output 30
+cargo run -p kgraf-cli -- unreconciled resolve <call-id> --no-charge
 cargo run -p kgraf-cli -- ledger verify
 cargo run -p kgraf-cli -- demand
 ```
 
 Every model call goes through the ledger. `spend` totals it (in dollars with a price
-table), `unreconciled` lists calls whose spend is not settled, `ledger verify` walks the
+table; `total unpriced` when no recorded model has a price), `unreconciled` lists calls
+whose spend is not settled, `unreconciled resolve` closes one with the usage the provider's
+own invoice shows (or `--no-charge` when the provider confirms it billed nothing), `ledger
+verify` walks the
 hash chain, and `ledger redact <call-id> --reason ...` removes a payload captured by
 accident while the chain still verifies. `demand` reports induced demand: whether
 runs offered workflow templates started more work than runs without. It claims no saving.
@@ -136,6 +154,14 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
 - kGraf sets no spend limit (decision 0080): set one in your provider's console. Every call
   is still on the ledger, and `kgraf spend` totals it. The concurrency caps are `--max-items`
   (default 4) and `--max-agents` (default 8).
+- A model the price table does not list still runs. The ledger keeps every call, and the
+  report and `kgraf spend` name its spend as unpriced (a local model as local, unpriced),
+  never as zero dollars. Routing never refuses or skips a route for lacking a price.
+- `orchestrate` exits non-zero unless the run completed: a run that ends blocked or
+  stopped is a failure to a script or a scheduler.
+- A planner answer that is not the JSON asked for, or a plan that breaks a rule, is asked
+  for again (at most twice, each ask on the ledger) with the refusal as a note, before the
+  run stops.
 - `--rate-limit ROUTE=RPM[/BURST][@MAX_WAIT_MS]` limits one route's call rate; a call that
   would wait too long fails loudly.
 - Every run indexes the working tree before it starts (incremental: about 65 ms warm and
@@ -143,8 +169,10 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   its merge, so workers read graph slices without a separate `kgraf index`. A graph that is
   still empty is reported as a notice.
 - An attempt that changes no file is accepted only when its check passes, and it is always
-  reported. It is refused when a declared Rust write target holds only `todo!`,
-  `unimplemented!` or `unreachable!` bodies (decision 0086).
+  reported. It is refused when a declared Rust write target holds only `todo!` or
+  `unimplemented!` bodies (decision 0086; `unreachable!` is not a marker), and an attempt
+  that did change files is refused when a declared target it left untouched held only such
+  bodies before the run.
 - Workers can build and test their own work (decision 0084). The build and test allowlist
   runs without approval, inside the sandbox with the network off: by default `cargo build`,
   `cargo check`, `cargo test`, `cargo clippy` and `cargo fmt --check`, each under argument
@@ -235,6 +263,11 @@ cargo run -p kgraf-cli -- schedule run-now nightly --route kimi:<model-id> --pri
   instruction. Each run is recorded on the node: start, outcome and spend by run id. The
   galaxy shows the schedule, its last run and any disable reason on the node's label.
   `remove` detaches the schedule; the node keeps its history.
+- `schedule run-now` refuses a schedule the claim table has disabled unless you pass
+  `--force`, and holds the schedule's run lock while it runs, so the scheduler does not
+  start the same schedule beside it and a second `run-now` is refused. `--verify` defaults to
+  the first test command the project's build files declare. A run that ends blocked or
+  stopped makes `orchestrate` exit non-zero, and `run-now` records it as failed.
 
 ## The desktop app
 
@@ -250,10 +283,20 @@ cargo run -p kgraf-shell --bin kgraf-app -- --probe
 - `--screenshot FILE` captures the window to a PNG after the first frame and
   `--screenshot-after` seconds (default 3), then quits.
 - Closing the window can leave the app in the tray, where scheduled runs fire.
+- **Updates.** Off by default: Settings > "Check for updates on start" lets the app read
+  the GitHub Releases of `Marceux-Croix/kGraf` at start, and "Check now" always checks.
+  This is the only network request the setting causes. An offered release counts on the
+  bell; its menu row says "kGraf <version> is available" and carries the button that
+  downloads it. Accepting twice queues one download. The download is checked against the
+  release's `SHA256SUMS` and refused when the line is missing or does not match. The
+  checksum file comes from the same release as the installer, so it detects a corrupt
+  download and does not prove who published it; a detached signature is not built yet.
 - The app builds runs from `.kgraf/run.json`: the `orchestrate` flags as JSON
-  (`routes`, `prices`, `cap_run` and the optional ones, snake case; unknown keys are
-  refused). There is no settings screen for routes yet, so write this file by hand.
-  Example: `{"routes": ["kimi:<model-id>"], "prices": "prices.json", "cap_run": 1.0}`.
+  (`routes`, `prices` and the optional ones, snake case; unknown keys are refused). An old
+  file that still sets `cap_run`, `cap_task` or `cap_hour` loads, prints one notice, and the
+  caps do nothing (decision 0080). There is no settings screen for routes yet, so write
+  this file by hand.
+  Example: `{"routes": ["kimi:<model-id>"], "prices": "prices.json"}`.
 - The settings file holds the compaction slider (5% to 95%, default 80%), the
   background-mode switch, the caps, the theme (device, dark or light), the color
   vision mode, reduced motion, whether the guide is open, and the open projects. Two

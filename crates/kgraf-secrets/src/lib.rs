@@ -78,41 +78,138 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock, RwLock};
 
-/// A `_`/`-`/`.`/space-separated word of a variable name that, matched whole
-/// (case-insensitive) against one of these, marks the name as holding a
-/// credential. See [`name_is_credential_shaped`], the one place this list is
-/// read: shared with `kgraf_sandbox`'s inherited-environment scrub, so a name
-/// is judged sensitive the same way in both places; each side of the sandbox
-/// boundary should raise it here, not add a second copy.
+/// Words of a variable name that, matched whole (case-insensitive), mark the
+/// name as holding a credential. See [`name_is_credential_shaped`], the one
+/// place these lists are read: shared with `kgraf_sandbox`'s
+/// inherited-environment scrub, so a name is judged sensitive the same way in
+/// both places; each side of the sandbox boundary should raise it here, not
+/// add a second copy.
 ///
 /// Matched as a whole word, not a substring: `"pat"` (a personal access
 /// token) must catch `GITLAB_PAT` without also catching `PATH` or `DB_PATH`,
-/// and `"auth"` must catch `BASIC_AUTH` without also catching `AUTHOR`.
+/// and `"auth"` must catch `BASIC_AUTH` without also catching `AUTHOR` or
+/// `OAUTH_CALLBACK_PORT`.
 pub const SECRET_NAME_NEEDLES: &[&str] = &[
     "key",
     "token",
     "secret",
     "password",
     "passwd",
+    "passphrase",
     "credential",
     "auth",
     "pat",
+    "dsn",
 ];
 
+/// Needles long enough to be matched inside a word, so a name written without
+/// separators (`APIKEY`, `ACCESSTOKEN`, `AWS_SESSIONTOKEN`, `PASSPHRASE`) is
+/// still caught. Short needles stay whole-word only (see
+/// [`SECRET_NAME_NEEDLES`]).
+pub const SECRET_NAME_SUBSTRINGS: &[&str] = &[
+    "apikey",
+    "accesskey",
+    "privatekey",
+    "secretkey",
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "passphrase",
+    "credential",
+];
+
+/// Words that contain a [`SECRET_NAME_SUBSTRINGS`] entry but name something
+/// else: a count of tokens (`MAX_TOKENS`), a tokenizer setting
+/// (`TOKENIZERS_PARALLELISM`), or a directory or file of secrets
+/// (`GOOGLE_APPLICATION_CREDENTIALS`, `SECRETS_DIR`), which holds a path, not
+/// a credential.
+pub const NOT_SECRET_WORDS: &[&str] = &[
+    "tokens",
+    "tokenizer",
+    "tokenizers",
+    "tokenize",
+    "tokenization",
+    "secrets",
+    "secretary",
+    "passwords",
+    "credentials",
+];
+
+/// How a variable name relates to credentials.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NameClass {
+    /// Not credential-shaped.
+    Ordinary,
+    /// The value is a credential (`API_KEY`, `DB_PASSWORD`).
+    Credential,
+    /// The value is a connection string (`DATABASE_URL`, `*_DSN`,
+    /// `*_CONNECTION_STRING`): it may carry a password, but most are a plain
+    /// host and port, so only the environment scrub treats the name alone as
+    /// sensitive.
+    Connection,
+}
+
+/// Split a name into lowercase words at every non-alphanumeric character and
+/// at camelCase boundaries: `apiKey` and `APIKey` both give `api`, `key`.
+fn name_words(name: &str) -> Vec<String> {
+    let chars: Vec<char> = name.chars().collect();
+    let mut words = Vec::new();
+    let mut cur = String::new();
+    for (i, &c) in chars.iter().enumerate() {
+        if !c.is_ascii_alphanumeric() {
+            if !cur.is_empty() {
+                words.push(std::mem::take(&mut cur));
+            }
+            continue;
+        }
+        if c.is_ascii_uppercase() && !cur.is_empty() {
+            let prev = chars[i - 1];
+            let next_lower = chars.get(i + 1).is_some_and(char::is_ascii_lowercase);
+            if prev.is_ascii_lowercase() || (prev.is_ascii_uppercase() && next_lower) {
+                words.push(std::mem::take(&mut cur));
+            }
+        }
+        cur.push(c.to_ascii_lowercase());
+    }
+    if !cur.is_empty() {
+        words.push(cur);
+    }
+    words
+}
+
+fn classify_name(name: &str) -> NameClass {
+    let words = name_words(name);
+    let credential = words.iter().any(|word| {
+        SECRET_NAME_NEEDLES.contains(&word.as_str())
+            || (!NOT_SECRET_WORDS.contains(&word.as_str())
+                && SECRET_NAME_SUBSTRINGS.iter().any(|n| word.contains(n)))
+    });
+    if credential {
+        return NameClass::Credential;
+    }
+    let pair = |a: &str, b: &str| words.windows(2).any(|w| w[0] == a && w[1] == b);
+    if pair("database", "url")
+        || pair("connection", "string")
+        || words
+            .iter()
+            .any(|w| w == "databaseurl" || w == "connectionstring")
+    {
+        return NameClass::Connection;
+    }
+    NameClass::Ordinary
+}
+
 /// Whether `name` (an environment variable or a dotenv key) is judged to hold
-/// a credential: one of its `_`/`-`/`.`/space-separated words matches a
-/// [`SECRET_NAME_NEEDLES`] entry exactly, case-insensitive. Word-based, not a
-/// raw substring test, so a needle chosen for a short, common abbreviation
-/// (`"pat"`, `"auth"`) does not also fire on an unrelated word that merely
-/// contains it (`PATH`, `AUTHOR`).
+/// a credential: a word of it (split at separators and camelCase boundaries)
+/// matches a [`SECRET_NAME_NEEDLES`] entry, or contains a
+/// [`SECRET_NAME_SUBSTRINGS`] entry and is not in [`NOT_SECRET_WORDS`]; or it
+/// names a connection string (`DATABASE_URL`, `*_DSN`, `*_CONNECTION_STRING`).
+/// Case-insensitive. The short needles (`pat`, `auth`) are whole-word only, so
+/// they do not fire on an unrelated word that merely contains them (`PATH`,
+/// `AUTHOR`).
 pub fn name_is_credential_shaped(name: &str) -> bool {
-    name.split(|c: char| !c.is_ascii_alphanumeric())
-        .filter(|word| !word.is_empty())
-        .any(|word| {
-            SECRET_NAME_NEEDLES
-                .iter()
-                .any(|needle| word.eq_ignore_ascii_case(needle))
-        })
+    classify_name(name) != NameClass::Ordinary
 }
 
 /// The shortest exact secret value the registry acts on. Matches
@@ -120,6 +217,24 @@ pub fn name_is_credential_shaped(name: &str) -> bool {
 /// (`"2.0"`, an empty API key placeholder) is ordinary text, and removing every
 /// occurrence of it would corrupt unrelated output rather than protect anything.
 pub const MIN_EXACT_SECRET_LEN: usize = 8;
+
+/// The shortest value registered under a credential-shaped name. Below this a
+/// value (`1`, `on`, `abc`) is a flag or a fragment, and redacting every
+/// occurrence of it would corrupt unrelated text.
+pub const MIN_CREDENTIAL_NAMED_LEN: usize = 4;
+
+/// Whether `value`, set under a credential-shaped name, is an unfilled
+/// template rather than a secret: a known placeholder, a run of `x` or `*`,
+/// `<...>` or `${...}`.
+fn is_literal_placeholder(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    PLACEHOLDERS.iter().any(|p| *p == lower)
+        || lower == "change-me"
+        || lower == "change_me"
+        || lower.chars().all(|c| c == 'x' || c == '*')
+        || (lower.starts_with('<') && lower.ends_with('>'))
+        || (lower.starts_with("${") && lower.ends_with('}'))
+}
 
 /// `generic-api-key`'s own entropy floor (bits per byte of the captured
 /// value), the only rule this crate enforces one for; see the module docs and
@@ -436,17 +551,23 @@ impl Scrubber {
     /// Register a dotenv file's text (`NAME=value` lines, `export ` prefixes,
     /// quotes and `#` comments understood) as exact secrets of kind `dotenv`,
     /// and return how many were newly registered. Only a pair worth treating
-    /// as a credential is even offered to the registry: its name contains one
-    /// of [`SECRET_NAME_NEEDLES`] (`API_KEY`, `GH_TOKEN`, `DB_PASSWORD`, ...),
-    /// or its value matches one of this crate's own gitleaks-derived pattern
-    /// rules regardless of its name. Everything else -- a target triple, a
-    /// model name, an IP address, a log filter, a relative path, a toolchain
-    /// date -- is ordinary configuration and is never registered, so it is
-    /// never redacted from unrelated text that happens to contain the same
-    /// bytes. The same refusals as [`Scrubber::register_exact_secret`] apply
-    /// to what is offered, but are not said: a dotenv file's ordinary values
-    /// are filtered out above, not reported as a credential kGraf will not
-    /// scrub. No value is ever logged.
+    /// as a credential is even offered to the registry: its name is
+    /// credential-shaped ([`name_is_credential_shaped`]: `API_KEY`,
+    /// `GH_TOKEN`, `DB_PASSWORD`, `apiKey`, ...), or its value matches one of
+    /// this crate's own gitleaks-derived pattern rules regardless of its name.
+    /// Everything else -- a target triple, a model name, an IP address, a log
+    /// filter, a relative path, a toolchain date -- is ordinary configuration
+    /// and is never registered, so it is never redacted from unrelated text
+    /// that happens to contain the same bytes.
+    ///
+    /// A credential-named value is registered whatever its shape (see
+    /// `register_credential_named`): `POSTGRES_PASSWORD=postgres`
+    /// and a webhook URL are secrets. It is refused only when empty, under
+    /// [`MIN_CREDENTIAL_NAMED_LEN`] or an unfilled template, and a refusal is
+    /// said with the variable name, never the value. A connection-string name
+    /// (`DATABASE_URL`) and a pattern-matched value under an ordinary name go
+    /// through the general checks of [`Scrubber::register_exact_secret`],
+    /// unsaid. No value is ever logged.
     ///
     /// Why (decision 0084): a checkout-root `.env` usually holds the user's
     /// vendor keys. A worker's build output reaches its model provider; the
@@ -454,17 +575,43 @@ impl Scrubber {
     /// every tool result, transcript and trace should one appear anyway.
     pub fn register_dotenv(&self, text: &str) -> usize {
         dotenv_pairs(text)
-            .filter(|(name, value)| self.dotenv_worth_registering(name, value))
-            .filter(|(_, value)| self.register("dotenv", value, false) == Registration::Registered)
+            .filter_map(|(name, value)| {
+                if classify_name(name) == NameClass::Credential {
+                    Some(self.register_credential_named(name, value))
+                } else if !self.pattern_spans(value).is_empty() {
+                    // A connection string (`DATABASE_URL`) is registered only
+                    // when the value itself carries a credential.
+                    Some(self.register("dotenv", value, false))
+                } else {
+                    None
+                }
+            })
+            .filter(|outcome| *outcome == Registration::Registered)
             .count()
     }
 
-    /// Whether a dotenv pair looks like a credential: its name is
-    /// [`SECRET_NAME_NEEDLES`]-shaped, or its value matches a pattern rule on
-    /// its own (an AWS key, a bare hex token, ... regardless of the name it
-    /// was assigned to).
-    fn dotenv_worth_registering(&self, name: &str, value: &str) -> bool {
-        name_is_credential_shaped(name) || !self.pattern_spans(value).is_empty()
+    /// Register the value of a credential-named variable. The name already
+    /// says it is a secret, so the shape checks that guard the general path
+    /// (word, path, URL, low entropy) do not apply: `POSTGRES_PASSWORD=postgres`,
+    /// a base64 secret that starts with `/` and a webhook URL are all
+    /// registered. Refused: an empty value (normal, silent), a value under
+    /// [`MIN_CREDENTIAL_NAMED_LEN`], and a literal placeholder
+    /// ([`is_literal_placeholder`]). A refusal is said with the variable name
+    /// only, never the value.
+    fn register_credential_named(&self, name: &str, value: &str) -> Registration {
+        let value = value.trim();
+        if value.is_empty() {
+            return Registration::TooShort;
+        }
+        if value.chars().count() < MIN_CREDENTIAL_NAMED_LEN {
+            self.refuse(name, value, "it is too short to scrub safely");
+            return Registration::TooShort;
+        }
+        if is_literal_placeholder(value) {
+            self.refuse(name, value, "it looks like a placeholder");
+            return Registration::Placeholder;
+        }
+        self.insert_exact("dotenv", value)
     }
 
     fn register(&self, kind: &str, value: &str, report: bool) -> Registration {
@@ -491,6 +638,10 @@ impl Scrubber {
             }
             return outcome;
         }
+        self.insert_exact(kind, value)
+    }
+
+    fn insert_exact(&self, kind: &str, value: &str) -> Registration {
         let mut secrets = self.exact.write().unwrap_or_else(|e| e.into_inner());
         if secrets.iter().any(|(_, v)| v == value) {
             return Registration::AlreadyKnown;
@@ -1421,7 +1572,7 @@ mod tests {
         // A hash in a git log is not a key.
         assert_not_redacted_persist(&s, "commit a1b2c3d4e5f6 by Jane <jane@example.com>");
         assert_not_redacted_persist(&s, "the cache-key for this workflow is main-branch");
-        // The exact false positive the security review found: a low-entropy
+        // A known false positive: a low-entropy
         // assignment whose value is an ordinary identifier.
         assert_not_redacted_persist(&s, "stats.code_tokens = code_spent;");
     }
@@ -1678,7 +1829,7 @@ mod tests {
         );
     }
 
-    // -- L2: every keyword in `generic-api-key`'s alternation, one mutation
+    // -- Every keyword in `generic-api-key`'s alternation, one mutation
     //    each -----------
 
     #[test]
@@ -1813,9 +1964,9 @@ mod tests {
         }
     }
 
-    /// Lines the security review's probe reported as `generic-api-key`
-    /// matches before the entropy gate and allowlist were restored. A
-    /// representative sample across the shapes the review named (code
+    /// Lines that were reported as `generic-api-key` matches before the
+    /// entropy gate and allowlist were restored. A
+    /// representative sample across the shapes seen (code
     /// assignments, SQL, test fixtures, comments), not the full list, kept
     /// small and readable; the full-tree regression above covers every
     /// tracked file, this one documents *why* by example.
@@ -2394,5 +2545,158 @@ mod tests {
         let a = global() as *const Scrubber;
         let b = global() as *const Scrubber;
         assert_eq!(a, b, "global() must return the same instance every call");
+    }
+
+    /// A credential-shaped name registers its value even when the value alone
+    /// would pass for a word, a path or a URL.
+    #[test]
+    fn credential_named_dotenv_values_are_registered_whatever_their_shape() {
+        let s = fresh();
+        let values = [
+            "postgres",
+            "mysecretpassword",
+            "/kD3+vQ9zXa1LmP7wR2tYc8B/Nf5hJ0sGq4Ue6Ow==",
+            "https://hooks.example.test/T000/B000/XXXXXXXX",
+        ];
+        let text = format!(
+            "POSTGRES_PASSWORD={}\nDB_PASSWORD={}\nJWT_SECRET={}\nSLACK_WEBHOOK_TOKEN={}\n",
+            values[0], values[1], values[2], values[3]
+        );
+        assert_eq!(s.register_dotenv(&text), 4);
+        assert!(s.take_refusal_notices().is_empty());
+        for v in values {
+            let shown = format!("log: {v} end");
+            let out = s.scrub_model_facing(&shown);
+            assert!(!out.contains(v), "{v} survived: {out}");
+        }
+    }
+
+    /// A credential-named value that is empty, tiny or an unfilled template is
+    /// not registered. Each refusal but the empty one is said, naming the
+    /// variable and never the value.
+    #[test]
+    fn credential_named_refusals_name_the_variable_not_the_value() {
+        let s = fresh();
+        let text = "EMPTY_PASSWORD=\n\
+                    TINY_TOKEN=ab1\n\
+                    A_SECRET=changeme\n\
+                    B_TOKEN=xxxxxx\n\
+                    C_API_KEY=<your key here>\n\
+                    D_PASSWORD=${DB_PASSWORD}\n";
+        assert_eq!(s.register_dotenv(text), 0);
+        let notices = s.take_refusal_notices();
+        assert_eq!(notices.len(), 5, "{notices:?}");
+        for (notice, name) in notices.iter().zip([
+            "TINY_TOKEN",
+            "A_SECRET",
+            "B_TOKEN",
+            "C_API_KEY",
+            "D_PASSWORD",
+        ]) {
+            assert!(notice.contains(name), "{notice}");
+        }
+        let all = notices.join(" ");
+        for value in [
+            "ab1",
+            "changeme",
+            "xxxxxx",
+            "your key here",
+            "${DB_PASSWORD}",
+        ] {
+            assert!(!all.contains(value), "value {value} leaked: {all}");
+        }
+    }
+
+    /// A connection-string name is registered only when the value itself
+    /// carries a credential.
+    #[test]
+    fn connection_string_names_register_only_a_value_with_userinfo() {
+        let s = fresh();
+        assert_eq!(
+            s.register_dotenv("DATABASE_URL=postgres://db.internal:5432/app\n"),
+            0
+        );
+        let url = "postgres://app:Zq8LmXv3Rt7Kp2Wd@db.internal:5432/app";
+        assert_eq!(s.register_dotenv(&format!("DATABASE_URL={url}\n")), 1);
+    }
+
+    #[test]
+    fn credential_names_without_separators_or_in_camel_case_are_matched() {
+        for name in [
+            "APIKEY",
+            "OPENAI_APIKEY",
+            "ACCESSTOKEN",
+            "AWS_SESSIONTOKEN",
+            "SESSIONTOKEN",
+            "PASSPHRASE",
+            "apiKey",
+            "accessToken",
+            "clientSecret",
+            "APIKey",
+            "DATABASE_URL",
+            "TEST_DATABASE_URL",
+            "SENTRY_DSN",
+            "DB_CONNECTION_STRING",
+            "GITLAB_PAT",
+            "SSH_AUTH_SOCK",
+        ] {
+            assert!(name_is_credential_shaped(name), "{name} not matched");
+        }
+    }
+
+    /// The explicit exemption list, and the whole-word short needles, keep
+    /// ordinary names out.
+    #[test]
+    fn credential_name_exemptions_hold() {
+        for name in [
+            "PATH",
+            "DB_PATH",
+            "AUTHOR_NAME",
+            "OAUTH_CALLBACK_PORT",
+            "MAX_TOKENS",
+            "TOKENIZERS_PARALLELISM",
+            "SECRETS_DIR",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "DATABASE_HOST",
+            "MONKEY",
+            "keyboardLayout",
+        ] {
+            assert!(!name_is_credential_shaped(name), "{name} matched");
+        }
+        for word in NOT_SECRET_WORDS {
+            assert!(
+                SECRET_NAME_SUBSTRINGS.iter().any(|n| word.contains(n)),
+                "{word} is exempt from nothing"
+            );
+        }
+        for needle in SECRET_NAME_SUBSTRINGS {
+            assert!(
+                name_is_credential_shaped(&format!("X_{needle}_Y")),
+                "{needle}"
+            );
+        }
+        for needle in SECRET_NAME_NEEDLES {
+            assert!(
+                name_is_credential_shaped(&format!("X_{needle}")),
+                "{needle}"
+            );
+        }
+    }
+
+    /// A key followed by a list, call, JSON or sentence delimiter is found.
+    #[test]
+    fn a_vendor_key_before_a_closing_delimiter_is_redacted() {
+        let s = fresh();
+        let secret = format!("hf_{}", "a".repeat(34));
+        for d in [",", ")", "]", "}", ">", ".", ":"] {
+            assert_redacted_persist(
+                &s,
+                &format!("x {secret}{d} y"),
+                "huggingface-access-token",
+                &secret,
+            );
+        }
+        // A longer run of letters is a different string, still not matched.
+        assert_not_redacted_persist(&s, &format!("x {secret}a, y"));
     }
 }

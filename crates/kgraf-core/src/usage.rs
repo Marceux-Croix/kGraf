@@ -166,19 +166,70 @@ impl TokenUsage {
     /// per field rather than to sum. A widely repeated belief that the delta
     /// carries only output tokens is true of the legacy examples and false of
     /// the current schema, so every field is merged, not just the output ones.
+    ///
+    /// A zero in `delta` is read as "not reported" here, since a normalized
+    /// delta cannot tell an absent field from a reported zero. A caller that
+    /// can tell uses [`Self::merge_cumulative_reported`], so a later event's
+    /// explicit zero is taken rather than left as the earlier, larger figure.
     pub fn merge_cumulative(&mut self, delta: &TokenUsage) {
-        fn take_last(target: &mut u64, seen: u64) {
-            if seen > 0 {
+        self.merge_cumulative_reported(delta, ReportedFields::nonzero(delta));
+    }
+
+    /// [`Self::merge_cumulative`], taking exactly the fields `reported` names,
+    /// including a reported zero.
+    pub fn merge_cumulative_reported(&mut self, delta: &TokenUsage, reported: ReportedFields) {
+        fn take_last(target: &mut u64, seen: u64, reported: bool) {
+            if reported {
                 *target = seen;
             }
         }
-        take_last(&mut self.uncached_input, delta.uncached_input);
-        take_last(&mut self.cache_read, delta.cache_read);
-        take_last(&mut self.cache_write, delta.cache_write);
-        take_last(&mut self.text_output, delta.text_output);
-        take_last(&mut self.reasoning_output, delta.reasoning_output);
+        take_last(
+            &mut self.uncached_input,
+            delta.uncached_input,
+            reported.uncached_input,
+        );
+        take_last(&mut self.cache_read, delta.cache_read, reported.cache_read);
+        take_last(
+            &mut self.cache_write,
+            delta.cache_write,
+            reported.cache_write,
+        );
+        take_last(
+            &mut self.text_output,
+            delta.text_output,
+            reported.text_output,
+        );
+        take_last(
+            &mut self.reasoning_output,
+            delta.reasoning_output,
+            reported.reasoning_output,
+        );
         if delta.raw.is_some() {
             self.raw = delta.raw.clone();
+        }
+    }
+}
+
+/// Which fields of a usage delta the provider actually reported, as opposed
+/// to fields that read as zero because the event never carried them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReportedFields {
+    pub uncached_input: bool,
+    pub cache_read: bool,
+    pub cache_write: bool,
+    pub text_output: bool,
+    pub reasoning_output: bool,
+}
+
+impl ReportedFields {
+    /// Every field whose value in `usage` is nonzero.
+    pub fn nonzero(usage: &TokenUsage) -> Self {
+        Self {
+            uncached_input: usage.uncached_input > 0,
+            cache_read: usage.cache_read > 0,
+            cache_write: usage.cache_write > 0,
+            text_output: usage.text_output > 0,
+            reasoning_output: usage.reasoning_output > 0,
         }
     }
 }
@@ -242,6 +293,31 @@ mod tests {
         });
         assert_eq!(usage.text_output, 40);
         // The field absent from the second event survives the merge.
+        assert_eq!(usage.uncached_input, 100);
+    }
+
+    #[test]
+    fn a_reported_zero_in_a_later_cumulative_event_is_taken() {
+        let mut usage = TokenUsage {
+            uncached_input: 100,
+            cache_read: 900,
+            text_output: 20,
+            ..TokenUsage::default()
+        };
+        // The later event reports cache_read as zero and says so; it does not
+        // mention uncached_input at all.
+        usage.merge_cumulative_reported(
+            &TokenUsage::default(),
+            ReportedFields {
+                cache_read: true,
+                ..ReportedFields::default()
+            },
+        );
+        assert_eq!(usage.cache_read, 0, "an explicit zero is taken");
+        assert_eq!(usage.uncached_input, 100, "an unreported field survives");
+        assert_eq!(usage.text_output, 20);
+        // The plain merge still reads a zero as not reported.
+        usage.merge_cumulative(&TokenUsage::default());
         assert_eq!(usage.uncached_input, 100);
     }
 

@@ -5,10 +5,11 @@
 // doc comment).
 // Changes: dropped the `ApplyPatchFileUpdateMode::PreserveLineEndings` branch (and
 // the `text_file::SourceFile` type it needed) along with the parameter that
-// selected it. kGraf always normalizes an updated file to LF, matching
-// upstream's historical (and still default) behavior; a worker that needs exact
-// line-ending preservation is a future extension, not a silent gap (fail loud: the
-// omission is stated here, not hidden).
+// selected it. The same result comes from a simpler rule in `derive_new_contents`:
+// the file's dominant line ending (LF or CRLF) and its final-newline state are
+// detected first, the edit runs on LF lines, and both are put back afterward. A
+// file with mixed endings takes its dominant one on the lines it rewrites as a
+// whole (the join uses one ending).
 // Also added (not ported): each `Err` case now appends
 // `seek_sequence::describe_mismatch`'s diagnostic -- see that function's doc
 // comment for why. It only adds text to an error message a caller already
@@ -144,14 +145,39 @@ pub(crate) fn apply_replacements(
     lines
 }
 
-/// Apply `chunks` to `original`, returning the new file contents. Lines are
-/// normalized to LF (see this module's doc comment).
+/// The dominant line ending of `text`: CRLF when more than half of its line
+/// feeds follow a carriage return, LF otherwise (and for a file with no line
+/// feed at all).
+fn uses_crlf(text: &str) -> bool {
+    let feeds = text.matches('\n').count();
+    let crlf = text.matches("\r\n").count();
+    feeds > 0 && crlf * 2 > feeds
+}
+
+/// Apply `chunks` to `original`, returning the new file contents. The file
+/// keeps its own line ending (LF or CRLF) and its final-newline state: a file
+/// that did not end in a newline still does not, and one that did still does.
+/// The edit itself runs on LF lines, so patch lines (always LF) match a CRLF
+/// file exactly.
 pub(crate) fn derive_new_contents(
     original: &str,
     path: &str,
     chunks: &[UpdateFileChunk],
 ) -> Result<String, String> {
-    let mut original_lines: Vec<String> = original.split('\n').map(String::from).collect();
+    let crlf = uses_crlf(original);
+    let ending = if crlf { "\r\n" } else { "\n" };
+    let final_newline = original.is_empty() || original.ends_with('\n');
+    let mut original_lines: Vec<String> = original
+        .split('\n')
+        .map(|line| {
+            let line = if crlf {
+                line.strip_suffix('\r').unwrap_or(line)
+            } else {
+                line
+            };
+            line.to_owned()
+        })
+        .collect();
     // Drop the trailing empty element that results from the final newline so
     // that line counts match the behaviour of standard `diff`.
     if original_lines.last().is_some_and(String::is_empty) {
@@ -160,10 +186,13 @@ pub(crate) fn derive_new_contents(
 
     let replacements = compute_replacements(&original_lines, path, chunks)?;
     let mut new_lines = apply_replacements(original_lines, &replacements);
-    if !new_lines.last().is_some_and(String::is_empty) {
+    if new_lines.is_empty() {
+        return Ok(String::new());
+    }
+    if final_newline {
         new_lines.push(String::new());
     }
-    Ok(new_lines.join("\n"))
+    Ok(new_lines.join(ending))
 }
 
 #[cfg(test)]
@@ -186,6 +215,43 @@ mod tests {
         let chunks = update_chunks("*** Update File: f\n@@\n foo\n-bar\n+baz");
         let new = derive_new_contents("foo\nbar\nqux\n", "f", &chunks).expect("applies");
         assert_eq!(new, "foo\nbaz\nqux\n");
+    }
+
+    /// A CRLF file stays CRLF on every line, not just the rewritten ones.
+    #[test]
+    fn a_crlf_file_keeps_its_line_endings() {
+        let chunks = update_chunks("*** Update File: f\n@@\n foo\n-bar\n+baz\n+extra");
+        let new = derive_new_contents("foo\r\nbar\r\nqux\r\n", "f", &chunks).expect("applies");
+        assert_eq!(new, "foo\r\nbaz\r\nextra\r\nqux\r\n");
+        // A pure addition at the end keeps them too.
+        let chunks = update_chunks("*** Update File: f\n@@\n+tail");
+        let new = derive_new_contents("a\r\nb\r\n", "f", &chunks).expect("applies");
+        assert_eq!(new, "a\r\nb\r\ntail\r\n");
+    }
+
+    /// An LF file stays LF, and a file whose last line has no newline does
+    /// not gain one; a file that ended in a newline keeps it.
+    #[test]
+    fn the_final_newline_state_is_kept() {
+        let chunks = update_chunks("*** Update File: f\n@@\n foo\n-bar\n+baz");
+        assert_eq!(
+            derive_new_contents("foo\nbar", "f", &chunks).expect("applies"),
+            "foo\nbaz"
+        );
+        assert_eq!(
+            derive_new_contents("foo\nbar\n", "f", &chunks).expect("applies"),
+            "foo\nbaz\n"
+        );
+        assert_eq!(
+            derive_new_contents("foo\r\nbar", "f", &chunks).expect("applies"),
+            "foo\r\nbaz"
+        );
+        // A pure addition to a file with no final newline.
+        let chunks = update_chunks("*** Update File: f\n@@\n+tail");
+        assert_eq!(
+            derive_new_contents("only", "f", &chunks).expect("applies"),
+            "only\ntail"
+        );
     }
 
     #[test]

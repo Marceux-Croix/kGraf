@@ -23,7 +23,7 @@
 use crate::run_state::GroundingTrigger;
 use crate::sizing::ProjectionSource;
 use kgraf_session::SessionError;
-use kgraf_session::transcript::{JsonlTranscript, Transcript};
+use kgraf_session::transcript::{JsonlTranscript, TornTail, Transcript};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -502,11 +502,21 @@ pub struct TraceLog {
 }
 
 impl TraceLog {
-    /// Open or create; an existing trace (a resumed run) is appended to.
+    /// Open or create; an existing trace (a resumed run) is appended to. A
+    /// torn last line is refused: see [`TraceLog::open_repairing`].
     pub async fn open(path: &Path) -> Result<Self, SessionError> {
         Ok(Self {
             file: JsonlTranscript::open(path.to_path_buf()).await?,
         })
+    }
+
+    /// As [`TraceLog::open`], for the run that owns the trace: a torn last
+    /// line (a kill mid-append) is dropped and returned, so the caller
+    /// records what was lost and the run resumes; other corruption is still
+    /// refused.
+    pub async fn open_repairing(path: &Path) -> Result<(Self, Option<TornTail>), SessionError> {
+        let (file, torn) = JsonlTranscript::open_repairing_torn_tail(path.to_path_buf()).await?;
+        Ok((Self { file }, torn))
     }
 
     pub async fn record(&mut self, event: TraceEvent) -> Result<(), SessionError> {
@@ -634,7 +644,7 @@ mod tests {
         assert!(text.contains(r#""event":"empty_graph_lookup""#));
     }
 
-    /// Task H1: `TraceLog::record` scrubs both a registered exact secret and a
+    /// `TraceLog::record` scrubs both a registered exact secret and a
     /// gitleaks-shaped pattern secret out of every free-text trace field,
     /// covering the fields the review named (a verdict's `reason`/`detail`,
     /// a gate's `detail`, a report's `note`, a message's `detail`).

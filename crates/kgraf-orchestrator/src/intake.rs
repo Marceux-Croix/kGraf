@@ -171,6 +171,8 @@ async fn interpret_inner(
 
     let basis = asker.caller.cost_basis();
     let input = bound_tokens(prepared.brief().system) + bound_tokens(&prepared.brief().user);
+    // An unpriced model's hold is zero: the call is made and ledgered, and its
+    // spend is unknown, never a known `$0` (decision 0075).
     let estimate = parts
         .prices
         .cost(
@@ -182,10 +184,7 @@ async fn interpret_inner(
                 u64::from(basis.max_output_tokens),
             ),
         )
-        .map_err(|_| OrchestratorError::Unpriced {
-            what: "the interpretation call".into(),
-            model: basis.model.clone(),
-        })?;
+        .unwrap_or(Money::ZERO);
     let key = run.to_string();
     let held = HeldCall {
         admission: parts.admission,

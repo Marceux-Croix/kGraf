@@ -21,7 +21,7 @@
 //! test this worktree": `--manifest-path` is relative, inside the worktree and
 //! never through `..`; `--config`, `-Z`, `--target-dir`, `--artifact-dir`,
 //! `-C`, `--lockfile-path`, a `+toolchain` and a target spec file are refused;
-//! `cargo fmt` needs `--check`; `cargo clippy --fix` is refused; arguments after
+//! `cargo fmt` needs `--check` (cargo's own, or rustfmt's after `--`); `cargo clippy --fix` is refused; arguments after
 //! `--` are held to the test harness's and clippy's own short lists.
 //!
 //! **The rules are not the security boundary.** `cargo test` runs code the
@@ -426,11 +426,18 @@ fn check_cargo(sub: CargoSubcommand, args: &[String]) -> Result<(), String> {
     // `cargo test NAME`: one bare filter word is the test name filter.
     let bare_allowed = if sub == CargoSubcommand::Test { 1 } else { 0 };
     check_options(own, &lists, ATTACHABLE, bare_allowed, filter_value)?;
-    if sub == CargoSubcommand::FmtCheck && !own.iter().any(|a| a == "--check") {
+    // `cargo fmt --all -- --check` hands `--check` to rustfmt, which is the
+    // same check-only mode as cargo's own `--check`.
+    let rustfmt_check = passthrough == ["--check"];
+    if sub == CargoSubcommand::FmtCheck
+        && !own.iter().any(|a| a == "--check")
+        && !passthrough.iter().any(|a| a == "--check")
+    {
         return Err("`cargo fmt` rewrites files unless it has `--check`".into());
     }
     match sub {
         _ if split.is_none() => Ok(()),
+        CargoSubcommand::FmtCheck if rustfmt_check => Ok(()),
         CargoSubcommand::Test => check_options(
             passthrough,
             &[HARNESS_OPTIONS],
@@ -712,6 +719,8 @@ mod tests {
             "clippy::too_many_lines",
         ]);
         allowed(&["cargo", "fmt", "--all", "--check"]);
+        allowed(&["cargo", "fmt", "--all", "--", "--check"]);
+        allowed(&["cargo", "fmt", "--check", "--", "--check"]);
         allowed(&["cargo", "build", "--manifest-path", "crates/x/Cargo.toml"]);
         allowed(&["cargo", "build", "--target", "aarch64-apple-darwin"]);
         allowed(&["cargo", "test", "--features", "serde/derive", "--release"]);
@@ -768,6 +777,12 @@ mod tests {
         refused(&["cargo", "test", "--", "-Z", "unstable-options"], "-Z");
         refused(&["cargo", "fmt"], "--check");
         refused(&["cargo", "fmt", "--all"], "--check");
+        refused(&["cargo", "fmt", "--all", "--"], "--check");
+        refused(
+            &["cargo", "fmt", "--", "--check", "--emit", "files"],
+            "after `--`",
+        );
+        refused(&["cargo", "fmt", "--", "--check=false"], "--check");
         refused(
             &["cargo", "fmt", "--check", "--", "--emit", "files"],
             "after `--`",

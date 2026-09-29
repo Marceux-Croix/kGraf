@@ -71,6 +71,12 @@ pub fn set(root: &Path, consent: Consent) -> Result<()> {
         Consent::Unset => "a run that needs a fetch asks first (or stops, when nobody can answer)",
     };
     println!("crates.io: {} ({what})", consent.name());
+    if consent == Consent::Allowed {
+        println!(
+            "{}",
+            kgraf_host::deps::worker_fetch_scope(Registry::CratesIo)
+        );
+    }
     Ok(())
 }
 

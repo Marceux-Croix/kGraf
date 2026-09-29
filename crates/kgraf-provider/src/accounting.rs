@@ -1764,14 +1764,17 @@ impl Ledger {
     /// `parent_call` to say so) and takes the median gap between
     /// consecutive `started_ms` values within each agent's own calls on this
     /// route, then the median of those per-agent medians across agents.
+    /// Only settled, counted calls are read: a refused, failed or open call
+    /// carries no usage and would drag both medians toward zero.
     /// `tok_r` is the median of `usage.uncached_input + usage.cache_read +
-    /// usage.total_output()` across every call on the route. Both are
+    /// usage.cache_write + usage.total_output()` across every counted call on
+    /// the route. Both are
     /// `None` (design: "20 s is the default until then") until the route has
     /// at least [`ROUTE_STATS_MIN_ROUNDS`] calls.
     pub fn route_round_stats(&self, route: &str) -> Result<RouteRoundStats, LedgerError> {
         let calls = self.read(|conn| {
             let mut stmt = conn.prepare(&format!(
-                "SELECT {CALL_COLUMNS} FROM calls WHERE route = ?1 ORDER BY agent_id, started_ms"
+                "SELECT {CALL_COLUMNS} FROM calls WHERE route = ?1 AND settlement = 'counted' ORDER BY agent_id, started_ms"
             ))?;
             let rows = stmt.query_map(rusqlite::params![route], record_from_row)?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -1809,7 +1812,12 @@ impl Ledger {
         let round_ms = (!per_agent_medians.is_empty()).then(|| median_u64(&mut per_agent_medians));
         let mut tokens: Vec<u64> = calls
             .iter()
-            .map(|c| c.usage.uncached_input + c.usage.cache_read + c.usage.total_output())
+            .map(|c| {
+                c.usage.uncached_input
+                    + c.usage.cache_read
+                    + c.usage.cache_write
+                    + c.usage.total_output()
+            })
             .collect();
         let tokens_per_round = (!tokens.is_empty()).then(|| median_u64(&mut tokens));
         Ok(RouteRoundStats {
@@ -5784,6 +5792,48 @@ mod tests {
         // the median index depends on how many rounds the loop above ran.
         let tokens = stats.tokens_per_round.expect("enough rounds for a median");
         assert!((100..=121).contains(&tokens), "{tokens}");
+    }
+
+    /// Refused, failed and open calls carry no usage and are not rounds; a
+    /// counted call's cache writes are tokens the route processed.
+    #[test]
+    fn route_round_stats_reads_only_counted_calls_and_includes_cache_writes() {
+        let ledger = Ledger::open_in_memory().expect("ledger");
+        for _ in 0..ROUTE_STATS_MIN_ROUNDS {
+            let token = ledger
+                .begin("r", Protocol::Additive, "m", "agent-a", "task")
+                .expect("begin");
+            token.record_route("r").expect("record route");
+            token
+                .settle(
+                    &TokenUsage {
+                        uncached_input: 10,
+                        cache_write: 1_000,
+                        text_output: 1,
+                        ..TokenUsage::default()
+                    },
+                    None,
+                )
+                .expect("settle");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        // Many refused or failed calls and one open call on the same route.
+        for _ in 0..(ROUTE_STATS_MIN_ROUNDS * 3) {
+            let token = ledger
+                .begin("r", Protocol::Additive, "m", "agent-a", "task")
+                .expect("begin");
+            token.record_route("r").expect("record route");
+            token.fail().expect("fail");
+        }
+        let open = ledger
+            .begin("r", Protocol::Additive, "m", "agent-a", "task")
+            .expect("begin");
+        open.record_route("r").expect("record route");
+        open.leave_unreconciled(None).expect("leave open");
+
+        let stats = ledger.route_round_stats("r").expect("stats");
+        assert_eq!(stats.rounds, ROUTE_STATS_MIN_ROUNDS, "counted calls only");
+        assert_eq!(stats.tokens_per_round, Some(1_011), "cache write included");
     }
 
     /// Decision 0067: two catalog routes that speak

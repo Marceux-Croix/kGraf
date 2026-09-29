@@ -553,7 +553,9 @@ impl LearnedRate {
 
 /// Debounces a changing [`Capacity`] so the slider does not jitter (design,
 /// "A new maximum takes effect only when it differs by more than 10% (or by
-/// 2) on three readings in a row").
+/// 2) on three readings in a row"). Each of the three limits is tested on its
+/// own: a change of writers or execution slots commits as a change of agents
+/// does, even when the agent maximum stays put.
 #[derive(Debug, Default)]
 pub struct Hysteresis {
     committed: Option<(u32, u32, u32)>,
@@ -584,7 +586,10 @@ impl Hysteresis {
             self.streak = 0;
             return Some(c.clone());
         };
-        if !differs_enough(committed.0, key.0) {
+        let enough = differs_enough(committed.0, key.0)
+            || differs_enough(committed.1, key.1)
+            || differs_enough(committed.2, key.2);
+        if !enough {
             self.candidate = None;
             self.streak = 0;
             return None;
@@ -860,6 +865,39 @@ mod tests {
             assert_eq!(h.observe(&cap_of(11)), None);
         }
         assert_eq!(h.committed(), Some((10, 1, 1)));
+    }
+
+    /// The agent maximum stays put while the writers, then the execution
+    /// slots, change enough: each commits on its third reading.
+    #[test]
+    fn hysteresis_commits_a_change_of_writers_or_exec_slots_alone() {
+        let with = |max_writers, exec_slots| Capacity {
+            max_agents: 10,
+            max_writers,
+            exec_slots,
+            bounds: Vec::new(),
+        };
+        let mut h = Hysteresis::new();
+        h.observe(&with(2, 2));
+        assert_eq!(h.observe(&with(8, 2)), None);
+        assert_eq!(h.observe(&with(8, 2)), None);
+        assert_eq!(
+            h.observe(&with(8, 2)).map(|c| c.max_writers),
+            Some(8),
+            "writers moved on the third reading"
+        );
+        assert_eq!(h.observe(&with(8, 9)), None);
+        assert_eq!(h.observe(&with(8, 9)), None);
+        assert_eq!(
+            h.observe(&with(8, 9)).map(|c| c.exec_slots),
+            Some(9),
+            "exec slots moved on the third reading"
+        );
+        assert_eq!(h.committed(), Some((10, 8, 9)));
+        // Jitter within the threshold on either still never commits.
+        for _ in 0..5 {
+            assert_eq!(h.observe(&with(9, 10)), None);
+        }
     }
 
     #[test]

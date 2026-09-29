@@ -1,4 +1,4 @@
-//! The orchestrator host against real runs (M7): a real orchestrator loop
+//! The orchestrator host against real runs: a real orchestrator loop
 //! built by a factory over the orchestrator crate's own fakes (fake providers that
 //! settle real call tokens, a real ledger and graph store), hosted by the shell's
 //! `OrchestratorHost` exactly as the window hosts it.
@@ -423,7 +423,7 @@ fn stop_then_play_resumes_the_same_run() {
     assert_eq!(r.verified_contracts, ["a", "b"]);
 }
 
-/// N5: the window's quit starts the stop off the UI thread and returns at once;
+/// The window's quit starts the stop off the UI thread and returns at once;
 /// the receiver answers when the run has stopped, saved as stopped.
 #[test]
 fn start_shutdown_returns_at_once_and_answers_when_the_run_stops() {
@@ -457,7 +457,7 @@ fn start_shutdown_returns_at_once_and_answers_when_the_run_stops() {
     assert!(host.start_shutdown().is_none(), "nothing left to stop");
 }
 
-/// L4: closing the window (dropping the host) stops a hosted run for real, within
+/// Closing the window (dropping the host) stops a hosted run for real, within
 /// the bound: its record is saved as stopped, not left running.
 #[test]
 fn closing_the_window_stops_the_run() {

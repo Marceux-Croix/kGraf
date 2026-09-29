@@ -194,7 +194,7 @@ struct Candidate {
     /// Set for an unmeasured route with no `PriceTable` entry:
     /// never an error, never excluded, always traced. `true` for
     /// a local route (ranked at `$0`), `false` for a hosted one (cost stays
-    /// unknown; ranks last on cost, same as before this ruling).
+    /// unknown; ranks last on cost, same as before local routes ranked at `$0`).
     unpriced: Option<bool>,
 }
 
@@ -293,8 +293,7 @@ fn from_tally(r: &RouteInfo, source: FigureSource, t: &KindTally) -> Candidate {
 
 /// Resolve a candidate's cost figure and its "unpriced" label from a known
 /// cost (`None` when unpriced, whether from a missing `PriceTable` entry or
-/// `model_profile`'s own `unpriced` count) and the route's locality (owner
-/// ruling, 2026-09-28): a local route with no known cost is free to call, so
+/// `model_profile`'s own `unpriced` count) and the route's locality: a local route with no known cost is free to call, so
 /// it ranks at `$0`; a hosted route's cost stays genuinely unknown and ranks
 /// on measured satisfaction rate instead ([`rank_key`]), last on cost when
 /// nothing is measured either.
@@ -318,8 +317,7 @@ fn apply_floor(mut candidates: Vec<Candidate>, kind: TaskKind) -> Vec<Candidate>
 }
 
 /// Rank key: measured beats unmeasured; within a tier, lower cost per
-/// satisfied task wins. When cost is unknown (`unpriced` and hosted, owner
-/// ruling 2026-09-28), cost sorts last within the tier and a higher measured
+/// satisfied task wins. When cost is unknown (`unpriced` and hosted), cost sorts last within the tier and a higher measured
 /// satisfaction rate breaks the tie, so an unpriced hosted route with a good
 /// record still outranks one with a poor or absent one. Every other tie sorts
 /// last within its tier rather than panicking a comparator.

@@ -87,7 +87,7 @@ impl RunStore {
 
     /// Validate and write the record.
     ///
-    /// **Does not scrub; intake does** (decision 0071, owner's H2 ruling).
+    /// **Does not scrub; intake does** (decision 0071).
     /// Scrubbing the whole serialized record here was built and reverted: a
     /// `RegexSet` scan of the whole record on nearly every state transition,
     /// plus several threads racing to build the scrubber, made a lease
@@ -188,9 +188,8 @@ impl RunStore {
     }
 
     /// Clear a run's marker (a finished run is not resumed).
-    /// Fold the WAL into graph.db and truncate it (decision 0071, review 4
-    /// L-2): old page images of rewritten run records otherwise stay in the
-    /// WAL file. Best effort; see `GraphStore::checkpoint_wal`.
+    /// Fold the WAL into graph.db and truncate it (decision 0071): old page
+    /// images of rewritten run records otherwise stay in the WAL file. Best effort; see `GraphStore::checkpoint_wal`.
     pub fn checkpoint_wal(&self) {
         let _ = self.with(|g| Ok(g.checkpoint_wal()?));
     }
@@ -290,7 +289,7 @@ mod tests {
         assert_eq!(store.load(&RunId::new("missing")).expect("load"), None);
     }
 
-    /// Decision 0071, H2: text is scrubbed at intake, and `save` stays a
+    /// Text is scrubbed at intake, and `save` stays a
     /// plain write (see its doc for the measured reason).
     #[test]
     fn save_stores_what_it_is_given_and_intake_is_where_text_is_scrubbed() {

@@ -192,7 +192,10 @@ fn overlaps(a: &Path, b: &Path, case: PathCase) -> bool {
     match case {
         PathCase::Sensitive => a.starts_with(b) || b.starts_with(a),
         PathCase::Insensitive => {
-            let fold = |p: &Path| PathBuf::from(p.to_string_lossy().to_lowercase());
+            // The same fold the write-scope and merge checks use (NFKC, case
+            // folding, ignorable code points, trailing dots and spaces), so
+            // an NFC and an NFD spelling of one name are one path here too.
+            let fold = |p: &Path| PathBuf::from(kgraf_core::paths::fold_path(p));
             let (a, b) = (fold(a), fold(b));
             a.starts_with(&b) || b.starts_with(&a)
         }
@@ -312,6 +315,25 @@ mod tests {
         let b = read("src/lib.rs");
         assert!(!a.conflicts_with(&b, PathCase::Sensitive));
         assert!(a.conflicts_with(&b, PathCase::Insensitive));
+    }
+
+    /// On a folding volume, spellings the file system resolves to one name
+    /// overlap: NFC and NFD, the long s, a trailing dot, a zero-width joiner.
+    /// A case-sensitive volume keeps them apart.
+    #[test]
+    fn folded_spellings_conflict_on_a_folding_filesystem() {
+        for (x, y) in [
+            ("caf\u{e9}/a.rs", "cafe\u{301}/a.rs"),
+            ("sample.rs", "\u{17F}ample.rs"),
+            ("a/b.rs", "a./b.rs"),
+            ("src/lib.rs", "src/li\u{200B}b.rs"),
+            ("Dir", "dir/inner.rs"),
+        ] {
+            let (a, b) = (write(x), write(y));
+            assert!(a.conflicts_with(&b, PathCase::Insensitive), "{x:?} {y:?}");
+            assert!(!a.conflicts_with(&b, PathCase::Sensitive), "{x:?} {y:?}");
+        }
+        assert!(!write("a/b.rs").conflicts_with(&write("a/c.rs"), PathCase::Insensitive));
     }
 
     #[test]

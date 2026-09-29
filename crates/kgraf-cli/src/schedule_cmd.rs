@@ -12,12 +12,15 @@
 //! separate SQLite file `kgraf_schedule::ScheduleStore` already owns
 //! (`.kgraf/schedule.db`), unchanged; `list` reads both and shows them together.
 //!
-//! **`run-now`** does not go through the claim table at all: it is a manual,
-//! immediate, single invocation, not a background race between instances, so it
-//! reuses `orchestrate_cmd::run` directly (the same live, ledgered, capped code path
-//! `kgraf orchestrate` uses) with the stored instruction written to a temporary
-//! file. Its start and outcome are still recorded on the schedule's node. The
-//! scheduler loop that *does* use the claim table lives in
+//! **`run-now`** is a manual, immediate, single invocation. It reuses
+//! `orchestrate_cmd::run` directly (the same live, ledgered code path `kgraf
+//! orchestrate` uses) with the stored instruction written to a temporary file, and
+//! its start and outcome are recorded on the schedule's node. It respects the claim
+//! table: a schedule the table has disabled is refused unless `--force`, and it
+//! takes the schedule's manual lock (`ScheduleStore::claim_manual_run`) for the
+//! length of the run, so the scheduler loop does not start the same schedule
+//! beside it and a second `run-now` is refused. It records no occurrence. The
+//! scheduler loop that uses the claim table lives in
 //! `kgraf-orchestrator::scheduler_loop` and is driven from `kgraf-shell`'s
 //! background mode.
 
@@ -26,7 +29,7 @@ use kgraf_core::PriceTable;
 use kgraf_graph::GraphStore;
 use kgraf_provider::Ledger;
 use kgraf_schedule::node_store::{self, EventKind, NodeChoice, RunRecord};
-use kgraf_schedule::{MissedRunPolicy, ScheduleDefinition, ScheduleStore};
+use kgraf_schedule::{ManualClaim, MissedRunPolicy, ScheduleDefinition, ScheduleStore};
 use std::path::{Path, PathBuf};
 
 use crate::orchestrate_cmd::{self, OrchestrateArgs};
@@ -52,7 +55,11 @@ pub struct RunNowArgs {
     pub steps: u32,
     pub max_tokens: u32,
     pub window: u64,
-    pub verify: String,
+    /// `--verify`; without it, the first validation command the project's build
+    /// files declare.
+    pub verify: Option<String>,
+    /// `--force`: run although the claim table has the schedule disabled.
+    pub force: bool,
     /// `--shell-timeout` (decision 0084).
     pub shell_timeout: Option<std::time::Duration>,
     /// `--fetch-deps` / `--no-fetch-deps` (decision 0087).
@@ -63,7 +70,7 @@ pub struct RunNowArgs {
 /// a work node, printing one notice per schedule (the move is visible, never
 /// silent). A schedule that cannot move keeps its old row and is named.
 fn open(root: &Path) -> Result<GraphStore> {
-    let graph = crate::open_graph(root)?;
+    let graph = crate::open_graph_facts(root)?;
     for m in node_store::migrate_legacy(&graph, chrono::Utc::now())
         .context("cannot move old schedules onto work nodes")?
     {
@@ -384,6 +391,120 @@ pub fn remove(root: &Path, id: &str) -> Result<()> {
 /// `orchestrate` path `kgraf orchestrate` uses (readiness, admission, spend caps
 /// and the ledger all apply exactly as they do there).
 pub fn run_now(root: &Path, args: RunNowArgs) -> Result<()> {
+    run_now_with(root, args, orchestrate_cmd::run)
+}
+
+/// How long a manual run's lock lasts without a renewal, and how often the
+/// holder renews it. A holder that died stops blocking the loop within the lease.
+const MANUAL_LEASE: std::time::Duration = std::time::Duration::from_secs(120);
+const MANUAL_RENEW: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The manual lock on a schedule, renewed by a thread until it is dropped.
+struct ManualRunLock {
+    path: PathBuf,
+    schedule_id: String,
+    holder: String,
+    stop: Option<std::sync::mpsc::Sender<()>>,
+    heartbeat: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ManualRunLock {
+    /// Take the lock, or say why not: disabled (unless `force`) or busy.
+    fn take(root: &Path, schedule_id: &str, holder: &str, force: bool) -> Result<Self> {
+        let path = crate::state_dir(root)?.join("schedule.db");
+        let claims = ScheduleStore::open(&path).context("cannot open the claim table")?;
+        match claims
+            .claim_manual_run(schedule_id, holder, chrono::Utc::now(), MANUAL_LEASE, force)
+            .context("cannot take the schedule's run lock")?
+        {
+            ManualClaim::Claimed { .. } => {}
+            ManualClaim::Disabled { reason } => bail!(
+                "schedule `{schedule_id}` is disabled in the claim table ({reason}); \
+                 `kgraf schedule enable {schedule_id}` clears that, or pass --force to run it once"
+            ),
+            ManualClaim::Busy { holder } => bail!(
+                "schedule `{schedule_id}` is already running: {holder}; wait for it to finish"
+            ),
+        }
+        let (stop, wait) = std::sync::mpsc::channel::<()>();
+        let (beat_path, beat_id, beat_holder) =
+            (path.clone(), schedule_id.to_owned(), holder.to_owned());
+        let heartbeat = std::thread::spawn(move || {
+            // Its own connection: a connection is not shared across threads.
+            let Ok(claims) = ScheduleStore::open(&beat_path) else {
+                return;
+            };
+            // Ends when the sender is dropped or sends.
+            while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                wait.recv_timeout(MANUAL_RENEW)
+            {
+                match claims.renew_manual_run(
+                    &beat_id,
+                    &beat_holder,
+                    chrono::Utc::now(),
+                    MANUAL_LEASE,
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        eprintln!("warning: the run lock on `{beat_id}` was lost");
+                        return;
+                    }
+                    Err(e) => {
+                        eprintln!("warning: could not renew the run lock on `{beat_id}`: {e}")
+                    }
+                }
+            }
+        });
+        Ok(Self {
+            path,
+            schedule_id: schedule_id.to_owned(),
+            holder: holder.to_owned(),
+            stop: Some(stop),
+            heartbeat: Some(heartbeat),
+        })
+    }
+}
+
+impl Drop for ManualRunLock {
+    fn drop(&mut self) {
+        drop(self.stop.take());
+        if let Some(heartbeat) = self.heartbeat.take() {
+            let _ = heartbeat.join();
+        }
+        let released = ScheduleStore::open(&self.path)
+            .and_then(|claims| claims.release_manual_run(&self.schedule_id, &self.holder));
+        if let Err(e) = released {
+            eprintln!(
+                "warning: could not release the run lock on `{}`: {e}",
+                self.schedule_id
+            );
+        }
+    }
+}
+
+/// The verify command for a manual run: the flag, else the first validation
+/// command the project's build files declare. A project with neither has none,
+/// and the run does not start with a command nobody chose.
+fn verify_command(root: &Path, flag: Option<String>) -> Result<String> {
+    if let Some(command) = flag {
+        return Ok(command);
+    }
+    let found = kgraf_host::discover_validation_commands(root, &[])
+        .context("cannot look for the project's test command")?;
+    let first = found.into_iter().next().context(
+        "no --verify command was given and the project's build files declare none; \
+         pass --verify",
+    )?;
+    println!("verify     {first} (from the project's build files)");
+    Ok(first)
+}
+
+/// `run_now` with the run itself injected, so a test can stand in for a live run.
+fn run_now_with(
+    root: &Path,
+    args: RunNowArgs,
+    orchestrate: impl FnOnce(&Path, OrchestrateArgs) -> Result<()>,
+) -> Result<()> {
     let graph = open(root)?;
     let schedules = node_store::load_all(&graph).context("cannot read the schedules")?;
     let def = schedules
@@ -402,6 +523,7 @@ pub fn run_now(root: &Path, args: RunNowArgs) -> Result<()> {
         );
     }
 
+    let verify = verify_command(root, args.verify.clone())?;
     let tmp =
         tempfile::NamedTempFile::new().context("cannot create a temporary instruction file")?;
     std::fs::write(tmp.path(), &def.instruction)
@@ -418,6 +540,10 @@ pub fn run_now(root: &Path, args: RunNowArgs) -> Result<()> {
     let suffix: u32 = rand_suffix();
     let run_id =
         kgraf_orchestrator::sanitize_id(&format!("sched-{}-{unix_seconds}-{suffix:08x}", args.id));
+
+    // The schedule's lock, held until this function returns: a disabled schedule
+    // is refused here, and so is one that is already running.
+    let _lock = ManualRunLock::take(root, &args.id, &format!("run-now:{run_id}"), args.force)?;
 
     // `run-now` never claims an occurrence
     // (this file's own module doc explains why), so without this its spend would be
@@ -454,7 +580,7 @@ pub fn run_now(root: &Path, args: RunNowArgs) -> Result<()> {
     };
     record(EventKind::Started, "manual run-now", None);
     let prices_path = args.prices.clone();
-    let result = orchestrate_cmd::run(
+    let result = orchestrate(
         root,
         OrchestrateArgs {
             routes: args.routes,
@@ -469,7 +595,7 @@ pub fn run_now(root: &Path, args: RunNowArgs) -> Result<()> {
             max_tokens: args.max_tokens,
             window: args.window,
             point: None,
-            verify: args.verify,
+            verify,
             interactive: false,
             gate_commands: Vec::new(),
             gate_timeout: std::time::Duration::from_secs(1800),
@@ -630,13 +756,14 @@ mod tests {
     fn add_on_a_node_then_remove_keeps_the_history_on_the_node() {
         let dir = tempfile::tempdir().expect("dir");
         let root = dir.path();
+        drop(crate::open_graph_for_index(root).expect("graph"));
         let err = add(root, add_args(root, "nightly", Some("p1/w1"))).expect_err("no node");
         assert!(
             format!("{err:#}").contains("no work node `p1/w1`"),
             "{err:#}"
         );
         {
-            let graph = crate::open_graph(root).expect("graph");
+            let graph = crate::open_graph_for_index(root).expect("graph");
             assert!(graph.schedules().expect("read").is_empty());
             graph
                 .put_work(
@@ -666,7 +793,7 @@ mod tests {
         }
         add(root, add_args(root, "nightly", Some("p1/w1"))).expect("add");
         remove(root, "nightly").expect("remove");
-        let graph = crate::open_graph(root).expect("graph");
+        let graph = crate::open_graph_for_index(root).expect("graph");
         assert!(graph.schedule("nightly").expect("read").is_none());
         let history: Vec<String> = graph
             .node_schedule_events("p1/w1", 10)
@@ -686,7 +813,7 @@ mod tests {
         let old = ScheduleDefinition::recurring("legacy", "Old task", "0 0 3 * * *", "UTC")
             .expect("valid");
         {
-            let graph = crate::open_graph(root).expect("graph");
+            let graph = crate::open_graph_for_index(root).expect("graph");
             graph
                 .set_meta(
                     &kgraf_schedule::schedule_key("legacy"),
@@ -695,7 +822,7 @@ mod tests {
                 .expect("meta");
         }
         list(root, None).expect("list");
-        let graph = crate::open_graph(root).expect("graph");
+        let graph = crate::open_graph_for_index(root).expect("graph");
         let all = node_store::load_all(&graph).expect("load");
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].node_id, "schedules/legacy");
@@ -714,14 +841,14 @@ mod tests {
         let dir = tempfile::tempdir().expect("dir");
         let root = dir.path();
         {
-            let graph = crate::open_graph(root).expect("graph");
+            let graph = crate::open_graph_for_index(root).expect("graph");
             graph
                 .set_meta(&kgraf_schedule::schedule_key("broken"), "{not json")
                 .expect("meta");
         }
         list(root, None).expect("list");
         remove(root, "broken").expect("remove");
-        let graph = crate::open_graph(root).expect("graph");
+        let graph = crate::open_graph_for_index(root).expect("graph");
         assert!(
             graph
                 .meta(&kgraf_schedule::schedule_key("broken"))
@@ -879,5 +1006,181 @@ mod tests {
             report.contains("1 unreconciled"),
             "the still-open call must be shown apart, not folded into the total, got {report}"
         );
+    }
+
+    fn run_now_args(id: &str, force: bool) -> RunNowArgs {
+        RunNowArgs {
+            id: id.to_owned(),
+            routes: vec!["ollama:llama3".to_owned()],
+            planner: None,
+            prices: PathBuf::from("no-such-prices.json"),
+            max_items: 1,
+            max_agents: 1,
+            steps: 1,
+            max_tokens: 16,
+            window: 1000,
+            verify: Some("true".to_owned()),
+            force,
+            shell_timeout: None,
+            fetch_deps: kgraf_host::deps::RunFetch::Stored,
+        }
+    }
+
+    fn scheduled(root: &Path) {
+        drop(crate::open_graph_for_index(root).expect("graph"));
+        add(root, add_args(root, "nightly", None)).expect("add");
+    }
+
+    fn events(root: &Path) -> Vec<String> {
+        let graph = crate::open_graph_for_index(root).expect("graph");
+        let mut all: Vec<String> = graph
+            .schedule_events("nightly", 20)
+            .expect("events")
+            .into_iter()
+            .map(|e| e.event)
+            .collect();
+        all.reverse();
+        all
+    }
+
+    /// A run that ends blocked is an error from the run, and `run-now` records
+    /// it as failed, not completed.
+    #[test]
+    fn a_blocked_run_is_recorded_as_failed() {
+        let dir = tempfile::tempdir().expect("dir");
+        let root = dir.path();
+        scheduled(root);
+        let blocked = |_: &Path, _: OrchestrateArgs| -> Result<()> {
+            let report =
+                crate::orchestrate_cmd::test_report(kgraf_orchestrator::RunStatus::Blocked {
+                    reason: "needs the user".into(),
+                });
+            crate::orchestrate_cmd::ensure_completed(&report)
+        };
+        let error = run_now_with(root, run_now_args("nightly", false), blocked)
+            .expect_err("a blocked run fails");
+        assert!(format!("{error:#}").contains("needs the user"), "{error:#}");
+        let recorded = events(root);
+        assert_eq!(
+            recorded.last().map(String::as_str),
+            Some("failed"),
+            "{recorded:?}"
+        );
+        assert!(!recorded.iter().any(|e| e == "completed"), "{recorded:?}");
+    }
+
+    #[test]
+    fn a_completed_run_is_recorded_as_completed() {
+        let dir = tempfile::tempdir().expect("dir");
+        let root = dir.path();
+        scheduled(root);
+        run_now_with(root, run_now_args("nightly", false), |_, _| Ok(())).expect("ok");
+        assert_eq!(events(root).last().map(String::as_str), Some("completed"));
+    }
+
+    fn disable(root: &Path) {
+        let claims = open_claims(root).expect("claims");
+        let now = chrono::Utc::now();
+        let generation = match claims
+            .claim_occurrence("nightly", now, "loop", now, Duration::from_secs(60))
+            .expect("claim")
+        {
+            ClaimOutcome::Claimed { generation, .. } => generation,
+            ClaimOutcome::NotClaimed => panic!("expected the claim to succeed"),
+        };
+        claims
+            .record_outcome(
+                "nightly",
+                now,
+                "loop",
+                generation,
+                &kgraf_schedule::RunOutcome::Failed(kgraf_schedule::FailureClass::Disabling(
+                    kgraf_schedule::DisableReason::ConfigurationMissing {
+                        detail: "no such route".into(),
+                    },
+                )),
+            )
+            .expect("disable");
+    }
+
+    /// A schedule the claim table disabled is refused, and `--force` runs it.
+    #[test]
+    fn a_claim_table_disable_refuses_run_now_unless_forced() {
+        let dir = tempfile::tempdir().expect("dir");
+        let root = dir.path();
+        scheduled(root);
+        disable(root);
+        let mut ran = false;
+        let error = run_now_with(root, run_now_args("nightly", false), |_, _| {
+            ran = true;
+            Ok(())
+        })
+        .expect_err("disabled");
+        assert!(!ran, "the run must not start");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("disabled") && text.contains("--force"),
+            "{text}"
+        );
+
+        let mut ran = false;
+        run_now_with(root, run_now_args("nightly", true), |_, _| {
+            ran = true;
+            Ok(())
+        })
+        .expect("forced");
+        assert!(ran);
+    }
+
+    /// While a run-now is running, a second one is refused and the scheduler
+    /// loop cannot claim the schedule; afterwards both work again.
+    #[test]
+    fn a_running_run_now_holds_the_schedule_and_releases_it() {
+        let dir = tempfile::tempdir().expect("dir");
+        let root = dir.path();
+        scheduled(root);
+        let inner = std::cell::RefCell::new(None);
+        run_now_with(root, run_now_args("nightly", false), |_, _| {
+            let second = run_now_with(root, run_now_args("nightly", false), |_, _| Ok(()));
+            let claims = open_claims(root).expect("claims");
+            let now = chrono::Utc::now();
+            let loop_claim = claims
+                .claim_occurrence(
+                    "nightly",
+                    now - chrono::Duration::seconds(1),
+                    "loop",
+                    now,
+                    Duration::from_secs(60),
+                )
+                .expect("claim");
+            *inner.borrow_mut() = Some((second, loop_claim));
+            Ok(())
+        })
+        .expect("outer");
+        let (second, loop_claim) = inner.into_inner().expect("ran");
+        let text = format!("{:#}", second.expect_err("second is refused"));
+        assert!(text.contains("already running"), "{text}");
+        assert_eq!(loop_claim, ClaimOutcome::NotClaimed);
+
+        // Released: another run-now works, and the held occurrence is claimable.
+        run_now_with(root, run_now_args("nightly", false), |_, _| Ok(())).expect("again");
+    }
+
+    #[test]
+    fn verify_falls_back_to_the_projects_own_test_command() {
+        let dir = tempfile::tempdir().expect("dir");
+        let root = dir.path();
+        assert_eq!(
+            verify_command(root, Some("make check".into())).expect("flag"),
+            "make check"
+        );
+        let none = verify_command(root, None).expect_err("nothing declared");
+        assert!(format!("{none:#}").contains("--verify"), "{none:#}");
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"scripts": {"test": "jest"}}"#,
+        )
+        .expect("write");
+        assert_eq!(verify_command(root, None).expect("npm"), "npm test");
     }
 }

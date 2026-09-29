@@ -404,7 +404,7 @@ mod tests {
         );
     }
 
-    /// L7: a poll reads the full value of only the records that changed.
+    /// A poll reads the full value of only the records that changed.
     #[test]
     fn only_changed_records_are_read_again() {
         let (dir, store) = project();
@@ -431,7 +431,7 @@ mod tests {
         assert_eq!(watch.values_read(), read + 1);
     }
 
-    /// N2: two saves in the same millisecond with the same length are both seen
+    /// Two saves in the same millisecond with the same length are both seen
     /// (the digest is a content hash, not length and `updated_ms`).
     #[test]
     fn two_same_millisecond_same_length_saves_are_both_seen() {
@@ -450,7 +450,7 @@ mod tests {
         assert_eq!(newest(&runs).expect("r1").verified_contracts, ["b"]);
     }
 
-    /// L10: a run whose lease a live process holds is reported as leased.
+    /// A run whose lease a live process holds is reported as leased.
     #[test]
     fn a_run_held_by_a_live_process_is_reported_as_leased() {
         let (dir, store) = project();

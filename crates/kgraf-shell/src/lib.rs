@@ -100,7 +100,7 @@ const WINDOW_ICON_PX: u32 = 256;
 /// The window's application id: the Wayland `app_id` and the X11 `WM_CLASS`
 /// class (eframe passes it to winit through its `wayland` and `x11`
 /// features). The Linux desktop entry's `StartupWMClass` must equal it, so
-/// the dock groups the window under the entry (L8).
+/// the dock groups the window under the entry.
 pub const APP_ID: &str = "kgraf";
 const TRAY_ICON_PX: u32 = 64;
 
@@ -339,7 +339,6 @@ pub fn run_with_host(
             let capacity_volumes = capacity_bg::Volumes::default();
             capacity_volumes.set(settings.projects.clone());
             let capacity = Some(capacity_bg::CapacityHandle::spawn(
-                machine_gate.clone(),
                 capacity_volumes,
                 wake.clone(),
             ));

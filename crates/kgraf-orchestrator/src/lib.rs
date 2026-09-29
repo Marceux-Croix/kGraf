@@ -163,7 +163,7 @@ pub use interface_review::{
 };
 pub use orchestrator::sessions::{
     AnswerOutput, AnswerRequest, ConnectionRequest, ConnectionVerdict, JudgeOutput, JudgeRequest,
-    QuestionAnswerer, SessionNoticeSink,
+    QuestionAnswerer, SESSION_CALL_TIMEOUT, SessionNoticeSink,
 };
 pub use orchestrator::{
     AttemptEnv, AttemptEnvs, CloseEnv, CompactError, DEFAULT_MAX_CONTRACTS_PER_PLAN,

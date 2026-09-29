@@ -28,7 +28,7 @@ pub fn default_path() -> Option<PathBuf> {
 
 /// The environment variable that overrides [`default_path`]: a test harness
 /// (or a user diagnosing something unusual) points diagnostics at a chosen
-/// file instead of the real per-user one. Reviewed in 2026-09-27 after a test
+/// file instead of the real per-user one. Hardened after a test
 /// run wrote 140 lines into the owner's actual
 /// `~/Library/Application Support/kGraf/diagnostics.jsonl`: every test that
 /// exercises a real binary must set this.

@@ -643,7 +643,7 @@ fn paused_cmd(cmd: &[&str]) -> kgraf_tools::approval::PausedCall {
     .expect("paused")
 }
 
-/// L5: a rule added to the file after the desk opened (at the CLI's terminal, or
+/// A rule added to the file after the desk opened (at the CLI's terminal, or
 /// by hand) covers the next ask without restarting anything.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_rule_added_on_disk_is_seen_at_the_next_ask() {
@@ -669,7 +669,7 @@ async fn a_rule_added_on_disk_is_seen_at_the_next_ask() {
     );
 }
 
-/// M1 with a real rule store: allow always on an ask whose worker was aborted
+/// With a real rule store: allow always on an ask whose worker was aborted
 /// is refused, and no rule reaches the file.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn allow_always_for_an_aborted_worker_records_no_rule() {

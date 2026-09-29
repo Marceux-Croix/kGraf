@@ -16,7 +16,7 @@
 //! the command reads them. The shell has no settings surface for routes yet, so the
 //! file is written by hand. With no file, or an invalid one, `configured()` fails
 //! with the reason, and `SchedulerLoop::tick` checks this *before* claiming anything
-//! (H2), so nothing is claimed or disabled for a fact true of the whole process: it
+//!, so nothing is claimed or disabled for a fact true of the whole process: it
 //! reports `TickEvent::NotRunnable` every tick, and the tray line shows the reason
 //! (logged once per distinct reason). The file is read again on each check until
 //! it opens, so adding it needs no restart; a later change of its content
@@ -27,7 +27,7 @@
 //! (`kgraf_host::host::DEFAULT_BUILD_TIMEOUT`), so lease renewal and stop wait at most that long
 //! for it.
 //!
-//! **Where a schedule lives (H4).** A schedule is a property of a work node
+//! **Where a schedule lives.** A schedule is a property of a work node
 //! (decision 0052 section 3). Each tick opens the project's graph for writing, moves
 //! any schedule still in the old graph-meta layout onto a work node (logged, and
 //! said on the tray line), records the tick's events as history rows on each
@@ -39,11 +39,11 @@
 //! only), the log says which. The claim table, not history, decides whether a node
 //! shows its schedule disabled.
 //!
-//! **What the tray shows.** The tray shows one aggregate line (H5): a schedule
+//! **What the tray shows.** The tray shows one aggregate line: a schedule
 //! count and how many are failing, never a per-schedule list. Per-schedule detail is
 //! on each schedule's work node in the graph.
 //!
-//! **What this thread never does** (M2): it never creates a project's `graph.db`
+//! **What this thread never does**: it never creates a project's `graph.db`
 //! just because `--project` pointed at it - a missing file reads as "no schedules",
 //! not an error. An existing one is opened for writing, as the run host already
 //! opens it, so run history can be recorded. The claim table (`schedule.db`) is this
@@ -72,8 +72,8 @@ use crate::schedule_store;
 /// occurrence still fires within one interval of becoming due.
 pub const TICK_INTERVAL: Duration = Duration::from_secs(20);
 
-/// How often the shutdown flag is polled while waiting for the next tick (H3:
-/// "stop reacts promptly" - bounded to this, not to a whole `TICK_INTERVAL`).
+/// How often the shutdown flag is polled while waiting for the next tick
+/// ("stop reacts promptly" - bounded to this, not to a whole `TICK_INTERVAL`).
 const STOP_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Where a project's scheduled-run settings live (see the module doc).
@@ -346,7 +346,7 @@ impl ProjectFactory {
     }
 
     /// A scheduled run's spend, read from the open host's ledger by run id and
-    /// priced from its price table, for the run's history row on its node (H4):
+    /// priced from its price table, for the run's history row on its node:
     /// settled micro-dollars, the call count, and the calls whose spend is not known
     /// counted apart. A reclaimed occurrence shares its run id with the
     /// abandoned attempt, so its spend includes that attempt's calls. `None` when no
@@ -472,17 +472,17 @@ impl OrchestratorFactory for ProjectFactory {
     }
 }
 
-/// One aggregate line the tray shows (H5): a count, never a per-schedule
+/// One aggregate line the tray shows: a count, never a per-schedule
 /// list. `kgraf schedule list` and the graph view are where the detail lives.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScheduleSummary {
     total: usize,
     failing: usize,
-    /// M3: every failure path in this thread (opening the runtime, the claim table,
+    /// Every failure path in this thread (opening the runtime, the claim table,
     /// `.kgraf`, reading definitions, building a schedule) sets this instead of
     /// leaving the previous, now-stale summary in place.
     error: Option<String>,
-    /// M3 remainder: decision 0052's global switch is off. Distinct from "0
+    /// Decision 0052's global switch is off. Distinct from "0
     /// schedules" - schedules exist and are simply not being evaluated right now.
     suspended: bool,
     /// A note after the count, such as a changed `run.json` waiting for the
@@ -522,7 +522,7 @@ impl ScheduleSummary {
 #[derive(Default)]
 pub struct ScheduleBoard {
     summary: Mutex<ScheduleSummary>,
-    /// The scheduled work nodes for the galaxy's plan overlay (H4): each schedule on
+    /// The scheduled work nodes for the galaxy's plan overlay: each schedule on
     /// its node, with its last run and a disable reason on the label. This is the
     /// graph's own content, not a list surface.
     nodes: Mutex<Vec<kgraf_galaxy::PlanNode>>,
@@ -530,7 +530,7 @@ pub struct ScheduleBoard {
     /// (`schedule_store::failed_runs`): (key, words).
     failed: Mutex<Vec<(String, String)>>,
     /// Called when the summary changes, so the UI redraws the tray line then and
-    /// only then (N1: no timer repaint while nothing changes).
+    /// only then (no timer repaint while nothing changes).
     wake: Mutex<Option<Wake>>,
 }
 
@@ -675,7 +675,7 @@ impl Drop for SchedulerPause {
     }
 }
 
-/// Owns the background scheduler thread. Dropping it stops the thread (H3: promptly,
+/// Owns the background scheduler thread. Dropping it stops the thread (promptly,
 /// polled every [`STOP_POLL_INTERVAL`]) and joins it, so the thread never outlives
 /// the `ShellApp` that started it and never leaks past a dropped board.
 pub struct SchedulerHandle {
@@ -697,7 +697,7 @@ impl SchedulerHandle {
 
     /// Spawns the scheduler over `factory`, shared with the orchestrator box so
     /// scheduled and box runs use one host and one `Admission`. `wake` runs when
-    /// the tray line changes (N1).
+    /// the tray line changes.
     pub fn spawn_with(
         project: PathBuf,
         background_mode: bool,
@@ -810,7 +810,7 @@ fn run_forever(
             return;
         }
     };
-    // H3: one runtime, kept alive for the thread's whole lifetime inside a single
+    // One runtime, kept alive for the thread's whole lifetime inside a single
     // `block_on`, not rebuilt every tick - a real `OrchestratorFactory`'s spawned
     // run tasks (`tokio::spawn`, inside `ScheduledRuns::start_run`) need the runtime
     // to keep polling *between* ticks to make progress at all; a runtime that only
@@ -830,19 +830,19 @@ async fn run_loop(
 ) {
     let state_dir = project.join(".kgraf");
     let claimant = format!("kgraf-app-{}", std::process::id());
-    // H3: the store and the loop are built once real schedules exist, and kept for
+    // The store and the loop are built once real schedules exist, and kept for
     // the rest of this thread's life - not reconstructed every tick, which would
     // discard `SchedulerLoop`'s own pending-run bookkeeping and its `ScheduledRuns`
     // concurrency cap on every single evaluation. `starter` is kept alongside
     // `loop_` (not only inside it) so `set_instructions` can be called on it every
-    // tick, independently of whatever `loop_` itself is doing (H2 regression: an
+    // tick, independently of whatever `loop_` itself is doing (an
     // empty, frozen instruction map meant a schedule added after the loop first
     // started ran with no instruction at all).
     let mut state: Option<LoopState> = None;
     // History rows not yet written, retried each tick; lost outcomes
     // are rebuilt from the claim table.
     let mut recorder = schedule_store::HistoryRecorder::default();
-    // M3 remainder: a schedule stays "failing" on the board until it actually
+    // A schedule stays "failing" on the board until it actually
     // succeeds, not only for the tick its failure happened on - otherwise the tray
     // line flickers back to "healthy" the instant a failed schedule's next tick has
     // nothing new to report.
@@ -851,8 +851,8 @@ async fn run_loop(
     let mut warned: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
     while !stop.load(Ordering::Relaxed) {
-        // H4: schedules live on work nodes in the project's graph. Opened for
-        // writing facts once per tick (never created: M2; never rebuilt: L1), so each
+        // Schedules live on work nodes in the project's graph. Opened for
+        // writing facts once per tick (never created, never rebuilt), so each
         // run's history is recorded on its node; old meta-stored schedules are moved
         // onto nodes here.
         let opened = match schedule_store::open(project) {
@@ -965,7 +965,7 @@ async fn run_loop(
         sleep_until_next_tick_or_stop(stop).await;
     }
 
-    // N5/D2: a graceful shutdown drains whatever already finished (so a real result
+    // A graceful shutdown drains whatever already finished (so a real result
     // is recorded, not thrown away) and gives back whatever is still genuinely
     // pending, immediately and visibly, rather than leaving it to expire on its own
     // lease - this instance may be the one restarting next, or another instance may
@@ -997,7 +997,7 @@ struct LoopState {
     loop_: SchedulerLoop,
     starter: Arc<ScheduledRuns>,
     /// The loop's own claim table connection, shared for reading run outcomes and
-    /// disable reasons (M3).
+    /// disable reasons.
     store: Arc<Mutex<ScheduleStore>>,
 }
 
@@ -1018,8 +1018,8 @@ fn open_existing_claims(state_dir: &Path) -> Option<ScheduleStore> {
 }
 
 /// The tray's words for the schedules moved or refused this tick: counts only,
-/// never names (L8). Each is logged by name. A refused row is said once per
-/// process (L4).
+/// never names. Each is logged by name. A refused row is said once per
+/// process.
 fn migration_notes(
     recorder: &mut schedule_store::HistoryRecorder,
     moved: &[kgraf_schedule::Migration],
@@ -1048,7 +1048,7 @@ fn migration_notes(
     notes
 }
 
-/// The tray's words for a tick's history writes: counts only (L8). The
+/// The tray's words for a tick's history writes: counts only. The
 /// detail goes to the log.
 fn history_notes(report: &schedule_store::TickRecord) -> Vec<String> {
     for e in report.errors.iter().chain(&report.dropped) {
@@ -1160,10 +1160,10 @@ async fn sleep_until_next_tick_or_stop(stop: &AtomicBool) {
 }
 
 /// Builds the claim table, the `ScheduledRuns`, and the loop the first time a
-/// schedule actually exists (M2: no `.kgraf/schedule.db` for a project nobody has
+/// schedule actually exists (no `.kgraf/schedule.db` for a project nobody has
 /// scheduled anything in), and hands back a reference to both from then on. The
 /// instruction map inside the returned `ScheduledRuns` starts empty; the caller sets
-/// it (`set_instructions`) every tick from the current definitions (H2 regression).
+/// it (`set_instructions`) every tick from the current definitions.
 fn ensure_state<'a>(
     state: &'a mut Option<LoopState>,
     state_dir: &Path,
@@ -1194,7 +1194,7 @@ fn ensure_state<'a>(
 }
 
 /// Builds this tick's `TrackedSchedule` list, and separately names every definition
-/// whose own `to_schedule()` failed (M3 remainder: these must show as failing on the
+/// whose own `to_schedule()` failed (these must show as failing on the
 /// board, not just be logged and silently dropped from the tick - the previous
 /// version's caller never learned they existed).
 fn track_schedules(
@@ -1241,13 +1241,13 @@ fn describe_event(event: &TickEvent) -> (String, bool) {
         // D3 (round 4): a drop is the same "missed, not late, not a failure" outcome
         // `Skip` already applies elsewhere.
         TickEvent::Dropped { schedule_id, .. } => (schedule_id.clone(), false),
-        // N6 (round 4): a bookkeeping warning about spend attribution, not about
+        // A bookkeeping warning about spend attribution, not about
         // whether the run itself succeeded.
         TickEvent::RunIdNotRecorded { schedule_id, .. } => (schedule_id.clone(), false),
     }
 }
 
-/// Updates the persistent failing-id set (M3 remainder): a schedule stays failing
+/// Updates the persistent failing-id set: a schedule stays failing
 /// until it actually completes successfully, not only for the tick its own failure
 /// happened on, and a schedule removed from the definitions entirely is dropped from
 /// the set too (it cannot be reported on any longer).
@@ -1353,7 +1353,7 @@ mod tests {
     /// checking the claim table file is never even created, not just by reading a
     /// flag this same code also sets. A schedule exists, stored the old way (a
     /// graph-meta row) so there is something to *not* claim; the thread still moves
-    /// it onto a work node (H4) and puts that node on the graph while suspended.
+    /// it onto a work node and puts that node on the graph while suspended.
     #[test]
     fn background_mode_off_from_the_start_never_claims_anything() {
         let dir = tempfile::tempdir().expect("dir");
@@ -1417,7 +1417,7 @@ mod tests {
         assert_eq!(board.snapshot().total, 1);
     }
 
-    /// F3: a reason nothing can run replaces the count on the tray line, and is
+    /// A reason nothing can run replaces the count on the tray line, and is
     /// logged once per distinct text; a waiting `run.json` change is a note
     /// after the count.
     #[test]
@@ -1920,7 +1920,7 @@ mod tests {
             "the planner's calls are the run's"
         );
         assert!(host.ledger().unreconciled().expect("ledger").is_empty());
-        // H4: the run's history lands on the schedule's work node, with its spend
+        // The run's history lands on the schedule's work node, with its spend
         // read from this host's ledger by the run id, priced from its table.
         let graph =
             kgraf_graph::GraphStore::open(&root.join(".kgraf/graph.db"), &root).expect("graph");
@@ -2079,7 +2079,7 @@ mod tests {
         assert_eq!(branch, "kgraf/from-file", "the build made the run's branch");
     }
 
-    /// F1: an MCP server in `worker.json` that does not answer fails the build
+    /// An MCP server in `worker.json` that does not answer fails the build
     /// as transient; through `ScheduledRuns` that counts toward the pause
     /// threshold and does not disable the schedule.
     #[test]
@@ -2110,7 +2110,7 @@ mod tests {
         assert_eq!(starter.active(), 0);
     }
 
-    /// F4: a changed `run.json` reopens the host once no scheduled run is
+    /// A changed `run.json` reopens the host once no scheduled run is
     /// active; while one is, the old host stays and the change is said to wait.
     #[test]
     fn a_changed_run_json_reopens_the_host_when_no_run_is_active() {
@@ -2169,7 +2169,7 @@ mod tests {
         );
     }
 
-    /// N4: a new host keeps the hourly cap's history. The ledger's spend of the
+    /// A new host keeps the hourly cap's history. The ledger's spend of the
     /// last hour is seeded into each new host's admission, on first open and on
     /// a reopen after `run.json` changes, so reopening never resets the cap.
     #[test]
@@ -2225,7 +2225,7 @@ mod tests {
         assert_eq!(hour(&factory), expected, "not reset by the reopen");
     }
 
-    /// N1: the board wakes the UI when its line changes and only then, so a
+    /// The board wakes the UI when its line changes and only then, so a
     /// visible idle window with a tray draws no timer frames.
     #[test]
     fn the_board_wakes_the_ui_only_when_it_changes() {
@@ -2447,7 +2447,7 @@ mod tests {
         assert!(recorded.body.contains("\"method\""), "{}", recorded.body);
     }
 
-    /// Decision 0071, H2: a secret-shaped token in a
+    /// A secret-shaped token in a
     /// routed question must never reach the box or the graph raw, while the
     /// model that classifies and answers still reads the real value
     /// (`model_copy`). Mutation check: if the scrub were dropped, `shown`

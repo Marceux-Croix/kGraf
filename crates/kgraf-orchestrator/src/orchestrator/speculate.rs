@@ -104,11 +104,33 @@ impl RunLoop {
         let workspaces = self.s.workspaces.clone();
         let runner = self.coord.gate_runner.clone();
         let tx = self.tx.clone();
+        // Inner task per the same panic-supervisor pattern as the attempt and
+        // verification spawns: a panic in a round must still reach the loop as
+        // a `Speculated` message, or `busy` and the round's slot are held for
+        // the rest of the run. The cache is lost with a panicked round (it
+        // may be half updated) and starts over.
         tokio::spawn(async move {
-            let result =
-                speculation::speculate(&*workspaces, runner.as_deref(), &in_flight, &mut cache)
-                    .await;
-            let inputs = in_flight.into_iter().map(|(c, _)| c).collect();
+            let inputs: Vec<String> = in_flight.iter().map(|(c, _)| c.clone()).collect();
+            let round = tokio::spawn(async move {
+                let result =
+                    speculation::speculate(&*workspaces, runner.as_deref(), &in_flight, &mut cache)
+                        .await;
+                (result, cache)
+            });
+            let (result, cache) = match round.await {
+                Ok(done) => done,
+                Err(e) => {
+                    let what = if e.is_panic() {
+                        "panicked"
+                    } else {
+                        "ended abnormally"
+                    };
+                    (
+                        Err(format!("the speculative round {what}: {e}")),
+                        ValidationCache::default(),
+                    )
+                }
+            };
             let _ = tx
                 .send(LoopMsg::Speculated(Box::new(SpecDone {
                     inputs,

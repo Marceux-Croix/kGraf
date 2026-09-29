@@ -116,7 +116,7 @@ pub(crate) fn read(candidate: &Candidate) -> Result<(Skill, Vec<Problem>), Probl
     let disable_model_invocation = flag("disable-model-invocation", false, &mut problems);
     let user_invocable = flag("user-invocable", true, &mut problems);
 
-    let files = bundled_files(dir);
+    let files = bundled_files(dir).map_err(problem)?;
     let hash = skill_hash(dir, &text, &files).map_err(problem)?;
 
     Ok((
@@ -189,21 +189,31 @@ fn split_tools(s: &str) -> Vec<String> {
         .collect()
 }
 
-fn bundled_files(dir: &Path) -> Vec<String> {
-    let mut files: Vec<String> = walkdir::WalkDir::new(dir)
-        .into_iter()
-        .flatten()
-        .filter(|e| e.file_type().is_file())
-        .filter_map(|e| {
-            e.path()
-                .strip_prefix(dir)
-                .ok()
-                .map(|p| p.to_string_lossy().replace('\\', "/"))
-        })
-        .filter(|rel| rel != "SKILL.md")
-        .collect();
+/// The files bundled with a skill, relative to its directory. An entry the walk
+/// cannot read is an error naming it: leaving it out would drop that file from
+/// the bundle hash, and two skills that differ only there would read as one.
+fn bundled_files(dir: &Path) -> Result<Vec<String>, String> {
+    let mut files = Vec::new();
+    for entry in walkdir::WalkDir::new(dir) {
+        let entry = entry.map_err(|e| {
+            let at = e
+                .path()
+                .map_or_else(|| dir.display().to_string(), |p| p.display().to_string());
+            format!("cannot read {at} in the skill bundle: {e}")
+        })?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let Ok(rel) = entry.path().strip_prefix(dir) else {
+            continue;
+        };
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        if rel != "SKILL.md" {
+            files.push(rel);
+        }
+    }
     files.sort();
-    files
+    Ok(files)
 }
 
 fn skill_hash(dir: &Path, skill_md: &str, files: &[String]) -> Result<String, String> {
@@ -220,4 +230,60 @@ fn skill_hash(dir: &Path, skill_md: &str, files: &[String]) -> Result<String, St
         add(rel, &bytes);
     }
     Ok(hasher.finalize().to_hex().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Kind, Scope};
+
+    fn skill_dir(root: &Path) -> std::path::PathBuf {
+        let dir = root.join("demo");
+        std::fs::create_dir_all(dir.join("refs")).expect("mkdir");
+        std::fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: demo\ndescription: A demo.\n---\nBody\n",
+        )
+        .expect("skill");
+        std::fs::write(dir.join("refs/a.md"), "a").expect("bundled");
+        dir
+    }
+
+    fn candidate(dir: &Path) -> Candidate {
+        Candidate {
+            agent: "test".to_owned(),
+            scope: Scope::Project,
+            kind: Kind::SkillDir,
+            path: dir.to_path_buf(),
+        }
+    }
+
+    #[test]
+    fn a_readable_bundle_lists_and_hashes_its_files() {
+        let root = tempfile::tempdir().expect("dir");
+        let dir = skill_dir(root.path());
+        let (skill, _) = read(&candidate(&dir)).expect("read");
+        assert_eq!(skill.files, ["refs/a.md"]);
+        std::fs::write(dir.join("refs/a.md"), "b").expect("edit");
+        let (edited, _) = read(&candidate(&dir)).expect("read");
+        assert_ne!(skill.hash, edited.hash);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_directory_in_the_bundle_is_an_error_naming_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().expect("dir");
+        let dir = skill_dir(root.path());
+        let refs = dir.join("refs");
+        std::fs::set_permissions(&refs, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        let unreadable = std::fs::read_dir(&refs).is_err();
+        let result = read(&candidate(&dir));
+        std::fs::set_permissions(&refs, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        if !unreadable {
+            return; // running as a user who ignores permissions
+        }
+        let problem = result.expect_err("a bundle that cannot be read is not hashed");
+        assert!(problem.reason.contains("refs"), "{}", problem.reason);
+    }
 }

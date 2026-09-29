@@ -112,7 +112,9 @@ pub struct SourceReport {
 }
 
 /// What a node's body holds, as read back. Every field defaults, so a body
-/// someone else rewrote reads as "no claim, names nothing" rather than failing.
+/// that lacks a field reads as "no claim, names nothing". A body that is not
+/// JSON at all is an error ([`body_of`]): reading it as empty would report the
+/// item as remaining work with no claim.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct Body {
     #[serde(default)]
@@ -131,8 +133,16 @@ struct Body {
     item_id: Option<String>,
 }
 
-fn body_of(node: &WorkNode) -> Body {
-    serde_json::from_str(&node.body).unwrap_or_default()
+fn body_of(node: &WorkNode) -> Result<Body, InterpretError> {
+    // A node with no body at all has no claim; one with a damaged body is
+    // named, not guessed at.
+    if node.body.trim().is_empty() {
+        return Ok(Body::default());
+    }
+    serde_json::from_str(&node.body).map_err(|e| InterpretError::CorruptBody {
+        node: node.id.clone(),
+        reason: e.to_string(),
+    })
 }
 
 /// A path the reader may open: relative, inside the root, no `..`.
@@ -429,7 +439,7 @@ fn roadmap_anchors(store: &GraphStore) -> Result<BTreeMap<String, String>, Inter
     let mut map = BTreeMap::new();
     for p in store.presumed_nodes()? {
         if p.origin.source_kind == ROADMAP && p.gone_ms.is_none() && p.node.kind == WorkKind::Item {
-            for a in body_of(&p.node).anchors {
+            for a in body_of(&p.node)?.anchors {
                 map.entry(a).or_insert_with(|| p.node.id.clone());
             }
         }
@@ -610,7 +620,7 @@ pub(crate) fn adopt_for_plan(
             if p.adopted.is_some() || p.node.kind != WorkKind::Item {
                 continue;
             }
-            let b = body_of(&p.node);
+            let b = body_of(&p.node)?;
             let from_reading = p.origin.source_kind == READING
                 && b.reading_plan.as_deref() == Some(plan_id)
                 && b.item_id.as_deref() == Some(w.id.as_str());
@@ -794,7 +804,7 @@ pub fn views(store: &GraphStore) -> Result<Vec<PresumedView>, InterpretError> {
     let stored = store.presumed_nodes()?;
     let mut out: Vec<PresumedView> = Vec::with_capacity(stored.len());
     for p in &stored {
-        let mut body = body_of(&p.node);
+        let mut body = body_of(&p.node)?;
         // The document's claim lives in the presumed row; a row
         // from before that column keeps the one in its body.
         if let Some(c) = claim_of_name(&p.origin.claim) {

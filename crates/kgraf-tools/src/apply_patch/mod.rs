@@ -206,6 +206,38 @@ fn written_paths(hunk: &Hunk) -> Result<Vec<PathBuf>, ToolError> {
     }
 }
 
+/// Refuses a patch that names one path in more than one hunk, a move
+/// destination included. Every hunk is planned against the file as it is on
+/// disk, so a second hunk on the same path would plan from the old content and
+/// its write would replace the first hunk's (an Update then an Update, a
+/// Delete then an Add, a Move onto a path another hunk edits). Paths are
+/// compared as the file system resolves them (`fold_path`), so a case or
+/// normalization twin counts as the same path. A hunk that moves a file onto
+/// its own path names it once.
+fn refuse_repeated_paths(hunks: &[Hunk]) -> Result<(), ToolError> {
+    let mut seen = std::collections::HashSet::new();
+    for hunk in hunks {
+        let mut own = std::collections::HashSet::new();
+        for path in written_paths(hunk)? {
+            let key = kgraf_core::paths::fold_path(&path);
+            if own.insert(key.clone()) && !seen.insert(key) {
+                return Err(ToolError::InvalidInput {
+                    tool: "apply_patch".into(),
+                    reason: format!(
+                        "{} is named in more than one hunk. Each hunk is matched against the \
+                         file as it is now, so a second hunk on one path would overwrite the \
+                         first. Put every change to one path in a single Update File hunk \
+                         (several @@ chunks are allowed) and send a separate patch for a \
+                         delete followed by an add.",
+                        path.display()
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 #[async_trait::async_trait]
 impl Tool for ApplyPatchTool {
     fn name(&self) -> &str {
@@ -250,6 +282,7 @@ impl Tool for ApplyPatchTool {
     /// time, since `access()` has no filesystem to resolve a symlink against.
     fn access(&self, input: &Value) -> Result<Access, ToolError> {
         let hunks = parse(input)?;
+        refuse_repeated_paths(&hunks)?;
         let mut access = Access::none();
         for hunk in &hunks {
             for path in written_paths(hunk)? {
@@ -319,6 +352,7 @@ fn apply_all(
     root: &Path,
     cancel: &CancellationToken,
 ) -> Result<ToolOutput, ToolError> {
+    refuse_repeated_paths(hunks)?;
     let dir = fs_safety::open_workspace("apply_patch", root)?;
 
     let mut planned = Vec::with_capacity(hunks.len());
@@ -534,6 +568,80 @@ mod tests {
         assert!(!out.is_error);
         let contents = std::fs::read_to_string(dir.path().join("hello.txt")).expect("read back");
         assert_eq!(contents, "hi\nnew\n");
+    }
+
+    /// A path named in two hunks used to lose the first edit: both planned
+    /// from the old content and the second write replaced the first.
+    #[tokio::test]
+    async fn one_path_in_two_hunks_is_refused_and_writes_nothing() {
+        let tool = ApplyPatchTool;
+        for (label, body) in [
+            (
+                "update twice",
+                "*** Update File: a.txt\n@@\n-one\n+ONE\n*** Update File: a.txt\n@@\n-two\n+TWO",
+            ),
+            (
+                "delete then add",
+                "*** Delete File: a.txt\n*** Add File: a.txt\n+fresh",
+            ),
+            (
+                "move onto an edited path",
+                "*** Update File: a.txt\n*** Move to: b.txt\n@@\n-one\n+ONE\n*** Update File: b.txt\n@@\n-x\n+y",
+            ),
+            (
+                "case twin",
+                "*** Update File: a.txt\n@@\n-one\n+ONE\n*** Update File: A.TXT\n@@\n-two\n+TWO",
+            ),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            std::fs::write(dir.path().join("a.txt"), "one\ntwo\n").expect("seed");
+            std::fs::write(dir.path().join("b.txt"), "x\n").expect("seed");
+            let input = wrap(body);
+            let err = tool.access(&input).expect_err(label);
+            assert!(
+                err.to_string().contains("more than one hunk"),
+                "{label}: {err}"
+            );
+            let err = tool
+                .call(
+                    input,
+                    &ctx(dir.path().to_path_buf()),
+                    &crate::CallPermit::new(),
+                )
+                .await
+                .expect_err(label);
+            assert!(
+                err.to_string().contains("more than one hunk"),
+                "{label}: {err}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("a.txt")).expect("read"),
+                "one\ntwo\n",
+                "{label}: nothing may be written"
+            );
+        }
+    }
+
+    /// Two chunks in one hunk on one path is the supported way to edit a file
+    /// in two places, and a move onto its own path names the path once.
+    #[tokio::test]
+    async fn two_chunks_in_one_hunk_still_apply() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("a.txt"), "one\nmid\ntwo\n").expect("seed");
+        let input = wrap("*** Update File: a.txt\n@@\n-one\n+ONE\n@@\n-two\n+TWO");
+        let out = ApplyPatchTool
+            .call(
+                input,
+                &ctx(dir.path().to_path_buf()),
+                &crate::CallPermit::new(),
+            )
+            .await
+            .expect("call");
+        assert!(!out.is_error);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).expect("read"),
+            "ONE\nmid\nTWO\n"
+        );
     }
 
     #[tokio::test]

@@ -735,7 +735,7 @@ fn work(key: &str, state: WorkState, asks: usize, parent: Option<&str>) -> PlanN
     }
 }
 
-/// The owner's request, on work nodes: a phase is folded by default (the cut never
+/// On work nodes: a phase is folded by default (the cut never
 /// opens a work node, and a notice never unfolds anything), so an item's question
 /// stacks on the phase as a yellow count with the kind in words; expanding the phase
 /// splits the count back onto the item.

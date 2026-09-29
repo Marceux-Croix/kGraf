@@ -161,6 +161,9 @@ pub enum NoticeKind {
     StepsLeft,
     /// This is the final round; tool calls in it will not run.
     FinalRound,
+    /// The last response reached the output ceiling and was discarded; this is
+    /// the one continuation round, asking the model to split large patches.
+    OutputLimit,
 }
 
 impl WorkerEvent {
@@ -305,7 +308,9 @@ impl WorkerEvent {
     /// `Stop { PauseTurn }` does not either: the provider paused mid-turn for a
     /// server-side tool it is still running, not for a tool call this build has
     /// to make, and the turn continues by sending the conversation back for
-    /// another round.
+    /// another round. The loop no longer records one (it fails the run instead,
+    /// since server tool blocks are not kept); the rule stays so an older
+    /// transcript still reads the same way.
     pub fn is_terminal(&self) -> bool {
         match self {
             WorkerEvent::Cancelled { .. } => true,

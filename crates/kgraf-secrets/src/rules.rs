@@ -3,7 +3,10 @@
 //! Source: `third_party/gitleaks/config/gitleaks-rules-subset.toml`, copied
 //! verbatim from gitleaks/gitleaks `config/gitleaks.toml` at commit
 //! `b58d3f102cf3a2c84cb7f923d05c25c9b1aed84b` (see `third_party/gitleaks/UPSTREAM`).
-//! Each `pattern` field below is the upstream `regex` value, unmodified: Go's
+//! Each `pattern` field below is the upstream `regex` value, with one deliberate
+//! widening: the trailing delimiter class also accepts `, ) ] } > . :`, so a
+//! key that ends a list, a call, a JSON value or a sentence is still found.
+//! Upstream's class stops at a quote, whitespace or `;`. Go's
 //! `regexp` (RE2) and Rust's `regex` crate share the same non-backtracking
 //! syntax, so every pattern here compiles as it does upstream. `kind` is
 //! gitleaks's rule `id`, kept as the transcript's typed marker so a redaction
@@ -53,43 +56,43 @@ pub struct PatternRule {
 pub static RULES: &[PatternRule] = &[
     PatternRule {
         kind: "anthropic-admin-api-key",
-        pattern: r#"\b(sk-ant-admin01-[a-zA-Z0-9_\-]{93}AA)(?:[\x60'"\s;]|\\[nr]|$)"#,
+        pattern: r#"\b(sk-ant-admin01-[a-zA-Z0-9_\-]{93}AA)(?:[\x60'"\s;,)\]}>.:]|\\[nr]|$)"#,
         capture: Some(1),
         entropy: None,
     },
     PatternRule {
         kind: "anthropic-api-key",
-        pattern: r#"\b(sk-ant-api03-[a-zA-Z0-9_\-]{93}AA)(?:[\x60'"\s;]|\\[nr]|$)"#,
+        pattern: r#"\b(sk-ant-api03-[a-zA-Z0-9_\-]{93}AA)(?:[\x60'"\s;,)\]}>.:]|\\[nr]|$)"#,
         capture: Some(1),
         entropy: None,
     },
     PatternRule {
         kind: "openai-api-key",
-        pattern: r#"\b(sk-(?:proj|svcacct|admin)-(?:[A-Za-z0-9_-]{74}|[A-Za-z0-9_-]{58})T3BlbkFJ(?:[A-Za-z0-9_-]{74}|[A-Za-z0-9_-]{58})\b|sk-[a-zA-Z0-9]{20}T3BlbkFJ[a-zA-Z0-9]{20})(?:[\x60'"\s;]|\\[nr]|$)"#,
+        pattern: r#"\b(sk-(?:proj|svcacct|admin)-(?:[A-Za-z0-9_-]{74}|[A-Za-z0-9_-]{58})T3BlbkFJ(?:[A-Za-z0-9_-]{74}|[A-Za-z0-9_-]{58})\b|sk-[a-zA-Z0-9]{20}T3BlbkFJ[a-zA-Z0-9]{20})(?:[\x60'"\s;,)\]}>.:]|\\[nr]|$)"#,
         capture: Some(1),
         entropy: Some(3.0),
     },
     PatternRule {
         kind: "cohere-api-token",
-        pattern: r#"[\w.-]{0,50}?(?i:[\w.-]{0,50}?(?:cohere|CO_API_KEY)(?:[ \t\w.-]{0,20})[\s'"]{0,3})(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-zA-Z0-9]{40})(?:[\x60'"\s;]|\\[nr]|$)"#,
+        pattern: r#"[\w.-]{0,50}?(?i:[\w.-]{0,50}?(?:cohere|CO_API_KEY)(?:[ \t\w.-]{0,20})[\s'"]{0,3})(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-zA-Z0-9]{40})(?:[\x60'"\s;,)\]}>.:]|\\[nr]|$)"#,
         capture: Some(1),
         entropy: Some(4.0),
     },
     PatternRule {
         kind: "huggingface-access-token",
-        pattern: r#"\b(hf_(?i:[a-z]{34}))(?:[\x60'"\s;]|\\[nr]|$)"#,
+        pattern: r#"\b(hf_(?i:[a-z]{34}))(?:[\x60'"\s;,)\]}>.:]|\\[nr]|$)"#,
         capture: Some(1),
         entropy: Some(2.0),
     },
     PatternRule {
         kind: "huggingface-organization-api-token",
-        pattern: r#"\b(api_org_(?i:[a-z]{34}))(?:[\x60'"\s;]|\\[nr]|$)"#,
+        pattern: r#"\b(api_org_(?i:[a-z]{34}))(?:[\x60'"\s;,)\]}>.:]|\\[nr]|$)"#,
         capture: Some(1),
         entropy: Some(2.0),
     },
     PatternRule {
         kind: "perplexity-api-key",
-        pattern: r#"\b(pplx-[a-zA-Z0-9]{48})(?:[\x60'"\s;]|\\[nr]|$|\b)"#,
+        pattern: r#"\b(pplx-[a-zA-Z0-9]{48})(?:[\x60'"\s;,)\]}>.:]|\\[nr]|$|\b)"#,
         capture: Some(1),
         entropy: Some(4.0),
     },
@@ -101,7 +104,7 @@ pub static RULES: &[PatternRule] = &[
     },
     PatternRule {
         kind: "gcp-api-key",
-        pattern: r#"\b(AIza[\w-]{35})(?:[\x60'"\s;]|\\[nr]|$)"#,
+        pattern: r#"\b(AIza[\w-]{35})(?:[\x60'"\s;,)\]}>.:]|\\[nr]|$)"#,
         capture: Some(1),
         entropy: Some(4.0),
     },
@@ -113,13 +116,13 @@ pub static RULES: &[PatternRule] = &[
     },
     PatternRule {
         kind: "digitalocean-access-token",
-        pattern: r#"\b(doo_v1_[a-f0-9]{64})(?:[\x60'"\s;]|\\[nr]|$)"#,
+        pattern: r#"\b(doo_v1_[a-f0-9]{64})(?:[\x60'"\s;,)\]}>.:]|\\[nr]|$)"#,
         capture: Some(1),
         entropy: Some(3.0),
     },
     PatternRule {
         kind: "digitalocean-pat",
-        pattern: r#"\b(dop_v1_[a-f0-9]{64})(?:[\x60'"\s;]|\\[nr]|$)"#,
+        pattern: r#"\b(dop_v1_[a-f0-9]{64})(?:[\x60'"\s;,)\]}>.:]|\\[nr]|$)"#,
         capture: Some(1),
         entropy: Some(3.0),
     },
@@ -167,7 +170,7 @@ pub static RULES: &[PatternRule] = &[
     },
     PatternRule {
         kind: "jwt",
-        pattern: r#"\b(ey[a-zA-Z0-9]{17,}\.ey[a-zA-Z0-9\/\\_-]{17,}\.(?:[a-zA-Z0-9\/\\_-]{10,}={0,2})?)(?:[\x60'"\s;]|\\[nr]|$)"#,
+        pattern: r#"\b(ey[a-zA-Z0-9]{17,}\.ey[a-zA-Z0-9\/\\_-]{17,}\.(?:[a-zA-Z0-9\/\\_-]{10,}={0,2})?)(?:[\x60'"\s;,)\]}>.:]|\\[nr]|$)"#,
         capture: Some(1),
         entropy: Some(3.0),
     },
@@ -214,13 +217,13 @@ pub static RULES: &[PatternRule] = &[
     },
     PatternRule {
         kind: "discord-api-token",
-        pattern: r#"(?i)[\w.-]{0,50}?(?:discord)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-f0-9]{64})(?:[\x60'"\s;]|\\[nr]|$)"#,
+        pattern: r#"(?i)[\w.-]{0,50}?(?:discord)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-f0-9]{64})(?:[\x60'"\s;,)\]}>.:]|\\[nr]|$)"#,
         capture: Some(1),
         entropy: None,
     },
     PatternRule {
         kind: "stripe-access-token",
-        pattern: r#"\b((?:sk|rk)_(?:test|live|prod)_[a-zA-Z0-9]{10,99})(?:[\x60'"\s;]|\\[nr]|$)"#,
+        pattern: r#"\b((?:sk|rk)_(?:test|live|prod)_[a-zA-Z0-9]{10,99})(?:[\x60'"\s;,)\]}>.:]|\\[nr]|$)"#,
         capture: Some(1),
         entropy: Some(2.0),
     },
@@ -232,7 +235,7 @@ pub static RULES: &[PatternRule] = &[
     },
     PatternRule {
         kind: "npm-access-token",
-        pattern: r#"(?i)\b(npm_[a-z0-9]{36})(?:[\x60'"\s;]|\\[nr]|$)"#,
+        pattern: r#"(?i)\b(npm_[a-z0-9]{36})(?:[\x60'"\s;,)\]}>.:]|\\[nr]|$)"#,
         capture: Some(1),
         entropy: Some(2.0),
     },
@@ -244,7 +247,7 @@ pub static RULES: &[PatternRule] = &[
     },
     PatternRule {
         kind: "rubygems-api-token",
-        pattern: r#"\b(rubygems_[a-f0-9]{48})(?:[\x60'"\s;]|\\[nr]|$)"#,
+        pattern: r#"\b(rubygems_[a-f0-9]{48})(?:[\x60'"\s;,)\]}>.:]|\\[nr]|$)"#,
         capture: Some(1),
         entropy: Some(2.0),
     },
@@ -256,13 +259,13 @@ pub static RULES: &[PatternRule] = &[
     },
     PatternRule {
         kind: "vault-service-token",
-        pattern: r#"\b((?:hvs\.[\w-]{90,120}|s\.(?i:[a-z0-9]{24})))(?:[\x60'"\s;]|\\[nr]|$)"#,
+        pattern: r#"\b((?:hvs\.[\w-]{90,120}|s\.(?i:[a-z0-9]{24})))(?:[\x60'"\s;,)\]}>.:]|\\[nr]|$)"#,
         capture: Some(1),
         entropy: Some(3.5),
     },
     PatternRule {
         kind: "vault-batch-token",
-        pattern: r#"\b(hvb\.[\w-]{138,300})(?:[\x60'"\s;]|\\[nr]|$)"#,
+        pattern: r#"\b(hvb\.[\w-]{138,300})(?:[\x60'"\s;,)\]}>.:]|\\[nr]|$)"#,
         capture: Some(1),
         entropy: Some(4.0),
     },
@@ -274,19 +277,19 @@ pub static RULES: &[PatternRule] = &[
     },
     PatternRule {
         kind: "sendgrid-api-token",
-        pattern: r#"\b(SG\.(?i)[a-z0-9=_\-\.]{66})(?:[\x60'"\s;]|\\[nr]|$)"#,
+        pattern: r#"\b(SG\.(?i)[a-z0-9=_\-\.]{66})(?:[\x60'"\s;,)\]}>.:]|\\[nr]|$)"#,
         capture: Some(1),
         entropy: Some(2.0),
     },
     PatternRule {
         kind: "mailgun-private-api-token",
-        pattern: r#"(?i)[\w.-]{0,50}?(?:mailgun)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}(key-[a-f0-9]{32})(?:[\x60'"\s;]|\\[nr]|$)"#,
+        pattern: r#"(?i)[\w.-]{0,50}?(?:mailgun)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}(key-[a-f0-9]{32})(?:[\x60'"\s;,)\]}>.:]|\\[nr]|$)"#,
         capture: Some(1),
         entropy: None,
     },
     PatternRule {
         kind: "square-access-token",
-        pattern: r#"\b((?:EAAA|sq0atp-)[\w-]{22,60})(?:[\x60'"\s;]|\\[nr]|$)"#,
+        pattern: r#"\b((?:EAAA|sq0atp-)[\w-]{22,60})(?:[\x60'"\s;,)\]}>.:]|\\[nr]|$)"#,
         capture: Some(1),
         entropy: Some(2.0),
     },
@@ -298,19 +301,19 @@ pub static RULES: &[PatternRule] = &[
     },
     PatternRule {
         kind: "new-relic-user-api-key",
-        pattern: r#"(?i)[\w.-]{0,50}?(?:new-relic|newrelic|new_relic)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}(NRAK-[a-z0-9]{27})(?:[\x60'"\s;]|\\[nr]|$)"#,
+        pattern: r#"(?i)[\w.-]{0,50}?(?:new-relic|newrelic|new_relic)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}(NRAK-[a-z0-9]{27})(?:[\x60'"\s;,)\]}>.:]|\\[nr]|$)"#,
         capture: Some(1),
         entropy: None,
     },
     PatternRule {
         kind: "grafana-api-key",
-        pattern: r#"(?i)\b(eyJrIjoi[A-Za-z0-9]{70,400}={0,3})(?:[\x60'"\s;]|\\[nr]|$)"#,
+        pattern: r#"(?i)\b(eyJrIjoi[A-Za-z0-9]{70,400}={0,3})(?:[\x60'"\s;,)\]}>.:]|\\[nr]|$)"#,
         capture: Some(1),
         entropy: Some(3.0),
     },
     PatternRule {
         kind: "planetscale-password",
-        pattern: r#"(?i)\b(pscale_pw_(?i)[\w=\.-]{32,64})(?:[\x60'"\s;]|\\[nr]|$)"#,
+        pattern: r#"(?i)\b(pscale_pw_(?i)[\w=\.-]{32,64})(?:[\x60'"\s;,)\]}>.:]|\\[nr]|$)"#,
         capture: Some(1),
         entropy: Some(3.0),
     },
@@ -325,7 +328,7 @@ pub static RULES: &[PatternRule] = &[
         // wins that tie, and this one only ever fires alone, on a shape none
         // of the specific rules recognized.
         kind: "generic-api-key",
-        pattern: r#"(?i)[\w.-]{0,50}?(?:access|auth|(?-i:[Aa]pi|API)|credential|creds|key|passw(?:or)?d|secret|token)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([\w.=-]{10,150}|[a-z0-9][a-z0-9+/]{11,}={0,3})(?:[\x60'"\s;]|\\[nr]|$)"#,
+        pattern: r#"(?i)[\w.-]{0,50}?(?:access|auth|(?-i:[Aa]pi|API)|credential|creds|key|passw(?:or)?d|secret|token)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([\w.=-]{10,150}|[a-z0-9][a-z0-9+/]{11,}={0,3})(?:[\x60'"\s;,)\]}>.:]|\\[nr]|$)"#,
         capture: Some(1),
         entropy: Some(3.5),
     },

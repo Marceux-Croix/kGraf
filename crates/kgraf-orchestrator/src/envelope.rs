@@ -206,7 +206,7 @@ impl Mailbox {
                 .collect(),
             kind: draft.kind,
             concerns: labels(draft.concerns),
-            // Scrubbed at intake (decision 0071, H2): stored, shown and
+            // Scrubbed at intake: stored, shown and
             // committed as this copy; `data_blocks` gives a peer's model
             // the registry-only copy.
             body: UntrustedText::new(draft.body).for_storage(),
@@ -474,7 +474,7 @@ pub fn append_to_comms_at(
                 .join(", "),
             m.body.to_markdown_fence()
         );
-        // Persist-scrubbed (task H1, security review): `docs/agent-comms` is
+        // Persist-scrubbed: `docs/agent-comms` is
         // committed to git, so this is the most important sink of all -- a
         // secret in a worker's message to another worker (a credential it
         // quoted from a file it read, a token an MCP call echoed) would
@@ -620,7 +620,7 @@ mod tests {
         assert!(text.contains("[redacted:github-pat;"), "{text}");
     }
 
-    /// Decision 0071, H2: a posted body is stored, shown and committed
+    /// A posted body is stored, shown and committed
     /// scrubbed; a peer's brief carries the registry-only copy.
     #[test]
     fn a_posted_body_is_stored_scrubbed_and_briefed_as_the_model_copy() {

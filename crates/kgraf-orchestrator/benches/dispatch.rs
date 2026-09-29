@@ -25,7 +25,7 @@
 //!   batch), and `note_48_live` is a direct note from the call to its
 //!   acknowledgment (liveness, the inbox row, the run record's note, the
 //!   injection). `old_recheck_48_live` times, for reference and unbudgeted,
-//!   the store reads the re-check did on every pass before L3 (one
+//!   the store reads the re-check did on every pass before the re-check was cached (one
 //!   `sessions_of_run` and one `undelivered` per session).
 //!
 //! `memory_ledger` isolates the orchestrator's own cost; `disk_ledger` is the
@@ -72,7 +72,7 @@ const BUDGETS: &[(&str, Duration)] = &[
         Duration::from_micros(12_000),
     ),
     // Measured 2026-09-28 (Apple silicon, release): one loop pass 19.5 us and
-    // a direct note 4.24 ms with 48 live sessions; the pre-L3 re-check's
+    // a direct note 4.24 ms with 48 live sessions; the earlier uncached re-check's
     // store reads alone took 6.06 ms per pass. Budgets are 2.5x, rounded up.
     ("sessions/status_48_live", Duration::from_micros(50)),
     ("sessions/note_48_live", Duration::from_micros(11_000)),

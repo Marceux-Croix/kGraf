@@ -134,8 +134,16 @@ impl TranscriptBuilder {
             }
             WorkerEvent::Usage { call, usage } => {
                 self.count_round(call);
-                self.last_usage_tokens = Some(usage.total_input() + usage.total_output());
-                self.tokens_since_usage = 0;
+                let total = usage.total_input() + usage.total_output();
+                // A zero report is a round that never reached the provider
+                // (a call cancelled before it was sent settles at zero). A real
+                // response always reads its input, so a zero must not replace
+                // the anchor: it would collapse the estimate to nothing and let
+                // an oversized request past the stop point.
+                if total > 0 {
+                    self.last_usage_tokens = Some(total);
+                    self.tokens_since_usage = 0;
+                }
             }
             WorkerEvent::Stop { reason } => {
                 self.flush_results();
@@ -227,7 +235,15 @@ impl TranscriptBuilder {
                     _ => self.messages.push(Message::user(text.clone())),
                 }
             }
-            WorkerEvent::RoundAbandoned { .. } => {
+            WorkerEvent::RoundAbandoned { reason, .. } => {
+                // A round abandoned before its request left the process bought
+                // no model turn: the loop refunded it from the step budget, so
+                // a rebuild does not count it either. Its ledger call stays
+                // listed in `calls`, and a later report for the same call does
+                // not count it again (`count_round`).
+                if reason == crate::worker::STEER_ABANDON_BEFORE_SEND_REASON {
+                    self.rounds = self.rounds.saturating_sub(1);
+                }
                 // Clears the partial turn the way `Cancelled` does, but is not
                 // terminal: the worker keeps running past it.
                 self.text.clear();
@@ -1041,5 +1057,52 @@ mod tests {
             is_error: false,
         });
         assert!(b.context_tokens() > 2_000);
+    }
+
+    fn zero_usage(call: &str) -> WorkerEvent {
+        WorkerEvent::Usage {
+            call: CallId::new(call),
+            usage: TokenUsage::default(),
+        }
+    }
+
+    fn model_call(call: &str) -> WorkerEvent {
+        WorkerEvent::ModelCall {
+            call: CallId::new(call),
+        }
+    }
+
+    #[test]
+    fn a_zero_usage_report_does_not_reset_the_context_anchor() {
+        let mut b = TranscriptBuilder::new(vec![Message::user("go")]);
+        b.apply(&model_call("c1"));
+        b.apply(&usage("c1", 5_000));
+        let anchored = b.context_tokens();
+        assert!(anchored >= 5_000);
+        // A call cancelled before its request left settles at zero.
+        b.apply(&model_call("c2"));
+        b.apply(&zero_usage("c2"));
+        assert_eq!(b.context_tokens(), anchored);
+    }
+
+    #[test]
+    fn a_round_abandoned_before_send_is_not_counted_but_one_abandoned_after_is() {
+        let mut b = TranscriptBuilder::new(vec![Message::user("go")]);
+        b.apply(&model_call("c1"));
+        b.apply(&WorkerEvent::RoundAbandoned {
+            phase: crate::event::CancelPhase::ModelStream,
+            reason: crate::worker::STEER_ABANDON_BEFORE_SEND_REASON.into(),
+        });
+        b.apply(&zero_usage("c1"));
+        assert_eq!(b.rounds(), 0, "the refunded round bought no model turn");
+        // The retry counts its own round.
+        b.apply(&model_call("c2"));
+        assert_eq!(b.rounds(), 1);
+        // An abandon after the request left keeps its round spent.
+        b.apply(&WorkerEvent::RoundAbandoned {
+            phase: crate::event::CancelPhase::ModelStream,
+            reason: crate::worker::STEER_ABANDON_REASON.into(),
+        });
+        assert_eq!(b.rounds(), 1);
     }
 }

@@ -190,14 +190,25 @@ pub fn build_from_commits(
 /// needs its own performance budget, and a missing or non-git directory must
 /// raise rather than silently yielding an empty relation (fail loud).
 pub fn read_git_history(root: &std::path::Path, max_commits: u32) -> Result<Vec<HistoryCommit>> {
+    if max_commits == 0 {
+        // `--max-count=0` prints nothing and succeeds: an empty relation that
+        // reads as "no history" (fail loud).
+        return Err(GraphError::History {
+            reason: "the commit limit is 0, which reads no history".to_owned(),
+        });
+    }
+    // `-z` ends each path with NUL and prints it raw. Without it git quotes a
+    // path holding non-ASCII bytes (`"\303\251.rs"`), and the quoted text would
+    // be stored as if it were the file's name.
     let output = std::process::Command::new("git")
         .arg("-C")
         .arg(root)
         .arg("log")
+        .arg("-z")
         .arg(format!("--max-count={max_commits}"))
         .arg("--no-merges")
         .arg("--name-only")
-        .arg("--pretty=format:%x00%ct")
+        .arg("--pretty=format:%x01%ct")
         .arg("--no-renames")
         .output()
         .map_err(|e| GraphError::History {
@@ -208,36 +219,64 @@ pub fn read_git_history(root: &std::path::Path, max_commits: u32) -> Result<Vec<
             reason: format_reason(&output),
         });
     }
-    let text = String::from_utf8_lossy(&output.stdout);
+    parse_git_log_z(&output.stdout)
+}
+
+/// Parse `git log -z --name-only --pretty=format:%x01%ct` output. A NUL ends
+/// each path (and separates commits with an empty token); a header token starts
+/// with `\x01`, holds the commit time, and is followed after a newline by that
+/// commit's first path.
+fn parse_git_log_z(stdout: &[u8]) -> Result<Vec<HistoryCommit>> {
+    let bad = |what: String| GraphError::History { reason: what };
     let mut commits = Vec::new();
     let mut current: Option<HistoryCommit> = None;
-    for line in text.lines() {
-        if let Some(stamp) = line.strip_prefix('\u{0}') {
-            if let Some(commit) = current.take()
-                && !commit.paths.is_empty()
-            {
-                commits.push(commit);
-            }
-            let timestamp = stamp.trim().parse::<i64>().unwrap_or(0);
+    let finish = |commit: Option<HistoryCommit>, commits: &mut Vec<HistoryCommit>| {
+        if let Some(commit) = commit
+            && !commit.paths.is_empty()
+        {
+            commits.push(commit);
+        }
+    };
+    for token in stdout.split(|b| *b == 0) {
+        if token.is_empty() {
+            continue;
+        }
+        let text = std::str::from_utf8(token).map_err(|_| {
+            bad(format!(
+                "git log printed a path that is not valid UTF-8: {}",
+                String::from_utf8_lossy(token)
+            ))
+        })?;
+        let mut path = text;
+        if let Some(header) = text.strip_prefix('\u{1}') {
+            finish(current.take(), &mut commits);
+            let (stamp, first) = match header.split_once('\n') {
+                Some((stamp, first)) => (stamp, first),
+                None => (header, ""),
+            };
+            let timestamp = stamp
+                .trim()
+                .parse::<i64>()
+                .map_err(|_| bad(format!("git log printed a bad commit time `{stamp}`")))?;
             current = Some(HistoryCommit {
                 timestamp,
                 paths: Vec::new(),
             });
-            continue;
+            path = first;
         }
-        let path = line.trim();
         if path.is_empty() {
             continue;
         }
-        if let Some(commit) = current.as_mut() {
-            commit.paths.push(path.to_owned());
+        match current.as_mut() {
+            Some(commit) => commit.paths.push(path.to_owned()),
+            None => {
+                return Err(bad(format!(
+                    "git log printed the path `{path}` before any commit header"
+                )));
+            }
         }
     }
-    if let Some(commit) = current
-        && !commit.paths.is_empty()
-    {
-        commits.push(commit);
-    }
+    finish(current, &mut commits);
     Ok(commits)
 }
 
@@ -634,6 +673,77 @@ mod tests {
             .find(|c| c.paths.len() == 2)
             .expect("the first commit touched two files");
         assert!(two_file.paths.contains(&"a.rs".to_owned()));
+    }
+
+    #[test]
+    fn non_ascii_paths_are_read_as_themselves_not_as_git_quoting() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .output()
+                .expect("git");
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        run(&["init", "-q", "-b", "main"]);
+        std::fs::write(dir.path().join("caf\u{e9}.rs"), "fn a() {}\n").expect("write");
+        std::fs::write(dir.path().join("with space.rs"), "fn b() {}\n").expect("write");
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "first"]);
+        let commits = read_git_history(dir.path(), 10).expect("history");
+        assert_eq!(commits.len(), 1);
+        let mut paths = commits[0].paths.clone();
+        paths.sort();
+        assert_eq!(paths, ["caf\u{e9}.rs", "with space.rs"]);
+    }
+
+    #[test]
+    fn a_commit_limit_of_zero_is_an_error() {
+        // A real repository with history, so the zero is the only thing wrong.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .output()
+                .expect("git");
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        run(&["init", "-q", "-b", "main"]);
+        std::fs::write(dir.path().join("a.rs"), "fn a() {}\n").expect("write");
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "first"]);
+        assert_eq!(read_git_history(dir.path(), 1).expect("one").len(), 1);
+        let err = read_git_history(dir.path(), 0).expect_err("must raise");
+        assert!(matches!(err, GraphError::History { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn the_log_parser_reads_nul_separated_paths_and_refuses_a_bad_time() {
+        let good = b"\x011700000000\na.rs\0b/c.rs\0\0\x011700000100\nd.rs\0";
+        let commits = parse_git_log_z(good).expect("parse");
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0].timestamp, 1_700_000_000);
+        assert_eq!(commits[0].paths, ["a.rs", "b/c.rs"]);
+        assert_eq!(commits[1].paths, ["d.rs"]);
+
+        let bad = parse_git_log_z(b"\x01notatime\na.rs\0").expect_err("bad time");
+        assert!(matches!(bad, GraphError::History { .. }), "{bad:?}");
+        let orphan = parse_git_log_z(b"a.rs\0").expect_err("path before header");
+        assert!(matches!(orphan, GraphError::History { .. }), "{orphan:?}");
+        let raw = parse_git_log_z(b"\x011\n\xff\xfe.rs\0").expect_err("non utf-8");
+        assert!(matches!(raw, GraphError::History { .. }), "{raw:?}");
     }
 
     #[test]

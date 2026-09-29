@@ -528,7 +528,7 @@ fn a_junction_inside_the_root_cannot_escape() {
     assert!(!outside.join("planted.txt").exists(), "{line}");
 }
 
-/// H1: a planted `scratch\.git` junction must be refused at prepare, so the
+/// A planted `scratch\.git` junction must be refused at prepare, so the
 /// host never rewrites DACLs across the junction target (the user profile).
 #[test]
 fn a_planted_git_junction_is_refused_at_prepare() {
@@ -584,7 +584,7 @@ fn reads_outside_the_workspace_are_not_confined() {
     assert_eq!((code, line.as_str()), (0, "visible"));
 }
 
-/// H2: the documented VM_READ gap. A Low sandbox can open the Medium harness
+/// The documented VM_READ gap. A Low sandbox can open the Medium harness
 /// process for PROCESS_VM_READ, and the harness holds provider keys. This test
 /// asserts the gap so a future change that closes it prompts updating STRENGTH.
 #[test]
@@ -597,7 +597,7 @@ fn the_harness_process_can_be_opened_for_vm_read() {
 
 // ---- process, job, console, desktop ------------------------------------------
 
-/// C1: a second sandbox must not open this sandbox's process for write.
+/// A second sandbox must not open this sandbox's process for write.
 #[test]
 fn one_sandbox_cannot_open_another_sandboxs_process_for_write() {
     let e = env();
@@ -708,7 +708,7 @@ fn the_command_runs_on_a_private_desktop_without_a_console() {
     assert_eq!(console, "false");
 }
 
-/// L1: two spawns in one workspace reuse one desktop; two workspaces do not.
+/// Two spawns in one workspace reuse one desktop; two workspaces do not.
 #[test]
 fn the_private_desktop_is_reused_per_workspace() {
     let e = env();
@@ -789,7 +789,7 @@ fn secrets_are_scrubbed_and_git_credential_helpers_are_reset() {
     );
 }
 
-/// M2: a host that already sets GIT_CONFIG_COUNT keeps its own entries and the
+/// A host that already sets GIT_CONFIG_COUNT keeps its own entries and the
 /// credential.helper reset is appended, not dropped.
 #[test]
 fn git_config_count_from_the_host_is_extended_not_dropped() {

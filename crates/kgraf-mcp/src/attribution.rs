@@ -1,4 +1,4 @@
-//! Attribution for every remote MCP call (decision 0051, main-session ruling: a
+//! Attribution for every remote MCP call (decision 0051: a
 //! remote MCP call is attributed as a provider call is, the accounting rule's sibling for
 //! non-token egress).
 //!

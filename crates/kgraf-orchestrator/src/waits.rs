@@ -44,8 +44,8 @@ pub enum WaitState {
     /// Open, and not yet looked at by a dispatch round (just planned, just
     /// resumed, or just returned to planned). Shown, never left out.
     Unchecked,
-    /// A merge conflict dispatched a resolver worker in its place (owner
-    /// request 17, decision 0073); `resolver` is that contract's id. Distinct
+    /// A merge conflict dispatched a resolver worker in its place (decision
+    /// 0073); `resolver` is that contract's id. Distinct
     /// from `Held`: nothing here needs the user, only the resolver's outcome.
     Resolver { resolver: String },
 }
@@ -157,7 +157,7 @@ pub fn set(waits: &mut BTreeMap<String, WaitState>, contract: &str, state: WaitS
 
 impl WaitState {
     /// A detail can quote an error from a provider, a server or a lease
-    /// holder, and is stored and shown (decision 0071, H2): persist-scrubbed.
+    /// holder, and is stored and shown: persist-scrubbed.
     fn scrubbed(self) -> Self {
         let s = kgraf_secrets::scrub_persist_owned;
         match self {

@@ -719,7 +719,7 @@ mod tests {
         assert!(failures.is_empty(), "{failures:?}");
     }
 
-    /// M1: at most one attempt per (interface, version, consumer, producer)
+    /// At most one attempt per (interface, version, consumer, producer)
     /// is recorded, whatever a caller tries to record afterward.
     #[test]
     fn the_book_bounds_one_attempt_per_pair_per_version() {
@@ -774,7 +774,7 @@ mod tests {
         assert!(book.accepted("double", 2).is_empty());
     }
 
-    /// Review fix (0076): a refused reservation or an unrunnable gate records
+    /// A refused reservation or an unrunnable gate records
     /// `NotRun` and is visible (`outcome` returns it), but is not a verdict
     /// and so does not consume the one-attempt bound: a later, successful
     /// attempt for the same pair still lands.
@@ -822,7 +822,7 @@ mod tests {
         ));
     }
 
-    /// Review fix (0076): the book persists in `RunStateRecord::consumer_tests`
+    /// The book persists in `RunStateRecord::consumer_tests`
     /// (not only in memory), so it must round-trip through JSON with every
     /// outcome kind, including `NotRun`.
     #[test]
@@ -911,7 +911,7 @@ mod tests {
         }
     }
 
-    /// M2 (rule 5, "the ledger attributes the call"): a consumer's test comes
+    /// A consumer's test comes
     /// from its own route's model, through the ledger; a route with no caller
     /// is refused, never answered by another model.
     #[tokio::test]

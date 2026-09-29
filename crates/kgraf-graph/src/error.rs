@@ -106,6 +106,24 @@ pub enum GraphError {
     #[error("fact {id}: {reason}")]
     Fact { id: i64, reason: String },
 
+    /// A read or facts open named an index file that does not exist. Only an index
+    /// command creates one.
+    #[error("no index at `{path}`; run `kgraf index` first")]
+    NoIndex { path: String },
+
+    /// A symbol name matches more than one node and none of them is an exact
+    /// qualified-name match. `candidates` lists them as `qualified_name (path:line)`.
+    #[error("`{name}` is ambiguous ({} candidates): {}", candidates.len(), candidates.join("; "))]
+    AmbiguousSymbol {
+        name: String,
+        candidates: Vec<String>,
+    },
+
+    /// A node's file changed after it was indexed, so its recorded lines may
+    /// name other text now.
+    #[error("`{path}` changed since it was indexed (node `{node}`); run `kgraf index`")]
+    StaleFile { node: String, path: String },
+
     /// An existing index was opened to record facts
     /// ([`crate::GraphStore::open_existing_for_facts`]) and its schema version is not
     /// this build's. Writing would first need a rebuild of the derived data, and only
@@ -131,6 +149,9 @@ impl kgraf_diag::DiagCode for GraphError {
             GraphError::UnknownSymbol { .. } => "KG-0202",
             GraphError::BadQuery { .. } => "KG-0203",
             GraphError::SchemaMismatch { .. } => "KG-0204",
+            GraphError::NoIndex { .. } => "KG-0205",
+            GraphError::AmbiguousSymbol { .. } => "KG-0206",
+            GraphError::StaleFile { .. } => "KG-0207",
             _ => kgraf_diag::catch_all_for("kgraf-graph").code,
         }
     }
@@ -168,11 +189,27 @@ mod diag_code_tests {
                 found: None,
                 expected: 1,
             },
+            GraphError::NoIndex { path: "x".into() },
+            GraphError::AmbiguousSymbol {
+                name: "x".into(),
+                candidates: vec!["a".into(), "b".into()],
+            },
+            GraphError::StaleFile {
+                node: "x".into(),
+                path: "x".into(),
+            },
             // Not named in `diag_code`'s match: exercises the catch-all arm.
             GraphError::InvalidWork { reason: "x".into() },
         ];
         for e in instances {
             let code = e.diag_code();
+            if !matches!(e, GraphError::InvalidWork { .. }) {
+                assert_ne!(
+                    code,
+                    kgraf_diag::catch_all_for("kgraf-graph").code,
+                    "{e:?} falls to the catch-all"
+                );
+            }
             assert!(
                 kgraf_diag::GLOSSARY.iter().any(|spec| spec.code == code),
                 "{e:?} names code {code}, which is not in kgraf_diag::GLOSSARY"

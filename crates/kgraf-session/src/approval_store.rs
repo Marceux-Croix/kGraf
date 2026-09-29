@@ -797,13 +797,57 @@ fn refuse_network_filesystem(_path: &Path) -> Result<(), SessionError> {
 /// Read-only by design: adding a rule is a distinct, explicit action (a user
 /// choosing "always allow" on an ask), not something a hook does to itself
 /// mid-review.
+///
+/// **Current, not a copy from start-up.** Each review compares the store
+/// file's identity (modification time, length, inode) with the one last
+/// read, and reads the file again when it changed: a rule revoked while a
+/// run is live stops allowing calls from the next review on. Writers
+/// replace the file with a rename, so a read never sees half a write. A file
+/// that cannot be read again allows nothing: the call is asked instead.
 pub struct PersistedAllowHook {
-    store: PersistedAllowStore,
+    store: std::sync::Mutex<HookSnapshot>,
     project: String,
     /// Resolves a call's subject the same way the rest of the approval chain
     /// does: `Tool::permission_subject`, never a guess this
     /// hook makes about which input field holds a command string.
     registry: Arc<ToolRegistry>,
+}
+
+/// The store as the hook last read it, and the file identity it read.
+struct HookSnapshot {
+    store: PersistedAllowStore,
+    /// `None` until the first review checks the file; `Some(None)` when the
+    /// file did not exist then.
+    stamp: Option<Option<FileStamp>>,
+}
+
+/// What tells one version of the store file from the next.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FileStamp {
+    modified: Option<SystemTime>,
+    len: u64,
+    inode: u64,
+}
+
+fn file_stamp(path: &Path) -> Result<Option<FileStamp>, SessionError> {
+    match std::fs::metadata(path) {
+        Ok(meta) => {
+            #[cfg(unix)]
+            let inode = std::os::unix::fs::MetadataExt::ino(&meta);
+            #[cfg(not(unix))]
+            let inode = 0;
+            Ok(Some(FileStamp {
+                modified: meta.modified().ok(),
+                len: meta.len(),
+                inode,
+            }))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(SessionError::ApprovalStore {
+            path: path.to_path_buf(),
+            reason: e.to_string(),
+        }),
+    }
 }
 
 impl PersistedAllowHook {
@@ -813,15 +857,37 @@ impl PersistedAllowHook {
         registry: Arc<ToolRegistry>,
     ) -> Self {
         Self {
-            store,
+            store: std::sync::Mutex::new(HookSnapshot { store, stamp: None }),
             project: project.into(),
             registry,
         }
     }
 
-    /// The rule that would cover `tool`/`subject`, if any, for display.
-    pub fn matching_rule(&self, tool: &str, subject: Option<&str>) -> Option<&AllowRule> {
-        self.store.matching_rule(&self.project, tool, subject)
+    /// The rule that would cover `tool`/`subject`, if any, for display, from
+    /// the store as it is on disk now.
+    pub fn matching_rule(
+        &self,
+        tool: &str,
+        subject: Option<&str>,
+    ) -> Result<Option<AllowRule>, SessionError> {
+        let snapshot = self.current()?;
+        Ok(snapshot
+            .store
+            .matching_rule(&self.project, tool, subject)
+            .cloned())
+    }
+
+    /// The snapshot, read again first when the file changed since the last
+    /// read.
+    fn current(&self) -> Result<std::sync::MutexGuard<'_, HookSnapshot>, SessionError> {
+        let mut snapshot = self.store.lock().unwrap_or_else(|p| p.into_inner());
+        let now = file_stamp(&snapshot.store.path)?;
+        if snapshot.stamp.as_ref() != Some(&now) {
+            // A missing file reads as no rules.
+            snapshot.store.file = PersistedAllowStore::read_store_file(&snapshot.store.path)?;
+            snapshot.stamp = Some(now);
+        }
+        Ok(snapshot)
     }
 
     fn subject_of(&self, call: &PendingCall) -> Option<String> {
@@ -840,12 +906,16 @@ impl ApprovalHook for PersistedAllowHook {
 
     async fn review(&self, call: &PendingCall) -> HookDecision {
         let subject = self.subject_of(call);
-        match self
-            .store
-            .matching_rule(&self.project, &call.tool, subject.as_deref())
-        {
-            Some(_) => HookDecision::Allow,
-            None => HookDecision::Ask {
+        match self.matching_rule(&call.tool, subject.as_deref()) {
+            Ok(Some(_)) => HookDecision::Allow,
+            Err(e) => HookDecision::Ask {
+                question: format!(
+                    "`{}`: the persisted allow rules could not be read again ({e}), so none \
+                     applies",
+                    call.tool
+                ),
+            },
+            Ok(None) => HookDecision::Ask {
                 question: format!(
                     "`{}` is not covered by a persisted allow rule for this project",
                     call.tool
@@ -1124,6 +1194,72 @@ mod tests {
                 "{compound} must not be reported as a simple subject"
             );
         }
+    }
+
+    /// A rule revoked through another handle while the hook is live stops
+    /// allowing calls at the next review, and a rule added the same way
+    /// applies without a restart.
+    #[tokio::test]
+    async fn a_rule_revoked_while_the_hook_is_live_stops_allowing_at_the_next_review() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("allow.json");
+        let (mut store, _) = PersistedAllowStore::open(&path, &outside_workspace()).expect("open");
+        store
+            .allow_any_call("proj-a", "test-command-tool", "test", ConfirmAllowAnyCall)
+            .expect("allow");
+        let mut registry = ToolRegistry::new();
+        registry
+            .register_builtin(
+                Arc::new(Shell {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                }),
+                Exposure::Prefix,
+            )
+            .expect("register");
+        let registry = Arc::new(registry);
+        let discovered = DiscoveredTools::new();
+        let view = ToolView {
+            registry: &registry,
+            discovered: &discovered,
+        };
+        let hook = PersistedAllowHook::new(store, "proj-a", registry.clone());
+        let chain = ApprovalChain::new(vec![Arc::new(hook)]);
+        let review = || async {
+            let mut log = MemoryApprovalLog::default();
+            chain
+                .review(
+                    view,
+                    pending("test-command-tool", json!({"cmd": "git status"})),
+                    &mut log,
+                )
+                .await
+                .expect("review")
+        };
+        assert!(
+            matches!(review().await, Verdict::Run(_)),
+            "allowed at first"
+        );
+
+        let (mut other, _) =
+            PersistedAllowStore::open(&path, &outside_workspace()).expect("second handle");
+        assert_eq!(
+            other
+                .revoke_any_call("proj-a", "test-command-tool")
+                .expect("revoke"),
+            1
+        );
+        assert!(
+            matches!(review().await, Verdict::Ask(_)),
+            "a revoked rule no longer allows the call"
+        );
+
+        other
+            .allow_any_call("proj-a", "test-command-tool", "again", ConfirmAllowAnyCall)
+            .expect("allow again");
+        assert!(
+            matches!(review().await, Verdict::Run(_)),
+            "a rule added meanwhile applies"
+        );
     }
 
     #[tokio::test]

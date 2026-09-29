@@ -96,6 +96,9 @@ kgraf orchestrate --route kimi:<model-id> --route openai:<model-id> \
   --instruction task.txt --prices prices.json
 ```
 
+A model missing from `prices.json` still runs; its spend is reported as unpriced, never as
+zero. `kgraf orchestrate` exits non-zero unless the run completed.
+
 The [usage guide](docs/USAGE.md) covers every command, flag and window in detail.
 
 ## How it works

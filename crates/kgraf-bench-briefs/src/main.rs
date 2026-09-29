@@ -8,8 +8,8 @@
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use kgraf_bench_briefs::{
-    BenchOptions, RouteHandle, WorkerBudget, apply_override, brief, default_price_table, report,
-    run_bench, unpriced_warning,
+    BenchOptions, RouteHandle, WorkerBudget, apply_override, brief, default_price_table_for,
+    report, run_bench, suite_store, unpriced_warning,
 };
 use kgraf_core::cost::Money;
 use kgraf_host::worker::config::{
@@ -101,7 +101,16 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let mut prices = default_price_table()?;
+    // A route whose vendor litellm keys under a provider prefix gets its bare
+    // model id priced from that prefix; a route with no known provider gets none.
+    let provider_ids: Vec<(&str, &str)> = args
+        .routes
+        .iter()
+        .filter_map(|spec| {
+            kgraf_fleet::litellm_provider(&spec.route).map(|p| (spec.model.as_str(), p))
+        })
+        .collect();
+    let mut prices = default_price_table_for(&provider_ids)?;
     if let Some(path) = &args.prices {
         apply_override(&mut prices, path)?;
     }
@@ -206,21 +215,25 @@ fn main() -> Result<()> {
             o.rep,
             o.brief_id,
             o.kind.as_str(),
-            if o.satisfied { "satisfied" } else { "unmet" },
+            if o.errored {
+                "ERROR (not tallied)"
+            } else if o.satisfied {
+                "satisfied"
+            } else {
+                "unmet"
+            },
             display_cost(o.cost),
             o.note
                 .as_ref()
                 .map_or_else(String::new, |n| format!("  note: {n}")),
         );
     }
-    let store =
-        kgraf_core::model_profile::ProfileStore::load(&args.state_dir).with_context(|| {
-            format!(
-                "cannot load the profile store at {}",
-                args.state_dir.display()
-            )
-        })?;
-    println!("\n{}", report::render(&store, &brief::suite_hash()));
+    let hash = brief::suite_hash();
+    let view = suite_store::inspect(&args.state_dir, &hash)?;
+    println!(
+        "\n{}",
+        report::render_with_stale(&view.store, &hash, view.stale.as_deref())
+    );
     Ok(())
 }
 

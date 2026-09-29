@@ -77,7 +77,7 @@ pollster = "1.0.1"
 # `wayland` and `x11` make eframe pass `with_app_id("kgraf")` to winit on Linux
 # (Wayland app_id, X11 WM_CLASS class), so the desktop entry's StartupWMClass
 # matches the window; without them the id is dropped and X11 falls back to
-# argv[0]. winit already builds both backends (L8).
+# argv[0]. winit already builds both backends.
 eframe = { version = "0.36.2", default-features = false, features = ["wgpu", "default_fonts", "accesskit", "wayland", "x11"] }
 egui = "0.36.2"
 egui-wgpu = "0.36.2"

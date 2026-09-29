@@ -113,6 +113,11 @@ pub enum InterpretError {
     #[error("cannot read the roadmap `{path}`: {reason}")]
     RoadmapUnreadable { path: String, reason: String },
 
+    /// A presumed node's stored body is not valid JSON. Reading it as empty
+    /// would show the item as remaining work with no claim.
+    #[error("the body of presumed node `{node}` is not valid JSON: {reason}")]
+    CorruptBody { node: String, reason: String },
+
     /// Approval accepted a command the plan does not propose.
     #[error(
         "`{command}` is not a command this plan proposes; accept only proposed commands, by name"

@@ -326,7 +326,7 @@ impl InteractiveRun {
 
     /// Stops the run and waits, at most `timeout`, for it to end: its workers are
     /// cancelled and its record is saved as stopped, so it resumes later. For a
-    /// window that is closing (L4). Call from a thread that is not a runtime
+    /// window that is closing. Call from a thread that is not a runtime
     /// worker. Returns whether the run ended in time.
     pub fn stop_and_wait(&mut self, timeout: std::time::Duration) -> bool {
         if self.finished {

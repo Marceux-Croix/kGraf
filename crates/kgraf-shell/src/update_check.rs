@@ -329,6 +329,44 @@ pub async fn download_and_verify(
     candidate: &UpdateCandidate,
     dest_dir: &Path,
 ) -> Result<PathBuf, UpdateError> {
+    let path = dest_dir.join(&candidate.asset_name);
+    let mut created = false;
+    let result = download_steps(client, candidate, dest_dir, &path, &mut created).await;
+    if result.is_err() && created {
+        // A failed or stalled download must not leave a partial installer
+        // behind for a later run to find. Errors before the file is created
+        // leave an earlier verified download alone.
+        let _ = std::fs::remove_file(&path);
+    }
+    result.map(|()| path)
+}
+
+/// How long a connection may take to open.
+pub const DOWNLOAD_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// How long a download may go without receiving a byte. Not a limit on the
+/// whole transfer: an installer of hundreds of megabytes on a slow link
+/// finishes as long as data keeps arriving.
+pub const DOWNLOAD_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The client for [`download_and_verify`]: a connect timeout and a read-idle
+/// timeout, and no whole-request timeout (the release query keeps its own
+/// short one).
+pub fn download_client(connect: std::time::Duration, idle: std::time::Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(connect)
+        .read_timeout(idle)
+        .build()
+        .unwrap_or_default()
+}
+
+/// The download itself. Sets `created` once the destination file exists.
+async fn download_steps(
+    client: &reqwest::Client,
+    candidate: &UpdateCandidate,
+    dest_dir: &Path,
+    path: &Path,
+    created: &mut bool,
+) -> Result<(), UpdateError> {
     use tokio::io::AsyncWriteExt as _;
 
     let checksum_body = client
@@ -353,7 +391,6 @@ pub async fn download_and_verify(
         path: dest_dir.to_owned(),
         message: e.to_string(),
     })?;
-    let path = dest_dir.join(&candidate.asset_name);
     let mut resp = client
         .get(&candidate.download_url)
         .header("User-Agent", user_agent())
@@ -363,12 +400,13 @@ pub async fn download_and_verify(
         .error_for_status()
         .map_err(|e| UpdateError::Http(e.status().map(|s| s.as_u16()).unwrap_or(0)))?;
 
-    let mut file = tokio::fs::File::create(&path)
+    let mut file = tokio::fs::File::create(path)
         .await
         .map_err(|e| UpdateError::Io {
-            path: path.clone(),
+            path: path.to_owned(),
             message: e.to_string(),
         })?;
+    *created = true;
     let mut hasher = Sha256::new();
     while let Some(chunk) = resp
         .chunk()
@@ -377,12 +415,12 @@ pub async fn download_and_verify(
     {
         hasher.update(&chunk);
         file.write_all(&chunk).await.map_err(|e| UpdateError::Io {
-            path: path.clone(),
+            path: path.to_owned(),
             message: e.to_string(),
         })?;
     }
     file.flush().await.map_err(|e| UpdateError::Io {
-        path: path.clone(),
+        path: path.to_owned(),
         message: e.to_string(),
     })?;
     drop(file);
@@ -393,14 +431,13 @@ pub async fn download_and_verify(
         .map(|b| format!("{b:02x}"))
         .collect();
     if actual != expected {
-        let _ = std::fs::remove_file(&path);
         return Err(UpdateError::ChecksumMismatch {
             asset: candidate.asset_name.clone(),
             expected,
             actual,
         });
     }
-    Ok(path)
+    Ok(())
 }
 
 /// The kind of installer a downloaded, verified file is, from its name.
@@ -819,6 +856,138 @@ mod tests {
             .await
             .expect("verified");
         assert_eq!(std::fs::read(&path).expect("read"), body);
+    }
+
+    /// A one-thread HTTP server on a local port: `/sum` returns `sum_body`;
+    /// `/asset` sends `chunks` with `gap` between them, then, when `stall` is
+    /// set, holds the connection open without finishing the body. Returns the
+    /// base URL. The thread ends with the process; each test binds its own.
+    fn drip_server(
+        sum_body: String,
+        chunks: Vec<Vec<u8>>,
+        gap: std::time::Duration,
+        stall: bool,
+    ) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let (sum_body, chunks) = (sum_body.clone(), chunks.clone());
+                std::thread::spawn(move || {
+                    let mut req = Vec::new();
+                    let mut buf = [0u8; 512];
+                    while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match stream.read(&mut buf) {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => req.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let first = String::from_utf8_lossy(&req);
+                    if first.starts_with("GET /sum") {
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sum_body}",
+                            sum_body.len()
+                        );
+                        return;
+                    }
+                    let total: usize = chunks.iter().map(Vec::len).sum();
+                    let declared = if stall { total + 1000 } else { total };
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {declared}\r\nConnection: close\r\n\r\n"
+                    );
+                    for chunk in &chunks {
+                        if stream.write_all(chunk).is_err() || stream.flush().is_err() {
+                            return;
+                        }
+                        std::thread::sleep(gap);
+                    }
+                    if stall {
+                        std::thread::sleep(std::time::Duration::from_secs(10));
+                    }
+                });
+            }
+        });
+        base
+    }
+
+    fn drip_candidate(base: &str) -> UpdateCandidate {
+        UpdateCandidate {
+            version: Version::new(9, 9, 9),
+            tag_name: "v9.9.9".into(),
+            asset_name: "asset.tar.gz".into(),
+            download_url: format!("{base}/asset"),
+            checksum_name: "asset.tar.gz.sha256".into(),
+            checksum_url: format!("{base}/sum"),
+        }
+    }
+
+    /// A download that keeps receiving bytes finishes even when the whole
+    /// transfer takes longer than a whole-request timeout would allow. The
+    /// control client, with that whole-request timeout, fails on the same
+    /// server, so the test proves the difference between the two.
+    #[tokio::test]
+    async fn a_slow_but_steady_download_is_not_cut_off_by_the_idle_timeout() {
+        use std::time::Duration;
+        let chunks: Vec<Vec<u8>> = (0..8).map(|i| vec![b'a' + i as u8; 64]).collect();
+        let body: Vec<u8> = chunks.concat();
+        let hex: String = Sha256::digest(&body)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let base = drip_server(
+            format!("{hex}  asset.tar.gz\n"),
+            chunks,
+            Duration::from_millis(150),
+            false,
+        );
+        let candidate = drip_candidate(&base);
+
+        let whole = reqwest::Client::builder()
+            .timeout(Duration::from_millis(500))
+            .build()
+            .expect("client");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = download_and_verify(&whole, &candidate, dir.path())
+            .await
+            .expect_err("a whole-request timeout cuts a slow transfer");
+        assert!(matches!(err, UpdateError::Network(_)), "{err}");
+
+        let client = download_client(Duration::from_secs(2), Duration::from_millis(600));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = download_and_verify(&client, &candidate, dir.path())
+            .await
+            .expect("steady progress is not idle");
+        assert_eq!(std::fs::read(path).expect("read"), body);
+    }
+
+    /// A download that stops sending fails after the idle timeout, and the
+    /// partial file is deleted.
+    #[tokio::test]
+    async fn a_stalled_download_fails_and_leaves_no_partial_file() {
+        use std::time::Duration;
+        let base = drip_server(
+            format!("{}  asset.tar.gz\n", "0".repeat(64)),
+            vec![vec![b'x'; 100]],
+            Duration::from_millis(10),
+            true,
+        );
+        let candidate = drip_candidate(&base);
+        let client = download_client(Duration::from_secs(2), Duration::from_millis(300));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let started = std::time::Instant::now();
+        let err = download_and_verify(&client, &candidate, dir.path())
+            .await
+            .expect_err("a stalled body must fail");
+        assert!(matches!(err, UpdateError::Network(_)), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(
+            !dir.path().join("asset.tar.gz").exists(),
+            "the partial installer was left behind"
+        );
     }
 
     /// The mechanism under test: a checksum mismatch is

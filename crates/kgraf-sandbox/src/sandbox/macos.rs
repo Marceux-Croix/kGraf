@@ -72,6 +72,17 @@ pub(super) const DENIED_HOME_READS: &[&str] = &[
     ".docker",
     ".netrc",
     ".git-credentials",
+    // Git's credential-store file under the XDG path. The rest of
+    // `~/.config/git` stays readable: git aborts on a config file it may not
+    // read, and builds run `git` for version stamps.
+    ".config/git/credentials",
+    // HashiCorp Vault's token helper file, PostgreSQL passwords, Terraform
+    // CLI credentials, RubyGems credentials, OpenAI Codex CLI auth.
+    ".vault-token",
+    ".pgpass",
+    ".terraform.d",
+    ".gem/credentials",
+    ".codex",
     ".password-store",
     ".pypirc",
     ".config/gh",
@@ -286,7 +297,19 @@ pub(super) fn profile(policy: &Resolved, home: &Path) -> (String, Vec<(String, P
     for (i, rel) in DENIED_HOME_READS.iter().enumerate() {
         let key = format!("DENY_READ_{i}");
         read_denies.push(format!("(subpath (param \"{key}\"))"));
-        params.push((key, home.join(rel)));
+        let path = home.join(rel);
+        // Seatbelt matches the resolved path, so a symlinked `~/.ssh` is
+        // readable at its target unless the target is denied too. The
+        // spelled path stays denied as well, for a path that does not exist
+        // yet or a link created after this profile was built.
+        if let Ok(real) = std::fs::canonicalize(&path)
+            && real != path
+        {
+            let real_key = format!("DENY_READ_REAL_{i}");
+            read_denies.push(format!("(subpath (param \"{real_key}\"))"));
+            params.push((real_key, real));
+        }
+        params.push((key, path));
     }
     // Another coding agent's configuration file, plus every sibling path
     // that starts with its name: `.claude.json.backup`, `.claude.json.tmp.*`
@@ -383,6 +406,44 @@ mod tests {
             home: Some(PathBuf::from("/home/u")),
             ancestor_limit: None,
             cargo_homes: None,
+        }
+    }
+
+    /// A symlinked credential directory is denied at its target, and the
+    /// spelled path stays denied too. Fake fixtures under a temp HOME only.
+    #[test]
+    fn a_symlinked_home_credential_directory_is_denied_at_its_target() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let home = std::fs::canonicalize(base.path()).expect("canonical");
+        let target = home.join("elsewhere/keys");
+        std::fs::create_dir_all(&target).expect("target");
+        std::os::unix::fs::symlink(&target, home.join(".ssh")).expect("link");
+        let (text, params) = profile(&resolved("/tmp/w", Network::Deny), &home);
+        let denied = |p: &Path| {
+            params
+                .iter()
+                .any(|(k, v)| k.starts_with("DENY_READ_") && v == p)
+        };
+        assert!(denied(&target), "the link's target is denied");
+        assert!(denied(&home.join(".ssh")), "the spelled path stays denied");
+        // Both are parameters used by a deny rule, not stray entries.
+        for (key, _) in params.iter().filter(|(k, _)| k.starts_with("DENY_READ_")) {
+            assert!(text.contains(&format!("(param \"{key}\")")), "{key}");
+        }
+    }
+
+    #[test]
+    fn the_new_credential_files_are_on_the_home_deny_list() {
+        for rel in [
+            ".config/git/credentials",
+            ".vault-token",
+            ".pgpass",
+            ".terraform.d",
+            ".gem/credentials",
+            ".codex",
+            ".netrc",
+        ] {
+            assert!(DENIED_HOME_READS.contains(&rel), "{rel}");
         }
     }
 

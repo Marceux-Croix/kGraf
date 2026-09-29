@@ -253,7 +253,7 @@ async fn a_note_to_a_resolver_is_refused_while_it_runs() {
             "hello".into(),
         )
         .await
-        .expect_err("a note to a running resolver is refused (request 17 addendum)");
+        .expect_err("a note to a running resolver is refused (decision 0073)");
     assert!(matches!(err, SessionError::Refused(_)), "{err:?}");
     let stop_err = handle
         .stop_session(resolver.id.clone())
@@ -577,5 +577,82 @@ fn a_kill_and_resume_mid_resolver_never_re_dispatches_the_original() {
         "a's own round never runs again after the kill: only the resolver's \
          interrupted round is asked again: {:?}",
         p2.stats.requests()
+    );
+}
+
+/// The routes of `a` and of its resolver, from the trace's dispatches, when
+/// `a` conflicts once. `pin` is the route the plan names for `a`, if any.
+async fn routes_of_a_and_its_resolver(pin: Option<&str>) -> (String, String) {
+    let dir = tempfile::tempdir().expect("dir");
+    let mut spec = serde_json::json!({
+        "id": "a",
+        "instruction": "make a WRITE src/a.rs",
+        "acceptance": "src/a.rs exists",
+        "writes": [{"path": "src/a.rs"}],
+        "tools": ["write_file"],
+    });
+    if let Some(r) = pin {
+        spec["route"] = serde_json::json!(r);
+    }
+    let plan = serde_json::json!({ "contracts": [spec] }).to_string();
+    let p = Parts::open(
+        dir.path(),
+        move |_| plan.clone(),
+        |_| SERVES.into(),
+        Duration::from_millis(5),
+    );
+    let integration = FakeIntegration::new(dir.path().join("worktrees"));
+    integration
+        .conflict_once
+        .lock()
+        .expect("lock")
+        .insert("a".into());
+    let mut cfg = config();
+    cfg.max_retries = 2;
+    let mut services = p.services(WINDOW);
+    services.workspaces = integration.clone();
+    let report = Orchestrator::new(cfg, services)
+        .expect("orchestrator")
+        .start(RunId::new("r1"), "make a".into())
+        .await
+        .expect("run");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    let dispatches: Vec<(String, String)> = trace_of(&p)
+        .await
+        .into_iter()
+        .filter_map(|e| match e {
+            TraceEvent::Dispatch {
+                contract, route, ..
+            } => Some((contract, route)),
+            _ => None,
+        })
+        .collect();
+    let of_a = dispatches
+        .iter()
+        .find(|(c, _)| c == "a")
+        .map(|(_, r)| r.clone())
+        .expect("a dispatched");
+    let of_resolver = dispatches
+        .iter()
+        .find(|(c, _)| c.contains("resolver"))
+        .map(|(_, r)| r.clone())
+        .expect("a resolver dispatched");
+    (of_a, of_resolver)
+}
+
+/// A resolver inherits its contract's pin, not the route its contract
+/// happened to be assigned: a contract the plan pinned keeps its resolver on
+/// that route, and an unpinned contract's resolver is picked afresh.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resolver_inherits_a_pin_and_never_turns_an_assignment_into_one() {
+    let (a, resolver) = routes_of_a_and_its_resolver(Some("beta")).await;
+    assert_eq!(a, "beta");
+    assert_eq!(resolver, "beta", "the plan's pin carries to the resolver");
+
+    let (a, resolver) = routes_of_a_and_its_resolver(None).await;
+    assert_eq!(a, "alpha", "the first pick of the rotation");
+    assert_eq!(
+        resolver, "beta",
+        "an assigned route is not a pin: the resolver's own pick moves on"
     );
 }

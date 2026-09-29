@@ -16,6 +16,11 @@ pub(crate) struct FakeTool {
     /// `fetch` waits (up to 10 s) for its stop, then fails.
     pub(crate) wait_for_stop: bool,
     pub(crate) saw_stop: std::sync::atomic::AtomicBool,
+    /// Once `fetch` ran, `check` cannot decide.
+    pub(crate) unchecked_after_fetch: bool,
+    /// `check_watched` waits (up to 10 s) for its stop, then cannot decide.
+    pub(crate) check_waits_for_stop: bool,
+    pub(crate) check_saw_stop: std::sync::atomic::AtomicBool,
     pub(crate) calls: Mutex<Vec<&'static str>>,
 }
 
@@ -41,8 +46,23 @@ impl DependencyTool for FakeTool {
         self.calls.lock().unwrap().push("applies");
         self.applies
     }
-    fn check(&self, _site: &FetchSite) -> Readiness {
+    fn check(&self, site: &FetchSite) -> Readiness {
+        self.check_watched(site, &Stop::default())
+    }
+    fn check_watched(&self, _site: &FetchSite, stop: &Stop) -> Readiness {
         self.calls.lock().unwrap().push("check");
+        if self.check_waits_for_stop {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !stop.is_stopped() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            self.check_saw_stop
+                .store(stop.is_stopped(), std::sync::atomic::Ordering::SeqCst);
+            return Readiness::Unchecked("stopped".into());
+        }
+        if self.unchecked_after_fetch && self.calls.lock().unwrap().contains(&"fetch") {
+            return Readiness::Unchecked("cargo metadata: could not start".into());
+        }
         if *self.ready.lock().unwrap() {
             Readiness::Ready
         } else {
@@ -215,6 +235,50 @@ fn a_fetch_that_leaves_a_dependency_missing_fails_loud() {
         matches!(err, DepsError::Fetch { .. }) && err.is_transient(),
         "{err}"
     );
+}
+
+/// After a fetch, a check that cannot decide confirms nothing: the fetch
+/// fails loud with the reason, at run start and for a worker alike.
+#[test]
+fn a_check_that_cannot_decide_after_a_fetch_is_a_failure_to_confirm() {
+    let (_d, store, site) = setup();
+    store.set(Registry::CratesIo, Consent::Allowed).unwrap();
+    let tool = FakeTool {
+        unchecked_after_fetch: true,
+        ..FakeTool::missing()
+    };
+    let err = ensure(&tool, &site, &store, RunFetch::Stored, Trigger::RunStart).unwrap_err();
+    assert!(
+        matches!(&err, DepsError::StillMissing { detail, .. }
+            if detail.contains("could not confirm") && detail.contains("could not start")),
+        "{err}"
+    );
+    assert_eq!(tool.calls(), ["applies", "check", "fetch", "check"]);
+}
+
+/// The consent question says what the consent covers beyond the start of the
+/// run: workers may fetch crates they add, up to the per-run bound.
+#[test]
+fn the_consent_text_says_workers_may_fetch_what_they_add() {
+    let q = ConsentQuestion {
+        registry: Registry::CratesIo,
+        project: PathBuf::from("/p"),
+        detail: "no matching package named `itoa`".into(),
+    };
+    let text = q.text();
+    assert!(
+        text.contains("workers fetch crates they add during the run"),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("up to {MAX_WORKER_FETCHES} fetches per run")),
+        "{text}"
+    );
+    assert!(
+        text.contains("names of those crates go to the registry"),
+        "{text}"
+    );
+    assert!(text.contains("outside the workers' sandbox"), "{text}");
 }
 
 #[test]
@@ -471,6 +535,76 @@ mod mid_run {
             matches!(&after, RefetchOutcome::Failed { reason } if reason.contains("ended")),
             "{after:?}"
         );
+    }
+
+    /// A fetch whose confirming check cannot decide is a failure for the
+    /// worker, with the reason.
+    #[test]
+    fn a_worker_is_told_when_the_check_after_its_fetch_cannot_decide() {
+        let (_d, store, _site) = setup();
+        store.set(Registry::CratesIo, Consent::Allowed).unwrap();
+        let tool = Arc::new(FakeTool {
+            unchecked_after_fetch: true,
+            ..FakeTool::missing()
+        });
+        let out = refetcher(tool, &store, RunFetch::Stored).refetch_blocking(Path::new("/wt"));
+        assert!(
+            matches!(&out, RefetchOutcome::Failed { reason } if reason.contains("could not confirm")),
+            "{out:?}"
+        );
+    }
+
+    /// The offline check is stopped with the run too: it does not run on to
+    /// its own timeout after the run ended.
+    #[test]
+    fn stopping_the_refetcher_stops_its_check() {
+        let (_d, store, _site) = setup();
+        store.set(Registry::CratesIo, Consent::Allowed).unwrap();
+        let tool = Arc::new(FakeTool {
+            check_waits_for_stop: true,
+            ..FakeTool::missing()
+        });
+        let r = refetcher(tool.clone(), &store, RunFetch::Stored);
+        let worker = {
+            let r = r.clone();
+            std::thread::spawn(move || r.refetch_blocking(Path::new("/wt")))
+        };
+        while !tool.calls().contains(&"check") {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        r.stop();
+        let out = worker.join().unwrap();
+        assert!(matches!(out, RefetchOutcome::Failed { .. }), "{out:?}");
+        assert!(
+            tool.check_saw_stop
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "the check was given the run's stop"
+        );
+        assert!(!tool.calls().contains(&"fetch"), "{:?}", tool.calls());
+    }
+
+    /// A call queued behind another worker's fetch is stopped when the run
+    /// ends while it waits: no check, no fetch after the lock is free.
+    #[test]
+    fn a_call_waiting_for_the_lock_when_the_run_ends_never_runs() {
+        let (_d, store, _site) = setup();
+        store.set(Registry::CratesIo, Consent::Allowed).unwrap();
+        let tool = Arc::new(FakeTool::missing());
+        let r = refetcher(tool.clone(), &store, RunFetch::Stored);
+        let held = r.hold_for_test();
+        let worker = {
+            let r = r.clone();
+            std::thread::spawn(move || r.refetch_blocking(Path::new("/wt")))
+        };
+        std::thread::sleep(Duration::from_millis(300));
+        r.stop();
+        drop(held);
+        let out = worker.join().unwrap();
+        assert!(
+            matches!(&out, RefetchOutcome::Failed { reason } if reason.contains("ended")),
+            "{out:?}"
+        );
+        assert!(tool.calls().is_empty(), "{:?}", tool.calls());
     }
 
     /// A cancelled call (its future dropped) stops its own fetch.

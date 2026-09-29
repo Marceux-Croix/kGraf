@@ -101,15 +101,101 @@ const CHECK_OUTPUT_CAP: usize = 1_000;
 /// verified with `Integration::Empty` is reported, not only traced, so a run
 /// that keeps "passing" without changing anything stays visible without
 /// reading the trace.
-const EMPTY_INTEGRATION_NOTICE: &str = "this attempt integrated no change: its check passed against the worktree exactly as it was \
-     dispatched";
+/// The notice names the contract: the run's notices are a set, so one fixed
+/// text would show once however many attempts were empty.
+fn empty_integration_notice(contract: &str) -> String {
+    format!(
+        "contract {}: this attempt integrated no change: its check passed against the worktree \
+         exactly as it was dispatched",
+        clean(contract)
+    )
+}
+
+/// `text` with every control character (an escape sequence, a newline, a NUL)
+/// replaced by `?`. A file name a worker created can hold them, and a notice
+/// is printed to a terminal and stored in the run record.
+pub(crate) fn clean(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
+}
 
 /// Reads one declared write target from the still-live worktree, for the
 /// placeholder check below. This only ever runs on an attempt merge-back
 /// reported `CommitOutcome::Empty`, so the worktree's content at this path is
 /// exactly what it held at dispatch, changed or not.
+///
+/// The path is worker-controlled ground (decision 0083): no component of it
+/// may be a link, the leaf is opened with `O_NOFOLLOW | O_NONBLOCK` so a named
+/// pipe never blocks the verifier, and only a regular file with one link is
+/// read.
 fn read_write_target(ws_root: &Path, path: &str) -> Option<String> {
-    std::fs::read_to_string(ws_root.join(path)).ok()
+    use std::io::Read;
+    let mut walked = ws_root.to_path_buf();
+    for part in Path::new(path).components() {
+        walked.push(part);
+        if std::fs::symlink_metadata(&walked)
+            .ok()?
+            .file_type()
+            .is_symlink()
+        {
+            return None;
+        }
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = opts.open(&walked).ok()?;
+    let meta = file.metadata().ok()?;
+    #[cfg(unix)]
+    let linked = {
+        use std::os::unix::fs::MetadataExt;
+        meta.nlink() > 1
+    };
+    #[cfg(not(unix))]
+    let linked = false;
+    if !meta.is_file() || linked {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    (&file).read_to_end(&mut bytes).ok()?;
+    String::from_utf8(bytes).ok()
+}
+
+/// A declared write target as the dispatch base held it, read from the
+/// repository's object store (never from the worker's tree). `None` when the
+/// base has no such regular file or it is not UTF-8.
+fn base_write_target(repo: &Path, base: &str, path: &str) -> Option<String> {
+    let git = kgraf_sandbox::git::Git::discover().ok()?;
+    let spec = format!("{base}:{path}");
+    // `cat-file blob` on a tree or a missing path fails, which reads as none.
+    let bytes = git.run(repo, ["cat-file", "blob", spec.as_str()]).ok()?;
+    String::from_utf8(bytes).ok()
+}
+
+/// The declared write targets a committed attempt left untouched
+/// (`changed` is the commit's diff against the base) that held only a
+/// placeholder body at dispatch (`read` returns the base content).
+pub(crate) fn untouched_placeholders<'a>(
+    contract: &'a OpenContract,
+    changed: &[String],
+    read: impl Fn(&str) -> Option<String>,
+) -> Vec<&'a str> {
+    let untouched: Vec<&str> = contract
+        .writes
+        .iter()
+        .map(|w| w.path.as_str())
+        .filter(|w| {
+            !changed
+                .iter()
+                .any(|c| same_path(Path::new(c), Path::new(w)))
+        })
+        .collect();
+    placeholder_writes_left_in_place(untouched, read)
 }
 
 fn declared(contract: &OpenContract, p: &Path) -> bool {
@@ -164,7 +250,7 @@ fn some_paths(paths: &[&Path]) -> String {
     let mut text = paths
         .iter()
         .take(NOTICE_PATHS)
-        .map(|p| p.display().to_string())
+        .map(|p| clean(&p.display().to_string()))
         .collect::<Vec<_>>()
         .join(", ");
     if paths.len() > NOTICE_PATHS {
@@ -184,7 +270,7 @@ pub(crate) fn worker_notices(excluded: &[Excluded]) -> Vec<String> {
                 "the worker's run generated {} (made by the worker), which the project does not \
                  commit; it was left out of the attempt. Commit it in the project to make builds \
                  reproducible",
-                e.path.display()
+                clean(&e.path.display().to_string())
             )),
             GeneratedKind::PythonBytecode => bytecode.push(e.path.as_path()),
         }
@@ -219,7 +305,7 @@ pub(crate) fn check_notices(command: &str, left: &Leftovers, excluded: &[Exclude
         notices.push(format!(
             "the check `{command}` generated {}, which the project does not commit; it was not \
              merged. Commit it in the project to make builds reproducible",
-            lock.display()
+            clean(&lock.display().to_string())
         ));
     }
     if !other.is_empty() {
@@ -343,6 +429,16 @@ impl Verifier for CommandVerifier {
                 if !config.is_empty() {
                     return fail(attempt, build_config_reason(&config));
                 }
+                // A declared target the commit left untouched that held only a
+                // placeholder at dispatch is a skipped part of the work, even
+                // though other files changed (decision 0086).
+                let base = ws.head().to_owned();
+                let skipped = untouched_placeholders(&contract, &changed, |p| {
+                    base_write_target(manager.repo(), &base, p)
+                });
+                if !skipped.is_empty() {
+                    return fail(attempt, placeholder_left_in_place_reason(&skipped));
+                }
             }
             if let Err(e) = merge_back.remove_excluded_bytecode(&attempt) {
                 return fail(
@@ -433,7 +529,7 @@ impl Verifier for CommandVerifier {
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .insert(root);
-                notices.push(EMPTY_INTEGRATION_NOTICE.to_owned());
+                notices.push(empty_integration_notice(&contract.contract));
                 return Ok(Verdict::Pass {
                     by: command,
                     commit: None,
@@ -472,5 +568,136 @@ impl Verifier for CommandVerifier {
         })
         .await
         .map_err(|e| e.to_string())?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::ffi::OsStrExt;
+
+    /// Runs `read_write_target` on a thread: a read that blocks on a named
+    /// pipe must fail this test, not hang the suite.
+    fn read_bounded(root: &Path, rel: &str) -> Option<String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (root, rel) = (root.to_path_buf(), rel.to_owned());
+        std::thread::spawn(move || {
+            let _ = tx.send(read_write_target(&root, &rel));
+        });
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("the read returned instead of blocking")
+    }
+
+    #[test]
+    fn a_regular_file_is_read() {
+        let dir = tempfile::tempdir().expect("dir");
+        std::fs::create_dir_all(dir.path().join("src")).expect("mkdir");
+        std::fs::write(dir.path().join("src/a.rs"), "fn a() {}").expect("write");
+        assert_eq!(
+            read_bounded(dir.path(), "src/a.rs").as_deref(),
+            Some("fn a() {}")
+        );
+    }
+
+    #[test]
+    fn a_named_pipe_is_never_opened_for_a_blocking_read() {
+        let dir = tempfile::tempdir().expect("dir");
+        let fifo = dir.path().join("a.rs");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("cstr");
+        // SAFETY: `c` is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert_eq!(read_bounded(dir.path(), "a.rs"), None);
+    }
+
+    #[test]
+    fn a_link_at_the_leaf_or_on_the_way_is_never_followed() {
+        let dir = tempfile::tempdir().expect("dir");
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::write(outside.path().join("secret.rs"), "fn f() { todo!() }").expect("write");
+        std::os::unix::fs::symlink(outside.path().join("secret.rs"), dir.path().join("leaf.rs"))
+            .expect("link");
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("dir")).expect("link");
+        assert_eq!(read_bounded(dir.path(), "leaf.rs"), None);
+        assert_eq!(read_bounded(dir.path(), "dir/secret.rs"), None);
+    }
+
+    #[test]
+    fn a_hard_linked_file_is_never_read() {
+        let dir = tempfile::tempdir().expect("dir");
+        std::fs::write(dir.path().join("a.rs"), "x").expect("write");
+        std::fs::hard_link(dir.path().join("a.rs"), dir.path().join("b.rs")).expect("link");
+        assert_eq!(read_bounded(dir.path(), "b.rs"), None);
+    }
+
+    #[test]
+    fn control_bytes_in_a_name_never_reach_a_notice() {
+        let evil = "a\u{1b}[2Jb\nc\0.txt";
+        assert_eq!(clean(evil), "a?[2Jb?c?.txt");
+        let excluded = vec![Excluded {
+            path: PathBuf::from("Cargo\u{1b}.lock"),
+            kind: GeneratedKind::Lockfile,
+        }];
+        let notices = worker_notices(&excluded);
+        assert!(
+            notices.iter().all(|n| !n.chars().any(char::is_control)),
+            "{notices:?}"
+        );
+        let byte = PathBuf::from(evil);
+        let text = some_paths(&[byte.as_path()]);
+        assert!(!text.chars().any(char::is_control), "{text:?}");
+        let left = Leftovers {
+            created: vec![
+                PathBuf::from("x\u{7}y.bin"),
+                PathBuf::from("Cargo\u{1b}.lock"),
+            ],
+            changed: Vec::new(),
+        };
+        let all = check_notices("true", &left, &[]);
+        assert!(
+            all.iter().all(|n| !n.chars().any(char::is_control)),
+            "{all:?}"
+        );
+    }
+
+    #[test]
+    fn the_empty_notice_names_its_contract_so_a_set_keeps_each() {
+        let a = empty_integration_notice("c-1");
+        let b = empty_integration_notice("c-2");
+        assert_ne!(a, b);
+        assert!(
+            a.contains("c-1") && a.contains("integrated no change"),
+            "{a}"
+        );
+        let set: std::collections::BTreeSet<String> = [a, b].into_iter().collect();
+        assert_eq!(set.len(), 2);
+    }
+
+    fn contract_writing(paths: &[&str]) -> OpenContract {
+        let mut c = OpenContract::planned("c1", "t".into(), "add it", "it exists");
+        c.writes = paths
+            .iter()
+            .map(|p| kgraf_orchestrator::WriteTarget {
+                path: (*p).into(),
+                node: None,
+            })
+            .collect();
+        c
+    }
+
+    #[test]
+    fn a_committed_attempt_that_skipped_a_dispatch_placeholder_is_named() {
+        let c = contract_writing(&["src/a.rs", "src/b.rs", "src/c.rs"]);
+        let base = |p: &str| match p {
+            "src/a.rs" | "src/b.rs" => Some("fn f() { todo!() }".to_owned()),
+            "src/c.rs" => Some("fn f() -> u8 { 1 }".to_owned()),
+            _ => None,
+        };
+        // a.rs was changed; b.rs (placeholder) and c.rs (real) were not.
+        let left = untouched_placeholders(&c, &["src/a.rs".to_owned()], base);
+        assert_eq!(left, vec!["src/b.rs"]);
+        // Every placeholder target changed: nothing to refuse.
+        let changed = ["src/a.rs".to_owned(), "src/b.rs".to_owned()];
+        let none = untouched_placeholders(&c, &changed, base);
+        assert!(none.is_empty(), "{none:?}");
     }
 }

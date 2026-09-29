@@ -369,7 +369,7 @@ impl AskDesk {
     }
 }
 
-/// Persist-scrubbed (task H1, decision 0071): `question` and `input` are what
+/// Persist-scrubbed (decision 0071): `question` and `input` are what
 /// the shell shows live in the orchestrator box while a call waits for an
 /// answer, before the call is ever turned into a `WorkerEvent::Approval`
 /// (which is scrubbed at that later point too, in `RecordingLog::record`) --
@@ -632,8 +632,7 @@ impl AskResolver for AskRouter {
 }
 
 /// One `ask_user_question` waiting for the user, once the orchestrator could
-/// not answer it from the run record (decision 0067, point 4; owner answer
-/// Q1). Shaped like [`AskDesk`]'s own waiting list (a numbered pending
+/// not answer it from the run record (decision 0067, point 4). Shaped like [`AskDesk`]'s own waiting list (a numbered pending
 /// question, listed until answered), but for free-text answers rather than
 /// allow/deny, so it does not reuse [`PausedCall`]'s sealed approval-chain
 /// type, which names a permission decision, not a question and its text.
@@ -853,7 +852,7 @@ mod tests {
         panic!("no ask reached the desk");
     }
 
-    /// Task H1: a pending ask's `question` and `input` (the shell's live
+    /// A pending ask's `question` and `input` (the shell's live
     /// orchestrator-box display, before any `WorkerEvent::Approval` exists)
     /// are scrubbed of both a registered exact secret and a gitleaks-shaped
     /// pattern secret.

@@ -68,7 +68,8 @@ impl Default for SessionMasker {
 }
 
 impl SessionMasker {
-    /// Mask with `config`: keep the last `keep_last_observations` tool results,
+    /// Mask with `config`: keep the tool results of the last
+    /// `keep_last_observations` rounds (user messages that carry results),
     /// replace older ones with `placeholder` where that shortens them.
     pub fn new(config: MaskConfig) -> Self {
         Self { config }
@@ -147,13 +148,43 @@ impl Reducible for Block<'_> {
 
 impl ObservationMasker for SessionMasker {
     fn mask(&self, messages: &[Message]) -> Vec<Message> {
+        // The window counts rounds, not blocks. One round is one user message
+        // holding the results of every call the model issued together, and the
+        // model has not seen those results yet when the round is sent. Counting
+        // blocks would mask the first results of a wide round before the model
+        // read them. Every block of the last `keep_last_observations` user
+        // messages that carry tool results is pinned, and the library's own
+        // block window is set to 0 so it masks the rest.
+        //
+        // Prompt cache: the window slides one round at a time, so a round's
+        // results are masked as it leaves the window. That changes the bytes of
+        // a message earlier in the request, once per round, the same as the
+        // block window did.
+        let keep_rounds = self.config.keep_last_observations;
+        let recent: BTreeSet<usize> = messages
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| {
+                m.content
+                    .iter()
+                    .any(|c| matches!(c, Content::ToolResult { .. }))
+            })
+            .map(|(i, _)| i)
+            .rev()
+            .take(keep_rounds)
+            .collect();
+        let config = MaskConfig {
+            keep_last_observations: 0,
+            ..self.config.clone()
+        };
         let blocks: Vec<Block<'_>> = messages
             .iter()
             .enumerate()
             .flat_map(|(i, m)| {
+                let pinned = i == 0 || recent.contains(&i);
                 m.content.iter().map(move |c| Block {
                     content: Cow::Borrowed(c),
-                    pinned: i == 0,
+                    pinned,
                 })
             })
             .collect();
@@ -162,7 +193,7 @@ impl ObservationMasker for SessionMasker {
             &BTreeSet::new(),
             // Unbounded: masking only, never truncation (see the module docs).
             TokenBudget(usize::MAX),
-            &self.config,
+            &config,
         );
         if view.report.masked == 0 {
             return messages.to_vec();
@@ -249,6 +280,38 @@ mod tests {
                 assert_eq!(m, o);
             }
         }
+    }
+
+    #[test]
+    fn a_wide_round_is_kept_whole_and_the_window_counts_rounds() {
+        // Eight results in one user message, then four single-result rounds:
+        // five rounds in all, so nothing is masked. A block count would have
+        // masked the first seven of the wide round.
+        let mut messages = vec![Message::user("the instruction, verbatim")];
+        messages.push(Message {
+            role: Role::Assistant,
+            content: (0..8)
+                .map(|i| Content::ToolUse {
+                    id: format!("w{i}"),
+                    name: "read".into(),
+                    input: serde_json::json!({}),
+                })
+                .collect(),
+        });
+        messages.push(Message {
+            role: Role::User,
+            content: (0..8).map(|i| result(100 + i, 3)).collect(),
+        });
+        messages.extend(transcript(4, 3).into_iter().skip(1));
+        let masker = SessionMasker::default();
+        assert_eq!(masker.mask(&messages), messages);
+        // One more round pushes the wide round out of the window: all eight
+        // of its blocks are masked together.
+        messages.extend(transcript(1, 3).into_iter().skip(1));
+        let masked = masker.mask(&messages);
+        let b = bodies(&masked);
+        assert!(b[..8].iter().all(|body| body == masker.placeholder()));
+        assert!(b[8..].iter().all(|body| body.starts_with("a line")));
     }
 
     #[test]

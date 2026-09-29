@@ -357,7 +357,7 @@ async fn a_gone_roadmap_node_is_not_adopted() {
     assert!(state(&s, &id("3")).gone);
 }
 
-/// Review M1, end to end: a 20,000-row roadmap with a detail heading per row is
+/// End to end: a 20,000-row roadmap with a detail heading per row is
 /// read, synced and derived in bounded time, and a re-read writes nothing. The
 /// bound is generous for a slow machine; before the fix the parse alone took
 /// 202 s in a debug build.
@@ -399,5 +399,26 @@ fn a_document_with_no_structure_yields_no_items_and_says_so() {
     assert_eq!(
         r[0].shape,
         "0 status table(s) with 0 row(s), 0 task item(s), 0 status heading(s)"
+    );
+}
+
+#[test]
+fn a_damaged_node_body_is_an_error_not_an_item_with_no_claim() {
+    let (_dir, _db, s) = fixture();
+    presume(&s, 100);
+    let mut node = s
+        .work_nodes(P)
+        .expect("nodes")
+        .into_iter()
+        .find(|n| n.id == id("2"))
+        .expect("2");
+    node.body = "{not json".into();
+    s.put_work(&[node], &[]).expect("edit");
+
+    let error = presumed::views(&s).expect_err("a damaged body must raise");
+    let text = error.to_string();
+    assert!(
+        text.contains(&id("2")) && text.contains("not valid JSON"),
+        "{text}"
     );
 }

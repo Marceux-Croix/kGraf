@@ -128,15 +128,21 @@ pub enum ChildMerge {
     /// The child's declared changes are in the parent's worktree; `commit`
     /// is the child's result commit. `not_applied`: paths the child changed
     /// without declaring them, never applied (reported, not dropped).
+    /// `warning`: something after the apply went wrong (its worktree could
+    /// not be removed); the merge itself stands.
     Merged {
         commit: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         not_applied: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        warning: Option<String>,
     },
     /// The child changed none of its declared paths.
     Empty {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         not_applied: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        warning: Option<String>,
     },
     /// A plain directory with no history: nothing to merge by.
     Unversioned,
@@ -196,10 +202,10 @@ impl SubagentReport {
                  worktree are unchanged"
             ),
             ChildMerge::ReadOnly => "it was read-only".to_owned(),
-            ChildMerge::Empty { not_applied } if not_applied.is_empty() => {
+            ChildMerge::Empty { not_applied, .. } if not_applied.is_empty() => {
                 "it changed nothing".to_owned()
             }
-            ChildMerge::Empty { not_applied } => format!(
+            ChildMerge::Empty { not_applied, .. } => format!(
                 "it changed none of its paths; it changed {not_applied:?}, which it did not \
                  declare, and those were NOT applied"
             ),
@@ -213,6 +219,15 @@ impl SubagentReport {
                 format!("its merge failed: {detail}; already applied: {applied:?}")
             }
             ChildMerge::NotMerged { reason } => format!("nothing was merged: {reason}"),
+        };
+        let headline = match &self.merge {
+            ChildMerge::Merged {
+                warning: Some(w), ..
+            }
+            | ChildMerge::Empty {
+                warning: Some(w), ..
+            } => format!("{headline} (warning: {w})"),
+            _ => headline,
         };
         let json = serde_json::to_string(self).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"));
         format!(

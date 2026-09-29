@@ -188,3 +188,88 @@ async fn a_stalled_attempt_leaves_a_live_tally_with_nothing_satisfied() {
     assert!(tally.attempts >= 1, "{tally:?}");
     assert_eq!(tally.satisfied, 0, "{tally:?}");
 }
+
+/// A verifier that cannot run: its answer is an error, never a verdict.
+struct BrokenVerifier;
+
+#[async_trait::async_trait]
+impl kgraf_orchestrator::Verifier for BrokenVerifier {
+    async fn verify(
+        &self,
+        _contract: &kgraf_orchestrator::OpenContract,
+        _workspace: &std::path::Path,
+        _result: &kgraf_runtime::WorkerResult,
+    ) -> Result<kgraf_orchestrator::Verdict, String> {
+        Err("the test runner is not installed".into())
+    }
+
+    async fn recheck(&self, _commit: &kgraf_orchestrator::VerifiedCommit) -> Result<bool, String> {
+        Ok(true)
+    }
+}
+
+/// The live tally of `ALPHA_MODEL` after one contract pinned to alpha ran with
+/// `verifier` (or the harness's own when `None`): `(attempts, satisfied)`, or
+/// `None` when no tally exists.
+async fn alpha_tally(
+    instruction: &str,
+    verifier: Option<Arc<dyn kgraf_orchestrator::Verifier>>,
+    require: Option<&str>,
+) -> Option<(u64, u64)> {
+    let dir = tempfile::tempdir().expect("dir");
+    std::fs::create_dir_all(dir.path().join("profiles")).expect("profiles dir");
+    let plan = json!({"contracts":[
+        {"id":"a","instruction":format!("{instruction} WRITE src/a.rs"),
+         "acceptance":"src/a.rs exists","writes":[{"path":"src/a.rs"}],
+         "tools":["write_file"],"route":"alpha"}
+    ]})
+    .to_string();
+    let p = Parts::open(
+        dir.path(),
+        move |_| plan.clone(),
+        |_| SERVES.into(),
+        Duration::ZERO,
+    );
+    if let Some(r) = require {
+        *p.verifier.require.lock().expect("lock") = Some(r.to_owned());
+    }
+    let mut services = p.services(WINDOW);
+    if let Some(v) = verifier {
+        services.verifier = v;
+    }
+    let mut cfg = config();
+    cfg.max_retries = 0;
+    Orchestrator::new(cfg, services)
+        .expect("orchestrator")
+        .start(RunId::new("r1"), "make a".into())
+        .await
+        .expect("run");
+    let store = ProfileStore::load(&dir.path().join("profiles")).expect("load");
+    store
+        .get(ALPHA_MODEL)
+        .and_then(|p| p.tally(Source::Live, TaskKind::Implementation))
+        .map(|t| (t.attempts, t.satisfied))
+}
+
+/// A verifier that could not run, or panicked, says nothing about the model:
+/// no live attempt is recorded for its route. A verdict that judged the work
+/// wrong is recorded, so the absence above is not a harness that records
+/// nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_infrastructure_failure_is_not_a_failed_attempt_in_the_live_tally() {
+    assert_eq!(
+        alpha_tally("make a", Some(Arc::new(BrokenVerifier)), None).await,
+        None,
+        "a verifier that could not run left a tally"
+    );
+    assert_eq!(
+        alpha_tally("make a PANIC_VERIFY", None, None).await,
+        None,
+        "a verifier that panicked left a tally"
+    );
+    assert_eq!(
+        alpha_tally("make a", None, Some("text the worker never writes")).await,
+        Some((1, 0)),
+        "a verdict that judged the work wrong is one failed attempt"
+    );
+}

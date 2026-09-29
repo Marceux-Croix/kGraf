@@ -16,8 +16,7 @@
 //!   readiness (route probe, tool discovery)        -- transient: defer; else Held
 //!   admission (work-item cap, live-agent ceiling)  -- refused: defer (pre-flight)
 //!   leases (whole write set, atomically)           -- blocked: defer, serialized
-//!   budget reservation (task, run, hour)           -- refused: defer, or Held when
-//!                                                     no amount of waiting fits
+//!   budget reservation (task, run, hour)           -- accounting only, never refuses
 //!   save record (Dispatched, worker ids)           -- the wakeup is registered
 //!   spawn attempts (forwarder registered first)       before the child detaches
 //! ```
@@ -309,6 +308,20 @@ pub trait Workspaces: Send + Sync {
     async fn discard_child(&self, _child: &AgentId) -> Result<(), String> {
         Ok(())
     }
+    /// A writer child whose worktree cannot be reopened: `Some` merge when
+    /// a result it recorded before the process stopped was merged again
+    /// (idempotent; paths already applied stay), `None` when it recorded
+    /// none. Without this, a kill after a merge removed the child's
+    /// worktree, and before the child was marked settled, would report
+    /// nothing merged while its files are in the parent's worktree.
+    async fn recover_child_merge(
+        &self,
+        _parent: &Path,
+        _child: &AgentId,
+        _writes: &[String],
+    ) -> Result<Option<crate::subagent_tool::ChildMerge>, String> {
+        Ok(None)
+    }
     /// Merge a finished writer subagent's declared `writes` at `child` back
     /// into its parent's worktree at `parent`. A conflict, a dropped declared
     /// path or a failure part-way is returned typed, never resolved.
@@ -459,8 +472,10 @@ impl Default for OrchestratorConfig {
 pub struct Services {
     pub graph: SharedGraph,
     pub ledger: Arc<Ledger>,
-    /// Must price every route's model and the orchestrator's own: an unpriced
-    /// model cannot be reserved against, so it is refused at construction.
+    /// Prices for the models the run calls. A model with no entry is not
+    /// refused (decision 0075): its calls are made and recorded in the ledger,
+    /// its holds are zero, and its spend is reported as unpriced
+    /// (`RunReport::unpriced`), never as a known cost of `$0`.
     pub prices: PriceTable,
     pub routes: Vec<Route>,
     pub decomposer: Arc<dyn Decomposer>,
@@ -488,8 +503,6 @@ pub enum OrchestratorError {
     NoRoutes,
     #[error("route `{0}` appears twice")]
     DuplicateRoute(String),
-    #[error("model `{model}` ({what}) has no price; spend cannot be reserved")]
-    Unpriced { what: String, model: String },
     #[error("run `{run}` is held by `{holder}` until {expires_ms}; refused rather than run twice")]
     RunBusy {
         run: String,
@@ -592,7 +605,7 @@ pub enum SessionError {
     #[error("unknown session `{0}`")]
     Unknown(String),
     /// The session ended; nothing reaches it again. The text can go to the
-    /// orchestrator instead (decision 0067, owner answer Q6).
+    /// orchestrator instead (decision 0067).
     #[error(
         "session `{session}` already ended ({outcome}); nothing reaches it any more: send it to \
          the orchestrator instead"
@@ -758,10 +771,41 @@ struct Finished {
     /// Its worktree could not be provided: the next attempt needs a fresh
     /// worker (and so a fresh worktree), not the same one again.
     worktree_failed: bool,
+    /// The attempt's task ended abnormally and the ledger could not be read
+    /// for the calls the worker made before it did: its spend is unknown, and
+    /// is charged at the hold, never as a known `$0`.
+    spend_unknown: bool,
 }
 
 /// Environment builds retried before a contract is held.
 const MAX_ENVIRONMENT_RETRIES: u32 = 3;
+
+/// The cluster cap's check (decision 0082) against `graph`'s co-change edges.
+/// A poisoned graph lock is [`StoreError::Poisoned`]: the cap is never
+/// skipped for want of the lock.
+fn cluster_cap_check(
+    graph: &SharedGraph,
+    open: &[OpenContract],
+    contract: &str,
+    in_flight: impl Iterator<Item = String>,
+    cap: usize,
+    now: i64,
+) -> Result<Option<cluster_cap::ClusterCapHold>, OrchestratorError> {
+    let clusters = {
+        let g = graph.lock().map_err(|_| StoreError::Poisoned)?;
+        routing::cluster_contracts(open, &g, routing::CLUSTER_COCHANGE_MIN_COUNT, now)
+    };
+    Ok(cluster_cap::check(contract, &clusters, in_flight, cap))
+}
+
+/// How many times the planner is asked again after a refused plan, on top of
+/// the first ask.
+const MAX_PLAN_REASKS: u32 = 2;
+
+/// A contract that keeps waiting for a transiently unready route is traced
+/// again, and noticed, every this many checks (the first check is traced on
+/// its own).
+const READINESS_REPORT_EVERY: u32 = 20;
 
 enum LoopMsg {
     Finished(Box<Finished>),
@@ -769,6 +813,12 @@ enum LoopMsg {
         contract: String,
         worker: AgentId,
         verdict: Verdict,
+        /// The verdict is a `Fail` because verification could not be done (the
+        /// verifier could not run, panicked, or a consumer-test runner was
+        /// absent or failed to run), not because the attempt's work was
+        /// judged wrong. Such a verdict is no measure of the model, so it
+        /// stays out of the live routing tallies.
+        infrastructure: bool,
         /// Decision 0079: the cross-vendor review of this attempt's delivery,
         /// run off the loop next to the verifier, when the setting is on and a
         /// cross-vendor consumer's route is known. Recorded in `on_verified`
@@ -922,7 +972,7 @@ impl OrchestratorHandle {
         rx.await.map_err(|_| SessionError::Stopped)?
     }
 
-    /// `request_connection` (decision 0067, point 6; owner answer Q2): ask the
+    /// `request_connection` (decision 0067, point 6): ask the
     /// orchestrator to open a connection no rule already covers.
     pub async fn request_connection(
         &self,
@@ -1061,7 +1111,7 @@ pub struct RunReport {
     pub contracts: crate::challenge::ContractCounters,
     /// Whether the run checked interface contracts, from its record: a report
     /// says so either way, so a run without checks is not read as one whose
-    /// checks all passed (M6).
+    /// checks all passed.
     pub contract_checks: crate::run_state::ContractCheckSettings,
     /// The demand record or template update failed; the run
     /// itself finished as `status` says.
@@ -1075,7 +1125,17 @@ pub struct RunReport {
     pub notices: Vec<String>,
 }
 
+/// One contract's attempts in flight, and what they hold.
+///
+/// **Dropped holding something means a failure path.** The normal paths
+/// return the admission and the budget holds explicitly (`finalize`); a flight
+/// dropped with them still inside was lost to an early return (a `?` while it
+/// was out of `in_flight`, being handled). Its `Drop` then cancels its
+/// workers first and returns the holds, so the process-wide gate never keeps
+/// a slot for a flight nobody tracks. This lives here, not on [`Admitted`]:
+/// the flight knows its gate and its workers' cancels.
 struct InFlight {
+    admission: Arc<Admission>,
     admitted: Option<Admitted>,
     reservations: BTreeMap<AgentId, Reservation>,
     attempts: Vec<Attempt>,
@@ -1103,6 +1163,23 @@ struct InFlight {
     /// paths on the same worker its parent runs as. Empty (refuses nothing)
     /// until a subagent fences paths on it.
     fences: BTreeMap<AgentId, ScopeFence>,
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        if self.admitted.is_none() && self.reservations.is_empty() {
+            return;
+        }
+        for n in self.cancels.values() {
+            n.notify_one();
+        }
+        if let Some(a) = self.admitted.take() {
+            self.admission.gate().release(a);
+        }
+        for (_, r) in std::mem::take(&mut self.reservations) {
+            self.admission.budget().release(r);
+        }
+    }
 }
 
 /// One held lease, of either grain (decision 0050).
@@ -1308,9 +1385,9 @@ pub struct Orchestrator {
     /// once the orchestrator itself cannot answer it. Always present (there is
     /// nothing to configure): `crate::asks::QuestionDesk::default()`.
     pub(crate) question_desk: Arc<crate::asks::QuestionDesk>,
-    /// Decision 0067, point 4, owner answer Q1: tried first, with one reserved,
+    /// Decision 0067, point 4: tried first, with one reserved,
     /// ledgered call, before a worker's question reaches the user; it also
-    /// judges connections no rule covers (Q2). The host wires
+    /// judges connections no rule covers. The host wires
     /// [`crate::ModelAnswerer`] over the planner route. `None`: every question
     /// goes to the user and every judged connection is refused, each with a
     /// recorded notice.
@@ -1319,6 +1396,9 @@ pub struct Orchestrator {
     /// ([`crate::SCHEDULED_ASK_TIMEOUT`]) unless the run was started from the
     /// box.
     pub(crate) question_timeout: Duration,
+    /// How long one paid session call may run
+    /// ([`sessions::SESSION_CALL_TIMEOUT`] unless set).
+    pub(crate) session_call_timeout: Duration,
     /// Where session notices are shown besides the trace and the report.
     pub(crate) session_notices: Option<sessions::SessionNoticeSink>,
 }
@@ -1333,23 +1413,6 @@ impl Orchestrator {
         for r in &services.routes {
             if !names.insert(r.name.as_str()) {
                 return Err(OrchestratorError::DuplicateRoute(r.name.clone()));
-            }
-            if services.prices.get(r.model()).is_none() {
-                return Err(OrchestratorError::Unpriced {
-                    what: format!("route {}", r.name),
-                    model: r.model().to_owned(),
-                });
-            }
-        }
-        for (what, basis) in [
-            ("decomposer", services.decomposer.cost_basis()),
-            ("grounder", services.grounder.cost_basis()),
-        ] {
-            if services.prices.get(&basis.model).is_none() {
-                return Err(OrchestratorError::Unpriced {
-                    what: what.into(),
-                    model: basis.model,
-                });
             }
         }
         let (tx, rx) = mpsc::channel(1_024);
@@ -1366,13 +1429,14 @@ impl Orchestrator {
             question_desk: Arc::new(crate::asks::QuestionDesk::default()),
             question_answerer: None,
             question_timeout: crate::asks::QuestionAttendance::Unattended.timeout(),
+            session_call_timeout: sessions::SESSION_CALL_TIMEOUT,
             session_notices: None,
         })
     }
 
     /// Try to answer a worker's `ask_user_question` from the run record before
-    /// it reaches the user (decision 0067, point 4; owner answer Q1), and judge
-    /// connections no rule covers (Q2). Without one, every question goes to
+    /// it reaches the user (decision 0067, point 4), and judge
+    /// connections no rule covers. Without one, every question goes to
     /// the user and every judged connection is refused, each with a notice.
     pub fn with_question_answerer(mut self, answerer: Arc<dyn sessions::QuestionAnswerer>) -> Self {
         self.question_answerer = Some(answerer);
@@ -1389,6 +1453,14 @@ impl Orchestrator {
     /// How long a worker's question waits for the user, set directly (tests).
     pub fn with_question_timeout(mut self, timeout: Duration) -> Self {
         self.question_timeout = timeout;
+        self
+    }
+
+    /// How long one paid session call (an answer, a connection judgment) may
+    /// run before it counts as failed. The default is
+    /// [`sessions::SESSION_CALL_TIMEOUT`].
+    pub fn with_session_call_timeout(mut self, timeout: Duration) -> Self {
+        self.session_call_timeout = timeout;
         self
     }
 
@@ -1434,17 +1506,6 @@ impl Orchestrator {
         mut self,
         checks: crate::challenge::ContractChecks,
     ) -> Result<Self, OrchestratorError> {
-        for (what, basis) in [
-            ("handshaker", checks.handshaker.cost_basis()),
-            ("reviewer", checks.reviewer.cost_basis()),
-        ] {
-            if self.services.prices.get(&basis.model).is_none() {
-                return Err(OrchestratorError::Unpriced {
-                    what: what.into(),
-                    model: basis.model,
-                });
-            }
-        }
         let desk = contract_hooks::Desk::new(checks).map_err(OrchestratorError::Contracts)?;
         // The run directory holds transcripts and the trace: a check must not
         // read it (the same rule the worker's shell follows).
@@ -1561,7 +1622,8 @@ struct RunLoop {
     nonce: String,
     /// The run lease was lost: another orchestrator owns the run.
     run_lease_lost: bool,
-    /// Ledger calls charged at open; never charged again.
+    /// Ledger calls already charged (at open, or when a worker or subagent
+    /// finished); never charged again.
     seeded: BTreeSet<CallId>,
     serialized_seen: BTreeSet<String>,
     since_reground: u32,
@@ -1570,6 +1632,9 @@ struct RunLoop {
     route_cursor: usize,
     /// Deferrals already traced, so a long wait is one record, not one per tick.
     deferred_logged: BTreeSet<(String, DeferReason)>,
+    /// Transient readiness deferrals so far, per waiting contract: a wait with
+    /// no end is reported periodically, not once.
+    readiness_waits: BTreeMap<String, u32>,
     /// Earliest time a deferred contract could proceed without another event.
     wake_at: Option<i64>,
     coord: coord::CoordRuntime,
@@ -1727,6 +1792,7 @@ impl RunLoop {
             question_desk,
             question_answerer,
             question_timeout,
+            session_call_timeout,
             session_notices,
         } = o;
         // The check setting is the run's: kept in the record, and a resume with
@@ -1817,7 +1883,7 @@ impl RunLoop {
         store.set_active(&record.run)?;
 
         let files = RunFiles::create(&services.runs_dir, &record.run)?;
-        let trace = TraceLog::open(&files.trace())
+        let (trace, torn_trace) = TraceLog::open_repairing(&files.trace())
             .await
             .map_err(|e| OrchestratorError::Trace(e.to_string()))?;
         // Only this run's calls, and the sizing history as a SQL aggregate: both
@@ -1861,6 +1927,7 @@ impl RunLoop {
             stopping: false,
             route_cursor: 0,
             deferred_logged: BTreeSet::new(),
+            readiness_waits: BTreeMap::new(),
             wake_at: None,
             coord: coord::CoordRuntime::new(gate_runner),
             frugal: frugality::FrugalRuntime::new(),
@@ -1872,8 +1939,25 @@ impl RunLoop {
             interface_reviewer,
             question_desk,
             question_answerer,
-            sessions_rt: sessions::SessionRuntime::new(question_timeout, session_notices),
+            sessions_rt: sessions::SessionRuntime::new(
+                question_timeout,
+                session_notices,
+                session_call_timeout,
+            ),
         };
+        if let Some(torn) = torn_trace {
+            let at = me.now();
+            me.trace(TraceEvent::Notice {
+                at_ms: at,
+                contract: String::new(),
+                worker: String::new(),
+                detail: format!(
+                    "the trace ended in a torn line ({} bytes), dropped on resume",
+                    torn.discarded.len()
+                ),
+            })
+            .await?;
+        }
         me.seed_spend(&calls)?;
         if resumed {
             me.on_resume().await?;
@@ -1901,18 +1985,16 @@ impl RunLoop {
             if !self.seeded.insert(c.id.clone()) {
                 continue;
             }
+            // An unpriced call's cost is unknown: it is not charged as `$0`
+            // here, and the report lists its model as unpriced.
             let cost = match c.settlement {
                 Settlement::Counted | Settlement::Cancelled => {
-                    self.s.prices.cost(&c.model, &c.usage).map_err(|_| {
-                        OrchestratorError::Unpriced {
-                            what: format!("ledger call {}", c.id),
-                            model: c.model.clone(),
-                        }
-                    })?
+                    self.s.prices.cost(&c.model, &c.usage).ok()
                 }
-                Settlement::Failed => Money::ZERO,
-                Settlement::Unreconciled => self.worst_case(&c.model)?,
+                Settlement::Failed => Some(Money::ZERO),
+                Settlement::Unreconciled => self.worst_case(&c.model),
             };
+            let Some(cost) = cost else { continue };
             let at = c.finished_ms.unwrap_or(c.started_ms);
             by_task
                 .entry(c.task_id.clone())
@@ -1944,7 +2026,8 @@ impl RunLoop {
 
     /// The most one call on `model` can cost: the largest context a route on it
     /// may send (its stop point) and a full output.
-    fn worst_case(&self, model: &str) -> Result<Money, OrchestratorError> {
+    /// `None` when the model has no price: the cost is unknown.
+    fn worst_case(&self, model: &str) -> Option<Money> {
         let (input, output) = match self.s.routes.iter().find(|r| r.model() == model) {
             Some(r) => (
                 r.context.worker_stop_tokens(),
@@ -1969,10 +2052,26 @@ impl RunLoop {
         self.s
             .prices
             .cost(model, &dear_usage(&self.s.prices, model, input, output))
-            .map_err(|_| OrchestratorError::Unpriced {
-                what: "an unreconciled call".into(),
-                model: model.to_owned(),
-            })
+            .ok()
+    }
+
+    /// How the reports name a model that has no price entry: a local route's
+    /// model costs nothing to call, a hosted one's cost is unknown.
+    fn unpriced_label(&self, model: &str) -> &'static str {
+        if self.s.routes.iter().any(|r| r.model() == model && r.local) {
+            "local, unpriced"
+        } else {
+            "unpriced"
+        }
+    }
+
+    /// Note, once per model, that a model with no price entry is in use.
+    fn note_unpriced(&mut self, model: &str) {
+        let label = self.unpriced_label(model);
+        self.notices.insert(format!(
+            "model `{model}` has no price entry ({label}): its calls are made and recorded, \
+             and its spend is reported as unpriced, never as $0"
+        ));
     }
 
     fn run_id(&self) -> String {
@@ -2065,7 +2164,7 @@ impl RunLoop {
                 channel: n.channel.clone(),
                 received_ms: n.received_ms,
                 kind: n.kind,
-                // The model's copy (decision 0071, H2).
+                // The model's copy.
                 text: n.text.for_model(),
             };
             blocks.push(m.to_data_block());
@@ -2096,12 +2195,12 @@ impl RunLoop {
 
     // ------------------------------------------------------------- orchestrator calls
 
-    /// Reserve one orchestrator model call before it is made.
-    fn reserve_call(
-        &mut self,
-        basis: &CostBasis,
-        input_tokens: u64,
-    ) -> Result<Reservation, OrchestratorError> {
+    /// Reserve one orchestrator model call before it is made. A reservation is
+    /// accounting only and never refuses a call: an unpriced model holds zero and
+    /// its spend is reported as unpriced.
+    fn reserve_call(&mut self, basis: &CostBasis, input_tokens: u64) -> Reservation {
+        // `None`: the model is unpriced. The call is still made and ledgered;
+        // its hold is zero and its spend is reported as unpriced.
         let estimate = self
             .s
             .prices
@@ -2114,10 +2213,11 @@ impl RunLoop {
                     u64::from(basis.max_output_tokens),
                 ),
             )
-            .map_err(|_| OrchestratorError::Unpriced {
-                what: "an orchestrator call".into(),
-                model: basis.model.clone(),
-            })?;
+            .ok();
+        if estimate.is_none() {
+            self.note_unpriced(&basis.model);
+        }
+        let estimate = estimate.unwrap_or(Money::ZERO);
         let run = self.run_id();
         let now = self.now();
         let reservation = self
@@ -2126,7 +2226,7 @@ impl RunLoop {
             .budget()
             .reserve(&run, &run, estimate, now, true);
         self.record.counters.budget_admitted += 1;
-        Ok(reservation)
+        reservation
     }
 
     /// Settle an orchestrator call's hold at the ledger cost of `calls`; a call
@@ -2173,7 +2273,13 @@ impl RunLoop {
     /// One decomposition call: the contracts, and the interface contracts
     /// binding them when the run checks interfaces (empty otherwise). An
     /// interface party must be a contract of this answer or one of `outer`:
-    /// the plan's other contracts, which a split's interface may bind (N5).
+    /// the plan's other contracts, which a split's interface may bind.
+    ///
+    /// A plan the planner got wrong (an answer that is not the JSON asked for,
+    /// or a plan that breaks a rule) is asked for again, at most
+    /// [`MAX_PLAN_REASKS`] times, with the refusal as a note. Every ask is a
+    /// ledgered, reserved call; a plan still wrong after the last ask fails the
+    /// run with the last refusal.
     async fn decompose(
         &mut self,
         mut request: PlanRequest,
@@ -2181,6 +2287,32 @@ impl RunLoop {
         outer: &BTreeSet<String>,
     ) -> Result<(Vec<ContractSpec>, Vec<crate::checks::InterfaceContract>), OrchestratorError> {
         request.interfaces = self.contracts.is_some();
+        let mut reasks = 0;
+        loop {
+            match self.decompose_once(&request, note_ids, outer).await {
+                Err(OrchestratorError::Plan(e)) if e.reaskable() && reasks < MAX_PLAN_REASKS => {
+                    reasks += 1;
+                    self.notices.insert(format!(
+                        "the planner's answer was refused ({e}); asking again ({reasks} of {MAX_PLAN_REASKS})"
+                    ));
+                    request.notes.push(format!(
+                        "<plan_refused>\nYour previous answer was refused: {}\nAnswer again with \
+                         one corrected JSON object.\n</plan_refused>",
+                        kgraf_secrets::model_copy(&e.to_string()).replace('<', "&lt;")
+                    ));
+                }
+                other => return other,
+            }
+        }
+    }
+
+    /// One ask of the planner, checked.
+    async fn decompose_once(
+        &mut self,
+        request: &PlanRequest,
+        note_ids: &[String],
+        outer: &BTreeSet<String>,
+    ) -> Result<(Vec<ContractSpec>, Vec<crate::checks::InterfaceContract>), OrchestratorError> {
         let input = estimate_tokens(&request.instruction)
             + request
                 .notes
@@ -2200,8 +2332,8 @@ impl RunLoop {
                 .sum::<u64>()
             + 1_000;
         let basis = self.s.decomposer.cost_basis();
-        let reservation = self.reserve_call(&basis, input)?;
-        let out = self.s.decomposer.decompose(&request).await;
+        let reservation = self.reserve_call(&basis, input);
+        let out = self.s.decomposer.decompose(request).await;
         match out {
             Ok(out) => {
                 self.settle_call(reservation, Some(&out.calls))?;
@@ -2435,7 +2567,7 @@ impl RunLoop {
                         },
                         &[],
                         // The whole plan so far: a split's interface may bind
-                        // a contract outside the split, as before M1 (N5).
+                        // a contract outside the split, as before.
                         &progress.ids.clone(),
                     )
                     .await?;
@@ -2548,7 +2680,7 @@ impl RunLoop {
         // Traced before the plan is saved as done: a crash between the two
         // plans again, and a second registration of an id changes nothing. A
         // refused registration drops the saved progress, so a resume plans
-        // afresh instead of meeting the same refusal from the record (M1).
+        // afresh instead of meeting the same refusal from the record.
         if let Err(e) = self.register_interfaces(interfaces).await {
             self.record.open_contracts.clear();
             self.record.plan_progress = None;
@@ -2615,6 +2747,24 @@ impl RunLoop {
         // was taken over from an owner known to be dead, its leases were
         // released with it: `acquire_run_lease`.)
         self.record.admitted_leases.clear();
+        // A record written before `route_pinned` existed reads `false` for
+        // every contract, whether its `route` came from the plan (a pin) or
+        // from a dispatch (an assignment). A contract that never dispatched
+        // and is not a resolver can only have got its route from the plan, so
+        // it is a pin; one that dispatched before cannot be told apart, and
+        // keeps reading as an assignment (its next pick is a fresh one).
+        for c in &mut self.record.open_contracts {
+            if c.route.is_some()
+                && !c.route_pinned
+                && c.resolver_for.is_none()
+                && c.status == ContractStatus::Planned
+                && c.workers.is_empty()
+                && c.failures == 0
+                && c.renewals == 0
+            {
+                c.route_pinned = true;
+            }
+        }
         // A stopped or blocked run is running again; a gate that was running
         // runs again.
         self.record.status = RunStatus::Running;
@@ -2629,8 +2779,8 @@ impl RunLoop {
         // dispatch continues each worker's transcript. A contract the user
         // stopped a session of stays held (decision 0067): pressing
         // play resumes the run, not the stopped session; `resume_session`
-        // alone releases it. A contract an open resolver targets (owner
-        // request 17, decision 0073) also stays Dispatched: `eligible()` has
+        // alone releases it. A contract an open resolver targets (decision
+        // 0073) also stays Dispatched: `eligible()` has
         // no shared-holder check, so flipping it to Planned here would let it
         // dispatch a second worker under the resolver's own lease holder
         // while the resolver still runs.
@@ -2687,7 +2837,64 @@ impl RunLoop {
         self.release_all_leases()
     }
 
+    /// Run the loop to its end, then close the run. An error from the loop
+    /// (any `?` inside it) still stops every worker it started and returns
+    /// every slot, hold and lease it took before the error goes out: the
+    /// admission gate and its `MachineGate` are process-wide, so a leak here
+    /// would shrink every later run in this process.
     async fn run(mut self) -> Result<RunReport, OrchestratorError> {
+        if let Err(e) = self.run_loop().await {
+            self.release_on_error();
+            return Err(e);
+        }
+        self.shutdown()?;
+        self.flush_coord().await?;
+        self.save()?;
+        if matches!(self.record.status, RunStatus::Completed) {
+            self.store.clear_active(&self.record.run)?;
+            // A completed run is not resumed: its text's model copies are not
+            // needed again (decision 0071). A stopped or blocked run keeps
+            // them, since this process may resume it.
+            self.record.forget_model_copies();
+        }
+        // Old page images of rewritten run records leave the WAL. Best
+        // effort: a reader holding the WAL open only delays it.
+        self.store.checkpoint_wal();
+        // Analytics: a failure is reported with the run, never allowed to
+        // turn a finished run into an error.
+        let analytics = self.analytics_outcome().await;
+        let mut report = self.report();
+        report.analytics_error = analytics;
+        Ok(report)
+    }
+
+    /// Release what an erroring loop still holds, best effort, in the order
+    /// that keeps the disjoint-writes rule: every running worker and child is
+    /// cancelled first, then its admission and budget holds are returned,
+    /// then `shutdown` releases the sessions, gate flights, speculation slot
+    /// and leases, and the record is saved so a resume sees the latest state.
+    /// Failures here are printed, never returned: the loop's own error is the
+    /// one the caller needs.
+    ///
+    /// Not a `Drop` on [`Admitted`]: an admission has no back-reference to
+    /// its gate, and a drop would free a slot while its detached worker is
+    /// still winding down after the cancel.
+    fn release_on_error(&mut self) {
+        // Each flight's `Drop` cancels its workers, then returns its
+        // admission and budget holds.
+        drop(std::mem::take(&mut self.in_flight));
+        self.release_subagents_on_error();
+        if let Err(e) = self.shutdown() {
+            eprintln!("kgraf-orchestrator: a failed run could not release all it held: {e}");
+        }
+        if let Err(e) = self.save() {
+            eprintln!("kgraf-orchestrator: a failed run's record could not be saved: {e}");
+        }
+    }
+
+    /// The loop itself, and the final landing check. Returns on the first
+    /// error; [`RunLoop::run`] cleans up after it.
+    async fn run_loop(&mut self) -> Result<(), OrchestratorError> {
         loop {
             if !self.stopping {
                 self.dispatch_ready().await?;
@@ -2730,11 +2937,19 @@ impl RunLoop {
                     contract,
                     worker,
                     verdict,
+                    infrastructure,
                     review,
                     producer_challenge,
                 }) => {
-                    self.on_verified(contract, worker, verdict, review, producer_challenge)
-                        .await?
+                    self.on_verified(
+                        contract,
+                        worker,
+                        verdict,
+                        infrastructure,
+                        review,
+                        producer_challenge,
+                    )
+                    .await?
                 }
                 Some(LoopMsg::LeaseLost { holder, path }) => {
                     self.on_lease_lost(holder, path).await?
@@ -2770,26 +2985,7 @@ impl RunLoop {
         // provider's own ground truth right before it goes out -- catching a
         // branch that moved after the fact (a force-reset, a bug upstream, a
         // provider that lied) rather than trusting bookkeeping alone.
-        self.verify_completion_landed().await?;
-        self.shutdown()?;
-        self.flush_coord().await?;
-        self.save()?;
-        if matches!(self.record.status, RunStatus::Completed) {
-            self.store.clear_active(&self.record.run)?;
-            // A completed run is not resumed: its text's model copies are not
-            // needed again (decision 0071, review 4 L-1). A stopped or blocked
-            // run keeps them, since this process may resume it.
-            self.record.forget_model_copies();
-        }
-        // Old page images of rewritten run records leave the WAL (review 4,
-        // L-2). Best effort: a reader holding the WAL open only delays it.
-        self.store.checkpoint_wal();
-        // Analytics: a failure is reported with the run, never allowed to
-        // turn a finished run into an error.
-        let analytics = self.analytics_outcome().await;
-        let mut report = self.report();
-        report.analytics_error = analytics;
-        Ok(report)
+        self.verify_completion_landed().await
     }
 
     /// `Completed` means every verified contract's commit is on
@@ -2857,9 +3053,41 @@ impl RunLoop {
         Ok(())
     }
 
+    /// The models this run called that have no price entry, as the reports
+    /// name them (`unpriced_label`), read from the ledger. Their spend is not
+    /// in `spent`, and never counted as `$0`. `Err` carries a ledger failure,
+    /// which a report shows as a warning instead of hiding it.
+    fn unpriced_models(&self) -> Result<Vec<String>, String> {
+        let ledger = self.s.ledger.clone();
+        let prices = self.s.prices.clone();
+        let run = self.run_id();
+        let groups = blocking(move || ledger.spend_by(kgraf_provider::GroupBy::Run, &prices))
+            .map_err(|e| e.to_string())?;
+        let mut models: BTreeSet<String> = BTreeSet::new();
+        for g in groups {
+            if g.key == kgraf_provider::GroupKey::Name(run.clone()) {
+                models.extend(g.unpriced);
+            }
+        }
+        Ok(models
+            .into_iter()
+            .map(|m| format!("{m} ({})", self.unpriced_label(&m)))
+            .collect())
+    }
+
     fn report(&mut self) -> RunReport {
         let c = self.record.counters;
         let run = self.run_id();
+        let mut warnings = self.frugal.warnings.clone();
+        let mut notices: Vec<String> = self.notices.iter().cloned().collect();
+        match self.unpriced_models() {
+            Ok(m) if m.is_empty() => {}
+            Ok(m) => notices.push(format!(
+                "spend on unpriced models is not in the total: {}",
+                m.join(", ")
+            )),
+            Err(e) => warnings.push(format!("unpriced spend could not be read: {e}")),
+        }
         RunReport {
             run: self.record.run.clone(),
             status: self.record.status.clone(),
@@ -2880,8 +3108,8 @@ impl RunLoop {
                 .unwrap_or_default(),
             contract_checks: self.record.contract_checks,
             analytics_error: None,
-            warnings: self.frugal.warnings.clone(),
-            notices: self.notices.iter().cloned().collect(),
+            warnings,
+            notices,
         }
     }
 
@@ -2905,7 +3133,7 @@ impl RunLoop {
             return Some(RunStatus::Completed);
         }
         // Blocked reasons are stored and shown: persist-scrubbed where the
-        // status is built (decision 0071, review 4 H-2), whatever fed them.
+        // status is built (decision 0071), whatever fed them.
         if self.wake_at.is_some() {
             return None;
         }
@@ -3037,7 +3265,13 @@ impl RunLoop {
     /// route, else its pin, else the next in rotation (or, under `RoutingPolicy::
     /// Fitness`, the next by measured cost per satisfied task: [`Self::fitness_base`]).
     /// `None` when a recorded or pinned route is not configured: it is never
-    /// silently replaced. `c.route` only counts here when `c.route_pinned` says
+    /// silently replaced. A fresh pick does not move the rotation cursor
+    /// itself: [`Self::commit_route_pick`] does, once a dispatch (or a recorded
+    /// handshake route) really uses it, so a contract deferred by readiness,
+    /// a lease or a slot asks again from the same cursor instead of skewing
+    /// the rotation (and, under `Fitness`, the exploration share) each tick.
+    /// Routes that lack a tool the contract names are passed over.
+    /// `c.route` only counts here when `c.route_pinned` says
     /// it is a genuine pin (decision 0085): the same field also holds the
     /// route `try_dispatch` recorded after an unpinned contract's own fresh
     /// pick, purely for a handoff child to read later, and that recorded
@@ -3059,11 +3293,40 @@ impl RunLoop {
                 {
                     return Some(pos);
                 }
-                let b = self.route_cursor;
-                self.route_cursor = self.route_cursor.wrapping_add(1);
+                // The first route from the cursor on that offers every tool
+                // the contract names. When none does, the cursor's own route:
+                // readiness then holds the contract with the missing tool named.
+                let n = names.len().max(1);
+                let b = (0..n)
+                    .map(|k| self.route_cursor.wrapping_add(k))
+                    .find(|b| self.route_offers(&names[b % n], &c.tools))
+                    .unwrap_or(self.route_cursor);
                 Some(b)
             }
         }
+    }
+
+    /// Whether `c`'s route comes from a fresh pick (no recorded worker route,
+    /// genuine pin or handshake route), the case [`Self::route_base`] takes
+    /// from the rotation cursor.
+    fn route_is_fresh(c: &OpenContract) -> bool {
+        let pin = c.route_pinned.then_some(()).and(c.route.as_ref());
+        c.worker_routes
+            .first()
+            .or(pin)
+            .or(c.handshake_route.as_ref())
+            .is_none()
+    }
+
+    /// A fresh route pick was used: the next pick starts one along.
+    fn commit_route_pick(&mut self) {
+        self.route_cursor = self.route_cursor.wrapping_add(1);
+    }
+
+    /// Whether route `name` registers every tool in `tools`.
+    fn route_offers(&self, name: &str, tools: &[String]) -> bool {
+        self.route(name)
+            .is_some_and(|r| check_tools(r.env.tools.names(), tools).is_ok())
     }
 
     /// `self.s.routes` as [`routing::RouteInfo`] (decision 0075): what
@@ -3091,7 +3354,12 @@ impl RunLoop {
     /// no candidate route): the caller falls back to plain rotation, which is
     /// always available.
     fn fitness_base(&mut self, c: &OpenContract, names: &[String]) -> Option<usize> {
-        let infos = self.route_infos();
+        // Only routes that offer every tool the contract names are candidates.
+        let infos: Vec<routing::RouteInfo> = self
+            .route_infos()
+            .into_iter()
+            .filter(|r| self.route_offers(&r.name, &c.tools))
+            .collect();
         let profiles = self.s.profiles.lock().ok()?;
         let (kind, defaulted) = match c.task_kind {
             Some(k) => (k, false),
@@ -3264,7 +3532,7 @@ impl RunLoop {
     }
 
     /// Hold `id` for the user. `reason` is persist-scrubbed here (decision
-    /// 0071, security review 4 H-2): it can quote a re-grounding model's
+    /// 0071): it can quote a re-grounding model's
     /// verdict, an interface check's output, a route's readiness error or a
     /// provider error, and it is stored, shown in the held list and copied
     /// into the run's `Blocked` status.
@@ -3314,28 +3582,19 @@ impl RunLoop {
                 .sum::<u64>()
             + 500;
         let basis = self.s.grounder.cost_basis();
-        let (serves, reason, call) = match self.reserve_call(&basis, input) {
-            Err(e) => (
-                false,
-                format!("re-grounding could not be reserved: {e}"),
-                None,
-            ),
-            Ok(reservation) => {
-                let verdict = self.s.grounder.ground(&request).await;
-                match verdict {
-                    Ok(v) => {
-                        let calls: Vec<CallId> = v.call.iter().cloned().collect();
-                        self.settle_call(reservation, Some(&calls))?;
-                        // Only an answered call has received the notes.
-                        self.mark_delivered(&note_ids);
-                        (v.serves, v.reason, v.call)
-                    }
-                    Err(e) => {
-                        self.settle_call(reservation, e.calls())?;
-                        // A re-grounding that cannot answer is not a pass.
-                        (false, format!("re-grounding failed: {e}"), None)
-                    }
-                }
+        let reservation = self.reserve_call(&basis, input);
+        let (serves, reason, call) = match self.s.grounder.ground(&request).await {
+            Ok(v) => {
+                let calls: Vec<CallId> = v.call.iter().cloned().collect();
+                self.settle_call(reservation, Some(&calls))?;
+                // Only an answered call has received the notes.
+                self.mark_delivered(&note_ids);
+                (v.serves, v.reason, v.call)
+            }
+            Err(e) => {
+                self.settle_call(reservation, e.calls())?;
+                // A re-grounding that cannot answer is not a pass.
+                (false, format!("re-grounding failed: {e}"), None)
             }
         };
         self.reground_on_resume = false;
@@ -3346,7 +3605,7 @@ impl RunLoop {
             trigger,
             contract: id.clone(),
             serves,
-            // A model's verdict, stored and shown (decision 0071, H2).
+            // A model's verdict, stored and shown.
             reason: kgraf_secrets::scrub_persist_owned(reason.clone()),
             call: call.as_ref().map(|c| c.to_string()),
         });
@@ -3377,26 +3636,18 @@ impl RunLoop {
     /// at once (decision 0082), under every routing policy:
     /// recomputed from every open contract each call, same cost trade-off as
     /// `fitness_base`'s own cluster pass and no cluster state to keep in
-    /// sync. `None` on a poisoned graph lock: never a silent skip of the
-    /// cap, but also never a reason to hold a contract that a lock failure
-    /// alone cannot justify (the caller falls back to admitting; the next
-    /// tick tries again with a fresh lock).
-    fn cluster_cap_hold(&self, contract: &OpenContract) -> Option<cluster_cap::ClusterCapHold> {
-        let now = self.now();
-        let clusters = {
-            let g = self.s.graph.lock().ok()?;
-            routing::cluster_contracts(
-                &self.record.open_contracts,
-                &g,
-                routing::CLUSTER_COCHANGE_MIN_COUNT,
-                now,
-            )
-        };
-        cluster_cap::check(
+    /// sync. A poisoned graph lock is an error, never a silent skip of the cap.
+    fn cluster_cap_hold(
+        &self,
+        contract: &OpenContract,
+    ) -> Result<Option<cluster_cap::ClusterCapHold>, OrchestratorError> {
+        cluster_cap_check(
+            &self.s.graph,
+            &self.record.open_contracts,
             &contract.contract,
-            &clusters,
             self.in_flight.keys().cloned(),
             self.config.max_in_flight_per_cluster,
+            self.now(),
         )
     }
 
@@ -3424,7 +3675,7 @@ impl RunLoop {
             .min(self.s.admission.gate().limits().max_live_agents());
         // A resumed contract continues its recorded workers on their recorded
         // routes; a fresh one gets new workers on assigned routes.
-        let (workers, routes): (Vec<AgentId>, Vec<String>) = if !contract.workers.is_empty()
+        let (mut workers, mut routes): (Vec<AgentId>, Vec<String>) = if !contract.workers.is_empty()
             && contract.worker_routes.len() == contract.workers.len()
         {
             (contract.workers.clone(), contract.worker_routes.clone())
@@ -3458,9 +3709,9 @@ impl RunLoop {
             // flight's own parallel attempts.
             //
             // Scoped to Fitness only. Rotation's own fresh pick already
-            // diversifies a redispatch on its own: `route_base`'s `None`
-            // branch advances the shared, ever-incrementing `route_cursor` on
-            // every unpinned call, so a second, freshly-picked `base` already
+            // diversifies a redispatch on its own: a dispatch of an unpinned
+            // contract advances the shared, ever-incrementing `route_cursor`
+            // (`commit_route_pick`), so a second, freshly-picked `base` already
             // differs from the first; adding the failures offset on top would
             // double-count that rotation (observed live: a 2-route roster's
             // `base` shift of 1 plus an `attempt` shift of 1 wrap back to the
@@ -3488,7 +3739,7 @@ impl RunLoop {
                 .collect();
             (w, r)
         };
-        let queued = attempts_total.saturating_sub(workers.len() as u32);
+        let mut queued = attempts_total.saturating_sub(workers.len() as u32);
 
         // Readiness before capacity.
         for r in &routes {
@@ -3507,7 +3758,28 @@ impl RunLoop {
                 let detail = format!("route `{r}`: {failure}");
                 if failure.is_transient() {
                     self.wake_at = Some(self.now() + self.config.tick.as_millis() as i64);
-                    self.defer(id, DeferReason::Readiness, detail).await?;
+                    // `defer` traces the first deferral only. A wait with no
+                    // end (a route that never becomes ready) is traced again,
+                    // and noticed, every `READINESS_REPORT_EVERY` checks.
+                    let waits = {
+                        let n = self.readiness_waits.entry(id.to_owned()).or_insert(0);
+                        *n += 1;
+                        *n
+                    };
+                    if waits.is_multiple_of(READINESS_REPORT_EVERY) {
+                        let at = self.now();
+                        let detail = format!("still not ready after {waits} checks: {detail}");
+                        self.notices.insert(format!("contract {id}: {detail}"));
+                        self.trace(TraceEvent::Deferred {
+                            at_ms: at,
+                            contract: id.to_owned(),
+                            reason: DeferReason::Readiness,
+                            detail,
+                        })
+                        .await?;
+                    } else {
+                        self.defer(id, DeferReason::Readiness, detail).await?;
+                    }
                 } else {
                     self.submit_report(&contract, None, ReportKind::NeedsInput, "readiness failed");
                     self.hold(id, detail);
@@ -3520,7 +3792,7 @@ impl RunLoop {
         // Cluster cap before admission (decision 0082): a coupled contract
         // waits its turn without spending a work-item slot on a dispatch that
         // would only add to the conflict risk 0023 measured.
-        if let Some(hold) = self.cluster_cap_hold(&contract) {
+        if let Some(hold) = self.cluster_cap_hold(&contract)? {
             self.wake_at = Some(self.now() + self.config.tick.as_millis() as i64);
             // `DeferReason::Capacity` is reused rather than adding a variant
             // (decision 0082): `wait_of_defer` (`orchestrator/coord.rs`, out
@@ -3542,7 +3814,28 @@ impl RunLoop {
         }
 
         // Admission: refused pre-flight, never started and killed.
-        let admitted = self.s.admission.gate().try_admit(workers.len());
+        let mut admitted = self.s.admission.gate().try_admit(workers.len());
+        // A fresh flight wider than the agent ceiling (the machine's, which a
+        // slider can set below the project's own) could never be admitted and
+        // would wait for ever: it runs at the ceiling instead, the rest
+        // queued as later attempts, with a notice.
+        if let Err(crate::admission::Refusal::LiveAgentCeiling {
+            requested, ceiling, ..
+        }) = &admitted
+            && *ceiling >= 1
+            && *requested > *ceiling
+            && contract.workers.is_empty()
+        {
+            let (requested, ceiling) = (*requested, *ceiling);
+            workers.truncate(ceiling);
+            routes.truncate(ceiling);
+            queued = attempts_total.saturating_sub(workers.len() as u32);
+            self.notices.insert(format!(
+                "contract {id}: {requested} parallel attempts exceed the ceiling of {ceiling} \
+                 agents; running {ceiling} at a time"
+            ));
+            admitted = self.s.admission.gate().try_admit(workers.len());
+        }
         let admitted = match admitted {
             Ok(a) => a,
             Err(e) => {
@@ -3566,23 +3859,50 @@ impl RunLoop {
             self.s.admission.gate().release(admitted);
             return Ok(());
         };
-        let slice_tokens = self.slice_tokens(&contract.slices)?;
+        let slice_tokens = match self.slice_tokens(&contract.slices) {
+            Ok(t) => t,
+            Err(e) => {
+                self.s.admission.gate().release(admitted);
+                return Err(e);
+            }
+        };
         let base = prefix_tokens.saturating_mul(3).div_ceil(2)
             + bound_tokens(&contract.instruction)
             + slice_tokens.saturating_mul(3).div_ceil(2);
         let projection = self
             .sizer
             .project(&model, base, self.config.step_budget, &context);
+        // An unpriced model's spend is unknown, not refused: the hold is zero
+        // and the report names the model as unpriced.
         let estimate = match self
             .sizer
             .estimate_cost(&self.s.prices, &model, &projection, max_out)
         {
             Ok(e) => e,
-            Err(e) => {
-                self.s.admission.gate().release(admitted);
-                self.hold(id, format!("cannot estimate spend: {e}"));
-                return self.save();
+            Err(_) => {
+                self.note_unpriced(&model);
+                Money::ZERO
             }
+        };
+
+        // Held by the flight from here on: an early return (a `?` below)
+        // drops it, and its `Drop` returns the admission and the holds.
+        let mut flight = InFlight {
+            admission: self.s.admission.clone(),
+            admitted: Some(admitted),
+            reservations: BTreeMap::new(),
+            attempts: Vec::new(),
+            cancels: BTreeMap::new(),
+            running: 0,
+            queued,
+            projection,
+            estimate,
+            handed_back: None,
+            lease_lost: false,
+            premerged: BTreeSet::new(),
+            renew_workers: false,
+            injectors: BTreeMap::new(),
+            fences: BTreeMap::new(),
         };
 
         // Leases: the whole write set, atomically, under the lineage root.
@@ -3590,7 +3910,8 @@ impl RunLoop {
         let leases = match self.acquire_leases(&contract, &holder).await? {
             Ok(l) => l,
             Err(detail) => {
-                self.s.admission.gate().release(admitted);
+                // No worker exists yet: the flight's drop returns its slot.
+                drop(flight);
                 if self.serialized_seen.insert(id.to_owned()) {
                     self.record.counters.serialized += 1;
                     self.save()?;
@@ -3604,7 +3925,6 @@ impl RunLoop {
         // lease wait does not churn reservations.
         let now = self.now();
         let run = self.run_id();
-        let mut reservations = BTreeMap::new();
         for w in &workers {
             let r = self.s.admission.budget().reserve(
                 &run,
@@ -3614,12 +3934,13 @@ impl RunLoop {
                 true,
             );
             self.record.counters.budget_admitted += 1;
-            reservations.insert(w.clone(), r);
+            flight.reservations.insert(w.clone(), r);
         }
         if !leases.is_empty() {
             self.keeper.insert(&holder, leases);
         }
         self.deferred_logged.retain(|(c, _)| c != id);
+        self.readiness_waits.remove(id);
         self.note_wait(id, crate::waits::WaitState::Running);
 
         // Record the dispatch before any worker exists, so a crash after this
@@ -3634,6 +3955,9 @@ impl RunLoop {
         }
         self.record.counters.dispatches += 1;
         self.since_reground += 1;
+        if Self::route_is_fresh(&contract) {
+            self.commit_route_pick();
+        }
         self.save()?;
         let at = self.now();
         self.trace(TraceEvent::Dispatch {
@@ -3650,22 +3974,6 @@ impl RunLoop {
         .await?;
         self.trace_spend().await?;
 
-        let mut flight = InFlight {
-            admitted: Some(admitted),
-            reservations,
-            attempts: Vec::new(),
-            cancels: BTreeMap::new(),
-            running: 0,
-            queued,
-            projection,
-            estimate,
-            handed_back: None,
-            lease_lost: false,
-            premerged: BTreeSet::new(),
-            renew_workers: false,
-            injectors: BTreeMap::new(),
-            fences: BTreeMap::new(),
-        };
         let contract = self.record.contract(id).cloned().unwrap_or(contract);
         for (i, w) in workers.iter().enumerate() {
             let route = routes.get(i).cloned().unwrap_or_else(|| routes[0].clone());
@@ -3885,6 +4193,7 @@ impl RunLoop {
                 env_failure: None,
                 merged: None,
                 worktree_failed: false,
+                spend_unknown: false,
             })));
         };
         let workspace = match workspace {
@@ -3907,6 +4216,7 @@ impl RunLoop {
                     env_failure,
                     merged,
                     worktree_failed,
+                    spend_unknown: false,
                 })));
                 return;
             }
@@ -4020,6 +4330,17 @@ impl RunLoop {
             .unwrap_or((route_name.as_str(), ""));
         kgraf_diag::record(kgraf_diag::DiagEvent::worker_spawned(provider, model));
         let panic_worker = worker.clone();
+        // What the panic path reads to attribute the calls a panicked attempt
+        // made: the worker's own ledger rows, found by its agent id.
+        let panic_ledger = self.s.ledger.clone();
+        let panic_task = contract.task.to_string();
+        // The ledger stamps calls with the system clock, so this attempt's
+        // calls are the worker's rows from now on: a retry of the same worker
+        // does not charge its earlier attempts' rows again.
+        let attempt_started_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
         // The attempt body runs in its own inner task so a panic there is a
         // `JoinError`, not a silent stop of this outer task: without the
         // inner task, a panic in `run_attempt` never reaches the `tx.send`
@@ -4085,6 +4406,7 @@ impl RunLoop {
             (result, peak_context, env_failure)
         });
         tokio::spawn(async move {
+            let mut spend_unknown = false;
             let (result, peak_context, env_failure) = match task.await {
                 Ok(v) => v,
                 Err(e) => {
@@ -4092,6 +4414,32 @@ impl RunLoop {
                         format!("the attempt panicked: {e}")
                     } else {
                         format!("the attempt's task ended abnormally: {e}")
+                    };
+                    // The worker may have made model calls before it died:
+                    // they are in the ledger under its agent id, and are
+                    // attributed to it here so its spend is settled from
+                    // them, not recorded as a known zero.
+                    let agent = panic_worker.to_string();
+                    let ledger = panic_ledger.clone();
+                    let calls = match tokio::task::spawn_blocking(move || {
+                        ledger
+                            .calls_under_task(&panic_task, Some(&agent))
+                            .map(|rows| {
+                                rows.into_iter()
+                                    .filter(|c| {
+                                        c.agent_id == agent && c.started_ms >= attempt_started_ms
+                                    })
+                                    .map(|c| c.id)
+                                    .collect::<Vec<_>>()
+                            })
+                    })
+                    .await
+                    {
+                        Ok(Ok(calls)) => calls,
+                        _ => {
+                            spend_unknown = true;
+                            Vec::new()
+                        }
                     };
                     (
                         WorkerResult {
@@ -4101,7 +4449,7 @@ impl RunLoop {
                             answer: String::new(),
                             changed_paths: Vec::new(),
                             commit: None,
-                            calls: Vec::new(),
+                            calls,
                             steps: 0,
                             prefix_digest: String::new(),
                             denied: 0,
@@ -4122,6 +4470,7 @@ impl RunLoop {
                     env_failure,
                     merged: None,
                     worktree_failed: false,
+                    spend_unknown,
                 })))
                 .await;
         });
@@ -4147,7 +4496,12 @@ impl RunLoop {
             .as_ref()
             .map(Reservation::amount)
             .unwrap_or(Money::ZERO);
-        let spend = self.spend_of(&f.result.calls, held_amount)?;
+        let spend = if f.spend_unknown {
+            // Not readable: unknown, charged at the hold.
+            held_amount.max(self.spend_of(&f.result.calls, held_amount)?)
+        } else {
+            self.spend_of(&f.result.calls, held_amount)?
+        };
         let overrun = {
             let mut budget = self.s.admission.budget();
             match reservation {
@@ -4158,6 +4512,10 @@ impl RunLoop {
                 }
             }
         };
+        // Charged now. An attempt stopped and resumed in this process is a
+        // worker that carries its earlier calls, so its next result lists them
+        // again; marking them keeps that result from charging them twice.
+        self.seeded.extend(f.result.calls.iter().cloned());
         if let Some(o) = overrun {
             self.on_overrun(o).await?;
         }
@@ -4342,12 +4700,16 @@ impl RunLoop {
                     } else {
                         format!("wrote outside the declared scope: {outside:?}")
                     };
+                    // A withdrawal is the environment's doing, an out-of-scope
+                    // write the model's: only the second is a tally.
+                    let withdrawn = flight.lease_lost;
                     self.in_flight.insert(f.contract.clone(), flight);
                     return self
                         .on_verified(
                             f.contract.clone(),
                             f.worker.clone(),
                             Verdict::Fail { reason },
+                            withdrawn,
                             None,
                             None,
                         )
@@ -4392,11 +4754,15 @@ impl RunLoop {
                 // still reach the loop as a `Verified` message, or the
                 // contract's slot in `in_flight` never clears.
                 let verify_task = tokio::spawn(async move {
+                    let mut infrastructure = false;
                     let mut verdict = match verifier.verify(&c, &workspace, &result).await {
                         Ok(v) => v,
-                        Err(e) => Verdict::Fail {
-                            reason: format!("the verifier could not run: {e}"),
-                        },
+                        Err(e) => {
+                            infrastructure = true;
+                            Verdict::Fail {
+                                reason: format!("the verifier could not run: {e}"),
+                            }
+                        }
                     };
                     let mut producer_challenge = None;
                     // Both checks run before a pass is recorded, so a failure
@@ -4440,6 +4806,7 @@ impl RunLoop {
                             // against the producer's real delivery. A runner
                             // that cannot run is not a pass.
                             let Some(runner) = checks_runner.as_ref() else {
+                                infrastructure = true;
                                 verdict = Verdict::Fail {
                                     reason: format!(
                                         "the accepted consumer tests of {} could not run: no \
@@ -4484,6 +4851,7 @@ impl RunLoop {
                                     break 'producer_checks;
                                 }
                                 Err(e) => {
+                                    infrastructure = true;
                                     verdict = Verdict::Fail {
                                         reason: format!(
                                             "the accepted consumer tests of {} could not run: {e}",
@@ -4510,25 +4878,27 @@ impl RunLoop {
                     } else {
                         None
                     };
-                    (verdict, review, producer_challenge)
+                    (verdict, infrastructure, review, producer_challenge)
                 });
                 tokio::spawn(async move {
-                    let (verdict, review, producer_challenge) = match verify_task.await {
-                        Ok(v) => v,
-                        Err(e) => {
-                            let reason = if e.is_panic() {
-                                format!("the verifier panicked: {e}")
-                            } else {
-                                format!("the verifier's task ended abnormally: {e}")
-                            };
-                            (Verdict::Fail { reason }, None, None)
-                        }
-                    };
+                    let (verdict, infrastructure, review, producer_challenge) =
+                        match verify_task.await {
+                            Ok(v) => v,
+                            Err(e) => {
+                                let reason = if e.is_panic() {
+                                    format!("the verifier panicked: {e}")
+                                } else {
+                                    format!("the verifier's task ended abnormally: {e}")
+                                };
+                                (Verdict::Fail { reason }, true, None, None)
+                            }
+                        };
                     let _ = tx
                         .send(LoopMsg::Verified {
                             contract: cid,
                             worker,
                             verdict,
+                            infrastructure,
                             review,
                             producer_challenge,
                         })
@@ -4756,6 +5126,7 @@ impl RunLoop {
         contract_id: String,
         worker: AgentId,
         verdict: Verdict,
+        infrastructure: bool,
         review: Option<crate::interface_review::ReviewRecord>,
         producer_challenge: Option<Box<Challenge>>,
     ) -> Result<(), OrchestratorError> {
@@ -4782,6 +5153,7 @@ impl RunLoop {
             let _ = self.on_challenge(*challenge, reply).await?;
         }
         // A lease lost while the verifier ran voids the pass.
+        let lease_lost = flight.lease_lost;
         let verdict = if flight.lease_lost && verdict.passed() {
             Verdict::Fail {
                 reason: "a lease was lost while the attempt was verified".into(),
@@ -4799,7 +5171,16 @@ impl RunLoop {
         // alike, so a run under Rotation still builds the Bench-independent
         // Live history Fitness will read later; only the routing *choice*
         // changes with policy, never the measurement.
-        if let Some(attempt) = flight.attempts.iter().find(|a| a.worker == worker) {
+        //
+        // Not recorded when the verdict says nothing about the model: the
+        // verifier could not run or panicked, or a lease was lost while the
+        // attempt was verified. Each would count against the route as a
+        // failed attempt (and tilt Fitness away from it) for a fault that is
+        // the environment's.
+        if !infrastructure
+            && !lease_lost
+            && let Some(attempt) = flight.attempts.iter().find(|a| a.worker == worker)
+        {
             self.record_live_outcome(
                 &contract_id,
                 &worker,
@@ -5256,7 +5637,7 @@ impl RunLoop {
             };
             let spec = ContractSpec {
                 id: format!("h{}", i + 1),
-                // A worker's own text, taken in here (decision 0071, H2).
+                // A worker's own text, taken in here.
                 // `acceptance` below is the parent's, already stored.
                 instruction: kgraf_secrets::intake(item),
                 acceptance: parent.acceptance.clone(),
@@ -5658,7 +6039,7 @@ impl RunLoop {
             channel: channel.to_owned(),
             received_ms: self.s.clock.now_ms(),
             kind,
-            // Scrubbed at intake (decision 0071, H2).
+            // Scrubbed at intake.
             text: UntrustedText::new(text).for_storage(),
             delivered: false,
         });
@@ -5686,7 +6067,7 @@ impl RunLoop {
                     channel: m.channel.clone(),
                     received_ms: m.received_ms,
                     kind: m.kind,
-                    // Scrubbed at intake (decision 0071, H2).
+                    // Scrubbed at intake.
                     text: m.text.for_storage(),
                     delivered: false,
                 });
@@ -5727,8 +6108,13 @@ impl RunLoop {
         let waiting = self.wait_line();
         // One read of the board serves the text and the figures.
         let occupancy = self.frugal.board.snapshot();
+        let unpriced = match self.unpriced_models() {
+            Ok(m) if m.is_empty() => String::new(),
+            Ok(m) => format!(" (not counting {})", m.join(", ")),
+            Err(_) => " (unpriced spend unreadable)".to_owned(),
+        };
         let text = format!(
-            "run {}: {} verified, {} open, {} in flight{}; spent {}{}; {waiting}{}",
+            "run {}: {} verified, {} open, {} in flight{}; spent {}{unpriced}{}; {waiting}{}",
             self.record.run,
             verified,
             open,
@@ -5781,8 +6167,6 @@ fn held_category(reason: &str) -> &'static str {
         "route not configured"
     } else if reason.contains("attempts failed") {
         "verification failed"
-    } else if reason.starts_with("cannot estimate") {
-        "unpriced"
     } else {
         "needs input"
     }
@@ -5834,7 +6218,7 @@ fn refusal_brief(c: &OpenContract) -> String {
 }
 
 fn brief_text(c: &OpenContract) -> String {
-    // The model's copies (decision 0071, H2): the record holds the stored ones.
+    // The model's copies: the record holds the stored ones.
     let mut s = kgraf_secrets::model_copy(&c.instruction).into_owned();
     s.push_str("\n\nAcceptance: ");
     s.push_str(&kgraf_secrets::model_copy(&c.acceptance));
@@ -5917,9 +6301,22 @@ async fn run_attempt(
     graph: SharedGraph,
     parent_call: Option<CallId>,
 ) -> Result<(WorkerResult, u64), String> {
-    let mut transcript: JsonlTranscript<WorkerEvent> = JsonlTranscript::open(path.clone())
-        .await
-        .map_err(|e| format!("transcript {}: {e}", path.display()))?;
+    // A kill mid-append leaves a torn last line: repaired (dropped) rather
+    // than refused, as the host's worker does, so a re-adopted worker
+    // continues from its last whole event. What was dropped is said.
+    let (mut transcript, torn): (JsonlTranscript<WorkerEvent>, _) =
+        JsonlTranscript::open_repairing_torn_tail(path.clone())
+            .await
+            .map_err(|e| format!("transcript {}: {e}", path.display()))?;
+    let torn_note = torn.map(|t| {
+        let note = format!(
+            "transcript {}: a torn last line ({} bytes) was dropped on resume",
+            path.display(),
+            t.discarded.len()
+        );
+        eprintln!("kgraf-orchestrator: {note}");
+        note
+    });
     let entries = transcript
         .load()
         .await
@@ -6001,7 +6398,9 @@ async fn run_attempt(
         // The worker finished before the process died, and its result was never
         // recorded: rebuild it from the transcript instead of running it again.
         Err(WorkerError::Resume(ResumeError::AlreadyCompleted)) => {
-            return Ok((completed_from(&brief, &prior), peak));
+            let mut result = completed_from(&brief, &prior);
+            result.trace_failures.extend(torn_note);
+            return Ok((result, peak));
         }
         Err(e) => return Err(format!("spawn: {e}")),
     };
@@ -6032,7 +6431,7 @@ async fn run_attempt(
         brief.context.effective_window(),
     );
     // Streamed deltas are held and written as the round's settled message,
-    // or as one whole-scrubbed partial on a cancel (decision 0071, C2): a
+    // or as one whole-scrubbed partial on a cancel: a
     // secret split across two deltas never reaches the file.
     let mut settler = TranscriptSettler::new();
     loop {
@@ -6083,6 +6482,7 @@ async fn run_attempt(
         }
     }
     let mut result = handle.result().await.map_err(|e| e.to_string())?;
+    result.trace_failures.extend(torn_note);
     if let Some(e) = broken {
         result.outcome = WorkerOutcome::Failed {
             error: format!("transcript write failed: {e}"),
@@ -6130,7 +6530,7 @@ fn completed_from(brief: &WorkerBrief, events: &[WorkerEvent]) -> WorkerResult {
         .rposition(|e| matches!(e, WorkerEvent::ModelCall { .. }))
         .unwrap_or(0);
     // The last round's settled message when the transcript has one (decision
-    // 0071, H1): joined deltas can carry a secret split across two of them,
+    // 0071): joined deltas can carry a secret split across two of them,
     // each half scrubbed alone. A transcript from before settled messages
     // has only deltas; their join is scrubbed whole below either way, as the
     // worker scrubs its own answer.
@@ -6208,6 +6608,29 @@ mod tests {
         }
     }
 
+    /// A poisoned graph lock is an error at the cluster cap, never a silent
+    /// pass of the check: the unpoisoned graph admits (no cluster in flight).
+    #[test]
+    fn a_poisoned_graph_lock_fails_the_cluster_cap_loud() {
+        let graph: SharedGraph = Arc::new(Mutex::new(
+            kgraf_graph::GraphStore::open_in_memory(Path::new("/nonexistent")).expect("graph"),
+        ));
+        let open = vec![OpenContract::planned("a", "r/a".into(), "do a", "ok")];
+        let check =
+            |g: &SharedGraph| cluster_cap_check(g, &open, "a", std::iter::empty::<String>(), 2, 0);
+        assert!(matches!(check(&graph), Ok(None)));
+        let poisoner = graph.clone();
+        let _ = std::thread::spawn(move || {
+            let _held = poisoner.lock().expect("lock");
+            panic!("poison the graph lock, on purpose");
+        })
+        .join();
+        assert!(matches!(
+            check(&graph),
+            Err(OrchestratorError::Store(StoreError::Poisoned))
+        ));
+    }
+
     fn completed_brief() -> WorkerBrief {
         WorkerBrief {
             task: "t1".into(),
@@ -6223,7 +6646,7 @@ mod tests {
         }
     }
 
-    /// H1 (third security review): a completed worker's answer, rebuilt
+    /// A completed worker's answer, rebuilt
     /// from its transcript, used to join the raw deltas, so a secret split
     /// across two of them came back whole. It now takes the round's settled
     /// message when there is one, and scrubs the result either way.

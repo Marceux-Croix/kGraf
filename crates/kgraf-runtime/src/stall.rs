@@ -13,10 +13,17 @@
 //! a worker going round in circles on the workspace; the loop counts denials apart
 //! (`WorkerResult::denied`).
 //!
-//! **Counting.** Every call in the run counts, not only consecutive ones: a worker
-//! cycling A, B, A, B is as stuck as one repeating A. The threshold is the number
-//! of times one identical call may be issued; reaching it is the stall. Because the
-//! step budget bounds the run, the counter is bounded too.
+//! **Counting.** Every call counts, not only consecutive ones: a worker cycling
+//! A, B, A, B is as stuck as one repeating A. The threshold is the number of times
+//! one identical call may be issued; reaching it is the stall. Because the step
+//! budget bounds the run, the counter is bounded too.
+//!
+//! **A change to the workspace starts a new count.** Running the same test after
+//! each edit, or reading a file again after writing it, is progress and not a
+//! loop. The worker calls [`StallDetector::reset`] after a call that wrote a
+//! path succeeds, so identical calls only count while the workspace stays as it
+//! was. A write that fails does not reset, so a worker repeating a failing edit
+//! still stalls. Repeating one successful write is bounded by the step budget.
 
 use std::collections::HashMap;
 
@@ -107,6 +114,12 @@ impl StallDetector {
         }
     }
 
+    /// Forget every call seen: the workspace changed, so an identical call may
+    /// now give a different result.
+    pub fn reset(&mut self) {
+        self.seen.clear();
+    }
+
     /// Record a round's calls, in order. Returns the first stall reached, if any.
     /// Every call is counted even after a stall is found, so the counts stay a
     /// true record of the round.
@@ -184,6 +197,18 @@ mod tests {
         let mut d = StallDetector::new(2);
         let a = json!({});
         assert!(d.observe([("t", &a), ("t", &a)]).is_some());
+    }
+
+    #[test]
+    fn a_reset_starts_a_new_count() {
+        let mut d = StallDetector::new(3);
+        let a = json!({"cmd": "cargo test"});
+        assert_eq!(d.observe([("shell", &a)]), None);
+        assert_eq!(d.observe([("shell", &a)]), None);
+        d.reset();
+        assert_eq!(d.observe([("shell", &a)]), None);
+        assert_eq!(d.observe([("shell", &a)]), None);
+        assert!(d.observe([("shell", &a)]).is_some());
     }
 
     #[test]

@@ -22,7 +22,8 @@
 //!   ToolCall (approval in issue order, stall check on approved calls,
 //!             then conflict-ordered execution, raced against cancel and
 //!             against an interrupt-mode message)
-//!        | a call repeated to the stall threshold -----------> Stalled
+//!        | a call repeated to the stall threshold, counted
+//!        |   since the last successful write ----------------> Stalled
 //!        | cancelled: record calls that finish within the
 //!        |   grace, mark the rest ----------------------------> Cancelled
 //!        | interrupt: record calls that finish within the
@@ -434,7 +435,14 @@ async fn prepare(
     let last_call = calls.last().cloned().or(options.parent_call);
     let mut changed = BTreeSet::new();
     let mut done = Vec::new();
+    let mut stall = StallDetector::new(env.settings.stall_repeats);
     for (tool, input) in builder.succeeded() {
+        // Only calls that ran and succeeded are replayed into the stall
+        // detector, as the live loop counts approved calls: a denied, refused or
+        // not-run call did nothing and must not push a resumed run toward a
+        // stall. A replay that already reached the threshold would have ended
+        // the earlier run, so the result is not acted on.
+        let _ = stall.observe([(tool.as_str(), input)]);
         let Some(registered) = env.tools.get(tool) else {
             continue;
         };
@@ -442,13 +450,11 @@ async fn prepare(
             for path in access.writes_paths() {
                 changed.insert(path.clone());
                 done.push(format!("{tool} wrote {}", path.to_string_lossy()));
+                // The same reset the live loop makes after a write.
+                stall.reset();
             }
         }
     }
-    let mut stall = StallDetector::new(env.settings.stall_repeats);
-    // Replayed calls count toward the stall threshold; a replay that already
-    // reached it would have ended the earlier run, so the result is not acted on.
-    let _ = stall.observe(builder.tool_calls().iter().map(|(t, i)| (t.as_str(), i)));
     let (mut handle, endpoint) = worker_channel(brief.worker.clone(), env.settings.bulk_capacity);
     // Decision 0067: the transcript's ids first, so a copy of one of them in
     // `injections` is refused rather than delivered a second time.
@@ -482,6 +488,8 @@ async fn prepare(
         seq: EventSequence::new(),
         builder,
         stall,
+        notified_round: None,
+        output_limit_retried: false,
         phase: CancelPhase::BetweenRounds,
         calls,
         last_call,
@@ -552,6 +560,22 @@ pub const STEER_STOP_WINDOW: std::time::Duration = std::time::Duration::from_sec
 /// The `RoundAbandoned` reason.
 pub const STEER_ABANDON_REASON: &str = "an interrupt-mode message arrived";
 
+/// The `RoundAbandoned` reason for a round whose request never left the
+/// process. The round bought no model turn, so a rebuild does not count it
+/// (the loop refunds it from the step budget the same way).
+pub const STEER_ABANDON_BEFORE_SEND_REASON: &str =
+    "an interrupt-mode message arrived before the request was sent";
+
+/// The `RoundAbandoned` reason for a round that stopped at the output ceiling
+/// with no tool call, given one continuation round.
+pub const OUTPUT_LIMIT_ABANDON_REASON: &str = "the output ceiling was reached";
+
+/// The notice that follows an output-ceiling stop: one continuation round.
+pub const OUTPUT_LIMIT_NOTICE: &str = "Your last response reached the output limit and was \
+     discarded. If you were writing a large patch, split it into several smaller apply_patch \
+     calls, one file or a few hunks at a time, and send them in separate calls. This is your \
+     only continuation: if the limit is reached again the run fails.";
+
 struct Worker {
     env: Arc<WorkerEnv>,
     approval: ApprovalChain,
@@ -560,6 +584,13 @@ struct Worker {
     builder: TranscriptBuilder,
     budget: StepBudget,
     stall: StallDetector,
+    /// The round number a step notice was last emitted for. A round refunded
+    /// after a pre-send steer is planned again under the same number, and its
+    /// notice is already in the transcript.
+    notified_round: Option<u32>,
+    /// Whether the round just before was an output-ceiling stop that got its
+    /// one continuation. Cleared by any round that ends another way.
+    output_limit_retried: bool,
     phase: CancelPhase,
     calls: Vec<CallId>,
     /// The parent of the next round's ledger row (see the module docs, Trace).
@@ -619,8 +650,11 @@ impl Worker {
             );
         }
         for path in access.writes_paths() {
-            if crate::paths::forbidden_path(path) {
-                return Some(format!("{} is not writable by a worker", path.display()));
+            if let Some(why) = kgraf_core::paths::forbidden_reason(path) {
+                return Some(format!(
+                    "{} is not writable by a worker: {why}",
+                    path.display()
+                ));
             }
             if let Some(scope) = &self.brief.write_scope {
                 let inside = scope.iter().any(|s| crate::paths::same_path(s, path));
@@ -784,6 +818,13 @@ impl Worker {
         if let Some(model_event) = model_event {
             self.builder.apply(model_event);
         }
+        // The builder has taken a finished tool result above, so the persisted
+        // transcript must carry it too. A bulk emit refused because of a cancel
+        // never sent the event; without this copy the work a call finished
+        // would be missing on resume (the resume would mark the call
+        // interrupted, though its writes are on disk).
+        let finished_result =
+            matches!(event, WorkerEvent::ToolCallFinished { .. }).then(|| event.clone());
         // A requested cancel outranks everything: the run was cancelled. A reader
         // that has gone away without a cancel is `WorkerHandle::result` discarding
         // the events it did not read, which its contract allows: the run goes on,
@@ -791,10 +832,15 @@ impl Worker {
         // (`builder`), so nothing it needs is lost.
         match ep.emit(event).await {
             Ok(()) => Ok(()),
-            Err(_) if ep.is_cancelled() => Err(Halt::Cancelled {
-                phase: self.phase,
-                partial: None,
-            }),
+            Err(_) if ep.is_cancelled() => {
+                if let Some(result) = finished_result {
+                    let _ = ep.emit_unbounded(result);
+                }
+                Err(Halt::Cancelled {
+                    phase: self.phase,
+                    partial: None,
+                })
+            }
             Err(RuntimeError::HandleDropped { .. }) => Ok(()),
             Err(other) => Err(Halt::Failed(other.to_string())),
         }
@@ -855,11 +901,14 @@ impl Worker {
             let final_round = match self.budget.next_round() {
                 RoundPlan::Exhausted => return Ok((WorkerOutcome::BudgetExhausted, String::new())),
                 RoundPlan::Run {
+                    round,
                     final_round,
                     notice,
-                    ..
                 } => {
-                    if let Some((kind, text)) = notice {
+                    if let Some((kind, text)) = notice
+                        && self.notified_round != Some(round)
+                    {
+                        self.notified_round = Some(round);
                         self.emit(ep, WorkerEvent::Notice { kind, text }).await?;
                     }
                     final_round
@@ -891,7 +940,15 @@ impl Worker {
                         // `BudgetExhausted` with the model never having acted.
                         self.budget.refund_round();
                     }
-                    self.abandon(ep, phase, partial).await?;
+                    let reason = if sent {
+                        STEER_ABANDON_REASON
+                    } else {
+                        STEER_ABANDON_BEFORE_SEND_REASON
+                    };
+                    // A round that never left still records its zero usage (the
+                    // call is settled as a known zero); the rebuild does not let
+                    // that zero replace the context anchor.
+                    self.abandon(ep, phase, partial, reason).await?;
                     continue;
                 }
                 other => other?,
@@ -902,6 +959,10 @@ impl Worker {
                 .map(|(id, name, input)| (id.to_owned(), name.to_owned(), input.clone()))
                 .collect();
             let reason = response.stop_reason;
+            if reason != StopReason::MaxTokens {
+                // A round that ended another way ends the run of ceiling stops.
+                self.output_limit_retried = false;
+            }
             match (reason, uses.is_empty()) {
                 (StopReason::ToolUse, true) => {
                     return Err(Halt::Failed(
@@ -914,19 +975,48 @@ impl Worker {
                         "the response carries tool calls but stopped with {other:?}"
                     )));
                 }
-                // The provider paused the turn for a server-side tool it is still
-                // running, not for one this build has to call. There is nothing to
-                // dispatch, so this falls through the same way `ToolUse` with no
-                // calls of its own would: the round's assistant text is recorded
-                // below and the loop goes on to the next round, which sends the
-                // conversation (now carrying the paused response) back to the
-                // provider. `final_round` still applies: a turn paused with no
-                // rounds left is handled exactly like a tool call with no rounds
-                // left, further down.
-                (StopReason::PauseTurn, true) => {}
+                // The provider paused the turn for a server-side tool. The
+                // rebuilt transcript keeps only text and client tool calls, so
+                // the server tool's blocks would be dropped and the paused turn
+                // resent damaged. No route uses server tools, so this fails
+                // loud. No `Stop` is recorded: a resume then sees a round that
+                // never finished, not a paused turn to continue.
+                (StopReason::PauseTurn, true) => {
+                    return Err(Halt::Failed(
+                        "the provider paused the turn for a server tool; server tool turns are \
+                         not supported"
+                            .into(),
+                    ));
+                }
                 (StopReason::EndTurn | StopReason::StopSequence, true) => {
                     self.emit_stop(ep, reason, &response).await?;
                     return Ok((WorkerOutcome::Completed, response.text()));
+                }
+                (StopReason::MaxTokens, true) if !final_round && !self.output_limit_retried => {
+                    // A large apply_patch is the usual cause: the call is cut
+                    // off and no complete tool call arrives. The round's spend
+                    // stays counted; its truncated text is dropped (the round is
+                    // abandoned, which is not a terminal `Stop`), and the model
+                    // gets one continuation round, counted in the budget, with
+                    // a request to split the work. A second stop in a row fails
+                    // below.
+                    self.output_limit_retried = true;
+                    self.abandon(
+                        ep,
+                        CancelPhase::ModelStream,
+                        None,
+                        OUTPUT_LIMIT_ABANDON_REASON,
+                    )
+                    .await?;
+                    self.emit(
+                        ep,
+                        WorkerEvent::Notice {
+                            kind: crate::event::NoticeKind::OutputLimit,
+                            text: OUTPUT_LIMIT_NOTICE.to_owned(),
+                        },
+                    )
+                    .await?;
+                    continue;
                 }
                 (StopReason::MaxTokens, true) => {
                     self.emit_stop(ep, reason, &response).await?;
@@ -983,7 +1073,8 @@ impl Worker {
                     // Reached only from `dispatch`'s own `Halt::Abandoned` (below),
                     // which always fires after the round's model call already ran;
                     // the round stays spent, so no refund here.
-                    self.abandon(ep, phase, partial).await?;
+                    self.abandon(ep, phase, partial, STEER_ABANDON_REASON)
+                        .await?;
                 }
                 Err(halt) => return Err(halt),
             }
@@ -1018,10 +1109,11 @@ impl Worker {
         ep: &WorkerEndpoint,
         phase: CancelPhase,
         partial: Option<(CallId, TokenUsage)>,
+        reason: &str,
     ) -> Result<(), Halt> {
         let abandoned = WorkerEvent::RoundAbandoned {
             phase,
-            reason: STEER_ABANDON_REASON.to_owned(),
+            reason: reason.to_owned(),
         };
         self.emit(ep, abandoned).await?;
         if let Some((call, usage)) = partial {
@@ -1588,6 +1680,10 @@ impl Worker {
             done[j] = true;
             let finished = self.record_result(j, &accesses, call_id, &tool, result);
             self.emit(ep, finished).await?;
+            // A sandboxed build declares no paths; ask git what it changed.
+            if accesses[j].is_sandboxed_build() {
+                self.record_tree_changes(&tool).await;
+            }
             // The emit above can wait for a bulk slot, which is exactly when
             // an interrupt can arrive: checked after it, not before.
             if !self.stopping(ep) {
@@ -1732,6 +1828,7 @@ impl Worker {
                             tools[j],
                             path.to_string_lossy()
                         ));
+                        self.stall.reset();
                     }
                     synthetic.push((
                         ids[j].clone(),
@@ -1813,12 +1910,41 @@ impl Worker {
                 self.changed.insert(path.clone());
                 self.done
                     .push(format!("{tool} wrote {}", path.to_string_lossy()));
+                // The workspace changed: identical calls (a test run, a re-read)
+                // may now differ, so they start a new count. The stall check for
+                // this round already ran, before execution.
+                self.stall.reset();
             }
         }
         WorkerEvent::ToolCallFinished {
             call_id,
             output,
             is_error,
+        }
+    }
+
+    /// Record the worktree paths git reports as changed after a sandboxed build
+    /// or test command, which declares none. A status that cannot be read is
+    /// reported on the result, not skipped: the handoff would otherwise omit
+    /// files the command wrote without saying so.
+    async fn record_tree_changes(&mut self, tool: &str) {
+        let root = self.brief.workspace_root.clone();
+        let read = tokio::task::spawn_blocking(move || crate::worktree::dirty_paths(&root)).await;
+        match read {
+            Ok(Ok(paths)) => {
+                for path in paths {
+                    if self.changed.insert(path.clone()) {
+                        self.done
+                            .push(format!("{tool} changed {}", path.to_string_lossy()));
+                    }
+                }
+            }
+            Ok(Err(e)) => self
+                .trace_failures
+                .push(format!("worktree status after {tool} not read: {e}")),
+            Err(e) => self
+                .trace_failures
+                .push(format!("worktree status after {tool} not read: {e}")),
         }
     }
 

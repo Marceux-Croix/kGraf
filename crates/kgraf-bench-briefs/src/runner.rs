@@ -29,9 +29,10 @@
 use crate::brief::Brief;
 use crate::check;
 use crate::gitutil;
+use crate::suite_store;
 use anyhow::{Context, Result};
 use kgraf_core::cost::{Money, PriceTable};
-use kgraf_core::model_profile::{ProfileStore, Source, TaskKind};
+use kgraf_core::model_profile::{Source, TaskKind};
 use kgraf_graph::{GraphStore, Indexer};
 use kgraf_host::worker::ask::Attendance;
 use kgraf_host::worker::assemble::{Assembly, GraphParts, allow_store_path};
@@ -42,7 +43,7 @@ use kgraf_host::worker::run::{Owner, SegmentEnd, open_transcript, plan_segment};
 use kgraf_host::worker::segment::{SegmentOptions, run_segment};
 use kgraf_host::worker::workspace::{self};
 use kgraf_provider::{Ledger, Provider};
-use kgraf_runtime::{CallMode, ContextConfig, WorkerBrief};
+use kgraf_runtime::{CallMode, ContextConfig, WorkerBrief, WorkerOutcome};
 use kgraf_sandbox::{Identity, MergeBack, WorkspaceManager};
 use kgraf_session::approval_store::PersistedAllowStore;
 use kgraf_tools::execpolicy::ExecPolicy;
@@ -128,6 +129,10 @@ pub struct AttemptOutcome {
     pub kind: TaskKind,
     pub rep: u32,
     pub satisfied: bool,
+    /// The attempt did not measure the model: the provider failed, or the
+    /// worker could not run, or its result could not be committed. Never
+    /// tallied. `satisfied` is `false` and `note` says why.
+    pub errored: bool,
     /// `None` when the model has no recorded price: never a fabricated
     /// `$0` (see the module docs).
     pub cost: Option<Money>,
@@ -146,6 +151,23 @@ pub struct AttemptOutcome {
     /// Wall-clock time the attempt's `run_segment` call took, in
     /// milliseconds. `0` for a dry run.
     pub wall_ms: u64,
+}
+
+/// Whether a `Failed` worker outcome is the model's own behavior (it hit its
+/// output ceiling, ended on an unmodeled stop reason, answered inconsistently
+/// or needed an approval nobody could give) rather than a provider or ledger
+/// failure. The list is the messages `kgraf_runtime`'s loop raises for the
+/// model's behavior; any other `Failed` text is treated as a fault outside
+/// the model, so an unknown message is never tallied against it.
+fn model_caused(error: &str) -> bool {
+    const MODEL_CAUSED: [&str; 5] = [
+        "the output ceiling was reached",
+        "unmodeled stop reason",
+        "the response carries tool calls but stopped with",
+        "the model stopped for a tool call and the response carries none",
+        "this worker has no one to ask",
+    ];
+    MODEL_CAUSED.iter().any(|m| error.contains(m))
 }
 
 /// The note an unpriced attempt's cost carries: decision 0041 holds a local
@@ -223,6 +245,7 @@ pub async fn run_bench(
                     kind: p.kind,
                     rep: p.rep,
                     satisfied: false,
+                    errored: false,
                     cost: p.estimated_cost,
                     note: Some("dry run: no call made".into()),
                     tokens_in: 0,
@@ -235,8 +258,10 @@ pub async fn run_bench(
 
     std::fs::create_dir_all(state_dir)
         .with_context(|| format!("cannot create {}", state_dir.display()))?;
-    let mut store = ProfileStore::load(state_dir)
-        .with_context(|| format!("cannot load the profile store at {}", state_dir.display()))?;
+    // Bench tallies are kept per suite version: another suite's are archived
+    // aside, never mixed into this run's rates (`suite_store`).
+    let suite = crate::brief::suite_hash();
+    let mut store = suite_store::open_for_recording(state_dir, &suite)?;
     let mut outcomes = Vec::new();
 
     for route in routes {
@@ -251,19 +276,22 @@ pub async fn run_bench(
                             route.route, brief.id
                         )
                     })?;
-                // An unpriced attempt still counts toward the rate; the tally
-                // marks its cost unknown rather than zero.
-                store.record(
-                    &route.model,
-                    &route.vendor,
-                    Source::Bench,
-                    brief.kind,
-                    outcome.satisfied,
-                    outcome.cost,
-                );
-                store.save(state_dir).with_context(|| {
-                    format!("cannot save the profile store at {}", state_dir.display())
-                })?;
+                // A provider or harness error is not a measurement of the model:
+                // it is returned to the caller but never tallied, so an outage
+                // cannot read as a run of failed briefs. An unpriced attempt
+                // still counts toward the rate; the tally marks its cost unknown
+                // rather than zero.
+                if !outcome.errored {
+                    store.record(
+                        &route.model,
+                        &route.vendor,
+                        Source::Bench,
+                        brief.kind,
+                        outcome.satisfied,
+                        outcome.cost,
+                    );
+                }
+                suite_store::save(state_dir, &store, &suite)?;
                 outcomes.push(outcome);
             }
         }
@@ -296,7 +324,7 @@ async fn run_one(
         attempt_tmp.path().to_path_buf()
     };
     let root = attempt_root.join("repo");
-    gitutil::init_fixture_repo(&brief.fixture_dir(), &root)
+    let base = gitutil::init_fixture_repo(&brief.fixture_dir(), &root)
         .with_context(|| format!("cannot init the fixture repo for {}", brief.id))?;
     let state = root.join(".kgraf");
     std::fs::create_dir_all(&state)
@@ -450,14 +478,40 @@ async fn run_one(
         .first()
         .map(|e| format!("{e:#}"))
         .filter(|_| report.result.is_none());
+    // Every error `run_segment` collected, and a `Failed` run outcome that is
+    // not the model's own doing (a provider or ledger failure), means the
+    // attempt measured the harness or the provider, not the model.
+    let provider_failure = match report.result.as_ref().map(|r| &r.outcome) {
+        Some(WorkerOutcome::Failed { error }) if !model_caused(error) => Some(error.clone()),
+        _ => None,
+    };
+    let errored = !report.errors.is_empty() || provider_failure.is_some();
+    if let Some(error) = &provider_failure {
+        note.get_or_insert_with(|| format!("provider or harness error: {error}"));
+    }
     let satisfied = match &report.end {
         SegmentEnd::Committed { commit, .. } => {
             let checked_out = attempt_root.join("checked-out");
             gitutil::checkout_commit(&root, commit, &checked_out).with_context(|| {
                 format!("cannot check out attempt commit {commit} for {}", brief.id)
             })?;
-            check::run(&brief.check, &checked_out)
-                .with_context(|| format!("cannot run the check for {}", brief.id))?
+            let scratch = attempt_root.join("check-scratch");
+            std::fs::create_dir_all(&scratch)
+                .with_context(|| format!("cannot create {}", scratch.display()))?;
+            check::verify(
+                brief,
+                &check::Attempt {
+                    dir: &checked_out,
+                    repo: &root,
+                    base: &base,
+                    commit,
+                },
+                &check::CheckEnv {
+                    scratch: &scratch,
+                    timeout: check::DEFAULT_TIMEOUT,
+                },
+            )
+            .with_context(|| format!("cannot run the check for {}", brief.id))?
         }
         SegmentEnd::Empty => {
             note.get_or_insert_with(|| "the worker changed nothing".to_owned());
@@ -499,7 +553,8 @@ async fn run_one(
         brief_id: brief.id.to_owned(),
         kind: brief.kind,
         rep,
-        satisfied,
+        satisfied: satisfied && !errored,
+        errored,
         cost,
         note,
         tokens_in,
@@ -513,6 +568,7 @@ mod tests {
     use super::*;
     use crate::brief::suite;
     use kgraf_core::cost::ModelPrice;
+    use kgraf_core::model_profile::ProfileStore;
     use kgraf_core::{Protocol, TokenUsage};
     use kgraf_provider::capability::{Capabilities, StreamEvent, Streaming};
     use kgraf_provider::{CallToken, Content, ProviderError, Request, Response, StopReason};
@@ -883,6 +939,75 @@ mod tests {
         assert_eq!(tally.attempts, 1);
     }
 
+    /// A tally from an older suite version is set aside, not added to: the
+    /// rate would otherwise mix runs of different briefs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_run_under_a_new_suite_does_not_add_to_an_old_suites_tally() {
+        let state = tempfile::tempdir().expect("state");
+        // Five satisfied Tests attempts recorded under an older suite.
+        let mut old = ProfileStore::default();
+        for _ in 0..5 {
+            old.record(
+                "fake-model",
+                "fake-vendor",
+                Source::Bench,
+                TaskKind::Tests,
+                true,
+                Some(Money::from_micros(1)),
+            );
+        }
+        suite_store::save(state.path(), &old, "older-suite-hash").expect("seed");
+        let brief = tests_sum_brief();
+        let opts = |dry_run| BenchOptions {
+            reps: 1,
+            dry_run,
+            budget: WorkerBudget::default(),
+        };
+        let attempts = || {
+            ProfileStore::load(state.path())
+                .expect("store")
+                .get("fake-model")
+                .and_then(|p| p.tally(Source::Bench, TaskKind::Tests))
+                .map(|t| (t.attempts, t.satisfied))
+        };
+
+        // A dry run leaves the store alone.
+        run_bench(
+            &[route(failing_provider())],
+            std::slice::from_ref(&brief),
+            &prices(),
+            state.path(),
+            &opts(true),
+        )
+        .await
+        .expect("dry run");
+        assert_eq!(attempts(), Some((5, 5)));
+
+        // A real run (an empty attempt: unsatisfied, and counted) starts from
+        // zero rather than from the old suite's five.
+        run_bench(
+            &[route(failing_provider())],
+            std::slice::from_ref(&brief),
+            &prices(),
+            state.path(),
+            &opts(false),
+        )
+        .await
+        .expect("bench");
+        assert_eq!(
+            attempts(),
+            Some((1, 0)),
+            "the old suite's satisfied attempts must not be mixed in"
+        );
+        assert!(
+            state
+                .path()
+                .join("model_profiles.oldersuitehash.json")
+                .is_file(),
+            "the old store is kept aside"
+        );
+    }
+
     #[tokio::test]
     async fn a_dry_run_makes_no_call_and_writes_nothing() {
         let brief = tests_sum_brief();
@@ -1004,5 +1129,125 @@ mod tests {
                 "{seen:?} for {budget:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod error_tests {
+    use super::*;
+    use crate::brief::suite;
+    use kgraf_core::Protocol;
+    use kgraf_core::cost::ModelPrice;
+    use kgraf_core::model_profile::ProfileStore;
+    use kgraf_provider::capability::{Capabilities, StreamEvent, Streaming};
+    use kgraf_provider::{CallToken, ProviderError, Request, Response};
+
+    /// A provider that fails every call, as an outage or a bad key does.
+    struct Down;
+
+    fn outage() -> ProviderError {
+        ProviderError::Http {
+            adapter: "bench-test-down",
+            status: 503,
+            body: "unavailable".into(),
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for Down {
+        fn adapter(&self) -> &'static str {
+            "bench-test-down"
+        }
+        fn protocol(&self) -> Protocol {
+            Protocol::Additive
+        }
+        async fn complete(
+            &self,
+            _request: &Request,
+            _token: &CallToken,
+        ) -> Result<Response, ProviderError> {
+            Err(outage())
+        }
+        fn capabilities(&self) -> Capabilities<'_> {
+            Capabilities::none().with_streaming(self)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Streaming for Down {
+        async fn stream(
+            &self,
+            _request: &Request,
+            _token: &CallToken,
+            _sink: &mut (dyn FnMut(StreamEvent) + Send),
+        ) -> Result<Response, ProviderError> {
+            Err(outage())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_provider_error_is_returned_as_an_error_and_never_tallied() {
+        let mut prices = PriceTable::new();
+        prices.set(
+            "down-model",
+            ModelPrice {
+                uncached_input: 1,
+                cache_read: 1,
+                cache_write: 1,
+                output: 1,
+                reasoning: 1,
+            },
+        );
+        let route = RouteHandle {
+            route: "down".into(),
+            vendor: "down-vendor".into(),
+            model: "down-model".into(),
+            provider: Arc::new(Down),
+            local: false,
+        };
+        let brief = suite()
+            .into_iter()
+            .find(|b| b.id == "tests-sum")
+            .expect("brief");
+        let state = tempfile::tempdir().expect("state");
+        let outcomes = run_bench(
+            &[route],
+            std::slice::from_ref(&brief),
+            &prices,
+            state.path(),
+            &BenchOptions {
+                reps: 1,
+                dry_run: false,
+                budget: WorkerBudget::default(),
+            },
+        )
+        .await
+        .expect("a provider outage is an outcome, not a bench abort");
+        assert_eq!(outcomes.len(), 1);
+        assert!(outcomes[0].errored, "{:?}", outcomes[0]);
+        assert!(!outcomes[0].satisfied);
+        assert!(outcomes[0].note.is_some());
+
+        let store = ProfileStore::load(state.path()).expect("store");
+        assert!(
+            store
+                .get("down-model")
+                .and_then(|p| p.tally(Source::Bench, TaskKind::Tests))
+                .is_none(),
+            "an outage must not read as an unsatisfied brief"
+        );
+    }
+
+    #[test]
+    fn only_the_models_own_failures_count_against_it() {
+        assert!(model_caused(
+            "the output ceiling was reached before the answer finished"
+        ));
+        assert!(model_caused(
+            "the provider ended the turn with an unmodeled stop reason"
+        ));
+        assert!(!model_caused("provider `x` returned HTTP 503: unavailable"));
+        assert!(!model_caused("cannot open a ledger row: disk full"));
+        assert!(!model_caused("something no one has seen before"));
     }
 }

@@ -1,7 +1,7 @@
 //! The galaxy's state, independent of egui: scene, camera, selection, GPU buffers,
 //! live changes with their animation, and the redraw decision.
 //!
-//! Redraw on change (0054, and the shell review's idle-repaint finding): a frame is
+//! Redraw on change (0054, idle repaint): a frame is
 //! rendered only when the camera moved, the scene or selection changed, an animation
 //! is running, or the target was resized. Everything else reuses the last frame in the
 //! target texture.

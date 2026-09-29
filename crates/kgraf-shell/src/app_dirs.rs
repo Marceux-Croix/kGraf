@@ -130,7 +130,7 @@ pub fn move_dirs(pairs: &[(PathBuf, PathBuf)]) -> Result<Vec<DirOutcome>, MoveEr
 
 /// Rename `old` to `new`. `Ok(false)` when the rename failed because a
 /// concurrent first launch already made it (the old directory is gone and
-/// the new one exists): that launch printed the notice (L6).
+/// the new one exists): that launch printed the notice.
 fn move_one(old: &Path, new: &Path) -> Result<bool, MoveError> {
     let fail = |source| MoveError {
         from: old.to_path_buf(),

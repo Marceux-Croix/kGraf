@@ -1,7 +1,7 @@
 //! [`DiagCode`]: the trait an error type implements to name its own glossary
 //! entry, so a caller recording it never has to guess or hand-map a variant
-//! to a code (2026-09-27 review finding: "the specific codes are never
-//! used").
+//! to a code: a variant left to hand-mapping never reaches its specific
+//! glossary entry.
 //!
 //! This trait lives here, not on `ErrorSpec` or in a crate any error type
 //! already depends on, specifically so implementing it never creates a

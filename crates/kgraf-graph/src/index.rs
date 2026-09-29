@@ -45,9 +45,19 @@ pub struct IndexReport {
     pub change_log_rows: u64,
     /// Files skipped because their bytes are not valid UTF-8.
     pub skipped_not_utf8: u64,
-    /// Named files skipped by [`Indexer::index_paths`] for exceeding the size
-    /// ceiling. A walk skips the same files without counting them.
+    /// Files skipped for exceeding the size ceiling, by a walk or by
+    /// [`Indexer::index_paths`]. A file that was indexed before it grew past the
+    /// ceiling leaves the index.
     pub skipped_too_large: u64,
+    /// Files whose metadata could not be read during a walk. Their indexed rows
+    /// are kept as they were, not deleted, and the paths are named here.
+    pub metadata_errors: Vec<String>,
+    /// Symbolic links to files in an indexed language. A walk does not follow
+    /// them, and a link never deletes an indexed row; the paths are named here.
+    pub symlinks_kept: Vec<String>,
+    /// Files whose bytes changed to something that is not valid UTF-8. Their
+    /// stale rows were removed rather than kept beside the new content.
+    pub non_utf8_removed: Vec<String>,
     /// Call sites whose callee name matches no indexed definition. Expected and
     /// large: standard-library and third-party calls dominate real code.
     pub calls_unresolved: u64,
@@ -81,9 +91,10 @@ pub struct IndexReport {
     /// per copy). Named rather than counted by file, because counting their files
     /// would mean walking what was skipped. See [`Indexer::with_nested_repositories`].
     pub nested_repositories_skipped: Vec<String>,
-    /// Directories not walked because their name is excluded (`target`,
-    /// `node_modules`, `build`, ...), relative to the root, so a reader that must
-    /// skip exactly what the index skipped can.
+    /// Directories not walked because they are excluded (`target` and
+    /// `node_modules` at any depth; `build`, `dist` and the like only at the
+    /// root), relative to the root, so a reader that must skip exactly what the
+    /// index skipped can.
     pub excluded_dirs_skipped: Vec<String>,
 }
 
@@ -135,6 +146,26 @@ type FileRows = (
     Vec<(String, String, EdgeKind, i64)>,
     Vec<(String, String)>,
 );
+
+/// What one walk found.
+#[derive(Default)]
+struct Walked {
+    /// Eligible files as (repository-relative path, bytes, mtime), or the error
+    /// that made one unreadable.
+    files: Vec<Result<(String, Vec<u8>, i64)>>,
+    /// Nested repositories skipped, relative to the root.
+    nested: Vec<String>,
+    /// Excluded directories skipped, relative to the root.
+    excluded: Vec<String>,
+    /// Paths the walk could not judge, which must stay in the index.
+    kept: Vec<String>,
+    /// Files over the size ceiling.
+    too_large: u64,
+    /// Files whose metadata could not be read.
+    metadata_errors: Vec<String>,
+    /// Symbolic links in an indexed language.
+    symlinks: Vec<String>,
+}
 
 /// How many definitions a callee name may match before the call site is treated
 /// as unresolved rather than as an edge to each candidate.
@@ -210,8 +241,9 @@ impl Drop for InProgress<'_> {
 /// Walks a working tree and keeps an index in step with it.
 pub struct Indexer<'store> {
     store: &'store GraphStore,
-    /// Directory names that are never walked. Build output and vendored
-    /// dependencies are not the project's code and would dominate the field.
+    /// Directories that are never walked. Build output and vendored
+    /// dependencies are not the project's code and would dominate the field. See
+    /// [`Indexer::with_excluded_dirs`] for how an entry matches.
     excluded_dirs: Vec<String>,
     /// Files above this many bytes are skipped. A generated file megabytes long
     /// is not something a person navigates or an agent should read.
@@ -226,6 +258,21 @@ pub struct Indexer<'store> {
     /// Whether directories with their own `.git` entry are walked.
     include_nested: bool,
 }
+
+/// Excluded directory names that match at any depth: tool output and tool
+/// state that is never source. Every other bare name in the exclusion list
+/// (`build`, `dist`, `venv`, ...) matches at the root only, because those names
+/// are also ordinary source directories.
+pub const ANY_DEPTH_EXCLUDED: &[&str] = &[
+    ".git",
+    "target",
+    "node_modules",
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".next",
+    ".venv",
+];
 
 /// The orchestrator's conversation files (decision 0026). The message bus is
 /// their sole writer and their sole indexer.
@@ -278,6 +325,18 @@ impl<'store> Indexer<'store> {
         self
     }
 
+    /// Whether a directory is excluded: `rel` is its path relative to the root,
+    /// `depth` its depth below the root (1 for a top-level directory).
+    fn is_excluded(&self, rel: &str, name: &str, depth: usize) -> bool {
+        self.excluded_dirs.iter().any(|entry| {
+            if entry.contains('/') {
+                rel == entry.trim_end_matches('/')
+            } else {
+                entry == name && (depth == 1 || ANY_DEPTH_EXCLUDED.contains(&name))
+            }
+        })
+    }
+
     /// An indexed file the bus wrote: its title heading is the bus's.
     fn is_bus_file(&self, rel: &str) -> Result<bool> {
         let title = BUS_FILE_TITLE.trim_start_matches('#').trim();
@@ -313,12 +372,16 @@ impl<'store> Indexer<'store> {
         self
     }
 
-    /// The directory names a walk never enters.
+    /// The directories a walk never enters.
     pub fn excluded_dirs(&self) -> &[String] {
         &self.excluded_dirs
     }
 
-    /// Replace the excluded directory list.
+    /// Replace the excluded directory list. An entry with a `/` is a path
+    /// relative to the root and matches that directory only. A bare name matches
+    /// a top-level directory of that name, and also any deeper one when it is a
+    /// name only tools write ([`ANY_DEPTH_EXCLUDED`]): `src/build/` is source,
+    /// `crates/x/target/` is not.
     pub fn with_excluded_dirs(mut self, dirs: Vec<String>) -> Self {
         self.excluded_dirs = dirs;
         self
@@ -388,10 +451,16 @@ impl<'store> Indexer<'store> {
         let root = self.store.root().to_path_buf();
 
         let mut seen_paths: Vec<String> = Vec::new();
-        let (entries, nested, excluded) = self.walk(&root);
-        report.nested_repositories_skipped = nested;
-        report.excluded_dirs_skipped = excluded;
-        for entry in entries {
+        let walked = self.walk(&root);
+        report.nested_repositories_skipped = walked.nested;
+        report.excluded_dirs_skipped = walked.excluded;
+        report.skipped_too_large += walked.too_large;
+        // A path the walk could not judge (metadata error, symbolic link) stays
+        // in the index as it was: not seeing a file is not the file leaving.
+        seen_paths.extend(walked.kept.iter().cloned());
+        report.metadata_errors = walked.metadata_errors;
+        report.symlinks_kept = walked.symlinks;
+        for entry in walked.files {
             let (rel_path, bytes, mtime_ns) = entry?;
             // Only the bus's own files are left to it; a file the user put in
             // the same directory is indexed like any other.
@@ -401,7 +470,7 @@ impl<'store> Indexer<'store> {
             }
             report.files_seen += 1;
             seen_paths.push(rel_path.clone());
-            self.index_one(&rel_path, bytes, mtime_ns, &mut report)?;
+            self.index_one(&rel_path, bytes, mtime_ns, None, &mut report)?;
         }
 
         // Files that left the tree.
@@ -498,7 +567,7 @@ impl<'store> Indexer<'store> {
                         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                         .map(|d| d.as_nanos() as i64)
                         .unwrap_or(0);
-                    self.index_one(rel, bytes, mtime_ns, &mut report)?;
+                    self.index_one(rel, bytes, mtime_ns, self.foreign_root(), &mut report)?;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     if self.store.file(rel)?.is_some() {
@@ -535,13 +604,22 @@ impl<'store> Indexer<'store> {
         Ok(report)
     }
 
+    /// The source root when it is a tree other than the store's root.
+    fn foreign_root(&self) -> Option<&Path> {
+        self.source_root
+            .as_deref()
+            .filter(|r| *r != self.store.root())
+    }
+
     /// One file's step: compare its content hash and, only when it differs,
-    /// rewrite its rows.
+    /// rewrite its rows. `foreign_root` is the tree the bytes came from when it
+    /// is not the store's root; it is recorded for `GraphStore::source_of`.
     fn index_one(
         &self,
         rel_path: &str,
         bytes: Vec<u8>,
         mtime_ns: i64,
+        foreign_root: Option<&Path>,
         report: &mut IndexReport,
     ) -> Result<()> {
         let content_hash = blake3::hash(&bytes).to_hex().to_string();
@@ -551,6 +629,12 @@ impl<'store> Indexer<'store> {
         if let Some(existing) = &existing
             && existing.content_hash == content_hash
         {
+            // The store's root holds the indexed content, so a root recorded by
+            // an earlier pass from a worktree is no longer needed. A pass from
+            // another root leaves it alone: it says nothing about the checkout.
+            if foreign_root.is_none() {
+                self.store.clear_file_source_root(rel_path)?;
+            }
             report.files_unchanged += 1;
             return Ok(());
         }
@@ -559,6 +643,14 @@ impl<'store> Indexer<'store> {
             Ok(text) => text,
             Err(_) => {
                 report.skipped_not_utf8 += 1;
+                // The bytes changed, so the rows describe content that is gone.
+                // Keeping them (and the old hash) would serve the old text's
+                // nodes for a file that no longer parses; remove them and say so.
+                if existing.is_some() {
+                    self.store.delete_file(rel_path)?;
+                    report.files_removed += 1;
+                    report.non_utf8_removed.push(rel_path.to_owned());
+                }
                 return Ok(());
             }
         };
@@ -573,8 +665,6 @@ impl<'store> Indexer<'store> {
             language,
             line_count: source.lines().count() as u32,
         };
-        self.store.upsert_file(&file)?;
-
         let chunks = match language {
             Some(language) => chunk::chunk_source(rel_path, language, &source)?,
             // A file in a language with no specification row is still a node,
@@ -583,7 +673,7 @@ impl<'store> Indexer<'store> {
         };
         let (nodes, edges, call_sites) = self.build_records(&file, &chunks);
         self.store
-            .replace_file_nodes(&file_id, &nodes, &edges, &call_sites)?;
+            .replace_file_nodes_from(&file, &nodes, &edges, &call_sites, foreign_root)?;
 
         if existing.is_some() {
             report.files_changed += 1;
@@ -593,19 +683,9 @@ impl<'store> Indexer<'store> {
         Ok(())
     }
 
-    /// Eligible files in the tree, as (repository-relative path, bytes, mtime).
-    /// Also returns the nested repositories and the excluded directories skipped,
-    /// relative to the root.
-    #[allow(clippy::type_complexity)]
-    fn walk(
-        &self,
-        root: &Path,
-    ) -> (
-        Vec<Result<(String, Vec<u8>, i64)>>,
-        Vec<String>,
-        Vec<String>,
-    ) {
-        let mut out = Vec::new();
+    /// Eligible files in the tree, plus what the walk skipped or could not judge.
+    fn walk(&self, root: &Path) -> Walked {
+        let mut walked = Walked::default();
         let mut nested = Vec::new();
         let mut excluded = Vec::new();
         let relative = |p: &Path| {
@@ -623,14 +703,15 @@ impl<'store> Indexer<'store> {
                 }
                 let name = entry.file_name().to_string_lossy();
                 if entry.file_type().is_dir() {
-                    if self.excluded_dirs.iter().any(|d| d == name.as_ref()) {
-                        excluded.push(relative(entry.path()));
+                    let rel = relative(entry.path());
+                    if self.is_excluded(&rel, name.as_ref(), entry.depth()) {
+                        excluded.push(rel);
                         return false;
                     }
                     // A directory with its own `.git` (a directory in a nested
                     // clone, a file in a git worktree) is another checkout.
                     if !self.include_nested && entry.path().join(".git").exists() {
-                        nested.push(relative(entry.path()));
+                        nested.push(rel);
                         return false;
                     }
                 }
@@ -643,7 +724,7 @@ impl<'store> Indexer<'store> {
                     // A directory that cannot be walked is reported, not
                     // silently treated as empty (fail loud): a missing directory
                     // reading as "nothing yet" is one of the founding failures.
-                    out.push(Err(GraphError::Io {
+                    walked.files.push(Err(GraphError::Io {
                         path: error
                             .path()
                             .map(|p| p.display().to_string())
@@ -655,29 +736,43 @@ impl<'store> Indexer<'store> {
                     continue;
                 }
             };
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let metadata = match entry.metadata() {
-                Ok(metadata) => metadata,
-                Err(_) => continue,
-            };
-            if metadata.len() > self.max_file_bytes {
-                continue;
-            }
             let rel = match entry.path().strip_prefix(root) {
                 Ok(rel) => rel.to_string_lossy().replace('\\', "/"),
                 Err(_) => continue,
             };
+            if entry.path_is_symlink() {
+                // Not followed. A link in an indexed language is named, and any
+                // row already indexed under its path is kept.
+                if Language::from_path(&rel).is_some() {
+                    walked.kept.push(rel.clone());
+                    walked.symlinks.push(rel);
+                }
+                continue;
+            }
+            if !entry.file_type().is_file() {
+                continue;
+            }
             // Only files in a known language, plus nothing else. An index of
             // every text file in a tree is noise, not a graph.
             if Language::from_path(&rel).is_none() {
                 continue;
             }
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(_) => {
+                    walked.kept.push(rel.clone());
+                    walked.metadata_errors.push(rel);
+                    continue;
+                }
+            };
+            if metadata.len() > self.max_file_bytes {
+                walked.too_large += 1;
+                continue;
+            }
             let bytes = match std::fs::read(entry.path()) {
                 Ok(bytes) => bytes,
                 Err(source) => {
-                    out.push(Err(GraphError::Io { path: rel, source }));
+                    walked.files.push(Err(GraphError::Io { path: rel, source }));
                     continue;
                 }
             };
@@ -687,11 +782,13 @@ impl<'store> Indexer<'store> {
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_nanos() as i64)
                 .unwrap_or(0);
-            out.push(Ok((rel, bytes, mtime_ns)));
+            walked.files.push(Ok((rel, bytes, mtime_ns)));
         }
         nested.sort();
         excluded.sort();
-        (out, nested, excluded)
+        walked.nested = nested;
+        walked.excluded = excluded;
+        walked
     }
 
     /// Turn a file's chunks into node rows plus the edges derivable from one
@@ -1423,7 +1520,7 @@ mod tests {
     }
 
     #[test]
-    fn source_is_read_from_disk_so_it_cannot_be_stale() {
+    fn source_is_read_from_disk_and_refused_once_the_file_has_changed() {
         let tree = Tree::new();
         tree.write("src/lib.rs", "fn target() {\n    original();\n}\n");
         let store = tree.store();
@@ -1431,24 +1528,82 @@ mod tests {
         let node = store.resolve_symbol("target").expect("resolve")[0].clone();
         assert!(store.source_of(&node).expect("source").contains("original"));
 
-        // Edit the file without reindexing. Because the index holds a location
-        // and not text, the next read returns the new bytes.
+        // An edit without a reindex: the recorded lines may name other text, so
+        // the read is refused instead of returning shifted or replaced lines.
+        tree.write(
+            "src/lib.rs",
+            "// new first line\nfn target() {\n    replaced();\n}\n",
+        );
+        let error = store.source_of(&node).expect_err("stale");
+        assert!(matches!(error, GraphError::StaleFile { .. }), "{error:?}");
+
+        // A same-length edit that keeps every span in place is stale too.
         tree.write("src/lib.rs", "fn target() {\n    replaced();\n}\n");
+        assert!(store.source_of(&node).is_err());
+
+        Indexer::new(&store).index().expect("reindex");
+        let node = store.resolve_symbol("target").expect("resolve")[0].clone();
         assert!(store.source_of(&node).expect("source").contains("replaced"));
+    }
+
+    /// A file indexed from another tree (a worktree holding a merge the checkout
+    /// has not received) is read from that tree, verified against the indexed
+    /// hash, and falls back to the store's root once the other tree stops
+    /// holding that content. Indexing it from the store's root clears the record.
+    #[test]
+    fn source_of_reads_the_recorded_source_root_and_still_checks_the_hash() {
+        let tree = Tree::new();
+        let other = Tree::new();
+        other.write("src/m.rs", "pub fn merged() {\n    1\n}\n");
+        let store = tree.store();
+        Indexer::new(&store)
+            .with_source_root(other.path())
+            .index_paths(&["src/m.rs".to_owned()])
+            .expect("indexed");
+        let node = store.resolve_symbol("merged").expect("resolve")[0].clone();
+        assert_eq!(
+            store.file_source_root("src/m.rs").expect("root").as_deref(),
+            Some(other.path())
+        );
+        // Not in the checkout at all: the recorded root serves it.
+        assert!(store.source_of(&node).expect("read").contains("1"));
+
+        // The checkout holds other content, the worktree is edited: stale.
+        tree.write("src/m.rs", "pub fn merged() {\n    2\n}\n");
+        other.write("src/m.rs", "pub fn merged() {\n    3\n}\n");
+        let error = store.source_of(&node).expect_err("stale");
+        assert!(matches!(error, GraphError::StaleFile { .. }), "{error:?}");
+
+        // The worktree is gone but the checkout received the merge: served
+        // from the checkout, hash verified.
+        tree.write("src/m.rs", "pub fn merged() {\n    1\n}\n");
+        std::fs::remove_file(other.path().join("src/m.rs")).expect("rm");
+        assert!(store.source_of(&node).expect("read").contains("1"));
+
+        // A walk of the checkout finds the indexed content and clears the record.
+        Indexer::new(&store).index().expect("walk");
+        assert_eq!(store.file_source_root("src/m.rs").expect("root"), None);
+        assert!(store.source_of(&node).expect("read").contains("1"));
+
+        // Content that differs everywhere is refused, not guessed.
+        tree.write("src/m.rs", "pub fn merged() {\n    9\n}\n");
+        assert!(matches!(
+            store.source_of(&node),
+            Err(GraphError::StaleFile { .. })
+        ));
     }
 
     #[test]
     fn a_span_that_no_longer_fits_its_file_raises() {
-        // A truncated file must not yield the wrong lines quietly.
+        // The hash matches, yet the recorded span lies outside the file: a
+        // corrupt row must not yield the wrong lines quietly.
         let tree = Tree::new();
-        tree.write(
-            "src/lib.rs",
-            "fn a() {}\nfn b() {}\nfn c() {}\nfn d() {}\nfn e() {}\n",
-        );
+        tree.write("src/lib.rs", "fn a() {}\nfn b() {}\n");
         let store = tree.store();
         Indexer::new(&store).index().expect("index");
-        let node = store.resolve_symbol("e").expect("resolve")[0].clone();
-        tree.write("src/lib.rs", "fn a() {}\n");
+        let mut node = store.resolve_symbol("b").expect("resolve")[0].clone();
+        node.start_line = 40;
+        node.end_line = 41;
         let err = store.source_of(&node).expect_err("must raise");
         assert!(matches!(err, GraphError::StaleSpan { .. }), "got {err:?}");
     }

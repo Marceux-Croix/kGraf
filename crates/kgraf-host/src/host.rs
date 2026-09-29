@@ -116,6 +116,10 @@ pub enum Notice {
     /// cannot read, say); the run goes on, and workers' builds will show the
     /// same error.
     DependenciesUnchecked(String),
+    /// The quality-gate commands this run uses (discovered, configured, or
+    /// the approved plan's), or none: a run that passes its gates says which
+    /// commands passed them.
+    GateCommands(Vec<String>),
 }
 
 /// How a prepared run begins.
@@ -801,14 +805,16 @@ impl Host {
         })
     }
 
-    /// Whole-process readiness: [`RunConfig::check_configured`], and every
-    /// route of the host in the catalog with its model in the price table (read
-    /// again when it changed). None of this is one schedule's fault, so a
-    /// scheduler reports it without claiming (`TickEvent::NotRunnable`).
+    /// Whole-process readiness: [`RunConfig::check_configured`], every route of
+    /// the host in the catalog, and a price table that can be read (again when
+    /// it changed). A model the table does not price is not a readiness
+    /// failure (decision 0075): its spend is reported as unpriced. None of this
+    /// is one schedule's fault, so a scheduler reports it without claiming
+    /// (`TickEvent::NotRunnable`).
     pub fn check_configured(&self) -> Result<(), NotReady> {
         self.config.check_configured()?;
-        let prices = self.current_prices()?;
-        check_routes(&self.route_set(), Some(&prices), &self.in_process, None)
+        self.current_prices()?;
+        check_routes(&self.route_set(), &self.in_process, None)
     }
 
     /// The credential of each route of the set, from the environment: the one
@@ -816,16 +822,17 @@ impl Host {
     /// removed from the shell), so the per-schedule check.
     pub fn check_credentials(&self, routes: &[RouteSpec]) -> Result<(), NotReady> {
         let lookup = |v: &str| kgraf_core::legacy::env_var(v);
-        check_routes(routes, None, &self.in_process, Some(&lookup))
+        check_routes(routes, &self.in_process, Some(&lookup))
     }
 
     /// Readiness of a route set: each route is in the catalog and has its
     /// credential in the environment, and the price table (read again when it
-    /// changed) prices each model. Builds nothing and calls nothing.
+    /// changed) can be read. A model with no price is ready: its spend is
+    /// reported as unpriced. Builds nothing and calls nothing.
     pub fn check_ready(&self, routes: &[RouteSpec]) -> Result<(), NotReady> {
-        let prices = self.current_prices()?;
+        self.current_prices()?;
         let lookup = |v: &str| kgraf_core::legacy::env_var(v);
-        check_routes(routes, Some(&prices), &self.in_process, Some(&lookup))
+        check_routes(routes, &self.in_process, Some(&lookup))
     }
 
     fn plan_limits(&self) -> kgraf_interpret::PlanLimits {
@@ -1105,15 +1112,17 @@ impl Host {
         notices: &mut (dyn FnMut(Notice) + Send),
     ) -> Result<PreparedRun> {
         // Decision 0087: dependencies first, before a branch or a worktree.
-        self.ensure_dependencies(&run, notices)?;
-        let base = self.build_base(startup, run, notices)?;
+        // Both are long synchronous work (a fetch, git, the index pass): off
+        // the async worker, so another run's loop on this runtime keeps going.
+        off_executor(|| self.ensure_dependencies(&run, notices))?;
+        let base = off_executor(|| self.build_base(startup, run, notices))?;
         self.finish_build(startup, base, plan, notices).await
     }
 
     /// The synchronous first part of [`Host::build`]: git and files, up to the
     /// route providers. [`Host::prepare_blocking`] runs it on a blocking thread
     /// so a git call that hangs never holds an async worker.
-    fn build_base(
+    pub(crate) fn build_base(
         &self,
         startup: &Startup,
         run: RunId,
@@ -1128,11 +1137,22 @@ impl Host {
         // already-current index costs one pass comparing unchanged file
         // hashes; see `build_base`'s callers for where this runs (every entry
         // point that starts a run).
+        //
+        // On its own connection to the same database, not the shared
+        // `self.graph`: the pass takes as long as the project is large, and
+        // holding the shared lock for it would stall every other run's loop in
+        // this process (their session and lease calls take that lock). SQLite
+        // (WAL, a busy timeout) serializes the writes; `open_existing_for_facts`
+        // never rebuilds, and the shared store already migrated this file.
+        //
+        // The index describes the checkout (`root`), also on a resume: the
+        // integration branch `kgraf/<run>` is never checked out, and its
+        // merged work reaches workers through their worktrees, which branch
+        // from it. Indexing the branch would need a second tree on disk; the
+        // checkout is what the user sees and what the planner's slices name.
         let index_report = {
-            let store = self
-                .graph
-                .lock()
-                .map_err(|_| Error::failed("graph lock poisoned"))?;
+            let store = GraphStore::open_existing_for_facts(&self.graph_path, root)
+                .step("cannot open the graph to index it")?;
             Indexer::new(&store)
                 .index()
                 .step("cannot index the project's graph")?
@@ -1369,6 +1389,7 @@ impl Host {
             Some(plan) if self.config.gate_commands.is_empty() => plan.validation_commands(),
             _ => discover_validation_commands(root, &self.config.gate_commands)?,
         };
+        notices(Notice::GateCommands(gate_commands.clone()));
         let orchestrator = orchestrator.with_gate_runner(Arc::new(CommandGateRunner {
             commands: gate_commands.clone(),
             manager: manager.clone(),
@@ -1481,7 +1502,7 @@ impl Host {
         plan: Option<&ApprovedPlan>,
         notices: &mut (dyn FnMut(Notice) + Send),
     ) -> Result<PreparedRun> {
-        let startup = self.startup(notices)?;
+        let startup = off_executor(|| self.startup(notices))?;
         self.build(&startup, run, plan, notices).await
     }
 
@@ -1604,7 +1625,15 @@ impl Host {
                         true,
                     ) => prices.cost(&c.model, &c.usage).lift()?,
                     (settlement, _) => {
-                        let amount = self.worst_case_call(&prices, &c.model)?;
+                        let amount = match self.worst_case_call(&prices, &c.model) {
+                            Ok(a) => a,
+                            // A model the table does not price, and a table
+                            // that prices nothing to bound it with: the
+                            // call's cost is unknown, so it is not seeded
+                            // (never as `$0`), and opening is not refused.
+                            Err(_) if !priced => continue,
+                            Err(e) => return Err(e),
+                        };
                         estimated.push(Notice::EstimatedSpend {
                             call: c.id.to_string(),
                             model: c.model.clone(),
@@ -1714,23 +1743,36 @@ impl Host {
     }
 }
 
+/// Run long synchronous work (git, the index pass, a dependency fetch) from
+/// async code without holding an async worker: on a multi-thread runtime the
+/// worker hands its other tasks to the rest of the pool first
+/// (`block_in_place`); elsewhere (a current-thread runtime, or none) it runs
+/// in place, since there is no other worker to hand them to. `spawn_blocking`
+/// is not used because the work borrows the host and the caller's notice sink.
+pub(crate) fn off_executor<T>(work: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(work)
+        }
+        _ => work(),
+    }
+}
+
 /// Reads one environment variable (`kgraf_core::legacy::env_var` outside tests,
 /// which also accepts a credential under its former `HAUSTORIA_*` name).
 pub(crate) type EnvLookup = dyn Fn(&str) -> Option<String>;
 
 /// The readiness of a route set: each route in the catalog (always; an
-/// in-process route has none), its credential when `lookup` is given, its model
-/// priced when `prices` is given.
+/// in-process route has none), its credential when `lookup` is given. Pricing
+/// is not checked: an unpriced model is never a readiness failure.
 pub(crate) fn check_routes(
     routes: &[RouteSpec],
-    prices: Option<&PriceTable>,
     in_process: &BTreeMap<String, Arc<dyn Provider>>,
     lookup: Option<&EnvLookup>,
 ) -> Result<(), NotReady> {
     if routes.is_empty() {
         return Err(NotReady::NoRoutes);
     }
-    let mut unpriced: Vec<String> = Vec::new();
     for r in routes {
         if !in_process.contains_key(&r.route) {
             let entry = kgraf_fleet::entry(&r.route).map_err(|e| NotReady::UnknownRoute {
@@ -1746,22 +1788,12 @@ pub(crate) fn check_routes(
                 })?;
             }
         }
-        if let Some(prices) = prices
-            && prices.get(&r.model).is_none()
-            && !unpriced.contains(&r.model)
-        {
-            unpriced.push(r.model.clone());
-        }
     }
-    if unpriced.is_empty() {
-        Ok(())
-    } else {
-        Err(NotReady::MissingPrices { models: unpriced })
-    }
+    Ok(())
 }
 
 /// What [`Host::build_base`] made, for [`Host::finish_build`].
-struct BuildBase {
+pub(crate) struct BuildBase {
     run: RunId,
     integration: String,
     merge_back: Arc<MergeBack>,
@@ -2173,7 +2205,12 @@ impl RunEnd {
             .store
             .load(&self.run)
             .lift()
-            .and_then(|record| self.workspaces.sweep_refs(record.as_ref()))
+            .and_then(|record| {
+                // Every run's records, not only this one's: a subagent of
+                // another run in this repository keeps its refs.
+                self.workspaces
+                    .sweep_refs(record.as_ref(), || self.store.referenced_worktrees().lift())
+            })
             .and_then(|mut swept| {
                 if let Some(stubs) = &self.stubs {
                     swept.extend(stubs.sweep().map_err(Error::failed)?);

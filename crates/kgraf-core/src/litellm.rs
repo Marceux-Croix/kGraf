@@ -187,6 +187,29 @@ impl LiteLlmCatalog {
         self.models.len()
     }
 
+    /// [`Self::to_price_table`], plus a bare-id entry for each `(model,
+    /// provider)` pair whose bare `model` is not itself a catalog key but
+    /// whose `provider/model` key is.
+    ///
+    /// litellm keys some vendors' models only under a provider prefix
+    /// (`moonshot/kimi-k3`, no bare `kimi-k3`), so a route that names the bare
+    /// id would run unpriced. The route's own provider is the only prefix
+    /// tried: a bare id is never matched to another provider's entry of the
+    /// same name, since two vendors can sell one model id at different rates.
+    /// An exact bare key always wins over a prefixed one.
+    pub fn to_price_table_for_providers(&self, wanted: &[(&str, &str)]) -> PriceTable {
+        let mut table = self.to_price_table();
+        for (model, provider) in wanted {
+            if self.models.contains_key(*model) {
+                continue;
+            }
+            if let Some(info) = self.models.get(&format!("{provider}/{model}")) {
+                table.set((*model).to_owned(), info.price);
+            }
+        }
+        table
+    }
+
     /// Build a [`PriceTable`] from every model this catalog mapped.
     ///
     /// This is the loader's output in kGraf's existing price-table type,
@@ -326,6 +349,30 @@ mod tests {
         assert_eq!(info.price.reasoning, 10_000_000);
         assert_eq!(info.context_window, 128_000);
         assert_eq!(catalog.context_window("gpt-4o"), Some(128_000));
+    }
+
+    #[test]
+    fn a_provider_prefixed_key_prices_the_bare_id_for_that_provider_only() {
+        let catalog = LiteLlmCatalog::load(vendored_bytes()).expect("vendored file must parse");
+        // The vendored table keys this model only as `moonshot/kimi-k3`.
+        assert!(catalog.get("kimi-k3").is_none());
+        let plain = catalog.to_price_table();
+        assert!(plain.get("kimi-k3").is_none());
+
+        let with = catalog.to_price_table_for_providers(&[("kimi-k3", "moonshot")]);
+        let expected = catalog.get("moonshot/kimi-k3").expect("prefixed key").price;
+        assert_eq!(with.get("kimi-k3").copied(), Some(expected));
+
+        // Another provider's prefix never prices it: the lookup does not guess
+        // across providers.
+        let wrong = catalog.to_price_table_for_providers(&[("kimi-k3", "databricks")]);
+        assert!(wrong.get("kimi-k3").is_none());
+        let unknown = catalog.to_price_table_for_providers(&[("kimi-k3", "nobody")]);
+        assert!(unknown.get("kimi-k3").is_none());
+
+        // An exact bare key is kept as is.
+        let exact = catalog.to_price_table_for_providers(&[("gpt-4o", "moonshot")]);
+        assert_eq!(exact.get("gpt-4o"), plain.get("gpt-4o"));
     }
 
     #[test]

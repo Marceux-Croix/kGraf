@@ -40,7 +40,6 @@ fn insert_chain(store: &GraphStore, depth: usize) -> (String, String) {
         language: None,
         line_count: 1,
     };
-    store.upsert_file(&file).expect("file");
     let mut parent: Option<String> = None;
     let mut nodes = Vec::with_capacity(depth);
     for i in 0..depth {
@@ -63,7 +62,7 @@ fn insert_chain(store: &GraphStore, depth: usize) -> (String, String) {
         parent = Some(id);
     }
     store
-        .replace_file_nodes(&file.id, &nodes, &[], &[])
+        .replace_file_nodes(&file, &nodes, &[], &[])
         .expect("nodes");
     (
         nodes.last().unwrap().id.clone(),

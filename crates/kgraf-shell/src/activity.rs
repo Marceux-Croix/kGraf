@@ -194,7 +194,7 @@ pub fn describe(c: &Change) -> ActivityRow {
     }
 }
 
-/// The events the card shows (H1): what agents, the plan and the
+/// The events the card shows: what agents, the plan and the
 /// scheduler did, and files coming and going. Index churn (layout moves, edges,
 /// node inserts and deletes, file updates) and lease renewals are left out, in
 /// SQL, before the row limit, so they never fill the tail.

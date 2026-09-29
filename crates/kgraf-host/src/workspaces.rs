@@ -372,9 +372,19 @@ impl GitWorkspaces {
 
     /// At the end of a run: delete the attempt refs of every worktree this
     /// process worked in that no open contract still uses.
+    ///
+    /// Subagent refs are shared by every run in the repository, so a child
+    /// is kept while any run still names it: `referenced` returns every
+    /// worktree name any run record names ([`RunStore::referenced_worktrees`]).
+    /// It is read after the refs are listed: a child's spawn record is saved
+    /// before its refs exist, so every listed child of another live run is
+    /// already in it, and a child spawned after the listing is not deleted.
+    ///
+    /// [`RunStore::referenced_worktrees`]: kgraf_orchestrator::RunStore::referenced_worktrees
     pub(crate) fn sweep_refs(
         &self,
         record: Option<&kgraf_orchestrator::RunStateRecord>,
+        referenced: impl FnOnce() -> Result<BTreeSet<String>>,
     ) -> Result<Vec<String>> {
         let still: BTreeSet<String> = record
             .map(|r| {
@@ -396,7 +406,7 @@ impl GitWorkspaces {
         // Subagents' refs (decision 0067), once no open contract of this run
         // names the child any more. The spawn record of every live or
         // unmerged child sits in its contract's `worktrees` map.
-        let keep: BTreeSet<String> = record
+        let mut keep: BTreeSet<String> = record
             .map(|r| {
                 r.open_contracts
                     .iter()
@@ -404,8 +414,11 @@ impl GitWorkspaces {
                     .collect()
             })
             .unwrap_or_default();
+        let listed = child::list_refs(self.manager.repo())
+            .map_err(|e| Error::Invalid(format!("subagent refs were not swept: {e}")))?;
+        keep.extend(referenced()?);
         swept.extend(
-            child::sweep(self.manager.repo(), &keep)
+            child::sweep(self.manager.repo(), listed, &keep)
                 .map_err(|e| Error::Invalid(format!("subagent refs were not swept: {e}")))?,
         );
         Ok(swept)
@@ -877,6 +890,31 @@ impl Workspaces for GitWorkspaces {
         tokio::task::spawn_blocking(move || child::discard(&manager, stale, &name))
             .await
             .map_err(|e| e.to_string())?
+    }
+
+    /// A child whose worktree cannot be reopened, but whose result was
+    /// recorded before the process stopped: merged again from that result
+    /// (idempotent), so its report says what is in the parent's worktree.
+    async fn recover_child_merge(
+        &self,
+        parent: &Path,
+        child: &kgraf_core::AgentId,
+        writes: &[String],
+    ) -> std::result::Result<Option<ChildMerge>, String> {
+        let Some(parent_ws) = self.get(parent) else {
+            return Ok(None);
+        };
+        let manager = self.manager.clone();
+        let name = child.to_string();
+        let writes = writes.to_vec();
+        tokio::task::spawn_blocking(move || {
+            if !child::has_result(manager.repo(), &name) {
+                return Ok(None);
+            }
+            child::merge(&manager, &parent_ws, None, &name, &writes).map(Some)
+        })
+        .await
+        .map_err(|e| e.to_string())?
     }
 
     /// Merge a finished writer subagent's declared writes back into its
@@ -1662,11 +1700,15 @@ pub(crate) mod child {
             }
             applied.push(c.path.clone());
         }
-        if let Some(ws) = child_ws {
-            manager
-                .remove(ws.clone())
-                .map_err(|e| format!("subagent `{child}` merged; its worktree: {e}"))?;
-        }
+        // The work is in the parent's worktree now: a worktree that cannot
+        // be removed is a warning on the result, never an error that would
+        // tell the parent nothing was applied. Startup cleanup removes it.
+        let warning = match child_ws {
+            Some(ws) => manager.remove(ws.clone()).err().map(|e| {
+                format!("subagent `{child}` merged, but its worktree could not be removed: {e}")
+            }),
+            None => None,
+        };
         // The handle goes with the worktree: nothing may reopen what is gone.
         // `checkpoint` and `result` stay, so the merge can be re-applied (and
         // audited) from the refs alone, until the contract closes.
@@ -1678,21 +1720,31 @@ pub(crate) mod child {
             None,
         );
         Ok(if mine.is_empty() {
-            ChildMerge::Empty { not_applied }
+            ChildMerge::Empty {
+                not_applied,
+                warning,
+            }
         } else {
             ChildMerge::Merged {
                 commit: result,
                 not_applied,
+                warning,
             }
         })
     }
 
-    /// Delete the refs of every child not in `keep`. Returns the refs deleted.
-    pub(crate) fn sweep(
-        repo: &Path,
-        keep: &std::collections::BTreeSet<String>,
-    ) -> Result<Vec<String>, String> {
-        let listed = git_str(
+    /// Whether `child` left a result that was merged, or can be merged again:
+    /// its `result` ref, recorded before any file is applied. For a child
+    /// whose worktree is gone (a kill after the merge removed it and before
+    /// the child was marked settled), [`merge`] with no live worktree
+    /// re-applies that result, finding every path already applied.
+    pub(crate) fn has_result(repo: &Path, child: &str) -> bool {
+        resolve(repo, &ref_of(child, "result")).is_some()
+    }
+
+    /// Every child ref, as `<refname> <oid>` lines.
+    pub(crate) fn list_refs(repo: &Path) -> Result<String, String> {
+        git_str(
             repo,
             None,
             None,
@@ -1701,7 +1753,17 @@ pub(crate) mod child {
                 "--format=%(refname) %(objectname)",
                 REF_ROOT,
             ],
-        )?;
+        )
+    }
+
+    /// Delete the `listed` refs ([`list_refs`]) of every child not in `keep`,
+    /// each only if it still names the listed object. Returns the refs
+    /// deleted.
+    pub(crate) fn sweep(
+        repo: &Path,
+        listed: String,
+        keep: &std::collections::BTreeSet<String>,
+    ) -> Result<Vec<String>, String> {
         let mut deleted = Vec::new();
         for line in listed.lines() {
             let Some((refname, oid)) = line.split_once(' ') else {
@@ -1920,6 +1982,7 @@ mod child_tests {
         let ChildMerge::Merged {
             commit,
             not_applied,
+            warning: None,
         } = merged
         else {
             panic!("expected a merge, got {merged:?}");
@@ -2479,12 +2542,15 @@ mod child_tests {
                 .worktrees
                 .insert("r1-s-r0-a0.s1".into(), "{}".into());
             open.open_contracts.push(contract);
-            f.ws.sweep_refs(Some(&open)).expect("sweep")
+            f.ws.sweep_refs(Some(&open), || Ok(Default::default()))
+                .expect("sweep")
         };
         assert!(swept_open.iter().all(|r| !r.contains("subagents")));
         assert!(!refs_under(&f.root, child::REF_ROOT).is_empty());
         record.open_contracts.clear();
-        let swept = f.ws.sweep_refs(Some(&record)).expect("sweep");
+        let swept =
+            f.ws.sweep_refs(Some(&record), || Ok(Default::default()))
+                .expect("sweep");
         assert!(
             swept.iter().any(|r| r.contains("r1-s-r0-a0.s1")),
             "{swept:?}"
@@ -2493,5 +2559,115 @@ mod child_tests {
             refs_under(&f.root, child::REF_ROOT).is_empty(),
             "no subagent refs remain"
         );
+    }
+
+    /// Two runs in one repository: the end of one run sweeps its own
+    /// children's refs and keeps those of a child another run's record
+    /// still names.
+    #[tokio::test]
+    async fn a_sweep_keeps_the_refs_of_another_runs_child() {
+        let f = fixture();
+        let p1 = parent(&f, &f.ws, "r1-s-r0-a0");
+        let p2 = parent(&f, &f.ws, "r2-s-r0-a0");
+        f.ws.prepare_child(&p1, &id("r1-s-r0-a0.s1"))
+            .await
+            .expect("child of r1");
+        f.ws.prepare_child(&p2, &id("r2-s-r0-a0.s1"))
+            .await
+            .expect("child of r2");
+        let record = kgraf_orchestrator::RunStateRecord::new(kgraf_core::RunId::new("r1"), "x", 0);
+        let swept =
+            f.ws.sweep_refs(Some(&record), || {
+                Ok(["r2-s-r0-a0.s1".to_owned()].into_iter().collect())
+            })
+            .expect("sweep");
+        assert!(
+            swept.iter().any(|r| r.contains("r1-s-r0-a0.s1")),
+            "r1's own child is swept: {swept:?}"
+        );
+        assert!(
+            swept.iter().all(|r| !r.contains("r2-s-r0-a0.s1")),
+            "{swept:?}"
+        );
+        let left = refs_under(&f.root, child::REF_ROOT);
+        assert!(
+            !left.is_empty() && left.iter().all(|r| r.contains("r2-s-r0-a0.s1")),
+            "only the other run's child keeps its refs: {left:?}"
+        );
+    }
+
+    /// A kill after the merge removed the child's worktree and before the
+    /// child was marked settled: the worktree cannot be reopened, but the
+    /// recorded result is merged again (every path already applied), so the
+    /// report says Merged. A child that recorded no result has nothing to
+    /// recover.
+    #[tokio::test]
+    async fn a_child_merged_before_a_kill_is_recovered_from_its_result() {
+        let f = fixture();
+        let p = parent(&f, &f.ws, "r1-m-r0-a0");
+        let c =
+            f.ws.prepare_child(&p, &id("r1-m-r0-a0.s1"))
+                .await
+                .expect("child");
+        std::fs::write(c.join("m.txt"), "m\n").expect("write");
+        let merged =
+            f.ws.merge_child(&p, &c, &w(&["m.txt"]))
+                .await
+                .expect("merge");
+        assert!(matches!(merged, ChildMerge::Merged { .. }), "{merged:?}");
+        assert!(!c.exists(), "the merge removed the child's worktree");
+        assert!(
+            f.ws.reopen_child(&p, &id("r1-m-r0-a0.s1")).await.is_err(),
+            "what a resumed process finds: nothing to reopen"
+        );
+        let recovered =
+            f.ws.recover_child_merge(&p, &id("r1-m-r0-a0.s1"), &w(&["m.txt"]))
+                .await
+                .expect("recover");
+        assert!(
+            matches!(recovered, Some(ChildMerge::Merged { .. })),
+            "{recovered:?}"
+        );
+        assert_eq!(read(&p.join("m.txt")), "m\n", "the landed file is kept");
+
+        f.ws.prepare_child(&p, &id("r1-m-r0-a0.s2"))
+            .await
+            .expect("second child");
+        let none =
+            f.ws.recover_child_merge(&p, &id("r1-m-r0-a0.s2"), &w(&["n.txt"]))
+                .await
+                .expect("recover");
+        assert_eq!(none, None, "no recorded result, nothing recovered");
+    }
+
+    /// The child's files are applied, then its worktree cannot be removed:
+    /// the merge is reported as merged with a warning, never as an error
+    /// that would tell the parent nothing was applied.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_child_worktree_that_cannot_be_removed_after_its_merge_is_a_warning() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = fixture();
+        let p = parent(&f, &f.ws, "r1-q-r0-a0");
+        let c =
+            f.ws.prepare_child(&p, &id("r1-q-r0-a0.s1"))
+                .await
+                .expect("child");
+        std::fs::write(c.join("q.txt"), "q\n").expect("write");
+        let stuck = c.join("stuck");
+        std::fs::create_dir_all(&stuck).expect("mkdir");
+        std::fs::write(stuck.join("f"), "f\n").expect("write");
+        std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o500)).expect("chmod");
+        let merged = f.ws.merge_child(&p, &c, &w(&["q.txt"])).await;
+        // Restored first, so the temporary directory can be removed.
+        std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        let merged = merged.expect("the applied files are reported, not an error");
+        match merged {
+            ChildMerge::Merged {
+                warning: Some(w), ..
+            } => assert!(w.contains("could not be removed"), "{w}"),
+            other => panic!("expected a merge with a warning, got {other:?}"),
+        }
+        assert_eq!(read(&p.join("q.txt")), "q\n", "the child's work landed");
     }
 }

@@ -303,7 +303,7 @@ mod tests {
         assert!(!is_private_group(b"ann", b"team", &v(&["ann"]), false));
     }
 
-    /// Review M1: `useradd -U ann; useradd -g ann bob` leaves `ann` named for
+    /// `useradd -U ann; useradd -g ann bob` leaves `ann` named for
     /// ann with no listed member, yet bob, whose primary group it is, can
     /// write ann's group-writable directories. Another primary user makes it
     /// shared.

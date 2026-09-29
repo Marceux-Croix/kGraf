@@ -464,6 +464,30 @@ pub(crate) fn refusal_notice(notices: Vec<String>) -> Option<String> {
     }
 }
 
+/// Whether an update needs the user: a release is offered and not yet accepted. It
+/// counts on the bell, like an approval.
+pub(crate) fn update_needs_you(state: &Option<UpdateState>) -> bool {
+    matches!(state, Some(UpdateState::Available(_)))
+}
+
+/// The bell's update row for `state`: the words and, for an offered release, the
+/// candidate the "Download and install" button accepts. `None` while there is
+/// nothing to say (idle, checking, up to date).
+pub(crate) fn update_notice(
+    state: &Option<UpdateState>,
+) -> Option<(String, Option<crate::update_check::UpdateCandidate>)> {
+    match state.as_ref()? {
+        UpdateState::Available(c) => Some((
+            format!("kGraf {} is available.", c.version),
+            Some(c.clone()),
+        )),
+        UpdateState::Downloading => Some(("Downloading the update...".to_owned(), None)),
+        UpdateState::Ready { words, .. } => Some((words.clone(), None)),
+        UpdateState::Failed(message) => Some((format!("Update failed: {message}"), None)),
+        UpdateState::Idle | UpdateState::Checking | UpdateState::UpToDate => None,
+    }
+}
+
 impl ShellApp {
     /// Draws one frame of the window.
     pub(crate) fn frame_ui(&mut self, ui: &mut Ui, frame: &eframe::Frame) {
@@ -950,7 +974,8 @@ impl ShellApp {
 
     fn masthead_end(&mut self, ui: &mut Ui, p: &Palette) {
         // Right to left: the bell, the render badge, the scheduler pill.
-        let bell_count = self.workspace.bell();
+        let bell_count =
+            self.workspace.bell() + usize::from(update_needs_you(&self.update_state()));
         let bell = chrome::icon_button(
             ui,
             p,
@@ -2135,7 +2160,7 @@ impl ShellApp {
             ("Needs your input", 4),
             ("Selected or matched", 5),
         ];
-        // What the graph does not draw yet, said plainly (M1). The galaxy
+        // What the graph does not draw yet, said plainly. The galaxy
         // takes its colors from the same palette as this legend
         // (`theme::galaxy_palette`, decision 0068), so colors are not listed.
         const NOTE: &str = "Not drawn on the graph yet: the progress bar on plan cards, \
@@ -2634,6 +2659,8 @@ impl ShellApp {
         }
         let screen = ctx.content_rect();
         let mut jump = None;
+        let mut install = None;
+        let update_row = update_notice(&self.update_state());
         let area = egui::Area::new(egui::Id::new("bell_menu"))
             .order(egui::Order::Foreground)
             .fixed_pos(pos2(screen.right() - 8.0 - 480.0, 48.0))
@@ -2656,6 +2683,20 @@ impl ShellApp {
                             });
                         separator(ui, p);
                         let mut any = false;
+                        if let Some((words, candidate)) = &update_row {
+                            any = true;
+                            egui::Frame::new()
+                                .inner_margin(egui::Margin::symmetric(16, 12))
+                                .show(ui, |ui| {
+                                    ui.set_width(448.0);
+                                    ui.label(RichText::new(words).font(theme::regular(14.0)).color(p.text));
+                                    if let Some(c) = candidate
+                                        && chrome::text_button(ui, p.primary, "Download and install").clicked()
+                                    {
+                                        install = Some(c.clone());
+                                    }
+                                });
+                        }
                         for (pi, proj) in self.workspace.projects().iter().enumerate() {
                             // Failures first: each jumps to its pinned card.
                             for f in proj.failures() {
@@ -2754,6 +2795,11 @@ impl ShellApp {
                         }
                     });
             });
+        if let Some(candidate) = install
+            && let Some(u) = &self.update
+        {
+            u.accept_and_install(candidate);
+        }
         if let Some((pi, ask)) = jump {
             self.workspace.switch_to(pi);
             let root = self.workspace.projects().get(pi).map(|p| p.root.clone());
@@ -3639,6 +3685,38 @@ mod tests {
     }
 
     use super::*;
+
+    /// An offered update reaches the bell: it counts, says the version, and
+    /// carries the candidate the button accepts. A finished check says nothing.
+    #[test]
+    fn an_offered_update_is_a_bell_notice_with_a_button() {
+        let candidate = crate::update_check::UpdateCandidate {
+            version: semver::Version::new(9, 9, 9),
+            tag_name: "v9.9.9".into(),
+            asset_name: "a".into(),
+            download_url: "u".into(),
+            checksum_name: "c".into(),
+            checksum_url: "cu".into(),
+        };
+        let offered = Some(UpdateState::Available(candidate.clone()));
+        assert!(update_needs_you(&offered));
+        let (words, button) = update_notice(&offered).expect("a notice");
+        assert!(words.contains("9.9.9"), "{words}");
+        assert_eq!(button, Some(candidate));
+        for quiet in [
+            None,
+            Some(UpdateState::Idle),
+            Some(UpdateState::Checking),
+            Some(UpdateState::UpToDate),
+        ] {
+            assert!(!update_needs_you(&quiet));
+            assert!(update_notice(&quiet).is_none());
+        }
+        let (words, button) =
+            update_notice(&Some(UpdateState::Failed("offline".into()))).expect("a failure is said");
+        assert!(words.contains("offline") && button.is_none(), "{words}");
+        assert!(update_notice(&Some(UpdateState::Downloading)).is_some());
+    }
 
     /// A refused credential reaches the window as one line,
     /// naming the kind; a scrubber that refused `lm-studio` says so.

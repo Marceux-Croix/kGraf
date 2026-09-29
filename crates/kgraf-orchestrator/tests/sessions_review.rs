@@ -102,6 +102,12 @@ struct Fake {
     no_verdicts: bool,
     /// Every judgment call parks until the test ends.
     judge_parks: bool,
+    /// Every judgment call panics.
+    judge_panics: bool,
+    /// Every answer call parks until the test ends.
+    answer_parks: bool,
+    /// Every answer call panics.
+    answer_panics: bool,
     judged: Mutex<Vec<usize>>,
     asked: AtomicUsize,
 }
@@ -110,6 +116,12 @@ struct Fake {
 impl QuestionAnswerer for Fake {
     async fn try_answer(&self, _r: &AnswerRequest) -> Result<AnswerOutput, PlanError> {
         self.asked.fetch_add(1, Ordering::SeqCst);
+        if self.answer_parks {
+            std::future::pending::<()>().await;
+        }
+        if self.answer_panics {
+            panic!("the answer call panicked, on purpose");
+        }
         if self.fail_answer {
             return Err(PlanError::Invalid(
                 "the answer call failed for the test".into(),
@@ -134,6 +146,9 @@ impl QuestionAnswerer for Fake {
 
     async fn judge_connections(&self, r: &JudgeRequest) -> Result<JudgeOutput, PlanError> {
         self.judged.lock().expect("lock").push(r.requests.len());
+        if self.judge_panics {
+            panic!("the judgment call panicked, on purpose");
+        }
         if self.judge_parks {
             std::future::pending::<()>().await;
         }
@@ -228,13 +243,13 @@ fn notices_sink() -> (
     )
 }
 
-// ------------------------------------------------------------------ H1, M8
+// ------------------------------------------------------------------
 
-/// H1 and M8: the product's answerer ([`ModelAnswerer`], the one the host
+/// The product's answerer ([`ModelAnswerer`], the one the host
 /// wires) answers a question in one call through the ledger, attributed to
 /// the orchestrator, reserved first and settled at its ledger row: the run's
 /// settled spend grows by exactly that row's cost and no hold is left. The
-/// question reaches the model quoted as data (M6).
+/// question reaches the model quoted as data.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_orchestrator_first_answer_is_one_ledgered_call_settled_at_its_row() {
     let dir = tempfile::tempdir().expect("dir");
@@ -300,7 +315,7 @@ async fn an_orchestrator_first_answer_is_one_ledgered_call_settled_at_its_row() 
     let _ = run.await.expect("join");
 }
 
-/// H1: in the product path a worker's own `ask_user_question` call reaches
+/// In the product path a worker's own `ask_user_question` call reaches
 /// the orchestrator first: the tool result is the answerer's answer, and no
 /// question is left for the user.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -337,7 +352,7 @@ async fn a_worker_question_through_the_tool_is_answered_by_the_orchestrator_firs
     assert_eq!(model.calls(), 1, "one answer call");
 }
 
-/// H1: a question that skips the orchestrator (no answerer wired) is never
+/// A question that skips the orchestrator (no answerer wired) is never
 /// silent: a notice is recorded before it reaches the user.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_question_that_skips_the_orchestrator_is_recorded_as_a_notice() {
@@ -386,27 +401,17 @@ async fn a_question_that_skips_the_orchestrator_is_recorded_as_a_notice() {
     assert!(report.notices.iter().any(skipped), "{:?}", report.notices);
 }
 
-/// M8: a refused reservation, and a failed answer call, each record a
-/// fallback notice, and the question reaches the user.
+/// A failed answer call records a fallback notice, and the question
+/// reaches the user.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_refused_reservation_or_a_failed_answer_call_is_a_notice_and_the_user_is_asked() {
-    for (case, fake) in [
-        (
-            "was not reserved",
-            Fake {
-                unpriced: true,
-                answer: Some(ANSWER.into()),
-                ..Fake::default()
-            },
-        ),
-        (
-            "call failed",
-            Fake {
-                fail_answer: true,
-                ..Fake::default()
-            },
-        ),
-    ] {
+async fn a_failed_answer_call_is_a_notice_and_the_user_is_asked() {
+    for (case, fake) in [(
+        "call failed",
+        Fake {
+            fail_answer: true,
+            ..Fake::default()
+        },
+    )] {
         let dir = tempfile::tempdir().expect("dir");
         let p = parts(
             dir.path(),
@@ -453,9 +458,194 @@ async fn a_refused_reservation_or_a_failed_answer_call_is_a_notice_and_the_user_
     }
 }
 
-// ------------------------------------------------------------------ H2
+/// Decision 0075: an answer model with no price entry is asked like any
+/// other. Its hold is zero, the call is made, and the question does not
+/// go to the user for want of a price.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unpriced_answer_model_is_still_asked() {
+    let dir = tempfile::tempdir().expect("dir");
+    let p = parts(
+        dir.path(),
+        &[c("a", "make a HANG", "src/a.rs", &[])],
+        Duration::from_millis(5),
+    );
+    hang(&p);
+    let (seen, sink) = notices_sink();
+    let fake = Arc::new(Fake {
+        unpriced: true,
+        answer: Some(ANSWER.into()),
+        ..Fake::default()
+    });
+    let o = Orchestrator::new(config(), p.services(WINDOW))
+        .expect("orchestrator")
+        .with_question_answerer(fake.clone())
+        .with_session_notices(sink);
+    let handle = o.handle();
+    let run = tokio::spawn(o.start(RunId::new("r1"), "make a".into()));
+    wait_hang(&p).await;
+    let _asked = tokio::spawn({
+        let handle = handle.clone();
+        async move {
+            handle
+                .ask_question(AgentId::new("r1-a-r0-a0"), "which file?".into())
+                .await
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while fake.asked.load(Ordering::SeqCst) == 0 {
+        assert!(Instant::now() < deadline, "the answerer was never asked");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        !seen
+            .lock()
+            .expect("lock")
+            .iter()
+            .any(|t| t.contains("skipped the orchestrator")),
+        "an unpriced model is not a reason to skip the orchestrator"
+    );
+    unhang(&p);
+    handle.stop().await;
+    let _ = run.await.expect("join");
+}
 
-/// H2: a message to a finished agent is refused as retired, with the offer to
+/// An answer call that panics, or never returns, does not leave the asking
+/// worker blocked: the supervisor turns it into a failed call, a notice says
+/// so, and the question goes to the user.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answer_call_that_panics_or_hangs_still_sends_the_question_to_the_user() {
+    for (case, fake) in [
+        (
+            "panicked",
+            Fake {
+                answer_panics: true,
+                ..Fake::default()
+            },
+        ),
+        (
+            "did not finish within",
+            Fake {
+                answer_parks: true,
+                ..Fake::default()
+            },
+        ),
+    ] {
+        let dir = tempfile::tempdir().expect("dir");
+        let p = parts(
+            dir.path(),
+            &[c("a", "make a HANG", "src/a.rs", &[])],
+            Duration::from_millis(5),
+        );
+        hang(&p);
+        let (seen, sink) = notices_sink();
+        let o = Orchestrator::new(config(), p.services(WINDOW))
+            .expect("orchestrator")
+            .with_question_answerer(Arc::new(fake))
+            .with_session_call_timeout(Duration::from_millis(200))
+            .with_session_notices(sink);
+        let handle = o.handle();
+        let run = tokio::spawn(o.start(RunId::new("r1"), "make a".into()));
+        wait_hang(&p).await;
+        let _asked = tokio::spawn({
+            let handle = handle.clone();
+            async move {
+                handle
+                    .ask_question(AgentId::new("r1-a-r0-a0"), "which file?".into())
+                    .await
+            }
+        });
+        let mut pending = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while pending.is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "{case}: no question reached the user"
+            );
+            pending = handle.pending_questions().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let seen = seen.lock().expect("lock").clone();
+        assert!(
+            seen.iter()
+                .any(|t| t.contains("skipped the orchestrator") && t.contains(case)),
+            "{case}: {seen:?}"
+        );
+        unhang(&p);
+        handle.stop().await;
+        let _ = run.await.expect("join");
+    }
+}
+
+/// A judgment call that panics, or never returns, refuses its waiters with
+/// the reason and clears: the next request is judged again rather than
+/// queued behind a judgment that will never come back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_judgment_call_that_panics_or_hangs_refuses_and_clears() {
+    for (case, fake) in [
+        (
+            "panicked",
+            Fake {
+                judge_panics: true,
+                ..Fake::default()
+            },
+        ),
+        (
+            "did not finish within",
+            Fake {
+                judge_parks: true,
+                ..Fake::default()
+            },
+        ),
+    ] {
+        let dir = tempfile::tempdir().expect("dir");
+        let p = parts(
+            dir.path(),
+            &[
+                c("a", "make a HANG", "src/a.rs", &[]),
+                c("b", "make b HANG", "src/b.rs", &[]),
+            ],
+            Duration::from_millis(5),
+        );
+        hang(&p);
+        let judge = Arc::new(fake);
+        let o = Orchestrator::new(config(), p.services(WINDOW))
+            .expect("orchestrator")
+            .with_question_answerer(judge.clone())
+            .with_session_call_timeout(Duration::from_millis(200));
+        let handle = o.handle();
+        let run = tokio::spawn(o.start(RunId::new("r1"), "make a and b".into()));
+        until("both park", || {
+            p.stats.requests().iter().filter(|r| r.2 == 1).count() >= 2
+        })
+        .await;
+        let (a0, b0) = (AgentId::new("r1-a-r0-a0"), AgentId::new("r1-b-r0-a0"));
+        for attempt in 1..=2 {
+            let err = tokio::time::timeout(
+                Duration::from_secs(10),
+                handle.send_message(a0.clone(), b0.clone(), "hi".into()),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{case}: judgment {attempt} never came back"))
+            .expect_err("a failed judgment is a refusal");
+            assert!(
+                matches!(&err, SessionError::Refused(r) if r.contains(case)),
+                "{case}: {err:?}"
+            );
+        }
+        assert_eq!(
+            judge.judged.lock().expect("lock").len(),
+            2,
+            "{case}: the second request was judged again"
+        );
+        unhang(&p);
+        handle.stop().await;
+        let _ = run.await.expect("join");
+    }
+}
+
+// ------------------------------------------------------------------
+
+/// A message to a finished agent is refused as retired, with the offer to
 /// send it to the orchestrator, before anything is judged
 /// or persisted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -498,7 +688,7 @@ async fn a_message_to_a_finished_agent_is_refused_and_nothing_is_persisted() {
     let _ = run.await.expect("join");
 }
 
-/// H2: an unknown recipient is refused as unknown, and no session row is
+/// An unknown recipient is refused as unknown, and no session row is
 /// invented for it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_message_to_an_unknown_agent_is_refused_as_unknown() {
@@ -532,9 +722,9 @@ async fn a_message_to_an_unknown_agent_is_refused_as_unknown() {
     let _ = run.await.expect("join");
 }
 
-// ------------------------------------------------------------------ H3
+// ------------------------------------------------------------------
 
-/// H3: a judgment with no verdict for a pair refuses that pair with a reason,
+/// A judgment with no verdict for a pair refuses that pair with a reason,
 /// and the loop keeps running (it used to panic on `expect`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_judge_that_returns_no_verdict_refuses_the_pair_and_the_loop_lives() {
@@ -586,9 +776,9 @@ async fn a_judge_that_returns_no_verdict_refuses_the_pair_and_the_loop_lives() {
     assert_eq!(report.status, RunStatus::Stopped);
 }
 
-// ------------------------------------------------------------------ H4
+// ------------------------------------------------------------------
 
-/// H4: an answer returned as the `ask_user_question` tool result is not
+/// An answer returned as the `ask_user_question` tool result is not
 /// injected again when the session resumes: ask, stop, resume, and the
 /// answer is in the transcript once, as the tool result.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -639,9 +829,9 @@ async fn an_answer_returned_as_a_tool_result_is_not_injected_again_on_resume() {
     );
 }
 
-// ------------------------------------------------------------------ H5
+// ------------------------------------------------------------------
 
-/// H5: an unanswered question times out with the recorded no-answer text,
+/// An unanswered question times out with the recorded no-answer text,
 /// and its contract shows "awaiting an answer" while it waits.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unanswered_question_times_out_with_the_recorded_no_answer_text() {
@@ -690,7 +880,7 @@ async fn an_unanswered_question_times_out_with_the_recorded_no_answer_text() {
     let _ = run.await.expect("join");
 }
 
-/// H5: the attendance rule never waits forever.
+/// The attendance rule never waits forever.
 #[test]
 fn a_box_run_waits_the_box_timeout_and_any_other_the_scheduled_one() {
     assert_eq!(
@@ -703,9 +893,9 @@ fn a_box_run_waits_the_box_timeout_and_any_other_the_scheduled_one() {
     );
 }
 
-// ------------------------------------------------------------------ M1, M2, L2
+// ------------------------------------------------------------------
 
-/// M2 and L2: a paced message is delivered by the loop's re-check once it
+/// A paced message is delivered by the loop's re-check once it
 /// comes due, not only when it was sent; the recipient's contract shows
 /// "delivery paced" meanwhile and goes back to running after. The clock is
 /// moved by hand; the recipient is slow enough to reach a boundary after it.
@@ -788,9 +978,97 @@ async fn a_paced_message_is_delivered_by_the_recheck_when_it_comes_due() {
     );
 }
 
-// ------------------------------------------------------------------ M3
+/// A message sent after an earlier paced one came due, and before the
+/// loop's re-check delivered it, does not overtake it: both reach the
+/// recipient in the order they were sent. The loop's tick is long, so the
+/// only wake between the two is the second message itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_message_sent_after_a_paced_one_came_due_does_not_overtake_it() {
+    let dir = tempfile::tempdir().expect("dir");
+    let mut p = parts(
+        dir.path(),
+        &[C {
+            id: "a",
+            instruction: "make a HANG",
+            path: "src/a.rs",
+            deps: &[],
+            attempts: 2,
+        }],
+        Duration::from_millis(5),
+    );
+    p.beta = WorkerFake::new("beta", p.stats.clone(), Duration::from_millis(1_500));
+    p.alpha.hang.store(true, Ordering::SeqCst);
+    let clock = Arc::new(ManualClock::new(SystemClock.now_ms()));
+    let mut services = p.services(WINDOW);
+    services.clock = clock.clone();
+    let mut cfg = config();
+    cfg.tick = Duration::from_secs(30);
+    let o = Orchestrator::new(cfg, services).expect("orchestrator");
+    let handle = o.handle();
+    let run = tokio::spawn(o.start(RunId::new("r1"), "make a".into()));
+    until("alpha parks", || {
+        p.alpha.hang_reached.load(Ordering::SeqCst)
+    })
+    .await;
+    let contract = record_of(&p)
+        .open_contracts
+        .into_iter()
+        .find(|c| c.contract == "a")
+        .expect("a");
+    let on = |route: &str| {
+        let i = contract
+            .worker_routes
+            .iter()
+            .position(|r| r == route)
+            .expect("route");
+        contract.workers[i].clone()
+    };
+    let (sender, receiver) = (on("alpha"), on("beta"));
+    for i in 0..13 {
+        handle
+            .send_message(sender.clone(), receiver.clone(), format!("message {i}"))
+            .await
+            .expect("never refused for volume");
+    }
+    // The last send's reply comes before the loop's re-check of that
+    // iteration: let the loop finish it and sleep on its long tick, so the
+    // clock moves while nothing re-checks.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Past the pacing window: "message 12" is due, and the next one is not
+    // paced at all.
+    clock.advance(61_000);
+    handle
+        .send_message(sender.clone(), receiver.clone(), "message 13".into())
+        .await
+        .expect("sent");
+    p.alpha.fail_parked.store(true, Ordering::SeqCst);
+    let report = tokio::time::timeout(Duration::from_secs(60), run)
+        .await
+        .expect("the run ended in time")
+        .expect("join")
+        .expect("run");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    let lines = transcript_lines(&p, receiver.as_str());
+    let order: Vec<String> = injected(&lines)
+        .iter()
+        .map(|l| l.to_string())
+        .filter_map(|l| {
+            (0..14)
+                .rev()
+                .find(|i| l.contains(&format!("message {i}")))
+                .map(|i| i.to_string())
+        })
+        .collect();
+    let at = |n: &str| order.iter().position(|x| x == n);
+    assert!(
+        at("12").is_some() && at("13").is_some() && at("12") < at("13"),
+        "sent order kept: {order:?}"
+    );
+}
 
-/// M3 (within one process): the run stays alive on a user stop, and a stop
+// ------------------------------------------------------------------
+
+/// The run stays alive on a user stop, and a stop
 /// never ends as `Blocked`. The restart case is in `sessions_restart.rs`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_user_stop_keeps_the_loop_alive_for_resume_session() {
@@ -817,9 +1095,9 @@ async fn a_user_stop_keeps_the_loop_alive_for_resume_session() {
     assert_eq!(report.status, RunStatus::Stopped);
 }
 
-// ------------------------------------------------------------------ M4, M5
+// ------------------------------------------------------------------
 
-/// M4 and M5: a message to an agent that retires is reported to the sending
+/// A message to an agent that retires is reported to the sending
 /// agent by injection: the report is a `Notice` row, and the re-check (or the
 /// direct injection) delivers it into the sender's transcript.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -885,7 +1163,7 @@ async fn a_message_to_an_agent_that_retires_is_reported_to_the_sender_by_injecti
     assert!(reports[0].to_string().contains(r#""kind":"notice""#));
 }
 
-/// M4: a session that can resume is never reported undelivered; its note
+/// A session that can resume is never reported undelivered; its note
 /// waits, and the resume delivers it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_note_to_a_stopped_session_is_not_reported_and_is_delivered_on_resume() {
@@ -944,9 +1222,9 @@ async fn a_note_to_a_stopped_session_is_not_reported_and_is_delivered_on_resume(
     );
 }
 
-// ------------------------------------------------------------------ M7
+// ------------------------------------------------------------------
 
-/// M7: connection requests that arrive together are judged in one call.
+/// Connection requests that arrive together are judged in one call.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn requests_that_arrive_together_are_judged_in_one_call() {
     let dir = tempfile::tempdir().expect("dir");
@@ -999,7 +1277,7 @@ async fn requests_that_arrive_together_are_judged_in_one_call() {
     let _ = run.await.expect("join");
 }
 
-/// M7: while a judgment call is pending, the loop still answers a stop and a
+/// While a judgment call is pending, the loop still answers a stop and a
 /// status read at once, and the run ends; the waiting sender's call ends too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stop_is_handled_while_a_judgment_call_is_pending() {
@@ -1062,9 +1340,9 @@ async fn a_stop_is_handled_while_a_judgment_call_is_pending() {
     assert_eq!(sent, Err(SessionError::Stopped), "the sender's call ends");
 }
 
-// ------------------------------------------------------------------ M9
+// ------------------------------------------------------------------
 
-/// M9: a refused `request_connection` tells the sender why, records the
+/// A refused `request_connection` tells the sender why, records the
 /// refusal on the pair, and a second request is refused from that record
 /// without a second paid call.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1133,9 +1411,9 @@ async fn a_refused_connection_request_tells_the_sender_and_is_not_judged_again()
     let _ = run.await.expect("join");
 }
 
-// ------------------------------------------------------------------ L6
+// ------------------------------------------------------------------
 
-/// L6: stopping one of two attempts frees exactly that attempt's agent slot
+/// Stopping one of two attempts frees exactly that attempt's agent slot
 /// (`AdmissionGate::release_one`) and its budget reservation once its
 /// `Finished` is processed, while the sibling keeps its own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

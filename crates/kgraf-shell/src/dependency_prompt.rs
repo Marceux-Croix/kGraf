@@ -134,6 +134,17 @@ mod tests {
         assert_eq!(card.tool, FETCH_PROMPT_TOOL);
         assert!(card.question.contains("crates.io"), "{}", card.question);
         assert!(card.question.contains("outside the workers' sandbox"));
+        // The consent also covers crates a worker adds mid-run: the card says so.
+        assert!(
+            card.question
+                .contains("workers fetch crates they add during the run"),
+            "{}",
+            card.question
+        );
+        assert!(card.question.contains(&format!(
+            "up to {} fetches per run",
+            kgraf_host::deps::MAX_WORKER_FETCHES
+        )));
         assert!(card.input.contains("itoa"));
         assert!(not_now_line(&q).contains("kgraf deps allow"));
     }

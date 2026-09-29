@@ -1919,6 +1919,42 @@ mod review {
             3,
             "only the three real turns left the process"
         );
+        // A rebuild from the stored events counts the three real rounds, not
+        // the three refunded attempts.
+        let mut rebuilt = kgraf_runtime::TranscriptBuilder::new(kgraf_runtime::opening_messages(
+            "instruction",
+            &[],
+        ));
+        for event in &events {
+            rebuilt.apply(event);
+        }
+        assert_eq!(rebuilt.rounds(), result.steps);
+        assert_eq!(result.steps, 3);
+        // The refunded attempts record a zero usage each; it must not reset
+        // the context estimate to nothing. Round two's real usage anchors it.
+        assert!(events.iter().any(|e| matches!(
+            e,
+            WorkerEvent::Usage { usage, .. } if usage.total_input() + usage.total_output() == 0
+        )));
+        assert!(
+            rebuilt.context_tokens() >= 110,
+            "{}",
+            rebuilt.context_tokens()
+        );
+        // The round-one notice is in the transcript once, not once per attempt.
+        let steps_left = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    WorkerEvent::Notice {
+                        kind: kgraf_runtime::NoticeKind::StepsLeft,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(steps_left, 1);
     }
 
     /// A bridge overflow that a steer's drain meets is reported on the result,

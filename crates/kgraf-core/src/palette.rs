@@ -94,7 +94,7 @@
 //! matching the style guide's own "Live dot and scrubber knob (accent)" row.
 //! `kgraf-shell`'s own tests (`theme::tests::vision_modes_extended_wcag_pairs`)
 //! cover the composited surfaces that only exist there: a badge fill derived
-//! from a remapped `danger` (H1: a fixed-alpha badge behind a remapped
+//! from a remapped `danger` (a fixed-alpha badge behind a remapped
 //! foreground cannot be assumed to still pass, and is now solved for, not
 //! assumed, in `kgraf-shell::theme::safe_tint`), a card, and a menu.
 //!
@@ -926,7 +926,7 @@ mod tests {
         }
     }
 
-    /// M2: every meaning except `neutral` (COL-5 exemption, see
+    /// Every meaning except `neutral` (COL-5 exemption, see
     /// [`text_colors`]) stays at least the mode's own bar away from the
     /// page's body and secondary text, simulated. `needs_input` reading as
     /// body text (achromatopsia, ΔE00 3.06 dark and 1.76 light before this
@@ -966,7 +966,7 @@ mod tests {
         }
     }
 
-    /// L4: `progress_end` keeps 3:1 contrast on its surface (the same floor
+    /// `progress_end` keeps 3:1 contrast on its surface (the same floor
     /// `progress` itself needs, since both only ever draw a dot, a bar or a
     /// scrubber knob) and stays at the mode's own bar away from `neutral`
     /// specifically (module docs: it is not checked against the other three
@@ -1014,7 +1014,7 @@ mod tests {
     /// only), and 3:1 for `progress` everywhere (it only ever draws a dot, a
     /// bar or a scrubber knob, matching the style guide's own "Live dot and
     /// scrubber knob (accent)" row, 14.1). `danger` also keeps 4.5:1 against
-    /// `--menu` (H1: the "degraded state text on menu" pairing), on the two
+    /// `--menu` (the "degraded state text on menu" pairing), on the two
     /// page surfaces.
     #[test]
     fn vision_modes_meet_wcag_aa() {

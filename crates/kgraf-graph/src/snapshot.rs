@@ -25,8 +25,8 @@
 use crate::chunk::NodeKind;
 use crate::error::{GraphError, Result};
 use crate::layout::{LayoutError, Position};
-use crate::store::{EdgeKind, GraphStore, SCHEMA_VERSION};
-use rusqlite::{OptionalExtension, params_from_iter};
+use crate::store::{EdgeKind, GraphStore};
+use rusqlite::params_from_iter;
 use std::path::{Path, PathBuf};
 
 /// The project's state directory, relative to its root. Matches `kgraf-cli`,
@@ -86,36 +86,19 @@ pub fn open_existing(root: &Path) -> Result<ProjectIndex> {
     if !db_path.is_file() {
         return Ok(ProjectIndex::Missing { db_path });
     }
-    let store = GraphStore::open_read_only(&db_path, root)?;
-    let found = {
-        let probe = store.conn();
-        let has_meta: Option<i64> = probe
-            .query_row(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
-        match has_meta {
-            None => None,
-            Some(_) => probe
-                .query_row(
-                    "SELECT value FROM meta WHERE key = 'schema_version'",
-                    [],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()?
-                .and_then(|v| v.parse::<i64>().ok()),
-        }
-    };
-    if found != Some(SCHEMA_VERSION) {
-        return Ok(ProjectIndex::OtherSchema {
+    // `open_read_only_checked` refuses another schema version; here that is a state to
+    // report, not an error.
+    match GraphStore::open_read_only_checked(&db_path, root) {
+        Ok(store) => Ok(ProjectIndex::Ready(store)),
+        Err(GraphError::SchemaMismatch {
+            found, expected, ..
+        }) => Ok(ProjectIndex::OtherSchema {
             db_path,
             found,
-            expected: SCHEMA_VERSION,
-        });
+            expected,
+        }),
+        Err(other) => Err(other),
     }
-    Ok(ProjectIndex::Ready(store))
 }
 
 /// One code node as the galaxy draws it.

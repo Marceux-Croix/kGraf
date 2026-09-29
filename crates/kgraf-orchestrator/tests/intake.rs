@@ -278,7 +278,7 @@ fn intake_parts<'a>(
     }
 }
 
-/// M3, error path: a call that fails after its ledger row opened keeps its call id,
+/// A call that fails after its ledger row opened keeps its call id,
 /// is settled at its ledger cost (a failed row is free, anything else costs its
 /// hold), is returned as charged, and leaves no hold behind.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -317,7 +317,7 @@ async fn a_failed_interpretation_call_is_settled_and_reported_as_charged() {
     );
 }
 
-/// M3, cancel path: an interpretation dropped mid-call releases its hold.
+/// An interpretation dropped mid-call releases its hold.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cancelled_interpretation_releases_its_hold() {
     let dir = tempfile::tempdir().expect("dir");
@@ -345,7 +345,7 @@ async fn a_cancelled_interpretation_releases_its_hold() {
     );
 }
 
-/// M3, overrun path (decision 0080: kGraf does not limit spend): a call that
+/// A call that
 /// settles over its hold is charged, reported, and its answer is kept, same as
 /// any other call. The overrun is an accounting fact about the estimate, not a
 /// reason to discard a reading that already happened.

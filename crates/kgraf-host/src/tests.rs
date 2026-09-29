@@ -828,14 +828,16 @@ async fn attempt_refs_are_swept_at_run_end_except_for_open_work() {
     record.open_contracts.push(c);
     assert!(
         r.workspaces
-            .sweep_refs(Some(&record))
+            .sweep_refs(Some(&record), || Ok(Default::default()))
             .expect("sweep")
             .is_empty()
     );
     assert!(exists(), "still open: kept");
     record.open_contracts.clear();
     assert_eq!(
-        r.workspaces.sweep_refs(Some(&record)).expect("sweep"),
+        r.workspaces
+            .sweep_refs(Some(&record), || Ok(Default::default()))
+            .expect("sweep"),
         vec![reference.to_owned()]
     );
     assert!(!exists(), "finished: swept");
@@ -2602,6 +2604,53 @@ async fn a_refused_stub_attempt_can_be_retried_with_a_fresh_worktree() {
     assert!(second.passed(), "{second:?}");
 }
 
+/// Decision 0086: a committed attempt that changed one declared target but
+/// left another, a `todo!()` placeholder at dispatch, byte-identical is
+/// refused. The dispatch content comes from the base commit.
+#[tokio::test]
+async fn a_committed_attempt_that_left_a_declared_placeholder_untouched_is_refused() {
+    let dir = tempfile::tempdir().expect("dir");
+    let root = dir.path().join("repo");
+    let base = dir.path().join("ws");
+    let r = repo_in(
+        dir,
+        root,
+        &base,
+        &[
+            ("src/a.rs", "pub fn a() -> u16 {\n    todo!()\n}\n"),
+            ("src/b.rs", "pub fn b() -> u16 {\n    todo!()\n}\n"),
+        ],
+    );
+    let mut c = named("src/a.rs", "w-partial");
+    c.writes.push(kgraf_orchestrator::WriteTarget {
+        path: "src/b.rs".into(),
+        node: None,
+    });
+    let ws = prepared(&r, &c, "w-partial").await;
+    std::fs::write(ws.join("src/a.rs"), "pub fn a() -> u16 { 1 }\n").expect("write");
+    let verdict = verifier(&r, "true")
+        .verify(&c, &ws, &result())
+        .await
+        .expect("ran");
+    match verdict {
+        Verdict::Fail { reason } => {
+            assert!(reason.contains("src/b.rs"), "{reason}");
+            assert!(!reason.contains("src/a.rs"), "{reason}");
+        }
+        other => panic!("expected a placeholder refusal, got {other:?}"),
+    }
+
+    // Both targets done: the same contract passes with a commit.
+    let ws2 = prepared(&r, &c, "w-partial-2").await;
+    std::fs::write(ws2.join("src/a.rs"), "pub fn a() -> u16 { 1 }\n").expect("write");
+    std::fs::write(ws2.join("src/b.rs"), "pub fn b() -> u16 { 2 }\n").expect("write");
+    let ok = verifier(&r, "true")
+        .verify(&c, &ws2, &result())
+        .await
+        .expect("ran");
+    assert!(ok.passed(), "{ok:?}");
+}
+
 /// A contract whose declared write target never held a placeholder (a
 /// re-verify, or a check-only contract) still auto-passes when nothing
 /// changed, and now carries a notice saying so (decision 0086): an accepted
@@ -2790,6 +2839,61 @@ fn validation_commands_are_discovered_or_configured_never_invented() {
     assert_eq!(
         discover_validation_commands(dir.path(), &["just check".into()]).expect("configured"),
         vec!["just check"]
+    );
+}
+
+/// A `pyproject.toml` alone (the tooling file of a Rust project) adds no
+/// pytest gate; Python tests or a pytest configuration do, with `python3`.
+#[test]
+fn a_tooling_pyproject_in_a_rust_project_adds_no_pytest_gate() {
+    let dir = tempfile::tempdir().expect("dir");
+    std::fs::write(dir.path().join("Cargo.toml"), "[workspace]\n").expect("w");
+    std::fs::write(
+        dir.path().join("pyproject.toml"),
+        "[tool.ruff]\nline-length = 100\n",
+    )
+    .expect("w");
+    assert_eq!(
+        discover_validation_commands(dir.path(), &[]).expect("found"),
+        vec!["cargo test --workspace"]
+    );
+    // An empty tests folder, or one with no test files, is not Python tests.
+    std::fs::create_dir_all(dir.path().join("tests")).expect("mkdir");
+    std::fs::write(dir.path().join("tests/data.json"), "{}").expect("w");
+    assert_eq!(
+        discover_validation_commands(dir.path(), &[]).expect("found"),
+        vec!["cargo test --workspace"]
+    );
+    // A test file under tests/ makes the gate plausible.
+    std::fs::create_dir_all(dir.path().join("tests/unit")).expect("mkdir");
+    std::fs::write(
+        dir.path().join("tests/unit/test_a.py"),
+        "def test_a(): pass\n",
+    )
+    .expect("w");
+    assert_eq!(
+        discover_validation_commands(dir.path(), &[]).expect("found"),
+        vec!["cargo test --workspace", "python3 -m pytest"]
+    );
+    // So does a pytest configuration, with no test file yet.
+    let cfg = tempfile::tempdir().expect("dir");
+    std::fs::write(
+        cfg.path().join("pyproject.toml"),
+        "[tool.pytest.ini_options]\naddopts = \"-q\"\n",
+    )
+    .expect("w");
+    assert_eq!(
+        discover_validation_commands(cfg.path(), &[]).expect("found"),
+        vec!["python3 -m pytest"]
+    );
+    // A test file with no pyproject.toml is not a Python project's gate.
+    let bare = tempfile::tempdir().expect("dir");
+    std::fs::create_dir_all(bare.path().join("tests")).expect("mkdir");
+    std::fs::write(bare.path().join("tests/test_a.py"), "").expect("w");
+    assert!(
+        discover_validation_commands(bare.path(), &[])
+            .expect("none")
+            .is_empty()
     );
 }
 
@@ -3284,37 +3388,24 @@ fn route_capacity_inputs_wires_the_header_through_tighter_rpm() {
 }
 
 /// Readiness is typed, and builds and calls nothing: an unknown route, a
-/// credential absent from the environment, an unpriced model.
+/// credential absent from the environment. A model with no price is ready
+/// (decision 0075).
 #[test]
-fn readiness_names_the_route_the_credential_or_the_price() {
-    let prices: kgraf_core::PriceTable = serde_json::from_str(
-        r#"{"llama3": {"uncached_input": 1, "cache_read": 1, "cache_write": 1, "output": 1, "reasoning": 1}}"#,
-    )
-    .expect("prices");
+fn readiness_names_the_route_or_the_credential_and_never_the_price() {
     let none = |_: &str| None;
     assert_eq!(
-        check_routes(
-            &[spec("ollama:llama3")],
-            Some(&prices),
-            &BTreeMap::new(),
-            Some(&none)
-        ),
+        check_routes(&[spec("ollama:llama3")], &BTreeMap::new(), Some(&none)),
         Ok(())
     );
     assert_eq!(
-        check_routes(&[], Some(&prices), &BTreeMap::new(), Some(&none)),
+        check_routes(&[], &BTreeMap::new(), Some(&none)),
         Err(NotReady::NoRoutes)
     );
     assert!(matches!(
-        check_routes(&[spec("nowhere:m")], Some(&prices), &BTreeMap::new(), Some(&none)),
+        check_routes(&[spec("nowhere:m")], &BTreeMap::new(), Some(&none)),
         Err(NotReady::UnknownRoute { route, .. }) if route == "nowhere"
     ));
-    let missing = check_routes(
-        &[spec("kimi:kimi-k2")],
-        Some(&prices),
-        &BTreeMap::new(),
-        Some(&none),
-    );
+    let missing = check_routes(&[spec("kimi:kimi-k2")], &BTreeMap::new(), Some(&none));
     assert!(
         matches!(&missing, Err(NotReady::MissingCredential { route, detail })
             if route == "kimi" && detail.contains("KGRAF_KIMI_API_KEY")),
@@ -3328,13 +3419,11 @@ fn readiness_names_the_route_the_credential_or_the_price() {
                 spec("ollama:qwen3"),
                 spec("ollama:llama3")
             ],
-            Some(&prices),
             &BTreeMap::new(),
             Some(&with_key)
         ),
-        Err(NotReady::MissingPrices {
-            models: vec!["kimi-k2".into(), "qwen3".into()]
-        })
+        Ok(()),
+        "no route here has a price entry, and none is refused for it"
     );
 }
 
@@ -3549,9 +3638,9 @@ fn host_futures_are_send(host: &Host) {
 
 /// An in-process provider for a route the configuration does not use would be
 /// silently unused: refused. For a used route it needs no catalog entry and no
-/// credential, and its model still needs a price.
+/// credential, and its model needs no price (decision 0075).
 #[test]
-fn an_in_process_provider_is_for_a_used_route_and_still_priced() {
+fn an_in_process_provider_is_for_a_used_route_and_an_unpriced_model_is_ready() {
     let (_dir, config) = project();
     let refused = Host::open(config.clone())
         .expect("open")
@@ -3569,9 +3658,8 @@ fn an_in_process_provider_is_for_a_used_route_and_still_priced() {
         .expect("used route");
     assert_eq!(
         host.check_ready(&host.route_set()),
-        Err(NotReady::MissingPrices {
-            models: vec!["unpriced".into()]
-        })
+        Ok(()),
+        "a model with no price is ready, not refused"
     );
     assert_eq!(host.check_ready(&[spec("mine:llama3")]), Ok(()));
     let catalog = Host::open(project().1)
@@ -3598,7 +3686,7 @@ fn rewrite_prices(path: &Path, text: &str, seconds_later: u64) {
         .expect("set mtime");
 }
 
-/// F2: catalog and prices are whole-process facts, `configured()`'s; the
+/// Catalog and prices are whole-process facts, `configured()`'s; the
 /// schedule's own `ready()` checks only credentials. A fixed price table is
 /// read again when it changes, without reopening the host; a table that no
 /// longer reads is refused, never replaced by the old one.
@@ -3609,11 +3697,10 @@ async fn configured_owns_catalog_and_prices_and_reads_a_changed_table() {
     let prices = config.prices.clone();
     let host = Arc::new(Host::open(config).expect("open"));
     let factory = HostFactory::new(host.clone());
-    let unpriced = factory.configured().await;
-    assert!(
-        matches!(&unpriced, Err(kgraf_orchestrator::ReadinessFailure::MissingConfiguration(m)) if m.contains("qwen3")),
-        "{unpriced:?}"
-    );
+    factory
+        .configured()
+        .await
+        .expect("qwen3 has no price entry, and that is not a readiness failure");
     factory
         .ready("nightly")
         .await
@@ -3773,7 +3860,7 @@ async fn a_timed_out_build_removes_its_probe_and_kills_its_mcp_server() {
     assert_eq!(probes(), 0, "the probe worktree outlived its aborted build");
 }
 
-/// F1: a build failure the same configuration can get past (an MCP server
+/// A build failure the same configuration can get past (an MCP server
 /// not answering, the build bound) is transient; a settings failure is not.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_build_step_is_transient_and_a_settings_failure_is_not() {
@@ -3806,7 +3893,7 @@ async fn a_failed_build_step_is_transient_and_a_settings_failure_is_not() {
     );
 }
 
-/// F4: `Host::build` indexes the working tree itself, before every build, so
+/// `Host::build` indexes the working tree itself, before every build, so
 /// a run never needs a separate `kgraf index` step first: the very first
 /// `prepare` already sees the fixture's `README.md` and gets `graph_slice`.
 /// A second `prepare` right after sees the same, unchanged index: the
@@ -3952,6 +4039,42 @@ async fn seeding_counts_unknown_spend_at_the_worst_case_with_a_notice() {
             .len(),
         0
     );
+}
+
+/// A price table that prices nothing does not close the host: a call on an
+/// unpriced model is not seeded (its cost is unknown, never `$0`), and opening
+/// is not refused for want of a price to bound it with.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn seeding_with_an_empty_price_table_skips_unpriced_calls_and_succeeds() {
+    let (_dir, config) = project();
+    std::fs::write(&config.prices, "{}").expect("prices");
+    let state = config.root.join(".kgraf");
+    std::fs::create_dir_all(&state).expect("state");
+    let usage = kgraf_core::TokenUsage {
+        uncached_input: 1_000,
+        text_output: 100,
+        ..Default::default()
+    };
+    {
+        let ledger = Ledger::open(&state.join("ledger.db")).expect("ledger");
+        ledger
+            .begin(
+                "fake",
+                kgraf_core::Protocol::Additive,
+                "local-model",
+                "a",
+                "t",
+            )
+            .expect("begin")
+            .settle(&usage, None)
+            .expect("settle");
+    }
+    let host = Host::open(config).expect("open");
+    let total = host
+        .seed_trailing_hour()
+        .expect("an unpriced call is not a reason to fail");
+    assert_eq!(total, kgraf_core::Money::ZERO);
+    assert!(host.take_notices().is_empty());
 }
 
 /// A credential missing when the run is built (removed after readiness)
@@ -4659,3 +4782,48 @@ mod speculation;
 
 #[path = "build_allowlist_tests.rs"]
 mod build_allowlist;
+
+/// A run's index pass does not hold the host's shared graph lock: another
+/// run's loop takes that lock for its session and lease calls, and holding it
+/// for a large project's whole pass stalls that loop. With the lock held
+/// elsewhere the whole time, the pass still finishes, and what it indexed is
+/// in the graph afterward.
+#[test]
+fn the_index_pass_runs_without_the_shared_graph_lock() {
+    let (_dir, config) = project();
+    std::fs::write(config.root.join("lib.rs"), "pub fn indexed_here() {}\n").expect("write");
+    let host = Arc::new(Host::open(config).expect("open"));
+    let startup = host.startup(&mut |_| {}).expect("startup");
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder = {
+        let host = host.clone();
+        std::thread::spawn(move || {
+            host.with_graph(|_| {
+                let _ = locked_tx.send(());
+                let _ = release_rx.recv();
+            })
+        })
+    };
+    locked_rx.recv().expect("the shared lock is held");
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    {
+        let host = host.clone();
+        std::thread::spawn(move || {
+            let built = host
+                .build_base(&startup, RunId::new("ix"), &mut |_| {})
+                .map(|_| ());
+            let _ = done_tx.send(built);
+        });
+    }
+    let done = done_rx.recv_timeout(Duration::from_secs(60));
+    let _ = release_tx.send(());
+    holder.join().expect("holder").expect("lock");
+    done.expect("the pass finished while another holder had the shared lock")
+        .expect("build base");
+    let nodes = host
+        .with_graph(|g| g.node_count())
+        .expect("lock")
+        .expect("count");
+    assert!(nodes > 0, "the pass indexed the project");
+}

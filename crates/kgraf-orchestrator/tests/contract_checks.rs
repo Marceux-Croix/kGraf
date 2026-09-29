@@ -402,7 +402,7 @@ fn py_ic() -> InterfaceContract {
     }
 }
 
-/// M6 measurement, not a check: the wall time of the mechanical checks of one
+/// Measurement, not a check: the wall time of the mechanical checks of one
 /// interface, cold (a fresh runner, so a fresh archive and a fresh target per
 /// run, as a live run pays), on the small real Rust crate of these tests and
 /// on the Python project. Run with
@@ -455,7 +455,7 @@ async fn measure_the_check_cost_of_one_interface() {
     }
 }
 
-/// M2: check runs queue behind one process-wide bound. One more run than the
+/// Check runs queue behind one process-wide bound. One more run than the
 /// bound, each sleeping a second, takes at least two seconds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn check_runs_beyond_the_process_bound_queue() {
@@ -481,7 +481,7 @@ async fn check_runs_beyond_the_process_bound_queue() {
     );
 }
 
-/// H1: a folder symlink committed in the base (`tests -> <outside>`) never
+/// A folder symlink committed in the base (`tests -> <outside>`) never
 /// carries an overlay out of the check tree. The overlay is refused, so the
 /// check could not run (no verdict on the contract), and nothing is written
 /// outside.
@@ -533,7 +533,7 @@ async fn a_program_this_machine_lacks_is_not_run_not_a_contract_failure() {
         "{e}"
     );
 
-    // H4: wrapped in a shell, the program is found only by running it, in
+    // Wrapped in a shell, the program is found only by running it, in
     // the sandbox; exit 127 there is a missing program, named.
     let mut ic = py_ic();
     ic.compile = s(&["sh", "-c", "kgraf-no-such-compiler --check"]);
@@ -545,7 +545,7 @@ async fn a_program_this_machine_lacks_is_not_run_not_a_contract_failure() {
         "{e}"
     );
 
-    // H4: a macOS shim with no Command Line Tools behind it exists on PATH and
+    // A macOS shim with no Command Line Tools behind it exists on PATH and
     // runs, and says so; simulated here, since the test machine has them.
     let mut ic = py_ic();
     ic.compile = s(&[
@@ -712,7 +712,7 @@ async fn p1_a_backgrounded_descendant_neither_stalls_the_run_nor_outlives_it() {
         Duration::from_secs(3),
     );
     // Measured from the moment the run took its check slot: the wait behind
-    // the process-wide bound (M2) is reported apart, so the bound on the run
+    // the process-wide bound is reported apart, so the bound on the run
     // itself stays tight. Under the 3-second check bound: the run did not wait
     // for the background sleep's 20 seconds.
     let t = Instant::now();
@@ -802,7 +802,7 @@ async fn assert_the_namespace_ended_the_escapee(
     out
 }
 
-/// M5: a descendant that leaves the process group with its own `setsid` is
+/// A descendant that leaves the process group with its own `setsid` is
 /// not reached by the group kill, but it still holds the run's hold file, so
 /// the check ends as one that could not run, never as a quiet tree. The
 /// descendant sleeps past the kill grace (5 s) and then exits by itself.
@@ -832,7 +832,7 @@ async fn a_descendant_that_leaves_the_group_is_seen_through_the_hold() {
     assert!(e.to_string().contains("left its process group"), "{e}");
 }
 
-/// N1, the verifier's probe: the check's forked child calls `setsid` and
+/// The check's forked child calls `setsid` and
 /// sleeps, and the parent deletes and recreates the hold file where it can
 /// reach (`../hold`, and any `*.hold` above that). The hold file lives outside
 /// the check's writable root, so the escaped child's lock stays visible.

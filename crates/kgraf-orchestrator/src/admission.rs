@@ -111,6 +111,10 @@ pub struct Admitted {
     /// this gate has none): released alongside the local count so the two
     /// never drift apart.
     machine_taken: u32,
+    /// Whether this admission holds a work item: `false` for an agent-only
+    /// admission ([`AdmissionGate::try_admit_agents`]), whose release must
+    /// not lower the work-item count it never raised.
+    item: bool,
 }
 
 impl Admitted {
@@ -133,21 +137,45 @@ pub struct MachineGate {
     max_agents: AtomicU32,
     agents_live: AtomicU32,
     limits: std::sync::Mutex<ParallelismLimits>,
-    /// Swapped wholesale on `set_limits` rather than resized in place: a
-    /// permit already handed out from the old `Semaphore` keeps a live shell
-    /// call running to completion (pre-flight only, nothing already running
-    /// is ever cancelled by a lowered limit), and a fresh `Semaphore` at the
-    /// new size is simpler and just as correct for every *future* acquire.
-    exec: std::sync::RwLock<Arc<tokio::sync::Semaphore>>,
+    /// One semaphore for the life of the gate, resized in place by
+    /// `set_limits`. A lowered limit never cancels a running shell call
+    /// (pre-flight only): `forget_permits` removes only free permits, and the
+    /// rest of the reduction is owed in `exec_owed` and taken as held slots
+    /// come back.
+    exec: Arc<tokio::sync::Semaphore>,
+    /// Permits still to remove after a lowered `exec_slots`: each returning
+    /// [`ExecSlot`] is forgotten instead of freed while this is above zero,
+    /// so the semaphore converges on the new size and never drifts above it.
+    /// A `Mutex`, not an atomic, so `set_limits` and a returning slot cannot
+    /// interleave between the forget and the count.
+    exec_owed: Arc<std::sync::Mutex<usize>>,
 }
 
 /// A held execution slot (one running shell-tool process). Dropping it frees
-/// the slot for the next waiter.
-pub struct ExecSlot(#[allow(dead_code)] tokio::sync::OwnedSemaphorePermit);
+/// the slot for the next waiter, or retires it when a lowered limit still
+/// owes a reduction.
+pub struct ExecSlot {
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    owed: Arc<std::sync::Mutex<usize>>,
+}
+
+impl Drop for ExecSlot {
+    fn drop(&mut self) {
+        let mut owed = self.owed.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(permit) = self.permit.take() {
+            if *owed > 0 {
+                *owed -= 1;
+                permit.forget();
+            } else {
+                drop(permit);
+            }
+        }
+    }
+}
 
 /// The one [`MachineGate`] of this process (decision 0067, "Scope": "The
 /// slider and its gate are therefore process-wide: one `MachineGate` shared
-/// by every project's `Admission`"; owner answer 4, 2026-09-27: the slider
+/// by every project's `Admission`": the slider
 /// binds this app process only, not across processes). Every [`Host`] this
 /// process opens, one per project, passes its own `Limits`
 /// to [`Admission::with_machine`], but shares this one gate, so two
@@ -172,9 +200,10 @@ impl MachineGate {
         Arc::new(Self {
             max_agents: AtomicU32::new(limits.max_agents),
             agents_live: AtomicU32::new(0),
-            exec: std::sync::RwLock::new(Arc::new(tokio::sync::Semaphore::new(
-                limits.exec_slots.max(1) as usize,
-            ))),
+            exec: Arc::new(tokio::sync::Semaphore::new(
+                limits.exec_slots.max(1) as usize
+            )),
+            exec_owed: Arc::new(std::sync::Mutex::new(0)),
             limits: std::sync::Mutex::new(limits),
         })
     }
@@ -183,25 +212,43 @@ impl MachineGate {
     /// next admission but kills nothing already live, exactly as
     /// [`AdmissionGate::set_limits`] does for the local ceiling (0017's
     /// pre-flight rule, carried to the shared gate).
+    ///
+    /// Lowering `exec_slots` removes free permits at once and owes the rest:
+    /// each held slot that comes back is retired until the debt is paid, so
+    /// the number of permits converges on the new limit. Raising it pays any
+    /// debt first and adds only the remainder.
     pub fn set_limits(&self, limits: ParallelismLimits) {
+        // Held for the whole resize, and by every returning slot, so the
+        // semaphore size and the debt change together.
+        let mut owed = self.exec_owed.lock().unwrap_or_else(|p| p.into_inner());
         let old_exec = {
             let mut cur = self.limits.lock().unwrap_or_else(|p| p.into_inner());
-            let old = cur.exec_slots;
+            let old = cur.exec_slots.max(1);
             *cur = limits;
             old
         };
+        let new_exec = limits.exec_slots.max(1);
         self.max_agents
             .store(limits.max_agents, AtomicOrdering::SeqCst);
-        let exec = self.exec.write().unwrap_or_else(|p| p.into_inner());
-        match limits.exec_slots.cmp(&old_exec) {
+        match new_exec.cmp(&old_exec) {
             std::cmp::Ordering::Greater => {
-                exec.add_permits((limits.exec_slots - old_exec) as usize)
+                let add = (new_exec - old_exec) as usize;
+                let paid = add.min(*owed);
+                *owed -= paid;
+                self.exec.add_permits(add - paid);
             }
             std::cmp::Ordering::Less => {
-                exec.forget_permits((old_exec - limits.exec_slots) as usize);
+                let cut = (old_exec - new_exec) as usize;
+                let forgotten = self.exec.forget_permits(cut);
+                *owed += cut - forgotten;
             }
             std::cmp::Ordering::Equal => {}
         }
+    }
+
+    /// Execution permits free now (for tests and status).
+    pub fn exec_available(&self) -> usize {
+        self.exec.available_permits()
     }
 
     pub fn limits(&self) -> ParallelismLimits {
@@ -244,15 +291,19 @@ impl MachineGate {
     /// slot" (`kgraf-tools::shell`); this method only blocks until a permit
     /// is free.
     pub async fn exec_slot(&self) -> ExecSlot {
-        let sem = self.exec.read().unwrap_or_else(|p| p.into_inner()).clone();
         // `acquire_owned` on a semaphore this type never closes cannot
         // return `Err`: closing would need a `close()` call this type never
         // makes.
-        let permit = sem
+        let permit = self
+            .exec
+            .clone()
             .acquire_owned()
             .await
             .expect("MachineGate's exec semaphore is never closed");
-        ExecSlot(permit)
+        ExecSlot {
+            permit: Some(permit),
+            owed: self.exec_owed.clone(),
+        }
     }
 }
 
@@ -373,12 +424,51 @@ impl AdmissionGate {
             } else {
                 0
             },
+            item: true,
+        })
+    }
+
+    /// Admit `agents` workers that are not a work item of their own: a
+    /// read-only subagent, which writes nothing and shares its parent's
+    /// worktree, so it is part of its parent's work item. The live-agent
+    /// ceilings (local and machine) still bind; the work-item cap does not.
+    pub fn try_admit_agents(&mut self, agents: usize) -> Result<Admitted, Refusal> {
+        let agents = agents.max(1);
+        let n = u32::try_from(agents).unwrap_or(u32::MAX);
+        if let Some(machine) = &self.machine
+            && !machine.try_take_agents(n)
+        {
+            self.refused_agents += 1;
+            return Err(Refusal::LiveAgentCeiling {
+                live: machine.agents_live() as usize,
+                requested: agents,
+                ceiling: machine.limits().max_agents as usize,
+            });
+        }
+        if self.agents + agents > self.limits.max_live_agents {
+            self.refused_agents += 1;
+            if let Some(machine) = &self.machine {
+                machine.release_agents(n);
+            }
+            return Err(Refusal::LiveAgentCeiling {
+                live: self.agents,
+                requested: agents,
+                ceiling: self.limits.max_live_agents,
+            });
+        }
+        self.agents += agents;
+        Ok(Admitted {
+            agents,
+            machine_taken: if self.machine.is_some() { n } else { 0 },
+            item: false,
         })
     }
 
     /// Give an admission back.
     pub fn release(&mut self, admitted: Admitted) {
-        self.items = self.items.saturating_sub(1);
+        if admitted.item {
+            self.items = self.items.saturating_sub(1);
+        }
         self.agents = self.agents.saturating_sub(admitted.agents);
         if admitted.machine_taken > 0
             && let Some(machine) = &self.machine
@@ -1040,6 +1130,40 @@ mod tests {
         assert_eq!(gate.agents_live(), 0);
     }
 
+    /// An agent-only admission (a read-only subagent) is not refused by a
+    /// full work-item cap, still counts against the live-agent ceilings,
+    /// and its release leaves the work-item count alone.
+    #[test]
+    fn an_agent_only_admission_skips_the_item_cap_but_not_the_agent_ceiling() {
+        let machine = MachineGate::new(machine_limits(3));
+        let mut gate =
+            AdmissionGate::new_with_machine(Limits::new(1, 3).expect("limits"), machine.clone());
+        let item = gate.try_admit(1).expect("the one work item");
+        assert!(gate.try_admit(1).is_err(), "the item cap is full");
+        let reader = gate
+            .try_admit_agents(1)
+            .expect("a reader is not a work item");
+        assert_eq!(gate.in_flight(), (1, 2));
+        assert_eq!(machine.agents_live(), 2);
+        let second = gate.try_admit_agents(1).expect("the third agent fits");
+        assert_eq!(
+            gate.try_admit_agents(1)
+                .expect_err("the agent ceiling binds"),
+            Refusal::LiveAgentCeiling {
+                live: 3,
+                requested: 1,
+                ceiling: 3
+            }
+        );
+        assert_eq!(machine.agents_live(), 3, "a refusal takes nothing");
+        gate.release(reader);
+        gate.release(second);
+        assert_eq!(gate.in_flight(), (1, 1), "the work item is still held");
+        gate.release(item);
+        assert_eq!(gate.in_flight(), (0, 0));
+        assert_eq!(machine.agents_live(), 0);
+    }
+
     /// Releasing an agent that was never held is a caller bug,
     /// reported as `Err(AdmissionError::AlreadyReleased)` rather than
     /// silently under-counting the gate (a double-release must not panic and take
@@ -1083,6 +1207,41 @@ mod tests {
         rx.await.expect("the waiter proceeds once a slot frees");
         drop(s2);
         waiter.await.expect("no panic");
+    }
+
+    /// Lowering `exec_slots` while slots are held never lets the capacity
+    /// drift above the new limit: held slots are retired as they return, and
+    /// a later raise pays that debt before it adds permits.
+    #[tokio::test]
+    async fn a_lowered_exec_limit_with_held_slots_converges_on_the_new_size() {
+        let gate = MachineGate::new(limits_with_exec(1, 8));
+        let mut held = Vec::new();
+        for _ in 0..6 {
+            held.push(gate.exec_slot().await);
+        }
+        assert_eq!(gate.exec_available(), 2);
+        gate.set_limits(limits_with_exec(1, 2));
+        assert_eq!(gate.exec_available(), 0, "the two free permits go at once");
+        // Four held slots come back: all four are retired (debt 4).
+        for _ in 0..4 {
+            drop(held.pop());
+        }
+        assert_eq!(gate.exec_available(), 0, "returned slots pay the debt");
+        drop(held.pop());
+        drop(held.pop());
+        assert_eq!(gate.exec_available(), 2, "exactly the new limit");
+        // Back up to 8 and down again with every slot held.
+        gate.set_limits(limits_with_exec(1, 8));
+        assert_eq!(gate.exec_available(), 8);
+        for _ in 0..8 {
+            held.push(gate.exec_slot().await);
+        }
+        gate.set_limits(limits_with_exec(1, 3));
+        // A raise before the slots return pays part of the debt instead of
+        // adding permits.
+        gate.set_limits(limits_with_exec(1, 5));
+        held.clear();
+        assert_eq!(gate.exec_available(), 5, "never above the current limit");
     }
 
     /// Raising `exec_slots` on a live gate lets a waiter through without

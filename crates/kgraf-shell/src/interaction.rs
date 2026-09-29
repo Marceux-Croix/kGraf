@@ -49,7 +49,7 @@ pub struct Runs {
 pub enum Resumable {
     /// This run: marked for resume, not completed, and held by no live process.
     Run(String),
-    /// Runs marked for resume exist, but a live process holds each (L10).
+    /// Runs marked for resume exist, but a live process holds each.
     HeldElsewhere(Vec<String>),
     None,
 }
@@ -205,7 +205,7 @@ pub fn parallelism_controls(
     if let Some(note) = slider.clamp_note() {
         ui.colored_label(p.danger, note);
     }
-    // M6: a live-agent ceiling below a contract's parallel attempts would hold
+    // A live-agent ceiling below a contract's parallel attempts would hold
     // that contract forever. Settings is configuration only (0017): it
     // states the cap fact alone; which contract cannot fit is said on its node.
     // `ConcurrencyCaps::live_agents()` used to be the number compared here;
@@ -262,7 +262,7 @@ pub const SEARCH_HINT: &str =
     "symbol, agent:, task:, status:, file:, \"phrase\", before:/after: (file time)";
 
 /// The search field's hover help. `before:` and `after:` bound a transcript by
-/// its file's last write, because transcript events carry no time (L3).
+/// its file's last write, because transcript events carry no time.
 pub const SEARCH_HELP: &str = "Operators: agent:, symbol:, file:, task: or contract:, \
 touched:, status: (done, running, blocked, held, cap, lease, waiting, planned, gate), \
 vendor: or model:, before: and after: (YYYY-MM-DD). before: and after: compare each \
@@ -272,7 +272,7 @@ time. Quote a phrase; operators do not work inside quotes.";
 /// Debounce before a typed query runs.
 pub const SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(150);
 
-/// The count line under the search field. Says when a count was cut (L2).
+/// The count line under the search field. Says when a count was cut.
 pub fn results_line(r: &Results, running: bool) -> String {
     let mut text = format!("{} lit", r.hits.len());
     if r.hits_dropped > 0 {
@@ -376,7 +376,7 @@ pub struct Interaction {
     plan_dirty: bool,
     /// Pending asks as last counted into the plan.
     asks_seen: Vec<u64>,
-    /// Scheduled work nodes from the scheduler thread (H4), added to the plan.
+    /// Scheduled work nodes from the scheduler thread, added to the plan.
     schedule_nodes: Vec<PlanNode>,
     pub search: SearchState,
     /// Counts run and transcript updates, so derived indexes know when to rebuild.
@@ -863,11 +863,11 @@ impl Interaction {
         }
         apply_parallelism(limits, &admission);
         self.applied_limits = Some((limits, admission));
-        // The ceiling decides which nodes can never fit (M6).
+        // The ceiling decides which nodes can never fit.
         self.plan_dirty = true;
     }
 
-    /// The scheduled work nodes (decision 0052 section 3, H4): each schedule on its
+    /// The scheduled work nodes (decision 0052 section 3): each schedule on its
     /// work node, with its last run and any disable reason on the label. They join
     /// the plan overlay; a change marks it for the galaxy to take.
     pub fn set_schedule_nodes(&mut self, nodes: Vec<PlanNode>) {
@@ -997,7 +997,7 @@ impl Interaction {
     }
 
     /// Sends `order`, keeping the previous one to restore if the orchestrator
-    /// refuses it (M3).
+    /// refuses it.
     fn set_order(&mut self, order: Vec<String>) -> Result<(), String> {
         let previous = std::mem::replace(&mut self.order, order.clone());
         match self.host.set_order(order) {
@@ -1148,7 +1148,7 @@ mod tests {
     }
 
     /// Play never offers a completed run (resume's AlreadyCompleted guard) nor one
-    /// a live process holds (L10); it offers the newest remaining one.
+    /// a live process holds; it offers the newest remaining one.
     #[test]
     fn play_skips_completed_runs_and_runs_held_elsewhere() {
         use kgraf_orchestrator::RunStatus;
@@ -1171,7 +1171,7 @@ mod tests {
         assert_eq!(resumable(&runs), Resumable::None);
     }
 
-    /// M3: pin a, a is verified, pin c: the order sent names c alone, since a
+    /// Pin a, a is verified, pin c: the order sent names c alone, since a
     /// verified contract cannot be ordered and would make the whole order refused.
     #[test]
     fn an_order_sends_only_open_contracts() {
@@ -1183,7 +1183,7 @@ mod tests {
         assert_eq!(next_order(&order, &["b", "c"], "c"), ["c"], "no repeats");
     }
 
-    /// M3: when the orchestrator refuses an order, the previous one comes back.
+    /// When the orchestrator refuses an order, the previous one comes back.
     #[test]
     fn a_refused_order_rolls_back() {
         let ctx = egui::Context::default();
@@ -1195,7 +1195,7 @@ mod tests {
         i.order_refused();
         assert_eq!(i.order(), ["a"]);
     }
-    /// M6: a live-agent ceiling below a contract's attempts is said on the node
+    /// A live-agent ceiling below a contract's attempts is said on the node
     /// and in the settings surface, never a silent forever-hold.
     #[test]
     fn a_ceiling_below_a_contracts_attempts_shows_can_never_fit() {
@@ -1431,7 +1431,7 @@ mod tests {
         assert!(err.contains("not in a run"), "{err}");
     }
 
-    /// H4: scheduled work nodes join the plan overlay the galaxy takes, and a
+    /// Scheduled work nodes join the plan overlay the galaxy takes, and a
     /// change to them (a new last run, a disable reason) marks it again.
     #[test]
     fn scheduled_work_nodes_join_the_plan_overlay() {

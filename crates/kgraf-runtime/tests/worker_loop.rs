@@ -517,12 +517,12 @@ async fn every_round_is_traced_in_the_ledger() {
     assert!(env.ledger.verify().expect("verify").ok);
 }
 
-/// A provider that pauses the turn for a server-side tool it is still
-/// running (Anthropic's `pause_turn`) is not a failure and carries no tool
-/// call of its own: the loop must send the conversation back for another
-/// round rather than ending the run, and both rounds are billed.
+/// A provider that pauses the turn for a server-side tool (Anthropic's
+/// `pause_turn`) is a loud failure: the rebuilt transcript would drop the
+/// server tool's blocks. The paused round is still billed, and no second
+/// request is sent.
 #[tokio::test]
-async fn a_paused_turn_continues_to_another_round_instead_of_failing() {
+async fn a_paused_turn_fails_loud_instead_of_resending_a_damaged_turn() {
     let dir = tempfile::tempdir().expect("dir");
     let provider = Fake::new(false, |request| match round_of(request) {
         0 => Round {
@@ -542,19 +542,33 @@ async fn a_paused_turn_continues_to_another_round_instead_of_failing() {
     )
     .await
     .expect("spawn");
-    let (_, result) = with_timeout(drain(handle)).await.expect("in time");
-    assert_eq!(result.outcome, WorkerOutcome::Completed);
-    assert_eq!(result.answer, "done");
-    // Both rounds reached the provider: the paused round was not treated as
-    // the end of the run.
-    assert_eq!(provider.requests().len(), 2);
-    // Both rounds were billed, the paused one included: continuing a turn
-    // must not drop the call it paused on from the ledger.
-    assert_eq!(result.calls.len(), 2);
-    for call in &result.calls {
-        let row = env.ledger.call(call).expect("read").expect("row");
-        assert_eq!(row.settlement, Settlement::Counted);
+    let (events, result) = with_timeout(drain(handle)).await.expect("in time");
+    match &result.outcome {
+        WorkerOutcome::Failed { error } => {
+            assert!(
+                error.contains("server tool turns are not supported"),
+                "{error}"
+            );
+        }
+        other => panic!("expected Failed, got {other:?}"),
     }
+    assert_eq!(provider.requests().len(), 1);
+    assert_eq!(result.calls.len(), 1);
+    let row = env
+        .ledger
+        .call(&result.calls[0])
+        .expect("read")
+        .expect("row");
+    assert_eq!(row.settlement, Settlement::Counted);
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            WorkerEvent::Stop {
+                reason: StopReason::PauseTurn
+            }
+        )),
+        "no paused Stop is recorded"
+    );
 }
 
 /// A refused trace write was discarded. Here the adapter
@@ -982,6 +996,64 @@ async fn a_cancel_while_a_tool_runs_marks_the_call_interrupted_for_resume() {
             is_error: true,
         }]
     );
+}
+
+/// A cancel that arrives while a finished result waits for a bulk slot must not
+/// lose the result: the call ran, and the persisted transcript has to say so.
+#[tokio::test]
+async fn a_cancel_while_a_result_waits_for_a_bulk_slot_still_persists_the_result() {
+    let dir = tempfile::tempdir().expect("dir");
+    let probe = Arc::new(Probe::default());
+    let provider = Fake::new(false, |_| {
+        Round::tool(vec![
+            ("a", "probe", json!({"node": "n1", "label": "a"})),
+            ("b", "probe", json!({"node": "n2", "label": "b"})),
+        ])
+    });
+    let mut env = env_with(provider, vec![probe.clone()], CallMode::Complete);
+    // One slot: the first finished result fills it while nobody reads, so the
+    // second result waits for a slot.
+    env.settings.bulk_capacity = 1;
+    let mut handle = spawn_worker(
+        Arc::new(env),
+        brief("w1", "probe", dir.path(), 5),
+        SpawnOptions::default(),
+    )
+    .await
+    .expect("spawn");
+    let mut events = Vec::new();
+    let mut started = 0;
+    while started < 2 {
+        let event = with_timeout(handle.next_event())
+            .await
+            .expect("in time")
+            .expect("event");
+        started += usize::from(matches!(event, WorkerEvent::ToolCallStarted { .. }));
+        events.push(event);
+    }
+    // Both calls finish; one result is queued and the other waits for a slot.
+    while probe.calls.load(Ordering::SeqCst) < 2 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    handle.cancel();
+    while let Some(event) = with_timeout(handle.next_event()).await.expect("in time") {
+        events.push(event);
+    }
+    assert_eq!(
+        handle.result().await.expect("result").outcome,
+        WorkerOutcome::Cancelled
+    );
+    for id in ["a", "b"] {
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                WorkerEvent::ToolCallFinished { call_id, output, is_error: false }
+                    if call_id == id && output.starts_with("out ")
+            )),
+            "the result of {id} is in the persisted transcript: {events:#?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1985,6 +2057,122 @@ async fn repeated_denied_calls_are_counted_apart_and_do_not_stall() {
     assert_eq!(result.denied, 4);
 }
 
+/// Edit, test, edit, test, edit, test is progress: each edit changes what the
+/// test sees, so the identical test call does not count toward a stall.
+#[tokio::test]
+async fn a_test_run_after_each_edit_is_not_a_stall() {
+    let dir = tempfile::tempdir().expect("dir");
+    let provider = Fake::new(false, |request| {
+        let n = round_of(request);
+        let id: &'static str = format!("t{n}").leak();
+        match n {
+            0 | 2 | 4 => Round::tool(vec![(
+                id,
+                "write_file",
+                json!({"path": "a.txt", "content": format!("v{n}")}),
+            )]),
+            1 | 3 | 5 => Round::tool(vec![(id, "build", json!({}))]),
+            _ => Round::answer("done"),
+        }
+    });
+    let env = Arc::new(env_with(
+        provider,
+        vec![Arc::new(WriteFile), Arc::new(SandboxedBuild)],
+        CallMode::Complete,
+    ));
+    let handle = spawn_worker(
+        env,
+        brief("w1", "edit and test", dir.path(), 12),
+        SpawnOptions::default(),
+    )
+    .await
+    .expect("spawn");
+    let (_, result) = with_timeout(drain(handle)).await.expect("in time");
+    assert_eq!(result.outcome, WorkerOutcome::Completed);
+}
+
+/// With no write between them, the same two reads alternating are still a loop.
+#[tokio::test]
+async fn alternating_identical_calls_with_no_write_between_still_stall() {
+    let dir = tempfile::tempdir().expect("dir");
+    let probe = Arc::new(Probe::default());
+    let provider = Fake::new(false, |request| {
+        let n = round_of(request);
+        let id: &'static str = format!("t{n}").leak();
+        let node = if n.is_multiple_of(2) { "n1" } else { "n2" };
+        Round::tool(vec![(id, "probe", json!({"node": node}))])
+    });
+    let env = Arc::new(env_with(provider, vec![probe], CallMode::Complete));
+    let handle = spawn_worker(
+        env,
+        brief("w1", "loop", dir.path(), 20),
+        SpawnOptions::default(),
+    )
+    .await
+    .expect("spawn");
+    let (_, result) = with_timeout(drain(handle)).await.expect("in time");
+    assert!(
+        matches!(result.outcome, WorkerOutcome::Stalled { repeats: 3, .. }),
+        "{:?}",
+        result.outcome
+    );
+    assert_eq!(result.steps, 5);
+}
+
+/// A resume replays only the calls that ran and succeeded into the stall
+/// detector. Three denied copies of a call in the earlier segment did nothing,
+/// so the same call issued once after the resume is not a repeat.
+#[tokio::test]
+async fn a_resume_does_not_count_denied_calls_toward_a_stall() {
+    let dir = tempfile::tempdir().expect("dir");
+    let call = json!({"path": "x.txt", "content": "same"});
+    let first_call = call.clone();
+    let denying = Fake::new(false, move |request| match round_of(request) {
+        n @ 0..=2 => {
+            let id: &'static str = format!("t{n}").leak();
+            Round::tool(vec![(id, "write_file", first_call.clone())])
+        }
+        _ => Round {
+            fail: true,
+            ..Round::answer("x")
+        },
+    });
+    let mut env = env_with(denying, vec![Arc::new(WriteFile)], CallMode::Complete);
+    env.approval = ApprovalChain::new(vec![Arc::new(DenyWrites)]);
+    let env = Arc::new(env);
+    let handle = spawn_worker(
+        env.clone(),
+        brief("w1", "write", dir.path(), 12),
+        SpawnOptions::default(),
+    )
+    .await
+    .expect("spawn");
+    let (events, first) = with_timeout(drain(handle)).await.expect("in time");
+    assert!(matches!(first.outcome, WorkerOutcome::Failed { .. }));
+    assert_eq!(first.denied, 3);
+
+    let second_call = call.clone();
+    let allowing = Fake::new(false, move |request| match round_of(request) {
+        3 => Round::tool(vec![("t3", "write_file", second_call.clone())]),
+        _ => Round::answer("done"),
+    });
+    let mut env2 = env_with(allowing, vec![Arc::new(WriteFile)], CallMode::Complete);
+    env2.ledger = env.ledger.clone();
+    let handle = spawn_worker(
+        Arc::new(env2),
+        brief("w1", "write", dir.path(), 12),
+        SpawnOptions {
+            resume_from: Some(events),
+            ..SpawnOptions::default()
+        },
+    )
+    .await
+    .expect("resume");
+    let (_, resumed) = with_timeout(drain(handle)).await.expect("in time");
+    assert_eq!(resumed.outcome, WorkerOutcome::Completed);
+    assert!(dir.path().join("x.txt").exists());
+}
+
 #[tokio::test]
 async fn a_prefix_naming_the_worker_is_refused_and_environments_share_the_global_registry() {
     let dir = tempfile::tempdir().expect("dir");
@@ -2110,7 +2298,7 @@ async fn writes_outside_the_declared_scope_or_in_the_repository_metadata_are_ref
     assert!(
         refusals
             .iter()
-            .any(|o| o.contains("not writable by a worker"))
+            .any(|o| o.contains("not writable by a worker") && o.contains("steers git"))
     );
 }
 
@@ -2277,6 +2465,170 @@ async fn a_sandboxed_build_runs_under_a_declared_scope() {
     let (_, result) = with_timeout(drain(handle)).await.expect("in time");
     assert_eq!(result.denied, 0);
     assert!(worktree.path().join("built").exists(), "the build ran");
+}
+
+/// A sandboxed build declares no paths, so the loop reads the worktree status
+/// after it: a file the build wrote is a changed path in the result.
+#[tokio::test]
+async fn a_sandboxed_build_records_the_paths_it_changed() {
+    let worktree = tempfile::tempdir().expect("worktree");
+    let init = std::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree.path())
+        .arg("init")
+        .output()
+        .expect("git init");
+    assert!(init.status.success());
+    let provider = Fake::new(true, |request| match round_of(request) {
+        0 => Round::tool(vec![("t1", "build", json!({}))]),
+        _ => Round::answer("done"),
+    });
+    let env = Arc::new(env_with(
+        provider,
+        vec![Arc::new(SandboxedBuild)],
+        CallMode::Stream,
+    ));
+    let handle = spawn_worker(
+        env,
+        brief("w1", "build it", worktree.path(), 6),
+        SpawnOptions::default(),
+    )
+    .await
+    .expect("spawn");
+    let (_, result) = with_timeout(drain(handle)).await.expect("in time");
+    assert_eq!(result.outcome, WorkerOutcome::Completed);
+    assert_eq!(
+        result.changed_paths,
+        vec![std::path::PathBuf::from("built")]
+    );
+    assert!(
+        result.trace_failures.is_empty(),
+        "{:?}",
+        result.trace_failures
+    );
+}
+
+/// A worktree git cannot read is reported on the result, not skipped.
+#[tokio::test]
+async fn an_unreadable_worktree_status_after_a_build_is_reported() {
+    let worktree = tempfile::tempdir().expect("worktree");
+    let missing = worktree.path().join("not-a-repository");
+    std::fs::create_dir(&missing).expect("dir");
+    // A fresh temp directory is not inside any repository on the test machine,
+    // so git refuses to read its status.
+    let provider = Fake::new(true, |request| match round_of(request) {
+        0 => Round::tool(vec![("t1", "build", json!({}))]),
+        _ => Round::answer("done"),
+    });
+    let env = Arc::new(env_with(
+        provider,
+        vec![Arc::new(SandboxedBuild)],
+        CallMode::Stream,
+    ));
+    let handle = spawn_worker(
+        env,
+        brief("w1", "build it", &missing, 6),
+        SpawnOptions::default(),
+    )
+    .await
+    .expect("spawn");
+    let (_, result) = with_timeout(drain(handle)).await.expect("in time");
+    assert!(
+        result
+            .trace_failures
+            .iter()
+            .any(|f| f.contains("worktree status after build not read")),
+        "{:?}",
+        result.trace_failures
+    );
+}
+
+/// A response cut off at the output ceiling with no tool call gets one
+/// continuation round asking the model to split large patches.
+#[tokio::test]
+async fn an_output_ceiling_stop_gets_one_continuation_round() {
+    let dir = tempfile::tempdir().expect("dir");
+    // The abandoned round leaves no assistant turn, so count requests instead.
+    let sent = AtomicUsize::new(0);
+    let provider = Fake::new(false, move |_| match sent.fetch_add(1, Ordering::SeqCst) {
+        0 => Round {
+            text: "a very large patch, cut o".into(),
+            stop: Some(StopReason::MaxTokens),
+            usage: usage(100, 10),
+            deltas: 1,
+            ..Round::default()
+        },
+        _ => Round::answer("done in pieces"),
+    });
+    let env = Arc::new(env_with(provider.clone(), vec![], CallMode::Complete));
+    let handle = spawn_worker(
+        env.clone(),
+        brief("w1", "patch", dir.path(), 6),
+        SpawnOptions::default(),
+    )
+    .await
+    .expect("spawn");
+    let (events, result) = with_timeout(drain(handle)).await.expect("in time");
+    assert_eq!(result.outcome, WorkerOutcome::Completed);
+    assert_eq!(result.answer, "done in pieces");
+    // The continuation is a counted round, with its own ledger row.
+    assert_eq!(result.steps, 2);
+    assert_eq!(result.calls.len(), 2);
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    let last = requests[1].messages.last().expect("last message");
+    assert!(
+        last.content.iter().any(|c| c
+            .as_text()
+            .is_some_and(|t| t.contains("split it into several smaller apply_patch"))),
+        "{last:?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            WorkerEvent::Notice {
+                kind: NoticeKind::OutputLimit,
+                ..
+            }
+        )),
+        "the notice is recorded"
+    );
+    // The truncated text is not kept as an assistant turn.
+    assert!(
+        !requests[1]
+            .messages
+            .iter()
+            .any(|m| m.role == Role::Assistant),
+        "the discarded response is not resent"
+    );
+}
+
+/// A second ceiling stop in a row fails loud; there is no third attempt.
+#[tokio::test]
+async fn a_second_output_ceiling_stop_in_a_row_fails_the_run() {
+    let dir = tempfile::tempdir().expect("dir");
+    let provider = Fake::new(false, |_| Round {
+        text: "cut o".into(),
+        stop: Some(StopReason::MaxTokens),
+        usage: usage(100, 10),
+        deltas: 1,
+        ..Round::default()
+    });
+    let env = Arc::new(env_with(provider.clone(), vec![], CallMode::Complete));
+    let handle = spawn_worker(
+        env,
+        brief("w1", "patch", dir.path(), 6),
+        SpawnOptions::default(),
+    )
+    .await
+    .expect("spawn");
+    let (_, result) = with_timeout(drain(handle)).await.expect("in time");
+    match &result.outcome {
+        WorkerOutcome::Failed { error } => assert!(error.contains("output ceiling"), "{error}"),
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    assert_eq!(provider.requests().len(), 2);
+    assert_eq!(result.steps, 2);
 }
 
 /// Decision 0084: a subagent's fence still refuses a sandboxed build, which

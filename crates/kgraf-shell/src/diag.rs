@@ -15,33 +15,33 @@
 //! understand what their machine did.
 //!
 //! **Windows-specific responsibilities**, all owned by the `windows` submodule:
-//! - **H3:** a console is attached (`AttachConsole(ATTACH_PARENT_PROCESS)`) only for a
+//! - A console is attached (`AttachConsole(ATTACH_PARENT_PROCESS)`) only for a
 //!   diagnostic invocation (`--probe`, `--measure`, `-h`/`--help`, `--version`, or a
 //!   clap usage error); every other launch never attaches one, and detaches
 //!   defensively if one is somehow already attached.
-//! - **H2/N3:** `STD_OUTPUT_HANDLE`/`STD_ERROR_HANDLE` are each checked independently
+//! - `STD_OUTPUT_HANDLE`/`STD_ERROR_HANDLE` are each checked independently
 //!   (`GetStdHandle` + `GetFileType`) before being touched; if *both* already have a
 //!   usable handle (a launcher redirected both), the log file is never opened, much
 //!   less rotated, at all -- there would be nothing to write to it.
-//! - **H4:** `CONOUT$` is reopened `GENERIC_READ | GENERIC_WRITE`, matching
+//! - `CONOUT$` is reopened `GENERIC_READ | GENERIC_WRITE`, matching
 //!   Microsoft's own guidance for reopening the console device.
-//! - **H5:** the log file lives under `directories::ProjectDirs::data_local_dir()`
+//! - The log file lives under `directories::ProjectDirs::data_local_dir()`
 //!   (`%LOCALAPPDATA%\kGraf\data`), not the roaming `data_dir()`.
-//! - **M1/M2/N6:** the log file is capped at 2 MiB, in place, for both the previous
+//! - The log file is capped at 2 MiB, in place, for both the previous
 //!   run's leftover log (at startup) and the current run's own (mid-run, the first
 //!   time a write would cross the cap) -- both go through the same
 //!   `rotate_keeping_tail`, which keeps the last 2 MiB as `<name>.log.1` rather than
 //!   either deleting an oversized log outright (an earlier version did exactly that,
 //!   throwing away the most recent, most useful lines) or letting either file grow
 //!   without bound.
-//! - **N3:** the "no console attached" notice is written only through the stream(s)
+//! - The "no console attached" notice is written only through the stream(s)
 //!   that actually got redirected to the log file, never blindly to both.
-//! - **L3:** `FreeConsole` when `AttachConsole` succeeds but the `CONOUT$` device
+//! - `FreeConsole` when `AttachConsole` succeeds but the `CONOUT$` device
 //!   handle fails to open, rather than leaving the process attached to a console
 //!   session it cannot write to.
-//! - **L4:** `SetStdHandle`'s return is checked in every build profile (a failure
+//! - `SetStdHandle`'s return is checked in every build profile (a failure
 //!   counts as a dropped write), not only in debug builds via `debug_assert`.
-//! - **L5:** the log path is turned into a wide string with
+//! - The log path is turned into a wide string with
 //!   `OsStrExt::encode_wide`, not `Path::to_string_lossy`'s UTF-8 round trip.
 //!
 //! **What this does not cover:** third-party code that writes to `stdout`/`stderr`
@@ -129,7 +129,7 @@ mod platform {
         STD_HANDLE, STD_OUTPUT_HANDLE, SetStdHandle,
     };
 
-    /// M1/M2/N6: the size at which a log file (the previous run's, at startup, or the
+    /// The size at which a log file (the previous run's, at startup, or the
     /// current run's, mid-write) is rotated, keeping only the last this-many bytes.
     const LOG_SIZE_CAP_BYTES: u64 = 2 * 1024 * 1024; // 2 MiB
 
@@ -152,7 +152,7 @@ mod platform {
         s.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
-    /// L5: builds the wide string from the `OsStr` directly, not through
+    /// Builds the wide string from the `OsStr` directly, not through
     /// `Path::to_string_lossy`'s UTF-8 round trip.
     fn wide_nul_path(path: &Path) -> Vec<u16> {
         path.as_os_str()
@@ -202,7 +202,7 @@ mod platform {
         }
     }
 
-    /// H2: true if `std_handle` already names something real that must not be
+    /// True if `std_handle` already names something real that must not be
     /// clobbered (a launcher-redirected file or pipe).
     fn already_has_a_usable_handle(std_handle: STD_HANDLE) -> bool {
         // SAFETY: GetStdHandle/GetFileType have no preconditions beyond a valid
@@ -216,7 +216,7 @@ mod platform {
     }
 
     /// Installs `handle` for `std_handle`, returning whether it actually did (`false`
-    /// if the stream already had a usable handle, or (L4) if `SetStdHandle` itself
+    /// if the stream already had a usable handle, or if `SetStdHandle` itself
     /// failed -- checked in every build profile, not only via `debug_assert`, and
     /// counted as a dropped write either way since nothing reaches that stream now).
     fn install(std_handle: STD_HANDLE, handle: HANDLE) -> bool {
@@ -229,7 +229,7 @@ mod platform {
         ok
     }
 
-    /// H5: `%LOCALAPPDATA%\kGraf\data` (`data_local_dir()`, not the roaming
+    /// `%LOCALAPPDATA%\kGraf\data` (`data_local_dir()`, not the roaming
     /// `data_dir()`), falling back to the system temp directory if there is no
     /// resolvable home directory, or if the preferred directory cannot be created.
     fn resolve_log_dir() -> (PathBuf, Option<String>) {
@@ -251,7 +251,7 @@ mod platform {
         }
     }
 
-    /// N6 + M1/M2: keeps the last `LOG_SIZE_CAP_BYTES` of `path`'s current content as
+    /// Keeps the last `LOG_SIZE_CAP_BYTES` of `path`'s current content as
     /// `<name>.log.1` (overwriting whatever was already there there), instead of
     /// dropping the whole thing. Shared by the startup path (the previous run's
     /// leftover log) and the mid-run path (this run's own log crossing the cap).
@@ -289,7 +289,7 @@ mod platform {
         let stdout_needs = !already_has_a_usable_handle(STD_OUTPUT_HANDLE);
         let stderr_needs = !already_has_a_usable_handle(STD_ERROR_HANDLE);
 
-        // N3: nothing to do at all if both streams are already usable (a launcher
+        // Nothing to do at all if both streams are already usable (a launcher
         // redirected both) -- in particular, never open (or rotate) the log file.
         if !stdout_needs && !stderr_needs {
             if !is_diagnostic {
@@ -310,7 +310,7 @@ mod platform {
                 let wide = wide_nul("CONOUT$");
                 let handle = open_for_write(&wide, GENERIC_READ | GENERIC_WRITE, OPEN_EXISTING);
                 if handle.is_none() {
-                    // L3: attached but the device handle didn't open -- detach.
+                    // Attached but the device handle didn't open -- detach.
                     unsafe {
                         FreeConsole();
                     }
@@ -320,7 +320,7 @@ mod platform {
                 None
             }
         } else {
-            // H3: a normal windowed launch never attaches a console.
+            // A normal windowed launch never attaches a console.
             unsafe {
                 FreeConsole();
             }
@@ -354,7 +354,7 @@ mod platform {
             written: 0,
         });
 
-        // N3: the notice goes only through the stream(s) that actually landed on the
+        // The notice goes only through the stream(s) that actually landed on the
         // log file, not unconditionally to both.
         let notice = match dir_error {
             Some(e) => format!(
@@ -374,7 +374,7 @@ mod platform {
         }
     }
 
-    /// Writes `bytes` to the shared log file, rotating it in place first (M2) if this
+    /// Writes `bytes` to the shared log file, rotating it in place first if this
     /// write would cross the cap. Returns `false` if the log file is not this
     /// stream's target at all (the caller falls back to a direct OS-handle write).
     fn write_to_log(bytes: &[u8]) -> bool {
@@ -491,11 +491,11 @@ mod platform {
         fn a_stream_with_an_existing_console_handle_is_left_alone() {
             // Exercises `already_has_a_usable_handle`/`install` against the real
             // STD_OUTPUT_HANDLE (whatever this test process has under `cargo test`),
-            // matching H2's point: behavior against the real GetStdHandle/GetFileType
+            // matching the point: behavior against the real GetStdHandle/GetFileType
             // pair, not a mocked config value.
             let before = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
             if unsafe { GetFileType(before) } == FILE_TYPE_UNKNOWN {
-                return; // nothing usable to assert preservation of; see H2 test note.
+                return; // nothing usable to assert preservation of; see the test note above.
             }
             let wide = wide_nul("NUL");
             let other = open_for_write(&wide, GENERIC_WRITE, OPEN_EXISTING).unwrap();

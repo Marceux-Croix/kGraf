@@ -386,7 +386,7 @@ struct Entry {
     /// Every stub path any version of this interface has landed. Kept across
     /// revisions (never reset), so a revised stub may replace the file an
     /// earlier version's stub put at the tip without declaring it in
-    /// `replaces` (0081 hardening, M1): that file is kGraf's own stub, not
+    /// `replaces`: that file is kGraf's own stub, not
     /// the project's code.
     landed_paths: BTreeSet<String>,
 }
@@ -468,7 +468,7 @@ impl ContractBook {
     }
 
     /// Every stub path an earlier (or the current) version of `id` landed
-    /// (0081 hardening, M1): a revision's stub may replace these at the tip.
+    ///: a revision's stub may replace these at the tip.
     pub fn landed_paths(&self, id: &str) -> BTreeSet<String> {
         self.entries
             .get(id)

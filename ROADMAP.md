@@ -33,6 +33,10 @@ what is planned next, as things you can do or expect, not as an internal project
   fresh checkout.
 - kGraf sets no spend limit; it records every token so you can set one in your provider's
   console (decision 0080).
+- A model with no price entry still runs: its spend is reported as unpriced, never as zero,
+  and `kgraf orchestrate` exits non-zero unless the run completed.
+- An opt-in update check (off by default) offers a newer release in the notification bell and
+  verifies the download against the release's checksum file.
 - Every model call is recorded in a tamper-evident ledger. `kgraf spend` totals it and
   `kgraf ledger verify` checks the chain.
 - kGraf reads roadmap and to-do files already in your repository and shows them as work
@@ -76,6 +80,8 @@ what is planned next, as things you can do or expect, not as an internal project
 - Signed, notarized installers for macOS, Linux and Windows. Local packaging scripts
   already build the app and the command line for all three platforms; the packages are
   unsigned today, so expect a security warning on first launch.
+- A detached signature for the update check, so a download is checked against a key and not
+  only against a checksum file published with it.
 
 ## Planned
 

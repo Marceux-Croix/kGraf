@@ -22,7 +22,6 @@ kgraf-diag = { path = "../kgraf-diag" }
 thiserror = "2.0.17"
 # MIT OR Apache-2.0, verified on crates.io 2026-09-26; already in Cargo.lock.
 # Merge-back folds paths to NFC to detect normalization-only collisions.
-unicode-normalization = "0.1.25"
 # Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT, read from the crate's
 # Cargo.toml 2026-09-26; already in Cargo.lock under cap-std, which kgraf-tools
 # uses for the same reason. Merge-back removes what a check left in a worktree from

@@ -518,6 +518,26 @@ impl kgraf_orchestrator::Workspaces for ChildDirs {
         }
     }
 
+    /// A result "recorded" under `.results/<child>` before a kill: merged
+    /// again (its files are already in the parent's worktree).
+    async fn recover_child_merge(
+        &self,
+        _parent: &Path,
+        child: &AgentId,
+        _writes: &[String],
+    ) -> Result<Option<ChildMerge>, String> {
+        Ok(self
+            .base
+            .join(".results")
+            .join(child.as_str())
+            .exists()
+            .then(|| ChildMerge::Merged {
+                commit: format!("dir:{child}"),
+                not_applied: Vec::new(),
+                warning: None,
+            }))
+    }
+
     async fn discard_child(&self, child: &AgentId) -> Result<(), String> {
         let _ = std::fs::remove_dir_all(self.base.join(child.as_str()));
         let _ = std::fs::remove_dir_all(self.checkpoint(child.as_str()));
@@ -586,11 +606,15 @@ impl kgraf_orchestrator::Workspaces for ChildDirs {
         }
         self.merged_at.lock().expect("lock").push(Instant::now());
         Ok(if empty {
-            ChildMerge::Empty { not_applied }
+            ChildMerge::Empty {
+                not_applied,
+                warning: None,
+            }
         } else {
             ChildMerge::Merged {
                 commit: format!("dir:{name}"),
                 not_applied,
+                warning: None,
             }
         })
     }
@@ -1386,12 +1410,20 @@ fn a_kill_while_a_child_runs_then_resume_wakes_the_parent_once_and_repeats_no_ro
     let plan = plan(&[("a", "PARENT-K make a", &["src/a.rs", "src/c.rs"])]);
     // `probe`: after the resume, the parent writes the child's path before
     // the child may finish; the fence must already hold.
-    let script = |hang: Option<Arc<AtomicBool>>, probe: Option<Arc<AtomicBool>>| {
+    // `hang`: (the child's flag, the parent's flag). The child hangs in its
+    // second round and the parent in its fourth, so at the kill nothing is
+    // in flight but two calls that never answer. A parent that kept napping
+    // through the kill could have a round answered whose result the runtime
+    // had not yet written down, and the resume would then ask that round
+    // again: the test would be racing the kill against the runtime's own
+    // write, not checking the resume.
+    let script = |hang: Option<(Arc<AtomicBool>, Arc<AtomicBool>)>,
+                  probe: Option<Arc<AtomicBool>>| {
         move |s: &Seen| {
             if s.is("CHILD-K") {
                 return match (s.round, &hang, &probe) {
                     (0, _, _) => Step::Reply(vec![write("c", "src/c.rs", "child c")]),
-                    (1, Some(reached), _) => Step::Hang(reached.clone()),
+                    (1, Some((reached, _)), _) => Step::Hang(reached.clone()),
                     (_, _, Some(probed)) => Step::After(probed.clone(), answer("wrote c")),
                     _ => Step::Reply(answer("wrote c")),
                 };
@@ -1407,6 +1439,11 @@ fn a_kill_while_a_child_runs_then_resume_wakes_the_parent_once_and_repeats_no_ro
                 }
             }
             if s.report().is_none() {
+                if let Some((_, parent_reached)) = &hang
+                    && s.round >= 3
+                {
+                    return Step::Hang(parent_reached.clone());
+                }
                 return Step::Reply(vec![nap(s.round)]);
             }
             if !s.used.contains("a") {
@@ -1425,7 +1462,11 @@ fn a_kill_while_a_child_runs_then_resume_wakes_the_parent_once_and_repeats_no_ro
 
     // ---- first process: killed while the child hangs in its second round.
     let reached = Arc::new(AtomicBool::new(false));
-    let first_provider = Scripted::new(script(Some(reached.clone()), None));
+    let parent_reached = Arc::new(AtomicBool::new(false));
+    let first_provider = Scripted::new(script(
+        Some((reached.clone(), parent_reached.clone())),
+        None,
+    ));
     let first = runtime();
     let rig1 = Rig::open(
         dir.path(),
@@ -1436,16 +1477,16 @@ fn a_kill_while_a_child_runs_then_resume_wakes_the_parent_once_and_repeats_no_ro
     );
     let o = first.block_on(async { rig1.orchestrator() });
     first.spawn(o.start(RunId::new(RUN), "do the work".into()));
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while !reached.load(Ordering::SeqCst) {
+    // Wait for both hangs (the events, not a delay): every earlier round of
+    // both agents is then complete and written down.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !(reached.load(Ordering::SeqCst) && parent_reached.load(Ordering::SeqCst)) {
         assert!(
             Instant::now() < deadline,
-            "the child never reached its hang"
+            "the child and the parent never both reached their hang"
         );
         std::thread::sleep(Duration::from_millis(5));
     }
-    // Let the parent's rounds settle into the ledger around the hang.
-    std::thread::sleep(Duration::from_millis(50));
     first.shutdown_background();
     let answered_before: BTreeSet<(String, usize)> =
         first_provider.answered().into_iter().collect();
@@ -1748,7 +1789,7 @@ async fn finish(
         .expect("run")
 }
 
-/// Review M3: a second stop stops the children of a parent that already
+/// A second stop stops the children of a parent that already
 /// finished, resumably: the parent is not verified without their work, the
 /// child's session shows paused, and a resume continues the child and
 /// merges it. The resume runs at a limit of one, so the re-adopted child
@@ -1844,10 +1885,10 @@ async fn a_second_stop_stops_a_finished_parents_children_resumably() {
         .undelivered(&AgentId::new("r1-a-r0-a0"))
         .expect("inbox");
     assert!(
-        inbox
-            .iter()
-            .any(|i| i.id == "subagent-notice:r1-a-r0-a0.s1:over-limit"
-                && i.text.contains("over the limit")),
+        inbox.iter().any(|i| i
+            .id
+            .starts_with("subagent-notice:r1-a-r0-a0.s1:over-limit:")
+            && i.text.contains("over the limit")),
         "the over-limit notice is in the parent's inbox: {inbox:?}"
     );
 }
@@ -1870,7 +1911,7 @@ async fn stopped_with_a_waiting_child(rig: &Rig, provider: &Arc<Scripted>) {
     assert_eq!(report.status, RunStatus::Stopped, "{report:?}");
 }
 
-/// Review M2: a child whose worktree stays busy is not retried on every tick
+/// A child whose worktree stays busy is not retried on every tick
 /// forever: the waits grow, the parent's inbox says why, and after the last
 /// try the child is settled as failed and reported.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1945,7 +1986,7 @@ async fn a_busy_worktree_is_retried_with_a_growing_wait_then_reported() {
     assert!(reason.contains("stayed in use"), "{reason}");
 }
 
-/// Review M1: a kill between a spawn's record and its rows leaves the record
+/// A kill between a spawn's record and its rows leaves the record
 /// `preparing`. The resume removes what it left and tells the parent; it is
 /// never run and never blocks later spawns.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2328,5 +2369,564 @@ async fn a_child_whose_environment_build_panics_reports_back_and_does_not_hang_t
         ended.map(|(o, _)| o),
         Some(kgraf_core::session::SessionOutcome::Failed),
         "the panicked child's session settled Failed, not left open"
+    );
+}
+
+/// A read-only child is part of its parent's work item: with the work-item
+/// cap full (a cap of one, held by the parent's own contract), its spawn is
+/// still admitted against the live-agent ceiling, and it runs and reports.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_read_only_child_is_admitted_when_the_work_item_cap_is_full() {
+    let dir = tempfile::tempdir().expect("dir");
+    let provider = Scripted::new(move |s| {
+        if s.is("CHILD-CAP") {
+            return Step::Reply(answer("looked"));
+        }
+        if !s.used.contains("spawn") {
+            return Step::Reply(vec![spawn_reader("spawn", "CHILD-CAP look at a")]);
+        }
+        if s.result("spawn").is_some_and(|(_, is_error)| is_error) {
+            return Step::Reply(answer("refused"));
+        }
+        if s.report().is_none() {
+            return Step::Reply(vec![nap(s.round)]);
+        }
+        if !s.used.contains("a") {
+            return Step::Reply(vec![write("a", "src/a.rs", "parent")]);
+        }
+        Step::Reply(answer("done"))
+    });
+    let rig = Rig::open(
+        dir.path(),
+        plan(&[("a", "PARENT-CAP make a", &["src/a.rs"])]),
+        Limits::new(1, 8).expect("limits"),
+        provider.clone(),
+        false,
+    );
+    let report = run(&rig).await;
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    let (out, is_error) = provider
+        .result("PARENT-CAP", "spawn")
+        .expect("the spawn's result");
+    assert!(!is_error, "a busy run does not refuse a reader: {out}");
+    let child_report = provider
+        .last("PARENT-CAP")
+        .and_then(|s| s.report())
+        .expect("the reader ran and reported");
+    assert_eq!(child_report.merge, ChildMerge::ReadOnly);
+}
+
+/// The spend of a finished child cannot be read from the ledger (its row is
+/// unreadable). Settling it must not end the run: the child's hold is
+/// charged instead, and its merge, report and settled mark still happen, so
+/// its parent's finish is released and the run completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_child_whose_spend_cannot_be_read_still_settles_and_releases_its_parent() {
+    let dir = tempfile::tempdir().expect("dir");
+    let go = Arc::new(AtomicBool::new(false));
+    let release = go.clone();
+    let provider = Scripted::new(move |s| {
+        if s.is("CHILD-SP") {
+            return match s.round {
+                0 => Step::Reply(vec![write("c", "src/c.rs", "child c")]),
+                _ => Step::After(release.clone(), answer("wrote c")),
+            };
+        }
+        if !s.used.contains("spawn") {
+            return Step::Reply(vec![spawn_writer("CHILD-SP write c", &["src/c.rs"])]);
+        }
+        if s.report().is_none() {
+            return Step::Reply(vec![nap(s.round)]);
+        }
+        if !s.used.contains("a") {
+            return Step::Reply(vec![write("a", "src/a.rs", "parent")]);
+        }
+        Step::Reply(answer("done"))
+    });
+    let rig = Rig::open(
+        dir.path(),
+        plan(&[("a", "PARENT-SP make a", &["src/a.rs", "src/c.rs"])]),
+        Limits::default(),
+        provider.clone(),
+        true,
+    );
+    let running = tokio::spawn(
+        rig.orchestrator()
+            .start(RunId::new(RUN), "do the work".into()),
+    );
+    let child = "r1-a-r0-a0.s1";
+    let ledger = rig.parts.ledger.clone();
+    wait_for("the child's first round is counted", || {
+        ledger.calls().is_ok_and(|calls| {
+            calls
+                .iter()
+                .any(|c| c.agent_id == child && c.settlement == Settlement::Counted)
+        })
+    })
+    .await;
+    let first = ledger
+        .calls()
+        .expect("calls")
+        .into_iter()
+        .find(|c| c.agent_id == child)
+        .expect("the child's first call")
+        .id;
+    let db = rusqlite::Connection::open(dir.path().join("ledger.db")).expect("db");
+    db.busy_timeout(Duration::from_secs(5)).expect("timeout");
+    db.execute(
+        "UPDATE calls SET uncached_input = 'unreadable' WHERE id = ?1",
+        [first.as_str()],
+    )
+    .expect("corrupt the row");
+    go.store(true, Ordering::SeqCst);
+    let report = finish(running).await;
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    let parent = provider.last("PARENT-SP").expect("parent");
+    let child_report = parent.report().expect("the child's report reached it");
+    assert!(
+        matches!(child_report.merge, ChildMerge::Merged { .. }),
+        "{child_report:?}"
+    );
+    assert_eq!(
+        read(&rig.worktree("r1-a-r0-a0").join("src/c.rs")),
+        "child c",
+        "the child's work is merged"
+    );
+    let trace = read(&rig.parts.dir.join("runs").join(RUN).join("trace.jsonl"));
+    assert!(
+        trace.contains("could not be read; its hold of"),
+        "the unreadable spend is said, not swallowed"
+    );
+}
+
+/// A child stopped alone is charged for its calls when it pauses. Its
+/// resumed result lists those calls again (a resumed worker carries its
+/// earlier calls); they are not charged a second time. The child's first
+/// round is counted before the stop, so a second charge would show: the
+/// run's spend must equal the ledger's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_paused_and_resumed_child_is_charged_once_for_its_calls() {
+    let dir = tempfile::tempdir().expect("dir");
+    let parked = Arc::new(AtomicBool::new(false));
+    let resumed = Arc::new(AtomicBool::new(false));
+    let (p2, r2) = (parked.clone(), resumed.clone());
+    let provider = Scripted::new(move |s| {
+        if s.is("CHILD-CHARGE") {
+            return match s.round {
+                0 => Step::Reply(vec![nap(0)]),
+                _ if r2.load(Ordering::SeqCst) => Step::Reply(answer("looked")),
+                _ => Step::Hang(p2.clone()),
+            };
+        }
+        if !s.used.contains("spawn") {
+            return Step::Reply(vec![spawn_reader("spawn", "CHILD-CHARGE look at a")]);
+        }
+        if s.report().is_none() {
+            return Step::After(r2.clone(), vec![nap(s.round)]);
+        }
+        if !s.used.contains("a") {
+            return Step::Reply(vec![write("a", "src/a.rs", "parent")]);
+        }
+        Step::Reply(answer("done"))
+    });
+    let rig = Rig::open(
+        dir.path(),
+        plan(&[("a", "PARENT-CHARGE make a", &["src/a.rs"])]),
+        Limits::default(),
+        provider.clone(),
+        false,
+    );
+    let o = rig.orchestrator();
+    let handle = o.handle();
+    let running = tokio::spawn(o.start(RunId::new(RUN), "do the work".into()));
+    let child = AgentId::new("r1-a-r0-a0.s1");
+    wait_for("the child parks in its second round", || {
+        parked.load(Ordering::SeqCst)
+    })
+    .await;
+    handle
+        .stop_session(child.clone())
+        .await
+        .expect("a subagent is stopped alone");
+    let sessions = rig.sessions();
+    wait_for("the child is paused", || {
+        sessions
+            .lifecycle(&child)
+            .ok()
+            .flatten()
+            .is_some_and(|(ended, paused)| ended.is_none() && paused.is_some())
+    })
+    .await;
+    resumed.store(true, Ordering::SeqCst);
+    handle
+        .resume_session(child.clone())
+        .await
+        .expect("resume the child");
+    let report = finish(running).await;
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    let calls = rig.parts.ledger.calls().expect("calls");
+    let counted = |agent: &str| {
+        calls
+            .iter()
+            .filter(|c| c.agent_id == agent && c.settlement == Settlement::Counted)
+            .count()
+    };
+    assert_eq!(
+        counted(child.as_str()),
+        2,
+        "the child's first round before the pause, its last after: {calls:#?}"
+    );
+    // The call the stop cut short stays unreconciled, so the pause charges
+    // the child's hold (the dispatch estimate) for its calls so far, in place
+    // of their ledger cost. After the resume only the new call is added.
+    let unreconciled: Vec<_> = calls
+        .iter()
+        .filter(|c| c.settlement == Settlement::Unreconciled)
+        .collect();
+    assert_eq!(unreconciled.len(), 1, "{calls:#?}");
+    assert_eq!(unreconciled[0].agent_id, child.as_str());
+    let events = kgraf_orchestrator::TraceLog::open(
+        &rig.parts.dir.join("runs").join(RUN).join("trace.jsonl"),
+    )
+    .await
+    .expect("trace")
+    .load()
+    .await
+    .expect("events");
+    let estimate = events
+        .iter()
+        .find_map(|e| match e {
+            kgraf_orchestrator::TraceEvent::Dispatch {
+                estimate_micros, ..
+            } => Some(kgraf_core::Money::from_micros(*estimate_micros)),
+            _ => None,
+        })
+        .expect("the dispatch");
+    let prices = prices();
+    let cost = |c: &&kgraf_provider::CallRecord| prices.cost(&c.model, &c.usage).expect("priced");
+    let counted = |c: &&kgraf_provider::CallRecord| c.settlement == Settlement::Counted;
+    let others: kgraf_core::Money = calls
+        .iter()
+        .filter(counted)
+        .filter(|c| c.agent_id != child.as_str())
+        .map(|c| cost(&c))
+        .sum();
+    let child_last = calls
+        .iter()
+        .filter(counted)
+        .rfind(|c| c.agent_id == child.as_str())
+        .map(|c| cost(&c))
+        .expect("the child's last call");
+    assert_eq!(
+        report.spent,
+        others + estimate + child_last,
+        "the pause's charge once, then only the call made after the resume"
+    );
+}
+
+/// A child resumed over the limit twice gets two notices in its parent's
+/// inbox: each notice has its own id, so the second is not refused as a
+/// duplicate of the first. The test takes the child's freed slot itself, so
+/// each resume finds the ceiling full.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_child_resumed_over_the_limit_twice_is_noticed_twice() {
+    let dir = tempfile::tempdir().expect("dir");
+    let parked = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(AtomicBool::new(false));
+    let (p2, d2) = (parked.clone(), done.clone());
+    let provider = Scripted::new(move |s| {
+        if s.is("CHILD-OL") {
+            if !d2.load(Ordering::SeqCst) {
+                return Step::Hang(p2.clone());
+            }
+            return match s.round {
+                0 => Step::Reply(vec![write("c", "src/c.rs", "child c")]),
+                _ => Step::Reply(answer("wrote c")),
+            };
+        }
+        match s.round {
+            0 => Step::Reply(vec![
+                spawn_writer("CHILD-OL write c", &["src/c.rs"]),
+                write("a", "src/a.rs", "parent"),
+            ]),
+            _ => Step::Reply(answer("done before my child")),
+        }
+    });
+    let rig = Rig::open(
+        dir.path(),
+        plan(&[("a", "PARENT-OL make a", &["src/a.rs", "src/c.rs"])]),
+        Limits::new(8, 2).expect("limits"),
+        provider.clone(),
+        false,
+    );
+    let admission = admission(rig.limits);
+    let o = {
+        let line = SessionLine::new();
+        let mut s: kgraf_orchestrator::Services = rig.parts.services(WINDOW);
+        s.routes = vec![scripted_route(
+            rig.provider.clone(),
+            rig.parts.ledger.clone(),
+            &line,
+            &rig.recorder,
+        )];
+        s.workspaces = rig.dirs.clone();
+        s.admission = admission.clone();
+        let o = Orchestrator::new(cfg(), s).expect("orchestrator");
+        line.bind(o.handle()).expect("bind");
+        o
+    };
+    let handle = o.handle();
+    let running = tokio::spawn(o.start(RunId::new(RUN), "do the work".into()));
+    let child = AgentId::new("r1-a-r0-a0.s1");
+    wait_for("the child parks", || parked.load(Ordering::SeqCst)).await;
+    wait_for("the parent is held with its child", || {
+        admission.gate().in_flight().1 == 2
+    })
+    .await;
+    handle.stop_session(child.clone()).await.expect("stop");
+    wait_for("the paused child's slot is back", || {
+        admission.gate().in_flight().1 == 1
+    })
+    .await;
+    // Someone else takes the freed slot: the child resumes over the limit.
+    let taken = admission.gate().try_admit(1).expect("the freed slot");
+    parked.store(false, Ordering::SeqCst);
+    handle.resume_session(child.clone()).await.expect("resume");
+    wait_for("the child parks again", || parked.load(Ordering::SeqCst)).await;
+    // Again: stopped, and resumed at once (applied when the pause lands).
+    parked.store(false, Ordering::SeqCst);
+    handle
+        .stop_session(child.clone())
+        .await
+        .expect("stop again");
+    handle
+        .resume_session(child.clone())
+        .await
+        .expect("resume again");
+    wait_for("the child parks a third time", || {
+        parked.load(Ordering::SeqCst)
+    })
+    .await;
+    let parent = AgentId::new("r1-a-r0-a0");
+    let sessions = rig.sessions();
+    // A notice is either still in the parent's inbox or already delivered into
+    // its transcript, depending on whether the parent woke between the two
+    // resumes. Both count: the distinct ids over the two places are the
+    // notices, so the wait does not depend on when the parent wakes.
+    const NOTICE: &str = "subagent-notice:r1-a-r0-a0.s1:over-limit:";
+    let transcript = rig.transcript("r1-a-r0-a0");
+    wait_for("two over-limit notices", || {
+        let mut ids: BTreeSet<String> = sessions
+            .undelivered(&parent)
+            .map(|inbox| {
+                inbox
+                    .into_iter()
+                    .filter(|i| i.id.starts_with(NOTICE))
+                    .map(|i| i.id)
+                    .collect()
+            })
+            .unwrap_or_default();
+        for piece in read(&transcript).split(NOTICE).skip(1) {
+            let tail: String = piece.chars().take_while(|c| *c != '"').collect();
+            ids.insert(format!("{NOTICE}{tail}"));
+        }
+        ids.len() == 2
+    })
+    .await;
+    admission.gate().release(taken);
+    done.store(true, Ordering::SeqCst);
+    handle
+        .stop_session(child.clone())
+        .await
+        .expect("stop to finish");
+    handle
+        .resume_session(child.clone())
+        .await
+        .expect("resume to finish");
+    let report = finish(running).await;
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+}
+
+/// A child stopped and resumed at once, while its own child's cancel is
+/// still in flight: the resumed child's adoption finds the grandchild still
+/// live and skips it. When the grandchild's cancel then lands, it is adopted
+/// again at once (its parent already runs), not dropped: it runs to its end
+/// and its report reaches its parent, and the run completes.
+#[tokio::test(flavor = "current_thread")]
+async fn a_grandchild_cancelled_by_a_pause_its_parent_outran_is_adopted_again() {
+    let dir = tempfile::tempdir().expect("dir");
+    let parked = Arc::new(AtomicBool::new(false));
+    let resumed = Arc::new(AtomicBool::new(false));
+    let (p2, r2) = (parked.clone(), resumed.clone());
+    let provider = Scripted::new(move |s| {
+        if s.is("GRAND-G") {
+            return if r2.load(Ordering::SeqCst) {
+                Step::Reply(answer("grandchild looked"))
+            } else {
+                Step::Hang(p2.clone())
+            };
+        }
+        if s.is("CHILD-C") {
+            if !s.used.contains("spawn-g") {
+                return Step::Reply(vec![spawn_reader("spawn-g", "GRAND-G look at a")]);
+            }
+            if s.report().is_none() {
+                return Step::Reply(vec![nap(s.round)]);
+            }
+            return Step::Reply(answer("child looked"));
+        }
+        if !s.used.contains("spawn") {
+            return Step::Reply(vec![spawn_reader("spawn", "CHILD-C look at a")]);
+        }
+        if s.report().is_none() {
+            return Step::Reply(vec![nap(s.round)]);
+        }
+        if !s.used.contains("a") {
+            return Step::Reply(vec![write("a", "src/a.rs", "parent")]);
+        }
+        Step::Reply(answer("done"))
+    });
+    let rig = Rig::open(
+        dir.path(),
+        plan(&[("a", "PARENT-GG make a", &["src/a.rs"])]),
+        Limits::default(),
+        provider.clone(),
+        false,
+    );
+    let o = rig.orchestrator();
+    let handle = o.handle();
+    let run = tokio::spawn(o.start(RunId::new(RUN), "do the work".into()));
+    wait_for("the grandchild parks", || parked.load(Ordering::SeqCst)).await;
+    let child = AgentId::new("r1-a-r0-a0.s1");
+    resumed.store(true, Ordering::SeqCst);
+    handle
+        .stop_session(child.clone())
+        .await
+        .expect("the child is stopped alone");
+    // At once: the resume is applied the moment the pause is confirmed,
+    // before the grandchild's own cancel reaches the loop.
+    handle
+        .resume_session(child.clone())
+        .await
+        .expect("resume the child");
+    let report = tokio::time::timeout(Duration::from_secs(30), run)
+        .await
+        .expect("the run ended: the grandchild was not orphaned")
+        .expect("join")
+        .expect("run");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    let child_seen = provider.last("CHILD-C").expect("child");
+    let grand_report = child_seen
+        .report()
+        .expect("the grandchild's report reached the child");
+    assert_eq!(grand_report.answer, "grandchild looked");
+    let (ended, _) = rig
+        .sessions()
+        .lifecycle(&AgentId::new("r1-a-r0-a0.s1.s1"))
+        .expect("read")
+        .expect("known");
+    assert_eq!(
+        ended.map(|(o, _)| o),
+        Some(kgraf_core::session::SessionOutcome::Completed)
+    );
+}
+
+/// A kill after a writer child's merge removed its worktree, and before the
+/// child was marked settled: on resume its worktree cannot be reopened, but
+/// the result it recorded before the kill is merged again, and the report
+/// says Merged (the files are in the parent's worktree), not NotMerged.
+#[test]
+fn a_child_merged_just_before_a_kill_is_reported_merged_on_resume() {
+    let dir = tempfile::tempdir().expect("dir");
+    let the_plan = plan(&[("a", "PARENT-RM make a", &["src/a.rs", "src/c.rs"])]);
+    let script = |hang: Option<Arc<AtomicBool>>| {
+        move |s: &Seen| {
+            if s.is("CHILD-RM") {
+                return match (s.round, &hang) {
+                    (0, _) => Step::Reply(vec![write("c", "src/c.rs", "child c")]),
+                    (_, Some(reached)) => Step::Hang(reached.clone()),
+                    _ => Step::Reply(answer("wrote c")),
+                };
+            }
+            if !s.used.contains("spawn") {
+                return Step::Reply(vec![spawn_writer("CHILD-RM write c", &["src/c.rs"])]);
+            }
+            if s.report().is_none() {
+                return Step::Reply(vec![nap(s.round)]);
+            }
+            if !s.used.contains("a") {
+                return Step::Reply(vec![write("a", "src/a.rs", "parent")]);
+            }
+            Step::Reply(answer("done"))
+        }
+    };
+    let runtime = || {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .expect("runtime")
+    };
+    let reached = Arc::new(AtomicBool::new(false));
+    let first_provider = Scripted::new(script(Some(reached.clone())));
+    let first = runtime();
+    let rig1 = Rig::open(
+        dir.path(),
+        the_plan.clone(),
+        Limits::default(),
+        first_provider,
+        true,
+    );
+    let o = first.block_on(async { rig1.orchestrator() });
+    first.spawn(o.start(RunId::new(RUN), "do the work".into()));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !reached.load(Ordering::SeqCst) {
+        assert!(Instant::now() < deadline, "the child never hung");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    first.shutdown_background();
+    drop(rig1);
+    std::thread::sleep(Duration::from_millis(450));
+
+    // What the kill left: the merge applied the child's file to the parent
+    // and removed the child's worktree; its result is recorded.
+    let base = dir.path().join("worktrees");
+    let child = "r1-a-r0-a0.s1";
+    std::fs::create_dir_all(base.join("r1-a-r0-a0/src")).expect("mkdir");
+    std::fs::write(base.join("r1-a-r0-a0/src/c.rs"), "child c").expect("landed");
+    std::fs::remove_dir_all(base.join(child)).expect("worktree removed");
+    std::fs::create_dir_all(base.join(".results")).expect("mkdir");
+    std::fs::write(base.join(".results").join(child), "").expect("result");
+
+    let second_provider = Scripted::new(script(None));
+    let second = runtime();
+    let rig2 = Rig::open(
+        dir.path(),
+        the_plan,
+        Limits::default(),
+        second_provider.clone(),
+        true,
+    );
+    let report = second
+        .block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(60),
+                rig2.orchestrator().resume(RunId::new(RUN)),
+            )
+            .await
+        })
+        .expect("the resume ended in time")
+        .expect("resume");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    let parent = second_provider.last("PARENT-RM").expect("parent resumed");
+    let child_report = parent.report().expect("the report reached the parent");
+    assert!(
+        matches!(child_report.merge, ChildMerge::Merged { .. }),
+        "the files landed before the kill: {child_report:?}"
+    );
+    assert_eq!(
+        read(&rig2.worktree("r1-a-r0-a0").join("src/c.rs")),
+        "child c"
     );
 }

@@ -96,7 +96,7 @@ fn node_path(node: &NodeRecord) -> Result<std::path::PathBuf, ToolError> {
             tool: TOOL.into(),
             source,
         })?;
-    fs_safety::refuses_git_or_kgraf(TOOL, &normalized)?;
+    fs_safety::refuses_git_dir_or_kgraf(TOOL, &normalized)?;
     Ok(normalized)
 }
 

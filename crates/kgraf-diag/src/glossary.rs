@@ -77,7 +77,7 @@ pub const GLOSSARY: &[ErrorSpec] = &[
         "KG-0101",
         "Price Missing",
         "kgraf-core",
-        "A model has no entry in the price table, so spend cannot be reserved for it.",
+        "A model has no entry in the price table, so its cost is unknown. The call is still made and ledgered; its spend is reported as unpriced.",
         "A new or renamed model used before the price table was updated.",
         "Add the model to the price table, or use a priced model."
     ),
@@ -121,6 +121,38 @@ pub const GLOSSARY: &[ErrorSpec] = &[
         "The on-disk graph database's schema does not match this build of kGraf.",
         "The graph was built by an older or newer kGraf version.",
         "Delete and rebuild the graph database with `kgraf index`."
+    ),
+    spec!(
+        "KG-0205",
+        "No Index",
+        "kgraf-graph",
+        "A command that only reads the graph found no index file at the project's index path.",
+        "The project was never indexed, or the index path points somewhere else.",
+        "Run `kgraf index` in the project first."
+    ),
+    spec!(
+        "KG-0206",
+        "Ambiguous Symbol",
+        "kgraf-graph",
+        "A symbol name matches more than one node and none is an exact qualified-name match.",
+        "The short name is defined in several files or scopes.",
+        "Retry with a qualified name from the candidate list in the message."
+    ),
+    spec!(
+        "KG-0207",
+        "Stale File",
+        "kgraf-graph",
+        "A node's file changed after it was indexed, so its recorded lines may name other text.",
+        "The file was edited since the last `kgraf index`, and the change has not been indexed.",
+        "Run `kgraf index`, then retry."
+    ),
+    spec!(
+        "KG-0208",
+        "WAL Residue Pending",
+        "kgraf-graph",
+        "A removed project record may still be in the index's write-ahead log: a reader held an older snapshot for the whole retry window, so the log could not be truncated.",
+        "A long-lived read transaction on the index, such as a viewer or a stuck process.",
+        "Close the reader. The log is truncated at the next checkpoint, at the end of a run, or when the last connection closes."
     ),
     spec!(
         "KG-0299",
@@ -170,6 +202,14 @@ pub const GLOSSARY: &[ErrorSpec] = &[
         "A provider response carried no usage, so the call cannot be attributed in the ledger.",
         "A provider API change, or a non-standard response from a self-hosted endpoint.",
         "Report this: every token must be attributed to the ledger, so this must be fixed, not ignored."
+    ),
+    spec!(
+        "KG-0306",
+        "Turn Not Usable",
+        "kgraf-provider",
+        "The provider ended the turn with a stop reason that is not an answer, such as a refusal or an exceeded context window. The call was billed and recorded.",
+        "The model refused the request, or the conversation no longer fits its context window.",
+        "Read the stop reason in the message; shorten the context or rephrase the task, then retry."
     ),
     spec!(
         "KG-0399",

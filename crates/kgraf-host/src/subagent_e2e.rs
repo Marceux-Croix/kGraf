@@ -521,7 +521,9 @@ impl Fixture {
         let record = RunStore::new(self.graph.clone())
             .load(&RunId::new("r1"))
             .expect("load");
-        self.workspaces.sweep_refs(record.as_ref()).expect("sweep");
+        self.workspaces
+            .sweep_refs(record.as_ref(), || Ok(Default::default()))
+            .expect("sweep");
         assert_eq!(
             git(
                 &self.root,

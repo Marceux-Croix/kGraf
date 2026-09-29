@@ -2,8 +2,6 @@
 
 use std::collections::BTreeMap;
 
-use unicode_normalization::UnicodeNormalization;
-
 use super::state::{ConflictMessage, ConflictSide, ConflictedPath};
 
 /// `git merge-tree --write-tree` arrived in 2.38, `--attr-source` in 2.42.
@@ -152,9 +150,11 @@ pub(super) fn parse_raw_diff_z(out: &[u8]) -> Result<Vec<RawChange>, String> {
 
 /// Paths that steer git itself rather than hold project content: attributes
 /// pick filter and merge drivers, `.gitmodules` points at other repositories,
-/// and a `.git*` directory can be a hooks path (this project's own hooks live
-/// in `.githooks`). An attempt that touches one is refused, never merged.
-/// `.gitignore`, `.gitkeep` and `.github/` are ordinary project files.
+/// `.gitconfig` can be included from the repository config, and a hooks
+/// directory can be a hooks path (this project's own hooks live in
+/// `.githooks`). An attempt that touches one is refused, never merged.
+/// `.gitignore`, `.gitkeep`, `.gitlab-ci.yml`, `.gitpod.yml`, `.github/` and
+/// similar dot files are ordinary project files.
 ///
 /// The state directories `.kgraf` and `.haustoria` (its former name, decision
 /// 0062) are refused too: a worker that landed either in the checkout would
@@ -166,12 +166,30 @@ pub(super) fn is_protected(path: &str) -> bool {
     path.split('/').any(kgraf_core::paths::is_protected_name)
 }
 
-/// Case-folded, NFC-normalized form. Two distinct paths with the same key
-/// are one file on a case-insensitive or normalization-insensitive file
-/// system (macOS and Windows defaults), so one would overwrite the other at
-/// checkout.
+/// The path as the file system resolves it (`kgraf_core::paths::fold_path`:
+/// NFKC and case folding, ignorable code points and trailing dots and spaces
+/// dropped). Two distinct paths with the same key are one file on a
+/// case-insensitive or normalization-insensitive file system (macOS and
+/// Windows defaults), so one would overwrite the other at checkout. It is the
+/// same fold the commit check and the declared-write match use, so the three
+/// cannot disagree about which paths are twins.
 fn collision_key(path: &str) -> String {
-    path.nfc().collect::<String>().to_lowercase()
+    kgraf_core::paths::fold_path(std::path::Path::new(path))
+}
+
+/// `paths` and every directory that holds one of them. A directory `Foo`
+/// and a directory `foo` collide the same way two files do.
+fn with_ancestors(paths: &[String]) -> Vec<String> {
+    let mut all: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for path in paths {
+        let mut end = 0;
+        for part in path.split('/') {
+            end += part.len();
+            all.insert(path[..end].to_string());
+            end += 1;
+        }
+    }
+    all.into_iter().collect()
 }
 
 /// Groups of distinct paths that share a collision key.
@@ -195,6 +213,7 @@ pub(super) fn collision_groups<'a>(
 /// Collision groups in `merged` that `before` did not already have. A
 /// collision already on the integration branch is not this attempt's doing.
 pub(super) fn new_collisions(before: &[String], merged: &[String]) -> Vec<Vec<String>> {
+    let (before, merged) = (with_ancestors(before), with_ancestors(merged));
     let old = collision_groups(before.iter().map(String::as_str));
     collision_groups(merged.iter().map(String::as_str))
         .into_iter()
@@ -269,6 +288,9 @@ mod tests {
             ".GitAttributes",
             ".githooks/pre-commit",
             "a/.gitconfig",
+            "GITMOD~1",
+            "sub/GITATT~1",
+            ".git::$INDEX_ALLOCATION/config",
             // Decision 0062: the state directory under both names, however spelled.
             ".kgraf/ledger.db",
             ".haustoria/x",
@@ -284,11 +306,55 @@ mod tests {
             ".gitignore",
             "a/.gitkeep",
             ".github/workflows/ci.yml",
+            ".gitlab-ci.yml",
+            ".gitpod.yml",
+            ".git-blame-ignore-revs",
+            ".gitleaks.toml",
             "git.rs",
             "x.git",
         ] {
             assert!(!is_protected(p), "{p}");
         }
+    }
+
+    /// The collision key is the file system's own fold, not lowercase and NFC
+    /// alone: the long s, a trailing dot, a zero-width joiner and an NTFS-style
+    /// spelling all name one file on some volume.
+    #[test]
+    fn collision_keys_use_the_full_path_fold() {
+        for (a, b) in [
+            ("sample.rs", "\u{17F}ample.rs"),
+            ("caf\u{e9}.txt", "cafe\u{301}.txt"),
+            ("a.txt", "a.txt."),
+            ("src/lib.rs", "src/li\u{200B}b.rs"),
+            ("Stra\u{DF}e", "STRASSE"),
+            ("d/x", "D./x"),
+        ] {
+            assert_eq!(collision_key(a), collision_key(b), "{a:?} {b:?}");
+            assert_eq!(collision_groups([a, b]).len(), 1, "{a:?} {b:?}");
+        }
+        assert_ne!(collision_key("a/b"), collision_key("ab"));
+    }
+
+    /// A new file that folds onto an existing one, or a new directory that
+    /// folds onto an existing directory, is a new collision; a collision the
+    /// base already had is not, and neither is a rename that removes the twin.
+    #[test]
+    fn new_collisions_compare_against_the_base_tree() {
+        let s = |v: &[&str]| v.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        let base = s(&["Foo.rs", "Dir/a.rs"]);
+        assert_eq!(
+            new_collisions(&base, &s(&["Foo.rs", "Dir/a.rs", "foo.rs"])),
+            [["Foo.rs", "foo.rs"]]
+        );
+        assert_eq!(
+            new_collisions(&base, &s(&["Foo.rs", "Dir/a.rs", "dir/b.rs"])),
+            [["Dir", "dir"]]
+        );
+        assert!(new_collisions(&base, &s(&["foo.rs", "Dir/a.rs"])).is_empty());
+        assert!(new_collisions(&base, &s(&["Foo.rs", "dir/a.rs"])).is_empty());
+        let already = s(&["A.rs", "a.rs"]);
+        assert!(new_collisions(&already, &already).is_empty());
     }
 
     #[test]

@@ -23,8 +23,14 @@
 //! settled when the task's result comes back through the loop's own channel
 //! ([`SessionWork`]). A stop, a steer or a worker's `Finished` is never held
 //! behind a model call. Every question that does not get an orchestrator
-//! answer attempt (no answerer, a refused reservation, a failed call) is
+//! answer attempt (no answerer, a failed call) is
 //! recorded as a notice before it reaches the user.
+//!
+//! **Supervised, and bounded in time.** Each paid call runs in an inner
+//! task under a supervisor ([`spawn_session_call`]): a panic, or a call
+//! that does not finish within [`SESSION_CALL_TIMEOUT`], comes back as a
+//! failed result, so the asking worker is never left blocked and a pending
+//! judgment always clears.
 //!
 //! **Nothing waits forever.** A question the orchestrator could
 //! not answer waits for the user until the run's attendance deadline
@@ -54,8 +60,7 @@ pub trait QuestionAnswerer: Send + Sync {
     /// What one call costs at most, so the orchestrator can reserve it first
     /// (mirrors `Grounder::cost_basis`, `Decomposer::cost_basis`).
     fn cost_basis(&self) -> CostBasis;
-    /// Judge every pair in `request` in one call (decision 0067, point 6;
-    /// owner answer Q2). A pair with no verdict in the output is refused.
+    /// Judge every pair in `request` in one call (decision 0067, point 6). A pair with no verdict in the output is refused.
     async fn judge_connections(&self, request: &JudgeRequest) -> Result<JudgeOutput, PlanError>;
 }
 
@@ -134,6 +139,8 @@ struct Asking {
 pub(super) struct SessionRuntime {
     /// How long a question waits for the user.
     pub(super) question_timeout: Duration,
+    /// How long one paid session call may run ([`SESSION_CALL_TIMEOUT`]).
+    pub(super) call_timeout: Duration,
     /// Where session notices go besides the trace and the report: the box's
     /// `RunEvent::SessionNotice`.
     pub(super) notice_sink: Option<SessionNoticeSink>,
@@ -149,10 +156,68 @@ pub(super) struct SessionRuntime {
 /// A callback that shows a session notice to the user.
 pub type SessionNoticeSink = Arc<dyn Fn(String) + Send + Sync>;
 
+/// How long one paid session call (an orchestrator-first answer, a
+/// connection judgment) may run before it counts as failed. Generous: one
+/// model call of a few hundred output tokens; a call that has not answered in
+/// this time is stuck, and the worker asking waits on it.
+pub const SESSION_CALL_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Aborts the call task when its supervisor is dropped: a run shutdown
+/// aborts the supervisor, and the call must not outlive it.
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Run one paid session call off the loop, supervised: `call` runs in its own
+/// task under `limit`; a panic or the limit becomes a failed result, and
+/// `wrap` of the result always reaches the loop. The error is a transport
+/// failure, since the request may have reached the provider: its hold is
+/// settled whole.
+pub(super) fn spawn_session_call<T, F>(
+    tx: mpsc::Sender<LoopMsg>,
+    limit: Duration,
+    what: &'static str,
+    call: F,
+    wrap: impl FnOnce(Result<T, PlanError>) -> SessionWork + Send + 'static,
+) -> tokio::task::JoinHandle<()>
+where
+    T: Send + 'static,
+    F: std::future::Future<Output = Result<T, PlanError>> + Send + 'static,
+{
+    let inner = tokio::spawn(tokio::time::timeout(limit, call));
+    tokio::spawn(async move {
+        let _abort = AbortOnDrop(inner.abort_handle());
+        let failed = |reason: String| {
+            PlanError::Provider(kgraf_provider::ProviderError::Transport {
+                adapter: "kgraf-orchestrator",
+                reason,
+            })
+        };
+        let result = match inner.await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_elapsed)) => Err(failed(format!(
+                "the {what} call did not finish within {limit:?}"
+            ))),
+            Err(e) if e.is_panic() => Err(failed(format!("the {what} call panicked: {e}"))),
+            Err(e) => Err(failed(format!("the {what} call ended abnormally: {e}"))),
+        };
+        let _ = tx.send(LoopMsg::Session(Box::new(wrap(result)))).await;
+    })
+}
+
 impl SessionRuntime {
-    pub(super) fn new(question_timeout: Duration, notice_sink: Option<SessionNoticeSink>) -> Self {
+    pub(super) fn new(
+        question_timeout: Duration,
+        notice_sink: Option<SessionNoticeSink>,
+        call_timeout: Duration,
+    ) -> Self {
         Self {
             question_timeout,
+            call_timeout,
             notice_sink,
             asking: BTreeMap::new(),
             next_id: 0,
@@ -302,7 +367,7 @@ impl RunLoop {
             .or_else(|| self.child_contract(id))
     }
 
-    /// Whether `id` takes direct notes (decision 0067, request 17 addendum):
+    /// Whether `id` takes direct notes (decision 0073):
     /// a session row with `addressable: false` (a merge-conflict resolver)
     /// does not. An absent row reads as addressable, the field's default.
     fn is_addressable(&self, id: &AgentId) -> bool {
@@ -512,8 +577,7 @@ impl RunLoop {
 
     // ------------------------------------------------------------- questions
 
-    /// A worker's `ask_user_question` (decision 0067, point 4; owner answer
-    /// Q1): tried against the run record first, with one reserved, ledgered
+    /// A worker's `ask_user_question` (decision 0067, point 4): tried against the run record first, with one reserved, ledgered
     /// call issued off the loop; the user is asked only when that cannot
     /// answer it. The reply is sent later, from [`Self::on_session_work`] or
     /// the user's answer, never by blocking this loop.
@@ -575,35 +639,18 @@ impl RunLoop {
                 .map(|n| estimate_tokens(n))
                 .sum::<u64>()
             + 200;
-        let reservation = match self.reserve_call(&answerer.cost_basis(), input) {
-            Ok(r) => r,
-            Err(e) => {
-                self.session_notice(
-                    &contract,
-                    session.as_str(),
-                    format!(
-                        "{session}'s question skipped the orchestrator: its answer call was not \
-                         reserved ({e}), so it went to the user"
-                    ),
-                );
-                self.ask_the_user(session, question, reply);
-                return self.save();
-            }
-        };
+        let reservation = self.reserve_call(&answerer.cost_basis(), input);
         // The reservation's counters reach the record now, not at the next
         // unrelated save.
         self.save()?;
         let id = self.sessions_rt.next_id();
-        let tx = self.tx.clone();
-        let task = tokio::spawn(async move {
-            let result = answerer.try_answer(&request).await;
-            let _ = tx
-                .send(LoopMsg::Session(Box::new(SessionWork::Answered {
-                    id,
-                    result,
-                })))
-                .await;
-        });
+        let task = spawn_session_call(
+            self.tx.clone(),
+            self.sessions_rt.call_timeout,
+            "answer",
+            async move { answerer.try_answer(&request).await },
+            move |result| SessionWork::Answered { id, result },
+        );
         self.sessions_rt.asking.insert(
             id,
             Asking {

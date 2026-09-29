@@ -596,19 +596,23 @@ impl MergeBack {
             // checkout there, and a declared write would match both
             // (decision 0083). Deleting one and adding the other is a rename
             // and passes.
-            let mut folded: std::collections::BTreeMap<String, Vec<String>> =
-                std::collections::BTreeMap::new();
-            for c in changes
-                .iter()
-                .filter(|c| !c.new_mode.bytes().all(|b| b == b'0'))
-            {
-                folded
-                    .entry(kgraf_core::paths::fold_path(Path::new(&c.path)))
-                    .or_default()
-                    .push(c.path.clone());
-            }
-            for paths in folded.into_values().filter(|p| p.len() > 1) {
-                reasons.push(RefusalReason::PathCollision { paths });
+            //
+            // Compared against the whole base tree, not only among the changed
+            // paths: a new `foo.rs` beside an existing `Foo.rs` overwrites it
+            // in a checkout on those volumes although only one of the two is
+            // in the change list. A collision the base already had is not
+            // this attempt's doing, and a rename that removes the twin leaves
+            // none behind.
+            if !changes.is_empty() {
+                let staged = self.git.ok_bytes(&wt, &[], ["ls-files", "-z"], None)?;
+                let staged: Vec<String> = staged
+                    .split(|b| *b == 0)
+                    .filter(|p| !p.is_empty())
+                    .map(|p| String::from_utf8_lossy(p).into_owned())
+                    .collect();
+                for paths in new_collisions(&self.tree_paths(&base)?, &staged) {
+                    reasons.push(RefusalReason::PathCollision { paths });
+                }
             }
             let mut outside = Vec::new();
             for change in changes {
@@ -839,9 +843,9 @@ impl MergeBack {
     /// 1. untracked `.gitignore` files that were not there at the snapshot are
     ///    removed first, so none can hide what the command wrote;
     /// 2. untracked, unignored paths are removed (a directory git will not
-    ///    enter, such as a nested repository, whole: L3);
+    ///    enter, such as a nested repository, whole);
     /// 3. snapshot files changed or deleted are listed after those removals (a
-    ///    case-only rename on a case-insensitive volume shows up only then: L2)
+    ///    case-only rename on a case-insensitive volume shows up only then)
     ///    and restored from the snapshot: the index is set to the snapshot's
     ///    tree with `read-tree -m`, which keeps the cached stat data of entries
     ///    that match (P1), then `checkout-index` writes the listed files.

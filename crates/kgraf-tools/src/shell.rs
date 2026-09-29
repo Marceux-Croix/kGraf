@@ -923,7 +923,15 @@ impl Tool for ShellTool {
         // `None`), so its path below is exactly what it was before this
         // seam existed.
         if let Some(executor) = &self.external {
-            return run_external(&cmd, ctx, executor.as_ref(), self.timeout, self.output_cap).await;
+            let output =
+                run_external(&cmd, ctx, executor.as_ref(), self.timeout, self.output_cap).await?;
+            // Same scrub as the local path: a container's build log can hold
+            // a credential just as a local one can.
+            return Ok(if verdict.build {
+                scrub_build_output(output)
+            } else {
+                output
+            });
         }
         let (mut policy, env) =
             sandbox_policy(ctx, self.workspace.as_ref(), self.checkout.as_deref())?;
@@ -1034,7 +1042,7 @@ fn confine_on_disk(cmd: &[String], ctx: &ToolContext) -> Result<(), ToolError> {
         if rel.as_os_str().is_empty() || rel == std::path::Path::new(".") {
             continue;
         }
-        crate::fs_safety::refuses_git_or_kgraf("shell", rel)?;
+        crate::fs_safety::refuses_git_dir_or_kgraf("shell", rel)?;
         crate::fs_safety::metadata_if_exists("shell", &dir, rel)
             .map_err(|e| outside(cmd, path, &e.to_string()))?;
     }
@@ -1060,7 +1068,7 @@ fn confine_manifest_on_disk(cmd: &[String], ctx: &ToolContext) -> Result<(), Too
     };
     crate::normalize_relative(rel).map_err(|e| escapes(e.to_string()))?;
     let dir = crate::fs_safety::open_workspace("shell", &ctx.workspace_root)?;
-    crate::fs_safety::refuses_git_or_kgraf("shell", rel)?;
+    crate::fs_safety::refuses_git_dir_or_kgraf("shell", rel)?;
     crate::fs_safety::metadata_if_exists("shell", &dir, rel).map_err(|e| escapes(e.to_string()))?;
     Ok(())
 }
@@ -1313,8 +1321,8 @@ async fn run_sandboxed(
         .take()
         .ok_or_else(|| internal("no stderr pipe"))?;
 
-    let (stdout_task, mut stdout_rx) = spawn_reader(stdout);
-    let (stderr_task, mut stderr_rx) = spawn_reader(stderr);
+    let (mut stdout_task, stdout_buf) = spawn_reader(stdout, output_cap);
+    let (mut stderr_task, stderr_buf) = spawn_reader(stderr, output_cap);
 
     enum Ended {
         Cancelled,
@@ -1334,11 +1342,16 @@ async fn run_sandboxed(
             // A grace window lets normal, already-flushed output through
             // while still bounding the wait.
             let (stdout_bytes, stdout_trunc) =
-                drain_with_cap(&mut stdout_rx, output_cap, DRAIN_GRACE).await;
+                drain_with_cap(&mut stdout_task, &stdout_buf, DRAIN_GRACE).await;
             let (stderr_bytes, stderr_trunc) =
-                drain_with_cap(&mut stderr_rx, output_cap, DRAIN_GRACE).await;
-            stdout_task.abort();
-            stderr_task.abort();
+                drain_with_cap(&mut stderr_task, &stderr_buf, DRAIN_GRACE).await;
+            // A normal exit can leave background descendants in the group
+            // (`cmd &`). They would keep running and hold the worktree, so
+            // the verifier would see a tree that is not final. The group is
+            // killed once the output is drained. The leader is reaped, but
+            // its pgid stays valid while any member lives; the window
+            // before a pid could be reused is the drain grace.
+            kill_group(pgid);
             let status = status.map_err(|e| internal(format!("wait failed: {e}")))?;
             let mut output = render_output(
                 status.success(),
@@ -1358,13 +1371,7 @@ async fn run_sandboxed(
             Ok(output)
         }
         Ended::TimedOut | Ended::Cancelled => {
-            if let Some(pid) = pgid {
-                // SAFETY: `killpg` only sends a signal to the process group
-                // rooted at `pid`; it touches no memory this process owns.
-                unsafe {
-                    libc::killpg(pid as libc::pid_t, libc::SIGKILL);
-                }
-            }
+            kill_group(pgid);
             let _ = child.wait().await;
             if matches!(ended, Ended::Cancelled) {
                 stdout_task.abort();
@@ -1379,11 +1386,9 @@ async fn run_sandboxed(
             // descendant that left the group and still holds a pipe is bounded
             // by the same grace as an exited command's.
             let (stdout_bytes, stdout_trunc) =
-                drain_with_cap(&mut stdout_rx, output_cap, DRAIN_GRACE).await;
+                drain_with_cap(&mut stdout_task, &stdout_buf, DRAIN_GRACE).await;
             let (stderr_bytes, stderr_trunc) =
-                drain_with_cap(&mut stderr_rx, output_cap, DRAIN_GRACE).await;
-            stdout_task.abort();
-            stderr_task.abort();
+                drain_with_cap(&mut stderr_task, &stderr_buf, DRAIN_GRACE).await;
             let mut output = render_output(
                 false,
                 None,
@@ -1397,6 +1402,19 @@ async fn run_sandboxed(
                 text: UntrustedText::new(killed_marker(timeout)),
             };
             Ok(output)
+        }
+    }
+}
+
+/// Sends SIGKILL to the sandboxed child's process group (its pgid equals its
+/// pid, see `setsid` above).
+#[cfg(unix)]
+fn kill_group(pgid: Option<u32>) {
+    if let Some(pid) = pgid {
+        // SAFETY: `killpg` only sends a signal to the process group rooted at
+        // `pid`; it touches no memory this process owns.
+        unsafe {
+            libc::killpg(pid as libc::pid_t, libc::SIGKILL);
         }
     }
 }
@@ -1451,7 +1469,6 @@ fn with_dependency_hint(output: ToolOutput) -> ToolOutput {
 }
 
 /// The status line of a command killed at its timeout: `[killed after N s]`.
-#[cfg(unix)]
 fn killed_marker(timeout: Duration) -> String {
     format!(
         "exit status: [killed after {} s] (the shell timeout; output up to the kill follows)",
@@ -1507,14 +1524,25 @@ async fn run_external(
         result = executor.exec(cmd, timeout) => result,
     };
     let outcome = outcome.map_err(|e| internal(format!("external executor failed: {e}")))?;
-    if outcome.timed_out {
-        return Err(ToolError::Timeout {
-            tool: "shell".into(),
-            after_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
-        });
-    }
     let (stdout, stdout_trunc) = cap_bytes(outcome.stdout, output_cap);
     let (stderr, stderr_trunc) = cap_bytes(outcome.stderr, output_cap);
+    if outcome.timed_out {
+        // Same shape as a local timeout: the output up to the kill says where
+        // a long build got to, so it is kept under the killed marker.
+        let mut output = render_output(
+            false,
+            None,
+            stdout,
+            stdout_trunc,
+            stderr,
+            stderr_trunc,
+            output_cap,
+        );
+        output.parts[0] = OutputPart::Text {
+            text: UntrustedText::new(killed_marker(timeout)),
+        };
+        return Ok(output);
+    }
     let success = outcome.exit_code == Some(0);
     Ok(render_output(
         success,
@@ -1527,64 +1555,80 @@ async fn run_external(
     ))
 }
 
-/// Reads a pipe on its own task, forwarding raw chunks over an unbounded
-/// channel. Decoupling the read loop from the caller lets [`run_sandboxed`]
-/// stop *waiting* on a stream (drop or abort the receiver side) without
-/// needing the reader to ever see EOF, which a grandchild holding the write
-/// end open would otherwise prevent.
+/// What a reader task has kept of one pipe: at most `cap` bytes, and whether
+/// anything after them was dropped.
+#[cfg(unix)]
+#[derive(Default)]
+struct Captured {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+/// Shared view of a reader's buffer. A std mutex is right here: it is held
+/// only for a copy of one chunk, never across an await.
+#[cfg(unix)]
+type SharedCapture = std::sync::Arc<std::sync::Mutex<Captured>>;
+
+/// Reads a pipe on its own task and keeps at most `cap` bytes. It keeps
+/// reading and drops the rest, so a chatty child never blocks on a full pipe
+/// and memory stays bounded by `cap` however much the child prints. The task
+/// returns its buffer when it ends; the shared handle lets a caller that
+/// stops waiting (a grandchild holds the write end open, so EOF never comes)
+/// still read what arrived, after aborting the task.
 #[cfg(unix)]
 fn spawn_reader(
     mut reader: impl tokio::io::AsyncRead + Unpin + Send + 'static,
-) -> (
-    tokio::task::JoinHandle<()>,
-    tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
-) {
+    cap: usize,
+) -> (tokio::task::JoinHandle<Captured>, SharedCapture) {
     use tokio::io::AsyncReadExt;
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let shared: SharedCapture = SharedCapture::default();
+    let task_shared = shared.clone();
     let handle = tokio::spawn(async move {
         let mut chunk = [0u8; 8192];
         loop {
             match reader.read(&mut chunk).await {
-                Ok(0) => break,
+                Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    if tx.send(chunk[..n].to_vec()).is_err() {
-                        break;
+                    let mut kept = task_shared
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let room = cap.saturating_sub(kept.bytes.len());
+                    let take = room.min(n);
+                    kept.bytes.extend_from_slice(&chunk[..take]);
+                    if take < n {
+                        kept.truncated = true;
                     }
                 }
-                Err(_) => break,
             }
         }
+        std::mem::take(
+            &mut *task_shared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
     });
-    (handle, rx)
+    (handle, shared)
 }
 
-/// Collects chunks from a [`spawn_reader`] channel, capped at `cap` bytes,
-/// for at most `grace`. The channel closing (the reader hit EOF or was
-/// aborted) ends the collection early; `grace` elapsing without that (a
-/// grandchild still holds the pipe open) ends it anyway.
+/// Waits for a [`spawn_reader`] task for at most `grace`. EOF ends it early;
+/// `grace` elapsing (a grandchild still holds the pipe open) ends the wait
+/// anyway, and the task is aborted and its buffer read as it stands.
 #[cfg(unix)]
 async fn drain_with_cap(
-    rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
-    cap: usize,
+    handle: &mut tokio::task::JoinHandle<Captured>,
+    shared: &SharedCapture,
     grace: Duration,
 ) -> (Vec<u8>, bool) {
-    let mut buf = Vec::new();
-    let mut truncated = false;
-    let collect = async {
-        while let Some(chunk) = rx.recv().await {
-            if buf.len() < cap {
-                let take = (cap - buf.len()).min(chunk.len());
-                buf.extend_from_slice(&chunk[..take]);
-                if take < chunk.len() {
-                    truncated = true;
-                }
-            } else {
-                truncated = true;
-            }
+    match tokio::time::timeout(grace, &mut *handle).await {
+        Ok(Ok(done)) => (done.bytes, done.truncated),
+        _ => {
+            handle.abort();
+            let mut kept = shared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (std::mem::take(&mut kept.bytes), kept.truncated)
         }
-    };
-    let _ = tokio::time::timeout(grace, collect).await;
-    (buf, truncated)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1845,6 +1889,73 @@ mod tests {
             marker.exists(),
             "the backgrounded grandchild must have been killed before it could remove the marker"
         );
+    }
+
+    /// A background descendant of a command that exited normally must not
+    /// outlive the call: it would hold the worktree open after the tool
+    /// reported the command finished.
+    #[tokio::test]
+    async fn a_background_descendant_is_killed_after_a_normal_exit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("still-running");
+        std::fs::write(&marker, "").expect("seed marker");
+        let (tool, _hook) = ShellTool::new(policy());
+        let script = format!("(sleep 0.6 && rm -f {}) & echo done", marker.display());
+        let input = json!({"command": ["/bin/sh", "-c", script]});
+        let out = tool
+            .call(input, &ctx(dir.path().to_path_buf()), &CallPermit::new())
+            .await
+            .expect("call");
+        assert!(out.render().contains("done"));
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(
+            marker.exists(),
+            "the background descendant outlived the call and removed the marker"
+        );
+    }
+
+    /// The reader keeps at most the cap however much the child prints, keeps
+    /// draining so the writer never blocks, and reports the truncation. A
+    /// writer of 100x the cap into a small duplex pipe completes only if the
+    /// reader keeps reading after it is full.
+    #[tokio::test]
+    async fn a_reader_holds_at_most_the_cap_and_never_blocks_the_writer() {
+        use tokio::io::AsyncWriteExt;
+        let cap = 4096usize;
+        let (mut writer, reader) = tokio::io::duplex(1024);
+        let (mut task, shared) = spawn_reader(reader, cap);
+        let block = vec![b'x'; 8192];
+        let write = async {
+            for _ in 0..(cap * 100 / block.len()) {
+                writer.write_all(&block).await.expect("write");
+            }
+            drop(writer);
+        };
+        tokio::time::timeout(Duration::from_secs(10), write)
+            .await
+            .expect("the writer must never block on a full pipe");
+        let (bytes, truncated) = drain_with_cap(&mut task, &shared, Duration::from_secs(5)).await;
+        assert_eq!(bytes.len(), cap);
+        assert!(truncated);
+    }
+
+    /// The same bound end to end: a command printing about 100x the cap
+    /// returns the cap plus the marker, not the whole stream.
+    #[tokio::test]
+    async fn a_command_printing_a_hundred_times_the_cap_is_bounded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (tool, _hook) = ShellTool::new(policy());
+        let tool = tool.with_output_cap(4096);
+        let input = json!({"command": [
+            "/bin/sh", "-c", "head -c 409600 /dev/zero | tr '\\0' x"
+        ]});
+        let out = tool
+            .call(input, &ctx(dir.path().to_path_buf()), &CallPermit::new())
+            .await
+            .expect("call");
+        let rendered = out.render();
+        assert!(rendered.contains("[truncated: stdout exceeded 4096 bytes]"));
+        assert!(rendered.len() < 8192, "{} bytes rendered", rendered.len());
     }
 
     #[tokio::test]
@@ -3121,6 +3232,61 @@ fn main() {
                 .expect("ran")
                 .render();
             assert!(echoed.contains(FAKE_TOKEN), "control: {echoed}");
+        }
+
+        /// Canned executor for the routed-build tests.
+        struct CannedExecutor {
+            stdout: String,
+            timed_out: bool,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::external::ExternalExecutor for CannedExecutor {
+            async fn exec(
+                &self,
+                _cmd: &[String],
+                _timeout: Duration,
+            ) -> Result<crate::external::ExternalOutcome, String> {
+                Ok(crate::external::ExternalOutcome {
+                    stdout: self.stdout.clone().into_bytes(),
+                    stderr: Vec::new(),
+                    exit_code: if self.timed_out { None } else { Some(0) },
+                    timed_out: self.timed_out,
+                })
+            }
+
+            async fn sync_to_remote(&self) -> Result<(), String> {
+                Ok(())
+            }
+        }
+
+        /// A routed build's output is scrubbed like a local one, and a routed
+        /// timeout keeps its output under the killed marker, scrubbed too.
+        #[tokio::test]
+        async fn a_routed_build_is_scrubbed_and_keeps_output_on_timeout() {
+            let f = fixture(PLAIN_BUILD_RS);
+            for timed_out in [false, true] {
+                let executor = std::sync::Arc::new(CannedExecutor {
+                    stdout: format!("progress-so-far {FAKE_TOKEN}"),
+                    timed_out,
+                });
+                let (tool, _hook) = bound_tool(&f.ws);
+                let out = tool
+                    .with_external_executor(executor)
+                    .call(
+                        call_input(&["cargo", "build"]),
+                        &ctx(f.ws.root().to_path_buf()),
+                        &CallPermit::new(),
+                    )
+                    .await
+                    .expect("output, not an error");
+                let rendered = out.clone().render();
+                assert!(rendered.contains("progress-so-far"), "{rendered}");
+                assert!(!rendered.contains(FAKE_TOKEN), "{rendered}");
+                assert!(rendered.contains("[redacted:github-pat"), "{rendered}");
+                assert_eq!(rendered.contains("[killed after"), timed_out, "{rendered}");
+                assert_eq!(out.is_error, timed_out, "{rendered}");
+            }
         }
 
         /// Decision 0087: the host's answer about a missing dependency is

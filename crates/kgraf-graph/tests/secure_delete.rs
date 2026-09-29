@@ -46,3 +46,53 @@ fn a_cleared_run_record_leaves_the_wal_while_the_store_is_open() {
     }
     drop(store);
 }
+
+/// A reader holding an older snapshot blocks the checkpoint `clear_meta` tries.
+/// The call returns at once, and once the reader lets go a background pass
+/// truncates the WAL, so the cleared record does not wait for the last
+/// connection to close.
+#[test]
+fn a_cleared_record_leaves_the_wal_after_a_blocking_reader_lets_go() {
+    let dir = tempfile::tempdir().expect("dir");
+    let path = dir.path().join("graph.db");
+    let wal = dir.path().join("graph.db-wal");
+    let marker = "CLEARED_BEHIND_READER_5d08";
+    let holds = |file: &std::path::Path| {
+        std::fs::read(file)
+            .unwrap_or_default()
+            .windows(marker.len())
+            .any(|w| w == marker.as_bytes())
+    };
+    let store = GraphStore::open(&path, dir.path()).expect("open");
+    store.set_meta("seed", "x").expect("seed");
+    let reader =
+        rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("reader");
+    reader
+        .execute_batch("BEGIN; SELECT COUNT(*) FROM meta;")
+        .expect("pin a snapshot");
+
+    let record = format!("{}{marker}", "z".repeat(20_000));
+    store.set_meta("orchestrator/run/r1", &record).expect("set");
+    let started = std::time::Instant::now();
+    store.clear_meta("orchestrator/run/r1").expect("clear");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "clear_meta waited for the reader"
+    );
+    assert!(
+        holds(&wal),
+        "the reader should have kept the cleared record's frames in the WAL"
+    );
+
+    reader.execute_batch("COMMIT;").expect("release");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while holds(&wal) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        !holds(&wal) && !holds(&path),
+        "the background pass never removed the cleared record"
+    );
+    drop(store);
+}

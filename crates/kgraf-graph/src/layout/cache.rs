@@ -256,9 +256,12 @@ mod tests {
         let before = cached(&store);
 
         let nodes = store.nodes_in_file("a/chain.rs").expect("nodes");
-        let file_id = nodes[0].file_id.clone();
+        let file = store
+            .file("a/chain.rs")
+            .expect("file row")
+            .expect("indexed");
         store
-            .replace_file_nodes(&file_id, &nodes, &[], &[])
+            .replace_file_nodes(&file, &nodes, &[], &[])
             .expect("replace");
         let after = cached(&store);
         for node in &nodes {

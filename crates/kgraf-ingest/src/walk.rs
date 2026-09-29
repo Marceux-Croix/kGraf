@@ -65,7 +65,9 @@ pub fn walk_corpus_excluding(
     }
     for entry in builder.build() {
         let entry = entry.map_err(|source| IngestError::Walk {
-            path: root.to_path_buf(),
+            // The entry that failed, so one unreadable directory is named
+            // rather than reported as a problem with the whole root.
+            path: failing_path(&source).unwrap_or_else(|| root.to_path_buf()),
             source,
         })?;
         let is_file = entry
@@ -78,6 +80,19 @@ pub fn walk_corpus_excluding(
     }
     files.sort();
     Ok(files)
+}
+
+/// The path an `ignore` error names, looking through its wrappers.
+fn failing_path(error: &ignore::Error) -> Option<PathBuf> {
+    match error {
+        ignore::Error::WithPath { path, .. } => Some(path.clone()),
+        ignore::Error::WithLineNumber { err, .. } | ignore::Error::WithDepth { err, .. } => {
+            failing_path(err)
+        }
+        ignore::Error::Partial(errors) => errors.iter().find_map(failing_path),
+        ignore::Error::Loop { child, .. } => Some(child.clone()),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -110,5 +125,24 @@ mod tests {
         let missing = Path::new("/does/not/exist/kgraf-ingest-test");
         let err = walk_corpus(missing).expect_err("missing root must error");
         assert!(matches!(err, IngestError::RootUnreadable { .. }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_directory_is_named_in_the_error_not_the_root() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).expect("mkdir");
+        std::fs::write(locked.join("a.txt"), "a").expect("write");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        let unreadable = std::fs::read_dir(&locked).is_err();
+        let result = walk_corpus(dir.path());
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        if !unreadable {
+            return; // running as a user who ignores permissions
+        }
+        let error = result.expect_err("an unreadable directory must raise");
+        assert_eq!(error.path(), locked, "{error}");
     }
 }

@@ -30,9 +30,18 @@ const VENDORED: &[u8] =
 /// [`kgraf_core::litellm::LiteLlmCatalog::unmapped`], which never applies
 /// here since this bench only ever looks a model up by name).
 pub fn default_price_table() -> Result<PriceTable> {
+    default_price_table_for(&[])
+}
+
+/// [`default_price_table`], plus a bare-id price for each `(model, litellm
+/// provider)` pair the vendored table only keys under that provider's prefix
+/// (`kimi-k3` on the platform route, keyed `moonshot/kimi-k3`). Only the
+/// route's own provider is tried; see
+/// [`kgraf_core::litellm::LiteLlmCatalog::to_price_table_for_providers`].
+pub fn default_price_table_for(wanted: &[(&str, &str)]) -> Result<PriceTable> {
     let catalog = LiteLlmCatalog::load(VENDORED)
         .context("kGraf's vendored litellm price table does not parse")?;
-    Ok(catalog.to_price_table())
+    Ok(catalog.to_price_table_for_providers(wanted))
 }
 
 /// Read a JSON price table at `path` (the same shape `kgraf orchestrate
@@ -166,6 +175,19 @@ mod tests {
     fn an_empty_table_says_so() {
         let warning = unpriced_warning(&PriceTable::new(), "m").expect("unpriced");
         assert!(warning.contains("empty"), "{warning}");
+    }
+
+    #[test]
+    fn a_route_with_a_known_provider_prices_a_prefix_only_model() {
+        assert!(
+            default_price_table()
+                .expect("table")
+                .get("kimi-k3")
+                .is_none()
+        );
+        let table = default_price_table_for(&[("kimi-k3", "moonshot")]).expect("table");
+        assert!(table.get("kimi-k3").is_some());
+        assert!(table.get("gpt-4o").is_some());
     }
 
     #[test]
