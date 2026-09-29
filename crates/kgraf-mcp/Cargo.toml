@@ -48,7 +48,7 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls", "j
 # name `sse_stream::Sse` and `BoxStream`. Both crates are already in the tree through
 # `rmcp` (sse-stream MIT OR Apache-2.0, futures-util MIT OR Apache-2.0); listed here
 # only so this crate can name the types.
-sse-stream = "0.2"
+sse-stream = "0.3"
 futures-util = "0.3"
 # `Bytes` in `http_client.rs`'s SSE byte stream (MIT, already in the tree
 # through `reqwest`).
