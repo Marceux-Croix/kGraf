@@ -1,0 +1,24 @@
+[package]
+name = "kgraf-decide"
+version.workspace = true
+description = "Typed, calibrated decisions from a local System-One class model. CPU everywhere, accelerated where possible."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+kgraf-core.workspace = true
+kgraf-provider.workspace = true
+async-trait.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+wiremock.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true

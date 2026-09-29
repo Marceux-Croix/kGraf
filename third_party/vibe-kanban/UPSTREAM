@@ -1,0 +1,30 @@
+Repository: https://github.com/BloopAI/vibe-kanban
+Commit:     d5cbb5380fa0b32e98ef9b8d987f63decce4be3a (2026-09-19)
+Paths:      crates/worktree-manager/src/worktree_manager.rs
+            crates/git/src/cli.rs (worktree_add, worktree_remove, worktree_prune)
+License:    Apache-2.0. The LICENSE file at the repository root is copied here
+            as LICENSE; verified at the source 2026-09-26. The upstream
+            repository has no NOTICE file.
+Ported to:  crates/kgraf-sandbox/src/workspace.rs
+            crates/kgraf-sandbox/src/git.rs
+
+What was taken: the lifecycle recipe. Serialize create and cleanup per path;
+remove a stale registration and directory before create; retry `git worktree
+add` once after clearing stale metadata; verify that the path exists after git
+reports success; prune after cleanup; clean orphans only inside an app-owned
+base directory.
+
+What changed:
+- Every git operation shells out to the git CLI. Upstream validates worktrees
+  and creates branches through git2 (libgit2). The sandboxing evidence
+  (docs/decisions/evidence/2026-09-24-sandboxing-and-worktrees.md) rules that
+  out: git2 worktree validation reports success for a missing directory.
+- Worktrees are created locked with a kGraf-tagged reason. Orphan cleanup
+  keys on that reason plus owner-process liveness (evidence recipe). Upstream
+  does not lock.
+- Upstream logs cleanup failures at debug level and continues. Here a failure
+  that leaves state behind is returned (SR-008 fail loud). The "not
+  registered" case is checked against the porcelain listing, not assumed.
+- Upstream keeps a process-global mutex map. Here the per-path guard lives in
+  the `WorkspaceManager` value (no hidden globals).
+- The API is synchronous. Callers on an async runtime use spawn_blocking.

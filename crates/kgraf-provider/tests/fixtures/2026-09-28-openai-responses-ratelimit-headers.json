@@ -1,0 +1,21 @@
+{
+  "route": "openai-responses",
+  "base_url": "https://api.openai.com/v1",
+  "captured": "2026-09-28T01:16Z",
+  "method": "curl (raw headers) and kgraf-provider-openai's own live test (parsed)",
+  "note": "openai-organization, openai-project and x-request-id removed: they identify the account. Every other header is kept verbatim.",
+  "headers": {
+    "x-ratelimit-limit-requests": "500",
+    "x-ratelimit-limit-tokens": "200000",
+    "x-ratelimit-remaining-requests": "499",
+    "x-ratelimit-remaining-tokens": "200000",
+    "x-ratelimit-reset-requests": "120ms",
+    "x-ratelimit-reset-tokens": "0s"
+  },
+  "parsed_by_kgraf_provider_limits_parse_openai_style": {
+    "requests_limit": 500,
+    "tokens_limit": 200000,
+    "requests_remaining": 499,
+    "reset_ms": 120
+  }
+}

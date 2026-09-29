@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=kGraf
+Comment=Orchestrator superagent with a galaxy-style code knowledge graph
+Exec=kgraf-app %U
+Icon=kgraf
+Terminal=false
+Categories=Development;IDE;
+StartupWMClass=kgraf

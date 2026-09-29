@@ -1,0 +1,16 @@
+{
+  "kimi-k3": {
+    "uncached_input": 3000000,
+    "cache_read": 300000,
+    "cache_write": 3000000,
+    "output": 15000000,
+    "reasoning": 15000000
+  },
+  "gpt-6-luna": {
+    "uncached_input": 100000,
+    "cache_read": 10000,
+    "cache_write": 0,
+    "output": 500000,
+    "reasoning": 500000
+  }
+}

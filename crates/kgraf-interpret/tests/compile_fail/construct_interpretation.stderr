@@ -1,0 +1,9 @@
+error: cannot construct `Interpretation` with struct literal syntax due to private fields
+ --> tests/compile_fail/construct_interpretation.rs:3:13
+  |
+3 |     let _ = kgraf_interpret::Interpretation {
+  |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+4 |         plan_id: "plan-x".into(),
+  |         ------------------------ private field
+  |
+  = note: ...and other private fields that were not provided

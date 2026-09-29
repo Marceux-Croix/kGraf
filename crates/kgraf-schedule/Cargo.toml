@@ -1,0 +1,46 @@
+[package]
+name = "kgraf-schedule"
+version.workspace = true
+description = "Scheduled runs: recurrence and the atomic claim table."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+# `impl DiagCode for ScheduleError` (decision 0069). No cycle: kgraf-diag
+# depends on nothing in this workspace but kgraf-core.
+kgraf-diag.workspace = true
+# Decision 0052 section 3: a schedule is a property of a work node. `node_store`
+# reads and writes schedules and their run history in the graph's work tables, so
+# both binaries (`kgraf-cli`, `kgraf-shell`) share one implementation.
+kgraf-graph.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+rusqlite.workspace = true
+async-trait.workspace = true
+blake3.workspace = true
+# Recurrence parsing (decision 0055): reuse over novel code. MIT, 4.0.0,
+# verified on crates.io 2026-09-26. kGraf takes only the parser and next-occurrence
+# computation, never a scheduler runtime (decision 0055): the
+# atomic claim table below is kGraf's own, because no candidate claims atomically
+# in SQLite.
+croner = { version = "4.0.0", default-features = false, features = ["chrono"] }
+# `croner`'s chrono feature works against any `chrono::TimeZone`; `chrono-tz` supplies
+# the IANA database so a schedule's zone is a real zone, not an offset (a
+# missing or invalid zone is refused, never defaulted to local or UTC).
+# `serde` is needed so `ScheduleDefinition` (decision 0052: persisted "as a property
+# of a work node") can serialize its `DateTime<Utc>` fields; `node_store` writes it as
+# JSON into the graph's `work_schedules` table.
+chrono = { version = "0.4.45", default-features = false, features = ["std", "clock", "serde"] }
+chrono-tz = "0.10.4"
+
+[dev-dependencies]
+tempfile = "3.24"
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "claim_latency"
+harness = false

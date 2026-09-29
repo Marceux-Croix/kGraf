@@ -1,0 +1,27 @@
+Repository: https://github.com/Untrivial-ai/agent-orchestrator
+Commit:     73473d45f0c18f3a81f66f150868459e3098ca35 (2026-09-26)
+Paths:      backend/internal/domain/report.go,
+            backend/internal/service/report/service.go,
+            backend/internal/service/report/coordinator.go
+License:    Apache-2.0. The full text is copied here as LICENSE; verified at
+            the source 2026-09-26. No NOTICE file exists at this commit.
+Date verified: 2026-09-26
+
+Ported (Go to Rust) into crates/kgraf-orchestrator/src/reports.rs, with
+significant changes stated here (Apache-2.0 section 4b):
+- Constants: MaxReportTextCharacters (1000), ReportBatchFallback (1 hour),
+  ReportSettlementWindow (5 minutes), ReportInterruptWindow (3 minutes).
+- `Service.Create`: done reports become available after the settlement window;
+  needs-input and stuck at once; other (informational) reports at the one-hour
+  fallback.
+- `Coordinator.deliverProject`: a stuck report interrupts at most once per
+  worker per window; a batch whose only urgency is a stuck report inside the
+  window is deferred ("coalesced") until the window opens, unless it also
+  carries needs-input.
+
+Changed: kGraf adds a fifth kind, contract-inadequate (decisions 0009,
+0027), the only kind delivered to peers holding the contract as well as the
+orchestrator. Informational reports ride along with any earlier delivery; a
+done report does not. Upstream's durable outbox (claim tokens, delivery
+attempts, acknowledgment, idempotency keys) is not ported: the queue lives in
+the orchestrator loop, its only consumer.

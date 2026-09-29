@@ -1,0 +1,54 @@
+[package]
+name = "kgraf-runtime"
+version.workspace = true
+description = "Agent runtime: the native worker loop, context assembly and cancellation."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# Explicit versions for third-party entries; the main session hoists them later.
+[dependencies]
+kgraf-core = { path = "../kgraf-core" }
+kgraf-graph = { path = "../kgraf-graph" }
+kgraf-provider = { path = "../kgraf-provider" }
+kgraf-secrets = { path = "../kgraf-secrets" }
+kgraf-session = { path = "../kgraf-session" }
+kgraf-tools = { path = "../kgraf-tools" }
+async-trait = "0.1"
+blake3 = "1"
+# FuturesUnordered: a round's independent tool calls run concurrently inside the
+# worker's task, with no spawn per call.
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+# `macros` for select!: a bulk emit races its channel slot against cancellation.
+# `rt` for spawn: each worker is a task in the kGraf process.
+# `rt-multi-thread` for block_in_place (ledger writes off the executor), `time`
+# for the tool-cancel grace period.
+tokio = { version = "1.53", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
+tokio-util = "0.7.19"
+# Path names compared as APFS resolves them (NFC), for the forbidden-path and
+# write-scope checks; the version kgraf-sandbox already pins.
+unicode-normalization = "0.1.25"
+
+[dev-dependencies]
+# `net` and `io-util` for the silent HTTP server (tests/support/silent_http.rs).
+tokio = { version = "1.53", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
+criterion = "0.8.2"
+tempfile = "3"
+# The real adapters, for the wire-byte prefix test and the HTTP cancel benchmark.
+kgraf-provider-anthropic = { path = "../kgraf-provider-anthropic" }
+kgraf-provider-openai = { path = "../kgraf-provider-openai" }
+# The route catalog, for the live steering exchange (tests/live_steer.rs):
+# base URLs, wire and adapter settings come from the one catalog, not a copy.
+kgraf-fleet = { path = "../kgraf-fleet" }
+wiremock = "0.6"
+
+# Loop overhead per turn outside the model call, worker spawn and teardown, and
+# cancel-to-release latency mid-stream: the harness budgets.
+[[bench]]
+name = "worker_loop"
+harness = false

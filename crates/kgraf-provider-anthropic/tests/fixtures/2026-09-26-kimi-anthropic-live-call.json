@@ -1,0 +1,38 @@
+{
+  "adapter": "anthropic-messages",
+  "base_url": "https://api.moonshot.ai/anthropic/v1",
+  "protocol": "additive",
+  "request_id": "chatcmpl-6ab71feddba21fe72f8b0285",
+  "requested_model": "kimi-k3",
+  "returned_model": "kimi-k3",
+  "route": "kimi-anthropic",
+  "settlement": "counted",
+  "stop_reason": "EndTurn",
+  "text": "pong",
+  "usage": {
+    "cache_read": 0,
+    "cache_write": 0,
+    "raw": {
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "cached_tokens": 0,
+      "completion_tokens": 54,
+      "inference_geo": "not_available",
+      "input_tokens": 92,
+      "output_tokens": 54,
+      "output_tokens_details": {
+        "thinking_tokens": 37
+      },
+      "prompt_tokens": 92,
+      "service_tier": "standard",
+      "total_tokens": 146
+    },
+    "reasoning_output": 0,
+    "text_output": 54,
+    "uncached_input": 92
+  }
+}

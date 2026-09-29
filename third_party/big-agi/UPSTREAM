@@ -1,0 +1,17 @@
+Repository: https://github.com/enricoros/big-AGI
+Commit:     00715049819786dc66bb6961a5795dd538e79f29 (2026-09-25)
+Paths:      src/modules/beam/scatter/beam.scatter.ts
+License:    MIT. The full text is copied here as LICENSE; verified at the
+            source 2026-09-26.
+Date verified: 2026-09-26
+
+Ported (TypeScript to Rust) into crates/kgraf-orchestrator/src/verify.rs:
+the per-attempt (ray) lifecycle `empty | scattering | success | stopped |
+error`; one cancellation per attempt, so stopping one never touches another;
+`messageWasInterruptedAtStart`, an attempt stopped before any content is
+empty (no candidate), not failed; and the `playNice` throttle as
+`OrchestratorConfig::max_parallel_attempts`.
+
+Not taken: Beam's fusion (a model merging answers). The owner excluded it,
+and decision 0009 selects among attempts by verifier. Selection here is the
+passing candidate with the lowest spend, then the earliest.

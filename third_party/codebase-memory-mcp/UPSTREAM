@@ -1,0 +1,108 @@
+Repository: https://github.com/DeusData/codebase-memory-mcp
+Commit:     64c23fab6c3eba3de226355c0ca1ff750116edab (2026-09-25)
+License:    MIT, Copyright (c) 2025 DeusData (full text in LICENSE, copied verbatim)
+Verified:   2026-09-26, LICENSE read at the commit above
+
+Ported (logic translated to Rust, not copied verbatim):
+
+  src/ui/layout3d.c
+    - directory ring seeding (FNV-1a cluster hash, 500 to 750 radius band)
+    -> crates/kgraf-graph/src/layout.rs (cluster_center, cluster_key)
+    - Z_DEPTH_SPACING and the call-depth walk
+    -> crates/kgraf-graph/src/layout.rs (z_for, call_depths)
+    - stellar_color, size_for_label, degree size boost
+    -> crates/kgraf-graph/src/layout/stellar.rs
+
+  graph-ui/src/lib/density.ts
+    - edgeIntensityScale, bloomIntensityScale, nodeBoostScale, nodeGlowBoost
+    -> crates/kgraf-graph/src/layout/density.rs
+
+  graph-ui/src/components/EdgeLines.tsx, NodeCloud.tsx
+    - edge intensity by cluster and selection, node dimming and scale
+    -> crates/kgraf-graph/src/layout/density.rs
+
+Not ported:
+
+  src/ui/layout3d.c local_optimize (Barnes-Hut refinement with anchor spring),
+  neither globally nor confined to one cluster. Globally it moves every
+  existing node when one node is inserted, which breaks decision 0015; per
+  cluster it moves every node of the cluster on each insert. Its spread is
+  approximated instead by a disc whose radius grows with the cluster's
+  population bucket (kGraf's own, not upstream's). Reasoning and
+  measurements are in the module comment of
+  crates/kgraf-graph/src/layout.rs.
+
+Deviations from upstream behavior are listed in the same module comment.
+
+---
+
+repository: https://github.com/DeusData/codebase-memory-mcp
+commit: 64c23fab6c3eba3de226355c0ca1ff750116edab
+paths: graph-ui/src/lib/density.ts, graph-ui/src/components/NodeCloud.tsx, graph-ui/src/components/EdgeLines.tsx, src/ui/layout3d.c
+license: MIT
+date verified: 2026-09-26
+
+Ported (logic translated to Rust) into the galaxy renderer:
+
+  graph-ui/src/lib/density.ts
+    - edgeIntensityScale: used from crates/kgraf-graph/src/layout/density.rs
+      (the renderer's own copy was removed on 2026-09-26; the renderer now builds
+      its scene from the graph store, so it depends on kgraf-graph anyway)
+
+  graph-ui/src/components/NodeCloud.tsx, EdgeLines.tsx
+    - selection: one-hop highlight, node scale 0.5 / dimmed 0.2 with color 0.15,
+      edge intensity 0.5 both selected, 0.04 half selected, dropped otherwise
+      (constants from crates/kgraf-graph/src/layout/density.rs)
+    -> crates/kgraf-galaxy/src/selection.rs
+    - camera constants and fly-to-centroid (distance max of 3x spread or a floor,
+      lerp 0.08 per frame, pivot moved in step), via the evidence file
+    -> crates/kgraf-galaxy/src/camera.rs
+
+  src/ui/layout3d.c
+    - stellar_color table and label base sizes: used from
+      crates/kgraf-graph/src/layout/stellar.rs by the scene builder
+      (crates/kgraf-galaxy/src/project.rs) and the synthetic test scenes
+      (crates/kgraf-galaxy/src/demo.rs); no copy remains in the renderer.
+
+---
+
+repository: https://github.com/DeusData/codebase-memory-mcp
+commit: 64c23fab6c3eba3de226355c0ca1ff750116edab
+paths: src/mcp/mcp.c, graph-ui/src/components/GraphTab.tsx
+license: MIT
+date verified: 2026-09-26
+
+Ported (logic translated to Rust) into the Phase 6 search (decision 0032):
+
+  src/mcp/mcp.c (the search_graph BM25 query)
+    - exact-name tier (+30 spelled exactly, +20 case-insensitively), kind tiers
+      (Function and Method +10, type-like labels +5), File excluded from text
+      results; camelCase name splitting
+    -> crates/kgraf-shell/src/search.rs (kind_boost, text_score_code, words)
+    Not taken: BM25 over FTS5 (the graph store has no FTS table; a fixed match
+    tier stands in), and the Route tier (no Route nodes in kGraf's graph).
+
+  graph-ui/src/components/GraphTab.tsx (handleSelectPath)
+    - a result set becomes the highlighted ids, with no neighbors added, and the
+      camera targets the set's centroid
+    -> crates/kgraf-galaxy/src/selection.rs (Selection::of_set),
+       crates/kgraf-galaxy/src/galaxy.rs (Galaxy::select_set)
+
+---
+
+repository: https://github.com/DeusData/codebase-memory-mcp
+commit: 64c23fab6c3eba3de226355c0ca1ff750116edab
+paths: graph-ui/src/components/NodeLabels.tsx
+license: MIT
+date verified: 2026-09-26
+
+Ported (logic translated to Rust) into the Phase 6 labels:
+
+  graph-ui/src/components/NodeLabels.tsx
+    - at most 80 labels (maxLabels), by descending node size; with a highlight,
+      only highlighted nodes; fitText's binary-search ellipsis fit; a dark
+      outline under the fill
+    -> crates/kgraf-galaxy/src/labels.rs (choose, fit, draw)
+    Changed: egui text painted over the rendered frame instead of billboarded
+    canvas textures; work nodes and agents are labeled before code; the CPU
+    budget halves the cap.

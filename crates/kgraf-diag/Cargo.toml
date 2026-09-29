@@ -1,0 +1,79 @@
+[features]
+# Only this crate's own dev-dependency (below) and its diag-smoke test binary
+# ever build with this on: it exists solely to widen a race window inside
+# store::trim_locked for tests/cross_process.rs (a release build of kgraf or
+# kgraf-app declares no dependency on kgraf-diag with this feature, so
+# KGRAF_DIAG_TEST_WIDEN_TRIM_RACE_US in its environment does nothing --
+# the sleep is not merely inert at runtime, it does not exist in that binary
+# at all).
+test-support = []
+
+[package]
+name = "kgraf-diag"
+version.workspace = true
+description = "Local-only diagnostics: usage counts and errors in one capped file (decision 0069). Never sent anywhere."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+# The record format is one JSON object per line (JSONL): human-readable without
+# a decoder, trivially append-only, and every dependency here is already in the
+# workspace lockfile (no new one for a file this small). See src/store.rs for
+# the size and rotation trade-off write-up.
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+# Hashes a path outside the project root (src/scrub.rs) so it never carries the
+# user's account name; already a workspace dependency (kgraf-schedule, kgraf-graph).
+blake3.workspace = true
+# Resolves the same per-user data directory kgraf-shell's app_dirs.rs does
+# (src/paths.rs), so the CLI and the desktop shell share one diagnostics file.
+directories.workspace = true
+# Generates the per-install random key for the keyed path hash (src/key.rs):
+# a syscall-based RNG (getrandom(2)/arc4random/BCryptGenRandom), not a network
+# dependency. Already in this workspace's lockfile transitively.
+getrandom = "0.4"
+# The path matcher `scrub_text` uses (src/scrub.rs): quoted, JSON-escaped and
+# bare Unix/Windows paths, `file://` URLs, and paths after `=`, `[`, a tab or a
+# newline.
+regex.workspace = true
+# Reused for `kgraf-core::flock::HeldLock`, the same fork-safe advisory-lock
+# release every other crate in this workspace that locks a file uses
+# (src/store.rs's cross-process append/trim lock).
+kgraf-core.workspace = true
+# Non-path secrets (a credentialed URL, an API key, a registered exact
+# credential) in a scrubbed context string (decision 0071): scrub_text calls
+# kgraf_secrets::scrub_persist, the persist path
+# (this file is persisted to disk, not shown to a model), after its own path
+# scrubbing.
+kgraf-secrets.workspace = true
+
+[[bin]]
+name = "gen-errors-doc"
+path = "src/bin/gen_errors_doc.rs"
+
+# A tiny process the exit-flush and cross-process tests spawn for real
+# (`tests/exit_flush.rs`, `tests/cross_process.rs`): those bugs are only
+# observable across a real process boundary, not inside one test binary's
+# threads.
+[[bin]]
+name = "diag-smoke"
+path = "src/bin/diag_smoke.rs"
+
+[dev-dependencies]
+tempfile.workspace = true
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+# Self-referential, on purpose: `cargo test`/`cargo bench` unify features
+# across a package's own dev-dependencies, so this turns test-support on for
+# every target in this package (the lib, diag-smoke included) while it is
+# under test, without kgraf-diag ever depending on itself normally, and
+# without kgraf-cli, kgraf-shell or anything else that depends on kgraf-diag
+# in the ordinary way ever getting it (see the [features] comment above).
+kgraf-diag = { path = ".", features = ["test-support"] }
+
+[[bench]]
+name = "record_latency"
+harness = false

@@ -1,0 +1,48 @@
+repository: https://github.com/dagger/container-use
+commit: 2e43e625e95216b719ec9338f4034fd3a0be2734
+paths: environment/environment.go, environment/state.go, cmd/container-use/merge.go, repository/repository.go, repository/git.go
+license: Apache-2.0
+date verified: 2026-09-26
+
+The LICENSE file at the repository root (Apache License 2.0) is copied here as
+LICENSE, read at the commit above on 2026-09-26. The upstream repository has no
+NOTICE file. Go source, ported to Rust (no Go code is vendored).
+
+Ported to: crates/kgraf-sandbox/src/merge.rs
+
+What was taken:
+- The environment lifecycle (environment.go New/apply, state.go State;
+  repository.go create, propagate, Merge, Delete) as an explicit state machine:
+  Working, Committed, Empty, Merged, Conflicted, Discarded.
+- repository/git.go commitWorktreeChanges: check for changes, stage, commit
+  with `-c core.hooksPath=/dev/null` (the noHooks constant).
+- cmd/container-use/merge.go and Repository.Merge: `merge --no-ff -m "Merge
+  environment <id>"` into the target branch, then delete the environment
+  (`--delete`).
+
+What changed:
+- The merge is computed with `git merge-tree --write-tree` and published by
+  compare-and-swap `update-ref`, not `git merge --autostash` in the user's
+  checkout. No working tree is touched; a conflict is returned as a typed
+  value with every stage's blob, never left as markers in a tree.
+- Staging is `add -A`. Upstream silently skips binary files and a fixed list
+  of directories, which is silent data loss (SR-008). Instead, an attempt
+  whose content git would drop or mangle is refused as a typed outcome:
+  FIFOs and other non-regular files, oversized files, nested repositories,
+  and paths that steer git (.gitattributes, .gitmodules, .git* directories).
+  Every git child process has a timeout.
+- Every git call passes an explicit `--git-dir` taken from the gitlink
+  recorded at worktree creation, strips inherited GIT_* variables, sets
+  GIT_CONFIG_NOSYSTEM=1, `core.hooksPath=/dev/null` and `core.fsmonitor=`,
+  and verifies the worktree gitlink first. Upstream runs git with the
+  worktree as cwd.
+- Every git call reads attributes from one trusted tree fixed at open (the
+  integration tip's tree), via `--attr-source`, so no worker-written
+  `.gitattributes` can name a filter driver (run on the host while hashing)
+  or a merge driver such as `union`.
+- A clean merge that creates paths differing only by case or Unicode
+  normalization is returned as a conflict.
+- Parallel attempts at one task are never merged together: the verifier's
+  selection merges one and discards the others with their worktrees.
+- Dagger containers, services, notes and the container-use remote are not
+  taken: a kGraf worker writes a git worktree directly (Phase 8 sandbox).

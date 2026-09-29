@@ -1,0 +1,13 @@
+repository: https://github.com/modelcontextprotocol/rust-sdk
+commit: 9427a929959e665e0d12e9395f674026baf4bd48
+paths: crates/rmcp/src/transport/common/reqwest/streamable_http_client.rs, crates/rmcp/src/transport/common/client_side_sse.rs, crates/rmcp/src/transport/common/http_header.rs
+license: Apache-2.0 (contributions not yet relicensed remain MIT; see LICENSE)
+date verified: 2026-09-26
+note: adapted, not copied verbatim, into crates/kgraf-mcp/src/http_client.rs (the rmcp 3.4.1 crates.io release, whose .cargo_vcs_info.json names this commit). Changes: every response body is read with a byte cap, GET streams are rate limited, the server/discover legacy path is dropped because kGraf only sends initialize. No upstream NOTICE file exists at this commit.
+
+repository: https://github.com/modelcontextprotocol/rust-sdk
+commit: 9427a929959e665e0d12e9395f674026baf4bd48
+paths: crates/rmcp/src/transport/auth.rs
+license: Apache-2.0 (contributions not yet relicensed remain MIT; see LICENSE)
+date verified: 2026-09-26
+note: ReqwestOAuthHttpClient and default_oauth_http_client adapted into crates/kgraf-mcp/src/oauth_http.rs. Changes: both inner clients ignore proxy environment variables and use only the configured proxy; the redirect-following client follows same-origin redirects only, at most 3 hops.

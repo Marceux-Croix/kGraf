@@ -1,0 +1,65 @@
+name: Bug report
+description: Something does not work as described.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Do not paste API keys, tokens or private code here.
+        For a security problem, use the security policy instead of an issue.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you do, what did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. kgraf index
+        2. kgraf ...
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Output or error
+      description: Any error message, including its `KG-nnnn` code if it has one.
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: kGraf version
+      description: Output of `kgraf --version`, or the commit you built.
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - macOS (Apple silicon)
+        - macOS (Intel)
+        - Linux (x86_64)
+        - Linux (aarch64)
+        - Windows
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Where
+      options:
+        - Command line (kgraf)
+        - Desktop app (kgraf-app)
+        - Both
+    validations:
+      required: true
+  - type: input
+    id: provider
+    attributes:
+      label: Provider route, if any
+      placeholder: kimi:<model-id>

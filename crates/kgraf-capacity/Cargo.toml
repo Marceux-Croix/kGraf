@@ -1,0 +1,19 @@
+[package]
+name = "kgraf-capacity"
+version.workspace = true
+description = "The per-machine parallelism cap (decision 0067): route, memory, descriptor and disk bounds, measured and combined."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+sysinfo.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

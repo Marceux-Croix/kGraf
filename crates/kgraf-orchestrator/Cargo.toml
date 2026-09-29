@@ -1,0 +1,60 @@
+[package]
+name = "kgraf-orchestrator"
+version.workspace = true
+description = "Orchestrator: decomposition, contracts, delegation and the message port."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# Explicit versions for third-party entries; the main session hoists them later.
+[dependencies]
+kgraf-core = { path = "../kgraf-core" }
+kgraf-graph = { path = "../kgraf-graph" }
+# Local-only diagnostics (decision 0069): `try_dispatch`
+# records each admitted worker's route (provider:model), never sent anywhere;
+# `record` is a no-op unless a binary called `kgraf_diag::init`.
+kgraf-diag = { path = "../kgraf-diag" }
+# A run started from a corpus (`intake.rs`).
+kgraf-interpret = { path = "../kgraf-interpret" }
+kgraf-provider = { path = "../kgraf-provider" }
+kgraf-secrets = { path = "../kgraf-secrets" }
+kgraf-runtime = { path = "../kgraf-runtime" }
+# The pre-dispatch contract checks run their commands in the sandbox (0030, 0031).
+kgraf-sandbox = { path = "../kgraf-sandbox" }
+# The scheduled-run seam (`RunStarter`) this crate implements (0052).
+kgraf-schedule = { path = "../kgraf-schedule" }
+kgraf-session = { path = "../kgraf-session" }
+kgraf-tools = { path = "../kgraf-tools" }
+async-trait = "0.1"
+# Workflow template shape ids.
+blake3 = "1"
+# `RunStarter::start_run` takes a `chrono::DateTime<Utc>`; same pin as kgraf-schedule.
+chrono = { version = "0.4.45", default-features = false, features = ["std", "clock"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+# `rt` for spawn (each worker's completion forwarder is a task), `sync` for the
+# loop's channels, `time` for lease and reservation renewal ticks, `macros` for select!,
+# `process` and `io-util` for the contract checks' commands and their timeout.
+tokio = { version = "1.53", features = ["io-util", "macros", "process", "rt", "rt-multi-thread", "sync", "time"] }
+
+[target.'cfg(unix)'.dependencies]
+# Contract checks: kill a check's process group, and set its rlimits before exec.
+libc = "0.2.185"
+
+[dev-dependencies]
+# `flock::Forkers`: fork pressure for the lock-release tests.
+kgraf-core = { path = "../kgraf-core", features = ["test-support"] }
+# Tests corrupt a graph row directly to force an analytics failure.
+rusqlite = { workspace = true }
+tokio = { version = "1.53", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
+tempfile = "3"
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+
+# Instruction-to-first-dispatch latency and dispatch throughput with leases held:
+# the dispatch budgets.
+[[bench]]
+name = "dispatch"
+harness = false

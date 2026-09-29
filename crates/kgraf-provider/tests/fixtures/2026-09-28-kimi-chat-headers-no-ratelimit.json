@@ -1,0 +1,26 @@
+{
+  "route": "openai-chat-completions (Kimi/Moonshot)",
+  "base_url": "https://api.moonshot.ai/v1",
+  "captured": "2026-09-28T01:15Z",
+  "method": "curl (raw headers)",
+  "note": "msh-gid, msh-org-id, msh-project-id, msh-uid, msh-request-id, x-msh-trace-id and cf-ray removed: they identify the account or the request. Kimi's Chat Completions endpoint sends no x-ratelimit-* header of any kind; this fixture exists to record that absence, not a value.",
+  "headers_seen": [
+    "content-type",
+    "content-length",
+    "msh-context-cache-token-boosted-nvme",
+    "msh-trace-mode",
+    "msh-usage-cache-write-tokens-1h",
+    "msh-usage-cache-write-tokens-5m",
+    "vary",
+    "strict-transport-security",
+    "cf-cache-status",
+    "server"
+  ],
+  "openai_style_ratelimit_headers_present": false,
+  "parsed_by_kgraf_provider_limits_parse_openai_style": {
+    "requests_limit": null,
+    "tokens_limit": null,
+    "requests_remaining": null,
+    "reset_ms": null
+  }
+}

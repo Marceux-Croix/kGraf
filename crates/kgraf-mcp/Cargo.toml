@@ -1,0 +1,110 @@
+[package]
+name = "kgraf-mcp"
+version.workspace = true
+description = "MCP client: stdio and Streamable HTTP servers, qualified tool names."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# Explicit versions for third-party entries; versions are hoisted to the workspace later.
+[dependencies]
+kgraf-core = { path = "../kgraf-core" }
+kgraf-secrets = { path = "../kgraf-secrets" }
+kgraf-tools = { path = "../kgraf-tools" }
+# `LedgerAttributionSink`: every MCP exchange is written to the accounting
+# ledger as a chained `mcp` event (decision 0051, the accounting rule's sibling for egress).
+kgraf-provider = { path = "../kgraf-provider" }
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+# URL parsing and host classification for Streamable HTTP servers. A hand-rolled
+# parser would misjudge IPv6 literals and userinfo, which the loopback check needs.
+url = "2"
+# The official Rust MCP SDK (Apache-2.0, crates.io, verified 2026-09-26). Stdio and
+# Streamable HTTP client transports, plus its own `auth` module for OAuth on hosted
+# servers (RFC 8414 discovery, PKCE, dynamic client registration) -- see the module
+# docs on `client` and `oauth` for why codex-rs's `rmcp-client` was evaluated and not
+# vendored (decision 0055 / the reuse rule): it duplicates what this crate already provides
+# and is inseparable from a dozen codex-internal crates kGraf does not have.
+# `reqwest` (rustls) backs the Streamable HTTP transport and the OAuth HTTP calls;
+# default features are off so no server-side or macro code reaches this dependency.
+rmcp = { version = "3.4.1", default-features = false, features = [
+    "client",
+    "transport-child-process",
+    "transport-streamable-http-client-reqwest",
+    "reqwest",
+    "auth",
+] }
+# `rt-multi-thread` for `block_in_place`: the ledger sink's SQLite write runs off
+# the executor thread that recorded the event.
+tokio = { version = "1.53", features = ["process", "time", "rt-multi-thread"] }
+# Backs the Streamable HTTP transport and OAuth HTTP calls. `rustls-tls` matches
+# the `reqwest` feature we enable on `rmcp` above (rustls, no OpenSSL dependency).
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream"] }
+# `RedactingClient` implements `rmcp`'s `StreamableHttpClient`, whose signatures
+# name `sse_stream::Sse` and `BoxStream`. Both crates are already in the tree through
+# `rmcp` (sse-stream MIT OR Apache-2.0, futures-util MIT OR Apache-2.0); listed here
+# only so this crate can name the types.
+sse-stream = "0.2"
+futures-util = "0.3"
+# `Bytes` in `http_client.rs`'s SSE byte stream (MIT, already in the tree
+# through `reqwest`).
+bytes = "1"
+# `http::Response` for the OAuth HTTP client's replies (`oauth_http.rs`), the
+# type `rmcp`'s `OAuthHttpClient` returns. Already in the tree through `reqwest`
+# (MIT OR Apache-2.0).
+http = "1"
+# Decodes MCP `ImageContent`/`AudioContent`/blob `Resource` payloads before they are
+# re-summarized as a `BinarySummary`; the decoded bytes are hashed and discarded, never
+# forwarded to the model (MCP result-parsing rule, ported from LibreChat's parsers.ts).
+base64 = "0.23"
+# Hashes decoded binary payloads for `BinarySummary`, matching `kgraf-tools`'s use.
+blake3 = "1"
+# Structured attribution for every MCP call (worker, task, server, tool), emitted
+# as a tracing event alongside the ledger record `LedgerAttributionSink` writes.
+tracing = "0.1"
+# OS keychain storage for OAuth tokens (never plain files). Default ("v1") features
+# already select the native backend per platform (Keychain on macOS, Credential
+# Manager on Windows, Secret Service on Linux) with the classic `Entry` API.
+keyring = "4"
+# The per-user cache directory for the per-server keychain lock that keeps a
+# token refresh and the move from the former keychain service apart (decision
+# 0062). Same version as kgraf-shell's, already in Cargo.lock.
+directories = "6.0.0"
+# Already pulled in transitively by rmcp's `transport-child-process` feature (it
+# spawns stdio servers through this crate); depended on directly here too so this
+# crate can add its own wrapper -- a process-group leader on Unix, a Job Object on
+# Windows -- so killing a stdio server's `TokioChildProcess` (on drop or on
+# `RmcpCaller::close`) also reaps grandchildren an `npx`/`uvx` launcher spawned,
+# instead of orphaning them.
+process-wrap = { version = "10.0", features = ["tokio1"] }
+
+[dev-dependencies]
+# The keychain-lock test's lock directory.
+tempfile.workspace = true
+tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "sync", "time", "process"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+criterion = { version = "0.8.2", default-features = false }
+# `rmcp::transport::auth::OAuthTokenResponse` is a `TokenResponse` (oauth2 crate);
+# only the `oauth` module's test needs the trait in scope to call `.access_token()`.
+oauth2 = { version = "5.0", default-features = false }
+# Builds and locates `mcp-echo-server`, the real MCP server over stdio
+# `tests/stdio_live.rs` and the bench spawn (verified against a real server). It lives in its own crate,
+# `kgraf-mcp-test-server` (`publish = false`, `[package.metadata.dist] dist =
+# false`), so `dist` never packages it (release-blocker fix: a `[[bin]]` on this
+# crate itself made `dist plan` include an archive for it on every release target,
+# alongside the real product binary). `CARGO_BIN_EXE_<name>` only reaches a bin in
+# the *same* package being tested, not a workspace-sibling's dependency (confirmed
+# empirically this session: it stayed unset even with the sibling listed as a
+# dev-dependency), so `escargot` (MIT OR Apache-2.0) runs `cargo build` for that
+# crate's manifest directly and returns the resulting executable's path -- the
+# standard solution for exactly this "helper binary lives in another workspace
+# crate" test setup.
+escargot = "0.5"
+
+[[bench]]
+name = "stdio_round_trip"
+harness = false

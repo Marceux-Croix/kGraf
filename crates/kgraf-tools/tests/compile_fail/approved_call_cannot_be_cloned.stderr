@@ -1,0 +1,5 @@
+error[E0599]: no method named `clone` found for struct `ApprovedCall` in the current scope
+ --> tests/compile_fail/approved_call_cannot_be_cloned.rs:6:15
+  |
+6 |     (approved.clone(), approved)
+  |               ^^^^^ method not found in `ApprovedCall`

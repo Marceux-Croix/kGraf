@@ -1,0 +1,160 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/kgraf-core",
+    "crates/kgraf-graph",
+    "crates/kgraf-provider",
+    "crates/kgraf-provider-anthropic",
+    "crates/kgraf-provider-openai",
+    "crates/kgraf-fleet",
+    "crates/kgraf-decide",
+    "crates/kgraf-instructions",
+    "crates/kgraf-host",
+    "crates/kgraf-cli",
+    "crates/kgraf-runtime",
+    "crates/kgraf-tools",
+    "crates/kgraf-mcp",
+    # Dev-only: a real MCP server over stdio for kgraf-mcp's own tests and
+    # benches. `publish = false`, `dist = false`; added here only so it
+    # resolves as a workspace path dependency (release-blocker fix, see its own
+    # Cargo.toml and kgraf-mcp/Cargo.toml's dev-dependencies comment).
+    "crates/kgraf-mcp-test-server",
+    # Dev-only: a second real OS process against the shared rate limit store, for
+    # kgraf-provider's own multi-process and crash tests (decision 0072).
+    # `publish = false`, `dist = false`, same reasoning as
+    # kgraf-mcp-test-server above.
+    "crates/kgraf-crosslimit-hammer",
+    "crates/kgraf-session",
+    "crates/kgraf-orchestrator",
+    "crates/kgraf-schedule",
+    "crates/kgraf-shell",
+    "crates/kgraf-ingest",
+    "crates/kgraf-interpret",
+    "crates/kgraf-sandbox",
+    "crates/kgraf-galaxy",
+    "crates/kgraf-capacity",
+    "crates/kgraf-diag",
+    "crates/kgraf-secrets",
+    # A per-model brief-following bench (item 8 of the coordination-hardening
+    # set): feeds kgraf-core's ProfileStore with Source::Bench tallies, per
+    # decision 0075's seam.
+    "crates/kgraf-bench-briefs",
+    # Terminal-Bench bridge: the concrete ExternalExecutor that talks to a Python
+    # Harbor shim. Not part of the shipped app; `publish = false` in its own
+    # manifest.
+    "crates/kgraf-tbench-bridge",
+]
+
+[workspace.package]
+# Every crate inherits this (`version.workspace = true`); the git tags the
+# release scripts and packaging read against are `v<this>` (see
+# scripts/release-local.md's version-alignment rule). Bump here, and only
+# here, when cutting a release; the packaging scripts and `--version` follow
+# automatically (Cargo sets `CARGO_PKG_VERSION` from this at build time).
+version = "0.7.6"
+edition = "2024"
+rust-version = "1.95"
+license = "Apache-2.0"
+repository = "https://github.com/Marceux-Croix/kGraf"
+authors = ["Marco Cross"]
+
+[workspace.dependencies]
+kgraf-core = { path = "crates/kgraf-core" }
+kgraf-graph = { path = "crates/kgraf-graph" }
+kgraf-provider = { path = "crates/kgraf-provider" }
+kgraf-provider-anthropic = { path = "crates/kgraf-provider-anthropic" }
+kgraf-provider-openai = { path = "crates/kgraf-provider-openai" }
+kgraf-fleet = { path = "crates/kgraf-fleet" }
+kgraf-decide = { path = "crates/kgraf-decide" }
+kgraf-instructions = { path = "crates/kgraf-instructions" }
+kgraf-host = { path = "crates/kgraf-host" }
+kgraf-runtime = { path = "crates/kgraf-runtime" }
+kgraf-tools = { path = "crates/kgraf-tools" }
+kgraf-mcp = { path = "crates/kgraf-mcp" }
+kgraf-session = { path = "crates/kgraf-session" }
+kgraf-orchestrator = { path = "crates/kgraf-orchestrator" }
+kgraf-schedule = { path = "crates/kgraf-schedule" }
+kgraf-shell = { path = "crates/kgraf-shell" }
+kgraf-ingest = { path = "crates/kgraf-ingest" }
+kgraf-interpret = { path = "crates/kgraf-interpret" }
+kgraf-sandbox = { path = "crates/kgraf-sandbox" }
+kgraf-galaxy = { path = "crates/kgraf-galaxy" }
+kgraf-capacity = { path = "crates/kgraf-capacity" }
+kgraf-diag = { path = "crates/kgraf-diag" }
+kgraf-secrets = { path = "crates/kgraf-secrets" }
+kgraf-tbench-bridge = { path = "crates/kgraf-tbench-bridge" }
+
+# Where kgraf-diag and kgraf-shell's app_dirs.rs each resolve the per-user
+# data directory (decision 0069). Pinned to the same major kgraf-shell already
+# uses so both resolve the identical path on every platform.
+directories = "6.0.0"
+
+anyhow = "1"
+# Pattern rules ported from gitleaks (third_party/gitleaks/UPSTREAM); a RegexSet
+# compiled once gives kgraf-secrets a single linear pass per scrub (decision 0071).
+regex = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+blake3 = "1"
+rusqlite = { version = "0.40", features = ["bundled", "functions"] }
+tree-sitter = "0.27"
+tree-sitter-rust = "0.24"
+tree-sitter-python = "0.25"
+tree-sitter-typescript = "0.23"
+tree-sitter-javascript = "0.25"
+tree-sitter-md = "0.5"
+# The tags tier (evidence 2026-09-27-graft-review.md, idea 3): each grammar crate's own
+# TAGS_QUERY drives a generic chunker. All MIT, all from the tree-sitter organization,
+# checked 2026-09-27 with `cargo info` and each crate's Cargo.toml `license` field.
+tree-sitter-go = "0.25"
+tree-sitter-java = "0.23"
+tree-sitter-c = "0.24"
+tree-sitter-cpp = "0.23"
+tree-sitter-ruby = "0.23"
+tree-sitter-c-sharp = "0.23"
+tree-sitter-php = "0.24"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+futures-util = "0.3"
+# The ledger writer's acknowledgement: one oneshot that can be awaited by an
+# async caller or waited on by a blocking one (futures-rs, MIT OR Apache-2.0).
+futures-channel = "0.3"
+futures-executor = "0.3"
+async-trait = "0.1"
+clap = { version = "4", features = ["derive"] }
+walkdir = "2"
+# Maintained fork of the archived serde_yaml; SKILL.md frontmatter is YAML, and a
+# hand-rolled subset parser would misread the files it does not expect.
+serde_yaml_ng = "0.10"
+trybuild = "1"
+wiremock = "0.6"
+tempfile = "3"
+# Machine measurement for the per-machine parallelism cap (decision 0067).
+# MIT (license read directly from the crate's own Cargo.toml, 2026-09-27); the
+# only maintained cross-platform crate found for memory/disk/core counts
+# (also checked `heim`, unmaintained since 2021, and `psutil`, Linux-only).
+sysinfo = "0.39"
+# `getrlimit`/`setrlimit` for the file-descriptor bound (decision 0067): the
+# workspace already carries `libc` transitively (rusqlite's bundled build), but
+# no crate calls it directly before this; pinned to the version already
+# resolved in Cargo.lock so this does not move anything else's build.
+libc = "0.2"
+# In-app update check: compares the running version
+# against a GitHub Releases tag. MIT OR Apache-2.0 (checked on crates.io,
+# 2026-09-28, version 1.0.28); dtolnay's `semver` is also what Cargo itself
+# uses to parse the workspace's own `version.workspace = true`.
+semver = "1.0.28"
+# Streams the installer asset to disk while hashing it, so the update check
+# never buffers a whole `.dmg`/`.msi` in memory (decision, this crate's
+# `update_check.rs`). MIT OR Apache-2.0 (checked on crates.io, 2026-09-28,
+# version 0.11.0); the RustCrypto project's own reference implementation.
+sha2 = "0.11.0"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+# cargo-dist builds with this profile.
+[profile.dist]
+inherits = "release"

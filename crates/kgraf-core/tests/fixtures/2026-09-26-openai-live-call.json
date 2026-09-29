@@ -1,0 +1,31 @@
+{
+  "adapter": "openai-responses",
+  "base_url": "https://api.openai.com/v1",
+  "protocol": "inclusive",
+  "request_id": "resp_067de162b526f8ee016ab7224649e887d2a8481913abca3adf",
+  "requested_model": "gpt-6-luna",
+  "returned_model": "gpt-6-luna",
+  "route": "openai",
+  "settlement": "counted",
+  "stop_reason": "EndTurn",
+  "text": "pong",
+  "usage": {
+    "cache_read": 0,
+    "cache_write": 0,
+    "raw": {
+      "input_tokens": 13,
+      "input_tokens_details": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0
+      },
+      "output_tokens": 5,
+      "output_tokens_details": {
+        "reasoning_tokens": 0
+      },
+      "total_tokens": 18
+    },
+    "reasoning_output": 0,
+    "text_output": 5,
+    "uncached_input": 13
+  }
+}

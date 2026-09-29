@@ -1,0 +1,22 @@
+[package]
+name = "kgraf-core"
+version.workspace = true
+description = "Shared identifiers, errors and the token-accounting normal form for kGraf."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+blake3.workspace = true
+# `paths`: names compared as APFS and NTFS resolve them (NFC). Moved here from
+# kgraf-runtime so kgraf-sandbox's merge-back applies the same rule (0062).
+unicode-normalization = "0.1.25"
+
+[features]
+# `flock::Forkers`, a fork-pressure helper for other crates' lock-release tests.
+test-support = []

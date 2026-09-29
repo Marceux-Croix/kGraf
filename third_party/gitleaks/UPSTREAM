@@ -1,0 +1,108 @@
+Repository: https://github.com/gitleaks/gitleaks
+Commit:     b58d3f102cf3a2c84cb7f923d05c25c9b1aed84b (2026-09-27, HEAD of `master`
+            at fetch time)
+License:    MIT. The full text is copied here as LICENSE; verified at the
+            source 2026-09-27.
+
+Copied, unmodified, a curated subset of `config/gitleaks.toml`'s `[[rules]]`
+entries (43 of ~222):
+  config/gitleaks.toml (rule blocks only, verbatim: id, description, regex,
+  entropy, keywords)
+      -> third_party/gitleaks/config/gitleaks-rules-subset.toml
+
+Copied and MODIFIED (3 of the 43, each noted at its `PatternRule` in
+crates/kgraf-secrets/src/rules.rs): `Scrubber::new` builds all 43 rules plus
+`generic-url-credential` into one `regex::RegexSet` with `.unicode(false)`
+(ASCII-only classes and case-insensitivity), because combining them with
+Unicode case-folding tables on pushed the compiled program well past a sane
+size limit (a single `(?i)` rule already folds the whole Unicode case-mapping
+table; 44 of them sharing one `RegexSet` compounds that). Three rules used a
+construct that is fine under Unicode but, under ASCII-only mode, could match a
+lone byte of a multi-byte UTF-8 sequence, which Rust's `str`-based `Regex`
+refuses to compile at all (rather than accept and risk splitting a character):
+  - `private-key`: `[\s\S-]` (Go's spelling of "any character, dotall") ->
+    `(?su:.)`, scoping Unicode back on for just that one group.
+  - `slack-webhook-url`, `sidekiq-sensitive-url`: an unescaped literal `.` in
+    a hostname (`hooks.slack.com`, `gems.contribsys.com`,
+    `enterprise.contribsys.com`) -> `\.`. This also tightens the match to the
+    literal dot, which is what was plainly intended.
+  - `generic-api-key`'s line-target allowlist (see below), the JS/TS `import`
+    pattern: a bare `{`/`}` (a literal brace to Go's `regexp`) -> `\{`/`\}`
+    (Rust's `regex` refuses a `{` that is not a valid `{m,n}` repetition).
+None of these three changes admit or exclude any string the upstream pattern
+did not already intend to match, by inspection of the pattern text alone.
+
+**Correction (2026-09-27, independent security review):** an earlier version
+of this file additionally claimed "each keeps its own gitleaks positive/negative
+test pair passing." That was not checked against anything: gitleaks' own test
+fixtures (`*_test.go`, per rule) were never fetched or run here, so the claim
+was unverified when written and is removed. What is actually verified is
+narrower and stated precisely: `cargo test -p kgraf-secrets` (this crate's own
+true/false-positive pair per rule, in `crates/kgraf-secrets/src/lib.rs`) passes
+for all three rewritten rules, and the `\.` tightening in particular can only
+narrow a match (a literal `.` is a strict subset of "any character"), so it
+cannot introduce a new false positive relative to the unescaped original --
+but it was never compared against gitleaks' own corpus of examples, and no
+claim about that corpus should have been made.
+
+Ported into Rust at crates/kgraf-secrets/src/rules.rs: each selected rule's
+`id` becomes a `PatternRule::kind` (the transcript's typed marker,
+`[redacted:<kind>]`) and its `regex` becomes `PatternRule::pattern`, copied
+character for character. Go's `regexp` package and Rust's `regex` crate both
+implement RE2 (no backtracking, no backreferences, no lookaround), so gitleaks
+patterns compile unchanged; this was verified for the selected 43 by
+`cargo test -p kgraf-secrets` (every rule has a compiling pattern and a
+positive test case). `description` is not carried over (it plays no role in
+matching or redaction). `entropy` **is** carried over now (`PatternRule::entropy`,
+2026-09-27, security-review fix C1), but is only *enforced* for
+`generic-api-key`: a review found that porting `generic-api-key` without
+upstream's entropy floor (3.5 bits/byte) and its allowlist/stopword mechanism
+(see below) matched ordinary code across 50 of this repository's own 651
+tracked files (`stats.code_tokens = code_spent;`, SQL, UUIDs, commit SHAs
+after a word like `key`), because the rule's own structural regex is
+deliberately loose (any `key=`/`token=`-shaped assignment) and relies on
+upstream's entropy and allowlist gates to stay precise. The other 42 rules'
+`entropy` values are recorded (for fidelity and so extending the gate to
+another rule later is a one-line change, not new data) but not enforced: each
+has a fixed prefix and a fixed length, which the review's own false-positive
+list confirms is already precise without an entropy gate (every entry in that
+list was a `generic-api-key` match; see `crates/kgraf-secrets/src/lib.rs`'s
+`fp_regression` test, ported from that list).
+
+Why a curated subset, not the full rule set: SR "harness-path code is
+skeptic-reviewed and benchmarked against measured budgets" reads onto every
+rule the same as onto the crate that runs them, so every included rule carries
+its own true- and false-positive test (task requirement). The subset is the
+44th "reused" line: kGraf's own credential shapes (the AI providers in the
+fleet catalog: Anthropic, OpenAI, Cohere, Hugging Face, Perplexity), common
+cloud/VCS/package-registry credentials a tool's output could plausibly echo
+(AWS, GCP, Azure, DigitalOcean, GitHub, GitLab, npm, PyPI, RubyGems,
+HashiCorp Vault/Terraform, Twilio, SendGrid, Mailgun, Square, Shopify, New
+Relic, Grafana, PlanetScale, Slack, Discord, Stripe), and generic high-signal
+shapes (JWT, PEM private key, a `key=`/`token=`/`secret=`-shaped assignment,
+a Sidekiq Pro/Enterprise credentialed URL). Extending the table later is:
+add a `PatternRule` row to `rules.rs`, add its true/false test.
+
+Not taken: the other ~178 rules (mostly single-vendor SaaS tokens outside
+kGraf's own dependency surface), and gitleaks' `paths`-only rules (for example
+`pkcs12-file`, which matches a file extension, not text content, and does not
+apply to scrubbing a text transcript). Every other selected rule's
+`[[rules.allowlists]]` sub-table, where one exists, is dropped from the copied
+TOML: only `generic-api-key`'s is taken (see the entropy paragraph above and
+`crates/kgraf-secrets/src/generic_api_key_allowlist.rs`), copied to
+`third_party/gitleaks/config/generic-api-key-allowlist.toml`. Its `stopwords`
+list drops one entry: an ordinary English word that also names a
+video-sharing site, which tripped `kgraf-core`'s "shipped code does not name
+the mockup's brand" check for a string this crate never reads or uses. Also
+not taken from that allowlist: the path-restricted sub-table (BitBake `.bb`/
+`.bbappend`/`.bbclass`/`.inc` files), which depends on a scanned file's
+extension, a concept a transcript event has no equivalent of.
+
+
+
+One rule in `crates/kgraf-secrets/src/rules.rs`, `generic-url-credential`, is
+NOT from gitleaks: none of its default rules cover a bare
+`scheme://user:pass@host` URL in general, only specific ones (for example
+`sidekiq-sensitive-url`, which is carried over above), and kGraf's task
+explicitly calls out "credentials in URLs" as a case to cover. It is new code
+written for this crate, not a port.

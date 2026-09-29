@@ -1,0 +1,12 @@
+{"seq":0,"event":{"type":"context","prefix_digest":"abc123","slices":["n-parse"]}}
+{"seq":1,"event":{"type":"model_call","call":"c1"}}
+{"seq":2,"event":{"type":"text_delta","text":"I will read the file first"}}
+{"seq":3,"event":{"type":"usage","call":"c1","usage":{"uncached_input":120,"cache_read":0,"cache_write":0,"text_output":12,"reasoning_output":0,"raw":null}}}
+{"seq":4,"event":{"type":"stop","reason":"tool_use"}}
+{"seq":5,"event":{"type":"tool_call_started","call_id":"t1","tool":"read_file","input":{"path":"src/lib.rs"}}}
+{"seq":6,"event":{"type":"tool_call_finished","call_id":"t1","output":"pub fn parse() {}","is_error":false}}
+{"seq":7,"event":{"type":"notice","kind":"steps_left","text":"3 rounds left"}}
+{"seq":8,"event":{"type":"model_call","call":"c2"}}
+{"seq":9,"event":{"type":"text_delta","text":"The file already has a parse function."}}
+{"seq":10,"event":{"type":"usage","call":"c2","usage":{"uncached_input":150,"cache_read":0,"cache_write":0,"text_output":8,"reasoning_output":0,"raw":null}}}
+{"seq":11,"event":{"type":"stop","reason":"end_turn"}}

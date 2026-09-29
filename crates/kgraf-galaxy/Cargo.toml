@@ -1,0 +1,44 @@
+[package]
+name = "kgraf-galaxy"
+version.workspace = true
+description = "Galaxy renderer: instanced wgpu drawing of the graph, camera and selection."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+# The project graph: cached layout, stellar and density data functions, the change log
+# and the read-only snapshot queries the scene is built from. Taken rather than copied
+# (the renderer's own density copy was removed): the shell needs the graph to open a
+# project anyway, so a separate copy saved no dependency and risked drift.
+kgraf-graph.workspace = true
+# The semantic colors and stage literals (`kgraf_core::palette`), one source with the
+# shell (decision 0068). Also the benchmark's `legacy::env_var` (decision 0062).
+kgraf-core.workspace = true
+thiserror.workspace = true
+# Same majors as kgraf-shell (eframe 0.36 pins wgpu 30); a mismatch would put two
+# wgpu versions in the binary and the renderer could not share the shell's device.
+wgpu = "30.0.1"
+egui = "0.36.2"
+egui-wgpu = "0.36.2"
+# Vertex and uniform structs are uploaded as plain bytes.
+bytemuck = { version = "1.25.2", features = ["derive"] }
+# Camera and projection math. re_renderer uses glam too; glam's perspective_rh already
+# maps depth to wgpu's 0..1 range.
+glam = { version = "0.32.1", features = ["bytemuck"] }
+
+[dev-dependencies]
+pollster = "1.0.1"
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+# Temporary project trees indexed for real in the project tests and benchmark.
+tempfile = "3.27.0"
+
+[[bench]]
+name = "frame"
+harness = false
+
+[[bench]]
+name = "project"
+harness = false

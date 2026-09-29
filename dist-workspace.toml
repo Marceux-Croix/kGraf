@@ -1,0 +1,48 @@
+[workspace]
+members = ["cargo:."]
+
+# Config for 'dist'
+[dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.32.0"
+# CI backends to support
+ci = "github"
+# The installers to generate for each app
+installers = []
+# `dist` normally refuses to run (`dist plan`/`dist build`) if the generated CI
+# file differs from what `dist generate --mode=ci` would write. release.yml
+# carries hand patches (draft-only releases, -wip tag exclusion, per-job
+# permissions, pinned action SHAs; see the PATCH/DEVIATION comments in that
+# file) that `dist generate` does not know about, so CI is allow-dirtied here
+# instead of losing the patches on every regeneration. `dist generate
+# --mode=ci` refuses to run at all while this is set (confirmed this
+# session) -- that is the point: it protects the patches from being
+# silently clobbered. To regenerate a fresh baseline, comment this line out,
+# run generate, then reapply the patches by hand and restore this line.
+allow-dirty = ["ci"]
+# Target platforms to build apps for (Rust target-triple syntax). Only the four
+# platforms this project ships; cargo-dist 0.32 has no "universal2-apple-darwin"
+# magic target yet (see its own FIXME comment in config/v1/mod.rs), so the two
+# macOS slices ship separately from CI and the universal .app/.dmg is assembled
+# by the local lipo path in scripts/release-local.md instead.
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+# Where to host releases
+hosting = "github"
+# Cheapest of the three PrRunMode values (cargo-dist-schema: skip < plan <
+# upload). "skip" means this workflow does not run on pull requests at all;
+# set explicitly per coordinator review item 6, rather than relying on
+# `plan` (the crate's `#[default]`). ci.yml still runs fmt/clippy/test on
+# every PR; this only turns off the separate release-workflow's PR-time
+# `dist plan` preview job, which is pure overhead for a repo not yet cutting
+# releases from PR branches.
+pr-run-mode = "skip"
+# kgraf-cli is the only package with a [[bin]], so it is the only one dist
+# picks up automatically (`dist plan` confirmed this without touching any
+# crate's Cargo.toml, per the packages-to-own restriction on this task).
+#
+# The desktop shell joins later (decision 0054: native Rust, winit/egui/wgpu,
+# crates/kgraf-shell). Once that crate grows a `[[bin]]`, the same
+# auto-detection adds it to `releases[]` and the CI matrix with no change
+# needed here, unless it needs its own installer kind (dmg/msi bundling) or a
+# narrower target set (e.g. GPU-present-only) -- add a `[[package.dist]]`-style
+# override for it then, still without touching kgraf-cli's config.

@@ -1,0 +1,27 @@
+[package]
+name = "kgraf-crosslimit-hammer"
+version.workspace = true
+description = "A second real OS process against kgraf-provider's shared rate limit store, used only by kgraf-provider's crash and multi-process tests (decision 0072). Never published, never packaged by dist."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+# Not a product artifact: `cargo publish` must refuse this crate outright.
+publish = false
+
+# Same reasoning as `kgraf-mcp-test-server`'s: `dist` auto-detects any crate
+# with a `[[bin]]` as a release artifact. This key tells it to skip this one.
+[package.metadata.dist]
+dist = false
+
+[[bin]]
+name = "crosslimit-hammer"
+path = "src/main.rs"
+
+[dependencies]
+kgraf-provider.workspace = true
+# `hold` mode's raw transaction, deliberately bypassing `SharedLimiterStore`'s
+# API: the crash test needs a lock held under a connection this process
+# controls directly, not the store's own retry/rollback behavior.
+rusqlite.workspace = true

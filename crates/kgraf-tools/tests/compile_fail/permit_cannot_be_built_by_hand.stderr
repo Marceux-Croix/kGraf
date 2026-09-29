@@ -1,0 +1,5 @@
+error[E0451]: field `_private` of struct `CallPermit` is private
+ --> tests/compile_fail/permit_cannot_be_built_by_hand.rs:6:32
+  |
+6 |     let _permit = CallPermit { _private: () };
+  |                                ^^^^^^^^ private field

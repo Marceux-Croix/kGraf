@@ -1,0 +1,40 @@
+[package]
+name = "kgraf-bench-briefs"
+version.workspace = true
+description = "A per-model brief-following bench: fixed small briefs, mechanically checked, feeding kgraf-core's ProfileStore (decision 0075)."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+name = "kgraf_bench_briefs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kgraf-bench-briefs"
+path = "src/main.rs"
+
+[dependencies]
+async-trait.workspace = true
+kgraf-core.workspace = true
+kgraf-graph.workspace = true
+kgraf-host.workspace = true
+kgraf-fleet.workspace = true
+kgraf-provider.workspace = true
+kgraf-runtime.workspace = true
+kgraf-sandbox.workspace = true
+kgraf-session.workspace = true
+kgraf-tools.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+blake3.workspace = true
+clap.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tempfile.workspace = true
+# Closest price-catalog keys for an unpriced model. MIT; already in the
+# lockfile through clap.
+strsim = "0.11.1"

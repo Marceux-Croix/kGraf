@@ -1,0 +1,471 @@
+//! Rate-limit header capture (decision 0067).
+//!
+//! **Why this is not a field on [`crate::message::Response`].** The first draft interface put `pub limits: Option<ObservedLimits>` on
+//! `Response`. `Response` is constructed by literal in around twenty places
+//! across the workspace, several of them in `kgraf-runtime` (its own tests
+//! and benches) and other units' owned files, which this unit's own scope
+//! ("must not touch: ... `kgraf-runtime`") forbids editing, and which are
+//! not this unit's files to edit even where they are not forbidden outright.
+//! Adding a field there would have either broken every one of those call
+//! sites' compilation or forced a `Default` derive and struct-update-syntax
+//! rewrite of all of them, none of which belongs in this change. This module's
+//! [`record`]/[`get`] pair gives the three adapters
+//! a place to put what they parsed without touching
+//! `Response` at all: reported here as a deviation from the draft interface,
+//! not a silent substitution.
+//!
+//! **Keyed by base URL** (design: "keyed by base URL and credential
+//! variable"). An adapter knows its own configured `base_url` but not the
+//! user-facing route name a `RouteLimiter` is bound to (that mapping is
+//! `kgraf-host::config`'s, one layer up); keying by base URL is what every
+//! adapter can do unassisted, and two routes that share a base URL (a second
+//! project's host pointed at the same vendor) legitimately share the same
+//! vendor-reported limit anyway. The design's compound key, for the
+//! two-credentials-one-base-URL case, was never called by a caller through
+//! this module (dead code, removed); a future
+//! caller with that case adds a compound key builder back when one exists to
+//! call it.
+
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
+/// What a vendor's rate-limit response headers said, the moment of one call.
+/// Every field is `None` when that header was absent (never invented).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ObservedLimits {
+    pub requests_limit: Option<u32>,
+    pub tokens_limit: Option<u64>,
+    pub requests_remaining: Option<u32>,
+    /// Milliseconds until the window resets, from `now`. Vendors report this
+    /// as a duration (OpenAI: `1m30s`-style) or an absolute instant
+    /// (Anthropic: an RFC 3339 timestamp); both are normalized to "ms from
+    /// now" here so a caller never needs to know which vendor's format it was.
+    pub reset_ms: Option<i64>,
+}
+
+impl ObservedLimits {
+    fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+fn registry() -> &'static Mutex<HashMap<String, ObservedLimits>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<String, ObservedLimits>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Record what one call's headers said for `key` (a base URL). An all-`None`
+/// [`ObservedLimits`] (nothing this module recognized in the response) is not
+/// recorded, so `get` cannot be made to look like "no limit at all" by a
+/// vendor that sent headers this crate does not yet parse.
+pub fn record(key: &str, limits: ObservedLimits) {
+    if limits.is_empty() {
+        return;
+    }
+    registry()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(key.to_owned(), limits);
+}
+
+/// The most recently observed limits for `key`, if any call has reported one.
+pub fn get(key: &str) -> Option<ObservedLimits> {
+    registry()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(key)
+        .copied()
+}
+
+/// Clears every recorded observation. `test-support` only: production code
+/// never needs to forget what a vendor told it, and clearing between tests
+/// is the only reason this exists (the registry is process-wide, so tests in
+/// one binary would otherwise see each other's recordings).
+#[cfg(any(test, feature = "test-support"))]
+pub fn clear_for_test() {
+    registry().lock().unwrap_or_else(|p| p.into_inner()).clear();
+}
+
+/// When a 429 (rate limited) response was last seen for `key` (a base URL),
+/// in epoch milliseconds. Decision 0067
+/// 2026-09-28: the per-machine capacity's learned rate
+/// (`kgraf_capacity::LearnedRate`) halves a route's rate on a 429 and
+/// recovers it over time; this is the one fact an adapter can report at the
+/// moment a 429 arrives; the shell's re-measure thread (which owns the
+/// `LearnedRate` state itself, one per route, since that state is a
+/// decaying value over time and does not belong in a "what did the vendor
+/// last say" registry like [`ObservedLimits`]) polls this to decide when to
+/// call `on_429`. A separate, small registry from `record`/`get`: a 429 is a
+/// discrete event, not a header value the next call simply overwrites.
+fn registry_429() -> &'static Mutex<HashMap<String, i64>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Records a 429 for `key` at `at_ms`.
+pub fn record_429(key: &str, at_ms: i64) {
+    registry_429()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(key.to_owned(), at_ms);
+}
+
+/// [`record_429`] with the current wall clock: what every production call
+/// site uses; a test that needs a specific timestamp calls [`record_429`]
+/// directly.
+pub fn record_429_now(key: &str) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    record_429(key, now);
+}
+
+/// The last recorded 429 time for `key`, if any.
+pub fn last_429(key: &str) -> Option<i64> {
+    registry_429()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(key)
+        .copied()
+}
+
+/// Clears every recorded 429. `test-support` only, same reasoning as
+/// [`clear_for_test`].
+#[cfg(any(test, feature = "test-support"))]
+pub fn clear_429_for_test() {
+    registry_429()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clear();
+}
+
+/// A minimal header reader: a closure over whatever header map an adapter
+/// already has. A function, not a trait an adapter would `impl` for
+/// `reqwest::header::HeaderMap`, because that type and this module's own
+/// trait would both be foreign to the adapter crate (Rust's orphan rule
+/// forbids implementing a foreign trait for a foreign type); a closure has
+/// no such restriction and needs no dependency on `reqwest` or `http` here.
+pub type HeaderGet<'a> = dyn Fn(&str) -> Option<String> + 'a;
+
+fn get_u32(h: &HeaderGet, name: &str) -> Option<u32> {
+    h(name)?.trim().parse().ok()
+}
+
+fn get_u64(h: &HeaderGet, name: &str) -> Option<u64> {
+    h(name)?.trim().parse().ok()
+}
+
+/// OpenAI-style headers (also DeepSeek, Kimi/Moonshot's OpenAI-compatible
+/// route and every other Chat Completions or Responses vendor this
+/// workspace talks to): `x-ratelimit-limit-requests`,
+/// `x-ratelimit-remaining-requests`, `x-ratelimit-limit-tokens`,
+/// `x-ratelimit-reset-requests` (a duration like `1s`, `6m0s`, `250ms`).
+pub fn parse_openai_style(h: &HeaderGet) -> ObservedLimits {
+    ObservedLimits {
+        requests_limit: get_u32(h, "x-ratelimit-limit-requests"),
+        tokens_limit: get_u64(h, "x-ratelimit-limit-tokens"),
+        requests_remaining: get_u32(h, "x-ratelimit-remaining-requests"),
+        reset_ms: h("x-ratelimit-reset-requests")
+            .as_deref()
+            .and_then(parse_go_duration_ms),
+    }
+}
+
+/// Anthropic Messages headers: `anthropic-ratelimit-requests-limit`,
+/// `anthropic-ratelimit-requests-remaining`, `anthropic-ratelimit-tokens-limit`,
+/// `anthropic-ratelimit-requests-reset` (an RFC 3339 instant). Kimi's
+/// Anthropic-compatible endpoint (no native Anthropic key in
+/// this environment) is exercised through this same parser, since it speaks
+/// the same header names on the same wire shape.
+pub fn parse_anthropic_style(h: &HeaderGet) -> ObservedLimits {
+    ObservedLimits {
+        requests_limit: get_u32(h, "anthropic-ratelimit-requests-limit"),
+        tokens_limit: get_u64(h, "anthropic-ratelimit-tokens-limit"),
+        requests_remaining: get_u32(h, "anthropic-ratelimit-requests-remaining"),
+        reset_ms: h("anthropic-ratelimit-requests-reset")
+            .as_deref()
+            .and_then(|v| parse_rfc3339_ms_from_now("anthropic-ratelimit-requests-reset", v)),
+    }
+}
+
+/// Parses a Go-style duration string (`"1s"`, `"6m0s"`, `"250ms"`,
+/// `"1h2m3s"`) into milliseconds. Returns `None` for anything else, rather
+/// than guessing: an unrecognized reset format is better reported as absent
+/// than silently wrong (fail loud).
+fn parse_go_duration_ms(s: &str) -> Option<i64> {
+    let mut total_ms: i64 = 0;
+    let mut num = String::new();
+    let mut any_unit = false;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c.is_ascii_digit() || c == '.' {
+            num.push(c);
+            continue;
+        }
+        // Unit: `ms`, or a single letter (`s`, `m`, `h`).
+        let unit = if c == 'm' && chars.peek() == Some(&'s') {
+            chars.next();
+            "ms"
+        } else {
+            match c {
+                's' => "s",
+                'm' => "m",
+                'h' => "h",
+                _ => return None,
+            }
+        };
+        let value: f64 = num.parse().ok()?;
+        num.clear();
+        any_unit = true;
+        total_ms += match unit {
+            "ms" => value,
+            "s" => value * 1_000.0,
+            "m" => value * 60_000.0,
+            "h" => value * 3_600_000.0,
+            _ => return None,
+        } as i64;
+    }
+    if !num.is_empty() || !any_unit {
+        return None;
+    }
+    Some(total_ms)
+}
+
+/// Parses an RFC 3339 timestamp and returns the milliseconds from `now` until
+/// it.
+///
+/// The header is named as documented for Anthropic (`.../.../Z`), but RFC
+/// 3339 also allows a numeric zone offset (`+00:00`, `-05:00`) instead of
+/// `Z`, and nothing here guarantees every vendor speaking this header format
+/// always emits Zulu time. A previous hand-rolled parser required the
+/// trailing `Z` and returned `None` for anything else, which would have
+/// silently disabled backoff timing against a vendor or proxy that emitted a
+/// numeric offset instead, the header still contains a well-formed instant,
+/// just not the one substring this parser looked for. `chrono::DateTime`'s
+/// own RFC 3339 parser handles both forms correctly, and `chrono` is already
+/// resolved in this workspace at this version, so it replaces the hand-rolled
+/// date math rather than sitting beside it.
+///
+/// A timestamp in the past yields `Some` with a negative or zero value (the
+/// window already reset), never `None`: only a genuinely unparsable string is
+/// `None`, and that case is traced with the header name so a vendor changing
+/// its reset format is visible in a debug trace rather than only showing up
+/// as backoff quietly stopping.
+fn parse_rfc3339_ms_from_now(header: &str, s: &str) -> Option<i64> {
+    let parsed = match chrono::DateTime::parse_from_rfc3339(s.trim()) {
+        Ok(instant) => instant,
+        Err(error) => {
+            tracing::trace!(
+                header,
+                value = s,
+                %error,
+                "rate-limit reset header is not a parsable RFC 3339 instant"
+            );
+            return None;
+        }
+    };
+    let target_ms = parsed.timestamp_millis();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis() as i64;
+    Some(target_ms - now_ms)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn map(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    fn owned_map(pairs: Vec<(&'static str, String)>) -> impl Fn(&str) -> Option<String> {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| v.clone())
+        }
+    }
+
+    #[test]
+    fn openai_style_headers_parse_into_observed_limits() {
+        let h = map(&[
+            ("x-ratelimit-limit-requests", "500"),
+            ("x-ratelimit-remaining-requests", "499"),
+            ("x-ratelimit-limit-tokens", "200000"),
+            ("x-ratelimit-reset-requests", "6m0s"),
+        ]);
+        let limits = parse_openai_style(&h);
+        assert_eq!(limits.requests_limit, Some(500));
+        assert_eq!(limits.requests_remaining, Some(499));
+        assert_eq!(limits.tokens_limit, Some(200_000));
+        assert_eq!(limits.reset_ms, Some(360_000));
+    }
+
+    #[test]
+    fn go_duration_parses_mixed_units() {
+        assert_eq!(parse_go_duration_ms("250ms"), Some(250));
+        assert_eq!(parse_go_duration_ms("1s"), Some(1_000));
+        assert_eq!(parse_go_duration_ms("1m2s"), Some(62_000));
+        assert_eq!(parse_go_duration_ms("1h2m3s"), Some(3_723_000));
+        assert_eq!(parse_go_duration_ms("nonsense"), None);
+        assert_eq!(parse_go_duration_ms(""), None);
+    }
+
+    #[test]
+    fn anthropic_style_headers_parse_a_future_reset_as_positive_ms() {
+        let future = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_secs()
+            + 3600;
+        // A hand-formatted RFC 3339 instant an hour from now, at second
+        // resolution (sub-second is not needed for this test).
+        let stamp = format_unix_as_rfc3339(future);
+        let h = owned_map(vec![
+            ("anthropic-ratelimit-requests-limit", "50".to_string()),
+            ("anthropic-ratelimit-requests-remaining", "49".to_string()),
+            ("anthropic-ratelimit-tokens-limit", "40000".to_string()),
+            ("anthropic-ratelimit-requests-reset", stamp),
+        ]);
+        let limits = parse_anthropic_style(&h);
+        assert_eq!(limits.requests_limit, Some(50));
+        assert_eq!(limits.requests_remaining, Some(49));
+        assert_eq!(limits.tokens_limit, Some(40_000));
+        let ms = limits.reset_ms.expect("parsed");
+        // An hour from now, give or take a few seconds of test execution time.
+        assert!((3_500_000..3_700_000).contains(&ms), "{ms}");
+    }
+
+    #[test]
+    fn a_numeric_zone_offset_parses_the_same_instant_as_zulu() {
+        // RFC 3339 permits a numeric offset instead of `Z`. A vendor or proxy
+        // reusing this header format is not guaranteed to always emit Zulu
+        // time, and a parser that requires the literal `Z` suffix would treat
+        // an offset instant as unparsable, silently disabling backoff timing
+        // against it.
+        let future = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_secs()
+            + 3600;
+        let zulu = format_unix_as_rfc3339(future);
+        let as_offset = zulu.replace('Z', "+00:00");
+        let h = owned_map(vec![("anthropic-ratelimit-requests-reset", as_offset)]);
+        let limits = parse_anthropic_style(&h);
+        let ms = limits.reset_ms.expect("a numeric +00:00 offset must parse");
+        assert!((3_500_000..3_700_000).contains(&ms), "{ms}");
+
+        // A non-zero offset must be honored, not just accepted and then
+        // misread as Zulu: 05:00 in a +05:00 zone is midnight UTC.
+        let five_hours_offset = parse_rfc3339_ms_from_now(
+            "anthropic-ratelimit-requests-reset",
+            "1970-01-01T05:00:00+05:00",
+        )
+        .expect("offset instant parses");
+        let zulu_midnight =
+            parse_rfc3339_ms_from_now("anthropic-ratelimit-requests-reset", "1970-01-01T00:00:00Z")
+                .expect("zulu instant parses");
+        assert_eq!(five_hours_offset, zulu_midnight);
+    }
+
+    #[test]
+    fn an_unparsable_anthropic_reset_is_none_not_a_guess() {
+        let h = owned_map(vec![(
+            "anthropic-ratelimit-requests-reset",
+            "not-an-instant".to_string(),
+        )]);
+        assert_eq!(parse_anthropic_style(&h).reset_ms, None);
+    }
+
+    /// A tiny, test-only inverse of `parse_rfc3339_ms_from_now`'s date math,
+    /// kept hand-rolled (rather than switched to `chrono` alongside the
+    /// parser) so this test formats the stamp by a path independent of the
+    /// one under test.
+    fn format_unix_as_rfc3339(unix_secs: u64) -> String {
+        let days = unix_secs as i64 / 86_400;
+        let rem = unix_secs as i64 % 86_400;
+        let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+        let (y, mo, d) = civil_from_days(days);
+        format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+    }
+
+    fn civil_from_days(z: i64) -> (i64, i64, i64) {
+        let z = z + 719_468;
+        let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        (if m <= 2 { y + 1 } else { y }, m, d)
+    }
+
+    #[test]
+    fn an_unparsable_reset_is_none_not_a_guess() {
+        let h = map(&[("x-ratelimit-reset-requests", "soon")]);
+        assert_eq!(parse_openai_style(&h).reset_ms, None);
+    }
+
+    #[test]
+    fn all_absent_headers_give_an_all_none_result_and_is_not_recorded() {
+        let h = map(&[]);
+        let limits = parse_openai_style(&h);
+        assert_eq!(limits, ObservedLimits::default());
+        record("http://example.test", limits);
+        assert_eq!(get("http://example.test"), None);
+    }
+
+    #[test]
+    fn record_and_get_round_trip_by_key() {
+        clear_for_test();
+        let limits = ObservedLimits {
+            requests_limit: Some(10),
+            ..ObservedLimits::default()
+        };
+        record("http://a.test", limits);
+        assert_eq!(get("http://a.test"), Some(limits));
+        assert_eq!(get("http://b.test"), None);
+    }
+
+    #[test]
+    fn record_429_and_last_429_round_trip_by_key() {
+        clear_429_for_test();
+        assert_eq!(last_429("http://c.test"), None);
+        record_429("http://c.test", 12_345);
+        assert_eq!(last_429("http://c.test"), Some(12_345));
+        assert_eq!(
+            last_429("http://d.test"),
+            None,
+            "a different key is unaffected"
+        );
+        // A later 429 overwrites, since only the most recent matters.
+        record_429("http://c.test", 99_999);
+        assert_eq!(last_429("http://c.test"), Some(99_999));
+    }
+
+    #[test]
+    fn record_429_now_uses_the_real_wall_clock() {
+        clear_429_for_test();
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_millis() as i64;
+        record_429_now("http://e.test");
+        let recorded = last_429("http://e.test").expect("recorded");
+        assert!(
+            recorded >= before,
+            "{recorded} should be at or after {before}"
+        );
+    }
+}

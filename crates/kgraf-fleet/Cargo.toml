@@ -1,0 +1,21 @@
+[package]
+name = "kgraf-fleet"
+version.workspace = true
+description = "The vendor catalog: which providers exist, which protocol each speaks, and what each is verified to honor."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+kgraf-core.workspace = true
+kgraf-provider.workspace = true
+kgraf-provider-anthropic.workspace = true
+kgraf-provider-openai.workspace = true
+kgraf-secrets.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

@@ -1,0 +1,875 @@
+//! The file-edit tool: codex-rs `apply_patch`'s patch format, ported (0055,
+//! third_party/codex/UPSTREAM).
+//!
+//! **What was ported and what was not.** codex-rs's own patch application walks
+//! an `ExecutorFileSystem` trait object through a sandbox context and resolves
+//! paths as `PathUri`s, both built for codex's own executor process. kGraf
+//! already has a filesystem seam of its own: [`crate::Access`] for lexical
+//! escape checks before approval, and [`crate::fs_safety`] for symlink-resistant
+//! reads and writes at execution time. Vendoring codex's I/O layer on top would
+//! mean two path-safety mechanisms disagreeing about what "the workspace" means,
+//! so only the pure, filesystem-free parts were ported:
+//!
+//! - [`parser`] and [`streaming_parser`]: the `*** Begin Patch` grammar, turning
+//!   patch text into [`parser::Hunk`]s.
+//! - [`seek_sequence`] and [`replace`]: the fuzzy context-matching and
+//!   line-replacement logic that turns an [`parser::UpdateFileChunk`] plus a
+//!   file's current contents into its new contents.
+//!
+//! Applying a [`parser::Hunk`] to the filesystem, and declaring the paths it
+//! touches, is kGraf's own, built on the seams above.
+//!
+//! **Validate-then-commit.** A patch's hunks are
+//! all planned, parsed, path-checked, and (for an update) matched against the
+//! file's current content, before any hunk is written. A patch whose third
+//! hunk fails to match no longer leaves the first two hunks' writes on disk
+//! with no way to tell the caller only part of the patch applied.
+//!
+//! **Off the async executor.** Parsing and fuzzy-matching a large or
+//! adversarial patch is synchronous CPU work with no natural yield point; it
+//! runs in [`tokio::task::spawn_blocking`] rather than on the worker's async
+//! task, and the call returns as soon as the worker is cancelled rather than
+//! waiting for that blocking work to finish (it cannot be interrupted
+//! mid-computation, only raced: the call returns, the spawned work finishes on
+//! its own thread and its result is discarded).
+
+pub(crate) mod parser;
+mod replace;
+mod seek_sequence;
+mod streaming_parser;
+
+pub use parser::parse_patch;
+pub use parser::{Hunk, ParseError, UpdateFileChunk};
+
+use crate::fs_safety::{self, MAX_READ_BYTES};
+use crate::{Access, CallPermit, Tool, ToolContext, ToolDefinition, ToolError, ToolOutput};
+use cap_std::fs::Dir;
+use serde_json::{Value, json};
+use std::path::{Path, PathBuf};
+use tokio_util::sync::CancellationToken;
+
+/// The `apply_patch` tool. Stateless: every call is self-contained.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ApplyPatchTool;
+
+/// [`ApplyPatchTool::definition`]'s `description`, pulled out to a constant so
+/// [`tests::the_description_s_own_examples_parse`] can hold it to its word: the
+/// worked examples below must themselves be valid patches, or the tool would be
+/// teaching a model a format it then refuses.
+///
+/// **Root-cause fix (Haiku failures).** Before
+/// this, the description was one line -- "Edit, add, delete or move files with
+/// a `*** Begin Patch` document (codex apply_patch format)" -- and named no
+/// rule of the grammar at all, banking on every model already knowing OpenAI's
+/// Codex CLI patch dialect cold. `gpt-6-luna` (OpenAI's own lineage) and
+/// `kimi-k3` (evidently trained on the same widely-copied convention) do;
+/// `claude-haiku-4-5-20251001` measurably does not: without the grammar it
+/// writes a unified-diff-style `--- a/file`/`+++ b/file` patch, then a
+/// `*** Update File:` header with unprefixed body lines, each rejected by
+/// [`parser::parse_patch`]'s own error text one rule at a time, spending the
+/// whole step budget on trial and error with nothing committed. This is a
+/// tool-description gap, not a wire-protocol or worker-loop defect: every
+/// route sends the same `description` string verbatim, so teaching the grammar
+/// once here reaches every model through its own tool definitions rather than
+/// through a model-specific branch.
+// Built with `concat!` rather than a single `\`-continued literal: the worked
+// example below needs meaningful leading spaces (a context line's ` ` prefix)
+// on some lines, and Rust's `\`-newline continuation eats *all* leading
+// whitespace on the next line, indentation and meaning alike -- exactly the
+// off-by-invisible-whitespace bug this fix exists to stop a model from making.
+// One string literal per line, joined by explicit `"\n"`s, sidesteps it.
+const APPLY_PATCH_DESCRIPTION: &str = concat!(
+    "Edit, add, delete or move files with a `*** Begin Patch` / `*** End Patch` ",
+    "document. One or more hunks, each starting its own `*** Add File: <path>`, ",
+    "`*** Delete File: <path>` or `*** Update File: <path>` line (paths are ",
+    "relative to the workspace root); an Update hunk may add a `*** Move to: ",
+    "<new path>` line right after it to rename while editing. Exact rules, since ",
+    "getting this wrong burns your whole step budget on rejected patches:\n",
+    "- An Add File hunk's body lines are the new file's contents, each prefixed ",
+    "with a literal `+` (even a blank line: just `+`).\n",
+    "- An Update File hunk's body lines are prefixed with one of three characters: ",
+    "a literal space for an unchanged context line copied from the file, `-` for a ",
+    "line the file currently has that is being removed, or `+` for a new line ",
+    "being added. Every body line needs one of these three prefixes -- a bare line ",
+    "with no prefix is invalid, even if it matches the file exactly. Include a few ",
+    "unchanged context lines around each change so the matcher can place it.\n",
+    "- A Delete File hunk has no body lines: just the header.\n",
+    "- Never use unified-diff syntax (`--- a/file`, `+++ b/file`, `@@ -1,3 +1,3 @@` ",
+    "with line numbers, `/dev/null`); this is not that format.\n",
+    "\n",
+    "Worked example, updating one file and adding another in the same patch:\n",
+    "```\n",
+    "*** Begin Patch\n",
+    "*** Update File: src/lib.rs\n",
+    "@@ fn greet\n",
+    " pub fn greet(name: &str) -> String {\n",
+    "-    format!(\"hi {name}\")\n",
+    "+    format!(\"hello, {name}!\")\n",
+    " }\n",
+    "*** Add File: NOTES.md\n",
+    "+First line of the new file.\n",
+    "+Second line.\n",
+    "*** End Patch\n",
+    "```",
+);
+
+/// A patch longer than this is refused before it is even parsed (cap
+/// patch size). Generous for a real multi-file change; a patch this large is
+/// already an unusual model output worth refusing rather than absorbing.
+const MAX_PATCH_BYTES: usize = 2 * 1024 * 1024;
+/// A patch naming more hunks than this is refused: a circuit breaker against
+/// an adversarial patch built from many small hunks, each cheap to parse but
+/// expensive in aggregate to match.
+const MAX_HUNKS: usize = 2_000;
+
+fn patch_text(input: &Value) -> Result<&str, ToolError> {
+    let patch =
+        input
+            .get("patch")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidInput {
+                tool: "apply_patch".into(),
+                reason: "expected a string `patch` field".into(),
+            })?;
+    if patch.len() > MAX_PATCH_BYTES {
+        return Err(ToolError::InvalidInput {
+            tool: "apply_patch".into(),
+            reason: format!(
+                "patch is {} bytes, over the {MAX_PATCH_BYTES}-byte cap",
+                patch.len()
+            ),
+        });
+    }
+    Ok(patch)
+}
+
+fn parse(input: &Value) -> Result<Vec<Hunk>, ToolError> {
+    let hunks = parse_patch(patch_text(input)?).map_err(|e| ToolError::InvalidInput {
+        tool: "apply_patch".into(),
+        reason: e.to_string(),
+    })?;
+    if hunks.len() > MAX_HUNKS {
+        return Err(ToolError::InvalidInput {
+            tool: "apply_patch".into(),
+            reason: format!(
+                "patch names {} hunks, over the {MAX_HUNKS} cap",
+                hunks.len()
+            ),
+        });
+    }
+    Ok(hunks)
+}
+
+fn internal(reason: impl Into<String>) -> ToolError {
+    ToolError::Internal {
+        tool: "apply_patch".into(),
+        reason: reason.into(),
+    }
+}
+
+/// Lexically normalize a hunk's path, refusing an absolute path, a `..`
+/// escape, and a path that normalizes to the workspace
+/// root itself (`x/..`): `apply_patch` edits files, not "the workspace".
+fn normalize_hunk_path(path: &Path) -> Result<PathBuf, ToolError> {
+    let normalized = crate::normalize_relative(path).map_err(|source| ToolError::Access {
+        tool: "apply_patch".into(),
+        source,
+    })?;
+    if normalized.as_os_str().is_empty() {
+        return Err(ToolError::InvalidInput {
+            tool: "apply_patch".into(),
+            reason: format!(
+                "{} normalizes to the workspace root; apply_patch edits files, not the workspace itself",
+                path.display()
+            ),
+        });
+    }
+    Ok(normalized)
+}
+
+/// Every path a hunk writes, normalized: the hunk's own path, plus a move
+/// destination.
+fn written_paths(hunk: &Hunk) -> Result<Vec<PathBuf>, ToolError> {
+    match hunk {
+        Hunk::AddFile { path, .. } | Hunk::DeleteFile { path } => {
+            Ok(vec![normalize_hunk_path(path)?])
+        }
+        Hunk::UpdateFile {
+            path, move_path, ..
+        } => {
+            let path = normalize_hunk_path(path)?;
+            match move_path {
+                Some(dest) => Ok(vec![path, normalize_hunk_path(dest)?]),
+                None => Ok(vec![path]),
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for ApplyPatchTool {
+    fn name(&self) -> &str {
+        "apply_patch"
+    }
+
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "apply_patch".into(),
+            description: APPLY_PATCH_DESCRIPTION.into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "patch": {
+                        "type": "string",
+                        "description": "A patch beginning with '*** Begin Patch' and \
+                            ending with '*** End Patch'. Every Add File line and every \
+                            Update File body line must start with '+', '-' or a literal \
+                            space; see this tool's own description for the full grammar \
+                            and a worked example.",
+                    }
+                },
+                "required": ["patch"],
+                "additionalProperties": false,
+            }),
+        }
+    }
+
+    /// No argument-scoped permission pattern applies to `apply_patch`: its
+    /// subject would be the whole patch body, which is not a command line a
+    /// prefix rule could meaningfully name.
+    /// `access()`'s per-file declarations, above, are the real gate.
+    fn permission_subject(&self, _input: &Value) -> Option<String> {
+        None
+    }
+
+    /// Parses the patch's file headers (`kgraf-tools`
+    /// already refuses an escaping path here for every built-in tool) so the
+    /// runtime knows every file this call will touch before it is approved.
+    /// This is a *lexical* check only; the symlink-resistant check that
+    /// actually prevents an escape runs in [`fs_safety`] at [`Tool::call`]
+    /// time, since `access()` has no filesystem to resolve a symlink against.
+    fn access(&self, input: &Value) -> Result<Access, ToolError> {
+        let hunks = parse(input)?;
+        let mut access = Access::none();
+        for hunk in &hunks {
+            for path in written_paths(hunk)? {
+                access = access
+                    .write_path(&path)
+                    .map_err(|source| ToolError::Access {
+                        tool: "apply_patch".into(),
+                        source,
+                    })?;
+            }
+        }
+        Ok(access)
+    }
+
+    async fn call(
+        &self,
+        input: Value,
+        ctx: &ToolContext,
+        _permit: &CallPermit,
+    ) -> Result<ToolOutput, ToolError> {
+        if ctx.cancel.is_cancelled() {
+            return Err(ToolError::Cancelled {
+                tool: "apply_patch".into(),
+            });
+        }
+        let hunks = parse(&input)?;
+        if hunks.is_empty() {
+            return Ok(ToolOutput::error("the patch made no changes"));
+        }
+        let root = ctx.workspace_root.clone();
+        let cancel = ctx.cancel.clone();
+        let task = tokio::task::spawn_blocking(move || apply_all(&hunks, &root, &cancel));
+        tokio::select! {
+            _ = ctx.cancel.cancelled() => Err(ToolError::Cancelled { tool: "apply_patch".into() }),
+            result = task => result.map_err(|e| internal(format!("apply task failed: {e}")))?,
+        }
+    }
+}
+
+/// One hunk's effect, fully validated (paths checked, an update's context
+/// matched against the file's current content) but not yet written to disk.
+enum Planned {
+    Add {
+        path: PathBuf,
+        contents: String,
+    },
+    Delete {
+        path: PathBuf,
+    },
+    Write {
+        path: PathBuf,
+        contents: String,
+    },
+    Move {
+        from: PathBuf,
+        to: PathBuf,
+        contents: String,
+    },
+}
+
+/// Plan and then commit every hunk (nothing is written until every hunk
+/// has been validated). Runs on a blocking-pool thread; `cancel` is
+/// checked between hunks so a multi-hunk patch can still bail out promptly,
+/// even though the matching work inside one hunk cannot be interrupted.
+fn apply_all(
+    hunks: &[Hunk],
+    root: &Path,
+    cancel: &CancellationToken,
+) -> Result<ToolOutput, ToolError> {
+    let dir = fs_safety::open_workspace("apply_patch", root)?;
+
+    let mut planned = Vec::with_capacity(hunks.len());
+    for hunk in hunks {
+        if cancel.is_cancelled() {
+            return Err(ToolError::Cancelled {
+                tool: "apply_patch".into(),
+            });
+        }
+        planned.push(plan_one(hunk, &dir)?);
+    }
+
+    let mut added = Vec::new();
+    let mut modified = Vec::new();
+    let mut deleted = Vec::new();
+    for change in planned {
+        if cancel.is_cancelled() {
+            return Err(ToolError::Cancelled {
+                tool: "apply_patch".into(),
+            });
+        }
+        commit_one(change, &dir, &mut added, &mut modified, &mut deleted)?;
+    }
+    Ok(ToolOutput::text(summary(&added, &modified, &deleted)))
+}
+
+fn plan_one(hunk: &Hunk, dir: &Dir) -> Result<Planned, ToolError> {
+    match hunk {
+        Hunk::AddFile { path, contents } => {
+            let path = normalize_hunk_path(path)?;
+            // An add over an existing hard-linked file would be refused at
+            // commit, after earlier hunks had written; refuse it here.
+            fs_safety::refuse_if_hard_linked("apply_patch", dir, &path)?;
+            Ok(Planned::Add {
+                path,
+                contents: contents.clone(),
+            })
+        }
+        Hunk::DeleteFile { path } => {
+            let path = normalize_hunk_path(path)?;
+            // Validated here, not deferred to the commit pass: a delete
+            // of a missing file or a directory must fail before any other
+            // hunk in this patch has written anything.
+            match fs_safety::metadata_if_exists("apply_patch", dir, &path)? {
+                Some(meta) if meta.is_file() => {
+                    fs_safety::refuse_if_hard_linked("apply_patch", dir, &path)?;
+                }
+                Some(_) => {
+                    return Err(internal(format!(
+                        "{} is a directory; apply_patch deletes files only",
+                        path.display()
+                    )));
+                }
+                None => {
+                    return Err(internal(format!("{} does not exist", path.display())));
+                }
+            }
+            Ok(Planned::Delete { path })
+        }
+        Hunk::UpdateFile {
+            path,
+            move_path,
+            chunks,
+        } => {
+            let path = normalize_hunk_path(path)?;
+            let original =
+                fs_safety::read_capped_to_string("apply_patch", dir, &path, MAX_READ_BYTES, false)?;
+            let new_contents =
+                replace::derive_new_contents(&original, &path.display().to_string(), chunks)
+                    .map_err(internal)?;
+            match move_path {
+                Some(dest) => {
+                    let dest = normalize_hunk_path(dest)?;
+                    // A move overwrites `dest`; a hard-linked `dest` is refused
+                    // now, before any hunk writes (the source was checked by
+                    // the read above).
+                    fs_safety::refuse_if_hard_linked("apply_patch", dir, &dest)?;
+                    // The lexically identical case (`dest == path`) is caught above; the
+                    // same bug
+                    // is reached two other ways a string comparison cannot see:
+                    // a case-only alias on a case-insensitive filesystem
+                    // (`Readme.md` -> `README.md`) and a symlink alias
+                    // (`b.txt -> a.txt`). Both name one real file on disk, so
+                    // "write the new content to `dest`, then delete `path`"
+                    // would write it and then delete that same file out from
+                    // under itself. Comparing `(dev, ino)` after resolution
+                    // catches both: the destination's *current* on-disk
+                    // identity is what matters, checked before any write.
+                    let same_file = dest == path || paths_are_same_file(dir, &path, &dest)?;
+                    if same_file {
+                        Ok(Planned::Write {
+                            path,
+                            contents: new_contents,
+                        })
+                    } else {
+                        Ok(Planned::Move {
+                            from: path,
+                            to: dest,
+                            contents: new_contents,
+                        })
+                    }
+                }
+                None => Ok(Planned::Write {
+                    path,
+                    contents: new_contents,
+                }),
+            }
+        }
+    }
+}
+
+fn commit_one(
+    change: Planned,
+    dir: &Dir,
+    added: &mut Vec<String>,
+    modified: &mut Vec<String>,
+    deleted: &mut Vec<String>,
+) -> Result<(), ToolError> {
+    match change {
+        Planned::Add { path, contents } => {
+            fs_safety::write_confined("apply_patch", dir, &path, contents.as_bytes())?;
+            added.push(display(&path));
+        }
+        Planned::Delete { path } => {
+            fs_safety::remove_file_confined("apply_patch", dir, &path)?;
+            deleted.push(display(&path));
+        }
+        Planned::Write { path, contents } => {
+            fs_safety::write_confined("apply_patch", dir, &path, contents.as_bytes())?;
+            modified.push(display(&path));
+        }
+        Planned::Move { from, to, contents } => {
+            fs_safety::write_confined("apply_patch", dir, &to, contents.as_bytes())?;
+            fs_safety::remove_file_confined("apply_patch", dir, &from)?;
+            modified.push(display(&to));
+        }
+    }
+    Ok(())
+}
+
+/// Whether `a` and `dest` currently name the same file on disk: a
+/// case-only alias on a case-insensitive filesystem, or a symlink alias. `a`
+/// is expected to exist (its content was just read); `dest` may not.
+#[cfg(unix)]
+fn paths_are_same_file(dir: &Dir, a: &Path, dest: &Path) -> Result<bool, ToolError> {
+    let a_id = fs_safety::file_identity("apply_patch", dir, a)?;
+    let dest_id = fs_safety::file_identity("apply_patch", dir, dest)?;
+    Ok(matches!((a_id, dest_id), (Some(a), Some(b)) if a == b))
+}
+
+#[cfg(not(unix))]
+fn paths_are_same_file(_dir: &Dir, _a: &Path, _dest: &Path) -> Result<bool, ToolError> {
+    // No portable inode-identity check off Unix; the lexical check (`dest ==
+    // path`) still applies. Documented gap, not a silent one (fail loud):
+    // kGraf does not build for a non-Unix target today.
+    Ok(false)
+}
+
+fn display(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+fn summary(added: &[String], modified: &[String], deleted: &[String]) -> String {
+    let mut lines = vec!["Success. Updated the following files:".to_string()];
+    for p in added {
+        lines.push(format!("A {p}"));
+    }
+    for p in modified {
+        lines.push(format!("M {p}"));
+    }
+    for p in deleted {
+        lines.push(format!("D {p}"));
+    }
+    lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::CancellationToken as CT;
+
+    fn ctx(root: std::path::PathBuf) -> ToolContext {
+        ToolContext {
+            worker: "w1".into(),
+            task: "t1".into(),
+            workspace_root: root,
+            cancel: CT::new(),
+            progress: crate::ProgressSink::default(),
+        }
+    }
+
+    fn wrap(body: &str) -> Value {
+        json!({ "patch": format!("*** Begin Patch\n{body}\n*** End Patch") })
+    }
+
+    #[tokio::test]
+    async fn a_patch_applied_to_a_temp_workspace_changes_the_file_as_expected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("hello.txt"), "hi\nold\n").expect("seed");
+        let input = wrap("*** Update File: hello.txt\n@@\n hi\n-old\n+new");
+        let tool = ApplyPatchTool;
+        let access = tool.access(&input).expect("access");
+        assert!(
+            access
+                .writes_paths()
+                .contains(std::path::Path::new("hello.txt"))
+        );
+        let permit = crate::CallPermit::new();
+        let out = tool
+            .call(input, &ctx(dir.path().to_path_buf()), &permit)
+            .await
+            .expect("call");
+        assert!(!out.is_error);
+        let contents = std::fs::read_to_string(dir.path().join("hello.txt")).expect("read back");
+        assert_eq!(contents, "hi\nnew\n");
+    }
+
+    #[tokio::test]
+    async fn adding_and_deleting_files_works() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("gone.txt"), "bye\n").expect("seed");
+        let input = wrap("*** Add File: new/nested.txt\n+created\n*** Delete File: gone.txt");
+        let tool = ApplyPatchTool;
+        let permit = crate::CallPermit::new();
+        let out = tool
+            .call(input, &ctx(dir.path().to_path_buf()), &permit)
+            .await
+            .expect("call");
+        assert!(!out.is_error);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("new/nested.txt")).expect("read"),
+            "created\n"
+        );
+        assert!(!dir.path().join("gone.txt").exists());
+    }
+
+    #[test]
+    fn a_patch_that_escapes_the_workspace_is_refused() {
+        let input = wrap("*** Add File: ../outside.txt\n+x");
+        let err = ApplyPatchTool.access(&input).expect_err("must refuse");
+        assert!(matches!(err, ToolError::Access { .. }));
+    }
+
+    #[test]
+    fn an_absolute_path_is_refused() {
+        let input = wrap("*** Delete File: /etc/passwd");
+        let err = ApplyPatchTool.access(&input).expect_err("must refuse");
+        assert!(matches!(err, ToolError::Access { .. }));
+    }
+
+    /// `x/..` normalizes to the empty path, i.e. the
+    /// workspace root itself. `apply_patch` edits files, not "the workspace".
+    #[test]
+    fn a_path_normalizing_to_the_workspace_root_is_refused() {
+        let input = wrap("*** Add File: x/..\n+x");
+        let err = ApplyPatchTool.access(&input).expect_err("must refuse");
+        assert!(matches!(err, ToolError::InvalidInput { .. }));
+    }
+
+    #[tokio::test]
+    async fn call_independently_refuses_an_escape_even_if_access_was_skipped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let input = wrap("*** Add File: ../outside.txt\n+x");
+        let tool = ApplyPatchTool;
+        let permit = crate::CallPermit::new();
+        let err = tool
+            .call(input, &ctx(dir.path().to_path_buf()), &permit)
+            .await
+            .expect_err("must refuse");
+        assert!(matches!(err, ToolError::Access { .. }));
+    }
+
+    /// Regression: writing through a symlinked
+    /// intermediate directory used to reach outside the workspace.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn adding_a_file_through_a_symlinked_directory_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside");
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("d")).expect("symlink");
+        let input = wrap("*** Add File: d/authorized_keys\n+pwned");
+        let tool = ApplyPatchTool;
+        let permit = crate::CallPermit::new();
+        let err = tool
+            .call(input, &ctx(dir.path().to_path_buf()), &permit)
+            .await
+            .expect_err("must refuse the escape");
+        assert!(matches!(
+            err,
+            ToolError::Access { .. } | ToolError::Internal { .. }
+        ));
+        assert!(!outside.path().join("authorized_keys").exists());
+    }
+
+    /// Regression: updating a path that is a symlink
+    /// to an outside file used to overwrite the outside target.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn updating_a_symlinked_file_pointing_outside_the_workspace_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside");
+        let target = outside.path().join(".zshrc");
+        std::fs::write(&target, "original\n").expect("seed");
+        std::os::unix::fs::symlink(&target, dir.path().join(".zshrc")).expect("symlink");
+        let input = wrap("*** Update File: .zshrc\n@@\n-original\n+pwned");
+        let tool = ApplyPatchTool;
+        let permit = crate::CallPermit::new();
+        let err = tool
+            .call(input, &ctx(dir.path().to_path_buf()), &permit)
+            .await
+            .expect_err("must refuse the escape");
+        assert!(matches!(
+            err,
+            ToolError::Access { .. } | ToolError::Internal { .. }
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("unchanged"),
+            "original\n"
+        );
+    }
+
+    /// Regression: deleting through a symlinked
+    /// intermediate directory used to delete the outside file.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deleting_through_a_symlinked_directory_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside");
+        let target = outside.path().join("keep.txt");
+        std::fs::write(&target, "do not delete").expect("seed");
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("d")).expect("symlink");
+        let input = wrap("*** Delete File: d/keep.txt");
+        let tool = ApplyPatchTool;
+        let permit = crate::CallPermit::new();
+        let err = tool
+            .call(input, &ctx(dir.path().to_path_buf()), &permit)
+            .await
+            .expect_err("must refuse the escape");
+        assert!(matches!(
+            err,
+            ToolError::Access { .. } | ToolError::Internal { .. }
+        ));
+        assert!(target.exists());
+    }
+
+    /// A move whose destination normalizes to the same
+    /// path as the source used to write the new content and then delete that
+    /// same file out from under itself, losing it entirely.
+    #[tokio::test]
+    async fn a_move_to_the_same_path_is_treated_as_a_plain_update() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("same.txt"), "old\n").expect("seed");
+        let input = wrap("*** Update File: same.txt\n*** Move to: ./same.txt\n@@\n-old\n+new");
+        let tool = ApplyPatchTool;
+        let permit = crate::CallPermit::new();
+        let out = tool
+            .call(input, &ctx(dir.path().to_path_buf()), &permit)
+            .await
+            .expect("call");
+        assert!(!out.is_error);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("same.txt")).expect("must still exist"),
+            "new\n"
+        );
+    }
+
+    /// A patch whose second hunk cannot be matched
+    /// must leave the first hunk's file untouched, not partially applied.
+    #[tokio::test]
+    async fn a_later_hunk_that_fails_to_match_leaves_earlier_hunks_uncommitted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("a.txt"), "a-old\n").expect("seed");
+        std::fs::write(dir.path().join("b.txt"), "b-old\n").expect("seed");
+        let input = wrap(
+            "*** Update File: a.txt\n@@\n-a-old\n+a-new\n\
+             *** Update File: b.txt\n@@\n-this-context-does-not-exist\n+b-new",
+        );
+        let tool = ApplyPatchTool;
+        let permit = crate::CallPermit::new();
+        let err = tool
+            .call(input, &ctx(dir.path().to_path_buf()), &permit)
+            .await
+            .expect_err("the unmatched hunk must fail the whole call");
+        assert!(matches!(err, ToolError::Internal { .. }));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).expect("read"),
+            "a-old\n",
+            "the first hunk must not have been committed"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_already_cancelled_call_is_refused_before_doing_any_work() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let c = ctx(dir.path().to_path_buf());
+        c.cancel.cancel();
+        let input = wrap("*** Add File: x.txt\n+x");
+        let permit = crate::CallPermit::new();
+        let err = ApplyPatchTool
+            .call(input, &c, &permit)
+            .await
+            .expect_err("must observe cancellation");
+        assert!(matches!(err, ToolError::Cancelled { .. }));
+        assert!(!dir.path().join("x.txt").exists());
+    }
+
+    #[test]
+    fn a_patch_over_the_byte_cap_is_refused() {
+        let huge = "x".repeat(MAX_PATCH_BYTES + 1);
+        let input = json!({ "patch": huge });
+        let err = ApplyPatchTool.access(&input).expect_err("must refuse");
+        assert!(matches!(err, ToolError::InvalidInput { .. }));
+    }
+
+    /// On a case-insensitive filesystem (macOS's
+    /// APFS default), `Readme.md` and `README.md` are the same directory
+    /// entry. Before this fix, writing the new content to `README.md` and
+    /// then deleting `Readme.md` deleted that same entry, losing the file.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_case_only_move_on_a_case_insensitive_filesystem_keeps_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("Readme.md"), "keep\n").expect("seed");
+        let input = wrap("*** Update File: Readme.md\n*** Move to: README.md\n@@\n-keep\n+kept");
+        let permit = crate::CallPermit::new();
+        let out = ApplyPatchTool
+            .call(input, &ctx(dir.path().to_path_buf()), &permit)
+            .await
+            .expect("call");
+        assert!(!out.is_error, "{out:?}");
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read_dir")
+            .map(|e| e.expect("entry").file_name())
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "the file must not have been lost: {entries:?}"
+        );
+        let content = std::fs::read_to_string(dir.path().join("README.md")).expect("read back");
+        assert_eq!(content, "kept\n");
+    }
+
+    /// Second case: `b.txt` is a symlink alias of `a.txt`, so "move `a.txt` to
+    /// `b.txt`" writes and deletes the same underlying file.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_move_to_a_symlink_alias_of_the_source_keeps_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("a.txt"), "data\n").expect("seed");
+        std::os::unix::fs::symlink("a.txt", dir.path().join("b.txt")).expect("symlink");
+        let input = wrap("*** Update File: a.txt\n*** Move to: b.txt\n@@\n-data\n+data2");
+        let permit = crate::CallPermit::new();
+        let out = ApplyPatchTool
+            .call(input, &ctx(dir.path().to_path_buf()), &permit)
+            .await
+            .expect("call");
+        assert!(!out.is_error, "{out:?}");
+        let content = std::fs::read_to_string(dir.path().join("b.txt")).expect("read via symlink");
+        assert_eq!(
+            content, "data2\n",
+            "the aliased file must keep its new content"
+        );
+    }
+
+    /// A pre-existing hard link inside the workspace names a file outside it.
+    /// Every hunk kind that would write, delete or move it is refused while
+    /// planning, so an earlier hunk in the same patch writes nothing either
+    /// and the refusal names the path.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn every_hunk_touching_a_hard_linked_file_is_refused_before_anything_is_written() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside");
+        let target = outside.path().join("authorized_keys");
+        std::fs::write(&target, "ssh-ed25519 AAAA\n").expect("seed");
+        std::fs::hard_link(&target, dir.path().join("keys")).expect("hard link");
+        std::fs::write(dir.path().join("plain.txt"), "p\n").expect("seed");
+        let permit = crate::CallPermit::new();
+        for body in [
+            "*** Add File: first.txt\n+x\n*** Update File: keys\n@@\n-ssh-ed25519 AAAA\n+pwned",
+            "*** Add File: first.txt\n+x\n*** Delete File: keys",
+            "*** Add File: first.txt\n+x\n*** Add File: keys\n+pwned",
+            "*** Add File: first.txt\n+x\n*** Update File: plain.txt\n*** Move to: keys\n@@\n-p\n+q",
+            "*** Add File: first.txt\n+x\n*** Update File: keys\n*** Move to: moved.txt\n@@\n-ssh-ed25519 AAAA\n+x",
+        ] {
+            let err = ApplyPatchTool
+                .call(wrap(body), &ctx(dir.path().to_path_buf()), &permit)
+                .await
+                .expect_err(body);
+            let message = err.to_string();
+            assert!(
+                message.contains("`keys`") && message.contains("hard links"),
+                "{body}: {message}"
+            );
+            assert!(!dir.path().join("first.txt").exists(), "{body}");
+            assert!(!dir.path().join("moved.txt").exists(), "{body}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("outside"),
+            "ssh-ed25519 AAAA\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("plain.txt")).expect("plain"),
+            "p\n"
+        );
+    }
+
+    /// Regression: the tool
+    /// description teaches the grammar with a worked example; this test pulls
+    /// that exact example back out of [`APPLY_PATCH_DESCRIPTION`] and parses
+    /// it, so a future edit that breaks the example (a missing `+`, a stray
+    /// unified-diff line) fails here instead of only failing silently against
+    /// whichever model happens to copy it verbatim. Tests the mechanism
+    /// (the example is real, parseable input), not a fixed string.
+    #[test]
+    fn the_description_s_own_worked_example_parses() {
+        let fenced: Vec<&str> = APPLY_PATCH_DESCRIPTION.split("```").collect();
+        assert_eq!(
+            fenced.len(),
+            3,
+            "expected exactly one fenced example in the description; got {} pieces",
+            fenced.len()
+        );
+        let example = fenced[1].trim_start_matches('\n');
+        let hunks = parse_patch(example).expect("the description's own example must parse");
+        // The example is written to exercise all three hunk shapes at once
+        // (context/add/remove in an Update, plus an Add) so this test would
+        // catch a description edit that quietly dropped one of them.
+        assert_eq!(hunks.len(), 2, "expected an Update and an Add hunk");
+        assert!(matches!(hunks[0], Hunk::UpdateFile { .. }));
+        assert!(matches!(hunks[1], Hunk::AddFile { .. }));
+    }
+
+    /// Regression, 2026-09-28: the description must actually teach the three
+    /// line-prefix rule and warn off unified-diff syntax -- the two things
+    /// every captured Haiku failure got wrong. Written as substring checks on the
+    /// real, shipped constant (not a copy) so a future rewrite that drops the
+    /// teaching content, even while keeping the tool working, is caught here.
+    #[test]
+    fn the_description_teaches_the_line_prefix_rule_and_warns_off_unified_diff() {
+        let d = APPLY_PATCH_DESCRIPTION;
+        assert!(d.contains("literal space"), "must name the context prefix");
+        assert!(
+            d.contains('-') && d.contains('+'),
+            "must name both edit prefixes"
+        );
+        assert!(
+            d.to_lowercase().contains("unified-diff") || d.to_lowercase().contains("unified diff"),
+            "must warn a model away from unified-diff syntax by name"
+        );
+        assert!(d.contains("*** Begin Patch"), "must name the outer markers");
+    }
+}

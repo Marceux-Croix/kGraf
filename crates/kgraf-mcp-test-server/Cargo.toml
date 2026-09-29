@@ -1,0 +1,43 @@
+[package]
+name = "kgraf-mcp-test-server"
+version.workspace = true
+description = "A real MCP server over stdio, used only by kgraf-mcp's tests and benches (verified against a real server). Never published, never packaged by dist."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+# Not a product artifact: `cargo publish` must refuse this crate outright.
+publish = false
+
+# Belt and suspenders alongside `publish = false`: `dist` auto-detects any crate
+# with a `[[bin]]` as a release artifact (confirmed by `dist plan` once this bin
+# existed on `kgraf-mcp` itself, the release blocker this crate exists to fix).
+# This key tells `dist` directly to skip the crate, independent of `publish`.
+[package.metadata.dist]
+dist = false
+
+[[bin]]
+name = "mcp-echo-server"
+path = "src/main.rs"
+
+[dependencies]
+# Server-side rmcp only: this crate is never a dependency of production code, so
+# its feature footprint never reaches `kgraf-mcp`'s own dependency graph.
+# `transport-streamable-http-server` adds the `--http` mode (`rmcp`'s own
+# `StreamableHttpService`), so the client is tested against the SDK's server side.
+rmcp = { version = "3.4.1", default-features = false, features = [
+    "server",
+    "transport-io",
+    "transport-streamable-http-server",
+] }
+tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "time", "net", "io-std", "io-util"] }
+serde_json = "1"
+anyhow = "1"
+# The HTTP/1 listener under `--http`. All four are already in the lockfile through
+# `reqwest` and `rmcp` (hyper, hyper-util, http-body-util and bytes: MIT). An `axum`
+# router was not used: one path and two admin paths do not need one.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"

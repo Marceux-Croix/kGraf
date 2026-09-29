@@ -1,0 +1,10 @@
+repository: https://github.com/marella/material-symbols (packages https://github.com/google/material-design-icons)
+commit: npm package @material-symbols/svg-400@0.47.5 (a published, immutable version; the icons were taken from it, not from a git commit)
+paths: outlined/<name>.svg for the 46 icons listed in crates/kgraf-shell/assets/fonts/build_fonts.py (ICONS)
+license: Apache-2.0
+date verified: 2026-09-27
+
+Copied unmodified: the 46 SVG files, now in crates/kgraf-shell/assets/icons/.
+MODIFIED form shipped: crates/kgraf-shell/assets/fonts/kgraf-icons.ttf, one glyph per
+icon at U+E000 upward, made by build_fonts.py (paths flipped to font coordinates,
+cubic curves converted to quadratic). No NOTICE file exists in the package.

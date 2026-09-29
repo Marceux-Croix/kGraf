@@ -1,0 +1,37 @@
+[package]
+name = "kgraf-ingest"
+version.workspace = true
+description = "Document ingestion: parsing and corpus traversal."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+kgraf-core.workspace = true
+# `impl DiagCode for IngestError` (decision 0069). No cycle: kgraf-diag
+# depends on nothing in this workspace but kgraf-core.
+kgraf-diag.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+# Gitignore-aware directory walking. Chosen over `code2prompt-core` (MIT, 4.3.0):
+# code2prompt-core wraps this same `ignore` walker plus git2, handlebars, tiktoken-rs,
+# rayon, csv and colored for its CLI prompt-templating use case, none of which this
+# crate needs. `ignore` (dual Unlicense/MIT, 0.4.33) is the walker ripgrep ships, is
+# maintained by BurntSushi, and gives the exact capability the spec asks for (gitignore
+# and .ignore aware traversal) with no unused surface. Verified on crates.io 2026-09-26.
+ignore = "0.4.33"
+pulldown-cmark = "0.13.4"
+pdf-extract = "0.12.1"
+docx-rs = "0.4.22"
+text-splitter = "0.33.0"
+
+[dev-dependencies]
+tempfile = "3.24"
+lopdf = "0.45.0"
+criterion = { version = "0.8.2", features = ["html_reports"] }
+
+[[bench]]
+name = "ingest_throughput"
+harness = false

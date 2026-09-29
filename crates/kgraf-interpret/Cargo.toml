@@ -1,0 +1,47 @@
+[package]
+name = "kgraf-interpret"
+version.workspace = true
+description = "Interpretation pass: a corpus into planned components and work items with dependencies and acceptance criteria."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# A crate of its own, not a module of kgraf-ingest: the pass needs the code
+# graph (ranking, work nodes, reconciliation against code) and a model, and
+# kgraf-ingest is deliberately the parsing half with neither. The model is a
+# trait here (`Asker`); the orchestrator implements it through its ledgered caller,
+# so this crate never issues a provider call itself (every token is attributed to the ledger).
+[dependencies]
+kgraf-core.workspace = true
+# `impl DiagCode for InterpretError` (decision 0069). No cycle: kgraf-diag
+# depends on nothing in this workspace but kgraf-core.
+kgraf-diag.workspace = true
+kgraf-graph.workspace = true
+kgraf-ingest.workspace = true
+# `forbidden_path`: the one write-path rule the orchestrator and merge-back apply,
+# checked when a plan is interpreted rather than first at dispatch.
+kgraf-runtime.workspace = true
+# `UntrustedText::quote_as_data`: corpus text goes into the brief as escaped data.
+kgraf-tools.workspace = true
+# The roadmap parser's Markdown events (tables, task lists, headings): the same
+# parser and version kgraf-ingest already uses (MIT), not a second one.
+pulldown-cmark = "0.13.4"
+async-trait.workspace = true
+blake3.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+# Compile-fail fixtures: an approval cannot be forged (tests/compile_fail/).
+trybuild.workspace = true
+tokio = { workspace = true }
+criterion = { version = "0.8.2", default-features = false }
+
+# Time to first useful action (measured budget).
+[[bench]]
+name = "first_action"
+harness = false

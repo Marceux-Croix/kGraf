@@ -1,0 +1,249 @@
+Repository: https://github.com/openai/codex
+Commit:     e72da2b53805894878023d01949a25a082e0a5cb (2026-09-26)
+License:    Apache-2.0. The full text is copied here as LICENSE; verified at the
+            source 2026-09-26.
+NOTICE:     Upstream NOTICE copied here as NOTICE. Its Ratatui clause does not
+            apply to the files taken.
+
+Copied, unmodified apart from an origin header:
+  codex-rs/sandboxing/src/seatbelt_base_policy.sbpl
+      -> crates/kgraf-sandbox/src/sandbox/seatbelt_base_policy.sbpl
+  codex-rs/sandboxing/src/seatbelt_preferences_policy.sbpl
+      -> crates/kgraf-sandbox/src/sandbox/seatbelt_preferences_policy.sbpl
+
+Copied and MODIFIED:
+  codex-rs/sandboxing/src/seatbelt_network_policy.sbpl
+      -> crates/kgraf-sandbox/src/sandbox/seatbelt_network_policy.sbpl
+      The com.apple.SecurityServer mach-lookup is removed: a live probe showed
+      it lets `git credential-osxkeychain get` read keychain passwords.
+
+Ported (subset) into crates/kgraf-sandbox/src/sandbox/macos.rs from
+codex-rs/sandboxing/src/seatbelt.rs: the fixed launcher path
+/usr/bin/sandbox-exec, full-read plus writable-root policy assembly with -D
+parameters, the anchor deny on each writable root, the protected top-level
+.git entry, the unix-socket allow rules keyed on path parameters, the
+xpc-service lookup deny, and the F_MAKECOMPRESSED / F_TRANSFEREXTENTS fcntl
+deny.
+
+Deliberately different from upstream: upstream's full-network mode emits a
+bare `(allow network-outbound)`, which also admits connect() to every unix
+socket (ssh-agent included). kGraf allows outbound to `(remote ip)` only.
+
+Not taken: restricted-read platform defaults, proxy-routed network, daemon
+socket protection, glob deny-read.
+
+---
+
+repository: https://github.com/openai/codex
+commit:     e72da2b53805894878023d01949a25a082e0a5cb (2026-09-26)
+license:    Apache-2.0. Verified at the source 2026-09-26 (see LICENSE, above).
+date verified: 2026-09-26
+
+Ported (Phase 3 file-edit tool) into
+crates/kgraf-tools/src/apply_patch/:
+  codex-rs/apply-patch/src/parser.rs           -> apply_patch/parser.rs
+  codex-rs/apply-patch/src/streaming_parser.rs -> apply_patch/streaming_parser.rs
+  codex-rs/apply-patch/src/seek_sequence.rs    -> apply_patch/seek_sequence.rs
+  codex-rs/apply-patch/src/file_update.rs      -> apply_patch/replace.rs
+    (compute_replacements/apply_replacements only)
+
+Trimmed to what kGraf calls: codex's own I/O layer (`ExecutorFileSystem`,
+`FileSystemSandboxContext`, `PathUri`) was not taken. kGraf already has a
+path-safety seam (`Access`, `resolve_in_workspace`); applying a parsed `Hunk`
+to the filesystem and declaring the paths it touches is kGraf's own code in
+apply_patch/mod.rs, built on that seam instead of codex's. `file_update.rs`'s
+`ApplyPatchFileUpdateMode::PreserveLineEndings` branch (and the `text_file.rs`
+module it needs) was dropped; only `NormalizeToLf` was ported. Per-file
+provenance and every other change are in the comment atop each copied file.
+
+Ported (Phase 3 command policy) into crates/kgraf-tools/src/execpolicy/:
+  codex-rs/execpolicy/src/decision.rs -> execpolicy/decision.rs
+  codex-rs/execpolicy/src/rule.rs     -> execpolicy/rule.rs
+    (PatternToken and PrefixPattern only)
+
+Not taken: codex's Starlark-based policy-authoring language (`policy.rs`,
+`parser.rs`, `amend.rs`, the `starlark` crate dependency), `RuleMatch`,
+`PrefixRule`, the `Rule` trait, `NetworkRule` and the example-validation
+helpers — all part of the `.codexpolicy` file format and its policy-object
+model, which kGraf does not have an authoring surface for yet. Only the
+prefix-token matcher was worth porting; `execpolicy/policy.rs` is kGraf's
+own small `ExecPolicy`/`CommandRule` built on top of it (see that file's doc
+comment for why, and for the `read_only` extension it adds).
+
+Evaluated and not taken: codex-rs `exec/` (the command executor around
+`execpolicy` and the OS sandbox) is codex's own process-lifecycle glue for its
+own CLI loop; kGraf's shell tool (crates/kgraf-tools/src/shell.rs)
+runs through `kgraf-sandbox`'s own runner (Phase 8, already in this
+workspace) instead, so `exec/`'s glue would have been thrown away almost
+entirely. Nothing from it was copied.
+
+---
+
+--- Windows backend (added 2026-09-26) ---
+
+Same commit, e72da2b53805894878023d01949a25a082e0a5cb. License re-verified at
+the source on 2026-09-26: the repository LICENSE (Apache-2.0) and NOTICE are
+byte-identical to the copies here, and codex-rs/Cargo.toml declares
+license = "Apache-2.0" for the workspace, which windows-sandbox-rs inherits.
+
+Ported (subset, rewritten against windows-sys 0.61 with errors propagated)
+into crates/kgraf-sandbox/src/sandbox/windows.rs:
+  codex-rs/windows-sandbox-rs/src/token.rs
+      restricted token for the unelevated backend: flags DISABLE_MAX_PRIVILEGE
+      | LUA_TOKEN | WRITE_RESTRICTED; restricting SIDs in the order
+      capabilities, logon SID, Everyone; default DACL of logon SID GENERIC_ALL
+      plus OWNER RIGHTS READ_CONTROL; SeChangeNotifyPrivilege enabled.
+  codex-rs/windows-sandbox-rs/src/acl.rs
+      WRITE_ALLOW_MASK (read, write, execute, DELETE, no FILE_DELETE_CHILD)
+      inherited by descendants; the deny-write ACE on a protected child.
+  codex-rs/windows-sandbox-rs/src/cap.rs
+      capability SID shape S-1-5-21-a-b-c-d, one SID per writable root.
+  codex-rs/windows-sandbox-rs/src/desktop.rs
+      private desktop whose DACL admits the logon SID.
+  codex-rs/windows-sandbox-rs/src/process.rs, proc_thread_attr.rs
+      CreateProcessAsUserW with lpDesktop set, STARTF_USESTDHANDLES and an
+      explicit PROC_THREAD_ATTRIBUTE_HANDLE_LIST.
+
+Deliberately different from upstream:
+  - ACL, desktop and token failures are errors. Upstream ignores several
+    (`let _ = ...`), which would run a command with less confinement (SR-008).
+  - Capability SIDs are derived from the root path (FNV-1a) instead of drawn
+    at random and persisted in a state file.
+  - The root itself gets no DELETE (an explicit non-inherited ACE plus an
+    inherit-only ACE), so it cannot be moved or removed.
+  - The deny-write mask omits the SYNCHRONIZE and READ_CONTROL bits of
+    FILE_GENERIC_WRITE.
+  - The job is joined through CREATE_SUSPENDED plus AssignProcessToJobObject
+    instead of PROC_THREAD_ATTRIBUTE_JOB_LIST; every UI limit is set.
+  - No global NUL-device DACL change and no offline-network environment
+    rewrite (proxy variables are not isolation).
+  - A private desktop reused per workspace (not per spawn and not a global
+    cache), on the process's own window station (queried, not a hard-coded
+    WinSta0), so scheduled and service runs work.
+  - The default DACL grants the user SID and a fresh per-spawn SID (also a
+    restricting SID), never the logon SID, so one spawn's process tree cannot
+    be opened for write by another same-session sandbox.
+  - The token integrity level is dropped to Low and each writable root and the
+    private desktop are labeled Low, so mandatory integrity control blocks
+    writes up to Medium objects and UIPI blocks SendInput to the user's
+    desktop. Upstream's unelevated backend does not use integrity levels.
+  - Reparse points on a root or its `.git` are refused, a root on a
+    non-ACL volume is refused, and effective write is verified with
+    AccessCheck under the restricted token (upstream does none of these).
+
+Not taken:
+  - codex-rs/windows-sandbox-service/ (whole crate) and the elevated backend
+    in windows-sandbox-rs (setup*.rs, identity.rs, wfp*.rs, elevated*,
+    provisioning*, hide_users.rs): they create a dedicated local user,
+    firewall (WFP) filters and a Windows service, all of which need
+    administrator rights. kGraf's constraint is no admin and no installer
+    (sandboxing evidence 2026-09-24). That path is also the only upstream one
+    that denies reads and network; its absence is why the kGraf Windows
+    backend reports partial isolation.
+  - deny_read_*.rs: upstream itself refuses deny-read under a
+    WRITE_RESTRICTED token ("this backend cannot make capability-SID
+    deny-read ACLs authoritative").
+  - conpty/, unified_exec/, stdio_bridge.rs: interactive sessions, out of
+    scope for the runner.
+
+---
+
+Repository: https://github.com/openai/codex
+Commit:     e72da2b53805894878023d01949a25a082e0a5cb (2026-09-26)
+Paths:      codex-rs/rollout/src/recorder.rs
+License:    Apache-2.0. Verified at the source 2026-09-26 (LICENSE and NOTICE
+            already present in this directory from the block above).
+Date verified: 2026-09-26
+
+**Note on scope.** ROADMAP Phase 3 (0055) names `rollout/` (a JSONL session
+log) as the resumable-transcript source. At this commit `rollout/` is 2,000+
+lines coupling the JSONL log to SQLite-backed thread listing, cross-thread
+search, archived-thread migration and a legacy ghost-snapshot rewrite -- none
+of which kGraf has an equivalent for (no thread store, no multi-agent
+forking model), so the crate is not vendored whole. What transfers is its
+core write/resume shape.
+
+Ported (Rust to Rust) into crates/kgraf-session/src/transcript.rs
+(`JsonlTranscript`): `JsonlWriter::write_line` (serialize one record, append a
+newline, `write_all`, then `flush`, so a crash cannot lose an acknowledged
+append) and `open_rollout_for_append` / `ensure_rollout_is_newline_terminated`
+(open in append mode; a file not ending in `\n` means the last write was cut
+short).
+
+**Deliberately different from upstream, and why (SR-008).**
+`ensure_rollout_is_newline_terminated` pads a torn last line with a trailing
+newline and continues; `load_rollout_items` then finds that padded line fails
+to parse as JSON, logs a `warn!`, increments a `parse_errors` counter, and
+*keeps going* -- the torn record is silently absent from the returned items.
+That is exactly the failure class SR-008 exists to name: a torn last line
+reads as "nothing to see here" instead of as a fact the resuming code must
+act on. kGraf's `JsonlTranscript::open` refuses to open a file with a
+torn or corrupt tail (returns `SessionError::TornTranscriptLine`); a
+`JsonlTranscript::open_repairing_torn_tail` is provided for a caller that
+wants to resume anyway, and it returns the discarded bytes as a named
+`TornTail` value rather than dropping them into a log line, so the fact is in
+the type the caller has to handle, not just in text.
+
+---
+
+Repository: https://github.com/openai/codex
+Commit:     e72da2b53805894878023d01949a25a082e0a5cb (2026-09-26)
+Paths:      codex-rs/core/src/codex_delegate.rs
+License:    Apache-2.0. Re-verified at the source 2026-09-26.
+Date verified: 2026-09-26
+
+Followed, not copied, in crates/kgraf-orchestrator/src/orchestrator.rs.
+The file is bound to codex's Session, SessionIo and Op types. What transfers:
+a delegate's cancellation is a child of the parent's, so a parent stop
+cascades (`child_token`; here the loop's Stop notifies every attempt's
+cancel); delegate events are forwarded to the parent (`forward_events`; here
+the forwarder appends them to the worker's transcript); delegates never ask
+for approval on the parent's behalf (approval policy `never`; here a worker
+has no ask resolver unless its route sets one); model fallback is off
+(`allow_provider_model_fallback: false`; here a route is one model).
+
+---
+
+--- Linux backend: seccomp (added 2026-09-26) ---
+
+Repository: https://github.com/openai/codex
+Commit:     e72da2b53805894878023d01949a25a082e0a5cb (2026-09-26)
+Paths:      codex-rs/linux-sandbox/src/landlock.rs
+            (install_network_seccomp_filter_on_current_thread, set_no_new_privs)
+License:    Apache-2.0. Re-verified at the source 2026-09-26: codex-rs/Cargo.toml
+            declares license = "Apache-2.0" for the workspace, which
+            linux-sandbox inherits (`license.workspace = true`); LICENSE and
+            NOTICE here are the repository's.
+Date verified: 2026-09-26
+
+Ported (subset, reworked) into
+crates/kgraf-sandbox/src/sandbox/linux/seccomp.rs: the unconditional
+denials of ptrace, process_vm_readv/writev and io_uring_setup/enter/register;
+socket-domain conditions on socket and socketpair; EPERM as the match action
+with allow as the default; compiling the program with `seccompiler` (0.5.0,
+Apache-2.0 OR BSD-3-Clause, the crate upstream depends on; license verified
+from its crates.io metadata and LICENSE-APACHE / LICENSE-BSD-3-Clause files).
+
+Deliberately different from upstream:
+  - socket(AF_UNIX) is denied in every mode; upstream's restricted mode allows
+    it and denies connect/sendto, which leaves sendmsg to a path open.
+  - With network allowed, socket() is limited to AF_INET/AF_INET6; upstream
+    installs no filter then, so every unix socket stays reachable.
+  - Also denied: keyctl/add_key/request_key, the mount family, setns, bpf,
+    perf_event_open, pidfd_getfd, ioctl TIOCSTI/TIOCLINUX.
+  - x86_64: x32-ABI syscall numbers are denied (seccompiler checks only the
+    audit arch, which x32 shares).
+  - No new namespaces: unshare and clone with any CLONE_NEW* bit get EPERM,
+    clone3 gets ENOSYS (libc falls back to clone). Also denied: userfaultfd,
+    open_by_handle_at, name_to_handle_at, kcmp, process_madvise.
+  - The filter is compiled in the parent and installed in the forked child
+    with one raw seccomp(2) call (no allocation after fork).
+
+Not taken: bubblewrap (bwrap.rs, bundled_bwrap.rs, launcher.rs,
+linux_run_main.rs). Upstream gets namespaces and read-only mounts from a
+bwrap binary. kGraf enters user, mount, IPC, PID (and, on network deny,
+network) namespaces with direct syscalls in
+crates/kgraf-sandbox/src/sandbox/linux/namespaces.rs, its own code, so no
+helper binary is shipped or looked up on PATH. Also not taken: the proxy
+routing and managed-network modes (proxy_routing.rs, proxy_lifecycle.rs),
+WSL and daemon-socket mounts.

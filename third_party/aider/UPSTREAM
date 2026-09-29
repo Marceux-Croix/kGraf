@@ -1,0 +1,69 @@
+repository: https://github.com/Aider-AI/aider
+commit: 94bd7abd17cdbcdab91b445b3ab165ecd2220938
+paths: aider/repomap.py
+license: Apache-2.0
+date verified: 2026-09-26
+
+The commit is the last one touching aider/repomap.py when read (2026-02-11);
+main was then at 5dc9490bb35f9729ef2c95d00a19ccd30c26339c. The file and
+LICENSE.txt at the pinned commit were compared byte for byte with what was
+read. Upstream has no NOTICE file at that commit. LICENSE here is upstream's
+LICENSE.txt, verbatim.
+
+Ported (Python to Rust) into crates/kgraf-graph/src/rank.rs (ROADMAP
+Phase 7, "Ranking what matters in a corpus ports aider's repo-map PageRank"):
+the file-level multigraph of references to definitions, aider's identifier
+multipliers (mentioned x10; snake, kebab or camel case of 8+ characters x10;
+leading underscore x0.1; more than five definers x0.1; focus-file referencer
+x50), the 0.1 self-edge for a definition nobody references, the fallback of
+definitions for references when there are none, the personalization
+(100 / files for focus files, mentioned files, and files whose path has a
+component equal to a mentioned identifier; the same vector as the dangling
+distribution; a zero sum falls back to uniform, as aider's ZeroDivisionError
+handler does), and the distribution of each file's rank across its out-edges
+to rank (file, identifier) pairs, sorted as Python's reverse tuple sort does.
+
+PageRank itself is networkx's `pagerank` (BSD-3-Clause), which aider calls.
+It is not copied: rank.rs implements the same power iteration from its
+documented definition (alpha 0.85, max_iter 100, tol 1e-6 per node, parallel
+edges summed, rows normalized by out-weight, dangling mass to the
+personalization vector). It is checked against networkx 3.7's own output to
+1e-9 on a fixed multigraph with parallel edges, self-loops, a dangling node,
+and with and without personalization: `verify/networkx_reference.py` prints
+the expected values, and the `matches_networkx_reference` test in rank.rs
+asserts them. Run it with:
+
+    uv run --no-project --with networkx --with scipy --with numpy \
+        python third_party/aider/verify/networkx_reference.py
+
+Not a literal match; the differences, each stated in rank.rs:
+
+- References and definitions come from kGraf's graph (the `call_sites`
+  table and the `nodes` table), not from aider's tree-sitter tag queries.
+  Only call references are recorded, so a type named in a signature is not a
+  reference here; `impl` blocks, files and Markdown sections are not
+  definitions. Callers can add references from outside the code graph (a
+  document naming a symbol).
+- aider reassigns `num_refs = math.sqrt(num_refs)` inside its loop over
+  definers, so an identifier with several definers gets sqrt, then the fourth
+  root, then the eighth, in Python set order (which varies with string hash
+  randomization between runs). The port takes the square root once, as the
+  adjacent upstream comment states the intent, and is deterministic.
+- A power iteration that does not converge is an error, as in networkx.
+- aider's token-bounded map (the binary search in
+  get_ranked_tags_map_uncached) is not ported; the interpretation pass
+  (crates/kgraf-interpret) fills its own token budget from the ranked
+  list.
+
+repository: https://github.com/networkx/networkx
+commit: 49ca2290b80c1389eb4d8d8e49dcba73f8fec016
+paths: networkx/algorithms/link_analysis/pagerank_alg.py
+license: BSD-3-Clause
+date verified: 2026-09-26
+
+Credited as the algorithm reference, not copied: tag networkx-3.7, the version
+the reference values were computed with. aider calls `nx.pagerank`;
+crates/kgraf-graph/src/rank.rs implements the same power iteration from
+its documented definition and is checked against this version's output (the
+verification script above). No networkx code is in this repository, so its
+license text is not copied here; the attribution is this block.

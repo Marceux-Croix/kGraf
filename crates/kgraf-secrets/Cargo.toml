@@ -1,0 +1,20 @@
+[package]
+name = "kgraf-secrets"
+version.workspace = true
+description = "Secret detection and redaction: pattern rules ported from gitleaks (third_party/gitleaks/UPSTREAM), plus an exact-value registry for kGraf's own configured credentials."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+regex.workspace = true
+tracing = "0.1"
+
+[dev-dependencies]
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "scrub"
+harness = false

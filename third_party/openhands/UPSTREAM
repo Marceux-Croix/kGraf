@@ -1,0 +1,39 @@
+Repository: https://github.com/OpenHands/software-agent-sdk
+Commit:     a350dc73ef9b4d3a801ffab2aed211a04d2120a9 (2026-09-25)
+Paths:      openhands-sdk/openhands/sdk/context/condenser/utils.py
+License:    MIT. The full text is copied here as LICENSE; verified at the
+            source 2026-09-26.
+Date verified: 2026-09-26
+
+**Note on scope.** The ROADMAP (Phase 3, decision 0057) names "OpenHands'
+observation-masking condenser" as a source. At this commit the SDK's
+`condenser/` package holds `NoOpCondenser`, `LLMSummarizingCondenser` and a
+`PipelineCondenser`; a standalone observation-masking condenser is not present
+in this history (superseded by the LLM-summarizing one, which 0057 explicitly
+rejects as a compaction method because it rewrites). What was ported instead
+is `utils.py`'s **token-budget suffix sizing**, the non-rewriting half of the
+condenser package that decides how much of a transcript's tail survives a
+token target -- the same problem 0057's truncation step solves.
+
+Ported (Python to Rust) into crates/kgraf-session/src/reduction.rs: the
+idea behind `get_shortest_prefix_above_token_count` /
+`get_suffix_length_for_token_reduction` -- decide how much of the *oldest*
+content must go to bring the total under a token target, keeping everything
+newer. Upstream finds that cut point with a binary search over prefix length,
+because its token count calls an LLM's tokenizer (an expensive call per
+probe). kGraf's `Reducible::approx_tokens` is a local O(1) estimate, so
+the port is a single linear scan over the oldest-first candidates instead of
+a binary search over prefix length: same result (drop from the front until
+under budget, keep the tail), cheaper for a cost function that is already
+cheap. This is a deliberate change, not an unported detail; "from the tail"
+describes what survives, not the direction of the scan itself.
+
+Not ported from this file, added on top of it in `reduce`, with no upstream
+equivalent found in this package:
+- Entries sharing a `Reducible::truncation_unit` are dropped as one group or
+  not at all (0057, and an owner review: a tool call and its result are one
+  unit, so truncation must never orphan one half of a pair).
+- `ReductionReport::over_budget` is set when pinned content alone (or pinned
+  plus whatever truncation could not safely remove) still exceeds the target
+  after both steps, rather than the caller silently receiving an
+  over-the-budget view.

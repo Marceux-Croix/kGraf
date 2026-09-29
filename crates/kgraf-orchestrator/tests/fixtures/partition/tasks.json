@@ -1,0 +1,25 @@
+{
+  "note": "Ten change requests against repo/, each with the files a correct change writes. The write sets were fixed by reading the code, before any predictor ran, and include the tests and docs a finished change touches (0019: done includes tests). Constructed by the same author as the predictor, so it measures the instrument, not the central bet at scale.",
+  "tasks": [
+    {"id": "t1", "text": "Support negative amounts in parse_amount: accept a leading minus sign.",
+     "writes": ["src/money.rs", "tests/money_tests.rs"]},
+    {"id": "t2", "text": "Add a thousands separator to format_amount, switched on by a new Config setting.",
+     "writes": ["src/money.rs", "src/config.rs", "docs/CONFIG.md", "tests/money_tests.rs"]},
+    {"id": "t3", "text": "Refuse to post to a closed account: post_entry must return an error when the Account is closed.",
+     "writes": ["src/ledger.rs", "src/account.rs", "tests/ledger_tests.rs"]},
+    {"id": "t4", "text": "Add close_account, which closes an account and writes an audit record.",
+     "writes": ["src/account.rs", "src/audit.rs", "tests/ledger_tests.rs"]},
+    {"id": "t5", "text": "Quote fields that contain commas when exporting CSV in export_csv.",
+     "writes": ["src/export.rs", "tests/export_tests.rs"]},
+    {"id": "t6", "text": "Add a --since option to the command line that limits the report to entries on or after a date.",
+     "writes": ["src/cli.rs", "src/report.rs", "src/ledger.rs", "tests/report_tests.rs", "README.md"]},
+    {"id": "t7", "text": "Group the totals in render_report by currency.",
+     "writes": ["src/report.rs", "tests/report_tests.rs"]},
+    {"id": "t8", "text": "Allow comment lines that start with # in imported ledger files.",
+     "writes": ["src/import.rs", "docs/FORMAT.md", "tests/import_tests.rs"]},
+    {"id": "t9", "text": "Let an environment variable override the rounding setting that load_config reads.",
+     "writes": ["src/config.rs", "docs/CONFIG.md"]},
+    {"id": "t10", "text": "Keep the source line number on each Entry so that parse errors can name the line.",
+     "writes": ["src/entry.rs", "src/import.rs"]}
+  ]
+}

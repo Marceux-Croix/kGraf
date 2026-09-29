@@ -1,0 +1,14 @@
+repository: https://github.com/Instrument/instrument-sans
+commit: npm package @fontsource/instrument-sans@5.3.0 (a published, immutable version; the fonts were taken from it, not from a git commit)
+paths: files/instrument-sans-latin-400-normal.woff2, files/instrument-sans-latin-500-normal.woff2, files/instrument-sans-latin-700-normal.woff2
+license: OFL-1.1
+date verified: 2026-09-27
+
+Copied unmodified: the three woff2 files, now in crates/kgraf-shell/assets/fonts/woff2/.
+MODIFIED form shipped: InstrumentSans-Regular.ttf, InstrumentSans-Medium.ttf and
+InstrumentSans-Bold.ttf, made by crates/kgraf-shell/assets/fonts/build_fonts.py: the
+woff2 is decompressed to TrueType and the character map points the digits 0 to 9
+(only) at the font's own tabular (`tnum`) glyphs. Outlines, names and metrics are
+unchanged. Copyright 2022 The Instrument Sans Project Authors. The font declares no
+Reserved Font Name, so the modified copy keeps the name Instrument Sans (style guide
+AST-4). The OFL text is copied as LICENSE.

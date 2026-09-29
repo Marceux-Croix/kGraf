@@ -1,0 +1,27 @@
+Repository: https://github.com/zhayujie/CowAgent
+Commit:     01a89d1ce8ce08c6651f5b06aa465d68fd7f3b72 (2026-09-26)
+Paths:      agent/tools/agent_delegate/agent_delegate.py
+License:    MIT. The full text is copied here as LICENSE; verified at the
+            source 2026-09-26.
+Date verified: 2026-09-26
+
+Ported (Python to Rust) into crates/kgraf-orchestrator/src/guards.rs:
+`DelegationPolicy` (allowed_targets table with "*", max_depth 3 in 1..=8,
+max_message_chars 8000 in 1..=100000, range checks raising on bad values) and
+the six guards of `AgentDelegateTool._delegate`, in upstream's order: task
+present and within the length limit; target on the roster; delegation trace
+ends with the source; target already in the trace is a cycle; the policy
+table allows the pair; depth within max_depth. The `@` prefix strip on the
+target is kept.
+
+Deliberately different, and why:
+- The trace is the contract lineage and the roster is the set of configured
+  routes. Upstream's agents are standing identities; kGraf's delegating
+  unit is a contract, whose handed-back remainder usually continues on the
+  same route, so "same agent again" is normal. A cycle is therefore a child
+  task that normalizes (whitespace, case) to an ancestor's task.
+- The policy default allows every configured pair; upstream's default
+  forbids source == target, for the reason above.
+- Upstream's `timeout_seconds` and relay locks are not ported: a worker is
+  bounded by its step budget and the admission limits, and each child runs in
+  sequence in its parent's worktree.

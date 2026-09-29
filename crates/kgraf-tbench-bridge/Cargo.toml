@@ -1,0 +1,25 @@
+[package]
+name = "kgraf-tbench-bridge"
+version.workspace = true
+description = "The concrete ExternalExecutor that talks to a Python Harbor BaseAgent shim over a Unix socket, for Terminal-Bench runs. Benchmark-only harness code, not part of the shipped kGraf app; kept in its own crate so kgraf-tools core does not depend on Harbor's process model."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+kgraf-tools = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["net", "fs"] }
+base64 = "0.22"
+sha2 = { workspace = true }
+
+[dev-dependencies]
+kgraf-tools = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["net", "fs", "process", "rt-multi-thread", "macros"] }

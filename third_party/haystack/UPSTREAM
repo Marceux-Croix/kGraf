@@ -1,0 +1,46 @@
+repository: https://github.com/deepset-ai/haystack
+commit: 8a5406eea71a0fc19e94c4b9a5cd96df2158a45a
+paths: haystack/components/agents/tool_calling.py (_schedule_tool_calls, _keys_intersect)
+license: Apache-2.0
+date verified: 2026-09-26
+
+Ported (logic translated to Rust, not copied verbatim) to
+crates/kgraf-graph/src/leases/schedule.rs, per ROADMAP Phase 1.6's build plan
+(decision 0055) and the evidence file
+docs/decisions/evidence/2026-09-24-reference-architectures.md ("The best idea in the
+repo for kGraf").
+
+What was taken: the **layered topological sort** structure of `_schedule_tool_calls` --
+compute a dependency set per item, repeatedly pull every item whose dependencies are
+already scheduled into one parallel batch, and when no item is ready (a dependency
+cycle), break it deterministically by running the lowest remaining index alone. This
+loop is about a dozen lines and is the entire reusable idea; the surrounding
+State-key-mapping code (`_state_io_for_call`, `_keys_intersect`) is Haystack's own
+`State` dataclass and was not ported, only its role as "how a call's read/write sets are
+compared" was, generalized to kGraf's lease keys (file paths and hierarchical node
+ids, decision 0050).
+
+Deliberate deviation from upstream, stated because it changes where dependency
+direction comes from:
+
+  Haystack: "read-after-write forces a later batch, write-write creates no
+  dependency." Direction comes from dataflow -- a tool's writes merge into a shared
+  `State` dict, and a later call must see an earlier call's write, so direction is a
+  correctness question with one right answer. A rare true cycle (a call that both
+  reads and writes the same key, requested more than once) is broken by running the
+  lowest remaining index alone.
+
+  kGraf: a write lease is mutual exclusion, not a merge target. Any overlap
+  between two items' read/write sets (`WorkFootprint::conflicts_with`) is a reason
+  they must not share a layer, but there is no data flowing between them, so which one
+  goes first is not a correctness question -- only a determinism one. The port
+  therefore orders a conflicting pair by declaration index (`i < j` always produces
+  the edge `i -> j`), never by which one "reads" or "writes". This makes the
+  dependency graph acyclic by construction, a stronger guarantee than upstream's, so
+  upstream's cycle tie-break becomes dead code here -- kept anyway, at zero cost, as
+  the same defensive fallback upstream reaches for. Items with disjoint footprints
+  still batch together exactly as upstream intends.
+
+kGraf's admission step (`LeaseRegistry` in the same crate) is not part of the port:
+Haystack's scheduler ends at producing batches, and kGraf adds layer-by-layer
+admission into the write-lease registry on top of it (`leases::schedule::admit_layers`).

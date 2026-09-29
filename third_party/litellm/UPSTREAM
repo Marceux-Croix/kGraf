@@ -1,0 +1,25 @@
+Repository: https://github.com/BerriAI/litellm
+Commit:     115668f43ea5f6ed5ce47ad9de0db2df0bf96ff1
+Path:       model_prices_and_context_window.json
+Blob sha:   d26ca15450b902bdf60f33ac2ae025deaa4d4726
+License:    MIT (core). Verified via the GitHub Contents API against LICENSE
+            at this commit: "All content that resides under the enterprise/
+            directory ... is licensed under the license defined in
+            enterprise/LICENSE. Content outside of the above mentioned
+            directories ... is available under the MIT license." The vendored
+            path is at the repository root, outside enterprise/, so it is
+            MIT. Full LICENSE text confirms the standard MIT grant, copyright
+            (c) 2023 Berri AI.
+Date verified: 2026-09-26
+
+Loaded by crates/kgraf-core/src/litellm.rs, which reports rather than
+prices at zero any entry it cannot map (SR-008). The vendored file is
+versioned in kGraf by the blake3 hash of its bytes
+(`LiteLlmCatalog::content_hash`), not by this commit sha: the sha identifies
+what was fetched, the hash is what the running loader is actually keyed to,
+and the two are recorded separately so either can be re-verified independently.
+
+To refresh: fetch
+https://raw.githubusercontent.com/BerriAI/litellm/<new-commit>/model_prices_and_context_window.json,
+overwrite model_prices_and_context_window.json in this directory, and update
+the commit, blob sha, and date above.

@@ -1,0 +1,81 @@
+[package]
+name = "kgraf-provider"
+version.workspace = true
+description = "kGraf's provider seam: a small mandatory trait, opt-in capabilities, and the accounting ledger every call must pass through."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+# The ledger's writer-fault injection (`WriterFaults`, `Ledger::open_with_faults`),
+# normally `#[cfg(test)]`-only, so a `#[cfg(test)] mod tests` in another module of
+# this same crate (`ratelimit.rs`'s) can reach it too. `#[doc(hidden)]`: never part
+# of the public API surface. Same name and reasoning as `kgraf-core`'s.
+test-support = []
+
+[dependencies]
+kgraf-core.workspace = true
+# `impl DiagCode for ProviderError` (error.rs): names this crate's KG-03xx
+# codes for the diagnostics file (decision 0069). No cycle: kgraf-diag depends
+# on nothing in this workspace but kgraf-core.
+kgraf-diag.workspace = true
+async-trait.workspace = true
+blake3.workspace = true
+futures-channel.workspace = true
+futures-executor.workspace = true
+futures-util.workspace = true
+# The anchor file's flush: plain fsync(2), as SQLite uses for the ledger itself.
+libc = "0.2.189"
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+# Per-route provider call rate limits (decision 0056). MIT, license read on
+# crates.io 2026-09-26 (0.10.4). Only `std` and `quanta`: the async wait is tokio's,
+# and jitter and the keyed (dashmap) limiter are not used.
+governor = { version = "0.10.4", default-features = false, features = ["std", "quanta"] }
+# The per-user data directory the cross-process rate limit store lives in
+# (`crosslimit.rs`, decision 0072). Same version already used by
+# `kgraf-shell::app_dirs` and `kgraf-mcp::oauth`'s keychain lock directory.
+directories = "6.0.0"
+# RFC 3339 parsing for `limits::parse_rfc3339_ms_from_now` (a rate-limit reset
+# header). Already resolved in the workspace at this exact version
+# (`kgraf-cli`, `kgraf-orchestrator`, `kgraf-schedule`, `kgraf-shell`), so this
+# adds no new dependency to the tree, just a direct edge to one already built.
+# `std` only: no `clock` feature, since the current instant comes from
+# `std::time::SystemTime` as before, not from chrono.
+chrono = { version = "0.4.45", default-features = false, features = ["std"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile.workspace = true
+trybuild.workspace = true
+# Explicit version; hoisted to the workspace later.
+criterion = "0.8.2"
+# Builds `crosslimit-hammer` (`kgraf-crosslimit-hammer`) for
+# `tests/crosslimit_processes.rs`'s real, multiple-process tests (the real-speaker rule: an
+# in-process mock of "another process" would restate this module's own
+# assumption). Same pattern and reasoning as `kgraf-mcp`'s dev-dependency on
+# `kgraf-mcp-test-server`, built with `escargot` from its manifest path since
+# `CARGO_BIN_EXE_<name>` does not reach a bin in a workspace-sibling crate.
+escargot = "0.5"
+
+# Ledger overhead per call (begin plus settle): the accounting path every provider
+# call pays, measured so the per-turn loop budget has a baseline.
+[[bench]]
+name = "ledger_overhead"
+harness = false
+
+# Throughput and p50/p99 settle latency with many tasks settling at once, on disk.
+[[bench]]
+name = "ledger_concurrent"
+harness = false
+
+# Cross-process rate limit latency at 1, 4 and 16 concurrent processes
+# (requirement 4, decision 0072): asserts the p99 budget.
+[[bench]]
+name = "crosslimit"
+harness = false

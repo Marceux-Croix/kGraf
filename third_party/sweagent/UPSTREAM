@@ -1,0 +1,40 @@
+Repository: https://github.com/SWE-agent/SWE-agent
+Commit:     3ea751c087f32b16e039a2233dd6eefecef325d5 (2026-07-16)
+Paths:      sweagent/agent/history_processors.py
+License:    MIT. The full text is copied here as LICENSE; verified at the
+            source 2026-09-26.
+Date verified: 2026-09-26
+
+Ported (Python to Rust) into crates/kgraf-session/src/reduction.rs:
+the `LastNObservations` history processor's core algorithm (decision 0057,
+ROADMAP Phase 3 "Compaction"): keep the most recent N observations unmasked,
+replace every older one with a placeholder, and never touch a pinned entry
+(upstream never touches the first entry specifically, the instance template;
+kGraf generalizes "never touch" to an explicit pinned-index set the caller
+supplies plus a self-reported `Reducible::is_pinned`, per 0057: "the original
+instruction and pinned items are never masked"). kGraf's port generalizes
+"observation" from SWE-agent's message-type tag to the `Reducible` trait, so
+the same algorithm works over any transcript entry type; the "keep last N"
+default (5, the paper-cited window this file itself names) is unchanged.
+
+Not a literal match, corrected here after an owner review found the earlier
+version of this file overclaimed it:
+
+- Upstream's placeholder is dynamic -- `"Old environment output: (N lines
+  omitted)"`, naming how much was cut. kGraf's placeholder
+  (`MaskConfig::placeholder`) is a fixed string the caller supplies; it does
+  not compute or report a size. If that detail matters later, it is a small
+  addition to `reduce`'s masking loop, not implemented here.
+- kGraf never applies a placeholder that would not shrink the entry (an
+  observation shorter than the placeholder is left alone): SWE-agent's
+  `LastNObservations` has no equivalent check, since its placeholder always
+  replaces content upstream considers already-consumed context regardless of
+  size.
+- `always_remove_output_for_tags` / `always_keep_output_for_tags` are not
+  ported: kGraf's pinning is the explicit index set and trait method
+  above, not a tag convention.
+- The truncation step (masking's counterpart when it alone does not fit the
+  budget) is not from this file at all -- see `third_party/openhands/UPSTREAM`
+  -- and, unlike either source, groups entries sharing a
+  `Reducible::truncation_unit` (a tool call and its result) so truncation
+  never drops one half of a pair.

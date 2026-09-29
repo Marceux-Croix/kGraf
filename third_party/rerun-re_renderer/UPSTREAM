@@ -1,0 +1,40 @@
+repository: https://github.com/rerun-io/rerun
+commit: f54fa0212aa1ff8595ea60fe841fd385821c1644
+paths: crates/viewer_support/re_renderer/shader/utils/sphere_quad.wgsl, crates/viewer_support/re_renderer/shader/utils/size.wgsl, crates/viewer_support/re_renderer/shader/point_cloud.wgsl, crates/viewer_support/re_renderer/src/device_caps.rs
+license: MIT OR Apache-2.0
+date verified: 2026-09-26
+
+License check: workspace Cargo.toml `license = "MIT OR Apache-2.0"`, re_renderer
+`license.workspace = true` (crate version 0.39.0-alpha.1+dev, wgpu 30). Copyright
+(c) 2022 Rerun Technologies AB. Both texts are copied here as LICENSE-MIT and
+LICENSE-APACHE; kGraf takes the code under Apache-2.0, its own license.
+
+Copied and MODIFIED (shader techniques, each marked at its site):
+  shader/utils/sphere_quad.wgsl
+      sphere_or_circle_quad_span corner pattern (six vertices per quad from
+      vertex_index, no index buffer); circle_quad's camera-plane billboard with half
+      a pixel of feather margin; circle_quad_coverage's fwidth-feathered edge.
+  shader/utils/size.wgsl
+      world_size_from_point_size, used as a minimum on-screen core radius.
+  shader/point_cloud.wgsl
+      the quick shading term max(0.4, sqrt(1.2 - d / r)).
+      -> crates/kgraf-galaxy/src/shaders/points.wgsl
+      Changed: instance-rate vertex buffers instead of data textures; separate core
+      (depth-writing) and halo (depth-tested only) passes; a maximum on-screen size;
+      no picking, outline or depth-offset variants.
+
+Adapted (subset):
+  src/device_caps.rs select_testing_adapter: prefer a CPU adapter for tests, then
+      discrete, then the rest; fail loudly when none exists.
+      -> crates/kgraf-galaxy/tests/headless.rs `gpu()`
+
+Not taken, and why:
+  The render context, view builder, draw-phase manager, CPU-write/GPU-read belt,
+  data-texture allocator, resource pools, shader import resolver, picking layer,
+  outlines, and the point-cloud and line renderers' Rust halves. They depend on each
+  other and on rerun's re_log, re_mutex, re_tracing, re_span, re_byte_size and
+  ecolor; the crate is about 32,000 lines. kGraf draws two primitives into one
+  target, so a copy would be mostly plumbing it never calls. lines.wgsl draws thick
+  quad lines with caps; the galaxy's edges are one-pixel additive segments. The
+  picking layer needs a GPU readback per click; a CPU screen-space pass costs
+  0.25 ms at 100,000 nodes (benches/frame.rs).

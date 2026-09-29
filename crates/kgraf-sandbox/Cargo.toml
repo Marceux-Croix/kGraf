@@ -1,0 +1,92 @@
+[package]
+name = "kgraf-sandbox"
+version.workspace = true
+description = "Sandboxed execution: worktrees and per-platform isolation."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+# `flock::HeldLock`: hold locks released by an explicit unlock, shared with
+# the session and orchestrator crates.
+kgraf-core = { path = "../kgraf-core" }
+# `impl DiagCode` for this crate's errors (decision 0069). No cycle: kgraf-diag
+# depends on nothing in this workspace but kgraf-core.
+# `SECRET_NAME_NEEDLES`, the one place a variable name is judged
+# credential-shaped, shared with this crate's inherited-environment scrub so
+# the two never drift apart.
+kgraf-secrets = { path = "../kgraf-secrets" }
+kgraf-diag = { path = "../kgraf-diag" }
+thiserror = "2.0.17"
+# MIT OR Apache-2.0, verified on crates.io 2026-09-26; already in Cargo.lock.
+# Merge-back folds paths to NFC to detect normalization-only collisions.
+unicode-normalization = "0.1.25"
+# Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT, read from the crate's
+# Cargo.toml 2026-09-26; already in Cargo.lock under cap-std, which kgraf-tools
+# uses for the same reason. Merge-back removes what a check left in a worktree from
+# the host, outside the sandbox: every directory is opened no-follow relative to its
+# parent's descriptor (`open_dir_nofollow`) and every entry is unlinked relative to
+# it, so a check process that swaps a directory for a symlink cannot steer a removal
+# outside the worktree . cap-primitives rather than cap-std:
+# cap-std's `Dir` has no no-follow directory open. rustix (also in the lock) was the
+# other candidate, rejected because it is unix-only and this crate builds for
+# Windows. Descriptor-relative path handling is reused, not hand-rolled.
+cap-primitives = "4.0.3"
+
+[target.'cfg(unix)'.dependencies]
+# Process liveness (`kill(pid, 0)`) for orphan detection; the lock reason
+# records the owning PID.
+libc = "0.2.185"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# MIT OR Apache-2.0, verified on crates.io 2026-09-26. The reuse
+# candidate for Linux isolation.
+landlock = "0.4.7"
+# Apache-2.0 OR BSD-3-Clause, verified at the source (crates.io metadata and the
+# crate's LICENSE files) 2026-09-26. The seccomp BPF compiler codex-rs
+# `linux-sandbox` uses; default features only (no serde/json).
+seccompiler = "0.5.0"
+
+[target.'cfg(windows)'.dependencies]
+# MIT OR Apache-2.0, verified on crates.io 2026-09-26. 0.61.2 is the
+# windows-sys release shipped with `windows` 0.62.2 (the sandboxing evidence's
+# "pin to 0.62"; no windows-sys 0.62 exists). Already in Cargo.lock through
+# other crates. `win32job` was not taken: it pulls `windows` 0.61 and
+# thiserror 1, a second copy of each, for four job-object calls.
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+    "Win32_System_StationsAndDesktops",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+kgraf-core = { path = "../kgraf-core", features = ["test-support"] }
+tempfile = "3.27.0"
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+# The Windows escape-test probe calls these directly (desktop name, console,
+# OpenProcess, registry, hard links, SendInput, waiting on a process handle).
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Registry",
+    "Win32_System_StationsAndDesktops",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+] }
+
+[[bench]]
+name = "lifecycle"
+harness = false

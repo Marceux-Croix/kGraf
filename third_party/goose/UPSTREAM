@@ -1,0 +1,73 @@
+Repository: https://github.com/block/goose
+Commit:     04ed836c8cde23e540cc77d256992e00be99298b (2026-09-25)
+Paths:      crates/goose/src/permission/permission_store.rs
+License:    Apache-2.0. The full text is copied here as LICENSE; verified at
+            the source 2026-09-26. No upstream NOTICE file exists at this
+            commit.
+Date verified: 2026-09-26
+
+Ported (Rust to Rust, restructured) into
+crates/kgraf-session/src/approval_store.rs: `ToolPermissionStore`'s
+overall shape -- one JSON file, loaded whole, one record per rule (tool, a
+match, a timestamp, a note) -- and its atomic-write idea (a temp file, then a
+rename over the target).
+
+The temp-file-then-rename step itself is **not** a literal port of goose's
+`save`: goose writes a fixed `tool_permissions.tmp` name with no `fsync` and
+no lock, which loses a rule under two concurrent `allow()` calls (an owner
+review found this after the first port landed). kGraf's
+`write_store_file` instead uses a per-write unique temp name, `fsync`s the
+temp file and (best effort) the containing directory, and every
+read-modify-write in `insert` runs under an exclusive `flock` on a sidecar
+`.lock` file, re-reading the store fresh before writing so two writers cannot
+each read the same stale state and overwrite one another.
+
+Changes, all deliberate:
+- Goose keys a record on `tool_name:blake3(exact arguments)`, an exact-context
+  cache entry. The task asks for "always allow this command pattern for this
+  project" (Phase 3 build plan), which is a *pattern*, not one exact call, so
+  kGraf's `AllowRule` carries a `Scope` (`AnyCall`, requiring an explicit
+  `ConfirmAllowAnyCall` marker to construct, or `Prefix(String)`, matched with
+  the same word-boundary rule `kgraf_session::skills::word_boundary_prefix`
+  uses for `allowed-tools`' `Name(prefix:*)` form), never a content hash and
+  never an implicit "match everything" default.
+- The subject a `Prefix` rule is checked against is read from
+  `Tool::permission_subject` -- the same call the rest of the approval chain
+  uses -- inside `PersistedAllowHook`, never guessed from a raw `cmd`/`command`
+  input field the way an earlier version of this file did. A tool that has not
+  parsed its input as one simple command reports no subject at all, so a
+  `Prefix` rule cannot match a compound command it was never meant to cover.
+- One store per project (goose has one global store under its config dir),
+  because approval is scoped "per project" (Phase 3 build plan); the store's
+  path is refused if it lies inside the workspace root it is meant to gate,
+  and the on-disk file carries an explicit schema version an unrecognized
+  value is rejected against, both to keep the store outside a worker's own
+  write access.
+- `readable_context` is dropped: not used by anything in kGraf's approval
+  chain. `note` is added instead, naming why the rule was added, because the
+  task requires the store be "auditable".
+- Applied through [`kgraf_tools::approval::ApprovalHook`]
+  (`PersistedAllowHook`) rather than a bespoke check call, so it composes with
+  the rest of the approval chain (0055) instead of being a second gate beside
+  it.
+
+---
+
+Repository: https://github.com/block/goose
+Commit:     04ed836c8cde23e540cc77d256992e00be99298b (2026-09-25)
+Paths:      crates/goose/src/agents/subagent_handler.rs,
+            crates/goose/src/agents/subagent_task_config.rs
+License:    Apache-2.0. Re-verified at the source 2026-09-26.
+Date verified: 2026-09-26
+
+Followed, not copied, in crates/kgraf-orchestrator/src/orchestrator.rs.
+The ROADMAP Phase 4 build plan names `agents/subagent_execution_tool/`; at
+this commit that directory holds only `notification_events.rs`, and the
+delegate lifecycle lives in `subagent_handler.rs`. What transfers: a delegate
+runs with its own cancellation, its events are forwarded to the parent while
+it runs (`notification_tx`), and its result is collected when its stream
+ends. kGraf's worker runtime already provides spawn, handle, cancel and
+the event stream, so no goose code is copied. Deliberately different: goose
+logs and ignores an extension that fails to load for a subagent (`debug!`);
+kGraf checks readiness, tool discovery included, before a worker gets
+capacity, and refuses the dispatch (SR-008).

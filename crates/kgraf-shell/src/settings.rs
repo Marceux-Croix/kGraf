@@ -1,0 +1,975 @@
+//! The settings surface's model: configuration only, never work state (0017).
+//!
+//! It carries the compaction slider (0057 addendum 2), the background-mode switch
+//! (0052) and the concurrency caps (0017). Anything that describes work in flight
+//! belongs on the graph, not here.
+
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+use crate::error::ShellError;
+
+/// Slider bounds, percent of the effective window (0057 addendum 2: Roo Code's user
+/// range starts at 5%, Codex caps usable input at 95%).
+pub const COMPACTION_MIN_PERCENT: u8 = 5;
+pub const COMPACTION_MAX_PERCENT: u8 = 95;
+/// Production default (goose `DEFAULT_COMPACTION_THRESHOLD = 0.8`), shown as the
+/// recommendation until a model has measured runs.
+pub const COMPACTION_DEFAULT_PERCENT: u8 = 80;
+
+/// A compaction point inside the slider's range. Construction is the only check, so a
+/// value of this type is always in range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CompactionPoint(u8);
+
+impl CompactionPoint {
+    pub fn new(percent: i64) -> Result<Self, ShellError> {
+        let range = i64::from(COMPACTION_MIN_PERCENT)..=i64::from(COMPACTION_MAX_PERCENT);
+        if !range.contains(&percent) {
+            return Err(ShellError::CompactionOutOfRange { percent });
+        }
+        // In range 5..=95, so the cast cannot truncate.
+        Ok(Self(percent as u8))
+    }
+
+    pub fn percent(self) -> u8 {
+        self.0
+    }
+}
+
+impl Default for CompactionPoint {
+    fn default() -> Self {
+        Self(COMPACTION_DEFAULT_PERCENT)
+    }
+}
+
+/// Where the recommendation came from. Until a model has enough recorded runs it is
+/// the unmeasured production default, and the slider says so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recommendation {
+    Unmeasured(CompactionPoint),
+    Measured(CompactionPoint),
+}
+
+impl Recommendation {
+    pub fn point(self) -> CompactionPoint {
+        match self {
+            Self::Unmeasured(p) | Self::Measured(p) => p,
+        }
+    }
+}
+
+impl Default for Recommendation {
+    fn default() -> Self {
+        Self::Unmeasured(CompactionPoint::default())
+    }
+}
+
+/// The slider's state machine: it follows the recommendation until the user moves it,
+/// then holds the user's value until the user returns it to the recommendation.
+///
+/// A user value equal to the current recommendation never pins: landing on the
+/// recommendation (or touching the slider without moving it) is following it. Only a
+/// move to a different value pins.
+///
+/// ```text
+///   Following --user moves to v != rec--> Pinned(v)
+///   Following --user moves to rec-------> Following
+///   Pinned    --user moves to rec-------> Following
+///   Pinned    --return------------------> Following
+///   Following --recommendation updates--> Following (value tracks it)
+///   Pinned    --recommendation updates--> Pinned (value unchanged)
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CompactionSlider {
+    recommendation: Recommendation,
+    pinned: Option<CompactionPoint>,
+}
+
+impl CompactionSlider {
+    pub fn value(&self) -> CompactionPoint {
+        self.pinned.unwrap_or(self.recommendation.point())
+    }
+
+    pub fn recommendation(&self) -> Recommendation {
+        self.recommendation
+    }
+
+    pub fn follows_recommendation(&self) -> bool {
+        self.pinned.is_none()
+    }
+
+    pub fn set_by_user(&mut self, point: CompactionPoint) {
+        self.pinned = (point != self.recommendation.point()).then_some(point);
+    }
+
+    pub fn return_to_recommendation(&mut self) {
+        self.pinned = None;
+    }
+
+    pub fn update_recommendation(&mut self, recommendation: Recommendation) {
+        self.recommendation = recommendation;
+    }
+}
+
+/// The parallelism slider (decision 0067): one number, `max_agents`,
+/// with a per-machine maximum computed elsewhere (`kgraf-capacity::compute`,
+/// wired through the shell's re-measure thread) rather than the fixed
+/// `MAX_LIVE_AGENTS_CAP` [`ConcurrencyCaps`] uses. Modeled after
+/// [`CompactionSlider`]'s own state machine (follows the maximum until the
+/// user moves it, holds where the user put it, returns to following on
+/// request), with one addition [`CompactionSlider`] does not need: the
+/// maximum can *fall* below a value the user pinned (a rate limit tightened,
+/// a machine's free memory dropped), and [`ParallelismSlider::effective`]
+/// is what a caller actually enforces in that case, distinct from
+/// [`ParallelismSlider::value`] (what the slider control shows, so the
+/// user's own choice is never silently rewritten out from under them).
+///
+/// ```text
+///   Following --user pins v != max--> Pinned(v)
+///   Following --user pins max------> Following
+///   Pinned    --user pins max------> Following
+///   Pinned    --return-------------> Following
+///   Following --max updates--------> Following (value tracks it)
+///   Pinned    --max updates--------> Pinned (value unchanged; effective may clamp)
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParallelismSlider {
+    max: u32,
+    pinned: Option<u32>,
+}
+
+impl ParallelismSlider {
+    /// A slider following `max` (not yet touched by the user).
+    pub fn new(max: u32) -> Self {
+        Self {
+            max: max.max(1),
+            pinned: None,
+        }
+    }
+
+    /// What the slider control shows: the user's own choice if pinned,
+    /// otherwise the current maximum. This is *not* clamped to the current
+    /// maximum on its own (design: "the slider says so" when the maximum has
+    /// fallen below it, which needs the un-clamped value to say anything
+    /// meaningful); see [`ParallelismSlider::effective`] for the number a
+    /// caller actually enforces.
+    pub fn value(&self) -> u32 {
+        self.pinned.unwrap_or(self.max)
+    }
+
+    /// The current per-machine maximum.
+    pub fn max(&self) -> u32 {
+        self.max
+    }
+
+    /// The number actually in force: `value()`, clamped down to `max()` when
+    /// a pinned value now exceeds it (design: "If the maximum falls below
+    /// the slider value, the effective limit is the maximum ... and running
+    /// agents keep running", this method names what a fresh admission is
+    /// bound by; it does not itself kill anything already running).
+    pub fn effective(&self) -> u32 {
+        self.value().min(self.max)
+    }
+
+    /// Whether the slider currently follows the maximum (never pinned, or
+    /// last set to exactly the maximum: landing on the maximum is following,
+    /// the same rule [`CompactionSlider::set_by_user`] uses).
+    pub fn follows_max(&self) -> bool {
+        self.pinned.is_none()
+    }
+
+    /// Whether `effective()` is below `value()` right now: the case the
+    /// design says the slider must state, not clamp silently.
+    pub fn is_clamped(&self) -> bool {
+        self.pinned.is_some_and(|v| v > self.max)
+    }
+
+    /// The note to show next to the slider when it is clamped, or `None`
+    /// when it is not (design: "the slider says so").
+    pub fn clamp_note(&self) -> Option<String> {
+        self.is_clamped().then(|| {
+            format!(
+                "Set to {}, but the machine's current maximum is {}; the effective limit is {} \
+                 until the maximum rises or you lower the slider.",
+                self.value(),
+                self.max,
+                self.effective()
+            )
+        })
+    }
+
+    /// Pin the slider to `v` (clamped to at least 1; not clamped to the
+    /// current maximum, since a value above it is exactly the state
+    /// `is_clamped`/`clamp_note` exist to report rather than silently
+    /// prevent). Landing exactly on the maximum returns to following it.
+    pub fn set_by_user(&mut self, v: u32) {
+        let v = v.max(1);
+        self.pinned = (v != self.max).then_some(v);
+    }
+
+    /// Stop following the maximum and return to it.
+    pub fn return_to_max(&mut self) {
+        self.pinned = None;
+    }
+
+    /// A newly measured maximum (`kgraf-capacity::compute`, through the
+    /// shell's re-measure thread and its hysteresis). A pinned value is left
+    /// alone; a following slider's `value()` tracks the new maximum at once.
+    pub fn update_max(&mut self, max: u32) {
+        self.max = max.max(1);
+    }
+}
+
+impl Default for ParallelismSlider {
+    /// Before the first measurement, the maximum is 0017's own starting
+    /// ceiling (`DEFAULT_MAX_LIVE_AGENTS`): the same number `ConcurrencyCaps`
+    /// already defaults to, so a settings file with neither the new
+    /// `parallelism_agents` key nor a legacy `max_live_agents` key (a first
+    /// run) behaves exactly as before this slider existed, until the shell's
+    /// re-measure thread runs its first `kgraf-capacity::compute` and calls
+    /// `update_max`.
+    fn default() -> Self {
+        Self::new(kgraf_orchestrator::DEFAULT_MAX_LIVE_AGENTS as u32)
+    }
+}
+
+/// Highest work-item cap the slider offers. 0017's starting band is three to five;
+/// sixteen leaves room to measure past it without inviting an unbounded fan-out.
+pub const MAX_WORK_ITEMS_CAP: usize = 16;
+/// Highest live-agent ceiling the slider offers.
+pub const MAX_LIVE_AGENTS_CAP: usize = 64;
+
+/// The two limits of decision 0017, as configuration: concurrent work items (the
+/// user-facing cap) and total live agents (the hard ceiling). Construction is the
+/// only check, so a value of this type is always in range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConcurrencyCaps {
+    work_items: usize,
+    live_agents: usize,
+}
+
+impl ConcurrencyCaps {
+    pub fn new(work_items: i64, live_agents: i64) -> Result<Self, ShellError> {
+        let check = |what, v: i64, max: usize| {
+            usize::try_from(v)
+                .ok()
+                .filter(|&n| (1..=max).contains(&n))
+                .ok_or(ShellError::CapOutOfRange {
+                    what,
+                    value: v,
+                    max,
+                })
+        };
+        Ok(Self {
+            work_items: check("max_work_items", work_items, MAX_WORK_ITEMS_CAP)?,
+            live_agents: check("max_live_agents", live_agents, MAX_LIVE_AGENTS_CAP)?,
+        })
+    }
+
+    pub fn work_items(self) -> usize {
+        self.work_items
+    }
+
+    pub fn live_agents(self) -> usize {
+        self.live_agents
+    }
+
+    /// The orchestrator's limits. In range by construction, so never zero.
+    pub fn limits(self) -> Result<kgraf_orchestrator::Limits, ShellError> {
+        kgraf_orchestrator::Limits::new(self.work_items, self.live_agents)
+            .map_err(|e| ShellError::Config(e.to_string()))
+    }
+}
+
+impl Default for ConcurrencyCaps {
+    /// The orchestrator's starting defaults (0017: a starting point, not researched).
+    fn default() -> Self {
+        Self {
+            work_items: kgraf_orchestrator::DEFAULT_MAX_WORK_ITEMS,
+            live_agents: kgraf_orchestrator::DEFAULT_MAX_LIVE_AGENTS,
+        }
+    }
+}
+
+/// The window's color theme (THM-1). The stage
+/// stays near-black (`--stage-bg`) in every theme.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Appearance {
+    /// Follow the operating system's light or dark setting.
+    Device,
+    #[default]
+    Dark,
+    Light,
+}
+
+/// All shell configuration.
+///
+/// The open projects (decision 0066) are configuration: which folders the window
+/// shows, like `--project`. Nothing about their work state is kept here (0017).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Settings {
+    pub compaction: CompactionSlider,
+    /// Closing the window leaves the process in the tray (0052).
+    pub background_mode: bool,
+    /// Discrete GPU first instead of integrated first. Read at launch, when the
+    /// adapter is chosen.
+    pub prefer_high_performance_gpu: bool,
+    /// Retired as a user-facing control (2026-09-28, item 5;
+    /// design consequence, "The work-item cap as a user control is gone").
+    /// Kept only so a settings file this build saves round-trips through the
+    /// legacy `max_work_items`/`max_live_agents` keys in a build that
+    /// predates the slider (`to_toml_string`); neither `cap_controls` nor
+    /// `apply_caps` (both removed) reads or writes it from the UI anymore.
+    /// [`Settings::parallelism`] is the sole source of the live-agent
+    /// ceiling every open project's admission actually enforces.
+    pub caps: ConcurrencyCaps,
+    /// The parallelism slider (decision 0067): one number, with a
+    /// per-machine maximum. The sole source of the live-agent ceiling every
+    /// open project's admission enforces (`kgraf-shell::layout`'s
+    /// `sync_parallelism` wiring); its own migration and clamp behavior are
+    /// complete and tested.
+    pub parallelism: ParallelismSlider,
+    /// Set by [`Settings::from_toml_str`] when a legacy `max_work_items` or
+    /// `max_live_agents` key drove [`Settings::parallelism`]'s initial pin
+    /// (design: "A warning names the migration"). Never persisted (not a
+    /// `SettingsFile` field): it is a one-time load-time notice, not stored
+    /// state.
+    pub migration_warning: Option<String>,
+    /// Light, dark, or the device's theme.
+    pub appearance: Appearance,
+    /// Standard color vision or one mode of color blindness (decision 0070). Remaps the five
+    /// semantic colors only; it lives in `kgraf_core::palette` and does not touch the style guide's
+    /// one palette.
+    pub color_vision: kgraf_core::palette::Vision,
+    /// No blinking or wiggling indicators. egui cannot read the operating system's
+    /// reduced-motion setting, so the user sets it here.
+    pub reduce_motion: bool,
+    /// The guide is expanded to its sidebar (it stays open until closed).
+    pub guide_open: bool,
+    /// The project folders open in the window, in the switcher's order.
+    pub projects: Vec<PathBuf>,
+    /// The project shown when the window opens, if it is one of `projects`.
+    pub active_project: Option<PathBuf>,
+    /// Check GitHub Releases for a newer kGraf on start.
+    /// **Off by default.** Decision 0051 permits egress only to the
+    /// model providers and MCP servers the user configured; a GitHub Releases query
+    /// is neither, so it is opt-in here rather than a third standing destination
+    /// (see `crate::update_check`'s module doc for the full reasoning). "Check now"
+    /// in Settings runs regardless of this switch, since the user just asked.
+    pub check_for_updates: bool,
+    /// Offer a prerelease as an update too, not only a full release. Off by default.
+    pub allow_prerelease_updates: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            compaction: CompactionSlider::default(),
+            background_mode: true,
+            prefer_high_performance_gpu: false,
+            caps: ConcurrencyCaps::default(),
+            parallelism: ParallelismSlider::default(),
+            migration_warning: None,
+            appearance: Appearance::default(),
+            color_vision: kgraf_core::palette::Vision::default(),
+            reduce_motion: false,
+            guide_open: false,
+            projects: Vec::new(),
+            active_project: None,
+            check_for_updates: false,
+            allow_prerelease_updates: false,
+        }
+    }
+}
+
+/// On-disk form. Unknown keys are rejected so a misspelled key fails loudly instead of
+/// being ignored.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SettingsFile {
+    /// Absent means "follow the recommendation".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compaction_percent: Option<i64>,
+    background_mode: Option<bool>,
+    prefer_high_performance_gpu: Option<bool>,
+    /// Legacy (decision 0017, before 0067): read once, then migrated onto
+    /// `parallelism_agents` if that key is absent. Still written back too
+    /// (see `to_toml_string`), so a settings file this build saves still
+    /// loads correctly in a build that predates the slider.
+    max_work_items: Option<i64>,
+    /// Legacy: see `max_work_items`'s doc comment. `Settings::parallelism`'s
+    /// initial pin, once, when `parallelism_agents` is absent (design:
+    /// "`max_live_agents` becomes the slider value if it is in range").
+    max_live_agents: Option<i64>,
+    /// The parallelism slider's pinned value (decision 0067). Absent
+    /// means "follow the machine's current maximum", exactly as
+    /// `compaction_percent`'s absence means "follow the recommendation".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parallelism_agents: Option<i64>,
+    /// `true` on every file this build (0067+) writes, `false` (the serde
+    /// default) on a file from before this key existed. This is the only
+    /// reliable way to tell "a file the parallelism slider does not know
+    /// about yet" apart from "a file where the slider is simply following
+    /// the maximum, which also omits `parallelism_agents`": both leave
+    /// `parallelism_agents` absent, so absence alone cannot distinguish a
+    /// genuinely legacy file from an ordinary, modern, unpinned one.
+    #[serde(default)]
+    parallelism_managed: bool,
+    appearance: Option<Appearance>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    color_vision: Option<kgraf_core::palette::Vision>,
+    reduce_motion: Option<bool>,
+    guide_open: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    projects: Vec<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    active_project: Option<PathBuf>,
+    /// Absent (an older settings file) means off, the
+    /// same default a fresh install gets.
+    check_for_updates: Option<bool>,
+    allow_prerelease_updates: Option<bool>,
+}
+
+impl Settings {
+    /// Parses a TOML settings file. An out-of-range compaction point is an error.
+    pub fn from_toml_str(text: &str) -> Result<Self, ShellError> {
+        let file: SettingsFile =
+            toml::from_str(text).map_err(|e| ShellError::Config(e.to_string()))?;
+        let mut settings = Self::default();
+        if let Some(p) = file.compaction_percent {
+            settings.compaction.set_by_user(CompactionPoint::new(p)?);
+        }
+        if let Some(b) = file.background_mode {
+            settings.background_mode = b;
+        }
+        if let Some(b) = file.prefer_high_performance_gpu {
+            settings.prefer_high_performance_gpu = b;
+        }
+        let d = ConcurrencyCaps::default();
+        settings.caps = ConcurrencyCaps::new(
+            file.max_work_items.unwrap_or(d.work_items as i64),
+            file.max_live_agents.unwrap_or(d.live_agents as i64),
+        )?;
+        // The parallelism slider (decision 0067).
+        //
+        // A file this build wrote (`parallelism_managed = true`) uses the
+        // modern `parallelism_agents` key alone: absent means following the
+        // maximum, exactly like `compaction_percent`.
+        //
+        // A file from before this key existed (`parallelism_managed` absent,
+        // the serde default `false`) migrates its `max_live_agents` into the
+        // slider's initial pin once, with a warning naming the migration
+        // (design: "Old settings files with `max_work_items` or
+        // `max_live_agents` are read once ... A warning names the
+        // migration"). "In range" here means positive: an old file's value
+        // above today's still-unmeasured default maximum is not rejected,
+        // since `ParallelismSlider::effective` and `clamp_note` exist
+        // precisely to state that case rather than silently reject or
+        // silently truncate it.
+        if file.parallelism_managed {
+            match file.parallelism_agents {
+                Some(n) if n > 0 => settings.parallelism.set_by_user(n as u32),
+                Some(n) => {
+                    return Err(ShellError::CapOutOfRange {
+                        what: "parallelism_agents",
+                        value: n,
+                        max: u32::MAX as usize,
+                    });
+                }
+                None => {}
+            }
+        } else if let Some(n) = file.max_live_agents.filter(|n| *n > 0) {
+            settings.parallelism.set_by_user(n as u32);
+            settings.migration_warning = Some(format!(
+                "`max_live_agents = {n}` (and `max_work_items`, if present) is a legacy \
+                 setting; the parallelism slider (decision 0067) replaces it, set here to {n} \
+                 from the migrated value."
+            ));
+        }
+        if let Some(a) = file.appearance {
+            settings.appearance = a;
+        }
+        if let Some(v) = file.color_vision {
+            settings.color_vision = v;
+        }
+        if let Some(b) = file.reduce_motion {
+            settings.reduce_motion = b;
+        }
+        if let Some(b) = file.guide_open {
+            settings.guide_open = b;
+        }
+        // A folder listed twice would open two hosts over one `.kgraf`; the
+        // second entry is dropped.
+        for p in file.projects {
+            if !settings.projects.contains(&p) {
+                settings.projects.push(p);
+            }
+        }
+        settings.active_project = file
+            .active_project
+            .filter(|a| settings.projects.contains(a));
+        if let Some(b) = file.check_for_updates {
+            settings.check_for_updates = b;
+        }
+        if let Some(b) = file.allow_prerelease_updates {
+            settings.allow_prerelease_updates = b;
+        }
+        Ok(settings)
+    }
+
+    /// Serializes to TOML. A slider that follows the recommendation writes no
+    /// `compaction_percent`, so it keeps following after a reload.
+    pub fn to_toml_string(&self) -> Result<String, ShellError> {
+        let file = SettingsFile {
+            compaction_percent: (!self.compaction.follows_recommendation())
+                .then(|| i64::from(self.compaction.value().percent())),
+            background_mode: Some(self.background_mode),
+            prefer_high_performance_gpu: Some(self.prefer_high_performance_gpu),
+            max_work_items: Some(self.caps.work_items() as i64),
+            max_live_agents: Some(self.caps.live_agents() as i64),
+            parallelism_agents: (!self.parallelism.follows_max())
+                .then(|| i64::from(self.parallelism.value())),
+            parallelism_managed: true,
+            appearance: Some(self.appearance),
+            color_vision: (self.color_vision != kgraf_core::palette::Vision::default())
+                .then_some(self.color_vision),
+            reduce_motion: Some(self.reduce_motion),
+            guide_open: Some(self.guide_open),
+            projects: self.projects.clone(),
+            active_project: self.active_project.clone(),
+            check_for_updates: Some(self.check_for_updates),
+            allow_prerelease_updates: Some(self.allow_prerelease_updates),
+        };
+        toml::to_string(&file).map_err(|e| ShellError::Config(e.to_string()))
+    }
+
+    /// Loads from `path`. A missing file is the defaults (first run); any other read
+    /// or parse failure is an error.
+    pub fn load(path: &Path) -> Result<Self, ShellError> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => Self::from_toml_str(&text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(ShellError::Io {
+                path: path.to_owned(),
+                source: e,
+            }),
+        }
+    }
+
+    /// Writes to `path` atomically: a temporary file in the same directory, flushed to
+    /// disk, then renamed over the target. A crash mid-write leaves the old file whole.
+    pub fn save(&self, path: &Path) -> Result<(), ShellError> {
+        let text = self.to_toml_string()?;
+        let io = |source| ShellError::Io {
+            path: path.to_owned(),
+            source,
+        };
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            std::fs::create_dir_all(dir).map_err(io)?;
+        }
+        // A name of this process and this write alone: two windows (two
+        // processes) saving at once never write into one temporary file.
+        static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut tmp_name = path.as_os_str().to_owned();
+        tmp_name.push(format!(".{}.{n}.tmp", std::process::id()));
+        let tmp = PathBuf::from(tmp_name);
+        {
+            let mut f = std::fs::File::create(&tmp).map_err(io)?;
+            f.write_all(text.as_bytes()).map_err(io)?;
+            f.sync_all().map_err(io)?;
+        }
+        std::fs::rename(&tmp, path).map_err(io)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounds_are_inclusive_and_outside_is_an_error() {
+        assert_eq!(CompactionPoint::new(5).expect("min").percent(), 5);
+        assert_eq!(CompactionPoint::new(95).expect("max").percent(), 95);
+        for bad in [-1, 0, 4, 96, 100, 1000] {
+            let err = CompactionPoint::new(bad).expect_err("out of range");
+            assert!(err.to_string().contains(&bad.to_string()));
+        }
+    }
+
+    #[test]
+    fn default_is_80_and_unmeasured() {
+        let s = CompactionSlider::default();
+        assert_eq!(s.value().percent(), 80);
+        assert!(matches!(s.recommendation(), Recommendation::Unmeasured(_)));
+        assert!(s.follows_recommendation());
+    }
+
+    #[test]
+    fn follows_recommendation_until_moved_then_holds() {
+        let mut s = CompactionSlider::default();
+        let m = |p| CompactionPoint::new(p).expect("valid");
+        s.update_recommendation(Recommendation::Measured(m(70)));
+        assert_eq!(s.value(), m(70));
+
+        s.set_by_user(m(50));
+        s.update_recommendation(Recommendation::Measured(m(60)));
+        assert_eq!(
+            s.value(),
+            m(50),
+            "a moved slider stays where the user put it"
+        );
+
+        s.return_to_recommendation();
+        assert_eq!(s.value(), m(60));
+        assert!(s.follows_recommendation());
+    }
+
+    #[test]
+    fn moving_onto_the_recommendation_does_not_pin() {
+        let mut s = CompactionSlider::default();
+        s.set_by_user(CompactionPoint::new(80).expect("valid"));
+        assert!(s.follows_recommendation(), "landing on 80 = following");
+
+        s.set_by_user(CompactionPoint::new(60).expect("valid"));
+        assert!(!s.follows_recommendation());
+        s.set_by_user(CompactionPoint::new(80).expect("valid"));
+        assert!(s.follows_recommendation(), "moving back onto it unpins");
+
+        // Still following: a later measurement moves the value.
+        s.update_recommendation(Recommendation::Measured(
+            CompactionPoint::new(70).expect("valid"),
+        ));
+        assert_eq!(s.value().percent(), 70);
+    }
+
+    #[test]
+    fn save_then_load_round_trips_through_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("nested").join("settings.toml");
+
+        let mut s = Settings::default();
+        s.compaction
+            .set_by_user(CompactionPoint::new(55).expect("valid"));
+        s.background_mode = false;
+        s.prefer_high_performance_gpu = true;
+        s.save(&path).expect("save");
+        let leftovers = std::fs::read_dir(dir.path().join("nested"))
+            .expect("dir")
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .count();
+        assert!(leftovers == 0, "temp file renamed away");
+        assert_eq!(Settings::load(&path).expect("load"), s);
+
+        // Return to the recommendation, save, reload: the slider follows again.
+        s.compaction.return_to_recommendation();
+        s.save(&path).expect("save");
+        let back = Settings::load(&path).expect("load");
+        assert!(back.compaction.follows_recommendation());
+        assert_eq!(back, s);
+    }
+
+    /// A non-default color vision round-trips
+    /// through the file; the default (`Standard`) is never written, so an
+    /// older build reading a file this one wrote sees no unfamiliar
+    /// `color_vision` key unless the mode was actually changed.
+    #[test]
+    fn color_vision_round_trips_and_the_default_is_not_written() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.toml");
+
+        let mut s = Settings::default();
+        assert_eq!(s.color_vision, kgraf_core::palette::Vision::Standard);
+        s.save(&path).expect("save");
+        assert!(
+            !std::fs::read_to_string(&path)
+                .expect("read")
+                .contains("color_vision"),
+            "the default is not written"
+        );
+        assert_eq!(Settings::load(&path).expect("load"), s);
+
+        s.color_vision = kgraf_core::palette::Vision::Protanopia;
+        s.save(&path).expect("save");
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(
+            text.contains("color_vision = \"protanopia\""),
+            "a chosen mode is written: {text}"
+        );
+        let loaded = Settings::load(&path).expect("load");
+        assert_eq!(loaded.color_vision, kgraf_core::palette::Vision::Protanopia);
+        assert_eq!(loaded, s);
+
+        // Moving back to standard drops the key again.
+        s.color_vision = kgraf_core::palette::Vision::Standard;
+        s.save(&path).expect("save");
+        assert!(
+            !std::fs::read_to_string(&path)
+                .expect("read")
+                .contains("color_vision"),
+            "back to the default, the key is gone again"
+        );
+    }
+
+    #[test]
+    fn missing_file_is_defaults_but_unreadable_file_is_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("absent.toml");
+        assert_eq!(
+            Settings::load(&missing).expect("defaults"),
+            Settings::default()
+        );
+        // A directory where the file should be cannot be read as a file.
+        assert!(Settings::load(dir.path()).is_err());
+    }
+
+    #[test]
+    fn config_file_out_of_range_is_an_error() {
+        let err = Settings::from_toml_str("compaction_percent = 99").expect_err("reject");
+        assert!(matches!(
+            err,
+            ShellError::CompactionOutOfRange { percent: 99 }
+        ));
+        assert!(Settings::from_toml_str("compaction_percent = 2").is_err());
+    }
+
+    #[test]
+    fn config_file_in_range_pins_the_slider() {
+        let s = Settings::from_toml_str("compaction_percent = 65\nbackground_mode = false")
+            .expect("valid");
+        assert_eq!(s.compaction.value().percent(), 65);
+        assert!(!s.compaction.follows_recommendation());
+        assert!(!s.background_mode);
+    }
+
+    #[test]
+    fn empty_config_is_defaults() {
+        assert_eq!(
+            Settings::from_toml_str("").expect("valid"),
+            Settings::default()
+        );
+    }
+
+    #[test]
+    fn unknown_key_is_an_error() {
+        let err = Settings::from_toml_str("compaction_pct = 50").expect_err("reject");
+        assert!(matches!(err, ShellError::Config(_)));
+    }
+
+    #[test]
+    fn caps_default_to_the_orchestrators_and_outside_the_range_is_an_error() {
+        let s = Settings::from_toml_str("").expect("valid");
+        assert_eq!(
+            s.caps.work_items(),
+            kgraf_orchestrator::DEFAULT_MAX_WORK_ITEMS
+        );
+        let s = Settings::from_toml_str("max_work_items = 2\nmax_live_agents = 5").expect("valid");
+        assert_eq!((s.caps.work_items(), s.caps.live_agents()), (2, 5));
+        for bad in [
+            "max_work_items = 0",
+            "max_work_items = 17",
+            "max_live_agents = -1",
+        ] {
+            assert!(
+                matches!(
+                    Settings::from_toml_str(bad),
+                    Err(ShellError::CapOutOfRange { .. })
+                ),
+                "{bad}"
+            );
+        }
+    }
+
+    /// Decision 0066: the open projects and the active one survive a restart,
+    /// through the file, in order; a duplicate is dropped, and an active project
+    /// that is not in the list is not restored.
+    #[test]
+    fn open_projects_round_trip_through_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.toml");
+        let s = Settings {
+            projects: vec![PathBuf::from("/a/one"), PathBuf::from("/b/two")],
+            active_project: Some(PathBuf::from("/b/two")),
+            guide_open: true,
+            appearance: Appearance::Light,
+            reduce_motion: true,
+            ..Settings::default()
+        };
+        s.save(&path).expect("save");
+        assert_eq!(Settings::load(&path).expect("load"), s);
+
+        let s =
+            Settings::from_toml_str("projects = [\"/a\", \"/b\", \"/a\"]\nactive_project = \"/c\"")
+                .expect("valid");
+        assert_eq!(s.projects, [PathBuf::from("/a"), PathBuf::from("/b")]);
+        assert_eq!(s.active_project, None, "not an open project");
+        assert!(Settings::from_toml_str("appearance = \"sepia\"").is_err());
+    }
+
+    #[test]
+    fn non_integer_percent_is_an_error() {
+        assert!(Settings::from_toml_str("compaction_percent = 50.5").is_err());
+    }
+
+    // --- ParallelismSlider (decision 0067) ---
+
+    #[test]
+    fn the_slider_follows_the_maximum_until_the_user_moves_it() {
+        let mut s = ParallelismSlider::new(8);
+        assert_eq!(s.value(), 8);
+        assert!(s.follows_max());
+        s.update_max(12);
+        assert_eq!(s.value(), 12, "a following slider tracks a new maximum");
+
+        s.set_by_user(6);
+        assert!(!s.follows_max());
+        s.update_max(20);
+        assert_eq!(s.value(), 6, "a pinned slider holds where the user put it");
+
+        s.return_to_max();
+        assert!(s.follows_max());
+        assert_eq!(s.value(), 20);
+    }
+
+    #[test]
+    fn landing_exactly_on_the_maximum_returns_to_following() {
+        let mut s = ParallelismSlider::new(8);
+        s.set_by_user(3);
+        assert!(!s.follows_max());
+        s.set_by_user(8);
+        assert!(
+            s.follows_max(),
+            "landing on the maximum is following, like the compaction slider"
+        );
+    }
+
+    /// "If the maximum falls below the slider value, the effective limit is
+    /// the maximum, the slider says so, and running agents keep running"
+    /// (design). This unit only states the fact (`effective`/`clamp_note`);
+    /// "running agents keep running" is `AdmissionGate`/`MachineGate`'s own
+    /// pre-flight-only behavior, tested in `kgraf-orchestrator::admission`.
+    #[test]
+    fn a_maximum_that_falls_below_a_pinned_value_clamps_the_effective_limit_and_says_so() {
+        let mut s = ParallelismSlider::new(20);
+        s.set_by_user(20); // still following at this point (see the test above)
+        s.set_by_user(15);
+        assert_eq!((s.value(), s.effective()), (15, 15));
+        assert!(s.clamp_note().is_none());
+
+        s.update_max(8);
+        assert_eq!(
+            s.value(),
+            15,
+            "the user's own choice is not silently rewritten"
+        );
+        assert_eq!(
+            s.effective(),
+            8,
+            "but the number actually enforced is the new maximum"
+        );
+        assert!(s.is_clamped());
+        let note = s.clamp_note().expect("stated, not hidden");
+        assert!(note.contains('8') && note.contains("15"), "{note}");
+
+        s.update_max(30);
+        assert!(
+            !s.is_clamped(),
+            "raising the maximum past the pin un-clamps it"
+        );
+        assert_eq!(s.effective(), 15);
+    }
+
+    /// Design: "Old settings files with `max_work_items` or `max_live_agents`
+    /// are read once ... `max_live_agents` becomes the slider value if it is
+    /// in range. A warning names the migration."
+    #[test]
+    fn an_old_file_with_max_live_agents_migrates_the_slider_and_warns() {
+        let s = Settings::from_toml_str("max_work_items = 4\nmax_live_agents = 12").expect("valid");
+        assert_eq!(
+            s.parallelism.value(),
+            12,
+            "the slider is set to the migrated value"
+        );
+        assert!(!s.parallelism.follows_max());
+        let warning = s.migration_warning.expect("a warning names the migration");
+        assert!(warning.contains("max_live_agents"), "{warning}");
+        assert!(warning.contains("12"), "{warning}");
+    }
+
+    /// A file this build wrote never re-triggers the legacy migration on a
+    /// later load, even though it still carries `max_live_agents` for
+    /// `ConcurrencyCaps`'s own persistence: `parallelism_managed` is the
+    /// signal, not mere key presence (see the field's own doc comment for
+    /// why presence alone cannot distinguish the two cases).
+    #[test]
+    fn a_modern_saved_file_does_not_re_trigger_the_legacy_migration() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.toml");
+        let mut s = Settings::default();
+        s.parallelism.set_by_user(5);
+        s.save(&path).expect("save");
+
+        let reloaded = Settings::load(&path).expect("load");
+        assert_eq!(reloaded.parallelism.value(), 5);
+        assert!(
+            reloaded.migration_warning.is_none(),
+            "a modern file must never produce a migration warning"
+        );
+
+        // A *following* slider (no pin) also round-trips without spuriously
+        // migrating, even though `max_live_agents` is still written for
+        // `ConcurrencyCaps`.
+        let mut s2 = Settings::default();
+        s2.parallelism.return_to_max();
+        s2.save(&path).expect("save");
+        let reloaded2 = Settings::load(&path).expect("load");
+        assert!(reloaded2.parallelism.follows_max());
+        assert!(reloaded2.migration_warning.is_none());
+    }
+
+    /// A `parallelism_agents` key wins over any legacy key, with no warning:
+    /// the modern path.
+    #[test]
+    fn the_modern_key_wins_over_a_legacy_key_present_in_the_same_file() {
+        let s = Settings::from_toml_str(
+            "max_live_agents = 12\nparallelism_agents = 30\nparallelism_managed = true",
+        )
+        .expect("valid");
+        assert_eq!(s.parallelism.value(), 30);
+        assert!(s.migration_warning.is_none());
+    }
+
+    /// Off by default (a fresh settings file, and an old
+    /// one written before this key existed, both read as off), and a chosen value
+    /// round-trips.
+    #[test]
+    fn update_check_settings_default_off_and_round_trip() {
+        let s = Settings::from_toml_str("").expect("valid");
+        assert!(!s.check_for_updates);
+        assert!(!s.allow_prerelease_updates);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.toml");
+        let s = Settings {
+            check_for_updates: true,
+            allow_prerelease_updates: true,
+            ..Settings::default()
+        };
+        s.save(&path).expect("save");
+        let loaded = Settings::load(&path).expect("load");
+        assert!(loaded.check_for_updates);
+        assert!(loaded.allow_prerelease_updates);
+    }
+
+    #[test]
+    fn a_zero_or_negative_parallelism_agents_is_rejected_not_clamped() {
+        let err = Settings::from_toml_str("parallelism_agents = 0\nparallelism_managed = true")
+            .expect_err("reject");
+        assert!(matches!(err, ShellError::CapOutOfRange { .. }));
+    }
+}

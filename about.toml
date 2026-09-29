@@ -1,0 +1,83 @@
+# cargo-about configuration: which dependency licenses THIRD_PARTY_NOTICES.md may
+# list. Regenerate with `scripts/third-party-notices.sh`.
+#
+# The accepted list is this project's qualifying licenses. A dependency under
+# anything else makes generation fail, which is the point: a new license is a
+# decision, not something a build quietly accepts. The last six entries
+# were accepted on 2026-09-26 and folded in from per-crate
+# entries on the same day, once no open branch touched this file: Unicode-3.0 (ICU4X
+# through idna and url), CDLA-Permissive-2.0 (webpki-roots), BSL-1.0 (clipboard-win,
+# error-code), OFL-1.1 and Ubuntu-font-1.0 (egui's default fonts), and Apache-2.0
+# WITH LLVM-exception (target-lexicon, winx). Where a crate offers a
+# choice (`MIT OR Apache-2.0`), cargo-about picks the first accepted license in this
+# order.
+accepted = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "CC0-1.0",
+    "Unlicense",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+    "BSL-1.0",
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
+    "Apache-2.0 WITH LLVM-exception",
+]
+
+# Dev-dependencies and build tooling do not ship in the binary.
+ignore-dev-dependencies = true
+ignore-build-dependencies = false
+
+# The platforms kGraf ships on (local desktop app).
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+]
+
+# kGraf's own crates are not third-party.
+private = { ignore = true }
+
+# Grammar crates whose package ships no LICENSE file: cargo-about otherwise prints
+# the SPDX MIT template with "<year> <copyright holders>", which is not the notice
+# MIT requires (review M4, 2026-09-27). Each clarification reads the upstream
+# LICENSE at the commit the crate was published from (its .cargo_vcs_info.json),
+# pinned by checksum. The copyright lines, checked 2026-09-27: java "2017 Ayman
+# Nadeem", cpp "2014 Max Brunsfeld", ruby "2016 Rob Rix", markdown "2021 Matthias
+# Deiml", typescript "2017 Max Brunsfeld".
+[tree-sitter-java.clarify]
+license = "MIT"
+[[tree-sitter-java.clarify.git]]
+path = "LICENSE"
+checksum = "52ed137b039cd9c46409bc22e89938af911c95b157feae2d040b51e6084369a7"
+
+[tree-sitter-cpp.clarify]
+license = "MIT"
+[[tree-sitter-cpp.clarify.git]]
+path = "LICENSE"
+checksum = "2e0110e07abef7c2548b26ec9d6969775617ca539a0dc8dbeeb14d6452c711d1"
+
+[tree-sitter-ruby.clarify]
+license = "MIT"
+[[tree-sitter-ruby.clarify.git]]
+path = "LICENSE"
+checksum = "ee006f02a3d856df282e409be2a86e24a65bb573a98b9c28343771141351bb6b"
+
+[tree-sitter-md.clarify]
+license = "MIT"
+[[tree-sitter-md.clarify.git]]
+path = "LICENSE"
+checksum = "52ec8a1bf8256511e2a92613e0bb41ffefba3897f16fa958d7bb28c466dd4804"
+
+[tree-sitter-typescript.clarify]
+license = "MIT"
+[[tree-sitter-typescript.clarify.git]]
+path = "LICENSE"
+checksum = "49bf33cf78ef5897e4e161ce1517df7de1ae5042a65b6bcfd44401e0fc606559"

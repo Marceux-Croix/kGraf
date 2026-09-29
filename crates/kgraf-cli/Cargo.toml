@@ -1,0 +1,94 @@
+[package]
+name = "kgraf-cli"
+version.workspace = true
+description = "Command-line access to kGraf's code graph and provider layer, ahead of the desktop shell."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+name = "kgraf_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kgraf"
+path = "src/main.rs"
+
+[dependencies]
+kgraf-secrets = { path = "../kgraf-secrets" }
+kgraf-core.workspace = true
+kgraf-graph.workspace = true
+# `kgraf diag show`/`export` (decision 0069): the local-only
+# usage-and-error file, never sent anywhere.
+kgraf-diag.workspace = true
+# The run construction `kgraf orchestrate` is a thin layer over, and the
+# `worker` module (re-exported as `kgraf_cli::worker`).
+kgraf-host.workspace = true
+kgraf-fleet.workspace = true
+kgraf-instructions.workspace = true
+kgraf-mcp.workspace = true
+# `kgraf orchestrate`: the orchestrator loop, and git worktrees per worker.
+kgraf-orchestrator.workspace = true
+# `kgraf schedule`: schedule definitions and the claim table (decision 0052).
+kgraf-schedule.workspace = true
+# `kgraf orchestrate --corpus`: a run started from the repository's documents.
+kgraf-interpret.workspace = true
+# `diag_code_for` (main.rs) downcasts to the specific IngestError a wrapping
+# InterpretError::Ingest names, when one is in the anyhow chain.
+kgraf-ingest.workspace = true
+kgraf-provider.workspace = true
+kgraf-provider-anthropic.workspace = true
+kgraf-provider-openai.workspace = true
+kgraf-runtime.workspace = true
+kgraf-sandbox.workspace = true
+kgraf-session.workspace = true
+kgraf-tools.workspace = true
+# `--tbench-bridge-socket` on `kgraf worker` and `kgraf orchestrate`. Adds nothing
+# to any other command's behavior; see crates/kgraf-tbench-bridge's own doc
+# comment for why it is its own crate rather than folded into kgraf-tools.
+kgraf-tbench-bridge.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+# `signal`: Ctrl-C cancels the worker so its work is still committed.
+tokio = { workspace = true, features = ["signal"] }
+# `schedule add --at` parses an RFC 3339 instant; same pin as kgraf-schedule.
+chrono = { version = "0.4.45", default-features = false, features = ["std", "clock"] }
+# `schedule run-now` writes the stored instruction to a temporary file for
+# `orchestrate_cmd::run`, which reads an instruction from a path.
+tempfile.workspace = true
+# The binary's log subscriber (`logging.rs`), with `kgraf-mcp`'s required
+# filter directives always applied. Both already in the tree through
+# `kgraf-mcp` (MIT); `env-filter` adds `matchers` (MIT).
+tracing = "0.1"
+# `ansi` (nu-ansi-term, MIT, already in Cargo.lock): colors on a terminal. Without
+# it, `with_ansi(true)` panics in a debug build and warns in a release one.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["ansi", "env-filter", "fmt", "std", "registry"] }
+
+[build-dependencies]
+# Embeds the icon + VERSIONINFO resource into kgraf.exe when this crate builds for
+# a Windows target (see build.rs, and crates/kgraf-shell/Cargo.toml's matching
+# entry for why this is unconditional rather than `target.'cfg(windows)'`-gated). MIT.
+embed-resource = "3.0"
+
+[dev-dependencies]
+# `Host::open_with_rate_limit_store`:
+# `orchestrate_cmd`'s own test opens a real `Host` with a real `--rate-limit`
+# and must point it at a temporary store, never the user's real per-user
+# directory. Same pattern as `kgraf-shell`'s `in-process-provider`
+# dev-dependency feature on this same crate.
+kgraf-host = { workspace = true, features = ["test-support"] }
+# The hosted-MCP approval test spawns `mcp-echo-server --http` and reads its
+# admin counters over a loopback socket.
+tokio = { workspace = true, features = ["process", "net"] }
+tempfile.workspace = true
+wiremock.workspace = true
+# Builds `mcp-echo-server` (kgraf-mcp-test-server), the real MCP server the
+# end-to-end worker test talks to over stdio; the same helper
+# kgraf-mcp's own tests use, for the same reason (a sibling crate's binary
+# is not in `CARGO_BIN_EXE_*`).
+escargot = "0.5"

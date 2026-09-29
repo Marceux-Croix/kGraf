@@ -1,0 +1,10 @@
+error[E0624]: associated function `new` is private
+ --> tests/compile_fail/permit_has_no_public_constructor.rs:6:31
+  |
+6 |     let _permit = CallPermit::new();
+  |                               ^^^ private associated function
+  |
+ ::: src/lib.rs
+  |
+  |     pub(crate) fn new() -> Self {
+  |     --------------------------- private associated function defined here

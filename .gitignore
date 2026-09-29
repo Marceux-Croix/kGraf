@@ -1,0 +1,34 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Tauri
+/src-tauri/target
+/src-tauri/gen
+
+# Node / TypeScript
+node_modules/
+dist/
+*.tsbuildinfo
+.env
+.env.local
+
+# Local index and agent state
+*.db
+*.db-shm
+*.db-wal
+/.kgraf/
+# Former name of the state directory (decision 0062): a project not yet
+# migrated still has it until its first run under kGraf moves it.
+/.haustoria/
+
+# macOS
+.DS_Store
+
+# Claude Code local state and campaign workspaces
+.claude/
+.claude_work/
+.claude_todo/
+
+# Python bytecode
+__pycache__/

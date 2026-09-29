@@ -1,0 +1,53 @@
+[package]
+name = "kgraf-graph"
+version.workspace = true
+description = "kGraf's code graph: chunker, SQLite schema, query surface and context slices."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+kgraf-core.workspace = true
+# `impl DiagCode for GraphError` (error.rs): names this crate's KG-02xx codes
+# for the diagnostics file (decision 0069). No cycle: kgraf-diag depends on
+# nothing in this workspace but kgraf-core.
+kgraf-diag.workspace = true
+kgraf-secrets = { path = "../kgraf-secrets" }
+blake3.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tree-sitter.workspace = true
+tree-sitter-rust.workspace = true
+tree-sitter-python.workspace = true
+tree-sitter-typescript.workspace = true
+tree-sitter-javascript.workspace = true
+tree-sitter-md.workspace = true
+tree-sitter-go.workspace = true
+tree-sitter-java.workspace = true
+tree-sitter-c.workspace = true
+tree-sitter-cpp.workspace = true
+tree-sitter-ruby.workspace = true
+tree-sitter-c-sharp.workspace = true
+tree-sitter-php.workspace = true
+walkdir.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+# `check_session_records` (decision 0067): `SharedSessions`'s own tests check
+# it against the same contract `kgraf-core`'s `MemorySessionRecords` does.
+kgraf-core = { workspace = true, features = ["test-support"] }
+# Layout-time benchmarks (measured budgets). Default features off: the HTML
+# report and plotting stack are not needed to read a number.
+criterion = { version = "0.8.2", default-features = false }
+
+[[bench]]
+name = "layout"
+harness = false
+
+[[bench]]
+name = "leases"
+harness = false

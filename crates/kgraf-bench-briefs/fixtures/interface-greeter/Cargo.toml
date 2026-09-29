@@ -1,0 +1,5 @@
+[package]
+name = "fx-interface-greeter"
+version = "0.1.0"
+edition = "2021"
+publish = false

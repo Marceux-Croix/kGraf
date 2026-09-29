@@ -1,0 +1,5 @@
+error[E0277]: the trait bound `CallToken<'_>: Default` is not satisfied
+ --> tests/compile_fail/token_cannot_be_defaulted.rs:8:38
+  |
+8 |     let _token: CallToken<'static> = Default::default();
+  |                                      ^^^^^^^^^^^^^^^^^^ the trait `Default` is not implemented for `CallToken<'_>`

@@ -1,0 +1,58 @@
+Repository: https://github.com/LibreChat-AI/LibreChat
+Commit:     7b2362d7a7c6148b84850924dc7fa5fc43307923 (2026-09-25)
+Paths:      packages/api/src/middleware/checkBalance.ts,
+            packages/api/src/schedules/README.md,
+            packages/api/src/schedules/capacity.ts,
+            packages/api/src/agents/steering/runtime.ts,
+            packages/api/src/stream/implementations/InMemoryJobStore.ts
+            (the steer queue methods only),
+            packages/api/src/stream/interfaces/IJobStore.ts
+            (`SteerQueueItem`, the enqueue refusal codes)
+License:    MIT. The full text is copied here as LICENSE; verified at the
+            source 2026-09-26.
+Date verified: 2026-09-26; the two stream/ paths read at the same commit
+            on 2026-09-27.
+
+Ported (TypeScript to Rust) into crates/kgraf-orchestrator:
+- src/admission.rs (`BudgetBook`): `checkBalance` / `holdReservation`. An
+  admitted request holds its estimated cost until its usage is recorded; a
+  hold is renewed at half its TTL measured from the stored expiry, so only an
+  unrenewed hold lapses. Changed: three caps (per task, per run, per trailing
+  hour) instead of one balance; renewal driven by the orchestrator's tick
+  instead of a timer per hold; release is an in-memory removal that cannot
+  fail.
+- src/readiness.rs and the dispatch order in src/orchestrator.rs: readiness
+  (credential, MCP reachability, complete tool discovery) before capacity, with
+  typed failures (missing credential, missing configuration, permission
+  revoked disable; transient counts). capacity.ts's "the slot is the contended
+  resource" is realized by `AdmissionGate` inside the single-owner loop, so no
+  slot table is needed.
+- src/orchestrator.rs (`OrchestratorHandle::steer`, `steer_worker`): steering
+  text is persisted before it is acknowledged and injected at the next
+  boundary where the transcript accepts it; steering a runtime that cannot
+  inject at a tool-batch boundary is refused rather than drained
+  (runtime.ts: "draining the queue without this silently drops the user's
+  words"). When this was written the worker runtime had no injection point,
+  so worker steering was refused; orchestrator steering is delivered as data
+  to the next orchestrator model call. The runtime injection point now exists
+  (below); routing a worker steer to it is decision 0067's U4.
+
+Ported (TypeScript to Rust) into crates/kgraf-runtime (decision 0067, U3):
+- src/inject.rs (`SteerQueue`, `Injector`): the per-run steer queue of
+  `InMemoryJobStore.ts` (`enqueueSteerVersioned`, `drainSteers`,
+  `restoreClaimedSteers`, `closeAndDrainSteers`) and the boundary drain of
+  runtime.ts (`drainAndBuildInjections`, `createSteerPreemptPoll`). Kept:
+  FIFO is instruction order; enqueue is refused once the run is not running;
+  the drain takes the whole queue; a failed apply restores the failed item
+  and its suffix at the queue front; the preempt flag is level-triggered and
+  cleared by the drain, never on read; the queue closes when the run ends and
+  its leftovers are reported, not dropped. Changed: one process owns the
+  queue, so no receipts, replica fences or claim expiry; the idempotency key
+  is the inbox id, and a resumed worker seeds it from the transcript's
+  `Injected` events; no depth cap (`STEER_QUEUE_MAX_DEPTH`), because decision
+  0067 never refuses or drops a message for volume. Not ported: the terminal
+  continuation (`StopFinalize`), because a kGraf worker that answered has
+  retired; quotes and attachments, which kGraf notes do not carry.
+- src/worker.rs: the PostToolBatch and PreemptBoundary injection points, as
+  the loop's boundary drain and its interrupt races against the model stream
+  and the tool round.

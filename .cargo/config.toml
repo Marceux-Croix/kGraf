@@ -1,0 +1,22 @@
+# Windows target: static CRT linking.
+#
+# Both kgraf.exe and kgraf-app.exe imported VCRUNTIME140.dll from the dynamic MSVC C
+# runtime, and scripts/package-windows.sh shipped neither that DLL nor a redistributable
+# installer for it. On a bare Windows machine without the Visual C++ Redistributable
+# already installed, both executables would fail to launch at all (a missing-DLL error
+# dialog), which is worse than the "unsigned binary" SmartScreen warning this project
+# already documents as a known gap.
+#
+# `target-feature=+crt-static` statically links the CRT into the binary instead
+# (supported for `*-pc-windows-msvc` targets since Rust 1.19), removing the
+# VCRUNTIME140.dll/MSVCP140.dll import entirely -- scripts/package-windows.sh's
+# llvm-objdump -p check asserts this on every packaged executable, so a future
+# regression here (e.g. a dependency that forces dynamic CRT linking back on) fails the
+# build instead of silently reintroducing the missing-DLL failure on a real machine.
+#
+# Only x86_64-pc-windows-msvc is pinned here: this project ships no other Windows
+# target, and static CRT linking has known trade-offs (a larger binary, and every
+# process gets its own copy of CRT globals) that are a deliberate, scoped choice for
+# this one target, not a workspace-wide default.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

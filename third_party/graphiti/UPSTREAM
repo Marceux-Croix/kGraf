@@ -1,0 +1,33 @@
+Repository: https://github.com/getzep/graphiti
+Commit:     ba4a9cb32495b6864160616f8dfa2b898f4a500c (HEAD of main, 2026-09-26)
+Paths:      graphiti_core/edges.py (EntityEdge: valid_at, invalid_at, created_at,
+            expired_at),
+            graphiti_core/utils/maintenance/edge_operations.py
+            (resolve_extracted_edge, the block after "Determine if the new_edge
+            needs to be expired"; resolve_edge_contradictions)
+License:    Apache-2.0. The full text is copied here as LICENSE; verified at
+            the source 2026-09-26. No NOTICE file exists at this commit (404).
+Date verified: 2026-09-26
+
+Ported (Python to Rust) into crates/kgraf-graph/src/facts.rs, with
+significant changes stated here (Apache-2.0 section 4b):
+- The bi-temporal model: valid time (valid_at, invalid_at) and transaction
+  time (created_at, expired_at) on every fact, stored in SQLite as epoch
+  milliseconds.
+- The expiry rules: a new fact arriving with invalid_at is expired at once; a
+  new fact older than an existing contradicting fact is closed at that fact's
+  valid_at; an existing contradicting fact whose interval overlaps and began
+  earlier is closed at the new fact's valid_at, expired_at set once.
+
+Changed: Graphiti asks a model which edges contradict or duplicate a new edge.
+kGraf decides structurally with no model call: a (subject, predicate) pair
+is single-valued, so an open fact with the same subject and predicate and a
+different object is a contradiction candidate, and one with the same object is
+a duplicate whose episodes gain the new source (the latest 32 are kept, with a
+count of all). Nothing is deleted (decision 0028). No embeddings, no graph
+database, no LLM-extracted timestamps.
+
+Changed (2026-09-26, review): only open facts are candidates, and an equal
+valid_at is a tie broken by transaction time (the later assertion closes the
+earlier). Graphiti leaves both open in that case; here at most one fact per
+(subject, predicate) is open.

@@ -1,0 +1,91 @@
+[package]
+name = "kgraf-host"
+version.workspace = true
+description = "Builds and starts orchestrator runs: the construction `kgraf orchestrate` and the desktop shell share."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+# `Host::with_route_provider`: a fake model for a route of its own. Tests only
+# (this crate's, and the shell's through its dev-dependency); never in a build
+# that runs real work.
+in-process-provider = []
+# `Host::open_with_rate_limit_store`: lets a dependent crate's own tests point
+# a real `Host` at a temporary shared rate-limit store instead of resolving
+# the user's real per-user directory. Tests only (this
+# crate's, and the CLI's through its dev-dependency); never in a build that
+# runs real work. Same name and reasoning as `kgraf-provider`'s.
+test-support = []
+
+[dependencies]
+kgraf-capacity.workspace = true
+kgraf-core.workspace = true
+kgraf-graph.workspace = true
+# Local-only diagnostics (decision 0069): `PreparedRun::run`
+# records a run's start and end, never sent anywhere. `record` is a no-op
+# unless a binary called `kgraf_diag::init` (see `kgraf-cli`'s `main` and the
+# shell's startup), so this dependency changes nothing for a caller that never
+# initializes it.
+kgraf-diag.workspace = true
+# Route catalog, credentials from the environment, provider construction. The
+# provider-specific code stays in the adapter crates behind it.
+kgraf-fleet.workspace = true
+kgraf-interpret.workspace = true
+kgraf-mcp.workspace = true
+kgraf-orchestrator.workspace = true
+kgraf-provider.workspace = true
+kgraf-runtime.workspace = true
+kgraf-sandbox.workspace = true
+# A checkout-root `.env`'s values join the secret scrubber when a worker is
+# assembled (decision 0084).
+kgraf-secrets.workspace = true
+kgraf-session.workspace = true
+kgraf-tools.workspace = true
+# The Terminal-Bench bridge: `AttemptAssembler::tbench_bridge_socket`.
+kgraf-tbench-bridge.workspace = true
+# The public API (`Error`, `NotReady`) is thiserror. `anyhow` is here only for
+# the `worker` module, moved verbatim from kgraf-cli, which already used it.
+thiserror.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# `signal`: `worker::run` cancels a worker on Ctrl-C so its work is committed.
+tokio = { workspace = true, features = ["signal", "rt"] }
+# The brief digest a transcript records to bind a resume to its owner (`worker::run`).
+blake3.workspace = true
+# Each run's contract-check scratch is a `mkdtemp` directory (mode 0700,
+# removed on drop).
+tempfile.workspace = true
+# Decision 0087: the dependency mirror reads a project's or a worktree's
+# manifests through a directory capability that cannot resolve outside it.
+# Same version kgraf-tools uses, already in Cargo.lock.
+cap-std = "4.0.3"
+# Decision 0087: the root manifest's `[patch]` and `[replace]` tables, read
+# before a fetch. Same version kgraf-shell uses, already in Cargo.lock.
+toml = "1.1.6"
+
+[target.'cfg(windows)'.dependencies]
+# `migrate`: the migration lock's file identity (volume serial and file index,
+# GetFileInformationByHandle), the Windows counterpart of Unix dev and inode.
+# Same version as kgraf-sandbox's, already in Cargo.lock.
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+] }
+
+[target.'cfg(unix)'.dependencies]
+# A timed-out gate command is killed with its whole process group (`killpg`).
+libc = "0.2.185"
+
+[dev-dependencies]
+# Builds `mcp-echo-server` (kgraf-mcp-test-server) for the attempt-environment
+# tests, which talk to a real MCP server over stdio.
+escargot = "0.5"
+# `kgraf_provider::limits::clear_for_test`: this crate's own
+# `route_capacity_inputs` tests must not see another test's recorded
+# header observations in the process-wide registry (decision 0067).
+kgraf-provider = { workspace = true, features = ["test-support"] }

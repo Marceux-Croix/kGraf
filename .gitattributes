@@ -1,0 +1,4 @@
+# Keep the GitHub language bar focused on kGraf's own code.
+docs/** linguist-documentation
+third_party/** linguist-vendored
+*.wgsl linguist-language=WGSL

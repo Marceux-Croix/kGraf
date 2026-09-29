@@ -1,0 +1,956 @@
+//! `kgraf orchestrate`: run the orchestrator against live provider
+//! routes, or resume a run from its record.
+//!
+//! This is the live acceptance path for the orchestrator (verified against
+//! running speakers). The run is built by `kgraf-host`, which the desktop shell
+//! uses too; this file maps the flags onto a `RunConfig`, calls the host's steps in
+//! order, and prints what they report. Every model call, the orchestrator's and
+//! every worker's, goes through the project ledger. Each worker gets its own git
+//! worktree under `.kgraf/worktrees`, created at the run's current
+//! integration tip and reopened by its recorded gitlink when a killed run resumes.
+//! Each worker's environment is assembled in its own worktree: the shell bound to
+//! it with its approval hook, and the MCP servers of `.kgraf/worker.json`.
+//! The verifier runs `--verify` in the worktree and commits the change through
+//! merge-back; the orchestrator then merges the selected attempt into the run's
+//! integration branch, `kgraf/<run>` (continuous merge-back, 0018). A conflict
+//! comes back typed and the contract runs again from the new tip. Quality gates run
+//! the project's discovered validation commands (or `--gate-command`) in a sandbox,
+//! in a worktree of the integration commit they pin. `--interactive` reads stdin as
+//! the message port: a line is a note, a line starting with `?` is a status
+//! question.
+
+use anyhow::{Context, Result, bail};
+use kgraf_core::RunId;
+use kgraf_host::{CorpusRequest, Host, Notice, RunConfig, RunStart};
+use kgraf_orchestrator::{
+    GateDecision, InboundKind, InboundMessage, MessagePort, OutboundReply, PortError, UntrustedText,
+};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+pub struct OrchestrateArgs {
+    pub routes: Vec<String>,
+    pub planner: Option<String>,
+    pub instruction: Option<PathBuf>,
+    pub resume: Option<String>,
+    pub run: Option<String>,
+    pub prices: PathBuf,
+    pub max_items: usize,
+    pub max_agents: usize,
+    pub steps: u32,
+    pub max_tokens: u32,
+    pub window: u64,
+    pub point: Option<u8>,
+    pub verify: String,
+    pub interactive: bool,
+    /// Validation commands for quality gates; empty discovers them.
+    pub gate_commands: Vec<String>,
+    /// Longest one gate command, or one run of `verify`, may run.
+    pub gate_timeout: Duration,
+    /// Interface contracts written, checked before dispatch, open to challenge.
+    pub contract_checks: bool,
+    /// Cross-vendor review at the interface (decision 0079): a model on a
+    /// cross-vendor consumer's route reviews a producer's delivery before it
+    /// counts as verified. Off by default; unmeasured. Threaded through
+    /// `RunConfig` into `kgraf-host`, which installs a `RoutedInterfaceReviewer`
+    /// on the orchestrator next to `Host::contract_checks` (`host.rs`).
+    pub interface_review: bool,
+    /// Every agent is an addressable session (decision 0067); on by
+    /// default since a live run shows all three together
+    /// (`2026-09-28-sessions-live.md`).
+    pub sessions: bool,
+    /// Bounds of one contract-check test run and one compile.
+    pub check_timeout: Duration,
+    pub check_compile_timeout: Duration,
+    /// `--shell-timeout` (decision 0084): wins over the worker configuration.
+    pub shell_timeout: Option<Duration>,
+    /// Output ceiling of each orchestrator call.
+    pub planner_max_tokens: u32,
+    /// A held or failed gate to retry, or to waive, before `--resume`.
+    pub retry_gate: Option<String>,
+    pub waive_gate: Option<String>,
+    pub gate_note: Option<String>,
+    /// Start from the corpus.
+    pub corpus: bool,
+    /// With `corpus`: approve the stored reading with this plan id and run it.
+    pub approve: Option<String>,
+    /// With `approve`: proposed validation commands accepted as gates, by name.
+    pub accept_commands: Vec<String>,
+    pub corrections: Vec<String>,
+    pub interpret_budget: Option<u64>,
+    /// `ROUTE=RPM[/BURST][@MAX_WAIT_MS]` per rate-limited route.
+    pub rate_limits: Vec<String>,
+    /// Vendor/model routing policy (decision 0075): `rotation` (default, and
+    /// what today's three-arm experiment depends on being unchanged) or
+    /// `fitness` (coupling- and measured-capability-aware).
+    pub routing: kgraf_orchestrator::RoutingPolicy,
+    /// A Unix socket a Python Harbor shim listens on. See
+    /// `RunConfig::tbench_bridge_socket`.
+    pub tbench_bridge_socket: Option<PathBuf>,
+    /// `--fetch-deps` / `--no-fetch-deps` (decision 0087).
+    pub fetch_deps: kgraf_host::deps::RunFetch,
+}
+
+/// The per-project part of the flags, as the host takes it. What is per
+/// invocation (the instruction, a resume, a gate decision, the corpus options,
+/// `--interactive`) stays here.
+fn run_config(root: &Path, args: &OrchestrateArgs) -> RunConfig {
+    RunConfig {
+        root: root.to_path_buf(),
+        routes: args.routes.clone(),
+        planner: args.planner.clone(),
+        prices: args.prices.clone(),
+        cap_run: None,
+        cap_task: None,
+        cap_hour: None,
+        max_items: args.max_items,
+        max_agents: args.max_agents,
+        steps: args.steps,
+        max_tokens: args.max_tokens,
+        window: args.window,
+        point: args.point,
+        verify: args.verify.clone(),
+        gate_commands: args.gate_commands.clone(),
+        gate_timeout: args.gate_timeout,
+        rate_limits: args.rate_limits.clone(),
+        contract_checks: args.contract_checks,
+        interface_review: args.interface_review,
+        check_timeout: args.check_timeout,
+        check_compile_timeout: args.check_compile_timeout,
+        shell_timeout: args.shell_timeout,
+        // Decision 0067: on by default (`--sessions false`
+        // to turn it off): a live run shows the steer, an
+        // orchestrator-answered question and an admitted, merged subagent
+        // together.
+        sessions: args.sessions,
+        planner_max_tokens: args.planner_max_tokens,
+        routing: args.routing,
+        tbench_bridge_socket: args.tbench_bridge_socket.clone(),
+        dependency_fetch: args.fetch_deps,
+    }
+}
+
+/// One line per notice, as the command always printed them.
+fn notice_line(n: &Notice) -> String {
+    match n {
+        Notice::Cleaned(removed) => format!(
+            "cleaned    {} ({:?})",
+            removed.path.display(),
+            removed.cause
+        ),
+        Notice::Stranded { path, name } => format!(
+            "stranded   {}: its owner ran on another machine or in another PID namespace \
+             (or its host is unreadable); check, then run `kgraf clean {name}`",
+            path.display()
+        ),
+        Notice::CleanedMcpHome(path) => {
+            format!("cleaned    {} (a dead process's MCP home)", path.display())
+        }
+        Notice::CleanedCheckScratch(path) => format!(
+            "cleaned    {} (a dead process's contract-check scratch)",
+            path.display()
+        ),
+        Notice::AncestorReadRefused(detail) => format!("sandbox    {detail}"),
+        Notice::NoWorkerConfig(path) => format!(
+            "config     none ({} is absent): no MCP servers",
+            path.display()
+        ),
+        Notice::McpServer {
+            route,
+            server,
+            report,
+        } => format!("mcp        {route}: {server}: {report:?}"),
+        Notice::EstimatedSpend {
+            call,
+            model,
+            amount,
+            reason,
+        } => format!("estimated  ledger call {call} ({model}) at {amount}: {reason}"),
+        Notice::PrefixChanged { route, change } => format!(
+            "cache miss {route}: its shared prefix differs from the last run's in this process \
+             ({} -> {}); the first calls pay a cache write",
+            change.old, change.new
+        ),
+        Notice::DependenciesFetched { registry, summary } => {
+            format!("fetched    dependencies from {registry} (decision 0087): {summary}")
+        }
+        Notice::DependenciesUnchecked(why) => format!(
+            "deps       the offline dependency check could not decide, so nothing was fetched: \
+             {why}"
+        ),
+        Notice::GraphEmpty { root, files_seen } => format!(
+            "graph      empty after indexing {} ({files_seen} file(s) seen): no graph slices \
+             for this run, likely no supported language in the tree",
+            root.display()
+        ),
+    }
+}
+
+fn print_notice(n: Notice) {
+    println!("{}", notice_line(&n));
+}
+
+pub fn run(root: &Path, args: OrchestrateArgs) -> Result<()> {
+    let host = Host::open(run_config(root, &args))?;
+    let run_id = match (&args.resume, &args.run) {
+        (Some(r), _) => RunId::new(r.clone()),
+        (None, Some(r)) => RunId::new(r.clone()),
+        (None, None) => RunId::new(format!(
+            "run-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        )),
+    };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("cannot start the async runtime")?;
+
+    // Reading a corpus (with or without corrections) creates nothing in
+    // the repository: no branch, no worktree. Approval names the plan id of a
+    // stored reading and makes no model call.
+    if args.corpus && args.approve.is_none() {
+        let instruction = match &args.instruction {
+            Some(path) => {
+                let text = std::fs::read_to_string(path)
+                    .with_context(|| format!("cannot read {}", path.display()))?;
+                if text.trim().is_empty() {
+                    bail!("the instruction file {} is empty", path.display());
+                }
+                Some(text)
+            }
+            None => None,
+        };
+        // Decision 0064: the roadmap first (deterministic, no tokens), so the
+        // reading's items that cite a section a roadmap node stands for are not
+        // presumed twice. No roadmap is said, not raised: the reading below
+        // plans from the whole corpus, or from the instruction alone.
+        host.with_graph(|g| crate::plan_cmd::presume_after_index(g, "the corpus is still read"))?;
+        let intake = runtime.block_on(host.read_corpus(
+            &run_id,
+            CorpusRequest {
+                instruction,
+                corrections: args.corrections.clone(),
+                budget_tokens: args.interpret_budget,
+            },
+        ))?;
+        for c in &intake.charged {
+            println!("ledger call {c} (interpretation)");
+        }
+        let reading = intake.result?;
+        println!("{}", reading.reading());
+        // Decision 0064: the reading's work items become presumed nodes now, so the
+        // galaxy shows the plan before it is approved. The tokens were the
+        // interpretation call's, already ledgered above; this makes no call.
+        // A failure here is a stated line: the reading is paid for and
+        // stored, and its plan id, printed below, is what the user approves.
+        let presumed = host.with_graph(|g| {
+            kgraf_interpret::presumed::presume_reading(g, &reading, crate::plan_cmd::now_ms())
+        })?;
+        match presumed {
+            Err(e) => println!(
+                "presumed   error: {e} (the reading is stored; its work items are not presumed)"
+            ),
+            Ok(presumed) if presumed.questions_only => {
+                println!("presumed   nothing: the reading has questions and no work items yet")
+            }
+            Ok(presumed) => {
+                let s = &presumed.sync;
+                println!(
+                    "presumed   {} from this reading ({} new, {} updated, {} unchanged, {} kept \
+                 (changed by someone else), {} kept (adopted), {} gone); {} already stood for by \
+                 a roadmap node",
+                    s.inserted.len() + s.updated.len() + s.unchanged as usize,
+                    s.inserted.len(),
+                    s.updated.len(),
+                    s.unchanged,
+                    s.kept_edited.len(),
+                    s.kept_adopted.len(),
+                    s.gone.len(),
+                    presumed.covered.len()
+                );
+            }
+        }
+        let t = reading.timings();
+        println!(
+            "first action in {} ms (index {} ms, brief {} ms, model {} ms)",
+            t.first_action_ms, t.index_ms, t.brief_ms, t.model_ms
+        );
+        let accept: String = reading
+            .proposed_commands()
+            .iter()
+            .map(|c| format!(" --accept-command {c:?}"))
+            .collect();
+        println!(
+            "\nNot started, and nothing was created. To run this plan as shown:\n  \
+             --corpus --approve {}{}\n(each --accept-command makes a proposed command a gate; \
+             omit the ones you do not accept). To correct the reading instead: --corpus \
+             --correction \"...\".",
+            reading.plan_id(),
+            accept
+        );
+        return Ok(());
+    }
+    let from_plan = match &args.approve {
+        Some(plan_id) => Some(host.approve_plan(plan_id, &args.accept_commands)?),
+        None => None,
+    };
+
+    let startup = host.startup(&mut print_notice)?;
+    // The user's decision about a held gate is recorded before the run resumes.
+    let decision = match (&args.retry_gate, &args.waive_gate) {
+        (Some(_), Some(_)) => bail!("give --retry-gate or --waive-gate, not both"),
+        (Some(g), None) => Some((g.clone(), GateDecision::Retry)),
+        (None, Some(g)) => Some((g.clone(), GateDecision::Waive)),
+        (None, None) => None,
+    };
+    if let Some((gate, decision)) = decision {
+        if args.resume.is_none() {
+            bail!("a gate decision applies to a run being resumed: give --resume RUN");
+        }
+        let note = args
+            .gate_note
+            .clone()
+            .context("a gate decision needs --gate-note saying why")?;
+        host.decide_gate(&run_id, &gate, decision, &note)?;
+        println!("gate       {gate}: {decision:?} recorded ({note})");
+    }
+    let build = |host: &Host| {
+        runtime.block_on(host.build(
+            &startup,
+            run_id.clone(),
+            from_plan.as_ref(),
+            &mut print_notice,
+        ))
+    };
+    // Decision 0087: dependencies not in the cache and no answer yet. A
+    // person at the terminal is asked once; nobody there, and the error
+    // (with the instruction) stands. The gate runs before anything of the
+    // run is built, so building again is safe.
+    let prepared = match build(&host) {
+        Ok(prepared) => prepared,
+        Err(e) => match e.dependency_question() {
+            Some(q) if crate::deps_cmd::attended() => {
+                use crate::deps_cmd::Answer;
+                use kgraf_host::deps::Consent;
+                match crate::deps_cmd::ask(&q)? {
+                    Answer::Once => host.grant_dependency_fetch(&run_id),
+                    Answer::Always => host.set_dependency_consent(q.registry, Consent::Allowed)?,
+                    Answer::NotNow => return Err(e.into()),
+                    // Stored, then built again: the refusal's own error (with
+                    // how to undo it) is what the user reads.
+                    Answer::Never => host.set_dependency_consent(q.registry, Consent::Refused)?,
+                }
+                build(&host)?
+            }
+            _ => return Err(e.into()),
+        },
+    };
+
+    let outcome = runtime.block_on(async {
+        if args.interactive {
+            prepared.attach_port(Arc::new(StdinPort::start()));
+        }
+        let summary = prepared.summary();
+        println!("run        {}", summary.run);
+        println!("integrate  {}", summary.integration);
+        if summary.gate_commands.is_empty() {
+            println!("gates      none: no validation commands discovered");
+        } else {
+            println!("gates      {}", summary.gate_commands.join(" && "));
+        }
+        println!("trace      {}", summary.trace.display());
+        let shape = prepared.shape();
+        if shape.contract_checks {
+            println!(
+                "contracts  interface contracts checked before dispatch (compile bound {}s, \
+                 test bound {}s); workers may challenge them",
+                shape.check_compile_timeout.as_secs(),
+                shape.check_timeout.as_secs()
+            );
+        } else {
+            println!(
+                "contracts  off: no interface contracts, no checks (--contract-checks turns them on)"
+            );
+        }
+        let start = if let Some(plan) = from_plan {
+            println!(
+                "plan       {} ({} items, {} already complete)",
+                plan.plan_id(),
+                plan.items().len(),
+                plan.skipped().len()
+            );
+            RunStart::Plan(Box::new(plan))
+        } else {
+            match (&args.resume, &args.instruction) {
+                (Some(_), _) => RunStart::Resume,
+                (None, Some(path)) => {
+                    let text = std::fs::read_to_string(path)
+                        .with_context(|| format!("cannot read {}", path.display()))?;
+                    if text.trim().is_empty() {
+                        bail!("the instruction file {} is empty", path.display());
+                    }
+                    RunStart::Instruction(text)
+                }
+                (None, None) => bail!("give --instruction FILE, --corpus or --resume RUN"),
+            }
+        };
+        prepared.run(start).await.map_err(anyhow::Error::from)
+    })?;
+
+    for line in report_lines(&outcome.report) {
+        println!("{line}");
+    }
+    // Housekeeping after the report: a failed sweep is said, and never hides
+    // the report or fails a run that completed.
+    let housekeeping = outcome.housekeeping;
+    match housekeeping.swept {
+        Ok(swept) if !swept.is_empty() => println!("swept      {} attempt ref(s)", swept.len()),
+        Ok(_) => {}
+        Err(e) => println!("sweep      failed, attempt refs left in place: {e:#}"),
+    }
+    let open = housekeeping.unreconciled?;
+    if open != 0 {
+        println!("{open} call(s) with unaccounted spend; run `kgraf unreconciled`");
+    }
+    Ok(())
+}
+
+/// `kgraf clean <worktree>`: remove a worktree on the owner's word (see
+/// `kgraf_host::clean`).
+pub fn clean(root: &Path, name: &str, force: bool) -> Result<PathBuf> {
+    Ok(kgraf_host::clean(root, name, force)?)
+}
+
+/// The run report as printed. A failure of the run analytics (the demand
+/// record or a template update) is printed, never dropped.
+fn report_lines(report: &kgraf_orchestrator::RunReport) -> Vec<String> {
+    let mut out = vec![
+        format!("status     {:?}", report.status),
+        format!("verified   {}", report.verified.join(", ")),
+    ];
+    for (c, reason) in &report.held {
+        out.push(format!("held       {c}: {reason}"));
+    }
+    out.push(format!(
+        "dispatched {} (serialized {}, fraction {:.3})",
+        report.counters.dispatches, report.counters.serialized, report.serialized_fraction
+    ));
+    out.push(format!(
+        "refusals   capacity {}, readiness {} (reservations {})",
+        report.counters.capacity_refusals,
+        report.counters.readiness_failures,
+        report.budget_admitted,
+    ));
+    out.push(format!("handbacks  {}", report.counters.sizing_misses));
+    if report.contract_checks.enabled {
+        let c = &report.contracts;
+        out.push(format!(
+            "contracts  {} (interfaces {}, passed {}, failed {}, not run {}, challenges {}, \
+             escalations {})",
+            report.contract_checks,
+            c.interfaces_registered,
+            c.checks_passed,
+            c.artifact_failures
+                + c.stub_compile_failures
+                + c.vacuity_failures
+                + c.handshake_failures,
+            c.checks_not_run,
+            c.challenges,
+            c.escalations
+        ));
+    } else {
+        out.push("contracts  off: no interface contract was written or checked".to_owned());
+    }
+    out.push(format!("spent      {}", report.spent));
+    for w in &report.warnings {
+        out.push(format!("warning    {w}"));
+    }
+    for n in &report.notices {
+        out.push(format!("notice     {n}"));
+    }
+    if let Some(e) = &report.analytics_error {
+        out.push(format!(
+            "analytics  FAILED: {e} (the run finished; its demand record may be missing)"
+        ));
+    }
+    out
+}
+
+/// stdin as a message port: `?` starts a status question, anything else is a
+/// note. Replies print to stdout.
+struct StdinPort {
+    lines: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<String>>,
+}
+
+impl StdinPort {
+    fn start() -> Self {
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        std::thread::spawn(move || {
+            let stdin = std::io::stdin();
+            let mut line = String::new();
+            while stdin.read_line(&mut line).map(|n| n > 0).unwrap_or(false) {
+                if tx.blocking_send(line.trim_end().to_owned()).is_err() {
+                    break;
+                }
+                line.clear();
+            }
+        });
+        Self {
+            lines: tokio::sync::Mutex::new(rx),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl MessagePort for StdinPort {
+    fn channel(&self) -> &str {
+        "stdin"
+    }
+
+    async fn receive(&self) -> Result<Option<InboundMessage>, PortError> {
+        let mut rx = self.lines.lock().await;
+        loop {
+            let Some(line) = rx.recv().await else {
+                return Ok(None);
+            };
+            if line.trim().is_empty() {
+                continue;
+            }
+            let (kind, text) = match line.strip_prefix('?') {
+                Some(q) => (InboundKind::StatusQuestion, q.trim().to_owned()),
+                None => (InboundKind::Note, line),
+            };
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            return Ok(Some(InboundMessage {
+                id: format!("stdin-{now}"),
+                channel: "stdin".into(),
+                received_ms: now,
+                kind,
+                text: UntrustedText::new(text),
+            }));
+        }
+    }
+
+    async fn reply(&self, reply: OutboundReply) -> Result<(), PortError> {
+        println!("[{}] {}", reply.in_reply_to, reply.text);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kgraf_core::Money;
+    use kgraf_graph::GraphStore;
+    use kgraf_orchestrator::OrchestratorConfig;
+    use kgraf_provider::Ledger;
+    use kgraf_runtime::ContextConfig;
+
+    /// The CLI report carries an analytics failure.
+    #[test]
+    fn the_printed_report_carries_an_analytics_failure() {
+        let mut report = kgraf_orchestrator::RunReport {
+            run: RunId::new("r1"),
+            status: kgraf_orchestrator::RunStatus::Completed,
+            verified: vec!["a".into()],
+            held: Vec::new(),
+            counters: Default::default(),
+            serialized_fraction: 0.0,
+            spent: Money::ZERO,
+            budget_admitted: 0,
+            contracts: Default::default(),
+            contract_checks: Default::default(),
+            analytics_error: None,
+            warnings: vec!["workflow template t1 quarantined".into()],
+            notices: vec!["the check generated Cargo.lock".into()],
+        };
+        assert!(
+            !report_lines(&report)
+                .iter()
+                .any(|l| l.contains("analytics")),
+            "nothing to report"
+        );
+        assert!(
+            report_lines(&report)
+                .iter()
+                .any(|l| l == "contracts  off: no interface contract was written or checked"),
+            "a run without checks says so"
+        );
+        assert!(
+            report_lines(&report)
+                .iter()
+                .any(|l| l == "warning    workflow template t1 quarantined"),
+            "warnings are printed"
+        );
+        assert!(
+            report_lines(&report)
+                .iter()
+                .any(|l| l == "notice     the check generated Cargo.lock"),
+            "notices are printed"
+        );
+        report.analytics_error = Some("graph: database is locked".into());
+        let lines = report_lines(&report);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("analytics  FAILED: graph: database is locked")),
+            "{lines:?}"
+        );
+    }
+
+    struct SeedAsker;
+
+    #[async_trait::async_trait]
+    impl kgraf_interpret::Asker for SeedAsker {
+        fn identity(&self) -> String {
+            "ollama:llama3".into()
+        }
+
+        async fn ask(
+            &self,
+            _system: &str,
+            _user: String,
+        ) -> std::result::Result<kgraf_interpret::AskAnswer, kgraf_interpret::AskFailure> {
+            Ok(kgraf_interpret::AskAnswer {
+                text: serde_json::json!({"reading": "r", "work_items": [{"id": "a",
+                    "title": "a", "instruction": "do", "acceptance": [{"text": "x"}]}]})
+                .to_string(),
+                call: None,
+            })
+        }
+    }
+
+    fn corpus_args(prices: PathBuf, approve: Option<String>) -> OrchestrateArgs {
+        OrchestrateArgs {
+            routes: vec!["ollama:llama3".into()],
+            planner: None,
+            instruction: None,
+            resume: None,
+            run: Some("r1".into()),
+            prices,
+            max_items: 4,
+            max_agents: 8,
+            steps: 5,
+            max_tokens: 256,
+            window: 128_000,
+            point: None,
+            verify: "true".into(),
+            interactive: false,
+            gate_commands: Vec::new(),
+            gate_timeout: Duration::from_secs(60),
+            contract_checks: true,
+            interface_review: false,
+            sessions: true,
+            check_timeout: Duration::from_secs(600),
+            check_compile_timeout: Duration::from_secs(600),
+            shell_timeout: None,
+            planner_max_tokens: 8_192,
+            retry_gate: None,
+            waive_gate: None,
+            gate_note: None,
+            corpus: true,
+            approve,
+            accept_commands: Vec::new(),
+            corrections: Vec::new(),
+            interpret_budget: None,
+            rate_limits: Vec::new(),
+            routing: kgraf_orchestrator::RoutingPolicy::default(),
+            tbench_bridge_socket: None,
+            fetch_deps: kgraf_host::deps::RunFetch::Stored,
+        }
+    }
+
+    fn assert_nothing_created(root: &Path) {
+        let refs = std::process::Command::new("git")
+            .current_dir(root)
+            .args(["for-each-ref", "--format=%(refname)", "refs/heads/kgraf"])
+            .output()
+            .expect("git");
+        assert!(
+            String::from_utf8_lossy(&refs.stdout).trim().is_empty(),
+            "a branch was created: {}",
+            String::from_utf8_lossy(&refs.stdout)
+        );
+        assert!(
+            !root.join(".kgraf/worktrees").exists(),
+            "a worktree base was created"
+        );
+    }
+
+    /// Reading a corpus, or refusing an approval, creates no
+    /// integration branch and no worktree. The reading is seeded with the brief the
+    /// command builds and the planner's identity, so `run` reuses it and makes no
+    /// model call (the route is local and needs no credential; nothing listens).
+    #[test]
+    fn a_corpus_read_or_a_refused_approval_creates_no_branch_or_worktree() {
+        let dir = tempfile::tempdir().expect("dir");
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        host_git(&root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "# Tool\n\nIt does a thing.\n").expect("write");
+        host_git(&root, &["add", "."]);
+        host_git(
+            &root,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "-m",
+                "init",
+            ],
+        );
+        let state = root.join(".kgraf");
+        std::fs::create_dir_all(&state).expect("state");
+        {
+            let store = GraphStore::open(&state.join("graph.db"), &root).expect("graph");
+            let mut request = kgraf_interpret::InterpretRequest::new("ollama:llama3");
+            request.budget_tokens = ContextConfig::for_model(128_000)
+                .expect("context")
+                .worker_plan_target_tokens();
+            request.limits = kgraf_interpret::PlanLimits {
+                max_items: OrchestratorConfig::default().max_contracts_per_plan,
+            };
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("runtime");
+            rt.block_on(async {
+                kgraf_interpret::prepare(&store, request)
+                    .expect("prepare")
+                    .ask(&SeedAsker)
+                    .await
+                    .expect("ask")
+                    .finish(&store, &kgraf_interpret::NoTestRuns)
+                    .expect("finish")
+            });
+        }
+        let prices = dir.path().join("prices.json");
+        std::fs::write(
+            &prices,
+            r#"{"llama3": {"uncached_input": 1, "cache_read": 1, "cache_write": 1, "output": 1, "reasoning": 1}}"#,
+        )
+        .expect("prices");
+
+        run(&root, corpus_args(prices.clone(), None)).expect("a read from the stored reading");
+        assert_nothing_created(&root);
+        let ledger = Ledger::open(&state.join("ledger.db")).expect("ledger");
+        assert!(
+            ledger.calls().expect("calls").is_empty(),
+            "the read reused the stored reading: no model call"
+        );
+        // Decision 0064: the reading's one work item is a presumed node now, with
+        // the model that read it on record; presuming made no call either.
+        {
+            let store = GraphStore::open(&state.join("graph.db"), &root).expect("graph");
+            let views = kgraf_interpret::presumed::views(&store).expect("views");
+            let item = views
+                .iter()
+                .find(|v| v.id == "presumed/reading/item/a")
+                .unwrap_or_else(|| panic!("{views:#?}"));
+            assert!(
+                item.parser.starts_with("model ollama:llama3"),
+                "{}",
+                item.parser
+            );
+        }
+
+        let err = run(
+            &root,
+            corpus_args(prices, Some("plan-0000000000000000".into())),
+        )
+        .expect_err("an unknown plan id is refused");
+        assert!(err.to_string().contains("no stored reading"), "{err}");
+        assert_nothing_created(&root);
+        assert!(
+            ledger.calls().expect("calls").is_empty(),
+            "approval makes no call"
+        );
+    }
+
+    fn host_git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(["-c", "core.hooksPath=/dev/null"])
+            .args(args)
+            .output()
+            .expect("git");
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// The command and the library build the same run from the same settings:
+    /// the flags mapped by `run_config`, and a configuration file loaded by
+    /// `RunConfig::load`, give one construction (routes, limiters, approval
+    /// chain, caps, limits, gates). Both build on the real steps: a git
+    /// repository, the route probes, the orchestrator. The routes are local
+    /// (`ollama`), so no credential is needed and nothing is called.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_command_and_the_library_build_the_same_run() {
+        let dir = tempfile::tempdir().expect("dir");
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        host_git(&root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "# t\n").expect("write");
+        host_git(&root, &["add", "."]);
+        host_git(
+            &root,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "-m",
+                "init",
+            ],
+        );
+        let prices = dir.path().join("prices.json");
+        std::fs::write(
+            &prices,
+            r#"{"llama3": {"uncached_input": 1, "cache_read": 1, "cache_write": 1, "output": 1, "reasoning": 1},
+               "qwen3": {"uncached_input": 2, "cache_read": 1, "cache_write": 1, "output": 2, "reasoning": 2}}"#,
+        )
+        .expect("prices");
+        let mut args = corpus_args(prices.clone(), None);
+        args.corpus = false;
+        args.routes = vec!["ollama:llama3".into(), "ollama:qwen3".into()];
+        args.planner = Some("ollama:qwen3".into());
+        args.max_items = 3;
+        args.max_agents = 5;
+        args.steps = 7;
+        args.max_tokens = 1_000;
+        args.window = 64_000;
+        args.point = Some(60);
+        args.gate_commands = vec!["true".into()];
+        args.gate_timeout = Duration::from_secs(90);
+        args.check_timeout = Duration::from_secs(120);
+        args.check_compile_timeout = Duration::from_secs(300);
+        args.rate_limits = vec!["ollama=60/5@30000".into()];
+        let from_flags = run_config(&root, &args);
+
+        let file = dir.path().join("run.json");
+        std::fs::write(
+            &file,
+            r#"{
+                "routes": ["ollama:llama3", "ollama:qwen3"],
+                "planner": "ollama:qwen3",
+                "prices": "prices.json",
+                "max_items": 3, "max_agents": 5, "steps": 7, "max_tokens": 1000,
+                "window": 64000, "point": 60, "verify": "true",
+                "gate_commands": ["true"], "gate_timeout": 90,
+                "contract_checks": true, "check_timeout": 120, "check_compile_timeout": 300,
+                "rate_limits": ["ollama=60/5@30000"]
+            }"#,
+        )
+        .expect("config");
+        let from_file = RunConfig::load(&root, &file).expect("load");
+        assert_eq!(from_flags, from_file);
+
+        // This test's `--rate-limit` on a
+        // used route (`ollama`) really does exercise `kgraf-host`'s shared
+        // rate-limit store, so it must point at its own tempdir, never
+        // `Host::open`'s real per-user default.
+        let store_path = dir.path().join("rate-limits.sqlite3");
+        let mut shapes = Vec::new();
+        for config in [from_flags, from_file] {
+            let host = Host::open_with_rate_limit_store(config, Some(&store_path)).expect("open");
+            let prepared = host
+                .prepare(RunId::new("same"), None, &mut |_| {})
+                .await
+                .expect("prepare");
+            shapes.push(prepared.shape().clone());
+        }
+        assert_eq!(shapes[0], shapes[1]);
+        let shape = &shapes[0];
+        let limit = kgraf_provider::RateLimit::parse("60/5@30000").expect("limit");
+        assert_eq!(shape.planner_rate_limit, Some(limit));
+        assert_eq!(
+            shape
+                .routes
+                .iter()
+                .map(|r| (r.name.as_str(), r.rate_limit))
+                .collect::<Vec<_>>(),
+            vec![
+                ("ollama:llama3", Some(limit)),
+                ("ollama:qwen3", Some(limit))
+            ]
+        );
+        assert!(
+            shape
+                .routes
+                .iter()
+                .all(|r| r.tools.iter().any(|t| t == "shell"))
+        );
+        assert!(
+            shape
+                .routes
+                .iter()
+                .all(|r| !r.approval.is_empty() && r.approval == shape.routes[0].approval),
+            "one approval chain for every route"
+        );
+        assert_eq!(
+            shape.limits,
+            kgraf_orchestrator::Limits::new(3, 5).expect("limits")
+        );
+        assert_eq!(shape.step_budget, 7);
+        assert_eq!(shape.gate_commands, vec!["true".to_owned()]);
+        assert_eq!(shape.gate_timeout, Duration::from_secs(90));
+        assert!(shape.contract_checks, "turned on in both, so on in both");
+        assert_eq!(shape.check_timeout, Duration::from_secs(120));
+        assert_eq!(shape.check_compile_timeout, Duration::from_secs(300));
+        assert!(
+            shape.routes.iter().all(|r| r
+                .tools
+                .iter()
+                .any(|t| t == kgraf_orchestrator::CHALLENGE_TOOL)),
+            "every route's workers can challenge a contract"
+        );
+        assert!(shape.routes.iter().all(|r| r.max_output_tokens == 1_000));
+        assert_eq!(shape.integration, "kgraf/same");
+    }
+
+    /// The notices print as the command always printed them.
+    #[test]
+    fn notices_print_as_before() {
+        assert_eq!(
+            notice_line(&Notice::NoWorkerConfig(PathBuf::from(
+                "/p/.kgraf/worker.json"
+            ))),
+            "config     none (/p/.kgraf/worker.json is absent): no MCP servers"
+        );
+        assert_eq!(
+            notice_line(&Notice::CleanedMcpHome(PathBuf::from("/h/w1"))),
+            "cleaned    /h/w1 (a dead process's MCP home)"
+        );
+        assert_eq!(
+            notice_line(&Notice::Stranded {
+                path: PathBuf::from("/b/w"),
+                name: "w".into()
+            }),
+            "stranded   /b/w: its owner ran on another machine or in another PID namespace \
+             (or its host is unreadable); check, then run `kgraf clean w`"
+        );
+        let report = kgraf_mcp::RegistrationReport::default();
+        assert_eq!(
+            notice_line(&Notice::McpServer {
+                route: "r:m".into(),
+                server: "s".into(),
+                report: report.clone()
+            }),
+            format!("mcp        r:m: s: {report:?}")
+        );
+    }
+}

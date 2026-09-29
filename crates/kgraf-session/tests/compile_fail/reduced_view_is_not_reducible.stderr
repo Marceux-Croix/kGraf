@@ -1,0 +1,18 @@
+error[E0277]: the trait bound `Reduced<Event>: Reducible` is not satisfied
+  --> tests/compile_fail/reduced_view_is_not_reducible.rs:33:9
+   |
+32 |     let _again = reduce(
+   |                  ------ required by a bound introduced by this call
+33 |         &view.entries,
+   |         ^^^^^^^^^^^^^ the trait `Reducible` is not implemented for `Reduced<Event>`
+   |
+help: the trait `Reducible` is implemented for `Event`
+  --> tests/compile_fail/reduced_view_is_not_reducible.rs:10:1
+   |
+10 | impl Reducible for Event {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^
+note: required by a bound in `kgraf_session::reduction::reduce`
+  --> src/reduction.rs
+   |
+   | pub fn reduce<T: Reducible + Clone>(
+   |                  ^^^^^^^^^ required by this bound in `reduce`

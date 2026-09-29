@@ -1,0 +1,73 @@
+# Validation gates: fmt check, clippy -D warnings, test.
+# Ubuntu-only by design: Actions minutes are limited, and macOS and Windows
+# runners bill at a higher per-minute rate than Linux. Cross-platform build
+# correctness is instead exercised by the release workflow's per-platform
+# matrix (.github/workflows/release.yml), which only runs on a version tag,
+# not on every push/PR. See scripts/release-local.md for a local Linux/macOS/
+# Windows build path that costs no Actions minutes at all.
+name: CI
+
+# Push-triggered runs are paused. The same gates run locally before every
+# push. Restore the push trigger below once re-enabled.
+on:
+  workflow_dispatch:
+  # push:
+  #   branches: [main]
+  #   paths-ignore:
+  #     - '**.md'
+  #     - 'docs/**'
+  pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+
+# No job here writes to the repository; read is enough for checkout.
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same ref so redundant pushes to an open PR
+# do not burn minutes twice.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  fmt:
+    name: fmt check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      # dtolnay/rust-toolchain's `stable` branch is an intentional moving
+      # target: the repo pushes a new commit to it on every Rust stable
+      # release, with no separate version tags for that alias, so pinning a
+      # SHA here freezes the toolchain version until this line is bumped by
+      # hand (checked at the source, 2026-09-26; no Dependabot ecosystem
+      # tracks this repo's branch moves the way it tracks tags).
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, as of 2026-09-26
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, as of 2026-09-26
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, as of 2026-09-26
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo test --workspace

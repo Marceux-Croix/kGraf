@@ -1,0 +1,4661 @@
+//! The unit tests of the run construction, moved from `kgraf-cli`'s
+//! `orchestrate_cmd.rs` with the code they test. The bodies are unchanged; only
+//! the import paths differ (`crate::` for `kgraf_cli::`).
+
+use crate::assembler::*;
+use crate::config::*;
+use crate::gates::*;
+use crate::host::check_routes;
+use crate::verifier::*;
+use crate::worker::config::WorkerConfig;
+use crate::workspaces::*;
+use crate::{Host, HostFactory, NotReady, RouteSpec, RunConfig, RunStart};
+use kgraf_core::RunId;
+use kgraf_graph::GraphStore;
+use kgraf_orchestrator::{
+    AttemptEnvs, GateRequest, GateRunner, Integration, MachineGate, OpenContract,
+    OrchestratorError, OrchestratorFactory, Route, RunStore, Verdict, VerifiedCommit, Verifier,
+    Workspaces,
+};
+use kgraf_provider::{Ledger, Provider};
+use kgraf_runtime::{ContextConfig, WorkerResult};
+use kgraf_sandbox::{MergeBack, WorkspaceManager};
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+/// Counts the calls that reached it, and settles each.
+struct Counts(std::sync::atomic::AtomicUsize);
+
+#[async_trait::async_trait]
+impl Provider for Counts {
+    fn adapter(&self) -> &'static str {
+        "counts"
+    }
+    fn protocol(&self) -> kgraf_core::Protocol {
+        kgraf_core::Protocol::Additive
+    }
+    async fn complete(
+        &self,
+        request: &kgraf_provider::Request,
+        token: &kgraf_provider::CallToken,
+    ) -> Result<kgraf_provider::Response, kgraf_provider::ProviderError> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let usage = kgraf_core::TokenUsage {
+            uncached_input: 1,
+            text_output: 1,
+            ..kgraf_core::TokenUsage::default()
+        };
+        token.settle(&usage, None)?;
+        Ok(kgraf_provider::Response {
+            model: request.model.clone(),
+            content: vec![kgraf_provider::Content::text("ok")],
+            stop_reason: kgraf_provider::StopReason::EndTurn,
+            usage,
+            request_id: None,
+        })
+    }
+}
+
+/// A configured `--rate-limit` throttles the calls of every provider built
+/// for the route (planner and worker share it), and leaves other routes alone.
+#[tokio::test]
+async fn a_configured_limit_throttles_the_routes_provider_calls() {
+    let store_dir = tempfile::tempdir().expect("store dir");
+    let store_path = store_dir.path().join("rate-limits.sqlite3");
+    let used = BTreeSet::from(["kimi".to_owned(), "openai".to_owned()]);
+    let limits = limiters(&["kimi=1/1@10".into()], &used, Some(&store_path)).expect("limits");
+    let reached = Arc::new(Counts(std::sync::atomic::AtomicUsize::new(0)));
+    let planner = limited(reached.clone(), "kimi", "key", &limits);
+    let worker = limited(reached.clone(), "kimi", "key", &limits);
+    let other = limited(reached.clone(), "openai", "key", &limits);
+    let ledger = Ledger::open_in_memory().expect("ledger");
+    let request = kgraf_provider::Request::new("m", "hi", 8);
+    let call = |p: Arc<dyn Provider>| {
+        let ledger = &ledger;
+        let request = &request;
+        async move {
+            let token = ledger
+                .begin("counts", kgraf_core::Protocol::Additive, "m", "a", "t")
+                .expect("begin");
+            p.complete(request, &token).await
+        }
+    };
+    call(planner)
+        .await
+        .expect("the first kimi call has the slot");
+    let refused = call(worker).await.expect_err("the second waits past 10 ms");
+    assert!(
+        matches!(refused, kgraf_provider::ProviderError::RateLimited { .. }),
+        "{refused}"
+    );
+    call(other.clone()).await.expect("openai is not limited");
+    call(other).await.expect("openai is not limited");
+    assert_eq!(
+        reached.0.load(std::sync::atomic::Ordering::SeqCst),
+        3,
+        "the refused call never reached the provider"
+    );
+}
+
+#[test]
+fn a_rate_limit_is_per_used_route_and_never_ignored() {
+    let store_dir = tempfile::tempdir().expect("store dir");
+    let store_path = store_dir.path().join("rate-limits.sqlite3");
+    let used = BTreeSet::from(["kimi".to_owned(), "openai".to_owned()]);
+    let got = limiters(&["kimi=60/5@30000".into()], &used, Some(&store_path)).expect("parsed");
+    let limit = got["kimi"].limit();
+    assert_eq!((limit.requests_per_minute, limit.burst), (60, 5));
+    assert_eq!(limit.max_wait_ms, 30_000);
+    assert!(
+        !got.contains_key("openai"),
+        "an unlimited route stays unlimited"
+    );
+    // A limit on a route the run never calls would be silently ignored.
+    assert!(limiters(&["other=60".into()], &used, Some(&store_path)).is_err());
+    assert!(
+        limiters(
+            &["kimi=60".into(), "kimi=30".into()],
+            &used,
+            Some(&store_path)
+        )
+        .is_err()
+    );
+    assert!(limiters(&["kimi=0".into()], &used, Some(&store_path)).is_err());
+    assert!(limiters(&["kimi".into()], &used, Some(&store_path)).is_err());
+}
+
+/// No per-user data directory is a fail-loud refusal, never a silent
+/// process-local limiter (requirement 3).
+#[test]
+fn a_missing_data_directory_refuses_rather_than_falling_back_to_a_process_local_limiter() {
+    let used = BTreeSet::from(["kimi".to_owned()]);
+    let err = match limiters(&["kimi=60".into()], &used, None) {
+        Err(e) => e,
+        Ok(_) => panic!("no store path must refuse, not silently limit only this process"),
+    };
+    assert!(err.to_string().contains("data directory"), "{err}");
+}
+
+#[test]
+fn routes_are_route_colon_model() {
+    assert_eq!(
+        split_route("kimi:kimi-k3").expect("ok"),
+        ("kimi".to_owned(), "kimi-k3".to_owned())
+    );
+    assert!(split_route("kimi").is_err());
+    assert!(split_route(":m").is_err());
+    assert!(split_route("r:").is_err());
+}
+
+/// A repository with one commit on `main`, a worktree manager whose base is
+/// outside it, and merge-back onto `main`.
+struct Repo {
+    _dir: tempfile::TempDir,
+    root: PathBuf,
+    outside: PathBuf,
+    workspaces: Arc<GitWorkspaces>,
+    merge_back: Arc<MergeBack>,
+}
+
+fn host_git(dir: &Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(["-c", "core.hooksPath=/dev/null"])
+        .args(args)
+        .output()
+        .expect("git");
+    assert!(
+        out.status.success(),
+        "{args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A fresh, generous `MachineGate` for a test's own `AttemptAssembler`
+/// (decision 0067): never the process-wide singleton
+/// (`kgraf_orchestrator::process_machine_gate`), so one test's admission or
+/// exec-slot limits never couple to another test's in the same binary. Wide
+/// enough (100 agents, 100 exec slots) that no existing test here is
+/// bottlenecked by it; a test that specifically exercises the gate builds its
+/// own narrower one instead.
+fn test_machine_gate() -> Arc<MachineGate> {
+    MachineGate::new(kgraf_core::ParallelismLimits::derive(100, 100, 100))
+}
+
+fn repo() -> Repo {
+    let dir = tempfile::tempdir().expect("dir");
+    let root = dir.path().join("repo");
+    let base = dir.path().join("ws");
+    repo_in(dir, root, &base, &[("README", "hello\n")])
+}
+
+/// A repository at `root` with `files` committed on `main`, its worktrees
+/// under `base`.
+fn repo_in(dir: tempfile::TempDir, root: PathBuf, base: &Path, files: &[(&str, &str)]) -> Repo {
+    std::fs::create_dir_all(&root).expect("mkdir");
+    host_git(&root, &["init", "-q", "-b", "main"]);
+    for (path, text) in files {
+        let path = root.join(path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("mkdir");
+        }
+        std::fs::write(path, text).expect("write");
+    }
+    host_git(&root, &["add", "."]);
+    host_git(
+        &root,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ],
+    );
+    let outside = dir.path().join("outside");
+    std::fs::create_dir_all(&outside).expect("mkdir");
+    let manager = Arc::new(WorkspaceManager::open(&root, base).expect("manager"));
+    // The run's integration branch, never checked out (as in `run`).
+    let branch = ensure_integration_branch(&root, "r 1").expect("branch");
+    assert_eq!(branch, "kgraf/r-1");
+    let merge_back = Arc::new(
+        MergeBack::open(
+            manager.clone(),
+            &branch,
+            kgraf_sandbox::Identity {
+                name: "Test Owner".into(),
+                email: "owner@example.invalid".into(),
+            },
+        )
+        .expect("merge-back"),
+    );
+    Repo {
+        _dir: dir,
+        root,
+        outside,
+        workspaces: Arc::new(GitWorkspaces::new(manager, merge_back.clone())),
+        merge_back,
+    }
+}
+
+/// Decision 0062: a run started before the rename has its integration branch
+/// under `haustoria/`. Resuming it continues that branch (a fresh `kgraf/`
+/// branch at HEAD would drop the work merged there); a new run gets `kgraf/`.
+#[test]
+fn a_run_started_before_the_rename_keeps_its_integration_branch() {
+    let r = repo();
+    host_git(&r.root, &["branch", "haustoria/r-old", "HEAD"]);
+    host_git(&r.root, &["branch", "kgraf/r-both", "HEAD"]);
+    host_git(&r.root, &["branch", "haustoria/r-both", "HEAD"]);
+    assert_eq!(
+        ensure_integration_branch(&r.root, "r old").expect("branch"),
+        "haustoria/r-old"
+    );
+    assert_eq!(
+        git_out(&r.root, &["branch", "--list", "kgraf/r-old"]),
+        "",
+        "no second branch was made"
+    );
+    assert_eq!(
+        ensure_integration_branch(&r.root, "r both").expect("branch"),
+        "kgraf/r-both"
+    );
+    assert_eq!(
+        ensure_integration_branch(&r.root, "r new").expect("branch"),
+        "kgraf/r-new"
+    );
+}
+
+fn git_out(dir: &Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .expect("git");
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
+/// A genuinely empty directory (`git init`, no commit) has an unborn
+/// `HEAD`, so a plan approved from it could be read but never built (`git
+/// branch ... HEAD` has nothing to point at). `ensure_integration_branch` now
+/// makes one empty first commit, under the repository's own configured
+/// identity, so the greenfield case reaches dispatch like any other.
+#[test]
+fn a_greenfield_directory_with_no_commit_still_gets_an_integration_branch() {
+    let dir = tempfile::tempdir().expect("dir");
+    let root = dir.path().join("repo");
+    std::fs::create_dir_all(&root).expect("mkdir");
+    host_git(&root, &["init", "-q", "-b", "main"]);
+    host_git(&root, &["config", "user.name", "Greenfield Owner"]);
+    host_git(&root, &["config", "user.email", "owner@example.invalid"]);
+    assert!(
+        std::process::Command::new("git")
+            .current_dir(&root)
+            .args(["rev-parse", "--verify", "--quiet", "HEAD"])
+            .status()
+            .expect("git")
+            .code()
+            != Some(0),
+        "the fixture must start with no commit"
+    );
+
+    let branch = ensure_integration_branch(&root, "r").expect("branch");
+    assert_eq!(branch, "kgraf/r");
+    assert_eq!(
+        git_out(&root, &["rev-list", "--count", "HEAD"]),
+        "1",
+        "one commit exists now"
+    );
+    assert_eq!(
+        git_out(&root, &["show", "-s", "--format=%an <%ae>", "HEAD"]),
+        "Greenfield Owner <owner@example.invalid>",
+        "the first commit carries the user's own identity"
+    );
+    assert_eq!(
+        git_out(&root, &["rev-parse", "kgraf/r"]),
+        git_out(&root, &["rev-parse", "HEAD"]),
+        "the integration branch points at the new first commit"
+    );
+
+    // Idempotent: calling it again (a resumed or re-approved run) makes no
+    // second commit and reuses the same branch.
+    let branch_again = ensure_integration_branch(&root, "r").expect("branch");
+    assert_eq!(branch_again, "kgraf/r");
+    assert_eq!(git_out(&root, &["rev-list", "--count", "HEAD"]), "1");
+}
+
+fn named(path: &str, id: &str) -> OpenContract {
+    let mut c = contract(path);
+    c.contract = id.into();
+    c
+}
+
+/// Verify (commit) then integrate one attempt writing `file`.
+async fn finish(r: &Repo, worker: &str, file: &str, text: &str) -> Integration {
+    let c = named(file, worker);
+    let ws = r
+        .workspaces
+        .prepare(&c, &worker.into())
+        .await
+        .expect("worktree");
+    std::fs::write(ws.join(file), text).expect("write");
+    let verdict = verifier(r, "true")
+        .verify(&c, &ws, &result())
+        .await
+        .expect("ran");
+    assert!(verdict.passed(), "{verdict:?}");
+    let i = r.workspaces.integrate(&c, &ws).await.expect("integrate");
+    r.workspaces.release(&ws, true).await;
+    i
+}
+
+#[tokio::test]
+async fn a_verified_attempt_is_merged_and_the_next_attempt_starts_from_the_new_tip() {
+    let r = repo();
+    let first = finish(&r, "w-one", "one.txt", "1").await;
+    let Integration::Merged { commit } = first else {
+        panic!("{first:?}");
+    };
+    assert_eq!(r.merge_back.integration_tip().expect("tip"), commit);
+    // A fresh attempt is created at the tip, so it sees the merged work.
+    let ws = r
+        .workspaces
+        .prepare(&named("two.txt", "w-two"), &"w-two".into())
+        .await
+        .expect("worktree");
+    assert!(
+        ws.join("one.txt").is_file(),
+        "starts from the integration tip"
+    );
+    // The user's checkout did not move.
+    assert!(!r.root.join("one.txt").exists());
+}
+
+/// A live-run defect: a run reported `Completed`, and a
+/// contract reported verified, when the merge-back its own record claimed
+/// landed was not actually on `kgraf/<run>` (a redirected worker's change
+/// went missing from the merged result). `Orchestrator::verify_completion_landed`
+/// checks a recorded `Integration::Merged { commit }` against
+/// [`kgraf_orchestrator::Workspaces::commit_landed`] before a run may report
+/// `Completed`; this is that check's ground truth, with real git, standing in
+/// for the fault it must catch: a branch that moved (here, forced back by
+/// hand) after a merge already reported accepted. Before `commit_is_on_branch`
+/// existed, nothing could tell these two states apart -- an
+/// `Integration::Merged` outcome was trusted forever once recorded, with no
+/// way to ask git whether it still held.
+#[tokio::test]
+async fn a_merge_moved_off_the_branch_is_no_longer_reported_landed() {
+    let r = repo();
+    let outcome = finish(&r, "w-one", "one.txt", "1").await;
+    let Integration::Merged { commit } = outcome else {
+        panic!("{outcome:?}");
+    };
+    assert!(
+        r.merge_back.commit_is_on_branch(&commit).expect("checked"),
+        "the merge just landed; it must be an ancestor of the tip"
+    );
+    // Simulate the fault this check exists for: something (a force-reset, a
+    // second process, a bug upstream of this check) moves the branch away
+    // from the commit an `Integration::Merged` outcome already named. No
+    // orchestrator code does this on its own reachable path -- reproducing it
+    // needs reaching in with git directly, exactly because the whole point of
+    // `commit_is_on_branch` is that a recorded outcome alone cannot tell.
+    let parent = git_out(&r.root, &["rev-parse", &format!("{commit}^1")]);
+    host_git(
+        &r.root,
+        &[
+            "update-ref",
+            &format!("refs/heads/{}", r.merge_back.integration_branch()),
+            &parent,
+            &commit,
+        ],
+    );
+    assert!(
+        !r.merge_back.commit_is_on_branch(&commit).expect("checked"),
+        "the branch no longer holds this commit; the check must say so, not assume the record"
+    );
+}
+
+#[tokio::test]
+async fn a_conflicting_attempt_comes_back_typed_and_the_tip_does_not_move() {
+    let r = repo();
+    // Both start from the same tip and write the same file differently.
+    let a = named("same.txt", "w-a");
+    let b = named("same.txt", "w-b");
+    let wa = r.workspaces.prepare(&a, &"w-a".into()).await.expect("a");
+    let wb = r.workspaces.prepare(&b, &"w-b".into()).await.expect("b");
+    std::fs::write(wa.join("same.txt"), "from a\n").expect("write");
+    std::fs::write(wb.join("same.txt"), "from b\n").expect("write");
+    for (c, ws) in [(&a, &wa), (&b, &wb)] {
+        let v = verifier(&r, "true").verify(c, ws, &result()).await;
+        assert!(v.expect("ran").passed());
+    }
+    assert!(matches!(
+        r.workspaces.integrate(&a, &wa).await.expect("a"),
+        Integration::Merged { .. }
+    ));
+    let tip = r.merge_back.integration_tip().expect("tip");
+    let second = r.workspaces.integrate(&b, &wb).await.expect("b");
+    let Integration::Conflict { tip: at, paths, .. } = second else {
+        panic!("{second:?}");
+    };
+    assert_eq!(at, tip);
+    assert_eq!(paths, vec!["same.txt".to_owned()]);
+    assert_eq!(
+        r.merge_back.integration_tip().expect("tip"),
+        tip,
+        "not moved"
+    );
+}
+
+/// Decision 0073, against real git worktrees (no fakes): a
+/// conflict's attempt is kept, not discarded, until a resolver worker settles
+/// it. This drives `GitWorkspaces` directly, the same seam
+/// `kgraf-orchestrator`'s `resolver.rs` exercises through the full loop with
+/// fakes for the dispatch and session bookkeeping.
+#[tokio::test]
+async fn a_real_git_conflicts_attempt_is_kept_until_a_resolver_settles_it() {
+    let r = repo();
+    let a = named("same.txt", "w-a");
+    let b = named("same.txt", "w-b");
+    let wa = r.workspaces.prepare(&a, &"w-a".into()).await.expect("a");
+    let wb = r.workspaces.prepare(&b, &"w-b".into()).await.expect("b");
+    std::fs::write(wa.join("same.txt"), "from a\n").expect("write");
+    std::fs::write(wb.join("same.txt"), "from b\n").expect("write");
+    for (c, ws) in [(&a, &wa), (&b, &wb)] {
+        let v = verifier(&r, "true").verify(c, ws, &result()).await;
+        assert!(v.expect("ran").passed());
+    }
+    assert!(matches!(
+        r.workspaces.integrate(&a, &wa).await.expect("a"),
+        Integration::Merged { .. }
+    ));
+    let tip = r.merge_back.integration_tip().expect("tip");
+    let conflict = r.workspaces.integrate(&b, &wb).await.expect("b");
+    let Integration::Conflict {
+        commit: Some(lost_commit),
+        ..
+    } = &conflict
+    else {
+        panic!("expected a conflict with a kept commit, got {conflict:?}");
+    };
+    // Kept, not discarded (0073 supersedes 0018's immediate discard): the
+    // attempt ref is still there, and it is the losing commit, reachable in
+    // the repository even though `refs/heads/kgraf/r-1` never moved for it.
+    assert_eq!(
+        git_out(
+            &r.root,
+            &["rev-parse", "--verify", "refs/kgraf/attempts/w-b+1"]
+        ),
+        *lost_commit,
+        "the conflicted attempt's commit is kept reachable"
+    );
+
+    // A resolver worker: a fresh worktree at the new tip (as any contract's
+    // first attempt would get), which can read the kept commit straight out
+    // of the repository's own history and bring in the change by hand.
+    let mut resolver = named("same.txt", "w-b-resolver1");
+    resolver.base = Some(tip.clone());
+    let rws = r
+        .workspaces
+        .prepare(&resolver, &"w-b-resolver1".into())
+        .await
+        .expect("resolver worktree");
+    assert_eq!(
+        git_out(&rws, &["rev-parse", "HEAD"]),
+        tip,
+        "starts at the new tip, not the old one"
+    );
+    assert_eq!(
+        git_out(&rws, &["show", &format!("{lost_commit}:same.txt")]),
+        "from b",
+        "the resolver can read the kept commit's content straight from history"
+    );
+    std::fs::write(rws.join("same.txt"), "from a\nfrom b\n").expect("write");
+    let verdict = verifier(&r, "true")
+        .verify(&resolver, &rws, &result())
+        .await
+        .expect("ran");
+    assert!(verdict.passed(), "{verdict:?}");
+    let resolved = r
+        .workspaces
+        .integrate(&resolver, &rws)
+        .await
+        .expect("resolver integrate");
+    assert!(
+        matches!(resolved, Integration::Merged { .. }),
+        "{resolved:?}"
+    );
+    assert_eq!(
+        git_out(
+            &r.root,
+            &[
+                "show",
+                &format!("{}:same.txt", r.merge_back.integration_tip().expect("tip"))
+            ]
+        ),
+        "from a\nfrom b"
+    );
+
+    // Settled: the superseded attempt's ref and worktree are discarded once,
+    // whichever way it went.
+    r.workspaces.discard_conflict(&wb).await;
+    assert_eq!(
+        git_out(
+            &r.root,
+            &[
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/kgraf/attempts/w-b+1"
+            ]
+        ),
+        "",
+        "the kept attempt is gone once the resolver settled it"
+    );
+    // A second call is a no-op, never an error, for the fallback path that
+    // also discards on failure.
+    r.workspaces.discard_conflict(&wb).await;
+}
+
+#[tokio::test]
+async fn a_remediation_starts_from_the_commit_its_gate_failed_on() {
+    let r = repo();
+    let Integration::Merged { commit: failed_at } = finish(&r, "w-1", "x.txt", "1").await else {
+        panic!("merge");
+    };
+    finish(&r, "w-2", "y.txt", "2").await;
+    let mut fix = named("x.txt", "fix-root-1");
+    fix.base = Some(failed_at.clone());
+    let ws = r
+        .workspaces
+        .prepare(&fix, &"w-fix".into())
+        .await
+        .expect("worktree");
+    assert_eq!(git_out(&ws, &["rev-parse", "HEAD"]), failed_at);
+    assert!(!ws.join("y.txt").exists());
+}
+
+/// The bus wrote conversation files into the user's
+/// checkout and copied them to the branch, so merging `kgraf/<run>`
+/// failed on the untracked copies. They are written only in a worktree of
+/// the integration tip now; the user's checkout stays clean and the merge
+/// succeeds. A second message continues the file from the branch.
+#[tokio::test]
+async fn conversation_files_reach_the_branch_without_touching_the_checkout() {
+    let r = repo();
+    let rel = "docs/notes/a--b.md";
+    for (i, line) in ["# Conversation\n", "## m2\n"].iter().enumerate() {
+        let root = r
+            .workspaces
+            .open_comms()
+            .await
+            .expect("open")
+            .expect("a worktree");
+        assert!(!root.starts_with(&r.root), "never the user's checkout");
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().expect("dir")).expect("mkdir");
+        let before = std::fs::read_to_string(&path).unwrap_or_default();
+        assert_eq!(before.is_empty(), i == 0, "continues the branch's file");
+        std::fs::write(&path, format!("{before}{line}")).expect("write");
+        let msg = format!("kgraf: agent message m{i}");
+        let merged = r
+            .workspaces
+            .commit_comms(&root, &[rel.to_owned()], &msg)
+            .await
+            .expect("commit");
+        assert!(matches!(merged, Integration::Merged { .. }), "{merged:?}");
+        assert!(!root.exists(), "the worktree is retired");
+    }
+    let shown = git_out(&r.root, &["show", &format!("kgraf/r-1:{rel}")]);
+    assert_eq!(shown, "# Conversation\n## m2");
+    assert!(!r.root.join("docs").exists(), "no copy in the checkout");
+    assert_eq!(git_out(&r.root, &["status", "--porcelain"]), "");
+    host_git(
+        &r.root,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "merge",
+            "-q",
+            "--no-edit",
+            "kgraf/r-1",
+        ],
+    );
+    assert!(r.root.join(rel).is_file(), "the owner's merge brings it in");
+}
+
+/// An empty commit, or one that fails (here a tampered
+/// gitlink, refused before any git runs in the tree), leaves no worktree.
+#[tokio::test]
+async fn a_conversation_worktree_is_removed_on_every_commit_outcome() {
+    let r = repo();
+    let empty = r
+        .workspaces
+        .open_comms()
+        .await
+        .expect("open")
+        .expect("root");
+    let i = r
+        .workspaces
+        .commit_comms(&empty, &[], "m")
+        .await
+        .expect("ran");
+    assert!(matches!(i, Integration::Empty), "{i:?}");
+    let failing = r
+        .workspaces
+        .open_comms()
+        .await
+        .expect("open")
+        .expect("root");
+    std::fs::write(failing.join(".git"), "gitdir: /tmp/elsewhere\n").expect("tamper");
+    assert!(r.workspaces.commit_comms(&failing, &[], "m").await.is_err());
+    for root in [&empty, &failing] {
+        assert!(!root.exists(), "{} removed", root.display());
+        assert!(
+            !git_out(&r.root, &["worktree", "list"]).contains(&root.display().to_string()),
+            "unregistered"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_conversation_worktree_that_is_never_committed_is_removed() {
+    let r = repo();
+    let root = r
+        .workspaces
+        .open_comms()
+        .await
+        .expect("open")
+        .expect("root");
+    r.workspaces.discard_comms(&root).await;
+    assert!(!root.exists());
+    assert!(
+        r.workspaces.commit_comms(&root, &[], "m").await.is_err(),
+        "a discarded worktree is not committed"
+    );
+}
+
+/// `kgraf clean` refuses a worktree a run record
+/// still names unless forced, and a live owner with a clear reason.
+#[tokio::test]
+async fn clean_refuses_a_worktree_a_record_names_unless_forced() {
+    let r = repo();
+    let c = named("a.txt", "w-named");
+    let ws = r
+        .workspaces
+        .prepare(&c, &"w-named".into())
+        .await
+        .expect("ws");
+    // Owned by this (live) process: refused, saying so.
+    let base = r._dir.path().join("ws");
+    let live = clean_in(&r.root, &base, "w-named", true).expect_err("live owner");
+    assert!(
+        format!("{live:#}").contains("still running here"),
+        "{live:#}"
+    );
+    kill_owner(&r, &ws);
+    let state = crate::state_dir(&r.root).expect("state");
+    let graph = Arc::new(Mutex::new(
+        GraphStore::open(&state.join("graph.db"), &r.root).expect("graph"),
+    ));
+    let mut record = kgraf_orchestrator::RunStateRecord::new(kgraf_core::RunId::new("r7"), "x", 0);
+    let mut named_c = c.clone();
+    named_c.workers = vec!["w-named".into()];
+    record.open_contracts.push(named_c);
+    RunStore::new(graph).save(&record).expect("save");
+    let err = clean_in(&r.root, &base, "w-named", false).expect_err("named");
+    assert!(format!("{err:#}").contains("run(s) r7"), "{err:#}");
+    assert!(ws.exists());
+    assert_eq!(
+        clean_in(&r.root, &base, "w-named", true).expect("forced"),
+        ws
+    );
+    assert!(!ws.exists());
+}
+
+/// Relock a worktree as a killed process leaves it.
+fn kill_owner(r: &Repo, root: &Path) {
+    let path = root.to_str().expect("utf-8");
+    host_git(&r.root, &["worktree", "unlock", path]);
+    let dead = {
+        let mut c = std::process::Command::new("true").spawn().expect("spawn");
+        let pid = c.id();
+        c.wait().expect("wait");
+        pid
+    };
+    let reason = format!(
+        "{}:pid={dead}:{}:name=x",
+        kgraf_sandbox::LOCK_TAG,
+        kgraf_sandbox::HostId::current().fields()
+    );
+    host_git(&r.root, &["worktree", "lock", "--reason", &reason, path]);
+}
+
+/// Startup cleanup runs at startup, removes what no run record names, and
+/// keeps what one does (including the worktrees a resume reopens). Without
+/// it, crashed conversation and probe worktrees would stay.
+#[tokio::test]
+async fn startup_cleanup_keeps_referenced_worktrees_and_removes_the_rest() {
+    let r = repo();
+    let mut c = named("a.txt", "w-kept");
+    let kept = r
+        .workspaces
+        .prepare(&c, &"w-kept".into())
+        .await
+        .expect("ws");
+    std::fs::write(kept.join("a.txt"), "work\n").expect("write");
+    c.worktrees.insert(
+        "w-kept".into(),
+        r.workspaces.handle(&kept).await.expect("handle"),
+    );
+    let dropped = r
+        .workspaces
+        .prepare(&named("b.txt", "w-dropped"), &"w-dropped".into())
+        .await
+        .expect("ws");
+    let comms = r
+        .workspaces
+        .open_comms()
+        .await
+        .expect("open")
+        .expect("root");
+    for root in [&kept, &dropped, &comms] {
+        kill_owner(&r, root);
+    }
+    let graph = Arc::new(Mutex::new(
+        GraphStore::open(&r._dir.path().join("graph.db"), &r.root).expect("graph"),
+    ));
+    let store = RunStore::new(graph);
+    let mut record = kgraf_orchestrator::RunStateRecord::new(kgraf_core::RunId::new("r1"), "x", 0);
+    c.workers = vec!["w-kept".into()];
+    record.open_contracts.push(c.clone());
+    store.save(&record).expect("save");
+
+    let manager = WorkspaceManager::open(&r.root, &r._dir.path().join("ws")).expect("m");
+    let removed = clean_stale_worktrees(&manager, &store).expect("clean");
+    // Worktrees (their scratch directories go with them).
+    let mut gone: Vec<PathBuf> = removed
+        .iter()
+        .map(|x| x.path.clone())
+        .filter(|p| !p.components().any(|c| c.as_os_str() == ".scratch"))
+        .collect();
+    gone.sort();
+    let mut expected = vec![dropped.clone(), comms.clone()];
+    expected.sort();
+    assert_eq!(gone, expected);
+    assert!(!dropped.exists() && !comms.exists());
+    assert!(
+        kept.join("a.txt").is_file(),
+        "the referenced worktree stays"
+    );
+    // And a resume still reopens it.
+    let again = restarted(&r);
+    assert_eq!(
+        again.prepare(&c, &"w-kept".into()).await.expect("reopen"),
+        kept
+    );
+}
+
+/// At the end of a run, attempt refs of the worktrees
+/// it worked in are swept, except those an open contract still uses (a
+/// reopen needs a committed, unmerged worktree's ref).
+#[tokio::test]
+async fn attempt_refs_are_swept_at_run_end_except_for_open_work() {
+    let r = repo();
+    let mut c = named("a.txt", "w-s");
+    c.verifications = 1;
+    let ws = r.workspaces.prepare(&c, &"w-s".into()).await.expect("ws");
+    std::fs::write(ws.join("a.txt"), "x\n").expect("write");
+    assert!(
+        verifier(&r, "true")
+            .verify(&c, &ws, &result())
+            .await
+            .expect("ran")
+            .passed()
+    );
+    let reference = "refs/kgraf/attempts/w-s+1";
+    let exists = || !git_out(&r.root, &["rev-parse", "--verify", "--quiet", reference]).is_empty();
+    assert!(exists());
+    let mut record = kgraf_orchestrator::RunStateRecord::new(kgraf_core::RunId::new("r1"), "x", 0);
+    c.workers = vec!["w-s".into()];
+    record.open_contracts.push(c);
+    assert!(
+        r.workspaces
+            .sweep_refs(Some(&record))
+            .expect("sweep")
+            .is_empty()
+    );
+    assert!(exists(), "still open: kept");
+    record.open_contracts.clear();
+    assert_eq!(
+        r.workspaces.sweep_refs(Some(&record)).expect("sweep"),
+        vec![reference.to_owned()]
+    );
+    assert!(!exists(), "finished: swept");
+}
+
+/// A second process's view of the same repository: nothing live, only
+/// what the run record kept.
+fn restarted(r: &Repo) -> Arc<GitWorkspaces> {
+    let manager =
+        Arc::new(WorkspaceManager::open(&r.root, &r._dir.path().join("ws")).expect("manager"));
+    let merge_back = Arc::new(
+        MergeBack::open(
+            manager.clone(),
+            "kgraf/r-1",
+            kgraf_sandbox::Identity {
+                name: "Test Owner".into(),
+                email: "owner@example.invalid".into(),
+            },
+        )
+        .expect("merge-back"),
+    );
+    Arc::new(GitWorkspaces::new(manager, merge_back))
+}
+
+/// Item 3: a killed run's worktree is reopened by its recorded gitlink,
+/// with the worker's changes, rather than refused (which restarted the
+/// contract with a fresh worker). Without the record it is still refused.
+#[tokio::test]
+async fn a_killed_runs_worktree_is_reopened_by_its_recorded_gitlink() {
+    let r = repo();
+    let mut c = named("a.txt", "w-a");
+    let ws = r.workspaces.prepare(&c, &"w-a".into()).await.expect("ws");
+    std::fs::write(ws.join("a.txt"), "half done\n").expect("write");
+    let handle = r.workspaces.handle(&ws).await.expect("a handle");
+
+    let again = restarted(&r);
+    let refused = again.prepare(&c, &"w-a".into()).await;
+    assert!(refused.is_err(), "no record: refused, never replaced");
+    assert!(ws.join("a.txt").is_file(), "and the work is still there");
+
+    c.worktrees.insert("w-a".into(), handle);
+    let reopened = again.prepare(&c, &"w-a".into()).await.expect("reopened");
+    assert_eq!(reopened, ws);
+    assert_eq!(
+        std::fs::read_to_string(reopened.join("a.txt")).expect("read"),
+        "half done\n"
+    );
+    // It verifies and merges like any attempt.
+    let v = CommandVerifier {
+        workspaces: again.clone(),
+        merge_back: again.merge_back.clone(),
+        ..verifier(&r, "true")
+    };
+    assert!(
+        v.verify(&c, &reopened, &result())
+            .await
+            .expect("ran")
+            .passed()
+    );
+    assert!(matches!(
+        again.integrate(&c, &reopened).await.expect("integrate"),
+        Integration::Merged { .. }
+    ));
+    assert_eq!(git_out(&r.root, &["show", "kgraf/r-1:a.txt"]), "half done");
+}
+
+/// Item 1: the process died after its verification committed the attempt
+/// and before the merge. The resumed run reopens the worktree and verifies
+/// it again; numbered by the record's counter, the new commit does not
+/// collide with the attempt ref the dead process left.
+#[tokio::test]
+async fn a_re_verified_contract_never_collides_with_its_attempt_ref() {
+    let r = repo();
+    let mut c = named("a.txt", "w-a");
+    let ws = r.workspaces.prepare(&c, &"w-a".into()).await.expect("ws");
+    std::fs::write(ws.join("a.txt"), "done\n").expect("write");
+    c.worktrees.insert(
+        "w-a".into(),
+        r.workspaces.handle(&ws).await.expect("handle"),
+    );
+    c.verifications = 1;
+    assert!(
+        verifier(&r, "true")
+            .verify(&c, &ws, &result())
+            .await
+            .expect("ran")
+            .passed()
+    );
+    let first = git_out(&r.root, &["rev-parse", "refs/kgraf/attempts/w-a+1"]);
+    assert_eq!(first.len(), 40, "the first verification's ref");
+
+    let again = restarted(&r);
+    let reopened = again.prepare(&c, &"w-a".into()).await.expect("reopened");
+    let v = CommandVerifier {
+        workspaces: again.clone(),
+        merge_back: again.merge_back.clone(),
+        ..verifier(&r, "true")
+    };
+    // The rollback removed the unmerged commit's ref.
+    assert_eq!(
+        git_out(
+            &r.root,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "refs/kgraf/attempts/w-a+1"
+            ]
+        ),
+        ""
+    );
+    // A kill between the rollback and that removal leaves it; reusing the
+    // number then collides with it.
+    host_git(
+        &r.root,
+        &["update-ref", "refs/kgraf/attempts/w-a+1", &first],
+    );
+    let same = v.verify(&c, &reopened, &result()).await.expect("ran");
+    assert!(
+        matches!(&same, Verdict::Fail { reason } if reason.contains("already exists")),
+        "{same:?}"
+    );
+    // The next number, as the orchestrator assigns it, does not.
+    c.verifications = 2;
+    let next = v.verify(&c, &reopened, &result()).await.expect("ran");
+    assert!(next.passed(), "{next:?}");
+    assert!(matches!(
+        again.integrate(&c, &reopened).await.expect("integrate"),
+        Integration::Merged { .. }
+    ));
+    assert_eq!(git_out(&r.root, &["show", "kgraf/r-1:a.txt"]), "done");
+}
+
+/// Item 2: each attempt's environment is assembled in its own worktree.
+/// The shell runs in that worktree (two attempts see their own files),
+/// its approval hook denies an unapproved write (a delegate never asks),
+/// and the configured MCP servers are registered. The model is fake; the
+/// worker loop, shell sandbox and approval chain are real.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_attempt_gets_a_shell_bound_to_its_own_worktree() {
+    let r = repo();
+    let state = r._dir.path().join("state");
+    std::fs::create_dir_all(&state).expect("state");
+    let ledger = Arc::new(Ledger::open(&state.join("ledger.db")).expect("ledger"));
+    let mut routes = BTreeMap::new();
+    routes.insert(
+        "fake:m".to_owned(),
+        RouteParts {
+            provider: Arc::new(ShellCaller),
+            vendor: "fake (fake)".into(),
+            vendor_name: "fake".into(),
+            model: "m".into(),
+        },
+    );
+    let assembler = AttemptAssembler {
+        root: r.root.clone(),
+        state: state.clone(),
+        graph_path: state.join("graph.db"),
+        indexed: false,
+        ledger: ledger.clone(),
+        config: WorkerConfig::with_servers(vec![echo_server()]).expect("config"),
+        max_output_tokens: 1_000,
+        read_denies: vec![state.clone()],
+        workspaces: r.workspaces.clone(),
+        routes,
+        extra_tools: Vec::new(),
+        session_line: None,
+        prefixes: Arc::new(kgraf_runtime::PrefixRegistry::new()),
+        machine_gate: test_machine_gate(),
+        tbench_bridge_socket: None,
+        dependency_refetch: crate::deps::inert_refetch(),
+    };
+    let context = ContextConfig::for_model(200_000).expect("context");
+    let mut seen = Vec::new();
+    for worker in ["w-one", "w-two"] {
+        let ws = worktree(&r, worker).await;
+        std::fs::write(ws.join(format!("mark-{worker}")), "x").expect("mark");
+        let route = Route {
+            name: "fake:m".into(),
+            vendor: "fake".into(),
+            // The route's own environment is not what the worker runs in.
+            env: Arc::new(kgraf_runtime::WorkerEnv::new(
+                ledger.clone(),
+                Arc::new(ShellCaller),
+                Arc::new(kgraf_tools::ToolRegistry::new()),
+                assemble_prefix(),
+            )),
+            context: context.clone(),
+            readiness: Arc::new(kgraf_orchestrator::AlwaysReady),
+            local: false,
+        };
+        let built = assembler
+            .build(&route, &ws, &worker.into(), &"r9/c-shell".into())
+            .await
+            .expect("built");
+        assert!(built.env.tools.names().any(|n| n == "shell"));
+        assert!(
+            built
+                .env
+                .tools
+                .names()
+                .any(|n| n.starts_with("mcp__echoserver__")),
+            "the configured MCP server is connected for this attempt"
+        );
+        let brief = kgraf_runtime::WorkerBrief {
+            task: "r9/c-shell".into(),
+            worker: worker.into(),
+            instruction: "list your files".into(),
+            workspace_root: ws.clone(),
+            model: "m".into(),
+            slices: vec![],
+            skills: vec![],
+            step_budget: 4,
+            context: context.clone(),
+            write_scope: None,
+        };
+        let mut handle = kgraf_runtime::spawn_worker(
+            built.env.clone(),
+            brief,
+            kgraf_runtime::SpawnOptions::default(),
+        )
+        .await
+        .expect("spawn");
+        let mut outputs = Vec::new();
+        while let Some(ev) = handle.next_event().await {
+            if let kgraf_runtime::WorkerEvent::ToolCallFinished {
+                output, is_error, ..
+            } = ev
+            {
+                outputs.push((output, is_error));
+            }
+        }
+        if let Some(closer) = built.closer {
+            closer.close().await;
+        }
+        // The two calls of one round finish in either order.
+        assert_eq!(outputs.len(), 2, "{outputs:?}");
+        let listed = outputs.iter().find(|o| !o.1).expect("ls ran");
+        let denied = outputs.iter().find(|o| o.1).expect("touch refused");
+        assert!(denied.0.contains("denied"), "{denied:?}");
+        assert!(!ws.join("unasked.txt").exists());
+        seen.push((worker, listed.0.clone()));
+    }
+    assert!(seen[0].1.contains("mark-w-one") && !seen[0].1.contains("mark-w-two"));
+    assert!(seen[1].1.contains("mark-w-two") && !seen[1].1.contains("mark-w-one"));
+}
+
+/// A fake model that calls one named tool on its first round, then answers.
+struct CallsOneTool(&'static str, serde_json::Value);
+
+#[async_trait::async_trait]
+impl Provider for CallsOneTool {
+    fn adapter(&self) -> &'static str {
+        "fake"
+    }
+    fn protocol(&self) -> kgraf_core::Protocol {
+        kgraf_core::Protocol::Additive
+    }
+    async fn complete(
+        &self,
+        request: &kgraf_provider::Request,
+        token: &kgraf_provider::CallToken,
+    ) -> std::result::Result<kgraf_provider::Response, kgraf_provider::ProviderError> {
+        use kgraf_provider::{Content, Role, StopReason};
+        let usage = kgraf_core::TokenUsage {
+            uncached_input: 5,
+            text_output: 1,
+            ..Default::default()
+        };
+        token.settle(&usage, None)?;
+        let first = !request.messages.iter().any(|m| m.role == Role::Assistant);
+        let content = if first {
+            vec![Content::ToolUse {
+                id: "c0".into(),
+                name: self.0.into(),
+                input: self.1.clone(),
+            }]
+        } else {
+            vec![Content::text("done")]
+        };
+        Ok(kgraf_provider::Response {
+            model: request.model.clone(),
+            content,
+            stop_reason: if first {
+                StopReason::ToolUse
+            } else {
+                StopReason::EndTurn
+            },
+            usage,
+            request_id: None,
+        })
+    }
+    fn capabilities(&self) -> kgraf_provider::capability::Capabilities<'_> {
+        kgraf_provider::capability::Capabilities::none()
+    }
+}
+
+/// Decision 0067: with the `sessions` flag on, a worker's call to a session
+/// tool reaches it (`assemble.rs`'s `builtins.extend(session_tools(line))`),
+/// and every one of them, unbuilt, answers with `is_error: true` -- a model
+/// reading the ordinary `ToolCallFinished.is_error` field must see this as a
+/// failed call, not as text it could act on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_tool_call_with_the_flag_on_answers_as_an_error() {
+    let r = repo();
+    let state = r._dir.path().join("state");
+    std::fs::create_dir_all(&state).expect("state");
+    let ledger = Arc::new(Ledger::open(&state.join("ledger.db")).expect("ledger"));
+    let mut routes = BTreeMap::new();
+    routes.insert(
+        "fake:m".to_owned(),
+        RouteParts {
+            provider: Arc::new(CallsOneTool(
+                "ask_user_question",
+                serde_json::json!({"question": "are you sure?"}),
+            )),
+            vendor: "fake (fake)".into(),
+            vendor_name: "fake".into(),
+            model: "m".into(),
+        },
+    );
+    let assembler = AttemptAssembler {
+        root: r.root.clone(),
+        state: state.clone(),
+        graph_path: state.join("graph.db"),
+        indexed: false,
+        ledger: ledger.clone(),
+        config: WorkerConfig::default(),
+        max_output_tokens: 1_000,
+        read_denies: vec![state.clone()],
+        workspaces: r.workspaces.clone(),
+        routes,
+        extra_tools: Vec::new(),
+        session_line: Some(kgraf_orchestrator::SessionLine::new()),
+        prefixes: Arc::new(kgraf_runtime::PrefixRegistry::new()),
+        machine_gate: test_machine_gate(),
+        tbench_bridge_socket: None,
+        dependency_refetch: crate::deps::inert_refetch(),
+    };
+    let context = ContextConfig::for_model(200_000).expect("context");
+    let ws = worktree(&r, "w-ask").await;
+    let route = Route {
+        name: "fake:m".into(),
+        vendor: "fake".into(),
+        env: Arc::new(kgraf_runtime::WorkerEnv::new(
+            ledger.clone(),
+            Arc::new(CallsOneTool("ask_user_question", serde_json::json!({}))),
+            Arc::new(kgraf_tools::ToolRegistry::new()),
+            assemble_prefix(),
+        )),
+        context: context.clone(),
+        readiness: Arc::new(kgraf_orchestrator::AlwaysReady),
+        local: false,
+    };
+    let built = assembler
+        .build(&route, &ws, &"w-ask".into(), &"r9/c-ask".into())
+        .await
+        .expect("built");
+    assert!(
+        built.env.tools.names().any(|n| n == "ask_user_question"),
+        "the session tools must be registered when a run carries a SessionLine"
+    );
+    let brief = kgraf_runtime::WorkerBrief {
+        task: "r9/c-ask".into(),
+        worker: "w-ask".into(),
+        instruction: "ask the user".into(),
+        workspace_root: ws.clone(),
+        model: "m".into(),
+        slices: vec![],
+        skills: vec![],
+        step_budget: 4,
+        context,
+        write_scope: None,
+    };
+    let mut handle = kgraf_runtime::spawn_worker(
+        built.env.clone(),
+        brief,
+        kgraf_runtime::SpawnOptions::default(),
+    )
+    .await
+    .expect("spawn");
+    let mut result = None;
+    while let Some(ev) = handle.next_event().await {
+        if let kgraf_runtime::WorkerEvent::ToolCallFinished {
+            output, is_error, ..
+        } = ev
+        {
+            result = Some((output, is_error));
+        }
+    }
+    if let Some(closer) = built.closer {
+        closer.close().await;
+    }
+    let (output, is_error) = result.expect("the tool call finished");
+    assert!(
+        is_error,
+        "the stub tool must report is_error: true: {output}"
+    );
+    assert!(output.contains("not built yet"));
+}
+
+/// The companion to the test above, through the same `assemble()` path, with
+/// the flag off: no session tool is registered, and the assembled prefix
+/// digest (not a hand-built `SharedPrefix` -- the actual bytes `assemble()`
+/// produces from the real built-in tools and system prompt) is pinned to a
+/// literal. `session_tools.rs`'s own digest tests hash a `SharedPrefix` it
+/// builds itself and never call `assemble()`; this is what proves the flag
+/// change here is what a real worker environment actually sees.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_assembled_prefix_digest_with_the_flag_off_is_pinned() {
+    let r = repo();
+    let state = r._dir.path().join("state");
+    std::fs::create_dir_all(&state).expect("state");
+    let ledger = Arc::new(Ledger::open(&state.join("ledger.db")).expect("ledger"));
+    let mut routes = BTreeMap::new();
+    routes.insert(
+        "fake:m".to_owned(),
+        RouteParts {
+            provider: Arc::new(CallsOneTool("noop", serde_json::json!({}))),
+            vendor: "fake (fake)".into(),
+            vendor_name: "fake".into(),
+            model: "m".into(),
+        },
+    );
+    let assembler = AttemptAssembler {
+        root: r.root.clone(),
+        state: state.clone(),
+        graph_path: state.join("graph.db"),
+        indexed: false,
+        ledger: ledger.clone(),
+        config: WorkerConfig::default(),
+        max_output_tokens: 1_000,
+        read_denies: vec![state.clone()],
+        workspaces: r.workspaces.clone(),
+        routes,
+        extra_tools: Vec::new(),
+        session_line: None,
+        prefixes: Arc::new(kgraf_runtime::PrefixRegistry::new()),
+        machine_gate: test_machine_gate(),
+        tbench_bridge_socket: None,
+        dependency_refetch: crate::deps::inert_refetch(),
+    };
+    let context = ContextConfig::for_model(200_000).expect("context");
+    let ws = worktree(&r, "w-off").await;
+    let route = Route {
+        name: "fake:m".into(),
+        vendor: "fake".into(),
+        env: Arc::new(kgraf_runtime::WorkerEnv::new(
+            ledger.clone(),
+            Arc::new(CallsOneTool("noop", serde_json::json!({}))),
+            Arc::new(kgraf_tools::ToolRegistry::new()),
+            assemble_prefix(),
+        )),
+        context: context.clone(),
+        readiness: Arc::new(kgraf_orchestrator::AlwaysReady),
+        local: false,
+    };
+    let built = assembler
+        .build(&route, &ws, &"w-off".into(), &"r9/c-off".into())
+        .await
+        .expect("built");
+    for tool in kgraf_orchestrator::SESSION_TOOL_NAMES {
+        assert!(
+            !built.env.tools.names().any(|n| n == tool),
+            "{tool} must not be registered with the sessions flag off"
+        );
+    }
+    let digest = built.env.prefix.digest().as_str().to_owned();
+    if let Some(closer) = built.closer {
+        closer.close().await;
+    }
+    // Pinned by decision 0084: the shell tool's description
+    // now names the build and test allowlist, the system prompt says those
+    // commands run without approval and that a `<verifier_refusal>` block is
+    // data, and the `apply_patch` description was rewritten in the same
+    // merge. One deliberate cache reset.
+    assert_eq!(
+        digest, "792919cc7ea9a0084e53986a4f216bed969d7e8da36673efdd611dd50b14e0a6",
+        "a change here means every worker's cache resets even with the \
+         sessions flag off, which nothing in decision 0067 may cause \
+         (re-pinned for the intentional `apply_patch` description \
+         rewrite; the tool's description is part of the assembled prefix the digest is taken over, so this is the \
+         one change expected to move it)"
+    );
+}
+
+/// The real MCP server over stdio, as `kgraf worker`'s tests use it.
+fn echo_server() -> kgraf_mcp::McpServerConfig {
+    static PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    let binary = PATH.get_or_init(|| {
+        escargot::CargoBuild::new()
+            .bin("mcp-echo-server")
+            .manifest_path(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../kgraf-mcp-test-server/Cargo.toml"
+            ))
+            .current_release()
+            .current_target()
+            .run()
+            .expect("build mcp-echo-server")
+            .path()
+            .to_path_buf()
+    });
+    kgraf_mcp::McpServerConfig::new(
+        "echoserver",
+        kgraf_mcp::McpTransport::Stdio {
+            command: binary.to_string_lossy().into_owned(),
+            args: vec![],
+            env: BTreeMap::new(),
+            cwd: None,
+        },
+    )
+    .expect("valid")
+}
+
+/// An MCP tool allowed with `kgraf allow` runs in an
+/// unattended orchestrate delegate; before that, the same call is denied.
+/// The delegate's environment is the one `orchestrate` assembles
+/// (`AttemptAssembler`), with the real echo server and worker loop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_mcp_tool_allowed_with_kgraf_allow_runs_in_an_unattended_delegate() {
+    let r = repo();
+    let state = r._dir.path().join("state");
+    std::fs::create_dir_all(&state).expect("state");
+    let ledger = Arc::new(Ledger::open(&state.join("ledger.db")).expect("ledger"));
+    let assembler = |ledger: Arc<Ledger>| {
+        let mut routes = BTreeMap::new();
+        routes.insert(
+            "fake:m".to_owned(),
+            RouteParts {
+                provider: Arc::new(McpCaller),
+                vendor: "fake-mcp (fake)".into(),
+                vendor_name: "fake-mcp".into(),
+                model: "m".into(),
+            },
+        );
+        AttemptAssembler {
+            root: r.root.clone(),
+            state: state.clone(),
+            graph_path: state.join("graph.db"),
+            indexed: false,
+            ledger,
+            config: WorkerConfig::with_servers(vec![echo_server()]).expect("config"),
+            max_output_tokens: 1_000,
+            read_denies: vec![state.clone()],
+            workspaces: r.workspaces.clone(),
+            routes,
+            extra_tools: Vec::new(),
+            session_line: None,
+            prefixes: Arc::new(kgraf_runtime::PrefixRegistry::new()),
+            machine_gate: test_machine_gate(),
+            tbench_bridge_socket: None,
+            dependency_refetch: crate::deps::inert_refetch(),
+        }
+    };
+    let context = ContextConfig::for_model(200_000).expect("context");
+    let mut outcomes = Vec::new();
+    for (allowed, worker) in [(false, "w-deny"), (true, "w-allow")] {
+        if allowed {
+            let project = r.root.canonicalize().expect("root");
+            crate::worker::ask::allow_mcp_tool(
+                &state,
+                &project.to_string_lossy(),
+                "mcp__echoserver__echo",
+                "test",
+                &["echoserver".to_owned()],
+            )
+            .expect("allow");
+        }
+        let ws = worktree(&r, worker).await;
+        let a = assembler(ledger.clone());
+        let route = Route {
+            name: "fake:m".into(),
+            vendor: "fake".into(),
+            env: Arc::new(kgraf_runtime::WorkerEnv::new(
+                ledger.clone(),
+                Arc::new(McpCaller),
+                Arc::new(kgraf_tools::ToolRegistry::new()),
+                assemble_prefix(),
+            )),
+            context: context.clone(),
+            readiness: Arc::new(kgraf_orchestrator::AlwaysReady),
+            local: false,
+        };
+        let built = a
+            .build(&route, &ws, &worker.into(), &"r9/c-mcp".into())
+            .await
+            .expect("built");
+        let brief = kgraf_runtime::WorkerBrief {
+            task: "r9/c-mcp".into(),
+            worker: worker.into(),
+            instruction: "echo".into(),
+            workspace_root: ws.clone(),
+            model: "m".into(),
+            slices: vec![],
+            skills: vec![],
+            step_budget: 4,
+            context: context.clone(),
+            write_scope: None,
+        };
+        let mut handle = kgraf_runtime::spawn_worker(
+            built.env.clone(),
+            brief,
+            kgraf_runtime::SpawnOptions::default(),
+        )
+        .await
+        .expect("spawn");
+        let mut finished = Vec::new();
+        while let Some(ev) = handle.next_event().await {
+            if let kgraf_runtime::WorkerEvent::ToolCallFinished {
+                output, is_error, ..
+            } = ev
+            {
+                finished.push((output, is_error));
+            }
+        }
+        if let Some(closer) = built.closer {
+            closer.close().await;
+        }
+        outcomes.push(finished);
+    }
+    let denied = &outcomes[0];
+    assert_eq!(denied.len(), 1, "{denied:?}");
+    assert!(
+        denied[0].1 && denied[0].0.contains("kgraf allow"),
+        "{denied:?}"
+    );
+    let allowed = &outcomes[1];
+    assert_eq!(allowed.len(), 1, "{allowed:?}");
+    assert_eq!(allowed[0], ("ping".to_owned(), false));
+}
+
+/// A fake model: round 0 calls the echo MCP tool; round 1 answers.
+struct McpCaller;
+
+#[async_trait::async_trait]
+impl Provider for McpCaller {
+    fn adapter(&self) -> &'static str {
+        "fake"
+    }
+    fn protocol(&self) -> kgraf_core::Protocol {
+        kgraf_core::Protocol::Additive
+    }
+    async fn complete(
+        &self,
+        request: &kgraf_provider::Request,
+        token: &kgraf_provider::CallToken,
+    ) -> std::result::Result<kgraf_provider::Response, kgraf_provider::ProviderError> {
+        use kgraf_provider::{Content, Role, StopReason};
+        let usage = kgraf_core::TokenUsage {
+            uncached_input: 10,
+            text_output: 1,
+            ..Default::default()
+        };
+        token.settle(&usage, None)?;
+        let first = !request.messages.iter().any(|m| m.role == Role::Assistant);
+        let content = if first {
+            vec![Content::ToolUse {
+                id: "c0".into(),
+                name: "mcp__echoserver__echo".into(),
+                input: serde_json::json!({"message": "ping"}),
+            }]
+        } else {
+            vec![Content::text("done")]
+        };
+        Ok(kgraf_provider::Response {
+            model: request.model.clone(),
+            content,
+            stop_reason: if first {
+                StopReason::ToolUse
+            } else {
+                StopReason::EndTurn
+            },
+            usage,
+            request_id: None,
+        })
+    }
+    fn capabilities(&self) -> kgraf_provider::capability::Capabilities<'_> {
+        kgraf_provider::capability::Capabilities::none()
+    }
+}
+
+fn assemble_prefix() -> kgraf_runtime::PrefixSnapshot {
+    kgraf_runtime::PrefixSnapshot::new(
+        kgraf_runtime::SharedPrefix {
+            vendor: "route-only".into(),
+            model: "m".into(),
+            system: vec![],
+            tools: vec![],
+            skill_catalog: vec![],
+            slice_pool: vec![],
+            mcp_instructions: vec![],
+        },
+        &kgraf_runtime::NeutralPrefixEncoder,
+    )
+    .expect("prefix")
+}
+
+/// A fake model: round 0 lists the worktree and tries an unapproved write;
+/// round 1 answers.
+struct ShellCaller;
+
+#[async_trait::async_trait]
+impl Provider for ShellCaller {
+    fn adapter(&self) -> &'static str {
+        "fake"
+    }
+    fn protocol(&self) -> kgraf_core::Protocol {
+        kgraf_core::Protocol::Additive
+    }
+    async fn complete(
+        &self,
+        request: &kgraf_provider::Request,
+        token: &kgraf_provider::CallToken,
+    ) -> std::result::Result<kgraf_provider::Response, kgraf_provider::ProviderError> {
+        use kgraf_provider::{Content, Role, StopReason};
+        let usage = kgraf_core::TokenUsage {
+            uncached_input: 10,
+            text_output: 1,
+            ..Default::default()
+        };
+        token.settle(&usage, None)?;
+        let first = !request.messages.iter().any(|m| m.role == Role::Assistant);
+        let content = if first {
+            vec![
+                Content::ToolUse {
+                    id: "c0".into(),
+                    name: "shell".into(),
+                    input: serde_json::json!({"command": ["ls"]}),
+                },
+                Content::ToolUse {
+                    id: "c1".into(),
+                    name: "shell".into(),
+                    input: serde_json::json!({"command": ["touch", "unasked.txt"]}),
+                },
+            ]
+        } else {
+            vec![Content::text("done")]
+        };
+        Ok(kgraf_provider::Response {
+            model: request.model.clone(),
+            content,
+            stop_reason: if first {
+                StopReason::ToolUse
+            } else {
+                StopReason::EndTurn
+            },
+            usage,
+            request_id: None,
+        })
+    }
+    fn capabilities(&self) -> kgraf_provider::capability::Capabilities<'_> {
+        kgraf_provider::capability::Capabilities::none()
+    }
+}
+
+fn gate_runner(r: &Repo, commands: &[&str], timeout: Duration) -> CommandGateRunner {
+    CommandGateRunner {
+        commands: commands.iter().map(|c| (*c).to_owned()).collect(),
+        manager: r.workspaces.manager.clone(),
+        merge_back: r.merge_back.clone(),
+        read_denies: Vec::new(),
+        timeout,
+        output_cap: 2_000,
+    }
+}
+
+fn request(r: &CommandGateRunner, pinned: &str) -> GateRequest {
+    GateRequest {
+        gate: "gate:root".into(),
+        covers: vec!["w-g".into()],
+        commands: r.commands.clone(),
+        pinned: Some(VerifiedCommit {
+            sha: pinned.to_owned(),
+            verified_by: "integration branch".into(),
+            verified_ms: 0,
+        }),
+    }
+}
+
+#[tokio::test]
+async fn the_gate_runs_the_commands_in_a_worktree_of_the_pinned_integration_commit() {
+    let r = repo();
+    let Integration::Merged { commit } = finish(&r, "w-g", "made.txt", "ok").await else {
+        panic!("merge");
+    };
+    let pass = gate_runner(
+        &r,
+        &["test -f made.txt", "echo checked"],
+        Duration::from_secs(30),
+    );
+    let v = pass.run(request(&pass, &commit)).await.expect("ran");
+    assert!(v.passed, "{v:?}");
+    assert!(v.by.contains(&commit));
+    let fail = gate_runner(&r, &["echo boom >&2; exit 3"], Duration::from_secs(30));
+    let v = fail.run(request(&fail, &commit)).await.expect("ran");
+    assert!(!v.passed);
+    let quoted = v.output.quote_as_data("gate_output", &[]);
+    assert!(quoted.contains("boom"), "{quoted}");
+    // The gate worktrees are removed after each run.
+    let left: Vec<_> = std::fs::read_dir(r.workspaces.manager.base())
+        .expect("base")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().starts_with("gate-"))
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
+}
+
+#[tokio::test]
+async fn a_gate_command_past_its_timeout_is_killed_and_fails() {
+    let r = repo();
+    let Integration::Merged { commit } = finish(&r, "w-t", "t.txt", "ok").await else {
+        panic!("merge");
+    };
+    let slow = gate_runner(&r, &["sleep 30"], Duration::from_millis(500));
+    let started = std::time::Instant::now();
+    let v = slow.run(request(&slow, &commit)).await.expect("ran");
+    assert!(!v.passed);
+    assert!(started.elapsed() < Duration::from_secs(20));
+    assert!(
+        v.output.quote_as_data("o", &[]).contains("killed after"),
+        "{v:?}"
+    );
+}
+
+/// A gate command's descendant that escapes the process group (its own
+/// `setsid`, as in `a_check_process_that_escapes_its_group_fails_the_verification`)
+/// is not reached by the group kill, so nothing stops a CPU-bound spin inside
+/// it except `RLIMIT_CPU`. The escapee spins for 1,200 s of real time, past
+/// the test's safety cap, and the group kill cannot reach it, so its death is
+/// attributed to the limit, and CPU time far past the limit fails the test.
+///
+/// Nothing here is bounded by wall time except generous safety caps; each
+/// step waits for an event, and the verdict is read from CPU time, which is
+/// what the limit counts:
+///
+/// 1. The escape. The parent waits until the child has written its pid, which
+///    it does after `setsid`, so the shell exits only once the child escaped.
+///    Under load a sandboxed `python3` could still take longer to start than
+///    the shell's 5 s wall budget (seen with two thin-LTO release builds
+///    running), so the budget killed the child inside the group and no pid
+///    was recorded. That run proves nothing about the limit, so the test runs
+///    the command again until a child has escaped (`ESCAPE_ATTEMPTS`), and it
+///    starts the real interpreter directly, not the macOS `xcrun` shim, which
+///    was most of the start time. The 5 s budget stays: the CPU limit is
+///    derived from it (`cpu_rlimit_seconds`), and a larger budget would make
+///    the spinner run for minutes.
+/// 2. The death. The test polls the escapee's own CPU time until it is gone.
+///    It fails if the escapee is seen alive with clearly more CPU time than
+///    the limit allows: that is a limit that did nothing, whatever the load.
+///    `SAFETY_CAP` only stops a hung test; on a loaded machine the spinner
+///    gets a small share of a core and takes long in wall time to spend its
+///    CPU seconds.
+///
+/// Skipped where the sandbox gives the command its own PID namespace (Linux
+/// with the namespaces the kernel allows; see [`sandbox_has_pid_namespace`]).
+/// The premise fails there twice: the kernel kills everything left in the
+/// namespace when the shell exits, so the descendant does not escape and it
+/// is not `RLIMIT_CPU` that stops it; and the pid it records is its namespace
+/// pid, so a host-side `kill(pid, 0)` would probe an unrelated process. The
+/// limit is still set there; the namespace teardown is the stronger bound.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_escaped_cpu_spinning_gate_command_is_stopped_by_the_cpu_limit() {
+    /// Runs of the command until one child has escaped.
+    const ESCAPE_ATTEMPTS: u32 = 10;
+    /// A hung test's stop, not the verdict: at a twentieth of one core the
+    /// spinner spends its 10 CPU seconds in 200 s.
+    const SAFETY_CAP: Duration = Duration::from_secs(900);
+    /// CPU seconds past the limit that mean the limit did nothing: the kernel
+    /// checks it about once a second, and `ps` rounds.
+    const CPU_MARGIN: f64 = 5.0;
+    // The escapee's own end (`end = time.time() + 1200` in the script) lies
+    // past `SAFETY_CAP`. The test sends it no signal: once it is gone its pid
+    // could name another process.
+    const _: () = assert!(1200 > SAFETY_CAP.as_secs());
+
+    if sandbox_has_pid_namespace() {
+        eprintln!("skipped: the sandbox runs the command in its own PID namespace here");
+        return;
+    }
+    let r = repo();
+    let c = named("b.txt", "w-cpu");
+    let ws_path = prepared(&r, &c, "w-cpu").await;
+    std::fs::write(ws_path.join("b.txt"), "b\n").expect("write");
+    let live = r.workspaces.get(&ws_path).expect("live");
+    let marker = live.root().join("escaped.pid");
+    // The real interpreter, resolved outside the sandbox: the macOS
+    // `/usr/bin/python3` shim runs `xcrun` on every start.
+    let python = std::process::Command::new("python3")
+        .args(["-c", "import sys; print(sys.executable)"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        .filter(|p| !p.is_empty() && !p.contains('\''))
+        .unwrap_or_else(|| "python3".to_owned());
+    // The child renames its pid file into place, so the parent (and the test)
+    // never read a partial one.
+    let script = format!(
+        "'{python}' -c 'import os, time\n\
+if os.fork() == 0:\n    \
+os.setsid()\n    \
+open(\"escaped.tmp\", \"w\").write(str(os.getpid()))\n    \
+os.rename(\"escaped.tmp\", \"escaped.pid\")\n    \
+end = time.time() + 1200\n    \
+while time.time() < end:\n        \
+pass\n\
+while not os.path.exists(\"escaped.pid\"):\n    \
+time.sleep(0.01)\n' >/dev/null 2>&1"
+    );
+    // The shell's wall budget; the CPU limit that bounds the escapee is
+    // derived from it (`cpu_rlimit_seconds`: twice it, 10 s).
+    let timeout = Duration::from_secs(5);
+    let cpu_seconds = kgraf_sandbox::lifecycle::cpu_rlimit_seconds(timeout);
+    let mut attempts = 0;
+    let text = loop {
+        attempts += 1;
+        let _ = run_confined(&live, &r.root, &[], &script, timeout, 2_000).expect("ran");
+        // A child that escaped just as the budget ran out writes its pid a
+        // moment later: look for a little while before running again.
+        let seen = std::time::Instant::now();
+        while !marker.exists() && seen.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if let Ok(text) = std::fs::read_to_string(&marker) {
+            break text;
+        }
+        assert!(
+            attempts < ESCAPE_ATTEMPTS,
+            "no child escaped in {ESCAPE_ATTEMPTS} runs: the machine is too loaded for \
+             `python3` to start within the shell's {timeout:?}"
+        );
+    };
+    let pid: i32 = text.trim().parse().expect("a pid");
+    let started = std::time::Instant::now();
+    // SAFETY: signal 0 only probes whether `pid` is alive; it has no other effect.
+    while unsafe { libc::kill(pid, 0) } == 0 {
+        if let Some(used) = cpu_time_of(pid) {
+            assert!(
+                used <= cpu_seconds as f64 + CPU_MARGIN,
+                "the escaped, CPU-spinning descendant (pid {pid}) ran {used:.1} s of CPU, \
+                 past RLIMIT_CPU ({cpu_seconds} s): the limit did not stop it"
+            );
+        }
+        assert!(
+            started.elapsed() < SAFETY_CAP,
+            "the escaped descendant (pid {pid}) was still alive after {SAFETY_CAP:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// A process's CPU time in seconds, as `ps` reports it (`[[dd-]hh:]mm:ss[.ff]`),
+/// or `None` once it is gone or unreadable.
+#[cfg(unix)]
+fn cpu_time_of(pid: i32) -> Option<f64> {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "time=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    if text.is_empty() {
+        return None;
+    }
+    let (days, rest) = match text.split_once('-') {
+        Some((d, r)) => (d.parse::<f64>().ok()?, r.to_owned()),
+        None => (0.0, text),
+    };
+    let mut seconds = 0.0;
+    for part in rest.split(':') {
+        seconds = seconds * 60.0 + part.parse::<f64>().ok()?;
+    }
+    Some(days * 86_400.0 + seconds)
+}
+
+/// The production layout, end to end: repository in a path with spaces,
+/// state in `<root>/.kgraf` and read-denied as `orchestrate` denies it,
+/// worktrees and scratch directories beneath it. A worker's change to a small
+/// cargo crate passes the sandboxed verifier's `cargo test`, merges, and the
+/// sandboxed quality gate's `cargo test` passes on the integration commit.
+/// Without the Seatbelt fix both fail on macOS with "could not parse/generate
+/// dep info ... Operation not permitted". The gate and verifier tests do not
+/// cover it because their worktrees are not under a denied directory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cargo_gates_pass_in_worktrees_under_the_read_denied_state_directory() {
+    let dir = tempfile::Builder::new()
+        .prefix("Want To Develop ")
+        .tempdir()
+        .expect("dir");
+    let root = dir.path().join("An App");
+    let state = root.join(".kgraf");
+    let files = [
+        (".gitignore", "target/\n.kgraf/\n"),
+        (
+            "Cargo.toml",
+            "[package]\nname = \"tiny\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        ),
+        // Committed, as a binary project should. A project without one is
+        // `a_lockfile_the_check_generates_is_reported_and_never_merged`.
+        (
+            "Cargo.lock",
+            "# This file is automatically @generated by Cargo.\n\
+             # It is not intended for manual editing.\n\
+             version = 4\n\n\
+             [[package]]\nname = \"tiny\"\nversion = \"0.1.0\"\n",
+        ),
+        (
+            "src/lib.rs",
+            "pub fn two() -> u8 { 2 }\n#[test]\nfn is_two() { assert_eq!(two(), 2); }\n",
+        ),
+    ];
+    let r = repo_in(dir, root.clone(), &state.join("worktrees"), &files);
+    owner_only_modes(&root, &files);
+    std::fs::write(state.join("worker.json"), "Bearer FAKE").expect("config");
+    let denies = crate::worker::assemble::state_read_denies(
+        &state,
+        None,
+        &state.join("ledger.db"),
+        &state.join("runs"),
+    )
+    .expect("denies");
+    assert!(denies.iter().any(|d| d.ends_with(".kgraf")), "{denies:?}");
+    let cargo_test = "cargo test --offline";
+
+    let c = named("src/lib.rs", "w-cargo");
+    let ws = r
+        .workspaces
+        .prepare(&c, &"w-cargo".into())
+        .await
+        .expect("worktree");
+    assert!(ws.canonicalize().expect("ws").starts_with(&denies[0]));
+    std::fs::write(
+        ws.join("src/lib.rs"),
+        "pub fn two() -> u8 { 1 + 1 }\n#[test]\nfn is_two() { assert_eq!(two(), 2); }\n",
+    )
+    .expect("write");
+    let v = CommandVerifier {
+        read_denies: denies.clone(),
+        ..verifier(&r, cargo_test)
+    };
+    let verdict = v.verify(&c, &ws, &result()).await.expect("ran");
+    assert!(verdict.passed(), "{verdict:?}");
+    let Integration::Merged { commit } = r.workspaces.integrate(&c, &ws).await.expect("merge")
+    else {
+        panic!("merge");
+    };
+    r.workspaces.release(&ws, true).await;
+
+    let gate = CommandGateRunner {
+        read_denies: denies,
+        ..gate_runner(&r, &[cargo_test], Duration::from_secs(300))
+    };
+    let v = gate.run(request(&gate, &commit)).await.expect("ran");
+    assert!(v.passed, "{}", v.output.quote_as_data("gate_output", &[]));
+}
+
+/// The checkout root 0755 and its files 0644, whatever the umask: the Linux
+/// sandbox grants cargo's reads above a worktree only from a checkout only
+/// its owner can change (`kgraf_sandbox::trust`), and a fixture should
+/// not pass or fail on the machine's umask.
+fn owner_only_modes(root: &Path, files: &[(&str, &str)]) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let set = |p: &Path, m: u32| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).expect("chmod")
+        };
+        set(root, 0o755);
+        for (path, _) in files {
+            set(&root.join(path), 0o644);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (root, files);
+}
+
+/// A small cargo crate with no committed `Cargo.lock`, its worktrees under a
+/// state directory the checks may not read, as `orchestrate` lays it out.
+fn lockless_crate() -> (Repo, Vec<PathBuf>) {
+    let dir = tempfile::Builder::new()
+        .prefix("lockless ")
+        .tempdir()
+        .expect("dir");
+    let root = dir.path().join("crate");
+    let state = root.join(".kgraf");
+    let files = [
+        (".gitignore", "target/\n.kgraf/\n"),
+        (
+            "Cargo.toml",
+            "[package]\nname = \"tiny\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        ),
+        (
+            "src/lib.rs",
+            "pub fn two() -> u8 { 2 }\n#[test]\nfn is_two() { assert_eq!(two(), 2); }\n",
+        ),
+    ];
+    let r = repo_in(dir, root.clone(), &state.join("worktrees"), &files);
+    owner_only_modes(&root, &files);
+    let denies = crate::worker::assemble::state_read_denies(
+        &state,
+        None,
+        &state.join("ledger.db"),
+        &state.join("runs"),
+    )
+    .expect("denies");
+    (r, denies)
+}
+
+const LIB_V2: &str =
+    "pub fn two() -> u8 { 1 + 1 }\n#[test]\nfn is_two() { assert_eq!(two(), 2); }\n";
+
+fn branch_tree(r: &Repo) -> String {
+    git_out(&r.root, &["ls-tree", "-r", "--name-only", "kgraf/r-1"])
+}
+
+async fn prepared(r: &Repo, c: &OpenContract, worker: &str) -> PathBuf {
+    r.workspaces
+        .prepare(c, &worker.into())
+        .await
+        .expect("worktree")
+}
+
+/// In a project with no committed `Cargo.lock`, the acceptance check's
+/// `cargo test` generates one. The scope check must not refuse the worker for
+/// it ("changes outside the declared write scope: [\"Cargo.lock\"]"). The
+/// scope is judged on the commit taken before the check: the attempt passes
+/// and merges, the lockfile is reported as a notice, it is not on the
+/// integration branch, and it is gone from the worktree. The quality gate on
+/// the merged tree passes too, and leaves the branch as it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lockfile_the_check_generates_is_reported_and_never_merged() {
+    let (r, denies) = lockless_crate();
+    let cargo_test = "cargo test --offline";
+    let c = named("src/lib.rs", "w-lockless");
+    let ws = prepared(&r, &c, "w-lockless").await;
+    std::fs::write(ws.join("src/lib.rs"), LIB_V2).expect("write");
+    let v = CommandVerifier {
+        read_denies: denies.clone(),
+        ..verifier(&r, cargo_test)
+    };
+    let verdict = v.verify(&c, &ws, &result()).await.expect("ran");
+    let Verdict::Pass {
+        commit: Some(_),
+        notices,
+        ..
+    } = &verdict
+    else {
+        panic!("expected a pass with a commit, got {verdict:?}");
+    };
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert!(
+        notices[0].contains("the check `cargo test --offline` generated Cargo.lock")
+            && notices[0].contains("Commit it"),
+        "{notices:?}"
+    );
+    assert!(
+        !ws.join("Cargo.lock").exists(),
+        "the check's lockfile is removed from the worktree"
+    );
+    let Integration::Merged { commit } = r.workspaces.integrate(&c, &ws).await.expect("merge")
+    else {
+        panic!("merge");
+    };
+    r.workspaces.release(&ws, true).await;
+    let tree = branch_tree(&r);
+    assert!(!tree.lines().any(|p| p == "Cargo.lock"), "{tree}");
+    assert_eq!(
+        git_out(&r.root, &["show", "kgraf/r-1:src/lib.rs"]),
+        LIB_V2.trim_end()
+    );
+
+    let gate = CommandGateRunner {
+        read_denies: denies,
+        ..gate_runner(&r, &[cargo_test], Duration::from_secs(300))
+    };
+    let g = gate.run(request(&gate, &commit)).await.expect("ran");
+    assert!(g.passed, "{}", g.output.quote_as_data("gate_output", &[]));
+    assert_eq!(
+        git_out(&r.root, &["rev-parse", "kgraf/r-1"]),
+        commit,
+        "a gate never moves the branch"
+    );
+}
+
+/// The same harness, the worker at fault: a file outside the declared scope
+/// is still refused, and the check's own lockfile is not named in the
+/// refusal. A lockfile name with no manifest beside it is the worker's write,
+/// refused like any other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_worker_write_outside_its_scope_is_still_refused_under_a_generating_check() {
+    let (r, denies) = lockless_crate();
+    let v = CommandVerifier {
+        read_denies: denies,
+        ..verifier(&r, "cargo test --offline")
+    };
+
+    let c = named("src/lib.rs", "w-stray");
+    let ws = prepared(&r, &c, "w-stray").await;
+    std::fs::write(ws.join("src/lib.rs"), LIB_V2).expect("write");
+    std::fs::write(ws.join("src/stray.rs"), "// not declared\n").expect("write");
+    match v.verify(&c, &ws, &result()).await.expect("ran") {
+        Verdict::Fail { reason } => {
+            assert!(
+                reason.contains("outside the declared write scope"),
+                "{reason}"
+            );
+            assert!(reason.contains("src/stray.rs"), "{reason}");
+            assert!(!reason.contains("Cargo.lock"), "{reason}");
+        }
+        other => panic!("expected a scope failure, got {other:?}"),
+    }
+
+    let c = named("src/lib.rs", "w-nomanifest");
+    let ws = prepared(&r, &c, "w-nomanifest").await;
+    std::fs::create_dir_all(ws.join("sub")).expect("mkdir");
+    std::fs::write(ws.join("sub/Cargo.lock"), "version = 4\n").expect("write");
+    match v.verify(&c, &ws, &result()).await.expect("ran") {
+        Verdict::Fail { reason } => assert!(reason.contains("sub/Cargo.lock"), "{reason}"),
+        other => panic!("a lockfile with no manifest beside it is a write: {other:?}"),
+    }
+}
+
+/// The worker's own shell generated the lockfile (it ran `cargo build`), out
+/// of scope, beside `Cargo.toml`, with none in the base: left out of the
+/// commit, reported "made by the worker", and not merged. The check still
+/// finds it in the tree.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lockfile_the_workers_run_generated_is_left_out_with_a_notice() {
+    let (r, denies) = lockless_crate();
+    let c = named("src/lib.rs", "w-ownlock");
+    let ws = prepared(&r, &c, "w-ownlock").await;
+    std::fs::write(ws.join("src/lib.rs"), LIB_V2).expect("write");
+    std::fs::write(ws.join("Cargo.lock"), "# made by the worker's build\n").expect("write");
+    let v = CommandVerifier {
+        read_denies: denies,
+        ..verifier(&r, "grep -q worker Cargo.lock")
+    };
+    let verdict = v.verify(&c, &ws, &result()).await.expect("ran");
+    let Verdict::Pass { notices, .. } = &verdict else {
+        panic!("{verdict:?}");
+    };
+    assert_eq!(notices.len(), 1, "reported once: {notices:?}");
+    assert!(
+        notices[0].contains("Cargo.lock (made by the worker)"),
+        "{notices:?}"
+    );
+    assert!(!ws.join("Cargo.lock").exists());
+    assert!(matches!(
+        r.workspaces.integrate(&c, &ws).await.expect("merge"),
+        Integration::Merged { .. }
+    ));
+    let tree = branch_tree(&r);
+    assert!(!tree.lines().any(|p| p == "Cargo.lock"), "{tree}");
+    assert!(tree.lines().any(|p| p == "src/lib.rs"), "{tree}");
+}
+
+/// Never left out: a lockfile the contract declares (committed and merged),
+/// and a change to a lockfile the base tracks (the worker's write, refused
+/// when out of scope).
+#[tokio::test]
+async fn a_declared_or_tracked_lockfile_is_never_left_out() {
+    let dir = tempfile::tempdir().expect("dir");
+    let root = dir.path().join("repo");
+    let base = dir.path().join("ws");
+    let r = repo_in(
+        dir,
+        root,
+        &base,
+        &[
+            ("Cargo.toml", "[package]\nname = \"t\"\n"),
+            ("sub/Cargo.toml", "[package]\nname = \"s\"\n"),
+            ("sub/Cargo.lock", "version = 4\n"),
+        ],
+    );
+    let mut c = named("Cargo.lock", "w-declared");
+    c.writes.push(kgraf_orchestrator::WriteTarget {
+        path: "a.txt".into(),
+        node: None,
+    });
+    let ws = prepared(&r, &c, "w-declared").await;
+    std::fs::write(ws.join("Cargo.lock"), "version = 4\n").expect("write");
+    std::fs::write(ws.join("a.txt"), "a\n").expect("write");
+    let verdict = verifier(&r, "true")
+        .verify(&c, &ws, &result())
+        .await
+        .expect("ran");
+    let Verdict::Pass { notices, .. } = &verdict else {
+        panic!("{verdict:?}");
+    };
+    assert!(notices.is_empty(), "{notices:?}");
+    r.workspaces.integrate(&c, &ws).await.expect("merge");
+    assert!(branch_tree(&r).lines().any(|p| p == "Cargo.lock"));
+
+    let c = named("a.txt", "w-tracked");
+    let ws = prepared(&r, &c, "w-tracked").await;
+    std::fs::write(ws.join("sub/Cargo.lock"), "version = 4\n# edited\n").expect("write");
+    match verifier(&r, "true")
+        .verify(&c, &ws, &result())
+        .await
+        .expect("ran")
+    {
+        Verdict::Fail { reason } => assert!(reason.contains("sub/Cargo.lock"), "{reason}"),
+        other => panic!("a tracked lockfile's change is the worker's: {other:?}"),
+    }
+}
+
+/// Bytecode the worker's run compiled into an unignored `__pycache__`: left
+/// out of the commit, removed before the check (the check sees the committed
+/// sources only), reported "made by the worker". Bytecode the contract
+/// declares is the worker's write and is committed.
+#[tokio::test]
+async fn bytecode_the_workers_run_left_is_left_out_and_removed_before_the_check() {
+    let r = repo();
+    let c = named("pkg/mod.py", "w-pyc");
+    let ws = prepared(&r, &c, "w-pyc").await;
+    std::fs::create_dir_all(ws.join("pkg/__pycache__")).expect("mkdir");
+    std::fs::write(ws.join("pkg/mod.py"), "X = 1\n").expect("write");
+    std::fs::write(ws.join("pkg/__pycache__/mod.cpython-39.pyc"), "b").expect("write");
+    std::fs::write(ws.join("pkg/__pycache__/mod.opt-1.pyo"), "b").expect("write");
+    let verdict = verifier(&r, "test ! -e pkg/__pycache__")
+        .verify(&c, &ws, &result())
+        .await
+        .expect("ran");
+    let Verdict::Pass { notices, .. } = &verdict else {
+        panic!("{verdict:?}");
+    };
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert!(
+        notices[0].contains("2 Python bytecode file(s) (made by the worker)"),
+        "{notices:?}"
+    );
+    r.workspaces.integrate(&c, &ws).await.expect("merge");
+    let tree = branch_tree(&r);
+    assert!(!tree.contains("__pycache__"), "{tree}");
+    assert!(tree.lines().any(|p| p == "pkg/mod.py"), "{tree}");
+
+    let c = named("pkg/__pycache__/m.cpython-39.pyc", "w-pyc-declared");
+    let ws = prepared(&r, &c, "w-pyc-declared").await;
+    std::fs::create_dir_all(ws.join("pkg/__pycache__")).expect("mkdir");
+    std::fs::write(ws.join("pkg/__pycache__/m.cpython-39.pyc"), "b").expect("write");
+    let verdict = verifier(&r, "true")
+        .verify(&c, &ws, &result())
+        .await
+        .expect("ran");
+    assert!(verdict.passed(), "{verdict:?}");
+    r.workspaces.integrate(&c, &ws).await.expect("merge");
+    assert!(
+        branch_tree(&r)
+            .lines()
+            .any(|p| p == "pkg/__pycache__/m.cpython-39.pyc")
+    );
+}
+
+/// A check that rewrites a committed file checked a tree that would not be
+/// merged. The verification fails naming the files, and the worktree is back
+/// to the commit.
+#[tokio::test]
+async fn a_check_that_changes_a_committed_file_fails_naming_it() {
+    let r = repo();
+    let c = named("b.txt", "w-rewrite");
+    let ws = prepared(&r, &c, "w-rewrite").await;
+    std::fs::write(ws.join("b.txt"), "worker\n").expect("write");
+    let check = "echo check >> b.txt && rm README";
+    match verifier(&r, check)
+        .verify(&c, &ws, &result())
+        .await
+        .expect("ran")
+    {
+        Verdict::Fail { reason } => {
+            assert!(
+                reason.contains("changed or deleted 2 committed file(s)")
+                    && reason.contains("README")
+                    && reason.contains("b.txt")
+                    && reason.contains("would differ"),
+                "{reason}"
+            );
+        }
+        other => panic!("expected a failure, got {other:?}"),
+    }
+    assert_eq!(
+        std::fs::read_to_string(ws.join("b.txt")).expect("read"),
+        "worker\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(ws.join("README")).expect("read"),
+        "hello\n"
+    );
+}
+
+/// What a check creates goes, whatever its shape, and nothing outside the
+/// worktree is touched: files in new directories, a link to a file outside
+/// (the link goes, not its target), a nested repository (git lists it as
+/// `nested/` and does not enter it), and a new `.gitignore` that ignores
+/// everything, itself included, with a file it would hide.
+#[tokio::test]
+async fn everything_a_check_creates_is_removed_and_nothing_outside() {
+    let r = repo();
+    let c = named("b.txt", "w-shapes");
+    let ws = prepared(&r, &c, "w-shapes").await;
+    std::fs::write(ws.join("b.txt"), "worker\n").expect("write");
+    let target = r.outside.join("keep.txt");
+    std::fs::write(&target, "keep\n").expect("write");
+    let check = format!(
+        "mkdir -p cache/deep && echo c > cache/deep/c.bin && ln -s '{}' link && \
+         mkdir nested && (cd nested && git init -q && echo n > n.txt) && \
+         mkdir hide && printf '*\\n' > hide/.gitignore && echo h > hide/hidden.txt",
+        target.display()
+    );
+    let verdict = verifier(&r, &check)
+        .verify(&c, &ws, &result())
+        .await
+        .expect("ran");
+    let Verdict::Pass { notices, .. } = &verdict else {
+        panic!("{verdict:?}");
+    };
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    for p in [
+        "cache/deep/c.bin",
+        "link",
+        "nested/",
+        "hide/.gitignore",
+        "hide/hidden.txt",
+    ] {
+        assert!(
+            notices[0].contains(p) || notices[0].contains("more"),
+            "{p}: {notices:?}"
+        );
+    }
+    for p in ["cache", "link", "nested", "hide"] {
+        assert!(ws.join(p).symlink_metadata().is_err(), "{p} remains");
+    }
+    assert_eq!(std::fs::read_to_string(&target).expect("read"), "keep\n");
+    assert!(matches!(
+        r.workspaces.integrate(&c, &ws).await.expect("merge"),
+        Integration::Merged { .. }
+    ));
+    assert_eq!(git_out(&r.root, &["show", "kgraf/r-1:b.txt"]), "worker");
+}
+
+/// A `.GitIgnore` that ignores everything. On a
+/// case-insensitive volume (macOS by default, `core.ignorecase`) git reads it
+/// as `.gitignore` and it hides itself and the file beside it; the listing
+/// matches the name without case, so both are found and removed. On a
+/// case-sensitive volume it is an ordinary file, listed and removed the same.
+#[tokio::test]
+async fn a_gitignore_spelled_in_another_case_cannot_hide_what_the_check_wrote() {
+    let r = repo();
+    let c = named("b.txt", "w-icase");
+    let ws = prepared(&r, &c, "w-icase").await;
+    std::fs::write(ws.join("b.txt"), "worker\n").expect("write");
+    let check = "mkdir hide && printf '*\\n' > hide/.GitIgnore && echo h > hide/hidden.txt";
+    let verdict = verifier(&r, check)
+        .verify(&c, &ws, &result())
+        .await
+        .expect("ran");
+    let Verdict::Pass { notices, .. } = &verdict else {
+        panic!("{verdict:?}");
+    };
+    assert!(
+        notices.iter().any(|n| n.contains("hide/.GitIgnore")),
+        "{notices:?}"
+    );
+    assert!(
+        ws.join("hide").symlink_metadata().is_err(),
+        "hide/ remains: {:?}",
+        std::fs::read_dir(ws.join("hide")).map(|d| d.count())
+    );
+}
+
+/// A real background process in the check's own
+/// sandbox: it keeps swapping a directory the check created for a symlink to a
+/// directory outside the worktree (standing in for `$HOME`, whose
+/// `.ssh/authorized_keys` the sandbox refuses the check itself). On 7fdd97d
+/// the host listed `d/.ssh/authorized_keys`, then followed the swapped link
+/// and deleted the file outside. Now the check's process group is killed when
+/// its shell exits, and the removal never follows a link: the file outside
+/// survives every round.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_background_process_cannot_steer_the_cleanup_outside_the_worktree() {
+    let r = repo();
+    let home = r.outside.join("home");
+    std::fs::create_dir_all(home.join(".ssh")).expect("mkdir");
+    let victim = home.join(".ssh/authorized_keys");
+    for round in 0..24 {
+        std::fs::write(&victim, "key\n").expect("write");
+        let worker = format!("w-probe-{round}");
+        let c = named("b.txt", &worker);
+        let ws = prepared(&r, &c, &worker).await;
+        std::fs::write(ws.join("b.txt"), "b\n").expect("write");
+        let check = format!(
+            "mkdir -p d/.ssh && echo k > d/.ssh/authorized_keys; \
+             (exec >/dev/null 2>&1 </dev/null; while :; do mv d d.real; ln -s '{}' d; rm -f d; mv d.real d; done) \
+             >/dev/null 2>&1 & sleep 0.3",
+            home.display()
+        );
+        let verdict = verifier(&r, &check)
+            .verify(&c, &ws, &result())
+            .await
+            .expect("ran");
+        assert!(
+            victim.is_file(),
+            "round {round}: the cleanup deleted a file outside the worktree"
+        );
+        for p in ["d", "d.real"] {
+            assert!(
+                ws.join(p).symlink_metadata().is_err(),
+                "round {round}: {p} remains: {verdict:?}"
+            );
+        }
+    }
+}
+
+/// The deterministic half of the probe: a background job of the check that
+/// writes after the check's shell has exited. On 7fdd97d it outlived the
+/// cleanup and left its file in the worktree (where a continued worker's
+/// next commit would take it as its own). Now the group is killed first.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_check_background_job_is_killed_before_the_cleanup() {
+    let r = repo();
+    let c = named("b.txt", "w-late");
+    let ws = prepared(&r, &c, "w-late").await;
+    std::fs::write(ws.join("b.txt"), "b\n").expect("write");
+    let check = "(exec >/dev/null 2>&1 </dev/null; sleep 1; echo late > late.txt) & true";
+    let verdict = verifier(&r, check)
+        .verify(&c, &ws, &result())
+        .await
+        .expect("ran");
+    assert!(verdict.passed(), "{verdict:?}");
+    std::thread::sleep(Duration::from_millis(2_000));
+    assert!(
+        !ws.join("late.txt").exists(),
+        "the background job outlived the check"
+    );
+}
+
+/// Whether a sandboxed command here is PID 1 of its own PID namespace: Linux
+/// with the namespaces the kernel allows. There the kernel kills everything
+/// left in the namespace when the command exits, so nothing escapes, and a pid
+/// the command records is its namespace's: the host must never signal it (as
+/// root in a container, pid 2 or 3 names an unrelated process).
+#[cfg(unix)]
+fn sandbox_has_pid_namespace() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        kgraf_sandbox::linux_confinement().namespaces
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+/// A process that leaves the check's process group (its own session) is not
+/// reached by the group kill; the hold check finds it, the verification
+/// fails, and nothing is cleaned while it runs.
+///
+/// Linux with a PID namespace: the kernel kills the would-be escapee when the
+/// check's shell (PID 1 there) exits, so the tree is quiet, the check passes,
+/// and the escapee's late write never lands. Either outcome is checked by
+/// what lands in the worktree, never by a host-side signal: the escapee
+/// records no pid, and ends when the test writes `release` after the verdict
+/// (or after `RELEASE_CAP`), writing `late.txt` as it goes.
+///
+/// The escapee must outlast everything that waits for a quiet tree: the group
+/// kill waits up to `GROUP_EXIT_GRACE` (5 s) for the hold to free, then the
+/// verifier's quiet check retries for about 1 s. A fixed lifetime (2 s, then
+/// 10 s) could end inside that wait under load, the tree read quiet, and the
+/// check passed; so its end is tied to the verdict instead of the clock.
+///
+/// The parent waits until the child has called `setsid` (the `escaped`
+/// marker) before the shell exits, so the child has left the group when the
+/// group kill comes; without the wait a slow child was killed inside the
+/// group and the test read that as "no escape".
+#[cfg(unix)]
+#[tokio::test]
+async fn a_check_process_that_escapes_its_group_fails_the_verification() {
+    // The escapee lives until the test releases it, after the verdict is in,
+    // capped so a failed test does not leave it running for long. A fixed
+    // lifetime raced the verifier's quiet-tree wait under load: the escapee
+    // could end first, and the tree then read quiet.
+    const RELEASE_CAP: Duration = Duration::from_secs(120);
+    let r = repo();
+    let c = named("b.txt", "w-escape");
+    let ws = prepared(&r, &c, "w-escape").await;
+    std::fs::write(ws.join("b.txt"), "b\n").expect("write");
+    let check = format!(
+        "python3 -c 'import os, time\n\
+if os.fork() == 0:\n    \
+os.setsid()\n    \
+open(\"escaped\", \"w\").close()\n    \
+t = time.time()\n    \
+while not os.path.exists(\"release\") and time.time() - t < {cap}:\n        \
+time.sleep(0.05)\n    \
+open(\"late.txt\", \"w\").write(\"late\")\n    \
+os._exit(0)\n\
+while not os.path.exists(\"escaped\"):\n    \
+time.sleep(0.01)\n' >/dev/null 2>&1",
+        cap = RELEASE_CAP.as_secs()
+    );
+    let verdict = verifier(&r, &check)
+        .verify(&c, &ws, &result())
+        .await
+        .expect("ran");
+    // Released only now, so the escapee is certainly alive while the verifier
+    // looks. Then wait for its late write: it lands promptly if the escapee is
+    // alive; in a PID namespace it was killed and never lands.
+    std::fs::write(ws.join("release"), "").expect("release");
+    let late = ws.join("late.txt");
+    let wait = if sandbox_has_pid_namespace() {
+        Duration::from_secs(3)
+    } else {
+        RELEASE_CAP
+    };
+    let released = std::time::Instant::now();
+    while !late.exists() && released.elapsed() < wait {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let late = late.exists();
+    if sandbox_has_pid_namespace() {
+        assert!(
+            verdict.passed(),
+            "nothing escapes a PID namespace: {verdict:?}"
+        );
+        assert!(!late, "the would-be escapee outlived the namespace");
+    } else {
+        match verdict {
+            Verdict::Fail { reason } => {
+                assert!(reason.contains("left a process running"), "{reason}")
+            }
+            other => panic!("expected a busy failure, got {other:?}"),
+        }
+        assert!(
+            late,
+            "the escapee ran on after the check and wrote once released, as the verdict says"
+        );
+    }
+}
+
+/// A worker that left a process running in its worktree (a background job of
+/// its shell) is not verified: its tree is not final.
+#[tokio::test]
+async fn a_worktree_the_worker_still_writes_is_not_snapshotted() {
+    let r = repo();
+    let c = named("b.txt", "w-busy");
+    let ws = prepared(&r, &c, "w-busy").await;
+    std::fs::write(ws.join("b.txt"), "b\n").expect("write");
+    let live = r.workspaces.get(&ws).expect("live");
+    let policy = kgraf_sandbox::SandboxPolicy::for_workspace(&live, kgraf_sandbox::Network::Deny);
+    let mut cmd = kgraf_sandbox::sandboxed_command(&policy, "sleep", live.root()).expect("cmd");
+    cmd.args(["60"]);
+    let mut child = cmd.spawn().expect("spawn");
+    let verdict = verifier(&r, "true")
+        .verify(&c, &ws, &result())
+        .await
+        .expect("ran");
+    let _ = child.kill();
+    let _ = child.wait();
+    match verdict {
+        Verdict::Fail { reason } => assert!(reason.contains("still runs"), "{reason}"),
+        other => panic!("expected a busy failure, got {other:?}"),
+    }
+}
+
+/// An attempt that changed nothing still runs its check; what the check
+/// generates is reported, and the attempt is empty, not a change.
+#[tokio::test]
+async fn an_empty_attempt_is_checked_and_what_its_check_writes_is_not_a_change() {
+    let r = repo();
+    let c = named("b.txt", "w-empty");
+    let ws = prepared(&r, &c, "w-empty").await;
+    let failed = verifier(&r, "touch gen.txt; exit 1")
+        .verify(&c, &ws, &result())
+        .await
+        .expect("ran");
+    assert!(matches!(failed, Verdict::Fail { .. }), "{failed:?}");
+    assert!(ws.is_dir(), "a failed check leaves the worktree");
+    assert!(!ws.join("gen.txt").exists(), "without the check's output");
+
+    let c2 = named("b.txt", "w-empty2");
+    let ws = prepared(&r, &c2, "w-empty2").await;
+    let verdict = verifier(&r, "touch gen.txt")
+        .verify(&c2, &ws, &result())
+        .await
+        .expect("ran");
+    let Verdict::Pass {
+        commit: None,
+        notices,
+        ..
+    } = &verdict
+    else {
+        panic!("expected an empty pass, got {verdict:?}");
+    };
+    assert!(notices[0].contains("gen.txt"), "{notices:?}");
+    assert!(!ws.exists(), "an empty attempt's worktree is removed");
+    assert!(matches!(
+        r.workspaces.integrate(&c2, &ws).await.expect("integrate"),
+        Integration::Empty
+    ));
+}
+
+/// Decision 0086: an attempt that never touched a declared write target still
+/// holding a `todo!()` placeholder from dispatch is refused, not passed --
+/// the exact benchmark failure mode this decision closes (a check that only
+/// proves the tree still builds, never that the worker did the work).
+#[tokio::test]
+async fn an_untouched_todo_stub_is_refused_not_passed() {
+    let dir = tempfile::tempdir().expect("dir");
+    let root = dir.path().join("repo");
+    let base = dir.path().join("ws");
+    let r = repo_in(
+        dir,
+        root,
+        &base,
+        &[("src/lib.rs", "pub fn parse() -> u16 {\n    todo!()\n}\n")],
+    );
+    let c = named("src/lib.rs", "w-stub");
+    let ws = prepared(&r, &c, "w-stub").await;
+    let verdict = verifier(&r, "true")
+        .verify(&c, &ws, &result())
+        .await
+        .expect("ran");
+    match verdict {
+        Verdict::Fail { reason } => {
+            assert!(reason.contains("src/lib.rs"), "{reason}");
+            assert!(
+                reason.contains("0081") && reason.contains("0086"),
+                "{reason}"
+            );
+        }
+        other => panic!("expected a placeholder refusal, got {other:?}"),
+    }
+}
+
+/// The same shape, retried: a fresh worktree for the same contract is still
+/// offered (a refusal is not a hold), so the next attempt can actually do the
+/// work.
+#[tokio::test]
+async fn a_refused_stub_attempt_can_be_retried_with_a_fresh_worktree() {
+    let dir = tempfile::tempdir().expect("dir");
+    let root = dir.path().join("repo");
+    let base = dir.path().join("ws");
+    let r = repo_in(
+        dir,
+        root,
+        &base,
+        &[("src/lib.rs", "pub fn parse() -> u16 {\n    todo!()\n}\n")],
+    );
+    let c = named("src/lib.rs", "w-stub");
+    let ws = prepared(&r, &c, "w-stub").await;
+    let first = verifier(&r, "true")
+        .verify(&c, &ws, &result())
+        .await
+        .expect("ran");
+    assert!(!first.passed(), "{first:?}");
+
+    let ws2 = prepared(&r, &c, "w-stub-2").await;
+    std::fs::write(ws2.join("src/lib.rs"), "pub fn parse() -> u16 { 42 }\n").expect("write");
+    let second = verifier(&r, "true")
+        .verify(&c, &ws2, &result())
+        .await
+        .expect("ran");
+    assert!(second.passed(), "{second:?}");
+}
+
+/// A contract whose declared write target never held a placeholder (a
+/// re-verify, or a check-only contract) still auto-passes when nothing
+/// changed, and now carries a notice saying so (decision 0086): an accepted
+/// no-op is reported, never only traced.
+#[tokio::test]
+async fn a_legitimately_unchanged_non_stub_file_passes_with_a_notice() {
+    let dir = tempfile::tempdir().expect("dir");
+    let root = dir.path().join("repo");
+    let base = dir.path().join("ws");
+    let r = repo_in(
+        dir,
+        root,
+        &base,
+        &[("src/lib.rs", "pub fn parse() -> u16 { 42 }\n")],
+    );
+    let c = named("src/lib.rs", "w-done");
+    let ws = prepared(&r, &c, "w-done").await;
+    let verdict = verifier(&r, "true")
+        .verify(&c, &ws, &result())
+        .await
+        .expect("ran");
+    let Verdict::Pass {
+        commit: None,
+        notices,
+        ..
+    } = &verdict
+    else {
+        panic!("expected an empty pass, got {verdict:?}");
+    };
+    assert!(
+        notices.iter().any(|n| n.contains("integrated no change")),
+        "{notices:?}"
+    );
+}
+
+/// Python: an import writes `__pycache__` next to the module when no
+/// `.gitignore` covers it. Reported, not merged, not a scope failure.
+#[tokio::test]
+async fn a_pycache_the_check_writes_is_not_the_workers_change() {
+    if std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("python3 is absent; skipped");
+        return;
+    }
+    let r = repo();
+    let c = named("pkg/mod.py", "w-py");
+    let ws = prepared(&r, &c, "w-py").await;
+    std::fs::create_dir_all(ws.join("pkg")).expect("mkdir");
+    std::fs::write(ws.join("pkg/mod.py"), "X = 1\n").expect("write");
+    // Apple's python3 sets a `pycache_prefix` under ~/Library; clearing it
+    // gives the default layout, `__pycache__` beside the module.
+    let check = "cd pkg && env -u PYTHONDONTWRITEBYTECODE -u PYTHONPYCACHEPREFIX python3 -c \
+                 'import sys; sys.pycache_prefix = None; import mod; assert mod.X == 1' \
+                 && ls __pycache__";
+    let verdict = verifier(&r, check)
+        .verify(&c, &ws, &result())
+        .await
+        .expect("ran");
+    let Verdict::Pass { notices, .. } = &verdict else {
+        panic!("{verdict:?}");
+    };
+    assert!(
+        notices.iter().any(|n| n.contains("pkg/__pycache__/mod.")),
+        "{notices:?}"
+    );
+    assert!(!ws.join("pkg/__pycache__").exists());
+    assert!(matches!(
+        r.workspaces.integrate(&c, &ws).await.expect("merge"),
+        Integration::Merged { .. }
+    ));
+    let tree = branch_tree(&r);
+    assert!(!tree.contains("__pycache__"), "{tree}");
+    assert!(tree.lines().any(|p| p == "pkg/mod.py"), "{tree}");
+}
+
+/// The check runs with `PYTHONPYCACHEPREFIX` in its scratch directory: a plain
+/// import writes no `__pycache__` into the worktree, so there is nothing to
+/// report or remove.
+#[tokio::test]
+async fn a_check_import_writes_its_bytecode_to_scratch() {
+    if std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("python3 is absent; skipped");
+        return;
+    }
+    let r = repo();
+    let c = named("pkg/mod.py", "w-pyscratch");
+    let ws = prepared(&r, &c, "w-pyscratch").await;
+    std::fs::create_dir_all(ws.join("pkg")).expect("mkdir");
+    std::fs::write(ws.join("pkg/mod.py"), "X = 1\n").expect("write");
+    let check = "cd pkg && env -u PYTHONDONTWRITEBYTECODE python3 -c \
+                 'import sys, mod; assert sys.pycache_prefix and \"pycache\" in sys.pycache_prefix'";
+    let verdict = verifier(&r, check)
+        .verify(&c, &ws, &result())
+        .await
+        .expect("ran");
+    let Verdict::Pass { notices, .. } = &verdict else {
+        panic!("{verdict:?}");
+    };
+    assert!(notices.is_empty(), "{notices:?}");
+}
+
+/// A name that is not UTF-8 is removed as git printed it, byte for byte.
+/// Linux only: APFS refuses such names.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_non_utf8_name_the_check_creates_is_removed_byte_for_byte() {
+    let r = repo();
+    let c = named("b.txt", "w-bytes");
+    let ws = prepared(&r, &c, "w-bytes").await;
+    std::fs::write(ws.join("b.txt"), "b\n").expect("write");
+    let verdict = verifier(&r, "printf x > \"$(printf 'bad\\377name')\"")
+        .verify(&c, &ws, &result())
+        .await
+        .expect("ran");
+    assert!(verdict.passed(), "{verdict:?}");
+    let left: Vec<_> = std::fs::read_dir(&ws)
+        .expect("dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name())
+        .filter(|n| n.to_string_lossy().starts_with("bad"))
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
+}
+
+#[test]
+fn notices_name_a_lockfile_apart_from_other_leftovers() {
+    let left = kgraf_sandbox::Leftovers {
+        created: (0..8)
+            .map(|i| PathBuf::from(format!("gen/{i}.o")))
+            .chain([
+                PathBuf::from("sub/package-lock.json"),
+                PathBuf::from("Cargo.lock"),
+            ])
+            .collect(),
+        changed: Vec::new(),
+    };
+    let excluded = [kgraf_sandbox::Excluded {
+        path: PathBuf::from("Cargo.lock"),
+        kind: kgraf_sandbox::GeneratedKind::Lockfile,
+    }];
+    let n = crate::verifier::check_notices("npm test", &left, &excluded);
+    assert_eq!(n.len(), 2, "{n:?}");
+    assert!(n[0].contains("generated sub/package-lock.json"), "{n:?}");
+    assert!(
+        n[1].contains("created 8 file(s)") && n[1].contains("and 3 more"),
+        "{n:?}"
+    );
+    let w = crate::verifier::worker_notices(&excluded);
+    assert_eq!(w.len(), 1);
+    assert!(w[0].contains("Cargo.lock (made by the worker)"), "{w:?}");
+    assert!(
+        crate::verifier::check_notices("x", &kgraf_sandbox::Leftovers::default(), &[]).is_empty()
+    );
+}
+
+#[test]
+fn validation_commands_are_discovered_or_configured_never_invented() {
+    let dir = tempfile::tempdir().expect("dir");
+    assert!(
+        discover_validation_commands(dir.path(), &[])
+            .expect("none")
+            .is_empty()
+    );
+    std::fs::write(dir.path().join("Cargo.toml"), "[workspace]\n").expect("w");
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{"scripts":{"test":"vitest"}}"#,
+    )
+    .expect("w");
+    std::fs::write(
+        dir.path().join("Makefile"),
+        "build:\n\ttrue\ntest:\n\ttrue\n",
+    )
+    .expect("w");
+    assert_eq!(
+        discover_validation_commands(dir.path(), &[]).expect("found"),
+        vec!["cargo test --workspace", "npm test", "make test"]
+    );
+    assert_eq!(
+        discover_validation_commands(dir.path(), &["just check".into()]).expect("configured"),
+        vec!["just check"]
+    );
+}
+
+fn verifier(r: &Repo, command: &str) -> CommandVerifier {
+    CommandVerifier {
+        command: command.into(),
+        repo: r.root.clone(),
+        workspaces: r.workspaces.clone(),
+        merge_back: r.merge_back.clone(),
+        read_denies: Vec::new(),
+        timeout: Duration::from_secs(300),
+    }
+}
+
+fn contract(path: &str) -> OpenContract {
+    let mut c = OpenContract::planned("c1", "t".into(), "add it", "it exists");
+    c.writes = vec![kgraf_orchestrator::WriteTarget {
+        path: path.into(),
+        node: None,
+    }];
+    c
+}
+
+fn result() -> WorkerResult {
+    WorkerResult {
+        task: "t".into(),
+        worker: "w".into(),
+        outcome: kgraf_runtime::WorkerOutcome::Completed,
+        answer: String::new(),
+        changed_paths: vec![],
+        commit: None,
+        calls: vec![],
+        steps: 1,
+        prefix_digest: String::new(),
+        denied: 0,
+        trace_failures: Vec::new(),
+        rationale: None,
+    }
+}
+
+async fn worktree(r: &Repo, worker: &str) -> PathBuf {
+    r.workspaces
+        .prepare(&contract("x"), &worker.into())
+        .await
+        .expect("worktree")
+}
+
+#[tokio::test]
+async fn a_passing_in_scope_change_is_committed_through_merge_back() {
+    let r = repo();
+    let ws = worktree(&r, "w-pass").await;
+    std::fs::write(ws.join("b.txt"), "b").expect("write");
+    let c = contract("b.txt");
+    let v = verifier(&r, "test -f b.txt");
+    let Verdict::Pass {
+        commit: Some(commit),
+        ..
+    } = v.verify(&c, &ws, &result()).await.expect("ran")
+    else {
+        panic!("expected a pass with a commit");
+    };
+    assert!(v.recheck(&commit).await.expect("ran"));
+    let bogus = VerifiedCommit {
+        sha: "0".repeat(40),
+        ..commit
+    };
+    assert!(!v.recheck(&bogus).await.expect("ran"));
+}
+
+#[tokio::test]
+async fn an_undeclared_change_fails_the_attempt() {
+    let r = repo();
+    let ws = worktree(&r, "w-stray").await;
+    std::fs::write(ws.join("b.txt"), "b").expect("write");
+    std::fs::write(ws.join("stray.txt"), "x").expect("write");
+    match verifier(&r, "true")
+        .verify(&contract("b.txt"), &ws, &result())
+        .await
+        .expect("ran")
+    {
+        Verdict::Fail { reason } => assert!(reason.contains("stray.txt"), "{reason}"),
+        other => panic!("expected a scope failure, got {other:?}"),
+    }
+}
+
+/// The review's scenario: worker code commits an out-of-scope edit itself,
+/// so a diff of the index against the moved HEAD would show nothing.
+#[tokio::test]
+async fn a_change_the_worker_committed_itself_does_not_escape_the_scope_check() {
+    let r = repo();
+    let ws = worktree(&r, "w-commits").await;
+    std::fs::write(ws.join("b.txt"), "b").expect("write");
+    std::fs::write(ws.join("stray.txt"), "x").expect("write");
+    host_git(&ws, &["add", "stray.txt"]);
+    host_git(
+        &ws,
+        &[
+            "-c",
+            "user.name=w",
+            "-c",
+            "user.email=w@w",
+            "commit",
+            "-q",
+            "-m",
+            "sneak",
+        ],
+    );
+    match verifier(&r, "true")
+        .verify(&contract("b.txt"), &ws, &result())
+        .await
+        .expect("ran")
+    {
+        Verdict::Fail { reason } => assert!(reason.contains("merge-back"), "{reason}"),
+        other => panic!("expected a failure, got {other:?}"),
+    }
+}
+
+/// The review's scenario: a write to `.GIT` (the gitlink, on a
+/// case-insensitive volume) points git at a config with a planted
+/// `core.fsmonitor`. Host git would run it; merge-back does not, and the
+/// attempt fails.
+#[tokio::test]
+async fn a_tampered_gitlink_never_runs_a_planted_fsmonitor() {
+    let r = repo();
+    let ws = worktree(&r, "w-evil").await;
+    let evil = r.outside.join("evil");
+    std::fs::create_dir_all(&evil).expect("mkdir");
+    host_git(&evil, &["init", "-q"]);
+    let marker = r.outside.join("PWNED");
+    host_git(
+        &evil,
+        &[
+            "config",
+            "core.fsmonitor",
+            &format!("touch {}", marker.display()),
+        ],
+    );
+    let dot = format!(".{}", "GIT");
+    std::fs::write(
+        ws.join(&dot),
+        format!("gitdir: {}\n", evil.join(".git").display()),
+    )
+    .expect("write");
+    std::fs::write(ws.join("b.txt"), "b").expect("write");
+    let verdict = verifier(&r, "true")
+        .verify(&contract(&dot), &ws, &result())
+        .await
+        .expect("ran");
+    assert!(matches!(verdict, Verdict::Fail { .. }), "{verdict:?}");
+    assert!(!marker.exists(), "the planted fsmonitor ran");
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn the_acceptance_command_runs_confined_to_the_worktree() {
+    let r = repo();
+    let ws = worktree(&r, "w-confined").await;
+    std::fs::write(ws.join("b.txt"), "b").expect("write");
+    let escaped = r.outside.join("escaped");
+    let command = format!("touch {} ; true", escaped.display());
+    let _ = verifier(&r, &command)
+        .verify(&contract("b.txt"), &ws, &result())
+        .await
+        .expect("ran");
+    assert!(
+        !escaped.exists(),
+        "the acceptance command wrote outside its worktree"
+    );
+}
+
+/// An attempt that changes cargo's or rustup's configuration is refused even
+/// when the contract declared the file: merged, it would apply to the host's
+/// own cargo and to every later build. The check never runs (its marker is
+/// never written), and the verdict tells the model what to do instead.
+#[tokio::test]
+async fn an_attempt_changing_cargo_or_rustup_configuration_is_refused() {
+    let r = repo();
+    for (i, path) in [
+        ".cargo/config.toml",
+        "crates/a/.cargo/config",
+        "rust-toolchain.toml",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let ws = worktree(&r, &format!("w-config-{i}")).await;
+        let file = ws.join(path);
+        std::fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&file, "[build]\nrustc-wrapper = \"/bin/true\"\n").expect("write");
+        let verdict = verifier(&r, "touch CHECK_RAN")
+            .verify(&contract(path), &ws, &result())
+            .await
+            .expect("ran");
+        match verdict {
+            Verdict::Fail { reason } => {
+                assert!(reason.contains(path), "{reason}");
+                assert!(reason.contains("never merges"), "{reason}");
+                assert!(reason.contains("say so in your result"), "{reason}");
+            }
+            other => panic!("{path} was not refused: {other:?}"),
+        }
+        assert!(!ws.join("CHECK_RAN").exists(), "the check ran for {path}");
+    }
+    assert!(build_config_changes(&["src/lib.rs".into(), "Cargo.toml".into()]).is_empty());
+}
+
+#[test]
+fn scope_compares_as_the_volume_resolves_names() {
+    let c = contract("src/Lib.rs");
+    assert!(scope_violations(&["src/lib.rs".into()], &c).is_empty());
+    assert_eq!(
+        scope_violations(&["src/other.rs".into(), ".GIT".into()], &c),
+        vec!["src/other.rs".to_owned(), ".GIT".to_owned()]
+    );
+}
+
+// ---- The host API (new with the extraction). ----
+
+/// A repository with one commit, its price table (llama3 priced), and a
+/// configuration on one local route (no credential, nothing called).
+fn project() -> (tempfile::TempDir, RunConfig) {
+    let dir = tempfile::tempdir().expect("dir");
+    let root = dir.path().join("repo");
+    std::fs::create_dir_all(&root).expect("mkdir");
+    host_git(&root, &["init", "-q", "-b", "main"]);
+    // The owner's identity, set in the repository itself: the host reads it
+    // for merge-back commits and refuses to build without one, so a fixture
+    // that relied on the user's global git config failed wherever none is
+    // set (root in a bare Linux container).
+    host_git(&root, &["config", "user.name", "Test Owner"]);
+    host_git(&root, &["config", "user.email", "owner@example.invalid"]);
+    std::fs::write(root.join("README.md"), "# t\n").expect("write");
+    host_git(&root, &["add", "."]);
+    host_git(&root, &["commit", "-q", "-m", "init"]);
+    let prices = dir.path().join("prices.json");
+    std::fs::write(
+        &prices,
+        r#"{"llama3": {"uncached_input": 1, "cache_read": 1, "cache_write": 1, "output": 1, "reasoning": 1}}"#,
+    )
+    .expect("prices");
+    let config = RunConfig::new(&root, vec!["ollama:llama3".into()], prices);
+    (dir, config)
+}
+
+fn spec(s: &str) -> RouteSpec {
+    RouteSpec::parse(s).expect("spec")
+}
+
+/// Decision 0067 (a live rerun):
+/// `RunConfig::new` leaves `sessions` at its default, now on -- a rerun, with
+/// the run's own admission caps sized from a dry run of the reservation math,
+/// showed the steer reaching the worker, a question the orchestrator itself
+/// answered (a ledgered call whose answer is the tool result), and a subagent
+/// admitted, run and merged back, all in one run
+/// so a `Host` built
+/// from it computes a `SessionLine` (`host.rs`'s `Host::session_line`, called
+/// from `build_base`). `sessions: false` still builds none, checked below.
+#[test]
+fn a_default_run_config_builds_a_session_line() {
+    let (_dir, config) = project();
+    assert!(
+        config.sessions,
+        "RunConfig::new must leave the sessions flag at its documented default: on"
+    );
+    let host = Host::open(config).expect("open");
+    assert!(host.session_line().is_some());
+}
+
+/// The other half of the pair above: turning the flag off still builds no
+/// `SessionLine` at all, not one that is merely never bound (a
+/// worker is never shown a tool this run cannot answer).
+#[test]
+fn sessions_off_builds_no_session_line() {
+    let (_dir, mut config) = project();
+    config.sessions = false;
+    let host = Host::open(config).expect("open");
+    assert!(host.session_line().is_none());
+}
+
+/// Decision 0067 two `Host`s, as two
+/// open projects in one shell process, sharing one `MachineGate` cannot
+/// together run more live agents than the gate's own limit, and the next
+/// admission is refused before spawn. A fresh, explicit
+/// `MachineGate::new(...)` is used, never `process_machine_gate`'s
+/// process-wide singleton: `cargo test` runs a crate's tests as threads in
+/// one process, so a test that cares about admission limits must never
+/// couple to another test's use of the shared one.
+#[test]
+fn two_hosts_sharing_one_machine_gate_cannot_together_exceed_it() {
+    let gate = MachineGate::new(kgraf_core::ParallelismLimits::derive(3, 3, 3));
+    let (_dir_a, mut config_a) = project();
+    config_a.max_agents = 10;
+    config_a.max_items = 10;
+    let (_dir_b, mut config_b) = project();
+    config_b.max_agents = 10;
+    config_b.max_items = 10;
+    let host_a =
+        Host::open_with_machine_gate(config_a, None, gate.clone()).expect("open project a");
+    let host_b =
+        Host::open_with_machine_gate(config_b, None, gate.clone()).expect("open project b");
+
+    let held = host_a
+        .admission()
+        .gate()
+        .try_admit(2)
+        .expect("project a takes two of the gate's three slots");
+    assert_eq!(gate.agents_live(), 2);
+    let refused = host_b
+        .admission()
+        .gate()
+        .try_admit(2)
+        .expect_err("two more would make four, over the shared gate's three");
+    assert!(matches!(
+        refused,
+        kgraf_orchestrator::Refusal::LiveAgentCeiling { .. }
+    ));
+    assert_eq!(
+        gate.agents_live(),
+        2,
+        "the refused admission touched neither host's count"
+    );
+
+    // Moving the slider down: nothing already admitted is dropped, and the
+    // next admission is refused under the lower ceiling.
+    gate.set_limits(kgraf_core::ParallelismLimits::derive(1, 1, 1));
+    assert_eq!(gate.agents_live(), 2, "nothing already admitted is killed");
+    assert!(
+        host_b.admission().gate().try_admit(1).is_err(),
+        "refused under the lowered ceiling"
+    );
+
+    // Moving the slider up: a waiting admission goes through at once.
+    gate.set_limits(kgraf_core::ParallelismLimits::derive(3, 3, 3));
+    let admitted_b = host_b
+        .admission()
+        .gate()
+        .try_admit(1)
+        .expect("admitted once the ceiling rises");
+
+    host_a.admission().gate().release(held);
+    host_b.admission().gate().release(admitted_b);
+    assert_eq!(gate.agents_live(), 0);
+}
+
+/// Decision 0067 (the slider maximum comes from the loaded models and their
+/// rate limits as well as this machine): a route with a known, configured rate
+/// limit binds `max_agents` below what the machine's own memory and
+/// descriptor bounds would allow alone, and the capacity breakdown names
+/// that route as the binding bound (what `parallelism_controls` shows
+/// verbatim in Settings).
+#[test]
+fn a_configured_route_rate_limit_binds_max_agents_below_the_machine_bound() {
+    let (dir, mut config) = project();
+    config.routes = vec!["kimi:kimi-k3".to_owned()];
+    config.rate_limits = vec!["kimi=6".to_owned()]; // 6 requests/minute: tiny
+    let store_path = dir.path().join("shared-rate-limits.sqlite3");
+    let gate = MachineGate::new(kgraf_core::ParallelismLimits::derive(100, 100, 100));
+    let host = Host::open_with_machine_gate(config, Some(&store_path), gate).expect("open");
+
+    let inputs: Vec<kgraf_capacity::RouteInputs> = host
+        .route_capacity_inputs()
+        .into_iter()
+        .map(|r| r.inputs)
+        .collect();
+    assert!(
+        inputs.iter().any(|r| r.route == "kimi"),
+        "the configured route is present: {inputs:?}"
+    );
+
+    // A generous machine: memory, descriptors and disk are effectively
+    // unlimited here, so only the route's own rate limit can bind.
+    let machine = kgraf_capacity::MachineInputs {
+        cores: 16,
+        mem_available: 64 * 1024 * 1024 * 1024,
+        mem_total: 64 * 1024 * 1024 * 1024,
+        fd_soft: 1_000_000,
+        fd_in_use: 0,
+        disk_free: 500 * 1024 * 1024 * 1024,
+        disk_total: 1_000 * 1024 * 1024 * 1024,
+        bytes_per_worktree: 1024 * 1024 * 1024,
+        mem_per_agent: kgraf_capacity::DEFAULT_MEM_PER_AGENT,
+        mem_per_job: kgraf_capacity::DEFAULT_MEM_PER_JOB,
+        fd_per_agent: kgraf_capacity::DEFAULT_FD_PER_AGENT,
+    };
+    let capacity = kgraf_capacity::compute(&inputs, &machine);
+    assert!(
+        capacity.max_agents < 100,
+        "the configured 6 rpm route must bind below the generous machine bounds: {capacity:?}"
+    );
+    let route_bound = capacity
+        .bounds
+        .iter()
+        .find(|b| b.name == "route")
+        .expect("a route bound exists");
+    assert_eq!(route_bound.source, kgraf_capacity::LimitSource::Configured);
+    assert_eq!(
+        capacity.max_agents, route_bound.value,
+        "the route bound is the one that binds"
+    );
+    assert!(
+        route_bound.detail.contains("kimi"),
+        "Settings shows this detail verbatim; it must name the binding route: {}",
+        route_bound.detail
+    );
+}
+
+/// A vendor's own reported header limit must never *raise* the effective bound above what the user
+/// configured. Before this fix, `route_capacity_inputs` preferred the header
+/// unconditionally, so a user capped at 6 rpm but whose vendor reports a
+/// header limit of 500 would see 500 used instead: about an 80x increase in
+/// the number of agents the machine would actually admit against that
+/// route, entirely defeating the user's own `--rate-limit`.
+///
+/// Exercises `tighter_rpm` directly (not through a real `Host` and
+/// `kgraf_provider::limits`'s process-wide registry): that registry is
+/// shared by every test in this binary, and `cargo test` runs them
+/// concurrently, so two tests recording under the same catalog route's real
+/// base URL could otherwise race each other's reads. The pure function has
+/// no such shared state to race over.
+#[test]
+fn the_tighter_of_a_header_and_a_configured_limit_wins_never_the_looser_one() {
+    assert_eq!(
+        crate::host::tighter_rpm(Some(500), Some(6)),
+        Some((6, kgraf_capacity::LimitSource::Configured)),
+        "the tighter, user-configured 6 rpm must win over the looser 500 rpm header, \
+         and its source must be reported as Configured, not Header"
+    );
+}
+
+/// The reverse: when the header is the *tighter* one, it wins, and is
+/// reported as `Header`.
+#[test]
+fn a_tighter_header_limit_wins_over_a_looser_configured_one() {
+    assert_eq!(
+        crate::host::tighter_rpm(Some(3), Some(60)),
+        Some((3, kgraf_capacity::LimitSource::Header)),
+        "the tighter header 3 rpm must win over the looser configured 60 rpm"
+    );
+}
+
+/// Either side alone still resolves, and neither present is `None`
+/// (`kgraf-capacity`'s own "unmeasured" fallback then applies).
+#[test]
+fn tighter_rpm_falls_through_when_only_one_side_or_neither_is_known() {
+    assert_eq!(
+        crate::host::tighter_rpm(Some(500), None),
+        Some((500, kgraf_capacity::LimitSource::Header))
+    );
+    assert_eq!(
+        crate::host::tighter_rpm(None, Some(6)),
+        Some((6, kgraf_capacity::LimitSource::Configured))
+    );
+    assert_eq!(crate::host::tighter_rpm(None, None), None);
+}
+
+/// End to end, through a real `Host`: a header observation that is looser
+/// than the configured limit does not leak into `route_capacity_inputs`'
+/// output (proves the wiring calls `tighter_rpm`, not only the function in
+/// isolation). Safe under `cargo test`'s concurrent execution: no other test
+/// in this file records under `kimi`'s real base URL (the two tests above
+/// that used to were rewritten to call `tighter_rpm` directly instead, for
+/// exactly this reason), so this is the sole reader and writer of that key.
+#[test]
+fn route_capacity_inputs_wires_the_header_through_tighter_rpm() {
+    kgraf_provider::limits::clear_for_test();
+    let base_url = "https://api.moonshot.ai/v1"; // kimi's catalog base_url
+    kgraf_provider::limits::record(
+        base_url,
+        kgraf_provider::ObservedLimits {
+            requests_limit: Some(500),
+            ..Default::default()
+        },
+    );
+    let (dir, mut config) = project();
+    config.routes = vec!["kimi:kimi-k3".to_owned()];
+    config.rate_limits = vec!["kimi=6".to_owned()];
+    let store_path = dir.path().join("shared-rate-limits.sqlite3");
+    let gate = MachineGate::new(kgraf_core::ParallelismLimits::derive(100, 100, 100));
+    let host = Host::open_with_machine_gate(config, Some(&store_path), gate).expect("open");
+
+    let kimi = host
+        .route_capacity_inputs()
+        .into_iter()
+        .find(|r| r.inputs.route == "kimi")
+        .expect("kimi is configured");
+    assert_eq!(
+        kimi.inputs.rpm,
+        Some((6, kgraf_capacity::LimitSource::Configured)),
+        "the tighter, user-configured 6 rpm must win over the looser 500 rpm header: {:?}",
+        kimi.inputs.rpm
+    );
+}
+
+/// Readiness is typed, and builds and calls nothing: an unknown route, a
+/// credential absent from the environment, an unpriced model.
+#[test]
+fn readiness_names_the_route_the_credential_or_the_price() {
+    let prices: kgraf_core::PriceTable = serde_json::from_str(
+        r#"{"llama3": {"uncached_input": 1, "cache_read": 1, "cache_write": 1, "output": 1, "reasoning": 1}}"#,
+    )
+    .expect("prices");
+    let none = |_: &str| None;
+    assert_eq!(
+        check_routes(
+            &[spec("ollama:llama3")],
+            Some(&prices),
+            &BTreeMap::new(),
+            Some(&none)
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        check_routes(&[], Some(&prices), &BTreeMap::new(), Some(&none)),
+        Err(NotReady::NoRoutes)
+    );
+    assert!(matches!(
+        check_routes(&[spec("nowhere:m")], Some(&prices), &BTreeMap::new(), Some(&none)),
+        Err(NotReady::UnknownRoute { route, .. }) if route == "nowhere"
+    ));
+    let missing = check_routes(
+        &[spec("kimi:kimi-k2")],
+        Some(&prices),
+        &BTreeMap::new(),
+        Some(&none),
+    );
+    assert!(
+        matches!(&missing, Err(NotReady::MissingCredential { route, detail })
+            if route == "kimi" && detail.contains("KGRAF_KIMI_API_KEY")),
+        "{missing:?}"
+    );
+    let with_key = |v: &str| (v == "KGRAF_KIMI_API_KEY").then(|| "k".to_owned());
+    assert_eq!(
+        check_routes(
+            &[
+                spec("kimi:kimi-k2"),
+                spec("ollama:qwen3"),
+                spec("ollama:llama3")
+            ],
+            Some(&prices),
+            &BTreeMap::new(),
+            Some(&with_key)
+        ),
+        Err(NotReady::MissingPrices {
+            models: vec!["kimi-k2".into(), "qwen3".into()]
+        })
+    );
+}
+
+/// The factory: ready for a configured host; `build` refuses a runtime it
+/// cannot block on (never panics); on a multi-thread runtime it builds the
+/// orchestrator, keeps the build's notices, and `finish_run` does the run's
+/// housekeeping once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_factory_builds_on_the_hosts_admission_and_finishes_once() {
+    let (_dir, config) = project();
+    let host = Arc::new(Host::open(config).expect("open"));
+    let factory = HostFactory::new(host.clone());
+    factory.configured().await.expect("configured");
+    factory.ready("nightly").await.expect("ready");
+    let run = RunId::new("f1");
+    let orchestrator = factory.build(&run).expect("build");
+    drop(orchestrator);
+    assert!(
+        host.take_notices()
+            .iter()
+            .any(|n| matches!(n, crate::Notice::NoWorkerConfig(_))),
+        "a factory build's notices are kept"
+    );
+    let done = host.finish_run(&run).expect("the run is known");
+    assert_eq!(done.swept.expect("swept"), Vec::<String>::new());
+    assert_eq!(done.unreconciled.expect("count"), 0);
+    assert!(host.finish_run(&run).is_none(), "finished once");
+}
+
+#[test]
+fn a_blocking_build_off_a_multi_thread_runtime_is_refused() {
+    let (_dir, config) = project();
+    let host = Arc::new(Host::open(config).expect("open"));
+    let factory = HostFactory::new(host);
+    let outside = factory.build(&RunId::new("f2"));
+    assert!(
+        matches!(&outside, Err(OrchestratorError::Build { detail: m, transient: false }) if m.contains("tokio runtime")),
+        "{:?}",
+        outside.err()
+    );
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    let current = rt.block_on(async { factory.build(&RunId::new("f3")) });
+    assert!(
+        matches!(&current, Err(OrchestratorError::Build { detail: m, transient: false }) if m.contains("multi-thread")),
+        "{:?}",
+        current.err()
+    );
+}
+
+/// `start_run` builds, spawns and hands back the run; its end arrives through
+/// the handle. A resume of a run with no record fails there, typed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_started_run_ends_through_its_handle() {
+    let (_dir, config) = project();
+    let host = Host::open(config).expect("open");
+    let mut seen = Vec::new();
+    let handle = host
+        .start_run(RunId::new("nope"), RunStart::Resume, None, &mut |n| {
+            seen.push(n)
+        })
+        .await
+        .expect("started");
+    assert_eq!(handle.summary().integration, "kgraf/nope");
+    let ended = handle.wait().await;
+    assert!(
+        matches!(
+            ended,
+            Err(crate::Error::Orchestrator(OrchestratorError::NoRecord(_)))
+        ),
+        "{ended:?}"
+    );
+    assert!(!seen.is_empty(), "the build's notices reach the caller");
+}
+
+/// A prepared run refuses an empty instruction, loudly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_prepared_run_refuses_an_empty_instruction() {
+    let (_dir, config) = project();
+    let host = Host::open(config).expect("open");
+    let prepared = host
+        .prepare(RunId::new("e1"), None, &mut |_| {})
+        .await
+        .expect("prepare");
+    let refused = prepared
+        .run(RunStart::Instruction("  \n".into()))
+        .await
+        .expect_err("empty");
+    assert!(refused.to_string().contains("empty"), "{refused}");
+}
+
+/// Answers every ask with Allow, counting them.
+struct AllowAll(std::sync::atomic::AtomicUsize);
+
+#[async_trait::async_trait]
+impl kgraf_runtime::AskResolver for AllowAll {
+    async fn answer(
+        &self,
+        _paused: &kgraf_tools::approval::PausedCall,
+    ) -> kgraf_tools::approval::UserAnswer {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        kgraf_tools::approval::UserAnswer::Allow
+    }
+}
+
+/// The host's own resolver answers the asks of an attempt's approval chain:
+/// the write a delegate is denied without it runs once the host allows it.
+/// The chain is unchanged; only who answers the ask is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_resolver_answers_the_attempts_asks() {
+    let r = repo();
+    let state = r._dir.path().join("state");
+    std::fs::create_dir_all(&state).expect("state");
+    let ledger = Arc::new(Ledger::open(&state.join("ledger.db")).expect("ledger"));
+    let mut routes = BTreeMap::new();
+    routes.insert(
+        "fake:m".to_owned(),
+        RouteParts {
+            provider: Arc::new(ShellCaller),
+            vendor: "fake-asked (fake)".into(),
+            vendor_name: "fake-asked".into(),
+            model: "m".into(),
+        },
+    );
+    let allow = Arc::new(AllowAll(std::sync::atomic::AtomicUsize::new(0)));
+    let envs = ResolverOverride {
+        inner: Arc::new(AttemptAssembler {
+            root: r.root.clone(),
+            state: state.clone(),
+            graph_path: state.join("graph.db"),
+            indexed: false,
+            ledger: ledger.clone(),
+            config: WorkerConfig::default(),
+            max_output_tokens: 1_000,
+            read_denies: vec![state.clone()],
+            workspaces: r.workspaces.clone(),
+            routes,
+            extra_tools: Vec::new(),
+            session_line: None,
+            prefixes: Arc::new(kgraf_runtime::PrefixRegistry::new()),
+            machine_gate: test_machine_gate(),
+            tbench_bridge_socket: None,
+            dependency_refetch: crate::deps::inert_refetch(),
+        }),
+        asks: allow.clone(),
+    };
+    let context = ContextConfig::for_model(200_000).expect("context");
+    let ws = worktree(&r, "w-asked").await;
+    let route = Route {
+        name: "fake:m".into(),
+        vendor: "fake".into(),
+        env: Arc::new(kgraf_runtime::WorkerEnv::new(
+            ledger.clone(),
+            Arc::new(ShellCaller),
+            Arc::new(kgraf_tools::ToolRegistry::new()),
+            assemble_prefix(),
+        )),
+        context: context.clone(),
+        readiness: Arc::new(kgraf_orchestrator::AlwaysReady),
+        local: false,
+    };
+    let built = envs
+        .build(&route, &ws, &"w-asked".into(), &"r9/c-ask".into())
+        .await
+        .expect("built");
+    let brief = kgraf_runtime::WorkerBrief {
+        task: "r9/c-ask".into(),
+        worker: "w-asked".into(),
+        instruction: "touch it".into(),
+        workspace_root: ws.clone(),
+        model: "m".into(),
+        slices: vec![],
+        skills: vec![],
+        step_budget: 4,
+        context,
+        write_scope: None,
+    };
+    let mut handle = kgraf_runtime::spawn_worker(
+        built.env.clone(),
+        brief,
+        kgraf_runtime::SpawnOptions::default(),
+    )
+    .await
+    .expect("spawn");
+    let mut errors = 0;
+    while let Some(ev) = handle.next_event().await {
+        if let kgraf_runtime::WorkerEvent::ToolCallFinished { is_error, .. } = ev {
+            errors += usize::from(is_error);
+        }
+    }
+    if let Some(closer) = built.closer {
+        closer.close().await;
+    }
+    assert_eq!(errors, 0, "both calls ran");
+    assert!(ws.join("unasked.txt").exists(), "the allowed write ran");
+    assert!(
+        allow.0.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+        "the host's resolver was asked"
+    );
+}
+
+/// A host's futures can run in a spawned task (the shell's runtime): they are
+/// `Send`. Compiled, never called.
+#[allow(dead_code)]
+fn host_futures_are_send(host: &Host) {
+    fn send<T: Send>(_: T) {}
+    send(host.prepare(RunId::new("s"), None, &mut |_| {}));
+    send(host.start_run(RunId::new("s"), RunStart::Resume, None, &mut |_| {}));
+    send(host.read_corpus(&RunId::new("s"), crate::CorpusRequest::default()));
+}
+
+/// An in-process provider for a route the configuration does not use would be
+/// silently unused: refused. For a used route it needs no catalog entry and no
+/// credential, and its model still needs a price.
+#[test]
+fn an_in_process_provider_is_for_a_used_route_and_still_priced() {
+    let (_dir, config) = project();
+    let refused = Host::open(config.clone())
+        .expect("open")
+        .with_route_provider("elsewhere", Arc::new(ShellCaller));
+    assert!(
+        matches!(&refused, Err(crate::Error::Invalid(m)) if m.contains("elsewhere")),
+        "{:?}",
+        refused.err()
+    );
+    let mut own = config;
+    own.routes = vec!["mine:llama3".into(), "mine:unpriced".into()];
+    let host = Host::open(own)
+        .expect("open")
+        .with_route_provider("mine", Arc::new(ShellCaller))
+        .expect("used route");
+    assert_eq!(
+        host.check_ready(&host.route_set()),
+        Err(NotReady::MissingPrices {
+            models: vec!["unpriced".into()]
+        })
+    );
+    assert_eq!(host.check_ready(&[spec("mine:llama3")]), Ok(()));
+    let catalog = Host::open(project().1)
+        .expect("open")
+        .with_route_provider("ollama", Arc::new(ShellCaller));
+    assert!(
+        matches!(&catalog, Err(crate::Error::Invalid(m)) if m.contains("catalog")),
+        "a real route is never replaced: {:?}",
+        catalog.err()
+    );
+}
+
+/// Write the price table again with a modification time other than the one
+/// read, so the change is seen whatever the file system's time resolution.
+fn rewrite_prices(path: &Path, text: &str, seconds_later: u64) {
+    let before = std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .expect("mtime");
+    std::fs::write(path, text).expect("write");
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .and_then(|f| f.set_modified(before + Duration::from_secs(seconds_later)))
+        .expect("set mtime");
+}
+
+/// F2: catalog and prices are whole-process facts, `configured()`'s; the
+/// schedule's own `ready()` checks only credentials. A fixed price table is
+/// read again when it changes, without reopening the host; a table that no
+/// longer reads is refused, never replaced by the old one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configured_owns_catalog_and_prices_and_reads_a_changed_table() {
+    let (_dir, mut config) = project();
+    config.routes = vec!["ollama:llama3".into(), "ollama:qwen3".into()];
+    let prices = config.prices.clone();
+    let host = Arc::new(Host::open(config).expect("open"));
+    let factory = HostFactory::new(host.clone());
+    let unpriced = factory.configured().await;
+    assert!(
+        matches!(&unpriced, Err(kgraf_orchestrator::ReadinessFailure::MissingConfiguration(m)) if m.contains("qwen3")),
+        "{unpriced:?}"
+    );
+    factory
+        .ready("nightly")
+        .await
+        .expect("ready checks credentials only; ollama needs none");
+    rewrite_prices(
+        &prices,
+        r#"{"llama3": {"uncached_input": 1, "cache_read": 1, "cache_write": 1, "output": 1, "reasoning": 1},
+            "qwen3": {"uncached_input": 1, "cache_read": 1, "cache_write": 1, "output": 1, "reasoning": 1}}"#,
+        5,
+    );
+    factory.configured().await.expect("the fixed table applies");
+    assert!(host.prices().expect("prices").get("qwen3").is_some());
+    rewrite_prices(&prices, "{not json", 10);
+    assert!(
+        host.prices().is_err(),
+        "no fallback: a table that no longer reads is an error, not the old table"
+    );
+    assert!(
+        matches!(
+            host.check_configured(),
+            Err(NotReady::PricesUnreadable { .. })
+        ),
+        "a broken table is refused, not replaced by the old one"
+    );
+    // An unknown route is the process's configuration, not one schedule's.
+    let (_d2, mut other) = project();
+    other.routes = vec!["nowhere:m".into()];
+    let host = Arc::new(Host::open(other).expect("open"));
+    assert!(matches!(
+        host.check_configured(),
+        Err(NotReady::UnknownRoute { .. })
+    ));
+}
+
+/// The build error of `config` through the factory (on a multi-thread runtime).
+fn build_error(config: RunConfig) -> OrchestratorError {
+    let host = Arc::new(Host::open(config).expect("open"));
+    match HostFactory::new(host).build(&RunId::new("classify")) {
+        Ok(_) => panic!("the build was expected to fail"),
+        Err(e) => e,
+    }
+}
+
+/// A settings failure fails the same way every time, so it is not
+/// transient: it disables the schedule with its reason. One test per class.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_invalid_worker_json_is_a_settings_failure() {
+    let (_dir, config) = project();
+    let state = config.root.join(".kgraf");
+    std::fs::create_dir_all(&state).expect("state");
+    std::fs::write(
+        state.join("worker.json"),
+        r#"{"mcp_servers": [], "mcp_server": []}"#,
+    )
+    .expect("worker.json");
+    let e = build_error(config);
+    assert!(
+        matches!(&e, OrchestratorError::Build { transient: false, detail } if detail.contains("worker")),
+        "{e:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_missing_commit_identity_is_a_settings_failure() {
+    let (_dir, config) = project();
+    // Set, but empty, in the repository: the owner has no usable identity.
+    host_git(&config.root, &["config", "user.name", ""]);
+    let e = build_error(config);
+    assert!(
+        matches!(&e, OrchestratorError::Build { transient: false, detail } if detail.contains("name and email")),
+        "{e:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_invalid_package_json_is_a_settings_failure() {
+    let (_dir, config) = project();
+    std::fs::write(config.root.join("package.json"), "{not json").expect("write");
+    let e = build_error(config);
+    assert!(
+        matches!(&e, OrchestratorError::Build { transient: false, detail } if detail.contains("package.json")),
+        "{e:?}"
+    );
+}
+
+#[test]
+fn a_provider_the_catalog_cannot_configure_is_a_settings_failure() {
+    let e = provider_with("kimi", "", "kimi-k2", &Limiters::new())
+        .err()
+        .expect("an empty credential cannot configure kimi");
+    assert!(matches!(e, crate::Error::Settings(_)), "{e:?}");
+    assert!(!e.is_transient());
+}
+
+fn alive(pid: &str) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", pid])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// A build past its bound leaves nothing behind: its route probe worktree
+/// is removed, and the stdio MCP server it was starting (which never answers)
+/// is killed with its process group.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_timed_out_build_removes_its_probe_and_kills_its_mcp_server() {
+    let (dir, config) = project();
+    let state = config.root.join(".kgraf");
+    std::fs::create_dir_all(&state).expect("state");
+    let pidfile = dir.path().join("server.pid");
+    let worker = serde_json::json!({"mcp_servers": [{
+        "name": "silent",
+        "timeout_ms": 600000,
+        "transport": {
+            "type": "stdio",
+            "command": "sh",
+            "args": ["-c", "echo $$ > \"$PIDFILE\"; exec sleep 600"],
+            "env": {"PIDFILE": pidfile.to_string_lossy()}
+        }
+    }]});
+    std::fs::write(state.join("worker.json"), worker.to_string()).expect("worker.json");
+    let host = Arc::new(
+        Host::open(config)
+            .expect("open")
+            .with_build_timeout(Duration::from_secs(3)),
+    );
+    let e = match HostFactory::new(host).build(&RunId::new("slow")) {
+        Ok(_) => panic!("a server that never answers cannot build"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(&e, OrchestratorError::Build { transient: true, detail } if detail.contains("did not finish")),
+        "{e:?}"
+    );
+    let pid = std::fs::read_to_string(&pidfile)
+        .expect("the server started")
+        .trim()
+        .to_owned();
+    let probes = || {
+        std::fs::read_dir(state.join("worktrees"))
+            .map(|d| {
+                d.filter_map(|e| e.ok())
+                    .filter(|e| e.file_name().to_string_lossy().starts_with("probe-"))
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while (alive(&pid) || probes() > 0) && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        !alive(&pid),
+        "the MCP server {pid} outlived its aborted build"
+    );
+    assert_eq!(probes(), 0, "the probe worktree outlived its aborted build");
+}
+
+/// F1: a build failure the same configuration can get past (an MCP server
+/// not answering, the build bound) is transient; a settings failure is not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_build_step_is_transient_and_a_settings_failure_is_not() {
+    let (_dir, config) = project();
+    let state = config.root.join(".kgraf");
+    std::fs::create_dir_all(&state).expect("state");
+    std::fs::write(
+        state.join("worker.json"),
+        r#"{"mcp_servers": [{"name": "gone", "transport": {"type": "streamable_http", "url": "http://127.0.0.1:1/mcp"}}]}"#,
+    )
+    .expect("worker.json");
+    let host = Arc::new(Host::open(config.clone()).expect("open"));
+    let built = HostFactory::new(host).build(&RunId::new("t1"));
+    assert!(
+        matches!(&built, Err(OrchestratorError::Build { transient: true, detail }) if detail.contains("gone")),
+        "{:?}",
+        built.err()
+    );
+    std::fs::remove_file(state.join("worker.json")).expect("rm");
+    let slow = Arc::new(
+        Host::open(config)
+            .expect("open")
+            .with_build_timeout(Duration::from_millis(1)),
+    );
+    let bounded = HostFactory::new(slow).build(&RunId::new("t2"));
+    assert!(
+        matches!(&bounded, Err(OrchestratorError::Build { transient: true, detail }) if detail.contains("did not finish")),
+        "{:?}",
+        bounded.err()
+    );
+}
+
+/// F4: `Host::build` indexes the working tree itself, before every build, so
+/// a run never needs a separate `kgraf index` step first: the very first
+/// `prepare` already sees the fixture's `README.md` and gets `graph_slice`.
+/// A second `prepare` right after sees the same, unchanged index: the
+/// incremental indexer's content-hash check leaves an already-current index
+/// alone (`kgraf_graph::index`'s own doc comment).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_index_made_before_open_reaches_the_first_build() {
+    let (_dir, config) = project();
+    let root = config.root.clone();
+    std::fs::create_dir_all(root.join(".kgraf")).expect("state dir");
+    assert_eq!(
+        GraphStore::open(&root.join(".kgraf").join("graph.db"), &root)
+            .expect("graph")
+            .node_count()
+            .expect("count"),
+        0,
+        "the fixture starts unindexed: `kgraf index` was never run"
+    );
+    let host = Host::open(config).expect("open");
+    let before = host
+        .prepare(RunId::new("i1"), None, &mut |_| {})
+        .await
+        .expect("prepare");
+    assert!(
+        before.shape().routes[0]
+            .tools
+            .iter()
+            .any(|t| t == "graph_slice"),
+        "the build's own index pass ran before dispatch: {:?}",
+        before.shape().routes[0].tools
+    );
+    let after = host
+        .prepare(RunId::new("i2"), None, &mut |_| {})
+        .await
+        .expect("prepare");
+    assert!(
+        after.shape().routes[0]
+            .tools
+            .iter()
+            .any(|t| t == "graph_slice"),
+        "{:?}",
+        after.shape().routes[0].tools
+    );
+}
+
+/// A probe worktree whose creation finishes after its build was aborted
+/// (the task's output is discarded) is removed: the guard is made with the
+/// worktree, on the blocking thread, and dropped with the output. That
+/// removal runs on a blocking thread.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_probe_created_after_an_abort_is_removed() {
+    let r = repo();
+    let manager = r.workspaces.manager.clone();
+    let base = manager.base().to_path_buf();
+    // Nobody awaits the creation, as after an abort.
+    drop(ProbeGuard::create(manager, "probe-orphan".into()));
+    let path = base.join("probe-orphan");
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut seen = false;
+    while std::time::Instant::now() < deadline {
+        seen |= path.exists();
+        if seen && !path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!path.exists(), "the orphaned probe worktree was left");
+    assert!(
+        !git_out(&r.root, &["worktree", "list"]).contains("probe-orphan"),
+        "and unregistered"
+    );
+}
+
+/// Seeding reads the last hour's calls and never fails on a call whose
+/// spend is unknown: a settled call counts at its price; a call on a model
+/// the table does not price, and an unreconciled call, count at the worst
+/// case, each with a visible notice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn seeding_counts_unknown_spend_at_the_worst_case_with_a_notice() {
+    let (_dir, config) = project();
+    // Real-sized rates ($3 and $15 per million), so costs are not rounded away.
+    std::fs::write(
+        &config.prices,
+        r#"{"llama3": {"uncached_input": 3000000, "cache_read": 300000, "cache_write": 3750000, "output": 15000000, "reasoning": 15000000}}"#,
+    )
+    .expect("prices");
+    let state = config.root.join(".kgraf");
+    std::fs::create_dir_all(&state).expect("state");
+    let usage = kgraf_core::TokenUsage {
+        uncached_input: 1_000,
+        text_output: 100,
+        ..Default::default()
+    };
+    {
+        let ledger = Ledger::open(&state.join("ledger.db")).expect("ledger");
+        let begin = |model: &str| {
+            ledger
+                .begin("fake", kgraf_core::Protocol::Additive, model, "a", "t")
+                .expect("begin")
+        };
+        begin("llama3").settle(&usage, None).expect("settle");
+        begin("not-in-the-table")
+            .settle(&usage, None)
+            .expect("settle");
+        drop(begin("llama3")); // unreconciled: its spend is not known
+    }
+    let host = Host::open(config).expect("open");
+    let prices = host.prices().expect("prices");
+    let priced = prices.cost("llama3", &usage).expect("priced");
+    let worst = host.worst_case_call(&prices, "llama3").expect("worst");
+    assert!(priced > kgraf_core::Money::ZERO);
+    assert!(worst > priced, "the worst case bounds a real call");
+    let total = host
+        .seed_trailing_hour()
+        .expect("seeding never fails on unknown spend");
+    // llama3 is the only (so the dearest) priced model: both estimates are `worst`.
+    assert_eq!(total, priced + worst + worst);
+    let estimates: Vec<_> = host
+        .take_notices()
+        .into_iter()
+        .filter_map(|n| match n {
+            crate::Notice::EstimatedSpend { model, amount, .. } => Some((model, amount)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(estimates.len(), 2, "{estimates:?}");
+    assert!(
+        estimates
+            .iter()
+            .any(|(m, a)| m == "not-in-the-table" && *a == worst)
+    );
+    assert!(estimates.iter().any(|(m, a)| m == "llama3" && *a == worst));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("time")
+        .as_millis() as i64;
+    assert_eq!(host.admission().budget().spent_last_hour(now), total);
+    // Only the last hour is read.
+    assert_eq!(
+        host.ledger()
+            .calls_finished_since(now + 60_000)
+            .expect("since")
+            .len(),
+        0
+    );
+}
+
+/// A credential missing when the run is built (removed after readiness)
+/// is its own class, which the factory seam carries as `MissingCredential`.
+#[test]
+fn a_credential_missing_at_build_time_is_a_missing_credential() {
+    let e = provider_from("kimi", "kimi-k2", &Limiters::new(), |_| None)
+        .err()
+        .expect("no credential");
+    assert!(matches!(e, crate::Error::Credential(_)), "{e:?}");
+    assert!(!e.is_transient());
+    let seam = crate::host::factory_error(e);
+    assert!(
+        matches!(&seam, OrchestratorError::MissingCredential(d) if d.contains("KGRAF_KIMI_API_KEY")),
+        "{seam:?}"
+    );
+}
+
+// `.kgraf` must never land in a plain `git add -A` (`ensure_local_exclude`).
+
+fn init_repo(dir: &Path) {
+    std::fs::create_dir_all(dir).expect("mkdir");
+    host_git(dir, &["init", "-q", "-b", "main"]);
+    host_git(dir, &["config", "user.name", "t"]);
+    host_git(dir, &["config", "user.email", "t@t"]);
+    std::fs::write(dir.join("README.md"), "# t\n").expect("write");
+    host_git(dir, &["add", "."]);
+    host_git(dir, &["commit", "-q", "-m", "init"]);
+}
+
+fn exclude_path(root: &Path) -> PathBuf {
+    root.join(".git").join("info").join("exclude")
+}
+
+/// The first command against a fresh repository adds the line once; a second
+/// call (as a later command in the same repo would make) leaves exactly one.
+#[test]
+fn state_dir_adds_the_exclude_line_once_and_is_idempotent() {
+    let dir = tempfile::tempdir().expect("dir");
+    let root = dir.path().join("repo");
+    init_repo(&root);
+
+    state_dir(&root).expect("first call");
+    let text = std::fs::read_to_string(exclude_path(&root)).expect("exclude");
+    assert_eq!(
+        text.lines().filter(|l| *l == "/.kgraf/").count(),
+        1,
+        "{text:?}"
+    );
+
+    state_dir(&root).expect("second call");
+    let text = std::fs::read_to_string(exclude_path(&root)).expect("exclude");
+    assert_eq!(
+        text.lines().filter(|l| *l == "/.kgraf/").count(),
+        1,
+        "run twice, still one line: {text:?}"
+    );
+
+    // The user's own tracked .gitignore is never touched.
+    assert!(!root.join(".gitignore").exists());
+}
+
+/// An exclude file that exists but cannot be read as text fails loud and is
+/// left byte for byte as it was: it may hold the user's own local ignores.
+#[test]
+fn an_unreadable_exclude_file_fails_and_is_never_overwritten() {
+    let dir = tempfile::tempdir().expect("dir");
+    let root = dir.path().join("repo");
+    init_repo(&root);
+    let path = exclude_path(&root);
+    let original: &[u8] = b"my-local-ignore\n\xff\xfe not utf-8\n";
+    std::fs::write(&path, original).expect("write exclude");
+
+    assert!(
+        state_dir(&root).is_err(),
+        "an unreadable exclude file must fail"
+    );
+    assert_eq!(std::fs::read(&path).expect("read back"), original);
+}
+
+/// A linked worktree resolves `info/exclude` back to the common directory the
+/// worktree it was made from uses, so the line still lands in one place.
+#[test]
+fn a_linked_worktree_resolves_the_common_info_exclude() {
+    let dir = tempfile::tempdir().expect("dir");
+    let root = dir.path().join("repo");
+    init_repo(&root);
+    let linked = dir.path().join("linked");
+    host_git(
+        &root,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            linked.to_str().expect("utf8"),
+        ],
+    );
+
+    state_dir(&linked).expect("state dir from the linked worktree");
+
+    // The line lands in the *common* exclude file (the main checkout's,
+    // already seeded with git's own commented template), not a copy under the
+    // linked worktree's own admin directory.
+    let text = std::fs::read_to_string(exclude_path(&root)).expect("common exclude");
+    assert_eq!(
+        text.lines().filter(|l| *l == "/.kgraf/").count(),
+        1,
+        "{text:?}"
+    );
+    assert!(
+        !linked.join(".git").is_dir(),
+        "a linked worktree's .git is a gitlink file, not its own admin directory"
+    );
+}
+
+/// A repository that already tracks files under `.kgraf` gets a warning
+/// naming the risk and the untracking command; the index is never touched.
+#[test]
+fn already_tracked_state_files_produce_a_named_warning() {
+    let dir = tempfile::tempdir().expect("dir");
+    let root = dir.path().join("repo");
+    std::fs::create_dir_all(&root).expect("mkdir");
+    host_git(&root, &["init", "-q", "-b", "main"]);
+    host_git(&root, &["config", "user.name", "t"]);
+    host_git(&root, &["config", "user.email", "t@t"]);
+    std::fs::create_dir_all(root.join(".kgraf")).expect("mkdir state");
+    std::fs::write(root.join(".kgraf").join("ledger.db"), "secret").expect("write");
+    host_git(&root, &["add", "-A"]);
+    host_git(&root, &["commit", "-q", "-m", "oops, committed state"]);
+
+    let git = kgraf_sandbox::git::Git::discover().expect("git");
+    let warning =
+        crate::workspaces::tracked_state_warning(&git, &root).expect("warning for tracked state");
+    assert!(warning.contains(".kgraf"), "{warning}");
+    assert!(warning.contains("git rm -r --cached .kgraf"), "{warning}");
+
+    // The warning is informational only: the index still names the file.
+    let tracked = git_out(&root, &["ls-files", "--", ".kgraf"]);
+    assert!(tracked.contains("ledger.db"), "{tracked}");
+}
+
+/// A repository with nothing yet under `.kgraf` gets no warning.
+#[test]
+fn a_clean_repository_gets_no_tracked_state_warning() {
+    let dir = tempfile::tempdir().expect("dir");
+    let root = dir.path().join("repo");
+    init_repo(&root);
+    state_dir(&root).expect("state");
+    let git = kgraf_sandbox::git::Git::discover().expect("git");
+    assert!(crate::workspaces::tracked_state_warning(&git, &root).is_none());
+}
+
+/// After a command that creates state, `git status --porcelain` shows nothing
+/// under `.kgraf`: the exclude line does its job end to end.
+#[test]
+fn git_status_shows_nothing_under_state_dir_after_state_dir_runs() {
+    let dir = tempfile::tempdir().expect("dir");
+    let root = dir.path().join("repo");
+    init_repo(&root);
+    let state = state_dir(&root).expect("state");
+    std::fs::write(state.join("ledger.db"), "data").expect("write");
+    std::fs::write(state.join("allow-rules.json"), "{}").expect("write");
+
+    let status = git_out(&root, &["status", "--porcelain"]);
+    assert!(
+        !status.contains(".kgraf"),
+        "state dir leaked into git status: {status:?}"
+    );
+    // Decision 0062: the former name and the migration lock stay out of git
+    // too (a lock left by a killed move, or a recreated `.haustoria/`).
+    std::fs::create_dir_all(root.join(".haustoria")).expect("mkdir");
+    std::fs::write(root.join(".haustoria/ledger.db"), "data").expect("write");
+    std::fs::write(root.join(".kgraf.migrating"), "").expect("write");
+    let status = git_out(&root, &["status", "--porcelain", "--untracked-files=all"]);
+    assert!(
+        !status.contains(".haustoria") && !status.contains(".kgraf.migrating"),
+        "{status:?}"
+    );
+}
+
+/// A root outside any git repository is left alone: `state_dir` still creates
+/// the directory, and does not fail for lack of a repository to ignore it in.
+#[test]
+fn a_non_git_root_is_not_an_error() {
+    let dir = tempfile::tempdir().expect("dir");
+    let root = dir.path().join("scratch");
+    let state = state_dir(&root).expect("state dir without a repository");
+    assert!(state.exists());
+}
+
+// ---- Linux ancestor reads: a refused cargo file is named. ----
+
+#[cfg(target_os = "linux")]
+fn other_writable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o646)).expect("chmod");
+}
+
+/// A checkout `Cargo.toml` anyone may write is not granted to the gate's
+/// cargo, and the gate's output says so beside cargo's own "Permission
+/// denied": the file and why, not only that cargo failed.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_cargo_file_is_named_in_the_gate_output() {
+    let (r, _denies) = lockless_crate();
+    other_writable(&r.root.join("Cargo.toml"));
+    let gate = gate_runner(&r, &["cargo test --offline"], Duration::from_secs(300));
+    let tip = git_out(&r.root, &["rev-parse", "kgraf/r-1"]);
+    let v = gate.run(request(&gate, tip.trim())).await.expect("ran");
+    assert!(!v.passed);
+    let out = v.output.quote_as_data("gate_output", &[]);
+    assert!(out.contains("Permission denied"), "{out}");
+    assert!(
+        out.contains("[sandbox]") && out.contains("is writable by others (mode 646)"),
+        "{out}"
+    );
+}
+
+/// The same refusal is said once when a run opens, before any command
+/// fails on it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_refused_cargo_file_is_a_notice_when_a_run_opens() {
+    let (_dir, config) = project();
+    let manifest = config.root.join("Cargo.toml");
+    std::fs::write(&manifest, "[package]\n").expect("write");
+    other_writable(&manifest);
+    let host = Host::open(config).expect("open");
+    let mut said = Vec::new();
+    host.startup(&mut |n| said.push(n)).expect("startup");
+    assert!(
+        said.iter().any(|n| matches!(
+            n,
+            crate::Notice::AncestorReadRefused(d)
+                if d.contains("Cargo.toml") && d.contains("writable by others (mode 646)")
+        )),
+        "{said:?}"
+    );
+}
+
+/// A run the host builds tries a
+/// worker's question against the run record first, in one call on the
+/// planner's route through the host's ledger, attributed to
+/// `orchestrator:<run>`, before any user is asked. Before the fix no host
+/// wired an answerer, so every question skipped the orchestrator.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hosted_run_answers_a_workers_question_through_the_planner_first() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    #[derive(Default)]
+    struct Script {
+        worker_parked: AtomicBool,
+        answers: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl Provider for Script {
+        fn adapter(&self) -> &'static str {
+            "script"
+        }
+        fn protocol(&self) -> kgraf_core::Protocol {
+            kgraf_core::Protocol::Additive
+        }
+        async fn complete(
+            &self,
+            request: &kgraf_provider::Request,
+            token: &kgraf_provider::CallToken,
+        ) -> Result<kgraf_provider::Response, kgraf_provider::ProviderError> {
+            let system: String = request
+                .system
+                .iter()
+                .filter_map(kgraf_provider::Content::as_text)
+                .collect();
+            let text = if system.contains("Split the user's instruction") {
+                r#"{"contracts":[{"id":"a","instruction":"write src/a.txt","acceptance":"src/a.txt exists","writes":[{"path":"src/a.txt"}],"tools":[]}]}"#.to_owned()
+            } else if system.contains("A worker in your run asked") {
+                self.answers.fetch_add(1, Ordering::SeqCst);
+                r#"{"answerable":true,"answer":"src/a.txt"}"#.to_owned()
+            } else if system.contains("still serves") {
+                r#"{"serves":true,"reason":"on track"}"#.to_owned()
+            } else {
+                // A worker: parked until the run is stopped.
+                self.worker_parked.store(true, Ordering::SeqCst);
+                std::future::pending::<()>().await;
+                String::new()
+            };
+            let usage = kgraf_core::TokenUsage {
+                uncached_input: 10,
+                text_output: 10,
+                ..kgraf_core::TokenUsage::default()
+            };
+            token.settle(&usage, None)?;
+            Ok(kgraf_provider::Response {
+                model: request.model.clone(),
+                content: vec![kgraf_provider::Content::text(text)],
+                stop_reason: kgraf_provider::StopReason::EndTurn,
+                usage,
+                request_id: None,
+            })
+        }
+    }
+    let (_dir, mut config) = project();
+    config.sessions = true;
+    config.routes = vec!["mine:llama3".into()];
+    let script = Arc::new(Script::default());
+    let host = Host::open(config)
+        .expect("open")
+        .with_route_provider("mine", script.clone())
+        .expect("a used route");
+    let prepared = host
+        .prepare(RunId::new("q1"), None, &mut |_| {})
+        .await
+        .expect("prepare");
+    let handle = prepared.handle();
+    let run = tokio::spawn(prepared.run(RunStart::Instruction("make a".into())));
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !script.worker_parked.load(Ordering::SeqCst) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the worker never started"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let answer = handle
+        .ask_question(
+            kgraf_core::AgentId::new("q1-a-r0-a0"),
+            "which file do I write?".into(),
+        )
+        .await
+        .expect("answered");
+    assert_eq!(answer, "src/a.txt");
+    assert_eq!(script.answers.load(Ordering::SeqCst), 1, "one answer call");
+    let rows: Vec<_> = host
+        .ledger()
+        .calls()
+        .expect("calls")
+        .into_iter()
+        .filter(|c| c.trace.kind.as_deref() == Some("answer_question"))
+        .collect();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].agent_id, "orchestrator:q1");
+    assert_eq!(rows[0].settlement, kgraf_provider::Settlement::Counted);
+    handle.stop().await;
+    let _ = run.await.expect("join");
+}
+
+/// Decision 0013: a plan approved from a genuinely empty directory
+/// (no commit at all -- the greenfield case) reaches dispatch, not merely a
+/// reading. Before the `ensure_integration_branch` fix, `HEAD` was unborn and
+/// `build` could never make the run's integration branch, so this never got
+/// past `--corpus` (evidence: "read but not dispatched").
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_greenfield_plan_is_approved_and_reaches_dispatch() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[derive(Default)]
+    struct Parked(AtomicBool);
+
+    #[async_trait::async_trait]
+    impl Provider for Parked {
+        fn adapter(&self) -> &'static str {
+            "script"
+        }
+        fn protocol(&self) -> kgraf_core::Protocol {
+            kgraf_core::Protocol::Additive
+        }
+        async fn complete(
+            &self,
+            request: &kgraf_provider::Request,
+            token: &kgraf_provider::CallToken,
+        ) -> Result<kgraf_provider::Response, kgraf_provider::ProviderError> {
+            let system: String = request
+                .system
+                .iter()
+                .filter_map(kgraf_provider::Content::as_text)
+                .collect();
+            // A plan-started run has no decomposition call (`seeded_record`
+            // builds contracts straight from the approved items); the only
+            // calls are the readiness check and the worker itself.
+            let text = if system.contains("still serves") {
+                r#"{"serves":true,"reason":"on track"}"#.to_owned()
+            } else {
+                self.0.store(true, Ordering::SeqCst);
+                std::future::pending::<()>().await;
+                String::new()
+            };
+            let usage = kgraf_core::TokenUsage {
+                uncached_input: 10,
+                text_output: 10,
+                ..kgraf_core::TokenUsage::default()
+            };
+            token.settle(&usage, None)?;
+            Ok(kgraf_provider::Response {
+                model: request.model.clone(),
+                content: vec![kgraf_provider::Content::text(text)],
+                stop_reason: kgraf_provider::StopReason::EndTurn,
+                usage,
+                request_id: None,
+            })
+        }
+    }
+
+    struct SeedAsker;
+    #[async_trait::async_trait]
+    impl kgraf_interpret::Asker for SeedAsker {
+        fn identity(&self) -> String {
+            "mine:llama3".into()
+        }
+        async fn ask(
+            &self,
+            _system: &str,
+            _user: String,
+        ) -> std::result::Result<kgraf_interpret::AskAnswer, kgraf_interpret::AskFailure> {
+            Ok(kgraf_interpret::AskAnswer {
+                text: serde_json::json!({
+                    "reading": "a tiny greenfield project",
+                    "work_items": [{
+                        "id": "a",
+                        "title": "a",
+                        "instruction": "write src/a.txt",
+                        "writes": ["src/a.txt"],
+                        "acceptance": [{
+                            "text": "src/a.txt exists",
+                            "check": {"kind": "path", "path": "src/a.txt"},
+                        }],
+                    }],
+                })
+                .to_string(),
+                call: None,
+            })
+        }
+    }
+
+    let dir = tempfile::tempdir().expect("dir");
+    let root = dir.path().join("repo");
+    std::fs::create_dir_all(&root).expect("mkdir");
+    host_git(&root, &["init", "-q", "-b", "main"]);
+    host_git(&root, &["config", "user.name", "Test Owner"]);
+    host_git(&root, &["config", "user.email", "owner@example.invalid"]);
+    assert_eq!(
+        git_out(&root, &["rev-list", "--count", "--all"]),
+        "0",
+        "the fixture starts with no commit: the greenfield case"
+    );
+
+    // Write the reading directly, exactly as `kgraf-cli`'s corpus test does:
+    // this test's subject is dispatch from an approved plan, not the model
+    // call that produces one. The store is closed before `Host::open` reopens
+    // the same file, as that test's does too.
+    let state = root.join(".kgraf");
+    std::fs::create_dir_all(&state).expect("state");
+    let plan_id = {
+        let store = GraphStore::open(&state.join("graph.db"), &root).expect("graph");
+        let mut request = kgraf_interpret::InterpretRequest::new("mine:llama3");
+        request.instruction = Some("write a to a file".into());
+        let prepared = kgraf_interpret::prepare(&store, request).expect("prepare");
+        let asked = prepared.ask(&SeedAsker).await.expect("ask");
+        let interpretation = asked
+            .finish(&store, &kgraf_interpret::NoTestRuns)
+            .expect("finish");
+        interpretation.plan_id().to_owned()
+    };
+
+    let prices = dir.path().join("prices.json");
+    std::fs::write(
+        &prices,
+        r#"{"llama3": {"uncached_input": 1, "cache_read": 1, "cache_write": 1, "output": 1, "reasoning": 1}}"#,
+    )
+    .expect("prices");
+    let config = RunConfig::new(&root, vec!["mine:llama3".into()], prices);
+    let parked = Arc::new(Parked::default());
+    let host = Host::open(config)
+        .expect("open")
+        .with_route_provider("mine", parked.clone())
+        .expect("a used route");
+
+    let approved = host.approve_plan(&plan_id, &[]).expect("approve");
+    assert_eq!(approved.items().len(), 1);
+
+    let startup = host.startup(&mut |_| {}).expect("startup");
+    let run_id = RunId::new("greenfield-1");
+    let prepared = host
+        .build(&startup, run_id.clone(), Some(&approved), &mut |_| {})
+        .await
+        .expect("build");
+    assert!(
+        !git_out(
+            &root,
+            &["rev-parse", "--verify", "--quiet", "kgraf/greenfield-1"]
+        )
+        .is_empty(),
+        "the integration branch exists: the greenfield directory got its first commit"
+    );
+
+    let handle = prepared.handle();
+    let run_task = tokio::spawn(prepared.run(RunStart::Plan(Box::new(approved))));
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !parked.0.load(Ordering::SeqCst) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the worker was never dispatched"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    handle.stop().await;
+    let outcome = run_task.await.expect("join").expect("run");
+    assert!(
+        outcome.report.counters.dispatches >= 1,
+        "{:?}",
+        outcome.report.counters
+    );
+}
+
+/// A worker in an orchestrated run on a repository that was never `kgraf
+/// index`-ed still gets `graph_slice` and a real slice of the code already in
+/// the repository: `Host::build` indexes the working tree before planning
+/// (`Host::build_base`), so a run never needs a separate `kgraf index` step
+/// first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_on_a_fresh_repo_gets_graph_slices() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[derive(Default)]
+    struct Captured {
+        parked: AtomicBool,
+        tool_names: Mutex<Vec<String>>,
+    }
+
+    struct Parked(Arc<Captured>);
+
+    #[async_trait::async_trait]
+    impl Provider for Parked {
+        fn adapter(&self) -> &'static str {
+            "script"
+        }
+        fn protocol(&self) -> kgraf_core::Protocol {
+            kgraf_core::Protocol::Additive
+        }
+        async fn complete(
+            &self,
+            request: &kgraf_provider::Request,
+            token: &kgraf_provider::CallToken,
+        ) -> Result<kgraf_provider::Response, kgraf_provider::ProviderError> {
+            let system: String = request
+                .system
+                .iter()
+                .filter_map(kgraf_provider::Content::as_text)
+                .collect();
+            let text = if system.contains("still serves") {
+                r#"{"serves":true,"reason":"on track"}"#.to_owned()
+            } else {
+                *self.0.tool_names.lock().unwrap_or_else(|p| p.into_inner()) =
+                    request.tools.iter().map(|t| t.name.clone()).collect();
+                self.0.parked.store(true, Ordering::SeqCst);
+                std::future::pending::<()>().await;
+                String::new()
+            };
+            let usage = kgraf_core::TokenUsage {
+                uncached_input: 10,
+                text_output: 10,
+                ..kgraf_core::TokenUsage::default()
+            };
+            token.settle(&usage, None)?;
+            Ok(kgraf_provider::Response {
+                model: request.model.clone(),
+                content: vec![kgraf_provider::Content::text(text)],
+                stop_reason: kgraf_provider::StopReason::EndTurn,
+                usage,
+                request_id: None,
+            })
+        }
+    }
+
+    struct SeedAsker;
+    #[async_trait::async_trait]
+    impl kgraf_interpret::Asker for SeedAsker {
+        fn identity(&self) -> String {
+            "mine:llama3".into()
+        }
+        async fn ask(
+            &self,
+            _system: &str,
+            _user: String,
+        ) -> std::result::Result<kgraf_interpret::AskAnswer, kgraf_interpret::AskFailure> {
+            Ok(kgraf_interpret::AskAnswer {
+                text: serde_json::json!({
+                    "reading": "a tiny project with existing code",
+                    "work_items": [{
+                        "id": "a",
+                        "title": "a",
+                        "instruction": "write src/b.rs",
+                        "writes": ["src/b.rs"],
+                        "acceptance": [{
+                            "text": "src/b.rs exists",
+                            "check": {"kind": "path", "path": "src/b.rs"},
+                        }],
+                    }],
+                })
+                .to_string(),
+                call: None,
+            })
+        }
+    }
+
+    let dir = tempfile::tempdir().expect("dir");
+    let root = dir.path().join("repo");
+    std::fs::create_dir_all(&root).expect("mkdir");
+    // A real symbol, committed but never `kgraf index`-ed: the case this test
+    // is for. Its slice (`indexed_fn`) is what the worker's `graph_slice` tool
+    // must be able to reach once `Host::build` has indexed it.
+    std::fs::create_dir_all(root.join("src")).expect("mkdir src");
+    std::fs::write(
+        root.join("src/a.rs"),
+        "pub fn indexed_fn() -> u32 {\n    42\n}\n",
+    )
+    .expect("write src/a.rs");
+    host_git(&root, &["init", "-q", "-b", "main"]);
+    host_git(&root, &["config", "user.name", "Test Owner"]);
+    host_git(&root, &["config", "user.email", "owner@example.invalid"]);
+    host_git(&root, &["add", "-A"]);
+    host_git(&root, &["commit", "-q", "-m", "seed"]);
+
+    let state = root.join(".kgraf");
+    std::fs::create_dir_all(&state).expect("state");
+    assert_eq!(
+        GraphStore::open(&state.join("graph.db"), &root)
+            .expect("graph")
+            .node_count()
+            .expect("node count"),
+        0,
+        "the fixture starts unindexed"
+    );
+    let plan_id = {
+        let store = GraphStore::open(&state.join("graph.db"), &root).expect("graph");
+        let mut request = kgraf_interpret::InterpretRequest::new("mine:llama3");
+        request.instruction = Some("write a file".into());
+        let prepared = kgraf_interpret::prepare(&store, request).expect("prepare");
+        let asked = prepared.ask(&SeedAsker).await.expect("ask");
+        let interpretation = asked
+            .finish(&store, &kgraf_interpret::NoTestRuns)
+            .expect("finish");
+        interpretation.plan_id().to_owned()
+    };
+
+    let prices = dir.path().join("prices.json");
+    std::fs::write(
+        &prices,
+        r#"{"llama3": {"uncached_input": 1, "cache_read": 1, "cache_write": 1, "output": 1, "reasoning": 1}}"#,
+    )
+    .expect("prices");
+    let config = RunConfig::new(&root, vec!["mine:llama3".into()], prices);
+    let captured = Arc::new(Captured::default());
+    let host = Host::open(config)
+        .expect("open")
+        .with_route_provider("mine", Arc::new(Parked(captured.clone())))
+        .expect("a used route");
+
+    let approved = host.approve_plan(&plan_id, &[]).expect("approve");
+    let startup = host.startup(&mut |_| {}).expect("startup");
+    let run_id = RunId::new("fresh-graph-1");
+    let prepared = host
+        .build(&startup, run_id.clone(), Some(&approved), &mut |_| {})
+        .await
+        .expect("build");
+
+    // The build itself indexed the repository, before any worker ran.
+    assert!(
+        GraphStore::open(&state.join("graph.db"), &root)
+            .expect("graph")
+            .node_count()
+            .expect("node count")
+            > 0,
+        "`Host::build` did not index the repository"
+    );
+
+    let handle = prepared.handle();
+    let run_task = tokio::spawn(prepared.run(RunStart::Plan(Box::new(approved))));
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !captured.parked.load(Ordering::SeqCst) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the worker was never dispatched"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    handle.stop().await;
+    let _ = run_task.await.expect("join");
+
+    assert!(
+        captured
+            .tool_names
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .any(|n| n == "graph_slice"),
+        "the worker's tools did not include graph_slice: {:?}",
+        captured
+            .tool_names
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    );
+}
+
+#[path = "speculation_tests.rs"]
+mod speculation;
+
+#[path = "build_allowlist_tests.rs"]
+mod build_allowlist;

@@ -1,0 +1,159 @@
+[package]
+name = "kgraf-shell"
+version.workspace = true
+description = "Desktop shell: native window, panels and tray, GPU-optional."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "kgraf-app"
+path = "src/bin/kgraf-app.rs"
+
+[dependencies]
+# Local-only diagnostics (decision 0069): the binary's own
+# `main` initializes it once; `kgraf-diag` itself never touches the network.
+kgraf-diag.workspace = true
+kgraf-secrets = { path = "../kgraf-secrets" }
+# The galaxy renderer mounted in the central panel.
+kgraf-galaxy.workspace = true
+# The per-machine parallelism maximum's breakdown (decision 0067), shown
+# in Settings > General next to the parallelism slider.
+kgraf-capacity.workspace = true
+# `kgraf_provider::limits::last_429`: the capacity re-measure thread's
+# learned-rate overlay reads it directly (decision 0067).
+kgraf-provider.workspace = true
+# Interaction: the message port, approval desk, run records and hosted runs
+# the orchestrator box, the text surface and the work-node status read.
+kgraf-orchestrator.workspace = true
+# Builds each scheduled run: the construction `kgraf orchestrate` uses.
+kgraf-host.workspace = true
+# The box desk's allow-rule subjects come from the shell tool's.
+kgraf-tools.workspace = true
+kgraf-core.workspace = true
+# The vendor catalog: reasoning visibility declared per route (0067,
+# Settings > Providers).
+kgraf-fleet.workspace = true
+kgraf-graph.workspace = true
+# Presumed work nodes and their derived states for the plan overlay (decision 0064).
+kgraf-interpret.workspace = true
+# Worker transcripts (JSON lines of `WorkerEvent`) for the text surface (0034).
+kgraf-runtime.workspace = true
+kgraf-session.workspace = true
+# Reads schedule definitions from the project's graph store meta table (0052).
+# The claim table, recurrence and definitions the background scheduler loop reads.
+kgraf-schedule.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# The scheduler thread's own async runtime (`ScheduledRuns::start_run` is async);
+# `rt` (current-thread), `time` for its tick interval elsewhere, `sync` and `macros`
+# match the other crates that already depend on `ScheduledRuns`. Hosted runs
+# use the workspace's multi-thread runtime, created only while a factory is given.
+# `fs` and `io-util` are the update-check thread's own need (`update_bg.rs`
+# streams the downloaded installer to disk while hashing it).
+tokio = { workspace = true, features = ["rt", "sync", "macros", "fs", "io-util"] }
+# The update check's own HTTP client: GitHub
+# Releases only, and only when the user has turned the setting on (decision
+# decision 0051's egress rule does not cover this destination, so it is opt-in;
+# see `update_check.rs`'s module doc).
+reqwest.workspace = true
+semver.workspace = true
+sha2.workspace = true
+chrono = { version = "0.4.45", default-features = false, features = ["std", "clock"] }
+# Settings file format; already in the lockfile through other crates.
+toml = "1.1.6"
+# Blocks on wgpu's async adapter calls in the headless probe; eframe uses the same.
+pollster = "1.0.1"
+# Platform layer (decisions 0054, 0055): eframe drives winit and wgpu. Default features
+# are off so the glow (OpenGL) renderer is not compiled in: wgpu is the only renderer,
+# and adapter classification depends on it. eframe 0.36 pins wgpu 30 and winit 0.30;
+# the direct wgpu and winit entries below must stay on those majors.
+# `wayland` and `x11` make eframe pass `with_app_id("kgraf")` to winit on Linux
+# (Wayland app_id, X11 WM_CLASS class), so the desktop entry's StartupWMClass
+# matches the window; without them the id is dropped and X11 falls back to
+# argv[0]. winit already builds both backends (L8).
+eframe = { version = "0.36.2", default-features = false, features = ["wgpu", "default_fonts", "accesskit", "wayland", "x11"] }
+egui = "0.36.2"
+egui-wgpu = "0.36.2"
+wgpu = "30.0.1"
+winit = "0.30.13"
+# Tray presence for background mode (decision 0052). Same crate Tauri uses.
+tray-icon = "0.25.1"
+log = "0.4.34"
+# Binary only: routes wgpu/egui-wgpu warnings to stderr. Default features off to skip
+# the regex filter engine; module-prefix filters still work.
+env_logger = { version = "0.11.11", default-features = false, features = ["auto-color"] }
+# The platform directories for the default settings path and the log file
+# (`app_dirs`, `diag`), and their former-name locations (decision 0062). Now a
+# workspace dependency (decision 0069) so `kgraf-diag::paths` resolves the same
+# per-user data directory this crate's `app_dirs.rs` does, without either
+# crate depending on the other.
+directories.workspace = true
+# The project switcher's folder picker (decision 0066): the native dialog on macOS
+# (AppKit) and Windows (the common item dialog), and the XDG desktop portal on
+# Linux, which rfd reaches by loading libdbus at run time, so no GTK is linked or
+# needed to build. MIT. `xdg-portal` only: the default `wayland` feature is for
+# parenting the dialog to a Wayland surface, which this app does not pass.
+rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal"] }
+# `--screenshot` writes the window capture as a PNG through
+# packaging/png_encoder.rs, which compresses with this. Already a build and
+# dev dependency here.
+miniz_oxide = "0.8"
+# Decodes the embedded app-icon PNGs (src/icon.rs) to RGBA for the window and
+# tray icons. MIT OR Apache-2.0; already in this workspace's lockfile at 0.18.1
+# via tray-icon, so this pins the same major rather than resolving a second copy.
+png = "0.18"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# proc_pid_rusage and getrusage for --measure's footprint and idle-CPU figures.
+libc = "0.2.189"
+
+[target.'cfg(windows)'.dependencies]
+# kgraf-app.exe is built with windows_subsystem = "windows" (no console window on
+# launch): a GUI-subsystem process starts with no usable stdout/stderr handle, even
+# when its parent is a console, unlike a console-subsystem exe. src/bin/kgraf-app.rs
+# uses this to AttachConsole to a launching terminal (reattaching stdout/stderr to it so
+# --probe/--measure's printed reports and env_logger's warnings still reach it) or, with
+# no parent console, redirect both streams to a log file instead. MIT OR Apache-2.0;
+# already in this workspace's dependency graph via winit/tray-icon at other versions.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_IO",
+] }
+
+[build-dependencies]
+# Embeds the icon + VERSIONINFO resource into kgraf-app.exe when this crate builds
+# for a Windows target (see build.rs). MIT. Unconditional here on purpose: Cargo's
+# `target.'cfg(...)'.build-dependencies` matches the HOST, not the target, so gating
+# this on `cfg(windows)` would only fire when building ON Windows, never when
+# cross-compiling for it from macOS (the actual Windows path).
+embed-resource = "3.0"
+
+[dev-dependencies]
+tempfile.workspace = true
+# The update check's own tests run against a local fake server, never the
+# real GitHub API (decision 0051: no test may make a
+# real network call to an unconfigured destination).
+wiremock.workspace = true
+# Makes a history write fail on demand in the H4 recorder tests (a refusing trigger).
+rusqlite.workspace = true
+# Drives the real widgets through AccessKit in tests (MIT OR Apache-2.0).
+egui_kittest = "0.36.2"
+# Headless render state for the graph interaction tests.
+pollster = "1.0.1"
+kgraf-tools.workspace = true
+async-trait.workspace = true
+# The in-process fake model of the scheduled-run test and the box adapter test.
+kgraf-host = { workspace = true, features = ["in-process-provider"] }
+# `clear_429_for_test`: this crate's own `capacity_bg` tests must not see
+# another test's 429 recordings in the process-wide registry.
+kgraf-provider = { workspace = true, features = ["test-support"] }

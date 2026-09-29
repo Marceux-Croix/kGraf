@@ -1,0 +1,63 @@
+[package]
+name = "kgraf-tools"
+version.workspace = true
+description = "Worker tools: the tool trait, file edit, shell execution and command policy."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# Explicit versions rather than `workspace = true` for the new third-party entries:
+# Wave 0 streams do not edit the root manifest; the main session hoists them later.
+[dependencies]
+kgraf-core = { path = "../kgraf-core" }
+# `impl DiagCode for ToolError` (decision 0069). No cycle: kgraf-diag depends
+# on nothing in this workspace but kgraf-core.
+kgraf-diag = { path = "../kgraf-diag" }
+kgraf-secrets = { path = "../kgraf-secrets" }
+kgraf-provider = { path = "../kgraf-provider" }
+# The shell tool runs through the isolation runner rather than a bare
+# `std::process::Command` (fail loud: never unconfined).
+kgraf-sandbox = { path = "../kgraf-sandbox" }
+# `graph_slice`: the graph read tool lives with the other built-ins so it meets
+# the same `fs_safety` rules (moved from the CLI's interim tools).
+kgraf-graph = { path = "../kgraf-graph" }
+# Every filesystem tool (read, list, search, apply-patch) resolves paths through
+# this instead of `std::fs` + a lexical check: a lexical check cannot see a
+# symlink, so `foo/passwd` can normalize as inside the workspace while resolving
+# outside it. cap-std's `Dir` confines every open to the directory tree with
+# `openat`-family syscalls, refusing an escape at the same syscall that opens
+# the path (no stat-then-open race). MIT OR Apache-2.0, verified on crates.io
+# 2026-09-26; it is the primitive WASI's own sandboxing is built on
+# (security-critical path resolution is reused, not hand-rolled).
+cap-std = "4.0.3"
+async-trait = "0.1"
+blake3 = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+# CancellationToken: the maintained tokio primitive for cooperative cancellation
+# (reused, not hand-rolled). It is cloned into every tool call so a mid-stream cancel reaches a
+# running tool, not only the model stream.
+tokio-util = "0.7.19"
+# The shell tool needs an async child process (spawn, kill, capped-read pipes,
+# a timeout race and cooperative cancellation), beyond what `tokio-util`'s
+# cancellation token alone provides.
+# `rt-multi-thread` for `block_in_place`: `graph_slice`'s synchronous `access`
+# runs its SQLite lookup off the executor thread.
+tokio = { version = "1.53", features = ["process", "time", "io-util", "rt", "rt-multi-thread", "sync", "macros"] }
+
+[target.'cfg(unix)'.dependencies]
+# O_NONBLOCK on a read (so a planted FIFO cannot hang a tool call) and killpg
+# on timeout (so a grandchild in the shell tool's own process group dies too).
+libc = "0.2.185"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+trybuild = "1"
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "tools"
+harness = false
