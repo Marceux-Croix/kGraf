@@ -247,6 +247,17 @@ pub enum NotReady {
     /// The price table cannot be read, or is not a price table.
     #[error("the price table {} cannot be used: {detail}", path.display())]
     PricesUnreadable { path: PathBuf, detail: String },
+    /// A local route's endpoint (one that takes no credential, such as Ollama)
+    /// accepts no connection at run start: every call to it would fail.
+    #[error(
+        "route `{route}` is unreachable at {endpoint}: {detail}; start its server or remove \
+         the route"
+    )]
+    Unreachable {
+        route: String,
+        endpoint: String,
+        detail: String,
+    },
 }
 
 impl kgraf_diag::DiagCode for NotReady {
@@ -256,6 +267,7 @@ impl kgraf_diag::DiagCode for NotReady {
             NotReady::UnknownRoute { .. } => "KG-0501",
             NotReady::MissingCredential { .. } => "KG-0501",
             NotReady::PricesUnreadable { .. } => "KG-0501",
+            NotReady::Unreachable { .. } => "KG-0501",
             NotReady::Invalid(_) => kgraf_diag::catch_all_for("kgraf-host").code,
         }
     }

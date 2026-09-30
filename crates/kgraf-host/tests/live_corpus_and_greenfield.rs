@@ -91,8 +91,8 @@ const ROUTE: &str = "kimi-anthropic:kimi-k3";
 /// correct interpretation is known, the plan model it produces is compared
 /// against the actual roadmap, decisions and standing rules." The comparison
 /// itself is written up in the evidence file (a live model's prose does not
-/// lend itself to a brittle automated assertion, per the existing readings in
-/// `2026-09-26-phase7-live.md`); this test's job is to produce the reading and
+/// lend itself to a brittle automated assertion, per the existing readings);
+/// this test's job is to produce the reading and
 /// record its mechanics: one ledgered call, a non-empty reading, and the
 /// bounded-input budget actually bounding it.
 #[tokio::test(flavor = "multi_thread")]
@@ -166,8 +166,8 @@ async fn self_test_reads_this_repository_against_its_own_roadmap() {
 /// states a frozen path in prose; the instruction asks, among other things,
 /// for a write inside it. Whatever the model actually returns is printed and
 /// recorded (a live model's instruction-following is not this
-/// mechanism's own contract, per the existing readings in
-/// `2026-09-26-phase7-live.md`); when it does name the forbidden path, this
+/// mechanism's own contract, per the existing readings); when it does name
+/// the forbidden path, this
 /// shows `ApprovedPlan::blocked_writes` actually strike it before the plan is
 /// seeded, not merely echo the rule in prose.
 #[tokio::test(flavor = "multi_thread")]
@@ -275,8 +275,8 @@ async fn a_forbidden_path_constraint_binds_live() {
 
 /// Acceptance item 3: a greenfield plan carried through to dispatch,
 /// against a real route. From an empty directory (`git init`, no commit) and
-/// one instruction, exactly the prior evidence's greenfield reading
-/// (`2026-09-26-phase7-live.md`), approved and built: the run's integration
+/// one instruction, exactly the earlier greenfield reading, approved and
+/// built: the run's integration
 /// branch now exists (the `ensure_integration_branch` fix) and at least one
 /// worker is actually dispatched.
 #[tokio::test(flavor = "multi_thread")]

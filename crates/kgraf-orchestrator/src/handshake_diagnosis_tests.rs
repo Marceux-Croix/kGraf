@@ -1,9 +1,8 @@
-//! Decision 0078: the first live handshake, replayed.
+//! Decision 0078: a recorded live handshake, replayed.
 //!
-//! The run `run-p4checks-rust2` (evidence `2026-09-27-contract-check-cost.md`,
-//! commit `0cbd67f`) held both parties on seven findings. Its trace is committed,
-//! so the test reads the parties' statements and the recorded findings verbatim
-//! from it, never from a restatement. Each recorded finding is pinned with its
+//! The recorded run held both parties on seven findings. Its trace is committed
+//! as a fixture, so the test reads the parties' statements and the recorded
+//! findings verbatim from it, never from a restatement. Each recorded finding is pinned with its
 //! classification: NOISE (same meaning, a spelling of it the comparator could not
 //! read) must no longer be reported, REAL (the parties disagree) still must be.
 //! For every class of noise relaxed, a synthetic REAL case proves the relaxation
@@ -59,7 +58,7 @@ enum Class {
 }
 
 /// The seven recorded findings, in recorded order, with their classification
-/// and the reason (the evidence file quotes each case in full).
+/// and the reason.
 const CLASSIFIED: [(Class, &str); 7] = [
     (
         Class::Noise,
@@ -393,4 +392,347 @@ fn a_python_signature_agrees_and_a_changed_return_type_disagrees() {
         matches!(&f[..], [HandshakeFinding::Disagree { symbol, .. }] if symbol == "parse_config"),
         "{f:?}"
     );
+}
+
+// ------------------------------------------------ recorded model statements
+//
+// Statements models gave in orchestrated runs, quoted verbatim. Each held its
+// run on a finding the parties' words do not support; the REAL companions
+// prove the relaxations keep true findings.
+
+/// The `state_tax_rate` interface those runs held on.
+fn tax_ic(id: &str, parties: &[&str]) -> InterfaceContract {
+    InterfaceContract {
+        id: id.into(),
+        version: 1,
+        parties: parties.iter().map(|p| (*p).to_owned()).collect(),
+        symbols: vec!["state_tax_rate".into()],
+        stub: vec![],
+        wrong: vec![],
+        reference: vec![],
+        consumer: vec![],
+        tests: vec![],
+        compile: vec![],
+        test: vec![],
+        consulted: vec![],
+        replaces: vec![],
+    }
+}
+
+fn statement(
+    party: &str,
+    provide: &[&str],
+    expect: &[&str],
+    consume: &[&str],
+) -> HandshakeStatement {
+    let own = |l: &[&str]| l.iter().map(|s| (*s).to_owned()).collect();
+    HandshakeStatement {
+        party: party.into(),
+        provide: own(provide),
+        expect: own(expect),
+        consume: own(consume),
+        touch: vec![],
+    }
+}
+
+const TAX_PROVIDES: &str = "I will provide `state_tax_rate` as a public function `fn state_tax_rate(state: &str) -> f64` in `tax_us/src/state_tax_rate.rs`, returning the `f64` value `0.08` for input CA, `0.0` for input OR, and `0.05` for every other `&str` input.";
+
+/// Two statements that agree: the expecter backticks the state codes the
+/// provider writes as plain words, and cites the interface by its label.
+#[test]
+fn an_expectation_citing_the_interface_and_the_providers_plain_words_agrees() {
+    let ic = tax_ic("c3.c1.i1", &["c3.c1.c1", "c3.c1.c2"]);
+    let f = compare_handshake(
+        &ic,
+        &[
+            statement("c3.c1.c1", &[TAX_PROVIDES], &[], &[]),
+            statement(
+                "c3.c1.c2",
+                &[
+                    "I will provide the integration test file `tax_us/tests/state_tax_rate.rs` that includes `tax_us/src/state_tax_rate.rs` directly and asserts the required rates for `CA`, `OR`, and an unlisted state; I provide no contract symbols of my own.",
+                ],
+                &[
+                    "I assume you provide the contract symbol `state_tax_rate` as a public, callable item defined in `tax_us/src/state_tax_rate.rs`.",
+                    "I assume you provide `state_tax_rate` with a signature compatible with `fn state_tax_rate(state: &str) -> f64`, i.e. accepting a state code as `&str` and returning a numeric rate of type `f64`.",
+                    "I assume you provide `state_tax_rate` behavior such that `CA` and `OR` return their required rates and any unlisted state returns the contract's default/unlisted rate, per contract `c3.c1.i1@v1`.",
+                ],
+                &[
+                    "I assume `state_tax_rate` can be invoked from my test with arguments of type `&str` and its return value can be compared against `f64` literals.",
+                ],
+            ),
+        ],
+        &BTreeMap::new(),
+    );
+    assert!(f.is_empty(), "{f:?}");
+}
+
+/// REAL companion: a state code the provider never states still disagrees.
+#[test]
+fn an_expected_value_the_provider_never_states_still_disagrees() {
+    let ic = tax_ic("c3.c1.i1", &["c3.c1.c1", "c3.c1.c2"]);
+    let f = compare_handshake(
+        &ic,
+        &[
+            statement("c3.c1.c1", &[TAX_PROVIDES], &[], &[]),
+            statement(
+                "c3.c1.c2",
+                &[],
+                &["I assume you provide `state_tax_rate` returning `0.06` for `WA`."],
+                &[],
+            ),
+        ],
+        &BTreeMap::new(),
+    );
+    assert!(
+        matches!(&f[..], [HandshakeFinding::Disagree { symbol, .. }] if symbol == "state_tax_rate"),
+        "{f:?}"
+    );
+}
+
+/// One function split across two workers: the implementer provides it, the
+/// test writer provides tests for it. Only one party provides the symbol.
+#[test]
+fn tests_for_a_symbol_are_not_a_second_provision_of_it() {
+    let ic = tax_ic("c3.c1.i1", &["c3.c1.c1", "c3.c1.c2"]);
+    let f = compare_handshake(
+        &ic,
+        &[
+            statement(
+                "c3.c1.c1",
+                &[
+                    "I will provide `state_tax_rate(state: &str) -> f64` in `tax_us/src/lib.rs`, returning the `f64` value `0.08` for `\"CA\"`, `0.0` for `\"OR\"`, and `0.05` for every other state code, while preserving all unrelated code in the file.",
+                ],
+                &[
+                    "I assume you (party `c3.c1.c2`) provide the call sites that invoke `state_tax_rate`, passing a two-letter uppercase US state code as a `&str` (e.g. `\"CA\"`, `\"OR\"`) and consuming the returned `f64` rate; I assume no additional types, traits, or modules beyond the `state_tax_rate` symbol are expected from me.",
+                ],
+                &[
+                    "I assume `state_tax_rate` is the only contract symbol and that its input arrives as a `&str` state code; I consume no other contract symbols from `c3.c1.c2`.",
+                ],
+            ),
+            statement(
+                "c3.c1.c2",
+                &[
+                    "I will provide integration tests for `state_tax_rate` in `tax_us/tests/state_tax_rate.rs`.",
+                ],
+                &["I assume `c3.c1.c1` provides the implementation of `state_tax_rate`."],
+                &["I assume the tests can call `state_tax_rate`."],
+            ),
+        ],
+        &BTreeMap::new(),
+    );
+    assert!(f.is_empty(), "{f:?}");
+}
+
+/// REAL companion: two parties that each implement the symbol still double
+/// provide it.
+#[test]
+fn two_implementations_of_one_symbol_are_still_double_provided() {
+    let ic = tax_ic("c3.c1.i1", &["c3.c1.c1", "c3.c1.c2"]);
+    let f = compare_handshake(
+        &ic,
+        &[
+            statement("c3.c1.c1", &[TAX_PROVIDES], &[], &[]),
+            statement(
+                "c3.c1.c2",
+                &["I will provide an implementation of `state_tax_rate` in `tax_us/src/lib.rs`."],
+                &[],
+                &[],
+            ),
+        ],
+        &BTreeMap::new(),
+    );
+    assert!(
+        f.iter().any(
+            |x| matches!(x, HandshakeFinding::DoubleProvided { symbol, .. } if symbol == "state_tax_rate")
+        ),
+        "{f:?}"
+    );
+}
+
+/// A sentence stating that nothing is expected names no symbol because it
+/// claims nothing; a sentence about the party's own code that only mentions
+/// the surface symbol it calls makes no claim about that symbol.
+#[test]
+fn a_stated_absence_and_a_mention_after_own_code_are_not_findings() {
+    let ic = tax_ic("c1.i1", &["c1.c1.c1", "c1.c2.c1"]);
+    let f = compare_handshake(
+        &ic,
+        &[
+            statement(
+                "c1.c1.c1",
+                &["I will provide `state_tax_rate` with type `fn(&str) -> f64`. "],
+                &[
+                    "I assume the other party does not provide any symbols required by this implementation.",
+                ],
+                &[],
+            ),
+            statement(
+                "c1.c2.c1",
+                &["I will provide `TaxUs2`'s implementation of `iface2::TaxRule`."],
+                &[],
+                &[
+                    "I assume `tax_cents` receives an `order` with a `state` field and a `taxable_cents` value, and can call `state_tax_rate`.",
+                ],
+            ),
+        ],
+        &BTreeMap::new(),
+    );
+    assert!(f.is_empty(), "{f:?}");
+}
+
+/// REAL companions: an unanchored assumption that states something is still
+/// unanchored, and a claim written after the symbol it is about still counts.
+#[test]
+fn a_positive_unanchored_assumption_and_a_later_claim_are_still_findings() {
+    let ic = tax_ic("c1.i1", &["c1.c1.c1", "c1.c2.c1"]);
+    let f = compare_handshake(
+        &ic,
+        &[
+            statement(
+                "c1.c1.c1",
+                &["I will provide `state_tax_rate` with type `fn(&str) -> f64`. "],
+                &["I assume the other party provides a rate table."],
+                &[],
+            ),
+            statement(
+                "c1.c2.c1",
+                &[],
+                &[
+                    "I assume `c1.c1.c1` provides `state_tax_rate` and the `iface2::TaxRule` interface.",
+                ],
+                &[],
+            ),
+        ],
+        &BTreeMap::new(),
+    );
+    assert!(
+        f.iter().any(
+            |x| matches!(x, HandshakeFinding::Unanchored { party, .. } if party == "c1.c1.c1")
+        ),
+        "{f:?}"
+    );
+    assert!(
+        f.iter().any(
+            |x| matches!(x, HandshakeFinding::Disagree { expecting, .. } if expecting == "c1.c2.c1")
+        ),
+        "{f:?}"
+    );
+}
+
+// ------------------------------------- true disagreements the reading keeps
+
+/// An anchor written before the symbol, in the same clause, is a claim about
+/// it: a type the provider does not give still disagrees.
+#[test]
+fn a_type_written_before_the_symbol_still_disagrees() {
+    let f = findings_for(&with_c2(
+        "consume",
+        "I assume `i32` is what `double` accepts and returns.",
+    ));
+    assert!(
+        f.iter().any(|x| matches!(x,
+            HandshakeFinding::Disagree { symbol, expecting, .. } if symbol == "double" && expecting == "c2")),
+        "{f:?}"
+    );
+}
+
+/// A negated assumption with no anchor still states something about the other
+/// party; only a stated absence of symbols is set aside.
+#[test]
+fn a_negated_assumption_about_behavior_is_still_unanchored() {
+    let ic = tax_ic("c1.i1", &["c1.c1.c1", "c1.c2.c1"]);
+    let f = compare_handshake(
+        &ic,
+        &[
+            statement(
+                "c1.c1.c1",
+                &["I will provide `state_tax_rate` with type `fn(&str) -> f64`."],
+                &["I assume the other party does not mutate the input or panic."],
+                &[],
+            ),
+            statement(
+                "c1.c2.c1",
+                &["I provide no contract symbols of my own."],
+                &[],
+                &["I assume `state_tax_rate` takes `&str`."],
+            ),
+        ],
+        &BTreeMap::new(),
+    );
+    assert_eq!(
+        f,
+        vec![HandshakeFinding::Unanchored {
+            party: "c1.c1.c1".into(),
+            text: "I assume the other party does not mutate the input or panic.".into(),
+        }],
+        "the stated absence of symbols is set aside, the behavior claim is not"
+    );
+}
+
+/// A type is matched only among the provider's anchors: a provider that writes
+/// the expected type in its prose, about something else, still disagrees.
+#[test]
+fn a_type_named_only_in_the_providers_prose_still_disagrees() {
+    let ic = InterfaceContract {
+        symbols: vec!["double".into()],
+        ..tax_ic("i1", &["p", "q"])
+    };
+    let f = compare_handshake(
+        &ic,
+        &[
+            statement(
+                "p",
+                &[
+                    "I will provide `double`, which accepts and returns `i32`; i64 callers must cast.",
+                ],
+                &[],
+                &[],
+            ),
+            statement(
+                "q",
+                &[],
+                &["I assume `double` accepts and returns `i64`."],
+                &[],
+            ),
+        ],
+        &BTreeMap::new(),
+    );
+    assert!(
+        matches!(&f[..], [HandshakeFinding::Disagree { symbol, .. }] if symbol == "double"),
+        "{f:?}"
+    );
+}
+
+/// A use word governs only the symbol it stands before: a provision that uses
+/// another crate to implement the symbol still provides it, and a test writer's
+/// provision is still set aside.
+#[test]
+fn a_use_word_about_another_anchor_does_not_drop_a_provision() {
+    let ic = InterfaceContract {
+        symbols: vec!["run".into()],
+        ..tax_ic("i1", &["p", "q"])
+    };
+    let f = compare_handshake(
+        &ic,
+        &[
+            statement("p", &["Using `clap`, I implement `run`."], &[], &[]),
+            statement("q", &[], &["I assume `run` is provided."], &[]),
+        ],
+        &BTreeMap::new(),
+    );
+    assert!(f.is_empty(), "{f:?}");
+    let f = compare_handshake(
+        &ic,
+        &[
+            statement("p", &["I will provide `run`."], &[], &[]),
+            statement(
+                "q",
+                &["I will provide tests in `tests/run.rs` that call `run`."],
+                &[],
+                &[],
+            ),
+        ],
+        &BTreeMap::new(),
+    );
+    assert!(f.is_empty(), "{f:?}");
 }

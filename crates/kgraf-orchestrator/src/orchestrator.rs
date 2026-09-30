@@ -2865,11 +2865,13 @@ impl RunLoop {
     }
 
     /// Resolve slice names to graph nodes; an empty lookup is traced
-    /// and the slice is not given.
+    /// and the slice is not given. `from` is a file the contract writes: a
+    /// crate-relative name (`crate::X`) resolves in that file's crate.
     async fn resolve_slices(
         &mut self,
         contract: &str,
         names: &[String],
+        from: Option<String>,
     ) -> Result<(Vec<NodeId>, u64), OrchestratorError> {
         let graph = self.s.graph.clone();
         let names_owned = names.to_vec();
@@ -2879,10 +2881,16 @@ impl RunLoop {
             for name in &names_owned {
                 let node = match g.node(name)? {
                     Some(n) => Some(n),
-                    None => match g.resolve_symbol(name) {
+                    None => match g.resolve_symbol_from(name, from.as_deref()) {
                         Ok(found) => found.into_iter().next(),
-                        // An unknown symbol is an empty lookup, traced below.
-                        Err(kgraf_graph::GraphError::UnknownSymbol { .. }) => None,
+                        // An unknown symbol is an empty lookup, traced below;
+                        // so is a crate-relative name found in several crates
+                        // with none chosen by `from`: giving one of them would
+                        // be a guess.
+                        Err(
+                            kgraf_graph::GraphError::UnknownSymbol { .. }
+                            | kgraf_graph::GraphError::AmbiguousSymbol { .. },
+                        ) => None,
                         Err(e) => return Err(e.into()),
                     },
                 };
@@ -2985,7 +2993,10 @@ impl RunLoop {
         };
         let run = self.run_id();
         while let Some(item) = progress.stack.pop() {
-            let (nodes, slice_tokens) = self.resolve_slices(&item.id, &item.spec.slices).await?;
+            let from = item.spec.writes.first().map(|w| w.path.clone());
+            let (nodes, slice_tokens) = self
+                .resolve_slices(&item.id, &item.spec.slices, from)
+                .await?;
             let route = self.sizing_route(item.spec.route.as_deref());
             let base = self.base_tokens(route, &item.spec.instruction, slice_tokens);
             let projection =
@@ -5228,6 +5239,7 @@ impl RunLoop {
             sizing_miss: handed_back,
             calls: f.result.calls.iter().map(|c| c.to_string()).collect(),
             spend_micros: spend.micros(),
+            error: outcome_error(&f.result.outcome),
         })
         .await?;
         self.trace_spend().await?;
@@ -5329,21 +5341,10 @@ impl RunLoop {
         }
         match &f.result.outcome {
             WorkerOutcome::Completed => {
-                // Merge-back scope: a declared write outside the contract's set
-                // fails the attempt before any verifier sees it.
-                let outside: Vec<String> = f
-                    .result
-                    .changed_paths
-                    .iter()
-                    .filter(|p| {
-                        kgraf_runtime::forbidden_path(p)
-                            || !contract
-                                .writes
-                                .iter()
-                                .any(|w| kgraf_runtime::same_path(Path::new(&w.path), p))
-                    })
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .collect();
+                // Merge-back scope: a write outside the contract's set fails
+                // the attempt before any verifier sees it.
+                let outside =
+                    outside_declared_scope(&f.result.changed_paths, &contract.writes, &workspace);
                 if flight.lease_lost || !outside.is_empty() {
                     let reason = if flight.lease_lost {
                         "the attempt was withdrawn: a lease was lost, or its interface contract was superseded".to_owned()
@@ -6177,6 +6178,9 @@ impl RunLoop {
         // Decision 0084: what the verifier said about this round's refused
         // attempts, for the next fresh attempt's brief (`refusal_brief`).
         let refusal = last_refusal(&flight.attempts);
+        // Said in the held reason, so a contract held on workers that never
+        // ran (a provider refusing every request) names the refusal.
+        let worker_failure = last_worker_failure(&flight.attempts);
         let backoff = (self.config.tick.as_millis() as i64).max(1);
         let retry_now = self.now();
         if let Some(c) = self.record.contract_mut(&id) {
@@ -6221,7 +6225,15 @@ impl RunLoop {
                 }
             } else if failures > max_retries && !not_a_failure {
                 ContractStatus::Held {
-                    reason: format!("{failures} attempts failed verification or did not complete"),
+                    reason: match &worker_failure {
+                        Some(e) => format!(
+                            "{failures} attempts failed verification or did not complete; \
+                             the last worker failure: {e}"
+                        ),
+                        None => {
+                            format!("{failures} attempts failed verification or did not complete")
+                        }
+                    },
                 }
             } else if c.verifier_failures > MAX_ENVIRONMENT_RETRIES {
                 ContractStatus::Held {
@@ -7038,6 +7050,71 @@ fn kind_default() -> kgraf_core::model_profile::TaskKind {
     kgraf_core::model_profile::TaskKind::Implementation
 }
 
+/// The merge-back scope check: the changed paths an attempt may not write,
+/// in the order given. A forbidden path is refused even when declared.
+///
+/// A file the worker's own build or test run generated (decision 0084: a
+/// lockfile beside its manifest in `workspace`, Python bytecode) is not the
+/// worker's write. It passes on to the verifier, whose merge-back commit
+/// applies the same rule (`kgraf_sandbox::generated_kind`) with the one test
+/// this check cannot make, that the file is new against the base: the commit
+/// leaves a new one out and removes it before the acceptance check (which so
+/// never runs against the worker's lockfile), and a tracked lockfile the run
+/// changed fails the verifier's own scope check there.
+fn outside_declared_scope(
+    changed: &[PathBuf],
+    writes: &[WriteTarget],
+    workspace: &Path,
+) -> Vec<String> {
+    changed
+        .iter()
+        .filter(|p| {
+            if kgraf_runtime::forbidden_path(p) {
+                return true;
+            }
+            let declared = writes
+                .iter()
+                .any(|w| kgraf_runtime::same_path(Path::new(&w.path), p));
+            // No workspace known: no manifest is looked up relative to the
+            // process's own directory, so nothing is passed on as generated.
+            let present =
+                |m: &Path| !workspace.as_os_str().is_empty() && workspace.join(m).is_file();
+            !declared && kgraf_sandbox::generated_kind(p, present).is_none()
+        })
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect()
+}
+
+/// The longest failure text kept from one worker, in characters.
+const MAX_FAILURE_CHARS: usize = 600;
+
+/// Why a `failed` worker failed, scrubbed for storage (decision 0071) and
+/// capped at [`MAX_FAILURE_CHARS`]; `None` for any other outcome. A provider
+/// that refuses the request (an HTTP 400 for a tool schema it does not take)
+/// fails the worker in its first step with no usage, so without this text the
+/// trace and the run report would show only "failed".
+fn outcome_error(o: &WorkerOutcome) -> Option<String> {
+    let WorkerOutcome::Failed { error } = o else {
+        return None;
+    };
+    let scrubbed = kgraf_secrets::scrub_persist(error).into_owned();
+    Some(if scrubbed.chars().count() > MAX_FAILURE_CHARS {
+        let head: String = scrubbed.chars().take(MAX_FAILURE_CHARS).collect();
+        format!("{head}...")
+    } else {
+        scrubbed
+    })
+}
+
+/// The failure text of the round's last attempt that failed in the runtime
+/// (not in verification), for the held reason.
+fn last_worker_failure(attempts: &[Attempt]) -> Option<String> {
+    attempts
+        .iter()
+        .rev()
+        .find_map(|a| a.result.as_ref().and_then(|r| outcome_error(&r.outcome)))
+}
+
 fn outcome_name(o: &WorkerOutcome) -> &'static str {
     match o {
         WorkerOutcome::Completed => "completed",
@@ -7381,6 +7458,63 @@ fn completed_from(brief: &WorkerBrief, events: &[WorkerEvent]) -> WorkerResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Decision 0084: a lockfile the worker's own build created beside a
+    /// manifest is passed on to the verifier's commit (which leaves it out), for
+    /// every build tool the lockfile list covers; any other undeclared write,
+    /// and a lockfile with no manifest beside it, still fails the attempt.
+    #[test]
+    fn a_lockfile_the_workers_build_made_is_not_an_out_of_scope_write() {
+        let ws = tempfile::tempdir().expect("dir");
+        for manifest in ["Cargo.toml", "web/package.json", "py/pyproject.toml"] {
+            let p = ws.path().join(manifest);
+            std::fs::create_dir_all(p.parent().expect("parent")).expect("mkdir");
+            std::fs::write(p, "").expect("write");
+        }
+        let writes = [WriteTarget {
+            path: "src/lib.rs".into(),
+            node: None,
+        }];
+        let changed: Vec<PathBuf> = [
+            "src/lib.rs",
+            "Cargo.lock",
+            "web/package-lock.json",
+            "web/pnpm-lock.yaml",
+            "web/yarn.lock",
+            "py/uv.lock",
+            "py/poetry.lock",
+            "py/__pycache__/m.cpython-312.pyc",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+        assert_eq!(
+            outside_declared_scope(&changed, &writes, ws.path()),
+            Vec::<String>::new()
+        );
+        let stray: Vec<PathBuf> = ["src/other.rs", "docs/Cargo.lock", "web/uv.lock"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        assert_eq!(
+            outside_declared_scope(&stray, &writes, ws.path()),
+            vec![
+                "src/other.rs".to_owned(),
+                "docs/Cargo.lock".to_owned(),
+                "web/uv.lock".to_owned()
+            ]
+        );
+        // A forbidden path is refused even when it is declared.
+        let git = [PathBuf::from(".git/config")];
+        let declared_git = [WriteTarget {
+            path: ".git/config".into(),
+            node: None,
+        }];
+        assert_eq!(
+            outside_declared_scope(&git, &declared_git, ws.path()),
+            vec![".git/config".to_owned()]
+        );
+    }
 
     fn bare_flight(admission: Arc<Admission>) -> InFlight {
         InFlight {

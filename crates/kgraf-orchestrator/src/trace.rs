@@ -95,6 +95,12 @@ pub enum TraceEvent {
         sizing_miss: bool,
         calls: Vec<String>,
         spend_micros: i64,
+        /// Why a `failed` worker failed, as the runtime said it (a provider
+        /// refusal carries its HTTP status and body), scrubbed for storage.
+        /// Absent for any other outcome, and in a trace written before the
+        /// field existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
     /// Question 2.
     Compaction {

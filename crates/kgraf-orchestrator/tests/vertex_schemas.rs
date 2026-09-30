@@ -31,3 +31,27 @@ fn every_orchestrator_tool_schema_converts_for_vertex() {
         }
     }
 }
+
+/// Every node of every orchestrator tool schema states its `type`: Moonshot
+/// refuses a request whose tool has an untyped node (an `enum` with no `type`
+/// failed every worker call that offered `challenge_contract`), and the tool
+/// registry refuses such a built-in. Registering each real tool proves both.
+#[test]
+fn every_orchestrator_tool_schema_states_every_type() {
+    let mut tools = session_tools(&SessionLine::new());
+    tools
+        .push(std::sync::Arc::new(ChallengeTool::new(ContractLine::new()))
+            as std::sync::Arc<dyn Tool>);
+    let mut registry = kgraf_tools::ToolRegistry::new();
+    for tool in tools {
+        let name = tool.name().to_owned();
+        let untyped = kgraf_tools::untyped_schema_nodes(&tool.definition().input_schema);
+        assert!(
+            untyped.is_empty(),
+            "`{name}` has untyped nodes: {untyped:?}"
+        );
+        registry
+            .register_builtin(tool, kgraf_tools::Exposure::Prefix)
+            .unwrap_or_else(|e| panic!("`{name}` is refused: {e}"));
+    }
+}

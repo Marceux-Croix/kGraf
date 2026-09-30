@@ -541,10 +541,13 @@ pub fn parse_interfaces(text: &str) -> Result<Vec<InterfaceContract>, PlanError>
 
 /// Sanitize interface ids and party ids as [`sanitize_plan`] sanitizes
 /// contract ids, so a party names the contract it was written for. Two ids that
-/// become one are refused. Nothing else is judged here: a party the plan does
-/// not have is refused when the interface is registered, at the end of
-/// planning, and an incomplete artifact fails the artifact check before
-/// dispatch, naming the artifact (0037) and holding only its parties.
+/// become one are refused, and so is a compile or test command the check
+/// sandbox cannot run whatever the code
+/// ([`InterfaceContract::command_problems`]), so the planner is asked again.
+/// Nothing else is judged here: a party the plan does not have is refused when
+/// the interface is registered, at the end of planning, and an incomplete
+/// artifact fails the artifact check before dispatch, naming the artifact
+/// (0037) and holding only its parties.
 pub fn sanitize_interfaces(
     interfaces: Vec<InterfaceContract>,
 ) -> Result<Vec<InterfaceContract>, PlanError> {
@@ -560,6 +563,17 @@ pub fn sanitize_interfaces(
         }
         ic.id = id;
         ic.parties = ic.parties.iter().map(|p| sanitize_id(p)).collect();
+        // A command that cannot run in the check sandbox whatever the code is
+        // the planner's to correct: refused here, so it is asked again with
+        // the reason, rather than the interface failing its checks.
+        let problems = ic.command_problems();
+        if !problems.is_empty() {
+            return Err(PlanError::Invalid(format!(
+                "interface `{}`: {}",
+                ic.id,
+                problems.join("; ")
+            )));
+        }
         out.push(ic);
     }
     Ok(out)
@@ -857,9 +871,13 @@ file); \"consumer\" (optional files: what the consumers expect of the producer);
 (the contract's test files); \"replaces\" (optional: stub paths that already exist in \
 the repository; every other stub path must be a new file, and a stub path that exists and \
 is not listed here is refused before it is committed); \"compile\" (an argv that builds the consumer and test files \
-without running the tests); \"test\" (an argv that runs the tests). A file is \
+without running the tests); \"test\" (an argv that runs the tests). An argv is the program \
+and then each argument as its own string ([\"cargo\",\"test\",\"--no-run\"], never \
+[\"cargo test --no-run\"]). A file is \
 {\"path\":\"relative/path\",\"content\":\"...\"}. Commands run in the repository root with the \
-project's own toolchain. Keep every file minimal: the whole answer must fit the output \
+project's own toolchain, and may write only inside the repository: name no absolute path \
+(no -o /tmp/...), and prefer the project's build tool, which keeps its output in its own \
+build directory. Keep every file minimal: the whole answer must fit the output \
 limit, and an answer cut off there is refused. Give \"interfaces\":[] when no contract \
 consumes another's code. \
 The answer is then {\"contracts\":[...],\"interfaces\":[{\"id\":\"i1\",\"parties\":[\"c1\",\
@@ -2208,6 +2226,77 @@ mod tests {
         parsed.push(twin);
         let err = sanitize_interfaces(parsed).expect_err("collide");
         assert!(err.to_string().contains("both become `cfg-one`"), "{err}");
+    }
+
+    /// Commands the check sandbox cannot run whatever the code, as planners
+    /// wrote them: a whole command line as the program, and an output path
+    /// outside the check's tree. Refused as an invalid plan, which the
+    /// orchestrator asks again with the reason.
+    #[test]
+    fn a_command_line_as_the_program_and_an_absolute_output_are_refused() {
+        let parsed = parse_interfaces(&answer_with(ONE_INTERFACE)).expect("parses");
+        let with = |compile: &[&str]| {
+            let mut ic = parsed[0].clone();
+            ic.compile = compile.iter().map(|s| (*s).to_owned()).collect();
+            sanitize_interfaces(vec![ic])
+        };
+        let err = with(&["cargo build --package discount_flat"]).expect_err("whole line");
+        assert!(
+            matches!(err, PlanError::Invalid(_)) && err.reaskable(),
+            "{err}"
+        );
+        assert!(err.to_string().contains("whole command line"), "{err}");
+        for out in [
+            &[
+                "rustc",
+                "--test",
+                "t.rs",
+                "-o",
+                "/tmp/state-tax-rate-contract",
+            ][..],
+            &["rustc", "--test", "t.rs", "-o/tmp/x"][..],
+            &["cargo", "build", "--target-dir=/tmp/t"][..],
+        ] {
+            let err = with(out).expect_err("absolute output");
+            assert!(
+                err.to_string()
+                    .contains("names an output outside the repository"),
+                "{err}"
+            );
+        }
+        with(&["cargo", "test", "-p", "tax_us", "--no-run"]).expect("a plain argv passes");
+        with(&["rustc", "--test", "t.rs", "-o", "target/t"]).expect("a relative output passes");
+        with(&["cc", "-I/usr/include", "t.c"]).expect("an absolute read passes");
+        with(&["rustc", "--test", "t.rs", "-o", "/dev/null"]).expect("discarded output passes");
+        with(&["cc", "t.c", "-o/dev/null"]).expect("discarded output passes");
+        with(&["/opt/My Tools/cargo", "test", "--no-run"]).expect("a program path with a space");
+        for line in ["cargo test && echo ok", "cargo test | tee out", "make>log"] {
+            let err = with(&[line]).expect_err("a shell line");
+            assert!(err.to_string().contains("whole command line"), "{err}");
+        }
+    }
+
+    /// The command rules judge a new plan only. An interface persisted before
+    /// them is not invalidated when a run resumes: `validate`, which the check
+    /// runs first, still accepts it, and its check reports what the command did.
+    #[test]
+    fn a_persisted_interface_is_not_invalidated_by_the_command_rules() {
+        let parsed = parse_interfaces(&answer_with(ONE_INTERFACE)).expect("parses");
+        let mut ic = parsed[0].clone();
+        ic.compile = vec!["cargo build --package discount_flat".into()];
+        ic.test = vec!["rustc".into(), "-o".into(), "/tmp/t".into()];
+        assert_eq!(
+            ic.command_problems().len(),
+            2,
+            "{:?}",
+            ic.command_problems()
+        );
+        ic.validate().expect("a persisted interface stays valid");
+        ic.compile.clear();
+        let err = ic
+            .validate()
+            .expect_err("a missing command is still incomplete");
+        assert!(err.contains("no compile command"), "{err}");
     }
 
     #[test]

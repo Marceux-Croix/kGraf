@@ -64,7 +64,10 @@ use crate::error::WorkspaceError;
 use crate::git::{Git, parse_porcelain_z};
 use crate::workspace::{Workspace, WorkspaceManager};
 
-pub use generated::{Excluded, GeneratedKind, LOCKFILES, is_python_bytecode, lockfile_manifests};
+pub use generated::{
+    Excluded, GeneratedKind, LOCKFILES, generated_kind, is_python_bytecode, lockfile_manifests,
+    manifests_beside,
+};
 use parse::{
     GITLINK_MODE, MIN_GIT, SYMLINK_MODE, is_protected, new_collisions, parse_merge_tree_z,
     parse_raw_diff_z, parse_version,
@@ -429,49 +432,39 @@ impl MergeBack {
             .map(|c| c.path.as_str())
             .filter(|p| !in_scope(Path::new(p)))
             .collect();
-        let mut excluded = Vec::new();
-        let mut lock_candidates: Vec<(&str, Vec<String>)> = Vec::new();
-        for path in new_outside {
-            let p = Path::new(path);
-            if is_python_bytecode(p) {
-                excluded.push(Excluded {
-                    path: PathBuf::from(path),
-                    kind: GeneratedKind::PythonBytecode,
-                });
-            } else if let Some(manifests) = lockfile_manifests(p) {
-                let dir = path.rsplit_once('/').map(|(d, _)| d);
-                let beside = manifests
-                    .iter()
-                    .map(|m| match dir {
-                        Some(d) => format!("{d}/{m}"),
-                        None => (*m).to_owned(),
-                    })
-                    .collect();
-                lock_candidates.push((path, beside));
-            }
-        }
-        if !lock_candidates.is_empty() {
+        // The manifests beside every lockfile-named path, looked up in the
+        // index with one `ls-files`; the rule itself is `generated_kind`.
+        let beside: Vec<String> = new_outside
+            .iter()
+            .flat_map(|p| manifests_beside(Path::new(p)))
+            .map(|m| m.to_string_lossy().into_owned())
+            .collect();
+        let listed = if beside.is_empty() {
+            Vec::new()
+        } else {
             let mut args: Vec<String> = ["ls-files", "-z", "--cached", "--"]
                 .iter()
                 .map(|a| (*a).to_owned())
                 .collect();
-            for (_, beside) in &lock_candidates {
-                args.extend(beside.iter().map(|m| format!(":(literal){m}")));
-            }
-            let listed = self.git.ok_bytes(wt, &[], &args, None)?;
-            let present: HashSet<&[u8]> = listed
-                .split(|b| *b == 0)
-                .filter(|p| !p.is_empty())
-                .collect();
-            for (path, beside) in lock_candidates {
-                if beside.iter().any(|m| present.contains(m.as_bytes())) {
-                    excluded.push(Excluded {
-                        path: PathBuf::from(path),
-                        kind: GeneratedKind::Lockfile,
-                    });
-                }
-            }
-        }
+            args.extend(beside.iter().map(|m| format!(":(literal){m}")));
+            self.git.ok_bytes(wt, &[], &args, None)?
+        };
+        let present: HashSet<&[u8]> = listed
+            .split(|b| *b == 0)
+            .filter(|p| !p.is_empty())
+            .collect();
+        let mut excluded: Vec<Excluded> = new_outside
+            .into_iter()
+            .filter_map(|path| {
+                generated_kind(Path::new(path), |m| {
+                    present.contains(m.to_string_lossy().as_bytes())
+                })
+                .map(|kind| Excluded {
+                    path: PathBuf::from(path),
+                    kind,
+                })
+            })
+            .collect();
         excluded.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(excluded)
     }
@@ -819,20 +812,17 @@ impl MergeBack {
         Ok(())
     }
 
-    /// Remove the Python bytecode [`MergeBack::commit_retaining`] left out of
-    /// the commit, before a check runs: the check then imports from the sources
-    /// that were committed, never from bytecode the worker's run compiled. A
-    /// lockfile left out stays for the check (a build would regenerate it) and
-    /// goes with the check's leftovers.
-    pub fn remove_excluded_bytecode(&self, attempt: &Attempt) -> Result<(), MergeError> {
-        let bytecode: Vec<PathBuf> = attempt
-            .excluded
-            .iter()
-            .filter(|e| e.kind == GeneratedKind::PythonBytecode)
-            .map(|e| e.path.clone())
-            .collect();
+    /// Remove every file [`MergeBack::commit_retaining`] left out of the
+    /// commit, before a check runs, so the check runs against the committed
+    /// tree only: Python bytecode, so it imports from the committed sources;
+    /// and a lockfile, so it never resolves dependencies to the versions,
+    /// `git` sources or registry URLs the worker's run chose, which are not
+    /// merged. A build the check runs generates its own lockfile, which goes
+    /// with the check's leftovers.
+    pub fn remove_excluded(&self, attempt: &Attempt) -> Result<(), MergeError> {
+        let excluded: Vec<PathBuf> = attempt.excluded.iter().map(|e| e.path.clone()).collect();
         Self::worktree_admin(&attempt.workspace)?;
-        self.remove_confined(attempt, &bytecode)
+        self.remove_confined(attempt, &excluded)
     }
 
     /// Put the worktree back to the snapshot [`MergeBack::commit_retaining`]

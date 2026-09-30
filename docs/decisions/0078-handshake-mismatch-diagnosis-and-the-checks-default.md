@@ -52,3 +52,46 @@ work.
 - **Flip the default on immediately, since the comparator now behaves correctly.** Rejected:
   a correct comparator is necessary but not sufficient; a separate limit elsewhere in the
   pipeline, and the lack of any full passing live run, are both still open.
+
+## Amendments (2026-09-30)
+
+Orchestrated runs held on handshake findings the parties' words did not support. Each case is
+now a test, each with a companion that proves a real disagreement still fails.
+
+- **The interface's own label is set aside**, like party ids. The bare id is set aside too,
+  unless it is also a surface symbol's name.
+- **Claims are the anchors written after the subject.** An anchor before the symbol a
+  sentence is about describes the party's own code, not the symbol. Known blind spot: an
+  off-surface type written before the symbol is not compared.
+- **A one-word claim written in the provision's prose matches**: a provider that writes "for
+  input CA" states the `CA` an expecter backticks. Case-sensitive, whole words, prose only; a
+  type or a signature must still be among the provider's anchors.
+- **A provision about a symbol is not a provision of it.** When the prose before the symbol
+  names a test or a use of it ("integration tests for `x`", "the call sites that invoke `x`"),
+  the party is not counted as a second provider. "An implementation of `x`" still provides
+  `x`. Known blind spot: "a wrapper that calls `x`" is read as not providing `x`.
+- **A negated sentence with no anchor states an absence** ("I assume the other party provides
+  nothing I need") and is not reported as unanchored. A positive unanchored sentence still
+  is.
+
+## Amendments (2026-09-30, corrections to the amendment above)
+
+Each relaxation above was probed with a true disagreement. Three hid one, and one dropped a
+real provision. Each probe is now a test; every case above still passes. These bullets
+supersede the matching bullets above.
+
+- **Claims are the anchors on either side of the subject, except those before it in an
+  earlier clause.** "I assume `i32` is what `double` accepts and returns" claims `i32` of
+  `double`. A clause ends at `;`, at a sentence end, or at a comma followed by a joiner (and,
+  but, or, while, which, and similar); a plain comma separates a list. The blind spot above
+  narrows to an anchor in an earlier clause.
+- **A one-word claim matches the provider's prose only when it is not a type.** A primitive
+  (`i64`, `u8`, `f32`, `int32`, `str`, `bool`) or a CamelCase name must be among the
+  provider's anchors. State codes (`CA`, `OR`) still match.
+- **A use word counts only when it governs the symbol**: it is the last word of the clause
+  before the symbol, skipping articles and prepositions ("tests for `x`"). "Using `clap`, I
+  implement `run`" provides `run`.
+- **Only a stated absence of symbols is set aside**, not every negated sentence with no
+  anchor: negated, with a verb of providing or needing and the noun symbol or item ("I
+  provide no contract symbols of my own"). "I assume the other party does not mutate the
+  input or panic" is `unanchored`.

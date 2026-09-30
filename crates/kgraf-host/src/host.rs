@@ -962,6 +962,23 @@ impl Host {
         check_routes(&self.route_set(), &self.in_process, None)
     }
 
+    /// Every local route of the host (the planner, the workers and the
+    /// non-generative model routes) accepts a connection now
+    /// ([`check_reachable`]). Called at the start of every [`Host::build`].
+    pub fn check_reachable(&self) -> Result<(), NotReady> {
+        let mut routes = self.route_set();
+        let specs = self
+            .config
+            .model_route_specs()
+            .map_err(|e| NotReady::Invalid(e.to_string()))?;
+        routes.extend(specs.into_iter().map(|s| s.route));
+        check_reachable(
+            &routes,
+            &|r| self.in_process.contains_key(r),
+            REACHABLE_TIMEOUT,
+        )
+    }
+
     /// The credential of each route of the set, from the environment: the one
     /// readiness fact that can differ between runs of a configured host (a key
     /// removed from the shell), so the per-schedule check.
@@ -1282,6 +1299,10 @@ impl Host {
         run: RunId,
         notices: &mut (dyn FnMut(Notice) + Send),
     ) -> Result<BuildBase> {
+        // A local route whose server is not running fails the run here, before
+        // a branch, a worktree or a model call (fail loud), instead of failing
+        // every attempt and orchestrator call routed to it.
+        self.check_reachable()?;
         let _claim = BaseBuildClaim::take(&self.base_builds, run.as_str())?;
         let root = self.config.root.as_path();
         let manager = &startup.manager;
@@ -2066,6 +2087,162 @@ pub(crate) fn check_model_routes(
     Ok(())
 }
 
+/// How long a local endpoint has to accept a connection at run start. A
+/// server on this machine answers a connect in milliseconds; a refused one
+/// answers at once. The bound only covers a host that drops the packets.
+/// Every endpoint and address is dialed at once ([`probe_endpoints`]), so it
+/// also bounds the whole check.
+const REACHABLE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// The `host:port` of an `http://` or `https://` base URL, the scheme's
+/// default port when none is given; `None` for anything else.
+fn endpoint_of(base_url: &str) -> Option<(String, u16)> {
+    let (rest, default) = if let Some(r) = base_url.strip_prefix("http://") {
+        (r, 80)
+    } else if let Some(r) = base_url.strip_prefix("https://") {
+        (r, 443)
+    } else {
+        return None;
+    };
+    let authority = rest.split('/').next().unwrap_or(rest);
+    if authority.is_empty() {
+        return None;
+    }
+    // `[::1]:11434`, `localhost:11434`, `localhost`.
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) if !p.contains(']') => (h, p.parse().ok()?),
+        _ => (authority, default),
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    Some((host.to_owned(), port))
+}
+
+/// Dial one address within a timeout. A plain function, so a probe thread can
+/// outlive the caller that stopped waiting for it.
+type Connect = fn(&std::net::SocketAddr, Duration) -> std::io::Result<()>;
+
+/// The real dial: a TCP connect, closed at once.
+fn tcp_connect(addr: &std::net::SocketAddr, timeout: Duration) -> std::io::Result<()> {
+    std::net::TcpStream::connect_timeout(addr, timeout).map(drop)
+}
+
+/// Whether some address of `host:port` accepts a TCP connection within
+/// `timeout`. Every resolved address is dialed at once (`localhost` names both
+/// `::1` and `127.0.0.1`, and a server may listen on only one), so the answer
+/// takes one connect time, not one per address; the first address that
+/// accepts answers, and the other dials end on their own within `timeout`.
+fn accepts_connection(
+    host: &str,
+    port: u16,
+    timeout: Duration,
+    connect: Connect,
+) -> Result<(), String> {
+    use std::net::ToSocketAddrs;
+    let addrs: Vec<std::net::SocketAddr> = (host, port)
+        .to_socket_addrs()
+        .map_err(|e| format!("cannot resolve `{host}`: {e}"))?
+        .collect();
+    if addrs.is_empty() {
+        return Err(format!("`{host}` resolves to no address"));
+    }
+    let dials = addrs.len();
+    let (tx, rx) = std::sync::mpsc::channel();
+    for addr in addrs {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            // The receiver is gone once an address answered: nothing to tell.
+            let _ = tx.send(connect(&addr, timeout).map_err(|e| format!("{addr}: {e}")));
+        });
+    }
+    drop(tx);
+    let mut last = None;
+    for outcome in rx.iter().take(dials) {
+        match outcome {
+            Ok(()) => return Ok(()),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| format!("no dial of `{host}` reported")))
+}
+
+/// Dial every `(route, base URL)` of `endpoints` at once and report the first
+/// one, in the given order, that accepts no connection. The whole check takes
+/// about one `timeout` whatever the number of local routes.
+fn probe_endpoints(
+    endpoints: &[(String, String)],
+    timeout: Duration,
+    connect: Connect,
+) -> Result<(), NotReady> {
+    let outcomes: Vec<Result<(), String>> = std::thread::scope(|s| {
+        let probes: Vec<_> = endpoints
+            .iter()
+            .map(|(_, url)| {
+                s.spawn(move || {
+                    let (host, port) = endpoint_of(url)
+                        .ok_or_else(|| "the base URL names no http endpoint".to_owned())?;
+                    accepts_connection(&host, port, timeout, connect)
+                })
+            })
+            .collect();
+        probes
+            .into_iter()
+            .map(|p| {
+                p.join()
+                    .unwrap_or_else(|_| Err("the connection probe panicked".to_owned()))
+            })
+            .collect()
+    });
+    for ((route, url), outcome) in endpoints.iter().zip(outcomes) {
+        outcome.map_err(|detail| NotReady::Unreachable {
+            route: route.clone(),
+            endpoint: url.clone(),
+            detail,
+        })?;
+    }
+    Ok(())
+}
+
+/// Every local route of `routes` (a catalog entry that takes no credential:
+/// Ollama, llama.cpp, vLLM, LM Studio) accepts a connection at its endpoint.
+/// A hosted route is not checked: its reachability is its vendor's, and its
+/// first call says so. In-process routes have no endpoint.
+///
+/// Run at the start of a build so a local server that is not running fails
+/// the run before any branch, worktree or model call, instead of failing each
+/// attempt and each orchestrator call routed there.
+pub(crate) fn check_reachable(
+    routes: &[RouteSpec],
+    in_process: &dyn Fn(&str) -> bool,
+    timeout: Duration,
+) -> Result<(), NotReady> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut endpoints = Vec::new();
+    for r in routes {
+        if in_process(&r.route) || !seen.insert(r.route.clone()) {
+            continue;
+        }
+        let Ok(entry) = kgraf_fleet::entry(&r.route) else {
+            // An unknown route is `check_routes`' finding, not this one's.
+            continue;
+        };
+        if entry.requires_credential {
+            continue;
+        }
+        endpoints.push((r.route.clone(), entry.base_url.to_owned()));
+    }
+    probe_endpoints(&endpoints, timeout, tcp_connect)
+}
+
+/// [`check_reachable`] for one route's base URL.
+#[cfg(test)]
+fn check_endpoint(route: &str, base_url: &str, timeout: Duration) -> Result<(), NotReady> {
+    probe_endpoints(
+        &[(route.to_owned(), base_url.to_owned())],
+        timeout,
+        tcp_connect,
+    )
+}
+
 /// What [`Host::build_base`] made, for [`Host::finish_build`].
 pub(crate) struct BuildBase {
     run: RunId,
@@ -2662,6 +2839,120 @@ impl Drop for BaseBuildClaim {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(&self.run);
+    }
+}
+
+#[cfg(test)]
+mod reachable_tests {
+    use super::*;
+
+    #[test]
+    fn an_endpoint_is_read_from_its_base_url() {
+        assert_eq!(
+            endpoint_of("http://localhost:11434/v1"),
+            Some(("localhost".to_owned(), 11434))
+        );
+        assert_eq!(
+            endpoint_of("https://api.example.com/v1"),
+            Some(("api.example.com".to_owned(), 443))
+        );
+        assert_eq!(
+            endpoint_of("http://[::1]:8080"),
+            Some(("::1".to_owned(), 8080))
+        );
+        assert_eq!(endpoint_of("unix:///tmp/s"), None);
+        assert_eq!(endpoint_of("http://"), None);
+    }
+
+    /// A port nobody listens on fails loud, naming the route and the
+    /// endpoint; a listening one passes.
+    #[test]
+    fn a_closed_local_endpoint_is_unreachable_and_a_listening_one_is_not() {
+        let listening = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let open = listening.local_addr().expect("addr").port();
+        let closed = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            l.local_addr().expect("addr").port()
+        };
+        let timeout = Duration::from_secs(2);
+        assert_eq!(
+            check_endpoint("local", &format!("http://127.0.0.1:{open}/v1"), timeout),
+            Ok(())
+        );
+        let err = check_endpoint("local", &format!("http://127.0.0.1:{closed}/v1"), timeout)
+            .expect_err("nothing listens");
+        match &err {
+            NotReady::Unreachable {
+                route, endpoint, ..
+            } => {
+                assert_eq!(route, "local");
+                assert_eq!(endpoint, &format!("http://127.0.0.1:{closed}/v1"));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(err.to_string().contains("start its server"), "{err}");
+    }
+
+    /// A connect that takes 300 ms and fails, for every address.
+    fn slow_refusal(_: &std::net::SocketAddr, _: Duration) -> std::io::Result<()> {
+        std::thread::sleep(Duration::from_millis(300));
+        Err(std::io::ErrorKind::ConnectionRefused.into())
+    }
+
+    /// Every endpoint (and every address of one) is dialed at once: six local
+    /// routes whose connects each take 300 ms are judged in about one connect
+    /// time, not six, and the error names the first route in the given order.
+    #[test]
+    fn local_endpoints_are_probed_concurrently() {
+        let endpoints: Vec<(String, String)> = (0..6)
+            .map(|i| {
+                (
+                    format!("local{i}"),
+                    format!("http://127.0.0.1:{}/v1", 40_000 + i),
+                )
+            })
+            .collect();
+        let started = std::time::Instant::now();
+        let err = probe_endpoints(&endpoints, Duration::from_secs(3), slow_refusal)
+            .expect_err("every connect fails");
+        let took = started.elapsed();
+        assert!(
+            took < Duration::from_millis(1_200),
+            "probed one after another: {took:?}"
+        );
+        match err {
+            NotReady::Unreachable { route, .. } => assert_eq!(route, "local0"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Only a local catalog route is checked: a hosted route (its vendor's
+    /// reachability) and an in-process route (no endpoint) are not.
+    #[test]
+    fn hosted_and_in_process_routes_are_not_dialed() {
+        let spec = |route: &str| RouteSpec {
+            route: route.to_owned(),
+            model: "m".to_owned(),
+        };
+        // A hosted route is never dialed, so no network is touched.
+        assert_eq!(
+            check_reachable(
+                &[spec("kimi"), spec("openai")],
+                &|_| false,
+                Duration::from_millis(1)
+            ),
+            Ok(())
+        );
+        let entry = kgraf_fleet::entry("ollama").expect("ollama");
+        assert!(!entry.requires_credential, "ollama is a local route");
+        assert_eq!(
+            check_reachable(
+                &[spec("ollama")],
+                &|r| r == "ollama",
+                Duration::from_millis(1)
+            ),
+            Ok(())
+        );
     }
 }
 

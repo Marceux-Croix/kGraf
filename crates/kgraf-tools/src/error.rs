@@ -98,6 +98,12 @@ pub enum RegistryError {
     /// The tool's definition names something other than the tool itself.
     #[error("tool `{tool}` returned a definition named `{definition}`")]
     DefinitionMismatch { tool: String, definition: String },
+
+    /// A built-in tool's input schema has a node with no `type`, which strict
+    /// vendor validators refuse for every request offering the tool
+    /// (`untyped_schema_nodes`).
+    #[error("built-in tool `{tool}` has schema nodes with no `type`: {paths:?}")]
+    UntypedSchema { tool: String, paths: Vec<String> },
 }
 
 /// A declared path cannot be compared safely.

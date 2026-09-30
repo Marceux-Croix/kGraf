@@ -236,6 +236,11 @@ discovered only when a document contains it whole; a proposed command
 becomes a gate only when the user accepts it by name. Doneness is derived
 from code and recorded test passes, never from a document's claim alone.
 
+The brief ranks documents by how many others name them, depth and planning words. The first
+six sections of each planning document at the repository root (`ROADMAP.md`, `CLAUDE.md`,
+`README.md`) are taken before all others, however many other documents exist. Nested copies
+rank as ordinary documents.
+
 **Presumed work nodes (decision 0064).** Before any plan is approved, the
 project's own roadmap document is read into the graph as **presumed** work
 nodes, so a fresh or half-built project shows what is done, in flight, and
@@ -834,7 +839,8 @@ symbolic links, relative to its parent's own descriptor, so a background
 process that swaps a folder for a symbolic link cannot steer the removal
 outside the worktree; on Windows that removal refuses rather than risk it. A
 lockfile the worker generated, and cache directories, are left out of the
-commit, with a notice. A check that changes committed files fails
+commit, with a notice, and removed before the check, so the check runs
+against the committed tree only. A check that changes committed files fails
 verification.
 
 A descendant process that calls its own session-detach call escapes the

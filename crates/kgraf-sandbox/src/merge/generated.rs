@@ -41,6 +41,46 @@ pub fn lockfile_manifests(path: &Path) -> Option<&'static [&'static str]> {
         .map(|(_, manifests)| *manifests)
 }
 
+/// The manifests a lockfile at `path` would belong to, as paths in the same
+/// folder, or empty when the name is no lockfile's. Joined with `/`, the
+/// separator of a repository path on every platform (git's index uses it).
+pub fn manifests_beside(path: &Path) -> Vec<PathBuf> {
+    let Some(manifests) = lockfile_manifests(path) else {
+        return Vec::new();
+    };
+    let text = path.to_string_lossy();
+    let dir = text.rsplit_once(['/', '\\']).map(|(d, _)| d);
+    manifests
+        .iter()
+        .map(|m| match dir {
+            Some(d) => PathBuf::from(format!("{d}/{m}")),
+            None => PathBuf::from(m),
+        })
+        .collect()
+}
+
+/// What a build or test run generated, if `path` is such a file: Python
+/// bytecode, or a lockfile with one of its manifests beside it
+/// (`manifest_present` answers for a path from [`manifests_beside`]).
+///
+/// The one rule for a worker-made file, applied in two places so they cannot
+/// disagree: merge-back leaves such a file out of an attempt's commit
+/// ([`super::MergeBack::commit_retaining`], which also requires the file to be
+/// new against the base), and the orchestrator's scope check, which runs first,
+/// passes it on to that commit instead of failing the attempt for it.
+pub fn generated_kind(
+    path: &Path,
+    manifest_present: impl Fn(&Path) -> bool,
+) -> Option<GeneratedKind> {
+    if is_python_bytecode(path) {
+        return Some(GeneratedKind::PythonBytecode);
+    }
+    manifests_beside(path)
+        .iter()
+        .any(|m| manifest_present(m))
+        .then_some(GeneratedKind::Lockfile)
+}
+
 /// `**/__pycache__/*.pyc` or `**/__pycache__/*.pyo`.
 pub fn is_python_bytecode(path: &Path) -> bool {
     let in_cache = path
@@ -84,5 +124,41 @@ mod tests {
         assert!(!is_python_bytecode(Path::new("pkg/m.pyc")));
         assert!(!is_python_bytecode(Path::new("__pycache__/deep/m.pyc")));
         assert!(!is_python_bytecode(Path::new("__pycache__/m.py")));
+    }
+
+    #[test]
+    fn a_lockfile_is_generated_only_beside_one_of_its_manifests() {
+        let present = ["Cargo.toml", "web/package.json", "py/pyproject.toml"];
+        let has = |m: &Path| present.iter().any(|p| Path::new(p) == m);
+        for lock in [
+            "Cargo.lock",
+            "web/package-lock.json",
+            "web/pnpm-lock.yaml",
+            "web/yarn.lock",
+            "py/uv.lock",
+            "py/poetry.lock",
+        ] {
+            assert_eq!(
+                generated_kind(Path::new(lock), has),
+                Some(GeneratedKind::Lockfile),
+                "{lock}"
+            );
+        }
+        for stray in [
+            "docs/Cargo.lock",
+            "web/uv.lock",
+            "py/yarn.lock",
+            "src/lib.rs",
+        ] {
+            assert_eq!(generated_kind(Path::new(stray), has), None, "{stray}");
+        }
+        assert_eq!(
+            generated_kind(Path::new("a/__pycache__/m.pyc"), has),
+            Some(GeneratedKind::PythonBytecode)
+        );
+        assert_eq!(
+            manifests_beside(Path::new("a/b/Gemfile.lock")),
+            vec![PathBuf::from("a/b/Gemfile"), PathBuf::from("a/b/gems.rb")]
+        );
     }
 }

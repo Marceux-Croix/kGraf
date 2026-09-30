@@ -19,6 +19,7 @@ use crate::error::{GraphError, Result};
 use crate::lang::Language;
 use crate::layout::{self, Position};
 use rusqlite::{Connection, OptionalExtension, params};
+use std::collections::BTreeSet;
 use std::path::Path;
 
 /// The schema version this build writes. A version bump rebuilds the *derived* tables
@@ -1024,8 +1025,132 @@ impl GraphStore {
     /// preference, and returns every candidate rather than guessing: two files
     /// may legitimately define `parse`, and silently picking one would be the
     /// silent-degradation failure the fail-loud rule forbids.
+    ///
+    /// A path the graph does not store verbatim is then read as the spellings
+    /// a model writes: Rust `::` paths (`TaxUs::tax_cents`), a crate or module
+    /// prefix (`iface::Discount`, `config.parse_config`), and a leading
+    /// `crate::`, `self::` or `super::`. The graph qualifies a method with a dot
+    /// and never prefixes the crate, so the path is matched by its longest tail
+    /// the graph holds, and every segment before that tail must name a
+    /// directory or the file stem of the defining file's path. A prefix that
+    /// names no part of that path matches nothing: handing back a same-named
+    /// symbol from another crate would be a silent guess.
+    ///
+    /// A crate-relative path (`crate::X`) names no crate here, so it returns
+    /// every crate's `X`, as the bare name does; a caller that must pick one
+    /// uses [`GraphStore::resolve_symbol_from`] with the requesting file.
     pub fn resolve_symbol(&self, name: &str) -> Result<Vec<NodeRecord>> {
-        let mut stmt = self.conn.prepare(
+        self.resolve_path(name, |_| true)
+    }
+
+    /// [`GraphStore::resolve_symbol`] for a lookup made from `from`, a file of
+    /// the graph (the file the name was written in or for). A crate-relative
+    /// path (`crate::X`, `self::X`, `super::X`) keeps only the candidates in
+    /// `from`'s crate: the nearest folder above each file that holds a
+    /// `Cargo.toml`. With no `from`, or a `from` in no crate, candidates in
+    /// more than one crate are refused as
+    /// [`GraphError::AmbiguousSymbol`](crate::GraphError::AmbiguousSymbol),
+    /// which lists them, rather than handed back as if the path had chosen
+    /// one. Any other name resolves as in [`GraphStore::resolve_symbol`].
+    pub fn resolve_symbol_from(&self, name: &str, from: Option<&str>) -> Result<Vec<NodeRecord>> {
+        let crate_relative = name
+            .split("::")
+            .next()
+            .is_some_and(|s| matches!(s.trim(), "crate" | "self" | "super"));
+        if !crate_relative {
+            return self.resolve_symbol(name);
+        }
+        match from.and_then(|f| self.crate_dir(f)) {
+            Some(own) => {
+                self.resolve_path(name, |n| self.crate_dir(&n.path).as_ref() == Some(&own))
+            }
+            None => {
+                let found = self.resolve_symbol(name)?;
+                let crates: BTreeSet<Option<String>> =
+                    found.iter().map(|n| self.crate_dir(&n.path)).collect();
+                if crates.len() > 1 {
+                    return Err(GraphError::AmbiguousSymbol {
+                        name: name.to_owned(),
+                        candidates: found
+                            .iter()
+                            .map(|n| format!("{} ({}:{})", n.qualified_name, n.path, n.start_line))
+                            .collect(),
+                    });
+                }
+                Ok(found)
+            }
+        }
+    }
+
+    /// The folder (relative to the root, `""` for the root itself) of the
+    /// crate a graph file belongs to: the nearest ancestor folder holding a
+    /// `Cargo.toml` on disk, or `None` when no folder up to the root does.
+    fn crate_dir(&self, path: &str) -> Option<String> {
+        let mut dir = Path::new(path).parent();
+        while let Some(d) = dir {
+            if self.root.join(d).join("Cargo.toml").is_file() {
+                return Some(d.to_string_lossy().replace('\\', "/"));
+            }
+            dir = d.parent();
+        }
+        None
+    }
+
+    /// The lookup behind [`GraphStore::resolve_symbol`], keeping only the
+    /// candidates `keep` accepts at every step, so a restriction chooses
+    /// among same-named symbols before a shorter tail is tried.
+    fn resolve_path(
+        &self,
+        name: &str,
+        keep: impl Fn(&NodeRecord) -> bool,
+    ) -> Result<Vec<NodeRecord>> {
+        let found: Vec<NodeRecord> = self
+            .symbols_named(name)?
+            .into_iter()
+            .filter(&keep)
+            .collect();
+        if !found.is_empty() {
+            return Ok(found);
+        }
+        let segments: Vec<&str> = name
+            .split("::")
+            .flat_map(|s| s.split('.'))
+            .map(str::trim)
+            .collect();
+        let skip = segments
+            .iter()
+            .take_while(|s| matches!(**s, "crate" | "self" | "super"))
+            .count();
+        let segments = &segments[skip..];
+        if segments.is_empty() || segments.iter().any(|s| s.is_empty()) {
+            return Err(GraphError::UnknownSymbol {
+                name: name.to_owned(),
+            });
+        }
+        for split in 0..segments.len() {
+            let (prefix, tail) = segments.split_at(split);
+            let tail = tail.join(".");
+            if tail == name {
+                continue;
+            }
+            let found: Vec<NodeRecord> = self
+                .symbols_named(&tail)?
+                .into_iter()
+                .filter(|n| prefix.iter().all(|m| path_names_module(&n.path, m)) && keep(n))
+                .collect();
+            if !found.is_empty() {
+                return Ok(found);
+            }
+        }
+        Err(GraphError::UnknownSymbol {
+            name: name.to_owned(),
+        })
+    }
+
+    /// Nodes whose qualified name or bare name is exactly `name`, the exact
+    /// qualified matches first.
+    fn symbols_named(&self, name: &str) -> Result<Vec<NodeRecord>> {
+        let mut stmt = self.conn.prepare_cached(
             "SELECT n.id, n.file_id, f.path, n.kind, n.name, n.qualified_name, n.parent_id,
                     n.start_line, n.end_line, n.start_byte, n.end_byte, n.signature,
                     n.identity_stable
@@ -1034,13 +1159,7 @@ impl GraphStore {
              ORDER BY (n.qualified_name = ?1) DESC, f.path, n.start_line",
         )?;
         let rows = stmt.query_map(params![name], node_from_row)?;
-        let found = rows.collect::<rusqlite::Result<Vec<_>>>()?;
-        if found.is_empty() {
-            return Err(GraphError::UnknownSymbol {
-                name: name.to_owned(),
-            });
-        }
-        Ok(found)
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     /// The one-hop neighborhood of a node: everything an edge connects it to, in
@@ -1247,6 +1366,20 @@ fn file_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileRecord> {
         language: language.as_deref().and_then(Language::parse),
         line_count: row.get(6)?,
     })
+}
+
+/// Whether `module` (a crate or module name from a symbol path) names a
+/// directory of `path` or its file stem. A crate `tax_us` lives in `tax_us/` or
+/// `tax-us/`, so `-` and `_` compare equal.
+fn path_names_module(path: &str, module: &str) -> bool {
+    let norm = |s: &str| s.replace('-', "_");
+    let module = norm(module);
+    let mut parts: Vec<&str> = path.split('/').collect();
+    if let Some(file) = parts.pop() {
+        let stem = file.rsplit_once('.').map_or(file, |(stem, _)| stem);
+        parts.push(stem);
+    }
+    parts.iter().any(|p| norm(p) == module)
 }
 
 fn node_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeRecord> {

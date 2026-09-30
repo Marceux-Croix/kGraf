@@ -101,6 +101,17 @@ impl ToolRegistry {
         exposure: Exposure,
     ) -> Result<QualifiedName, RegistryError> {
         let name = QualifiedName::builtin(tool.name())?;
+        // Built-in schemas are this project's own, so an untyped node is a
+        // defect here, refused before any request carries it. An MCP server's
+        // schema is its author's and is registered as given; a vendor that
+        // refuses it fails the call with its reason.
+        let untyped = crate::untyped_schema_nodes(&tool.definition().input_schema);
+        if !untyped.is_empty() {
+            return Err(RegistryError::UntypedSchema {
+                tool: tool.name().to_owned(),
+                paths: untyped,
+            });
+        }
         self.insert(name, tool, exposure)
     }
 
@@ -517,6 +528,55 @@ mod tests {
             .expect_err("mismatch");
         assert!(matches!(err, RegistryError::DefinitionMismatch { .. }));
         assert!(reg.is_empty());
+    }
+
+    /// A tool whose schema has an `enum` with no `type`.
+    struct Untyped;
+
+    #[async_trait::async_trait]
+    impl Tool for Untyped {
+        fn name(&self) -> &str {
+            "untyped"
+        }
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "untyped".into(),
+                description: String::new(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {"kind": {"enum": ["a", "b"]}}
+                }),
+            }
+        }
+        fn access(&self, _input: &Value) -> Result<Access, ToolError> {
+            Ok(Access::none())
+        }
+        async fn call(
+            &self,
+            _input: Value,
+            _ctx: &ToolContext,
+            _permit: &CallPermit,
+        ) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::text(""))
+        }
+    }
+
+    #[test]
+    fn a_builtin_with_an_untyped_schema_node_is_refused_an_mcp_tool_is_not() {
+        let mut reg = ToolRegistry::new();
+        let err = reg
+            .register_builtin(Arc::new(Untyped), P)
+            .expect_err("untyped");
+        match err {
+            RegistryError::UntypedSchema { tool, paths } => {
+                assert_eq!(tool, "untyped");
+                assert_eq!(paths, vec!["properties.kind".to_owned()]);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(reg.is_empty());
+        reg.register_mcp("s", Arc::new(Untyped), P)
+            .expect("an MCP schema is its server's");
     }
 
     #[test]

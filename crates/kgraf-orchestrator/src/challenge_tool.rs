@@ -124,7 +124,7 @@ impl Tool for ChallengeTool {
                     "evidence": {
                         "type": "object",
                         "properties": {
-                            "kind": {"enum": ["not_consulted", "recompute", "quote", "none"]},
+                            "kind": {"type": "string", "enum": ["not_consulted", "recompute", "quote", "none"]},
                             "item": {"type": "string"},
                             "artifact": {"type": "string"},
                             "text": {"type": "string"}

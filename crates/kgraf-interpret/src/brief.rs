@@ -129,6 +129,16 @@ const PLANNING_WORDS: &[&str] = &[
     "contributing",
 ];
 
+/// Score added to the leading slices of a root planning document. It exceeds any
+/// score the other terms reach, so those slices are taken first, however many
+/// other documents the repository holds.
+const ROOT_PLANNING_LEAD: i64 = 1 << 20;
+
+/// How many slices of each root planning document take the lead. The rest of the
+/// document competes on its ordinary score, so one long roadmap cannot fill the
+/// whole document share.
+const ROOT_PLANNING_SLICES: usize = 6;
+
 /// What the model is asked for.
 #[derive(Clone, Debug)]
 pub struct BriefInput<'a> {
@@ -460,6 +470,10 @@ pub fn build(
                 .collect()
         };
         let depth = path.matches('/').count();
+        // A planning document at the repository root (`ROADMAP.md`, `CLAUDE.md`).
+        // Nested copies are ordinary documents.
+        let root_planning =
+            depth == 0 && d.kind != DocumentKind::Code && planning_score(&path, "") > 0;
         let name = d
             .path
             .file_name()
@@ -484,6 +498,7 @@ pub fn build(
                 .count() as i64
         };
         let mut section_index = 0i64;
+        let mut slices_of_doc = 0usize;
         for (heading, text) in parts {
             if text.trim().is_empty() {
                 continue;
@@ -499,7 +514,11 @@ pub fn build(
                     (false, true) => format!("{path}#{heading} [part {}/{n}]", i + 1),
                 };
                 let position = (section_index + i as i64).min(3);
-                let score = importance + heading_score + overlap(&chunk).min(10) - position;
+                let mut score = importance + heading_score + overlap(&chunk).min(10) - position;
+                if root_planning && slices_of_doc < ROOT_PLANNING_SLICES {
+                    score += ROOT_PLANNING_LEAD;
+                }
+                slices_of_doc += 1;
                 let mut block =
                     UntrustedText::new(chunk).quote_as_data("document", &[("source", &label)]);
                 block.push('\n');
@@ -709,6 +728,52 @@ mod tests {
     #[test]
     fn planning_headings_score_above_others() {
         assert!(planning_score("ROADMAP.md", "Milestone 7") > planning_score("notes.md", "Lunch"));
+    }
+
+    /// A repository with hundreds of other documents, all of which name the same
+    /// files and sit under planning words, still leads with its root planning
+    /// documents. A nested `ROADMAP.md` is an ordinary document.
+    #[test]
+    fn root_planning_documents_lead_however_many_other_documents_exist() {
+        use crate::corpus::{GatherOptions, gather};
+        let dir = tempfile::tempdir().expect("dir");
+        let db = tempfile::tempdir().expect("db");
+        let write = |p: &str, t: &str| {
+            let p = dir.path().join(p);
+            std::fs::create_dir_all(p.parent().expect("parent")).expect("dir");
+            std::fs::write(p, t).expect("write");
+        };
+        write(
+            "ROADMAP.md",
+            "# Roadmap\n\n## Milestone 1\n\nShip the parser.\n",
+        );
+        write("CLAUDE.md", "# Project\n\nRules for agents.\n");
+        for n in 0..600 {
+            write(
+                &format!("runs/plan-phase/spec-{n}/notes.md"),
+                &format!(
+                    "# Status plan design goal {n}\n\nSee `notes.md` and `ROADMAP.md`.\n\n\
+                     ## Acceptance scope\n\nResult {n} of the feature run.\n"
+                ),
+            );
+        }
+        write(
+            "fixtures/ROADMAP.md",
+            "# Nested\n\n## Milestone 9\n\nNot a root document.\n",
+        );
+        let store = GraphStore::open(&db.path().join("g.db"), dir.path()).expect("store");
+        let corpus = gather(&store, &GatherOptions::default()).expect("gather");
+        let input = BriefInput {
+            instruction: None,
+            corrections: &[],
+            budget_tokens: 20_000,
+        };
+        let (brief, _) = build(&corpus, &store, &input).expect("brief");
+        assert!(brief.stats.sections_total > 1_000);
+        assert!(brief.stats.sections_included < brief.stats.sections_total);
+        for must in ["ROADMAP.md#Milestone 1", "CLAUDE.md"] {
+            assert!(brief.user.contains(must), "the brief lacks {must}");
+        }
     }
 
     fn slice(doc: usize, order: usize, score: i64, tokens: u64) -> Slice {

@@ -257,9 +257,9 @@ pub const GLOSSARY: &[ErrorSpec] = &[
         "KG-0501",
         "Route Not Ready",
         "kgraf-host",
-        "A configured route is missing a credential, an unknown catalog id, or has no price.",
-        "The environment is not fully set up for the routes a run names.",
-        "Run `kgraf providers` (or the shell's readiness check) and fix what it names."
+        "A configured route is missing a credential, an unknown catalog id, or has no price; or a local route's server (Ollama, llama.cpp, System One, TEI) accepts no connection at run start.",
+        "The environment is not fully set up for the routes a run names, or the local model server is not running.",
+        "Run `kgraf providers` (or the shell's readiness check) and fix what it names; for an unreachable local route, start its server (for Ollama, `ollama serve`) or remove the route."
     ),
     spec!(
         "KG-0502",

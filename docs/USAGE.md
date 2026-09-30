@@ -417,6 +417,11 @@ and each model route with the tool that reaches it.
 - **Credentials** are the route's own: an `embedding=openai:...` route reads
   `KGRAF_OPENAI_API_KEY`; the local `systemone`, `ollama`, `llama-cpp` and `tei` routes take
   none. A missing key fails the run's readiness check and names the variable.
+- **A local route must be running.** At the start of every run, each local route's endpoint
+  (planner, worker or model route: `ollama`, `llama-cpp`, `systemone`, `tei`) must accept a
+  connection, or the run fails before it builds anything:
+  "route `ollama` is unreachable at http://localhost:11434/v1: ...; start its server or
+  remove the route". Hosted routes are not dialed at start.
 - **Accounting.** Every call is a ledger row. Embedding and rerank calls record their input
   tokens; a typed decision records what the server reports. Add the model to the price table
   to see its cost; without a row it is shown as unpriced, never as $0. A priced call too

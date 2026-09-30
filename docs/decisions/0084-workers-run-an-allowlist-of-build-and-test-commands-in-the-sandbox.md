@@ -152,3 +152,25 @@ returns its output so far.
   read as the answer to the next request.
 - **A missing-dependency line counts only while cargo itself writes stderr.**
 - **Windows ACL probe directories a dead process left in a worktree root are removed.**
+
+## Amendments (2026-09-30)
+
+- **The orchestrator's scope check applies the verifier's generated-file rule.** A worker that
+  runs `cargo build` in a project with no committed lockfile creates `Cargo.lock`; the
+  orchestrator's merge-back scope check, which runs before the verifier, failed the attempt
+  for it, although the verifier's commit already leaves such a file out. The rule now lives in
+  one place, `kgraf_sandbox::generated_kind`: Python bytecode, or a lockfile named in
+  `LOCKFILES` (Cargo, npm, pnpm, Yarn, Bun, Poetry, uv, PDM, Pipenv, Bundler, Go, Composer,
+  Nix, Mix, Pub, SwiftPM, Gradle) with one of its manifests in the same folder. The
+  orchestrator's check looks the manifest up in the worker's tree and passes such a file on
+  to the verifier; merge-back's commit looks it up in git's index and also requires the file
+  to be new against the base, so a tracked lockfile the run changed still fails the
+  verifier's scope check.
+
+## Amendments (2026-09-30, corrections to the amendment above)
+
+- **A lockfile the commit left out is removed before the acceptance check**, as bytecode
+  already was. Kept in the worktree, it let the acceptance command run against dependency
+  versions, `git` sources and registry URLs the worker's run chose, although that file is
+  never merged. The check now runs against the committed tree only; a build it runs
+  generates its own lockfile, which goes with its leftovers.

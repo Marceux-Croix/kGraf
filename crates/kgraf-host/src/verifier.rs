@@ -398,8 +398,8 @@ pub(crate) fn worker_notices(excluded: &[Excluded]) -> Vec<String> {
         match e.kind {
             GeneratedKind::Lockfile => notices.push(format!(
                 "the worker's run generated {} (made by the worker), which the project does not \
-                 commit; it was left out of the attempt. Commit it in the project to make builds \
-                 reproducible",
+                 commit; it was left out of the attempt and removed before the check. Commit it \
+                 in the project to make builds reproducible",
                 clean(&e.path.display().to_string())
             )),
             GeneratedKind::PythonBytecode => bytecode.push(e.path.as_path()),
@@ -418,7 +418,8 @@ pub(crate) fn worker_notices(excluded: &[Excluded]) -> Vec<String> {
 
 /// The owner's notices for the files the check created: one per lockfile (the
 /// owner acts on each), one for the rest. Paths the commit already left out as
-/// the worker's (an excluded lockfile stays for the check) are reported once,
+/// the worker's (removed before the check, which may generate it again) are
+/// reported once,
 /// by [`worker_notices`].
 pub(crate) fn check_notices(command: &str, left: &Leftovers, excluded: &[Excluded]) -> Vec<String> {
     let mut notices = Vec::new();
@@ -579,10 +580,12 @@ impl Verifier for CommandVerifier {
                     return fail(attempt, placeholder_left_in_place_reason(&skipped));
                 }
             }
-            if let Err(e) = merge_back.remove_excluded_bytecode(&attempt) {
+            // The check runs against the committed tree only: what the commit
+            // left out (the worker's lockfile, its bytecode) is removed first.
+            if let Err(e) = merge_back.remove_excluded(&attempt) {
                 return fail(
                     attempt,
-                    format!("cannot remove the bytecode the worker's run left: {e}"),
+                    format!("cannot remove the files the worker's run generated: {e}"),
                 );
             }
             // 4. The acceptance command, confined, in the worker's tree; its

@@ -108,7 +108,7 @@ tree-sitter-python = "0.25"
 tree-sitter-typescript = "0.23"
 tree-sitter-javascript = "0.25"
 tree-sitter-md = "0.5"
-# The tags tier (evidence 2026-09-27-graft-review.md, idea 3): each grammar crate's own
+# The tags tier: each grammar crate's own
 # TAGS_QUERY drives a generic chunker. All MIT, all from the tree-sitter organization,
 # checked 2026-09-27 with `cargo info` and each crate's Cargo.toml `license` field.
 tree-sitter-go = "0.25"

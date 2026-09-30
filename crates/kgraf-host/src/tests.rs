@@ -2139,8 +2139,9 @@ async fn a_worker_write_outside_its_scope_is_still_refused_under_a_generating_ch
 
 /// The worker's own shell generated the lockfile (it ran `cargo build`), out
 /// of scope, beside `Cargo.toml`, with none in the base: left out of the
-/// commit, reported "made by the worker", and not merged. The check still
-/// finds it in the tree.
+/// commit, removed before the check (the check never runs against dependency
+/// versions or sources the worker chose and nothing merges), reported "made by
+/// the worker", and not merged.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_lockfile_the_workers_run_generated_is_left_out_with_a_notice() {
     let (r, denies) = lockless_crate();
@@ -2150,7 +2151,7 @@ async fn a_lockfile_the_workers_run_generated_is_left_out_with_a_notice() {
     std::fs::write(ws.join("Cargo.lock"), "# made by the worker's build\n").expect("write");
     let v = CommandVerifier {
         read_denies: denies,
-        ..verifier(&r, "grep -q worker Cargo.lock")
+        ..verifier(&r, "! grep -qs worker Cargo.lock")
     };
     let verdict = v.verify(&c, &ws, &result()).await.expect("ran");
     let Verdict::Pass { notices, .. } = &verdict else {
@@ -5767,6 +5768,42 @@ fn a_host_builds_each_run_with_the_worktree_policy_in_force() {
     );
 }
 
+/// The two tests that use the catalog's `systemone` endpoint port, one
+/// listening on it and one needing it closed, run one at a time.
+static SYSTEMONE_PORT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// A local route whose server is not running fails the build at its start,
+/// naming the route and its endpoint, before a branch or a worktree exists.
+#[test]
+fn a_build_with_an_unreachable_local_route_fails_at_start() {
+    let _port = SYSTEMONE_PORT.lock().unwrap_or_else(|p| p.into_inner());
+    // The catalog's `systemone` endpoint is `localhost:8000`. Asserted only
+    // when nothing listens there; a port in use says nothing about the check.
+    let free = std::net::TcpListener::bind("127.0.0.1:8000").is_ok()
+        && std::net::TcpStream::connect("127.0.0.1:8000").is_err();
+    if !free {
+        eprintln!("skipped: something listens on 127.0.0.1:8000");
+        return;
+    }
+    let (_dir, mut config) = project();
+    config.model_routes = vec!["typed-decision=systemone:jev-latest".into()];
+    let host = Host::open(config).expect("open");
+    let startup = host.startup(&mut |_| {}).expect("startup");
+    let err = host
+        .build_base(&startup, RunId::new("unreach"), &mut |_| {})
+        .err()
+        .expect("an unreachable local route fails the build");
+    let text = err.to_string();
+    assert!(
+        text.contains("route `systemone` is unreachable at http://localhost:8000"),
+        "{text}"
+    );
+    assert!(
+        !host.root().join(".git/refs/heads/kgraf/unreach").exists(),
+        "no integration branch was made"
+    );
+}
+
 /// Decision 0089: a run's non-generative routes are built with the run, their
 /// tools join every environment of it, and a run that declares none adds none.
 #[test]
@@ -5776,6 +5813,11 @@ fn a_runs_model_routes_are_built_and_their_tools_join_every_environment() {
     let host = Host::open(config).expect("open");
     host.check_ready(&host.route_set())
         .expect("a local typed-decision route needs no key");
+    // A build dials every local route's endpoint first (`check_reachable`).
+    // Something must accept at the catalog's `localhost:8000`: this listener,
+    // or, when the port is taken, whatever already listens there.
+    let _port = SYSTEMONE_PORT.lock().unwrap_or_else(|p| p.into_inner());
+    let _listener = std::net::TcpListener::bind("127.0.0.1:8000");
     let startup = host.startup(&mut |_| {}).expect("startup");
     let base = host
         .build_base(&startup, RunId::new("mk"), &mut |_| {})

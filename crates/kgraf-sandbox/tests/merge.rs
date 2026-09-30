@@ -468,12 +468,13 @@ fn only_commit_retaining_leaves_generated_files_out() {
             ),
         ]
     );
-    mb.remove_excluded_bytecode(&w).unwrap();
+    mb.remove_excluded(&w).unwrap();
     assert!(!w.workspace().root().join("p").exists());
     assert!(
-        w.workspace().root().join("Cargo.lock").is_file(),
-        "kept for a check"
+        !w.workspace().root().join("Cargo.lock").exists(),
+        "a check never runs against the worker's lockfile"
     );
+    assert!(w.workspace().root().join("Cargo.toml").is_file());
 
     let mut plain = attempt(&e, "plain");
     write(&plain, "Cargo.toml", "[package]\n");

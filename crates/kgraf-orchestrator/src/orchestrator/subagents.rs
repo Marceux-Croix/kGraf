@@ -1913,6 +1913,7 @@ impl RunLoop {
                 sizing_miss: false,
                 calls: d.result.calls.iter().map(|c| c.to_string()).collect(),
                 spend_micros: spend.micros(),
+                error: outcome_error(&d.result.outcome),
             })
             .await;
         if let Err(e) = traced {

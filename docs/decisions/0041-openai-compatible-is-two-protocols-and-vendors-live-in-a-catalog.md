@@ -176,3 +176,15 @@ can name vendors freely because nothing below it can see it.
 A third OpenAI-family surface, a Chat Completions usage dialect neither
 existing one covers, or a vendor whose route moves. The first two extend the
 usage-dialect representation; the third is a data edit.
+
+## Amendments (2026-09-30)
+
+- **A local route must accept a connection at run start.** A run whose local model server
+  was not running used to start anyway, and each attempt or orchestrator call routed there
+  failed in a millisecond and cost a retry. Every build now dials the endpoint of each local
+  route it uses (a catalog entry that takes no credential: `ollama`, `llama-cpp`,
+  `systemone`, `tei`; planner, worker and model routes), every route and address at once, so
+  the check is bounded at about 3 s however many local routes a run has, before any branch,
+  worktree or model call. A route that accepts no connection fails the run (KG-0501): "route
+  `ollama` is unreachable at http://localhost:11434/v1: ...; start its server or remove the
+  route". Hosted routes are not dialed; their first call reports their vendor's state.

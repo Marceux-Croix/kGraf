@@ -275,6 +275,7 @@ mod tests {
                     sizing_miss: false,
                     calls: Vec::new(),
                     spend_micros: 0,
+                    error: None,
                 })
                 .await
                 .expect("record");
@@ -328,6 +329,7 @@ mod tests {
                     sizing_miss: false,
                     calls: Vec::new(),
                     spend_micros: 0,
+                    error: None,
                 })
                 .await
                 .expect("record");
@@ -382,6 +384,7 @@ mod tests {
             sizing_miss: false,
             calls: Vec::new(),
             spend_micros: 0,
+            error: None,
         };
         let events: Vec<TraceEvent> = ["completed", "handed_back", "cancelled", "failed"]
             .into_iter()

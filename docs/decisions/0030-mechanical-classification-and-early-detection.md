@@ -149,3 +149,25 @@ result is an upper bound obtained with injected ground truth, and treating
 it as a proven capability would repeat an error already corrected elsewhere
 in this project: recording that same figure as a bound rather than a
 demonstration.
+
+## Amendments (2026-09-30)
+
+- **A check command that cannot run whatever the code is refused when the plan is read**, and
+  the planner is asked again with the reason, instead of the interface failing its checks. Two
+  shapes: a whole command line given as the program (`["cargo build --package x"]`, looked
+  up as one program name), and an output outside the repository (an absolute path given to
+  an output flag such as `-o /tmp/x`, or any path under a temporary directory), which the
+  check sandbox refuses to write. An absolute path read elsewhere is allowed. The interface request now says an argv is the program and each
+  argument as its own string, and that a command writes only inside the repository.
+
+## Amendments (2026-09-30, corrections to the amendment above)
+
+- **The command rules judge a new plan only.** An interface persisted before them is not
+  invalidated when a run resumes; its check runs and reports what the command did. A missing
+  program is still an incomplete artifact.
+- **A whole command line is a program string with a shell operator, or one that splits into
+  a program and at least one flag** (`cargo build --package x`). A program path with a space
+  is a program.
+- **`/dev/null` is allowed as an output.** An absolute path into the repository stays
+  refused: a check runs in a scratch copy of the repository whose own directory is the only
+  one it may write, so only a relative path works.

@@ -77,11 +77,15 @@ fn resolve(store: &Mutex<GraphStore>, symbol: &str) -> Result<NodeRecord, ToolEr
     // A poisoned lock means another query panicked; the store itself is a
     // read-only SQLite handle here, so its state is still usable.
     let store = store.lock().unwrap_or_else(|p| p.into_inner());
+    // No requesting file: a crate-relative path found in several crates is
+    // refused with its candidates rather than resolved to the first.
     store
-        .resolve_symbol(symbol)
+        .resolve_symbol_from(symbol, None)
         .map_err(|e| match e {
-            // The model named a symbol that does not exist: its input to fix.
-            kgraf_graph::GraphError::UnknownSymbol { .. } => invalid(e.to_string()),
+            // The model named a symbol that does not exist, or a
+            // crate-relative path several crates hold: its input to fix.
+            kgraf_graph::GraphError::UnknownSymbol { .. }
+            | kgraf_graph::GraphError::AmbiguousSymbol { .. } => invalid(e.to_string()),
             other => internal(other),
         })?
         .into_iter()
@@ -232,6 +236,28 @@ mod tests {
             matches!(result, Err(ToolError::InvalidInput { .. })),
             "{result:?}"
         );
+    }
+
+    /// `crate::alpha` held by two crates names neither: refused as input to
+    /// fix, with both candidates, never resolved to the first.
+    #[tokio::test]
+    async fn a_crate_relative_symbol_in_two_crates_is_invalid_input_naming_both() {
+        let (_dir, tool) = indexed(&[
+            ("a/Cargo.toml", "[package]\nname = \"a\"\n"),
+            ("a/src/lib.rs", "pub fn alpha() {}\n"),
+            ("b/Cargo.toml", "[package]\nname = \"b\"\n"),
+            ("b/src/lib.rs", "pub fn alpha() {}\n"),
+        ]);
+        match tool.access(&json!({"symbol": "crate::alpha"})) {
+            Err(ToolError::InvalidInput { reason, .. }) => {
+                assert!(
+                    reason.contains("a/src/lib.rs") && reason.contains("b/src/lib.rs"),
+                    "{reason}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(tool.access(&json!({"symbol": "a::alpha"})).is_ok());
     }
 
     /// The slice text comes from the graph, but a hard-linked source file is

@@ -63,8 +63,7 @@ pub struct OrchestrateArgs {
     /// source for it: the command does not read `.kgraf/run.json`.
     pub worktrees: kgraf_host::WorktreeRetention,
     /// Every agent is an addressable session (decision 0067); on by
-    /// default since a live run shows all three together
-    /// (`2026-09-28-sessions-live.md`).
+    /// default since a live run shows all three together.
     pub sessions: bool,
     /// Bounds of one contract-check test run and one compile.
     pub check_timeout: Duration,

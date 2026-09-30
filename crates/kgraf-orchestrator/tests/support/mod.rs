@@ -145,6 +145,10 @@ impl Drop for HangGuard<'_> {
     }
 }
 
+/// The body a `REFUSED_REQUEST` worker call fails with (Moonshot's answer to a
+/// tool schema node with no `type`).
+pub const REFUSAL_BODY: &str = "{\"error\":{\"message\":\"Invalid request: tools.function.parameters is not a valid moonshot flavored json schema, details: <At path 'properties.evidence.properties.kind': type is not defined>\",\"type\":\"invalid_request_error\"}}";
+
 pub struct WorkerFake {
     pub vendor: &'static str,
     pub stats: Arc<Stats>,
@@ -226,6 +230,15 @@ impl Provider for WorkerFake {
         // a model adapter's own bug or a downstream dependency's would.
         if instruction.contains("PANIC_CALL") {
             panic!("the worker call panicked, on purpose");
+        }
+        // A vendor that refuses the request before the model runs, the way a
+        // strict tool-schema validator does: HTTP 400, no usage.
+        if instruction.contains("REFUSED_REQUEST") {
+            return Err(ProviderError::Http {
+                adapter: "fake-worker",
+                status: 400,
+                body: REFUSAL_BODY.into(),
+            });
         }
         if round == 0 {
             self.stats

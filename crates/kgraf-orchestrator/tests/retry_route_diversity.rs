@@ -7,8 +7,8 @@
 //! `max_retries` hold decision, was never read by routing). Attempt `0`
 //! never escalates (`attempt_route`'s own early return), so a stalled
 //! worker's contract, redispatched from `Planned`, was routed exactly like
-//! its first, failed attempt -- confirmed live in 4 of 18
-//! `distributed-efficacy` benchmark runs (2026-09-28), where a gate
+//! its first, failed attempt -- seen live in 4 of 18
+//! orchestrated runs, where a gate
 //! remediation's two allowed attempts always landed on the identical model
 //! and repeated the identical failure (see
 //! `docs/decisions/0085-retry-route-diversity.md`).

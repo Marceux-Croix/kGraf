@@ -63,6 +63,92 @@ impl FileOverlay {
     }
 }
 
+/// Flags whose value is a path a command writes.
+const OUTPUT_FLAGS: &[&str] = &[
+    "-o",
+    "--out",
+    "--output",
+    "--out-dir",
+    "--output-dir",
+    "--target-dir",
+    "--outdir",
+];
+
+/// Temporary directories outside the repository. A check writes only inside
+/// its own tree, so any argument under one of these names a write it is
+/// refused (a compiler's `-o /tmp/x`) or a file the check cannot have made.
+const TEMP_ROOTS: &[&str] = &["/tmp", "/var/tmp", "/private/tmp", "/var/folders"];
+
+fn is_absolute_path(s: &str) -> bool {
+    s.starts_with('/') || Path::new(s).is_absolute()
+}
+
+fn under_temp(s: &str) -> bool {
+    TEMP_ROOTS
+        .iter()
+        .any(|t| s == *t || s.strip_prefix(t).is_some_and(|r| r.starts_with('/')))
+}
+
+/// Where every check sandbox lets a command write outside its tree: output
+/// thrown away (`-o /dev/null`).
+const DISCARD_SINK: &str = "/dev/null";
+
+/// The arguments of `args` (an argv without its program) that name a write
+/// outside the check's tree: an absolute path given to an output flag (`-o
+/// /tmp/x`, `-o/tmp/x`, `--out-dir=/tmp/x`), or any path under a temporary
+/// directory. An absolute path read elsewhere (`-I/usr/include`) is allowed:
+/// the sandbox lets a check read the toolchain. `/dev/null` is allowed: the
+/// sandbox lets every command write it.
+///
+/// An absolute path under the repository is refused like any other: a check
+/// runs in a scratch copy of the repository, whose directory is the only one
+/// it may write, so a path into the repository itself is outside it (the
+/// check runner's module documentation lays out that tree). The planner
+/// cannot know the copy's path, so a relative path is the one that works.
+fn outside_writes(args: &[String]) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut after_output_flag = false;
+    for arg in args {
+        let value = if after_output_flag {
+            Some(arg.as_str())
+        } else if let Some((flag, v)) = arg.split_once('=')
+            && OUTPUT_FLAGS.contains(&flag)
+        {
+            Some(v)
+        } else {
+            arg.strip_prefix("-o").filter(|v| !v.is_empty())
+        };
+        after_output_flag = OUTPUT_FLAGS.contains(&arg.as_str());
+        let path = value.unwrap_or(arg);
+        if path == DISCARD_SINK {
+            continue;
+        }
+        if value.is_some_and(is_absolute_path) || under_temp(path) {
+            out.push(arg.as_str());
+        }
+    }
+    out
+}
+
+/// Shell operators: a program string holding one is a shell line, which an
+/// argv never runs through a shell.
+const SHELL_OPERATORS: &[&str] = &["&&", "||", "|", ";", ">", "<", "$(", "`"];
+
+/// Whether a program string is a whole command line rather than a program: it
+/// holds a shell operator, or it splits at whitespace into a program and
+/// arguments of which at least one is a flag (`cargo build --package x`). A
+/// program path that holds a space (`/opt/My Tools/cargo`) is a program.
+fn whole_command_line(program: &str) -> bool {
+    let program = program.trim();
+    if SHELL_OPERATORS.iter().any(|op| program.contains(op)) {
+        return true;
+    }
+    program
+        .split_whitespace()
+        .skip(1)
+        .any(|arg| arg.len() > 1 && arg.starts_with('-'))
+}
+
 /// An interface contract between work contracts (0026).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InterfaceContract {
@@ -109,6 +195,41 @@ impl InterfaceContract {
     /// `id@vN`, the name every record uses.
     pub fn label(&self) -> String {
         format!("{}@v{}", self.id, self.version)
+    }
+
+    /// What makes the compile and test argv unrunnable in the check sandbox,
+    /// whatever the code: a whole command line given as the program
+    /// (`"cargo build -p x"` is looked up as one program name, which no machine
+    /// has; see [`whole_command_line`]); an output outside the check's tree
+    /// (`-o /tmp/x`), which the sandbox refuses to write ([`outside_writes`]).
+    ///
+    /// Checked only when a new plan is read ([`crate::sanitize_interfaces`]),
+    /// so the planner is asked again with the reason. Not part of
+    /// [`InterfaceContract::validate`]: an interface persisted before these
+    /// rules is not invalidated on resume; its check runs and reports what the
+    /// command did. A missing command is `validate`'s, as an incomplete
+    /// artifact.
+    pub fn command_problems(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+        for (what, argv) in [("compile", &self.compile), ("test", &self.test)] {
+            let Some(program) = argv.first().filter(|p| !p.trim().is_empty()) else {
+                continue;
+            };
+            if whole_command_line(program) {
+                problems.push(format!(
+                    "the {what} program `{program}` is a whole command line in one string; \
+                     give the program and each argument as separate strings"
+                ));
+            }
+            for arg in outside_writes(&argv[1..]) {
+                problems.push(format!(
+                    "the {what} argument `{arg}` names an output outside the repository; a \
+                     check writes only inside its own tree, so give a path relative to the \
+                     repository root, or leave the output where the build tool puts it"
+                ));
+            }
+        }
+        problems
     }
 
     /// Whether the artifact is complete enough to check. An incomplete artifact
@@ -781,21 +902,128 @@ struct Reading<'s> {
     /// The first anchor that is neither a party id, a path nor a contract
     /// symbol: what an unbound sentence is about instead.
     first_other: Option<String>,
-    /// What the sentence claims about its subject: the other anchors, with
-    /// signatures reduced to their canonical form and their types.
+    /// What the sentence claims about its subject: the anchors written after
+    /// it, and those written before it in the same clause, with signatures
+    /// reduced to their canonical form and their types.
     claims: BTreeSet<String>,
+    /// The prose word that governs the subject names a use of it or a test of
+    /// it ("tests for `x`", "the call sites that invoke `x`"): in a provision,
+    /// the party provides something about the symbol, not the symbol.
+    subject_used: bool,
 }
 
-/// Read a sentence. Party ids (the handshake prompt itself backticks them) and
-/// paths are not claims about a symbol, so they are set aside (decision 0078).
+/// Words that join clauses when written right after a comma (", and can call
+/// `x`"): an anchor before such a comma is about another clause's subject.
+const CLAUSE_JOINERS: &[&str] = &[
+    "and", "but", "or", "while", "whereas", "so", "then", "which", "where", "because", "although",
+];
+
+/// The prose of `chunk` after its last clause boundary, or `None` when it has
+/// none. A boundary is `;`, a `.`, `!` or `?` that ends a sentence (followed by
+/// whitespace or the chunk's end), or a comma followed by a clause joiner. A
+/// plain comma is not one: it separates a list (`` `i64`, `i32` ``).
+fn after_last_boundary(chunk: &str) -> Option<&str> {
+    let bytes = chunk.as_bytes();
+    let mut cut = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        let ends_sentence = matches!(b, b'.' | b'!' | b'?')
+            && bytes.get(i + 1).is_none_or(|n| n.is_ascii_whitespace());
+        let joined = b == b','
+            && chunk[i + 1..]
+                .split(|c: char| !c.is_alphanumeric())
+                .find(|w| !w.is_empty())
+                .is_some_and(|w| CLAUSE_JOINERS.contains(&w.to_lowercase().as_str()));
+        if b == b';' || ends_sentence || joined {
+            cut = Some(i + 1);
+        }
+    }
+    cut.map(|i| &chunk[i..])
+}
+
+/// Words that may stand between a use word and the symbol it governs ("tests
+/// for `x`", "that call the `x`").
+const GOVERNING_FILLERS: &[&str] = &[
+    "a", "an", "the", "for", "of", "to", "on", "in", "with", "against", "that", "which", "its",
+    "each", "every", "all", "directly",
+];
+
+/// Whether the prose of a clause, up to the subject, ends in a use word: its
+/// last word, skipping fillers, is one of [`USE_WORDS`]. A use word earlier in
+/// the clause governs something else ("Using `clap`, I implement `x`").
+fn governed_by_use_word(clause_prose: &str) -> bool {
+    clause_prose
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+        .rev()
+        .find(|w| !GOVERNING_FILLERS.contains(&w.as_str()))
+        .is_some_and(|w| USE_WORDS.contains(&w.as_str()))
+}
+
+/// Prose words that, governing a symbol in a provision, make the provision one
+/// about the symbol (its tests, its callers) rather than of it.
+/// "implementation of `x`" and "a function `x`" still provide `x`.
+const USE_WORDS: &[&str] = &[
+    "test",
+    "tests",
+    "testing",
+    "tested",
+    "call",
+    "calls",
+    "calling",
+    "caller",
+    "callers",
+    "invoke",
+    "invokes",
+    "invoking",
+    "use",
+    "uses",
+    "using",
+    "consume",
+    "consumes",
+    "consuming",
+    "exercise",
+    "exercises",
+    "exercising",
+    "cover",
+    "covers",
+    "covering",
+];
+
+/// Read a sentence. Party ids (the handshake prompt itself backticks them),
+/// the interface's own id and label, and paths are not claims about a symbol,
+/// so they are set aside (decision 0078).
+///
+/// Anchors on either side of the subject are claims about it, except those
+/// written before it in an earlier clause ([`after_last_boundary`]): "`f`
+/// receives an `order`, and can call `x`" says nothing about `x`'s `order`.
+/// Anchors before the subject still name an unbound sentence's `first_other`.
 fn read_sentence<'s>(
     text: &str,
     surface: &BTreeSet<&'s str>,
-    parties: &BTreeSet<&str>,
+    set_aside: &BTreeSet<&str>,
 ) -> Reading<'s> {
     let mut r = Reading::default();
-    for a in anchors(text) {
-        if parties.contains(a.as_str()) || is_path(&a) {
+    // Before the subject: the claims and the prose of the current clause,
+    // both dropped at a clause boundary.
+    let mut pending: BTreeSet<String> = BTreeSet::new();
+    let mut clause_prose = String::new();
+    for (i, chunk) in text.split('`').enumerate() {
+        if i % 2 == 0 {
+            if r.subject.is_none() {
+                if let Some(rest) = after_last_boundary(chunk) {
+                    pending.clear();
+                    clause_prose.clear();
+                    clause_prose.push_str(rest);
+                } else {
+                    clause_prose.push_str(chunk);
+                }
+                clause_prose.push(' ');
+            }
+            continue;
+        }
+        let a = chunk.split_whitespace().collect::<Vec<_>>().join(" ");
+        if a.is_empty() || set_aside.contains(a.as_str()) || is_path(&a) {
             continue;
         }
         let sig = signature(&a);
@@ -804,10 +1032,17 @@ fn read_sentence<'s>(
             Some(_) => None,
             None => resolve(&a, surface),
         };
+        let claims = if r.subject.is_some() {
+            &mut r.claims
+        } else {
+            &mut pending
+        };
         match (named, sig) {
             (Some(sym), sig) => {
                 if r.subject.is_none() {
                     r.subject = Some(sym);
+                    r.subject_used = governed_by_use_word(&clause_prose);
+                    r.claims.append(&mut pending);
                 } else if r.subject != Some(sym) {
                     r.claims.insert(sym.to_owned());
                 }
@@ -817,18 +1052,61 @@ fn read_sentence<'s>(
                 }
             }
             (None, Some(sig)) if sig.name.is_empty() => {
-                r.claims.insert(sig.canonical);
-                r.claims.extend(sig.types);
+                claims.insert(sig.canonical);
+                claims.extend(sig.types);
             }
             (None, _) => {
                 if r.first_other.is_none() {
                     r.first_other = Some(a.clone());
                 }
-                r.claims.insert(a);
+                claims.insert(a);
             }
         }
     }
     r
+}
+
+/// Primitive type names across the languages a contract is written in.
+const PRIMITIVE_TYPES: &[&str] = &[
+    "bool", "boolean", "char", "str", "string", "int", "float", "double", "long", "short", "byte",
+    "bytes", "rune", "void", "number", "any", "object", "usize", "isize", "uint", "uintptr",
+    "complex",
+];
+
+/// Whether a one-word claim names a type: a primitive (`i64`, `u8`, `f32`,
+/// `int32`, `float64`, `str`), or a CamelCase name (`Config`, `Order`). A
+/// word in capitals (`CA`, `OR`) or in lower case (`state`) is a value or a
+/// name, not a type.
+fn is_type_word(w: &str) -> bool {
+    let sized = ["i", "u", "f", "int", "uint", "float", "complex"]
+        .iter()
+        .any(|p| {
+            w.strip_prefix(p)
+                .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+        });
+    let camel =
+        w.chars().next().is_some_and(char::is_uppercase) && w.chars().any(char::is_lowercase);
+    sized || camel || PRIMITIVE_TYPES.contains(&w)
+}
+
+/// Whether a claim is stated in `text`: one word of its prose, outside the
+/// backticks, spelled the same (case kept, so `OR` is not the word "or"). A
+/// provider that writes "for input CA" states the `CA` an expecter backticks.
+/// Only a claim that is one plain word and not a type ([`is_type_word`]) is
+/// looked up this way: a type or a signature must be among the provider's
+/// anchors, since prose that names a type ("i64 callers must cast") may be
+/// about something other than the symbol.
+fn stated_in_prose(claim: &str, text: &str) -> bool {
+    if claim.is_empty()
+        || !claim.chars().all(|c| c.is_alphanumeric() || c == '_')
+        || is_type_word(claim)
+    {
+        return false;
+    }
+    text.split('`')
+        .step_by(2)
+        .flat_map(|chunk| chunk.split(|c: char| !(c.is_alphanumeric() || c == '_')))
+        .any(|w| w == claim)
 }
 
 /// One provision: (party, sentence, the sentence's claims).
@@ -863,6 +1141,43 @@ fn negated(text: &str) -> bool {
         == 1
 }
 
+/// Verbs of providing or needing a symbol, for [`states_no_symbols`].
+const PROVISION_VERBS: &[&str] = &[
+    "provide",
+    "provides",
+    "providing",
+    "supply",
+    "supplies",
+    "expose",
+    "exposes",
+    "export",
+    "exports",
+    "need",
+    "needs",
+    "require",
+    "requires",
+    "required",
+    "expect",
+    "expects",
+    "consume",
+    "consumes",
+];
+
+/// Nouns for what a party provides, for [`states_no_symbols`].
+const SYMBOL_NOUNS: &[&str] = &["symbol", "symbols", "item", "items"];
+
+/// Whether a sentence only states that no symbols pass between the parties
+/// ("I provide no contract symbols of my own", "I assume the other party does
+/// not provide any symbols required by this implementation"): negated, with a
+/// verb of providing or needing and a noun for a symbol. Such a sentence claims
+/// nothing to compare. Any other negated sentence ("the other party does not
+/// mutate the input") is an assumption, and with no anchor it is unanchored.
+fn states_no_symbols(text: &str) -> bool {
+    let words = prose_words(text);
+    let has = |set: &[&str]| words.iter().any(|w| set.contains(&w.as_str()));
+    negated(text) && has(PROVISION_VERBS) && has(SYMBOL_NOUNS)
+}
+
 /// The numbers a sentence states outside its anchors.
 fn numbers(text: &str) -> BTreeSet<String> {
     prose_words(text)
@@ -891,15 +1206,29 @@ fn contradicts(a: &str, b: &str) -> bool {
 /// - every expectation and consumption claim about a symbol **another** party
 ///   provides is bound to the surface and matches one of that party's
 ///   provisions: every claim the expecting sentence makes (its other anchors,
-///   a signature reduced to its parameter and return types) is among the claims
-///   of that provision, and **the same behavior**: neither sentence is negated
+///   except those before its subject in an earlier clause, and a signature
+///   reduced to its parameter and return types) is among the claims of that
+///   provision, or, for a claim that is one plain word and not a type, such as
+///   a state code, written as that word in the provision's prose;
+///   and **the same behavior**: neither sentence is negated
 ///   where the other is not, and they state no different numbers. A provider
 ///   may say more than the expecter restates. A sentence about a symbol the
 ///   party itself provides is not an assumption about a counterparty and is not
 ///   compared;
 /// - touches stay inside each party's declared writes and do not overlap.
 ///
-/// **What it does not catch**, stated so that a pass is not over-read: a
+/// Set aside, never findings: the interface's own id or label in backticks; a
+/// provision in which a use or test word governs the symbol ("tests for `x`",
+/// "the call sites that invoke `x`"), which provides something about the
+/// symbol and not the symbol; and a sentence with no anchor that only states
+/// that no symbols pass ("I provide no contract symbols", "the other party does
+/// not provide any symbols"), which claims nothing. Any other negated sentence
+/// with no anchor is still unanchored.
+///
+/// **What it does not catch**, stated so that a pass is not over-read: an
+/// anchor written before the symbol in an earlier clause (read as context, not
+/// a claim about the symbol), a second implementation described with a use word
+/// ("a wrapper that calls `x`" read as not providing `x`), a
 /// paraphrase or synonym ("fails" against "returns an error"), an antonym without
 /// a negation word ("ascending" against "descending"), a unit or type written
 /// outside backticks, a bare type whose position differs (`i64` stated alone
@@ -913,13 +1242,19 @@ pub fn compare_handshake(
     writes: &BTreeMap<String, Vec<WriteTarget>>,
 ) -> Vec<HandshakeFinding> {
     let surface: BTreeSet<&str> = ic.symbols.iter().map(String::as_str).collect();
-    let parties: BTreeSet<&str> = ic
+    let label = ic.label();
+    // The interface's id is set aside only when it is not also a surface
+    // symbol's name (an interface `double` over the symbol `double`).
+    let own_id = (!surface.contains(ic.id.as_str())).then_some(ic.id.as_str());
+    let set_aside: BTreeSet<&str> = ic
         .parties
         .iter()
         .map(String::as_str)
         .chain(statements.iter().map(|s| s.party.as_str()))
+        .chain(own_id)
+        .chain([label.as_str()])
         .collect();
-    let read = |text: &str| read_sentence(text, &surface, &parties);
+    let read = |text: &str| read_sentence(text, &surface, &set_aside);
     let mut findings = Vec::new();
     for p in &ic.parties {
         match statements.iter().find(|s| &s.party == p) {
@@ -943,6 +1278,9 @@ pub fn compare_handshake(
         for text in &s.provide {
             let r = read(text);
             match (r.subject, r.first_other) {
+                // Tests for the symbol, or its callers: the party's own brief,
+                // not a provision of the symbol.
+                (Some(_), _) if r.subject_used => {}
                 (Some(sym), _) => {
                     provided.entry(sym).or_default().push((
                         s.party.as_str(),
@@ -954,6 +1292,9 @@ pub fn compare_handshake(
                 // about the counterparty. A surface symbol nobody provides
                 // is still `SymbolUnprovided` below.
                 (None, Some(_)) => {}
+                // "I provide no contract symbols": a stated absence, nothing
+                // to compare.
+                (None, None) if states_no_symbols(text) => {}
                 (None, None) => findings.push(HandshakeFinding::Unanchored {
                     party: s.party.clone(),
                     text: text.clone(),
@@ -983,9 +1324,13 @@ pub fn compare_handshake(
                 subject,
                 first_other,
                 claims: mine,
+                ..
             } = read(text);
             let sym = match (subject, first_other) {
                 (Some(sym), _) => sym,
+                // "I assume the other party does not provide any symbols": a
+                // stated absence, nothing to compare.
+                (None, None) if states_no_symbols(text) => continue,
                 (None, None) => {
                     findings.push(HandshakeFinding::Unanchored {
                         party: s.party.clone(),
@@ -1025,7 +1370,10 @@ pub fn compare_handshake(
             }
             let same: Vec<&&Provision<'_>> = others
                 .iter()
-                .filter(|(_, _, theirs)| mine.is_subset(theirs))
+                .filter(|(_, t, theirs)| {
+                    mine.iter()
+                        .all(|c| theirs.contains(c) || stated_in_prose(c, t))
+                })
                 .collect();
             if same.is_empty() {
                 let (p, t, _) = others[0];

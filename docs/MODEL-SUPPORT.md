@@ -93,6 +93,17 @@ Notes on single rows:
   the route.
 - `kimi-code`, `zai`, `qwen`, `grok-chat`, `meta`, `together`: the catalog and the record
   agree. Nobody has run them.
+- `kimi`: Moonshot validates tool schemas strictly. A schema node with no `type` (an `enum`
+  alone) is refused with HTTP 400 ("is not a valid moonshot flavored json schema, details:
+  <At path 'properties.evidence.properties.kind': type is not defined>") before the model
+  runs, for every request that offers the tool; the same request with `"type": "string"`
+  added was answered (two live calls, 2026-09-30). kGraf refuses a built-in tool whose schema
+  has an untyped node when the tool set is built; the check walks every keyword that holds a
+  subschema (`$defs`, `patternProperties`, `not`, `if`/`then`/`else`, `contains` and the
+  rest) and follows a local `$ref`, and a `$ref` it cannot resolve counts as untyped. An MCP
+  server's schema is registered as its
+  server gives it, so such a schema still fails the call, and the worker's failure names the
+  refusal.
 
 ## What the statuses mean
 

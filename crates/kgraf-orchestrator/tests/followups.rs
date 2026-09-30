@@ -314,6 +314,58 @@ async fn an_attempt_whose_environment_cannot_be_built_fails_loudly() {
     );
 }
 
+/// A provider that refuses every worker request (an HTTP 400 before the model
+/// runs, zero usage) fails loud: each failed worker's trace event carries the
+/// refusal, and the held contract's reason names it, so the run report says
+/// why no attempt ran instead of a bare "failed".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_provider_refusal_is_named_in_the_trace_and_the_held_reason() {
+    let dir = tempfile::tempdir().expect("dir");
+    let plan = plan_json(&[c("a", "REFUSED_REQUEST make a", "src/a.rs", &[])]);
+    let p = Parts::open(
+        dir.path(),
+        move |_| plan.clone(),
+        |_| SERVES.into(),
+        Duration::from_millis(5),
+    );
+    let report = Orchestrator::new(config(), p.services(WINDOW))
+        .expect("orchestrator")
+        .start(RunId::new("r1"), "make a".into())
+        .await
+        .expect("run");
+    assert!(report.verified.is_empty(), "{report:?}");
+    let trace = trace_of(&p).await;
+    let errors: Vec<&String> = trace
+        .iter()
+        .filter_map(|e| match e {
+            TraceEvent::WorkerFinished {
+                outcome,
+                error: Some(error),
+                ..
+            } if outcome == "failed" => Some(error),
+            _ => None,
+        })
+        .collect();
+    assert!(!errors.is_empty(), "no failed worker names its error");
+    for e in &errors {
+        assert!(
+            e.contains("HTTP 400") && e.contains("type is not defined"),
+            "{e}"
+        );
+    }
+    let record = RunStore::new(p.graph.clone())
+        .load(&RunId::new("r1"))
+        .expect("load")
+        .expect("record");
+    let a = record.contract("a").expect("open");
+    assert!(
+        matches!(&a.status, kgraf_orchestrator::ContractStatus::Held { reason }
+            if reason.contains("attempts failed") && reason.contains("type is not defined")),
+        "{:?}",
+        a.status
+    );
+}
+
 /// An environment that fails twice and then builds is
 /// retried with backoff and the contract verifies; no model attempt was
 /// charged against max_retries.
