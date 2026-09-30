@@ -290,6 +290,35 @@ impl InterfaceContract {
                 }
             }
         }
+        // The stub, the consumer files and the test are overlaid together in
+        // one tree (stub-compile, vacuity), the later over the earlier. Two of
+        // them at one path with different content would leave one silently
+        // unchecked: the check would build a tree the artifact does not
+        // describe. The same content twice is harmless.
+        let together: Vec<(&str, &FileOverlay)> = self
+            .stub
+            .iter()
+            .map(|f| ("stub", f))
+            .chain(self.consumer.iter().map(|f| ("consumer", f)))
+            .chain(self.tests.iter().map(|f| ("tests", f)))
+            .collect();
+        for (i, (wa, a)) in together.iter().enumerate() {
+            for (wb, b) in &together[i + 1..] {
+                if a.content != b.content
+                    && kgraf_core::paths::same_path(
+                        Path::new(a.path.trim_start_matches("./")),
+                        Path::new(b.path.trim_start_matches("./")),
+                    )
+                {
+                    problems.push(format!(
+                        "the {wa} file `{}` and the {wb} file `{}` are one path with different \
+                         content; they are overlaid in one tree, so one would silently replace \
+                         the other",
+                        a.path, b.path
+                    ));
+                }
+            }
+        }
         let stub: BTreeSet<&str> = self.stub.iter().map(|f| f.path.as_str()).collect();
         for r in &self.replaces {
             if !stub.contains(r.as_str()) {
@@ -501,6 +530,23 @@ pub async fn check_mechanical(
         }))
     };
 
+    // 0. A contract test replaces nothing the project already has: over an
+    // existing file (a fixed consumer test, a benchmark's own test) it would
+    // make the check validate against a weaker test than the project's, or
+    // fail on the planner's rewrite of a file it was told to leave alone.
+    for f in &ic.tests {
+        if runner.base_differs(&f.path, &f.content).await? {
+            return fail(
+                CheckStage::Artifact,
+                format!(
+                    "the test file `{}` would replace a file that already exists in the \
+                     repository with different content; put the contract's test in a new file",
+                    f.path
+                ),
+            );
+        }
+    }
+
     // 1. Stub-compile. A timeout says nothing about the contract: it is retried
     // once, then reported as inconclusive (`CheckError`, a check that could not
     // run), never as a stub-compile failure counted against the contract.
@@ -708,6 +754,47 @@ pub enum HandshakeFinding {
         providing: String,
         provides: String,
     },
+}
+
+impl HandshakeFinding {
+    /// Whether the finding holds the parties. A sentence the comparator could
+    /// not bind to the contract surface ([`HandshakeFinding::Unanchored`],
+    /// [`HandshakeFinding::OutsideSurface`]) says nothing another party
+    /// contradicts: it is recorded as a warning and holds nothing. Every
+    /// other finding is a disagreement between the parties, or a party that
+    /// did not state its side, and holds them.
+    pub fn holds(&self) -> bool {
+        !matches!(
+            self,
+            HandshakeFinding::Unanchored { .. } | HandshakeFinding::OutsideSurface { .. }
+        )
+    }
+}
+
+/// Every pair of contracts a dependency path joins, either way, each pair
+/// once as `(lesser, greater)`: the pairs that never run at once. From each
+/// contract's direct dependencies.
+pub fn ordered_pairs(depends_on: &BTreeMap<String, Vec<String>>) -> BTreeSet<(String, String)> {
+    let mut pairs = BTreeSet::new();
+    for start in depends_on.keys() {
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        let mut stack: Vec<&str> = depends_on[start].iter().map(String::as_str).collect();
+        while let Some(d) = stack.pop() {
+            if d == start || !seen.insert(d) {
+                continue;
+            }
+            let (a, b) = if start.as_str() < d {
+                (start.as_str(), d)
+            } else {
+                (d, start.as_str())
+            };
+            pairs.insert((a.to_owned(), b.to_owned()));
+            if let Some(next) = depends_on.get(d) {
+                stack.extend(next.iter().map(String::as_str));
+            }
+        }
+    }
+    pairs
 }
 
 /// The backticked anchors of a sentence, whitespace-normalized.
@@ -1186,10 +1273,161 @@ fn numbers(text: &str) -> BTreeSet<String> {
         .collect()
 }
 
-/// Whether two sentences with the same anchors state opposite behavior.
-fn contradicts(a: &str, b: &str) -> bool {
+/// Whether an expectation `a` (claims `mine`) and a matching provision `b`
+/// (claims `theirs`) state opposite behavior: different numbers, or one
+/// negated where the other is not. The negation is read only when the
+/// expectation's anchors are nothing but the symbol, or the same anchors as
+/// the provision's: an expectation with anchors of its own negates something
+/// about those ("requires no construction of `TaxUs`"), which a provision
+/// that names more anchors does not state the opposite of.
+fn contradicts(a: &str, b: &str, mine: &BTreeSet<String>, theirs: &BTreeSet<String>) -> bool {
     let (na, nb) = (numbers(a), numbers(b));
-    negated(a) != negated(b) || (!na.is_empty() && !nb.is_empty() && na != nb)
+    let same_anchors = mine.is_empty() || mine == theirs;
+    (same_anchors && negated(a) != negated(b)) || (!na.is_empty() && !nb.is_empty() && na != nb)
+}
+
+/// What the interface's own files state: the stub, reference, consumer and
+/// test files and the check commands, which stub-compile and vacuity already
+/// hold the parties to. An expectation these state is guaranteed by the
+/// mechanical checks whatever the provider's sentence leaves out.
+struct ArtifactText {
+    /// Everything, whitespace-normalized, for claims that are not one word.
+    text: String,
+    /// Identifier words, for one-word claims.
+    words: BTreeSet<String>,
+    /// Canonical signatures of the functions the files define, by the last
+    /// segment of the function's name.
+    signatures: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl ArtifactText {
+    fn of(ic: &InterfaceContract) -> Self {
+        let files: Vec<&FileOverlay> = ic
+            .stub
+            .iter()
+            .chain(&ic.reference)
+            .chain(&ic.consumer)
+            .chain(&ic.tests)
+            .collect();
+        let mut raw = String::new();
+        for f in &files {
+            raw.push_str(&f.path);
+            raw.push('\n');
+            raw.push_str(&f.content);
+            raw.push('\n');
+        }
+        raw.push_str(&ic.compile.join(" "));
+        raw.push('\n');
+        raw.push_str(&ic.test.join(" "));
+        let words = raw
+            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .filter(|w| !w.is_empty())
+            .map(str::to_owned)
+            .collect();
+        let mut signatures: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for f in &files {
+            for (i, _) in f
+                .content
+                .match_indices("fn ")
+                .chain(f.content.match_indices("def "))
+            {
+                let starts_word = f.content[..i]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
+                if !starts_word {
+                    continue;
+                }
+                let rest = &f.content[i..];
+                let end = rest.find(['{', ';', '\n']).unwrap_or(rest.len());
+                if let Some(sig) = signature(&rest[..end])
+                    && let Some(name) = segments(&sig.name).last().filter(|n| !n.is_empty())
+                {
+                    signatures
+                        .entry((*name).to_owned())
+                        .or_default()
+                        .insert(sig.canonical);
+                }
+            }
+        }
+        Self {
+            text: raw.split_whitespace().collect::<Vec<_>>().join(" "),
+            words,
+            signatures,
+        }
+    }
+
+    fn signatures_of(&self, symbol: &str) -> Option<&BTreeSet<String>> {
+        segments(symbol)
+            .last()
+            .and_then(|n| self.signatures.get(*n))
+    }
+
+    /// Whether the files state `claim` about `symbol`: a signature the files
+    /// give the symbol, a word they contain, or a phrase they contain.
+    fn states(&self, symbol: &str, claim: &str) -> bool {
+        if claim.starts_with("fn(") {
+            return self
+                .signatures_of(symbol)
+                .is_some_and(|s| s.contains(claim));
+        }
+        if claim.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return self.words.contains(claim);
+        }
+        self.text.contains(claim)
+    }
+
+    /// Whether a provision may be silent where the files speak: it states no
+    /// signature for `symbol` other than one the files give it. A provider
+    /// that states another signature disagrees with the contract itself.
+    fn provision_consistent(&self, symbol: &str, theirs: &BTreeSet<String>) -> bool {
+        !self.text.is_empty()
+            && theirs
+                .iter()
+                .filter(|c| c.starts_with("fn("))
+                .all(|c| self.signatures_of(symbol).is_some_and(|s| s.contains(c)))
+    }
+}
+
+/// The parties that may provide `symbol`: those whose declared writes hold a
+/// stub file that defines it (a stub file naming the symbol, or any stub file
+/// when none names it). `None` when no party writes such a file: the plan
+/// then names no producer, which landing the stub refuses on its own, and the
+/// provisions are read from the sentences alone.
+fn stub_writers<'p>(
+    ic: &InterfaceContract,
+    symbol: &str,
+    parties: &[&'p str],
+    writes: &BTreeMap<String, Vec<WriteTarget>>,
+) -> Option<BTreeSet<&'p str>> {
+    let name = segments(symbol).last().copied().unwrap_or(symbol);
+    let naming: Vec<&str> = ic
+        .stub
+        .iter()
+        .filter(|f| {
+            f.content
+                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .any(|w| w == name)
+        })
+        .map(|f| f.path.as_str())
+        .collect();
+    let files: Vec<&str> = if naming.is_empty() {
+        ic.stub.iter().map(|f| f.path.as_str()).collect()
+    } else {
+        naming
+    };
+    let norm = |p: &str| p.trim().trim_start_matches("./").to_owned();
+    let files: BTreeSet<String> = files.into_iter().map(norm).collect();
+    let writers: BTreeSet<&str> = parties
+        .iter()
+        .copied()
+        .filter(|p| {
+            writes
+                .get(*p)
+                .is_some_and(|w| w.iter().any(|t| files.contains(&norm(&t.path))))
+        })
+        .collect();
+    (!writers.is_empty()).then_some(writers)
 }
 
 /// Compare the parties' statements. Empty means the handshake holds.
@@ -1236,11 +1474,48 @@ fn contradicts(a: &str, b: &str) -> bool {
 /// (stub-compile builds the consumer against the stub, which pins the path), and
 /// any behavior neither party states. Those are the semantic class 0033 leaves to
 /// the gates.
+///
+/// Every party is taken to run at the same time as every other, so any path
+/// two parties touch overlaps; [`compare_handshake_ordered`] takes the plan's
+/// dependency order.
 pub fn compare_handshake(
     ic: &InterfaceContract,
     statements: &[HandshakeStatement],
     writes: &BTreeMap<String, Vec<WriteTarget>>,
 ) -> Vec<HandshakeFinding> {
+    compare_handshake_ordered(ic, statements, writes, &BTreeSet::new())
+}
+
+/// [`compare_handshake`] with the plan's dependency order: `ordered` holds the
+/// pairs of parties that never run at once ([`ordered_pairs`]).
+///
+/// Beyond the rules above:
+/// - a provision counts only from a party whose declared writes hold the stub
+///   file defining the symbol ([`stub_writers`]). A test writer, or a party
+///   that writes nothing, provides nothing, whatever its sentence says ("I
+///   will provide `x` integration-test coverage"). With no party writing that
+///   file, the sentences alone decide, as before;
+/// - an expectation claim the provider's sentence leaves out is not a
+///   disagreement when the interface's own files state it (a type the stub's
+///   signature gives, a crate name its test imports), unless the provider
+///   states a signature for the symbol that the files do not give;
+/// - a touch shared by two parties overlaps only when no dependency orders
+///   them: parties in order never write at once;
+/// - [`HandshakeFinding::Unanchored`] and [`HandshakeFinding::OutsideSurface`]
+///   are returned, and the caller records them as warnings
+///   ([`HandshakeFinding::holds`]).
+///
+/// **What this adds to what it does not catch:** a claim the files state
+/// anywhere, not only about the symbol (`i64` in another function of the
+/// stub), backs a silent provider.
+pub fn compare_handshake_ordered(
+    ic: &InterfaceContract,
+    statements: &[HandshakeStatement],
+    writes: &BTreeMap<String, Vec<WriteTarget>>,
+    ordered: &BTreeSet<(String, String)>,
+) -> Vec<HandshakeFinding> {
+    let artifact = ArtifactText::of(ic);
+    let party_ids: Vec<&str> = ic.parties.iter().map(String::as_str).collect();
     let surface: BTreeSet<&str> = ic.symbols.iter().map(String::as_str).collect();
     let label = ic.label();
     // The interface's id is set aside only when it is not also a surface
@@ -1281,6 +1556,12 @@ pub fn compare_handshake(
                 // Tests for the symbol, or its callers: the party's own brief,
                 // not a provision of the symbol.
                 (Some(_), _) if r.subject_used => {}
+                // A party that writes no stub file of the symbol cannot
+                // provide it: its work is about the symbol (tests of it,
+                // checks of it), not the symbol.
+                (Some(sym), _)
+                    if stub_writers(ic, sym, &party_ids, writes)
+                        .is_some_and(|w| !w.contains(s.party.as_str())) => {}
                 (Some(sym), _) => {
                     provided.entry(sym).or_default().push((
                         s.party.as_str(),
@@ -1371,8 +1652,12 @@ pub fn compare_handshake(
             let same: Vec<&&Provision<'_>> = others
                 .iter()
                 .filter(|(_, t, theirs)| {
-                    mine.iter()
-                        .all(|c| theirs.contains(c) || stated_in_prose(c, t))
+                    let silent_ok = artifact.provision_consistent(sym, theirs);
+                    mine.iter().all(|c| {
+                        theirs.contains(c)
+                            || stated_in_prose(c, t)
+                            || (silent_ok && artifact.states(sym, c))
+                    })
                 })
                 .collect();
             if same.is_empty() {
@@ -1384,7 +1669,10 @@ pub fn compare_handshake(
                     providing: (*p).to_owned(),
                     provides: (*t).to_owned(),
                 });
-            } else if same.iter().all(|(_, t, _)| contradicts(text, t)) {
+            } else if same
+                .iter()
+                .all(|(_, t, theirs)| contradicts(text, t, &mine, theirs))
+            {
                 let (p, t, _) = same[0];
                 findings.push(HandshakeFinding::Contradict {
                     symbol: sym.to_owned(),
@@ -1410,11 +1698,26 @@ pub fn compare_handshake(
             touched.entry(path).or_default().insert(s.party.as_str());
         }
     }
+    // Only parties that may run at once overlap: a pair a dependency orders
+    // writes the path one after the other.
+    let at_once = |a: &str, b: &str| {
+        let key = if a < b {
+            (a.to_owned(), b.to_owned())
+        } else {
+            (b.to_owned(), a.to_owned())
+        };
+        !ordered.contains(&key)
+    };
     for (path, parties) in touched {
-        if parties.len() > 1 {
+        let overlapping: Vec<String> = parties
+            .iter()
+            .filter(|p| parties.iter().any(|q| q != *p && at_once(p, q)))
+            .map(|p| (*p).to_owned())
+            .collect();
+        if overlapping.len() > 1 {
             findings.push(HandshakeFinding::TouchOverlap {
                 path,
-                parties: parties.into_iter().map(str::to_owned).collect(),
+                parties: overlapping,
             });
         }
     }
@@ -1798,11 +2101,29 @@ mod tests {
         assert!(f.contains(&HandshakeFinding::Missing {
             party: "consumer".into()
         }));
+        // A consumer that writes no stub file provides nothing, whatever its
+        // sentence says.
         let b = st("consumer", &["I will provide `Config`"], &[], &[]);
-        let f = compare_handshake(&ic(), &[a, b], &writes());
+        let f = compare_handshake(&ic(), &[a.clone(), b.clone()], &writes());
         assert!(
-            f.iter()
-                .any(|x| matches!(x, HandshakeFinding::DoubleProvided { .. }))
+            !f.iter()
+                .any(|x| matches!(x, HandshakeFinding::DoubleProvided { .. })),
+            "{f:?}"
+        );
+        // Declaring a write to the stub file makes it a second provider.
+        let mut both = writes();
+        both.get_mut("consumer")
+            .expect("consumer")
+            .push(WriteTarget {
+                path: "src/config.rs".into(),
+                node: None,
+            });
+        let f = compare_handshake(&ic(), &[a, b], &both);
+        assert!(
+            f.iter().any(|x| matches!(x,
+                HandshakeFinding::DoubleProvided { symbol, parties }
+                    if symbol == "Config" && parties == &["consumer", "producer"])),
+            "{f:?}"
         );
     }
 
@@ -1926,6 +2247,29 @@ mod tests {
         ];
         c.reference = c.stub.clone();
         assert!(c.validate().is_err(), "NFC-equal names collide too");
+    }
+
+    /// A consumer file and a test at one path, with different content (a
+    /// planner's rewrite of a fixed test next to the original): overlaid in
+    /// one tree, the later would silently win. Refused; the same content
+    /// twice is not.
+    #[test]
+    fn two_overlaid_files_at_one_path_with_different_content_are_refused() {
+        let mut c = ic();
+        c.consumer = vec![FileOverlay::new("checkout/tests/integration.rs", "a")];
+        c.tests = vec![FileOverlay::new("checkout/tests/integration.rs", "b")];
+        let e = c.validate().expect_err("refused");
+        assert!(
+            e.contains("the consumer file `checkout/tests/integration.rs` and the tests file"),
+            "{e}"
+        );
+        c.tests[0].content = "a".into();
+        c.validate().expect("the same content twice is harmless");
+        // A stub and a test are overlaid together too.
+        c.consumer.clear();
+        c.tests = vec![FileOverlay::new("./src/config.rs", "b")];
+        let e = c.validate().expect_err("refused");
+        assert!(e.contains("the stub file `src/config.rs`"), "{e}");
     }
 
     #[test]

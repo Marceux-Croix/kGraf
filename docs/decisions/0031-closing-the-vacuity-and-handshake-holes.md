@@ -142,3 +142,23 @@ symbols gets mechanical comparison without giving up readability.
 **Agents confirm each other's handshakes.** Rejected on sycophantic echo,
 and because it delegates detection to the parties that already failed to
 detect.
+
+## Amendment (2026-09-30): a failing check goes back to the planner first
+
+A plan whose interface failed a mechanical check ended the run with no dispatch, on a
+mistake a second ask could fix: an interface with no test files, stubs of the wrong trait
+arity, a test importing the wrong crate. These now go back to the planner through the
+existing bounded re-ask before any hold.
+
+- **The mechanical checks (artifact, stub-compile, vacuity) run on each planner answer.** A
+  failing interface refuses the answer with the check's failure text, and the planner is
+  asked again, at most twice. The last answer is taken, and the pre-dispatch gate holds the
+  parties on the same failure as before. A check that could not run is left to the gate.
+  The gate runs the checks again at dispatch, against the tip of that moment.
+- **A check's kept output leads with the compiler's errors.** Error blocks (the error line
+  and its location and context lines) come first within the 4096-byte cap, then the tail,
+  so trailing toolchain warnings cannot push out the error that explains the failure.
+- **Two artifact refusals, fed to the same re-ask:** a contract test at the path of a file
+  the base already tracks, with different content (it would make the check validate a
+  rewrite of the project's own test); and stub, consumer or test files naming one path with
+  different content (overlaid in one tree, the later would silently win).

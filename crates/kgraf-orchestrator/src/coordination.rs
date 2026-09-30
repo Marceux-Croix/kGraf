@@ -84,6 +84,15 @@ pub struct Coordination {
     pub integration: BTreeMap<String, Integration>,
     /// The integration tip after the last merge this run made.
     pub integration_tip: Option<String>,
+    /// The integration tip when the run planned its gates, before any of the
+    /// plan landed: the commit a failing gate below the root is compared
+    /// with ([`crate::gates::record_inconclusive`]). `None` for unversioned
+    /// workspaces and for a record written before it was kept; such a run's
+    /// gates are judged as they stand.
+    pub base_commit: Option<String>,
+    /// The project's validation commands run once at `base_commit`, the
+    /// first time a gate below the root failed.
+    pub base_check: Option<BaseCheck>,
     /// Merge-back conflicts and refusals, each re-dispatched.
     pub integration_rejections: u64,
     /// Conversation-file commits that did not reach the integration branch.
@@ -101,6 +110,15 @@ pub struct Coordination {
     /// with their brief kept: search reaches them (0032: "contract: ... including
     /// superseded ones"), and the text surface shows their brief.
     pub closed: Vec<ClosedContract>,
+}
+
+/// The validation commands' outcome at the run's base commit.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BaseCheck {
+    pub commit: String,
+    pub passed: bool,
+    /// What ran, as the gate runner says.
+    pub by: String,
 }
 
 /// How a contract left the open set.

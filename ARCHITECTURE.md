@@ -139,7 +139,7 @@ the codebase.
 and size.** Comparing only time and size misses a change that preserves
 both, and rapid agent writes are precisely that workload.
 
-**An index write is one transaction, and a read never builds an index.** A file's content hash commits with its nodes, so a failure between the two cannot leave a file that reads as unchanged with stale or missing nodes. Only `kgraf index` creates or rebuilds the database. Every other command, and the host, opens an existing one, and stops with a message naming `kgraf index` when it is missing or was written by another schema version. A slice reads each node's lines from the file, compares the file's hash with the indexed one, and refuses an edited file. The store records a source root for each file, so code merged from a worker's worktree can be sliced before it reaches the checkout.
+**An index write is one transaction, and a read never builds an index.** A file's content hash commits with its nodes, so a failure between the two cannot leave a file that reads as unchanged with stale or missing nodes. Only `kgraf index` creates or rebuilds the database. Every other command, and the host, opens an existing one, and stops with a message naming `kgraf index` when it is missing or was written by another schema version. A slice reads each node's lines from the file, compares the file's hash with the indexed one, and refuses an edited file. The store records a source root for each file, so code merged from a worker's worktree can be sliced before it reaches the checkout. A pass writes up to 256 files per transaction and rolls the open group back as a whole if it fails, because one commit per file rewrote the same hash-keyed index pages for every file and grew slower as the index grew. The cache holds up to 64 MiB. Call resolution groups each name's definitions by language family, file and directory once, so its work follows the number of call sites and not their product with the definitions of a common name like `new`.
 
 **Call resolution is name-based, scoped by proximity, and bounded in
 fan-out.** An edge per same-named definition, with no bound, produced 6.8
@@ -227,7 +227,7 @@ Interpretation is a model pass over prose and will sometimes be wrong, so the
 orchestrator states its reading and takes correction before acting on it.
 Re-interpretation is incremental, scoped by change detection.
 
-`kgraf-ingest` parses Markdown, PDF and DOCX. `kgraf-interpret` gathers the
+`kgraf-ingest` parses Markdown, PDF and DOCX, and reads plain-text and source-format files (`.txt`, `.log`, `.json` and the like) up to 2 MiB; a larger one is reported as unreadable, not read. `kgraf-interpret` gathers the
 corpus with the graph's incremental index, ranks it with aider's repo-map
 PageRank (ported into `kgraf-graph`), builds a bounded brief, and makes one
 accounted model call. The reading prints a plan id, and nothing is created in
@@ -507,6 +507,19 @@ reference, then a handshake, one call per party on that party's own route
 through the ledger. A worker challenges with a dedicated tool; one challenge
 per lineage and interface is open at a time, each worker has a fixed budget
 of challenges, and escalation to the user follows only a paid review.
+
+The mechanical checks also run on each planner answer: an interface that is
+incomplete, or fails stub-compile or vacuity, refuses the answer with the
+check's failure (the compiler's error lines come first in a check's kept
+output), and the planner is asked again, at most twice; the last answer is
+taken and the gate holds on the same failure. A contract test may not
+replace a file the project already tracks, and the stub, consumer and test
+files may not name one path with different content. In the handshake, a
+provision counts only from a party that writes the symbol's stub file; a
+shared touch is an overlap only between parties no dependency orders; an
+expectation the interface's own files state is not a disagreement with a
+silent provider. A sentence bound to no surface symbol is recorded as a
+warning and holds nothing.
 
 ### Message bus
 
@@ -797,6 +810,18 @@ are both true. A failure halts new dispatch without canceling in-flight
 work and produces a remediation node. Because a gate is itself a node, a
 failing gate is already a blocking node with a visible edge to what it holds
 up, needing no separate state model.
+
+The discovered commands cover the whole project (`cargo test --workspace`),
+so a gate over part of the plan also runs tests of parts not built yet. When
+a gate below the root fails, the same commands run once per run at the
+commit the run started from. If they fail there too, the gate is
+**inconclusive**: it opens no remediation, halts nothing and blocks nothing,
+and the root gate, which runs once everything is built, judges its cover.
+The root gate is never inconclusive. A remediation carries the failing
+gate's commands, and its verifier runs them after the run's own check, so a
+remediation is accepted only when the gate's commands pass in its worktree.
+A remediation that integrates no change counts as failed: the gate opens the
+next one or holds, and never runs again on the unchanged commit.
 
 Gates are also what makes an imperfect partition survivable. The
 interference the underlying research most warns about is **semantic**:

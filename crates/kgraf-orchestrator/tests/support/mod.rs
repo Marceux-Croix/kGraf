@@ -540,6 +540,8 @@ pub struct FileVerifier {
     pub verified: AtomicUsize,
     /// `contract.verifications` as each verification saw it.
     pub numbers: Mutex<Vec<u32>>,
+    /// (contract, `contract.gate_commands`) as each verification saw them.
+    pub gate_commands: Mutex<Vec<(String, Vec<String>)>>,
 }
 
 impl FileVerifier {
@@ -553,6 +555,7 @@ impl FileVerifier {
             recheck_ok: AtomicBool::new(true),
             verified: AtomicUsize::new(0),
             numbers: Mutex::new(Vec::new()),
+            gate_commands: Mutex::new(Vec::new()),
         })
     }
 }
@@ -575,6 +578,10 @@ impl Verifier for FileVerifier {
             .lock()
             .expect("lock")
             .push(contract.verifications);
+        self.gate_commands
+            .lock()
+            .expect("lock")
+            .push((contract.contract.clone(), contract.gate_commands.clone()));
         let delay = *self.delay.lock().expect("lock");
         tokio::time::sleep(delay).await;
         let probe = self.probe.lock().expect("lock").clone();
@@ -899,6 +906,9 @@ pub struct FakeIntegration {
     /// brief quotes it as data): default matches the real merge-back's own
     /// wording closely enough for a test that does not care about it.
     pub conflict_detail: Mutex<String>,
+    /// Contracts whose attempts change nothing: integrated as
+    /// `Integration::Empty`, the tip unmoved.
+    pub empty_for: Mutex<std::collections::BTreeSet<String>>,
     next: AtomicUsize,
 }
 
@@ -913,6 +923,7 @@ impl FakeIntegration {
             conflicted: Mutex::new(Default::default()),
             conflicts_discarded: Mutex::new(Vec::new()),
             conflict_detail: Mutex::new("CONFLICT (content)".into()),
+            empty_for: Mutex::new(Default::default()),
             next: AtomicUsize::new(1),
         })
     }
@@ -924,6 +935,12 @@ impl FakeIntegration {
     pub fn tip(&self) -> Option<String> {
         let n = self.next.load(Ordering::SeqCst);
         (n > 1).then(|| format!("{:040x}", n - 1))
+    }
+
+    /// Give the branch a first commit, the base a run starts from, before
+    /// any merge: the tip is then known when the run plans.
+    pub fn start_from_a_base(&self) -> String {
+        self.commit()
     }
 }
 
@@ -967,6 +984,14 @@ impl kgraf_orchestrator::Workspaces for FakeIntegration {
                 detail: self.conflict_detail.lock().expect("lock").clone(),
                 commit: Some(commit),
             });
+        }
+        if self
+            .empty_for
+            .lock()
+            .expect("lock")
+            .contains(&contract.contract)
+        {
+            return Ok(kgraf_orchestrator::Integration::Empty);
         }
         let commit = self.commit();
         self.merges

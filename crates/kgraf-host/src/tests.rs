@@ -3081,6 +3081,41 @@ async fn a_passing_in_scope_change_is_committed_through_merge_back() {
     assert!(!v.recheck(&bogus).await.expect("ran"));
 }
 
+/// A gate remediation passes the run's check and must also pass the failing
+/// gate's own commands in its worktree: a fix they still fail on is refused,
+/// naming the gate's command; one they pass on is accepted.
+#[tokio::test]
+async fn a_remediation_must_also_pass_the_failing_gates_commands() {
+    let r = repo();
+    let ws = worktree(&r, "w-fix").await;
+    std::fs::write(ws.join("b.txt"), "b").expect("write");
+    let mut c = contract("b.txt");
+    c.gate_commands = vec!["test -f b.txt".into(), "grep -q fixed b.txt".into()];
+    match verifier(&r, "true")
+        .verify(&c, &ws, &result())
+        .await
+        .expect("ran")
+    {
+        Verdict::Fail { reason } => {
+            assert!(reason.contains("`grep -q fixed b.txt` failed"), "{reason}")
+        }
+        other => panic!("the run's check alone does not accept it: {other:?}"),
+    }
+    let ws = worktree(&r, "w-fix-2").await;
+    std::fs::write(ws.join("b.txt"), "fixed").expect("write");
+    let v = verifier(&r, "true").verify(&c, &ws, &result()).await;
+    assert!(
+        matches!(
+            v,
+            Ok(Verdict::Pass {
+                commit: Some(_),
+                ..
+            })
+        ),
+        "{v:?}"
+    );
+}
+
 #[tokio::test]
 async fn an_undeclared_change_fails_the_attempt() {
     let r = repo();

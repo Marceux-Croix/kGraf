@@ -40,6 +40,15 @@ pub use model::{
 /// report rather than load whole.
 pub const DEFAULT_MAX_FILE_SIZE: u64 = 64 * 1024 * 1024;
 
+/// Default ceiling on a plain-text or source-format file read as a document
+/// (`.txt`, `.log`, `.json`, `.toml`, `.yaml`, source files). Files of these
+/// formats over 2 MiB are machine output (logs, data dumps, generated code), not
+/// prose a reader can use, and they match the code index's own size ceiling. A
+/// larger file is reported as [`IngestError::TooLarge`] in
+/// `IngestReport::failures`, never read and never dropped silently. Markdown,
+/// PDF and DOCX keep [`DEFAULT_MAX_FILE_SIZE`].
+pub const DEFAULT_MAX_TEXT_FILE_SIZE: u64 = 2 * 1024 * 1024;
+
 /// `ingest_directory` with [`DEFAULT_MAX_FILE_SIZE`].
 pub fn ingest_directory(root: &Path) -> Result<IngestReport, IngestError> {
     ingest_directory_with_limit(root, DEFAULT_MAX_FILE_SIZE)
@@ -74,6 +83,9 @@ pub fn ingest_directory_with_limit(
 pub struct IngestOptions {
     /// See [`ingest_directory_with_limit`].
     pub max_file_size: u64,
+    /// The lower ceiling for plain-text and source-format files; see
+    /// [`DEFAULT_MAX_TEXT_FILE_SIZE`]. The smaller of the two limits applies to them.
+    pub max_text_file_size: u64,
     /// Source files the caller already holds another way, by path relative to
     /// the root (forward slashes): the files the code graph actually indexed, not
     /// every file with a code extension, so a source file the graph skipped (a
@@ -91,6 +103,7 @@ impl Default for IngestOptions {
     fn default() -> Self {
         Self {
             max_file_size: DEFAULT_MAX_FILE_SIZE,
+            max_text_file_size: DEFAULT_MAX_TEXT_FILE_SIZE,
             covered_paths: std::collections::BTreeSet::new(),
             excluded_dir_paths: std::collections::BTreeSet::new(),
         }
@@ -113,7 +126,12 @@ pub fn ingest_directory_with(
             });
             continue;
         }
-        match parse::parse_file(&path, root, options.max_file_size) {
+        let limit = if parse::is_text_format(&path) {
+            options.max_file_size.min(options.max_text_file_size)
+        } else {
+            options.max_file_size
+        };
+        match parse::parse_file(&path, root, limit) {
             Ok(parse::ParseOutcome::Parsed(document)) => report.documents.push(document),
             Ok(parse::ParseOutcome::Skipped(reason)) => {
                 report.skipped.push(SkippedFile { path, reason });
@@ -218,6 +236,54 @@ mod tests {
             &report.skipped[0].reason,
             SkipReason::CoveredElsewhere
         ));
+    }
+
+    #[test]
+    fn a_large_text_format_file_is_a_failure_but_large_prose_and_lockfiles_are_not() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let options = IngestOptions {
+            max_text_file_size: 1024,
+            ..IngestOptions::default()
+        };
+        std::fs::write(dir.path().join("dump.json"), vec![b' '; 4096]).expect("write");
+        std::fs::write(dir.path().join("run.log"), vec![b'x'; 4096]).expect("write");
+        std::fs::write(dir.path().join("notes.md"), "a ".repeat(2048)).expect("write");
+        std::fs::write(dir.path().join("Cargo.lock"), vec![b'#'; 4096]).expect("write");
+        std::fs::write(dir.path().join("small.json"), "{}").expect("write");
+        let report = ingest_directory_with(dir.path(), &options).expect("ingest");
+        let mut failed: Vec<_> = report
+            .failures
+            .iter()
+            .map(|f| {
+                f.path
+                    .file_name()
+                    .expect("name")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        failed.sort();
+        assert_eq!(failed, ["dump.json", "run.log"]);
+        assert!(
+            report
+                .failures
+                .iter()
+                .all(|f| matches!(f.error, IngestError::TooLarge { limit: 1024, .. }))
+        );
+        let mut read: Vec<_> = report
+            .documents
+            .iter()
+            .map(|d| {
+                d.path
+                    .file_name()
+                    .expect("name")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        read.sort();
+        assert_eq!(read, ["notes.md", "small.json"]);
+        assert!(matches!(report.skipped[0].reason, SkipReason::LockFile));
     }
 
     #[test]

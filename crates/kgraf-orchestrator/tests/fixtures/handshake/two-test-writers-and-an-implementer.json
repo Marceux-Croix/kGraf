@@ -1,0 +1,166 @@
+{
+  "interface": {
+    "id": "c3.i1",
+    "version": 1,
+    "parties": [
+      "c3.c1.c1",
+      "c3.c2.c1",
+      "c3.c2.c2"
+    ],
+    "symbols": [
+      "state_tax_rate"
+    ],
+    "stub": [
+      {
+        "path": "tax_us/src/lib.rs",
+        "content": "pub fn state_tax_rate(_state: &str) -> f64 {\n    0.0\n}\n"
+      }
+    ],
+    "wrong": [],
+    "reference": [
+      {
+        "path": "tax_us/src/lib.rs",
+        "content": "pub fn state_tax_rate(state: &str) -> f64 {\n    match state {\n        \"CA\" => 0.08,\n        \"OR\" => 0.0,\n        _ => 0.05,\n    }\n}\n"
+      }
+    ],
+    "consumer": [],
+    "tests": [
+      {
+        "path": "tax_us/tests/state_tax_rate.rs",
+        "content": "use tax_us::state_tax_rate;\n\n#[test]\nfn rates_match_the_state_rules() {\n    assert_eq!(state_tax_rate(\"CA\"), 0.08);\n    assert_eq!(state_tax_rate(\"OR\"), 0.0);\n    assert_eq!(state_tax_rate(\"NY\"), 0.05);\n}\n"
+      }
+    ],
+    "compile": [
+      "cargo",
+      "test",
+      "-p",
+      "tax_us",
+      "--no-run"
+    ],
+    "test": [
+      "cargo",
+      "test",
+      "-p",
+      "tax_us",
+      "--test",
+      "state_tax_rate"
+    ],
+    "consulted": [],
+    "replaces": [
+      "tax_us/src/lib.rs"
+    ]
+  },
+  "handshake": [
+    {
+      "party": "c3.c1.c1",
+      "provide": [
+        "I will provide `state_tax_rate` and `TaxUs::tax_cents` using the existing `TaxUs` and `Order` types."
+      ],
+      "expect": [
+        "I assume `c3.c2.c1` and `c3.c2.c2` follow the existing `iface` conventions and agree on the `Order` interface."
+      ],
+      "consume": [
+        "I assume `Order.state` is a `String`-like value, `state_tax_rate` accepts `&str` and returns `f64`, and `TaxUs::tax_cents` returns `i64`."
+      ],
+      "touch": [
+        "tax_us/src/lib.rs"
+      ]
+    },
+    {
+      "party": "c3.c2.c1",
+      "provide": [
+        "I will provide `state_tax_rate` integration-test coverage in `tax_us/tests/state_tax_rate_ca_or.rs` that calls the public `tax_us::state_tax_rate` once for California and once for Oregon and asserts each returned rate against a concrete expected numeric literal, without touching `TaxUs` or any production code"
+      ],
+      "expect": [
+        "I assume you (collectively `c3.c1.c1` and `c3.c2.c2`) provide `state_tax_rate` as a public function exported at the path `tax_us::state_tax_rate`, callable from an external integration test under `tax_us/tests/`",
+        "I assume you provide `state_tax_rate` with a stable signature that lets me denote California and Oregon as inputs and returns a single numeric rate per call, of a type comparable to a numeric literal (e.g. `f64`)"
+      ],
+      "consume": [
+        "I assume `state_tax_rate` is deterministic and side-effect free, so repeated calls for California and for Oregon always return the same rates within a test run",
+        "I assume `state_tax_rate`'s agreed return values for California and Oregon under contract `c3.i1@v1` are fixed and known, so the concrete expected numeric values I hard-code in assertions will match exactly",
+        "I assume `state_tax_rate` requires no construction of `TaxUs` or other setup beyond whatever state-identifier value I pass in"
+      ],
+      "touch": [
+        "tax_us/tests/state_tax_rate_ca_or.rs"
+      ]
+    },
+    {
+      "party": "c3.c2.c2",
+      "provide": [
+        "I will provide an integration test for `state_tax_rate` in tax_us/tests/state_tax_rate_other.rs that calls the public function for at least one state other than CA or OR and asserts the returned `f64` against a concrete expected numeric rate defined by the existing implementation"
+      ],
+      "expect": [
+        "I assume `c3.c1.c1` or `c3.c2.c1` provides `state_tax_rate` as a public, already-implemented function exported from the `tax_us` crate (i.e., reachable as `tax_us::state_tax_rate`), with explicitly defined rates for at least one state other than CA or OR so my assertion can target a concrete value",
+        "I assume the other parties provide the production implementation and the crate's public API surface; I will not modify production code and only add my declared test file"
+      ],
+      "consume": [
+        "I assume `state_tax_rate` has signature `fn state_tax_rate(state: &str) -> f64` (or an equivalent public signature taking a state identifier as a string-like type and returning a numeric rate), and that calling it with a state whose rate is explicitly defined returns that exact rate rather than a default or error"
+      ],
+      "touch": [
+        "tax_us/tests/state_tax_rate_other.rs"
+      ]
+    }
+  ],
+  "recorded_findings": [
+    {
+      "finding": "double_provided",
+      "symbol": "state_tax_rate",
+      "parties": [
+        "c3.c1.c1",
+        "c3.c2.c1"
+      ]
+    },
+    {
+      "finding": "outside_surface",
+      "party": "c3.c1.c1",
+      "symbol": "iface",
+      "text": "I assume `c3.c2.c1` and `c3.c2.c2` follow the existing `iface` conventions and agree on the `Order` interface."
+    },
+    {
+      "finding": "disagree",
+      "symbol": "state_tax_rate",
+      "expecting": "c3.c2.c2",
+      "expects": "I assume `c3.c1.c1` or `c3.c2.c1` provides `state_tax_rate` as a public, already-implemented function exported from the `tax_us` crate (i.e., reachable as `tax_us::state_tax_rate`), with explicitly defined rates for at least one state other than CA or OR so my assertion can target a concrete value",
+      "providing": "c3.c1.c1",
+      "provides": "I will provide `state_tax_rate` and `TaxUs::tax_cents` using the existing `TaxUs` and `Order` types."
+    },
+    {
+      "finding": "unanchored",
+      "party": "c3.c2.c2",
+      "text": "I assume the other parties provide the production implementation and the crate's public API surface; I will not modify production code and only add my declared test file"
+    },
+    {
+      "finding": "disagree",
+      "symbol": "state_tax_rate",
+      "expecting": "c3.c2.c2",
+      "expects": "I assume `state_tax_rate` has signature `fn state_tax_rate(state: &str) -> f64` (or an equivalent public signature taking a state identifier as a string-like type and returning a numeric rate), and that calling it with a state whose rate is explicitly defined returns that exact rate rather than a default or error",
+      "providing": "c3.c1.c1",
+      "provides": "I will provide `state_tax_rate` and `TaxUs::tax_cents` using the existing `TaxUs` and `Order` types."
+    }
+  ],
+  "writes": {
+    "c3.c1.c1": [
+      {
+        "path": "tax_us/src/lib.rs"
+      }
+    ],
+    "c3.c2.c1": [
+      {
+        "path": "tax_us/tests/state_tax_rate_ca_or.rs"
+      }
+    ],
+    "c3.c2.c2": [
+      {
+        "path": "tax_us/tests/state_tax_rate_other.rs"
+      }
+    ]
+  },
+  "depends_on": {
+    "c3.c2.c1": [
+      "c3.c1.c1"
+    ],
+    "c3.c2.c2": [
+      "c3.c1.c1"
+    ]
+  }
+}

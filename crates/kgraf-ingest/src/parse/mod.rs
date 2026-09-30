@@ -58,6 +58,17 @@ fn classify(path: &Path) -> Option<DocumentKind> {
     }
 }
 
+/// Whether `path` is read as plain text or source (not Markdown, PDF, DOCX, a
+/// lockfile or an unsupported format): the formats the smaller text-file limit
+/// applies to.
+pub fn is_text_format(path: &Path) -> bool {
+    !is_lock_file(path)
+        && matches!(
+            classify(path),
+            Some(DocumentKind::PlainText | DocumentKind::Code)
+        )
+}
+
 /// Whether `path` is a source file listed in `covered` (root-relative, forward
 /// slashes). Only `DocumentKind::Code` files qualify: prose is never covered.
 pub fn covered_code(

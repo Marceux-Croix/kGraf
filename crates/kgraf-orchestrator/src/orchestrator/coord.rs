@@ -36,6 +36,9 @@ pub(super) struct GateDone {
     pub(super) gate: String,
     pub(super) pinned: Option<String>,
     pub(super) verdict: Result<GateVerdict, String>,
+    /// The same commands at the run's base commit, run after a failure of a
+    /// gate below the root when the base was not checked yet: (commit, verdict).
+    pub(super) base: Option<(String, Result<GateVerdict, String>)>,
 }
 
 /// What `integrate_winner` found, for the caller to act on: accepted (or
@@ -267,11 +270,80 @@ impl RunLoop {
                 _ => IntegrateOutcome::Refused,
             });
         }
+        let empty = matches!(outcome, Integration::Empty);
         self.record
             .coordination
             .integration
             .insert(contract.contract.clone(), outcome);
+        if empty && gates::is_remediation(&self.record.coordination.gates, &contract.contract) {
+            self.remediation_changed_nothing(contract, at);
+        }
         Ok(IntegrateOutcome::Accepted)
+    }
+
+    /// A remediation that integrated no change fixed nothing: its gate opens
+    /// the next remediation or holds, and is not run again on the same commit.
+    fn remediation_changed_nothing(&mut self, remediation: &OpenContract, at: i64) {
+        let run = self.run_id();
+        let max = self.config_max_remediations();
+        let next = gates::remediation_changed_nothing(
+            &mut self.record.coordination.gates,
+            remediation,
+            at,
+            max,
+            &run,
+        );
+        let Some(gate) = self
+            .record
+            .coordination
+            .gates
+            .iter()
+            .find(|g| g.remediations.contains(&remediation.contract))
+            .map(|g| (g.id.clone(), g.status.clone()))
+        else {
+            return;
+        };
+        let (gate, status) = gate;
+        match next {
+            Some(mut fix) => {
+                if fix.gate_commands.is_empty() {
+                    fix.gate_commands = self
+                        .coord
+                        .gate_runner
+                        .as_ref()
+                        .map(|r| r.commands())
+                        .unwrap_or_default();
+                }
+                self.queue(TraceEvent::Gate {
+                    at_ms: at,
+                    gate: gate.clone(),
+                    state: "failed".into(),
+                    detail: format!(
+                        "remediation {} changed nothing; remediation {}",
+                        remediation.contract, fix.contract
+                    ),
+                });
+                gates::open_remediation(&mut self.record.coordination.gates, &gate, &fix.contract);
+                self.record.open_contracts.push(fix);
+            }
+            None => {
+                if let GateStatus::Held { reason } = status {
+                    self.queue(TraceEvent::Gate {
+                        at_ms: at,
+                        gate: gate.clone(),
+                        state: "held".into(),
+                        detail: reason,
+                    });
+                    let holder = OpenContract::planned(
+                        gate.clone(),
+                        format!("{run}/{gate}").as_str().into(),
+                        "quality gate",
+                        "passes",
+                    );
+                    self.submit_report(&holder, None, ReportKind::NeedsInput, "quality gate held");
+                }
+            }
+        }
     }
 
     /// The task id the co-change tables use for a contract: scoped to the run, so
@@ -937,6 +1009,24 @@ impl RunLoop {
                 commands: runner.commands(),
                 pinned,
             };
+            // A gate below the root runs the project-wide commands, which can
+            // fail on parts of the plan outside its cover that are not built
+            // yet. Should it fail, the same commands run once per run at the
+            // base commit, to tell that apart from a failure of its cover.
+            let coordination = &self.record.coordination;
+            let probe = match (&coordination.base_commit, &coordination.base_check) {
+                (Some(base), None) if id != gates::ROOT_GATE => Some(GateRequest {
+                    gate: gates::BASE_GATE_PROBE.to_owned(),
+                    covers: Vec::new(),
+                    commands: request.commands.clone(),
+                    pinned: Some(VerifiedCommit {
+                        sha: base.clone(),
+                        verified_by: "the run's base commit".into(),
+                        verified_ms: at,
+                    }),
+                }),
+                _ => None,
+            };
             self.coord.gate_flights.insert(id.clone(), admitted);
             self.note_wait(&id, WaitState::Running);
             self.queue(TraceEvent::Gate {
@@ -956,18 +1046,29 @@ impl RunLoop {
             // reach the loop as a `GateFinished` message, releasing the
             // admission slot held for this gate and clearing its wait state,
             // or the gate (and any run waiting on it) hangs forever.
-            let gate_task = tokio::spawn(async move { runner.run(request).await });
+            let gate_task = tokio::spawn(async move {
+                let verdict = runner.run(request).await;
+                let base = match (&verdict, probe) {
+                    (Ok(v), Some(p)) if !v.passed => {
+                        let at = p.pinned.as_ref().map(|c| c.sha.clone()).unwrap_or_default();
+                        Some((at, runner.run(p).await))
+                    }
+                    _ => None,
+                };
+                (verdict, base)
+            });
             tokio::spawn(async move {
-                let verdict = match gate_task.await {
+                let (verdict, base) = match gate_task.await {
                     Ok(v) => v,
-                    Err(e) if e.is_panic() => Err(format!("the gate panicked: {e}")),
-                    Err(e) => Err(format!("the gate's task ended abnormally: {e}")),
+                    Err(e) if e.is_panic() => (Err(format!("the gate panicked: {e}")), None),
+                    Err(e) => (Err(format!("the gate's task ended abnormally: {e}")), None),
                 };
                 let _ = tx
                     .send(LoopMsg::GateFinished(Box::new(GateDone {
                         gate: id,
                         pinned: pin,
                         verdict,
+                        base,
                     })))
                     .await;
             });
@@ -985,6 +1086,7 @@ impl RunLoop {
             gate,
             pinned,
             verdict,
+            base,
         } = done;
         if let Some(a) = self.coord.gate_flights.remove(&gate) {
             self.s.admission.gate().release(a);
@@ -996,6 +1098,76 @@ impl RunLoop {
             return self.save();
         }
         let at = self.now();
+        if let Some((commit, result)) = base {
+            match result {
+                Ok(v) => {
+                    self.queue(TraceEvent::Gate {
+                        at_ms: at,
+                        gate: gates::BASE_GATE_PROBE.into(),
+                        state: if v.passed { "passed" } else { "failed" }.into(),
+                        detail: format!(
+                            "the validation commands at the run's base commit: {}",
+                            v.by
+                        ),
+                    });
+                    self.record.coordination.base_check = Some(crate::coordination::BaseCheck {
+                        commit,
+                        passed: v.passed,
+                        by: v.by,
+                    });
+                }
+                // Said, never read as either outcome: the gate is judged
+                // as it stands, and the base is tried again at the next
+                // failure.
+                Err(e) => self.queue(TraceEvent::Gate {
+                    at_ms: at,
+                    gate: gates::BASE_GATE_PROBE.into(),
+                    state: "not run".into(),
+                    detail: kgraf_secrets::scrub_persist_owned(format!(
+                        "the validation commands could not run at the run's base commit \
+                         {commit}: {e}; gate {gate} is judged as it stands"
+                    )),
+                }),
+            }
+        }
+        let failed_below_root = gate != gates::ROOT_GATE && matches!(&verdict, Ok(v) if !v.passed);
+        let base_fails = self
+            .record
+            .coordination
+            .base_check
+            .as_ref()
+            .filter(|b| Some(&b.commit) == self.record.coordination.base_commit.as_ref())
+            .filter(|b| !b.passed)
+            .map(|b| b.by.clone());
+        if failed_below_root
+            && let Some(base_by) = base_fails
+            && gates::record_inconclusive(
+                &mut self.record.coordination.gates,
+                &gate,
+                pinned.clone(),
+                at,
+                &base_by,
+            )
+        {
+            let reason = self
+                .record
+                .coordination
+                .gates
+                .iter()
+                .find(|g| g.id == gate)
+                .and_then(|g| match &g.status {
+                    GateStatus::Inconclusive { reason, .. } => Some(reason.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            self.queue(TraceEvent::Gate {
+                at_ms: at,
+                gate: gate.clone(),
+                state: "inconclusive".into(),
+                detail: reason,
+            });
+            return self.save();
+        }
         let run = self.run_id();
         let passed = matches!(&verdict, Ok(v) if v.passed);
         let max_remediations = self.config_max_remediations();
@@ -1029,7 +1201,15 @@ impl RunLoop {
             state: state.into(),
             detail,
         });
-        if let Some(fix) = fix {
+        if let Some(mut fix) = fix {
+            // The fix is accepted only once the failing gate's own commands
+            // pass in its worktree, not only the run's check.
+            fix.gate_commands = self
+                .coord
+                .gate_runner
+                .as_ref()
+                .map(|r| r.commands())
+                .unwrap_or_default();
             gates::open_remediation(&mut self.record.coordination.gates, &gate, &fix.contract);
             self.record.open_contracts.push(fix);
         } else if !passed {

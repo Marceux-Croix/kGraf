@@ -682,6 +682,59 @@ async fn a_handshake_mismatch_holds_the_parties_with_the_statements_recorded() {
     ));
 }
 
+/// An assumption that names no contract symbol cannot be compared with any
+/// other party's statement: it is recorded with the pass as a warning, and both
+/// parties dispatch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unanchored_assumption_is_a_warning_and_the_parties_dispatch() {
+    let dir = tempfile::tempdir().expect("dir");
+    let rig = Rig::new(
+        dir.path(),
+        plan_json(&parties_plan(false)),
+        |prompt| {
+            if prompt.contains("You are party `prod`") {
+                agreeing(prompt)
+            } else {
+                serde_json::json!({
+                    "expect": [CONS_SAYS, "I assume `prod` keeps the existing crate setup."],
+                    "consume": ["I assume the `iface` conventions hold."],
+                    "touch": ["consumer.py"]
+                })
+                .to_string()
+            }
+        },
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    let report = rig
+        .orchestrator(vec![py_ic()])
+        .start(RunId::new("r1"), "parse the config".into())
+        .await
+        .expect("run");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    assert_eq!(report.contracts.handshake_failures, 0);
+    for party in ["prod", "cons"] {
+        assert!(report.verified.iter().any(|v| v == party), "{report:?}");
+    }
+    let events = rig.contract_events().await;
+    let Some(ContractEvent::ChecksPassed { warnings, .. }) = events.first() else {
+        panic!("{events:?}")
+    };
+    assert!(
+        warnings
+            .iter()
+            .any(|w| matches!(w, HandshakeFinding::Unanchored { party, .. } if party == "cons")),
+        "{warnings:?}"
+    );
+    assert!(
+        warnings.iter().any(
+            |w| matches!(w, HandshakeFinding::OutsideSurface { symbol, .. } if symbol == "iface")
+        ),
+        "{warnings:?}"
+    );
+    assert!(warnings.iter().all(|w| !w.holds()));
+}
+
 /// a party the run does not know skipped the handshake.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unknown_party_is_an_artifact_failure() {
@@ -1536,6 +1589,127 @@ async fn an_interface_naming_a_contract_the_plan_lacks_is_refused() {
         rig.parts.planner.prompts().len(),
         calls + 3,
         "planned afresh: one ask, and two more after each refusal"
+    );
+}
+
+/// The plan with `ic` as its one interface over `prod` and `cons`.
+fn plan_with(ic: &InterfaceContract) -> String {
+    let mut plan: serde_json::Value =
+        serde_json::from_str(&plan_json(&parties_plan(false))).expect("the plan is JSON");
+    plan["interfaces"] = serde_json::json!([serde_json::to_value(ic).expect("json")]);
+    plan.to_string()
+}
+
+/// `py_ic` with a consumer that imports a name the stub lacks: stub-compile
+/// fails on it.
+fn stub_compile_failing_ic() -> InterfaceContract {
+    let mut ic = py_ic();
+    ic.consumer[0].content = "from config import load_config\n".into();
+    ic
+}
+
+/// A planner that answers `first` once, then `then` to every ask after a
+/// refusal.
+fn first_then(first: String, then: String) -> impl Fn(&str) -> String + Send + Sync + 'static {
+    move |prompt: &str| {
+        if prompt.contains("<plan_refused>") {
+            then.clone()
+        } else {
+            first.clone()
+        }
+    }
+}
+
+/// A plan whose interface fails its stub-compile check is returned to the
+/// planner with the compiler's output, through the bounded re-ask, before
+/// anything is registered or held. The corrected plan is checked, registered
+/// and dispatched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_plan_failing_stub_compile_is_asked_again_with_the_check_output() {
+    let dir = tempfile::tempdir().expect("dir");
+    let rig = Rig::with_planner(
+        dir.path(),
+        first_then(plan_with(&stub_compile_failing_ic()), plan_with(&py_ic())),
+        agreeing,
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    let report = rig
+        .orchestrator(vec![])
+        .start(RunId::new("r1"), "parse the config".into())
+        .await
+        .expect("run");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    for party in ["prod", "cons"] {
+        assert!(report.verified.iter().any(|v| v == party), "{report:?}");
+    }
+    let prompts = rig.parts.planner.prompts();
+    assert_eq!(prompts.len(), 2, "one ask, one re-ask");
+    let refusal = &prompts[1];
+    assert!(
+        refusal.contains("StubCompile check failed") && refusal.contains("load_config"),
+        "the re-ask carries the check's failure text: {refusal}"
+    );
+    assert_eq!(
+        report.contracts.stub_compile_failures, 0,
+        "nothing was held"
+    );
+    assert_eq!(report.contracts.interfaces_registered, 1);
+}
+
+/// A plan whose interface leaves out a required field (no test files) is
+/// asked for again, not held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_plan_missing_an_interface_field_is_asked_again() {
+    let dir = tempfile::tempdir().expect("dir");
+    let mut incomplete = py_ic();
+    incomplete.tests.clear();
+    let rig = Rig::with_planner(
+        dir.path(),
+        first_then(plan_with(&incomplete), plan_with(&py_ic())),
+        agreeing,
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    let report = rig
+        .orchestrator(vec![])
+        .start(RunId::new("r1"), "parse the config".into())
+        .await
+        .expect("run");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    let prompts = rig.parts.planner.prompts();
+    assert_eq!(prompts.len(), 2, "one ask, one re-ask");
+    assert!(prompts[1].contains("no tests files"), "{}", prompts[1]);
+    assert_eq!(report.contracts.artifact_failures, 0);
+}
+
+/// A planner that keeps answering the failing plan is asked twice more, then
+/// its plan is taken and the interface's parties are held on the failure, as
+/// a failed pre-dispatch check always held them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn after_two_re_asks_a_failing_interface_is_held() {
+    let dir = tempfile::tempdir().expect("dir");
+    let rig = Rig::new(
+        dir.path(),
+        plan_with(&stub_compile_failing_ic()),
+        agreeing,
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    let report = rig
+        .orchestrator(vec![])
+        .start(RunId::new("r1"), "parse the config".into())
+        .await
+        .expect("run");
+    assert!(
+        matches!(report.status, RunStatus::Blocked { .. }),
+        "{report:?}"
+    );
+    assert_eq!(rig.parts.planner.prompts().len(), 3, "one ask, two re-asks");
+    assert_eq!(report.contracts.stub_compile_failures, 1, "{report:?}");
+    assert!(
+        worker_requests(&rig.parts).is_empty(),
+        "no worker was spent"
     );
 }
 

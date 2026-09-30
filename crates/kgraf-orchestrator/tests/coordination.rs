@@ -342,6 +342,318 @@ async fn a_gate_that_keeps_failing_is_held_and_its_dependents_never_run() {
     assert_eq!(g.decisions[0].decision, GateDecision::Retry);
 }
 
+/// A two-crate workspace, modeled from what is merged at the commit a gate
+/// pins. Crate `a` is written by `h.p1` and `h.p2`; crate `b` holds an
+/// integration test calling a function that is `todo!()` until `z` implements
+/// it. The project's one validation command, `cargo test --workspace`, passes
+/// only once `z` is merged, and never while `defect` (a contract that breaks
+/// `b`'s build) is. The base commit has nothing merged, so it fails too.
+struct TwoCrateGate {
+    integration: Arc<FakeIntegration>,
+    base: String,
+    defect: Option<&'static str>,
+    /// `b` is already implemented at the base: the base passes.
+    implemented_at_base: bool,
+    runs: Mutex<Vec<GateRequest>>,
+}
+
+impl TwoCrateGate {
+    fn merged_at(&self, pin: &str) -> Vec<String> {
+        self.integration
+            .merges
+            .lock()
+            .expect("lock")
+            .iter()
+            .filter(|(_, commit)| commit.as_str() <= pin)
+            .map(|(c, _)| c.clone())
+            .collect()
+    }
+
+    fn pins_of(&self, gate: &str) -> Vec<Option<String>> {
+        self.runs
+            .lock()
+            .expect("lock")
+            .iter()
+            .filter(|r| r.gate == gate)
+            .map(|r| r.pinned.as_ref().map(|p| p.sha.clone()))
+            .collect()
+    }
+}
+
+#[async_trait::async_trait]
+impl GateRunner for TwoCrateGate {
+    fn commands(&self) -> Vec<String> {
+        vec!["cargo test --workspace".into()]
+    }
+
+    async fn run(&self, request: GateRequest) -> Result<GateVerdict, String> {
+        let pin = request
+            .pinned
+            .as_ref()
+            .map(|p| p.sha.clone())
+            .unwrap_or_else(|| self.base.clone());
+        self.runs.lock().expect("lock").push(request);
+        let merged = self.merged_at(&pin);
+        let broken = self.defect.is_some_and(|d| merged.iter().any(|m| m == d));
+        let implemented = self.implemented_at_base || merged.iter().any(|m| m == "z");
+        let (passed, output) = if broken {
+            (
+                false,
+                "error[E0433]: failed to resolve: use of undeclared crate `a` --> b/src/lib.rs",
+            )
+        } else if !implemented {
+            (
+                false,
+                "thread 'checkout' panicked at b/src/lib.rs: not yet implemented",
+            )
+        } else {
+            (true, "test result: ok")
+        };
+        Ok(GateVerdict {
+            passed,
+            by: format!("cargo test --workspace at {pin}"),
+            output: UntrustedText::new(output),
+        })
+    }
+}
+
+fn two_crate_run(
+    dir: &std::path::Path,
+    defect: Option<&'static str>,
+    implemented_at_base: bool,
+) -> (Parts, Arc<FakeIntegration>, Arc<TwoCrateGate>, Orchestrator) {
+    let p = split_parts(dir);
+    let integration = FakeIntegration::new(dir.join("worktrees"));
+    let base = integration.start_from_a_base();
+    let gate = Arc::new(TwoCrateGate {
+        integration: integration.clone(),
+        base,
+        defect,
+        implemented_at_base,
+        runs: Mutex::new(Vec::new()),
+    });
+    let mut services = p.services(WINDOW);
+    services.workspaces = integration.clone();
+    let o = Orchestrator::new(config(), services)
+        .expect("orchestrator")
+        .with_gate_runner(gate.clone());
+    (p, integration, gate, o)
+}
+
+/// A gate over part of the plan runs the project-wide command, which fails on
+/// a contract not yet implemented outside its cover. The same command fails
+/// at the run's base commit too, so the partial gate cannot judge its cover:
+/// it is recorded inconclusive, halts nothing, opens no remediation, and the
+/// contract after it dispatches. The root gate, over everything, passes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_partial_gate_failing_at_the_base_too_does_not_stop_the_plan() {
+    let dir = tempfile::tempdir().expect("dir");
+    let (p, integration, gate, o) = two_crate_run(dir.path(), None, false);
+    let report = o
+        .start(RunId::new("r1"), "one huge part and one small".into())
+        .await
+        .expect("run");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    assert!(report.verified.iter().any(|v| v == "z"), "{report:?}");
+    let record = record_of(&p);
+    let h = record
+        .coordination
+        .gates
+        .iter()
+        .find(|g| g.id == "gate:h")
+        .expect("gate:h");
+    assert!(
+        matches!(&h.status, GateStatus::Inconclusive { reason, .. } if reason.contains("base")),
+        "{:?}",
+        h.status
+    );
+    assert!(
+        h.remediations.is_empty(),
+        "no remediation for a base failure"
+    );
+    let root = record
+        .coordination
+        .gates
+        .iter()
+        .find(|g| g.id == ROOT_GATE)
+        .expect("root");
+    assert!(matches!(root.status, GateStatus::Passed { .. }), "{root:?}");
+    // The base was checked once, at the commit the run started from.
+    assert_eq!(
+        gate.pins_of(kgraf_orchestrator::BASE_GATE_PROBE),
+        vec![Some(gate.base.clone())]
+    );
+    assert!(!integration.merges.lock().expect("lock").is_empty());
+    let trace = trace_of(&p).await;
+    assert!(trace.iter().any(|e| matches!(
+        e,
+        TraceEvent::Gate { gate, state, .. } if gate == "gate:h" && state == "inconclusive"
+    )));
+}
+
+/// The root gate stays strict: a defect a partial gate could not judge is
+/// still found over the whole plan, and the run does not complete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_root_gate_still_fails_on_a_real_defect() {
+    let dir = tempfile::tempdir().expect("dir");
+    let (p, _integration, gate, o) = two_crate_run(dir.path(), Some("h.p2"), false);
+    let report = o
+        .start(RunId::new("r1"), "one huge part and one small".into())
+        .await
+        .expect("run");
+    let RunStatus::Blocked { reason } = &report.status else {
+        panic!("{report:?}");
+    };
+    assert!(reason.contains(ROOT_GATE), "{reason}");
+    assert!(report.verified.iter().any(|v| v == "z"), "z still ran");
+    let record = record_of(&p);
+    let root = record
+        .coordination
+        .gates
+        .iter()
+        .find(|g| g.id == ROOT_GATE)
+        .expect("root");
+    assert!(matches!(root.status, GateStatus::Held { .. }), "{root:?}");
+    assert_eq!(root.remediations.len(), 2, "the root gate was remediated");
+    assert!(gate.pins_of(ROOT_GATE).len() >= 3);
+}
+
+/// When the base passes, a failure of a partial gate is its cover's: the gate
+/// is remediated and held as always, and the contract after it never runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_partial_gate_that_passes_at_the_base_stays_strict() {
+    let dir = tempfile::tempdir().expect("dir");
+    let (p, _integration, gate, o) = two_crate_run(dir.path(), Some("h.p2"), true);
+    let report = o
+        .start(RunId::new("r1"), "one huge part and one small".into())
+        .await
+        .expect("run");
+    let RunStatus::Blocked { reason } = &report.status else {
+        panic!("{report:?}");
+    };
+    assert!(reason.contains("gate:h"), "{reason}");
+    assert!(!report.verified.iter().any(|v| v == "z"), "z never ran");
+    let h = record_of(&p)
+        .coordination
+        .gates
+        .into_iter()
+        .find(|g| g.id == "gate:h")
+        .expect("gate:h");
+    assert!(matches!(h.status, GateStatus::Held { .. }), "{h:?}");
+    assert_eq!(h.remediations.len(), 2);
+    assert_eq!(
+        gate.pins_of(kgraf_orchestrator::BASE_GATE_PROBE).len(),
+        1,
+        "the base is checked once per run"
+    );
+}
+
+/// A remediation whose worker changes nothing passes the run's check on the
+/// failing code, and fixes nothing. It counts as a failed remediation: the
+/// gate is not run again on the unchanged commit, the next remediation is
+/// told why the last did not count, and each carries the gate's commands for
+/// its verifier.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_empty_remediation_counts_as_failed_and_the_gate_does_not_rerun() {
+    let dir = tempfile::tempdir().expect("dir");
+    let p = split_parts(dir.path());
+    let gate = ScriptGate::new(&[("gate:h", &[false, true])], "still failing");
+    let integration = FakeIntegration::new(dir.path().join("worktrees"));
+    integration
+        .empty_for
+        .lock()
+        .expect("lock")
+        .insert("fix-h-1".into());
+    let mut services = p.services(WINDOW);
+    services.workspaces = integration.clone();
+    let o = Orchestrator::new(config(), services)
+        .expect("orchestrator")
+        .with_gate_runner(gate.clone());
+    let report = o
+        .start(RunId::new("r1"), "one huge part and one small".into())
+        .await
+        .expect("run");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    let record = record_of(&p);
+    let h = &record.coordination.gates[0];
+    assert_eq!(
+        h.remediations,
+        vec!["fix-h-1".to_owned(), "fix-h-2".to_owned()]
+    );
+    let pins: Vec<String> = gate
+        .runs
+        .lock()
+        .expect("lock")
+        .iter()
+        .filter(|r| r.gate == "gate:h")
+        .map(|r| r.pinned.as_ref().expect("pinned").sha.clone())
+        .collect();
+    assert_eq!(pins.len(), 2, "failed, then passed after fix-h-2: {pins:?}");
+    assert_ne!(pins[0], pins[1], "never rerun on the unchanged commit");
+    let fix2 = p
+        .stats
+        .requests()
+        .into_iter()
+        .map(|r| r.1)
+        .find(|b| b.contains("remediation fix-h-1 changed no file"))
+        .expect("the next remediation is told why the last did not count");
+    assert!(fix2.contains("Quality gate `gate:h` failed"), "{fix2}");
+    let trace = trace_of(&p).await;
+    assert!(trace.iter().any(|e| matches!(
+        e,
+        TraceEvent::Gate { gate, state, detail, .. }
+            if gate == "gate:h" && state == "failed" && detail.contains("fix-h-1 changed nothing")
+    )));
+}
+
+/// Remediations that all change nothing hold the gate without running it again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn empty_remediations_past_the_limit_hold_the_gate() {
+    let dir = tempfile::tempdir().expect("dir");
+    let p = split_parts(dir.path());
+    let gate = ScriptGate::new(&[("gate:h", &[false])], "still failing");
+    let integration = FakeIntegration::new(dir.path().join("worktrees"));
+    integration
+        .empty_for
+        .lock()
+        .expect("lock")
+        .extend(["fix-h-1".to_owned(), "fix-h-2".to_owned()]);
+    let mut services = p.services(WINDOW);
+    services.workspaces = integration.clone();
+    let o = Orchestrator::new(config(), services)
+        .expect("orchestrator")
+        .with_gate_runner(gate.clone());
+    let report = o
+        .start(RunId::new("r1"), "one huge part and one small".into())
+        .await
+        .expect("run");
+    let RunStatus::Blocked { reason } = &report.status else {
+        panic!("{report:?}");
+    };
+    assert!(reason.contains("fix-h-2 changed nothing"), "{reason}");
+    assert_eq!(
+        gate.runs_of("gate:h"),
+        1,
+        "never run again on the same code"
+    );
+    // Each remediation reached its verifier with the gate's commands; other
+    // contracts carry none.
+    let seen = p.verifier.gate_commands.lock().expect("lock").clone();
+    let fixes: Vec<&(String, Vec<String>)> =
+        seen.iter().filter(|(c, _)| c.starts_with("fix-")).collect();
+    assert_eq!(fixes.len(), 2, "{seen:?}");
+    assert!(
+        fixes.iter().all(|(_, cmds)| *cmds == gate.commands),
+        "{seen:?}"
+    );
+    assert!(
+        seen.iter()
+            .filter(|(c, _)| !c.starts_with("fix-"))
+            .all(|(_, cmds)| cmds.is_empty()),
+        "{seen:?}"
+    );
+}
+
 /// A record for a resumed run: `verified` are verified (and merged when
 /// `merged`), `open` are planned, and the gates are as given.
 fn crafted(

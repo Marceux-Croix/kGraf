@@ -736,3 +736,156 @@ fn a_use_word_about_another_anchor_does_not_drop_a_provision() {
     );
     assert!(f.is_empty(), "{f:?}");
 }
+
+// ------------------------------------------ recorded plans held on wording
+//
+// Three handshakes from orchestrated runs, each fixture holding the registered
+// interface, the parties' statements and the findings recorded then, verbatim.
+// The plan itself is not in a trace: each party's declared writes are its
+// touches (no `touch_outside_scope` was recorded, so each touch was declared),
+// and the dependency order is the one the run's dependency waits recorded.
+
+#[derive(serde::Deserialize)]
+struct Replay {
+    interface: InterfaceContract,
+    handshake: Vec<HandshakeStatement>,
+    recorded_findings: Vec<HandshakeFinding>,
+    writes: BTreeMap<String, Vec<WriteTarget>>,
+    depends_on: BTreeMap<String, Vec<String>>,
+}
+
+fn replay(json: &str) -> Replay {
+    serde_json::from_str(json).expect("fixture")
+}
+
+fn replayed(r: &Replay) -> Vec<HandshakeFinding> {
+    compare_handshake_ordered(
+        &r.interface,
+        &r.handshake,
+        &r.writes,
+        &ordered_pairs(&r.depends_on),
+    )
+}
+
+fn holding(f: &[HandshakeFinding]) -> Vec<HandshakeFinding> {
+    f.iter().filter(|x| x.holds()).cloned().collect()
+}
+
+/// One implementer and two test writers of `state_tax_rate`, all agreeing on
+/// the stub's `fn state_tax_rate(&str) -> f64`. A test writer that says "I
+/// will provide `state_tax_rate` integration-test coverage" writes no file of
+/// the stub, so it provides nothing; an expectation the implementer's short
+/// sentence does not restate, but the interface's own stub and test state, is
+/// not a disagreement; an assumption naming no surface symbol is kept as a
+/// warning, not a hold.
+#[test]
+fn test_writers_beside_one_implementer_do_not_hold() {
+    let r = replay(include_str!(
+        "../tests/fixtures/handshake/two-test-writers-and-an-implementer.json"
+    ));
+    assert!(
+        r.recorded_findings.iter().any(|f| matches!(f,
+            HandshakeFinding::DoubleProvided { parties, .. } if parties.len() == 2)),
+        "the record held on a double provision"
+    );
+    let now = replayed(&r);
+    assert_eq!(holding(&now), vec![], "{now:#?}");
+    assert!(
+        now.iter().any(|f| matches!(f,
+            HandshakeFinding::OutsideSurface { symbol, .. } if symbol == "iface")),
+        "the off-surface assumption is still recorded: {now:#?}"
+    );
+    assert!(
+        now.iter().any(
+            |f| matches!(f, HandshakeFinding::Unanchored { party, .. } if party == "c3.c2.c2")
+        ),
+        "{now:#?}"
+    );
+}
+
+/// Two test writers of one test file, the second after the first, and one
+/// implementer: nobody provides `accumulate` twice, and a file written by two
+/// parties in dependency order is never written by both at once.
+#[test]
+fn serialized_test_writers_sharing_a_file_do_not_hold() {
+    let r = replay(include_str!(
+        "../tests/fixtures/handshake/tests-split-from-implementation.json"
+    ));
+    assert_eq!(r.recorded_findings.len(), 3, "the record held on three");
+    let now = replayed(&r);
+    assert_eq!(holding(&now), vec![], "{now:#?}");
+    // The same statements with no order between the test writers: both may
+    // run at once, so the shared file is still an overlap.
+    let unordered =
+        compare_handshake_ordered(&r.interface, &r.handshake, &r.writes, &BTreeSet::new());
+    assert_eq!(
+        holding(&unordered),
+        vec![HandshakeFinding::TouchOverlap {
+            path: "tests/accumulate.rs".into(),
+            parties: vec!["c1.c1.c1".into(), "c1.c1.c2".into()],
+        }],
+        "{unordered:#?}"
+    );
+}
+
+/// Three parties each write the one stub file and say they provide
+/// `parse_duration`: a real double provision, still held, over exactly the
+/// three writers. The fourth party writes nothing and provides nothing,
+/// whatever its sentence names. The three run in dependency order, so their
+/// shared file is not an overlap.
+#[test]
+fn three_implementers_of_one_symbol_still_hold() {
+    let r = replay(include_str!(
+        "../tests/fixtures/handshake/three-implementers-of-one-symbol.json"
+    ));
+    let now = replayed(&r);
+    assert!(
+        holding(&now).contains(&HandshakeFinding::DoubleProvided {
+            symbol: "parse_duration".into(),
+            parties: vec!["c1.c1.c1".into(), "c1.c2.c1".into(), "c1.c2.c2".into()],
+        }),
+        "{now:#?}"
+    );
+    assert!(
+        !now.iter()
+            .any(|f| matches!(f, HandshakeFinding::TouchOverlap { .. })),
+        "{now:#?}"
+    );
+}
+
+/// Which findings hold a contract: disagreements between parties do; a
+/// sentence the comparator cannot bind to the surface does not.
+#[test]
+fn only_findings_between_parties_hold() {
+    let warn = [
+        HandshakeFinding::Unanchored {
+            party: "p".into(),
+            text: "t".into(),
+        },
+        HandshakeFinding::OutsideSurface {
+            party: "p".into(),
+            symbol: "s".into(),
+            text: "t".into(),
+        },
+    ];
+    assert!(warn.iter().all(|f| !f.holds()));
+    let hold = [
+        HandshakeFinding::DoubleProvided {
+            symbol: "s".into(),
+            parties: vec![],
+        },
+        HandshakeFinding::SymbolUnprovided { symbol: "s".into() },
+        HandshakeFinding::Disagree {
+            symbol: "s".into(),
+            expecting: "a".into(),
+            expects: "e".into(),
+            providing: "b".into(),
+            provides: "p".into(),
+        },
+        HandshakeFinding::TouchOverlap {
+            path: "a.rs".into(),
+            parties: vec![],
+        },
+    ];
+    assert!(hold.iter().all(HandshakeFinding::holds));
+}

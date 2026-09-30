@@ -16,9 +16,9 @@
 use crate::chunk::{self, Chunk, NodeKind};
 use crate::error::{GraphError, Result};
 use crate::lang::Language;
-use crate::store::{EdgeKind, FileRecord, GraphStore, NodeRecord};
+use crate::store::{EdgeKind, FileRecord, GraphStore, NodeRecord, WriteBatch};
 use kgraf_core::ids::stable_id;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 /// What one index pass did.
@@ -72,6 +72,13 @@ pub struct IndexReport {
     /// [`IndexReport::calls_unresolved`] too. Before this gate a Python call to
     /// `make()` resolved to a Rust `fn make`.
     pub calls_cross_language: u64,
+    /// Work call resolution did: one scope lookup per resolvable call site plus
+    /// one per candidate kept. Grows linearly with call sites, not with the
+    /// product of call sites and same-name definitions.
+    pub call_work: u64,
+    /// Write transactions the file loop committed. Files are written in batches
+    /// rather than one commit each; see [`FILES_PER_WRITE_BATCH`].
+    pub write_batches: u64,
     /// Languages whose extractor changed since their files were indexed
     /// ([`Language::extractor_stamp`]), with how many files each had: those files
     /// are re-derived by this pass (or, for [`Indexer::index_paths`], the next
@@ -131,6 +138,7 @@ impl IndexReport {
         self.calls_unresolved = counts.unresolved;
         self.calls_too_ambiguous = counts.too_ambiguous;
         self.calls_cross_language = counts.cross_language;
+        self.call_work = counts.examined;
     }
 }
 
@@ -185,6 +193,64 @@ struct Walked {
 /// sites dropped this way is reported in [`IndexReport::calls_too_ambiguous`] so
 /// the exception is visible rather than silent.
 const MAX_CALL_FANOUT: usize = 8;
+
+/// How many file writes one write transaction holds during a pass. A commit per
+/// file rewrote the same index pages for every file, and its cost grew with the
+/// size of the index; a batch pays that once per batch. The bound keeps the write
+/// lock, taken at the first write of a batch, from being held across the whole
+/// tree: other writers (a lease grant, the bus) wait at most one batch.
+pub const FILES_PER_WRITE_BATCH: usize = 256;
+
+/// Groups a pass's file writes into transactions of [`FILES_PER_WRITE_BATCH`]. A
+/// limit of zero writes each file in its own transaction. The transaction opens
+/// at the first write, not at the first file, so a pass over an unchanged tree
+/// never takes the write lock for its reads.
+struct Batch<'a> {
+    store: &'a GraphStore,
+    limit: usize,
+    open: Option<WriteBatch<'a>>,
+    writes: usize,
+    commits: u64,
+}
+
+impl<'a> Batch<'a> {
+    fn new(store: &'a GraphStore, limit: usize) -> Self {
+        Self {
+            store,
+            limit,
+            open: None,
+            writes: 0,
+            commits: 0,
+        }
+    }
+
+    /// Open the transaction if batching and none is open. Call before a write.
+    fn ensure(&mut self) -> Result<()> {
+        if self.limit > 0 && self.open.is_none() {
+            self.open = Some(self.store.begin_batch()?);
+        }
+        Ok(())
+    }
+
+    /// Count one finished write; commit when the batch is full.
+    fn wrote(&mut self) -> Result<()> {
+        self.writes += 1;
+        if self.writes >= self.limit {
+            self.finish()?;
+        }
+        Ok(())
+    }
+
+    /// Commit what is open.
+    fn finish(&mut self) -> Result<()> {
+        self.writes = 0;
+        if let Some(open) = self.open.take() {
+            open.commit()?;
+            self.commits += 1;
+        }
+        Ok(())
+    }
+}
 
 /// `meta` key prefix of the in-progress markers. Each pass writes its own key,
 /// `index_in_progress/<token>`, whose value is its start time in milliseconds
@@ -468,6 +534,7 @@ impl<'store> Indexer<'store> {
         // and layout for the rest of the tree. The pass finishes and then reports
         // the first walk error (fail loud). An unreadable file stays in the index.
         let mut first_walk_error: Option<GraphError> = None;
+        let mut batch = Batch::new(self.store, FILES_PER_WRITE_BATCH);
         for entry in walked.files {
             let (rel_path, bytes, mtime_ns) = match entry {
                 Ok(entry) => entry,
@@ -487,7 +554,7 @@ impl<'store> Indexer<'store> {
             }
             report.files_seen += 1;
             seen_paths.push(rel_path.clone());
-            self.index_one(&rel_path, bytes, mtime_ns, None, &mut report)?;
+            self.index_one(&rel_path, bytes, mtime_ns, None, &mut batch, &mut report)?;
         }
 
         // Files that left the tree.
@@ -511,10 +578,14 @@ impl<'store> Indexer<'store> {
                     }
                     continue;
                 }
+                batch.ensure()?;
                 self.store.delete_file(&indexed)?;
+                batch.wrote()?;
                 report.files_removed += 1;
             }
         }
+        batch.finish()?;
+        report.write_batches = batch.commits;
 
         // Cross-file call resolution runs after every file is present, since a
         // call can precede its callee's file in walk order. It is skipped
@@ -596,7 +667,14 @@ impl<'store> Indexer<'store> {
                         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                         .map(|d| d.as_nanos() as i64)
                         .unwrap_or(0);
-                    self.index_one(rel, bytes, mtime_ns, self.foreign_root(), &mut report)?;
+                    self.index_one(
+                        rel,
+                        bytes,
+                        mtime_ns,
+                        self.foreign_root(),
+                        &mut Batch::new(self.store, 0),
+                        &mut report,
+                    )?;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     if self.store.file(rel)?.is_some() {
@@ -649,6 +727,7 @@ impl<'store> Indexer<'store> {
         bytes: Vec<u8>,
         mtime_ns: i64,
         foreign_root: Option<&Path>,
+        batch: &mut Batch<'_>,
         report: &mut IndexReport,
     ) -> Result<()> {
         let content_hash = blake3::hash(&bytes).to_hex().to_string();
@@ -676,7 +755,9 @@ impl<'store> Indexer<'store> {
                 // Keeping them (and the old hash) would serve the old text's
                 // nodes for a file that no longer parses; remove them and say so.
                 if existing.is_some() {
+                    batch.ensure()?;
                     self.store.delete_file(rel_path)?;
+                    batch.wrote()?;
                     report.files_removed += 1;
                     report.non_utf8_removed.push(rel_path.to_owned());
                 }
@@ -701,8 +782,10 @@ impl<'store> Indexer<'store> {
             None => Vec::new(),
         };
         let (nodes, edges, call_sites) = self.build_records(&file, &chunks);
+        batch.ensure()?;
         self.store
             .replace_file_nodes_from(&file, &nodes, &edges, &call_sites, foreign_root)?;
+        batch.wrote()?;
 
         if existing.is_some() {
             report.files_changed += 1;
@@ -963,53 +1046,62 @@ impl<'store> Indexer<'store> {
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
 
+        // Scope lookups by hash, built once per (name, family): a name defined in
+        // thousands of files (`new`, `main`, a test helper) is looked up per call
+        // site, and filtering its whole definition list per site made resolution
+        // quadratic in the number of copies.
+        let mut scopes: HashMap<(&str, &str), NameScope<'_>> = HashMap::new();
+        for (name, all) in &definitions {
+            for d in all {
+                let Some(family) = d.family else { continue };
+                let scope = scopes.entry((name.as_str(), family)).or_default();
+                scope.all.push(d);
+                scope.by_path.entry(d.path.as_str()).or_default().push(d);
+                scope
+                    .by_dir
+                    .entry(crate::layout::directory_of(&d.path))
+                    .or_default()
+                    .push(d);
+            }
+        }
+
         let mut counts = CallCounts::default();
         let mut wanted: Vec<(String, String, i64)> = Vec::new();
         for (caller_id, callee_name, caller_path, caller_family) in &sites {
-            let Some(all) = definitions.get(callee_name) else {
+            if !definitions.contains_key(callee_name) {
                 counts.unresolved += 1;
                 continue;
-            };
+            }
             // The language-family gate comes before scoping: a definition in
             // another family is not a candidate at any scope.
-            let candidates: Vec<&Definition> = all
-                .iter()
-                .filter(|d| d.family.is_some() && d.family == *caller_family)
-                .collect();
-            if candidates.is_empty() {
+            let scope = caller_family.and_then(|f| scopes.get(&(callee_name.as_str(), f)));
+            let Some(scope) = scope else {
                 // Defined only in another language: counted, so the gate is
                 // visible rather than silent (fail loud).
                 counts.cross_language += 1;
                 counts.unresolved += 1;
                 continue;
-            }
-            let caller_dir = crate::layout::directory_of(caller_path);
-            // Narrowest non-empty scope wins.
-            let same_file: Vec<&Definition> = candidates
-                .iter()
-                .copied()
-                .filter(|d| &d.path == caller_path)
-                .collect();
-            let same_dir: Vec<&Definition> = candidates
-                .iter()
-                .copied()
-                .filter(|d| crate::layout::directory_of(&d.path) == caller_dir)
-                .collect();
-            let scoped: Vec<&Definition> = if !same_file.is_empty() {
-                same_file
-            } else if !same_dir.is_empty() {
-                same_dir
-            } else {
-                candidates
             };
+            // Narrowest non-empty scope wins.
+            let caller_dir = crate::layout::directory_of(caller_path);
+            let scoped: &[&Definition] = if let Some(same) = scope.by_path.get(caller_path.as_str())
+            {
+                same
+            } else if let Some(same) = scope.by_dir.get(caller_dir) {
+                same
+            } else {
+                &scope.all
+            };
+            counts.examined += 1;
             if scoped.len() > MAX_CALL_FANOUT {
                 counts.too_ambiguous += 1;
                 continue;
             }
+            counts.examined += scoped.len() as u64;
             // Ambiguity that survives scoping is carried in the weight, not
             // discarded: 100 is an unambiguous resolution, 100/n an ambiguous one.
             let weight = (100 / scoped.len().max(1)) as i64;
-            for Definition { id: target, .. } in scoped {
+            for Definition { id: target, .. } in scoped.iter().copied() {
                 if target != caller_id {
                     wanted.push((caller_id.clone(), target.clone(), weight));
                 }
@@ -1063,9 +1155,20 @@ struct Definition {
     family: Option<&'static str>,
 }
 
+/// The definitions of one name in one language family, grouped for scope lookup.
+#[derive(Default)]
+struct NameScope<'a> {
+    all: Vec<&'a Definition>,
+    by_path: HashMap<&'a str, Vec<&'a Definition>>,
+    by_dir: HashMap<&'a str, Vec<&'a Definition>>,
+}
+
 /// The call sites resolution could not turn into edges.
 #[derive(Default)]
 struct CallCounts {
+    /// Scope lookups plus candidates carried into edges: the work resolution did,
+    /// a count that does not depend on machine load.
+    examined: u64,
     unresolved: u64,
     too_ambiguous: u64,
     cross_language: u64,
@@ -1307,6 +1410,96 @@ mod tests {
         let node = reader.resolve_symbol("m").expect("resolve")[0].clone();
         assert!(reader.source_of(&node).expect("source").contains("1"));
         assert_eq!(reader.file_source_root("src/m.rs").expect("root"), None);
+    }
+
+    /// A tree of `dirs` directories, each with a file defining `shared` and a file
+    /// calling it, so the name has `dirs` definitions and `dirs` call sites.
+    fn shared_name_tree(dirs: usize) -> Tree {
+        let tree = Tree::new();
+        for d in 0..dirs {
+            tree.write(&format!("d{d}/def.rs"), "pub fn shared() {}\n");
+            tree.write(&format!("d{d}/call.rs"), "pub fn go() { shared(); }\n");
+        }
+        tree
+    }
+
+    /// Call resolution's work must grow with the call sites, not with their
+    /// product with the definitions of the name they call. Counted as operations
+    /// (`call_work`), so the assertion holds at any machine load. A per-site scan
+    /// of every same-name definition would quadruple the count when the tree
+    /// doubles twice; grouped lookups double it.
+    #[test]
+    fn call_resolution_work_grows_linearly_with_a_name_defined_in_every_directory() {
+        let work = |dirs: usize| {
+            let tree = shared_name_tree(dirs);
+            let store = tree.store();
+            let report = Indexer::new(&store).index().expect("index");
+            // Same-directory scope resolves every site to its own neighbor.
+            assert_eq!(report.calls_too_ambiguous, 0);
+            assert_eq!(store.edge_count().expect("edges"), 3 * dirs as u64);
+            report.call_work
+        };
+        let (small, large) = (work(50), work(200));
+        assert!(small > 0, "nothing was counted");
+        assert!(
+            large <= small * 4 + small / 2,
+            "4x the directories cost {large} against {small}: not linear"
+        );
+    }
+
+    /// Files are written in batches of [`FILES_PER_WRITE_BATCH`], not one commit
+    /// each, and a pass that changes nothing opens no write transaction.
+    #[test]
+    fn a_pass_commits_files_in_batches_and_an_unchanged_pass_commits_none() {
+        let tree = Tree::new();
+        let files = FILES_PER_WRITE_BATCH * 2 + 1;
+        for i in 0..files {
+            tree.write(&format!("src/m{i}.rs"), &format!("pub fn f{i}() {{}}\n"));
+        }
+        let store = tree.store();
+        let first = Indexer::new(&store).index().expect("first");
+        assert_eq!(first.files_added, files as u64);
+        assert_eq!(first.write_batches, 3, "{files} files in batches of 256");
+        assert_eq!(store.node_count().expect("nodes"), 2 * files as u64);
+
+        let second = Indexer::new(&store).index().expect("second");
+        assert_eq!(second.files_unchanged, files as u64);
+        assert_eq!(second.write_batches, 0);
+
+        // A deletion is a write too, and joins the same batching.
+        fs::remove_file(tree.path().join("src/m0.rs")).expect("remove");
+        let third = Indexer::new(&store).index().expect("third");
+        assert_eq!(third.files_removed, 1);
+        assert_eq!(third.write_batches, 1);
+        assert!(store.file("src/m0.rs").expect("file").is_none());
+    }
+
+    /// Dropping an open batch rolls back every file written in it: a pass that
+    /// fails midway leaves no file row without its nodes.
+    #[test]
+    fn a_dropped_write_batch_rolls_back_the_files_written_in_it() {
+        let tree = Tree::new();
+        tree.write("src/a.rs", "pub fn a() {}\n");
+        let store = tree.store();
+        let mut batch = Batch::new(&store, FILES_PER_WRITE_BATCH);
+        batch.ensure().expect("open");
+        let indexer = Indexer::new(&store);
+        let bytes = fs::read(tree.path().join("src/a.rs")).expect("read");
+        let mut report = IndexReport::default();
+        indexer
+            .index_one("src/a.rs", bytes, 0, None, &mut batch, &mut report)
+            .expect("one");
+        assert_eq!(report.files_added, 1);
+        assert!(
+            store.file("src/a.rs").expect("file").is_some(),
+            "visible inside"
+        );
+        drop(batch);
+        assert!(
+            store.file("src/a.rs").expect("file").is_none(),
+            "rolled back"
+        );
+        assert_eq!(store.node_count().expect("nodes"), 0);
     }
 
     #[test]

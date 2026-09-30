@@ -590,7 +590,7 @@ impl Verifier for CommandVerifier {
             }
             // 4. The acceptance command, confined, in the worker's tree; its
             // process group is killed when its shell exits.
-            let (passed, output) = run_confined(
+            let (mut passed, mut output) = run_confined(
                 &ws,
                 manager.repo(),
                 &denies,
@@ -598,6 +598,24 @@ impl Verifier for CommandVerifier {
                 timeout,
                 CHECK_OUTPUT_CAP,
             )?;
+            // A gate remediation must also pass the failing gate's own
+            // commands: the run's check alone can pass on the code the gate
+            // failed on, which would accept a remediation that fixed nothing.
+            let mut failing = command.clone();
+            for gate_command in contract.gate_commands.iter().filter(|_| passed) {
+                let (ok, out) = run_confined(
+                    &ws,
+                    manager.repo(),
+                    &denies,
+                    gate_command,
+                    timeout,
+                    CHECK_OUTPUT_CAP,
+                )?;
+                if !ok {
+                    (passed, output, failing) = (false, out, gate_command.clone());
+                    break;
+                }
+            }
             // 5. Quiet again, held through the cleanup. A process that escaped
             // the group fails the verification and nothing is cleaned: the
             // worktree is left as it is, never merged, never continued.
@@ -617,7 +635,7 @@ impl Verifier for CommandVerifier {
             let cleared = merge_back.discard_leftovers(&attempt);
             drop(quiet);
             if !passed {
-                let mut reason = format!("`{}` failed: {}", clean(&command), clean_lines(&output));
+                let mut reason = format!("`{}` failed: {}", clean(&failing), clean_lines(&output));
                 if let Err(e) = &cleared {
                     reason.push_str(&format!("; also, what it left could not be removed: {e}"));
                 }

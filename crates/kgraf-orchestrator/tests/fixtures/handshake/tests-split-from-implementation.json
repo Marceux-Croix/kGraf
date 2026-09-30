@@ -1,0 +1,138 @@
+{
+  "interface": {
+    "id": "c1.i1",
+    "version": 1,
+    "parties": [
+      "c1.c1.c1",
+      "c1.c1.c2",
+      "c1.c2.c1"
+    ],
+    "symbols": [
+      "accumulate"
+    ],
+    "stub": [
+      {
+        "path": "src/lib.rs",
+        "content": "pub fn accumulate<T, U>(collection: Vec<T>, _f: impl FnMut(T) -> U) -> Vec<U> {\n    Vec::new()\n}\n"
+      }
+    ],
+    "wrong": [],
+    "reference": [
+      {
+        "path": "src/lib.rs",
+        "content": "pub fn accumulate<T, U>(collection: Vec<T>, mut f: impl FnMut(T) -> U) -> Vec<U> {\n    let mut result = Vec::new();\n    for item in collection {\n        result.push(f(item));\n    }\n    result\n}\n"
+      }
+    ],
+    "consumer": [],
+    "tests": [
+      {
+        "path": "tests/accumulate.rs",
+        "content": "use accumulate::accumulate;\n\n#[test]\nfn transforms_values_in_order() {\n    assert_eq!(accumulate(vec![1, 2, 3], |value| value * 2), vec![2, 4, 6]);\n}\n"
+      }
+    ],
+    "compile": [
+      "cargo",
+      "test",
+      "--no-run"
+    ],
+    "test": [
+      "cargo",
+      "test"
+    ],
+    "consulted": [],
+    "replaces": [
+      "src/lib.rs"
+    ]
+  },
+  "handshake": [
+    {
+      "party": "c1.c1.c1",
+      "provide": [
+        "I will provide an integration test verifying `accumulate` transforms each input value exactly once."
+      ],
+      "expect": [
+        "I assume `c1.c1.c2` and `c1.c2.c1` preserve the existing API for `accumulate`."
+      ],
+      "consume": [
+        "I assume `accumulate` accepts distinct input values and a transformation whose invocations can be counted per value."
+      ],
+      "touch": [
+        "tests/accumulate.rs"
+      ]
+    },
+    {
+      "party": "c1.c1.c2",
+      "provide": [
+        "I will provide an integration test for `accumulate` that verifies output order using a transformation that clearly maps inputs to outputs."
+      ],
+      "expect": [
+        "I assume `c1.c1.c1` provides the `accumulate` implementation.",
+        "I assume `c1.c2.c1` preserves the existing test and crate setup."
+      ],
+      "consume": [
+        "I assume `accumulate` is available to the integration test through the existing public API."
+      ],
+      "touch": [
+        "tests/accumulate.rs"
+      ]
+    },
+    {
+      "party": "c1.c2.c1",
+      "provide": [
+        "I will provide `accumulate`."
+      ],
+      "expect": [
+        "I assume `c1.c1.c1` and `c1.c1.c2` provide no additional contract symbols."
+      ],
+      "consume": [],
+      "touch": [
+        "src/lib.rs"
+      ]
+    }
+  ],
+  "recorded_findings": [
+    {
+      "finding": "double_provided",
+      "symbol": "accumulate",
+      "parties": [
+        "c1.c1.c1",
+        "c1.c2.c1"
+      ]
+    },
+    {
+      "finding": "unanchored",
+      "party": "c1.c1.c2",
+      "text": "I assume `c1.c2.c1` preserves the existing test and crate setup."
+    },
+    {
+      "finding": "touch_overlap",
+      "path": "tests/accumulate.rs",
+      "parties": [
+        "c1.c1.c1",
+        "c1.c1.c2"
+      ]
+    }
+  ],
+  "writes": {
+    "c1.c1.c1": [
+      {
+        "path": "tests/accumulate.rs"
+      }
+    ],
+    "c1.c1.c2": [
+      {
+        "path": "tests/accumulate.rs"
+      }
+    ],
+    "c1.c2.c1": [
+      {
+        "path": "src/lib.rs"
+      }
+    ]
+  },
+  "depends_on": {
+    "c1.c1.c2": [
+      "c1.c1.c1"
+    ]
+  }
+}

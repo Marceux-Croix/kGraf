@@ -202,6 +202,12 @@ pub struct OpenContract {
     /// ([`MAX_REFUSAL_CHARS`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_refusal: Option<String>,
+    /// Commands an attempt must pass besides the run's own check: a gate
+    /// remediation carries the commands of the gate it remediates, so a fix
+    /// that the run's check already passed without is not accepted until the
+    /// failing gate's own commands pass in its worktree.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gate_commands: Vec<String>,
 }
 
 /// The longest [`OpenContract::last_refusal`] kept, in characters, from the
@@ -276,6 +282,7 @@ impl OpenContract {
             resolver_source: None,
             task_kind: None,
             last_refusal: None,
+            gate_commands: Vec::new(),
         }
     }
 

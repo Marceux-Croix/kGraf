@@ -337,7 +337,9 @@ pub fn plan_nodes(
         }
         for g in &r.coordination.gates {
             let state = match &g.status {
-                GateStatus::Pending => WorkState::GatePending,
+                // An inconclusive gate is judged by the root gate: not yet
+                // passed, and holding nothing, so it shows as pending.
+                GateStatus::Pending | GateStatus::Inconclusive { .. } => WorkState::GatePending,
                 GateStatus::Running { .. } => WorkState::GateRunning,
                 GateStatus::Passed { .. } | GateStatus::Waived { .. } => WorkState::GatePassed,
                 GateStatus::Failed { .. } | GateStatus::Held { .. } => WorkState::GateHolding,

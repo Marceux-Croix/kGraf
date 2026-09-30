@@ -22,6 +22,15 @@
 //!   region the gate covers, briefed with the failing output **as data**; the gate
 //!   runs again once it verifies. After [`DEFAULT_MAX_REMEDIATIONS`] the gate is
 //!   held for the user.
+//! - **A partial gate that cannot judge.** Every gate runs the project's
+//!   commands, which cover the whole project (`cargo test --workspace`), so a
+//!   gate below the root also runs tests of parts of the plan not built yet.
+//!   When one fails, the same commands run once per run at the base commit the
+//!   run started from. If they fail there too, the gate is
+//!   [`GateStatus::Inconclusive`]: no remediation, no halt, nothing blocked,
+//!   and the root gate, which runs once everything is built, judges its cover.
+//!   The root gate is never inconclusive. If they pass at the base, the failure
+//!   is the cover's and the gate fails as above.
 //! - **No runner, no gate** (0018): a project with no discoverable
 //!   validation commands gets no gate and the run record says so; nothing plausible
 //!   is invented.
@@ -37,6 +46,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 /// The id of the gate on the run's root.
 pub const ROOT_GATE: &str = "gate:root";
+
+/// The gate id of a run of the project's validation commands at the run's
+/// base commit ([`record_inconclusive`]). Not a gate of the plan: no node
+/// carries it.
+pub const BASE_GATE_PROBE: &str = "gate:base";
 
 /// Failed runs of one gate that each get a remediation contract before the gate
 /// is held for the user. A starting point, not a researched number.
@@ -73,6 +87,17 @@ pub enum GateStatus {
     /// Failed more often than remediation is allowed: the user decides
     /// ([`decide`]).
     Held { reason: String },
+    /// A gate below the root failed, and the same commands fail at the run's
+    /// base commit too: the project's validation does not pass before any of
+    /// the plan lands, so a gate over part of the plan cannot tell its cover's
+    /// failure from the parts not yet built ([`record_inconclusive`]). It
+    /// halts nothing and blocks nothing; the root gate, over everything,
+    /// judges the cover.
+    Inconclusive {
+        pinned: Option<String>,
+        at_ms: i64,
+        reason: String,
+    },
     /// The user waived it: it counts as passed, and the record says who and why.
     Waived {
         by: String,
@@ -150,11 +175,14 @@ pub struct GateNode {
 }
 
 impl GateNode {
-    /// Passed, or waived by the user.
+    /// Passed, waived by the user, or left to the root gate as
+    /// inconclusive: nothing waits on it any longer. The root gate is never
+    /// inconclusive ([`record_inconclusive`]), so a run completes only once
+    /// the root gate has passed or been waived.
     pub fn passed(&self) -> bool {
         matches!(
             self.status,
-            GateStatus::Passed { .. } | GateStatus::Waived { .. }
+            GateStatus::Passed { .. } | GateStatus::Waived { .. } | GateStatus::Inconclusive { .. }
         )
     }
 
@@ -179,6 +207,7 @@ impl GateNode {
             GateStatus::Failed { .. } => "failed",
             GateStatus::Held { .. } => "held",
             GateStatus::Waived { .. } => "waived",
+            GateStatus::Inconclusive { .. } => "inconclusive",
         }
     }
 }
@@ -551,6 +580,95 @@ pub fn record_verdict(
     Some(c)
 }
 
+/// A remediation verified with no change: its check passed on the code as the
+/// gate failed it, so it fixed nothing, and running the gate again would run
+/// it on the same commit. It counts as a failed remediation: the gate opens
+/// the next one (returned, for the caller to open), briefed with the same
+/// failure and told why the last did not count, or, past the limit, holds.
+/// `None` also when no failed gate waits on `remediation`.
+pub fn remediation_changed_nothing(
+    gates: &mut [GateNode],
+    remediation: &OpenContract,
+    now_ms: i64,
+    max_remediations: u32,
+    run: &str,
+) -> Option<OpenContract> {
+    let g = gates.iter_mut().find(|g| {
+        matches!(&g.status, GateStatus::Failed { remediation: r, .. } if *r == remediation.contract)
+    })?;
+    let GateStatus::Failed { pinned, .. } = g.status.clone() else {
+        return None;
+    };
+    if g.remediations.len() as u32 >= max_remediations + g.allowance {
+        g.status = GateStatus::Held {
+            reason: format!(
+                "remediation {} changed nothing; {} remediations did not fix the gate",
+                remediation.contract,
+                g.remediations.len()
+            ),
+        };
+        return None;
+    }
+    let n = g.remediations.len() + 1;
+    let id = crate::plan::sanitize_id(&format!("fix-{}-{n}", g.major));
+    let mut c = OpenContract::planned(
+        id.clone(),
+        format!("{run}/{id}").as_str().into(),
+        remediation.instruction.clone(),
+        remediation.acceptance.clone(),
+    );
+    c.writes = remediation.writes.clone();
+    c.tools = remediation.tools.clone();
+    c.base = remediation.base.clone();
+    c.gate_commands = remediation.gate_commands.clone();
+    // Carried to the next brief as data, as a refused attempt's reason is.
+    c.last_refusal = Some(format!(
+        "remediation {} changed no file: its check passed on the code exactly as the gate \
+         failed it, which does not fix the gate. Change the code so that the gate's commands \
+         pass.",
+        remediation.contract
+    ));
+    g.remediations.push(id.clone());
+    g.status = GateStatus::Failed {
+        pinned,
+        at_ms: now_ms,
+        remediation: id,
+    };
+    Some(c)
+}
+
+/// A gate below the root failed, and its commands fail at the run's base
+/// commit too (`base_by`: what ran there). The gate is inconclusive rather
+/// than failed: no remediation is opened (none can make the unbuilt rest of
+/// the plan pass), and new dispatch is not halted. Returns whether the gate
+/// was recorded so; the root gate never is, since it covers everything and
+/// its failure is always the plan's.
+pub fn record_inconclusive(
+    gates: &mut [GateNode],
+    gate: &str,
+    pinned: Option<String>,
+    now_ms: i64,
+    base_by: &str,
+) -> bool {
+    if gate == ROOT_GATE {
+        return false;
+    }
+    let Some(g) = gates.iter_mut().find(|g| g.id == gate) else {
+        return false;
+    };
+    g.runs += 1;
+    g.status = GateStatus::Inconclusive {
+        pinned,
+        at_ms: now_ms,
+        reason: format!(
+            "its commands fail at the run's base commit too (`{base_by}`), before any of the \
+             plan landed, so a gate over part of the plan cannot judge its cover; the root \
+             gate judges it"
+        ),
+    };
+    true
+}
+
 /// Open a remediation: every gate that covers anything `gate` covers (the gate and
 /// its ancestors) now covers the remediation too, so none passes before it
 /// verifies. The failed gate stays failed, halting other dispatch, until it runs
@@ -843,6 +961,36 @@ mod tests {
             ),
             Err(GateDecisionError::NotDecidable { .. })
         ));
+    }
+
+    /// An inconclusive gate below the root halts nothing and blocks nothing,
+    /// and lets its parent gate run; the root gate is never recorded so.
+    #[test]
+    fn an_inconclusive_gate_halts_and_blocks_nothing_and_the_root_is_never_one() {
+        let contracts = vec![
+            contract("a.x", &[], "x.rs"),
+            contract("b", &["a.x"], "b.rs"),
+        ];
+        let leaves: BTreeMap<String, Vec<String>> =
+            [("a".to_owned(), vec!["a.x".to_owned()])].into();
+        let mut gates = plan_gates(&contracts, &leaves);
+        assert!(!record_inconclusive(&mut gates, ROOT_GATE, None, 1, "t"));
+        assert!(record_inconclusive(
+            &mut gates,
+            "gate:a",
+            Some("ab".into()),
+            1,
+            "cargo test"
+        ));
+        assert!(matches!(
+            &gates[0].status,
+            GateStatus::Inconclusive { reason, .. } if reason.contains("`cargo test`")
+        ));
+        assert_eq!(gates[0].runs, 1);
+        assert!(halting(&gates).is_none());
+        assert!(blocking(&gates, &contracts[1]).is_none());
+        assert_eq!(ready(&gates, &|_| true), vec![ROOT_GATE.to_owned()]);
+        assert!(!all_passed(&gates), "the root gate still has to pass");
     }
 
     #[test]

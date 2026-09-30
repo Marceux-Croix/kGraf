@@ -2737,7 +2737,11 @@ impl RunLoop {
         request.interfaces = self.contracts.is_some();
         let mut reasks = 0;
         loop {
-            match self.decompose_once(&request, note_ids, outer).await {
+            let last_ask = reasks >= MAX_PLAN_REASKS;
+            match self
+                .decompose_once(&request, note_ids, outer, last_ask)
+                .await
+            {
                 Err(OrchestratorError::Plan(e)) if e.reaskable() && reasks < MAX_PLAN_REASKS => {
                     reasks += 1;
                     // The refusal can quote the model's own output: scrubbed
@@ -2756,12 +2760,15 @@ impl RunLoop {
         }
     }
 
-    /// One ask of the planner, checked.
+    /// One ask of the planner, checked. Unless it is the `last_ask`, an
+    /// interface failing its mechanical checks refuses the answer, so the
+    /// planner is asked again with the failure ([`Self::precheck_interfaces`]).
     async fn decompose_once(
         &mut self,
         request: &PlanRequest,
         note_ids: &[String],
         outer: &BTreeSet<String>,
+        last_ask: bool,
     ) -> Result<(Vec<ContractSpec>, Vec<crate::checks::InterfaceContract>), OrchestratorError> {
         let input = estimate_tokens(&request.instruction)
             + request
@@ -2841,6 +2848,9 @@ impl RunLoop {
                         .into());
                     }
                 }
+                if !last_ask {
+                    self.precheck_interfaces(&interfaces).await?;
+                }
                 Ok((specs, interfaces))
             }
             Err(e) => {
@@ -2848,6 +2858,42 @@ impl RunLoop {
                 Err(e.into())
             }
         }
+    }
+
+    /// The mechanical checks (artifact, stub-compile, vacuity) of a plan's
+    /// interfaces, run on the answer before it is taken. A failure is the
+    /// planner's to correct as much as a malformed plan is, and the planner is
+    /// the only party that can: refused as [`PlanError::Invalid`] with the
+    /// check's failure (the compiler's error lines included), so
+    /// [`Self::decompose`]'s bounded re-ask returns it to the planner. On the
+    /// last ask the plan is taken, and the pre-dispatch gate holds the
+    /// interface's parties on the same failure, as it always did.
+    ///
+    /// A check that could not run (no toolchain, a compile that timed out
+    /// twice) says nothing about the plan: it is left to the gate, which
+    /// records it. The gate runs the checks again at dispatch, against the
+    /// integration tip of that moment; a plan-time pass is not reused, since
+    /// work merged in between can change what the stub compiles against.
+    /// Trade-off: one more run of the checks per interface. The checks run on
+    /// the loop, as the planner's own call does; the loop takes controls only
+    /// after planning.
+    async fn precheck_interfaces(
+        &mut self,
+        interfaces: &[crate::checks::InterfaceContract],
+    ) -> Result<(), OrchestratorError> {
+        let Some(runner) = self.checks_runner() else {
+            return Ok(());
+        };
+        for ic in interfaces {
+            if let Ok(Err(failure)) = crate::checks::check_mechanical(&runner, ic).await {
+                return Err(PlanError::Invalid(format!(
+                    "interface `{}` failed its pre-dispatch check: {failure}",
+                    ic.id
+                ))
+                .into());
+            }
+        }
+        Ok(())
     }
 
     // ------------------------------------------------------------- planning
@@ -3155,6 +3201,12 @@ impl RunLoop {
         }
         self.note_plan()?;
         self.plan_gates_hook(&progress.leaves);
+        // The commit the run starts from, before any of the plan lands: a
+        // gate below the root that fails is compared with it.
+        if !self.record.coordination.gates.is_empty() {
+            self.record.coordination.base_commit =
+                self.s.workspaces.integration_tip().await.ok().flatten();
+        }
         self.record.planned = true;
         self.record.plan_progress = None;
         self.save()?;

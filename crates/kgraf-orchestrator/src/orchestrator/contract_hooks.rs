@@ -43,7 +43,7 @@ use crate::challenge::{
 use crate::checks::{
     CheckFailure, CheckRun, CheckStage, FileOverlay, HandshakeFinding, HandshakeRequest,
     HandshakeStatement, Handshaker, InterfaceContract, SandboxRunner, check_mechanical,
-    compare_handshake,
+    compare_handshake_ordered, ordered_pairs,
 };
 use crate::consumer_tests::{self, ConsumerTestKey, ConsumerTestOutcome};
 use crate::plan::PlanError;
@@ -626,20 +626,23 @@ impl RunLoop {
                     return Ok(false);
                 }
             };
-            if !findings.is_empty() {
+            // A sentence not bound to the surface is a warning: recorded
+            // with the pass (or with the failure), never a hold by itself.
+            if let Some(first) = findings.iter().find(|f| f.holds()) {
+                let holding = findings.iter().filter(|f| f.holds()).count();
                 let failure = CheckFailure {
                     stage: CheckStage::Handshake,
                     artifact: ic.artifact(CheckStage::Handshake),
                     detail: format!(
-                        "{} mismatch(es) between the parties' statements; the first: {}",
-                        findings.len(),
-                        serde_json::to_string(&findings[0]).unwrap_or_default()
+                        "{holding} mismatch(es) between the parties' statements; the first: {}",
+                        serde_json::to_string(first).unwrap_or_default()
                     ),
                 };
                 self.check_failed(&ic, failure, findings, statements)
                     .await?;
                 return Ok(false);
             }
+            let warnings = findings;
             if let Some(d) = self.contracts.as_mut() {
                 d.mechanical.remove(&key);
             }
@@ -649,6 +652,7 @@ impl RunLoop {
                 runs,
                 handshake: statements,
                 handshake_skipped: skipped,
+                warnings,
             })
             .await?;
             // 0081: land the interface's stub onto the integration branch
@@ -1000,7 +1004,20 @@ impl RunLoop {
             parties: open.iter().map(|o| o.contract.clone()).collect(),
             ..ic.clone()
         };
-        let findings = compare_handshake(&only_open, &statements, &writes);
+        // Parties a dependency orders never write at once (a shared test file
+        // written by one test writer after another is not an overlap).
+        let depends_on: BTreeMap<String, Vec<String>> = self
+            .record
+            .open_contracts
+            .iter()
+            .map(|c| (c.contract.clone(), c.depends_on.clone()))
+            .collect();
+        let findings = compare_handshake_ordered(
+            &only_open,
+            &statements,
+            &writes,
+            &ordered_pairs(&depends_on),
+        );
         Ok(Ok((statements, findings, None)))
     }
 

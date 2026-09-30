@@ -594,6 +594,41 @@ async fn python_a_sound_contract_passes_and_a_missing_name_fails_stub_compile() 
     assert!(f.detail.contains("ImportError"), "{}", f.detail);
 }
 
+/// A contract test at the path of a file the project already tracks would
+/// replace it in every check tree: refused as an artifact failure, before any
+/// command runs. The same bytes as the tracked file are not a replacement.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_contract_test_replacing_a_tracked_file_is_refused() {
+    let dir = tempfile::tempdir().expect("dir");
+    let repo = dir.path().join("pyrepo");
+    std::fs::create_dir_all(&repo).expect("mkdir");
+    std::fs::write(repo.join("README.md"), "python project\n").expect("write");
+    // The project's own consumer test, which the contract must not rewrite.
+    std::fs::write(repo.join("test_contract.py"), PY_TEST).expect("write");
+    commit_all(&repo);
+    let r = runner(dir.path(), &repo);
+
+    let mut ic = py_ic();
+    ic.tests[0].content = PY_TEST.replace("8080", "80");
+    let f = check_mechanical(&r, &ic)
+        .await
+        .expect("ran")
+        .expect_err("refused");
+    assert_eq!(f.stage, CheckStage::Artifact);
+    assert!(
+        f.detail
+            .contains("`test_contract.py` would replace a file that already exists"),
+        "{}",
+        f.detail
+    );
+
+    // The tracked file's own content, unchanged, is checked as usual.
+    check_mechanical(&r, &py_ic())
+        .await
+        .expect("ran")
+        .expect("the unchanged test passes");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn python_a_hang_against_the_stub_is_a_failure_not_a_pass() {
     let dir = tempfile::tempdir().expect("dir");

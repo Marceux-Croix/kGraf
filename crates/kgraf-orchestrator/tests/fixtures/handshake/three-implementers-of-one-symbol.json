@@ -1,0 +1,189 @@
+{
+  "interface": {
+    "id": "c1.i1",
+    "version": 1,
+    "parties": [
+      "c1.c1.c1",
+      "c1.c1.c2",
+      "c1.c2.c1",
+      "c1.c2.c2"
+    ],
+    "symbols": [
+      "parse_duration"
+    ],
+    "stub": [
+      {
+        "path": "src/lib.rs",
+        "content": "pub fn parse_duration(_input: &str) -> Result<u64, String> {\n    Err(\"unimplemented\".to_string())\n}\n"
+      }
+    ],
+    "wrong": [],
+    "reference": [
+      {
+        "path": "src/lib.rs",
+        "content": "pub fn parse_duration(input: &str) -> Result<u64, String> {\n    let split = input.len().saturating_sub(1);\n    let (num, unit) = input.split_at(split);\n    if num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) {\n        return Err(format!(\"invalid duration {input:?}: expected an integer followed by 's' or 'm'\"));\n    }\n    let value: u64 = num\n        .parse()\n        .map_err(|_| format!(\"invalid duration {input:?}: number out of range\"))?;\n    match unit {\n        \"s\" => Ok(value),\n        \"m\" => value\n            .checked_mul(60)\n            .ok_or_else(|| format!(\"invalid duration {input:?}: too large\")),\n        _ => Err(format!(\"invalid duration {input:?}: unknown unit, expected 's' or 'm'\")),\n    }\n}\n"
+      }
+    ],
+    "consumer": [],
+    "tests": [
+      {
+        "path": "tests/interface_parse_duration.rs",
+        "content": "use fx_interface_duration::parse_duration;\n\n#[test]\nfn parses_seconds() {\n    assert_eq!(parse_duration(\"45s\"), Ok(45));\n}\n\n#[test]\nfn parses_minutes_as_seconds() {\n    assert_eq!(parse_duration(\"3m\"), Ok(180));\n}\n\n#[test]\nfn rejects_missing_or_unknown_unit() {\n    assert!(parse_duration(\"10\").is_err());\n    assert!(parse_duration(\"10h\").is_err());\n}\n\n#[test]\nfn rejects_non_numeric_or_empty() {\n    assert!(parse_duration(\"xs\").is_err());\n    assert!(parse_duration(\"\").is_err());\n}\n"
+      }
+    ],
+    "compile": [
+      "cargo",
+      "test",
+      "--test",
+      "interface_parse_duration",
+      "--no-run"
+    ],
+    "test": [
+      "cargo",
+      "test",
+      "--test",
+      "interface_parse_duration"
+    ],
+    "consulted": [],
+    "replaces": [
+      "src/lib.rs"
+    ]
+  },
+  "handshake": [
+    {
+      "party": "c1.c1.c1",
+      "provide": [
+        "I will provide `parse_duration` in src/lib.rs of crate fx-interface-duration with exactly the public signature `pub fn parse_duration(input: &str) -> Result<u64, String>` and a stub body that always returns `Err(\"unimplemented\".to_string())`."
+      ],
+      "expect": [
+        "I assume you provide tests/consumer.rs as a consumer of `parse_duration` that invokes it with a `&str` argument and matches on the returned `Result<u64, String>`, allowing me to confirm the exact signature before writing src/lib.rs."
+      ],
+      "consume": [
+        "I assume `parse_duration` is consumed by parties `c1.c1.c2`, `c1.c2.c1`, and `c1.c2.c2` with a `&str` input, and that they handle both the `Ok(u64)` and `Err(String)` variants of the returned `Result<u64, String>` without requiring any behavior beyond the stub."
+      ],
+      "touch": [
+        "src/lib.rs"
+      ]
+    },
+    {
+      "party": "c1.c1.c2",
+      "provide": [
+        "I will provide no writes or file changes for `parse_duration`; I will only verify and report compile/test behavior."
+      ],
+      "expect": [
+        "I assume `c1.c1.c1` provides the `src/lib.rs` stub that defines `parse_duration`.",
+        "I assume `c1.c2.c1` provides `tests/consumer.rs` that compiles against `parse_duration`.",
+        "I assume `c1.c2.c2` provides the crate/test setup so `cargo test` builds `src/lib.rs` and `tests/consumer.rs` against the same `parse_duration`."
+      ],
+      "consume": [
+        "I assume `parse_duration` is the only contract symbol consumed by the consumer test.",
+        "I assume the expected failure mode is `Err` with message `\"unimplemented\"` from `parse_duration`, not a compile error in `src/lib.rs` or `tests/consumer.rs`."
+      ],
+      "touch": []
+    },
+    {
+      "party": "c1.c2.c1",
+      "provide": [
+        "I will provide `parse_duration` with the exact signature `pub fn parse_duration(input: &str) -> Result<u64, String>` in src/lib.rs of crate fx-interface-duration, replacing the stub body with a real implementation: a non-negative decimal integer immediately followed by `s` returns `Ok` with the value as-is `u64` seconds, and followed by `m` returns `Ok` with the value multiplied by 60 as `u64`; empty input, non-numeric input, missing unit, unknown unit, and `u64` overflow all return `Err(String)`.",
+        "I will provide `parse_duration` without modifying tests/consumer.rs or any file other than src/lib.rs."
+      ],
+      "expect": [
+        "I assume parties `c1.c1.c1`, `c1.c1.c2`, and `c1.c2.c2` call `parse_duration` only via the agreed signature `pub fn parse_duration(input: &str) -> Result<u64, String>`, passing a `&str` and handling both `Ok(u64)` and `Err(String)` outcomes.",
+        "I assume parties `c1.c1.c1`, `c1.c1.c2`, and `c1.c2.c2` rely on the success-path semantics of `parse_duration`: the `s` unit yields seconds unchanged and the `m` unit yields minutes multiplied by 60, both as `u64`.",
+        "I assume parties `c1.c1.c1`, `c1.c1.c2`, and `c1.c2.c2` assert only that invalid inputs produce an `Err`, not the exact `String` error text.",
+        "I assume parties `c1.c1.c1`, `c1.c1.c2`, and `c1.c2.c2` treat tests/consumer.rs as read-only for me and do not expect changes outside src/lib.rs."
+      ],
+      "consume": [],
+      "touch": [
+        "src/lib.rs"
+      ]
+    },
+    {
+      "party": "c1.c2.c2",
+      "provide": [
+        "I will provide `parse_duration` in src/lib.rs with the exact signature `pub fn parse_duration(input: &str) -> Result<u64, String>`, keeping the existing `Ok` (`u64`) behavior unchanged and producing short, human-readable `Err` (`String`) messages that match tests/consumer.rs exactly for the empty, non-numeric, missing-unit, unknown-unit, and overflow input classes"
+      ],
+      "expect": [
+        "I assume you (the other parties `c1.c1.c1`, `c1.c1.c2`, `c1.c2.c1`) provide no conflicting definition of `parse_duration` and treat src/lib.rs of fx-interface-duration as the sole implementation of the contract symbol `parse_duration`",
+        "I assume you provide the consumers/tests (tests/consumer.rs) that pin the exact expected `Err` (`String`) text per rejected input class, and that these expectations are stable for contract `c1.i1@v1`"
+      ],
+      "consume": [
+        "I assume `parse_duration` is invoked only with a borrowed `&str` and that callers match on `Result<u64, String>` using the exact `Err` (`String`) messages and unchanged `Ok` (`u64`) values",
+        "I assume no caller relies on `parse_duration` accepting new unit strings or returning error text other than what tests/consumer.rs specifies"
+      ],
+      "touch": [
+        "src/lib.rs"
+      ]
+    }
+  ],
+  "recorded_findings": [
+    {
+      "finding": "double_provided",
+      "symbol": "parse_duration",
+      "parties": [
+        "c1.c1.c1",
+        "c1.c1.c2",
+        "c1.c2.c1",
+        "c1.c2.c2"
+      ]
+    },
+    {
+      "finding": "outside_surface",
+      "party": "c1.c2.c1",
+      "symbol": "Err",
+      "text": "I assume parties `c1.c1.c1`, `c1.c1.c2`, and `c1.c2.c2` assert only that invalid inputs produce an `Err`, not the exact `String` error text."
+    },
+    {
+      "finding": "unanchored",
+      "party": "c1.c2.c1",
+      "text": "I assume parties `c1.c1.c1`, `c1.c1.c2`, and `c1.c2.c2` treat tests/consumer.rs as read-only for me and do not expect changes outside src/lib.rs."
+    },
+    {
+      "finding": "outside_surface",
+      "party": "c1.c2.c2",
+      "symbol": "Err",
+      "text": "I assume you provide the consumers/tests (tests/consumer.rs) that pin the exact expected `Err` (`String`) text per rejected input class, and that these expectations are stable for contract `c1.i1@v1`"
+    },
+    {
+      "finding": "touch_overlap",
+      "path": "src/lib.rs",
+      "parties": [
+        "c1.c1.c1",
+        "c1.c2.c1",
+        "c1.c2.c2"
+      ]
+    }
+  ],
+  "writes": {
+    "c1.c1.c1": [
+      {
+        "path": "src/lib.rs"
+      }
+    ],
+    "c1.c1.c2": [],
+    "c1.c2.c1": [
+      {
+        "path": "src/lib.rs"
+      }
+    ],
+    "c1.c2.c2": [
+      {
+        "path": "src/lib.rs"
+      }
+    ]
+  },
+  "depends_on": {
+    "c1.c1.c2": [
+      "c1.c1.c1"
+    ],
+    "c1.c2.c1": [
+      "c1.c1.c1",
+      "c1.c1.c2"
+    ],
+    "c1.c2.c2": [
+      "c1.c1.c1",
+      "c1.c1.c2",
+      "c1.c2.c1"
+    ]
+  }
+}

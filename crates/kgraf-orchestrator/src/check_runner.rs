@@ -66,6 +66,12 @@ use std::time::Duration;
 /// Bytes of output kept per stream.
 pub const DEFAULT_TAIL_BYTES: usize = 4_096;
 
+/// Bytes of each stream scanned for compiler errors before it is cut to
+/// [`DEFAULT_TAIL_BYTES`]. `RLIMIT_FSIZE` is the only bound on the output
+/// files, so the scan reads at most this much from each file's end.
+#[cfg(unix)]
+const SCAN_BYTES: usize = 8 * 1024 * 1024;
+
 /// Most contract-check runs at once in this process: half the cores, at least
 /// one, at most four. A starting point, not a measured number.
 pub fn max_concurrent_checks() -> usize {
@@ -142,6 +148,10 @@ impl RunResult {
 enum Resolved {
     Commit {
         repo: PathBuf,
+        /// The commit the runner was made from: the run's base, before any
+        /// of the plan landed. The project's own files are read from it
+        /// ([`SandboxRunner::base_differs`]).
+        origin: String,
         /// The commit and its archive (made once per commit). The commit moves
         /// when continuous merge-back advances the integration branch
         /// ([`SandboxRunner::advance_base`]).
@@ -251,6 +261,7 @@ impl SandboxRunner {
                     })?;
                 Resolved::Commit {
                     repo: root,
+                    origin: sha.clone(),
                     current: Mutex::new(CommitBase { sha, archive: None }),
                 }
             }
@@ -305,7 +316,7 @@ impl SandboxRunner {
     /// made from now, or the base directory.
     pub fn artifacts(&self) -> Artifacts {
         match &self.base {
-            Resolved::Commit { repo, current } => {
+            Resolved::Commit { repo, current, .. } => {
                 Artifacts::Commit(crate::challenge::CommitArtifacts {
                     repo: repo.clone(),
                     sha: current
@@ -338,7 +349,7 @@ impl SandboxRunner {
     /// a fresh worktree now starts from. Checks already running keep the tree
     /// they made. Returns whether the base moved; a directory base never does.
     pub fn advance_base(&self, rev: &str) -> Result<bool, CheckError> {
-        let Resolved::Commit { repo, current } = &self.base else {
+        let Resolved::Commit { repo, current, .. } = &self.base else {
             return Ok(false);
         };
         let git =
@@ -363,6 +374,53 @@ impl SandboxRunner {
             return false;
         };
         self.read_denies.iter().any(|d| p.starts_with(d))
+    }
+
+    /// Whether the base holds something at `path` other than a file with
+    /// exactly `content`: a file with other bytes, a link, a directory, or a
+    /// file over the read bound. An absent path is `false`. Read from the
+    /// commit the runner was made from, never an advanced base: a file a party
+    /// of the plan wrote since is the plan's, not the project's. Read through
+    /// the hardened blob reader (no filter, no textconv), or from the base
+    /// directory.
+    pub async fn base_differs(&self, path: &str, content: &str) -> Result<bool, CheckError> {
+        let rel = path.trim().trim_start_matches("./").to_owned();
+        let want = content.as_bytes().to_vec();
+        match &self.base {
+            Resolved::Commit { repo, origin, .. } => {
+                let repo = repo.clone();
+                let sha = origin.clone();
+                blocking(move || {
+                    use kgraf_sandbox::merge::blob::{BlobError, read_blob};
+                    let max = crate::challenge::MAX_ARTIFACT_BYTES;
+                    match read_blob(&repo, &sha, &rel, max) {
+                        Ok(bytes) => Ok(bytes != want),
+                        Err(BlobError::Absent { .. }) => Ok(false),
+                        Err(
+                            BlobError::Symlink { .. }
+                            | BlobError::NotAFile { .. }
+                            | BlobError::TooLarge { .. },
+                        ) => Ok(true),
+                        Err(e) => Err(CheckError::Config(format!(
+                            "cannot read `{rel}` at the base commit: {e}"
+                        ))),
+                    }
+                })
+                .await
+            }
+            Resolved::Directory(root) => {
+                let at = root.join(&rel);
+                blocking(move || match std::fs::symlink_metadata(&at) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                    Err(source) => Err(CheckError::Io { path: at, source }),
+                    Ok(m) if !m.is_file() => Ok(true),
+                    Ok(_) => std::fs::read(&at)
+                        .map(|bytes| bytes != want)
+                        .map_err(|source| CheckError::Io { path: at, source }),
+                })
+                .await
+            }
+        }
     }
 
     /// Make a fresh tree of the base, overlay `layers` in order, and run `argv`
@@ -439,7 +497,7 @@ impl SandboxRunner {
                 let (root, tree) = (root.clone(), tree.to_path_buf());
                 blocking(move || copy_tree(&root, &tree, true)).await?;
             }
-            Resolved::Commit { repo, current } => {
+            Resolved::Commit { repo, current, .. } => {
                 let tarball = {
                     let mut cur = current.lock().unwrap_or_else(|p| p.into_inner());
                     match cur.archive.as_ref() {
@@ -640,11 +698,10 @@ impl SandboxRunner {
                 "a process the check started left its process group and is still running".into(),
             ));
         }
-        let keep = DEFAULT_TAIL_BYTES;
         let tail = blocking(move || {
             Ok(join_tail(
-                &last_bytes(&err_path, keep),
-                &last_bytes(&out_path, keep),
+                &last_bytes(&err_path, SCAN_BYTES),
+                &last_bytes(&out_path, SCAN_BYTES),
             ))
         })
         .await?;
@@ -942,11 +999,77 @@ fn last_bytes(path: &Path, keep: usize) -> Vec<u8> {
 fn join_tail(err: &[u8], out: &[u8]) -> String {
     format!(
         "{}\n{}",
-        String::from_utf8_lossy(err),
-        String::from_utf8_lossy(out)
+        condense(&String::from_utf8_lossy(err), DEFAULT_TAIL_BYTES),
+        condense(&String::from_utf8_lossy(out), DEFAULT_TAIL_BYTES)
     )
     .trim()
     .to_owned()
+}
+
+/// Whether a line starts a compiler diagnostic that is an error: rustc's
+/// `error[E0560]: ...` and `error: ...`, and the `file:line: error: ...` form
+/// of C compilers and many others.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn starts_error(line: &str) -> bool {
+    line.starts_with("error[")
+        || line.starts_with("error:")
+        || line.contains(": error:")
+        || line.contains(": error[")
+}
+
+/// Whether a line continues the diagnostic above it: rustc's ` --> path`,
+/// `  |` gutter, `3 | code` and `= note` lines, all indented or numbered.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn continues_error(line: &str) -> bool {
+    line.starts_with([' ', '\t', '|', '='])
+        || line.split_once('|').is_some_and(|(n, _)| {
+            let n = n.trim();
+            !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())
+        })
+}
+
+/// `text` cut to at most `keep` bytes, compiler errors first: every error
+/// block (the error line and the context lines after it) up to three quarters
+/// of `keep`, then the end of the output in the room left. A plain tail let
+/// trailing warnings (a toolchain's own noise on stderr) push the one error
+/// that explains a failed check out of the record.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn condense(text: &str, keep: usize) -> String {
+    const MARKER: &str = "[... output cut; the compiler errors above were kept ...]\n";
+    if text.len() <= keep {
+        return text.to_owned();
+    }
+    let budget = (keep / 4 * 3).saturating_sub(MARKER.len());
+    let mut errors = String::new();
+    let mut in_block = false;
+    for line in text.lines() {
+        in_block = if starts_error(line) {
+            true
+        } else {
+            in_block && !line.trim().is_empty() && continues_error(line)
+        };
+        // A block that does not fit is left out whole line by line; later
+        // shorter lines may still fit, which keeps more locations.
+        if in_block && errors.len() + line.len() < budget {
+            errors.push_str(line);
+            errors.push('\n');
+        }
+    }
+    let used = if errors.is_empty() {
+        0
+    } else {
+        errors.len() + MARKER.len()
+    };
+    let mut start = text.len() - keep.saturating_sub(used).min(text.len());
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    let tail = &text[start..];
+    if errors.is_empty() {
+        tail.to_owned()
+    } else {
+        format!("{errors}{MARKER}{tail}")
+    }
 }
 
 /// Copy `from` to `to`, skipping only the top-level `.git` and `.kgraf`.
@@ -989,7 +1112,53 @@ fn copy_tree(from: &Path, to: &Path, top: bool) -> Result<(), CheckError> {
 
 #[cfg(test)]
 mod tests {
-    use super::missing_program;
+    use super::{DEFAULT_TAIL_BYTES, RunResult, condense, missing_program};
+
+    /// A compile error in the middle of the output, then more than the cap of
+    /// trailing toolchain warnings: the error and its location are kept.
+    #[test]
+    fn compiler_errors_survive_trailing_warnings() {
+        let mut out = String::from("   Compiling iface v0.1.0\n");
+        out.push_str("error[E0560]: struct `Receipt` has no field named `taxable_cents`\n");
+        out.push_str(" --> pricing_engine/src/lib.rs:3:53\n");
+        out.push_str("  |\n");
+        out.push_str("3 |     Receipt { total_cents, taxable_cents }\n");
+        out.push_str("  |                            ^^^^^^^^^^^^^ no such field\n\n");
+        for i in 0..80 {
+            out.push_str(&format!(
+                "2026-01-01 xcrun[{i}] DVTFilePathFSEvents: Failed to start fs event stream.\n"
+            ));
+        }
+        assert!(out.len() > 5 * 1024, "{}", out.len());
+        let kept = condense(&out, DEFAULT_TAIL_BYTES);
+        assert!(kept.len() <= DEFAULT_TAIL_BYTES, "{}", kept.len());
+        assert!(kept.contains("error[E0560]"), "{kept}");
+        assert!(kept.contains("pricing_engine/src/lib.rs:3:53"), "{kept}");
+        assert!(kept.contains("^^^^^^^^^^^^^ no such field"), "{kept}");
+        assert!(
+            !kept.contains("Compiling iface"),
+            "a line that is not an error is not moved up: {kept}"
+        );
+        assert!(
+            kept.ends_with("Failed to start fs event stream.\n"),
+            "the end of the output is still kept"
+        );
+        let r = RunResult {
+            success: false,
+            timed_out: false,
+            status: "exit status: 101".into(),
+            tail: kept,
+            queued: std::time::Duration::ZERO,
+        };
+        assert!(
+            r.describe(&["cargo".into(), "build".into()])
+                .contains("E0560")
+        );
+        // Output under the cap is kept whole; output with no error is a tail.
+        assert_eq!(condense("short", 10), "short");
+        let noise = "w\n".repeat(3_000);
+        assert_eq!(condense(&noise, 100), noise[noise.len() - 100..]);
+    }
 
     #[test]
     fn a_missing_program_is_told_apart_from_a_failing_command() {

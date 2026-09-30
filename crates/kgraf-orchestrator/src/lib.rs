@@ -132,7 +132,7 @@ pub use checks::{
     CANARY, CheckError, CheckFailure, CheckRun, CheckStage, FileOverlay, HandshakeFinding,
     HandshakeRequest, HandshakeStatement, Handshaker, InterfaceContract, ModelHandshaker,
     RoutedHandshaker, RunResult, SandboxRunner, anchors, check_mechanical, compare_handshake,
-    parse_handshake,
+    compare_handshake_ordered, ordered_pairs, parse_handshake,
 };
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use cluster_cap::{ClusterCapHold, DEFAULT_MAX_IN_FLIGHT_PER_CLUSTER};
@@ -142,15 +142,15 @@ pub use consumer_tests::{
     RoutedConsumerTestWriter, gate_consumer_test, parse_consumer_test, producer_of,
     verify_producer_against_consumer_tests,
 };
-pub use coordination::{ClosedContract, Closure, Coordination, Integration};
+pub use coordination::{BaseCheck, ClosedContract, Closure, Coordination, Integration};
 pub use envelope::{
     Addressee, COMMS_DIR, COMMS_FILE_MAX_BYTES, COMMS_LOCK, Draft, Envelope, EnvelopeError,
     FeedEntry, MAX_CONCERNS, MAX_LABEL_CHARS, Mailbox, append_to_comms, heading_name, label,
     observed_reads, pair_file, pair_file_for,
 };
 pub use gates::{
-    DEFAULT_MAX_REMEDIATIONS, GateDecision, GateDecisionError, GateDecisionRecord, GateNode,
-    GateRequest, GateRunner, GateStatus, GateVerdict, ROOT_GATE,
+    BASE_GATE_PROBE, DEFAULT_MAX_REMEDIATIONS, GateDecision, GateDecisionError, GateDecisionRecord,
+    GateNode, GateRequest, GateRunner, GateStatus, GateVerdict, ROOT_GATE,
 };
 pub use guards::{
     DEFAULT_MAX_DEPTH, DEFAULT_MAX_TASK_CHARS, Delegation, DelegationPolicy, DelegationRequest,

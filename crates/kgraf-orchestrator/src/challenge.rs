@@ -283,6 +283,11 @@ pub enum ContractEvent {
         /// Why no handshake was compared, when none was.
         #[serde(default)]
         handshake_skipped: Option<String>,
+        /// Handshake findings that hold nothing (a sentence not bound to the
+        /// contract surface, [`crate::checks::HandshakeFinding::holds`]),
+        /// kept so the record shows what the comparison could not read.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        warnings: Vec<crate::checks::HandshakeFinding>,
     },
     CheckFailed {
         interface: String,
@@ -1748,6 +1753,7 @@ mod tests {
             runs: vec![],
             handshake: vec![],
             handshake_skipped: None,
+            warnings: vec![],
         });
         let mut other = ic();
         other.symbols = vec!["elsewhere".into()];

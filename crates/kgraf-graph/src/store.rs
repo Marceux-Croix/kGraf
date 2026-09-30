@@ -232,6 +232,13 @@ impl GraphStore {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // Every row id is a hash, so inserts land on random b-tree leaves. With
+        // SQLite's default 2 MiB page cache a cold index of a large tree misses the
+        // cache on most inserts and rereads and rewrites pages it just held. The
+        // cache fills on demand, so a small index costs nothing; 64 MiB is the most
+        // a connection holds.
+        conn.pragma_update(None, "cache_size", -65536)?;
+        conn.pragma_update(None, "temp_store", "MEMORY")?;
         // Deleted and overwritten text is zeroed where that costs no extra
         // I/O (decision 0071): b-tree pages are purged, freed overflow pages
         // are not. `set_meta` and `clear_meta` raise it to ON for their one
@@ -811,15 +818,25 @@ impl GraphStore {
     /// `node_leases` in the schema on purpose (see `replace_file_nodes`), so this is
     /// explicit rather than automatic.
     pub fn delete_file(&self, path: &str) -> Result<()> {
-        let tx = unsafe { self.unchecked_tx() }?;
+        let tx = WriteScope::begin(&self.conn)?;
         purge_node_leases_for_file(&tx, path)?;
         tx.execute("DELETE FROM files WHERE path = ?1", params![path])?;
         tx.commit()?;
         Ok(())
     }
 
+    /// Open a write batch: every [`GraphStore::replace_file_nodes`] and
+    /// [`GraphStore::delete_file`] until [`WriteBatch::commit`] joins one
+    /// transaction. A failed write must end the batch (see [`WriteScope`]).
+    /// One commit per file rewrote the same b-tree pages (every id is a hash, so
+    /// inserts land at random leaves) once per file instead of once per batch.
+    /// Dropped without `commit`, the batch rolls back.
+    pub(crate) fn begin_batch(&self) -> Result<WriteBatch<'_>> {
+        Ok(WriteBatch(WriteScope::begin(&self.conn)?))
+    }
+
     /// Write one file's row and replace every node and edge belonging to it,
-    /// in one transaction.
+    /// in one transaction (or, inside a write batch, as part of the batch).
     ///
     /// This is the unit of incremental reindexing: one changed file, one
     /// replaced subgraph, and the change log records exactly that. The file row
@@ -851,7 +868,7 @@ impl GraphStore {
         source_root: Option<&Path>,
     ) -> Result<()> {
         let file_id = file.id.as_str();
-        let tx = unsafe { self.unchecked_tx() }?;
+        let tx = WriteScope::begin(&self.conn)?;
         Self::upsert_file_on(&tx, file)?;
         Self::set_source_root_on(&tx, file_id, source_root)?;
         // Deleting the file's nodes cascades to their layout rows. Capture the
@@ -975,17 +992,6 @@ impl GraphStore {
         }
         tx.commit()?;
         Ok(())
-    }
-
-    /// A transaction. Wrapped so the borrow checker permits `&self` use.
-    ///
-    /// # Safety
-    ///
-    /// Not actually unsafe; the marker is a reminder that `GraphStore` is not
-    /// `Sync` and must not be shared across threads without external
-    /// synchronization.
-    unsafe fn unchecked_tx(&self) -> Result<rusqlite::Transaction<'_>> {
-        Ok(self.conn.unchecked_transaction()?)
     }
 
     // ---- nodes ----------------------------------------------------------
@@ -1401,10 +1407,77 @@ fn node_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeRecord> {
     })
 }
 
+/// A write scope: a transaction when none is open, and a no-op inside one.
+///
+/// Takes the write lock at `BEGIN IMMEDIATE`, like every other transaction on the
+/// store's connection. Dropped without `commit`, an outermost scope rolls back.
+///
+/// Inside an open [`WriteBatch`] the scope joins the batch instead of opening a
+/// savepoint: a savepoint copies every page it first touches into a journal
+/// file, which measured as the largest cost of a batched pass. The price is that
+/// a failed write cannot roll back alone. A caller that holds a batch must let
+/// the error end the batch (dropping it rolls everything back), never continue
+/// past it.
+pub(crate) struct WriteScope<'a> {
+    conn: &'a Connection,
+    /// Whether this scope opened the transaction.
+    owns: bool,
+    done: bool,
+}
+
+impl<'a> WriteScope<'a> {
+    pub(crate) fn begin(conn: &'a Connection) -> Result<Self> {
+        let owns = conn.is_autocommit();
+        if owns {
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+        }
+        Ok(Self {
+            conn,
+            owns,
+            done: false,
+        })
+    }
+
+    pub(crate) fn commit(mut self) -> Result<()> {
+        self.done = true;
+        if self.owns {
+            self.conn.execute_batch("COMMIT")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::ops::Deref for WriteScope<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        self.conn
+    }
+}
+
+impl Drop for WriteScope<'_> {
+    fn drop(&mut self) {
+        if self.done || !self.owns {
+            return;
+        }
+        // A rollback that fails leaves the connection's own state to report the
+        // next statement's error; there is nothing more to do from a destructor.
+        let _ = self.conn.execute_batch("ROLLBACK");
+    }
+}
+
+/// An open write batch; see [`GraphStore::begin_batch`].
+pub(crate) struct WriteBatch<'a>(WriteScope<'a>);
+
+impl WriteBatch<'_> {
+    pub(crate) fn commit(self) -> Result<()> {
+        self.0.commit()
+    }
+}
+
 /// Delete every node-lease row naming one of `vanished_ids`, in the caller's
 /// transaction. A no-op, not a query, when the slice is empty -- called
 /// unconditionally by `replace_file_nodes` so the empty case is the common one.
-fn purge_node_leases(tx: &rusqlite::Transaction<'_>, vanished_ids: &[&str]) -> Result<()> {
+fn purge_node_leases(tx: &Connection, vanished_ids: &[&str]) -> Result<()> {
     if vanished_ids.is_empty() {
         return Ok(());
     }
@@ -1425,7 +1498,7 @@ fn purge_node_leases(tx: &rusqlite::Transaction<'_>, vanished_ids: &[&str]) -> R
 /// Delete every node-lease row for a node that belongs to `path`, before that file's
 /// nodes are removed. Used by `delete_file`, where the file (and so every node in it)
 /// is about to stop existing outright.
-fn purge_node_leases_for_file(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<()> {
+fn purge_node_leases_for_file(tx: &Connection, path: &str) -> Result<()> {
     tx.execute(
         "DELETE FROM node_leases WHERE node_id IN (
              SELECT n.id FROM nodes n JOIN files f ON f.id = n.file_id WHERE f.path = ?1

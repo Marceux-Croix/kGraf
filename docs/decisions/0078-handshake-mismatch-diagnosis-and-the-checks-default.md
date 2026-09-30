@@ -95,3 +95,32 @@ supersede the matching bullets above.
   anchor: negated, with a verb of providing or needing and the noun symbol or item ("I
   provide no contract symbols of my own"). "I assume the other party does not mutate the
   input or panic" is `unanchored`.
+
+## Amendments (2026-09-30, plans held on wording)
+
+Coherent plans were held on the handshake: a test writer counted as a second provider, two
+test writers of one file in dependency order counted as an overlap, and sentences naming no
+surface symbol held the plan. Three recorded handshakes, two coherent and one with three
+real implementers of one symbol, are replayed verbatim as test fixtures.
+
+- **A provision counts only from a party that writes the symbol's stub file** (a stub file
+  naming the symbol, or any stub file when none names it). A test writer ("I will provide
+  `x` integration-test coverage", "an integration test verifying `x`") or a party that
+  writes nothing provides nothing, whatever the word before the symbol. With no party
+  writing such a file the sentences alone decide, as before.
+- **A shared touch is an overlap only between parties no dependency orders.** Two test
+  writers of one file, one after the other, never write it at once.
+- **`unanchored` and `outside_surface` hold nothing.** They are recorded as warnings with
+  the pass. Every other finding holds.
+- **An expectation claim the interface's own files state is not a disagreement with a
+  silent provider**: a type the stub's signature gives, a crate name its test imports. The
+  files are held to the parties by stub-compile and vacuity already. A provider that states
+  a signature for the symbol the files do not give still disagrees. Known blind spot: a
+  claim the files state anywhere (`i64` in another function of the stub) backs a silent
+  provider.
+- **A negation contradicts only between the same anchors.** An expectation with anchors of
+  its own beyond the symbol negates something about those, which a provision naming more
+  anchors does not state the opposite of. Different numbers still contradict.
+
+On the fixtures, the two coherent plans hold nothing (warnings only), and the three
+implementers still hold on the double provision, with no overlap between them.

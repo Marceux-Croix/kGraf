@@ -111,3 +111,25 @@ nominal.
 have had nothing to do with the failure, and discarding their work to
 punish someone else's breakage costs more than letting them finish into a
 tree already known to be broken.
+
+## Amendment (2026-09-30): a partial gate that cannot judge, and remediations that must fix
+
+Every gate runs the project's validation commands, which cover the whole project
+(`cargo test --workspace`). A gate below the root therefore also ran tests of contracts
+outside its cover that were not built yet, failed on them, halted all other dispatch, and
+spent its remediations on a failure no remediation in its region could fix; the contracts
+that would have made it pass never started.
+
+- **A gate below the root that fails is compared with the run's base commit.** The same
+  commands run once per run at the integration tip recorded when the gates were planned,
+  before any of the plan landed. If they fail there too, the gate is `inconclusive`: no
+  remediation, no halt, nothing blocked, and its parent gates may run. The root gate covers
+  everything and is never inconclusive, so the run completes only when the root gate passes
+  or is waived. If the base passes, the failure is the cover's and the gate fails as before.
+  A run with no recorded base (unversioned workspaces) judges its gates as they stand.
+- **A remediation must pass the failing gate's commands.** It carries them, and the verifier
+  runs them after the run's own check; the run's check alone can pass on the code the gate
+  failed on.
+- **A remediation that integrates no change counts as failed.** The gate opens the next
+  remediation, whose brief says why the last did not count, or holds past the limit; it is
+  never run again on the unchanged commit.
