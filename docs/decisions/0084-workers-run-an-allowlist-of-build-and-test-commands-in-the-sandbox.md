@@ -139,7 +139,9 @@ returns its output so far.
   registry cache linked back, and points `CARGO_HOME` there. Tokens, credential providers,
   `[http]`, `[env]` and a URL carrying a login stay on the host, and a failing command names
   each withheld key. A project's own config still wins key by key. The file is rewritten before every
-  command without following links. Rejected: `CARGO_*` variables, which outrank the project's
+  command without following links. A cache cargo makes there while the real cargo home has
+  none is kept, then renamed aside (never deleted from the host) once the real one exists.
+  Rejected: `CARGO_*` variables, which outrank the project's
   config and cannot express `[source]`.
 - **A failed check's output keeps its joiners** (U+200C, U+200D) while control characters,
   separators and bidirectional overrides are still replaced.

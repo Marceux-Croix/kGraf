@@ -11,9 +11,14 @@ what is planned next, as things you can do or expect, not as an internal project
   token budget, or run a structured query over calls and definitions.
 - Give the orchestrator an instruction, or let it read your project's own documentation
   first, and it splits the work into contracts and dispatches worker agents across the
-  providers you configure. Anthropic, OpenAI and Moonshot's Kimi are verified live; the
-  route catalog also covers Google, DeepSeek, xAI, z.ai, Qwen, Llama-based hosts and local
-  models such as Ollama or llama.cpp.
+  providers you configure. Anthropic, OpenAI and Moonshot's Kimi are verified live, and so
+  is a local Ollama server. The route catalog also covers Google (Gemini native and Vertex
+  AI), AWS Bedrock, Azure OpenAI, DeepSeek, xAI, z.ai, Qwen, Llama-based hosts and local
+  models such as llama.cpp. Those routes are built and tested against recorded replies only;
+  `docs/MODEL-SUPPORT.md` says which routes have run against the real service.
+- A route can serve a kind of model other than a chat model: embeddings, reranking and typed
+  decisions (for example a local System-One server). The orchestrator decides when to use one;
+  nothing calls one on its own (decision 0089).
 - Workers run in parallel, each in its own git worktree and its own sandbox: full
   confinement on macOS and Linux, a lighter sandbox on Windows.
 - Every worker reads the code graph in bounded slices, not whole files, and writes only to
@@ -29,6 +34,8 @@ what is planned next, as things you can do or expect, not as an internal project
 - Dependencies a project needs are fetched from crates.io on your machine, outside the
   sandbox, only after you allow it once per project (`kgraf deps allow`); a run that needs
   a fetch you have not allowed stops before it starts (decision 0087).
+- Worker worktrees and their builds are deleted after use by default. A setting (and
+  `--keep-worktrees`) keeps them for inspection (decision 0088).
 - Every run refreshes the code graph before it starts, so workers read graph slices on a
   fresh checkout.
 - kGraf sets no spend limit; it records every token so you can set one in your provider's
@@ -75,6 +82,8 @@ what is planned next, as things you can do or expect, not as an internal project
   two parties, with either worker able to challenge a contract it disagrees with.
 - Automatic conflict handling: when two workers' merges collide, a dedicated resolver
   worker is dispatched to reconcile them before falling back to a plain re-dispatch.
+- A live call on each route that is built but not yet run against the real service, starting
+  with the cloud routes (Gemini, Vertex AI, Bedrock and Azure OpenAI).
 - Full sandbox confinement on Windows. It is compiled today but not yet exercised on
   Windows; macOS and Linux confinement is in daily use.
 - Signed, notarized installers for macOS, Linux and Windows. Local packaging scripts

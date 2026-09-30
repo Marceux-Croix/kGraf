@@ -41,16 +41,9 @@
 //! the container; after it the container's changes are downloaded and verified
 //! by sha256 on the host, before the response returns. `push` runs only the
 //! first half, after a host-side write. The protocol carries no file bytes.
-use async_trait::async_trait;
-use kgraf_tools::external::{ExternalExecutor, ExternalOutcome};
-use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
-use tokio::sync::Mutex;
 
 #[derive(Debug, thiserror::Error)]
 pub enum BridgeError {
@@ -65,41 +58,12 @@ pub enum BridgeError {
         path: std::path::PathBuf,
         reason: String,
     },
-}
-
-#[derive(Serialize)]
-struct HelloRequest<'a> {
-    op: &'static str,
-    host_root: &'a str,
-}
-
-#[derive(Serialize)]
-struct Request<'a> {
-    op: &'static str,
-    cmd: &'a [String],
-    timeout_sec: f64,
-}
-
-#[derive(Serialize)]
-struct PushRequest {
-    op: &'static str,
-}
-
-/// The answer to `hello` and `push`.
-#[derive(Deserialize)]
-struct Ack {
-    ok: bool,
-    #[serde(default)]
-    error: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct Response {
-    stdout_b64: String,
-    stderr_b64: String,
-    exit_code: Option<i32>,
-    timed_out: bool,
-    error: Option<String>,
+    /// The transport is a Unix domain socket, which this platform lacks.
+    #[error(
+        "the Terminal-Bench bridge is not supported on this platform: it talks to the shim \
+         over a Unix domain socket"
+    )]
+    Unsupported,
 }
 
 /// How long the shim gets, beyond a command's own timeout, to sync files and
@@ -133,307 +97,404 @@ impl Default for Limits {
     }
 }
 
-/// The concrete, subprocess-bridged [`ExternalExecutor`]. One instance is bound
-/// to one Unix socket (one Python shim, one live task container).
-///
-/// A request that times out, or whose caller stops waiting for it, leaves the
-/// stream out of step (a late response would be read as the answer to the
-/// next request), so the connection is
-/// marked broken and every later request fails at once, naming the first
-/// failure. A response line over the bound is read to its end and dropped: that
-/// request fails and the connection stays usable. If the stream ends inside
-/// such a line, the connection is broken.
-pub struct ProcessExecutor {
-    stream: Mutex<BufReader<UnixStream>>,
-    limits: Limits,
-    broken: AtomicBool,
-}
+/// The Unix-socket transport and the executor built on it.
+#[cfg(unix)]
+mod transport {
+    use super::{BridgeError, Limits};
+    use async_trait::async_trait;
+    use kgraf_tools::external::{ExternalExecutor, ExternalOutcome};
+    use serde::{Deserialize, Serialize};
+    use std::io;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+    use tokio::sync::Mutex;
 
-impl ProcessExecutor {
-    /// Connect to a Python shim already listening at `socket_path`, and tell
-    /// it which host directory to keep equal to the container's working
-    /// directory (`host_root`: the worker's own worktree). The shim checks
-    /// that the two trees are equal now; if they are not it refuses, and so
-    /// does this call.
-    pub async fn connect(socket_path: &Path, host_root: &Path) -> Result<Self, BridgeError> {
-        Self::connect_with_limits(socket_path, host_root, Limits::default()).await
+    #[derive(Serialize)]
+    struct HelloRequest<'a> {
+        op: &'static str,
+        host_root: &'a str,
     }
 
-    /// [`Self::connect`], with the timeouts and the line bound given.
-    pub async fn connect_with_limits(
-        socket_path: &Path,
-        host_root: &Path,
+    #[derive(Serialize)]
+    struct Request<'a> {
+        op: &'static str,
+        cmd: &'a [String],
+        timeout_sec: f64,
+    }
+
+    #[derive(Serialize)]
+    struct PushRequest {
+        op: &'static str,
+    }
+
+    /// The answer to `hello` and `push`.
+    #[derive(Deserialize)]
+    struct Ack {
+        ok: bool,
+        #[serde(default)]
+        error: Option<String>,
+    }
+
+    #[derive(Deserialize)]
+    struct Response {
+        stdout_b64: String,
+        stderr_b64: String,
+        exit_code: Option<i32>,
+        timed_out: bool,
+        error: Option<String>,
+    }
+
+    /// The concrete, subprocess-bridged [`ExternalExecutor`]. One instance is bound
+    /// to one Unix socket (one Python shim, one live task container).
+    ///
+    /// A request that times out, or whose caller stops waiting for it, leaves the
+    /// stream out of step (a late response would be read as the answer to the
+    /// next request), so the connection is
+    /// marked broken and every later request fails at once, naming the first
+    /// failure. A response line over the bound is read to its end and dropped: that
+    /// request fails and the connection stays usable. If the stream ends inside
+    /// such a line, the connection is broken.
+    pub struct ProcessExecutor {
+        stream: Mutex<BufReader<UnixStream>>,
         limits: Limits,
-    ) -> Result<Self, BridgeError> {
-        let connect_err = |source| BridgeError::Connect {
-            path: socket_path.to_path_buf(),
-            source,
-        };
-        let stream = UnixStream::connect(socket_path)
-            .await
-            .map_err(connect_err)?;
-        let mut stream = BufReader::new(stream);
-        let hello = HelloRequest {
-            op: "hello",
-            host_root: &host_root.to_string_lossy(),
-        };
-        let line = serde_json::to_string(&hello).expect("HelloRequest always serializes");
-        write_line(&mut stream, &line).await.map_err(connect_err)?;
-        let response =
-            read_json_line_within(&mut stream, limits.control_timeout, limits.max_line_bytes)
+        broken: AtomicBool,
+    }
+
+    impl ProcessExecutor {
+        /// Connect to a Python shim already listening at `socket_path`, and tell
+        /// it which host directory to keep equal to the container's working
+        /// directory (`host_root`: the worker's own worktree). The shim checks
+        /// that the two trees are equal now; if they are not it refuses, and so
+        /// does this call.
+        pub async fn connect(socket_path: &Path, host_root: &Path) -> Result<Self, BridgeError> {
+            Self::connect_with_limits(socket_path, host_root, Limits::default()).await
+        }
+
+        /// [`Self::connect`], with the timeouts and the line bound given.
+        pub async fn connect_with_limits(
+            socket_path: &Path,
+            host_root: &Path,
+            limits: Limits,
+        ) -> Result<Self, BridgeError> {
+            let connect_err = |source| BridgeError::Connect {
+                path: socket_path.to_path_buf(),
+                source,
+            };
+            let stream = UnixStream::connect(socket_path)
                 .await
                 .map_err(connect_err)?;
-        let ack: Ack = serde_json::from_str(&response).map_err(|e| {
-            connect_err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("bad hello response: {e}"),
-            ))
-        })?;
-        if !ack.ok {
-            return Err(BridgeError::Refused {
-                path: socket_path.to_path_buf(),
-                reason: ack.error.unwrap_or_else(|| "no reason given".into()),
-            });
+            let mut stream = BufReader::new(stream);
+            let hello = HelloRequest {
+                op: "hello",
+                host_root: &host_root.to_string_lossy(),
+            };
+            let line = serde_json::to_string(&hello).expect("HelloRequest always serializes");
+            write_line(&mut stream, &line).await.map_err(connect_err)?;
+            let response =
+                read_json_line_within(&mut stream, limits.control_timeout, limits.max_line_bytes)
+                    .await
+                    .map_err(connect_err)?;
+            let ack: Ack = serde_json::from_str(&response).map_err(|e| {
+                connect_err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("bad hello response: {e}"),
+                ))
+            })?;
+            if !ack.ok {
+                return Err(BridgeError::Refused {
+                    path: socket_path.to_path_buf(),
+                    reason: ack.error.unwrap_or_else(|| "no reason given".into()),
+                });
+            }
+            Ok(Self {
+                stream: Mutex::new(stream),
+                limits,
+                broken: AtomicBool::new(false),
+            })
         }
-        Ok(Self {
-            stream: Mutex::new(stream),
-            limits,
-            broken: AtomicBool::new(false),
-        })
+
+        /// One request, one response line, under the connection lock, with the
+        /// response due within `within`.
+        async fn round_trip(&self, line: &str, within: Duration) -> Result<String, String> {
+            let mut stream = self.stream.lock().await;
+            if self.broken.load(Ordering::Acquire) {
+                return Err("the bridge connection is broken by an earlier timeout or \
+                            oversized response"
+                    .to_owned());
+            }
+            // A caller that stops waiting (a cancel, the host's own bound, which
+            // is shorter than `exec_slack`) drops this future between the request
+            // and its response. The late response would then be read as the answer
+            // to the next request, so a drop before the end breaks the connection.
+            let pending = BreakOnDrop {
+                broken: &self.broken,
+                armed: true,
+            };
+            let outcome = async {
+                write_line(&mut stream, line).await.map_err(|e| {
+                    (
+                        format!("writing the request to the bridge socket: {e}"),
+                        false,
+                    )
+                })?;
+                read_json_line_within(&mut stream, within, self.limits.max_line_bytes)
+                    .await
+                    .map_err(|e| {
+                        (
+                            format!("reading the bridge response: {e}"),
+                            is_oversized(&e),
+                        )
+                    })
+            }
+            .await;
+            pending.disarm();
+            // An oversized line that was read to its end leaves the stream in step,
+            // so only that failure keeps the connection usable.
+            match outcome {
+                Ok(line) => Ok(line),
+                Err((message, in_step)) => {
+                    if !in_step {
+                        self.broken.store(true, Ordering::Release);
+                    }
+                    Err(message)
+                }
+            }
+        }
     }
 
-    /// One request, one response line, under the connection lock, with the
-    /// response due within `within`.
-    async fn round_trip(&self, line: &str, within: Duration) -> Result<String, String> {
-        let mut stream = self.stream.lock().await;
-        if self.broken.load(Ordering::Acquire) {
-            return Err("the bridge connection is broken by an earlier timeout or \
-                        oversized response"
-                .to_owned());
+    /// Marks a connection broken when dropped while armed: a request whose
+    /// response was never read.
+    struct BreakOnDrop<'a> {
+        broken: &'a AtomicBool,
+        armed: bool,
+    }
+
+    impl BreakOnDrop<'_> {
+        fn disarm(mut self) {
+            self.armed = false;
         }
-        // A caller that stops waiting (a cancel, the host's own bound, which
-        // is shorter than `exec_slack`) drops this future between the request
-        // and its response. The late response would then be read as the answer
-        // to the next request, so a drop before the end breaks the connection.
-        let pending = BreakOnDrop {
-            broken: &self.broken,
-            armed: true,
-        };
-        let outcome = async {
-            write_line(&mut stream, line).await.map_err(|e| {
-                (
-                    format!("writing the request to the bridge socket: {e}"),
-                    false,
+    }
+
+    impl Drop for BreakOnDrop<'_> {
+        fn drop(&mut self) {
+            if self.armed {
+                self.broken.store(true, Ordering::Release);
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ExternalExecutor for ProcessExecutor {
+        /// The connection is broken already (the dropped request marked it).
+        /// Closing the write side ends the shim's session once the abandoned
+        /// command returns; the shim enforces the command's own timeout, and the
+        /// protocol has no request that stops a command early.
+        async fn abandon(&self) {
+            self.broken.store(true, Ordering::Release);
+            if let Ok(mut stream) = self.stream.try_lock() {
+                let _ = stream.get_mut().shutdown().await;
+            }
+        }
+
+        async fn exec(&self, cmd: &[String], timeout: Duration) -> Result<ExternalOutcome, String> {
+            let request = Request {
+                op: "exec",
+                cmd,
+                timeout_sec: timeout.as_secs_f64(),
+            };
+            let line = serde_json::to_string(&request).map_err(|e| e.to_string())?;
+            let within = timeout.saturating_add(self.limits.exec_slack);
+            let response = self.round_trip(&line, within).await?;
+            let response: Response = serde_json::from_str(&response)
+                .map_err(|e| format!("bad JSON from the bridge: {e} (line: {response})"))?;
+            if let Some(err) = response.error {
+                return Err(format!("the bridge shim reported an error: {err}"));
+            }
+
+            use base64::Engine;
+            let stdout = base64::engine::general_purpose::STANDARD
+                .decode(&response.stdout_b64)
+                .map_err(|e| format!("bad stdout_b64: {e}"))?;
+            let stderr = base64::engine::general_purpose::STANDARD
+                .decode(&response.stderr_b64)
+                .map_err(|e| format!("bad stderr_b64: {e}"))?;
+
+            Ok(ExternalOutcome {
+                stdout,
+                stderr,
+                exit_code: response.exit_code,
+                timed_out: response.timed_out,
+            })
+        }
+
+        async fn sync_to_remote(&self) -> Result<(), String> {
+            let line =
+                serde_json::to_string(&PushRequest { op: "push" }).map_err(|e| e.to_string())?;
+            let response = self.round_trip(&line, self.limits.control_timeout).await?;
+            let ack: Ack = serde_json::from_str(&response)
+                .map_err(|e| format!("bad JSON from the bridge: {e} (line: {response})"))?;
+            if ack.ok {
+                Ok(())
+            } else {
+                Err(format!(
+                    "the bridge shim could not sync: {}",
+                    ack.error.unwrap_or_else(|| "no reason given".into())
+                ))
+            }
+        }
+    }
+
+    async fn write_line(stream: &mut BufReader<UnixStream>, line: &str) -> io::Result<()> {
+        let inner = stream.get_mut();
+        inner.write_all(line.as_bytes()).await?;
+        inner.write_all(b"\n").await?;
+        inner.flush().await
+    }
+
+    /// [`read_json_line`], due within `within`, at most `max_bytes` long.
+    async fn read_json_line_within(
+        stream: &mut BufReader<UnixStream>,
+        within: Duration,
+        max_bytes: usize,
+    ) -> io::Result<String> {
+        tokio::time::timeout(within, read_json_line(stream, max_bytes))
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("no response line within {within:?}"),
                 )
-            })?;
-            read_json_line_within(&mut stream, within, self.limits.max_line_bytes)
-                .await
-                .map_err(|e| {
-                    (
-                        format!("reading the bridge response: {e}"),
-                        is_oversized(&e),
-                    )
-                })
+            })?
+    }
+
+    /// Read one newline-delimited line from `stream` (payload fields are base64
+    /// or JSON, so a raw newline cannot occur inside them). Stops with an error
+    /// once `max_bytes` have arrived without a newline.
+    pub(super) async fn read_json_line(
+        stream: &mut BufReader<UnixStream>,
+        max_bytes: usize,
+    ) -> io::Result<String> {
+        let mut buf = Vec::new();
+        let mut limited = (&mut *stream).take(max_bytes as u64 + 1);
+        let n = limited.read_until(b'\n', &mut buf).await?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "the bridge socket closed before sending a response",
+            ));
         }
-        .await;
-        pending.disarm();
-        // An oversized line that was read to its end leaves the stream in step,
-        // so only that failure keeps the connection usable.
-        match outcome {
-            Ok(line) => Ok(line),
-            Err((message, in_step)) => {
-                if !in_step {
-                    self.broken.store(true, Ordering::Release);
+        if buf.last() == Some(&b'\n') {
+            buf.pop();
+        } else if buf.len() > max_bytes {
+            // Read on to the end of the line without keeping it, so the next
+            // response is read from its own start. Only when the newline arrives
+            // is the stream still in step and the error an [`Oversized`] one.
+            let in_step = discard_to_newline(stream).await?;
+            return Err(if in_step {
+                io::Error::new(io::ErrorKind::InvalidData, Oversized { max_bytes })
+            } else {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "the bridge response line is longer than {max_bytes} bytes and the socket \
+                         closed before it ended"
+                    ),
+                )
+            });
+        }
+        String::from_utf8(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+
+    /// A response line longer than the bound whose end was reached and dropped:
+    /// this request failed, and the connection is in step for the next.
+    #[derive(Debug)]
+    struct Oversized {
+        max_bytes: usize,
+    }
+
+    impl std::fmt::Display for Oversized {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                f,
+                "the bridge response line is longer than {} bytes; it was discarded",
+                self.max_bytes
+            )
+        }
+    }
+
+    impl std::error::Error for Oversized {}
+
+    fn is_oversized(e: &io::Error) -> bool {
+        e.get_ref().is_some_and(|inner| inner.is::<Oversized>())
+    }
+
+    /// Consume input up to and including the next newline. `false` when the
+    /// stream ended first.
+    async fn discard_to_newline(stream: &mut BufReader<UnixStream>) -> io::Result<bool> {
+        loop {
+            let chunk = stream.fill_buf().await?;
+            if chunk.is_empty() {
+                return Ok(false);
+            }
+            match chunk.iter().position(|&b| b == b'\n') {
+                Some(i) => {
+                    stream.consume(i + 1);
+                    return Ok(true);
                 }
-                Err(message)
+                None => {
+                    let all = chunk.len();
+                    stream.consume(all);
+                }
             }
         }
     }
 }
 
-/// Marks a connection broken when dropped while armed: a request whose
-/// response was never read.
-struct BreakOnDrop<'a> {
-    broken: &'a AtomicBool,
-    armed: bool,
+#[cfg(unix)]
+pub use transport::ProcessExecutor;
+
+/// The executor is a Unix-socket client. On this platform no connection can be
+/// made: [`ProcessExecutor::connect`] fails with [`BridgeError::Unsupported`],
+/// so a run that asks for the bridge stops with that error instead of running
+/// without it.
+#[cfg(not(unix))]
+pub struct ProcessExecutor {
+    never: std::convert::Infallible,
 }
 
-impl BreakOnDrop<'_> {
-    fn disarm(mut self) {
-        self.armed = false;
+#[cfg(not(unix))]
+impl ProcessExecutor {
+    /// Always fails with [`BridgeError::Unsupported`].
+    pub async fn connect(_socket_path: &Path, _host_root: &Path) -> Result<Self, BridgeError> {
+        Err(BridgeError::Unsupported)
+    }
+
+    /// Always fails with [`BridgeError::Unsupported`].
+    pub async fn connect_with_limits(
+        _socket_path: &Path,
+        _host_root: &Path,
+        _limits: Limits,
+    ) -> Result<Self, BridgeError> {
+        Err(BridgeError::Unsupported)
     }
 }
 
-impl Drop for BreakOnDrop<'_> {
-    fn drop(&mut self) {
-        if self.armed {
-            self.broken.store(true, Ordering::Release);
-        }
-    }
-}
-
-#[async_trait]
-impl ExternalExecutor for ProcessExecutor {
-    /// The connection is broken already (the dropped request marked it).
-    /// Closing the write side ends the shim's session once the abandoned
-    /// command returns; the shim enforces the command's own timeout, and the
-    /// protocol has no request that stops a command early.
-    async fn abandon(&self) {
-        self.broken.store(true, Ordering::Release);
-        if let Ok(mut stream) = self.stream.try_lock() {
-            let _ = stream.get_mut().shutdown().await;
-        }
-    }
-
-    async fn exec(&self, cmd: &[String], timeout: Duration) -> Result<ExternalOutcome, String> {
-        let request = Request {
-            op: "exec",
-            cmd,
-            timeout_sec: timeout.as_secs_f64(),
-        };
-        let line = serde_json::to_string(&request).map_err(|e| e.to_string())?;
-        let within = timeout.saturating_add(self.limits.exec_slack);
-        let response = self.round_trip(&line, within).await?;
-        let response: Response = serde_json::from_str(&response)
-            .map_err(|e| format!("bad JSON from the bridge: {e} (line: {response})"))?;
-        if let Some(err) = response.error {
-            return Err(format!("the bridge shim reported an error: {err}"));
-        }
-
-        use base64::Engine;
-        let stdout = base64::engine::general_purpose::STANDARD
-            .decode(&response.stdout_b64)
-            .map_err(|e| format!("bad stdout_b64: {e}"))?;
-        let stderr = base64::engine::general_purpose::STANDARD
-            .decode(&response.stderr_b64)
-            .map_err(|e| format!("bad stderr_b64: {e}"))?;
-
-        Ok(ExternalOutcome {
-            stdout,
-            stderr,
-            exit_code: response.exit_code,
-            timed_out: response.timed_out,
-        })
+#[cfg(not(unix))]
+#[async_trait::async_trait]
+impl kgraf_tools::external::ExternalExecutor for ProcessExecutor {
+    async fn exec(
+        &self,
+        _cmd: &[String],
+        _timeout: Duration,
+    ) -> Result<kgraf_tools::external::ExternalOutcome, String> {
+        match self.never {}
     }
 
     async fn sync_to_remote(&self) -> Result<(), String> {
-        let line = serde_json::to_string(&PushRequest { op: "push" }).map_err(|e| e.to_string())?;
-        let response = self.round_trip(&line, self.limits.control_timeout).await?;
-        let ack: Ack = serde_json::from_str(&response)
-            .map_err(|e| format!("bad JSON from the bridge: {e} (line: {response})"))?;
-        if ack.ok {
-            Ok(())
-        } else {
-            Err(format!(
-                "the bridge shim could not sync: {}",
-                ack.error.unwrap_or_else(|| "no reason given".into())
-            ))
-        }
-    }
-}
-
-async fn write_line(stream: &mut BufReader<UnixStream>, line: &str) -> io::Result<()> {
-    let inner = stream.get_mut();
-    inner.write_all(line.as_bytes()).await?;
-    inner.write_all(b"\n").await?;
-    inner.flush().await
-}
-
-/// [`read_json_line`], due within `within`, at most `max_bytes` long.
-async fn read_json_line_within(
-    stream: &mut BufReader<UnixStream>,
-    within: Duration,
-    max_bytes: usize,
-) -> io::Result<String> {
-    tokio::time::timeout(within, read_json_line(stream, max_bytes))
-        .await
-        .map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!("no response line within {within:?}"),
-            )
-        })?
-}
-
-/// Read one newline-delimited line from `stream` (payload fields are base64
-/// or JSON, so a raw newline cannot occur inside them). Stops with an error
-/// once `max_bytes` have arrived without a newline.
-async fn read_json_line(
-    stream: &mut BufReader<UnixStream>,
-    max_bytes: usize,
-) -> io::Result<String> {
-    let mut buf = Vec::new();
-    let mut limited = (&mut *stream).take(max_bytes as u64 + 1);
-    let n = limited.read_until(b'\n', &mut buf).await?;
-    if n == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "the bridge socket closed before sending a response",
-        ));
-    }
-    if buf.last() == Some(&b'\n') {
-        buf.pop();
-    } else if buf.len() > max_bytes {
-        // Read on to the end of the line without keeping it, so the next
-        // response is read from its own start. Only when the newline arrives
-        // is the stream still in step and the error an [`Oversized`] one.
-        let in_step = discard_to_newline(stream).await?;
-        return Err(if in_step {
-            io::Error::new(io::ErrorKind::InvalidData, Oversized { max_bytes })
-        } else {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "the bridge response line is longer than {max_bytes} bytes and the socket \
-                     closed before it ended"
-                ),
-            )
-        });
-    }
-    String::from_utf8(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-}
-
-/// A response line longer than the bound whose end was reached and dropped:
-/// this request failed, and the connection is in step for the next.
-#[derive(Debug)]
-struct Oversized {
-    max_bytes: usize,
-}
-
-impl std::fmt::Display for Oversized {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "the bridge response line is longer than {} bytes; it was discarded",
-            self.max_bytes
-        )
-    }
-}
-
-impl std::error::Error for Oversized {}
-
-fn is_oversized(e: &io::Error) -> bool {
-    e.get_ref().is_some_and(|inner| inner.is::<Oversized>())
-}
-
-/// Consume input up to and including the next newline. `false` when the
-/// stream ended first.
-async fn discard_to_newline(stream: &mut BufReader<UnixStream>) -> io::Result<bool> {
-    loop {
-        let chunk = stream.fill_buf().await?;
-        if chunk.is_empty() {
-            return Ok(false);
-        }
-        match chunk.iter().position(|&b| b == b'\n') {
-            Some(i) => {
-                stream.consume(i + 1);
-                return Ok(true);
-            }
-            None => {
-                let all = chunk.len();
-                stream.consume(all);
-            }
-        }
+        match self.never {}
     }
 }
 
@@ -483,10 +544,13 @@ pub async fn hash_tree(root: &Path) -> std::collections::BTreeMap<String, String
     out
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
+    use super::transport::*;
     use super::*;
-    use tokio::net::UnixListener;
+    use kgraf_tools::external::ExternalExecutor;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::{UnixListener, UnixStream};
 
     const OK: &[u8] = b"{\"ok\":true,\"error\":null}\n";
 

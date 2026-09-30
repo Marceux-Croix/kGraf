@@ -774,7 +774,7 @@ fn check_has_its_own_pid_namespace() -> bool {
     kgraf_sandbox::linux_confinement().namespaces
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn check_has_its_own_pid_namespace() -> bool {
     false
 }

@@ -312,7 +312,11 @@ fn an_empty_attempt_whose_removal_is_refused_can_be_committed_again() {
     let mut child =
         kgraf_sandbox::workspace_command(w.workspace(), kgraf_sandbox::Network::Deny, "/bin/sh")
             .unwrap()
-            .args(["-c", "sleep 30"])
+            // `exec`: the kill below must end the only process holding the
+            // worktree. A shell that forks `sleep` (dash does) would leave it
+            // running, holding the hold, where no PID namespace kills it with the
+            // shell (macOS, Linux without user namespaces).
+            .args(["-c", "exec sleep 30"])
             .spawn()
             .unwrap();
     let busy = mb.commit(&mut w, "noop");
@@ -1280,6 +1284,7 @@ fn changed_paths_names_everything_a_committed_attempt_changed_against_its_base()
 
 // ---- Decision 0083: links and declared writes. ----
 
+#[cfg(unix)]
 fn links_refused(reasons: &[RefusalReason]) -> Vec<(String, String)> {
     let mut out: Vec<_> = reasons
         .iter()

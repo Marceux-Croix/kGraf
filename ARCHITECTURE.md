@@ -308,9 +308,24 @@ counted as text; both are fixed, and each incident replays as a regression
 test.
 
 **Vendors live in a catalog, not in code** (decision 0041). The catalog holds
-fifteen routes, each with its wire protocol, usage convention, verified
+twenty-three routes, each with its wire protocol, usage convention, verified
 capabilities and a confidence rating. "OpenAI-compatible" is treated as two
 distinct protocols, Responses and Chat Completions.
+
+**Models of every kind, and the cloud routes** (decisions 0089 to 0092). A route also has a
+model kind, an open name checked against a registry: `generative` (prose and tool calls, the
+default), `typed-decision` (a value inside a declared answer space, with a probability),
+`embedding` and `rerank`. A kind is one row in each layer's table (the core registry, a call
+trait, a fleet builder, a worker tool), so a new kind touches nothing else. Every call of every
+kind takes a ledger-minted token and is priced where the price table has the model, and
+reported as unpriced otherwise. Nothing calls a model of a non-generative kind on its own: the
+decomposition request lists the run's routes by kind, and the orchestrator decides. Kinds never
+cross: a call for a kind a route does not serve fails loud. The catalog also holds `gemini`
+(native `generateContent`), `vertex-gemini` and `vertex-anthropic` (Vertex AI), `bedrock` (the
+Converse operations, signed with SigV4), and `azure-openai` and `azure-openai-responses` (a
+transport option of the two OpenAI adapters, with a configured deployment-to-model mapping). All
+of these are built and tested against recorded replies only. `docs/MODEL-SUPPORT.md` lists every
+route and kind as verified or built and untested.
 
 **Credentials.** Each route reads its credential from its own environment
 variable, shared only where one key genuinely works on several routes. A
@@ -949,6 +964,7 @@ crate and the orchestrator.
 | `kgraf-tools` | worker tools and command policy |
 | `kgraf-secrets` | secret detection and redaction: gitleaks-derived pattern rules plus kGraf's own configured-credential registry (decision 0071) |
 | `kgraf-mcp` (+ `kgraf-mcp-test-server`, tests only) | the MCP client |
+| `kgraf-crosslimit-hammer` | a second real process against the shared rate-limit store, used only by the provider crate's crash and multi-process tests; never published or packaged |
 | `kgraf-session` | transcript, approvals, skills at run time |
 | `kgraf-capacity` | the per-machine parallelism maximum: route rate limits, memory, file-descriptor and writer bounds, measured and combined |
 | `kgraf-orchestrator` | decomposition, contracts, checks, gates, run record, scheduler loop, templates, demand |

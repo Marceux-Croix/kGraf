@@ -3523,7 +3523,7 @@ dependencies = [
 
 [[package]]
 name = "kgraf-bench-briefs"
-version = "0.7.7"
+version = "0.7.8"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3548,7 +3548,7 @@ dependencies = [
 
 [[package]]
 name = "kgraf-capacity"
-version = "0.7.7"
+version = "0.7.8"
 dependencies = [
  "libc",
  "sysinfo",
@@ -3558,7 +3558,7 @@ dependencies = [
 
 [[package]]
 name = "kgraf-cli"
-version = "0.7.7"
+version = "0.7.8"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3597,7 +3597,7 @@ dependencies = [
 
 [[package]]
 name = "kgraf-core"
-version = "0.7.7"
+version = "0.7.8"
 dependencies = [
  "blake3",
  "serde",
@@ -3608,7 +3608,7 @@ dependencies = [
 
 [[package]]
 name = "kgraf-crosslimit-hammer"
-version = "0.7.7"
+version = "0.7.8"
 dependencies = [
  "kgraf-provider",
  "rusqlite",
@@ -3616,7 +3616,7 @@ dependencies = [
 
 [[package]]
 name = "kgraf-decide"
-version = "0.7.7"
+version = "0.7.8"
 dependencies = [
  "async-trait",
  "kgraf-core",
@@ -3632,7 +3632,7 @@ dependencies = [
 
 [[package]]
 name = "kgraf-diag"
-version = "0.7.7"
+version = "0.7.8"
 dependencies = [
  "blake3",
  "criterion",
@@ -3650,7 +3650,7 @@ dependencies = [
 
 [[package]]
 name = "kgraf-fleet"
-version = "0.7.7"
+version = "0.7.8"
 dependencies = [
  "kgraf-core",
  "kgraf-decide",
@@ -3669,7 +3669,7 @@ dependencies = [
 
 [[package]]
 name = "kgraf-galaxy"
-version = "0.7.7"
+version = "0.7.8"
 dependencies = [
  "bytemuck",
  "criterion",
@@ -3686,7 +3686,7 @@ dependencies = [
 
 [[package]]
 name = "kgraf-graph"
-version = "0.7.7"
+version = "0.7.8"
 dependencies = [
  "blake3",
  "criterion",
@@ -3716,7 +3716,7 @@ dependencies = [
 
 [[package]]
 name = "kgraf-host"
-version = "0.7.7"
+version = "0.7.8"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3750,7 +3750,7 @@ dependencies = [
 
 [[package]]
 name = "kgraf-ingest"
-version = "0.7.7"
+version = "0.7.8"
 dependencies = [
  "criterion",
  "docx-rs",
@@ -3768,7 +3768,7 @@ dependencies = [
 
 [[package]]
 name = "kgraf-instructions"
-version = "0.7.7"
+version = "0.7.8"
 dependencies = [
  "blake3",
  "serde",
@@ -3781,7 +3781,7 @@ dependencies = [
 
 [[package]]
 name = "kgraf-interpret"
-version = "0.7.7"
+version = "0.7.8"
 dependencies = [
  "async-trait",
  "blake3",
@@ -3804,7 +3804,7 @@ dependencies = [
 
 [[package]]
 name = "kgraf-mcp"
-version = "0.7.7"
+version = "0.7.8"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -3837,7 +3837,7 @@ dependencies = [
 
 [[package]]
 name = "kgraf-mcp-test-server"
-version = "0.7.7"
+version = "0.7.8"
 dependencies = [
  "anyhow",
  "bytes",
@@ -3851,7 +3851,7 @@ dependencies = [
 
 [[package]]
 name = "kgraf-orchestrator"
-version = "0.7.7"
+version = "0.7.8"
 dependencies = [
  "async-trait",
  "blake3",
@@ -3881,7 +3881,7 @@ dependencies = [
 
 [[package]]
 name = "kgraf-provider"
-version = "0.7.7"
+version = "0.7.8"
 dependencies = [
  "async-trait",
  "blake3",
@@ -3908,7 +3908,7 @@ dependencies = [
 
 [[package]]
 name = "kgraf-provider-anthropic"
-version = "0.7.7"
+version = "0.7.8"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -3924,7 +3924,7 @@ dependencies = [
 
 [[package]]
 name = "kgraf-provider-bedrock"
-version = "0.7.7"
+version = "0.7.8"
 dependencies = [
  "async-trait",
  "aws-credential-types",
@@ -3949,7 +3949,7 @@ dependencies = [
 
 [[package]]
 name = "kgraf-provider-google"
-version = "0.7.7"
+version = "0.7.8"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -3968,7 +3968,7 @@ dependencies = [
 
 [[package]]
 name = "kgraf-provider-openai"
-version = "0.7.7"
+version = "0.7.8"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -3984,7 +3984,7 @@ dependencies = [
 
 [[package]]
 name = "kgraf-runtime"
-version = "0.7.7"
+version = "0.7.8"
 dependencies = [
  "async-trait",
  "blake3",
@@ -4010,7 +4010,7 @@ dependencies = [
 
 [[package]]
 name = "kgraf-sandbox"
-version = "0.7.7"
+version = "0.7.8"
 dependencies = [
  "cap-primitives",
  "criterion",
@@ -4028,7 +4028,7 @@ dependencies = [
 
 [[package]]
 name = "kgraf-schedule"
-version = "0.7.7"
+version = "0.7.8"
 dependencies = [
  "async-trait",
  "blake3",
@@ -4047,7 +4047,7 @@ dependencies = [
 
 [[package]]
 name = "kgraf-secrets"
-version = "0.7.7"
+version = "0.7.8"
 dependencies = [
  "criterion",
  "regex",
@@ -4056,7 +4056,7 @@ dependencies = [
 
 [[package]]
 name = "kgraf-session"
-version = "0.7.7"
+version = "0.7.8"
 dependencies = [
  "async-trait",
  "criterion",
@@ -4075,7 +4075,7 @@ dependencies = [
 
 [[package]]
 name = "kgraf-shell"
-version = "0.7.7"
+version = "0.7.8"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4128,7 +4128,7 @@ dependencies = [
 
 [[package]]
 name = "kgraf-tbench-bridge"
-version = "0.7.7"
+version = "0.7.8"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4143,7 +4143,7 @@ dependencies = [
 
 [[package]]
 name = "kgraf-tools"
-version = "0.7.7"
+version = "0.7.8"
 dependencies = [
  "async-trait",
  "blake3",

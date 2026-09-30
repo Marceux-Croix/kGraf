@@ -53,7 +53,7 @@ members = [
 # scripts/release-local.md's version-alignment rule). Bump here, and only
 # here, when cutting a release; the packaging scripts and `--version` follow
 # automatically (Cargo sets `CARGO_PKG_VERSION` from this at build time).
-version = "0.7.7"
+version = "0.7.8"
 edition = "2024"
 rust-version = "1.95"
 license = "Apache-2.0"

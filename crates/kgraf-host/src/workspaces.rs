@@ -3038,6 +3038,17 @@ mod child_tests {
     #[tokio::test]
     async fn a_child_worktree_that_cannot_be_removed_after_its_merge_is_a_warning() {
         use std::os::unix::fs::PermissionsExt;
+        // The removal is made to fail with a read-only folder, and root
+        // ignores file modes, so as root the worktree is removed and there is
+        // nothing to warn about.
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!(
+                "skipped: running as root, which ignores the read-only folder this test \
+                 relies on to make the removal fail"
+            );
+            return;
+        }
         let f = fixture();
         let p = parent(&f, &f.ws, "r1-q-r0-a0");
         let c =

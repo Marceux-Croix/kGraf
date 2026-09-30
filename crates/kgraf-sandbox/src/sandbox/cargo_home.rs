@@ -152,11 +152,16 @@ pub(super) fn prepare(
     for name in LINKED {
         let target = cargo_home.join(name);
         if target.exists() {
+            // A directory here is the cache cargo made on an earlier run,
+            // while the user's cargo home had none (it gains one on the first
+            // host-side fetch). It is set aside so the link can take its name.
+            set_aside_dir(&dir, name).map_err(io_err(name))?;
             replace_link(&dir, name, &target).map_err(io_err(name))?;
         } else {
             // A link to nothing would make cargo fail creating the cache;
-            // without one it creates it here, empty.
-            remove_entry(&dir, name).map_err(io_err(name))?;
+            // without one it creates it here, empty, and a directory it made
+            // on an earlier run is kept for the next.
+            remove_link_or_file(&dir, name).map_err(io_err(name))?;
         }
     }
     let mut notes: Vec<String> = sanitized
@@ -431,8 +436,8 @@ fn replace_file(dir: &File, name: &str, contents: &[u8]) -> io::Result<()> {
 }
 
 /// Make `name` in `dir` a symbolic link to `target` (absolute), replacing
-/// whatever file or link was there. A directory there is an error: a
-/// command made it, and it is not removed recursively from the host.
+/// whatever file or link was there. A directory there makes the rename fail:
+/// callers set it aside first ([`set_aside_dir`]).
 fn replace_link(dir: &File, name: &str, target: &Path) -> io::Result<()> {
     let tmp = temp_name(name);
     let c = |p: &[u8]| {
@@ -451,6 +456,36 @@ fn replace_link(dir: &File, name: &str, target: &Path) -> io::Result<()> {
         let _ = remove_file(dir, Path::new(&tmp));
     }
     placed
+}
+
+/// Rename a directory `name` in `dir` to a unique hidden name beside it, so
+/// the name is free; anything else there, or nothing, is left alone.
+///
+/// Renamed, never deleted: the directory was written by sandboxed commands,
+/// and a recursive delete from the host would walk what they planted. The
+/// renamed copy stays in the command's temporary directory and goes with it
+/// when the worktree is removed.
+fn set_aside_dir(dir: &File, name: &str) -> io::Result<()> {
+    match stat(dir, Path::new(name), FollowSymlinks::No) {
+        Ok(m) if m.is_dir() => {
+            let aside = temp_name(&format!("{name}.set-aside"));
+            rename(dir, Path::new(name), dir, Path::new(&aside))
+        }
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Remove a file or link `name` in `dir`; nothing there, or a directory
+/// (cargo's own cache, made where no link was), is left as it is.
+fn remove_link_or_file(dir: &File, name: &str) -> io::Result<()> {
+    match stat(dir, Path::new(name), FollowSymlinks::No) {
+        Ok(m) if m.is_dir() => Ok(()),
+        Ok(_) => remove_file(dir, Path::new(name)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// Remove a file or link `name` in `dir`; nothing there is fine. A directory
@@ -687,6 +722,54 @@ mod tests {
         assert_eq!(
             std::fs::read_link(own.join("registry")).expect("link"),
             cargo.join("registry")
+        );
+    }
+
+    /// A cache cargo made in the sandbox's cargo home while the user's had
+    /// none is kept for the next command, and once the user's cargo home has
+    /// one (the first host-side fetch made it), it is set aside, not deleted,
+    /// and the link takes its name. Before, the second command after cargo
+    /// made one failed on every run.
+    #[test]
+    fn a_cache_cargo_made_here_is_kept_then_set_aside_for_the_link() {
+        let (_home, cargo) = user_home("[net]\noffline = true\n");
+        std::fs::remove_dir(cargo.join("registry")).expect("no user cache yet");
+        let root = tempfile::tempdir().expect("root");
+        let root = root.path().canonicalize().expect("canonical");
+        let tmp = root.join("scratch");
+        std::fs::create_dir(&tmp).expect("scratch");
+        let own = tmp.join(DIR_NAME);
+
+        prepare(&cargo, &root, &tmp).expect("first command");
+        // What cargo does in the sandbox when there is no link: it creates
+        // its own cache.
+        std::fs::create_dir_all(own.join("registry/index")).expect("cargo's cache");
+        std::fs::write(own.join("registry/index/entry"), "x").expect("entry");
+
+        prepare(&cargo, &root, &tmp).expect("a later command, no user cache");
+        assert!(
+            own.join("registry/index/entry").is_file(),
+            "cargo's own cache is kept while there is nothing to link"
+        );
+
+        std::fs::create_dir(cargo.join("registry")).expect("the host fetched");
+        prepare(&cargo, &root, &tmp).expect("a later command, user cache");
+        assert_eq!(
+            std::fs::read_link(own.join("registry")).expect("link"),
+            cargo.join("registry")
+        );
+        let aside: Vec<_> = std::fs::read_dir(&own)
+            .expect("list")
+            .map(|e| e.expect("entry").path())
+            .filter(|p| p.join("index/entry").is_file())
+            .collect();
+        assert_eq!(aside.len(), 1, "set aside, not deleted: {aside:?}");
+        assert!(
+            std::fs::read_dir(cargo.join("registry"))
+                .expect("list")
+                .next()
+                .is_none(),
+            "nothing moved into the user's cache"
         );
     }
 

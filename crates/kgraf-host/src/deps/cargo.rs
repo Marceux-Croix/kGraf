@@ -2156,6 +2156,7 @@ mod tests {
         assert!(stubs.is_empty(), "{stubs:?}");
     }
 
+    #[cfg(unix)]
     fn small_project() -> tempfile::TempDir {
         let project = tempfile::tempdir().unwrap();
         write(project.path(), "Cargo.toml", &format!("{PKG}[workspace]\n"));

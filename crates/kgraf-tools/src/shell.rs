@@ -492,6 +492,7 @@ fn read_only_access() -> Result<Access, ToolError> {
 /// not meant to be judged as a simple, transparent command line.
 const SHELL_METACHARACTERS: &[char] = &[';', '&', '|', '`', '$', '(', ')', '<', '>', '\n'];
 
+#[cfg(unix)]
 fn basename(program: &str) -> &str {
     program.rsplit('/').next().unwrap_or(program)
 }
@@ -1479,7 +1480,8 @@ fn kill_group(pgid: Option<u32>) {
 /// unpack a cached `.crate` into `~/.cargo/registry/src` (measured 2026-09-28,
 /// cargo 1.95.0: "failed to unpack package ... Operation not permitted";
 /// 2026-09-29: "As a reminder, you're using offline mode" after a missing
-/// package).
+/// package; cargo 1.98.1 words that note "note: offline mode (via
+/// `--offline`) can sometimes cause surprising resolution failures").
 ///
 /// Whole line starts, never a substring anywhere: every match costs one of
 /// the run's bounded dependency checks on the host, and a test or a program
@@ -1493,6 +1495,7 @@ const DEPENDENCY_NOT_READY: &[&str] = &[
     "error: attempting to make an HTTP request, but --offline was specified",
     "  attempting to make an HTTP request, but --offline was specified",
     "As a reminder, you're using offline mode",
+    "note: offline mode (via ",
 ];
 
 /// Decision 0084: a failed allowlisted build that could not get a dependency
@@ -3106,9 +3109,15 @@ mod tests {
 
         /// The boundary is the sandbox, not the argument rules: `cargo build`
         /// runs a build script the worker wrote, and that script cannot write
-        /// outside the worktree and its scratch directory, nor rewrite the
-        /// gitlink. It records what it tried in the worktree, which it may
-        /// write.
+        /// outside the worktree and its scratch directory. It records what it
+        /// tried in the worktree, which it may write.
+        ///
+        /// The gitlink is read-only only where the backend reports it
+        /// (`gitlink_protected`): on Linux that needs unprivileged user
+        /// namespaces, which Docker's default seccomp profile and Ubuntu's
+        /// AppArmor userns restriction both deny. Without them the build script
+        /// can rewrite `.git`, and what stops the host from following it is
+        /// `Workspace::verify_gitlink`, which then reads the rewrite.
         #[tokio::test]
         async fn an_allowlisted_build_cannot_write_outside_the_worktree_and_scratch() {
             let outside_marker = |f: &Fixture| f.outside.join("pwned");
@@ -3147,16 +3156,31 @@ fn main() {
             let rendered = out.render();
             let attempted = std::fs::read_to_string(f.ws.root().join("attempted"))
                 .unwrap_or_else(|e| panic!("the build script did not run ({e}): {rendered}"));
+            let protected = kgraf_sandbox::platform_isolation()
+                .expect("isolation")
+                .gitlink_protected;
             assert_eq!(
-                attempted, "outside=false gitlink=false inside=true",
+                attempted,
+                format!("outside=false gitlink={} inside=true", !protected),
                 "{rendered}"
             );
             assert!(!outside_marker(&f).exists(), "wrote outside the sandbox");
-            assert_eq!(
-                std::fs::read(f.ws.root().join(".git")).expect("gitlink"),
-                gitlink_before,
-                "the gitlink was rewritten"
-            );
+            if protected {
+                assert_eq!(
+                    std::fs::read(f.ws.root().join(".git")).expect("gitlink"),
+                    gitlink_before,
+                    "the gitlink was rewritten"
+                );
+                f.ws.verify_gitlink().expect("gitlink intact");
+            } else {
+                assert!(
+                    matches!(
+                        f.ws.verify_gitlink(),
+                        Err(kgraf_sandbox::WorkspaceError::GitlinkTampered { .. })
+                    ),
+                    "the host must read the rewritten gitlink as tampered"
+                );
+            }
         }
 
         /// A dependency the local cache does not hold fails at once, offline
@@ -3310,6 +3334,7 @@ fn main() {
                 "error: failed to get `x` as a dependency\n\nCaused by:\n  failed to download from `x`\n",
                 "error: x\n\nCaused by:\n  attempting to make an HTTP request, but --offline was specified\n",
                 "error: no matching package named `x` found\nAs a reminder, you're using offline mode (--offline) which can ...\n",
+                "error: no matching package named `x` found\nlocation searched: crates.io index\nrequired by package `p v0.1.0 (/w)`\nnote: offline mode (via `--offline`) can sometimes cause surprising resolution failures\nhelp: if this error is too confusing you may wish to retry without `--offline`\n",
             ] {
                 assert!(dependency_not_ready(&failed("", stderr)), "{stderr:?}");
             }

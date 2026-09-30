@@ -110,7 +110,11 @@ fn remove_refuses_while_a_process_started_in_the_worktree_runs() {
     let ws = mgr.create(&spec("w1")).unwrap();
     let mut child = kgraf_sandbox::workspace_command(&ws, kgraf_sandbox::Network::Deny, "/bin/sh")
         .unwrap()
-        .args(["-c", "sleep 30"])
+        // `exec`: the kill below must end the only process holding the
+        // worktree. A shell that forks `sleep` (dash does) would leave it
+        // running, holding the hold, where no PID namespace kills it with the
+        // shell (macOS, Linux without user namespaces).
+        .args(["-c", "exec sleep 30"])
         .spawn()
         .unwrap();
     let root = ws.root().to_path_buf();
