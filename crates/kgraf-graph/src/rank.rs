@@ -200,12 +200,14 @@ fn path_mentions(path: &str, idents: &BTreeSet<String>) -> bool {
         .any(|c| idents.contains(c))
 }
 
-/// One labeled edge of the multigraph.
-struct Edge {
+/// One labeled edge of the multigraph. The label borrows the defining map's key:
+/// an owned copy per edge was an allocation for every (referencing file, defining
+/// file) pair of every identifier.
+struct Edge<'a> {
     src: usize,
     dst: usize,
     weight: f64,
-    ident: String,
+    ident: &'a str,
 }
 
 /// Rank the indexed repository's definitions (see the module documentation).
@@ -295,12 +297,12 @@ pub fn rank_repository(store: &GraphStore, request: &RankRequest) -> Result<Repo
                 src: i,
                 dst: i,
                 weight: 0.1,
-                ident: ident.clone(),
+                ident: ident.as_str(),
             });
         }
     }
     for (ident, refs) in &references {
-        let Some(definers) = defines.get(ident) else {
+        let Some((ident, definers)) = defines.get_key_value(ident) else {
             continue;
         };
         let mul = ident_multiplier(ident, &request.mentioned_idents, definers.len());
@@ -322,7 +324,7 @@ pub fn rank_repository(store: &GraphStore, request: &RankRequest) -> Result<Repo
                     src,
                     dst,
                     weight,
-                    ident: ident.clone(),
+                    ident,
                 });
             }
         }
@@ -351,7 +353,7 @@ pub fn rank_repository(store: &GraphStore, request: &RankRequest) -> Result<Repo
     }
     let mut credit: BTreeMap<(usize, &str), f64> = BTreeMap::new();
     for e in &edges {
-        *credit.entry((e.dst, e.ident.as_str())).or_default() +=
+        *credit.entry((e.dst, e.ident)).or_default() +=
             ranked[e.src] * e.weight / out_weight[e.src];
     }
     let mut definitions: Vec<RankedDefinition> = credit

@@ -156,3 +156,48 @@ async fn time_to_first_useful_action_on_this_repository() {
         );
     }
 }
+
+/// The same measurement on any tree, read in place and never written: the graph
+/// database lives in a temp directory. Run with `KGRAF_FIRST_ACTION_TREE=<dir>`
+/// and `--ignored`; prints the phase timings for profiling a large tree.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs KGRAF_FIRST_ACTION_TREE"]
+async fn first_action_on_a_tree_named_in_the_environment() {
+    let Some(tree) = std::env::var_os("KGRAF_FIRST_ACTION_TREE") else {
+        panic!("set KGRAF_FIRST_ACTION_TREE to the tree to read");
+    };
+    // The graph database goes to `KGRAF_FIRST_ACTION_DB` when set (kept between runs,
+    // so a later run is warm), otherwise to a temp directory.
+    let temp = tempfile::tempdir().expect("db");
+    let db = std::env::var_os("KGRAF_FIRST_ACTION_DB")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| temp.path().to_path_buf());
+    std::fs::create_dir_all(&db).expect("db dir");
+    let store = store(Path::new(&tree), &db);
+    let model = FakeModel::new(|_| answer(vec![], json!([]), &["what is this tree?"]));
+    for pass in ["cold", "warm"] {
+        let started = Instant::now();
+        let prepared = prepare(&store, request()).expect("prepare");
+        let done = prepared
+            .ask(&model)
+            .await
+            .expect("ask")
+            .finish(&store, &NoTestRuns);
+        let ms = started.elapsed().as_millis();
+        match done {
+            Ok(i) => eprintln!(
+                "{pass} first action {ms} ms: {:?}; {} files indexed, {} documents, brief {} tokens, \
+                 {} of {} sections, {} of {} definitions",
+                i.timings(),
+                i.corpus().files_indexed,
+                i.corpus().documents,
+                i.brief().tokens,
+                i.brief().sections_included,
+                i.brief().sections_total,
+                i.brief().definitions_included,
+                i.brief().definitions_ranked
+            ),
+            Err(e) => eprintln!("{pass} first action {ms} ms (the fake answer was refused: {e})"),
+        }
+    }
+}

@@ -218,4 +218,35 @@ mod tests {
             .collect();
         assert_eq!(docs, ["README.md", "tools/gen.sh"]);
     }
+
+    /// A virtual environment's packages are neither indexed nor read as documents,
+    /// and the directory is named in the stats rather than dropped silently.
+    #[test]
+    fn a_virtual_environment_is_read_by_neither_the_index_nor_ingest_and_is_named() {
+        let dir = tempfile::tempdir().expect("dir");
+        let db = tempfile::tempdir().expect("db");
+        write(dir.path(), "README.md", "# R\n\nx\n");
+        write(dir.path(), "src/app.py", "def app():\n    pass\n");
+        write(dir.path(), "envs/bench/pyvenv.cfg", "home = /usr/bin\n");
+        write(
+            dir.path(),
+            "envs/bench/lib/pkg/README.md",
+            "# Vendored\n\nnot ours\n",
+        );
+        write(
+            dir.path(),
+            "envs/bench/lib/pkg/mod.py",
+            "def vendored():\n    pass\n",
+        );
+        let store = GraphStore::open(&db.path().join("g.db"), dir.path()).expect("store");
+        let c = gather(&store, &GatherOptions::default()).expect("gather");
+        let docs: Vec<String> = c
+            .documents
+            .iter()
+            .map(|d| d.path.display().to_string())
+            .collect();
+        assert_eq!(docs, ["README.md"]);
+        assert_eq!(c.stats().excluded_directories, ["envs/bench"]);
+        assert_eq!(c.code_files, 1, "only src/app.py is code");
+    }
 }

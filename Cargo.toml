@@ -164,6 +164,22 @@ sha2 = "0.11.0"
 # security code.
 gcp_auth = "0.12.7"
 
+# Dependencies that do the bulk work of a first reading run optimized in the dev and
+# test profiles: SQLite, the content hash, the parsers and the text splitter at
+# opt-level 0 cost 5x to 10x their release time, which made debug-build timing
+# tests measure the compiler flags rather than kGraf's own code. kGraf's crates stay
+# at opt-level 0, so a quadratic regression in them still shows.
+[profile.dev.package.libsqlite3-sys]
+opt-level = 2
+[profile.dev.package.blake3]
+opt-level = 2
+[profile.dev.package.tree-sitter]
+opt-level = 2
+[profile.dev.package.text-splitter]
+opt-level = 2
+[profile.dev.package.unicode-segmentation]
+opt-level = 2
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

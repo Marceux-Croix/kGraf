@@ -326,6 +326,8 @@ pub struct Indexer<'store> {
     bus_owned: Vec<String>,
     /// Whether directories with their own `.git` entry are walked.
     include_nested: bool,
+    /// Threads that chunk files during a walk; 1 chunks on the calling thread.
+    parse_workers: usize,
 }
 
 /// Excluded directory names that match at any depth: tool output and tool
@@ -342,6 +344,74 @@ pub const ANY_DEPTH_EXCLUDED: &[&str] = &[
     ".next",
     ".venv",
 ];
+
+/// A changed file between the change decision and its write.
+struct Staged {
+    file: FileRecord,
+    source: String,
+    language: Option<Language>,
+    /// Whether the store already had a row for the path (changed, not added).
+    existed: bool,
+}
+
+impl Staged {
+    /// The file's chunks. Pure: reads no store, so it runs on any thread. A
+    /// file in a language with no specification row is still a node (findable
+    /// and drawable) and is simply not chunked.
+    fn chunk(&self) -> Result<Vec<Chunk>> {
+        match self.language {
+            Some(language) => chunk::chunk_source(&self.file.path, language, &self.source),
+            None => Ok(Vec::new()),
+        }
+    }
+}
+
+/// Chunk every staged file, returning the results in input order. Workers take
+/// the next unclaimed file from a shared counter, so a few large files do not
+/// leave the other threads idle.
+fn chunk_in_parallel(staged: &[Staged], workers: usize) -> Vec<Result<Vec<Chunk>>> {
+    let workers = workers.min(staged.len());
+    if workers <= 1 {
+        return staged.iter().map(Staged::chunk).collect();
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut done: Vec<(usize, Result<Vec<Chunk>>)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut mine = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(file) = staged.get(i) else { break };
+                        mine.push((i, file.chunk()));
+                    }
+                    mine
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("a chunking worker panicked"))
+            .collect()
+    });
+    done.sort_by_key(|(i, _)| *i);
+    done.into_iter().map(|(_, r)| r).collect()
+}
+
+/// Threads a pass chunks files on, unless [`Indexer::with_parse_workers`] says
+/// otherwise: the machine's parallelism, capped, because the single writer is the
+/// limit beyond a few threads.
+fn default_parse_workers() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(4)
+}
+
+/// The file whose presence marks a directory as a Python virtual environment.
+/// A walk leaves such a directory out at any depth and names it in
+/// [`IndexReport::excluded_dirs_skipped`].
+pub const VENV_MARKER: &str = "pyvenv.cfg";
 
 /// The orchestrator's conversation files (decision 0026). The message bus is
 /// their sole writer and their sole indexer.
@@ -377,7 +447,15 @@ impl<'store> Indexer<'store> {
             source_root: None,
             bus_owned: BUS_OWNED_DIRS.iter().map(|d| (*d).to_owned()).collect(),
             include_nested: false,
+            parse_workers: default_parse_workers(),
         }
+    }
+
+    /// Set how many threads chunk files during a walk (minimum 1). The rows
+    /// written do not depend on it.
+    pub fn with_parse_workers(mut self, workers: usize) -> Self {
+        self.parse_workers = workers.max(1);
+        self
     }
 
     /// Replace the directories only the message bus indexes (default
@@ -535,6 +613,7 @@ impl<'store> Indexer<'store> {
         // the first walk error (fail loud). An unreadable file stays in the index.
         let mut first_walk_error: Option<GraphError> = None;
         let mut batch = Batch::new(self.store, FILES_PER_WRITE_BATCH);
+        let mut window: Vec<Staged> = Vec::new();
         for entry in walked.files {
             let (rel_path, bytes, mtime_ns) = match entry {
                 Ok(entry) => entry,
@@ -554,8 +633,16 @@ impl<'store> Indexer<'store> {
             }
             report.files_seen += 1;
             seen_paths.push(rel_path.clone());
-            self.index_one(&rel_path, bytes, mtime_ns, None, &mut batch, &mut report)?;
+            if let Some(staged) =
+                self.stage_one(&rel_path, bytes, mtime_ns, None, &mut batch, &mut report)?
+            {
+                window.push(staged);
+                if window.len() >= FILES_PER_WRITE_BATCH {
+                    self.flush_window(&mut window, &mut batch, &mut report)?;
+                }
+            }
         }
+        self.flush_window(&mut window, &mut batch, &mut report)?;
 
         // Files that left the tree.
         seen_paths.sort();
@@ -730,6 +817,27 @@ impl<'store> Indexer<'store> {
         batch: &mut Batch<'_>,
         report: &mut IndexReport,
     ) -> Result<()> {
+        if let Some(staged) =
+            self.stage_one(rel_path, bytes, mtime_ns, foreign_root, batch, report)?
+        {
+            let chunks = staged.chunk()?;
+            self.write_staged(staged, chunks, foreign_root, batch, report)?;
+        }
+        Ok(())
+    }
+
+    /// The first half of [`Indexer::index_one`]: the change decision. `None` when
+    /// nothing is left to do (unchanged, or not UTF-8); otherwise the file, ready
+    /// to be chunked (which needs no store and runs on worker threads) and written.
+    fn stage_one(
+        &self,
+        rel_path: &str,
+        bytes: Vec<u8>,
+        mtime_ns: i64,
+        foreign_root: Option<&Path>,
+        batch: &mut Batch<'_>,
+        report: &mut IndexReport,
+    ) -> Result<Option<Staged>> {
         let content_hash = blake3::hash(&bytes).to_hex().to_string();
         let existing = self.store.file(rel_path)?;
 
@@ -744,7 +852,7 @@ impl<'store> Indexer<'store> {
                 self.store.clear_file_source_root(rel_path)?;
             }
             report.files_unchanged += 1;
-            return Ok(());
+            return Ok(None);
         }
 
         let source = match String::from_utf8(bytes) {
@@ -761,13 +869,12 @@ impl<'store> Indexer<'store> {
                     report.files_removed += 1;
                     report.non_utf8_removed.push(rel_path.to_owned());
                 }
-                return Ok(());
+                return Ok(None);
             }
         };
         let language = Language::from_path(rel_path);
-        let file_id = stable_id("file", &[rel_path]);
         let file = FileRecord {
-            id: file_id.clone(),
+            id: stable_id("file", &[rel_path]),
             path: rel_path.to_owned(),
             content_hash,
             size_bytes: source.len() as u64,
@@ -775,22 +882,56 @@ impl<'store> Indexer<'store> {
             language,
             line_count: source.lines().count() as u32,
         };
-        let chunks = match language {
-            Some(language) => chunk::chunk_source(rel_path, language, &source)?,
-            // A file in a language with no specification row is still a node,
-            // so it is findable and drawable. It is simply not chunked.
-            None => Vec::new(),
-        };
-        let (nodes, edges, call_sites) = self.build_records(&file, &chunks);
-        batch.ensure()?;
-        self.store
-            .replace_file_nodes_from(&file, &nodes, &edges, &call_sites, foreign_root)?;
-        batch.wrote()?;
+        Ok(Some(Staged {
+            file,
+            source,
+            language,
+            existed: existing.is_some(),
+        }))
+    }
 
-        if existing.is_some() {
+    /// The second half of [`Indexer::index_one`]: write a staged file's rows.
+    fn write_staged(
+        &self,
+        staged: Staged,
+        chunks: Vec<Chunk>,
+        foreign_root: Option<&Path>,
+        batch: &mut Batch<'_>,
+        report: &mut IndexReport,
+    ) -> Result<()> {
+        let (nodes, edges, call_sites) = self.build_records(&staged.file, &chunks);
+        batch.ensure()?;
+        self.store.replace_file_nodes_from(
+            &staged.file,
+            &nodes,
+            &edges,
+            &call_sites,
+            foreign_root,
+        )?;
+        batch.wrote()?;
+        if staged.existed {
             report.files_changed += 1;
         } else {
             report.files_added += 1;
+        }
+        Ok(())
+    }
+
+    /// Chunk and write a window of staged files, in the order they were staged.
+    /// Chunking (the tree-sitter parse, the largest cost of a cold pass) runs on
+    /// `parse_workers` threads; the writes stay on this thread, one writer, in
+    /// walk order, so the rows and the change log are the same as a serial pass
+    /// would produce.
+    fn flush_window(
+        &self,
+        window: &mut Vec<Staged>,
+        batch: &mut Batch<'_>,
+        report: &mut IndexReport,
+    ) -> Result<()> {
+        let staged = std::mem::take(window);
+        let chunked = chunk_in_parallel(&staged, self.parse_workers);
+        for (staged, chunks) in staged.into_iter().zip(chunked) {
+            self.write_staged(staged, chunks?, None, batch, report)?;
         }
         Ok(())
     }
@@ -817,6 +958,15 @@ impl<'store> Indexer<'store> {
                 if entry.file_type().is_dir() {
                     let rel = relative(entry.path());
                     if self.is_excluded(&rel, name.as_ref(), entry.depth()) {
+                        excluded.push(rel);
+                        return false;
+                    }
+                    // A Python virtual environment, whatever it is named, holds
+                    // installed third-party packages: tens of thousands of files
+                    // that are not the project's code. Its marker file is
+                    // `pyvenv.cfg` (written by `venv`, `virtualenv` and `uv`).
+                    // It is named in the report like any excluded directory.
+                    if entry.path().join(VENV_MARKER).is_file() {
                         excluded.push(rel);
                         return false;
                     }
@@ -1820,6 +1970,91 @@ mod tests {
         let report = Indexer::new(&store).index().expect("index");
         assert_eq!(report.files_seen, 1);
         assert!(store.resolve_symbol("generated").is_err());
+    }
+
+    /// A Python virtual environment is installed third-party code. It is left out
+    /// at any depth, whatever its name, recognised by its `pyvenv.cfg`, and named in
+    /// the report; a directory with the same name and no marker is source.
+    #[test]
+    fn a_python_virtual_environment_is_skipped_by_marker_and_named() {
+        let tree = Tree::new();
+        tree.write("src/lib.rs", "fn keep() {}\n");
+        tree.write("tools/bench-env/pyvenv.cfg", "home = /usr/bin\n");
+        tree.write(
+            "tools/bench-env/lib/python3.12/site-packages/dep/mod.py",
+            "def vendored():\n    pass\n",
+        );
+        tree.write("deep/a/b/env/pyvenv.cfg", "home = /usr/bin\n");
+        tree.write("deep/a/b/env/lib/dep.py", "def vendored_two():\n    pass\n");
+        tree.write("tools/env-like/helper.py", "def helper():\n    pass\n");
+        let store = tree.store();
+        let report = Indexer::new(&store).index().expect("index");
+        assert_eq!(
+            report.excluded_dirs_skipped,
+            ["deep/a/b/env", "tools/bench-env"],
+            "each environment is named"
+        );
+        assert!(store.resolve_symbol("vendored").is_err());
+        assert!(store.resolve_symbol("vendored_two").is_err());
+        assert!(store.resolve_symbol("helper").is_ok());
+        assert_eq!(
+            report.files_seen, 2,
+            "src/lib.rs and tools/env-like/helper.py"
+        );
+    }
+
+    /// Chunking on worker threads changes nothing that is written: the same files,
+    /// nodes (ids, spans, parents), edges, call edges and change-log rows as a
+    /// single-threaded pass, over more files than one chunking window holds.
+    #[test]
+    fn chunking_on_worker_threads_writes_what_a_serial_pass_writes() {
+        let tree = Tree::new();
+        let files = FILES_PER_WRITE_BATCH + 40;
+        for i in 0..files {
+            let next = (i + 1) % files;
+            tree.write(
+                &format!("src/d{}/m{i}.rs", i % 7),
+                &format!("pub fn f{i}() {{ f{next}(); }}\npub struct S{i};\n"),
+            );
+        }
+        // A file in a known language that chunks to nothing, and one that is not
+        // UTF-8, pass through the same window.
+        tree.write("src/empty.rs", "");
+        fs::write(tree.path().join("src/binary.rs"), [0xff, 0xfe, 0x00]).expect("write");
+        let dump = |workers: usize| {
+            let store = tree.store();
+            let report = Indexer::new(&store)
+                .with_parse_workers(workers)
+                .index()
+                .expect("index");
+            let mut nodes = Vec::new();
+            for path in store.file_paths().expect("paths") {
+                for n in store.nodes_in_file(&path).expect("nodes") {
+                    nodes.push((
+                        path.clone(),
+                        n.id,
+                        n.parent_id,
+                        n.start_byte,
+                        n.end_byte,
+                        n.signature,
+                    ));
+                }
+            }
+            (
+                nodes,
+                report.files_added,
+                report.skipped_not_utf8,
+                report.nodes,
+                report.edges,
+                report.change_log_rows,
+                report.write_batches,
+            )
+        };
+        let serial = dump(1);
+        assert_eq!(serial.1, files as u64 + 1);
+        assert_eq!(serial.2, 1);
+        assert_eq!(dump(4), serial);
+        assert_eq!(dump(64), serial);
     }
 
     #[test]

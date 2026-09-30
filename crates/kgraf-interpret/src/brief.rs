@@ -42,7 +42,7 @@ use kgraf_ingest::DocumentKind;
 use kgraf_tools::UntrustedText;
 use serde::Serialize;
 use std::cmp::Reverse;
-use std::collections::{BTreeSet, BinaryHeap, HashMap};
+use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet};
 
 /// The default input bound: 40% of the default 100,000-token effective window
 /// (0057 addendum 2, the worker plan target, applied to this orchestrator call).
@@ -252,11 +252,23 @@ impl Picker {
 /// How many documents name each file name (`ROADMAP.md`, `SPEC.adoc`), counted
 /// once per naming document.
 fn inbound_mentions(corpus: &Corpus) -> HashMap<String, u64> {
-    let names: BTreeSet<&str> = corpus
+    // Delimiters between tokens: whitespace and these punctuation marks.
+    fn delimiter(c: char) -> bool {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '`' | '\'' | '"' | '(' | ')' | '[' | ']' | '<' | '>' | ',' | ';' | ':' | '/'
+            )
+    }
+    let names: HashSet<&str> = corpus
         .documents
         .iter()
         .filter_map(|d| d.path.file_name().and_then(|n| n.to_str()))
         .collect();
+    // Every token of every document is tested against the names; a length window
+    // rejects almost all of them before any hashing.
+    let shortest = names.iter().map(|n| n.len()).min().unwrap_or(0);
+    let longest = names.iter().map(|n| n.len()).max().unwrap_or(0);
     let mut counts: HashMap<String, u64> = HashMap::new();
     for d in &corpus.documents {
         let own = d
@@ -264,12 +276,12 @@ fn inbound_mentions(corpus: &Corpus) -> HashMap<String, u64> {
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or_default();
-        let mut seen: BTreeSet<&str> = BTreeSet::new();
-        for token in d
-            .text
-            .split(|c: char| c.is_whitespace() || "`'\"()[]<>,;:/".contains(c))
-        {
+        let mut seen: HashSet<&str> = HashSet::new();
+        for token in d.text.split(delimiter) {
             let token = token.trim_end_matches(['.', '!', '?']);
+            if token.len() < shortest || token.len() > longest {
+                continue;
+            }
             if token != own && names.contains(token) && seen.insert(token) {
                 *counts.entry(token.to_owned()).or_default() += 1;
             }
@@ -538,16 +550,23 @@ pub fn build(
     stats.sections_total = slices.len();
 
     // Code map lines in rank order, charged at their escaped size.
-    let mut nodes_by_file: HashMap<String, Vec<kgraf_graph::NodeRecord>> = HashMap::new();
+    // Per file, the first definition node of each name, built once: looking a
+    // ranked definition up by scanning the file's nodes made a file with many
+    // definitions quadratic.
+    let mut nodes_by_file: HashMap<String, HashMap<String, kgraf_graph::NodeRecord>> =
+        HashMap::new();
     let mut code_lines: Vec<(String, String, u64)> = Vec::new();
     for def in &rank.definitions {
         if !nodes_by_file.contains_key(&def.path) {
-            nodes_by_file.insert(def.path.clone(), store.nodes_in_file(&def.path)?);
+            let mut first: HashMap<String, kgraf_graph::NodeRecord> = HashMap::new();
+            for n in store.nodes_in_file(&def.path)? {
+                if !matches!(n.kind, NodeKind::File | NodeKind::Section | NodeKind::Impl) {
+                    first.entry(n.name.clone()).or_insert(n);
+                }
+            }
+            nodes_by_file.insert(def.path.clone(), first);
         }
-        let node = nodes_by_file[&def.path].iter().find(|n| {
-            n.name == def.ident
-                && !matches!(n.kind, NodeKind::File | NodeKind::Section | NodeKind::Impl)
-        });
+        let node = nodes_by_file[&def.path].get(&def.ident);
         if let Some(n) = node {
             let sig: String = n
                 .signature
@@ -723,6 +742,40 @@ mod tests {
         assert!(refs.contains(&"GraphStore".to_owned()));
         assert!(!refs.contains(&"Plain".to_owned()));
         assert!(!refs.contains(&"then".to_owned()));
+    }
+
+    /// Inbound mentions count each naming document once per file name, skip a
+    /// document's own name, and see a name through trailing sentence punctuation
+    /// and inside quotes, brackets and paths.
+    #[test]
+    fn inbound_mentions_count_once_per_naming_document_and_not_self() {
+        use crate::corpus::{GatherOptions, gather};
+        let dir = tempfile::tempdir().expect("dir");
+        let db = tempfile::tempdir().expect("db");
+        let write = |p: &str, t: &str| {
+            let p = dir.path().join(p);
+            std::fs::create_dir_all(p.parent().expect("parent")).expect("dir");
+            std::fs::write(p, t).expect("write");
+        };
+        write(
+            "A.md",
+            "# A\n\nSee B.md. Also `C.md`, B.md again, and A.md itself.\n",
+        );
+        write("B.md", "# B\n\nRead (docs/C.md)!!! and [C.md] ... B.md\n");
+        write(
+            "C.md",
+            "# C\n\nNothing named here, only NOTC.md and C.markdown.\n",
+        );
+        let store = GraphStore::open(&db.path().join("g.db"), dir.path()).expect("store");
+        let corpus = gather(&store, &GatherOptions::default()).expect("gather");
+        let counts = inbound_mentions(&corpus);
+        assert_eq!(
+            counts.get("B.md"),
+            Some(&1),
+            "A names it twice, once counted"
+        );
+        assert_eq!(counts.get("C.md"), Some(&2), "A and B each name it");
+        assert_eq!(counts.get("A.md"), None, "only A itself names A.md");
     }
 
     #[test]
