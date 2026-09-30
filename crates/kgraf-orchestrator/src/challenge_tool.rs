@@ -52,6 +52,11 @@ impl ContractLine {
     pub fn is_bound(&self) -> bool {
         self.0.get().is_some()
     }
+
+    /// The bound orchestrator, if any.
+    pub(crate) fn get(&self) -> Option<&OrchestratorHandle> {
+        self.0.get()
+    }
 }
 
 /// `challenge_contract`: challenge an interface contract (0029).

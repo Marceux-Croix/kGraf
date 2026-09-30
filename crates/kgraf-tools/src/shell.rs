@@ -788,6 +788,15 @@ impl Tool for ShellTool {
                 build.describe()
             ));
         }
+        // Decision 0093: a run-wide operator setting, so the definition is
+        // still byte-identical across the run's workers (0043). A grant to one
+        // contract is not named here; the contract's brief names it.
+        if self.policy.is_unrestricted() {
+            description.push_str(
+                " This run executes in a disposable container: any command runs without \
+                 approval, except the few the policy forbids.",
+            );
+        }
         ToolDefinition {
             name: "shell".into(),
             description,
@@ -879,6 +888,15 @@ impl Tool for ShellTool {
             && let Some(ws) = &self.workspace
         {
             build_config_unchanged(self.build_config.as_ref(), ws.root())?;
+            return Ok(Access::sandboxed_build());
+        }
+        // Decision 0093: a granted command (a program granted to this
+        // contract, or any command when the run's container is the sandbox)
+        // is confined the same way from a workspace-bound tool: the sandbox
+        // (or the task container) holds its writes, `record_tree_changes`
+        // asks git what it changed, and the verifier's scope check on the
+        // committed attempt refuses a change outside the declared writes.
+        if verdict.granted && self.workspace.is_some() {
             return Ok(Access::sandboxed_build());
         }
         Ok(Access::exclusive())
@@ -2994,6 +3012,53 @@ mod tests {
                     "{off:?} must still need approval"
                 );
             }
+        }
+
+        /// Decision 0093: a program granted to the contract is confined like
+        /// a build and runs unasked; another program still needs approval.
+        /// With the container as the sandbox, any command is confined and
+        /// unasked, and the definition says so.
+        #[tokio::test]
+        async fn a_granted_program_and_an_unrestricted_shell_are_confined_and_unasked() {
+            let f = fixture(PLAIN_BUILD_RS);
+            let policy = ExecPolicy::default_kgraf_policy()
+                .with_build_allowlist(BuildAllowlist::cargo_default())
+                .with_granted_programs(["touch".to_owned()]);
+            let (tool, hook) = ShellTool::new(policy);
+            let tool = tool.with_workspace(f.ws.clone());
+            let access = tool.access(&call_input(&["touch", "x"])).expect("access");
+            assert!(access.is_sandboxed_build());
+            assert_eq!(
+                hook.review(&pending(&["touch", "x"])).await,
+                HookDecision::Allow
+            );
+            let other = tool.access(&call_input(&["curl", "x"])).expect("access");
+            assert!(!other.is_sandboxed_build());
+            assert!(matches!(
+                hook.review(&pending(&["curl", "x"])).await,
+                HookDecision::Ask { .. }
+            ));
+            assert!(
+                !tool
+                    .definition()
+                    .description
+                    .contains("disposable container")
+            );
+
+            let policy = ExecPolicy::default_kgraf_policy().with_unrestricted_shell(true);
+            let (tool, hook) = ShellTool::new(policy);
+            let tool = tool.with_workspace(f.ws.clone());
+            let access = tool.access(&call_input(&["curl", "x"])).expect("access");
+            assert!(access.is_sandboxed_build());
+            assert_eq!(
+                hook.review(&pending(&["curl", "x"])).await,
+                HookDecision::Allow
+            );
+            assert!(
+                tool.definition()
+                    .description
+                    .contains("disposable container")
+            );
         }
 
         /// The approval question shows the argv the call will run: every

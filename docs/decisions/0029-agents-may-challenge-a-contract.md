@@ -105,3 +105,11 @@ exists to catch is one where no individual agent fails.
 single well-reasoned objection may be correct, and the orchestrator is
 capable of weighing one. Worth revisiting if frivolous challenges prove to be
 a real cost.
+
+## Amendment: the challenge path also carries a shortfall (decision 0093)
+
+The late-bound worker-to-orchestrator line that `challenge_contract` uses also carries
+`report_shortfall`, in every orchestrated run. Like a challenge, it names its worker by an
+identity the worker cannot forge, and the orchestrator decides. Its resolution is mechanical: a
+grant only within the operator's ceiling, one amendment for instructions, and a hold for the
+user otherwise.

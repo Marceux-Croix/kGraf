@@ -1386,9 +1386,11 @@ async fn the_assembled_prefix_digest_with_the_flag_off_is_pinned() {
     // now names the build and test allowlist, the system prompt says those
     // commands run without approval and that a `<verifier_refusal>` block is
     // data, and the `apply_patch` description was rewritten in the same
-    // merge. One deliberate cache reset.
+    // merge. One deliberate cache reset. Decision 0093 re-pinned it once more:
+    // the system prompt now tells a refused worker to report the shortfall and
+    // names the `<worker_shortfall>` block as data.
     assert_eq!(
-        digest, "792919cc7ea9a0084e53986a4f216bed969d7e8da36673efdd611dd50b14e0a6",
+        digest, "64cf96e795c053054f5ef67fac3c744c84eab4cb81387ecd90bc5885f2dde410",
         "a change here means every worker's cache resets even with the \
          sessions flag off, which nothing in decision 0067 may cause \
          (re-pinned for the intentional `apply_patch` description \
@@ -5223,6 +5225,9 @@ mod speculation;
 
 #[path = "build_allowlist_tests.rs"]
 mod build_allowlist;
+
+#[path = "shortfall_tests.rs"]
+mod shortfall;
 
 /// A run's index pass does not hold the host's shared graph lock: another
 /// run's loop takes that lock for its session and lease calls, and holding it

@@ -97,6 +97,7 @@ old one rather than editing it.
 | [0086](0086-empty-attempts-checked-against-a-placeholder.md) | An empty attempt is refused when its declared write target is still a placeholder, and every accepted empty attempt is reported | Accepted |
 | [0087](0087-dependencies-fetched-on-the-host-with-consent.md) | Dependencies are fetched on the host, outside the sandbox, with the user's per-project consent | Accepted |
 | [0088](0088-worker-worktrees-deleted-after-use-unless-kept.md) | Worker worktrees and their builds are deleted after use unless the user chooses to keep them | Accepted |
+| [0093](0093-a-worker-reports-a-shortfall-and-the-orchestrator-grants-within-the-operator-ceiling.md) | A worker reports a permission or instruction shortfall; the orchestrator grants within the operator's ceiling, amends, or asks the user; a run inside a disposable container may lift the shell policy | Accepted |
 | [0092](0092-azure-openai-transport.md) | Azure OpenAI is a transport option of the Chat Completions and Responses adapters, with a configured deployment-to-model mapping the response is checked against | Accepted |
 | [0091](0091-bedrock-converse-adapter.md) | AWS Bedrock is reached through the Converse operations, signed with SigV4, over AWS's own signer and event-stream crates | Accepted |
 | [0090](0090-google-adapters.md) | Google routes: a native Gemini adapter, Gemini on Vertex AI, and Anthropic on Vertex AI, all unverified | Accepted |

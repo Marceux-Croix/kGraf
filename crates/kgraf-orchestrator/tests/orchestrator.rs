@@ -813,6 +813,21 @@ async fn a_plan_still_bad_after_two_more_asks_fails_the_run() {
         "{err:?}"
     );
     assert_eq!(p.planner.calls(), 3, "one ask and two more");
+    // Every refusal is traced, the last included.
+    let refused: Vec<(u32, u32)> = trace_of(&p)
+        .await
+        .iter()
+        .filter_map(|e| match e {
+            TraceEvent::PlanRefused {
+                ask, of, reason, ..
+            } => {
+                assert!(reason.contains("never a plan"), "{reason}");
+                Some((*ask, *of))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(refused, vec![(1, 3), (2, 3), (3, 3)]);
 }
 
 /// Decision 0075: a route whose model has no price entry is not refused. A run

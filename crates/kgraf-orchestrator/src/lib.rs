@@ -94,6 +94,7 @@ pub mod routing;
 mod run_state;
 pub mod scheduler_loop;
 mod session_tools;
+mod shortfall;
 mod sizing;
 mod speculation;
 mod starter;
@@ -207,6 +208,10 @@ pub use scheduler_loop::{
     DEFAULT_LEASE, DEFAULT_ON_TIME_WINDOW, SchedulerLoop, TickEvent, TrackedSchedule,
 };
 pub use session_tools::{SESSION_TOOL_NAMES, SessionLine, session_tools};
+pub use shortfall::{
+    GrantCeiling, GrantRecord, MAX_SHORTFALL_REDISPATCHES, SHORTFALL_TAG, SHORTFALL_TOOL,
+    ShortfallDecision, ShortfallKind, ShortfallTool, unverified_reason, vacuous_check,
+};
 pub use sizing::{
     ORCHESTRATOR_AGENT_PREFIX, Projection, ProjectionSource, Sizer, dear_usage, dear_usage_on,
 };

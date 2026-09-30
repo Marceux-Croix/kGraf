@@ -170,6 +170,13 @@ claim. Every other claim is `Unverified`.
 Each item is a documented limit of a route that has no live exchange, unless it says
 otherwise.
 
+- **A buffered generative call waits for its whole answer** (every generative route; the
+  Chat Completions, Responses, Anthropic, Bedrock and Gemini adapters). The response
+  headers of a call that is not streamed arrive when generation ends, so the bound on
+  them is the larger of the route's timeout and the output cap at 20 tokens per second
+  (3,200 seconds at a 64,000-token cap). A mock server checks this for Chat Completions.
+  No route has had a live call that waited this long.
+
 - **Google embeddings truncate silently** (`google`, embedding). Input over the model's
   limit is cut with no error, and the OpenAI-compatible body has no field to refuse it.
   Keep each text within the model's limit. Decision
@@ -220,3 +227,4 @@ otherwise.
 ## Changelog
 
 - 2026-09-29: first version.
+- 2026-09-30: buffered calls scale their time bound with the output cap (see Known limits).

@@ -249,6 +249,7 @@ impl BedrockAdapter {
         model: &str,
         operation: &str,
         body: &Value,
+        bound: std::time::Duration,
     ) -> Result<reqwest::Response, (ProviderError, Option<String>)> {
         let no_id = |error: ProviderError| (error, None);
         let auth = self.resolve().map_err(no_id)?;
@@ -280,19 +281,15 @@ impl BedrockAdapter {
         for (name, value) in signed {
             builder = builder.header(name, value);
         }
-        let response =
-            match tokio::time::timeout(self.config.timeout, builder.body(bytes).send()).await {
-                Ok(result) => result.map_err(|e| no_id(send_error(e)))?,
-                Err(_) => {
-                    return Err(no_id(ProviderError::Transport {
-                        adapter: ADAPTER,
-                        reason: format!(
-                            "no response within {:?} of sending the request",
-                            self.config.timeout
-                        ),
-                    }));
-                }
-            };
+        let response = match tokio::time::timeout(bound, builder.body(bytes).send()).await {
+            Ok(result) => result.map_err(|e| no_id(send_error(e)))?,
+            Err(_) => {
+                return Err(no_id(ProviderError::Transport {
+                    adapter: ADAPTER,
+                    reason: format!("no response within {:?} of sending the request", bound),
+                }));
+            }
+        };
         let status = response.status();
         if status.as_u16() == 429 {
             kgraf_provider::limits::record_429_now(&self.config.base_url);
@@ -436,7 +433,10 @@ impl kgraf_provider::Provider for BedrockAdapter {
             return Err(error);
         }
         let body = wire::to_wire(request, self.config.honors_cache_control);
-        let http = match self.post(&request.model, "converse", &body).await {
+        // Buffered: no byte arrives until the answer exists, so the bound
+        // scales with the output cap (`ProviderConfig::buffered_timeout`).
+        let bound = self.config.buffered_timeout(request.max_output_tokens);
+        let http = match self.post(&request.model, "converse", &body, bound).await {
             Ok(http) => http,
             Err((error, failed_id)) => {
                 close_after_failed_post(token, &error, failed_id.as_deref()).await?;
@@ -445,7 +445,7 @@ impl kgraf_provider::Provider for BedrockAdapter {
         };
         let request_id = request_id_of(&http);
         // A whole-call bound is right here: one buffered response.
-        let text = match tokio::time::timeout(self.config.timeout, http.text()).await {
+        let text = match tokio::time::timeout(bound, http.text()).await {
             Ok(Ok(text)) => text,
             Ok(Err(e)) => {
                 token
@@ -462,10 +462,7 @@ impl kgraf_provider::Provider for BedrockAdapter {
                     .await?;
                 return Err(ProviderError::Transport {
                     adapter: ADAPTER,
-                    reason: format!(
-                        "response body did not finish within {:?}",
-                        self.config.timeout
-                    ),
+                    reason: format!("response body did not finish within {:?}", bound),
                 });
             }
         };
@@ -635,7 +632,15 @@ impl Streaming for BedrockAdapter {
             return Err(error);
         }
         let body = wire::to_wire(request, self.config.honors_cache_control);
-        let http = match self.post(&request.model, "converse-stream", &body).await {
+        let http = match self
+            .post(
+                &request.model,
+                "converse-stream",
+                &body,
+                self.config.timeout,
+            )
+            .await
+        {
             Ok(http) => http,
             Err((error, failed_id)) => {
                 close_after_failed_post(token, &error, failed_id.as_deref()).await?;

@@ -668,6 +668,8 @@ async fn prepare(
         changed,
         done,
         denied: 0,
+        refused: crate::shortfall::RefusedCalls::default(),
+        capabilities: std::collections::HashMap::new(),
         fence: options.fence,
         steering,
     };
@@ -890,6 +892,11 @@ struct Worker {
     changed: BTreeSet<PathBuf>,
     done: Vec<String>,
     denied: u32,
+    /// Calls a policy refused, for the result (decision 0093).
+    refused: crate::shortfall::RefusedCalls,
+    /// Each call of the current round by id: its tool and capability
+    /// ([`crate::shortfall::capability_of`]), to match a refusal to a retry.
+    capabilities: std::collections::HashMap<String, (String, String)>,
     /// This worker's write fence, if it has one (decision 0067, point 5).
     fence: Option<ScopeFence>,
     /// This worker's steering queue (decision 0067, point 3).
@@ -1018,6 +1025,7 @@ impl Worker {
             denied: self.denied,
             trace_failures: std::mem::take(&mut self.trace_failures),
             rationale,
+            refused: self.refused.take(),
         };
         // `Err` means the handle is gone: nobody is waiting for the result, and the
         // ledger already holds every call it names.
@@ -1859,7 +1867,12 @@ impl Worker {
         let chain = self.approval.clone();
         let asks = self.env.asks.clone();
         let mut approved = Vec::new();
+        self.capabilities.clear();
         for (call_id, tool, input) in uses {
+            self.capabilities.insert(
+                call_id.clone(),
+                (tool.clone(), crate::shortfall::capability_of(&tool, &input)),
+            );
             let pending = PendingCall {
                 call_id: call_id.clone(),
                 tool,
@@ -1882,11 +1895,12 @@ impl Worker {
                     Verdict::Run(call) => {
                         if let Some(why) = self.scope_violation(call.access()) {
                             self.denied += 1;
-                            let finished = WorkerEvent::ToolCallFinished {
+                            let mut finished = WorkerEvent::ToolCallFinished {
                                 call_id: call_id.clone(),
                                 output: format!("{REFUSED_PREFIX}{why}"),
                                 is_error: true,
                             };
+                            self.note_refusal(&mut finished);
                             self.emit(ep, finished).await?;
                             break;
                         }
@@ -1895,11 +1909,12 @@ impl Worker {
                     }
                     Verdict::Denied { by, reason } => {
                         self.denied += 1;
-                        let finished = WorkerEvent::ToolCallFinished {
+                        let mut finished = WorkerEvent::ToolCallFinished {
                             call_id: call_id.clone(),
                             output: format!("{DENIED_PREFIX}{by}: {reason}"),
                             is_error: true,
                         };
+                        self.note_refusal(&mut finished);
                         self.emit(ep, finished).await?;
                         break;
                     }
@@ -2058,7 +2073,9 @@ impl Worker {
             // during it cannot lose the call's writes or mark a finished call
             // interrupted.
             done[j] = true;
-            let finished = self.record_result(j, &accesses, call_id, &tool, &digests[j], result);
+            let mut finished =
+                self.record_result(j, &accesses, call_id, &tool, &digests[j], result);
+            self.note_refusal(&mut finished);
             // A sandboxed build declares no paths; ask git what it changed. Before
             // any emit: a cancel during an emit must not lose the paths.
             if accesses[j].is_sandboxed_build() {
@@ -2348,6 +2365,48 @@ impl Worker {
             output,
             is_error,
         }
+    }
+
+    /// Decision 0093: note a finished call for the refusal record. A policy
+    /// refusal (a scope or fence refusal, or a denial a policy made) is
+    /// recorded and its text gets the reporting hint; a call that ran without
+    /// error marks earlier refusals of its capability as retried. A denial
+    /// for malformed input or a misplaced path is neither.
+    fn note_refusal(&mut self, event: &mut WorkerEvent) {
+        let WorkerEvent::ToolCallFinished {
+            call_id,
+            output,
+            is_error,
+        } = event
+        else {
+            return;
+        };
+        let Some((tool, capability)) = self.capabilities.get(call_id.as_str()).cloned() else {
+            return;
+        };
+        if !*is_error {
+            self.refused.ran_ok(&tool, &capability);
+            return;
+        }
+        let policy = if let Some(rest) = output.strip_prefix(DENIED_PREFIX) {
+            let (by, reason) = rest.split_once(": ").unwrap_or((rest, ""));
+            crate::shortfall::is_policy_denial(by, reason)
+        } else {
+            output.starts_with(REFUSED_PREFIX)
+        };
+        if !policy {
+            return;
+        }
+        self.refused.refused(&tool, capability, output.clone());
+        let can_report = self
+            .env
+            .tools
+            .get(crate::shortfall::SHORTFALL_TOOL)
+            .is_some();
+        if !output.trim_end().ends_with('.') {
+            output.push('.');
+        }
+        output.push_str(crate::shortfall::refusal_hint(can_report));
     }
 
     /// Record the worktree paths git reports as changed after a sandboxed build

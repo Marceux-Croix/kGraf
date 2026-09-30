@@ -155,6 +155,67 @@ async fn under_a_write_scope_only_the_allowlisted_build_runs() {
     assert!(out.contains("--config"), "{out}");
 }
 
+/// Decision 0093: with the operator's container setting, a command off the
+/// allowlist runs under a declared write scope (the verifier still judges the
+/// committed attempt); a `forbid` rule still refuses. Without it, the same
+/// command is refused, as above.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn with_the_container_sandbox_a_command_off_the_allowlist_runs_under_a_scope() {
+    let (r, _denies) = lockless_crate();
+    let config = WorkerConfig::default().with_container_sandbox(true);
+    let (out, is_error) = one_shell_call(
+        &r,
+        config.clone(),
+        "w-box-touch",
+        serde_json::json!(["touch", "src/lib.rs"]),
+        scope(),
+    )
+    .await;
+    assert!(!is_error, "{out}");
+    assert!(out.contains("exit status: 0"), "{out}");
+    let (out, is_error) = one_shell_call(
+        &r,
+        config,
+        "w-box-forbid",
+        serde_json::json!(["rm", "-rf", "/"]),
+        scope(),
+    )
+    .await;
+    assert!(is_error, "{out}");
+    assert!(
+        out.contains("refuses to remove the filesystem root"),
+        "{out}"
+    );
+}
+
+/// Decision 0093: a program granted to the contract runs under its write
+/// scope; another program off the allowlist is still refused, and its
+/// refusal says how to report the shortfall.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_granted_program_runs_under_a_scope_and_another_is_still_refused() {
+    let (r, _denies) = lockless_crate();
+    let config = WorkerConfig::default().with_granted_programs(["touch".to_owned()]);
+    let (out, is_error) = one_shell_call(
+        &r,
+        config.clone(),
+        "w-grant-touch",
+        serde_json::json!(["touch", "src/lib.rs"]),
+        scope(),
+    )
+    .await;
+    assert!(!is_error, "{out}");
+    let (out, is_error) = one_shell_call(
+        &r,
+        config,
+        "w-grant-mkdir",
+        serde_json::json!(["mkdir", "src/x"]),
+        scope(),
+    )
+    .await;
+    assert!(is_error, "{out}");
+    assert!(out.contains("do not work around it"), "{out}");
+}
+
 /// A fake vendor key for a throwaway checkout's `.env`; never a real one.
 const FAKE_DOTENV_KEY: &str = "sk-HOSTTESTKEY9f8e7d6c5b4a3210zyxwvQ";
 

@@ -44,6 +44,12 @@ pub struct PolicyVerdict {
     /// approval and, from a workspace-bound shell tool, run as a sandboxed
     /// build that a worker with a declared write scope may issue.
     pub build: bool,
+    /// Allowed by an operator grant (decision 0093): a program the run's
+    /// operator ceiling let the orchestrator grant to this contract, or any
+    /// command when the run's container is the sandbox. From a
+    /// workspace-bound shell tool it runs as a confined command, like a
+    /// build, which a worker with a declared write scope may issue.
+    pub granted: bool,
 }
 
 /// An ordered set of [`CommandRule`]s, tried first match wins, falling back to
@@ -54,6 +60,12 @@ pub struct ExecPolicy {
     default: Decision,
     /// Decision 0084: empty unless the caller sets one.
     build: BuildAllowlist,
+    /// Decision 0093: programs (an exact `argv[0]`) granted to this
+    /// contract by the orchestrator, within the operator's ceiling.
+    granted: std::collections::BTreeSet<String>,
+    /// Decision 0093: the run's container is the sandbox, so every command
+    /// that no `forbid` rule refuses runs without approval.
+    unrestricted: bool,
 }
 
 impl ExecPolicy {
@@ -63,7 +75,37 @@ impl ExecPolicy {
             rules: Vec::new(),
             default,
             build: BuildAllowlist::empty(),
+            granted: std::collections::BTreeSet::new(),
+            unrestricted: false,
         }
+    }
+
+    /// Allow these programs without approval (decision 0093): each is an
+    /// exact `argv[0]`, granted to one contract by the orchestrator within
+    /// the operator's ceiling. A `forbid` rule and a refused build argument
+    /// still win. Set from the run's configuration only, never by a model.
+    pub fn with_granted_programs(mut self, programs: impl IntoIterator<Item = String>) -> Self {
+        self.granted.extend(programs);
+        self
+    }
+
+    /// The programs [`Self::with_granted_programs`] allowed.
+    pub fn granted_programs(&self) -> &std::collections::BTreeSet<String> {
+        &self.granted
+    }
+
+    /// Let every command that no `forbid` rule or refused build argument
+    /// stops run without approval (decision 0093, "the container is the
+    /// sandbox"). Only the operator turns this on, for a run whose commands
+    /// execute in a disposable container.
+    pub fn with_unrestricted_shell(mut self, on: bool) -> Self {
+        self.unrestricted = on;
+        self
+    }
+
+    /// Whether [`Self::with_unrestricted_shell`] is on.
+    pub fn is_unrestricted(&self) -> bool {
+        self.unrestricted
     }
 
     /// Allow these build and test commands without approval (decision 0084).
@@ -119,6 +161,7 @@ impl ExecPolicy {
                     matched_prefix: Some(matched_prefix),
                     reason: rule.reason.clone(),
                     build: false,
+                    granted: false,
                 })
         });
         // A `forbid` rule wins over the allowlist.
@@ -133,6 +176,7 @@ impl ExecPolicy {
                 matched_prefix: None,
                 reason: Some("on the build and test allowlist".into()),
                 build: true,
+                granted: false,
             },
             AllowlistMatch::Refused { reason } => PolicyVerdict {
                 decision: Decision::Forbidden,
@@ -140,14 +184,37 @@ impl ExecPolicy {
                 matched_prefix: None,
                 reason: Some(reason),
                 build: false,
+                granted: false,
             },
-            AllowlistMatch::NotListed => ruled.unwrap_or(PolicyVerdict {
-                decision: self.default,
-                read_only: false,
-                matched_prefix: None,
-                reason: None,
-                build: false,
-            }),
+            AllowlistMatch::NotListed => {
+                let verdict = ruled.unwrap_or(PolicyVerdict {
+                    decision: self.default,
+                    read_only: false,
+                    matched_prefix: None,
+                    reason: None,
+                    build: false,
+                    granted: false,
+                });
+                // Decision 0093: a grant turns what would be asked about
+                // (or allowed unconfined) into a confined allow. A read-only
+                // command keeps its own classification and confinement.
+                let listed = argv.first().is_some_and(|p| self.granted.contains(p));
+                if verdict.read_only || !(self.unrestricted || listed) {
+                    return verdict;
+                }
+                PolicyVerdict {
+                    decision: Decision::Allow,
+                    read_only: false,
+                    matched_prefix: verdict.matched_prefix,
+                    reason: Some(if listed {
+                        "granted to this contract within the operator's ceiling".into()
+                    } else {
+                        "the run's container is the sandbox".into()
+                    }),
+                    build: false,
+                    granted: true,
+                }
+            }
         }
     }
 
@@ -297,5 +364,47 @@ mod tests {
                 "{variant:?} must require approval, not run as Allow or as a covered Forbidden"
             );
         }
+    }
+
+    /// Decision 0093: a granted program runs without approval, marked
+    /// granted; another program is still asked about; a `forbid` rule still
+    /// wins over a grant; the match is on the exact `argv[0]`.
+    #[test]
+    fn a_granted_program_is_allowed_and_nothing_else_changes() {
+        let policy = ExecPolicy::default_kgraf_policy()
+            .with_granted_programs(["python3".to_owned(), "rm".to_owned()]);
+        let granted = policy.evaluate(&argv(&["python3", "fetch.py"]));
+        assert_eq!(granted.decision, Decision::Allow);
+        assert!(granted.granted && !granted.build && !granted.read_only);
+        let other = policy.evaluate(&argv(&["curl", "https://example.com"]));
+        assert_eq!(other.decision, Decision::Prompt);
+        assert!(!other.granted);
+        let spelled = policy.evaluate(&argv(&["/usr/bin/python3", "fetch.py"]));
+        assert_eq!(spelled.decision, Decision::Prompt, "exact argv[0] only");
+        let forbidden = policy.evaluate(&argv(&["rm", "-rf", "/"]));
+        assert_eq!(forbidden.decision, Decision::Forbidden);
+        let read_only = policy.evaluate(&argv(&["ls"]));
+        assert!(read_only.read_only && !read_only.granted);
+    }
+
+    /// Decision 0093: with the container as the sandbox, any command runs
+    /// without approval, marked granted; a `forbid` rule still wins; off, the
+    /// same command is asked about.
+    #[test]
+    fn an_unrestricted_shell_allows_every_command_but_a_forbidden_one() {
+        let on = ExecPolicy::default_kgraf_policy().with_unrestricted_shell(true);
+        let any = on.evaluate(&argv(&["curl", "https://example.com"]));
+        assert_eq!(any.decision, Decision::Allow);
+        assert!(any.granted);
+        assert_eq!(
+            on.evaluate(&argv(&["git", "push", "--force"])).decision,
+            Decision::Forbidden
+        );
+        let off = ExecPolicy::default_kgraf_policy();
+        assert_eq!(
+            off.evaluate(&argv(&["curl", "https://example.com"]))
+                .decision,
+            Decision::Prompt
+        );
     }
 }

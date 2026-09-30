@@ -673,6 +673,10 @@ fn run_now_with(
             // invocation (that pilot always calls `kgraf orchestrate`
             // directly); this stays unset here.
             tbench_bridge_socket: None,
+            // Decision 0093: a scheduled run has no operator at a command
+            // line, so it grants nothing and keeps the strict shell.
+            may_grant: Vec::new(),
+            container_sandbox: false,
         },
     );
     let spend = match run_spend(root, &run_id, &prices_path) {

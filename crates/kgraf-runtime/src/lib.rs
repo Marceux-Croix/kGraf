@@ -50,6 +50,7 @@ mod paths;
 mod prefix;
 mod rebuild;
 mod settle;
+mod shortfall;
 mod stall;
 mod step;
 mod thresholds;
@@ -80,6 +81,7 @@ pub use prefix::{
 };
 pub use rebuild::{INTERRUPTED_RESULT, ResumeError, ResumeState, TranscriptBuilder};
 pub use settle::{TranscriptSettler, settle_for_disk};
+pub use shortfall::{RefusedCall, SHORTFALL_TOOL, capability_of, refusal_hint};
 pub use stall::{DEFAULT_STALL_REPEATS, Stall, StallDetector, call_digest};
 pub use step::{RoundPlan, StepBudget, WARN_AT_ROUNDS_LEFT};
 pub use thresholds::{

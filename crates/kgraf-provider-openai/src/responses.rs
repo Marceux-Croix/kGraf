@@ -221,13 +221,15 @@ impl OpenAiAdapter {
         Ok(())
     }
 
-    /// Issue the request and return the raw response, bounded by
-    /// `config.timeout` for `send()` alone: reading the body, streaming or
-    /// not, is bounded separately by the caller.
+    /// Issue the request and return the raw response, bounded by `bound` for
+    /// `send()` alone: reading the body, streaming or not, is bounded
+    /// separately by the caller. `bound` is `config.timeout` for a streamed
+    /// call and [`ProviderConfig::buffered_timeout`] for a buffered one.
     async fn post(
         &self,
         body: &serde_json::Value,
         model: &str,
+        bound: std::time::Duration,
     ) -> Result<reqwest::Response, ProviderError> {
         let builder = match &self.azure {
             Some(transport) => {
@@ -254,15 +256,12 @@ impl OpenAiAdapter {
                 }
             }
         };
-        let http = match tokio::time::timeout(self.config.timeout, builder.send()).await {
+        let http = match tokio::time::timeout(bound, builder.send()).await {
             Ok(result) => result.map_err(|e| crate::send_error(self.adapter_name(), e))?,
             Err(_) => {
                 return Err(ProviderError::Transport {
                     adapter: self.adapter_name(),
-                    reason: format!(
-                        "no response within {:?} of sending the request",
-                        self.config.timeout
-                    ),
+                    reason: format!("no response within {:?} of sending the request", bound),
                 });
             }
         };
@@ -707,7 +706,10 @@ impl kgraf_provider::Provider for OpenAiAdapter {
             return Err(error);
         }
         let body = self.to_wire(request);
-        let http = match self.post(&body, &request.model).await {
+        // Buffered: no byte arrives until the answer exists, so the bound
+        // scales with the output cap (`ProviderConfig::buffered_timeout`).
+        let bound = self.config.buffered_timeout(request.max_output_tokens);
+        let http = match self.post(&body, &request.model, bound).await {
             Ok(http) => http,
             Err(error) => {
                 token.close_on_async(&error, None).await?;
@@ -736,7 +738,7 @@ impl kgraf_provider::Provider for OpenAiAdapter {
         // A whole-call bound is correct here: `complete` buffers one response
         // and returns, unlike `stream`, so there is no legitimate reason for
         // reading the body to take longer than `config.timeout`.
-        let text = match tokio::time::timeout(self.config.timeout, http.text()).await {
+        let text = match tokio::time::timeout(bound, http.text()).await {
             Ok(Ok(text)) => text,
             Ok(Err(e)) => {
                 token
@@ -753,10 +755,7 @@ impl kgraf_provider::Provider for OpenAiAdapter {
                     .await?;
                 return Err(ProviderError::Transport {
                     adapter: self.adapter_name(),
-                    reason: format!(
-                        "response body did not finish within {:?}",
-                        self.config.timeout
-                    ),
+                    reason: format!("response body did not finish within {:?}", bound),
                 });
             }
         };
@@ -864,7 +863,7 @@ impl Streaming for OpenAiAdapter {
         let mut body = self.to_wire(request);
         body["stream"] = serde_json::json!(true);
 
-        let http = match self.post(&body, &request.model).await {
+        let http = match self.post(&body, &request.model, self.config.timeout).await {
             Ok(http) => http,
             Err(error) => {
                 token.close_on_async(&error, None).await?;

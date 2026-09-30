@@ -165,6 +165,19 @@ pub struct RunConfig {
     /// `worktrees` is refused ([`RunConfig::load`]) rather than ignored.
     #[serde(skip)]
     pub worktrees: WorktreeRetention,
+    /// `--may-grant` (decision 0093): the shell programs the orchestrator may
+    /// grant a contract after a worker's permission shortfall without asking.
+    /// Empty by default. Operator-only: never in `run.json`, which a
+    /// process other than the operator's command line could write.
+    #[serde(skip)]
+    pub may_grant: Vec<String>,
+    /// `--container-sandbox` (decision 0093): this run's commands execute in a
+    /// disposable container, so workers' shell commands are not held to the
+    /// command policy or the write scope's shell rule. Operator-only, never
+    /// in `run.json`; the command also requires the environment variable
+    /// `KGRAF_CONTAINER_SANDBOX=1`.
+    #[serde(skip)]
+    pub container_sandbox: bool,
 }
 
 /// The run-file key [`RunConfig::load`] refuses (decision 0088).
@@ -318,6 +331,8 @@ impl RunConfig {
             tbench_bridge_socket: None,
             dependency_fetch: crate::deps::RunFetch::Stored,
             worktrees: WorktreeRetention::default(),
+            may_grant: Vec::new(),
+            container_sandbox: false,
         }
     }
 

@@ -114,6 +114,9 @@ mod connections;
 // Subagents (decision 0067, point 5).
 mod subagents;
 // Speculative merge across in-flight branches (decision 0074).
+/// A worker's shortfall report, and the grant, amendment or hold that
+/// answers it (decision 0093).
+mod shortfall_hooks;
 mod speculate;
 
 /// Default cap on contracts in one plan (one decomposition answer).
@@ -419,6 +422,28 @@ pub trait AttemptEnvs: Send + Sync {
         worker: &AgentId,
         task: &kgraf_core::TaskId,
     ) -> Result<AttemptEnv, String>;
+
+    /// [`Self::build`], with shell programs granted to the attempt's contract
+    /// after a permission shortfall (decision 0093). The default applies no
+    /// grant, so it refuses a non-empty one rather than build an environment
+    /// without it (fail loud); a builder that can apply grants overrides it.
+    async fn build_granted(
+        &self,
+        route: &Route,
+        workspace: &Path,
+        worker: &AgentId,
+        task: &kgraf_core::TaskId,
+        granted: &[String],
+    ) -> Result<AttemptEnv, String> {
+        if !granted.is_empty() {
+            return Err(format!(
+                "this environment builder cannot apply the programs granted to the contract \
+                 ({})",
+                granted.join(", ")
+            ));
+        }
+        self.build(route, workspace, worker, task).await
+    }
 }
 
 /// An attempt's environment, and what to close once its worker has finished.
@@ -486,6 +511,11 @@ pub struct OrchestratorConfig {
     /// `0` is floored to `1` at the check (`cluster_cap::effective_cap`),
     /// never silently stalling a run.
     pub max_in_flight_per_cluster: usize,
+    /// What the orchestrator may grant a contract after a worker's permission
+    /// shortfall without asking (decision 0093): set by the operator only,
+    /// never by a model. Empty by default: nothing beyond the configured
+    /// policy is granted, and every permission shortfall holds for the user.
+    pub grant_ceiling: crate::shortfall::GrantCeiling,
 }
 
 impl Default for OrchestratorConfig {
@@ -506,6 +536,7 @@ impl Default for OrchestratorConfig {
             interface_review: false,
             routing: crate::routing::RoutingPolicy::default(),
             max_in_flight_per_cluster: crate::cluster_cap::DEFAULT_MAX_IN_FLIGHT_PER_CLUSTER,
+            grant_ceiling: crate::shortfall::GrantCeiling::none(),
         }
     }
 }
@@ -1162,6 +1193,9 @@ pub struct RunReport {
     /// for example "the check generated Cargo.lock; commit it". Not failures;
     /// nothing they name was merged.
     pub notices: Vec<String>,
+    /// Verified contracts whose acceptance says nothing about the work, with
+    /// why (decision 0093). A run with any is completed but unverified.
+    pub unverified: Vec<(String, String)>,
 }
 
 /// How long a release waits for a worker that ignores its cancel before it
@@ -2742,7 +2776,20 @@ impl RunLoop {
                 .decompose_once(&request, note_ids, outer, last_ask)
                 .await
             {
-                Err(OrchestratorError::Plan(e)) if e.reaskable() && reasks < MAX_PLAN_REASKS => {
+                Err(OrchestratorError::Plan(e)) if e.reaskable() => {
+                    // One record per refusal, the last included: a run that
+                    // fails planning still shows every answer it was refused on.
+                    let at = self.now();
+                    self.trace(TraceEvent::PlanRefused {
+                        at_ms: at,
+                        ask: reasks + 1,
+                        of: MAX_PLAN_REASKS + 1,
+                        reason: e.to_string(),
+                    })
+                    .await?;
+                    if reasks >= MAX_PLAN_REASKS {
+                        return Err(OrchestratorError::Plan(e));
+                    }
                     reasks += 1;
                     // The refusal can quote the model's own output: scrubbed
                     // before it is shown or persisted.
@@ -3688,6 +3735,12 @@ impl RunLoop {
             analytics_error: None,
             warnings,
             notices,
+            unverified: self
+                .record
+                .unverified
+                .iter()
+                .map(|(c, r)| (c.clone(), r.clone()))
+                .collect(),
         }
     }
 
@@ -4944,7 +4997,8 @@ impl RunLoop {
         let instruction = self.brief_with_inbox(contract, &worker)
             + &self.interface_brief(&contract.contract)
             + &self.producer_rationale_brief(contract)
-            + &refusal_brief(contract);
+            + &refusal_brief(contract)
+            + &crate::shortfall::shortfall_brief(contract);
         let Some(route) = self.route(&route_name) else {
             send_failed(format!("route `{route_name}` is not configured"));
             return;
@@ -4952,6 +5006,9 @@ impl RunLoop {
         let route_env = route.env.clone();
         // Per-attempt environments are built off the loop, in the worker's task.
         let attempt_env = self.attempt_envs.clone().map(|envs| (envs, route.clone()));
+        // Decision 0093: the programs granted to this contract reach the
+        // attempt's shell through its environment builder.
+        let granted = contract.granted_programs.clone();
         let brief = WorkerBrief {
             task: contract.task.clone(),
             worker: worker.clone(),
@@ -5047,7 +5104,13 @@ impl RunLoop {
                     closer: None,
                 }),
                 Some((envs, route)) => envs
-                    .build(&route, &brief.workspace_root, &brief.worker, &brief.task)
+                    .build_granted(
+                        &route,
+                        &brief.workspace_root,
+                        &brief.worker,
+                        &brief.task,
+                        &granted,
+                    )
                     .await
                     .map_err(|e| format!("the attempt's environment could not be built: {e}")),
             };
@@ -5340,6 +5403,12 @@ impl RunLoop {
             a.result = Some(f.result.clone());
         }
         self.record_write_set(&f.contract, &f.result.changed_paths, now);
+        // Decision 0093: an attempt that reported a shortfall stopped on the
+        // orchestrator's cancel. It is neither verified nor a failure; its
+        // contract goes on as the shortfall's resolution says.
+        if f.merged.is_none() && self.take_shortfall(&f.contract, &f.worker, &mut flight) {
+            return self.finish_attempt(contract, flight).await;
+        }
         // Merged before the kill: verified by the merge that already happened.
         if let Some(commit) = &f.merged {
             if let Some(i) = idx {
@@ -6149,6 +6218,28 @@ impl RunLoop {
                 }
             }
             let result = flight.attempts[winner].result.clone();
+            // Decision 0093: accepted on a check that says nothing about the
+            // work (it always passes, or the worker finished after a policy
+            // refused a call it never ran): reported unverified.
+            if let Some(Verdict::Pass { by, .. }) = &flight.attempts[winner].verdict
+                && let Some(reason) = crate::shortfall::unverified_reason(
+                    by,
+                    !contract.gate_commands.is_empty(),
+                    result.as_ref(),
+                )
+            {
+                let at = self.now();
+                self.trace(TraceEvent::Unverified {
+                    at_ms: at,
+                    contract: id.clone(),
+                    worker: flight.attempts[winner].worker.to_string(),
+                    reason: reason.clone(),
+                })
+                .await?;
+                self.record
+                    .unverified
+                    .insert(id.clone(), kgraf_secrets::scrub_persist_owned(reason));
+            }
             self.announce_verified(&contract, result.as_ref()).await?;
             self.clear_wait(&id);
             if let Some(open) = self.record.contract(&id) {
@@ -6275,6 +6366,10 @@ impl RunLoop {
                 ContractStatus::Held {
                     reason: format!("stopped by the user ({session})"),
                 }
+            } else if let Some(reason) = c.shortfall_hold.take() {
+                // Decision 0093: a shortfall beyond what the orchestrator may
+                // resolve alone waits for the user.
+                ContractStatus::Held { reason }
             } else if failures > max_retries && !not_a_failure {
                 ContractStatus::Held {
                     reason: match &worker_failure {
@@ -6711,9 +6806,20 @@ impl RunLoop {
             } => {
                 let _ = reply.send(self.decide_gate(&gate, decision, &note));
             }
-            Control::Contract(control, reply) => {
-                self.on_contract_control(*control, reply).await?;
-            }
+            // Decision 0093: a shortfall is answered by the run loop in every
+            // run, with or without interface contracts.
+            Control::Contract(control, reply) => match *control {
+                crate::challenge::ContractControl::Shortfall {
+                    worker,
+                    kind,
+                    need,
+                    why,
+                } => {
+                    let answer = self.on_shortfall(worker, kind, need, why).await?;
+                    let _ = reply.send(answer);
+                }
+                other => self.on_contract_control(other, reply).await?,
+            },
             Control::SendToSession {
                 session,
                 kind,

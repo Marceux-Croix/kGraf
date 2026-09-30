@@ -162,6 +162,13 @@ pub struct WorkerConfig {
     build_allowlist: BuildAllowlist,
     /// Decision 0084: how long one shell command may run.
     shell_timeout: Duration,
+    /// Decision 0093: programs granted to one contract, within the operator's
+    /// ceiling. Never read from the file: set per attempt by the host.
+    granted_programs: Vec<String>,
+    /// Decision 0093: the run's container is the sandbox, so the shell runs
+    /// any command a `forbid` rule does not refuse. Never read from the file:
+    /// only the operator's command line sets it.
+    container_sandbox: bool,
 }
 
 /// No MCP servers, no hard-linked reads, the cargo build and test allowlist,
@@ -173,6 +180,8 @@ impl Default for WorkerConfig {
             hardlink_reads: AllowedHardlinkReads::default(),
             build_allowlist: BuildAllowlist::cargo_default(),
             shell_timeout: kgraf_tools::shell::DEFAULT_TIMEOUT,
+            granted_programs: Vec::new(),
+            container_sandbox: false,
         }
     }
 }
@@ -223,6 +232,8 @@ impl WorkerConfig {
             hardlink_reads,
             build_allowlist,
             shell_timeout,
+            granted_programs: Vec::new(),
+            container_sandbox: false,
         })
     }
 
@@ -254,6 +265,32 @@ impl WorkerConfig {
     /// How long one shell command may run before it is killed (decision 0084).
     pub fn shell_timeout(&self) -> Duration {
         self.shell_timeout
+    }
+
+    /// Programs granted to this attempt's contract (decision 0093).
+    pub fn granted_programs(&self) -> &[String] {
+        &self.granted_programs
+    }
+
+    /// This configuration with programs granted to one contract after a
+    /// worker's permission shortfall (decision 0093). Set by the host from
+    /// the contract's record; the file cannot name any.
+    pub fn with_granted_programs(mut self, programs: impl IntoIterator<Item = String>) -> Self {
+        self.granted_programs.extend(programs);
+        self
+    }
+
+    /// Whether the run's container is the sandbox (decision 0093).
+    pub fn container_sandbox(&self) -> bool {
+        self.container_sandbox
+    }
+
+    /// This configuration for a run whose commands execute in a disposable
+    /// container (decision 0093, `--container-sandbox`). Only the operator's
+    /// command line reaches this; the file cannot set it.
+    pub fn with_container_sandbox(mut self, on: bool) -> Self {
+        self.container_sandbox = on;
+        self
     }
 
     /// This configuration with another shell timeout: a `--shell-timeout`
@@ -293,6 +330,26 @@ impl WorkerConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Decision 0093: the worker file cannot raise what a worker may run: it
+    /// has no key for a grant or for the container setting, and an unknown
+    /// key fails the load rather than being ignored.
+    #[test]
+    fn the_file_cannot_grant_programs_or_turn_on_the_container_sandbox() {
+        for text in [
+            r#"{"container_sandbox": true}"#,
+            r#"{"granted_programs": ["python3"]}"#,
+            r#"{"grant_ceiling": ["python3"]}"#,
+        ] {
+            assert!(
+                matches!(parse(text), Err(WorkerConfigError::Parse { .. })),
+                "{text}"
+            );
+        }
+        let config = parse("{}").expect("valid");
+        assert!(!config.container_sandbox());
+        assert!(config.granted_programs().is_empty());
+    }
 
     fn parse(text: &str) -> Result<WorkerConfig, WorkerConfigError> {
         WorkerConfig::parse(Path::new("worker.json"), text)

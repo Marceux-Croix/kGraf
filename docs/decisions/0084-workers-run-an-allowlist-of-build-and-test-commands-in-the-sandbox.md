@@ -174,3 +174,13 @@ returns its output so far.
   versions, `git` sources and registry URLs the worker's run chose, although that file is
   never merged. The check now runs against the committed tree only; a build it runs
   generates its own lockfile, which goes with its leftovers.
+
+## Amendment: a refused worker reports the shortfall, and the operator may widen the shell (decision 0093)
+
+- **A refusal under point 3 tells the worker how to report it** (`report_shortfall`), and the
+  result lists the refusal.
+- **Two operator-only ways past point 3, both confined as a build is:** a program granted to one
+  contract within the operator's `--may-grant` ceiling, and any command under
+  `--container-sandbox` (with `KGRAF_CONTAINER_SANDBOX=1`). The verifier's scope check on the
+  commit still refuses undeclared writes, a fence still refuses them, and a `forbid` rule still
+  wins. Neither can be set in the worker configuration or by a model. The default is unchanged.

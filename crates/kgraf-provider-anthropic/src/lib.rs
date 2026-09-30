@@ -508,6 +508,7 @@ impl AnthropicAdapter {
         body: &serde_json::Value,
         model: &str,
         stream: bool,
+        bound: std::time::Duration,
     ) -> Result<reqwest::Response, ProviderError> {
         let builder = match &self.transport {
             Some(transport) => {
@@ -540,19 +541,15 @@ impl AnthropicAdapter {
         // Bounds only "does the provider ever start responding", not "how long
         // may the whole body take", the client no longer sets that second,
         // stream-hostile bound itself (see `new`'s doc comment).
-        let response =
-            match tokio::time::timeout(self.config.timeout, builder.json(body).send()).await {
-                Ok(result) => result.map_err(|e| send_error(self.adapter_name(), e))?,
-                Err(_) => {
-                    return Err(ProviderError::Transport {
-                        adapter: self.adapter_name(),
-                        reason: format!(
-                            "no response within {:?} of sending the request",
-                            self.config.timeout
-                        ),
-                    });
-                }
-            };
+        let response = match tokio::time::timeout(bound, builder.json(body).send()).await {
+            Ok(result) => result.map_err(|e| send_error(self.adapter_name(), e))?,
+            Err(_) => {
+                return Err(ProviderError::Transport {
+                    adapter: self.adapter_name(),
+                    reason: format!("no response within {:?} of sending the request", bound),
+                });
+            }
+        };
         let status = response.status();
         // Rate-limit header capture (decision 0067). Recorded
         // whether or not the call succeeded: a 429's own headers are exactly
@@ -777,7 +774,10 @@ impl kgraf_provider::Provider for AnthropicAdapter {
         }
 
         let body = self.to_wire(request, false);
-        let http = match self.post(&body, &request.model, false).await {
+        // Buffered: no byte arrives until the answer exists, so the bound
+        // scales with the output cap (`ProviderConfig::buffered_timeout`).
+        let bound = self.config.buffered_timeout(request.max_output_tokens);
+        let http = match self.post(&body, &request.model, false, bound).await {
             Ok(http) => http,
             Err(error) => {
                 // A connection that never opened, or a rejection before generation,
@@ -794,7 +794,7 @@ impl kgraf_provider::Provider for AnthropicAdapter {
         // A whole-call bound is correct here: `complete` buffers one response and
         // returns, so unlike `stream` there is no legitimate reason for reading it
         // to take longer than `config.timeout`.
-        let text = match tokio::time::timeout(self.config.timeout, http.text()).await {
+        let text = match tokio::time::timeout(bound, http.text()).await {
             Ok(Ok(text)) => text,
             Ok(Err(e)) => {
                 // The request reached the provider and may well have billed, but its
@@ -813,10 +813,7 @@ impl kgraf_provider::Provider for AnthropicAdapter {
                     .await?;
                 return Err(ProviderError::Transport {
                     adapter: self.adapter_name(),
-                    reason: format!(
-                        "response body did not finish within {:?}",
-                        self.config.timeout
-                    ),
+                    reason: format!("response body did not finish within {:?}", bound),
                 });
             }
         };
@@ -926,7 +923,10 @@ impl Streaming for AnthropicAdapter {
             return Err(error);
         }
         let body = self.to_wire(request, true);
-        let http = match self.post(&body, &request.model, true).await {
+        let http = match self
+            .post(&body, &request.model, true, self.config.timeout)
+            .await
+        {
             Ok(http) => http,
             Err(error) => {
                 token.close_on_async(&error, None).await?;

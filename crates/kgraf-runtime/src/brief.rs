@@ -269,6 +269,13 @@ pub struct WorkerResult {
     /// this field existed still loads.
     #[serde(default)]
     pub rationale: Option<Rationale>,
+    /// Calls a policy refused (the write scope, the command policy, a skill's
+    /// `allowed-tools`, an unattended approval, a fence), each with whether a
+    /// later call of the same capability ran without error (decision 0093).
+    /// An attempt that finished with an unretried refusal is reported
+    /// unverified. Serde-defaulted so an older record still loads.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refused: Vec<crate::shortfall::RefusedCall>,
 }
 
 impl WorkerResult {
@@ -293,6 +300,7 @@ impl WorkerResult {
             denied: 0,
             trace_failures: Vec::new(),
             rationale: None,
+            refused: Vec::new(),
         }
     }
 }

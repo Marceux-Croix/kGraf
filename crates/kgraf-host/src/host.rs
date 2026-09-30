@@ -405,6 +405,12 @@ impl Host {
             // Decision 0079; the reviewer itself is bound in `run`.
             interface_review: config.interface_review,
             routing: config.routing,
+            // Decision 0093: the operator's `--may-grant`, checked here so a
+            // bad entry fails the open, not the first shortfall.
+            grant_ceiling: kgraf_orchestrator::GrantCeiling::programs(
+                config.may_grant.iter().cloned(),
+            )
+            .map_err(|e| Error::Invalid(format!("--may-grant: {e}")))?,
             ..OrchestratorConfig::default()
         };
         // Decision 0075: loaded once here, so a malformed store fails loud at
@@ -1390,6 +1396,9 @@ impl Host {
             Some(timeout) => worker_config.with_shell_timeout(timeout),
             None => worker_config,
         };
+        // Decision 0093: only the operator's `--container-sandbox` reaches
+        // this; the worker file cannot set it.
+        let worker_config = worker_config.with_container_sandbox(self.config.container_sandbox);
         let mut parts = BTreeMap::new();
         for spec in &self.config.routes {
             let (route, model) = split_route(spec)?;
@@ -1421,6 +1430,13 @@ impl Host {
             .iter()
             .map(|l| Arc::new(ChallengeTool::new(l.clone())) as Arc<dyn kgraf_tools::Tool>)
             .collect();
+        // Decision 0093: every orchestrated worker may report a shortfall
+        // (`report_shortfall`), with or without contract checks; bound to the
+        // orchestrator once it is built, as `line` is.
+        let shortfall_line = ContractLine::new();
+        extra_tools.push(Arc::new(kgraf_orchestrator::ShortfallTool::new(
+            shortfall_line.clone(),
+        )));
         // Decision 0089: the run's non-generative routes, each built with its
         // own credential. Their tools join every environment of the run (so the
         // prefix stays one per vendor and model, 0043); none is called unless
@@ -1484,6 +1500,7 @@ impl Host {
             read_denies,
             assembler,
             line,
+            shortfall_line,
             session_line,
             model_calls,
             extractor_changed: index_report.extractor_changed,
@@ -1509,6 +1526,7 @@ impl Host {
             read_denies,
             assembler,
             line,
+            shortfall_line,
             session_line,
             model_calls,
             extractor_changed,
@@ -1627,6 +1645,11 @@ impl Host {
             timeout: self.config.gate_timeout,
             output_cap: GATE_OUTPUT_CAP,
         }));
+        // Decision 0093: every worker's `report_shortfall` reaches this run's
+        // orchestrator.
+        shortfall_line
+            .bind(orchestrator.handle())
+            .map_err(Error::failed)?;
         let (orchestrator, check_scratch, stubs) = match &line {
             Some(line) => {
                 let stubs = Arc::new(GitStubLander::new(manager.clone(), merge_back.clone()));
@@ -2253,6 +2276,9 @@ pub(crate) struct BuildBase {
     assembler: Arc<AttemptAssembler>,
     /// Bound to the orchestrator when the run checks contracts.
     line: Option<ContractLine>,
+    /// Bound to the orchestrator in every run: `report_shortfall`
+    /// (decision 0093).
+    shortfall_line: ContractLine,
     /// Bound to the orchestrator when the run registers session tools
     /// (decision 0067).
     session_line: Option<SessionLine>,

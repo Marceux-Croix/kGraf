@@ -1432,6 +1432,17 @@ pub enum ContractControl {
         overturn: bool,
         note: String,
     },
+    /// A running worker cannot do its brief as given (decision 0093): a
+    /// policy refused a call it needs, or its instructions fall short. Named
+    /// by its agent id, as a `WorkerChallenge` is; sent by the
+    /// `report_shortfall` tool ([`crate::ShortfallTool`]). Handled by the run
+    /// loop whether or not the run checks interface contracts.
+    Shortfall {
+        worker: AgentId,
+        kind: crate::shortfall::ShortfallKind,
+        need: String,
+        why: String,
+    },
 }
 
 /// The orchestrator's answer.
@@ -1446,6 +1457,8 @@ pub enum ContractReply {
         recipients: usize,
     },
     Arbitrated,
+    /// How a shortfall was resolved (decision 0093), for the reporting worker.
+    Shortfall(String),
     /// Refused without effect.
     Refused(String),
 }

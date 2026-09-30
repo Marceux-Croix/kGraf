@@ -117,3 +117,11 @@ shared problem and must reach everyone holding it.
 **Let the gate catch it.** Retained as a backstop, rejected as the primary
 path. The gate is the latest possible detection point, after both workers
 have built.
+
+## Amendment: a work contract's inadequacy, reported by its worker (decision 0093)
+
+A worker whose instructions are missing something or wrong reports it with `report_shortfall`
+(kind `instructions`), on any contract. The orchestrator marks it on the contract, never as a
+silent edit, and amends additively once: the next attempt's brief quotes the report as data. A
+second report holds for the user. A work contract has no peers holding it, so the report goes to
+the orchestrator alone.

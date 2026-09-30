@@ -602,6 +602,7 @@ impl GeminiAdapter {
         &self,
         url: &str,
         body: &serde_json::Value,
+        bound: std::time::Duration,
     ) -> Result<reqwest::Response, ProviderError> {
         let mut builder = self
             .http
@@ -622,19 +623,15 @@ impl GeminiAdapter {
                 }
             }
         };
-        let response =
-            match tokio::time::timeout(self.config.timeout, builder.json(body).send()).await {
-                Ok(result) => result.map_err(|e| self.send_error(e))?,
-                Err(_) => {
-                    return Err(ProviderError::Transport {
-                        adapter: self.name,
-                        reason: format!(
-                            "no response within {:?} of sending the request",
-                            self.config.timeout
-                        ),
-                    });
-                }
-            };
+        let response = match tokio::time::timeout(bound, builder.json(body).send()).await {
+            Ok(result) => result.map_err(|e| self.send_error(e))?,
+            Err(_) => {
+                return Err(ProviderError::Transport {
+                    adapter: self.name,
+                    reason: format!("no response within {:?} of sending the request", bound),
+                });
+            }
+        };
         let status = response.status();
         if status.as_u16() == 429 {
             kgraf_provider::limits::record_429_now(&self.config.base_url);
@@ -1331,14 +1328,20 @@ impl kgraf_provider::Provider for GeminiAdapter {
                 return Err(error);
             }
         };
-        let http = match self.post(&self.url(&request.model, false), &body).await {
+        // Buffered: no byte arrives until the answer exists, so the bound
+        // scales with the output cap (`ProviderConfig::buffered_timeout`).
+        let bound = self.config.buffered_timeout(request.max_output_tokens);
+        let http = match self
+            .post(&self.url(&request.model, false), &body, bound)
+            .await
+        {
             Ok(http) => http,
             Err(error) => {
                 token.close_on_async(&error, None).await?;
                 return Err(error);
             }
         };
-        let text = match tokio::time::timeout(self.config.timeout, http.text()).await {
+        let text = match tokio::time::timeout(bound, http.text()).await {
             Ok(Ok(text)) => text,
             Ok(Err(e)) => {
                 token.leave_unreconciled_async(None).await?;
@@ -1351,10 +1354,7 @@ impl kgraf_provider::Provider for GeminiAdapter {
                 token.leave_unreconciled_async(None).await?;
                 return Err(ProviderError::Transport {
                     adapter: self.name,
-                    reason: format!(
-                        "response body did not finish within {:?}",
-                        self.config.timeout
-                    ),
+                    reason: format!("response body did not finish within {:?}", bound),
                 });
             }
         };
@@ -1418,7 +1418,10 @@ impl Streaming for GeminiAdapter {
                 return Err(error);
             }
         };
-        let http = match self.post(&self.url(&request.model, true), &body).await {
+        let http = match self
+            .post(&self.url(&request.model, true), &body, self.config.timeout)
+            .await
+        {
             Ok(http) => http,
             Err(error) => {
                 token.close_on_async(&error, None).await?;

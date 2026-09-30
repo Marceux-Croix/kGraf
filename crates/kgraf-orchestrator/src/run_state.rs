@@ -208,6 +208,31 @@ pub struct OpenContract {
     /// failing gate's own commands pass in its worktree.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gate_commands: Vec<String>,
+    /// Shell programs granted to this contract after a worker's permission
+    /// shortfall, each within the operator's ceiling (decision 0093). Every
+    /// fresh attempt's shell allows them, and its brief names them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub granted_programs: Vec<String>,
+    /// Who asked for each grant, and why (decision 0093).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub grants: Vec<crate::shortfall::GrantRecord>,
+    /// Amendments from `instructions` shortfalls (decision 0027's inadequacy,
+    /// recorded, never a silent edit): each is quoted as data in the next
+    /// attempt's brief. Scrubbed and capped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shortfall_notes: Vec<String>,
+    /// Re-dispatches from shortfalls so far, bounded by
+    /// `MAX_SHORTFALL_REDISPATCHES`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub shortfall_redispatches: u32,
+    /// Workers whose attempts ended in a shortfall report: when one finishes,
+    /// its attempt is neither verified nor counted a failure.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shortfall_workers: Vec<AgentId>,
+    /// Set when a shortfall is held for the user: the held reason, applied
+    /// once the reporting attempt has finished.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shortfall_hold: Option<String>,
 }
 
 /// The longest [`OpenContract::last_refusal`] kept, in characters, from the
@@ -283,6 +308,12 @@ impl OpenContract {
             task_kind: None,
             last_refusal: None,
             gate_commands: Vec::new(),
+            granted_programs: Vec::new(),
+            grants: Vec::new(),
+            shortfall_notes: Vec::new(),
+            shortfall_redispatches: 0,
+            shortfall_workers: Vec::new(),
+            shortfall_hold: None,
         }
     }
 
@@ -476,6 +507,12 @@ pub struct RunStateRecord {
     /// resume; a record from before this field existed reads as empty.
     #[serde(default)]
     pub consumer_tests: crate::consumer_tests::ConsumerTestBook,
+    /// Verified contracts whose acceptance says nothing about the work
+    /// (decision 0093): the check always passes, or the accepted worker
+    /// finished after a policy refused a call it never ran. Contract id to
+    /// reason. The run reports them as unverified, never as plainly done.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub unverified: BTreeMap<String, String>,
 }
 
 /// A run's contract-check setting, as its record keeps it.
@@ -638,6 +675,7 @@ impl RunStateRecord {
             source_plan: None,
             parent_run: None,
             consumer_tests: crate::consumer_tests::ConsumerTestBook::default(),
+            unverified: BTreeMap::new(),
         }
     }
 

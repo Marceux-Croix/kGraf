@@ -171,21 +171,26 @@ impl AttemptAssembler {
         })
     }
 
-    /// One attempt's environment, assembled in its live worktree.
+    /// One attempt's environment, assembled in its live worktree, with the
+    /// programs granted to its contract (decision 0093) allowed by its shell.
     async fn assembled(
         &self,
         route: &Route,
         workspace: &Path,
         worker: &kgraf_core::AgentId,
         task: &kgraf_core::TaskId,
+        granted: &[String],
     ) -> std::result::Result<Assembled, String> {
         let ws = self
             .workspaces
             .get(workspace)
             .ok_or_else(|| format!("{} is not a live worktree of this run", workspace.display()))?;
-        let assembly = self
+        let mut assembly = self
             .assembly(&route.name, ws, worker.as_str(), task.as_str())
             .map_err(|e| format!("{e:#}"))?;
+        assembly.config = assembly
+            .config
+            .with_granted_programs(granted.iter().cloned());
         assemble(assembly).await.map_err(|e| format!("{e:#}"))
     }
 }
@@ -209,7 +214,21 @@ impl AttemptEnvs for AttemptAssembler {
         worker: &kgraf_core::AgentId,
         task: &kgraf_core::TaskId,
     ) -> std::result::Result<AttemptEnv, String> {
-        let assembled = self.assembled(route, workspace, worker, task).await?;
+        self.build_granted(route, workspace, worker, task, &[])
+            .await
+    }
+
+    async fn build_granted(
+        &self,
+        route: &Route,
+        workspace: &Path,
+        worker: &kgraf_core::AgentId,
+        task: &kgraf_core::TaskId,
+        granted: &[String],
+    ) -> std::result::Result<AttemptEnv, String> {
+        let assembled = self
+            .assembled(route, workspace, worker, task, granted)
+            .await?;
         Ok(AttemptEnv {
             env: assembled.env.clone(),
             closer: Some(Box::new(AssembledCloser(assembled))),
@@ -236,7 +255,22 @@ impl AttemptEnvs for ResolverOverride {
         worker: &kgraf_core::AgentId,
         task: &kgraf_core::TaskId,
     ) -> std::result::Result<AttemptEnv, String> {
-        let mut assembled = self.inner.assembled(route, workspace, worker, task).await?;
+        self.build_granted(route, workspace, worker, task, &[])
+            .await
+    }
+
+    async fn build_granted(
+        &self,
+        route: &Route,
+        workspace: &Path,
+        worker: &kgraf_core::AgentId,
+        task: &kgraf_core::TaskId,
+        granted: &[String],
+    ) -> std::result::Result<AttemptEnv, String> {
+        let mut assembled = self
+            .inner
+            .assembled(route, workspace, worker, task, granted)
+            .await?;
         // `assemble` returns the only handle to a new environment, so this holds;
         // if it ever did not, the ask would silently go to the rule resolver
         // instead of the host, so it fails loudly.

@@ -562,13 +562,15 @@ impl ChatCompletionsAdapter {
     /// Issue the request and check the status, returning the raw response for
     /// the caller to read (buffered or incrementally) as it sees fit.
     ///
-    /// The `send()` itself is bounded by `config.timeout`: unlike reading the
-    /// body, there is no legitimate reason for the provider to take longer
-    /// than that just to start responding, streaming or not.
+    /// The `send()` itself is bounded by `bound`: `config.timeout` for a
+    /// streamed call, whose first byte does not wait for the answer, and
+    /// [`ProviderConfig::buffered_timeout`] for a buffered one, whose headers
+    /// arrive only when generation ends.
     async fn post(
         &self,
         body: &serde_json::Value,
         model: &str,
+        bound: std::time::Duration,
     ) -> Result<reqwest::Response, ProviderError> {
         let builder = match &self.azure {
             Some(transport) => {
@@ -595,15 +597,12 @@ impl ChatCompletionsAdapter {
                 }
             }
         };
-        let http = match tokio::time::timeout(self.config.timeout, builder.send()).await {
+        let http = match tokio::time::timeout(bound, builder.send()).await {
             Ok(result) => result.map_err(|e| crate::send_error(self.adapter_name(), e))?,
             Err(_) => {
                 return Err(ProviderError::Transport {
                     adapter: self.adapter_name(),
-                    reason: format!(
-                        "no response within {:?} of sending the request",
-                        self.config.timeout
-                    ),
+                    reason: format!("no response within {bound:?} of sending the request"),
                 });
             }
         };
@@ -1042,7 +1041,10 @@ impl kgraf_provider::Provider for ChatCompletionsAdapter {
             return Err(error);
         }
         let body = self.to_wire(request);
-        let http = match self.post(&body, &request.model).await {
+        // Buffered: no byte arrives until the answer exists, so the bound
+        // scales with the output cap (`ProviderConfig::buffered_timeout`).
+        let bound = self.config.buffered_timeout(request.max_output_tokens);
+        let http = match self.post(&body, &request.model, bound).await {
             Ok(http) => http,
             Err(error) => {
                 token.close_on_async(&error, None).await?;
@@ -1071,7 +1073,7 @@ impl kgraf_provider::Provider for ChatCompletionsAdapter {
         // A whole-call bound is correct here: `complete` buffers one response
         // and returns, unlike `stream`, so there is no legitimate reason for
         // reading the body to take longer than `config.timeout`.
-        let text = match tokio::time::timeout(self.config.timeout, http.text()).await {
+        let text = match tokio::time::timeout(bound, http.text()).await {
             Ok(Ok(text)) => text,
             Ok(Err(e)) => {
                 token
@@ -1088,10 +1090,7 @@ impl kgraf_provider::Provider for ChatCompletionsAdapter {
                     .await?;
                 return Err(ProviderError::Transport {
                     adapter: self.adapter_name(),
-                    reason: format!(
-                        "response body did not finish within {:?}",
-                        self.config.timeout
-                    ),
+                    reason: format!("response body did not finish within {:?}", bound),
                 });
             }
         };
@@ -1286,7 +1285,7 @@ impl Streaming for ChatCompletionsAdapter {
         // all (fail loud).
         body["stream_options"] = serde_json::json!({"include_usage": true});
 
-        let http = match self.post(&body, &request.model).await {
+        let http = match self.post(&body, &request.model, self.config.timeout).await {
             Ok(http) => http,
             Err(error) => {
                 token.close_on_async(&error, None).await?;
@@ -1741,6 +1740,53 @@ mod tests {
                 "completion_tokens_details": {"reasoning_tokens": 10}
             }
         })
+    }
+
+    /// A buffered call sends no header until the answer exists, so the bound
+    /// scales with the output cap: headers later than the base timeout but
+    /// inside the scaled bound succeed, and a server that stays silent past
+    /// the scaled bound fails loud.
+    #[tokio::test]
+    async fn a_buffered_call_waits_for_late_headers_within_the_scaled_bound() {
+        use std::time::{Duration, Instant};
+        let slow = |delay: Duration| async move {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(details_body("compatible-model"))
+                        .set_delay(delay),
+                )
+                .mount(&server)
+                .await;
+            // Base 200 ms; 100 tokens at a floor of 100 tokens/s scales to 1 s.
+            let config = config(&server.uri())
+                .with_timeout(Duration::from_millis(200))
+                .with_floor_rate(100);
+            let adapter =
+                ChatCompletionsAdapter::new(config, UsageDialect::Details).expect("adapter");
+            let ledger = Ledger::open_in_memory().expect("ledger");
+            let token = ledger
+                .begin(ADAPTER, Protocol::Inclusive, "compatible-model", "w", "t")
+                .expect("begin");
+            let started = Instant::now();
+            let result = adapter
+                .complete(&Request::new("compatible-model", "hi", 100), &token)
+                .await;
+            (result, started.elapsed())
+        };
+        let (late, _) = slow(Duration::from_millis(600)).await;
+        late.expect("headers after the base timeout, inside the scaled bound");
+        let (never, took) = slow(Duration::from_secs(5)).await;
+        let err = never.expect_err("past the scaled bound");
+        assert!(
+            matches!(&err, ProviderError::Transport { reason, .. } if reason.contains("no response within")),
+            "{err:?}"
+        );
+        assert!(
+            took < Duration::from_secs(3),
+            "fails at the bound: {took:?}"
+        );
     }
 
     /// A model echo mismatch is a parse error, but the body still carries the

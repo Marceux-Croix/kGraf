@@ -445,6 +445,21 @@ enum Command {
         /// are not in the local cache stops before it starts.
         #[arg(long)]
         no_fetch_deps: bool,
+        /// A shell program (an exact argv[0], for example `python3`) the
+        /// orchestrator may grant a contract when a worker reports that a
+        /// policy refused a command it needs (decision 0093). Repeatable.
+        /// Without it nothing is granted, and such a report holds the
+        /// contract for you.
+        #[arg(long = "may-grant", value_name = "PROGRAM")]
+        may_grant: Vec<String>,
+        /// This run's commands execute in a disposable container: workers'
+        /// shell commands are not held to the command policy or to the write
+        /// scope's shell rule (a few forbidden shapes stay refused, and the
+        /// verifier still refuses writes outside a contract's declared
+        /// files). Also requires `KGRAF_CONTAINER_SANDBOX=1` in the
+        /// environment. Never use it on a machine you care about.
+        #[arg(long)]
+        container_sandbox: bool,
     },
     /// Always allow an MCP tool (`mcp__<server>__<tool>`) in this project, for
     /// every worker, attended or not; recorded in `.kgraf/allow-rules.json`.
@@ -948,6 +963,8 @@ fn main() -> Result<()> {
             tbench_bridge_socket,
             fetch_deps,
             no_fetch_deps,
+            may_grant,
+            container_sandbox,
         } => orchestrate_cmd::run(
             &root,
             orchestrate_cmd::OrchestrateArgs {
@@ -988,6 +1005,8 @@ fn main() -> Result<()> {
                 routing,
                 tbench_bridge_socket,
                 fetch_deps: fetch_choice(fetch_deps, no_fetch_deps),
+                may_grant,
+                container_sandbox,
             },
         ),
         Command::Instructions { action } => instructions(&root, action),

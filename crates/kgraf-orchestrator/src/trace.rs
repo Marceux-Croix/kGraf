@@ -156,6 +156,26 @@ pub enum TraceEvent {
         passed: bool,
         detail: String,
     },
+    /// A worker reported that it cannot do its brief as given, and how the
+    /// orchestrator resolved it (decision 0093): `granted ...`, `amended ...`
+    /// or `held for the user: ...`. `kind` is `permission` or `instructions`.
+    Shortfall {
+        at_ms: i64,
+        contract: String,
+        worker: String,
+        kind: String,
+        need: String,
+        why: String,
+        resolution: String,
+    },
+    /// A contract accepted on a check that says nothing about the work
+    /// (decision 0093): reported unverified, never plainly done.
+    Unverified {
+        at_ms: i64,
+        contract: String,
+        worker: String,
+        reason: String,
+    },
     /// A passing verdict's notice: a fact for the owner, not a failure (a
     /// lockfile the check generated and that was not merged).
     Notice {
@@ -163,6 +183,19 @@ pub enum TraceEvent {
         contract: String,
         worker: String,
         detail: String,
+    },
+    /// The planner's answer was refused (not the JSON asked for, or a plan that
+    /// breaks a rule). One per refusal, the last one included, so a run that
+    /// fails planning still shows what it was told and how often. `reason` is
+    /// the refusal text; for an answer that is not JSON it carries the start
+    /// of the answer.
+    PlanRefused {
+        at_ms: i64,
+        /// Which ask was refused, counting from 1.
+        ask: u32,
+        /// How many asks the run allows.
+        of: u32,
+        reason: String,
     },
     Report {
         at_ms: i64,
@@ -369,6 +402,45 @@ fn scrub_trace_fields(event: TraceEvent) -> TraceEvent {
             contract,
             worker,
             detail: s(detail),
+        },
+        TraceEvent::PlanRefused {
+            at_ms,
+            ask,
+            of,
+            reason,
+        } => TraceEvent::PlanRefused {
+            at_ms,
+            ask,
+            of,
+            reason: s(reason),
+        },
+        TraceEvent::Shortfall {
+            at_ms,
+            contract,
+            worker,
+            kind,
+            need,
+            why,
+            resolution,
+        } => TraceEvent::Shortfall {
+            at_ms,
+            contract,
+            worker,
+            kind,
+            need: s(need),
+            why: s(why),
+            resolution: s(resolution),
+        },
+        TraceEvent::Unverified {
+            at_ms,
+            contract,
+            worker,
+            reason,
+        } => TraceEvent::Unverified {
+            at_ms,
+            contract,
+            worker,
+            reason: s(reason),
         },
         TraceEvent::Report {
             at_ms,

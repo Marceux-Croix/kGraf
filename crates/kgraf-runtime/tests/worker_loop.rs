@@ -1643,11 +1643,16 @@ async fn a_denied_call_is_not_run_and_the_model_is_told_why() {
     assert_eq!(result.outcome, WorkerOutcome::Completed);
     assert!(!dir.path().join("x.txt").exists());
     assert!(result.changed_paths.is_empty());
+    // Decision 0093: the denial is followed by how to report a shortfall, and
+    // the result lists it.
     assert!(events.iter().any(|e| matches!(
         e,
         WorkerEvent::ToolCallFinished { output, is_error: true, .. }
-            if output == "ERROR: denied by deny-writes: read-only run"
+            if output.starts_with("ERROR: denied by deny-writes: read-only run.")
+                && output.contains("do not work around it")
     )));
+    assert_eq!(result.refused.len(), 1, "{:?}", result.refused);
+    assert_eq!(result.refused[0].capability, "write_file");
 }
 
 /// A hook whose denial quotes the call's argument back, secret and all.
@@ -2511,6 +2516,88 @@ async fn a_tool_that_may_write_anywhere_is_refused_under_a_declared_scope() {
     let (_, result) = with_timeout(drain(handle)).await.expect("in time");
     assert_eq!(result.denied, 1);
     assert!(!worktree.path().join("outside.rs").exists());
+}
+
+/// Stands in for the orchestrator's `report_shortfall` tool: only its name
+/// matters to the worker loop's refusal text.
+struct ShortfallStandIn;
+
+#[async_trait::async_trait]
+impl Tool for ShortfallStandIn {
+    fn name(&self) -> &str {
+        kgraf_runtime::SHORTFALL_TOOL
+    }
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: kgraf_runtime::SHORTFALL_TOOL.into(),
+            description: "report a shortfall".into(),
+            input_schema: json!({"type": "object"}),
+        }
+    }
+    fn access(&self, _input: &Value) -> Result<Access, ToolError> {
+        Ok(Access::none())
+    }
+    async fn call(
+        &self,
+        _input: Value,
+        _ctx: &ToolContext,
+        _permit: &CallPermit,
+    ) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput::text("recorded"))
+    }
+}
+
+/// Decision 0093: a call refused under a declared scope tells the worker to
+/// report the shortfall rather than work around it, naming
+/// `report_shortfall` when the environment offers it, and the result lists
+/// the refusal as not retried. A call of the same capability that later
+/// runs (the sandboxed build, unscoped) leaves nothing listed.
+#[tokio::test]
+async fn a_policy_refusal_says_how_to_report_it_and_is_listed_on_the_result() {
+    for offered in [false, true] {
+        let worktree = tempfile::tempdir().expect("worktree");
+        let provider = Fake::new(true, |request| match round_of(request) {
+            0 => Round::tool(vec![("t1", "anywhere", json!({}))]),
+            _ => Round::answer("done"),
+        });
+        let mut tools: Vec<Arc<dyn Tool>> = vec![Arc::new(Anywhere)];
+        if offered {
+            tools.push(Arc::new(ShortfallStandIn));
+        }
+        let env = Arc::new(env_with(provider.clone(), tools, CallMode::Stream));
+        let mut b = brief("w1", "run it", worktree.path(), 6);
+        b.write_scope = Some(vec![std::path::PathBuf::from("src/a.rs")]);
+        let handle = spawn_worker(env, b, SpawnOptions::default())
+            .await
+            .expect("spawn");
+        let (events, result) = with_timeout(drain(handle)).await.expect("in time");
+        let (output, _) = finished_output(&events, "t1");
+        assert!(output.starts_with("ERROR: refused: "), "{output}");
+        assert!(output.contains("do not work around it"), "{output}");
+        assert_eq!(output.contains("report_shortfall"), offered, "{output}");
+        assert_eq!(result.refused.len(), 1, "{:?}", result.refused);
+        assert_eq!(result.refused[0].capability, "anywhere");
+        assert!(!result.refused[0].retried_ok);
+    }
+    let worktree = tempfile::tempdir().expect("worktree");
+    let provider = Fake::new(true, |request| match round_of(request) {
+        0 => Round::tool(vec![("t1", "anywhere", json!({}))]),
+        _ => Round::answer("done"),
+    });
+    let env = Arc::new(env_with(
+        provider.clone(),
+        vec![Arc::new(Anywhere)],
+        CallMode::Stream,
+    ));
+    let handle = spawn_worker(
+        env,
+        brief("w1", "run it", worktree.path(), 6),
+        SpawnOptions::default(),
+    )
+    .await
+    .expect("spawn");
+    let (_, result) = with_timeout(drain(handle)).await.expect("in time");
+    assert!(result.refused.is_empty(), "{:?}", result.refused);
 }
 
 /// Declares what an allowlisted build from a workspace-bound shell tool

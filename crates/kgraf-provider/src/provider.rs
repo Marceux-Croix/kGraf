@@ -56,9 +56,20 @@ pub struct ProviderConfig {
     /// Defaults to false where unknown, because emitting breakpoints at a
     /// provider that drops them costs money silently and gains nothing.
     pub honors_cache_control: bool,
-    /// Request timeout.
+    /// Request timeout: how long a provider may take to start responding, and
+    /// the base allowance for a buffered (non-streamed) call.
     pub timeout: std::time::Duration,
+    /// The slowest generation rate a buffered call tolerates, in tokens per
+    /// second. A buffered call sends no byte until the whole answer exists, so
+    /// its wait is the generation time; [`ProviderConfig::buffered_timeout`]
+    /// scales the bound by this rate. Streamed calls are not scaled: their
+    /// first byte does not wait for the answer.
+    pub floor_tokens_per_second: u32,
 }
+
+/// The default of [`ProviderConfig::floor_tokens_per_second`]. A 64,000-token
+/// answer then gets 3,200 seconds before it is declared lost.
+pub const DEFAULT_FLOOR_TOKENS_PER_SECOND: u32 = 20;
 
 impl ProviderConfig {
     /// A configuration, refusing an absent credential at construction.
@@ -81,6 +92,7 @@ impl ProviderConfig {
             protocol,
             honors_cache_control: false,
             timeout: std::time::Duration::from_secs(600),
+            floor_tokens_per_second: DEFAULT_FLOOR_TOKENS_PER_SECOND,
         })
     }
 
@@ -107,6 +119,7 @@ impl ProviderConfig {
             // has no rate limit to protect. A timeout tuned for a hosted endpoint
             // would cancel legitimate work.
             timeout: std::time::Duration::from_secs(1800),
+            floor_tokens_per_second: DEFAULT_FLOOR_TOKENS_PER_SECOND,
         }
     }
 
@@ -135,6 +148,25 @@ impl ProviderConfig {
     pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.timeout = timeout;
         self
+    }
+
+    /// Set the slowest generation rate a buffered call tolerates (tokens per
+    /// second). `u32::MAX` leaves the bound at `timeout`.
+    pub fn with_floor_rate(mut self, tokens_per_second: u32) -> Self {
+        self.floor_tokens_per_second = tokens_per_second.max(1);
+        self
+    }
+
+    /// The bound on one buffered (non-streamed) call that may generate up to
+    /// `max_output_tokens`: the larger of `timeout` and the time the answer
+    /// takes at `floor_tokens_per_second`. A fixed bound cut off a 64,000-token
+    /// planner answer that was still being generated, since the response
+    /// headers of a buffered call arrive only when generation ends.
+    pub fn buffered_timeout(&self, max_output_tokens: u32) -> std::time::Duration {
+        let rate = u64::from(self.floor_tokens_per_second.max(1));
+        let generation =
+            std::time::Duration::from_secs(u64::from(max_output_tokens).div_ceil(rate));
+        self.timeout.max(generation)
     }
 
     /// Refuse a model this configuration does not serve.
@@ -241,6 +273,20 @@ mod tests {
             other => panic!("wrong error: {other:?}"),
         }
         config().check_model("test", "good-model").expect("served");
+    }
+
+    #[test]
+    fn a_buffered_call_is_bounded_by_its_generation_time_at_the_floor_rate() {
+        use std::time::Duration;
+        let c = config();
+        assert_eq!(
+            c.buffered_timeout(1_000),
+            Duration::from_secs(600),
+            "base holds"
+        );
+        assert_eq!(c.buffered_timeout(64_000), Duration::from_secs(3_200));
+        let fast = config().with_floor_rate(u32::MAX);
+        assert_eq!(fast.buffered_timeout(64_000), Duration::from_secs(600));
     }
 
     #[test]

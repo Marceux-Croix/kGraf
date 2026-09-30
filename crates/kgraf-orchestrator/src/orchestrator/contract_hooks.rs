@@ -1101,6 +1101,11 @@ impl RunLoop {
                 overturn,
                 note,
             } => Some((self.on_arbitrate(interface, overturn, note).await?, reply)),
+            // The run loop takes a shortfall before this point (decision 0093).
+            ContractControl::Shortfall { .. } => Some((
+                ContractReply::Refused("a shortfall is handled by the run loop".into()),
+                reply,
+            )),
         };
         self.save()?;
         if let Some((r, reply)) = now {

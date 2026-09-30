@@ -579,6 +579,31 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   that changes a file outside the declared writes. The list is on unless `build_commands`
   says otherwise, for attended workers too, and a cargo command that breaks an argument rule
   is refused outright, not asked about.
+- A worker whose call is refused by policy, or whose instruction lacks something it needs, is
+  told to report it and stop (`report_shortfall`, decision 0093). What the orchestrator does:
+  - `--may-grant PROGRAM` (repeatable, on `orchestrate`): a program the orchestrator may grant
+    to that one contract without asking, an exact `argv[0]` such as `python3`. The next attempt
+    is a fresh worker whose shell runs it under the contract's write scope, in the sandbox;
+    the verifier still refuses a commit that changes a file outside the declared writes.
+    Without `--may-grant` nothing is granted, and the contract is held with a message that
+    names the program and the flag that would allow it. Rerun with it to continue.
+  - An instructions report amends the contract once: the next attempt's brief carries the
+    report. A second one holds the contract for you.
+  - A contract is re-dispatched at most twice for shortfalls; a grant that did not help holds.
+  - Every grant and hold is in the run's trace (`shortfall` events), and each grant is kept on
+    the contract with the worker that asked for it and why.
+- `--container-sandbox` (on `orchestrate`) says this run's commands execute in a disposable
+  container. Workers' shell commands then run without approval and under a write scope,
+  except the few the policy forbids; a skill's `allowed-tools` still applies. It needs
+  `KGRAF_CONTAINER_SANDBOX=1` in the environment as well: the flag alone stops the command
+  before it starts, and the variable alone does nothing. The command prints
+  `kgraf: CONTAINER SANDBOX ON` to stderr. Neither this nor `--may-grant` can be set in
+  `.kgraf/worker.json` or `.kgraf/run.json`; only the command line sets them, and a scheduled
+  run uses neither. Never use it on a machine you care about.
+- A contract whose check always passes (`--verify true`, `:`, `exit 0`), or whose worker
+  finished after a policy refused a call it never ran, is printed as `unverified <id>:
+  <reason>` after the `verified` line. The run still completes; the line says the check did
+  not look at the work.
 - While a worker's worktree has a `.cargo/config.toml`, `.cargo/config`, `rust-toolchain` or
   `rust-toolchain.toml` that differs from the one it started with, every allowlisted command
   is refused: those files can change what cargo runs whatever its arguments say.

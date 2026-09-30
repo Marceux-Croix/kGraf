@@ -301,6 +301,15 @@ inside the input total, and one vendor ships both behind a single key. Every
 call stores six independent usage fields plus the raw usage response
 verbatim.
 
+**A buffered call's time bound scales with its output cap.** A call that is not
+streamed sends no byte until the whole answer exists, so the wait for the response
+headers is the generation time. The bound is the larger of the configured timeout
+(600 seconds by default) and the output cap divided by a floor rate of 20 tokens per
+second (`ProviderConfig::floor_tokens_per_second`): 3,200 seconds at a 64,000-token
+cap. A streamed call keeps the configured timeout, since its first byte does not wait
+for the answer. The Chat Completions, Responses, Anthropic, Bedrock and Gemini adapters
+all apply it.
+
 **Every adapter asserts the response model equals the requested model.**
 Testing against real vendors, rather than mocks, found three providers that
 silently substitute or ignore the requested model while still returning
@@ -509,6 +518,11 @@ reference, then a handshake, one call per party on that party's own route
 through the ledger. A worker challenges with a dedicated tool; one challenge
 per lineage and interface is open at a time, each worker has a fixed budget
 of challenges, and escalation to the user follows only a paid review.
+
+A refused planner answer is named where it can be corrected: an interface file entry with no
+`content` is refused with its location (`interfaces[0].tests[1]`) and path, and a contract
+that depends on an interface id is refused as such. Every refusal, the last included, is a
+`plan_refused` trace event, and a run that fails planning prints them.
 
 The mechanical checks also run on each planner answer: an interface that is
 incomplete, or fails stub-compile or vacuity, refuses the answer with the
@@ -1050,8 +1064,17 @@ directly by a worker's edits before its merge is accepted.
 
 A worker builds and tests its own work. A declared allowlist of build and
 test commands runs without approval in the sandbox with the network off
-(decision 0084); under a write scope nothing else that can write runs. A
-dependency missing from the local cargo cache is fetched by the host, outside
+(decision 0084); under a write scope nothing else that can write runs, unless
+the operator granted it. A worker refused by policy, or short of
+instructions, reports it with `report_shortfall` and stops; the orchestrator
+grants the program to that contract only within the operator's `--may-grant`
+ceiling (empty by default), amends the contract once for an instructions
+report, and otherwise holds it with a question for the user, at most two
+re-dispatches per contract. `--container-sandbox` (with
+`KGRAF_CONTAINER_SANDBOX=1`) lifts the shell's command policy for a run inside
+a disposable container. A contract accepted on a check that always passes, or
+after a refusal its worker never retried, is reported unverified (decision
+0093). A dependency missing from the local cargo cache is fetched by the host, outside
 the sandbox, only with the project's consent, checked at every run start
 before anything is built (decision 0087). An attempt that changed no file is
 refused when a declared Rust write target holds only placeholder bodies, and
