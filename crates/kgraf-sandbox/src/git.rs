@@ -62,6 +62,25 @@ impl Git {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
+        self.run_with_stdin(cwd, args, &[])
+    }
+
+    /// [`Self::run`] with `input` written to git's standard input, for a
+    /// command that reads requests from it (`cat-file --batch`). The input is
+    /// written from a second thread, so a large reply cannot deadlock against
+    /// an unread pipe.
+    pub fn run_with_stdin<I, S>(
+        &self,
+        cwd: &Path,
+        args: I,
+        input: &[u8],
+    ) -> Result<Vec<u8>, WorkspaceError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        use std::io::Write;
+        use std::process::Stdio;
         let args: Vec<OsString> = args.into_iter().map(|a| a.as_ref().to_owned()).collect();
         let mut cmd = Command::new(&self.exe);
         cmd.arg("-C").arg(cwd).args(&args);
@@ -71,7 +90,25 @@ impl Git {
         // Never block on a credential prompt; keep messages in one language
         // so callers can match the "is not a working tree" case if needed.
         cmd.env("GIT_TERMINAL_PROMPT", "0").env("LC_ALL", "C");
-        let output = cmd.output().map_err(|e| WorkspaceError::io(&self.exe, e))?;
+        cmd.stdin(if input.is_empty() {
+            Stdio::null()
+        } else {
+            Stdio::piped()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+        let mut child = cmd.spawn().map_err(|e| WorkspaceError::io(&self.exe, e))?;
+        let writer = child.stdin.take();
+        let output = std::thread::scope(|scope| {
+            if let Some(mut stdin) = writer {
+                // A write error is git having exited early; its status says why.
+                scope.spawn(move || {
+                    let _ = stdin.write_all(input);
+                });
+            }
+            child.wait_with_output()
+        })
+        .map_err(|e| WorkspaceError::io(&self.exe, e))?;
         if output.status.success() {
             Ok(output.stdout)
         } else {

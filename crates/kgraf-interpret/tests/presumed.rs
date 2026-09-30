@@ -391,6 +391,44 @@ fn a_large_roadmap_is_presumed_and_a_re_read_writes_nothing() {
     }
 }
 
+/// Reading, syncing and deriving grow in step with the roadmap, on any machine:
+/// four times the rows take far less than the sixteen times a quadratic pass
+/// would need. Each size runs three times on a fresh store and the fastest
+/// counts. The ratio is asserted, not an absolute time.
+#[test]
+fn presuming_a_roadmap_grows_in_step_with_its_size() {
+    let fastest = |n: usize| {
+        (0..3)
+            .map(|_| {
+                let dir = tempfile::tempdir().expect("dir");
+                let db = tempfile::tempdir().expect("db");
+                let mut doc = String::from("## P\n\n| Phase | What | Status |\n|---|---|---|\n");
+                for i in 0..n {
+                    doc.push_str(&format!("| {i} | thing {i} | Complete |\n"));
+                }
+                for i in 0..n {
+                    doc.push_str(&format!("\n### Phase {i}: thing\n\nIn `src/m{i}.rs`.\n"));
+                }
+                write(dir.path(), "ROADMAP.md", &doc);
+                let s = store(dir.path(), db.path());
+                let started = std::time::Instant::now();
+                let r = presume(&s, 1);
+                let views = presumed::views(&s).expect("views");
+                let took = started.elapsed();
+                assert_eq!((r.items, views.len()), (n, n + 2));
+                took
+            })
+            .min()
+            .expect("three runs")
+    };
+    let (small, large) = (fastest(1_000), fastest(4_000));
+    let floor = std::time::Duration::from_millis(1);
+    assert!(
+        large < small.max(floor) * 10,
+        "4x the rows took {large:?} against {small:?}: presuming is no longer linear"
+    );
+}
+
 #[test]
 fn a_document_with_no_structure_yields_no_items_and_says_so() {
     let dir = tempfile::tempdir().expect("dir");

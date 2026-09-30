@@ -167,3 +167,11 @@ and breadth option, since it genuinely honors cache control including a
 one-hour TTL and takes no markup on inference.
 
 **Hand-rolled clients behind a thin trait.** Chosen.
+
+**Amended 2026-09-29: an inconsistent usage object keeps the answer.** When a hybrid endpoint's
+usage object cannot be trusted (`cached_tokens` above the cache read the adapter reads, or
+`total_tokens` not equal to the parts), the Anthropic adapter no longer refuses the reply after
+the call was billed. It returns the answer, settles nothing, leaves the ledger row
+unreconciled with the counted fields as a lower bound and a `kgraf_note` in the raw usage, and
+logs a warning. The row is then priced by the reconcile step (`kgraf unreconciled resolve`), not
+guessed. The direct `normalize_usage` function still refuses such an object.

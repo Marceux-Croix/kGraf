@@ -401,19 +401,7 @@ async fn prepare(
     // `.git` on disk now may have been planted by an earlier command.
     let git_at_start = match options.resume_from.as_deref() {
         None => crate::worktree::git_entry(&brief.workspace_root),
-        Some(events) => match events.iter().find_map(|event| match event {
-            WorkerEvent::Context { gitlink, .. } => Some(gitlink.clone()),
-            _ => None,
-        }) {
-            Some(Some(gitlink)) => Ok(crate::worktree::GitEntry::recorded(
-                &brief.workspace_root,
-                gitlink,
-            )),
-            _ => Err(format!(
-                "no gitlink at {} was recorded when this worker first started",
-                brief.workspace_root.display()
-            )),
-        },
+        Some(events) => resumed_git_entry(&brief.workspace_root, events),
     };
     let (builder, rounds_used, delivered) = match options.resume_from {
         Some(events) => {
@@ -547,7 +535,7 @@ async fn prepare(
     if saw_build {
         let root = brief.workspace_root.clone();
         // Checked against the gitlink the first segment recorded, not the
-        // `.git` on disk now.
+        // `.git` on disk now (`resumed_git_entry`).
         let at_start = git_at_start.clone();
         match tokio::task::spawn_blocking(move || crate::worktree::dirty_paths(&root, &at_start?))
             .await
@@ -1059,6 +1047,7 @@ impl Worker {
                 .as_ref()
                 .ok()
                 .map(|entry| entry.gitlink().to_owned()),
+            no_gitlink: self.git_at_start.is_err(),
         };
         self.emit(ep, context).await?;
         loop {
@@ -2426,6 +2415,52 @@ impl StreamSeen {
 /// The tool calls of the last round in `events`, in issue order: those started
 /// after the last model call. Empty when the last round made none (it answered,
 /// or was cancelled before its response).
+/// The `.git` entry a resumed worker's status reads check against: the one
+/// the transcript's first recorded `Context` holds. A recorded "no gitlink"
+/// stays that way: a `.git` found at the root now could have been planted
+/// by an earlier command. A transcript written before the gitlink was
+/// recorded has a `Context` with neither field; for it the entry is read at
+/// the root now. The worker is resumed only in a worktree the host has just
+/// reopened, and reopen refuses one whose gitlink or admin directory is not
+/// what the host recorded when it made it, so that read is the host's
+/// verified entry. This segment's `Context` then records it, and a later
+/// resume uses the record.
+fn resumed_git_entry(
+    root: &std::path::Path,
+    events: &[WorkerEvent],
+) -> Result<crate::worktree::GitEntry, String> {
+    let none_recorded = || {
+        Err(format!(
+            "no gitlink at {} was recorded when this worker first started",
+            root.display()
+        ))
+    };
+    let mut old_format = false;
+    for event in events {
+        if let WorkerEvent::Context {
+            gitlink,
+            no_gitlink,
+            ..
+        } = event
+        {
+            match (gitlink, no_gitlink) {
+                (Some(gitlink), _) => {
+                    return Ok(crate::worktree::GitEntry::recorded(root, gitlink.clone()));
+                }
+                // A record of none, even one a segment after an old-format
+                // one wrote: never read what is on disk now.
+                (None, true) => return none_recorded(),
+                (None, false) => old_format = true,
+            }
+        }
+    }
+    if old_format {
+        crate::worktree::git_entry(root)
+    } else {
+        none_recorded()
+    }
+}
+
 fn last_round_tools(events: &[WorkerEvent]) -> Vec<String> {
     let mut tools = Vec::new();
     for event in events {
@@ -2528,5 +2563,56 @@ mod known_limits {
             kgraf_secrets::scrub_persist(part2)
         );
         assert!(reassembled.contains(&secret));
+    }
+}
+
+#[cfg(test)]
+mod resumed_git_entry_tests {
+    use super::{WorkerEvent, resumed_git_entry};
+    use std::path::Path;
+
+    fn context(gitlink: Option<&str>, no_gitlink: bool) -> WorkerEvent {
+        WorkerEvent::Context {
+            prefix_digest: "d".into(),
+            slices: vec![],
+            gitlink: gitlink.map(str::to_owned),
+            no_gitlink,
+        }
+    }
+
+    /// A recorded "no gitlink" survives the store: it is written, and read
+    /// back as a record, not as the old format's gap.
+    #[test]
+    fn a_recorded_none_round_trips() {
+        let text = serde_json::to_string(&context(None, true)).expect("json");
+        assert!(text.contains("\"no_gitlink\":true"), "{text}");
+        let back: WorkerEvent = serde_json::from_str(&text).expect("back");
+        assert!(matches!(
+            back,
+            WorkerEvent::Context {
+                no_gitlink: true,
+                ..
+            }
+        ));
+        let with = serde_json::to_string(&context(Some("gitdir: x"), false)).expect("json");
+        assert!(!with.contains("no_gitlink"), "{with}");
+    }
+
+    /// Nowhere to read from: the root has no `.git` at all. A recorded none,
+    /// even after an old-format segment, is final; an old-format transcript
+    /// alone reads the root (and here finds nothing).
+    #[test]
+    fn a_record_wins_and_only_the_old_format_reads_the_root() {
+        let dir = tempfile::tempdir().expect("dir");
+        let root = dir.path();
+        let recorded = resumed_git_entry(root, &[context(Some("gitdir: /x"), false)]);
+        assert_eq!(recorded.expect("recorded").gitlink(), "gitdir: /x");
+        let none = resumed_git_entry(root, &[context(None, false), context(None, true)])
+            .expect_err("a recorded none");
+        assert!(none.contains("was recorded"), "{none}");
+        let old = resumed_git_entry(root, &[context(None, false)]).expect_err("nothing on disk");
+        assert!(!old.contains("was recorded"), "the root was read: {old}");
+        let empty = resumed_git_entry(Path::new("/nonexistent"), &[]).expect_err("no context");
+        assert!(empty.contains("was recorded"), "{empty}");
     }
 }

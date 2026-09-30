@@ -489,8 +489,13 @@ impl ScheduleStore {
     }
 
     /// Extend a manual run's lock. `false` when `holder` no longer holds it: the
-    /// row is gone, or the lease had already lapsed as of `now`. A lapsed lease may
-    /// already have let the scheduler claim the schedule, so it is not revived.
+    /// row is gone or another manual run took it over, or the scheduler claimed the
+    /// schedule while the lease had lapsed (a live scheduled claim exists).
+    ///
+    /// A lease that lapsed with nobody having taken the schedule (a laptop asleep
+    /// past the lease) is renewed: the row still names `holder`, and no claim
+    /// changed the schedule's state, so the run has not lost anything. Once the
+    /// scheduler has claimed an occurrence the lapsed lock is not revived.
     pub fn renew_manual_run(
         &self,
         schedule_id: &str,
@@ -499,12 +504,33 @@ impl ScheduleStore {
         lease: Duration,
     ) -> Result<bool, ScheduleError> {
         let expires = now + to_chrono_duration(lease, "manual run lease")?;
-        let updated = self.conn.execute(
-            "UPDATE manual_locks SET lease_expires_at_millis = ?1
-             WHERE schedule_id = ?2 AND holder = ?3 AND lease_expires_at_millis >= ?4",
-            params![to_millis(expires), schedule_id, holder, to_millis(now)],
-        )?;
-        Ok(updated == 1)
+        let now_millis = to_millis(now);
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let outcome = (|| -> Result<bool, ScheduleError> {
+            let live_claim: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM occurrences
+                     WHERE schedule_id = ?1 AND status = 'claimed'
+                       AND lease_expires_at_millis >= ?2)",
+                params![schedule_id, now_millis],
+                |row| row.get(0),
+            )?;
+            if live_claim {
+                return Ok(false);
+            }
+            let updated = self.conn.execute(
+                "UPDATE manual_locks SET lease_expires_at_millis = ?1
+                 WHERE schedule_id = ?2 AND holder = ?3",
+                params![to_millis(expires), schedule_id, holder],
+            )?;
+            Ok(updated == 1)
+        })();
+        match &outcome {
+            Ok(_) => self.conn.execute_batch("COMMIT")?,
+            Err(_) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+            }
+        }
+        outcome
     }
 
     /// End a manual run's lock. A holder that is no longer the holder leaves the
@@ -2598,8 +2624,57 @@ mod tests {
         );
     }
 
-    /// A lapsed manual lock is not revived by a late renewal: the scheduler may
-    /// already have claimed the schedule.
+    /// A lease that lapsed while nobody took the schedule (the machine slept past
+    /// it) is renewed: the run still holds the lock and lost nothing.
+    #[test]
+    fn a_lapsed_manual_lock_nobody_took_is_renewed() {
+        let store = ScheduleStore::open_in_memory().expect("store");
+        let now = t(9, 0, 0);
+        store
+            .claim_manual_run("s", "run-now:1", now, LEASE, false)
+            .expect("manual");
+        let woke = now + chrono::Duration::seconds(LEASE.as_secs() as i64 * 5);
+        assert!(
+            store
+                .renew_manual_run("s", "run-now:1", woke, LEASE)
+                .expect("renew"),
+            "the run lost nothing while the machine slept"
+        );
+        // The renewed lock blocks the scheduler again.
+        assert_eq!(
+            store
+                .claim_occurrence("s", t(9, 0, 30), "loop-a", woke, LEASE)
+                .expect("claim"),
+            ClaimOutcome::NotClaimed
+        );
+    }
+
+    /// A lapsed lock another manual run has since taken is not renewed by the
+    /// first run.
+    #[test]
+    fn a_lapsed_manual_lock_another_run_took_is_not_renewed() {
+        let store = ScheduleStore::open_in_memory().expect("store");
+        let now = t(9, 0, 0);
+        store
+            .claim_manual_run("s", "run-now:1", now, LEASE, false)
+            .expect("manual");
+        let later = now + chrono::Duration::seconds(LEASE.as_secs() as i64 + 1);
+        assert!(matches!(
+            store
+                .claim_manual_run("s", "run-now:2", later, LEASE, false)
+                .expect("second"),
+            ManualClaim::Claimed { .. }
+        ));
+        assert!(
+            !store
+                .renew_manual_run("s", "run-now:1", later, LEASE)
+                .expect("renew"),
+            "the first run renewed the second run's lock"
+        );
+    }
+
+    /// A lapsed manual lock is not revived by a late renewal once the scheduler
+    /// has claimed the schedule.
     #[test]
     fn a_lapsed_manual_lock_is_not_renewed() {
         let store = ScheduleStore::open_in_memory().expect("store");

@@ -206,7 +206,9 @@ const SYSTEM_READS: &[&str] = &[
 /// Toolchain paths under `$HOME`, readable (not writable).
 const HOME_READS: &[&str] = &[
     // Not ~/.cargo itself: credentials.toml lives there. config.toml is
-    // therefore not read either; pass CARGO_HOME settings through env.
+    // therefore not read either; its non-secret settings reach the command
+    // through a cargo home of its own that the host writes
+    // (`super::cargo_home`).
     ".cargo/bin",
     ".cargo/registry",
     ".cargo/git",
@@ -225,6 +227,16 @@ const HOME_READS: &[&str] = &[
     ".cache/sccache",
     ".cache/node-gyp",
     ".cache/pre-commit",
+    // Poetry's cache (its package cache and, by default, the project
+    // virtualenvs; its repository logins live in `~/.config/pypoetry` or the
+    // system keyring), the browser builds Playwright and Cypress download,
+    // and Deno's module cache (`DENO_DIR`; Deno takes registry tokens from
+    // `DENO_AUTH_TOKENS`, never from a file here). Each tool's documented
+    // Linux default.
+    ".cache/pypoetry",
+    ".cache/ms-playwright",
+    ".cache/Cypress",
+    ".cache/deno",
     ".nvm",
     ".pyenv",
     ".gitconfig",
@@ -248,6 +260,11 @@ const HOME_READS: &[&str] = &[
     ".local/share/pipx",
     ".local/share/virtualenv",
     ".local/share/rustup",
+    // Pipenv's virtualenvs (`WORKON_HOME`) and the Poetry installation the
+    // official installer makes (`POETRY_HOME`). No login is stored in either;
+    // the keyrings beside them in `~/.local/share` stay unreadable.
+    ".local/share/virtualenvs",
+    ".local/share/pypoetry",
 ];
 
 // Files cargo reads in every ancestor of the directory it runs in, relative
@@ -915,6 +932,12 @@ mod tests {
             ".cache/sccache/0/entry",
             ".cache/node-gyp/20/include/node.h",
             ".cache/pre-commit/repo/hook.py",
+            ".cache/pypoetry/virtualenvs/p-py3.12/bin/python",
+            ".cache/ms-playwright/chromium-1140/chrome-linux/chrome",
+            ".cache/Cypress/13.6.0/Cypress/Cypress",
+            ".cache/deno/remote/https/deno.land/mod.ts",
+            ".local/share/virtualenvs/p-AbCd/bin/python",
+            ".local/share/pypoetry/venv/bin/poetry",
         ] {
             let path = home.join(rel);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();

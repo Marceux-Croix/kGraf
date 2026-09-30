@@ -846,7 +846,8 @@ const UNPRICED_READ_TTL_MS: i64 = 5_000;
 
 /// Ticks (500 ms by default, so 20 minutes) after which a contract still
 /// waiting on a route that is not ready is held with the reason, instead of
-/// waiting without end. Measured in time from the first failed check.
+/// waiting without end. Measured in time from the first failed check. The
+/// hold notice says how to resume once the route is back.
 const READINESS_GIVE_UP_TICKS: i64 = 2400;
 
 enum LoopMsg {
@@ -1285,9 +1286,9 @@ struct InFlight {
     clock: Arc<dyn Clock>,
     /// Read at drop to settle each running worker at its exact spend.
     ledger: Arc<Ledger>,
-    prices: PriceTable,
+    prices: Arc<PriceTable>,
     /// Calls already charged to the budget when the flight began.
-    charged: BTreeSet<CallId>,
+    charged: Arc<BTreeSet<CallId>>,
 }
 
 impl Drop for InFlight {
@@ -1844,7 +1845,11 @@ struct RunLoop {
     run_lease_lost: bool,
     /// Ledger calls already charged (at open, or when a worker or subagent
     /// finished); never charged again.
-    seeded: BTreeSet<CallId>,
+    /// Shared with each flight's drop-time settlement, which reads the set as
+    /// it stood at dispatch: a mutation while a flight holds it copies on write.
+    seeded: Arc<BTreeSet<CallId>>,
+    /// `s.prices`, shared so a dispatch clones a handle, not the table.
+    shared_prices: Arc<PriceTable>,
     serialized_seen: BTreeSet<String>,
     since_reground: u32,
     reground_on_resume: bool,
@@ -2159,6 +2164,7 @@ impl RunLoop {
             since_reground: 0,
             reground_on_resume: resumed,
             config,
+            shared_prices: Arc::new(services.prices.clone()),
             s: services,
             tx,
             rx,
@@ -2176,7 +2182,7 @@ impl RunLoop {
             nonce: run_holder.rsplit(':').next().unwrap_or_default().to_owned(),
             run_holder,
             run_lease_lost: false,
-            seeded: precharged.into_inner().unwrap_or_default(),
+            seeded: Arc::new(precharged.into_inner().unwrap_or_default()),
             serialized_seen: BTreeSet::new(),
             stopping: false,
             route_cursor: 0,
@@ -2254,7 +2260,7 @@ impl RunLoop {
                 continue;
             }
             // Already charged in this process (see `Orchestrator::precharged`).
-            if !self.seeded.insert(c.id.clone()) {
+            if !Arc::make_mut(&mut self.seeded).insert(c.id.clone()) {
                 continue;
             }
             // An unpriced call's cost is unknown: it is not charged as `$0`
@@ -2356,7 +2362,7 @@ impl RunLoop {
         };
         let mut charged = Vec::new();
         for record in records.into_iter().flatten() {
-            if !self.seeded.insert(record.id.clone()) {
+            if !Arc::make_mut(&mut self.seeded).insert(record.id.clone()) {
                 continue;
             }
             match self.ledger_cost(&record) {
@@ -4316,11 +4322,17 @@ impl RunLoop {
                 if failure.is_transient() && now - since < give_up_ms {
                     // A fresh pick moves on: the next one starts at the next
                     // route (Rotation) or passes this route over (Fitness).
-                    if Self::route_is_fresh(&contract) {
-                        self.not_ready_routes
+                    // The shared cursor moves once per route the contract
+                    // finds not ready, not once per check: a contract stuck
+                    // on one route for many ticks must not spin the rotation
+                    // the other contracts draw from.
+                    if Self::route_is_fresh(&contract)
+                        && self
+                            .not_ready_routes
                             .entry(id.to_owned())
                             .or_default()
-                            .insert(r.clone());
+                            .insert(r.clone())
+                    {
                         self.commit_route_pick();
                     }
                     self.wake_at = Some(self.now() + self.config.tick.as_millis() as i64);
@@ -4355,7 +4367,11 @@ impl RunLoop {
                     self.readiness_since.remove(id);
                     self.not_ready_routes.remove(id);
                     let detail = if failure.is_transient() {
-                        format!("not ready after {waits_so_far} checks: {detail}")
+                        format!(
+                            "not ready after {waits_so_far} checks over {} minutes: {detail}; \
+                             fix the route, then run `kgraf orchestrate --resume <run>` to try again",
+                            (now - since) / 60_000
+                        )
                     } else {
                         detail
                     };
@@ -4536,7 +4552,7 @@ impl RunLoop {
             task: contract.task.as_str().to_owned(),
             clock: self.s.clock.clone(),
             ledger: self.s.ledger.clone(),
-            prices: self.s.prices.clone(),
+            prices: self.shared_prices.clone(),
             charged: self.seeded.clone(),
         };
 
@@ -5114,8 +5130,8 @@ impl RunLoop {
         // Charged now. An attempt stopped and resumed in this process is a
         // worker that carries its earlier calls, so its next result lists them
         // again; marking them keeps that result from charging them twice.
-        self.seeded.extend(f.result.calls.iter().cloned());
-        self.seeded.extend(tool_calls);
+        Arc::make_mut(&mut self.seeded).extend(f.result.calls.iter().cloned());
+        Arc::make_mut(&mut self.seeded).extend(tool_calls);
         if let Some(o) = overrun {
             self.on_overrun(o).await?;
         }
@@ -7365,8 +7381,8 @@ mod tests {
             task: "r/a".into(),
             clock: Arc::new(crate::clock::SystemClock),
             ledger: Arc::new(Ledger::open_in_memory().expect("ledger")),
-            prices: PriceTable::new(),
-            charged: BTreeSet::new(),
+            prices: Arc::new(PriceTable::new()),
+            charged: Arc::new(BTreeSet::new()),
         }
     }
 
@@ -7444,7 +7460,7 @@ mod tests {
     async fn a_dropped_flight_keeps_its_slot_and_hold_until_the_worker_ends() {
         let admission = Admission::new(crate::admission::Limits::new(4, 4).unwrap());
         let mut flight = bare_flight(admission.clone());
-        flight.prices = prices_for_m();
+        flight.prices = Arc::new(prices_for_m());
         ledger_call(&flight.ledger, "w1", "m", 700);
         let hold = Money::from_micros(700);
         let ended_tx = dropped_flight_with_running_worker(flight, &admission, "w1", hold);
@@ -7475,7 +7491,7 @@ mod tests {
         let admission = Admission::new(crate::admission::Limits::new(4, 4).unwrap());
         let clock = Arc::new(crate::clock::ManualClock::new(0));
         let mut flight = bare_flight(admission.clone());
-        flight.prices = prices_for_m();
+        flight.prices = Arc::new(prices_for_m());
         flight.clock = clock.clone();
         ledger_call(&flight.ledger, "w1", "m", 5_000);
         ledger_call(&flight.ledger, "w1", "m", 2_000);
@@ -7504,7 +7520,7 @@ mod tests {
     async fn a_dropped_flight_never_records_an_unpriced_worker_as_a_known_zero() {
         let admission = Admission::new(crate::admission::Limits::new(4, 4).unwrap());
         let mut flight = bare_flight(admission.clone());
-        flight.prices = prices_for_m();
+        flight.prices = Arc::new(prices_for_m());
         ledger_call(&flight.ledger, "w1", "unpriced", 8_000);
         let hold = Money::from_micros(900);
         let ended_tx = dropped_flight_with_running_worker(flight, &admission, "w1", hold);

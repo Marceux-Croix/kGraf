@@ -196,6 +196,15 @@ fn overlaps(a: &Path, b: &Path, case: PathCase) -> bool {
         // name as one file, so the comparison normalizes; on a volume that
         // does not (ext4), two such names only serialize, which is safe.
         PathCase::Sensitive => {
+            // Two ASCII paths are already in NFC, so the plain component-wise
+            // comparison gives the same answer without allocating; a run of
+            // calls compares every pair of paths, and nearly all are ASCII.
+            if let (Some(x), Some(y)) = (a.to_str(), b.to_str())
+                && x.is_ascii()
+                && y.is_ascii()
+            {
+                return a.starts_with(b) || b.starts_with(a);
+            }
             let norm = |p: &Path| PathBuf::from(kgraf_core::paths::normalize_path(p));
             let (a, b) = (norm(a), norm(b));
             a.starts_with(&b) || b.starts_with(&a)
@@ -255,6 +264,40 @@ mod tests {
 
     fn write(p: &str) -> Access {
         Access::none().write_path(p).expect("valid")
+    }
+
+    /// The allocation-free comparison of ASCII paths agrees with the normalizing
+    /// one on every pair, and a non-ASCII pair still normalizes.
+    #[test]
+    fn the_ascii_fast_path_agrees_with_the_normalizing_comparison() {
+        let paths = [
+            "a",
+            "a/b",
+            "a/b/c.rs",
+            "ab",
+            "a/bc",
+            "b",
+            "src/lib.rs",
+            "src",
+            "",
+        ];
+        let normalizing = |a: &Path, b: &Path| {
+            let norm = |p: &Path| PathBuf::from(kgraf_core::paths::normalize_path(p));
+            let (a, b) = (norm(a), norm(b));
+            a.starts_with(&b) || b.starts_with(&a)
+        };
+        for x in paths {
+            for y in paths {
+                let (x, y) = (Path::new(x), Path::new(y));
+                assert_eq!(overlaps(x, y, S), normalizing(x, y), "{x:?} {y:?}");
+            }
+        }
+        // NFC `e` with an acute accent against its NFD spelling: one file.
+        assert!(overlaps(
+            Path::new("caf\u{e9}/a"),
+            Path::new("cafe\u{301}"),
+            S
+        ));
     }
 
     #[test]

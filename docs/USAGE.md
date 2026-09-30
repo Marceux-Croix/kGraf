@@ -553,7 +553,10 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   stopped run, a lost lease, a pending merge, a later part of the same work (a handoff
   continues in its parent's worktree) or a conflict resolver still needs is never deleted,
   whichever way this is set. A worktree that cannot be deleted stays, and the run's report
-  says which one and why (one warning each). A worker's build folder lives in the worktree's
+  says which one and why (one warning each). This includes a worktree a process started by a
+  build or test still runs in (a daemon that detached itself): kGraf does not kill it, and
+  removes the worktree at its next start once that process has ended, or `kgraf clean`
+  removes it. A worker's build folder lives in the worktree's
   scratch directory and goes with it.
 - An attempt that changes no file is accepted only when its check passes, and it is always
   reported. It is refused when a declared Rust write target holds only `todo!` or
@@ -579,11 +582,18 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   removed from what a worker's model sees, and build and test output is scrubbed of
   key-shaped strings before the model sees it.
 - A sandboxed build cannot read your per-user cargo config (`~/.cargo/config.toml`,
-  `~/.cargo/config`) on any platform, since it can hold a registry token or a proxy
-  password; cargo skips it, so settings kept there (a linker, rustflags, a source mirror) do
-  not apply to worker builds. Put build settings in the project's own `.cargo/config.toml`.
-  Package-index logins (pip, Yarn, Poetry) and other command-line tool logins in your home
-  are unreadable too.
+  `~/.cargo/config`, or the one in `$CARGO_HOME`) on macOS or Linux, since it can hold a
+  registry token or a proxy password. kGraf passes its build settings in for you: a source
+  replacement (a mirror or vendored directory), registry index URLs, rustflags, rustdocflags,
+  a linker, `target-dir` and `net.offline` are copied into a cargo home of the command's own
+  (`.kgraf-cargo-home` in the worktree's scratch directory, named by `CARGO_HOME`), with your
+  registry cache linked in. Nothing else is copied: no token, credential provider, `[http]`
+  proxy, `[env]` value or alias. A source or registry URL with a login in it
+  (`https://user:secret@host`) is not copied either, and a failing build's output names each key
+  left out. Your project's own `.cargo/config.toml` still wins over these settings, as it does
+  outside the sandbox. Package-index logins (pip, Yarn, Poetry) and other command-line tool
+  logins in your home are unreadable too. On Linux the Poetry, Pipenv, Playwright, Cypress and
+  Deno caches and environments are readable, so tests that use them run.
 - The sandbox cannot download or unpack crates. A run checks that the dependencies are in
   the local cargo cache before it starts, and fetches them outside the sandbox only with the
   project's consent (see [Set up a project](#set-up-a-project)).
@@ -826,6 +836,62 @@ keeps working, and each move prints one notice:
 - A worker transcript recorded before the rename does not resume: the worker's system
   prompt names the product, so the prefix differs and the runtime refuses, saying the
   transcript predates the rename. Finish or stop running work before you upgrade.
+
+## Changes users will notice
+
+Behavior that differs from earlier builds. Each item names the decision that holds the reasons.
+
+**Cost and spend**
+
+- A model with no price entry runs, and its spend is shown as unpriced (a local model as
+  local, unpriced), never as zero dollars (0075).
+- A model priced from the bundled catalog is priced only up to the input size where its vendor
+  changes rates. A larger call is shown as unpriced, not costed at the base rate. A price
+  entry you set yourself replaces the catalog's tier for that model (0075).
+- `kgraf spend` prints `total unpriced` when no recorded model has a price, and
+  `total <amount> (partial: some calls could not be costed)` when some calls could not be
+  costed (0075).
+- Money is summed at full precision and rounded once, so a total can differ by a few
+  micro-dollars from a sum of separately rounded calls (0075).
+- A benchmark attempt reads as unpriced only when the price table cannot cost its calls. A
+  ledger read error stops the attempt with the error.
+
+**The ledger**
+
+- A settle is accepted only for a call that is in flight, and a reconcile only for a call that
+  is unreconciled or in flight. Anything else is refused with the call's state, so a resolve
+  cannot overwrite a counted row and a late settle cannot overwrite a reconciled figure.
+- `kgraf unreconciled` lists each open call with its state (`in_flight` or `unreconciled`) and
+  the usage recorded so far, which is a lower bound. A call still in flight needs
+  `--abandoned` before `resolve` will close it.
+- `kgraf unreconciled resolve` keeps the recorded figure for any field you leave out. Only
+  `--no-charge` states zero for every field.
+- When an Anthropic-protocol endpoint sends a usage object that does not add up (a cached
+  count above the cache read, or a total that differs from the parts), the reply is returned,
+  the call stays unreconciled with the counted fields as a lower bound and a note in the raw
+  usage, and a warning is logged. Resolve it as any other open call (0006).
+
+**Runs**
+
+- A contract waiting on a route that is not ready is held after 2,400 checks from the first
+  failure (20 minutes at the default tick). The hold says how long it waited and how to try
+  again: fix the route, then `kgraf orchestrate --resume <run>`. Earlier builds waited without
+  end (0075).
+- A contract whose route is not ready moves the rotation on once for each route it finds not
+  ready, not once for each check (0075).
+- A file made only of plain structs and trait impls whose bodies are all `todo!()` or
+  `unimplemented!()` counts as an abandoned stub. An enum, a constant, a macro call, an
+  inherent impl, anything under `cfg`, or a struct with a non-standard derive marks the file as
+  finished code (0086).
+- A background process that leaves a worker's process group keeps the worktree from being
+  deleted. The worktree stays, with a warning; stop the process, then run `kgraf clean
+  <worktree>` (0088).
+
+**Scheduled runs**
+
+- A manual run (`kgraf schedule run-now`) keeps its lock when the machine slept past the lease
+  and nothing else took the schedule. The run is reported as failed only when another manual
+  run or a scheduled claim took the lock.
 
 ## Installers
 

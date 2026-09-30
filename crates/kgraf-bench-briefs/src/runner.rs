@@ -565,7 +565,8 @@ async fn run_one(
     // model is not. A price that cannot cost the calls (above a rate tier) leaves
     // the attempt unpriced too: the calls are already paid for, so the run goes on.
     let priced = if prices.is_priced_on(Some(&route.route), &route.model) {
-        ledger.cost_for_agent(worker_id, prices).ok()
+        priced_or_unpriced(ledger.cost_for_agent(worker_id, prices))
+            .with_context(|| format!("reading the cost of worker `{worker_id}` from the ledger"))?
     } else {
         None
     };
@@ -596,6 +597,22 @@ async fn run_one(
         tokens_out,
         wall_ms,
     })
+}
+
+/// A ledger cost as an attempt's cost: `None` (unpriced) only when the price
+/// table cannot cost the calls (no entry, or a call above a rate tier). Any
+/// other failure, a ledger read error or a corrupt row, is an error: reading
+/// it as "unpriced" would hide a broken ledger behind a plausible note.
+fn priced_or_unpriced(cost: Result<Money, kgraf_provider::LedgerError>) -> Result<Option<Money>> {
+    use kgraf_core::cost::CostError;
+    use kgraf_provider::LedgerError;
+    match cost {
+        Ok(cost) => Ok(Some(cost)),
+        Err(LedgerError::Cost(
+            CostError::AboveTierThreshold { .. } | CostError::UnpricedModel { .. },
+        )) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
 }
 
 #[cfg(test)]
@@ -1342,5 +1359,35 @@ mod error_tests {
         assert!(!model_caused("provider `x` returned HTTP 503: unavailable"));
         assert!(!model_caused("cannot open a ledger row: disk full"));
         assert!(!model_caused("something no one has seen before"));
+    }
+
+    #[test]
+    fn only_a_price_that_cannot_cost_the_calls_reads_as_unpriced() {
+        use kgraf_core::cost::CostError;
+        use kgraf_provider::LedgerError;
+        let money = Money::from_micros(5);
+        assert_eq!(priced_or_unpriced(Ok(money)).expect("priced"), Some(money));
+        for unpriced in [
+            CostError::AboveTierThreshold {
+                model: "m".into(),
+                threshold: 200_000,
+                input: 300_000,
+            },
+            CostError::UnpricedModel { model: "m".into() },
+        ] {
+            assert_eq!(
+                priced_or_unpriced(Err(LedgerError::Cost(unpriced))).expect("unpriced"),
+                None
+            );
+        }
+        for broken in [
+            LedgerError::Io("read failed".into()),
+            LedgerError::WriterStopped,
+        ] {
+            assert!(
+                priced_or_unpriced(Err(broken)).is_err(),
+                "a broken ledger is not an unpriced model"
+            );
+        }
     }
 }

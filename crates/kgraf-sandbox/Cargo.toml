@@ -20,6 +20,9 @@ kgraf-core = { path = "../kgraf-core" }
 kgraf-secrets = { path = "../kgraf-secrets" }
 kgraf-diag = { path = "../kgraf-diag" }
 thiserror = "2.0.17"
+# MIT OR Apache-2.0; already in Cargo.lock (kgraf-host, kgraf-shell). Parses the
+# user's cargo config to pass its non-secret settings into the sandbox.
+toml = "1.1.6"
 # MIT OR Apache-2.0, verified on crates.io 2026-09-26; already in Cargo.lock.
 # Merge-back folds paths to NFC to detect normalization-only collisions.
 # Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT, read from the crate's

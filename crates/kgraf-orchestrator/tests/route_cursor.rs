@@ -108,6 +108,56 @@ async fn fitness_passes_over_a_route_that_never_becomes_ready() {
     run_with_first_route_never_ready(RoutingPolicy::Fitness).await;
 }
 
+/// A contract stuck on unready routes moves the shared cursor once per route it
+/// finds not ready, not once per check. Both routes fail their first three
+/// checks together: the third check lands on the first route again, which the
+/// contract already left behind, so the cursor stays put and the contract
+/// runs on the first route once it answers, leaving the second for the next
+/// contract in the rotation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_contract_stuck_on_unready_routes_moves_the_cursor_once_per_route() {
+    let dir = tempfile::tempdir().expect("dir");
+    let plan = plan_json(&[
+        c("a", "make a", "src/a.rs", &[]),
+        c("b", "make b", "src/b.rs", &["a"]),
+    ]);
+    let p = Parts::open(
+        dir.path(),
+        move |_| plan.clone(),
+        |_| SERVES.into(),
+        Duration::from_millis(5),
+    );
+    let mut s = p.services(WINDOW);
+    let probes = Arc::new(AtomicUsize::new(0));
+    for route in &mut s.routes {
+        let seen = probes.clone();
+        route.readiness = Arc::new(FnProbe(Arc::new(move || {
+            if seen.fetch_add(1, Ordering::SeqCst) < 3 {
+                Err(ReadinessFailure::Transient("warming up".into()))
+            } else {
+                Ok(())
+            }
+        })));
+    }
+    let report = Orchestrator::new(support::config(), s)
+        .expect("orchestrator")
+        .start(RunId::new("r1"), "make a then b".into())
+        .await
+        .expect("run");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    let vendor_of = |instruction: &str| {
+        p.stats
+            .requests()
+            .into_iter()
+            .find(|r| r.1.contains(instruction))
+            .map(|r| r.0)
+    };
+    let a = vendor_of("make a").expect("a ran");
+    let b = vendor_of("make b").expect("b ran");
+    assert_eq!(a, "alpha", "a stayed on the route it left behind once");
+    assert_eq!(b, "beta", "b took the next route in the rotation");
+}
+
 /// Under `Fitness`, each dispatched pick moves the cursor, so the exploration
 /// share is one pick in eight and not every pick.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

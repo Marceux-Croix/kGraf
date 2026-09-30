@@ -1209,6 +1209,7 @@ mod tests {
                 prefix_digest: "d1".into(),
                 slices: vec![],
                 gitlink: None,
+                no_gitlink: false,
             },
             WorkerEvent::TextDelta {
                 text: "half an answ".into(),
@@ -1225,6 +1226,7 @@ mod tests {
             prefix_digest: "d1".into(),
             slices: vec![],
             gitlink: None,
+            no_gitlink: false,
         });
         events.push(WorkerEvent::Injected {
             id: "msg-1".into(),
@@ -1254,6 +1256,7 @@ mod tests {
             prefix_digest: "d1".into(),
             slices: vec![],
             gitlink: None,
+            no_gitlink: false,
         }];
         let mut killed = tool_round("c1", &["a"]);
         killed.pop(); // "a" never finishes: the kill lands mid-tool.
@@ -1263,6 +1266,7 @@ mod tests {
             prefix_digest: "d2".into(),
             slices: vec![],
             gitlink: None,
+            no_gitlink: false,
         });
         events.push(WorkerEvent::TextDelta {
             text: "done".into(),

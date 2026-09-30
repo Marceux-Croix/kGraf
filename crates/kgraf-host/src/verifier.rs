@@ -136,12 +136,27 @@ pub(crate) fn clean(text: &str) -> String {
         .collect()
 }
 
+/// Whether `c` can repaint a terminal or reorder the lines of multi-line
+/// output: a control character (an escape sequence), a line or paragraph
+/// separator, or a bidirectional override or isolate. Narrower than
+/// [`is_display_altering`]: the zero-width joiner and non-joiner (U+200D,
+/// U+200C) move no text, and Persian and Indic words and emoji sequences in a
+/// command's output need them.
+fn is_line_altering(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{2028}' | '\u{2029}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+        )
+}
+
 /// [`clean`] for multi-line text (a command's output): line breaks and tabs
-/// stay, everything else display-altering becomes `?`.
+/// stay, and so do joiners and other marks that move no text; each
+/// [`is_line_altering`] character becomes `?`.
 pub(crate) fn clean_lines(text: &str) -> String {
     text.chars()
         .map(|c| {
-            if c != '\n' && c != '\t' && is_display_altering(c) {
+            if c != '\n' && c != '\t' && is_line_altering(c) {
                 '?'
             } else {
                 c
@@ -207,40 +222,89 @@ fn read_write_target(ws_root: &Path, path: &str) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
-/// A declared write target as the dispatch base held it, read from the
-/// repository's object store (never from the worker's tree). `Ok(None)` when
-/// the base has no such regular file or it is not UTF-8. A git failure is an
-/// error: reading it as "absent" would skip the placeholder check silently.
-fn base_write_target(repo: &Path, base: &str, path: &str) -> Result<Option<String>, String> {
+/// The declared write targets as the dispatch base held them, read from the
+/// repository's object store (never from the worker's tree), in two git
+/// processes however many paths there are: one `ls-tree` naming each path's
+/// mode, blob and size, then one `cat-file --batch` for the regular files small
+/// enough to read. A path maps to `None` when the base has no regular file
+/// there, the file is over the read cap, or it is not UTF-8. A git failure is
+/// an error: reading it as "absent" would skip the placeholder check silently.
+fn base_write_targets(
+    repo: &Path,
+    base: &str,
+    paths: &[&str],
+) -> Result<std::collections::BTreeMap<String, Option<String>>, String> {
+    let mut found: std::collections::BTreeMap<String, Option<String>> =
+        paths.iter().map(|p| ((*p).to_owned(), None)).collect();
+    if paths.is_empty() {
+        return Ok(found);
+    }
     let git = kgraf_sandbox::git::Git::discover().map_err(|e| e.to_string())?;
+    let mut args = vec!["ls-tree", "-l", "-z", base, "--"];
+    args.extend_from_slice(paths);
     // `ls-tree` succeeds with no output for a path the base lacks, so a
     // failure here is git failing, not an absent file.
     let listing = git
-        .run(repo, ["ls-tree", "-z", base, "--", path])
-        .map_err(|e| format!("cannot list `{}` at {base}: {e}", clean(path)))?;
-    let listing = String::from_utf8_lossy(&listing);
-    // "<mode> blob <sha>\t<path>": only a regular file (100644, 100755).
-    let is_file = listing
-        .split_once(' ')
-        .is_some_and(|(mode, rest)| mode.starts_with("100") && rest.starts_with("blob "));
-    if !is_file {
-        return Ok(None);
+        .run(repo, args)
+        .map_err(|e| format!("cannot list the write targets at {base}: {e}"))?;
+    // "<mode> blob <sha> <size>\t<path>\0": only a regular file (100644,
+    // 100755) no larger than the read cap is read.
+    let mut wanted: Vec<(String, String)> = Vec::new();
+    for entry in listing.split(|b| *b == 0).filter(|e| !e.is_empty()) {
+        let entry = String::from_utf8_lossy(entry);
+        let Some((meta, path)) = entry.split_once('\t') else {
+            continue;
+        };
+        let mut fields = meta.split_whitespace();
+        let (Some(mode), Some(kind), Some(sha), Some(size)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let small = size.parse::<u64>().is_ok_and(|n| n <= MAX_PLACEHOLDER_READ);
+        if mode.starts_with("100") && kind == "blob" && small && found.contains_key(path) {
+            wanted.push((path.to_owned(), sha.to_owned()));
+        }
     }
-    let spec = format!("{base}:{path}");
-    let size = git
-        .run(repo, ["cat-file", "-s", spec.as_str()])
-        .map_err(|e| format!("cannot size `{}` at {base}: {e}", clean(path)))?;
-    if String::from_utf8_lossy(&size)
-        .trim()
-        .parse::<u64>()
-        .is_ok_and(|n| n > MAX_PLACEHOLDER_READ)
-    {
-        return Ok(None);
+    if wanted.is_empty() {
+        return Ok(found);
     }
-    let bytes = git
-        .run(repo, ["cat-file", "blob", spec.as_str()])
-        .map_err(|e| format!("cannot read `{}` at {base}: {e}", clean(path)))?;
-    Ok(String::from_utf8(bytes).ok())
+    let request: String = wanted.iter().map(|(_, sha)| format!("{sha}\n")).collect();
+    let reply = git
+        .run_with_stdin(repo, ["cat-file", "--batch"], request.as_bytes())
+        .map_err(|e| format!("cannot read the write targets at {base}: {e}"))?;
+    // Replies come in request order: "<sha> blob <size>\n<content>\n".
+    let mut at = 0usize;
+    for (path, sha) in wanted {
+        let malformed = || {
+            format!(
+                "cannot read `{}` at {base}: malformed git reply",
+                clean(&path)
+            )
+        };
+        let line_end = reply[at..]
+            .iter()
+            .position(|b| *b == b'\n')
+            .map(|n| at + n)
+            .ok_or_else(malformed)?;
+        let header = String::from_utf8_lossy(&reply[at..line_end]).into_owned();
+        let mut fields = header.split_whitespace();
+        let (Some(got), Some("blob"), Some(size)) = (fields.next(), fields.next(), fields.next())
+        else {
+            return Err(format!(
+                "cannot read `{}` at {base}: {header}",
+                clean(&path)
+            ));
+        };
+        let size: usize = size.parse().map_err(|_| malformed())?;
+        let (start, end) = (line_end + 1, line_end + 1 + size);
+        if got != sha || end > reply.len() {
+            return Err(malformed());
+        }
+        found.insert(path, String::from_utf8(reply[start..end].to_vec()).ok());
+        at = end + 1;
+    }
+    Ok(found)
 }
 
 /// The declared write targets a committed attempt left untouched
@@ -501,20 +565,16 @@ impl Verifier for CommandVerifier {
                 let base = ws.head().to_owned();
                 // A git failure while reading a base file is not "absent": it
                 // fails the verification rather than skipping the check.
-                let read_error = std::cell::RefCell::new(None::<String>);
-                let skipped = untouched_placeholders(&contract, &changed, |p| {
-                    match base_write_target(manager.repo(), &base, p) {
-                        Ok(content) => content,
-                        Err(e) => {
-                            read_error.borrow_mut().get_or_insert(e);
-                            None
-                        }
+                let declared: Vec<&str> = contract.writes.iter().map(|w| w.path.as_str()).collect();
+                let held = match base_write_targets(manager.repo(), &base, &declared) {
+                    Ok(held) => held,
+                    Err(e) => {
+                        workspaces.committed().insert(root.clone(), attempt);
+                        return Err(format!("cannot check the placeholder targets: {e}"));
                     }
-                });
-                if let Some(e) = read_error.into_inner() {
-                    workspaces.committed().insert(root.clone(), attempt);
-                    return Err(format!("cannot check the placeholder targets: {e}"));
-                }
+                };
+                let skipped =
+                    untouched_placeholders(&contract, &changed, |p| held.get(p).cloned().flatten());
                 if !skipped.is_empty() {
                     return fail(attempt, placeholder_left_in_place_reason(&skipped));
                 }
@@ -776,8 +836,21 @@ mod tests {
     fn clean_replaces_bidi_overrides_and_line_separators() {
         let text = "a\u{202E}b\u{2028}c\u{2066}d\u{200B}e\u{1b}[31mf\ng";
         assert_eq!(clean(text), "a?b?c?d?e?[31mf?g");
-        assert_eq!(clean_lines(text), "a?b?c?d?e?[31mf\ng");
+        assert_eq!(clean_lines(text), "a?b?c?d\u{200B}e?[31mf\ng");
         assert_eq!(clean("plain \u{e9} text"), "plain \u{e9} text");
+    }
+
+    /// Joiners carry meaning in output: a Persian word with a non-joiner and
+    /// an emoji family sequence come back unchanged, while every bidi
+    /// override and isolate beside them is still replaced.
+    #[test]
+    fn clean_lines_keeps_joiners() {
+        let persian = "\u{645}\u{6CC}\u{200C}\u{62E}\u{648}\u{627}\u{647}\u{645}";
+        let family = "\u{1F469}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+        let text = format!(
+            "{persian}\n{family}\t\u{202A}\u{202B}\u{202C}\u{202D}\u{2067}\u{2069}\u{2029}"
+        );
+        assert_eq!(clean_lines(&text), format!("{persian}\n{family}\t???????"));
     }
 
     fn git_repo_with(file: &str, content: &str) -> (tempfile::TempDir, String) {
@@ -802,19 +875,70 @@ mod tests {
     }
 
     #[test]
-    fn a_base_target_reads_absent_or_fails_loud() {
+    fn base_targets_read_absent_or_fail_loud() {
         let (dir, sha) = git_repo_with("a.rs", "fn f() { todo!() }");
-        assert_eq!(
-            base_write_target(dir.path(), &sha, "a.rs"),
-            Ok(Some("fn f() { todo!() }".to_owned()))
-        );
+        let read = |paths: &[&str]| base_write_targets(dir.path(), &sha, paths);
+        let got = read(&["a.rs", "missing.rs"]).expect("read");
+        assert_eq!(got["a.rs"], Some("fn f() { todo!() }".to_owned()));
         // A path the base lacks is absent, not an error.
-        assert_eq!(base_write_target(dir.path(), &sha, "missing.rs"), Ok(None));
+        assert_eq!(got["missing.rs"], None);
+        assert!(read(&[]).expect("none").is_empty());
         // A revision git cannot resolve, and a repository that is not one,
         // are errors: never read as "absent".
-        assert!(base_write_target(dir.path(), "0".repeat(40).as_str(), "a.rs").is_err());
+        assert!(base_write_targets(dir.path(), &"0".repeat(40), &["a.rs"]).is_err());
         let not_repo = tempfile::tempdir().expect("dir");
-        assert!(base_write_target(not_repo.path(), &sha, "a.rs").is_err());
+        assert!(base_write_targets(not_repo.path(), &sha, &["a.rs"]).is_err());
+    }
+
+    /// Many targets, kinds and sizes come back from one listing and one batch
+    /// read: files with newlines and spaces in the name and content, a
+    /// directory, a symlink, an empty file, a non-UTF-8 file and one over the cap
+    /// are each read or skipped by their own kind.
+    #[cfg(unix)]
+    #[test]
+    fn base_targets_are_read_in_one_batch_by_kind() {
+        let (dir, _) = git_repo_with("seed.txt", "x");
+        let big = "y".repeat(MAX_PLACEHOLDER_READ as usize + 1);
+        std::fs::create_dir_all(dir.path().join("d")).expect("dir");
+        std::fs::write(dir.path().join("one.rs"), "fn a() { todo!() }\n").expect("one");
+        std::fs::write(dir.path().join("two words.rs"), "line1\nline2\n\n").expect("two");
+        std::fs::write(dir.path().join("empty.rs"), "").expect("empty");
+        std::fs::write(dir.path().join("bin.rs"), [0xff, 0xfe, 0x00]).expect("bin");
+        std::fs::write(dir.path().join("big.rs"), &big).expect("big");
+        std::fs::write(dir.path().join("d/inner.rs"), "inner").expect("inner");
+        std::os::unix::fs::symlink("one.rs", dir.path().join("link.rs")).expect("link");
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(dir.path())
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(args)
+                .output()
+                .expect("git");
+            assert!(out.status.success(), "{args:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        };
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "y"]);
+        let sha = run(&["rev-parse", "HEAD"]);
+        let paths = [
+            "one.rs",
+            "two words.rs",
+            "empty.rs",
+            "bin.rs",
+            "big.rs",
+            "d",
+            "d/inner.rs",
+            "link.rs",
+            "missing.rs",
+        ];
+        let got = base_write_targets(dir.path(), &sha, &paths).expect("read");
+        assert_eq!(got["one.rs"].as_deref(), Some("fn a() { todo!() }\n"));
+        assert_eq!(got["two words.rs"].as_deref(), Some("line1\nline2\n\n"));
+        assert_eq!(got["empty.rs"].as_deref(), Some(""));
+        assert_eq!(got["d/inner.rs"].as_deref(), Some("inner"));
+        for skipped in ["bin.rs", "big.rs", "d", "link.rs", "missing.rs"] {
+            assert_eq!(got[skipped], None, "{skipped}");
+        }
     }
 
     #[test]

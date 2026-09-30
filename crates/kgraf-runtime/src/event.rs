@@ -122,10 +122,17 @@ pub enum WorkerEvent {
         /// started, before any of its calls ran; a resumed segment carries the
         /// first segment's. A resume reads the worktree status only against
         /// this record, never against a `.git` found on disk at resume, which
-        /// an earlier command could have planted. `None`: no gitlink was at
-        /// the root, and the status is not read.
+        /// an earlier command could have planted. `None` with `no_gitlink`: no
+        /// gitlink was at the root, and the status is not read.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         gitlink: Option<String>,
+        /// Set when the first segment found no gitlink it could read at the
+        /// root, so a `None` above is a record, not a gap. A transcript written
+        /// before the gitlink was recorded has neither field: its resume reads
+        /// the entry at the root once the host's reopen has verified the
+        /// worktree's gitlink against its own record, and records that.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        no_gitlink: bool,
     },
     /// A ledger row was opened for one model round, before the request left.
     /// Counts the round against the step budget on resume even when the call

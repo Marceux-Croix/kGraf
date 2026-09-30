@@ -564,81 +564,88 @@ impl RunLoop {
         // A resolver never retries in place, win or lose: it is dropped
         // either way, and `original` alone carries the outcome forward.
         self.record.open_contracts.retain(|c| c.contract != id);
-        let at = self.now();
-        if accepted {
-            // The gate machinery pins a commit only once every contract it
-            // covers has an `integration` entry (`coordination.rs`'s own
-            // doc); `integrate_winner` wrote one for the resolver's own id,
-            // and `original` needs the same fact under its own id, since a
-            // gate covers `original`, never the resolver it never knew about.
-            if let Some(outcome) = self.record.coordination.integration.get(&id).cloned() {
+        // Every exit of this settlement, an error included, still reaches the
+        // conflicted attempt's discard below: a failure in between must not
+        // leave the kept worktree for startup cleanup.
+        let settled: Result<(), OrchestratorError> = async {
+            let at = self.now();
+            if accepted {
+                // The gate machinery pins a commit only once every contract it
+                // covers has an `integration` entry (`coordination.rs`'s own
+                // doc); `integrate_winner` wrote one for the resolver's own id,
+                // and `original` needs the same fact under its own id, since a
+                // gate covers `original`, never the resolver it never knew about.
+                if let Some(outcome) = self.record.coordination.integration.get(&id).cloned() {
+                    self.record
+                        .coordination
+                        .integration
+                        .insert(original.clone(), outcome);
+                }
+                if let Some(open) = self.record.contract(&original) {
+                    let closed = crate::coordination::ClosedContract::of(
+                        open,
+                        crate::coordination::Closure::Verified,
+                    );
+                    self.record.coordination.closed.push(closed);
+                }
+                if let Some(oc) = self.record.contract(&original).cloned() {
+                    let result = winner.and_then(|w| flight.attempts[w].result.clone());
+                    self.announce_verified(&oc, result.as_ref()).await?;
+                }
                 self.record
-                    .coordination
-                    .integration
-                    .insert(original.clone(), outcome);
+                    .open_contracts
+                    .retain(|c| c.contract != original);
+                if !self
+                    .record
+                    .verified_contracts
+                    .iter()
+                    .any(|c| c == &original)
+                {
+                    self.record.verified_contracts.push(original.clone());
+                }
+                self.queue(TraceEvent::Integration {
+                    at_ms: at,
+                    contract: original.clone(),
+                    outcome: "resolved".into(),
+                    detail: format!("resolver {id} merged the conflict"),
+                });
+                self.release_leases_if_unused(&holder)?;
+            } else {
+                let max_retries = self.config.max_retries;
+                if let Some(c) = self.record.contract_mut(&original) {
+                    c.workspace = None;
+                    c.base = None;
+                    super::forget_workers(c);
+                    // A failed resolver counts as a failed attempt of `original`
+                    // (0018's own bookkeeping this fallback re-enters): past
+                    // `max_retries` it holds instead of looping forever, and the
+                    // bump gives the retry a fresh worker id (`worker_id`'s
+                    // `r<failures>`), never replaying the superseded attempt's
+                    // transcript.
+                    c.failures += 1;
+                    c.status = if c.failures > max_retries {
+                        ContractStatus::Held {
+                            reason: format!(
+                                "{} attempts failed verification or did not complete",
+                                c.failures
+                            ),
+                        }
+                    } else {
+                        ContractStatus::Planned
+                    };
+                }
+                self.queue(TraceEvent::Integration {
+                    at_ms: at,
+                    contract: original.clone(),
+                    outcome: "resolver_failed".into(),
+                    detail: format!(
+                        "resolver {id} did not merge; {original} is re-dispatched from the new tip"
+                    ),
+                });
             }
-            if let Some(open) = self.record.contract(&original) {
-                let closed = crate::coordination::ClosedContract::of(
-                    open,
-                    crate::coordination::Closure::Verified,
-                );
-                self.record.coordination.closed.push(closed);
-            }
-            if let Some(oc) = self.record.contract(&original).cloned() {
-                let result = winner.and_then(|w| flight.attempts[w].result.clone());
-                self.announce_verified(&oc, result.as_ref()).await?;
-            }
-            self.record
-                .open_contracts
-                .retain(|c| c.contract != original);
-            if !self
-                .record
-                .verified_contracts
-                .iter()
-                .any(|c| c == &original)
-            {
-                self.record.verified_contracts.push(original.clone());
-            }
-            self.queue(TraceEvent::Integration {
-                at_ms: at,
-                contract: original.clone(),
-                outcome: "resolved".into(),
-                detail: format!("resolver {id} merged the conflict"),
-            });
-            self.release_leases_if_unused(&holder)?;
-        } else {
-            let max_retries = self.config.max_retries;
-            if let Some(c) = self.record.contract_mut(&original) {
-                c.workspace = None;
-                c.base = None;
-                super::forget_workers(c);
-                // A failed resolver counts as a failed attempt of `original`
-                // (0018's own bookkeeping this fallback re-enters): past
-                // `max_retries` it holds instead of looping forever, and the
-                // bump gives the retry a fresh worker id (`worker_id`'s
-                // `r<failures>`), never replaying the superseded attempt's
-                // transcript.
-                c.failures += 1;
-                c.status = if c.failures > max_retries {
-                    ContractStatus::Held {
-                        reason: format!(
-                            "{} attempts failed verification or did not complete",
-                            c.failures
-                        ),
-                    }
-                } else {
-                    ContractStatus::Planned
-                };
-            }
-            self.queue(TraceEvent::Integration {
-                at_ms: at,
-                contract: original.clone(),
-                outcome: "resolver_failed".into(),
-                detail: format!(
-                    "resolver {id} did not merge; {original} is re-dispatched from the new tip"
-                ),
-            });
+            Ok(())
         }
+        .await;
         // The conflicted attempt is superseded either way (0073). When the
         // resolver merged, a contract that continued in its worktree (a later
         // child of the same handoff) starts from the tip, which now holds the
@@ -654,6 +661,7 @@ impl RunLoop {
                 self.s.workspaces.discard_conflict(&contract, source).await;
             }
         }
+        settled?;
         self.save()
     }
 

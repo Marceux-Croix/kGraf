@@ -63,4 +63,12 @@ choice is the user's.
   `MergedWorktree::Keep` or `Remove`.
 - An empty attempt whose worktree cannot be removed yet, because a process still runs in it,
   stays open, so its commit can be retried.
+- Under `Delete`, a worktree a process still runs in is not removed, including one a daemon
+  that left its process group or session keeps busy: removal retries for about one second,
+  then reports the worktree once. It stays registered and locked, and the next startup
+  cleanup (or `kgraf clean`) removes it once its processes have ended. kGraf does not kill
+  such a process: finding it means matching every process's session or working directory,
+  and a working-directory match could hit a shell of the user's own open in the worktree.
+  Stop the process, then run `kgraf clean`.
 - A `run.json` written with the `worktrees` key must drop it.
+

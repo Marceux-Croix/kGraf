@@ -287,9 +287,9 @@ fn tail(text: &str, cap: usize) -> String {
 /// `kgraf_sandbox::lifecycle::limit_cpu_seconds`, at
 /// `lifecycle::cpu_rlimit_seconds(timeout)`: twice the gate's own timeout, at
 /// least one second, so a normal multi-threaded build has headroom but a
-/// spinning escapee is eventually stopped). It can race the worktree's
-/// removal: a write after the removal lands in a directory the next startup
-/// cleanup finds.
+/// spinning escapee is eventually stopped). While it runs, the worktree is
+/// not removed (`WorkspaceManager::remove` returns `Busy`, decision 0088);
+/// the next startup cleanup removes it once the escapee has ended.
 ///
 /// `checkout` is the checkout root the worktree was made from (the
 /// directory holding `.kgraf`, `WorkspaceManager::repo`): cargo in the

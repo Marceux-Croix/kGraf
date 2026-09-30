@@ -1090,6 +1090,44 @@ mod tests {
         }
     }
 
+    /// The parse grows in step with the input, on any machine: a document four
+    /// times the size takes far less than the sixteen times a quadratic scan
+    /// would need. Each size is timed three times and the fastest run counts, so
+    /// a load spike on one run does not decide the result. The ratio, not the
+    /// absolute time, is asserted, so the check holds on a slow machine.
+    #[test]
+    fn parse_time_grows_in_step_with_the_document() {
+        let doc_of = |n: usize| {
+            let mut doc = String::from("## P\n\n| Milestone | What | Status |\n|---|---|---|\n");
+            for i in 0..n {
+                doc.push_str(&format!("| {i} | thing {i} | Complete |\n"));
+            }
+            for i in 0..n {
+                doc.push_str(&format!("\n### Phase {i}: thing\n\nIn `src/m{i}.rs`.\n"));
+            }
+            doc
+        };
+        let fastest = |n: usize| {
+            let doc = doc_of(n);
+            (0..3)
+                .map(|_| {
+                    let started = std::time::Instant::now();
+                    let r = parse("R.md", &doc);
+                    assert_eq!(r.table_rows, n);
+                    started.elapsed()
+                })
+                .min()
+                .expect("three runs")
+        };
+        let (small, large) = (fastest(1_500), fastest(6_000));
+        // Four times the input: about 4x when linear, about 16x when quadratic.
+        let floor = std::time::Duration::from_millis(1);
+        assert!(
+            large < small.max(floor) * 10,
+            "4x the rows took {large:?} against {small:?}: the parse is no longer linear"
+        );
+    }
+
     #[test]
     fn a_row_links_only_the_heading_that_names_it() {
         assert!(names_row("Milestone 4.5: Scheduled runs", "4.5"));

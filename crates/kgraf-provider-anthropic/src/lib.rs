@@ -53,13 +53,18 @@ pub const ADAPTER: &str = "anthropic-messages";
 ///
 /// Moonshot's Anthropic route sends both protocols' fields. Whether its
 /// `input_tokens` counts cache reads is not proven for a warm call, and a wrong
-/// guess would cost the cached share twice or not at all. Two checks refuse a
+/// guess would cost the cached share twice or not at all. Two checks find a
 /// figure that cannot be trusted, so the call is left unreconciled instead of
 /// mis-costed:
 /// - `cached_tokens` above `cache_read_input_tokens` means the cache read sits
 ///   in a field this adapter does not read;
 /// - when `total_tokens` is present, the parts must sum to it under the
 ///   configured protocol.
+///
+/// The answer is still returned when a check fails: the call was made and
+/// billed, and refusing the reply would discard work the caller paid for. The
+/// caller leaves the row unreconciled with the counts as a lower bound and
+/// records the doubt (see [`with_doubt`]).
 ///
 /// `usage` is the figure after `raw` was applied: for one complete object, that
 /// object alone; for a stream, the running figure merged over every event so
@@ -68,23 +73,18 @@ pub const ADAPTER: &str = "anthropic-messages";
 /// correct stream. The claims in `raw` (`cached_tokens`, `total_tokens`) are
 /// checked only when this event carries them, against the merged figure.
 fn check_usage_consistency(
-    adapter: &'static str,
     protocol: Protocol,
     usage: &TokenUsage,
     raw: &serde_json::Value,
-) -> Result<(), ProviderError> {
+) -> Result<(), String> {
     let get = |name: &str| raw.get(name).and_then(|v| v.as_u64());
-    let inconsistent = |reason: String| ProviderError::Decode {
-        adapter,
-        reason: format!("the usage object is inconsistent: {reason}"),
-    };
     let read = usage.cache_read;
     if let Some(cached) = get("cached_tokens")
         && cached > read
     {
-        return Err(inconsistent(format!(
+        return Err(format!(
             "`cached_tokens` is {cached} but `cache_read_input_tokens` is {read}"
-        )));
+        ));
     }
     if let Some(total) = get("total_tokens") {
         // Both protocols reach the same sum once normalized: an additive input
@@ -92,13 +92,41 @@ fn check_usage_consistency(
         // the same figure, so input plus cache plus output is the vendor's sum.
         let parts = usage.total();
         if parts != total {
-            return Err(inconsistent(format!(
+            return Err(format!(
                 "the parts sum to {parts} under the {protocol:?} protocol but \
                  `total_tokens` is {total}"
-            )));
+            ));
         }
     }
     Ok(())
+}
+
+/// A usage check failure as the decode error [`AnthropicAdapter::normalize_usage`]
+/// returns for it.
+fn inconsistent(adapter: &'static str, reason: String) -> ProviderError {
+    ProviderError::Decode {
+        adapter,
+        reason: format!("the usage object is inconsistent: {reason}"),
+    }
+}
+
+/// `usage` with the doubt recorded in its raw object under `kgraf_note`, and a
+/// loud warning: the row stays unreconciled and the figure is a lower bound.
+fn with_doubt(adapter: &'static str, mut usage: TokenUsage, doubt: &str) -> TokenUsage {
+    tracing::warn!(
+        adapter,
+        %doubt,
+        "the usage object is inconsistent; the answer is returned and the call is left \
+         unreconciled with its counts as a lower bound"
+    );
+    let note = format!("{doubt}; left unreconciled, counts are a lower bound");
+    match usage.raw.as_mut().and_then(|raw| raw.as_object_mut()) {
+        Some(object) => {
+            object.insert("kgraf_note".to_owned(), serde_json::Value::String(note));
+        }
+        None => usage.raw = Some(serde_json::json!({ "kgraf_note": note })),
+    }
+    usage
 }
 
 /// The counted fields of a usage object as reported, with no consistency check
@@ -132,15 +160,16 @@ fn lower_bound_usage(protocol: Protocol, raw: &serde_json::Value) -> Option<Toke
 }
 
 /// Fold one streamed usage event into the running figure and check the merged
-/// result. When the check refuses, the merged figure (with the event's raw
-/// object) is recorded on `guard` first, so the open row keeps a floor.
+/// result. A parse failure records the merged floor on `guard` and is an error.
+/// A failed consistency check is not: it returns the doubt, and the stream goes
+/// on, so the answer is kept and the row is left unreconciled at the end.
 fn apply_stream_usage(
     adapter: &'static str,
     protocol: Protocol,
     usage: &mut TokenUsage,
     raw: &serde_json::Value,
     guard: &StreamGuard<'_, '_>,
-) -> Result<(), ProviderError> {
+) -> Result<Option<String>, ProviderError> {
     let partial = match AnthropicAdapter::parse_usage(adapter, protocol, raw) {
         Ok(partial) => partial,
         Err(error) => {
@@ -153,11 +182,7 @@ fn apply_stream_usage(
         }
     };
     merge_stream_usage(adapter, usage, partial, raw)?;
-    if let Err(error) = check_usage_consistency(adapter, protocol, usage, raw) {
-        guard.record_usage(usage);
-        return Err(error);
-    }
-    Ok(())
+    Ok(check_usage_consistency(protocol, usage, raw).err())
 }
 
 /// Which usage fields `raw` reports. An event that names a field, even at
@@ -586,7 +611,7 @@ impl AnthropicAdapter {
         raw: &serde_json::Value,
     ) -> Result<TokenUsage, ProviderError> {
         let usage = Self::parse_usage(adapter, protocol, raw)?;
-        check_usage_consistency(adapter, protocol, &usage, raw)?;
+        check_usage_consistency(protocol, &usage, raw).map_err(|r| inconsistent(adapter, r))?;
         Ok(usage)
     }
 
@@ -637,11 +662,14 @@ impl AnthropicAdapter {
         .map_err(|source| ProviderError::Usage { adapter, source })
     }
 
+    /// The parsed response and, when the usage object failed its consistency
+    /// check, the reason. The answer is kept either way; the caller leaves the
+    /// row unreconciled on a doubt.
     fn parse_response(
         &self,
         requested_model: &str,
         body: &serde_json::Value,
-    ) -> Result<Response, ProviderError> {
+    ) -> Result<(Response, Option<String>), ProviderError> {
         let returned_model =
             body.get("model")
                 .and_then(|m| m.as_str())
@@ -657,7 +685,9 @@ impl AnthropicAdapter {
         let usage = body.get("usage").ok_or(ProviderError::UsageMissing {
             adapter: self.adapter_name(),
         })?;
-        let usage = Self::normalize_usage_as(self.adapter_name(), self.config.protocol, usage)?;
+        let parsed_usage = Self::parse_usage(self.adapter_name(), self.config.protocol, usage)?;
+        let doubt = check_usage_consistency(self.config.protocol, &parsed_usage, usage).err();
+        let usage = parsed_usage;
 
         let mut content = Vec::new();
         if let Some(blocks) = body.get("content").and_then(|c| c.as_array()) {
@@ -700,7 +730,7 @@ impl AnthropicAdapter {
             }
         }
 
-        Ok(Response {
+        let response = Response {
             model: returned_model.to_owned(),
             content,
             stop_reason: match body.get("stop_reason").and_then(|s| s.as_str()) {
@@ -717,7 +747,8 @@ impl AnthropicAdapter {
             },
             usage,
             request_id: body.get("id").and_then(|i| i.as_str()).map(str::to_owned),
-        })
+        };
+        Ok((response, doubt))
     }
 }
 
@@ -802,13 +833,30 @@ impl kgraf_provider::Provider for AnthropicAdapter {
             }
         };
         match self.parse_response(&request.model, &parsed) {
-            Ok(mut response) => {
+            Ok((mut response, doubt)) => {
                 if response.request_id.is_none() {
                     response.request_id = request_id.clone();
                 }
-                token
-                    .settle_async(&response.usage, response.request_id.as_deref())
-                    .await?;
+                match doubt {
+                    // The counts cannot be trusted: nothing is settled. The row
+                    // keeps them as a lower bound with the doubt noted, and the
+                    // answer is returned because the call was billed.
+                    Some(doubt) => {
+                        response.usage =
+                            with_doubt(self.adapter_name(), response.usage.clone(), &doubt);
+                        token
+                            .leave_unreconciled_with_async(
+                                Some(&response.usage),
+                                response.request_id.as_deref(),
+                            )
+                            .await?;
+                    }
+                    None => {
+                        token
+                            .settle_async(&response.usage, response.request_id.as_deref())
+                            .await?;
+                    }
+                }
                 if let Some(reason) = parsed
                     .get("stop_reason")
                     .and_then(|s| s.as_str())
@@ -925,6 +973,9 @@ impl Streaming for AnthropicAdapter {
         // keeps the partial usage and id testing found being discarded
         // on every early exit. Disarmed only on the single success path below.
         let guard = StreamGuard::new(token);
+        // The first usage inconsistency the stream showed. The stream goes on and
+        // its answer is returned; the row is left unreconciled at the end.
+        let mut usage_doubt: Option<String> = None;
         // Recorded immediately, not only once `message_start`'s own `id` field
         // arrives: every failure before that point
         // (the model-echo check below included) closed the row with no
@@ -1011,13 +1062,15 @@ impl Streaming for AnthropicAdapter {
                         // `message_start` carries the input side, including cache
                         // counts. It is the half a consumer that only reads
                         // `message_delta` would miss.
-                        apply_stream_usage(
+                        if let Some(doubt) = apply_stream_usage(
                             self.adapter_name(),
                             self.config.protocol,
                             &mut usage,
                             raw,
                             &guard,
-                        )?;
+                        )? {
+                            usage_doubt.get_or_insert(doubt);
+                        }
                         saw_usage = true;
                         guard.record_usage(&usage);
                         sink(StreamEvent::Usage {
@@ -1302,13 +1355,15 @@ impl Streaming for AnthropicAdapter {
                         // Cumulative: merge field by field, taking the last value.
                         // Summing here is the common bug and would double the output
                         // count on any stream carrying two usage events.
-                        apply_stream_usage(
+                        if let Some(doubt) = apply_stream_usage(
                             self.adapter_name(),
                             self.config.protocol,
                             &mut usage,
                             raw,
                             &guard,
-                        )?;
+                        )? {
+                            usage_doubt.get_or_insert(doubt);
+                        }
                         saw_usage = true;
                         guard.record_usage(&usage);
                         sink(StreamEvent::Usage {
@@ -1395,9 +1450,19 @@ impl Streaming for AnthropicAdapter {
         }
 
         guard.disarm();
-        token
-            .settle_async(&usage, stream_request_id.as_deref())
-            .await?;
+        match &usage_doubt {
+            Some(doubt) => {
+                usage = with_doubt(self.adapter_name(), usage, doubt);
+                token
+                    .leave_unreconciled_with_async(Some(&usage), stream_request_id.as_deref())
+                    .await?;
+            }
+            None => {
+                token
+                    .settle_async(&usage, stream_request_id.as_deref())
+                    .await?;
+            }
+        }
         if let Some(stop_reason) = unusable_reason {
             return Err(ProviderError::TurnNotUsable {
                 adapter: self.adapter_name(),
@@ -3865,16 +3930,51 @@ mod tests {
         assert!(rows.is_empty(), "{rows:?}");
     }
 
-    /// A stream refused on its merged total still billed: the open row keeps the
-    /// merged figure and the last raw usage object.
+    /// Counts the warnings a test emits, so a test can assert one was loud.
+    struct WarnCounter(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl tracing::Subscriber for WarnCounter {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    fn count_warnings() -> (
+        tracing::subscriber::DefaultGuard,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        (
+            tracing::subscriber::set_default(WarnCounter(count.clone())),
+            count,
+        )
+    }
+
+    /// A stream whose merged total does not add up still billed and still
+    /// answered: the answer is returned, nothing is settled, and the open row
+    /// keeps the merged figure as a lower bound, the raw object and a note.
     #[tokio::test]
-    async fn a_refused_stream_keeps_its_usage_and_raw_object_on_the_open_row() {
+    async fn a_stream_with_an_inconsistent_total_returns_the_answer_and_stays_unreconciled() {
+        let (_guard, warnings) = count_warnings();
         let (result, ledger) = stream_usage_events([
             r#"{"input_tokens":200,"cache_read_input_tokens":800,"output_tokens":1}"#,
             r#"{"output_tokens":54,"total_tokens":5000}"#,
         ])
         .await;
-        assert!(matches!(result, Err(ProviderError::Decode { .. })));
+        let response = result.expect("the billed answer is returned");
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
         let rows = ledger.unreconciled().expect("open rows");
         assert_eq!(rows.len(), 1);
         let usage = &rows[0].usage;
@@ -3882,13 +3982,37 @@ mod tests {
             (usage.uncached_input, usage.cache_read, usage.text_output),
             (200, 800, 54)
         );
-        assert_eq!(usage.raw.as_ref().expect("raw kept")["total_tokens"], 5000);
+        let raw = usage.raw.as_ref().expect("raw kept");
+        assert_eq!(raw["total_tokens"], 5000);
+        assert!(
+            raw["kgraf_note"]
+                .as_str()
+                .is_some_and(|n| n.contains("5000") && n.contains("lower bound")),
+            "{raw}"
+        );
+        assert!(warnings.load(std::sync::atomic::Ordering::SeqCst) >= 1);
     }
 
-    /// A complete response refused on its total still billed: the open row keeps
-    /// the parsed counts and the raw usage object.
+    /// A warm-cache hybrid call whose `input_tokens` already counts the cache
+    /// read (the additive sum exceeds the vendor total) keeps its answer too.
     #[tokio::test]
-    async fn a_refused_complete_call_keeps_its_usage_and_raw_object() {
+    async fn a_warm_cache_stream_whose_parts_exceed_the_total_keeps_the_answer() {
+        let (result, ledger) = stream_usage_events([
+            r#"{"input_tokens":1000,"cache_read_input_tokens":800,"cached_tokens":800,"output_tokens":1}"#,
+            r#"{"output_tokens":54,"cached_tokens":800,"total_tokens":1054}"#,
+        ])
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(ledger.unreconciled().expect("open rows").len(), 1);
+    }
+
+    /// A complete response whose total does not add up still billed and still
+    /// answers: the answer is returned, the row stays unreconciled with the
+    /// parsed counts as a lower bound, the raw object and a note.
+    #[tokio::test]
+    async fn a_complete_call_with_an_inconsistent_total_returns_the_answer_and_stays_unreconciled()
+    {
+        let (_guard, warnings) = count_warnings();
         let server = MockServer::start().await;
         let mut refused = body("model-a");
         refused["usage"] = json!({"input_tokens": 100, "output_tokens": 10, "total_tokens": 5});
@@ -3902,15 +4026,54 @@ mod tests {
             let token = ledger
                 .begin(ADAPTER, Protocol::Additive, "model-a", "a", "t")
                 .expect("begin");
-            let result = adapter
+            let response = adapter
                 .complete(&Request::new("model-a", "hi", 100), &token)
-                .await;
-            assert!(result.is_err());
+                .await
+                .expect("the billed answer is returned");
+            assert!(!response.text().is_empty());
+            assert_eq!(response.usage.uncached_input, 100);
         }
         let rows = ledger.unreconciled().expect("open rows");
         assert_eq!(rows.len(), 1);
         let usage = &rows[0].usage;
         assert_eq!((usage.uncached_input, usage.text_output), (100, 10));
-        assert_eq!(usage.raw.as_ref().expect("raw kept")["total_tokens"], 5);
+        let raw = usage.raw.as_ref().expect("raw kept");
+        assert_eq!(raw["total_tokens"], 5);
+        assert!(raw["kgraf_note"].as_str().is_some(), "{raw}");
+        assert!(warnings.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+    }
+
+    /// A consistent complete response settles as before, with no note.
+    #[tokio::test]
+    async fn a_consistent_complete_call_settles_without_a_note() {
+        let server = MockServer::start().await;
+        let mut ok = body("model-a");
+        ok["usage"] = json!({"input_tokens": 100, "output_tokens": 10, "total_tokens": 110});
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok))
+            .mount(&server)
+            .await;
+        let adapter = AnthropicAdapter::new(config(&server.uri())).expect("adapter");
+        let ledger = Ledger::open_in_memory().expect("ledger");
+        let id = {
+            let token = ledger
+                .begin(ADAPTER, Protocol::Additive, "model-a", "a", "t")
+                .expect("begin");
+            let response = adapter
+                .complete(&Request::new("model-a", "hi", 100), &token)
+                .await
+                .expect("answer");
+            assert!(
+                response
+                    .usage
+                    .raw
+                    .as_ref()
+                    .is_some_and(|r| r.get("kgraf_note").is_none())
+            );
+            token.id().clone()
+        };
+        assert!(ledger.unreconciled().expect("open rows").is_empty());
+        let record = ledger.call(&id).expect("read").expect("present");
+        assert_eq!(record.settlement, Settlement::Counted);
     }
 }

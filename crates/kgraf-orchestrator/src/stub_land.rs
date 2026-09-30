@@ -560,9 +560,10 @@ pub fn stub_left_in_place_failure(
 ///
 /// Bodies inside `impl Trait for Type` blocks count as placeholders only
 /// when no function body sits outside such a block and the file has no item
-/// besides `use`, `mod`, `type` and trait impls: error types with derived
-/// traits, data types or macro calls next to a mock of unimplemented methods
-/// are a finished file, not an abandoned stub. A file over
+/// besides `use`, `mod`, `type`, plain structs and trait impls: enums, error
+/// types with non-standard derives, constants, macro calls and anything under
+/// `cfg` next to a mock of unimplemented methods are a finished file. A
+/// struct and its all-placeholder trait impls alone are an abandoned stub. A file over
 /// [`MAX_SCANNED_BYTES`] is never a placeholder.
 pub fn is_placeholder_source(path: &str, content: &str) -> bool {
     if !path.ends_with(".rs") || content.len() > MAX_SCANNED_BYTES {
@@ -792,9 +793,11 @@ struct Scan {
     free: Vec<String>,
     /// Function bodies inside `impl Trait for Type` blocks.
     trait_impl: Vec<String>,
-    /// An item other than a function, `use`, `mod`, `type`, `extern crate` or
-    /// trait impl: a struct, enum, trait, constant, static, macro call or
-    /// inherent impl. Real code lives next to it.
+    /// An item other than a function, `use`, `mod`, `type`, `extern crate`,
+    /// trait impl or plain struct: an enum, trait, constant, static, macro
+    /// call or inherent impl, or any item under a `cfg` or a non-standard
+    /// derive or attribute. Real code lives next to it. A plain struct is the
+    /// scaffolding an abandoned stub declares for its trait impls.
     real_items: bool,
 }
 
@@ -810,6 +813,41 @@ fn scan_source(masked: &str) -> Scan {
     let mut scan = Scan::default();
     scan_items(masked, &mut scan);
     scan
+}
+
+/// Whether the text of an attribute (inside `#[..]`) marks the item under it as
+/// part of a finished file: conditional compilation, a derive that is not a
+/// standard trait (an error or serde derive), or an attribute that is not
+/// documentation, a lint level or a layout hint.
+fn attribute_is_real(attr: &str) -> bool {
+    let attr = attr.trim();
+    let name_end = attr
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(attr.len());
+    match &attr[..name_end] {
+        "doc" | "allow" | "warn" | "deny" | "expect" | "must_use" | "repr" | "non_exhaustive"
+        | "inline" => false,
+        "derive" => attr[name_end..]
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == ':'))
+            .filter(|w| !w.is_empty())
+            .any(|w| {
+                !matches!(
+                    w.rsplit(':').next(),
+                    Some(
+                        "Debug"
+                            | "Clone"
+                            | "Copy"
+                            | "Default"
+                            | "PartialEq"
+                            | "Eq"
+                            | "Hash"
+                            | "PartialOrd"
+                            | "Ord"
+                    )
+                )
+            }),
+        _ => true,
+    }
 }
 
 /// The keyword that names the item starting `text`, after any visibility and
@@ -943,6 +981,9 @@ fn scan_items(content: &str, scan: &mut Scan) {
                     }
                     k += 1;
                 }
+                if attribute_is_real(content.get(j + 1..k).unwrap_or("")) {
+                    scan.real_items = true;
+                }
                 i = k + 1;
                 continue;
             }
@@ -961,7 +1002,7 @@ fn scan_items(content: &str, scan: &mut Scan) {
         let header = &content[i..end];
         if bytes[end] == b';' {
             match kw {
-                "use" | "type" | "mod" | "extern_crate" | "fn" => {}
+                "use" | "type" | "mod" | "extern_crate" | "fn" | "struct" => {}
                 _ => scan.real_items = true,
             }
             i = end + 1;
@@ -989,6 +1030,7 @@ fn scan_items(content: &str, scan: &mut Scan) {
                 scan.real_items = true;
                 scan_items(inner, scan);
             }
+            "struct" => {}
             _ => scan.real_items = true,
         }
         i = after;
@@ -1881,8 +1923,12 @@ mod tests {
         for src in [
             "#[derive(Debug)]\npub enum E { A }\n\
              impl std::fmt::Display for E {\n    fn fmt(&self, f: &mut F) -> R { unimplemented!() }\n}\n",
-            "pub struct Mock { n: u8 }\n\
-             impl<T: Clone> Backend for Mock {\n    fn get(&self) { todo!() }\n}\n",
+            "#[derive(thiserror::Error, Debug)]\npub struct E { n: u8 }\n\
+             impl Backend for E {\n    fn get(&self) { todo!() }\n}\n",
+            "#[cfg(unix)]\npub struct Mock;\n\
+             impl Backend for Mock {\n    fn get(&self) { todo!() }\n}\n",
+            "#![cfg_attr(not(test), no_std)]\npub struct Mock;\n\
+             impl Backend for Mock {\n    fn get(&self) { todo!() }\n}\n",
             "const N: usize = 4;\nimpl Backend for Mock { fn get(&self) { unimplemented!() } }\n",
             "macro_rules! m { () => {}; }\nm!();\n\
              impl Backend for Mock { fn get(&self) { todo!() } }\n",
@@ -1905,6 +1951,11 @@ mod tests {
              impl Backend for Repo { fn get(&self) { todo!() } }\n",
             "mod inner {\n    pub fn a() { todo!() }\n}\n",
             "trait T { fn d(&self); fn e(&self) { todo!() } }\n",
+            "pub struct Mock { n: u8 }\n\
+             impl<T: Clone> Backend for Mock {\n    fn get(&self) { todo!() }\n}\n",
+            "#[derive(Debug, Clone)]\n/// A stub.\npub struct Mock;\n\
+             impl Backend for Mock {\n    fn get(&self) { unimplemented!() }\n}\n",
+            "pub struct Mock(u8);\nimpl Backend for Mock { fn get(&self) { todo!() } }\n",
         ] {
             assert!(is_placeholder_source("src/lib.rs", src), "{src}");
         }

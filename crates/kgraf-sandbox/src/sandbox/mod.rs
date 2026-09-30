@@ -27,6 +27,8 @@
 //! inherit a console input handle, for the same reason.
 
 #[cfg(unix)]
+mod cargo_home;
+#[cfg(unix)]
 mod child;
 #[cfg(target_os = "linux")]
 mod linux;
@@ -75,6 +77,11 @@ pub struct SandboxPolicy {
     /// and its descendants keep until they exit (see `child::install`).
     #[cfg_attr(not(unix), allow(dead_code))]
     hold: Option<PathBuf>,
+    /// The cargo home whose config is passed in without its secrets
+    /// ([`Self::with_user_cargo_home`]); `None` takes `$CARGO_HOME`, else
+    /// `~/.cargo`.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    user_cargo_home: Option<PathBuf>,
 }
 
 impl SandboxPolicy {
@@ -91,6 +98,7 @@ impl SandboxPolicy {
             accept_partial: false,
             ancestor_limit: None,
             hold: None,
+            user_cargo_home: None,
         }
     }
 
@@ -120,6 +128,20 @@ impl SandboxPolicy {
     /// writable root (checked when the command is built).
     pub fn with_tmp_dir(mut self, dir: PathBuf) -> Self {
         self.tmp_dir = Some(dir);
+        self
+    }
+
+    /// The user's cargo home, whose config's non-secret settings (a source
+    /// replacement, a linker, rustflags) a command with a temporary directory
+    /// gets in a cargo home of its own, `<tmp>/.kgraf-cargo-home`, named by
+    /// `CARGO_HOME` (decision 0084). The real config is never readable inside
+    /// the sandbox: it can hold registry tokens. Default: `$CARGO_HOME`, else
+    /// `~/.cargo`. Without a config file there, `CARGO_HOME` is left as it
+    /// is. A setting withheld for a login in its URL is reported with
+    /// [`SandboxedCommand::refused_reads`]. Unix only; Windows does not
+    /// confine reads, so cargo reads the real file there.
+    pub fn with_user_cargo_home(mut self, dir: PathBuf) -> Self {
+        self.user_cargo_home = Some(dir);
         self
     }
 
@@ -590,8 +612,10 @@ pub struct SandboxedCommand {
 impl SandboxedCommand {
     /// Each cargo file above a writable root the policy opted in to
     /// ([`SandboxPolicy::with_ancestor_reads`]) that exists but was not
-    /// granted, with its cause. Show them with the command's own output when
-    /// it fails: cargo's "Permission denied" alone does not say why.
+    /// granted, with its cause; and each setting of the user's cargo config
+    /// withheld from the command ([`SandboxPolicy::with_user_cargo_home`]).
+    /// Show them with the command's own output when it fails: cargo's
+    /// "Permission denied" alone does not say why.
     pub fn refused_reads(&self) -> &[String] {
         &self.refused_reads
     }
@@ -760,7 +784,7 @@ pub fn sandboxed_command(
         #[cfg(target_os = "macos")]
         let (mut cmd, setup) = macos::command(&resolved, program.as_ref())?;
         #[cfg(target_os = "linux")]
-        let (mut cmd, setup, refused_reads) = {
+        let (mut cmd, setup, mut refused_reads) = {
             if !policy.accept_partial && linux::is_partial() {
                 return Err(SandboxError::PartialIsolation {
                     backend: linux::BACKEND_NAME,
@@ -771,7 +795,8 @@ pub fn sandboxed_command(
         };
         // Only Linux grants (and so may refuse) ancestor reads.
         #[cfg(not(target_os = "linux"))]
-        let refused_reads: Vec<String> = Vec::new();
+        #[cfg_attr(windows, allow(unused_mut))]
+        let mut refused_reads: Vec<String> = Vec::new();
         #[cfg(unix)]
         let hold = match &policy.hold {
             Some(file) => {
@@ -821,6 +846,35 @@ pub fn sandboxed_command(
             std::env::vars_os().map(|(k, _)| k),
             &policy.pass_env,
         );
+        // The user's cargo settings without the user's cargo secrets
+        // (`cargo_home`, decision 0084).
+        #[cfg(unix)]
+        if let Some(tmp) = &policy.tmp_dir {
+            let user = policy
+                .user_cargo_home
+                .clone()
+                .or_else(|| cargo_home::user_cargo_home(resolved.home.as_deref()));
+            if let Some(user) = user {
+                let tmp = resolve(tmp)?;
+                // The deepest writable root holding it (checked in `resolved`).
+                let root = resolved
+                    .writable
+                    .iter()
+                    .filter(|r| tmp.starts_with(r))
+                    .max_by_key(|r| r.components().count())
+                    .ok_or_else(|| {
+                        SandboxError::InvalidPolicy(format!(
+                            "tmp dir {} is not under a writable root",
+                            tmp.display()
+                        ))
+                    })?;
+                let prepared = cargo_home::prepare(&user, root, &tmp)?;
+                if let Some(home) = prepared.home {
+                    cmd.env("CARGO_HOME", home);
+                }
+                refused_reads.extend(prepared.notes);
+            }
+        }
         if let Some(tmp) = &policy.tmp_dir {
             cmd.env("TMPDIR", tmp).env("TMP", tmp).env("TEMP", tmp);
             // ~/.npmrc holds registry tokens and is read-denied on macOS.

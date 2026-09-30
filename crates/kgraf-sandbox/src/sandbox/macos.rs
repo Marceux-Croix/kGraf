@@ -128,8 +128,9 @@ pub(super) const DENIED_HOME_READS: &[&str] = &[
     ".config/pypoetry/auth.toml",
     // Cargo's per-user config can hold a registry token and a proxy URL with
     // a password. Seatbelt denies the stat too, and cargo skips a config file
-    // it cannot stat (measured), so builds still run; settings kept there
-    // (a linker, a source mirror) do not apply inside the sandbox, as on
+    // it cannot stat (measured). Its non-secret settings (a source
+    // replacement, a linker, rustflags) reach the command through a cargo
+    // home of its own that the host writes (`super::cargo_home`), as on
     // Linux, where the file is never granted.
     ".cargo/config.toml",
     ".cargo/config",

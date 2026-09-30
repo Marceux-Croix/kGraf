@@ -1711,7 +1711,7 @@ impl RunLoop {
             let run = run.clone();
             let (ledger, prices, clock) = (
                 self.s.ledger.clone(),
-                self.s.prices.clone(),
+                self.shared_prices.clone(),
                 self.s.clock.clone(),
             );
             let charged = self.seeded.clone();
@@ -2070,7 +2070,7 @@ impl RunLoop {
             }
         };
         if !read_lost {
-            self.seeded.extend(calls.iter().cloned());
+            Arc::make_mut(&mut self.seeded).extend(calls.iter().cloned());
         }
         if let Some(o) = overrun
             && let Err(e) = self.on_overrun(o).await
@@ -2096,7 +2096,7 @@ impl RunLoop {
                         .admission
                         .budget()
                         .record_spend(&run, pending.task.as_str(), spend, now);
-                    self.seeded.extend(pending.calls.iter().cloned());
+                    Arc::make_mut(&mut self.seeded).extend(pending.calls.iter().cloned());
                     self.subagents.errors.push(format!(
                         "the spend of subagent `{}` was read at last and charged: {spend}",
                         pending.child

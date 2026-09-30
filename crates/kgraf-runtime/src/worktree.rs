@@ -21,6 +21,9 @@
 //! - the gitlink sits at the root itself and is the one read when the worker
 //!   first started, before any call ran; a resumed worker takes that record
 //!   from its transcript and never trusts a `.git` found on disk at resume.
+//!   The one exception is a transcript written before the gitlink was
+//!   recorded at all: its resume reads the gitlink the host's reopen has just
+//!   verified against the host's own record, and records it from then on.
 //!   A root below the top of its work tree has no gitlink of its own, and a
 //!   `.git` found there later may have been planted, so it is not read;
 //! - submodules are not entered (`--ignore-submodules=all`): a submodule's

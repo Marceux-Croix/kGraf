@@ -59,3 +59,13 @@ unchanged content is, not whether it changed.
 - **Parse a check command's own output for a "no tests ran" signal.** Would catch more cases
   but needs a parser per test runner and output format, and nothing to check for a project
   with no tests at all.
+
+**Amended 2026-09-29: a struct and its placeholder trait impls are a stub.** A file whose only
+items are plain structs, `use`, `mod`, `type` and trait impls whose bodies are all `todo!()` or
+`unimplemented!()` is a placeholder: the shape an abandoned stub takes. An enum, a constant, a
+macro call, an inherent impl, a trait definition, any item under a `cfg` attribute, and a
+struct with a non-standard derive or attribute (an error or serde derive) each mark the file
+as finished code, so error types with derived traits, platform shims and mocks written next to
+real items are never flagged. The standard derives (`Debug`, `Clone`, `Copy`, `Default`,
+`PartialEq`, `Eq`, `Hash`, `PartialOrd`, `Ord`) and documentation, lint and layout attributes
+do not. Tests cover the shape both ways.

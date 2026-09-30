@@ -3336,9 +3336,62 @@ async fn a_resume_recovers_the_paths_an_earlier_build_wrote() {
     );
 }
 
+/// A transcript written before the `Context` event recorded the gitlink has
+/// neither `gitlink` nor `no_gitlink`. Its resume reads the entry the host's
+/// reopen verified, still lists what the earlier build wrote, and records the
+/// entry in its own `Context` for the next resume.
+#[tokio::test]
+async fn a_resume_of_an_old_transcript_reads_the_verified_gitlink_and_records_it() {
+    let dir = tempfile::tempdir().expect("dir");
+    let worktree = linked_worktree(dir.path());
+    let gitlink = std::fs::read_to_string(worktree.join(".git")).expect("gitlink");
+    let (second_segment, resumed) = build_then_resume_from(
+        &worktree,
+        |_| {},
+        |events| {
+            events
+                .into_iter()
+                .map(|event| {
+                    // The stored form, less the fields the old format lacked.
+                    let mut value = serde_json::to_value(&event).expect("to json");
+                    if value["type"] == "context" {
+                        let fields = value.as_object_mut().expect("object");
+                        assert!(fields.remove("gitlink").is_some(), "{fields:?}");
+                        fields.remove("no_gitlink");
+                    }
+                    serde_json::from_value(value).expect("an old transcript still reads")
+                })
+                .collect()
+        },
+    )
+    .await;
+    assert_eq!(resumed.outcome, WorkerOutcome::Completed);
+    assert_eq!(
+        resumed.changed_paths,
+        vec![std::path::PathBuf::from("built")]
+    );
+    let recorded = second_segment.iter().find_map(|event| match event {
+        WorkerEvent::Context { gitlink, .. } => Some(gitlink.clone()),
+        _ => None,
+    });
+    assert_eq!(recorded, Some(Some(gitlink.trim().to_owned())));
+}
+
 /// Run one segment whose build writes `built` and then fails, call
 /// `between` (a crash window), and resume the worker to its answer.
 async fn build_then_resume(root: &Path, between: impl FnOnce(&Path)) -> WorkerResult {
+    build_then_resume_from(root, between, |events| events)
+        .await
+        .1
+}
+
+/// [`build_then_resume`], resuming from `stored(events)` (the transcript as
+/// a store hands it back), and also returning the resumed segment's events.
+async fn build_then_resume_from(
+    root: &Path,
+    between: impl FnOnce(&Path),
+    stored: impl FnOnce(Vec<WorkerEvent>) -> Vec<WorkerEvent>,
+) -> (Vec<WorkerEvent>, WorkerResult) {
     let first = Fake::new(false, |request| match round_of(request) {
         0 => Round::tool(vec![("t0", "build", json!({}))]),
         _ => Round {
@@ -3369,14 +3422,13 @@ async fn build_then_resume(root: &Path, between: impl FnOnce(&Path)) -> WorkerRe
         Arc::new(env2),
         brief("w1", "build it", root, 6),
         SpawnOptions {
-            resume_from: Some(events),
+            resume_from: Some(stored(events)),
             ..SpawnOptions::default()
         },
     )
     .await
     .expect("resume");
-    let (_, resumed) = with_timeout(drain(handle)).await.expect("in time");
-    resumed
+    with_timeout(drain(handle)).await.expect("in time")
 }
 
 /// A root below the top of its work tree has no gitlink the host recorded.

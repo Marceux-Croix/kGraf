@@ -126,11 +126,23 @@ returns its output so far.
 - **The host-side status read runs no program a command planted.** `git status` runs a clean
   filter for a changed file and enters populated submodules, so the read ignores submodules,
   allows no fetch, and runs only on a gitlink at the worktree root whose git directories lie
-  outside the root. A resume checks the gitlink recorded when the worker first started.
+  outside the root. A resume checks the gitlink recorded when the worker first started, and a
+  recorded absence stays an absence. A transcript from before the gitlink was recorded
+  resumes on the gitlink the host's reopen has just verified, and records it.
 - **More denies and grants.** On macOS, pip, Yarn and Poetry index logins, cargo's per-user
-  config (settings kept there do not apply inside the sandbox) and more command-line tool
-  logins are denied. On Linux, version-manager toolchain trees and build caches that hold no
-  login are readable.
+  config and more command-line tool logins are denied. On Linux, version-manager toolchain
+  trees, Pipenv and Poetry environments, and the Poetry, Playwright, Cypress and Deno caches
+  are readable; none holds a login, and the keyrings stay unreadable.
+- **The per-user cargo config's settings reach a sandboxed build without its secrets.** The
+  host writes only the source replacement, registry index, rustflags, linker, target-dir and
+  offline keys of `$CARGO_HOME/config.toml` into a cargo home of the command's own, with the
+  registry cache linked back, and points `CARGO_HOME` there. Tokens, credential providers,
+  `[http]`, `[env]` and a URL carrying a login stay on the host, and a failing command names
+  each withheld key. A project's own config still wins key by key. The file is rewritten before every
+  command without following links. Rejected: `CARGO_*` variables, which outrank the project's
+  config and cannot express `[source]`.
+- **A failed check's output keeps its joiners** (U+200C, U+200D) while control characters,
+  separators and bidirectional overrides are still replaced.
 - **The approval text escapes every blank or hidden character**, including tag characters,
   fillers, variation selectors and typographic spaces, in the tool name and rule note too.
 - **`apply_patch` compares the files hunks reach**, so a link and its target are one file.

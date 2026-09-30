@@ -88,3 +88,17 @@ unpriced, never as a known zero, and a profile store written with such a zero is
 load. A pick found transiently not ready also moves the cursor (and, under `Fitness`, is passed
 over for that contract), so one unready route does not hold a contract while another is
 healthy.
+
+**Addendum, 2026-09-29: how long a route may stay not ready, and what a tier or a sum means.**
+A contract waiting on a route that is transiently not ready is held after 2,400 ticks from its
+first failed check (20 minutes at the default 500 ms tick; the wait used to have no end). The
+hold notice gives the wait in minutes and says to fix the route and run `kgraf orchestrate
+--resume <run>`, which tries the contract again. There is no configuration key for the bound. The rotation cursor moves once for each
+route a contract finds not ready, not once for each check, so a contract stuck for many ticks
+does not turn the rotation other contracts draw from. A call larger than the input size above
+which the vendor bills different rates, on a model priced only at its base rate, is unpriced
+(the cost is not known), never costed at the base rate; `kgraf spend` and the run report name
+it as unpriced. A price entry set by hand replaces the bundled catalog's tier for that model,
+so a flat override is never refused above the catalog's tier. Money totals are summed at full
+precision and rounded once at the end, so a total can differ by a few micro-dollars from a sum
+of separately rounded calls.
