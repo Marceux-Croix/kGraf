@@ -387,7 +387,7 @@ fn settle(g: &mut Galaxy) {
     panic!("the galaxy never settled");
 }
 
-/// The review measured 3 to 7.5% of clicks on a child returning its selected parent
+/// A measurement found 3 to 7.5% of clicks on a child returning its selected parent
 /// (the parent won anywhere in its disc). Now a child in front of its parent is picked
 /// wherever its core is under the cursor, and a proxy's selection lights all its
 /// children (139 of 139 were dimmed before).
@@ -871,7 +871,7 @@ fn a_handoff_childs_failure_stacks_on_its_folded_parent_contract() {
     assert_eq!(model.refused_contains(), 0, "and not as a contains edge");
     assert!(model.task_slot("r1/a").is_none(), "the old plan left");
 
-    // The review's false count: a parent order that flips direction between two plans
+    // A false count once seen: a parent order that flips direction between two plans
     // (c under b becomes b under c) is no cycle and counts nothing.
     let before = model.refused_work_parents();
     model
@@ -901,7 +901,7 @@ fn a_handoff_childs_failure_stacks_on_its_folded_parent_contract() {
 }
 
 /// The fold handles drawn over the stage at the fit view and zoomed in, through a real
-/// egui pass: no handle covers another drawn node's center (the review found 336 such
+/// egui pass: no handle covers another drawn node's center (336 such
 /// centers under 200 always-on handles), and a click on a covered center would still go
 /// to the node, since a click picks first ([`kgraf_galaxy::view::click_at`]).
 #[test]

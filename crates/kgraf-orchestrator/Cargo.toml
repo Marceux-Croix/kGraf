@@ -12,6 +12,8 @@ authors.workspace = true
 [dependencies]
 kgraf-core = { path = "../kgraf-core" }
 kgraf-graph = { path = "../kgraf-graph" }
+# `decide` question and answer types for the orchestrator's own typed-decision calls (0089).
+kgraf-decide = { path = "../kgraf-decide" }
 # Local-only diagnostics (decision 0069): `try_dispatch`
 # records each admitted worker's route (provider:model), never sent anywhere;
 # `record` is a no-op unless a binary called `kgraf_diag::init`.
@@ -45,6 +47,8 @@ tokio = { version = "1.53", features = ["io-util", "macros", "process", "rt", "r
 libc = "0.2.185"
 
 [dev-dependencies]
+# Every orchestrator tool schema is converted for Vertex in `tests/vertex_schemas.rs`.
+kgraf-provider-google = { path = "../kgraf-provider-google" }
 # `flock::Forkers`: fork pressure for the lock-release tests.
 kgraf-core = { path = "../kgraf-core", features = ["test-support"] }
 # Tests corrupt a graph row directly to force an analytics failure.

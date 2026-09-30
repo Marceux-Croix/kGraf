@@ -102,7 +102,7 @@ pub enum GraphError {
     #[error("invalid work node: {reason}")]
     InvalidWork { reason: String },
 
-    /// A fact could not be closed or asserted as asked (`facts.rs`).
+    /// A fact could not be asserted as asked (`facts.rs`).
     #[error("fact {id}: {reason}")]
     Fact { id: i64, reason: String },
 

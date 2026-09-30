@@ -223,6 +223,7 @@ fn call(id: &str, name: &str, input: Value) -> Content {
         id: id.into(),
         name: name.into(),
         input,
+        signature: None,
     }
 }
 
@@ -628,6 +629,8 @@ struct Rig {
     dirs: Arc<ChildDirs>,
     recorder: Arc<Recorder>,
     limits: Limits,
+    /// The route's model has no price entry, so a dispatch holds nothing.
+    unpriced: bool,
 }
 
 fn registry(line: &SessionLine, recorder: &Arc<Recorder>) -> ToolRegistry {
@@ -723,6 +726,7 @@ impl Rig {
             dirs: ChildDirs::new(dir.join("worktrees")),
             recorder: Arc::new(Recorder::default()),
             limits,
+            unpriced: false,
         }
     }
 
@@ -737,6 +741,9 @@ impl Rig {
         )];
         s.workspaces = self.dirs.clone();
         s.admission = admission(self.limits);
+        if self.unpriced {
+            s.prices = prices_without(ALPHA_MODEL);
+        }
         let o = Orchestrator::new(cfg(), s).expect("orchestrator");
         line.bind(o.handle()).expect("bind");
         o
@@ -1986,6 +1993,80 @@ async fn a_busy_worktree_is_retried_with_a_growing_wait_then_reported() {
     assert!(reason.contains("stayed in use"), "{reason}");
 }
 
+/// A child resumed over the limit whose worktree stays busy is retried up to
+/// the bound, but the parent hears about the limit once, not once per try.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_over_limit_child_retried_on_a_busy_worktree_is_announced_once() {
+    let dir = tempfile::tempdir().expect("dir");
+    let go = Arc::new(AtomicBool::new(false));
+    let gate = go.clone();
+    let provider = Scripted::new(move |s| {
+        if s.is("CHILD-ONCE") {
+            return Step::After(gate.clone(), answer("never"));
+        }
+        if !s.used.contains("spawn") {
+            return Step::Reply(vec![spawn_writer("CHILD-ONCE write c", &["src/c.rs"])]);
+        }
+        if s.report().is_none() {
+            return Step::Reply(vec![call(
+                &format!("nap{}", s.round),
+                "sleep",
+                json!({"ms": 200, "round": s.round}),
+            )]);
+        }
+        if !s.used.contains("a") {
+            return Step::Reply(vec![write("a", "src/a.rs", "parent")]);
+        }
+        Step::Reply(answer("done"))
+    });
+    let the_plan = plan(&[("a", "PARENT-ONCE make a", &["src/a.rs", "src/c.rs"])]);
+    let rig = Rig::open(
+        dir.path(),
+        the_plan.clone(),
+        Limits::default(),
+        provider.clone(),
+        false,
+    );
+    stopped_with_a_waiting_child(&rig, &provider).await;
+    drop(rig);
+
+    let rig = Rig::open(
+        dir.path(),
+        the_plan,
+        Limits::new(1, 1).expect("limits"),
+        provider.clone(),
+        false,
+    );
+    rig.dirs.busy.store(usize::MAX, Ordering::SeqCst);
+    let report = tokio::time::timeout(
+        Duration::from_secs(60),
+        rig.orchestrator().resume(RunId::new(RUN)),
+    )
+    .await
+    .expect("the resume ended in time")
+    .expect("resume");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    assert_eq!(rig.dirs.reopen_tries.load(Ordering::SeqCst), 8);
+    const NOTICE: &str = "subagent-notice:r1-a-r0-a0.s1:over-limit:";
+    let parent = AgentId::new("r1-a-r0-a0");
+    let mut ids: BTreeSet<String> = rig
+        .sessions()
+        .undelivered(&parent)
+        .map(|inbox| {
+            inbox
+                .into_iter()
+                .filter(|i| i.id.starts_with(NOTICE))
+                .map(|i| i.id)
+                .collect()
+        })
+        .unwrap_or_default();
+    for piece in read(&rig.transcript("r1-a-r0-a0")).split(NOTICE).skip(1) {
+        let tail: String = piece.chars().take_while(|c| *c != '"').collect();
+        ids.insert(format!("{NOTICE}{tail}"));
+    }
+    assert_eq!(ids.len(), 1, "one notice over eight tries: {ids:?}");
+}
+
 /// A kill between a spawn's record and its rows leaves the record
 /// `preparing`. The resume removes what it left and tells the parent; it is
 /// never run and never blocks later spawns.
@@ -2496,6 +2577,78 @@ async fn a_child_whose_spend_cannot_be_read_still_settles_and_releases_its_paren
     assert!(
         trace.contains("could not be read; its hold of"),
         "the unreadable spend is said, not swallowed"
+    );
+}
+
+/// A settled child with no hold (an unpriced route) whose spend cannot be read
+/// is not charged as a silent zero: the run still completes, and the missing
+/// charge is said, with the promise to read it again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_child_with_no_hold_and_an_unreadable_spend_is_reported_not_charged_zero() {
+    let dir = tempfile::tempdir().expect("dir");
+    let go = Arc::new(AtomicBool::new(false));
+    let release = go.clone();
+    let provider = Scripted::new(move |s| {
+        if s.is("CHILD-NH") {
+            return match s.round {
+                0 => Step::Reply(vec![write("c", "src/c.rs", "child c")]),
+                _ => Step::After(release.clone(), answer("wrote c")),
+            };
+        }
+        if !s.used.contains("spawn") {
+            return Step::Reply(vec![spawn_writer("CHILD-NH write c", &["src/c.rs"])]);
+        }
+        if s.report().is_none() {
+            return Step::Reply(vec![nap(s.round)]);
+        }
+        if !s.used.contains("a") {
+            return Step::Reply(vec![write("a", "src/a.rs", "parent")]);
+        }
+        Step::Reply(answer("done"))
+    });
+    let mut rig = Rig::open(
+        dir.path(),
+        plan(&[("a", "PARENT-NH make a", &["src/a.rs", "src/c.rs"])]),
+        Limits::default(),
+        provider.clone(),
+        true,
+    );
+    rig.unpriced = true;
+    let running = tokio::spawn(
+        rig.orchestrator()
+            .start(RunId::new(RUN), "do the work".into()),
+    );
+    let child = "r1-a-r0-a0.s1";
+    let ledger = rig.parts.ledger.clone();
+    wait_for("the child's first round is counted", || {
+        ledger.calls().is_ok_and(|calls| {
+            calls
+                .iter()
+                .any(|c| c.agent_id == child && c.settlement == Settlement::Counted)
+        })
+    })
+    .await;
+    let first = ledger
+        .calls()
+        .expect("calls")
+        .into_iter()
+        .find(|c| c.agent_id == child)
+        .expect("the child's first call")
+        .id;
+    let db = rusqlite::Connection::open(dir.path().join("ledger.db")).expect("db");
+    db.busy_timeout(Duration::from_secs(5)).expect("timeout");
+    db.execute(
+        "UPDATE calls SET uncached_input = 'unreadable' WHERE id = ?1",
+        [first.as_str()],
+    )
+    .expect("corrupt the row");
+    go.store(true, Ordering::SeqCst);
+    let report = finish(running).await;
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    let trace = read(&rig.parts.dir.join("runs").join(RUN).join("trace.jsonl"));
+    assert!(
+        trace.contains("had no hold, so none is charged yet"),
+        "a child with no hold and an unreadable spend was charged silently"
     );
 }
 

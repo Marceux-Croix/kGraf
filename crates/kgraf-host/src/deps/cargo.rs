@@ -534,10 +534,9 @@ impl Mirror {
         let root = dir.path().to_path_buf();
         let found = copy_manifests(&source, &root)?;
         if !root.join("Cargo.toml").is_file() {
-            return Err(DepsError::io(
-                format!("{} has no root Cargo.toml", site.source.display()),
-                std::io::Error::from(std::io::ErrorKind::NotFound),
-            ));
+            return Err(DepsError::Project {
+                detail: format!("{} has no root Cargo.toml", site.source.display()),
+            });
         }
         if let Some(lock) = read_regular(&source, Path::new("Cargo.lock"), MAX_LOCK_BYTES)? {
             write_new(&root.join("Cargo.lock"), &lock)?;
@@ -700,10 +699,102 @@ fn copy_manifests(source: &Dir, to: &Path) -> Result<Findings, DepsError> {
                     .map_err(|e| DepsError::io("cannot write the manifest mirror", e))?;
                 write_new(&target.join("Cargo.toml"), &bytes)?;
                 write_new(&target.join("src").join("lib.rs"), b"")?;
+                for stub in target_stubs(&String::from_utf8_lossy(&bytes)) {
+                    // Never over a file the mirror already holds. A stub that
+                    // cannot be written (its path runs through a file) leaves
+                    // cargo to name the missing target itself.
+                    let path = target.join(&stub);
+                    if !path.exists() {
+                        let _ = write_new(&path, b"");
+                    }
+                }
             }
         }
     }
     Ok(found)
+}
+
+/// The most target stubs one manifest may add to the mirror.
+const MAX_TARGET_STUBS: usize = 512;
+
+/// The source files `cargo metadata` needs to exist for the targets a
+/// manifest names, relative to its folder: a library at a custom `path`, every
+/// `[[bin]]`, `[[example]]`, `[[test]]` and `[[bench]]` (at its `path` or the
+/// default place for its name), and the `default-run` binary. Without them
+/// `cargo metadata` fails on a manifest whose targets have no file, and the
+/// project reads as unchecked. A path that is absolute or has a `..`
+/// component is skipped: no stub is written outside the manifest's folder.
+fn target_stubs(manifest: &str) -> Vec<PathBuf> {
+    let Ok(doc) = manifest.parse::<toml::Table>() else {
+        return Vec::new();
+    };
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut add = |rel: &str| {
+        let rel = Path::new(rel);
+        let plain = rel
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)));
+        if plain && !rel.as_os_str().is_empty() && out.len() < MAX_TARGET_STUBS {
+            out.push(rel.to_path_buf());
+        }
+    };
+    if let Some(path) = doc
+        .get("lib")
+        .and_then(toml::Value::as_table)
+        .and_then(|t| t.get("path"))
+        .and_then(toml::Value::as_str)
+    {
+        add(path);
+    }
+    let mut bins: Vec<&str> = Vec::new();
+    for (key, dir) in [
+        ("bin", "src/bin"),
+        ("example", "examples"),
+        ("test", "tests"),
+        ("bench", "benches"),
+    ] {
+        let targets = doc.get(key).and_then(toml::Value::as_array);
+        for target in targets
+            .into_iter()
+            .flatten()
+            .filter_map(toml::Value::as_table)
+        {
+            let name = target.get("name").and_then(toml::Value::as_str);
+            if key == "bin"
+                && let Some(name) = name
+            {
+                bins.push(name);
+            }
+            match (target.get("path").and_then(toml::Value::as_str), name) {
+                (Some(path), _) => add(path),
+                (None, Some(name)) if is_target_name(name) => add(&format!("{dir}/{name}.rs")),
+                _ => {}
+            }
+        }
+    }
+    let default_run = doc
+        .get("package")
+        .and_then(toml::Value::as_table)
+        .and_then(|p| p.get("default-run"))
+        .and_then(toml::Value::as_str);
+    if let Some(name) = default_run
+        && !bins.contains(&name)
+        && is_target_name(name)
+    {
+        add(&format!("src/bin/{name}.rs"));
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// A target name that is safe as a file name: cargo's own rule for a package
+/// or target name (letters, digits, `-`, `_`).
+fn is_target_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 /// Keys whose string values (or arrays of strings) are paths cargo resolves
@@ -813,7 +904,13 @@ fn manifest_findings(rel: &Path, manifest: &str) -> Findings {
                     .sources
                     .push(format!("{here} = {value} in {}", file.display()));
             }
-            let path_key = is_path_key(key, &at);
+            // `path` in `[lib]`, `[[bin]]`, `[[test]]`, `[[example]]` and
+            // `[[bench]]` names a source file. Cargo does not open it to load
+            // the manifest (the mirror holds no sources), so it is no path
+            // that leaves the project.
+            let target_source = key == "path"
+                && matches!(at.as_str(), "lib" | "bin" | "test" | "example" | "bench");
+            let path_key = is_path_key(key, &at) && !target_source;
             let strings: Vec<&str> = match value {
                 toml::Value::String(v) if path_key => vec![v.as_str()],
                 toml::Value::Array(items) if path_key => {
@@ -844,10 +941,9 @@ fn manifest_findings(rel: &Path, manifest: &str) -> Findings {
 }
 
 fn too_large(what: String) -> DepsError {
-    DepsError::io(
-        format!("the project is too large to mirror its manifests: {what}"),
-        std::io::Error::other("limit reached"),
-    )
+    DepsError::Project {
+        detail: format!("the project is too large to mirror its manifests: {what}"),
+    }
 }
 
 /// `rel` beneath `dir` when it is a regular file no larger than `cap`; `None`
@@ -859,8 +955,18 @@ fn read_regular(dir: &Dir, rel: &Path, cap: u64) -> Result<Option<Vec<u8>>, Deps
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(DepsError::io(format!("cannot stat {}", rel.display()), e)),
     }
+    // Non-blocking: a file swapped for a named pipe after the check above
+    // must not hold the fetch on `open`. The read below only happens for a
+    // regular file (checked on the open descriptor).
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
     let file = dir
-        .open(rel)
+        .open_with(rel, &options)
         .map_err(|e| DepsError::io(format!("cannot open {}", rel.display()), e))?;
     let meta = file
         .metadata()
@@ -902,11 +1008,34 @@ struct Watch<'a> {
 /// so a full pipe never stalls cargo; stderr line by line, so downloads are
 /// counted while they happen.
 ///
-/// Only cargo itself is killed, not a process group: cargo downloads
-/// crates.io packages in its own process, and a git child (the only other
-/// kind, `net.git-fetch-with-cli`) never runs, since git sources are refused.
+/// On Unix cargo leads its own process group, and a kill takes the whole
+/// group: cargo can start children (a credential provider named in the
+/// checkout's configuration, the `git` program), and none may outlive a
+/// timeout or a cancel.
 fn run_bounded(mut cmd: Command, timeout: Duration, watch: Watch<'_>) -> std::io::Result<Output> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    #[cfg(target_os = "linux")]
+    super::group::die_with_parent(&mut cmd);
     let mut child = cmd.spawn()?;
+    // The group dies with kGraf (see `group`). A registry that cannot take
+    // the group, or handlers that cannot be installed, fail the command
+    // rather than let it outlive an interrupt.
+    #[cfg(unix)]
+    let group = match super::group::GroupGuard::register(child.id()) {
+        Ok(guard) => guard,
+        Err(e) => {
+            // SAFETY: killpg only signals the group this function created.
+            unsafe {
+                libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
+            }
+            let _ = child.wait();
+            return Err(e);
+        }
+    };
     let stdout = child.stdout.take();
     let out = std::thread::spawn(move || {
         let mut bytes = Vec::new();
@@ -936,11 +1065,35 @@ fn run_bounded(mut cmd: Command, timeout: Duration, watch: Watch<'_>) -> std::io
     });
     let deadline = Instant::now() + timeout;
     let kill = |child: &mut std::process::Child, kind, why: String| {
+        // Before the wait below reaps the leader: its pid, the group's id, is
+        // still reserved, so the signal cannot reach a reused group.
+        #[cfg(unix)]
+        {
+            // SAFETY: killpg only signals the group this function created.
+            unsafe {
+                libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
+            }
+            group.release();
+        }
         let _ = child.kill();
         let _ = child.wait();
         Err(std::io::Error::new(kind, why))
     };
     let status = loop {
+        // Unix: look without reaping (`WNOWAIT`), so the leader's pid, the
+        // group's id, stays reserved while the whole group is killed. Cargo
+        // can leave a child behind that still holds the output pipes, and
+        // the reads below would wait for it.
+        #[cfg(unix)]
+        if kgraf_sandbox::lifecycle::exited_unreaped(child.id())? {
+            // SAFETY: killpg only signals the group this function created.
+            unsafe {
+                libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
+            }
+            group.release();
+            break child.wait()?;
+        }
+        #[cfg(not(unix))]
         if let Some(status) = child.try_wait()? {
             break status;
         }
@@ -1074,6 +1227,201 @@ mod tests {
              c = { path = \"/etc\" }\n[package.metadata.x]\npath = \"/ignored\"\n",
         );
         assert_eq!(found.escapes.len(), 2, "{found:?}");
+    }
+
+    /// `path` in a target table is a source file, not a manifest path: cargo
+    /// does not open it, so one that climbs is no escape. A dependency's
+    /// `path` still is.
+    #[test]
+    fn a_target_source_path_is_not_a_manifest_escape() {
+        let found = manifest_findings(
+            Path::new("crates/a"),
+            "[lib]\npath = \"../../../x/lib.rs\"\n[[bin]]\nname = \"b\"\npath = \"/abs/main.rs\"\n\
+             [[test]]\nname = \"t\"\npath = \"../../../t.rs\"\n",
+        );
+        assert_eq!(found, Findings::default(), "{found:?}");
+        let dep = manifest_findings(
+            Path::new("a"),
+            "[lib]\npath = \"../x.rs\"\n[dependencies]\nz = { path = \"../../z\" }\n",
+        );
+        assert_eq!(dep.escapes.len(), 1, "{dep:?}");
+    }
+
+    /// A project too large to mirror, or with no root manifest, fails the
+    /// same way every time: it is not a transient error to retry.
+    #[test]
+    fn a_project_that_cannot_be_mirrored_is_a_permanent_error() {
+        assert!(!too_large("more than 1 entries".into()).is_transient());
+        let project = tempfile::tempdir().unwrap();
+        write(project.path(), "a/Cargo.toml", PKG);
+        let err = Mirror::build(&FetchSite::project(project.path()))
+            .err()
+            .expect("no root manifest");
+        assert!(
+            matches!(err, DepsError::Project { .. }) && !err.is_transient(),
+            "{err}"
+        );
+        // A real I/O failure is still transient.
+        assert!(DepsError::io("x", std::io::Error::other("y")).is_transient());
+    }
+
+    /// The pid a shell child wrote to `file`, once it has (the command is
+    /// running and has started its own child).
+    #[cfg(unix)]
+    fn pid_written(file: &Path) -> libc::pid_t {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Ok(text) = std::fs::read_to_string(file)
+                && let Ok(pid) = text.trim().parse()
+            {
+                return pid;
+            }
+            assert!(Instant::now() < deadline, "the command never started");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Whether `pid` is gone within a few seconds.
+    #[cfg(unix)]
+    fn gone(pid: libc::pid_t) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            // SAFETY: signal 0 only probes whether the process exists.
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// A shell that starts `sleep 30`, writes its pid to `$PID_FILE`, then
+    /// `tail`.
+    #[cfg(unix)]
+    fn shell_with_sleeper(pid_file: &Path, tail: &str) -> Command {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg(format!("sleep 30 & echo $! > \"$PID_FILE\"; {tail}"))
+            .env("PID_FILE", pid_file)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        cmd
+    }
+
+    /// A cancel kills the command's whole group, not only the leader: a
+    /// child it started does not outlive the call. The test waits until the
+    /// child exists, so it does not depend on how fast the shell starts.
+    #[cfg(unix)]
+    #[test]
+    fn a_stop_kills_the_children_of_the_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let stop = Stop::default();
+        let watch = Watch {
+            stop: Some(&stop),
+            max_downloads: None,
+        };
+        let err = std::thread::scope(|scope| {
+            let run = scope.spawn(|| {
+                run_bounded(
+                    shell_with_sleeper(&pid_file, "wait"),
+                    Duration::from_secs(120),
+                    watch,
+                )
+            });
+            let pid = pid_written(&pid_file);
+            stop.stop();
+            let err = run.join().unwrap().err().expect("stopped");
+            assert!(gone(pid), "the child of the command is still running");
+            err
+        });
+        assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
+    }
+
+    /// A timeout ends the command, and promptly.
+    #[cfg(unix)]
+    #[test]
+    fn a_timeout_ends_the_command() {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30").stdout(Stdio::piped()).stderr(Stdio::piped());
+        let started = Instant::now();
+        let err = run_bounded(cmd, Duration::from_millis(300), Watch::default())
+            .err()
+            .expect("timed out");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(20));
+    }
+
+    /// A command that exits and leaves a child holding its output pipes does
+    /// not stall the call: the group is killed when the leader exits, before
+    /// the pipes are read to their end.
+    #[cfg(unix)]
+    #[test]
+    fn a_child_left_holding_the_pipes_does_not_stall_the_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let started = Instant::now();
+        let out = run_bounded(
+            shell_with_sleeper(&pid_file, "true"),
+            Duration::from_secs(120),
+            Watch::default(),
+        )
+        .expect("the command exits");
+        assert!(out.ok);
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the call waited for the child that held the pipes"
+        );
+        assert!(gone(pid_written(&pid_file)), "the child is still running");
+    }
+
+    /// Runs as the child of `a_sigint_kills_the_command_in_flight`; does
+    /// nothing in a normal test run.
+    #[cfg(unix)]
+    #[test]
+    fn signal_helper() {
+        let Some(pid_file) = std::env::var_os("KGRAF_TEST_PID_FILE") else {
+            return;
+        };
+        let _ = run_bounded(
+            shell_with_sleeper(Path::new(&pid_file), "wait"),
+            Duration::from_secs(120),
+            Watch::default(),
+        );
+    }
+
+    /// An interrupt of kGraf ends a command in flight. A second copy of this
+    /// test binary runs a command, gets `SIGINT` (its default action stays:
+    /// it dies of the signal), and the command's child must be gone.
+    #[cfg(unix)]
+    #[test]
+    fn a_sigint_kills_the_command_in_flight() {
+        use std::os::unix::process::ExitStatusExt;
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let mut helper = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "deps::cargo::tests::signal_helper",
+                "--test-threads",
+                "1",
+            ])
+            .env("KGRAF_TEST_PID_FILE", &pid_file)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let sleeper = pid_written(&pid_file);
+        // SAFETY: signals the helper this test started.
+        unsafe { libc::kill(helper.id() as libc::pid_t, libc::SIGINT) };
+        let status = helper.wait().unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGINT), "{status:?}");
+        assert!(
+            gone(sleeper),
+            "the command outlived the interrupted process"
+        );
     }
 
     /// Every `git`, `registry` and `registry-index` key in a dependency
@@ -1758,6 +2106,54 @@ mod tests {
         let err = cargo.fetch(&site, &Stop::default()).expect_err("refused");
         assert!(err.to_string().contains("is not installed"), "{err}");
         assert!(!marker.exists(), "the shim was allowed to download");
+    }
+
+    /// A manifest with a binary that has no path, a `default-run`, an example,
+    /// a bench and a library at a custom path checks as decided: the mirror
+    /// holds a stub for each target, so `cargo metadata` does not fail on a
+    /// missing file and leave the project unchecked.
+    #[test]
+    fn the_mirror_holds_a_stub_for_every_named_target() {
+        let project = tempfile::tempdir().unwrap();
+        write(
+            project.path(),
+            "Cargo.toml",
+            &format!(
+                "{PKG}default-run = \"tool\"\n\
+                 [lib]\npath = \"core/lib.rs\"\n\
+                 [[bin]]\nname = \"tool\"\n\
+                 [[bin]]\nname = \"other\"\npath = \"cmd/other.rs\"\n\
+                 [[example]]\nname = \"ex\"\n\
+                 [[bench]]\nname = \"b\"\nharness = false\n\
+                 [workspace]\n"
+            ),
+        );
+        let site = FetchSite::project(project.path());
+        let mirror = Mirror::build(&site).unwrap();
+        for stub in [
+            "core/lib.rs",
+            "src/bin/tool.rs",
+            "cmd/other.rs",
+            "examples/ex.rs",
+            "benches/b.rs",
+        ] {
+            assert!(mirror.path().join(stub).is_file(), "no stub {stub}");
+        }
+        assert!(
+            matches!(offline_cargo().check(&site), Readiness::Ready),
+            "a project whose targets the mirror lacks is unchecked"
+        );
+    }
+
+    /// A target path that leaves the manifest's folder gets no stub.
+    #[test]
+    fn a_target_path_that_leaves_the_folder_gets_no_stub() {
+        let stubs = target_stubs(
+            "[package]\nname = \"a\"\n[[bin]]\nname = \"x\"\npath = \"../x.rs\"\n\
+             [[bin]]\nname = \"y\"\npath = \"/tmp/y.rs\"\n\
+             [[bin]]\nname = \"a/../../z\"\n",
+        );
+        assert!(stubs.is_empty(), "{stubs:?}");
     }
 
     fn small_project() -> tempfile::TempDir {

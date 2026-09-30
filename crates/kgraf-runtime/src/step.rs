@@ -58,6 +58,11 @@ impl StepBudget {
         self.used
     }
 
+    /// Rounds not yet spent, the final round included.
+    pub fn rounds_left(&self) -> u32 {
+        self.budget.saturating_sub(self.used)
+    }
+
     /// Plan the next round and count it as spent.
     pub fn next_round(&mut self) -> RoundPlan {
         // Checked before the query, as upstream does.
@@ -181,6 +186,18 @@ mod tests {
             }
         ));
         assert_eq!(b.next_round(), RoundPlan::Exhausted);
+    }
+
+    #[test]
+    fn rounds_left_counts_the_final_round_and_shrinks_with_each_round() {
+        let mut b = StepBudget::new(4, 0);
+        assert_eq!(b.rounds_left(), 4);
+        b.next_round();
+        assert_eq!(b.rounds_left(), 3);
+        b.refund_round();
+        assert_eq!(b.rounds_left(), 4);
+        let resumed = StepBudget::new(4, 3);
+        assert_eq!(resumed.rounds_left(), 1);
     }
 
     #[test]

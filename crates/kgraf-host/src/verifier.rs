@@ -1,5 +1,4 @@
-//! The acceptance check of one attempt. Moved from `kgraf-cli`'s
-//! `orchestrate_cmd.rs`. The order of its steps matters (see
+//! The acceptance check of one attempt. The order of its steps matters (see
 //! [`CommandVerifier`]).
 
 use crate::gates::run_confined;
@@ -111,14 +110,49 @@ fn empty_integration_notice(contract: &str) -> String {
     )
 }
 
-/// `text` with every control character (an escape sequence, a newline, a NUL)
+/// Whether `c` can change how a terminal or a reader shows the text around
+/// it: a control character (an escape sequence, a newline, a NUL), a
+/// line or paragraph separator (U+2028, U+2029), a zero-width or
+/// direction mark, a bidirectional override or isolate, or a byte order mark.
+fn is_display_altering(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{061C}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{FEFF}'
+        )
+}
+
+/// `text` with every display-altering character ([`is_display_altering`])
 /// replaced by `?`. A file name a worker created can hold them, and a notice
 /// is printed to a terminal and stored in the run record.
 pub(crate) fn clean(text: &str) -> String {
     text.chars()
-        .map(|c| if c.is_control() { '?' } else { c })
+        .map(|c| if is_display_altering(c) { '?' } else { c })
         .collect()
 }
+
+/// [`clean`] for multi-line text (a command's output): line breaks and tabs
+/// stay, everything else display-altering becomes `?`.
+pub(crate) fn clean_lines(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c != '\n' && c != '\t' && is_display_altering(c) {
+                '?'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// The most bytes the placeholder check reads of one declared write target. A
+/// larger file is real code, never a placeholder.
+const MAX_PLACEHOLDER_READ: u64 = 4 * 1024 * 1024;
 
 /// Reads one declared write target from the still-live worktree, for the
 /// placeholder check below. This only ever runs on an attempt merge-back
@@ -158,23 +192,55 @@ fn read_write_target(ws_root: &Path, path: &str) -> Option<String> {
     };
     #[cfg(not(unix))]
     let linked = false;
-    if !meta.is_file() || linked {
+    if !meta.is_file() || linked || meta.len() > MAX_PLACEHOLDER_READ {
         return None;
     }
     let mut bytes = Vec::new();
-    (&file).read_to_end(&mut bytes).ok()?;
+    // Bounded again at the read: the file can grow after the metadata call.
+    (&file)
+        .take(MAX_PLACEHOLDER_READ + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_PLACEHOLDER_READ {
+        return None;
+    }
     String::from_utf8(bytes).ok()
 }
 
 /// A declared write target as the dispatch base held it, read from the
-/// repository's object store (never from the worker's tree). `None` when the
-/// base has no such regular file or it is not UTF-8.
-fn base_write_target(repo: &Path, base: &str, path: &str) -> Option<String> {
-    let git = kgraf_sandbox::git::Git::discover().ok()?;
+/// repository's object store (never from the worker's tree). `Ok(None)` when
+/// the base has no such regular file or it is not UTF-8. A git failure is an
+/// error: reading it as "absent" would skip the placeholder check silently.
+fn base_write_target(repo: &Path, base: &str, path: &str) -> Result<Option<String>, String> {
+    let git = kgraf_sandbox::git::Git::discover().map_err(|e| e.to_string())?;
+    // `ls-tree` succeeds with no output for a path the base lacks, so a
+    // failure here is git failing, not an absent file.
+    let listing = git
+        .run(repo, ["ls-tree", "-z", base, "--", path])
+        .map_err(|e| format!("cannot list `{}` at {base}: {e}", clean(path)))?;
+    let listing = String::from_utf8_lossy(&listing);
+    // "<mode> blob <sha>\t<path>": only a regular file (100644, 100755).
+    let is_file = listing
+        .split_once(' ')
+        .is_some_and(|(mode, rest)| mode.starts_with("100") && rest.starts_with("blob "));
+    if !is_file {
+        return Ok(None);
+    }
     let spec = format!("{base}:{path}");
-    // `cat-file blob` on a tree or a missing path fails, which reads as none.
-    let bytes = git.run(repo, ["cat-file", "blob", spec.as_str()]).ok()?;
-    String::from_utf8(bytes).ok()
+    let size = git
+        .run(repo, ["cat-file", "-s", spec.as_str()])
+        .map_err(|e| format!("cannot size `{}` at {base}: {e}", clean(path)))?;
+    if String::from_utf8_lossy(&size)
+        .trim()
+        .parse::<u64>()
+        .is_ok_and(|n| n > MAX_PLACEHOLDER_READ)
+    {
+        return Ok(None);
+    }
+    let bytes = git
+        .run(repo, ["cat-file", "blob", spec.as_str()])
+        .map_err(|e| format!("cannot read `{}` at {base}: {e}", clean(path)))?;
+    Ok(String::from_utf8(bytes).ok())
 }
 
 /// The declared write targets a committed attempt left untouched
@@ -433,9 +499,22 @@ impl Verifier for CommandVerifier {
                 // placeholder at dispatch is a skipped part of the work, even
                 // though other files changed (decision 0086).
                 let base = ws.head().to_owned();
+                // A git failure while reading a base file is not "absent": it
+                // fails the verification rather than skipping the check.
+                let read_error = std::cell::RefCell::new(None::<String>);
                 let skipped = untouched_placeholders(&contract, &changed, |p| {
-                    base_write_target(manager.repo(), &base, p)
+                    match base_write_target(manager.repo(), &base, p) {
+                        Ok(content) => content,
+                        Err(e) => {
+                            read_error.borrow_mut().get_or_insert(e);
+                            None
+                        }
+                    }
                 });
+                if let Some(e) = read_error.into_inner() {
+                    workspaces.committed().insert(root.clone(), attempt);
+                    return Err(format!("cannot check the placeholder targets: {e}"));
+                }
                 if !skipped.is_empty() {
                     return fail(attempt, placeholder_left_in_place_reason(&skipped));
                 }
@@ -475,7 +554,7 @@ impl Verifier for CommandVerifier {
             let cleared = merge_back.discard_leftovers(&attempt);
             drop(quiet);
             if !passed {
-                let mut reason = format!("`{command}` failed: {output}");
+                let mut reason = format!("`{}` failed: {}", clean(&command), clean_lines(&output));
                 if let Err(e) = &cleared {
                     reason.push_str(&format!("; also, what it left could not be removed: {e}"));
                 }
@@ -505,8 +584,13 @@ impl Verifier for CommandVerifier {
                 // dispatch by construction (nothing changed at all), so this
                 // asks what that unchanged content *is*, not whether it
                 // changed. A target still holding nothing but a placeholder
-                // body is refused rather than passed, before the worktree is
-                // removed.
+                // body is refused rather than passed.
+                //
+                // Either way the worktree is left where it is: `release` (a
+                // refused one, a losing one) or `integrate` (the selected one)
+                // removes it under decision 0088's `Delete` and keeps it under
+                // `Keep`, and neither removes one an open contract still
+                // continues in (a handoff child's inherited worktree).
                 let write_paths: Vec<&str> =
                     contract.writes.iter().map(|w| w.path.as_str()).collect();
                 let left_as_stub = placeholder_writes_left_in_place(write_paths, |p| {
@@ -514,16 +598,8 @@ impl Verifier for CommandVerifier {
                 });
                 if !left_as_stub.is_empty() {
                     let reason = placeholder_left_in_place_reason(&left_as_stub);
-                    manager.remove(ws).map_err(|e| {
-                        format!("cannot remove the refused empty attempt's worktree: {e}")
-                    })?;
                     return Ok(Verdict::Fail { reason });
                 }
-                // Nothing to merge: the worktree goes, as merge-back's plain
-                // commit would have removed it.
-                manager
-                    .remove(ws)
-                    .map_err(|e| format!("cannot remove the empty attempt's worktree: {e}"))?;
                 workspaces
                     .empty
                     .lock()
@@ -571,7 +647,7 @@ impl Verifier for CommandVerifier {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::ffi::OsStrExt;
@@ -597,6 +673,18 @@ mod tests {
             read_bounded(dir.path(), "src/a.rs").as_deref(),
             Some("fn a() {}")
         );
+    }
+
+    /// A file over the cap is not read (it is real code, never a placeholder).
+    #[test]
+    fn a_file_over_the_read_cap_is_not_read() {
+        let dir = tempfile::tempdir().expect("dir");
+        let big = std::fs::File::create(dir.path().join("big.rs")).expect("create");
+        big.set_len(MAX_PLACEHOLDER_READ + 1).expect("len");
+        assert_eq!(read_bounded(dir.path(), "big.rs"), None);
+        let ok = std::fs::File::create(dir.path().join("ok.rs")).expect("create");
+        ok.set_len(MAX_PLACEHOLDER_READ).expect("len");
+        assert!(read_bounded(dir.path(), "ok.rs").is_some());
     }
 
     #[test]
@@ -682,6 +770,51 @@ mod tests {
             })
             .collect();
         c
+    }
+
+    #[test]
+    fn clean_replaces_bidi_overrides_and_line_separators() {
+        let text = "a\u{202E}b\u{2028}c\u{2066}d\u{200B}e\u{1b}[31mf\ng";
+        assert_eq!(clean(text), "a?b?c?d?e?[31mf?g");
+        assert_eq!(clean_lines(text), "a?b?c?d?e?[31mf\ng");
+        assert_eq!(clean("plain \u{e9} text"), "plain \u{e9} text");
+    }
+
+    fn git_repo_with(file: &str, content: &str) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("dir");
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(dir.path())
+                .args(["-c", "core.hooksPath=/dev/null"])
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(args)
+                .output()
+                .expect("git");
+            assert!(out.status.success(), "{args:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        };
+        run(&["init", "-q"]);
+        std::fs::write(dir.path().join(file), content).expect("write");
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "x"]);
+        let sha = run(&["rev-parse", "HEAD"]);
+        (dir, sha)
+    }
+
+    #[test]
+    fn a_base_target_reads_absent_or_fails_loud() {
+        let (dir, sha) = git_repo_with("a.rs", "fn f() { todo!() }");
+        assert_eq!(
+            base_write_target(dir.path(), &sha, "a.rs"),
+            Ok(Some("fn f() { todo!() }".to_owned()))
+        );
+        // A path the base lacks is absent, not an error.
+        assert_eq!(base_write_target(dir.path(), &sha, "missing.rs"), Ok(None));
+        // A revision git cannot resolve, and a repository that is not one,
+        // are errors: never read as "absent".
+        assert!(base_write_target(dir.path(), "0".repeat(40).as_str(), "a.rs").is_err());
+        let not_repo = tempfile::tempdir().expect("dir");
+        assert!(base_write_target(not_repo.path(), &sha, "a.rs").is_err());
     }
 
     #[test]

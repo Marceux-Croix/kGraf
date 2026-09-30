@@ -1,6 +1,4 @@
-//! The unit tests of the run construction, moved from `kgraf-cli`'s
-//! `orchestrate_cmd.rs` with the code they test. The bodies are unchanged; only
-//! the import paths differ (`crate::` for `kgraf_cli::`).
+//! Unit tests of the run construction: gates, verifier, workspaces and the assembler.
 
 use crate::assembler::*;
 use crate::config::*;
@@ -97,6 +95,70 @@ async fn a_configured_limit_throttles_the_routes_provider_calls() {
         3,
         "the refused call never reached the provider"
     );
+}
+
+/// A route with no `--rate-limit` still records its route on every ledger row.
+/// Without it the row is costed by the bare model entry: an Azure deployment
+/// named like a priced model took that model's price although the route is
+/// priced only under its own key. The same call on a limited route agrees.
+#[tokio::test]
+async fn an_unlimited_generative_route_records_its_route_and_stays_unpriced() {
+    let dir = tempfile::tempdir().expect("dir");
+    let prices_path = dir.path().join("prices.json");
+    std::fs::write(
+        &prices_path,
+        r#"{"gpt-4o": {"uncached_input": 1000000, "cache_read": 0, "cache_write": 0, "output": 0, "reasoning": 0}}"#,
+    )
+    .expect("write");
+    let prices = read_prices(&prices_path).expect("prices");
+
+    for limited_route in [false, true] {
+        let store_path = dir.path().join("rate-limits.sqlite3");
+        let used = BTreeSet::from(["azure-openai".to_owned()]);
+        let specs: Vec<String> = if limited_route {
+            vec!["azure-openai=600/60@10".into()]
+        } else {
+            Vec::new()
+        };
+        let limits = limiters(&specs, &used, Some(&store_path)).expect("limits");
+        let provider = limited(
+            Arc::new(Counts(std::sync::atomic::AtomicUsize::new(0))),
+            "azure-openai",
+            "key",
+            &limits,
+        );
+        let ledger = Ledger::open_in_memory().expect("ledger");
+        let request = kgraf_provider::Request::new("gpt-4o", "hi", 8);
+        let token = ledger
+            .begin(
+                "counts",
+                kgraf_core::Protocol::Additive,
+                "gpt-4o",
+                "a",
+                "run-1",
+            )
+            .expect("begin");
+        let id = token.id().clone();
+        provider.complete(&request, &token).await.expect("call");
+        drop(token);
+
+        let row = ledger.call(&id).expect("read").expect("row");
+        assert_eq!(
+            row.route.as_deref(),
+            Some("azure-openai"),
+            "{limited_route}"
+        );
+        let groups = ledger
+            .spend_by(kgraf_provider::GroupBy::Run, &prices)
+            .expect("spend");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            groups[0].unpriced,
+            vec!["gpt-4o".to_owned()],
+            "limited: {limited_route}"
+        );
+        assert_eq!(groups[0].cost, kgraf_core::Money::ZERO);
+    }
 }
 
 #[test]
@@ -544,7 +606,12 @@ async fn a_real_git_conflicts_attempt_is_kept_until_a_resolver_settles_it() {
 
     // Settled: the superseded attempt's ref and worktree are discarded once,
     // whichever way it went.
-    r.workspaces.discard_conflict(&wb).await;
+    r.workspaces.discard_conflict(&resolver, &wb).await;
+    assert!(
+        !wb.exists(),
+        "deleting: the settled attempt's worktree goes"
+    );
+    assert!(r.workspaces.take_problems().is_empty());
     assert_eq!(
         git_out(
             &r.root,
@@ -559,7 +626,8 @@ async fn a_real_git_conflicts_attempt_is_kept_until_a_resolver_settles_it() {
     );
     // A second call is a no-op, never an error, for the fallback path that
     // also discards on failure.
-    r.workspaces.discard_conflict(&wb).await;
+    r.workspaces.discard_conflict(&resolver, &wb).await;
+    assert!(r.workspaces.take_problems().is_empty());
 }
 
 #[tokio::test]
@@ -779,7 +847,8 @@ async fn startup_cleanup_keeps_referenced_worktrees_and_removes_the_rest() {
     store.save(&record).expect("save");
 
     let manager = WorkspaceManager::open(&r.root, &r._dir.path().join("ws")).expect("m");
-    let removed = clean_stale_worktrees(&manager, &store).expect("clean");
+    let removed =
+        clean_stale_worktrees(&manager, &store, WorktreeRetention::Delete).expect("clean");
     // Worktrees (their scratch directories go with them).
     let mut gone: Vec<PathBuf> = removed
         .iter()
@@ -1114,6 +1183,7 @@ impl Provider for CallsOneTool {
                 id: "c0".into(),
                 name: self.0.into(),
                 input: self.1.clone(),
+                signature: None,
             }]
         } else {
             vec![Content::text("done")]
@@ -1499,6 +1569,7 @@ impl Provider for McpCaller {
                 id: "c0".into(),
                 name: "mcp__echoserver__echo".into(),
                 input: serde_json::json!({"message": "ping"}),
+                signature: None,
             }]
         } else {
             vec![Content::text("done")]
@@ -1567,11 +1638,13 @@ impl Provider for ShellCaller {
                     id: "c0".into(),
                     name: "shell".into(),
                     input: serde_json::json!({"command": ["ls"]}),
+                    signature: None,
                 },
                 Content::ToolUse {
                     id: "c1".into(),
                     name: "shell".into(),
                     input: serde_json::json!({"command": ["touch", "unasked.txt"]}),
+                    signature: None,
                 },
             ]
         } else {
@@ -2533,11 +2606,15 @@ async fn an_empty_attempt_is_checked_and_what_its_check_writes_is_not_a_change()
         panic!("expected an empty pass, got {verdict:?}");
     };
     assert!(notices[0].contains("gen.txt"), "{notices:?}");
-    assert!(!ws.exists(), "an empty attempt's worktree is removed");
+    assert!(ws.is_dir(), "left for the integration to settle");
     assert!(matches!(
         r.workspaces.integrate(&c2, &ws).await.expect("integrate"),
         Integration::Empty
     ));
+    assert!(
+        !ws.exists(),
+        "deleting: an empty attempt's worktree is removed"
+    );
 }
 
 /// Decision 0086: an attempt that never touched a declared write target still
@@ -2842,8 +2919,61 @@ fn validation_commands_are_discovered_or_configured_never_invented() {
     );
 }
 
+/// The pytest command the platform's interpreter runs.
+fn pytest_command() -> &'static str {
+    if cfg!(windows) {
+        "python -m pytest"
+    } else {
+        "python3 -m pytest"
+    }
+}
+
+/// Discovery with the pytest import probe fixed to `importable`.
+fn discover_py(root: &std::path::Path, importable: bool) -> (Vec<String>, Vec<String>) {
+    crate::gates::discover_with(root, &[], &|| importable).expect("discover")
+}
+
+/// A `setup.py`, `setup.cfg` or `requirements.txt` project with Python tests
+/// that declares pytest gets the pytest gate as a `pyproject.toml` one does.
+#[test]
+fn a_setup_py_or_requirements_project_with_tests_gets_the_pytest_gate() {
+    for marker in ["setup.py", "setup.cfg", "requirements.txt"] {
+        let dir = tempfile::tempdir().expect("dir");
+        std::fs::create_dir_all(dir.path().join("tests")).expect("mkdir");
+        std::fs::write(dir.path().join("tests/test_a.py"), "def test_a(): pass\n").expect("w");
+        assert!(
+            discover_py(dir.path(), true).0.is_empty(),
+            "{marker}: tests alone are not a Python project"
+        );
+        std::fs::write(dir.path().join(marker), "pytest\n").expect("w");
+        assert_eq!(
+            discover_py(dir.path(), false).0,
+            vec![pytest_command()],
+            "{marker}"
+        );
+    }
+}
+
+/// Python tests with no pytest declared and none importable add no pytest
+/// gate, and say why; an importable pytest brings the gate back.
+#[test]
+fn python_tests_without_pytest_say_the_gate_does_not_apply() {
+    let dir = tempfile::tempdir().expect("dir");
+    std::fs::create_dir_all(dir.path().join("tests")).expect("mkdir");
+    std::fs::write(dir.path().join("tests/test_a.py"), "def test_a(): pass\n").expect("w");
+    std::fs::write(dir.path().join("requirements.txt"), "requests\n").expect("w");
+    let (found, notes) = discover_py(dir.path(), false);
+    assert!(found.is_empty(), "{found:?}");
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(notes[0].contains("not applicable"), "{notes:?}");
+    let (found, notes) = discover_py(dir.path(), true);
+    assert_eq!(found, vec![pytest_command()]);
+    assert!(notes.is_empty(), "{notes:?}");
+}
+
 /// A `pyproject.toml` alone (the tooling file of a Rust project) adds no
-/// pytest gate; Python tests or a pytest configuration do, with `python3`.
+/// pytest gate; Python tests or a pytest configuration do, with the
+/// platform's interpreter.
 #[test]
 fn a_tooling_pyproject_in_a_rust_project_adds_no_pytest_gate() {
     let dir = tempfile::tempdir().expect("dir");
@@ -2854,17 +2984,17 @@ fn a_tooling_pyproject_in_a_rust_project_adds_no_pytest_gate() {
     )
     .expect("w");
     assert_eq!(
-        discover_validation_commands(dir.path(), &[]).expect("found"),
+        discover_py(dir.path(), true).0,
         vec!["cargo test --workspace"]
     );
     // An empty tests folder, or one with no test files, is not Python tests.
     std::fs::create_dir_all(dir.path().join("tests")).expect("mkdir");
     std::fs::write(dir.path().join("tests/data.json"), "{}").expect("w");
     assert_eq!(
-        discover_validation_commands(dir.path(), &[]).expect("found"),
+        discover_py(dir.path(), true).0,
         vec!["cargo test --workspace"]
     );
-    // A test file under tests/ makes the gate plausible.
+    // A test file under tests/ makes the gate plausible, with pytest importable.
     std::fs::create_dir_all(dir.path().join("tests/unit")).expect("mkdir");
     std::fs::write(
         dir.path().join("tests/unit/test_a.py"),
@@ -2872,8 +3002,8 @@ fn a_tooling_pyproject_in_a_rust_project_adds_no_pytest_gate() {
     )
     .expect("w");
     assert_eq!(
-        discover_validation_commands(dir.path(), &[]).expect("found"),
-        vec!["cargo test --workspace", "python3 -m pytest"]
+        discover_py(dir.path(), true).0,
+        vec!["cargo test --workspace", pytest_command()]
     );
     // So does a pytest configuration, with no test file yet.
     let cfg = tempfile::tempdir().expect("dir");
@@ -2882,19 +3012,12 @@ fn a_tooling_pyproject_in_a_rust_project_adds_no_pytest_gate() {
         "[tool.pytest.ini_options]\naddopts = \"-q\"\n",
     )
     .expect("w");
-    assert_eq!(
-        discover_validation_commands(cfg.path(), &[]).expect("found"),
-        vec!["python3 -m pytest"]
-    );
+    assert_eq!(discover_py(cfg.path(), false).0, vec![pytest_command()]);
     // A test file with no pyproject.toml is not a Python project's gate.
     let bare = tempfile::tempdir().expect("dir");
     std::fs::create_dir_all(bare.path().join("tests")).expect("mkdir");
     std::fs::write(bare.path().join("tests/test_a.py"), "").expect("w");
-    assert!(
-        discover_validation_commands(bare.path(), &[])
-            .expect("none")
-            .is_empty()
-    );
+    assert!(discover_py(bare.path(), true).0.is_empty());
 }
 
 fn verifier(r: &Repo, command: &str) -> CommandVerifier {
@@ -2919,18 +3042,8 @@ fn contract(path: &str) -> OpenContract {
 
 fn result() -> WorkerResult {
     WorkerResult {
-        task: "t".into(),
-        worker: "w".into(),
-        outcome: kgraf_runtime::WorkerOutcome::Completed,
-        answer: String::new(),
-        changed_paths: vec![],
-        commit: None,
-        calls: vec![],
         steps: 1,
-        prefix_digest: String::new(),
-        denied: 0,
-        trace_failures: Vec::new(),
-        rationale: None,
+        ..WorkerResult::bare("t", "w", kgraf_runtime::WorkerOutcome::Completed)
     }
 }
 
@@ -2979,7 +3092,7 @@ async fn an_undeclared_change_fails_the_attempt() {
     }
 }
 
-/// The review's scenario: worker code commits an out-of-scope edit itself,
+/// Worker code commits an out-of-scope edit itself,
 /// so a diff of the index against the moved HEAD would show nothing.
 #[tokio::test]
 async fn a_change_the_worker_committed_itself_does_not_escape_the_scope_check() {
@@ -3011,7 +3124,7 @@ async fn a_change_the_worker_committed_itself_does_not_escape_the_scope_check() 
     }
 }
 
-/// The review's scenario: a write to `.GIT` (the gitlink, on a
+/// A write to `.GIT` (the gitlink, on a
 /// case-insensitive volume) points git at a config with a planted
 /// `core.fsmonitor`. Host git would run it; merge-back does not, and the
 /// attempt fails.
@@ -3385,6 +3498,260 @@ fn route_capacity_inputs_wires_the_header_through_tighter_rpm() {
         "the tighter, user-configured 6 rpm must win over the looser 500 rpm header: {:?}",
         kimi.inputs.rpm
     );
+}
+
+/// Every route whose catalog base URL holds a placeholder: a limit or a 429 an
+/// adapter recorded under its resolved URL is found by the host. The catalog
+/// text (`{resource}`, `{region}`, `{project}`) is what the host used to look
+/// up, and never matched.
+#[test]
+fn a_recorded_429_and_limit_are_found_for_every_placeholder_route() {
+    fn env(name: &str) -> Option<String> {
+        match name {
+            "KGRAF_VERTEX_CREDENTIALS" => Some("adc".to_owned()),
+            "KGRAF_VERTEX_PROJECT" => Some("a-project".to_owned()),
+            "KGRAF_VERTEX_REGION" => Some("us-central1".to_owned()),
+            "KGRAF_AZURE_OPENAI_API_KEY" => Some("an-azure-key-value".to_owned()),
+            "KGRAF_AZURE_OPENAI_RESOURCE" => Some("a-resource".to_owned()),
+            "KGRAF_AZURE_OPENAI_API_VERSION" => Some("v1".to_owned()),
+            "KGRAF_AZURE_OPENAI_DEPLOYMENTS" => Some("dep=some-model".to_owned()),
+            "AWS_ACCESS_KEY_ID" => Some("AKIDEXAMPLE".to_owned()),
+            "AWS_SECRET_ACCESS_KEY" => Some("a-secret-access-key".to_owned()),
+            "AWS_REGION" => Some("us-west-2".to_owned()),
+            _ => None,
+        }
+    }
+    let routes = [
+        "azure-openai:dep",
+        "azure-openai-responses:dep",
+        "bedrock:m",
+        "vertex-gemini:m",
+        "vertex-anthropic:m",
+    ];
+    let (dir, mut config) = project();
+    config.routes = routes.iter().map(|r| (*r).to_owned()).collect();
+    let store_path = dir.path().join("shared-rate-limits.sqlite3");
+    let gate = MachineGate::new(kgraf_core::ParallelismLimits::derive(100, 100, 100));
+    let host = Host::open_with_machine_gate(config, Some(&store_path), gate).expect("open");
+    let lookup: &dyn Fn(&str) -> Option<String> = &env;
+
+    // The key an adapter records under is what its own configuration holds.
+    for spec in routes {
+        let spec = RouteSpec::parse(spec).expect("spec");
+        let entry = kgraf_fleet::entry(&spec.route).expect("entry");
+        let credential = kgraf_fleet::credential_from(entry, env).expect("credential");
+        let config = kgraf_fleet::configure(entry, &credential, vec![spec.model.clone()])
+            .expect("configure");
+        let recorded_under = if spec.route.starts_with("azure") {
+            kgraf_provider::limits::scoped_key(&config.base_url, &spec.model)
+        } else {
+            config.base_url
+        };
+        kgraf_provider::limits::record(
+            &recorded_under,
+            kgraf_provider::ObservedLimits {
+                requests_limit: Some(77),
+                ..Default::default()
+            },
+        );
+        kgraf_provider::limits::record_429(&recorded_under, 4_242);
+
+        let input = host
+            .route_capacity_inputs_with(lookup)
+            .into_iter()
+            .find(|r| r.inputs.route == spec.route)
+            .expect("route present");
+        assert_eq!(
+            input.inputs.rpm,
+            Some((77, kgraf_capacity::LimitSource::Header)),
+            "{}: the recorded limit was not found",
+            spec.route
+        );
+        let key = input.base_url.expect("a key");
+        assert_eq!(key, recorded_under, "{}", spec.route);
+        assert_eq!(
+            kgraf_provider::limits::last_429(&key),
+            Some(4_242),
+            "{}: the recorded 429 was not found",
+            spec.route
+        );
+    }
+}
+
+/// A placeholder route whose settings do not resolve reports no limit and no
+/// key, rather than the catalog text.
+#[test]
+fn a_placeholder_route_with_no_settings_reports_no_limit_key() {
+    let (dir, mut config) = project();
+    config.routes = vec!["azure-openai:dep".to_owned()];
+    let store_path = dir.path().join("shared-rate-limits.sqlite3");
+    let gate = MachineGate::new(kgraf_core::ParallelismLimits::derive(100, 100, 100));
+    let host = Host::open_with_machine_gate(config, Some(&store_path), gate).expect("open");
+    let none = |_: &str| None;
+    let input = host
+        .route_capacity_inputs_with(&none)
+        .into_iter()
+        .next()
+        .expect("route");
+    assert_eq!(input.base_url, None);
+    assert_eq!(input.inputs.rpm, None);
+}
+
+/// A route with several Azure deployments reads every deployment's key: the
+/// tightest limit, and the newest 429 wherever it happened.
+#[test]
+fn an_azure_route_with_two_deployments_reads_both_keys() {
+    fn env(name: &str) -> Option<String> {
+        match name {
+            "KGRAF_AZURE_OPENAI_API_KEY" => Some("an-azure-key-value".to_owned()),
+            "KGRAF_AZURE_OPENAI_RESOURCE" => Some("two-deps".to_owned()),
+            "KGRAF_AZURE_OPENAI_API_VERSION" => Some("v1".to_owned()),
+            "KGRAF_AZURE_OPENAI_DEPLOYMENTS" => Some("da=model-a,db=model-b".to_owned()),
+            _ => None,
+        }
+    }
+    let (dir, mut config) = project();
+    config.routes = vec!["azure-openai:da".to_owned(), "azure-openai:db".to_owned()];
+    let store_path = dir.path().join("shared-rate-limits.sqlite3");
+    let gate = MachineGate::new(kgraf_core::ParallelismLimits::derive(100, 100, 100));
+    let host = Host::open_with_machine_gate(config, Some(&store_path), gate).expect("open");
+    let lookup: &dyn Fn(&str) -> Option<String> = &env;
+    let entry = kgraf_fleet::entry("azure-openai").expect("entry");
+    let key = |deployment: &str| kgraf_fleet::limit_key(entry, env, deployment).expect("key");
+    let (key_a, key_b) = (key("da"), key("db"));
+    assert_ne!(key_a, key_b);
+    for (k, rpm) in [(&key_a, 300), (&key_b, 60)] {
+        kgraf_provider::limits::record(
+            k,
+            kgraf_provider::ObservedLimits {
+                requests_limit: Some(rpm),
+                ..Default::default()
+            },
+        );
+    }
+    kgraf_provider::limits::record_429(&key_a, 1_000);
+    kgraf_provider::limits::record_429(&key_b, 2_000);
+    let input = host
+        .route_capacity_inputs_with(lookup)
+        .into_iter()
+        .find(|r| r.inputs.route == "azure-openai")
+        .expect("route");
+    assert_eq!(
+        input.inputs.rpm,
+        Some((60, kgraf_capacity::LimitSource::Header)),
+        "the tightest deployment limit"
+    );
+    assert_eq!(
+        input.base_url.as_deref(),
+        Some(key_b.as_str()),
+        "newest 429"
+    );
+}
+
+/// Decision 0089: a model route's limits are read too, under the key its
+/// adapter records them under (the model's own, since OpenAI states limits per
+/// model), and a route declared only as a model route still reports capacity.
+#[test]
+fn model_routes_are_read_for_capacity_under_their_per_model_keys() {
+    let (dir, mut config) = project();
+    config.routes = vec!["openai:chat-model".to_owned()];
+    config.model_routes = vec![
+        "embedding=openai:embed-model".to_owned(),
+        "rerank=together:rank-model".to_owned(),
+    ];
+    let store_path = dir.path().join("shared-rate-limits.sqlite3");
+    let gate = MachineGate::new(kgraf_core::ParallelismLimits::derive(100, 100, 100));
+    let host = Host::open_with_machine_gate(config, Some(&store_path), gate).expect("open");
+    let env = |_: &str| Some("a-credential-value".to_owned());
+    let lookup: &dyn Fn(&str) -> Option<String> = &env;
+    let key = |route: &str, kind, model: &str| {
+        kgraf_fleet::kind_limit_key(kgraf_fleet::entry(route).expect("entry"), env, kind, model)
+            .expect("key")
+    };
+    let chat = key("openai", kgraf_core::ModelKind::GENERATIVE, "chat-model");
+    let embed = key("openai", kgraf_core::ModelKind::EMBEDDING, "embed-model");
+    let rank = key("together", kgraf_core::ModelKind::RERANK, "rank-model");
+    assert_ne!(chat, embed, "an embedding model has its own key");
+    for (k, rpm) in [(&chat, 500), (&embed, 40), (&rank, 90)] {
+        kgraf_provider::limits::record(
+            k,
+            kgraf_provider::ObservedLimits {
+                requests_limit: Some(rpm),
+                ..Default::default()
+            },
+        );
+    }
+    kgraf_provider::limits::record_429(&embed, 9_000);
+    let inputs = host.route_capacity_inputs_with(lookup);
+    let openai = inputs
+        .iter()
+        .find(|r| r.inputs.route == "openai")
+        .expect("openai");
+    assert_eq!(
+        openai.inputs.rpm,
+        Some((40, kgraf_capacity::LimitSource::Header)),
+        "the tightest of the chat and the embedding model"
+    );
+    assert_eq!(
+        openai.base_url.as_deref(),
+        Some(embed.as_str()),
+        "newest 429"
+    );
+    let together = inputs
+        .iter()
+        .find(|r| r.inputs.route == "together")
+        .expect("a route used only as a model route still reports");
+    assert_eq!(
+        together.inputs.rpm,
+        Some((90, kgraf_capacity::LimitSource::Header))
+    );
+}
+
+/// Seeding rounds once over the hour's calls: ten calls of a fifth of a
+/// micro-dollar each seed two micro-dollars, not ten.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn seeding_many_small_calls_rounds_their_sum_once() {
+    let (_dir, config) = project();
+    std::fs::write(
+        &config.prices,
+        r#"{"e": {"uncached_input": 20000, "cache_read": 0, "cache_write": 0, "output": 0, "reasoning": 0}}"#,
+    )
+    .expect("prices");
+    let state = config.root.join(".kgraf");
+    std::fs::create_dir_all(&state).expect("state");
+    let ten = kgraf_core::TokenUsage {
+        uncached_input: 10,
+        ..Default::default()
+    };
+    {
+        let ledger = Ledger::open(&state.join("ledger.db")).expect("ledger");
+        for _ in 0..10 {
+            ledger
+                .begin("fake", kgraf_core::Protocol::Inclusive, "e", "a", "t")
+                .expect("begin")
+                .settle(&ten, None)
+                .expect("settle");
+        }
+    }
+    let host = Host::open(config).expect("open");
+    let total = host.seed_trailing_hour().expect("seed");
+    assert_eq!(total, kgraf_core::Money::from_micros(2));
+}
+
+/// A price file cannot price an Azure deployment by a bare model entry.
+#[test]
+fn an_azure_route_is_priced_only_under_its_route_scoped_key() {
+    let (dir, _config) = project();
+    let path = dir.path().join("azure-prices.json");
+    std::fs::write(
+        &path,
+        r#"{"gpt-4o": {"uncached_input": 1, "cache_read": 1, "cache_write": 1, "output": 1, "reasoning": 1}}"#,
+    )
+    .expect("prices");
+    let table = crate::config::read_prices(&path).expect("read");
+    assert!(table.is_priced_on(Some("openai"), "gpt-4o"));
+    assert!(!table.is_priced_on(Some("azure-openai"), "gpt-4o"));
+    assert!(!table.is_priced_on(Some("azure-openai-responses"), "gpt-4o"));
 }
 
 /// Readiness is typed, and builds and calls nothing: an unknown route, a
@@ -4003,7 +4370,9 @@ async fn seeding_counts_unknown_spend_at_the_worst_case_with_a_notice() {
     let host = Host::open(config).expect("open");
     let prices = host.prices().expect("prices");
     let priced = prices.cost("llama3", &usage).expect("priced");
-    let worst = host.worst_case_call(&prices, "llama3").expect("worst");
+    let worst = host
+        .worst_case_call(&prices, None, "llama3")
+        .expect("worst");
     assert!(priced > kgraf_core::Money::ZERO);
     assert!(worst > priced, "the worst case bounds a real call");
     let total = host
@@ -4039,6 +4408,37 @@ async fn seeding_counts_unknown_spend_at_the_worst_case_with_a_notice() {
             .len(),
         0
     );
+}
+
+/// A table model whose rate tier lies below the window cannot bound a call at
+/// its base rate. It does not fail the bound for an unpriced model, and a
+/// tiered model's own worst case is an error the seeding skips, not one it
+/// propagates.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tiered_model_below_the_window_does_not_fail_the_worst_case() {
+    let (_dir, config) = project();
+    let host = Host::open(config).expect("open");
+    let rate = kgraf_core::ModelPrice {
+        uncached_input: 3_000_000,
+        cache_read: 300_000,
+        cache_write: 3_000_000,
+        output: 15_000_000,
+        reasoning: 15_000_000,
+    };
+    let mut prices = kgraf_core::PriceTable::new();
+    prices.set("flat", rate);
+    prices.set("tiered", rate);
+    prices.set_tier_threshold("tiered", 1);
+    let flat = host
+        .worst_case_call(&prices, None, "flat")
+        .expect("a flat model prices");
+    // The unpriced model is bounded by the flat one; the tiered one is skipped.
+    assert_eq!(
+        host.worst_case_call(&prices, None, "unlisted")
+            .expect("bounded"),
+        flat
+    );
+    assert!(host.worst_case_call(&prices, None, "tiered").is_err());
 }
 
 /// A price table that prices nothing does not close the host: a call on an
@@ -4826,4 +5226,871 @@ fn the_index_pass_runs_without_the_shared_graph_lock() {
         .expect("lock")
         .expect("count");
     assert!(nodes > 0, "the pass indexed the project");
+}
+
+// Decision 0088: a worker's worktree, with its build output, is deleted after
+// use unless the user chose to keep worktrees. Real git in temp repositories.
+
+/// `r` with its worktree policy set. The worktree base and merge-back are the
+/// fixture's own.
+fn with_retention(mut r: Repo, retention: WorktreeRetention) -> Repo {
+    r.workspaces = Arc::new(
+        GitWorkspaces::new(r.workspaces.manager.clone(), r.merge_back.clone())
+            .with_retention(retention),
+    );
+    r
+}
+
+/// A repository whose `.gitignore` names `target/`, as a Rust project's does.
+fn repo_ignoring_target() -> Repo {
+    let dir = tempfile::tempdir().expect("dir");
+    let root = dir.path().join("repo");
+    let base = dir.path().join("ws");
+    repo_in(
+        dir,
+        root,
+        &base,
+        &[("README", "hello\n"), (".gitignore", "target/\n")],
+    )
+}
+
+/// Build output where a worker leaves it: a `target/` folder in the worktree
+/// and the shell tool's own build directory in the worktree's scratch
+/// directory. Returns both files.
+fn write_build_output(r: &Repo, root: &Path) -> (PathBuf, PathBuf) {
+    let in_tree = root.join("target").join("debug").join("blob");
+    std::fs::create_dir_all(in_tree.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&in_tree, vec![7u8; 4096]).expect("write");
+    let scratch = r
+        .workspaces
+        .get(root)
+        .expect("live")
+        .scratch()
+        .to_path_buf();
+    let in_scratch = scratch.join("target").join("blob");
+    std::fs::create_dir_all(in_scratch.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&in_scratch, vec![7u8; 4096]).expect("write");
+    (in_tree, in_scratch)
+}
+
+#[tokio::test]
+async fn a_failed_workers_worktree_and_build_are_deleted_when_deleting() {
+    let r = with_retention(repo_ignoring_target(), WorktreeRetention::Delete);
+    let ws = worktree(&r, "w-failed").await;
+    let (in_tree, in_scratch) = write_build_output(&r, &ws);
+    r.workspaces.release(&ws, false).await;
+    assert!(!ws.exists(), "the worktree is gone");
+    assert!(!in_tree.exists() && !in_scratch.exists(), "the builds too");
+    assert!(
+        !git_out(&r.root, &["worktree", "list"]).contains("w-failed"),
+        "and unregistered"
+    );
+    assert!(r.workspaces.take_problems().is_empty());
+}
+
+#[tokio::test]
+async fn a_failed_workers_worktree_and_build_stay_when_keeping() {
+    let r = with_retention(repo_ignoring_target(), WorktreeRetention::Keep);
+    let ws = worktree(&r, "w-failed").await;
+    let (in_tree, in_scratch) = write_build_output(&r, &ws);
+    r.workspaces.release(&ws, false).await;
+    assert!(in_tree.is_file() && in_scratch.is_file());
+    assert!(r.workspaces.take_problems().is_empty());
+}
+
+/// The acceptance command failed: the attempt is committed but never
+/// registered for merge or discard, the case that used to stay on disk.
+#[tokio::test]
+async fn a_worktree_whose_acceptance_check_failed_follows_the_policy() {
+    for (retention, stays) in [
+        (WorktreeRetention::Delete, false),
+        (WorktreeRetention::Keep, true),
+    ] {
+        let r = with_retention(repo_ignoring_target(), retention);
+        let ws = worktree(&r, "w-check").await;
+        std::fs::write(ws.join("a.txt"), "work\n").expect("write");
+        let (in_tree, in_scratch) = write_build_output(&r, &ws);
+        let verdict = verifier(&r, "false")
+            .verify(&contract("a.txt"), &ws, &result())
+            .await
+            .expect("ran");
+        assert!(matches!(verdict, Verdict::Fail { .. }), "{verdict:?}");
+        r.workspaces.release(&ws, false).await;
+        assert_eq!(ws.exists(), stays, "{retention:?}");
+        assert_eq!(in_tree.exists(), stays, "{retention:?}");
+        assert_eq!(in_scratch.exists(), stays, "{retention:?}");
+        assert!(r.workspaces.take_problems().is_empty());
+    }
+}
+
+/// A worktree released to be continued (a stopped run, a lost lease, a
+/// voided pass) is never removed, under either policy, and a resume reopens
+/// it with its work.
+#[tokio::test]
+async fn a_worktree_kept_for_its_worker_survives_both_policies_and_reopens() {
+    for retention in [WorktreeRetention::Delete, WorktreeRetention::Keep] {
+        let r = with_retention(repo_ignoring_target(), retention);
+        let mut c = named("a.txt", "w-resume");
+        let ws = r
+            .workspaces
+            .prepare(&c, &"w-resume".into())
+            .await
+            .expect("ws");
+        std::fs::write(ws.join("a.txt"), "work\n").expect("write");
+        let (in_tree, in_scratch) = write_build_output(&r, &ws);
+        c.worktrees.insert(
+            "w-resume".into(),
+            r.workspaces.handle(&ws).await.expect("handle"),
+        );
+        r.workspaces.release(&ws, true).await;
+        assert!(in_tree.is_file() && in_scratch.is_file(), "{retention:?}");
+        assert!(r.workspaces.take_problems().is_empty());
+        let again = restarted(&r);
+        let back = again
+            .prepare(&c, &"w-resume".into())
+            .await
+            .expect("reopened");
+        let text = std::fs::read_to_string(back.join("a.txt")).expect("read");
+        assert_eq!(text, "work\n", "{retention:?}");
+    }
+}
+
+/// A merged attempt's work is on the integration branch under either policy.
+/// Its worktree and build output go with the merge under `Delete` and stay
+/// on disk under `Keep`.
+#[tokio::test]
+async fn a_merged_attempts_worktree_and_build_follow_the_policy() {
+    for (retention, stays) in [
+        (WorktreeRetention::Delete, false),
+        (WorktreeRetention::Keep, true),
+    ] {
+        let r = with_retention(repo_ignoring_target(), retention);
+        let c = named("a.txt", "w-merged");
+        let ws = r
+            .workspaces
+            .prepare(&c, &"w-merged".into())
+            .await
+            .expect("ws");
+        std::fs::write(ws.join("a.txt"), "work\n").expect("write");
+        let (in_tree, in_scratch) = write_build_output(&r, &ws);
+        let verdict = verifier(&r, "true")
+            .verify(&c, &ws, &result())
+            .await
+            .expect("ran");
+        assert!(verdict.passed(), "{verdict:?}");
+        let merged = r.workspaces.integrate(&c, &ws).await.expect("integrate");
+        assert!(
+            matches!(merged, Integration::Merged { .. }),
+            "{retention:?}"
+        );
+        r.workspaces.release(&ws, true).await;
+        assert_eq!(ws.exists(), stays, "{retention:?}");
+        assert_eq!(in_tree.exists(), stays, "{retention:?}");
+        assert_eq!(in_scratch.exists(), stays, "{retention:?}");
+        assert_eq!(
+            git_out(
+                &r.root,
+                &[
+                    "show",
+                    &format!("{}:a.txt", r.merge_back.integration_branch())
+                ]
+            ),
+            "work",
+            "{retention:?}: the work is on the branch"
+        );
+        assert!(r.workspaces.take_problems().is_empty());
+    }
+}
+
+/// A losing attempt that was committed loses its attempt refs under either
+/// policy. Its worktree and build output go under `Delete` and stay under
+/// `Keep`; a kept loser cannot be reopened as live work.
+#[tokio::test]
+async fn a_discarded_losers_worktree_and_build_follow_the_policy() {
+    for (retention, stays) in [
+        (WorktreeRetention::Delete, false),
+        (WorktreeRetention::Keep, true),
+    ] {
+        let r = with_retention(repo_ignoring_target(), retention);
+        let mut c = named("a.txt", "w-loser");
+        let ws = r
+            .workspaces
+            .prepare(&c, &"w-loser".into())
+            .await
+            .expect("ws");
+        std::fs::write(ws.join("a.txt"), "work\n").expect("write");
+        let (in_tree, in_scratch) = write_build_output(&r, &ws);
+        c.worktrees.insert(
+            "w-loser".into(),
+            r.workspaces.handle(&ws).await.expect("handle"),
+        );
+        let verdict = verifier(&r, "true")
+            .verify(&c, &ws, &result())
+            .await
+            .expect("ran");
+        assert!(verdict.passed(), "{verdict:?}");
+        r.workspaces.release(&ws, false).await;
+        assert_eq!(ws.exists(), stays, "{retention:?}");
+        assert_eq!(in_tree.exists(), stays, "{retention:?}");
+        assert_eq!(in_scratch.exists(), stays, "{retention:?}");
+        assert_eq!(attempt_refs(&r, "w-loser"), "", "{retention:?}");
+        assert!(r.workspaces.take_problems().is_empty(), "{retention:?}");
+        if stays {
+            assert!(
+                r.workspaces.prepare(&c, &"w-loser".into()).await.is_err(),
+                "a kept loser is never reopened as live work"
+            );
+        }
+    }
+}
+
+/// The attempt refs of the worktree `name`, one per line.
+fn attempt_refs(r: &Repo, name: &str) -> String {
+    let refs = git_out(
+        &r.root,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/kgraf/attempts/",
+        ],
+    );
+    refs.lines()
+        .filter(|l| {
+            l.strip_prefix("refs/kgraf/attempts/")
+                .is_some_and(|t| t == name || t.starts_with(&format!("{name}+")))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A removal that fails is reported, not swallowed: the worktree stays, and
+/// the run is told which one and why.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_worktree_that_cannot_be_removed_is_reported() {
+    use std::os::unix::fs::PermissionsExt;
+    let r = with_retention(repo_ignoring_target(), WorktreeRetention::Delete);
+    let ws = worktree(&r, "w-stuck").await;
+    let stuck = ws.join("stuck");
+    std::fs::create_dir_all(&stuck).expect("mkdir");
+    std::fs::write(stuck.join("file"), "x").expect("write");
+    std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o500)).expect("chmod");
+    // A user that can remove it anyway (root) cannot show the failure.
+    let removable = std::fs::remove_file(stuck.join("file")).is_ok();
+    if removable {
+        std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        return;
+    }
+    r.workspaces.release(&ws, false).await;
+    let problems = r.workspaces.take_problems();
+    std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(
+        problems[0].contains("w-stuck") && problems[0].contains("could not be removed"),
+        "{problems:?}"
+    );
+    assert!(r.workspaces.take_problems().is_empty(), "taken once");
+    assert!(stuck.join("file").is_file(), "nothing was half-deleted");
+}
+
+/// Startup cleanup with the keep policy leaves a dead process's worker
+/// attempt worktrees alone (a worker's, a writer subagent's), and still
+/// removes every worktree kGraf made for itself: conversation, gate, probe and
+/// interface-stub worktrees, each made under the name its maker gives it.
+#[tokio::test]
+async fn startup_cleanup_with_keep_spares_worker_attempt_worktrees_only() {
+    let r = repo();
+    let tip = r.merge_back.integration_tip().expect("tip");
+    let make = |name: &str| {
+        r.workspaces
+            .manager
+            .create(&kgraf_sandbox::WorkspaceSpec {
+                name,
+                base: &tip,
+                branch: None,
+            })
+            .expect("create")
+            .root()
+            .to_path_buf()
+    };
+    let worker = make("r1-c1-r0-a0");
+    let child = make("r1-c1-r0-a0.s1");
+    let comms = r
+        .workspaces
+        .open_comms()
+        .await
+        .expect("open")
+        .expect("root");
+    let gate = make(&harness_worktree_name(GATE_PREFIX));
+    let probe = make(&harness_worktree_name(PROBE_PREFIX));
+    let stub = make("stub-api_parse-v2");
+    let harness = [&comms, &gate, &probe, &stub];
+    for root in [&worker, &child].into_iter().chain(harness) {
+        kill_owner(&r, root);
+    }
+    let graph = Arc::new(Mutex::new(
+        GraphStore::open(&r._dir.path().join("graph.db"), &r.root).expect("graph"),
+    ));
+    let store = RunStore::new(graph);
+    let manager = WorkspaceManager::open(&r.root, &r._dir.path().join("ws")).expect("m");
+    clean_stale_worktrees(&manager, &store, WorktreeRetention::Keep).expect("clean");
+    assert!(worker.exists(), "the worker's worktree stays");
+    assert!(child.exists(), "the writer subagent's worktree stays");
+    for root in harness {
+        assert!(!root.exists(), "{} goes", root.display());
+    }
+    clean_stale_worktrees(&manager, &store, WorktreeRetention::Delete).expect("clean");
+    assert!(
+        !worker.exists() && !child.exists(),
+        "deleting removes them at the next start"
+    );
+}
+
+/// Only the names kGraf gives its own worktrees read as its own: a worker's
+/// id (whatever its run is called) and a writer subagent's never do.
+#[test]
+fn harness_worktree_names_never_match_a_workers() {
+    for name in [
+        harness_worktree_name(COMMS_PREFIX),
+        harness_worktree_name(GATE_PREFIX),
+        harness_worktree_name(PROBE_PREFIX),
+        "stub-api_parse-v2".to_owned(),
+        "stub-a.b-v10".to_owned(),
+    ] {
+        assert!(is_harness_worktree(&name), "{name}");
+    }
+    for name in [
+        "r1-c1-r0-a0",
+        "gate-7-c1-r0-a0",
+        "comms-run-big.h1-r1n2-a1",
+        "stub-api-v2-c1-r0-a0",
+        "r1-c1-r0-a0.s3",
+        "gate-",
+        "stub--v1",
+        "stub-api-v",
+    ] {
+        assert!(!is_harness_worktree(name), "{name}");
+    }
+}
+
+/// A handoff child continues in its parent's worktree (decision 0067): the
+/// worktree is adopted, never replaced, with the parent's uncommitted work.
+/// After a failed check released it for the retry that still needs it, and
+/// after a restart, it reopens with that work, and the retry verifies and
+/// merges it. One that is gone is refused, never replaced by a fresh one.
+#[tokio::test]
+async fn an_inherited_worktree_is_adopted_with_the_parents_work_and_never_replaced() {
+    for retention in [WorktreeRetention::Delete, WorktreeRetention::Keep] {
+        let r = with_retention(repo_ignoring_target(), retention);
+        let parent = named("a.txt", "w-parent");
+        let ws = r
+            .workspaces
+            .prepare(&parent, &"w-parent".into())
+            .await
+            .expect("ws");
+        std::fs::write(ws.join("a.txt"), "the parent's work\n").expect("write");
+        let mut child = named("a.txt", "w-parent.h1");
+        child.workspace = Some(ws.clone());
+        child.worktrees.insert(
+            "w-parent".into(),
+            r.workspaces.handle(&ws).await.expect("handle"),
+        );
+        assert_eq!(
+            r.workspaces.adopt(&child, &ws).await.expect("adopt"),
+            ws,
+            "held: the same worktree"
+        );
+        let failed = verifier(&r, "false")
+            .verify(&child, &ws, &result())
+            .await
+            .expect("ran");
+        assert!(matches!(failed, Verdict::Fail { .. }), "{failed:?}");
+        // The orchestrator keeps it: the child's retry still names it.
+        r.workspaces.release(&ws, true).await;
+        let again = restarted(&r);
+        assert_eq!(
+            again.adopt(&child, &ws).await.expect("reopened"),
+            ws,
+            "{retention:?}: a later process reopens it"
+        );
+        drop(again);
+        assert_eq!(r.workspaces.adopt(&child, &ws).await.expect("reopened"), ws);
+        assert_eq!(
+            std::fs::read_to_string(ws.join("a.txt")).expect("read"),
+            "the parent's work\n"
+        );
+        child.verifications = 2;
+        let passed = verifier(&r, "true")
+            .verify(&child, &ws, &result())
+            .await
+            .expect("ran");
+        assert!(passed.passed(), "{retention:?}: {passed:?}");
+        let merged = r.workspaces.integrate(&child, &ws).await.expect("merge");
+        assert!(matches!(merged, Integration::Merged { .. }), "{merged:?}");
+        r.workspaces.release(&ws, true).await;
+        assert!(r.workspaces.take_problems().is_empty(), "{retention:?}");
+        if !retention.deletes() {
+            continue;
+        }
+        let refused = r
+            .workspaces
+            .adopt(&child, &ws)
+            .await
+            .expect_err("gone")
+            .to_string();
+        assert!(refused.contains("is gone"), "{refused}");
+        assert!(!ws.exists(), "no fresh worktree took its place");
+    }
+    let r = repo();
+    let outside = r.outside.join("w-elsewhere");
+    let refused = r
+        .workspaces
+        .adopt(&named("a.txt", "c"), &outside)
+        .await
+        .expect_err("outside");
+    assert!(
+        refused.to_string().contains("not a worktree of this run"),
+        "{refused}"
+    );
+}
+
+/// Under `Keep`, every attempt's worktree and build output stay, whatever
+/// became of it: an empty attempt that was selected, one refused for a
+/// placeholder left in place, and a conflict its resolver settled. Under
+/// `Delete` each goes once nothing needs it.
+#[tokio::test]
+async fn every_kind_of_attempt_follows_the_policy() {
+    for (retention, stays) in [
+        (WorktreeRetention::Delete, false),
+        (WorktreeRetention::Keep, true),
+    ] {
+        let r = with_retention(repo_ignoring_target(), retention);
+        // Empty, selected: nothing to merge.
+        let empty = named("b.txt", "w-empty");
+        let we = prepared(&r, &empty, "w-empty").await;
+        let (tree_e, scratch_e) = write_build_output(&r, &we);
+        let v = verifier(&r, "true")
+            .verify(&empty, &we, &result())
+            .await
+            .expect("ran");
+        assert!(v.passed(), "{v:?}");
+        assert!(matches!(
+            r.workspaces.integrate(&empty, &we).await.expect("empty"),
+            Integration::Empty
+        ));
+        r.workspaces.release(&we, true).await;
+        assert_eq!(we.exists(), stays, "{retention:?} empty");
+        assert_eq!(tree_e.exists() && scratch_e.exists(), stays);
+
+        // Empty, refused: a placeholder left in a declared target.
+        let dir = tempfile::tempdir().expect("dir");
+        let (root, base) = (dir.path().join("repo"), dir.path().join("ws"));
+        let s = with_retention(
+            repo_in(
+                dir,
+                root,
+                &base,
+                &[("src/lib.rs", "pub fn parse() -> u16 {\n    todo!()\n}\n")],
+            ),
+            retention,
+        );
+        let stub = named("src/lib.rs", "w-stub");
+        let ws = prepared(&s, &stub, "w-stub").await;
+        let refused = verifier(&s, "true")
+            .verify(&stub, &ws, &result())
+            .await
+            .expect("ran");
+        assert!(matches!(refused, Verdict::Fail { .. }), "{refused:?}");
+        assert!(ws.is_dir(), "left for the release to settle");
+        s.workspaces.release(&ws, false).await;
+        assert_eq!(ws.exists(), stays, "{retention:?} refused empty");
+        assert!(s.workspaces.take_problems().is_empty());
+
+        // Conflict, settled by its resolver.
+        let a = named("same.txt", "w-a");
+        let b = named("same.txt", "w-b");
+        let wa = prepared(&r, &a, "w-a").await;
+        let wb = prepared(&r, &b, "w-b").await;
+        std::fs::write(wa.join("same.txt"), "from a\n").expect("write");
+        std::fs::write(wb.join("same.txt"), "from b\n").expect("write");
+        let (tree_b, _) = write_build_output(&r, &wb);
+        for (c, ws) in [(&a, &wa), (&b, &wb)] {
+            let v = verifier(&r, "true").verify(c, ws, &result()).await;
+            assert!(v.expect("ran").passed());
+        }
+        r.workspaces.integrate(&a, &wa).await.expect("a");
+        r.workspaces.release(&wa, true).await;
+        assert!(matches!(
+            r.workspaces.integrate(&b, &wb).await.expect("b"),
+            Integration::Conflict { .. }
+        ));
+        r.workspaces.release(&wb, true).await;
+        r.workspaces
+            .discard_conflict(&named("same.txt", "w-b.resolver1"), &wb)
+            .await;
+        assert_eq!(wb.exists(), stays, "{retention:?} conflict");
+        assert_eq!(tree_b.exists(), stays);
+        assert_eq!(attempt_refs(&r, "w-b"), "", "{retention:?}");
+        assert!(r.workspaces.take_problems().is_empty(), "{retention:?}");
+    }
+}
+
+/// Decision 0088: the policy a host holds is the one each run it builds
+/// applies. A run file's `keep` reaches the run, and a change made while the
+/// host is open reaches the runs built after it, not the one already built.
+#[test]
+fn a_host_builds_each_run_with_the_worktree_policy_in_force() {
+    let (_dir, mut config) = project();
+    config.worktrees = WorktreeRetention::Keep;
+    let host = Host::open(config).expect("open");
+    assert_eq!(host.worktree_retention(), WorktreeRetention::Keep);
+    let startup = host.startup(&mut |_| {}).expect("startup");
+    let first = host
+        .build_base(&startup, RunId::new("k1"), &mut |_| {})
+        .expect("build");
+    assert_eq!(first.workspaces().retention(), WorktreeRetention::Keep);
+
+    host.set_worktree_retention(WorktreeRetention::Delete);
+    let second = host
+        .build_base(&startup, RunId::new("k2"), &mut |_| {})
+        .expect("build");
+    assert_eq!(second.workspaces().retention(), WorktreeRetention::Delete);
+    assert_eq!(
+        first.workspaces().retention(),
+        WorktreeRetention::Keep,
+        "a run already built keeps its policy"
+    );
+}
+
+/// Decision 0089: a run's non-generative routes are built with the run, their
+/// tools join every environment of it, and a run that declares none adds none.
+#[test]
+fn a_runs_model_routes_are_built_and_their_tools_join_every_environment() {
+    let (_dir, mut config) = project();
+    config.model_routes = vec!["typed-decision=systemone:jev-latest".into()];
+    let host = Host::open(config).expect("open");
+    host.check_ready(&host.route_set())
+        .expect("a local typed-decision route needs no key");
+    let startup = host.startup(&mut |_| {}).expect("startup");
+    let base = host
+        .build_base(&startup, RunId::new("mk"), &mut |_| {})
+        .expect("build");
+    let calls = base.model_calls().expect("model routes built");
+    assert_eq!(
+        calls.routes().kinds(),
+        vec![kgraf_core::ModelKind::TYPED_DECISION]
+    );
+    assert!(base.extra_tool_names().contains(&"decide".to_owned()));
+    assert!(!base.extra_tool_names().contains(&"embed".to_owned()));
+
+    let (_dir, config) = project();
+    let host = Host::open(config).expect("open");
+    let startup = host.startup(&mut |_| {}).expect("startup");
+    let base = host
+        .build_base(&startup, RunId::new("mk2"), &mut |_| {})
+        .expect("build");
+    assert!(base.model_calls().is_none());
+    assert!(
+        !base
+            .extra_tool_names()
+            .iter()
+            .any(|n| ["decide", "embed", "rerank"].contains(&n.as_str()))
+    );
+}
+
+/// Decision 0089: a model route whose catalog route does not serve its kind
+/// fails readiness, before anything is built.
+#[test]
+fn a_model_route_on_a_route_that_does_not_serve_its_kind_is_not_ready() {
+    let (_dir, mut config) = project();
+    config.model_routes = vec!["typed-decision=ollama:llama3".into()];
+    let host = Host::open(config).expect("open");
+    let err = host.check_ready(&host.route_set()).expect_err("not served");
+    assert!(
+        err.to_string().contains("does not serve typed-decision"),
+        "{err}"
+    );
+}
+
+/// The full index pass a run opens with owns the extractor stamps, so its
+/// report of changed extractors is carried to the run: a stale stamp on an
+/// indexed language shows in what `build_base` hands on.
+#[test]
+fn the_full_index_pass_reports_a_changed_extractor_to_the_build() {
+    let (_dir, config) = project();
+    std::fs::write(config.root.join("lib.rs"), "pub fn indexed_here() {}\n").expect("write");
+    let host = Host::open(config).expect("open");
+    let startup = host.startup(&mut |_| {}).expect("startup");
+    let first = host
+        .build_base(&startup, RunId::new("ix"), &mut |_| {})
+        .expect("first build");
+    assert!(first.extractor_changed.is_empty(), "nothing changed yet");
+    host.with_graph(|g| g.set_meta("extractor_stamp/rust", "an older extractor"))
+        .expect("lock")
+        .expect("stamp");
+    let second = host
+        .build_base(&startup, RunId::new("ix"), &mut |_| {})
+        .expect("second build");
+    assert!(
+        second
+            .extractor_changed
+            .iter()
+            .any(|c| c.language == "rust" && c.files >= 1 && c.had_stamp),
+        "{:?}",
+        second.extractor_changed
+    );
+}
+
+// Decision 0088: every failed removal or discard is reported once, and a
+// worktree an open contract still names outlives its attempt.
+
+/// Makes a worktree impossible for this user to remove: a read-only folder
+/// with a file in it, made writable again on drop. `None` when this user can
+/// remove it anyway (root), where no failure can be shown.
+#[cfg(unix)]
+struct Stuck(PathBuf);
+
+#[cfg(unix)]
+impl Stuck {
+    fn in_worktree(ws: &Path) -> Option<Self> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = ws.join("stuck");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join("file"), "x").expect("write");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).expect("chmod");
+        let stuck = Self(dir);
+        if std::fs::remove_file(stuck.0.join("file")).is_ok() {
+            return None;
+        }
+        Some(stuck)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Stuck {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+    }
+}
+
+/// A committed attempt whose discard fails is reported once: the discard
+/// already tried the removal, so the worktree it left is not removed a second
+/// time with a second report. The same for a settled conflict.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_failed_discard_is_reported_once() {
+    let r = with_retention(repo_ignoring_target(), WorktreeRetention::Delete);
+    let c = named("a.txt", "w-lost");
+    let ws = prepared(&r, &c, "w-lost").await;
+    std::fs::write(ws.join("a.txt"), "work\n").expect("write");
+    let v = verifier(&r, "true")
+        .verify(&c, &ws, &result())
+        .await
+        .expect("ran");
+    assert!(v.passed(), "{v:?}");
+    let Some(stuck) = Stuck::in_worktree(&ws) else {
+        return;
+    };
+    r.workspaces.release(&ws, false).await;
+    let problems = r.workspaces.take_problems();
+    drop(stuck);
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(
+        problems[0].contains("w-lost") && problems[0].contains("could not be discarded"),
+        "{problems:?}"
+    );
+
+    let a = named("same.txt", "w-a");
+    let b = named("same.txt", "w-b");
+    let wa = prepared(&r, &a, "w-a").await;
+    let wb = prepared(&r, &b, "w-b").await;
+    std::fs::write(wa.join("same.txt"), "from a\n").expect("write");
+    std::fs::write(wb.join("same.txt"), "from b\n").expect("write");
+    for (c, ws) in [(&a, &wa), (&b, &wb)] {
+        let v = verifier(&r, "true").verify(c, ws, &result()).await;
+        assert!(v.expect("ran").passed());
+    }
+    r.workspaces.integrate(&a, &wa).await.expect("a");
+    assert!(matches!(
+        r.workspaces.integrate(&b, &wb).await.expect("b"),
+        Integration::Conflict { .. }
+    ));
+    r.workspaces.release(&wb, true).await;
+    let Some(stuck) = Stuck::in_worktree(&wb) else {
+        return;
+    };
+    r.workspaces
+        .discard_conflict(&named("same.txt", "w-b.resolver1"), &wb)
+        .await;
+    let problems = r.workspaces.take_problems();
+    drop(stuck);
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(problems[0].contains("w-b"), "{problems:?}");
+}
+
+/// A merge merge-back refuses (here: the integration branch is checked out)
+/// neither discards the attempt on the spot nor drops a failure: the attempt
+/// is handed to `release`, which settles it under the policy once the
+/// orchestrator says nothing names the worktree.
+#[tokio::test]
+async fn a_merge_merge_back_refuses_is_settled_by_its_release() {
+    for (retention, stays) in [
+        (WorktreeRetention::Delete, false),
+        (WorktreeRetention::Keep, true),
+    ] {
+        let r = with_retention(repo_ignoring_target(), retention);
+        let c = named("a.txt", "w-refused");
+        let ws = prepared(&r, &c, "w-refused").await;
+        std::fs::write(ws.join("a.txt"), "work\n").expect("write");
+        let v = verifier(&r, "true")
+            .verify(&c, &ws, &result())
+            .await
+            .expect("ran");
+        assert!(v.passed(), "{v:?}");
+        host_git(&r.root, &["checkout", "-q", "kgraf/r-1"]);
+        let refused = r.workspaces.integrate(&c, &ws).await;
+        host_git(&r.root, &["checkout", "-q", "main"]);
+        assert!(refused.is_err(), "{refused:?}");
+        assert!(ws.is_dir(), "{retention:?}: not discarded on the spot");
+        r.workspaces.release(&ws, false).await;
+        assert_eq!(ws.exists(), stays, "{retention:?}");
+        assert_eq!(attempt_refs(&r, "w-refused"), "", "{retention:?}");
+        assert!(r.workspaces.take_problems().is_empty(), "{retention:?}");
+    }
+}
+
+/// A conversation worktree that cannot be removed is reported once, not only
+/// printed.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_conversation_worktree_that_cannot_be_removed_is_reported() {
+    let r = repo();
+    let root = r
+        .workspaces
+        .open_comms()
+        .await
+        .expect("open")
+        .expect("root");
+    let Some(stuck) = Stuck::in_worktree(&root) else {
+        return;
+    };
+    r.workspaces.discard_comms(&root).await;
+    let problems = r.workspaces.take_problems();
+    drop(stuck);
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(
+        problems[0].contains("conversation worktree") && problems[0].contains("comms-"),
+        "{problems:?}"
+    );
+}
+
+/// `r`'s repository as a later run sees it, with `retention`: nothing held.
+fn later_run(r: &Repo, retention: WorktreeRetention) -> GitWorkspaces {
+    let manager =
+        Arc::new(WorkspaceManager::open(&r.root, &r._dir.path().join("ws")).expect("manager"));
+    let merge_back = Arc::new(
+        MergeBack::open(
+            manager.clone(),
+            "kgraf/r-1",
+            kgraf_sandbox::Identity {
+                name: "Test Owner".into(),
+                email: "owner@example.invalid".into(),
+            },
+        )
+        .expect("merge-back"),
+    );
+    GitWorkspaces::new(manager, merge_back).with_retention(retention)
+}
+
+/// A run stopped before its resolver settled: the conflict's attempt was
+/// kept by that run's provider, which is gone. The resumed run settles it
+/// from what the resolver recorded: under `Delete` the worktree and its refs
+/// go (in this process, which still owns its lock, and after a restart, when
+/// the owner is dead); under `Keep` the worktree stays and only the refs go.
+#[tokio::test]
+async fn a_conflict_kept_by_a_stopped_run_is_settled_when_its_resolver_settles() {
+    for (retention, stays, restart) in [
+        (WorktreeRetention::Delete, false, false),
+        (WorktreeRetention::Delete, false, true),
+        (WorktreeRetention::Keep, true, false),
+    ] {
+        let r = with_retention(repo_ignoring_target(), retention);
+        let a = named("same.txt", "w-a");
+        let b = named("same.txt", "w-b");
+        let wa = prepared(&r, &a, "w-a").await;
+        let wb = prepared(&r, &b, "w-b").await;
+        std::fs::write(wa.join("same.txt"), "from a\n").expect("write");
+        std::fs::write(wb.join("same.txt"), "from b\n").expect("write");
+        for (c, ws) in [(&a, &wa), (&b, &wb)] {
+            let v = verifier(&r, "true").verify(c, ws, &result()).await;
+            assert!(v.expect("ran").passed());
+        }
+        r.workspaces.integrate(&a, &wa).await.expect("a");
+        assert!(matches!(
+            r.workspaces.integrate(&b, &wb).await.expect("b"),
+            Integration::Conflict { .. }
+        ));
+        let mut resolver = named("same.txt", "w-b.resolver1");
+        resolver.resolver_source = Some(wb.clone());
+        resolver.worktrees.insert(
+            "w-b".into(),
+            r.workspaces.handle(&wb).await.expect("handle"),
+        );
+        r.workspaces.release(&wb, true).await;
+        let (in_tree, _) = {
+            let dir = wb.join("target").join("debug");
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            std::fs::write(dir.join("blob"), "build").expect("write");
+            (dir.join("blob"), ())
+        };
+        if restart {
+            kill_owner(&r, &wb);
+        }
+        let resumed = later_run(&r, retention);
+        resumed.discard_conflict(&resolver, &wb).await;
+        assert_eq!(wb.exists(), stays, "{retention:?} restart={restart}");
+        assert_eq!(in_tree.exists(), stays);
+        assert_eq!(attempt_refs(&r, "w-b"), "", "{retention:?}");
+        assert!(
+            resumed.take_problems().is_empty(),
+            "{retention:?} restart={restart}"
+        );
+    }
+}
+
+/// At the end of a run, the attempt refs of a worktree an open contract still
+/// names are kept even though no open contract lists its worker: a handoff
+/// child's inherited worktree (its retry reopens it at the ref's commit) and
+/// a conflicted attempt a resolver cites.
+#[tokio::test]
+async fn attempt_refs_of_a_worktree_an_open_contract_names_are_kept() {
+    let r = repo();
+    let mut c = named("a.txt", "w-kept");
+    c.verifications = 1;
+    let ws = prepared(&r, &c, "w-kept").await;
+    std::fs::write(ws.join("a.txt"), "x\n").expect("write");
+    let v = verifier(&r, "true")
+        .verify(&c, &ws, &result())
+        .await
+        .expect("ran");
+    assert!(v.passed(), "{v:?}");
+    let mut child = named("a.txt", "w-kept.h1");
+    child.workspace = Some(ws.clone());
+    let mut resolver = named("a.txt", "w-kept.resolver1");
+    resolver.resolver_source = Some(ws.clone());
+    for open in [child, resolver] {
+        let mut record =
+            kgraf_orchestrator::RunStateRecord::new(kgraf_core::RunId::new("r1"), "x", 0);
+        record.open_contracts.push(open.clone());
+        r.workspaces
+            .sweep_refs(Some(&record), || Ok(Default::default()))
+            .expect("sweep");
+        assert_ne!(attempt_refs(&r, "w-kept"), "", "{}", open.contract);
+    }
+    let record = kgraf_orchestrator::RunStateRecord::new(kgraf_core::RunId::new("r1"), "x", 0);
+    r.workspaces
+        .sweep_refs(Some(&record), || Ok(Default::default()))
+        .expect("sweep");
+    assert_eq!(attempt_refs(&r, "w-kept"), "", "nothing names it: swept");
 }

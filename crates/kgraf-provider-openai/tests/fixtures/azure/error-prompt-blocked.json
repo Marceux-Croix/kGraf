@@ -1,0 +1,12 @@
+{
+  "_fixture": {
+    "source": [
+      "https://learn.microsoft.com/en-us/azure/ai-foundry/openai/how-to/responses"
+    ],
+    "provenance": "The error object is copied from the cited page's 'Detect blocked input' section: HTTP 400 with code content_filter. Not a live capture."
+  },
+  "error": {
+    "code": "content_filter",
+    "message": "The response was filtered due to the prompt triggering content management policy."
+  }
+}

@@ -502,6 +502,91 @@ impl RouteLimiter {
     }
 }
 
+/// A provider that records its catalog route on every call's ledger row and
+/// otherwise passes calls through: the wrapper for a route with no rate limit.
+///
+/// The route on the row is what scopes a price to a route (decision 0067,
+/// `PriceTable::require_route_scoped`). A call with no route is costed by the
+/// bare model entry, so a deployment named like a priced model would take that
+/// model's price. Recording the route only when a limiter is configured left
+/// exactly the unlimited routes open to that.
+pub struct RouteRecorded {
+    inner: Arc<dyn Provider>,
+    route: String,
+}
+
+impl RouteRecorded {
+    pub fn new(inner: Arc<dyn Provider>, route: impl Into<String>) -> Self {
+        Self {
+            inner,
+            route: route.into(),
+        }
+    }
+
+    /// Records the route while the row is in flight. A failure to record is
+    /// logged, never fatal, the same rule the limiter follows: a row without a
+    /// route is priced as an unscoped call, and the log says which call.
+    async fn record(&self, token: &CallToken<'_>) {
+        if let Err(e) = token.record_route_async(&self.route).await {
+            eprintln!(
+                "kgraf: could not record the route on call {}: {e}",
+                token.id()
+            );
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for RouteRecorded {
+    fn adapter(&self) -> &'static str {
+        self.inner.adapter()
+    }
+
+    fn protocol(&self) -> Protocol {
+        self.inner.protocol()
+    }
+
+    async fn complete(
+        &self,
+        request: &Request,
+        token: &CallToken,
+    ) -> Result<Response, ProviderError> {
+        self.record(token).await;
+        self.inner.complete(request, token).await
+    }
+
+    /// The inner provider's capabilities, with streaming routed through the
+    /// recorder too: a stream that bypassed it would leave its row without a
+    /// route.
+    fn capabilities(&self) -> Capabilities<'_> {
+        let inner = self.inner.capabilities();
+        Capabilities {
+            streaming: inner.streaming.map(|_| self as &dyn Streaming),
+            cache_control: inner.cache_control,
+            reasoning: inner.reasoning,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Streaming for RouteRecorded {
+    async fn stream(
+        &self,
+        request: &Request,
+        token: &CallToken,
+        sink: &mut (dyn FnMut(StreamEvent) + Send),
+    ) -> Result<Response, ProviderError> {
+        let Some(inner) = self.inner.capabilities().streaming else {
+            return Err(ProviderError::CapabilityNotHonored {
+                adapter: self.inner.adapter(),
+                capability: "streaming",
+            });
+        };
+        self.record(token).await;
+        inner.stream(request, token, sink).await
+    }
+}
+
 /// A provider whose calls pass its route's limiter first.
 pub struct RateLimited {
     inner: Arc<dyn Provider>,
@@ -517,27 +602,43 @@ impl RateLimited {
         &self.limiter
     }
 
-    /// Take a slot, or close the token as never sent and return the refusal.
+    async fn admit(&self, token: &CallToken<'_>) -> Result<(), ProviderError> {
+        self.limiter.admit(self.inner.adapter(), token).await
+    }
+}
+
+impl RouteLimiter {
+    /// Take a slot for the call `token` opened, or close the token as never
+    /// sent and return the refusal. The one admission path: a generative
+    /// provider takes it through [`RateLimited`], a route of any other kind
+    /// through its caller (decision 0089), so every call on a limited route is
+    /// paced alike.
     ///
     /// A cancel while waiting drops this future; the guard then closes the row as
     /// failed, since the request never left.
-    async fn admit(&self, token: &CallToken<'_>) -> Result<(), ProviderError> {
+    pub async fn admit(
+        &self,
+        adapter: &'static str,
+        token: &CallToken<'_>,
+    ) -> Result<(), ProviderError> {
         // Decision 0067: the catalog
-        // route id, distinct from `self.inner.adapter()` (the wire adapter
+        // route id, distinct from `adapter` (the wire adapter
         // constant, which several routes can share), recorded while the row
         // is still in flight, before the rate-limit check, so a refused
         // call still carries its route (harmless: `route_round_stats` reads
-        // only settled, counted rows, so a refused call never skews it). A failure to record it
+        // only settled, counted rows, so a refused call never skews it, and
+        // leaves out the embedding, rerank and decision calls admitted here,
+        // which are not rounds). A failure to record it
         // is logged, never fatal: a route this crate cannot yet resolve is
         // reported as "unmeasured" downstream, not as a broken call.
-        if let Err(e) = token.record_route_async(self.limiter.route()).await {
+        if let Err(e) = token.record_route_async(self.route()).await {
             eprintln!(
                 "kgraf: could not record the route on call {}: {e}",
                 token.id()
             );
         }
         let mut guard = FailIfDropped { token, armed: true };
-        let acquired = self.limiter.acquire(self.inner.adapter()).await;
+        let acquired = self.acquire(adapter).await;
         guard.armed = false;
         if let Err(mut e) = acquired {
             if let Err(ledger) = token.close_on_async(&e, None).await {

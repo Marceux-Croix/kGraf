@@ -1371,7 +1371,7 @@ impl RunLoop {
     }
 
     /// The rationale of each contract this one `depends_on`, for its worker's
-    /// brief (item 3, coordination-hardening set): a producer's model-written
+    /// brief: a producer's model-written
     /// conclusions, quoted as data, never as instructions, so a worker on
     /// another vendor does not have to rebuild them from the diff alone. The
     /// reasoning block that produced them is never replayed (0005); this is
@@ -1893,8 +1893,8 @@ impl RunLoop {
     }
 }
 
-/// One dependency's rationale, quoted as data (item 3, coordination-hardening
-/// set), or `None` when `closed` carries no rationale to show -- a worker
+/// One dependency's rationale, quoted as data, or `None` when `closed` carries
+/// no rationale to show -- a worker
 /// that gave none, or a `Superseded` closure, both contribute nothing rather
 /// than a fabricated placeholder. Pure, so `producer_rationale_brief`'s
 /// per-contract lookup and this rendering can be tested apart.
@@ -2038,7 +2038,7 @@ mod tests {
         ClosedContract::of(&open, Closure::Verified).with_rationale(rationale)
     }
 
-    /// Item 3, coordination-hardening set: a producer's rationale reaches a
+    /// A producer's rationale reaches a
     /// dependent's brief text as quoted data (`<producer_rationale ...>`),
     /// labeled with the producing model and worker (0026), never as bare
     /// instruction text a model could follow.

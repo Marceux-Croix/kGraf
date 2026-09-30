@@ -150,15 +150,6 @@ impl ReportQueue {
         self.pending.len()
     }
 
-    /// When the next delivery could happen.
-    pub fn next_due_ms(&self) -> Option<i64> {
-        let earliest = self.pending.iter().map(|p| p.available_ms).min()?;
-        Some(match self.deferred_until {
-            Some(d) => earliest.max(d),
-            None => earliest,
-        })
-    }
-
     /// Everything due at `now`, as deliveries.
     pub fn due(&mut self, now: i64) -> Vec<Delivery> {
         if self.deferred_until.is_some_and(|d| now < d) {
@@ -256,7 +247,6 @@ mod tests {
         q.submit(report("w1", ReportKind::Informational, 0), &[])
             .expect("ok");
         assert!(q.due(1_000).is_empty());
-        assert_eq!(q.next_due_ms(), Some(BATCH_FALLBACK_MS));
         q.submit(report("w2", ReportKind::NeedsInput, 2_000), &[])
             .expect("ok");
         let out = q.due(2_000);
@@ -296,7 +286,6 @@ mod tests {
         q.submit(report("w1", ReportKind::Stuck, 1_000), &[])
             .expect("ok");
         assert!(q.due(1_000).is_empty(), "coalesced inside the window");
-        assert_eq!(q.next_due_ms(), Some(INTERRUPT_WINDOW_MS));
         let out = q.due(INTERRUPT_WINDOW_MS);
         assert!(out[0].interrupt);
         // A different worker's stuck report is not rate-limited by w1's window.

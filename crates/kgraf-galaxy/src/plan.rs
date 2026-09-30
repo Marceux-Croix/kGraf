@@ -75,6 +75,9 @@ pub enum WorkState {
     PresumedPartial,
     /// Presumed; nothing of it exists and the document does not say it started.
     PresumedRemaining,
+    /// Presumed, but its stored record is damaged, so neither what it names nor
+    /// whether work remains is known. Not counted as remaining.
+    PresumedUnknown,
 }
 
 impl WorkState {
@@ -99,6 +102,7 @@ impl WorkState {
             WorkState::PresumedDone => "presumed done",
             WorkState::PresumedPartial => "presumed partly done",
             WorkState::PresumedRemaining => "presumed remaining",
+            WorkState::PresumedUnknown => "presumed, state unknown",
         }
     }
 
@@ -128,9 +132,10 @@ impl WorkState {
             // Presumed (0064): smaller than real work and a dim gray, so a plan read
             // from a document never looks like work kGraf ran. The stage has no green
             // or cyan for them (COL-6, COL-4): the three are told apart by their words.
-            WorkState::PresumedDone | WorkState::PresumedPartial | WorkState::PresumedRemaining => {
-                (p.state_presumed, WORK_SIZE * 0.7)
-            }
+            WorkState::PresumedDone
+            | WorkState::PresumedPartial
+            | WorkState::PresumedRemaining
+            | WorkState::PresumedUnknown => (p.state_presumed, WORK_SIZE * 0.7),
         }
     }
 
@@ -451,7 +456,12 @@ mod tests {
             assert!(!s.is_failed());
         }
         // Presumed work is dimmer and smaller than any real work (0064).
-        for s in [PresumedDone, PresumedPartial, PresumedRemaining] {
+        for s in [
+            PresumedDone,
+            PresumedPartial,
+            PresumedRemaining,
+            PresumedUnknown,
+        ] {
             assert_eq!(s.look(&p).0, p.state_presumed, "{s:?}");
             assert!(s.look(&p).1 < Planned.look(&p).1);
             assert!(!s.is_failed());

@@ -139,8 +139,8 @@ impl GalaxyView {
 
     /// Sets the click targets drawn over the galaxy (in points), each with the node it
     /// belongs to. A click picks first: a zone takes it only when the pick hits nothing
-    /// or hits the zone's own node, so a zone never covers another node's click (review,
-    /// 2026-09-27: 336 node centers were unclickable under "+N" zones). A zone's click is
+    /// or hits the zone's own node, so a zone never covers another node's click (336 node centers were
+    /// unclickable under "+N" zones once). A zone's click is
     /// reported with its index and does not change the selection.
     pub fn set_hot_zones(&mut self, zones: Vec<(Rect, u32)>) {
         self.hot_zones = zones;

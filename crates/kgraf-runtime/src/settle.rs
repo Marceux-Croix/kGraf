@@ -84,11 +84,6 @@ impl TranscriptSettler {
         self.flush()
     }
 
-    /// Whether a round's text is held.
-    pub fn is_holding(&self) -> bool {
-        !self.text.is_empty() || !self.reasoning.is_empty()
-    }
-
     fn flush(&mut self) -> Vec<WorkerEvent> {
         let mut out = Vec::new();
         let mut counts = kgraf_secrets::Redactions::default();
@@ -159,12 +154,39 @@ mod tests {
     }
 
     #[test]
+    fn a_provider_signature_is_written_unchanged_and_never_scrubbed() {
+        // A token can look like a secret to a pattern rule, and a changed byte
+        // makes the provider refuse it, so it is written exactly as received.
+        let signature = kgraf_provider::Signature::new(format!("sig_{}", token()), "adapter:model");
+        let live = vec![
+            delta("hello"),
+            WorkerEvent::AssistantMessage {
+                text: "hello".into(),
+                reasoning: String::new(),
+                signature: Some(signature.clone()),
+            },
+            WorkerEvent::Stop {
+                reason: StopReason::EndTurn,
+            },
+        ];
+        let disk: Vec<WorkerEvent> = settle_for_disk(&live)
+            .into_iter()
+            .map(WorkerEvent::scrubbed_for_persist)
+            .collect();
+        assert!(matches!(
+            &disk[0],
+            WorkerEvent::AssistantMessage { signature: Some(s), .. } if *s == signature
+        ));
+    }
+
+    #[test]
     fn a_settled_round_writes_only_its_assistant_message() {
         let t = token();
         let (a, b) = t.split_at(12);
         let message = WorkerEvent::AssistantMessage {
             text: kgraf_secrets::scrub_persist(&format!("key {t}")).into_owned(),
             reasoning: String::new(),
+            signature: None,
         };
         let live = vec![
             delta("key "),
@@ -224,8 +246,6 @@ mod tests {
     fn a_stream_that_closes_mid_round_flushes_on_finish() {
         let mut s = TranscriptSettler::new();
         assert!(s.push(delta("partial")).is_empty());
-        assert!(s.is_holding());
         assert_eq!(s.finish(), vec![delta("partial")]);
-        assert!(!s.is_holding());
     }
 }

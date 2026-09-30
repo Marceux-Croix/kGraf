@@ -37,10 +37,25 @@ The check is strict in four ways:
   the attempt's directory and a scratch directory, an environment cleared to
   `PATH`, `HOME`, `CARGO_HOME`, `RUSTUP_HOME`, `CARGO_TARGET_DIR` and
   `CARGO_NET_OFFLINE`, a 300 second wall-clock limit, and a kill of the whole
-  process group at the limit.
+  process group at the limit. Where reads are allowlisted, the check reads
+  only `bin`, `registry` and `git` under the cargo home and the rustup home,
+  not the cargo home itself (its `credentials.toml` holds registry tokens).
+- The check does not trust the tree it builds. A tree with a `build.rs`, a
+  `.cargo` directory or a toolchain pin is unsatisfied and is never built. The
+  runner writes its own copy of each protected file back before the build, and
+  a run that changed one is void. Tests are counted one process each: the
+  test executables are built once, asked for their tests with `--list`, and
+  every test runs alone and is judged by its exit status. Nothing a test
+  prints is read, so a test cannot forge a result line. A mutant is built and
+  run at the attempt's own path and target directory. Files read from the
+  attempt are not followed through links and are capped in size. An unmet
+  brief carries its reason in the outcome note.
+- Before the first model call, the runner runs its checks on a known-good
+  crate. If that fails, the run stops: a broken toolchain or sandbox is not a
+  set of failed briefs.
 
 A provider or harness error (an outage, a failed ledger write, a worker that
-could not run) is printed as `ERROR (not tallied)` and never recorded: only an
+could not run, a check that could not run) is printed as `ERROR (not tallied)` and never recorded: only an
 attempt that measured the model is a tally.
 
 Tallies are kept per suite version. The store at `--state-dir` holds the

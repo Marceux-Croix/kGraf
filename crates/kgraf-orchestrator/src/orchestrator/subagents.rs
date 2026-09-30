@@ -151,6 +151,9 @@ struct LiveChild {
     /// Reopen attempts that found its worktree busy, and when to try next.
     busy_tries: u32,
     retry_at_ms: i64,
+    /// The over-limit notice was sent for this adoption. Every notice has its
+    /// own id, so nothing else stops a busy retry from sending it again.
+    over_limit_notified: bool,
     /// The user stopped this child directly (`stop_session`): its `Done`
     /// pauses it rather than settling it, and `resume_session` continues it.
     user_stopped: bool,
@@ -162,9 +165,11 @@ struct LiveChild {
     /// pause from a genuine end, so a resume that raced ahead of the
     /// confirmation would make a merely-*requested* cancel look like an
     /// unrequested one, retiring the child for good instead of pausing and
-    /// restarting it (its queued inbox rows lost with it: review, subagent
-    /// resume race). Held here and applied once `pause_child` actually runs.
+    /// restarting it (its queued inbox rows lost with it). Held here and applied once `pause_child` actually runs.
     resume_after_stop: bool,
+    /// Resolves when the child's detached task ends (its sender drops with
+    /// the task). Set when the child starts.
+    ended: Option<tokio::sync::oneshot::Receiver<()>>,
 }
 
 /// A finish held until the finisher's children settle.
@@ -195,6 +200,10 @@ pub(super) struct Subagents {
     /// Session-store failures seen off an async path, traced on the next tick
     /// (never dropped).
     errors: Vec<String>,
+    /// Settled children whose spend could not be read from the ledger and who had
+    /// no hold to stand in for it. Retried at every tick until the read works;
+    /// until then their spend is missing from the budget, and that was said.
+    uncharged: Vec<Uncharged>,
     orchestrator_row: bool,
     /// Spawns a killed process left `preparing`: `(contract, child)`.
     never_started: BTreeSet<(String, AgentId)>,
@@ -203,6 +212,13 @@ pub(super) struct Subagents {
     stops: u32,
     stop_at_ms: Option<i64>,
     stopped_held: bool,
+}
+
+/// A settled child's calls whose spend has not been charged yet.
+struct Uncharged {
+    child: AgentId,
+    task: TaskId,
+    calls: Vec<CallId>,
 }
 
 /// The inbox id prefix of a notice about a child to its parent.
@@ -654,8 +670,10 @@ impl RunLoop {
                     ended_parent: None,
                     busy_tries: 0,
                     retry_at_ms: 0,
+                    over_limit_notified: false,
                     user_stopped: false,
                     resume_after_stop: false,
+                    ended: None,
                     facts,
                 },
             );
@@ -766,40 +784,39 @@ impl RunLoop {
     }
 
     fn unstarted_result(&self, child: &AgentId) -> WorkerResult {
-        WorkerResult {
-            task: self
-                .subagents
-                .live
-                .get(child)
-                .map(|c| c.task.clone())
-                .unwrap_or_else(|| TaskId::new("")),
-            worker: child.clone(),
-            outcome: WorkerOutcome::Cancelled,
-            answer: String::new(),
-            changed_paths: Vec::new(),
-            commit: None,
-            calls: Vec::new(),
-            steps: 0,
-            prefix_digest: String::new(),
-            denied: 0,
-            trace_failures: Vec::new(),
-            rationale: None,
-        }
+        let task = self
+            .subagents
+            .live
+            .get(child)
+            .map(|c| c.task.clone())
+            .unwrap_or_else(|| TaskId::new(""));
+        WorkerResult::bare(task, child.clone(), WorkerOutcome::Cancelled)
     }
 
     /// Hook after every loop message: deliver reports, restart adopted
     /// children that now have a slot, and trace store failures.
     pub(super) async fn subagent_tick(&mut self) -> Result<(), OrchestratorError> {
+        // Every drained detail is traced before a store failure is returned:
+        // the list is already taken, so an early return would drop the rest.
+        let mut failed = None;
         for detail in std::mem::take(&mut self.subagents.errors) {
             let at = self.now();
-            self.trace(TraceEvent::Notice {
-                at_ms: at,
-                contract: String::new(),
-                worker: String::new(),
-                detail: format!("subagent sessions: {detail}"),
-            })
-            .await?;
+            let traced = self
+                .trace(TraceEvent::Notice {
+                    at_ms: at,
+                    contract: String::new(),
+                    worker: String::new(),
+                    detail: format!("subagent sessions: {detail}"),
+                })
+                .await;
+            if let Err(e) = traced {
+                failed.get_or_insert(e);
+            }
         }
+        if let Some(e) = failed {
+            return Err(e);
+        }
+        self.charge_unread_children().await;
         if !self.subagents.never_started.is_empty() {
             self.discard_never_started().await?;
         }
@@ -1143,8 +1160,10 @@ impl RunLoop {
                 ended_parent: None,
                 busy_tries: 0,
                 retry_at_ms: 0,
+                over_limit_notified: false,
                 user_stopped: false,
                 resume_after_stop: false,
+                ended: None,
             },
         );
         if let Err(e) = self.start_child(&child) {
@@ -1284,25 +1303,17 @@ impl RunLoop {
                 .then(|| facts.writes.iter().map(PathBuf::from).collect()),
         };
         let route_env = route.env.clone();
-        let attempt_env = self.attempt_envs.clone().map(|envs| {
-            let route = Route {
-                name: route.name.clone(),
-                vendor: route.vendor.clone(),
-                env: route.env.clone(),
-                context: route.context.clone(),
-                readiness: route.readiness.clone(),
-                local: route.local,
-            };
-            (envs, route)
-        });
+        let attempt_env = self.attempt_envs.clone().map(|envs| (envs, route.clone()));
         let path = self.files.worker_transcript(id.as_str());
         let parent_call = facts.parent_call.map(CallId::new);
         let tx = self.tx.clone();
         let board = self.frugal.board.clone();
         let graph = self.s.graph.clone();
         let child = id.clone();
+        let (ended_tx, ended_rx) = tokio::sync::oneshot::channel::<()>();
         if let Some(c) = self.subagents.live.get_mut(id) {
             c.running = true;
+            c.ended = Some(ended_rx);
         }
         // Local-only diagnostics (decision 0069), after this function's one
         // early failure (the route lookup), as `start_attempt` records it.
@@ -1358,6 +1369,8 @@ impl RunLoop {
             (result, env_failure)
         });
         tokio::spawn(async move {
+            // Dropped when this task ends, by any path.
+            let _ended = ended_tx;
             let (result, env_failure) = match subagent_task.await {
                 Ok(v) => v,
                 Err(e) => {
@@ -1435,7 +1448,14 @@ impl RunLoop {
                         "subagent `{id}` continues over the limit ({refusal}): it was admitted \
                          before the process stopped"
                     );
-                    self.notify_parent(&parent, &id, "over-limit", &text);
+                    let first = self
+                        .subagents
+                        .live
+                        .get_mut(&id)
+                        .is_some_and(|c| !std::mem::replace(&mut c.over_limit_notified, true));
+                    if first {
+                        self.notify_parent(&parent, &id, "over-limit", &text);
+                    }
                     None
                 }
             };
@@ -1656,24 +1676,80 @@ impl RunLoop {
         {
             c.resume_after_stop = false;
             c.user_stopped = false;
+            c.over_limit_notified = false;
             self.subagents.restart.insert(id);
         }
         Ok(())
     }
 
-    /// The run loop failed: cancel every running child and return its slot
-    /// and hold. Its spawn record stays unsettled, so a resume adopts it
-    /// again; its fence on the parent is lifted with the parent's run.
+    /// The run loop failed: cancel every running child. A running child
+    /// keeps its slot and hold until its task has ended, then returns the slot
+    /// and settles the hold against its exact spend read from the ledger (its
+    /// hold, an upper bound, when that read fails or a call's cost is unknown;
+    /// a child with no hold still has its spend recorded), stamped with the
+    /// time the child ended. Releasing at once would free the slot for a new
+    /// worker while the child still writes, and would drop its spend from the
+    /// hourly total. A child that ignores the cancel is waited for at most
+    /// [`RELEASE_WAIT_BOUND`](super::RELEASE_WAIT_BOUND); then the slot and hold are released with a
+    /// notice, since a slot held forever is capacity lost for the process. Its
+    /// spawn record stays unsettled, so a resume adopts it again; its fence on
+    /// the parent is lifted with the parent's run.
     pub(super) fn release_subagents_on_error(&mut self) {
-        for (_, mut c) in std::mem::take(&mut self.subagents.live) {
-            if c.running {
+        let handle = tokio::runtime::Handle::try_current().ok();
+        let run = self.run_id();
+        for (child, mut c) in std::mem::take(&mut self.subagents.live) {
+            let waiting = if c.running {
                 c.cancel.notify_one();
-            }
-            if let Some(a) = c.admitted.take() {
-                self.s.admission.gate().release(a);
-            }
-            if let Some(r) = c.reservation.take() {
-                self.s.admission.budget().release(r);
+                c.ended.take().filter(|_| handle.is_some())
+            } else {
+                None
+            };
+            let admitted = c.admitted.take();
+            let reservation = c.reservation.take();
+            let admission = self.s.admission.clone();
+            let task = c.task.as_str().to_owned();
+            let run = run.clone();
+            let (ledger, prices, clock) = (
+                self.s.ledger.clone(),
+                self.s.prices.clone(),
+                self.s.clock.clone(),
+            );
+            let charged = self.seeded.clone();
+            let agent = child.clone();
+            match (waiting, &handle) {
+                (Some(rx), Some(handle)) => {
+                    handle.spawn(async move {
+                        wait_for_end(rx, &format!("subagent `{agent}`")).await;
+                        if let Some(a) = admitted {
+                            admission.gate().release(a);
+                        }
+                        let held = reservation.as_ref().map(Reservation::amount);
+                        let spend = exact_agent_spend(
+                            &ledger,
+                            &prices,
+                            &task,
+                            &agent,
+                            &charged,
+                            held.unwrap_or(Money::ZERO),
+                        );
+                        let at = clock.now_ms();
+                        let mut budget = admission.budget();
+                        match reservation {
+                            Some(r) => {
+                                let _ = budget.settle(r, &run, &task, spend, at);
+                            }
+                            None => budget.record_spend(&run, &task, spend, at),
+                        }
+                    });
+                }
+                _ => {
+                    if let Some(a) = admitted {
+                        admission.gate().release(a);
+                    }
+                    if let Some(r) = reservation {
+                        admission.budget().release(r);
+                    }
+                }
             }
             drop(c.parent_guard.take());
         }
@@ -1758,6 +1834,7 @@ impl RunLoop {
                 c.resume_after_stop = true;
             } else {
                 c.user_stopped = false;
+                c.over_limit_notified = false;
                 self.subagents.restart.insert(id.clone());
             }
         }
@@ -1799,6 +1876,7 @@ impl RunLoop {
                 peak_context_tokens: 0,
                 projected_tokens: 0,
                 stop_tokens: 0,
+                window_tokens: 0,
                 sizing_miss: false,
                 calls: d.result.calls.iter().map(|c| c.to_string()).collect(),
                 spend_micros: spend.micros(),
@@ -1829,6 +1907,7 @@ impl RunLoop {
                 c.ended_parent = None;
                 c.busy_tries = 0;
                 c.retry_at_ms = 0;
+                c.over_limit_notified = false;
                 c.user_stopped = false;
                 c.resume_after_stop = false;
                 self.subagents.live.insert(id.clone(), c);
@@ -1951,13 +2030,31 @@ impl RunLoop {
             .as_ref()
             .map(Reservation::amount)
             .unwrap_or(Money::ZERO);
+        let mut read_lost = false;
         let spend = match self.spend_of(calls, held) {
-            Ok(s) => s,
+            Ok((s, _)) => s,
             Err(e) => {
-                self.subagents.errors.push(format!(
-                    "the spend of subagent `{id}` could not be read; its hold of {held} is \
-                     charged instead: {e}"
-                ));
+                if held == Money::ZERO {
+                    // With no hold to stand in for it, nothing can be charged
+                    // now. The child is settled and will not report again, so
+                    // its calls are kept and read again at every tick until the
+                    // charge lands; the calls stay unmarked until then.
+                    read_lost = true;
+                    self.subagents.uncharged.push(Uncharged {
+                        child: id.clone(),
+                        task: task.clone(),
+                        calls: calls.to_vec(),
+                    });
+                    self.subagents.errors.push(format!(
+                        "the spend of subagent `{id}` could not be read and it had no hold, so \
+                         none is charged yet; it is read again at every tick: {e}"
+                    ));
+                } else {
+                    self.subagents.errors.push(format!(
+                        "the spend of subagent `{id}` could not be read; its hold of {held} is \
+                         charged instead: {e}"
+                    ));
+                }
                 held
             }
         };
@@ -1972,7 +2069,9 @@ impl RunLoop {
                 }
             }
         };
-        self.seeded.extend(calls.iter().cloned());
+        if !read_lost {
+            self.seeded.extend(calls.iter().cloned());
+        }
         if let Some(o) = overrun
             && let Err(e) = self.on_overrun(o).await
         {
@@ -1981,6 +2080,31 @@ impl RunLoop {
             ));
         }
         spend
+    }
+
+    /// Read again the spend of settled children whose first read failed, and
+    /// charge what is found. A child stays listed until its read works.
+    async fn charge_unread_children(&mut self) {
+        if self.subagents.uncharged.is_empty() {
+            return;
+        }
+        for pending in std::mem::take(&mut self.subagents.uncharged) {
+            match self.spend_of(&pending.calls, Money::ZERO) {
+                Ok((spend, _)) => {
+                    let (now, run) = (self.now(), self.run_id());
+                    self.s
+                        .admission
+                        .budget()
+                        .record_spend(&run, pending.task.as_str(), spend, now);
+                    self.seeded.extend(pending.calls.iter().cloned());
+                    self.subagents.errors.push(format!(
+                        "the spend of subagent `{}` was read at last and charged: {spend}",
+                        pending.child
+                    ));
+                }
+                Err(_) => self.subagents.uncharged.push(pending),
+            }
+        }
     }
 
     fn push_report(&mut self, parent: &AgentId, child: &AgentId, report: &SubagentReport) {
@@ -2137,20 +2261,11 @@ impl RunLoop {
 }
 
 fn failed(brief: &WorkerBrief, error: String) -> WorkerResult {
-    WorkerResult {
-        task: brief.task.clone(),
-        worker: brief.worker.clone(),
-        outcome: WorkerOutcome::Failed { error },
-        answer: String::new(),
-        changed_paths: Vec::new(),
-        commit: None,
-        calls: Vec::new(),
-        steps: 0,
-        prefix_digest: String::new(),
-        denied: 0,
-        trace_failures: Vec::new(),
-        rationale: None,
-    }
+    WorkerResult::bare(
+        brief.task.clone(),
+        brief.worker.clone(),
+        WorkerOutcome::Failed { error },
+    )
 }
 
 #[cfg(test)]
@@ -2176,6 +2291,63 @@ mod tests {
         };
         let text = serde_json::to_string(&SpawnRecord { subagent: facts }).expect("json");
         assert!(serde_json::from_str::<SpawnRecord>(&text).is_ok());
+    }
+
+    /// A failed run settles a running child against its exact ledger spend, not
+    /// its hold: only the child's own calls, not those already charged, priced
+    /// from the table; a hold stands in only for a cost that is unknown.
+    #[test]
+    fn a_released_childs_spend_is_read_from_the_ledger_not_taken_from_its_hold() {
+        use kgraf_core::{Money, PriceTable, Protocol, TokenUsage};
+        let mut prices = PriceTable::new();
+        prices.set(
+            "m",
+            kgraf_core::ModelPrice {
+                uncached_input: 1_000_000,
+                cache_read: 0,
+                cache_write: 0,
+                output: 0,
+                reasoning: 0,
+            },
+        );
+        let ledger = kgraf_provider::Ledger::open_in_memory().expect("ledger");
+        let mut ids = Vec::new();
+        for (agent, model, input) in [
+            ("c1", "m", 1_000u64),
+            ("c1", "m", 2_000),
+            ("other", "m", 4_000),
+            ("c1", "unpriced", 8_000),
+        ] {
+            let token = ledger
+                .begin("probe", Protocol::Additive, model, agent, "run/t")
+                .expect("begin");
+            ids.push(token.id().clone());
+            token
+                .settle(
+                    &TokenUsage {
+                        uncached_input: input,
+                        ..TokenUsage::default()
+                    },
+                    None,
+                )
+                .expect("settle");
+        }
+        let child = AgentId::new("c1");
+        let cost = |input: u64| Money::from_micros(input as i64);
+        let mut charged = BTreeSet::new();
+        charged.insert(ids[0].clone());
+        // A call on an unpriced model is unknown: the larger hold stands in.
+        let big_hold = Money::from_micros(1_000_000);
+        assert_eq!(
+            exact_agent_spend(&ledger, &prices, "run/t", &child, &charged, big_hold),
+            big_hold
+        );
+        // With a hold below the known spend, the exact figure wins; the charged
+        // call and the other agent's call are not counted.
+        assert_eq!(
+            exact_agent_spend(&ledger, &prices, "run/t", &child, &charged, Money::ZERO),
+            cost(2_000)
+        );
     }
 
     #[test]

@@ -34,12 +34,6 @@ pub const SIZE_BOOST_PER_DEGREE: f32 = 0.3;
 /// Cap on the degree boost (upstream `10.0f`).
 pub const SIZE_BOOST_MAX: f32 = 10.0;
 
-/// Upstream base sizes for labels kGraf has no node kind for yet. Kept so
-/// project, package and folder nodes, when they arrive, use the reference scale.
-pub const PROJECT_SIZE: f32 = 20.0;
-pub const PACKAGE_SIZE: f32 = 15.0;
-pub const FOLDER_SIZE: f32 = 12.0;
-
 /// The star color for a degree, as `0xRRGGBB`.
 pub fn stellar_color(degree: u32) -> u32 {
     STELLAR_TABLE
@@ -85,8 +79,7 @@ pub fn node_size(kind: NodeKind, degree: u32) -> f32 {
     base_size(kind) + degree_boost(degree)
 }
 
-/// A `0xRRGGBB` color as `[r, g, b]` channels in `0..=1`, the form
-/// [`super::density::node_glow_boost`] takes.
+/// A `0xRRGGBB` color as `[r, g, b]` channels in `0..=1`.
 pub fn channels(color: u32) -> [f32; 3] {
     [
         ((color >> 16) & 0xFF) as f32 / 255.0,

@@ -157,6 +157,7 @@ impl Instant0 {
                 id: format!("t{round}"),
                 name: "noop".into(),
                 input: serde_json::json!({ "round": round }),
+                signature: None,
             });
         }
         Response {

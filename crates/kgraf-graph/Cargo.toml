@@ -38,7 +38,7 @@ walkdir.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 # `check_session_records` (decision 0067): `SharedSessions`'s own tests check
-# it against the same contract `kgraf-core`'s `MemorySessionRecords` does.
+# it against the `SessionRecords` contract.
 kgraf-core = { workspace = true, features = ["test-support"] }
 # Layout-time benchmarks (measured budgets). Default features off: the HTML
 # report and plotting stack are not needed to read a number.

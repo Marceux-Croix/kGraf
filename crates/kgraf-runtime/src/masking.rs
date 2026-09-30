@@ -37,6 +37,22 @@ use std::collections::BTreeSet;
 pub trait ObservationMasker: Send + Sync {
     /// The transcript as it will be sent.
     fn mask(&self, messages: &[Message]) -> Vec<Message>;
+
+    /// How many of the most recent tool rounds keep their results unmasked,
+    /// when the masker hides older ones. `None`: results are never hidden. The
+    /// stall detector reads it: a call repeated after its result was hidden is
+    /// a re-read, not a loop.
+    fn observation_window(&self) -> Option<usize> {
+        None
+    }
+
+    /// Whether a result with this body is one the masker replaces once it
+    /// leaves the window. A result the placeholder would not shorten is never
+    /// hidden, so a repeated call that produced it is a loop, not a re-read.
+    /// Default `false`: a masker that does not say is assumed to hide nothing.
+    fn hides_result(&self, _output: &str, _is_error: bool) -> bool {
+        false
+    }
 }
 
 /// No masking. For tests and for a caller that has decided the transcript is small.
@@ -147,6 +163,18 @@ impl Reducible for Block<'_> {
 }
 
 impl ObservationMasker for SessionMasker {
+    fn observation_window(&self) -> Option<usize> {
+        Some(self.config.keep_last_observations)
+    }
+
+    fn hides_result(&self, output: &str, is_error: bool) -> bool {
+        // The library's rule (`reduce`): masked only where the placeholder
+        // costs fewer tokens than the result. An error keeps an `ERROR: `
+        // prefix on its placeholder (`Block::masked`).
+        let prefix = if is_error { "ERROR: ".len() } else { 0 };
+        approx(prefix + self.config.placeholder.len()) < approx(output.len())
+    }
+
     fn mask(&self, messages: &[Message]) -> Vec<Message> {
         // The window counts rounds, not blocks. One round is one user message
         // holding the results of every call the model issued together, and the
@@ -242,6 +270,7 @@ mod tests {
                     id: format!("t{i}"),
                     name: "read".into(),
                     input: serde_json::json!({}),
+                    signature: None,
                 }],
             });
             messages.push(Message {
@@ -295,6 +324,7 @@ mod tests {
                     id: format!("w{i}"),
                     name: "read".into(),
                     input: serde_json::json!({}),
+                    signature: None,
                 })
                 .collect(),
         });
@@ -391,5 +421,43 @@ mod tests {
         for (m, o) in masked.iter().zip(&original) {
             assert_eq!(m.content.len(), o.content.len());
         }
+    }
+    #[test]
+    fn a_result_is_hidden_only_where_the_placeholder_is_shorter() {
+        let masker = SessionMasker::default();
+        assert!(
+            !masker.hides_result("ok", false),
+            "a short result is never masked"
+        );
+        assert!(masker.hides_result(&"line of output\n".repeat(20), false));
+        // The masker agrees with `mask` itself.
+        let short = Message {
+            role: Role::User,
+            content: vec![Content::ToolResult {
+                tool_use_id: "s".into(),
+                content: "ok".into(),
+                is_error: false,
+            }],
+        };
+        let mut messages = vec![Message::user("go"), short.clone()];
+        for i in 0..DEFAULT_KEEP_RECENT + 1 {
+            messages.push(Message {
+                role: Role::User,
+                content: vec![Content::ToolResult {
+                    tool_use_id: format!("t{i}"),
+                    content: "ok".into(),
+                    is_error: false,
+                }],
+            });
+        }
+        assert_eq!(
+            masker.mask(&messages),
+            messages,
+            "short results stay visible"
+        );
+        // An error keeps a longer placeholder, so a mid-size error is not hidden.
+        let mid = "x".repeat(masker.placeholder().len() + 8);
+        assert!(masker.hides_result(&mid, false));
+        assert!(!masker.hides_result(&mid, true));
     }
 }

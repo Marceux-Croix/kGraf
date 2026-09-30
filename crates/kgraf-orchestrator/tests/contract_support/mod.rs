@@ -11,7 +11,7 @@ pub fn s(v: &[&str]) -> Vec<String> {
     v.iter().map(|x| (*x).to_owned()).collect()
 }
 
-fn git(repo: &Path, args: &[&str]) {
+pub fn git(repo: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .arg("-C")
         .arg(repo)
@@ -24,6 +24,7 @@ fn git(repo: &Path, args: &[&str]) {
         "git {args:?}: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
 }
 
 /// Make `repo` a git repository whose one commit holds its current files.

@@ -6,6 +6,8 @@ members = [
     "crates/kgraf-provider",
     "crates/kgraf-provider-anthropic",
     "crates/kgraf-provider-openai",
+    "crates/kgraf-provider-bedrock",
+    "crates/kgraf-provider-google",
     "crates/kgraf-fleet",
     "crates/kgraf-decide",
     "crates/kgraf-instructions",
@@ -64,6 +66,8 @@ kgraf-graph = { path = "crates/kgraf-graph" }
 kgraf-provider = { path = "crates/kgraf-provider" }
 kgraf-provider-anthropic = { path = "crates/kgraf-provider-anthropic" }
 kgraf-provider-openai = { path = "crates/kgraf-provider-openai" }
+kgraf-provider-bedrock = { path = "crates/kgraf-provider-bedrock" }
+kgraf-provider-google = { path = "crates/kgraf-provider-google" }
 kgraf-fleet = { path = "crates/kgraf-fleet" }
 kgraf-decide = { path = "crates/kgraf-decide" }
 kgraf-instructions = { path = "crates/kgraf-instructions" }
@@ -150,6 +154,15 @@ semver = "1.0.28"
 # `update_check.rs`). MIT OR Apache-2.0 (checked on crates.io, 2026-09-28,
 # version 0.11.0); the RustCrypto project's own reference implementation.
 sha2 = "0.11.0"
+# Google OAuth for Vertex AI: Application Default Credentials discovery, service-account
+# key files, the metadata server, token caching and refresh. MIT (crates.io, version
+# 0.12.7, checked 2026-09-29), maintained by the author of the `rustls` bindings; uses
+# `ring` and `hyper-rustls`, both already in the tree. The official
+# `google-cloud-auth` (Apache-2.0) was checked too: its default features pull a native TLS
+# stack and a second `reqwest`, and `yup-oauth2` (MIT OR Apache-2.0) is a device-flow
+# library first. Nothing hand-rolled: JWT signing and token refresh are cost-path and
+# security code.
+gcp_auth = "0.12.7"
 
 [profile.release]
 lto = "thin"

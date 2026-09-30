@@ -42,6 +42,10 @@ impl ReliabilityBin {
 pub struct Calibration {
     /// Predictions scored.
     pub n: usize,
+    /// Predictions left out because the probability was not a finite number. They
+    /// are counted here, not in `n`, so a NaN never reads as a wrong answer or
+    /// turns every aggregate into NaN.
+    pub non_finite: usize,
     /// Accuracy at the given decision threshold.
     pub accuracy: f64,
     /// Expected calibration error: the count-weighted mean absolute gap across bins.
@@ -74,10 +78,15 @@ pub fn score(
     confident_at: f64,
     bin_count: usize,
 ) -> Calibration {
+    let all = predictions;
+    let finite: Vec<(f64, bool)> = all.iter().copied().filter(|(p, _)| p.is_finite()).collect();
+    let non_finite = all.len() - finite.len();
+    let predictions = finite.as_slice();
     let n = predictions.len();
     if n == 0 {
         return Calibration {
             n: 0,
+            non_finite,
             accuracy: 0.0,
             ece: 0.0,
             max_bin_gap: 0.0,
@@ -162,6 +171,7 @@ pub fn score(
 
     Calibration {
         n,
+        non_finite,
         accuracy: correct as f64 / n as f64,
         ece,
         max_bin_gap,
@@ -179,6 +189,12 @@ impl Calibration {
             "n {}  accuracy {:.3}  ECE {:.3}  max bin gap {:.3}  Brier {:.3}\n",
             self.n, self.accuracy, self.ece, self.max_bin_gap, self.brier
         ));
+        if self.non_finite > 0 {
+            out.push_str(&format!(
+                "{} prediction(s) with a non-finite probability were left out\n",
+                self.non_finite
+            ));
+        }
         match self.confident_tail {
             Some((count, accuracy)) => out.push_str(&format!(
                 "confident tail: {count} of {} predictions at {:.3} accuracy\n",
@@ -204,6 +220,18 @@ impl Calibration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_non_finite_probability_is_counted_apart_and_poisons_nothing() {
+        let scored = score(&[(0.9, true), (f64::NAN, true), (0.1, false)], 0.5, 0.3, 10);
+        assert_eq!(scored.n, 2);
+        assert_eq!(scored.non_finite, 1);
+        assert!(scored.brier.is_finite() && scored.ece.is_finite());
+        assert!((scored.accuracy - 1.0).abs() < 1e-12);
+        assert!(scored.report().contains("non-finite"));
+        let none = score(&[(f64::NAN, true)], 0.5, 0.3, 10);
+        assert_eq!((none.n, none.non_finite), (0, 1));
+    }
 
     #[test]
     fn a_perfectly_calibrated_set_scores_near_zero_error() {

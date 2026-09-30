@@ -669,6 +669,143 @@ async fn a_rule_added_on_disk_is_seen_at_the_next_ask() {
     );
 }
 
+/// A rule revoked by an in-place rewrite that keeps the file's length and
+/// modification time stops allowing at the next ask: the desk uses the same
+/// stamp as the persisted-rule hook (inode, and no trust in a young or future
+/// time).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rule_revoked_by_a_same_length_rewrite_stops_allowing() {
+    use kgraf_session::approval_store::PersistedAllowStore;
+    let state = tempfile::tempdir().expect("state");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let path = state.path().join("allow-rules.json");
+    {
+        let (mut store, _) = PersistedAllowStore::open(&path, workspace.path()).expect("store");
+        store
+            .allow_exact("proj", "shell", "[\"cargo\",\"test\"]", "by hand")
+            .expect("rule");
+    }
+    // A time in the future is never trusted as proof of "unchanged", which keeps
+    // the test independent of how long it takes to run.
+    let later = std::time::SystemTime::now() + Duration::from_secs(3600);
+    let pin = |bytes: Option<&[u8]>| {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open in place");
+        if let Some(bytes) = bytes {
+            std::io::Write::write_all(&mut &file, bytes).expect("write in place");
+        }
+        file.set_modified(later).expect("set the time");
+    };
+    pin(None);
+    let desk = shell_desk(state.path(), workspace.path());
+    let answer = AskResolver::answer(&*desk, &paused_cmd(&["cargo", "test"])).await;
+    assert_eq!(
+        answer,
+        kgraf_tools::approval::UserAnswer::Allow,
+        "the rule applies"
+    );
+
+    let text = std::fs::read_to_string(&path).expect("read");
+    let revoked = text.replace("cargo", "cargx");
+    assert_eq!(text.len(), revoked.len());
+    pin(Some(revoked.as_bytes()));
+    let d = desk.clone();
+    let worker =
+        tokio::spawn(
+            async move { AskResolver::answer(&*d, &paused_cmd(&["cargo", "test"])).await },
+        );
+    // Asked about, not allowed: the ask shows in the box and nobody answers it.
+    let mut asked = false;
+    for _ in 0..100 {
+        if !desk.pending().is_empty() {
+            asked = true;
+            break;
+        }
+        if worker.is_finished() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let finished = worker.is_finished();
+    worker.abort();
+    assert!(
+        asked && !finished,
+        "the revoked rule still allowed the call (asked: {asked})"
+    );
+}
+
+/// A rules file that cannot be read allows nothing: the rules read before are
+/// not kept in force, the call is asked about, and the desk says why.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unreadable_rules_file_allows_nothing() {
+    use kgraf_session::approval_store::PersistedAllowStore;
+    let state = tempfile::tempdir().expect("state");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let path = state.path().join("allow-rules.json");
+    {
+        let (mut store, _) = PersistedAllowStore::open(&path, workspace.path()).expect("store");
+        store
+            .allow_exact("proj", "shell", "[\"cargo\",\"test\"]", "by hand")
+            .expect("rule");
+    }
+    let desk = shell_desk(state.path(), workspace.path());
+    let answer = AskResolver::answer(&*desk, &paused_cmd(&["cargo", "test"])).await;
+    assert_eq!(
+        answer,
+        kgraf_tools::approval::UserAnswer::Allow,
+        "the rule applies"
+    );
+    desk.take_notices();
+
+    std::fs::write(
+        &path,
+        "{ this is not a rules file, and is longer than before ...",
+    )
+    .expect("damage");
+    let unattended = desk.answer_unattended(&paused_cmd(&["cargo", "test"]));
+    assert!(
+        matches!(unattended, kgraf_tools::approval::UserAnswer::Deny { .. }),
+        "an unreadable file kept allowing: {unattended:?}"
+    );
+    assert!(
+        desk.take_notices()
+            .iter()
+            .any(|n| matches!(n, DeskNotice::RulesUnreadable { .. })),
+        "the desk did not say the rules were unreadable"
+    );
+    // Allow always cannot write over a file it could not read: the call runs
+    // once and the damaged file is left as it was.
+    let d = desk.clone();
+    let worker =
+        tokio::spawn(async move { AskResolver::answer(&*d, &paused_cmd(&["cargo", "fmt"])).await });
+    let mut id = None;
+    for _ in 0..200 {
+        if let Some(a) = desk.pending().first() {
+            id = Some(a.id);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    desk.answer(id.expect("an ask"), AskAnswer::AllowAlways)
+        .expect("answer");
+    assert_eq!(
+        worker.await.expect("worker"),
+        kgraf_tools::approval::UserAnswer::Allow
+    );
+    assert!(
+        desk.take_notices()
+            .iter()
+            .any(|n| matches!(n, DeskNotice::RuleNotRecorded { .. })),
+        "the desk did not say no rule was recorded"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "{ this is not a rules file, and is longer than before ..."
+    );
+}
+
 /// With a real rule store: allow always on an ask whose worker was aborted
 /// is refused, and no rule reaches the file.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -712,7 +849,7 @@ fn paused_in(
     .expect("paused")
 }
 
-/// Item 1: a scheduled run's ask, with nobody at the window, is answered at once:
+/// A scheduled run's ask, with nobody at the window, is answered at once:
 /// denied when no persisted rule covers it (never shown in the box, never waited
 /// on), allowed when one does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -761,7 +898,7 @@ async fn a_scheduled_runs_ask_is_answered_unattended_at_once() {
     assert_eq!(answer, kgraf_tools::approval::UserAnswer::Allow);
 }
 
-/// Item 1: a run started from the box asks in the box; a scheduled run's ask
+/// A run started from the box asks in the box; a scheduled run's ask
 /// reaches the box only while a person is at the window, with the desk's timeout.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn box_runs_and_attended_scheduled_runs_ask_in_the_box() {
@@ -815,7 +952,7 @@ async fn box_runs_and_attended_scheduled_runs_ask_in_the_box() {
     );
 }
 
-/// Item 2: allow always on an `mcp__` tool records the any-call rule the CLI's
+/// Allow always on an `mcp__` tool records the any-call rule the CLI's
 /// terminal `a` records, and says so; then an unattended call to the same tool
 /// (a scheduled run) runs under it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -868,7 +1005,7 @@ async fn allow_always_on_an_mcp_tool_records_an_any_call_rule() {
     assert_eq!(answer, kgraf_tools::approval::UserAnswer::Allow);
 }
 
-/// D3: attendance that has lapsed (the last input too long ago) answers a
+/// Attendance that has lapsed (the last input too long ago) answers a
 /// scheduled run's ask unattended, at once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stale_attendance_answers_a_scheduled_ask_unattended() {
@@ -893,7 +1030,7 @@ async fn stale_attendance_answers_a_scheduled_ask_unattended() {
     assert!(desk.pending().is_empty());
 }
 
-/// D3: a scheduled run's ask waiting in the box is denied the moment attendance
+/// A scheduled run's ask waiting in the box is denied the moment attendance
 /// turns false, and never waits past the scheduled timeout (60 s by default).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_waiting_scheduled_ask_is_denied_when_attendance_lapses_or_times_out() {

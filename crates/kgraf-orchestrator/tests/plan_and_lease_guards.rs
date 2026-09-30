@@ -1,5 +1,6 @@
-//! Tests for the findings of the second review of the orchestrator, with
-//! the reviewer's scenarios ported. Each fails on the code before its fix.
+//! Guards on plans and run leases: a plan that declares repository
+//! metadata is refused, a settlement over its hold never pauses dispatch,
+//! and a run whose lease is lost writes nothing more.
 
 mod support;
 
@@ -14,22 +15,7 @@ use support::*;
 
 const WINDOW: u64 = 200_000;
 
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("time")
-        .as_millis() as i64
-}
-
-async fn until(what: &str, f: impl Fn() -> bool) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while !f() {
-        assert!(std::time::Instant::now() < deadline, "timed out: {what}");
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-}
-
-/// The reviewer's first step: a plan declares the repository metadata in
+/// A plan declares the repository metadata in
 /// another case. On a case-insensitive volume `.GIT/config` is `.git/config`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_plan_declaring_repository_metadata_in_any_spelling_is_refused() {

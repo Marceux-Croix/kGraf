@@ -749,7 +749,13 @@ impl RunLoop {
                     text: kgraf_secrets::model_copy(&item.text).into_owned(),
                 }) {
                     Ok(()) | Err(InjectError::Duplicate { .. }) => {}
-                    Err(InjectError::Finished { .. }) | Err(InjectError::NotBuilt) => break,
+                    Err(InjectError::Finished { .. }) => break,
+                    // Not built yet: the rows stay undelivered, so the
+                    // session is checked again on a later pass.
+                    Err(InjectError::NotBuilt) => {
+                        self.sessions_rt.recheck.mark(&session);
+                        break;
+                    }
                 }
             }
             if !self.sessions_rt.recheck.is_paced(&session)
@@ -788,7 +794,7 @@ mod tests {
         assert_eq!(paced.not_before_ms, 1_012 + DELAY_PER_EXCESS_MS);
     }
 
-    /// The reviewer's probe: 25 fast messages, then a 61 s gap. The window
+    /// A burst then a gap: 25 fast messages, then a 61 s gap. The window
     /// has emptied, so the 26th is not paced for volume, but it is never
     /// scheduled before the 25th, which is still pending.
     #[test]

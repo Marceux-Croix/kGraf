@@ -195,9 +195,14 @@ impl Sizer {
     /// The spend to reserve for a block: the 90th percentile of a measured task's
     /// cost on this model, or, unmeasured, every projected round billed at the
     /// projected peak context plus a full output. Conservative by construction.
+    ///
+    /// Each call is priced at its own size: a model's rate tier applies to one
+    /// call's input, so a task's summed usage is never priced as a single call.
+    /// A measured task is priced as its average call repeated for its rounds.
     pub fn estimate_cost(
         &self,
         prices: &PriceTable,
+        route: Option<&str>,
         model: &str,
         projection: &Projection,
         max_output_tokens: u32,
@@ -205,19 +210,33 @@ impl Sizer {
         if let Some(h) = self.history(model) {
             let costs = h
                 .iter()
-                .map(|t| prices.cost(model, &t.usage))
+                .map(|t| {
+                    let calls = u64::from(t.rounds).max(1);
+                    let each = |n: u64| n.div_ceil(calls);
+                    let average = TokenUsage {
+                        uncached_input: each(t.usage.uncached_input),
+                        cache_read: each(t.usage.cache_read),
+                        cache_write: each(t.usage.cache_write),
+                        text_output: each(t.usage.text_output),
+                        reasoning_output: each(t.usage.reasoning_output),
+                        ..TokenUsage::default()
+                    };
+                    prices.cost_calls_on(route, model, &average, calls)
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             return Ok(p90(costs).unwrap_or(Money::ZERO));
         }
-        let rounds = u64::from(projection.rounds);
-        prices.cost(
+        prices.cost_calls_on(
+            route,
             model,
-            &dear_usage(
+            &dear_usage_on(
                 prices,
+                route,
                 model,
-                rounds * projection.tokens,
-                rounds * u64::from(max_output_tokens),
+                projection.tokens,
+                u64::from(max_output_tokens),
             ),
+            u64::from(projection.rounds),
         )
     }
 }
@@ -226,9 +245,24 @@ impl Sizer {
 /// the model's uncached and cache-write rates: a provider may write a prompt to
 /// its cache on any call, so a projection at the uncached rate alone can be low.
 pub fn dear_usage(prices: &PriceTable, model: &str, input: u64, output: u64) -> TokenUsage {
-    let cache_write_dearer = prices
-        .get(model)
-        .is_some_and(|p| p.cache_write > p.uncached_input);
+    dear_usage_on(prices, None, model, input, output)
+}
+
+/// [`dear_usage`] for a call on `route`: the dearer-rate comparison reads the
+/// route's own price when it has one.
+pub fn dear_usage_on(
+    prices: &PriceTable,
+    route: Option<&str>,
+    model: &str,
+    input: u64,
+    output: u64,
+) -> TokenUsage {
+    let routed = route.map(|r| PriceTable::route_key(model, r));
+    let price = routed
+        .as_deref()
+        .and_then(|k| prices.get(k))
+        .or_else(|| prices.get(model));
+    let cache_write_dearer = price.is_some_and(|p| p.cache_write > p.uncached_input);
     if cache_write_dearer {
         TokenUsage {
             cache_write: input,
@@ -342,10 +376,39 @@ mod tests {
         let p = sizer.project("m", 1_000, 2, &ctx());
         // 2 rounds * 3,500 tokens at $1/M + 2 * 100 at $2/M = 7,000 + 400 micros.
         assert_eq!(
-            sizer.estimate_cost(&prices, "m", &p, 100).expect("priced"),
+            sizer
+                .estimate_cost(&prices, None, "m", &p, 100)
+                .expect("priced"),
             Money(7_400)
         );
-        assert!(sizer.estimate_cost(&prices, "x", &p, 100).is_err());
+        assert!(sizer.estimate_cost(&prices, None, "x", &p, 100).is_err());
+    }
+
+    /// The tier applies to one call. A tiered model whose every projected call
+    /// is small is priced, though the rounds together exceed the tier.
+    #[test]
+    fn a_tiered_model_is_estimated_per_call_not_on_the_sum() {
+        let mut prices = PriceTable::new();
+        prices.set(
+            "m",
+            ModelPrice {
+                uncached_input: 1_000_000,
+                cache_read: 0,
+                cache_write: 0,
+                output: 2_000_000,
+                reasoning: 2_000_000,
+            },
+        );
+        prices.set_tier_threshold("m", 5_000);
+        let sizer = Sizer::default();
+        let p = sizer.project("m", 1_000, 2, &ctx());
+        // 2 rounds of 3,500 tokens: 7,000 in all, above 5,000, but each call is below.
+        assert_eq!(
+            sizer
+                .estimate_cost(&prices, None, "m", &p, 100)
+                .expect("each call is below the tier"),
+            Money(7_400)
+        );
     }
 
     /// The orchestrator sizes from the ledger's SQL aggregate, not from a fold

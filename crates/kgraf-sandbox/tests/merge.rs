@@ -11,7 +11,8 @@ use common::{fixture, git};
 use kgraf_sandbox::git::Git;
 use kgraf_sandbox::{
     Attempt, AttemptGroup, AttemptState, CommitOutcome, FinishOutcome, GeneratedKind, Identity,
-    Limits, MergeBack, MergeError, MergeOutcome, RefusalReason, WorkspaceManager, WorkspaceSpec,
+    Limits, MergeBack, MergeError, MergeOutcome, MergedWorktree, RefusalReason, WorkspaceManager,
+    WorkspaceSpec,
 };
 // Only referenced by the `#[cfg(unix)]` gitlink-tampering test below (planting a
 // symlinked `.git` file is a unix-specific attack shape here); a plain, unconditional
@@ -297,6 +298,76 @@ fn an_empty_attempt_merges_nothing_and_is_removed() {
     );
     assert_eq!(tip(&e.f.repo), before);
     assert!(!w.workspace().root().exists());
+}
+
+/// An empty attempt whose worktree cannot be removed yet (a process started
+/// in it still runs) stays `Working`, so the commit can be tried again once
+/// the process has ended; the worktree is removed then.
+#[cfg(unix)]
+#[test]
+fn an_empty_attempt_whose_removal_is_refused_can_be_committed_again() {
+    let e = env();
+    let mb = merger(&e);
+    let mut w = attempt(&e, "idle-busy");
+    let mut child =
+        kgraf_sandbox::workspace_command(w.workspace(), kgraf_sandbox::Network::Deny, "/bin/sh")
+            .unwrap()
+            .args(["-c", "sleep 30"])
+            .spawn()
+            .unwrap();
+    let busy = mb.commit(&mut w, "noop");
+    // Stop it before any assertion can fail, so no process outlives the test.
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(
+        matches!(
+            &busy,
+            Err(MergeError::Workspace(WorkspaceError::Busy { .. }))
+        ),
+        "{busy:?}"
+    );
+    assert_eq!(w.state(), &AttemptState::Working, "not final yet");
+    assert!(w.workspace().root().is_dir());
+    assert_eq!(mb.commit(&mut w, "noop").unwrap(), CommitOutcome::Empty);
+    assert!(!w.workspace().root().exists());
+}
+
+/// Decision 0088: with worktrees kept, a merged attempt's worktree and the
+/// build output in it and in its scratch directory stay on disk; the work is
+/// on the branch and the attempt ref is gone. The default removes them.
+#[test]
+fn a_merged_attempt_keeps_its_worktree_and_builds_only_when_asked() {
+    for after in [MergedWorktree::Keep, MergedWorktree::Remove] {
+        let e = env();
+        let mb = merger(&e);
+        let mut w = attempt(&e, "built");
+        write(&w, "README", "merged work\n");
+        let root = w.workspace().root().to_path_buf();
+        let in_scratch = w.workspace().scratch().join("target/debug/blob");
+        std::fs::create_dir_all(in_scratch.parent().unwrap()).unwrap();
+        std::fs::write(&in_scratch, [7u8; 64]).unwrap();
+        mb.commit_declared(&mut w, "work", &["README"]).unwrap();
+        let outcome = mb.merge_then(&mut w, after).unwrap();
+        assert!(
+            matches!(outcome, MergeOutcome::Merged { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(show(&e.f.repo, &format!("{BRANCH}:README")), "merged work");
+        assert!(!ref_exists(&e.f.repo, &w.attempt_ref()), "{after:?}");
+        let kept = after == MergedWorktree::Keep;
+        assert_eq!(root.join("README").is_file(), kept, "{after:?}");
+        assert_eq!(in_scratch.is_file(), kept, "{after:?}");
+        if kept {
+            // Still a worktree git knows, so it can be removed later (by
+            // `kgraf clean` once this process has ended).
+            assert!(
+                git(&e.f.repo, &["worktree", "list", "--porcelain"]).contains("built"),
+                "{after:?}"
+            );
+            e.mgr.remove(w.workspace().clone()).unwrap();
+            assert!(!root.exists() && !in_scratch.exists());
+        }
+    }
 }
 
 /// The snapshot a check runs after: `commit_retaining` keeps an empty

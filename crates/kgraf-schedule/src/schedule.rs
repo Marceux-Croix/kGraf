@@ -314,10 +314,6 @@ pub struct WakeResolution {
     pub missed: MissedCount,
 }
 
-/// Re-export so callers configuring a rule's search budget do not need to reach into
-/// `recurrence` directly.
-pub const DEFAULT_WAKE_SCAN_BUDGET: std::time::Duration = DEFAULT_EXPANSION_BUDGET;
-
 #[cfg(test)]
 mod tests {
     use super::*;

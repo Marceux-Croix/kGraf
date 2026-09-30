@@ -284,6 +284,15 @@ pub enum WorkerError {
     /// An item of `SpawnOptions::injections` could not be queued.
     #[error("cannot queue a spawn injection: {0}")]
     Injection(InjectError),
+    /// The prefix and the opening messages alone reach the context stop point.
+    /// The worker would hand back before its first round with nothing done, and
+    /// the same brief split again would do so forever.
+    #[error(
+        "the worker's pinned context of {floor} tokens (prefix, slices, instruction) reaches its \
+         stop point of {stop}; it cannot run a round. Raise the context ceiling or shrink the \
+         slices and the instruction"
+    )]
+    PinnedContextTooLarge { floor: u64, stop: u64 },
 }
 
 /// Options for one spawn.
@@ -385,6 +394,27 @@ async fn prepare(
         .as_deref()
         .map(last_round_tools)
         .unwrap_or_default();
+    let fresh = options.resume_from.is_none();
+    // The `.git` entry every status read checks against. A fresh worker reads
+    // it now, before any call runs: the host has just made or reopened the
+    // worktree. A resume takes the one its first segment recorded, since a
+    // `.git` on disk now may have been planted by an earlier command.
+    let git_at_start = match options.resume_from.as_deref() {
+        None => crate::worktree::git_entry(&brief.workspace_root),
+        Some(events) => match events.iter().find_map(|event| match event {
+            WorkerEvent::Context { gitlink, .. } => Some(gitlink.clone()),
+            _ => None,
+        }) {
+            Some(Some(gitlink)) => Ok(crate::worktree::GitEntry::recorded(
+                &brief.workspace_root,
+                gitlink,
+            )),
+            _ => Err(format!(
+                "no gitlink at {} was recorded when this worker first started",
+                brief.workspace_root.display()
+            )),
+        },
+    };
     let (builder, rounds_used, delivered) = match options.resume_from {
         Some(events) => {
             let state = ResumeState::from_events(opening, &events)?;
@@ -398,6 +428,14 @@ async fn prepare(
             BTreeSet::new(),
         ),
     };
+    // A fresh worker that starts at the stop point can only hand back at once with the
+    // same remainder: refuse it, rather than let the caller split it forever.
+    if fresh && brief.context.reached_point(builder.context_tokens()) {
+        return Err(WorkerError::PinnedContextTooLarge {
+            floor: builder.context_tokens(),
+            stop: brief.context.worker_stop_tokens(),
+        });
+    }
     // Fail loud: a transcript resumed on a different prefix or different slices would
     // continue a conversation the model never had.
     if let Some(stored) = builder.prefix_digest()
@@ -435,24 +473,98 @@ async fn prepare(
     let last_call = calls.last().cloned().or(options.parent_call);
     let mut changed = BTreeSet::new();
     let mut done = Vec::new();
-    let mut stall = StallDetector::new(env.settings.stall_repeats);
-    for (tool, input) in builder.succeeded() {
-        // Only calls that ran and succeeded are replayed into the stall
-        // detector, as the live loop counts approved calls: a denied, refused or
-        // not-run call did nothing and must not push a resumed run toward a
-        // stall. A replay that already reached the threshold would have ended
-        // the earlier run, so the result is not acted on.
-        let _ = stall.observe([(tool.as_str(), input)]);
-        let Some(registered) = env.tools.get(tool) else {
-            continue;
-        };
-        if let Ok(access) = registered.tool().access(input) {
+    let mut stall =
+        StallDetector::new(env.settings.stall_repeats).with_window(env.masker.observation_window());
+    let mut saw_build = false;
+    let mut trace_failures = Vec::new();
+    // The live loop counts a round's approved calls once, before they run, and
+    // resets after a write that succeeded. The replay does the same per round,
+    // on the input each call ran with (after any approval rewrite).
+    for round in builder.replay_rounds() {
+        // Denied and refused calls did nothing and are not counted. A replay
+        // that reaches the threshold would have ended the earlier run, so the
+        // result is not acted on.
+        let _ = stall.observe(
+            round
+                .iter()
+                .filter(|call| call.counted)
+                .map(|call| (call.tool.as_str(), &call.input)),
+        );
+        let mut wrote = false;
+        for call in round
+            .iter()
+            .filter(|call| call.succeeded || call.interrupted_by_steer())
+        {
+            let Some(registered) = env.tools.get(&call.tool) else {
+                continue;
+            };
+            // The stored input is pattern-scrubbed: a marker where the call had
+            // text. A write path with a marker in it is not the path the call
+            // wrote, so it is reported, not recorded.
+            let access = match registered.tool().access(&call.input) {
+                Ok(access) => access,
+                Err(e) => {
+                    trace_failures.push(format!(
+                        "call {}: the writes of `{}` cannot be replayed from its stored input: {e}",
+                        call.id, call.tool
+                    ));
+                    continue;
+                }
+            };
+            saw_build |= access.is_sandboxed_build();
             for path in access.writes_paths() {
+                if crate::rebuild::has_redaction_marker(&path.to_string_lossy()) {
+                    trace_failures.push(format!(
+                        "call {}: `{}` wrote a path that its stored input redacted",
+                        call.id, call.tool
+                    ));
+                    continue;
+                }
                 changed.insert(path.clone());
-                done.push(format!("{tool} wrote {}", path.to_string_lossy()));
-                // The same reset the live loop makes after a write.
-                stall.reset();
+                // The live loop's own wording for each case.
+                let verb = if call.succeeded {
+                    "wrote"
+                } else {
+                    "may have written"
+                };
+                done.push(format!("{} {verb} {}", call.tool, path.to_string_lossy()));
+                wrote = true;
             }
+        }
+        // Tell the detector which results the masker hid, as the live loop did.
+        for call in round.iter().filter(|call| call.counted) {
+            stall.note_result(
+                &crate::stall::call_digest(&call.tool, &call.input),
+                env.masker.hides_result(&call.output, call.is_error),
+            );
+        }
+        if wrote {
+            stall.reset();
+        }
+    }
+    // A sandboxed build declares no paths, so its writes are not in the replay
+    // above. What the worktree shows dirty now includes them.
+    if saw_build {
+        let root = brief.workspace_root.clone();
+        // Checked against the gitlink the first segment recorded, not the
+        // `.git` on disk now.
+        let at_start = git_at_start.clone();
+        match tokio::task::spawn_blocking(move || crate::worktree::dirty_paths(&root, &at_start?))
+            .await
+        {
+            Ok(Ok(status)) => {
+                note_nested_repositories(&mut trace_failures, &status);
+                for path in status.paths {
+                    if changed.insert(path.clone()) {
+                        done.push(format!(
+                            "an earlier build changed {}",
+                            path.to_string_lossy()
+                        ));
+                    }
+                }
+            }
+            Ok(Err(e)) => trace_failures.push(format!("worktree status on resume not read: {e}")),
+            Err(e) => trace_failures.push(format!("worktree status on resume not read: {e}")),
         }
     }
     let (mut handle, endpoint) = worker_channel(brief.worker.clone(), env.settings.bulk_capacity);
@@ -481,6 +593,7 @@ async fn prepare(
     steering.seed_delivered(delivered);
     handle.set_spawn_duplicates(already_delivered, listed_twice);
     let worker = Worker {
+        git_at_start,
         env: env.clone(),
         approval: options.approval.unwrap_or_else(|| env.approval.clone()),
         budget: StepBudget::new(brief.step_budget, rounds_used),
@@ -494,7 +607,8 @@ async fn prepare(
         calls,
         last_call,
         given_tools: resumed_tools,
-        trace_failures: Vec::new(),
+        trace_failures,
+        cancel_unsent: false,
         round_redactions: kgraf_secrets::Redactions::default(),
         changed,
         done,
@@ -536,6 +650,14 @@ enum Interruption {
     Steer,
 }
 
+/// The start of the result of a call the approval chain denied. A stored
+/// transcript is told from a failed run by it: a denied call did nothing.
+pub(crate) const DENIED_PREFIX: &str = "ERROR: denied by ";
+
+/// The start of the result of a call refused before it ran (outside the write
+/// scope or fenced).
+pub(crate) const REFUSED_PREFIX: &str = "ERROR: refused: ";
+
 /// The result a call gets when an interrupt-mode message abandons its round
 /// before the call started (decision 0067, point 3).
 pub const STEER_NOT_RUN: &str = "ERROR: not run: the worker was redirected by a new message";
@@ -566,9 +688,41 @@ pub const STEER_ABANDON_REASON: &str = "an interrupt-mode message arrived";
 pub const STEER_ABANDON_BEFORE_SEND_REASON: &str =
     "an interrupt-mode message arrived before the request was sent";
 
+/// The `RoundAbandoned` reason recorded just before `Cancelled` when a cancel
+/// ended the run before the round's request left the process. The loop spends no
+/// round on a resume for it, as it refunds one abandoned by a steer.
+pub const CANCEL_BEFORE_SEND_REASON: &str = "the worker was cancelled before the request was sent";
+
+/// Why the final round's tool calls do not run.
+const FINAL_ROUND_WHY: &str = "the step budget is spent";
+
+/// The result a call gets when the final round issues it. The call never reached
+/// the stall check, so a replay must not count it.
+pub(crate) fn final_round_refusal() -> String {
+    format!("ERROR: not run: {FINAL_ROUND_WHY}")
+}
+
 /// The `RoundAbandoned` reason for a round that stopped at the output ceiling
 /// with no tool call, given one continuation round.
 pub const OUTPUT_LIMIT_ABANDON_REASON: &str = "the output ceiling was reached";
+
+/// Say, once per directory, that a directory holding its own repository is
+/// listed as one changed path: git does not list the files inside it, so the
+/// changed-path list is not complete there.
+fn note_nested_repositories(
+    trace_failures: &mut Vec<String>,
+    status: &crate::worktree::TreeStatus,
+) {
+    for dir in &status.nested_repositories {
+        let note = format!(
+            "{} holds its own git repository; files changed inside it are not listed",
+            dir.to_string_lossy()
+        );
+        if !trace_failures.contains(&note) {
+            trace_failures.push(note);
+        }
+    }
+}
 
 /// The notice that follows an output-ceiling stop: one continuation round.
 pub const OUTPUT_LIMIT_NOTICE: &str = "Your last response reached the output limit and was \
@@ -577,6 +731,11 @@ pub const OUTPUT_LIMIT_NOTICE: &str = "Your last response reached the output lim
      only continuation: if the limit is reached again the run fails.";
 
 struct Worker {
+    /// `<root>/.git` as it was when this worker first started
+    /// ([`crate::worktree::GitEntry`]; recorded in the transcript's
+    /// [`WorkerEvent::Context`] for a resume), or why there is none; every
+    /// status read checks against it.
+    git_at_start: Result<crate::worktree::GitEntry, String>,
     env: Arc<WorkerEnv>,
     approval: ApprovalChain,
     brief: WorkerBrief,
@@ -605,6 +764,10 @@ struct Worker {
     /// `AssistantMessage` reports its whole text instead; reported before a
     /// `Cancelled` or `RoundAbandoned` that ends the round unsettled.
     round_redactions: kgraf_secrets::Redactions,
+    /// Set when a cancel ends the run before the round's request left the
+    /// process: `run` records `RoundAbandoned` first, so a resume does not count
+    /// the round.
+    cancel_unsent: bool,
     changed: BTreeSet<PathBuf>,
     done: Vec<String>,
     denied: u32,
@@ -676,6 +839,17 @@ impl Worker {
                 // Control events: never refused by the cancel, never stuck behind a
                 // full channel (see handle.rs). A reader that has gone away cannot
                 // see them, and the result below is then dropped with the handle.
+                if self.cancel_unsent {
+                    let _ = self
+                        .emit(
+                            &endpoint,
+                            WorkerEvent::RoundAbandoned {
+                                phase,
+                                reason: CANCEL_BEFORE_SEND_REASON.to_owned(),
+                            },
+                        )
+                        .await;
+                }
                 let _ = self.emit(&endpoint, WorkerEvent::Cancelled { phase }).await;
                 if let Some((call, usage)) = partial {
                     let _ = self
@@ -864,6 +1038,12 @@ impl Worker {
             WorkerEvent::AssistantMessage {
                 text: response.text(),
                 reasoning: response.reasoning(),
+                // The last text part's token: the one a provider attaches at the
+                // end of a reply.
+                signature: response.content.iter().rev().find_map(|block| match block {
+                    Content::Text { signature, .. } => signature.clone(),
+                    _ => None,
+                }),
             },
         )
         .await?;
@@ -874,6 +1054,11 @@ impl Worker {
         let context = WorkerEvent::Context {
             prefix_digest: self.env.prefix.digest().as_str().to_owned(),
             slices: self.brief.slices.clone(),
+            gitlink: self
+                .git_at_start
+                .as_ref()
+                .ok()
+                .map(|entry| entry.gitlink().to_owned()),
         };
         self.emit(ep, context).await?;
         loop {
@@ -970,31 +1155,19 @@ impl Worker {
                     ));
                 }
                 (StopReason::ToolUse, false) => {}
-                (other, false) => {
-                    return Err(Halt::Failed(format!(
-                        "the response carries tool calls but stopped with {other:?}"
-                    )));
-                }
-                // The provider paused the turn for a server-side tool. The
-                // rebuilt transcript keeps only text and client tool calls, so
-                // the server tool's blocks would be dropped and the paused turn
-                // resent damaged. No route uses server tools, so this fails
-                // loud. No `Stop` is recorded: a resume then sees a round that
-                // never finished, not a paused turn to continue.
-                (StopReason::PauseTurn, true) => {
-                    return Err(Halt::Failed(
-                        "the provider paused the turn for a server tool; server tool turns are \
-                         not supported"
-                            .into(),
-                    ));
-                }
-                (StopReason::EndTurn | StopReason::StopSequence, true) => {
-                    self.emit_stop(ep, reason, &response).await?;
-                    return Ok((WorkerOutcome::Completed, response.text()));
-                }
-                (StopReason::MaxTokens, true) if !final_round && !self.output_limit_retried => {
+                (StopReason::MaxTokens, _)
+                    if !final_round
+                        && !self.output_limit_retried
+                        // The continuation is a round of its own. When it would
+                        // be the final round, it would carry two contradictory
+                        // notices (split your work, and no tool calls run), so
+                        // the ceiling stop fails instead.
+                        && self.budget.rounds_left() >= 2 =>
+                {
                     // A large apply_patch is the usual cause: the call is cut
-                    // off and no complete tool call arrives. The round's spend
+                    // off (the adapter drops it and reports `MaxTokens`). Any
+                    // complete calls beside a cut-off one are dropped with the
+                    // round: a turn that hit the ceiling is not run. The round's spend
                     // stays counted; its truncated text is dropped (the round is
                     // abandoned, which is not a terminal `Stop`), and the model
                     // gets one continuation round, counted in the budget, with
@@ -1018,7 +1191,7 @@ impl Worker {
                     .await?;
                     continue;
                 }
-                (StopReason::MaxTokens, true) => {
+                (StopReason::MaxTokens, _) => {
                     self.emit_stop(ep, reason, &response).await?;
                     return Ok((
                         WorkerOutcome::Failed {
@@ -1027,6 +1200,28 @@ impl Worker {
                         },
                         response.text(),
                     ));
+                }
+                (other, false) => {
+                    return Err(Halt::Failed(format!(
+                        "the response carries tool calls but stopped with {other:?}"
+                    )));
+                }
+                // The provider paused the turn for a server-side tool. The
+                // rebuilt transcript keeps only text and client tool calls, so
+                // the server tool's blocks would be dropped and the paused turn
+                // resent damaged. No route uses server tools, so this fails
+                // loud. No `Stop` is recorded: a resume then sees a round that
+                // never finished, not a paused turn to continue.
+                (StopReason::PauseTurn, true) => {
+                    return Err(Halt::Failed(
+                        "the provider paused the turn for a server tool; server tool turns are \
+                         not supported"
+                            .into(),
+                    ));
+                }
+                (StopReason::EndTurn | StopReason::StopSequence, true) => {
+                    self.emit_stop(ep, reason, &response).await?;
+                    return Ok((WorkerOutcome::Completed, response.text()));
                 }
                 (StopReason::Other, true) => {
                     self.emit_stop(ep, reason, &response).await?;
@@ -1049,13 +1244,21 @@ impl Worker {
                     call_id: id.clone(),
                     tool: name.clone(),
                     input: input.clone(),
+                    signature: response.content.iter().find_map(|block| match block {
+                        Content::ToolUse {
+                            id: block_id,
+                            signature,
+                            ..
+                        } if block_id == id => signature.clone(),
+                        _ => None,
+                    }),
                 };
                 self.emit(ep, started).await?;
             }
             if final_round {
                 // A turn that ends on a tool call produces no answer.
                 let ids: Vec<String> = uses.iter().map(|u| u.0.clone()).collect();
-                self.refuse_all(ep, ids, "the step budget is spent").await?;
+                self.refuse_all(ep, ids, FINAL_ROUND_WHY).await?;
                 return Ok((WorkerOutcome::BudgetExhausted, String::new()));
             }
             match self.dispatch(ep, uses).await {
@@ -1141,6 +1344,18 @@ impl Worker {
         Ok(())
     }
 
+    /// Settle a call whose request never left the process as a known zero. A
+    /// ledger error is recorded on the result, not dropped.
+    async fn settle_unsent(&mut self, call: &CallId, token: &kgraf_provider::CallToken<'_>) {
+        let zero = TokenUsage::default();
+        match token.cancel_async(Some(&zero)).await {
+            Ok(()) | Err(kgraf_provider::LedgerError::AlreadySettled { .. }) => {}
+            Err(e) => self
+                .trace_failures
+                .push(ledger_failure(call, "zero settle", &e)),
+        }
+    }
+
     fn hand_back(&self, context_tokens: u64) -> WorkerOutcome {
         let stop = self.brief.context.worker_stop_tokens();
         WorkerOutcome::HandedBack {
@@ -1208,8 +1423,25 @@ impl Worker {
         self.calls.push(call.clone());
         self.last_call = Some(call.clone());
         // Before the request leaves: a round that fails without usage still counts.
-        self.emit(ep, WorkerEvent::ModelCall { call: call.clone() })
-            .await?;
+        if let Err(halt) = self
+            .emit(ep, WorkerEvent::ModelCall { call: call.clone() })
+            .await
+        {
+            // The row is open and no request was sent. Whatever ends the worker
+            // here settles the row as a known zero; returning with the token
+            // dropped would leave it unreconciled, as unknown spend. (A reader
+            // that left is not a halt: `emit` treats it as delivered.)
+            let zero = TokenUsage::default();
+            self.settle_unsent(&call, &token).await;
+            if matches!(halt, Halt::Cancelled { .. }) {
+                self.cancel_unsent = true;
+                return Err(Halt::Cancelled {
+                    phase: CancelPhase::ModelStream,
+                    partial: Some((call, zero)),
+                });
+            }
+            return Err(halt);
+        }
 
         // Decision 0067: an interrupt that arrived after the drain and before
         // this point (the ledger write above is an await) finds a request that
@@ -1227,12 +1459,26 @@ impl Worker {
         // `Injector::undelivered` and routes to the orchestrator.
         if !final_round && self.steering.is_armed() {
             let zero = TokenUsage::default();
-            let _ = token.cancel_async(Some(&zero)).await;
+            self.settle_unsent(&call, &token).await;
             return Err(Halt::Abandoned {
                 phase: CancelPhase::ModelStream,
                 partial: Some((call, zero)),
                 // The request never left this function: no provider was called.
                 sent: false,
+            });
+        }
+        // A cancel that arrived before the request left is the same case: the
+        // provider future below is never polled when the cancel is already
+        // pending (the select is biased), so no request was sent and the call
+        // settles as a known zero rather than an unreconciled row of unknown
+        // spend.
+        if ep.is_cancelled() {
+            let zero = TokenUsage::default();
+            self.settle_unsent(&call, &token).await;
+            self.cancel_unsent = true;
+            return Err(Halt::Cancelled {
+                phase: CancelPhase::ModelStream,
+                partial: Some((call, zero)),
             });
         }
         // An interrupt-mode message abandons the call in flight. Raced after
@@ -1256,7 +1502,11 @@ impl Worker {
                 match outcome {
                     Err(why) => {
                         // No usage was received, so the spend is unknown, not zero.
-                        settle_cancelled(&token, &StreamSeen::default()).await;
+                        if let Some(failure) =
+                            settle_cancelled(&call, &token, &StreamSeen::default()).await
+                        {
+                            self.trace_failures.push(failure);
+                        }
                         return Err(match why {
                             Interruption::Cancel => Halt::Cancelled {
                                 phase: CancelPhase::ModelStream,
@@ -1297,7 +1547,9 @@ impl Worker {
                         adapter: provider.adapter(),
                         capability: "streaming",
                     };
-                    let _ = token.close_on_async(&error, None).await;
+                    if let Err(e) = token.close_on_async(&error, None).await {
+                        self.trace_failures.push(ledger_failure(&call, "close", &e));
+                    }
                     return Err(Halt::Failed(error.to_string()));
                 };
                 let (sink, mut pump) = stream_bridge(self.env.settings.bridge_limit_bytes);
@@ -1417,7 +1669,9 @@ impl Worker {
                                 )),
                             }
                         }
-                        settle_cancelled(&token, &seen).await;
+                        if let Some(failure) = settle_cancelled(&call, &token, &seen).await {
+                            self.trace_failures.push(failure);
+                        }
                         let partial = seen.usage.map(|usage| (call, usage));
                         return Err(match end {
                             End::Halted(Halt::Failed(e)) => Halt::Failed(e),
@@ -1510,7 +1764,7 @@ impl Worker {
                             self.denied += 1;
                             let finished = WorkerEvent::ToolCallFinished {
                                 call_id: call_id.clone(),
-                                output: format!("ERROR: refused: {why}"),
+                                output: format!("{REFUSED_PREFIX}{why}"),
                                 is_error: true,
                             };
                             self.emit(ep, finished).await?;
@@ -1523,7 +1777,7 @@ impl Worker {
                         self.denied += 1;
                         let finished = WorkerEvent::ToolCallFinished {
                             call_id: call_id.clone(),
-                            output: format!("ERROR: denied by {by}: {reason}"),
+                            output: format!("{DENIED_PREFIX}{by}: {reason}"),
                             is_error: true,
                         };
                         self.emit(ep, finished).await?;
@@ -1583,6 +1837,12 @@ impl Worker {
         let waits = dependencies(&accesses, self.env.settings.path_case);
         let ids: Vec<String> = approved.iter().map(|a| a.call_id().to_owned()).collect();
         let tools: Vec<String> = approved.iter().map(|a| a.tool().to_owned()).collect();
+        // The stall detector's key for each call, to tell it whether the call's
+        // result is one the masker hides (`record_result`).
+        let digests: Vec<String> = approved
+            .iter()
+            .map(|a| crate::stall::call_digest(a.tool(), a.input()))
+            .collect();
         // Decision 0067: a call that declares writes is never
         // cancelled by a steer. Cancelling it would not stop work already
         // handed to a blocking thread (apply_patch), so the transcript would
@@ -1640,7 +1900,7 @@ impl Worker {
                 &progress_tx,
             );
         }
-        let why = loop {
+        let why = 'round: loop {
             let next = tokio::select! {
                 biased;
                 () = ep.cancelled() => break Interruption::Cancel,
@@ -1650,8 +1910,13 @@ impl Worker {
                         Some(reason) => WorkerEvent::Waiting { call_id, reason },
                         None => WorkerEvent::Resumed { call_id },
                     };
-                    self.emit(ep, event).await?;
-                    continue;
+                    match self.emit(ep, event).await {
+                        Ok(()) => continue,
+                        // A cancel during the emit still runs the grace loop
+                        // below, so a sibling that finishes is recorded.
+                        Err(Halt::Cancelled { .. }) => break Interruption::Cancel,
+                        Err(other) => return Err(other),
+                    }
                 }
                 next = running.next() => next,
             };
@@ -1667,6 +1932,18 @@ impl Worker {
             // race against the `select!` above) guarantees a `Resumed`
             // reaches the transcript before the call's own
             // `ToolCallFinished`, deterministically, not by scheduling luck.
+            //
+            // The finished call is recorded before this drain, so a cancel
+            // during it cannot lose the call's writes or mark a finished call
+            // interrupted.
+            done[j] = true;
+            let finished = self.record_result(j, &accesses, call_id, &tool, &digests[j], result);
+            // A sandboxed build declares no paths; ask git what it changed. Before
+            // any emit: a cancel during an emit must not lose the paths.
+            if accesses[j].is_sandboxed_build() {
+                self.record_tree_changes(&tool).await;
+            }
+            let mut cancelled_in_drain = false;
             while let Ok((report_id, reason)) = progress_rx.try_recv() {
                 let event = match reason {
                     Some(reason) => WorkerEvent::Waiting {
@@ -1675,14 +1952,28 @@ impl Worker {
                     },
                     None => WorkerEvent::Resumed { call_id: report_id },
                 };
-                self.emit(ep, event).await?;
+                match self.emit(ep, event).await {
+                    Ok(()) => {}
+                    Err(Halt::Cancelled { .. }) => {
+                        cancelled_in_drain = true;
+                        break;
+                    }
+                    Err(other) => return Err(other),
+                }
             }
-            done[j] = true;
-            let finished = self.record_result(j, &accesses, call_id, &tool, result);
-            self.emit(ep, finished).await?;
-            // A sandboxed build declares no paths; ask git what it changed.
-            if accesses[j].is_sandboxed_build() {
-                self.record_tree_changes(&tool).await;
+            if cancelled_in_drain {
+                // The call finished: its result reaches the transcript (an
+                // unbounded emit, since a bulk emit is refused after a cancel),
+                // then the grace loop records the siblings still running.
+                self.emit_after_cancel(ep, finished)?;
+                break 'round Interruption::Cancel;
+            }
+            match self.emit(ep, finished).await {
+                Ok(()) => {}
+                // The result was persisted unbounded by `send`; the grace loop
+                // records the siblings still running.
+                Err(Halt::Cancelled { .. }) => break Interruption::Cancel,
+                Err(other) => return Err(other),
             }
             // The emit above can wait for a bulk slot, which is exactly when
             // an interrupt can arrive: checked after it, not before.
@@ -1723,7 +2014,10 @@ impl Worker {
                 break;
             };
             done[j] = true;
-            let finished = self.record_result(j, &accesses, call_id, &tool, result);
+            let finished = self.record_result(j, &accesses, call_id, &tool, &digests[j], result);
+            if accesses[j].is_sandboxed_build() {
+                self.record_tree_changes(&tool).await;
+            }
             self.emit_round_end(ep, finished).await?;
         }
         // On a steer, writing calls were let run through the grace.
@@ -1765,6 +2059,12 @@ impl Worker {
         let outlived: Vec<usize> = (0..ids.len())
             .filter(|&j| !done[j] && calls[j].is_none())
             .collect();
+        // A sandboxed build or test that outlived the grace declares no paths,
+        // and may have written part of its work already: ask git, as for one
+        // that returned. What it writes after this scan is not seen.
+        if let Some(&j) = outlived.iter().find(|&&j| accesses[j].is_sandboxed_build()) {
+            self.record_tree_changes(&tools[j]).await;
+        }
         // Calls still waiting on a conflicting call, or held back because the
         // round was stopping, never started.
         let unstarted: Vec<String> = calls
@@ -1896,6 +2196,7 @@ impl Worker {
         accesses: &[kgraf_tools::Access],
         call_id: String,
         tool: &str,
+        digest: &str,
         result: Result<ToolOutput, ToolError>,
     ) -> WorkerEvent {
         let (output, is_error) = match result {
@@ -1905,6 +2206,10 @@ impl Worker {
             }
             Err(e) => (format!("ERROR: {e}"), true),
         };
+        // A repeat of this call after its result leaves the masker's window is a
+        // re-read only if the masker hid the result.
+        self.stall
+            .note_result(digest, self.env.masker.hides_result(&output, is_error));
         if !is_error {
             for path in accesses[j].writes_paths() {
                 self.changed.insert(path.clone());
@@ -1929,10 +2234,14 @@ impl Worker {
     /// files the command wrote without saying so.
     async fn record_tree_changes(&mut self, tool: &str) {
         let root = self.brief.workspace_root.clone();
-        let read = tokio::task::spawn_blocking(move || crate::worktree::dirty_paths(&root)).await;
+        let at_start = self.git_at_start.clone();
+        let read =
+            tokio::task::spawn_blocking(move || crate::worktree::dirty_paths(&root, &at_start?))
+                .await;
         match read {
-            Ok(Ok(paths)) => {
-                for path in paths {
+            Ok(Ok(status)) => {
+                note_nested_repositories(&mut self.trace_failures, &status);
+                for path in status.paths {
                     if self.changed.insert(path.clone()) {
                         self.done
                             .push(format!("{tool} changed {}", path.to_string_lossy()));
@@ -2136,14 +2445,29 @@ fn last_round_tools(events: &[WorkerEvent]) -> Vec<String> {
 /// with the request id, where `Ledger::unreconciled` reports it until the
 /// provider's own record resolves it. `AlreadySettled` means the adapter finished
 /// the call as the cancel landed, and its settlement stands.
-async fn settle_cancelled(token: &kgraf_provider::CallToken<'_>, seen: &StreamSeen) {
-    // A ledger write that fails leaves the row in flight, which `unreconciled`
-    // also reports; there is no better place to surface it from a cancel.
+///
+/// A settle that the ledger refuses leaves the row in flight. It is returned as a
+/// failure line for the run's `trace_failures`, never dropped.
+async fn settle_cancelled(
+    call: &CallId,
+    token: &kgraf_provider::CallToken<'_>,
+    seen: &StreamSeen,
+) -> Option<String> {
     let ack = match &seen.usage {
         Some(usage) => token.cancel_async(Some(usage)),
         None => token.leave_unreconciled_async(seen.request_id.as_deref()),
     };
-    let _ = ack.await;
+    match ack.await {
+        Ok(()) => None,
+        // The adapter finished the call as the cancel landed; that stands.
+        Err(kgraf_provider::LedgerError::AlreadySettled { .. }) => None,
+        Err(e) => Some(ledger_failure(call, "cancel settle", &e)),
+    }
+}
+
+/// The failure line for a ledger write the loop could not make.
+fn ledger_failure(call: &CallId, what: &str, error: &kgraf_provider::LedgerError) -> String {
+    format!("call {call}: ledger {what} failed, the row stays open: {error:?}")
 }
 
 fn approval_halt(e: ApprovalError) -> Halt {

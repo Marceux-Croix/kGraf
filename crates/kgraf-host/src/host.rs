@@ -209,6 +209,15 @@ pub struct Host {
     ended: Mutex<BTreeMap<RunId, RunEnd>>,
     /// Notices of builds nobody was there to print ([`HostFactory`]).
     notices: Mutex<Vec<Notice>>,
+    /// Runs whose synchronous build (`build_base`) is executing on a blocking
+    /// thread. A build that outlives `prepare_blocking`'s time bound keeps
+    /// running there after its task is aborted, so a retry for the same run
+    /// is refused until it ends instead of starting a second one.
+    base_builds: Arc<Mutex<std::collections::BTreeSet<String>>>,
+    /// Held for the graph index pass in `build_base`. The pass uses its own
+    /// connection, so the shared graph lock no longer orders two builds; this
+    /// does, and only they wait on it.
+    index_pass: Mutex<()>,
     /// Longest a [`Host::prepare_blocking`] build may take.
     build_timeout: Duration,
     /// Measured per-model capability profiles (decision 0075), loaded once at
@@ -225,9 +234,17 @@ pub struct Host {
     /// Each run's refetcher, until [`Host::finish_run`] stops it (a worker's
     /// fetch still running then is killed).
     refetchers: Mutex<BTreeMap<RunId, crate::deps::HostRefetch>>,
+    /// The stored fetch consent each run's start gate read, until
+    /// [`Host::finish_run`]: a refusal stored after that point is a change
+    /// the run's workers honor.
+    start_consents: Mutex<BTreeMap<RunId, crate::deps::Consent>>,
     /// The question each run stopped on for want of an answer about
     /// fetching, until [`Host::take_dependency_question`] (the desktop asks it).
     dependency_questions: Mutex<BTreeMap<RunId, crate::deps::ConsentQuestion>>,
+    /// Whether a run's worker worktrees are deleted after use (decision
+    /// 0088). Read when a run is built, so a change applies to the runs that
+    /// start after it; a run in flight keeps the policy it began with.
+    worktrees: Mutex<crate::config::WorktreeRetention>,
 }
 
 /// Most dependency questions a host keeps for [`Host::take_dependency_question`].
@@ -415,6 +432,7 @@ impl Host {
             .iter()
             .map(|s| RouteSpec::parse(s))
             .collect::<Result<Vec<_>>>()?;
+        let worktrees = Mutex::new(config.worktrees);
         Ok(Self {
             config,
             state,
@@ -433,13 +451,28 @@ impl Host {
             in_process: BTreeMap::new(),
             ended: Mutex::new(BTreeMap::new()),
             notices: Mutex::new(Vec::new()),
+            base_builds: Arc::default(),
+            index_pass: Mutex::new(()),
             build_timeout: DEFAULT_BUILD_TIMEOUT,
             profiles,
             deps_tool: Arc::new(crate::deps::CargoDeps::default()),
             fetch_grants: Mutex::new(std::collections::BTreeSet::new()),
             refetchers: Mutex::new(BTreeMap::new()),
+            start_consents: Mutex::new(BTreeMap::new()),
             dependency_questions: Mutex::new(BTreeMap::new()),
+            worktrees,
         })
+    }
+
+    /// The worktree policy in force for runs built from now on.
+    pub fn worktree_retention(&self) -> crate::config::WorktreeRetention {
+        *self.worktrees.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Change the worktree policy for runs built from now on (decision 0088).
+    /// A run already built keeps the policy it started with.
+    pub fn set_worktree_retention(&self, retention: crate::config::WorktreeRetention) {
+        *self.worktrees.lock().unwrap_or_else(|p| p.into_inner()) = retention;
     }
 
     /// Bound each [`Host::prepare_blocking`] build (default
@@ -526,6 +559,26 @@ impl Host {
         notices: &mut (dyn FnMut(Notice) + Send),
     ) -> Result<()> {
         use crate::deps::{FetchSite, GateOutcome, Trigger, ensure};
+        // The consent as the start gate sees it, kept for the run's workers.
+        // Read again on a second gate of the same run: the latest start wins.
+        let at_start = self
+            .dependency_consents()
+            .get(self.deps_tool.registry())
+            .unwrap_or_default();
+        self.start_consents
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(run.clone(), at_start);
+        // A refetcher the run already has keeps its bounds and its stop, and
+        // takes this gate's consent.
+        if let Some(existing) = self
+            .refetchers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(run)
+        {
+            existing.set_consent_at_start(at_start);
+        }
         let outcome = ensure(
             self.deps_tool.as_ref(),
             &FetchSite::project(&self.config.root),
@@ -570,21 +623,40 @@ impl Host {
     }
 
     /// The refetcher every worker environment of `run` gets (decision 0087).
-    fn dependency_refetch(&self, run: &RunId) -> Arc<dyn kgraf_tools::DependencyRefetch> {
+    pub(crate) fn dependency_refetch(
+        &self,
+        run: &RunId,
+    ) -> Arc<dyn kgraf_tools::DependencyRefetch> {
         // One per run: a second build of the same run shares the first's, so
-        // its bounds and its stop cover every worker of the run.
+        // its bounds and its stop cover every worker of the run. The consent
+        // it holds from the start gate is replaced when the run passes the
+        // gate again ([`Host::ensure_dependencies`]).
+        let at_start = self
+            .start_consents
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(run)
+            .copied();
         let refetch = self
             .refetchers
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .entry(run.clone())
-            .or_insert_with(|| {
-                crate::deps::HostRefetch::new(
+            .or_insert_with(|| match at_start {
+                Some(stored_at_start) => crate::deps::HostRefetch::with_consent_at_start(
                     self.deps_tool.clone(),
                     self.dependency_consents(),
                     self.run_fetch(run),
                     self.config.root.clone(),
-                )
+                    stored_at_start,
+                ),
+                // A run that never passed the start gate: read it now.
+                None => crate::deps::HostRefetch::new(
+                    self.deps_tool.clone(),
+                    self.dependency_consents(),
+                    self.run_fetch(run),
+                    self.config.root.clone(),
+                ),
             })
             .clone();
         Arc::new(refetch)
@@ -724,15 +796,62 @@ impl Host {
     /// returns "not enough rounds yet" (`None`), the same honest default an
     /// unmeasured route already gets, never a wrong number.
     pub fn route_capacity_inputs(&self) -> Vec<RouteCapacityInput> {
-        let mut seen = std::collections::BTreeSet::new();
-        self.route_set()
+        self.route_capacity_inputs_with(&kgraf_core::legacy::env_var)
+    }
+
+    /// [`Self::route_capacity_inputs`] reading route settings through `lookup`
+    /// (the process environment in production). A route whose settings do not
+    /// resolve reports no header limit and no 429 key: no adapter for it could
+    /// have recorded one.
+    ///
+    /// Limits and the last 429 are read under the key the adapters record under
+    /// (`kgraf_fleet::kind_limit_key`): the resolved base URL, for Azure the
+    /// deployment too, and for an embedding or rerank model route the model
+    /// too. A route serving several deployments or models reads every key:
+    /// the limits reported are the tightest (so a model route with lower
+    /// limits than the route's chat model bounds the route, which errs toward
+    /// fewer agents), and the key reported (`base_url`) is the one with the
+    /// newest 429, so a 429 on any of them reaches the learned rate.
+    pub(crate) fn route_capacity_inputs_with(
+        &self,
+        lookup: &dyn Fn(&str) -> Option<String>,
+    ) -> Vec<RouteCapacityInput> {
+        // The generative routes, then the model routes (decision 0089): an
+        // embedding or rerank model on a route has limits of its own, recorded
+        // under its own key (`kgraf_fleet::kind_limit_key`), and a route used
+        // only for them still has capacity to report. A model route list that
+        // does not parse was refused when the host opened, so it adds nothing.
+        let model_specs = self.config.model_route_specs().unwrap_or_default();
+        let specs = self
+            .route_set()
             .into_iter()
-            .filter(|r| seen.insert(r.route.clone()))
-            .map(|r| self.one_route_capacity_input(&r))
+            .map(|spec| (kgraf_core::ModelKind::GENERATIVE, spec))
+            .chain(model_specs.into_iter().map(|m| (m.kind, m.route)));
+        let mut order: Vec<RouteSpec> = Vec::new();
+        let mut models: std::collections::BTreeMap<String, Vec<(kgraf_core::ModelKind, String)>> =
+            std::collections::BTreeMap::new();
+        for (kind, spec) in specs {
+            let of_route = models.entry(spec.route.clone()).or_default();
+            if of_route.is_empty() {
+                order.push(spec.clone());
+            }
+            let model = (kind, spec.model);
+            if !of_route.contains(&model) {
+                of_route.push(model);
+            }
+        }
+        order
+            .iter()
+            .map(|r| self.one_route_capacity_input(r, &models[&r.route], lookup))
             .collect()
     }
 
-    fn one_route_capacity_input(&self, route: &RouteSpec) -> RouteCapacityInput {
+    fn one_route_capacity_input(
+        &self,
+        route: &RouteSpec,
+        models: &[(kgraf_core::ModelKind, String)],
+        lookup: &dyn Fn(&str) -> Option<String>,
+    ) -> RouteCapacityInput {
         let Ok(entry) = kgraf_fleet::entry(&route.route) else {
             // A route this host's own `RunConfig` already validated at
             // `open` should always resolve; kept as a graceful "unmeasured"
@@ -760,7 +879,33 @@ impl Host {
                 base_url: Some(entry.base_url.to_owned()),
             };
         }
-        let header = kgraf_provider::limits::get(entry.base_url);
+        let mut keys: Vec<String> = Vec::new();
+        for (kind, model) in models {
+            if let Ok(key) = kgraf_fleet::kind_limit_key(entry, lookup, *kind, model)
+                && !keys.contains(&key)
+            {
+                keys.push(key);
+            }
+        }
+        // The tightest observed limits over every key, and the key whose 429 is
+        // newest (else the first): the shell reads that key's 429 time.
+        let observed: Vec<_> = keys
+            .iter()
+            .filter_map(|k| kgraf_provider::limits::get(k))
+            .collect();
+        let header = (!observed.is_empty()).then(|| kgraf_provider::ObservedLimits {
+            requests_limit: observed.iter().filter_map(|o| o.requests_limit).min(),
+            tokens_limit: observed.iter().filter_map(|o| o.tokens_limit).min(),
+            ..Default::default()
+        });
+        let limit_key = keys
+            .iter()
+            .reduce(|best, k| {
+                let newer =
+                    kgraf_provider::limits::last_429(k) > kgraf_provider::limits::last_429(best);
+                if newer { k } else { best }
+            })
+            .cloned();
         let configured = self.rate_limit(&route.route);
         let rpm = tighter_rpm(
             header.and_then(|o| o.requests_limit),
@@ -779,7 +924,7 @@ impl Host {
                 tokens_per_round: stats.as_ref().and_then(|s| s.tokens_per_round),
                 local_slots: None,
             },
-            base_url: Some(entry.base_url.to_owned()),
+            base_url: limit_key,
         }
     }
 
@@ -832,7 +977,12 @@ impl Host {
     pub fn check_ready(&self, routes: &[RouteSpec]) -> Result<(), NotReady> {
         self.current_prices()?;
         let lookup = |v: &str| kgraf_core::legacy::env_var(v);
-        check_routes(routes, &self.in_process, Some(&lookup))
+        check_routes(routes, &self.in_process, Some(&lookup))?;
+        let specs = self
+            .config
+            .model_route_specs()
+            .map_err(|e| NotReady::Invalid(e.to_string()))?;
+        check_model_routes(&specs, Some(&lookup))
     }
 
     fn plan_limits(&self) -> kgraf_interpret::PlanLimits {
@@ -1034,7 +1184,11 @@ impl Host {
             WorkspaceManager::open(&self.config.root, &self.state.join("worktrees"))
                 .step("cannot open the worktree manager")?,
         );
-        for removed in clean_stale_worktrees(&manager, &RunStore::new(self.graph.clone()))? {
+        for removed in clean_stale_worktrees(
+            &manager,
+            &RunStore::new(self.graph.clone()),
+            self.worktree_retention(),
+        )? {
             notices(Notice::Cleaned(removed));
         }
         // Never silent: work nothing here can judge (another machine or PID
@@ -1128,6 +1282,7 @@ impl Host {
         run: RunId,
         notices: &mut (dyn FnMut(Notice) + Send),
     ) -> Result<BuildBase> {
+        let _claim = BaseBuildClaim::take(&self.base_builds, run.as_str())?;
         let root = self.config.root.as_path();
         let manager = &startup.manager;
         // Keep the graph in step with the working tree before planning: a run
@@ -1151,6 +1306,7 @@ impl Host {
         // from it. Indexing the branch would need a second tree on disk; the
         // checkout is what the user sees and what the planner's slices name.
         let index_report = {
+            let _one_pass = self.index_pass.lock().unwrap_or_else(|p| p.into_inner());
             let store = GraphStore::open_existing_for_facts(&self.graph_path, root)
                 .step("cannot open the graph to index it")?;
             Indexer::new(&store)
@@ -1181,7 +1337,10 @@ impl Host {
                     .unwrap_err(),
             })?,
         );
-        let workspaces = Arc::new(GitWorkspaces::new(manager.clone(), merge_back.clone()));
+        let workspaces = Arc::new(
+            GitWorkspaces::new(manager.clone(), merge_back.clone())
+                .with_retention(self.worktree_retention()),
+        );
         let read_denies = state_read_denies(
             &self.state,
             None,
@@ -1237,10 +1396,27 @@ impl Host {
         // and every attempt) carries `challenge_contract`, bound to the
         // orchestrator once it is built (`finish_build`).
         let line = self.config.contract_checks.then(ContractLine::new);
-        let extra_tools: Vec<Arc<dyn kgraf_tools::Tool>> = line
+        let mut extra_tools: Vec<Arc<dyn kgraf_tools::Tool>> = line
             .iter()
             .map(|l| Arc::new(ChallengeTool::new(l.clone())) as Arc<dyn kgraf_tools::Tool>)
             .collect();
+        // Decision 0089: the run's non-generative routes, each built with its
+        // own credential. Their tools join every environment of the run (so the
+        // prefix stays one per vendor and model, 0043); none is called unless
+        // the orchestrator or a worker chooses to.
+        let model_specs = self.config.model_route_specs()?;
+        let model_calls = if model_specs.is_empty() {
+            None
+        } else {
+            let routes = crate::config::model_routes_from(
+                &model_specs,
+                &self.limiters,
+                kgraf_core::legacy::env_var,
+            )?;
+            let calls = kgraf_tools::ModelCalls::new(self.ledger.clone(), Arc::new(routes));
+            extra_tools.extend(kgraf_tools::model_tools(&calls));
+            Some(calls)
+        };
         // Every agent is an addressable session (decision 0067), behind the
         // `sessions` flag (default off): the line is bound to the
         // orchestrator's handle once it exists, exactly as `line` above is.
@@ -1278,6 +1454,8 @@ impl Host {
             assembler,
             line,
             session_line,
+            model_calls,
+            extractor_changed: index_report.extractor_changed,
         })
     }
 
@@ -1301,6 +1479,8 @@ impl Host {
             assembler,
             line,
             session_line,
+            model_calls,
+            extractor_changed,
         } = base;
         let routes = route_envs(
             &assembler,
@@ -1383,12 +1563,30 @@ impl Host {
         // Wired for every run: without session tools no worker can
         // ask, so nothing is called.
         let orchestrator = Orchestrator::new(self.orchestrator_config.clone(), services)?
+            .with_index_extractor_changes(extractor_changed)
             .with_attempt_envs(envs)
             .with_question_answerer(Arc::new(ModelAnswerer(self.caller(&run)?)));
+        // Decision 0089: the planner is told the run's model routes by kind,
+        // and the orchestrator may call them itself.
+        let orchestrator = match model_calls {
+            Some(calls) => orchestrator.with_model_kinds(Arc::new(
+                kgraf_orchestrator::ModelKindCalls::new(calls, run.as_str()),
+            )),
+            None => orchestrator,
+        };
         let gate_commands = match plan {
             Some(plan) if self.config.gate_commands.is_empty() => plan.validation_commands(),
             _ => discover_validation_commands(root, &self.config.gate_commands)?,
         };
+        // A blank command runs nothing and passes: refused for a command from
+        // the plan as for one from the configuration.
+        if let Some(blank) = gate_commands.iter().position(|c| c.trim().is_empty()) {
+            return Err(Error::Invalid(format!(
+                "gate command {} is empty: an empty gate command passes without checking \
+                 anything",
+                blank + 1
+            )));
+        }
         notices(Notice::GateCommands(gate_commands.clone()));
         let orchestrator = orchestrator.with_gate_runner(Arc::new(CommandGateRunner {
             commands: gate_commands.clone(),
@@ -1612,43 +1810,66 @@ impl Host {
         let prices = self.prices()?;
         let calls = self.ledger.calls_finished_since(now - HOUR_MS + 1).lift()?;
         let mut estimated = Vec::new();
-        let mut total = kgraf_core::Money::ZERO;
+        // Each call's exact cost, apportioned from the sum rounded once:
+        // rounding each call up to a micro-dollar on its own would seed many
+        // small embedding calls at several times what they cost.
+        let mut seeds: Vec<(String, i64, kgraf_core::cost::ExactMoney)> = Vec::new();
         {
-            let mut budget = self.admission.budget();
             for c in calls {
                 let at = c.finished_ms.unwrap_or(c.started_ms);
-                let priced = prices.get(&c.model).is_some();
-                let cost = match (c.settlement, priced) {
-                    (kgraf_provider::Settlement::Failed, _) => continue,
+                let route = c.route.as_deref();
+                let priced = prices.is_priced_on(route, &c.model);
+                // A recorded call the table cannot cost (a tiered model's
+                // call above its tier) is seeded as an estimate, like an
+                // unsettled one, and never aborts the seeding.
+                let recorded = match (c.settlement, priced) {
                     (
                         kgraf_provider::Settlement::Counted | kgraf_provider::Settlement::Cancelled,
                         true,
-                    ) => prices.cost(&c.model, &c.usage).lift()?,
-                    (settlement, _) => {
-                        let amount = match self.worst_case_call(&prices, &c.model) {
+                    ) => prices.cost_exact_on(route, &c.model, &c.usage).ok(),
+                    _ => None,
+                };
+                let cost = match (c.settlement, recorded) {
+                    (kgraf_provider::Settlement::Failed, _) => continue,
+                    (_, Some(cost)) => cost,
+                    (settlement, None) => {
+                        let amount = match self.worst_case_call(&prices, route, &c.model) {
                             Ok(a) => a,
-                            // A model the table does not price, and a table
-                            // that prices nothing to bound it with: the
-                            // call's cost is unknown, so it is not seeded
+                            // A call whose cost is unknown and that nothing
+                            // in the table can bound: it is not seeded
                             // (never as `$0`), and opening is not refused.
-                            Err(_) if !priced => continue,
-                            Err(e) => return Err(e),
+                            Err(_) => continue,
                         };
                         estimated.push(Notice::EstimatedSpend {
                             call: c.id.to_string(),
                             model: c.model.clone(),
                             amount,
-                            reason: if priced {
-                                format!("{settlement:?}: its spend is not known")
-                            } else {
+                            reason: if !priced {
                                 "its model is not in the price table".to_owned()
+                            } else if matches!(
+                                settlement,
+                                kgraf_provider::Settlement::Counted
+                                    | kgraf_provider::Settlement::Cancelled
+                            ) {
+                                "its size is above the model's rate tier".to_owned()
+                            } else {
+                                format!("{settlement:?}: its spend is not known")
                             },
                         });
-                        amount
+                        kgraf_core::cost::ExactMoney::from_money(amount)
                     }
                 };
-                budget.seed_hour(c.id.as_str(), at, cost);
-                total += cost;
+                seeds.push((c.id.to_string(), at, cost));
+            }
+        }
+        let amounts: Vec<_> = seeds.iter().map(|(_, _, cost)| *cost).collect();
+        let shares = kgraf_core::cost::ExactMoney::apportion(&amounts);
+        let mut total = kgraf_core::Money::ZERO;
+        {
+            let mut budget = self.admission.budget();
+            for ((call, at, _), share) in seeds.iter().zip(shares) {
+                budget.seed_hour(call, *at, share);
+                total += share;
             }
         }
         self.notices
@@ -1665,19 +1886,28 @@ impl Host {
     pub(crate) fn worst_case_call(
         &self,
         prices: &PriceTable,
+        route: Option<&str>,
         model: &str,
     ) -> Result<kgraf_core::Money> {
         let input = self.context.effective_window();
         let output = u64::from(self.config.max_tokens.max(self.config.planner_max_tokens));
-        let cost =
-            |m: &str| prices.cost(m, &kgraf_orchestrator::dear_usage(prices, m, input, output));
-        if prices.get(model).is_some() {
-            return cost(model).lift();
+        let cost = |r: Option<&str>, m: &str| {
+            prices.cost_on(
+                r,
+                m,
+                &kgraf_orchestrator::dear_usage_on(prices, r, m, input, output),
+            )
+        };
+        if prices.is_priced_on(route, model) {
+            return cost(route, model).lift();
         }
+        // A table model whose rate tier lies below the window cannot bound one
+        // call at its base rate; it is left out of the bound, not an error.
         let mut dearest = kgraf_core::Money::ZERO;
         for m in prices.models() {
-            let c = cost(m).lift()?;
-            if c > dearest {
+            if let Ok(c) = cost(None, m)
+                && c > dearest
+            {
                 dearest = c;
             }
         }
@@ -1723,6 +1953,10 @@ impl Host {
     /// for a run this host did not hand out (or already finished).
     pub fn finish_run(&self, run: &RunId) -> Option<Housekeeping> {
         self.fetch_grants
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(run);
+        self.start_consents
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(run);
@@ -1792,6 +2026,36 @@ pub(crate) fn check_routes(
     Ok(())
 }
 
+/// The readiness of the run's non-generative routes (decision 0089): each in
+/// the catalog, serving its kind, with its credential when `lookup` is given.
+/// An unpriced model is ready, as for any route.
+pub(crate) fn check_model_routes(
+    specs: &[crate::config::ModelRouteSpec],
+    lookup: Option<&EnvLookup>,
+) -> Result<(), NotReady> {
+    for spec in specs {
+        let entry = kgraf_fleet::entry(&spec.route.route).map_err(|e| NotReady::UnknownRoute {
+            route: spec.route.route.clone(),
+            detail: e.to_string(),
+        })?;
+        if !kgraf_fleet::serves(entry, spec.kind) {
+            return Err(NotReady::Invalid(format!(
+                "route `{}` does not serve {} models (`{spec}`)",
+                spec.route.route, spec.kind
+            )));
+        }
+        if let Some(lookup) = lookup {
+            kgraf_fleet::credential_from(entry, lookup).map_err(|e| {
+                NotReady::MissingCredential {
+                    route: spec.route.route.clone(),
+                    detail: e.to_string(),
+                }
+            })?;
+        }
+    }
+    Ok(())
+}
+
 /// What [`Host::build_base`] made, for [`Host::finish_build`].
 pub(crate) struct BuildBase {
     run: RunId,
@@ -1805,6 +2069,36 @@ pub(crate) struct BuildBase {
     /// Bound to the orchestrator when the run registers session tools
     /// (decision 0067).
     session_line: Option<SessionLine>,
+    /// The run's non-generative routes (decision 0089), or `None` when it
+    /// declares none.
+    model_calls: Option<kgraf_tools::ModelCalls>,
+    /// What the full index pass that opened this build reported about
+    /// extractors that changed; the run's trace records it.
+    pub(crate) extractor_changed: Vec<kgraf_graph::ExtractorChange>,
+}
+
+impl BuildBase {
+    /// The run's worktree provider (tests read its policy).
+    #[cfg(test)]
+    pub(crate) fn workspaces(&self) -> &Arc<GitWorkspaces> {
+        &self.workspaces
+    }
+
+    /// The tools every environment of the run adds (tests read them).
+    #[cfg(test)]
+    pub(crate) fn extra_tool_names(&self) -> Vec<String> {
+        self.assembler
+            .extra_tools
+            .iter()
+            .map(|t| t.name().to_owned())
+            .collect()
+    }
+
+    /// The run's non-generative routes (tests read them).
+    #[cfg(test)]
+    pub(crate) fn model_calls(&self) -> Option<&kgraf_tools::ModelCalls> {
+        self.model_calls.as_ref()
+    }
 }
 
 /// Where the check scratch root may be, in order: under the system temporary
@@ -2323,5 +2617,61 @@ pub(crate) fn factory_error(e: Error) -> OrchestratorError {
             transient: e.is_transient(),
             detail: format!("{e:#}"),
         },
+    }
+}
+
+/// The claim on a run's `build_base`: released when the build returns, on
+/// whichever thread it runs.
+struct BaseBuildClaim {
+    set: Arc<Mutex<std::collections::BTreeSet<String>>>,
+    run: String,
+}
+
+impl BaseBuildClaim {
+    fn take(set: &Arc<Mutex<std::collections::BTreeSet<String>>>, run: &str) -> Result<Self> {
+        let fresh = set
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(run.to_owned());
+        if !fresh {
+            return Err(Error::failed(format!(
+                "an earlier build of run {run} is still running (it passed its time bound); \
+                 try again when it has ended"
+            )));
+        }
+        Ok(Self {
+            set: set.clone(),
+            run: run.to_owned(),
+        })
+    }
+}
+
+impl Drop for BaseBuildClaim {
+    fn drop(&mut self) {
+        self.set
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.run);
+    }
+}
+
+#[cfg(test)]
+mod base_build_claim_tests {
+    use super::*;
+
+    /// A second build of the same run is refused while the first holds its
+    /// claim, another run is not, and the claim is free again once dropped.
+    #[test]
+    fn a_run_has_one_base_build_at_a_time_until_the_first_ends() {
+        let set = Arc::default();
+        let first = BaseBuildClaim::take(&set, "r1").expect("first");
+        assert!(
+            BaseBuildClaim::take(&set, "r1").is_err(),
+            "same run refused"
+        );
+        let other = BaseBuildClaim::take(&set, "r2").expect("another run");
+        drop(first);
+        let again = BaseBuildClaim::take(&set, "r1").expect("free after the first ended");
+        drop((other, again));
     }
 }

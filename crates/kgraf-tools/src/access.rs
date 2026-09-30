@@ -21,7 +21,9 @@
 //! **Case.** On a case-insensitive filesystem (the macOS and Windows defaults),
 //! `Src/Lib.rs` and `src/lib.rs` are one file. The runtime detects the workspace's
 //! behavior once with [`detect_path_case`] and passes it to
-//! [`Access::conflicts_with`].
+//! [`Access::conflicts_with`]. On a case-sensitive one, names are still
+//! compared in Unicode NFC: case-sensitive APFS treats an NFC and an NFD
+//! spelling as one file.
 //!
 //! **Symlinks are not resolved here.** Two paths reaching one file through a
 //! symlink compare as different. Resolving them needs the filesystem at call time,
@@ -190,7 +192,14 @@ impl Access {
 /// Whether one path contains the other, component-wise.
 fn overlaps(a: &Path, b: &Path, case: PathCase) -> bool {
     match case {
-        PathCase::Sensitive => a.starts_with(b) || b.starts_with(a),
+        // Case-sensitive APFS still treats an NFC and an NFD spelling of one
+        // name as one file, so the comparison normalizes; on a volume that
+        // does not (ext4), two such names only serialize, which is safe.
+        PathCase::Sensitive => {
+            let norm = |p: &Path| PathBuf::from(kgraf_core::paths::normalize_path(p));
+            let (a, b) = (norm(a), norm(b));
+            a.starts_with(&b) || b.starts_with(&a)
+        }
         PathCase::Insensitive => {
             // The same fold the write-scope and merge checks use (NFKC, case
             // folding, ignorable code points, trailing dots and spaces), so
@@ -319,11 +328,14 @@ mod tests {
 
     /// On a folding volume, spellings the file system resolves to one name
     /// overlap: NFC and NFD, the long s, a trailing dot, a zero-width joiner.
-    /// A case-sensitive volume keeps them apart.
+    /// A case-sensitive volume keeps them apart, except NFC and NFD, which
+    /// case-sensitive APFS still resolves to one name.
     #[test]
     fn folded_spellings_conflict_on_a_folding_filesystem() {
+        let (nfc, nfd) = (write("caf\u{e9}/a.rs"), write("cafe\u{301}/a.rs"));
+        assert!(nfc.conflicts_with(&nfd, PathCase::Insensitive));
+        assert!(nfc.conflicts_with(&nfd, PathCase::Sensitive));
         for (x, y) in [
-            ("caf\u{e9}/a.rs", "cafe\u{301}/a.rs"),
             ("sample.rs", "\u{17F}ample.rs"),
             ("a/b.rs", "a./b.rs"),
             ("src/lib.rs", "src/li\u{200B}b.rs"),

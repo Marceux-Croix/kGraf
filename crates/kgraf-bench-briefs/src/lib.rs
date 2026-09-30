@@ -41,7 +41,8 @@ pub mod suite_store;
 
 pub use brief::{Brief, Check, DocFact, Mutation, ScriptCase, suite, suite_hash};
 pub use prices::{
-    apply_override, closest_keys, default_price_table, default_price_table_for, unpriced_warning,
+    ScopedPrice, apply_override, closest_keys, default_price_table, default_price_table_for,
+    default_price_table_for_routes, unpriced_warning,
 };
 pub use runner::{
     AttemptOutcome, BenchOptions, PlannedAttempt, RouteHandle, WorkerBudget, plan_attempts,

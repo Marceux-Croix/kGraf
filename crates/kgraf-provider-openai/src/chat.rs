@@ -35,11 +35,15 @@ use kgraf_provider::{
 /// per-machine capacity's learned-rate backoff needs. Keyed by base URL, not
 /// by the route name this adapter does not know
 /// (`kgraf_provider::limits`'s own module doc explains why).
-fn observe_rate_limit_headers(base_url: &str, http: &reqwest::Response) {
+fn observe_rate_limit_headers(
+    key: &str,
+    parse: impl Fn(&kgraf_provider::limits::HeaderGet) -> kgraf_provider::limits::ObservedLimits,
+    http: &reqwest::Response,
+) {
     let headers = http.headers().clone();
     kgraf_provider::limits::record(
-        base_url,
-        kgraf_provider::limits::parse_openai_style(&move |name: &str| {
+        key,
+        parse(&move |name: &str| {
             headers
                 .get(name)
                 .and_then(|v| v.to_str().ok())
@@ -50,7 +54,7 @@ fn observe_rate_limit_headers(base_url: &str, http: &reqwest::Response) {
     // per-machine capacity's learned rate (`kgraf_capacity::LearnedRate`),
     // read back by the shell's re-measure thread.
     if http.status().as_u16() == 429 {
-        kgraf_provider::limits::record_429_now(base_url);
+        kgraf_provider::limits::record_429_now(key);
     }
 }
 
@@ -274,6 +278,99 @@ pub(crate) fn warn_on_unrecognized_cache_key(
     scan(adapter, raw, "", recognized_paths)
 }
 
+/// Reconcile the parts of a usage object with the vendor's own `total_tokens`,
+/// when it sends one, and return the billed tokens the parts leave out.
+///
+/// A vendor may bill tokens it does not put in the counted fields: a reasoning
+/// share left out of `completion_tokens` shows up only as a total larger than
+/// the parts (Gemini's thinking tokens sit outside its candidate count). That is
+/// a normal response, so the difference is returned for the caller to record as
+/// reasoning output, which is billed at the output rate. A total smaller than
+/// the parts cannot occur in a correct response and raises, leaving the call
+/// unreconciled. Under the additive reasoning dialect the reasoning count is
+/// outside the output count, so it joins the sum.
+pub(crate) fn unaccounted_total_tokens(
+    adapter: &'static str,
+    raw: &serde_json::Value,
+    input: u64,
+    output: u64,
+    reasoning: u64,
+    reasoning_dialect: ReasoningDialect,
+) -> Result<u64, ProviderError> {
+    let Some(total) = raw.get("total_tokens").and_then(|v| v.as_u64()) else {
+        return Ok(0);
+    };
+    let parts = input
+        + output
+        + match reasoning_dialect {
+            ReasoningDialect::Inclusive => 0,
+            ReasoningDialect::Additive => reasoning,
+        };
+    if total < parts {
+        return Err(ProviderError::Decode {
+            adapter,
+            reason: format!(
+                "usage is inconsistent: input {input} plus output {output} \
+                 (reasoning {reasoning}, {reasoning_dialect:?} dialect) is {parts} but \
+                 `total_tokens` is {total}, below the counted fields"
+            ),
+        });
+    }
+    Ok(total - parts)
+}
+
+/// A lower bound for a usage object the strict parse refused: the counted
+/// fields as reported, with no consistency check, and the raw object kept.
+/// `None` only when the object carries neither a prompt nor a completion count.
+/// A refused call keeps this on its open row as a floor, never as the spend.
+pub(crate) fn lower_bound_usage(
+    protocol: Protocol,
+    dialect: UsageDialect,
+    reasoning_dialect: ReasoningDialect,
+    raw: &serde_json::Value,
+) -> Option<TokenUsage> {
+    let field = |name: &str| raw.get(name).and_then(|v| v.as_u64()).unwrap_or(0);
+    raw.get("prompt_tokens")
+        .or_else(|| raw.get("completion_tokens"))?;
+    let prompt = field("prompt_tokens");
+    let completion = field("completion_tokens");
+    let reasoning = raw
+        .get("completion_tokens_details")
+        .and_then(|d| d.get("reasoning_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let (cache_read, cache_write) = match dialect {
+        UsageDialect::Details => (
+            raw.get("prompt_tokens_details")
+                .and_then(|d| d.get("cached_tokens"))
+                .and_then(|v| v.as_u64())
+                .or_else(|| raw.get("cached_tokens").and_then(|v| v.as_u64()))
+                .unwrap_or(0),
+            raw.get("prompt_tokens_details")
+                .and_then(|d| d.get("cache_write_tokens"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+        ),
+        UsageDialect::HitAndMiss => (field("prompt_cache_hit_tokens"), 0),
+    };
+    let uncached_input = match protocol {
+        Protocol::Additive => prompt,
+        Protocol::Inclusive => prompt.saturating_sub(cache_read.saturating_add(cache_write)),
+    };
+    let text_output = match reasoning_dialect {
+        ReasoningDialect::Inclusive => completion.saturating_sub(reasoning),
+        ReasoningDialect::Additive => completion,
+    };
+    Some(TokenUsage {
+        uncached_input,
+        cache_read,
+        cache_write,
+        text_output,
+        reasoning_output: reasoning,
+        raw: Some(raw.clone()),
+    })
+}
+
 fn is_tool_use(content: &Content) -> bool {
     matches!(content, Content::ToolUse { .. })
 }
@@ -321,9 +418,30 @@ pub struct ChatCompletionsAdapter {
     /// behavioral consequence of this field is refusing to stream at all
     /// when it is [`StreamedUsageLocation::None`] (fail loud).
     streamed_usage_location: StreamedUsageLocation,
+    /// Azure OpenAI transport, when set: its URL, `api-key` header, model
+    /// mapping and content-filter handling replace the defaults.
+    azure: Option<crate::azure::AzureTransport>,
 }
 
 impl ChatCompletionsAdapter {
+    /// Record the rate-limit headers of one response. Azure limits are per
+    /// deployment, so its key names the deployment and its headers are read
+    /// with the Azure rules; every other endpoint is keyed by its base URL.
+    fn observe_limits(&self, model: &str, http: &reqwest::Response) {
+        match &self.azure {
+            Some(transport) => observe_rate_limit_headers(
+                &transport.limit_key(model),
+                kgraf_provider::limits::parse_azure_style,
+                http,
+            ),
+            None => observe_rate_limit_headers(
+                &self.config.base_url,
+                kgraf_provider::limits::parse_openai_style,
+                http,
+            ),
+        }
+    }
+
     /// Build an adapter over a configured endpoint.
     ///
     /// The configured protocol is asserted, as in the Responses adapter: every Chat
@@ -369,7 +487,42 @@ impl ChatCompletionsAdapter {
             reports_reasoning_tokens: false,
             reasoning_dialect: ReasoningDialect::Inclusive,
             streamed_usage_location: StreamedUsageLocation::TopLevelChunk,
+            azure: None,
         })
+    }
+
+    /// Serve this adapter's body through Azure OpenAI.
+    ///
+    /// Every configured model must be a deployment with a configured underlying
+    /// model, or construction fails: a response could otherwise be accepted with
+    /// nothing to check its `model` against.
+    pub fn with_azure(
+        mut self,
+        transport: crate::azure::AzureTransport,
+    ) -> Result<Self, ProviderError> {
+        transport.check_models(transport.name(), &self.config.models)?;
+        self.azure = Some(transport);
+        Ok(self)
+    }
+
+    /// The name reported to the ledger: the transport's when one is set.
+    fn adapter_name(&self) -> &'static str {
+        self.azure.as_ref().map_or(ADAPTER, |t| t.name())
+    }
+
+    /// Checks that run before a request leaves: the model is one this adapter
+    /// serves, and a response for it has a model to be checked against.
+    fn preflight(&self, model: &str) -> Result<(), ProviderError> {
+        self.config.check_model(self.adapter_name(), model)?;
+        self.echo_target(model).map(|_| ())
+    }
+
+    /// The model the response must name for a request to `requested`.
+    fn echo_target<'a>(&'a self, requested: &'a str) -> Result<&'a str, ProviderError> {
+        match &self.azure {
+            Some(transport) => transport.underlying(self.adapter_name(), requested),
+            None => Ok(requested),
+        }
     }
 
     /// Declare where this endpoint puts usage in a streamed response.
@@ -412,19 +565,41 @@ impl ChatCompletionsAdapter {
     /// The `send()` itself is bounded by `config.timeout`: unlike reading the
     /// body, there is no legitimate reason for the provider to take longer
     /// than that just to start responding, streaming or not.
-    async fn post(&self, body: &serde_json::Value) -> Result<reqwest::Response, ProviderError> {
-        let mut builder = self
-            .http
-            .post(format!("{}/chat/completions", self.config.base_url))
-            .json(body);
-        if let Some(credential) = self.config.credential() {
-            builder = builder.bearer_auth(credential);
-        }
+    async fn post(
+        &self,
+        body: &serde_json::Value,
+        model: &str,
+    ) -> Result<reqwest::Response, ProviderError> {
+        let builder = match &self.azure {
+            Some(transport) => {
+                let mut builder = self.http.post(transport.url(model)).json(body);
+                if let Some(query) = transport.query() {
+                    builder = builder.query(&[query]);
+                }
+                match self.config.credential() {
+                    Some(key) => builder.header(
+                        "api-key",
+                        crate::azure::key_header(self.adapter_name(), key)?,
+                    ),
+                    None => builder,
+                }
+            }
+            None => {
+                let builder = self
+                    .http
+                    .post(format!("{}/chat/completions", self.config.base_url))
+                    .json(body);
+                match self.config.credential() {
+                    Some(credential) => builder.bearer_auth(credential),
+                    None => builder,
+                }
+            }
+        };
         let http = match tokio::time::timeout(self.config.timeout, builder.send()).await {
-            Ok(result) => result.map_err(|e| crate::send_error(ADAPTER, e))?,
+            Ok(result) => result.map_err(|e| crate::send_error(self.adapter_name(), e))?,
             Err(_) => {
                 return Err(ProviderError::Transport {
-                    adapter: ADAPTER,
+                    adapter: self.adapter_name(),
                     reason: format!(
                         "no response within {:?} of sending the request",
                         self.config.timeout
@@ -488,13 +663,15 @@ impl ChatCompletionsAdapter {
                 .content
                 .iter()
                 .filter_map(|block| match block {
-                    Content::ToolUse { id, name, input } => Some(serde_json::json!({
+                    Content::ToolUse {
+                        id, name, input, ..
+                    } => Some(serde_json::json!({
                         "id": id,
                         "type": "function",
                         "function": {
                             "name": name,
                             // Arguments are a JSON *string* here, not an object.
-                            "arguments": input.to_string(),
+                            "arguments": kgraf_provider::tool_arguments_text(input),
                         }
                     })),
                     _ => None,
@@ -549,6 +726,22 @@ impl ChatCompletionsAdapter {
             "messages": messages,
             "max_tokens": request.max_output_tokens,
         });
+        if self.azure.is_some()
+            && let Some(object) = body.as_object_mut()
+        {
+            // Azure reasoning deployments refuse `max_tokens`; every Azure Chat
+            // Completions version this transport accepts takes
+            // `max_completion_tokens` for all deployments.
+            if let Some(limit) = object.remove("max_tokens") {
+                object.insert("max_completion_tokens".to_owned(), limit);
+            }
+        }
+        if self.azure.as_ref().is_some_and(|t| !t.body_names_model())
+            && let Some(object) = body.as_object_mut()
+        {
+            // The deployment is in the URL on this surface.
+            object.remove("model");
+        }
         if let Some(temperature) = request.temperature {
             body["temperature"] = serde_json::json!(temperature);
         }
@@ -590,13 +783,25 @@ impl ChatCompletionsAdapter {
         reasoning_dialect: ReasoningDialect,
         raw: &serde_json::Value,
     ) -> Result<TokenUsage, ProviderError> {
+        Self::normalize_usage_as(ADAPTER, protocol, dialect, reasoning_dialect, raw)
+    }
+
+    /// [`Self::normalize_usage`] with errors labeled as `adapter`, so a transport
+    /// that serves this body under its own name is named correctly.
+    fn normalize_usage_as(
+        adapter: &'static str,
+        protocol: Protocol,
+        dialect: UsageDialect,
+        reasoning_dialect: ReasoningDialect,
+        raw: &serde_json::Value,
+    ) -> Result<TokenUsage, ProviderError> {
         let field = |name: &str| raw.get(name).and_then(|v| v.as_u64()).unwrap_or(0);
         // An absent usage object is not a zero-token call, and must not read as one.
         if raw.get("prompt_tokens").is_none() && raw.get("completion_tokens").is_none() {
-            return Err(ProviderError::UsageMissing { adapter: ADAPTER });
+            return Err(ProviderError::UsageMissing { adapter });
         }
         warn_on_unrecognized_cache_key(
-            ADAPTER,
+            adapter,
             raw,
             match dialect {
                 UsageDialect::Details => CHAT_DETAILS_CACHE_PATHS,
@@ -631,7 +836,7 @@ impl ChatCompletionsAdapter {
                 // would be wrong. Fail loud: raise rather than reconcile.
                 if hit + miss != prompt {
                     return Err(ProviderError::Decode {
-                        adapter: ADAPTER,
+                        adapter,
                         reason: format!(
                             "hit-and-miss usage is inconsistent: {hit} hit plus {miss} miss \
                              does not equal {prompt} prompt tokens; the dialect is likely \
@@ -669,7 +874,7 @@ impl ChatCompletionsAdapter {
                 // dialect above, both of which already raise.
                 if reasoning > completion {
                     return Err(ProviderError::Decode {
-                        adapter: ADAPTER,
+                        adapter,
                         reason: format!(
                             "{reasoning} reasoning tokens reported against {completion} \
                              completion tokens under the inclusive reasoning dialect; the \
@@ -684,19 +889,26 @@ impl ChatCompletionsAdapter {
             ReasoningDialect::Additive => completion,
         };
 
+        // Billed tokens the vendor left out of the counted fields are recorded
+        // as reasoning output, the billed share nothing else accounts for.
+        let hidden = unaccounted_total_tokens(
+            adapter,
+            raw,
+            prompt,
+            completion,
+            reasoning,
+            reasoning_dialect,
+        )?;
         TokenUsage::normalize(
             protocol,
             prompt,
             cache_read,
             cache_write,
             text_output,
-            reasoning,
+            reasoning + hidden,
             Some(raw.clone()),
         )
-        .map_err(|source| ProviderError::Usage {
-            adapter: ADAPTER,
-            source,
-        })
+        .map_err(|source| ProviderError::Usage { adapter, source })
     }
 
     fn parse_response(
@@ -708,18 +920,22 @@ impl ChatCompletionsAdapter {
             body.get("model")
                 .and_then(|m| m.as_str())
                 .ok_or_else(|| ProviderError::Decode {
-                    adapter: ADAPTER,
+                    adapter: self.adapter_name(),
                     reason: "response has no `model` field, so the echo cannot be checked"
                         .to_owned(),
                 })?;
         // The assertion every adapter owes. This is the one that catches a provider
         // remapping an unknown model name to its cheap tier and returning HTTP 200.
-        kgraf_provider::provider::assert_model_echo(requested_model, returned_model)?;
+        kgraf_provider::provider::assert_model_echo(
+            self.echo_target(requested_model)?,
+            returned_model,
+        )?;
 
-        let usage = body
-            .get("usage")
-            .ok_or(ProviderError::UsageMissing { adapter: ADAPTER })?;
-        let usage = Self::normalize_usage(
+        let usage = body.get("usage").ok_or(ProviderError::UsageMissing {
+            adapter: self.adapter_name(),
+        })?;
+        let usage = Self::normalize_usage_as(
+            self.adapter_name(),
             self.config.protocol,
             self.dialect,
             self.reasoning_dialect,
@@ -731,7 +947,7 @@ impl ChatCompletionsAdapter {
             .and_then(|c| c.as_array())
             .and_then(|c| c.first())
             .ok_or_else(|| ProviderError::Decode {
-                adapter: ADAPTER,
+                adapter: self.adapter_name(),
                 reason: "response carries no choices".to_owned(),
             })?;
         let message = choice.get("message").cloned().unwrap_or_default();
@@ -763,10 +979,13 @@ impl ChatCompletionsAdapter {
                     .get("arguments")
                     .and_then(|a| a.as_str())
                     .map(|a| {
-                        // Arguments arrive as a JSON string. A string that will not
-                        // parse is kept verbatim rather than dropped, so a worker can
-                        // see what the model actually emitted instead of receiving
-                        // silence.
+                        // Arguments arrive as a JSON string. An empty one is a call
+                        // with no arguments. A string that will not parse is kept
+                        // verbatim rather than dropped, so a worker can see what the
+                        // model actually emitted instead of receiving silence.
+                        if a.trim().is_empty() {
+                            return serde_json::json!({});
+                        }
                         serde_json::from_str(a).unwrap_or(serde_json::Value::String(a.to_owned()))
                     })
                     .unwrap_or(serde_json::Value::Null);
@@ -782,6 +1001,7 @@ impl ChatCompletionsAdapter {
                         .unwrap_or_default()
                         .to_owned(),
                     input: arguments,
+                    signature: None,
                 });
             }
         }
@@ -803,7 +1023,7 @@ impl ChatCompletionsAdapter {
 #[async_trait::async_trait]
 impl kgraf_provider::Provider for ChatCompletionsAdapter {
     fn adapter(&self) -> &'static str {
-        ADAPTER
+        self.adapter_name()
     }
 
     fn protocol(&self) -> Protocol {
@@ -815,14 +1035,14 @@ impl kgraf_provider::Provider for ChatCompletionsAdapter {
         request: &Request,
         token: &CallToken,
     ) -> Result<Response, ProviderError> {
-        if let Err(error) = self.config.check_model(ADAPTER, &request.model) {
+        if let Err(error) = self.preflight(&request.model) {
             // Refused before sending, so nothing billed; close the row as such
             // rather than letting the dropped token report a hole.
             token.close_on_async(&error, None).await?;
             return Err(error);
         }
         let body = self.to_wire(request);
-        let http = match self.post(&body).await {
+        let http = match self.post(&body, &request.model).await {
             Ok(http) => http,
             Err(error) => {
                 token.close_on_async(&error, None).await?;
@@ -830,7 +1050,7 @@ impl kgraf_provider::Provider for ChatCompletionsAdapter {
             }
         };
         let status = http.status();
-        observe_rate_limit_headers(&self.config.base_url, &http);
+        self.observe_limits(&request.model, &http);
         let request_id = http
             .headers()
             .get("x-request-id")
@@ -839,7 +1059,7 @@ impl kgraf_provider::Provider for ChatCompletionsAdapter {
         if !status.is_success() {
             let text = crate::bounded_error_body(self.config.timeout, http).await;
             let error = ProviderError::Http {
-                adapter: ADAPTER,
+                adapter: self.adapter_name(),
                 status: status.as_u16(),
                 body: text,
             };
@@ -858,7 +1078,7 @@ impl kgraf_provider::Provider for ChatCompletionsAdapter {
                     .leave_unreconciled_async(request_id.as_deref())
                     .await?;
                 return Err(ProviderError::Transport {
-                    adapter: ADAPTER,
+                    adapter: self.adapter_name(),
                     reason: e.to_string(),
                 });
             }
@@ -867,7 +1087,7 @@ impl kgraf_provider::Provider for ChatCompletionsAdapter {
                     .leave_unreconciled_async(request_id.as_deref())
                     .await?;
                 return Err(ProviderError::Transport {
-                    adapter: ADAPTER,
+                    adapter: self.adapter_name(),
                     reason: format!(
                         "response body did not finish within {:?}",
                         self.config.timeout
@@ -882,7 +1102,7 @@ impl kgraf_provider::Provider for ChatCompletionsAdapter {
                     .leave_unreconciled_async(request_id.as_deref())
                     .await?;
                 return Err(ProviderError::Decode {
-                    adapter: ADAPTER,
+                    adapter: self.adapter_name(),
                     reason: e.to_string(),
                 });
             }
@@ -897,7 +1117,7 @@ impl kgraf_provider::Provider for ChatCompletionsAdapter {
                 .leave_unreconciled_async(request_id.as_deref())
                 .await?;
             return Err(ProviderError::Decode {
-                adapter: ADAPTER,
+                adapter: self.adapter_name(),
                 reason: format!(
                     "provider returned HTTP 200 with an `error` object in the body: {error}"
                 ),
@@ -911,6 +1131,16 @@ impl kgraf_provider::Provider for ChatCompletionsAdapter {
                 token
                     .settle_async(&response.usage, response.request_id.as_deref())
                     .await?;
+                // The call billed, so it settles above; the filtered turn is
+                // then refused rather than returned as an answer.
+                if self.azure.is_some()
+                    && let Some(stop_reason) = crate::azure::chat_filter(&parsed)
+                {
+                    return Err(ProviderError::TurnNotUsable {
+                        adapter: self.adapter_name(),
+                        stop_reason: stop_reason.to_owned(),
+                    });
+                }
                 Ok(response)
             }
             Err(error) => {
@@ -918,13 +1148,23 @@ impl kgraf_provider::Provider for ChatCompletionsAdapter {
                 // so the row stays open for reconciliation. Usage the body already
                 // carries is kept on the open row, not dropped with the parse error.
                 let carried = parsed.get("usage").and_then(|u| {
-                    Self::normalize_usage(
+                    Self::normalize_usage_as(
+                        self.adapter_name(),
                         self.config.protocol,
                         self.dialect,
                         self.reasoning_dialect,
                         u,
                     )
                     .ok()
+                    // A usage a consistency check refused is still a floor.
+                    .or_else(|| {
+                        lower_bound_usage(
+                            self.config.protocol,
+                            self.dialect,
+                            self.reasoning_dialect,
+                            u,
+                        )
+                    })
                 });
                 token
                     .leave_unreconciled_with_async(carried.as_ref(), request_id.as_deref())
@@ -998,7 +1238,8 @@ impl ToolCallAccumulator {
     /// actually emitted, not silence.
     fn finish(self) -> Content {
         let input = if self.arguments.trim().is_empty() {
-            serde_json::Value::Null
+            // A call with no arguments.
+            serde_json::json!({})
         } else {
             serde_json::from_str(&self.arguments)
                 .unwrap_or(serde_json::Value::String(self.arguments))
@@ -1007,6 +1248,7 @@ impl ToolCallAccumulator {
             id: self.id,
             name: self.name,
             input,
+            signature: None,
         }
     }
 }
@@ -1019,7 +1261,7 @@ impl Streaming for ChatCompletionsAdapter {
         token: &CallToken,
         sink: &mut (dyn FnMut(StreamEvent) + Send),
     ) -> Result<Response, ProviderError> {
-        if let Err(error) = self.config.check_model(ADAPTER, &request.model) {
+        if let Err(error) = self.preflight(&request.model) {
             token.close_on_async(&error, None).await?;
             return Err(error);
         }
@@ -1029,7 +1271,7 @@ impl Streaming for ChatCompletionsAdapter {
             // the connection closed would be exactly the silent spend the fail-loud rule
             // forbids. Refused here, before anything is sent.
             let error = ProviderError::CapabilityNotHonored {
-                adapter: ADAPTER,
+                adapter: self.adapter_name(),
                 capability: "streamed usage accounting",
             };
             token.close_on_async(&error, None).await?;
@@ -1044,7 +1286,7 @@ impl Streaming for ChatCompletionsAdapter {
         // all (fail loud).
         body["stream_options"] = serde_json::json!({"include_usage": true});
 
-        let http = match self.post(&body).await {
+        let http = match self.post(&body, &request.model).await {
             Ok(http) => http,
             Err(error) => {
                 token.close_on_async(&error, None).await?;
@@ -1052,7 +1294,7 @@ impl Streaming for ChatCompletionsAdapter {
             }
         };
         let status = http.status();
-        observe_rate_limit_headers(&self.config.base_url, &http);
+        self.observe_limits(&request.model, &http);
         let request_id = http
             .headers()
             .get("x-request-id")
@@ -1061,7 +1303,7 @@ impl Streaming for ChatCompletionsAdapter {
         if !status.is_success() {
             let text = crate::bounded_error_body(self.config.timeout, http).await;
             let error = ProviderError::Http {
-                adapter: ADAPTER,
+                adapter: self.adapter_name(),
                 status: status.as_u16(),
                 body: text,
             };
@@ -1075,6 +1317,12 @@ impl Streaming for ChatCompletionsAdapter {
         let mut saw_model = false;
         let mut model = request.model.clone();
         let mut started = false;
+        // Set when the Azure content filter acted on the prompt or the
+        // completion; raised after the call settles.
+        let mut filtered: Option<&'static str> = None;
+        // Whether `stream_request_id` came from a chunk's `id`.
+        let mut id_from_chunk = false;
+        let expected_model = self.echo_target(&request.model)?.to_owned();
         let mut stop_reason = StopReason::Other;
         let mut stream_request_id = request_id.clone();
         let mut text = String::new();
@@ -1090,7 +1338,7 @@ impl Streaming for ChatCompletionsAdapter {
         // Read incrementally, never buffered whole: see `kgraf_provider::
         // streaming` for why. A dropped future drops `byte_stream` with it,
         // which aborts the in-flight request.
-        let mut decoder = kgraf_provider::SseDecoder::new(ADAPTER);
+        let mut decoder = kgraf_provider::SseDecoder::new(self.adapter_name());
         let mut byte_stream = http.bytes_stream();
         let mut pending: std::collections::VecDeque<serde_json::Value> =
             std::collections::VecDeque::new();
@@ -1108,7 +1356,7 @@ impl Streaming for ChatCompletionsAdapter {
                         }
                         Ok(Some(Err(e))) => {
                             return Err(ProviderError::Transport {
-                                adapter: ADAPTER,
+                                adapter: self.adapter_name(),
                                 reason: e.to_string(),
                             });
                         }
@@ -1121,7 +1369,7 @@ impl Streaming for ChatCompletionsAdapter {
                         }
                         Err(_) => {
                             return Err(ProviderError::Transport {
-                                adapter: ADAPTER,
+                                adapter: self.adapter_name(),
                                 reason: format!(
                                     "no data received for {:?}; the stream stalled",
                                     self.config.timeout
@@ -1141,16 +1389,30 @@ impl Streaming for ChatCompletionsAdapter {
             // `Ok` with whatever partial content had streamed so far.
             if let Some(error) = event.get("error").filter(|e| !e.is_null()) {
                 return Err(ProviderError::Decode {
-                    adapter: ADAPTER,
+                    adapter: self.adapter_name(),
                     reason: format!("provider sent a stream `error` chunk: {error}"),
                 });
             }
 
+            // Azure opens a stream with a chunk that carries the prompt filter
+            // results and an empty `id` and `model`. An empty value is no value:
+            // the first chunk that names an id or a model supplies it.
+            if let Some(id) = event
+                .get("id")
+                .and_then(|i| i.as_str())
+                .filter(|i| !i.is_empty())
+                && !id_from_chunk
+            {
+                id_from_chunk = true;
+                stream_request_id = Some(id.to_owned());
+                guard.record_request_id(stream_request_id.as_deref());
+            }
+            if self.azure.is_some()
+                && let Some(reason) = crate::azure::chat_filter(&event)
+            {
+                filtered = Some(reason);
+            }
             if !started {
-                if let Some(id) = event.get("id").and_then(|i| i.as_str()) {
-                    stream_request_id = Some(id.to_owned());
-                    guard.record_request_id(stream_request_id.as_deref());
-                }
                 started = true;
                 sink(StreamEvent::Started {
                     model: model.clone(),
@@ -1164,9 +1426,13 @@ impl Streaming for ChatCompletionsAdapter {
             // to omit `model`, a real shape at least one vendor sends, so a
             // later chunk substituting a different model went unchecked for
             // the rest of the call (fail loud).
-            if let Some(returned) = event.get("model").and_then(|m| m.as_str()) {
+            if let Some(returned) = event
+                .get("model")
+                .and_then(|m| m.as_str())
+                .filter(|m| !m.is_empty() || self.azure.is_none())
+            {
                 saw_model = true;
-                kgraf_provider::provider::assert_model_echo(&request.model, returned)?;
+                kgraf_provider::provider::assert_model_echo(&expected_model, returned)?;
                 model = returned.to_owned();
             }
 
@@ -1189,12 +1455,28 @@ impl Streaming for ChatCompletionsAdapter {
                 // Not cumulative on this protocol: the usage chunk carries the
                 // call's final totals in one shot, so it is taken as-is rather
                 // than merged.
-                let normalized = Self::normalize_usage(
+                let normalized = match Self::normalize_usage_as(
+                    self.adapter_name(),
                     self.config.protocol,
                     self.dialect,
                     self.reasoning_dialect,
                     usage_raw,
-                )?;
+                ) {
+                    Ok(normalized) => normalized,
+                    Err(error) => {
+                        // The call is refused, but it billed: keep the counted
+                        // fields as reported and the raw object on the open row.
+                        if let Some(floor) = lower_bound_usage(
+                            self.config.protocol,
+                            self.dialect,
+                            self.reasoning_dialect,
+                            usage_raw,
+                        ) {
+                            guard.record_usage(&floor);
+                        }
+                        return Err(error);
+                    }
+                };
                 // Kimi has been observed sending the identical final usage
                 // twice: once inside the finish chunk's `choices[0].usage`,
                 // once more top-level on a trailing chunk with empty
@@ -1266,7 +1548,7 @@ impl Streaming for ChatCompletionsAdapter {
                                     [(only_key, _)] => only_key.clone(),
                                     _ => {
                                         return Err(ProviderError::Decode {
-                                            adapter: ADAPTER,
+                                            adapter: self.adapter_name(),
                                             reason: format!(
                                                 "a tool_calls delta fragment carries neither \
                                                  `index` nor `id`, and {} tool call(s) are \
@@ -1297,7 +1579,7 @@ impl Streaming for ChatCompletionsAdapter {
                         if let Some(fragment) = function.get("arguments").and_then(|v| v.as_str()) {
                             if entry.arguments.len() + fragment.len() > MAX_TOOL_ARGUMENT_BYTES {
                                 return Err(ProviderError::Decode {
-                                    adapter: ADAPTER,
+                                    adapter: self.adapter_name(),
                                     reason: format!(
                                         "a tool call accumulated more than \
                                          {MAX_TOOL_ARGUMENT_BYTES} bytes of argument \
@@ -1320,7 +1602,6 @@ impl Streaming for ChatCompletionsAdapter {
                 {
                     saw_finish_reason = true;
                     stop_reason = stop_reason_for(reason, !tool_calls.is_empty());
-                    sink(StreamEvent::Finished { stop_reason });
                 }
             }
         }
@@ -1337,7 +1618,23 @@ impl Streaming for ChatCompletionsAdapter {
             // none) as the call's final figure, silently understating spend
             // (every call is attributed to the ledger), recorded as unreconciled instead, with the partial
             // figure kept as a stated lower bound.
-            return Err(ProviderError::StreamTruncated { adapter: ADAPTER });
+            //
+            // A stream the Azure content filter cut may end with no usage chunk. It
+            // raises the filter reason, which says why it ended, and the row stays
+            // open for reconciliation the same way (the guard is not disarmed).
+            // Only a cut reason stands in for the truncation: a filter that merely
+            // did not run says nothing about why the stream ended.
+            if let Some(stop_reason) = filtered
+                && stop_reason != "content_filter_results_error"
+            {
+                return Err(ProviderError::TurnNotUsable {
+                    adapter: self.adapter_name(),
+                    stop_reason: stop_reason.to_owned(),
+                });
+            }
+            return Err(ProviderError::StreamTruncated {
+                adapter: self.adapter_name(),
+            });
         }
 
         if !saw_model {
@@ -1347,7 +1644,7 @@ impl Streaming for ChatCompletionsAdapter {
             // per-chunk assertion above only fires on a chunk that has the
             // field to check in the first place.
             return Err(ProviderError::Decode {
-                adapter: ADAPTER,
+                adapter: self.adapter_name(),
                 reason: "no chunk in the stream carried a `model` field; the response \
                          could not be verified against the requested model"
                     .to_owned(),
@@ -1370,11 +1667,21 @@ impl Streaming for ChatCompletionsAdapter {
         for (_, call) in tool_calls {
             content.push(call.finish());
         }
+        // Announced once, after the stream ends, so it carries the same stop
+        // reason as the assembled response (tool calls that arrive after a `stop`
+        // chunk turn it into `ToolUse`).
+        sink(StreamEvent::Finished { stop_reason });
 
         guard.disarm();
         token
             .settle_async(&usage, stream_request_id.as_deref())
             .await?;
+        if let Some(stop_reason) = filtered {
+            return Err(ProviderError::TurnNotUsable {
+                adapter: self.adapter_name(),
+                stop_reason: stop_reason.to_owned(),
+            });
+        }
         Ok(Response {
             model,
             content,
@@ -1460,6 +1767,66 @@ mod tests {
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].usage.total_input(), 1050);
         assert_eq!(open[0].usage.cache_read, 900);
+    }
+
+    /// A usage refused on its total (below the counted parts) still billed. The
+    /// open row keeps the counted fields and the raw object, whether the call
+    /// was buffered or streamed.
+    #[tokio::test]
+    async fn a_call_refused_on_its_total_keeps_its_usage_and_raw_object() {
+        let refused_usage = json!({
+            "prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 90
+        });
+        // Buffered.
+        let server = MockServer::start().await;
+        let mut body = details_body("compatible-model");
+        body["usage"] = refused_usage.clone();
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+        let adapter = ChatCompletionsAdapter::new(config(&server.uri()), UsageDialect::Details)
+            .expect("adapter");
+        let ledger = Ledger::open_in_memory().expect("ledger");
+        {
+            let token = ledger
+                .begin(ADAPTER, Protocol::Inclusive, "compatible-model", "w", "t")
+                .expect("begin");
+            adapter
+                .complete(&Request::new("compatible-model", "hi", 100), &token)
+                .await
+                .expect_err("refused");
+        }
+        let open = ledger.unreconciled().expect("query");
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].usage.total_input(), 100);
+        assert_eq!(open[0].usage.text_output, 10);
+        assert_eq!(open[0].usage.raw.as_ref().expect("raw")["total_tokens"], 90);
+
+        // Streamed.
+        let server = MockServer::start().await;
+        let sse = format!(
+            "data: {{\"id\":\"c\",\"model\":\"compatible-model\",\"choices\":[{{\"index\":0,\
+             \"delta\":{{\"content\":\"hi\"}}}}]}}\n\n\
+             data: {{\"id\":\"c\",\"model\":\"compatible-model\",\"choices\":[],\"usage\":{refused_usage}}}\n\n"
+        );
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(sse))
+            .mount(&server)
+            .await;
+        let adapter = ChatCompletionsAdapter::new(config(&server.uri()), UsageDialect::Details)
+            .expect("adapter");
+        let ledger = Ledger::open_in_memory().expect("ledger");
+        {
+            let token = ledger
+                .begin(ADAPTER, Protocol::Inclusive, "compatible-model", "w", "t")
+                .expect("begin");
+            run_stream(&adapter, &token).await.expect_err("refused");
+        }
+        let open = ledger.unreconciled().expect("query");
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].usage.total_input(), 100);
+        assert_eq!(open[0].usage.raw.as_ref().expect("raw")["total_tokens"], 90);
     }
 
     #[tokio::test]
@@ -1844,6 +2211,74 @@ mod tests {
     }
 
     #[test]
+    fn a_total_larger_than_the_counted_parts_is_recorded_as_billed_reasoning() {
+        // Billed reasoning tokens absent from `completion_tokens` show up only in
+        // the vendor's total. The call is accepted and the difference is billed
+        // as reasoning output, so the figure matches the vendor's total.
+        let hidden = json!({
+            "prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 150
+        });
+        let usage = ChatCompletionsAdapter::normalize_usage(
+            Protocol::Inclusive,
+            UsageDialect::Details,
+            ReasoningDialect::Inclusive,
+            &hidden,
+        )
+        .expect("a total above the parts is a normal response");
+        assert_eq!(usage.text_output, 10);
+        assert_eq!(usage.reasoning_output, 40);
+        assert_eq!(usage.total(), 150);
+
+        // A total below the parts cannot occur and is refused.
+        let below = json!({
+            "prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 90
+        });
+        let err = ChatCompletionsAdapter::normalize_usage(
+            Protocol::Inclusive,
+            UsageDialect::Details,
+            ReasoningDialect::Inclusive,
+            &below,
+        )
+        .expect_err("must raise");
+        assert!(matches!(err, ProviderError::Decode { .. }), "got {err:?}");
+
+        // The refused object still yields a floor with the raw object kept.
+        let floor = lower_bound_usage(
+            Protocol::Inclusive,
+            UsageDialect::Details,
+            ReasoningDialect::Inclusive,
+            &below,
+        )
+        .expect("floor");
+        assert_eq!((floor.uncached_input, floor.text_output), (100, 10));
+        assert_eq!(floor.raw.as_ref().expect("raw")["total_tokens"], 90);
+
+        // A matching total passes, and under the additive dialect the reasoning
+        // count joins the sum.
+        let matching = json!({
+            "prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 135,
+            "completion_tokens_details": {"reasoning_tokens": 25}
+        });
+        ChatCompletionsAdapter::normalize_usage(
+            Protocol::Inclusive,
+            UsageDialect::Details,
+            ReasoningDialect::Additive,
+            &matching,
+        )
+        .expect("additive parts sum to the total");
+        assert!(
+            ChatCompletionsAdapter::normalize_usage(
+                Protocol::Inclusive,
+                UsageDialect::Details,
+                ReasoningDialect::Inclusive,
+                &matching,
+            )
+            .is_err(),
+            "the same object is inconsistent when reasoning is inside completion"
+        );
+    }
+
+    #[test]
     fn an_unrecognized_nonzero_cache_field_raises_rather_than_vanishing() {
         // A vendor reporting a cache-related count under a field name neither
         // dialect reads must not have those tokens silently dropped.
@@ -2073,6 +2508,43 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_argument_string_is_a_call_with_no_arguments() {
+        let adapter =
+            ChatCompletionsAdapter::new(config("https://example.invalid"), UsageDialect::Details)
+                .expect("adapter");
+        let mut body = details_body("compatible-model");
+        body["choices"][0]["message"] = json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{"id": "c1", "function": {"name": "f", "arguments": ""}}]
+        });
+        let response = adapter
+            .parse_response("compatible-model", &body)
+            .expect("parse");
+        assert_eq!(response.tool_uses()[0].2, &json!({}));
+    }
+
+    #[test]
+    fn a_call_with_no_arguments_is_replayed_as_an_empty_object() {
+        let adapter =
+            ChatCompletionsAdapter::new(config("https://example.invalid"), UsageDialect::Details)
+                .expect("adapter");
+        let mut request = Request::new("compatible-model", "x", 10);
+        request.messages = vec![kgraf_provider::Message {
+            role: Role::Assistant,
+            content: vec![Content::ToolUse {
+                id: "c1".into(),
+                name: "f".into(),
+                input: json!(""),
+                signature: None,
+            }],
+        }];
+        let wire = adapter.to_wire(&request);
+        let text = serde_json::to_string(&wire).expect("wire");
+        assert!(text.contains(r#""arguments":"{}""#), "{text}");
+    }
+
+    #[test]
     fn a_tool_failure_is_stated_in_the_content_as_well_as_flagged() {
         // At least one provider in this family ignores the error flag entirely.
         let adapter =
@@ -2095,6 +2567,28 @@ mod tests {
                 .expect("string")
                 .contains("ERROR"),
             "failure must be legible in the content: {wire}"
+        );
+    }
+
+    #[test]
+    fn unparseable_tool_arguments_go_back_verbatim_not_encoded_twice() {
+        let adapter =
+            ChatCompletionsAdapter::new(config("https://example.invalid"), UsageDialect::Details)
+                .expect("adapter");
+        let mut request = Request::new("compatible-model", "x", 10);
+        request.messages = vec![kgraf_provider::Message {
+            role: Role::Assistant,
+            content: vec![Content::ToolUse {
+                id: "c1".into(),
+                name: "f".into(),
+                input: json!("{not json"),
+                signature: None,
+            }],
+        }];
+        let wire = adapter.to_wire(&request);
+        assert_eq!(
+            wire["messages"][0]["tool_calls"][0]["function"]["arguments"],
+            "{not json"
         );
     }
 
@@ -2579,8 +3073,20 @@ mod tests {
              \"function\":{\"name\":\"f\",\"arguments\":\"{}\"}}]}}],\
              \"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n",
         );
-        let (r, _, _) = probe(sse).await;
+        let (r, _, events) = probe(sse).await;
         assert_eq!(r.expect("stream").stop_reason, StopReason::ToolUse);
+        let finished: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::Finished { stop_reason } => Some(*stop_reason),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            finished,
+            vec![StopReason::ToolUse],
+            "one Finished event, agreeing with the response"
+        );
     }
 
     #[tokio::test]

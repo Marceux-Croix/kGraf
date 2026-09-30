@@ -144,3 +144,14 @@ cycle. The pinned floor of context that can never be dropped (system prompt, too
 definitions, shared context slices, the original instruction) must sit below the
 post-compaction target, or compaction cannot free any room; that constraint is a matter of
 arithmetic, not a tuned value.
+
+## Amendment (2026-09-29): the slider's recommendation is measured from stored runs
+
+Each finished worker's trace record now carries its route's effective window, so peak
+context reads as a share of it. The desktop app reads the stored runs of the open
+projects, off the UI thread, at most once a minute. For the model with the most finished
+workers (at least 20 with a known window; a hand-back or a cancel says nothing about the
+outcome and is left out) the recommendation is the highest point, in steps of 5 percent,
+up to which the workers whose peak stayed at or under it completed at 90 percent or better
+(over at least 10 workers). With no such point the recommendation stays the unmeasured
+default. A slider the user has not moved follows the result; a moved slider keeps its value.

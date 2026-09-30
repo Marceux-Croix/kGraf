@@ -7,9 +7,10 @@
 // the `text_file::SourceFile` type it needed) along with the parameter that
 // selected it. The same result comes from a simpler rule in `derive_new_contents`:
 // the file's dominant line ending (LF or CRLF) and its final-newline state are
-// detected first, the edit runs on LF lines, and both are put back afterward. A
-// file with mixed endings takes its dominant one on the lines it rewrites as a
-// whole (the join uses one ending).
+// detected first, the edit runs on lines without their endings, and every line
+// the patch did not touch keeps its own ending. Only the lines the patch adds
+// take the dominant ending, so a file with mixed endings changes only where
+// it was edited.
 // Also added (not ported): each `Err` case now appends
 // `seek_sequence::describe_mismatch`'s diagnostic -- see that function's doc
 // comment for why. It only adds text to an error message a caller already
@@ -119,10 +120,10 @@ pub(crate) fn compute_replacements(
 
 /// Apply the `(start_index, old_len, new_lines)` replacements to `original_lines`,
 /// returning the modified file contents as a vector of lines.
-pub(crate) fn apply_replacements(
-    mut lines: Vec<String>,
-    replacements: &[Replacement],
-) -> Vec<String> {
+pub(crate) fn apply_replacements<T: Clone>(
+    mut lines: Vec<T>,
+    replacements: &[(usize, usize, Vec<T>)],
+) -> Vec<T> {
     // We must apply replacements in descending order so that earlier replacements
     // don't shift the positions of later ones.
     for (start_idx, old_len, new_segment) in replacements.iter().rev() {
@@ -154,45 +155,99 @@ fn uses_crlf(text: &str) -> bool {
     feeds > 0 && crlf * 2 > feeds
 }
 
-/// Apply `chunks` to `original`, returning the new file contents. The file
-/// keeps its own line ending (LF or CRLF) and its final-newline state: a file
-/// that did not end in a newline still does not, and one that did still does.
-/// The edit itself runs on LF lines, so patch lines (always LF) match a CRLF
-/// file exactly.
+/// How far past the current old line a context line is looked for when
+/// lining up a replaced region; bounds the work on a large region.
+const CONTEXT_LOOKAHEAD: usize = 64;
+
+/// The endings for `new`, the lines that replace `old` (whose endings are
+/// `old_endings`). A replaced region holds the chunk's context lines as well
+/// as its changes; a new line equal to an old line at or shortly after the
+/// last one matched is that context line and keeps its ending. Every other
+/// new line is an added line and takes `dominant`.
+fn region_endings(
+    old: &[String],
+    old_endings: &[&'static str],
+    new: &[String],
+    dominant: &'static str,
+) -> Vec<&'static str> {
+    let mut next = 0;
+    new.iter()
+        .map(|line| {
+            let window = old.len().min(next + CONTEXT_LOOKAHEAD);
+            match (next..window).find(|&k| old[k] == *line) {
+                Some(k) => {
+                    next = k + 1;
+                    old_endings[k]
+                }
+                None => dominant,
+            }
+        })
+        .collect()
+}
+
+/// Apply `chunks` to `original`, returning the new file contents. Each line
+/// the patch does not touch keeps its own ending (LF or CRLF), and the file
+/// keeps its final-newline state: a file that did not end in a newline still
+/// does not, and one that did still does. Lines the patch adds take the
+/// file's dominant ending. The edit itself runs on lines without their
+/// endings, so patch lines (always LF) match a CRLF line exactly.
 pub(crate) fn derive_new_contents(
     original: &str,
     path: &str,
     chunks: &[UpdateFileChunk],
 ) -> Result<String, String> {
-    let crlf = uses_crlf(original);
-    let ending = if crlf { "\r\n" } else { "\n" };
+    let dominant = if uses_crlf(original) { "\r\n" } else { "\n" };
     let final_newline = original.is_empty() || original.ends_with('\n');
-    let mut original_lines: Vec<String> = original
-        .split('\n')
-        .map(|line| {
-            let line = if crlf {
-                line.strip_suffix('\r').unwrap_or(line)
-            } else {
-                line
-            };
-            line.to_owned()
-        })
-        .collect();
+    let segments: Vec<&str> = original.split('\n').collect();
+    let last = segments.len() - 1;
+    let mut original_lines = Vec::with_capacity(segments.len());
+    let mut endings: Vec<&'static str> = Vec::with_capacity(segments.len());
+    for (i, segment) in segments.iter().enumerate() {
+        if i == last {
+            // After the final line feed (empty when the file ends in one), or
+            // a final line with no line feed at all: it has no ending of its
+            // own, and takes the dominant one if a later line is added.
+            original_lines.push((*segment).to_owned());
+            endings.push(dominant);
+        } else if let Some(content) = segment.strip_suffix('\r') {
+            original_lines.push(content.to_owned());
+            endings.push("\r\n");
+        } else {
+            original_lines.push((*segment).to_owned());
+            endings.push("\n");
+        }
+    }
     // Drop the trailing empty element that results from the final newline so
     // that line counts match the behaviour of standard `diff`.
     if original_lines.last().is_some_and(String::is_empty) {
         original_lines.pop();
+        endings.pop();
     }
 
     let replacements = compute_replacements(&original_lines, path, chunks)?;
-    let mut new_lines = apply_replacements(original_lines, &replacements);
+    let ending_replacements: Vec<(usize, usize, Vec<&'static str>)> = replacements
+        .iter()
+        .map(|(start, old_len, new)| {
+            let old = &original_lines[*start..*start + *old_len];
+            let old_endings = &endings[*start..*start + *old_len];
+            let new_endings = region_endings(old, old_endings, new, dominant);
+            (*start, *old_len, new_endings)
+        })
+        .collect();
+    let new_lines = apply_replacements(original_lines, &replacements);
+    let new_endings = apply_replacements(endings, &ending_replacements);
     if new_lines.is_empty() {
         return Ok(String::new());
     }
-    if final_newline {
-        new_lines.push(String::new());
+    let mut out = String::with_capacity(original.len());
+    let count = new_lines.len();
+    for (i, (line, ending)) in new_lines.iter().zip(&new_endings).enumerate() {
+        out.push_str(line);
+        if i + 1 < count || final_newline {
+            out.push_str(ending);
+        }
     }
-    Ok(new_lines.join(ending))
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -227,6 +282,29 @@ mod tests {
         let chunks = update_chunks("*** Update File: f\n@@\n+tail");
         let new = derive_new_contents("a\r\nb\r\n", "f", &chunks).expect("applies");
         assert_eq!(new, "a\r\nb\r\ntail\r\n");
+    }
+
+    /// A file with mixed endings changes only where it was edited: context
+    /// and untouched lines keep their own ending, added lines take the
+    /// dominant one.
+    #[test]
+    fn a_mixed_file_changes_only_where_it_was_edited() {
+        // CRLF dominant, one LF line the patch does not touch.
+        let chunks = update_chunks("*** Update File: f\n@@\n a\n-b\n+B");
+        let new = derive_new_contents("a\r\nb\r\nlf\nc\r\n", "f", &chunks).expect("applies");
+        assert_eq!(new, "a\r\nB\r\nlf\nc\r\n");
+        // LF dominant, one CRLF line the patch does not touch.
+        let chunks = update_chunks("*** Update File: f\n@@\n-a\n+A\n+added");
+        let new = derive_new_contents("a\nb\ncr\r\nc\n", "f", &chunks).expect("applies");
+        assert_eq!(new, "A\nadded\nb\ncr\r\nc\n");
+        // A CRLF line in an LF file still matches patch context.
+        let chunks = update_chunks("*** Update File: f\n@@\n cr\n-c\n+C");
+        let new = derive_new_contents("a\ncr\r\nc\nd\n", "f", &chunks).expect("applies");
+        assert_eq!(new, "a\ncr\r\nC\nd\n");
+        // A line added after a final line with no newline gives it one.
+        let chunks = update_chunks("*** Update File: f\n@@\n last\n+more");
+        let new = derive_new_contents("x\r\nlast", "f", &chunks).expect("applies");
+        assert_eq!(new, "x\r\nlast\r\nmore");
     }
 
     /// An LF file stays LF, and a file whose last line has no newline does

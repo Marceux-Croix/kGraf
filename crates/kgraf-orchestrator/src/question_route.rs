@@ -10,8 +10,7 @@
 //! and is meant to house the random questions that may come up, and then an
 //! agent should be tasked with the question."
 //!
-//! 1. [`cheap_match`] only pre-selects: it never decides on its own (review
-//!    finding, 2026-09-28: "is my activity card missing from the payment
+//! 1. [`cheap_match`] only pre-selects: it never decides on its own (for example, "is my activity card missing from the payment
 //!    history report" cheaply matches a "Live activity card" node on shared
 //!    words alone). [`QuestionClassifier::classify`] is always called, sees
 //!    the cheap match's suggestion has no special weight in the prompt beyond
@@ -152,8 +151,7 @@ pub fn cheap_match(question_preview: &str, candidates: &[RoadmapCandidate]) -> O
         .map(|(c, _)| c.node_id.clone())
 }
 
-/// Which method decided a routed question's final classification (review
-/// finding, 2026-09-28: "record which method decided the route").
+/// Which method decided a routed question's final classification, so the route can be audited.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DecisionMethod {
@@ -684,7 +682,7 @@ mod tests {
         );
     }
 
-    /// Review finding, 2026-09-28: the reviewer's own example. A cheap match
+    /// A cheap match
     /// on shared words alone ("activity", "card") would wrongly attach an
     /// unrelated question to a "Live activity card" node; the classifier
     /// disagreeing must win, and nothing is dispatched under that node.
@@ -785,7 +783,7 @@ mod tests {
         assert_eq!(*answerer.1.lock().expect("lock"), 1);
         assert!(dispatcher.dispatched.lock().expect("lock").is_empty());
 
-        // Review finding, 2026-09-28: route 2 must be recorded on the graph.
+        // Route 2 must be recorded on the graph.
         let dir = tempfile::tempdir().expect("tempdir");
         let graph = GraphStore::open_in_memory(dir.path()).expect("graph");
         let id = record_answered(
@@ -824,7 +822,7 @@ mod tests {
         assert_eq!(*answerer.1.lock().expect("lock"), 0);
         assert!(dispatcher.dispatched.lock().expect("lock").is_empty());
 
-        // Review finding, 2026-09-28: the offer must be recorded when made
+        // The offer must be recorded when made
         // and again when resolved, on the origin project's graph.
         let dir = tempfile::tempdir().expect("tempdir");
         let graph = GraphStore::open_in_memory(dir.path()).expect("graph");

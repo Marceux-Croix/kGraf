@@ -1,0 +1,10 @@
+: Written from the streamGenerateContent reference (https://ai.google.dev/api/generate-content#method:-models.streamgeneratecontent)
+: with alt=sse, where each event is a GenerateContentResponse and usageMetadata restates the running totals.
+: Not recorded from a live call.
+
+data: {"candidates":[{"content":{"role":"model","parts":[{"text":"Hello"}]},"index":0}],"usageMetadata":{"promptTokenCount":10,"totalTokenCount":10},"modelVersion":"gemini-2.5-flash","responseId":"resp-s1"}
+
+data: {"candidates":[{"content":{"role":"model","parts":[{"text":", wor"}]},"index":0}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":3,"totalTokenCount":13},"modelVersion":"gemini-2.5-flash","responseId":"resp-s1"}
+
+data: {"candidates":[{"content":{"role":"model","parts":[{"text":"ld!"}]},"finishReason":"STOP","index":0}],"usageMetadata":{"promptTokenCount":10,"cachedContentTokenCount":4,"candidatesTokenCount":5,"thoughtsTokenCount":7,"totalTokenCount":22},"modelVersion":"gemini-2.5-flash","responseId":"resp-s1"}
+

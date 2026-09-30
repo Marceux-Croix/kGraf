@@ -23,6 +23,7 @@ pub mod accounting;
 pub mod capability;
 pub mod crosslimit;
 pub mod error;
+pub mod kinds;
 pub mod limits;
 pub mod message;
 pub mod provider;
@@ -32,19 +33,26 @@ pub mod streaming;
 pub use accounting::{
     CallRecord, CallToken, CallTrace, GroupBy, GroupKey, Ledger, LedgerAck, LedgerError, McpCall,
     McpCallRecord, ROUTE_STATS_MIN_ROUNDS, RouteRoundStats, Settlement, SpendGroup, SpendOf,
-    TaskUsage, UnreconciledGroup, UsageGroup,
+    TaskUsage,
 };
 pub use capability::{CacheControl, Capabilities, Reasoning, StreamEvent, Streaming};
 pub use crosslimit::{CrossLimitError, SharedLimiterStore, default_store_path, key_id};
 pub use error::{Billing, ProviderError};
+pub use kinds::{
+    DEFAULT_RERANK_MAX_DOCUMENTS, EmbedLimits, Embedder, Embeddings, ModelRoute, ModelRoutes,
+    Ranked, Ranking, Reranker, cosine_similarity, rank_by_similarity,
+};
 pub use limits::{
     HeaderGet, ObservedLimits, last_429, parse_anthropic_style, parse_openai_style, record_429,
     record_429_now,
 };
-pub use message::{Content, Message, Request, Response, Role, StopReason};
+pub use message::{
+    Content, Message, Request, Response, Role, Signature, StopReason, tool_arguments_object,
+    tool_arguments_text,
+};
 pub use provider::{Provider, ProviderConfig};
 pub use ratelimit::{
-    LimiterStats, NoticeSink, RateLimit, RateLimitError, RateLimited, RouteLimiter,
+    LimiterStats, NoticeSink, RateLimit, RateLimitError, RateLimited, RouteLimiter, RouteRecorded,
     set_notice_sink, take_rate_limit_notices,
 };
 pub use streaming::{SseDecoder, StreamGuard};

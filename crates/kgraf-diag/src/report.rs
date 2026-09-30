@@ -228,7 +228,9 @@ mod tests {
                 ok: true,
             }),
             Record::now(DiagEvent::worker_spawned("kimi", "kimi-k2")),
-            Record::now(DiagEvent::feature_used("index")),
+            Record::now(DiagEvent::FeatureUsed {
+                feature: "index".into(),
+            }),
             Record::now(DiagEvent::error("KG-0501", "kgraf-host", "route not ready")),
         ];
         let summary = render_summary(&records);

@@ -6,7 +6,7 @@
 //! component code is vendored (decision 0055: UI code lives in this tree so
 //! it can be reshaped).
 
-use egui::{Color32, Pos2, Rect, Response, RichText, Sense, Stroke, Ui, Vec2, pos2, vec2};
+use egui::{Color32, Pos2, Rect, Response, RichText, Sense, Stroke, Ui, pos2, vec2};
 
 use crate::theme::{self, Palette};
 
@@ -408,11 +408,6 @@ pub fn badge(painter: &egui::Painter, anchor: Pos2, count: usize, p: &Palette) {
     painter.galley(rect.center() - galley.size() * 0.5, galley, Color32::WHITE);
 }
 
-/// A size in points as a `Vec2`, for readability at call sites.
-pub fn sz(w: f32, h: f32) -> Vec2 {
-    vec2(w, h)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -422,7 +417,7 @@ mod tests {
     /// returns for the real widgets.
     #[test]
     fn every_control_meets_the_minimum_target_size() {
-        type Sizes = std::rc::Rc<std::cell::RefCell<Vec<(&'static str, Vec2)>>>;
+        type Sizes = std::rc::Rc<std::cell::RefCell<Vec<(&'static str, egui::Vec2)>>>;
         let sizes: Sizes = Default::default();
         let seen = sizes.clone();
         let mut h = egui_kittest::Harness::new_ui(move |ui| {

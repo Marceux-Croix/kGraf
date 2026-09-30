@@ -82,9 +82,6 @@ pub enum PortError {
     /// The channel's transport failed; the message was not delivered.
     #[error("channel `{channel}` failed: {reason}")]
     Transport { channel: String, reason: String },
-    /// A reply names a message this channel did not deliver.
-    #[error("channel `{channel}` has no message `{id}` to reply to")]
-    UnknownMessage { channel: String, id: String },
 }
 
 /// One channel, as the orchestrator sees it.

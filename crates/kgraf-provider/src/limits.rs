@@ -25,6 +25,13 @@
 //! this module (dead code, removed); a future
 //! caller with that case adds a compound key builder back when one exists to
 //! call it.
+//!
+//! **The key is the URL the adapter holds after its settings resolve.** A catalog
+//! URL with a placeholder (`{resource}`, `{project}`, `{region}`) never matches
+//! what an adapter records, so the host derives the key with
+//! `kgraf_fleet::limit_key`, which builds it from the same settings. An Azure
+//! route adds the deployment ([`scoped_key`]), since Azure limits are per
+//! deployment.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -57,15 +64,25 @@ fn registry() -> &'static Mutex<HashMap<String, ObservedLimits>> {
 /// Record what one call's headers said for `key` (a base URL). An all-`None`
 /// [`ObservedLimits`] (nothing this module recognized in the response) is not
 /// recorded, so `get` cannot be made to look like "no limit at all" by a
-/// vendor that sent headers this crate does not yet parse.
+/// vendor that sent headers this crate does not yet parse. The record merges
+/// field by field: a response that carries only some headers (a 429 with just
+/// `retry-after`) updates those fields and leaves the rest as last seen,
+/// instead of erasing the limits an earlier response reported.
 pub fn record(key: &str, limits: ObservedLimits) {
     if limits.is_empty() {
         return;
     }
-    registry()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert(key.to_owned(), limits);
+    let mut registry = registry().lock().unwrap_or_else(|p| p.into_inner());
+    let merged = match registry.get(key) {
+        Some(old) => ObservedLimits {
+            requests_limit: limits.requests_limit.or(old.requests_limit),
+            tokens_limit: limits.tokens_limit.or(old.tokens_limit),
+            requests_remaining: limits.requests_remaining.or(old.requests_remaining),
+            reset_ms: limits.reset_ms.or(old.reset_ms),
+        },
+        None => limits,
+    };
+    registry.insert(key.to_owned(), merged);
 }
 
 /// The most recently observed limits for `key`, if any call has reported one.
@@ -170,6 +187,43 @@ pub fn parse_openai_style(h: &HeaderGet) -> ObservedLimits {
             .as_deref()
             .and_then(parse_go_duration_ms),
     }
+}
+
+/// Azure OpenAI headers (Microsoft Learn, "Manage Azure OpenAI quota"):
+/// the OpenAI names, limits that are per deployment, a reset given as a bare
+/// number (the page shows `10` and `300` without a unit; read here as seconds),
+/// and on a 429 `retry-after-ms`, or the standard `retry-after` in seconds, which
+/// is the wait the service asks for and so wins over the window reset. The
+/// value is recorded only; nothing waits on it.
+pub fn parse_azure_style(h: &HeaderGet) -> ObservedLimits {
+    let mut observed = parse_openai_style(h);
+    observed.reset_ms = h("x-ratelimit-reset-requests")
+        .as_deref()
+        .and_then(parse_bare_seconds_ms)
+        .or(observed.reset_ms);
+    let retry_ms = h("retry-after-ms")
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .map(|v| v as i64)
+        .or_else(|| h("retry-after").as_deref().and_then(parse_bare_seconds_ms));
+    if retry_ms.is_some() {
+        observed.reset_ms = retry_ms;
+    }
+    observed
+}
+
+/// A bare non-negative number of seconds, as milliseconds. Anything else is
+/// `None`, including an HTTP-date `retry-after`.
+fn parse_bare_seconds_ms(s: &str) -> Option<i64> {
+    let seconds: f64 = s.trim().parse().ok()?;
+    (seconds.is_finite() && seconds >= 0.0).then_some((seconds * 1_000.0) as i64)
+}
+
+/// The key one Azure deployment's limits are recorded under: the resource
+/// origin and the deployment. Azure limits apply per deployment, so two
+/// deployments on one resource must not overwrite each other.
+pub fn scoped_key(base_url: &str, scope: &str) -> String {
+    format!("{base_url}#{scope}")
 }
 
 /// Anthropic Messages headers: `anthropic-ratelimit-requests-limit`,
@@ -311,6 +365,49 @@ mod tests {
     }
 
     #[test]
+    fn azure_headers_read_a_bare_reset_and_the_retry_wait() {
+        let plain = parse_azure_style(&map(&[
+            ("x-ratelimit-limit-requests", "60"),
+            ("x-ratelimit-limit-tokens", "150000"),
+            ("x-ratelimit-remaining-requests", "59"),
+            ("x-ratelimit-reset-requests", "10"),
+        ]));
+        assert_eq!(plain.requests_limit, Some(60));
+        assert_eq!(plain.tokens_limit, Some(150_000));
+        assert_eq!(plain.reset_ms, Some(10_000));
+
+        let throttled = parse_azure_style(&map(&[
+            ("x-ratelimit-reset-requests", "10"),
+            ("retry-after-ms", "2000"),
+            ("retry-after", "7"),
+        ]));
+        assert_eq!(throttled.reset_ms, Some(2_000), "retry-after-ms wins");
+
+        let seconds_only = parse_azure_style(&map(&[("retry-after", "7")]));
+        assert_eq!(seconds_only.reset_ms, Some(7_000));
+
+        let date = parse_azure_style(&map(&[("retry-after", "Wed, 21 Oct 2026 07:28:00 GMT")]));
+        assert_eq!(date.reset_ms, None, "an HTTP date is not guessed at");
+    }
+
+    #[test]
+    fn scoped_keys_keep_two_deployments_apart() {
+        clear_for_test();
+        let a = scoped_key("https://r.openai.azure.com", "chat-a");
+        let b = scoped_key("https://r.openai.azure.com", "chat-b");
+        assert_ne!(a, b);
+        record(
+            &a,
+            ObservedLimits {
+                requests_limit: Some(10),
+                ..ObservedLimits::default()
+            },
+        );
+        assert!(get(&a).is_some());
+        assert!(get(&b).is_none());
+    }
+
+    #[test]
     fn go_duration_parses_mixed_units() {
         assert_eq!(parse_go_duration_ms("250ms"), Some(250));
         assert_eq!(parse_go_duration_ms("1s"), Some(1_000));
@@ -436,6 +533,34 @@ mod tests {
         record("http://a.test", limits);
         assert_eq!(get("http://a.test"), Some(limits));
         assert_eq!(get("http://b.test"), None);
+    }
+
+    #[test]
+    fn a_response_with_only_some_headers_keeps_the_limits_an_earlier_one_reported() {
+        clear_for_test();
+        let key = "http://merge.test";
+        record(
+            key,
+            ObservedLimits {
+                requests_limit: Some(60),
+                tokens_limit: Some(1_000),
+                requests_remaining: Some(5),
+                reset_ms: Some(9_000),
+            },
+        );
+        // A 429 that carries only the wait the service asks for.
+        record(
+            key,
+            ObservedLimits {
+                reset_ms: Some(2_000),
+                ..ObservedLimits::default()
+            },
+        );
+        let seen = get(key).expect("recorded");
+        assert_eq!(seen.requests_limit, Some(60));
+        assert_eq!(seen.tokens_limit, Some(1_000));
+        assert_eq!(seen.requests_remaining, Some(5));
+        assert_eq!(seen.reset_ms, Some(2_000));
     }
 
     #[test]

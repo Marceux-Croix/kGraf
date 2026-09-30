@@ -75,13 +75,26 @@ pub enum WorkerEvent {
     /// live delivery), but a secret split across two of them is only ever
     /// caught here, once the whole round's text is scrubbed as one string.
     /// `reasoning` is `""` when the round produced none.
-    AssistantMessage { text: String, reasoning: String },
+    AssistantMessage {
+        text: String,
+        reasoning: String,
+        /// The provider's token on the round's last text part (see
+        /// `kgraf_provider::Content::Text`), kept so a resumed run sends it
+        /// back. Never scrubbed: a changed byte makes the provider refuse it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<kgraf_provider::Signature>,
+    },
     /// A tool call began.
     ToolCallStarted {
         call_id: String,
         /// The tool's wire name.
         tool: String,
         input: serde_json::Value,
+        /// The provider's opaque token for this call (see
+        /// `kgraf_provider::Content::ToolUse`), kept so a resumed run sends it
+        /// back. Never scrubbed: a changed byte makes the provider refuse it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<kgraf_provider::Signature>,
     },
     /// A tool call ended.
     ToolCallFinished {
@@ -105,6 +118,14 @@ pub enum WorkerEvent {
     Context {
         prefix_digest: String,
         slices: Vec<NodeId>,
+        /// The gitlink at the worktree root as read when the worker first
+        /// started, before any of its calls ran; a resumed segment carries the
+        /// first segment's. A resume reads the worktree status only against
+        /// this record, never against a `.git` found on disk at resume, which
+        /// an earlier command could have planted. `None`: no gitlink was at
+        /// the root, and the status is not read.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        gitlink: Option<String>,
     },
     /// A ledger row was opened for one model round, before the request left.
     /// Counts the round against the step budget on resume even when the call
@@ -231,18 +252,25 @@ impl WorkerEvent {
             WorkerEvent::ReasoningDelta { text } => WorkerEvent::ReasoningDelta {
                 text: scrub(text, counts),
             },
-            WorkerEvent::AssistantMessage { text, reasoning } => WorkerEvent::AssistantMessage {
+            WorkerEvent::AssistantMessage {
+                text,
+                reasoning,
+                signature,
+            } => WorkerEvent::AssistantMessage {
                 text: scrub(text, counts),
                 reasoning: scrub(reasoning, counts),
+                signature,
             },
             WorkerEvent::ToolCallStarted {
                 call_id,
                 tool,
                 input,
+                signature,
             } => WorkerEvent::ToolCallStarted {
                 call_id,
                 tool,
                 input: scrub_json(input, scrub, counts),
+                signature,
             },
             WorkerEvent::ToolCallFinished {
                 call_id,
@@ -290,8 +318,10 @@ impl WorkerEvent {
             // `ToolCallStarted`'s own (also never scrubbed).
             other @ WorkerEvent::Resumed { .. } => other,
             // Structured data only: ids, usage counts, a stop reason, a
-            // phase, a digest, node ids, and kind names from this crate's
-            // own rules and registry.
+            // phase, a digest, node ids, kind names from this crate's own
+            // rules and registry, and the gitlink git wrote when the host
+            // made the worktree (read before any model output could reach
+            // it; a scrub that changed it would only stop the status read).
             other @ (WorkerEvent::Usage { .. }
             | WorkerEvent::Stop { .. }
             | WorkerEvent::Cancelled { .. }
@@ -574,6 +604,7 @@ mod tests {
             call_id: id.into(),
             tool: "edit".into(),
             input: json!({}),
+            signature: None,
         }
     }
 

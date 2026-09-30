@@ -1,0 +1,16 @@
+{
+  "_source": "Shaped after the Claude on Vertex AI guide (https://cloud.google.com/vertex-ai/generative-ai/docs/partner-models/claude/use-claude), whose rawPredict response is the Anthropic Messages response with a msg_vrtx_ id. The guide does not say how the response model relates to the id in the request path; the name-version spelling here is an assumption, accepted by the adapter with the other forms it lists. Usage fields are the Messages usage object (https://docs.anthropic.com/en/api/messages). Not recorded from a live call.",
+  "id": "msg_vrtx_0142SmpleVertexId",
+  "type": "message",
+  "role": "assistant",
+  "model": "claude-3-5-sonnet-v2-20241022",
+  "content": [{ "type": "text", "text": "Hello from Vertex." }],
+  "stop_reason": "end_turn",
+  "stop_sequence": null,
+  "usage": {
+    "input_tokens": 25,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "output_tokens": 6
+  }
+}

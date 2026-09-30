@@ -1,4 +1,4 @@
-//! Bounded autonomy (decision 0017) and spend accounting at admission (review §A6).
+//! Bounded autonomy (decision 0017) and spend accounting at admission.
 //!
 //! **The concurrency limits are pre-flight.** [`AdmissionGate::try_admit`] refuses a
 //! work item before its workers exist; nothing here kills a worker after it started.
@@ -246,7 +246,8 @@ impl MachineGate {
         }
     }
 
-    /// Execution permits free now (for tests and status).
+    /// Execution permits free now.
+    #[cfg(test)]
     pub fn exec_available(&self) -> usize {
         self.exec.available_permits()
     }
@@ -798,7 +799,8 @@ impl BudgetBook {
         self.recent.insert(pos, (at, actual));
     }
 
-    /// Whether the hold is still live (for tests and status).
+    /// Whether the hold is still live.
+    #[cfg(test)]
     pub fn is_held(&self, reservation: &Reservation) -> bool {
         self.holds.contains_key(&reservation.id)
     }
@@ -962,9 +964,8 @@ mod tests {
         assert_eq!(book.spent_task("t1"), Money(1_000_600));
     }
 
-    /// An overrun (settled above its hold) is still counted for accounting: it
-    /// no longer pauses dispatch or refuses further reservations (decision
-    /// 0080).
+    /// An overrun (settled above its hold) is counted for accounting only: it
+    /// never pauses dispatch or refuses further reservations (decision 0080).
     #[test]
     fn an_overrun_is_counted_but_never_refuses_further_reservation() {
         let mut book = BudgetBook::new();

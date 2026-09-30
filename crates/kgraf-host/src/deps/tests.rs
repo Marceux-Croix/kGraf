@@ -508,6 +508,41 @@ mod mid_run {
         ));
     }
 
+    /// A second start gate of the run replaces the consent the refetcher took
+    /// at the first: a refusal the user had stored before the second gate
+    /// was overridden by that run's answer, so the run's "allow" stands
+    /// again; the fetch count of the run is kept.
+    #[test]
+    fn a_second_start_gate_replaces_the_refetchers_consent_at_start() {
+        let (_d, store, _site) = setup();
+        // The fetch runs but leaves the package missing: each attempt is
+        // `Failed` (it fetched) or `NotAllowed` (it did not).
+        let tool = Arc::new(FakeTool {
+            fetch_fixes: false,
+            ..FakeTool::missing()
+        });
+        let fetches = || tool.calls().iter().filter(|c| **c == "fetch").count();
+        // First gate: consent unset, so a refusal stored later wins.
+        let r = refetcher(tool.clone(), &store, RunFetch::Allow);
+        assert!(matches!(
+            r.refetch_blocking(Path::new("/wt")),
+            RefetchOutcome::Failed { .. }
+        ));
+        store.set(Registry::CratesIo, Consent::Refused).unwrap();
+        assert!(matches!(
+            r.refetch_blocking(Path::new("/wt")),
+            RefetchOutcome::NotAllowed { .. }
+        ));
+        assert_eq!(fetches(), 1);
+        // Second gate: it read the refusal and the run's answer overrode it.
+        r.set_consent_at_start(Consent::Refused);
+        assert!(matches!(
+            r.refetch_blocking(Path::new("/wt")),
+            RefetchOutcome::Failed { .. }
+        ));
+        assert_eq!(fetches(), 2);
+    }
+
     /// The end of the run kills a worker's fetch in flight and refuses the
     /// next one.
     #[test]

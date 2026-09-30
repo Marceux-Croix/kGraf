@@ -98,7 +98,7 @@ async fn a_transient_build_failure_counts_and_does_not_disable() {
         ),
         "{out:?}"
     );
-    // D5: a credential gone between the readiness check and the build disables
+    // A credential gone between the readiness check and the build disables
     // with a missing-credential reason, not a configuration one.
     *factory.build_fails.lock().expect("lock") = Some(OrchestratorError::MissingCredential(
         "no credential for `kimi`: set KGRAF_KIMI_API_KEY".into(),

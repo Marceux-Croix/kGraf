@@ -26,7 +26,7 @@
 use kgraf_provider::{RateLimit, SharedLimiterStore};
 use std::io::Write;
 use std::path::PathBuf;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -55,7 +55,7 @@ fn admit(args: &[String]) {
     let start = Instant::now();
     let mut admitted = 0_u64;
     while start.elapsed() < duration {
-        match store.check(route, key, limit, SystemTime::now(), lock_budget) {
+        match store.check_now(route, key, limit, lock_budget) {
             Ok(kgraf_provider::crosslimit::Admission::Admitted) => admitted += 1,
             Ok(kgraf_provider::crosslimit::Admission::Wait(w)) => {
                 // A short, bounded sleep: a busy loop here would spend this

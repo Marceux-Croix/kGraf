@@ -33,6 +33,8 @@
 //! script ran and no `target` directory was made).
 
 mod cargo;
+#[cfg(unix)]
+mod group;
 mod refetch;
 
 pub use cargo::{CargoDeps, FetchSite};
@@ -375,6 +377,10 @@ pub enum DepsError {
     /// The fetch itself failed (the network, a timeout, the package manager).
     #[error("fetching from {registry} failed: {detail}")]
     Fetch { registry: Registry, detail: String },
+    /// The project's own shape stops the fetch (too large to mirror, no root
+    /// `Cargo.toml`). The same run fails the same way each time.
+    #[error("the project cannot be fetched for: {detail}")]
+    Project { detail: String },
     /// The consent file is damaged.
     #[error("{} is not a dependency-fetch consent file: {detail}", path.display())]
     Store { path: PathBuf, detail: String },
@@ -395,7 +401,8 @@ impl DepsError {
     }
 
     /// Whether the same run could start later unchanged: a failed fetch (the
-    /// network) could; a missing answer, a refusal or a damaged file cannot.
+    /// network) could; a missing answer, a refusal, a damaged file or a
+    /// project that cannot be mirrored cannot.
     pub fn is_transient(&self) -> bool {
         matches!(self, DepsError::Fetch { .. } | DepsError::Io { .. })
     }

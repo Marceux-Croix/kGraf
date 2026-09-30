@@ -38,7 +38,8 @@ impl NoticeKind {
             | WorkState::Split
             | WorkState::PresumedDone
             | WorkState::PresumedPartial
-            | WorkState::PresumedRemaining => None,
+            | WorkState::PresumedRemaining
+            | WorkState::PresumedUnknown => None,
         }
     }
 }

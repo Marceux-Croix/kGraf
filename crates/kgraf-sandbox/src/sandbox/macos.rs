@@ -94,17 +94,58 @@ pub(super) const DENIED_HOME_READS: &[&str] = &[
     // directory on a case-insensitive volume and is denied too (measured).
     "Library/Application Support/kGraf",
     "Library/Caches/kGraf",
-    // Another coding agent's session backups, which can hold the same secrets
-    // as its configuration file. The configuration file itself, and every
+    // Another coding agent's own directory: its stored login, session
+    // backups and histories. Its configuration file beside it, and every
     // sibling path that starts with its name (a `.backup` or `.tmp.NNNN`
     // copy an editor or the agent itself leaves next to it), is denied below
     // by a regex: a plain `subpath` entry only matches that one literal path
     // and its own descendants, not a sibling file whose name happens to
     // start the same way.
-    ".claude/backups",
+    ".claude",
+    // Maven and Gradle repository passwords, Podman registry logins, Hugging
+    // Face tokens (old and current location), the 1Password CLI, Oracle
+    // Cloud keys, Bundler's per-user config with private gem source logins.
+    // The Maven and Gradle caches beside them stay readable for builds.
+    ".m2/settings.xml",
+    ".m2/settings-security.xml",
+    ".gradle/gradle.properties",
+    ".config/containers/auth.json",
+    ".huggingface",
+    ".cache/huggingface/token",
+    ".config/op",
+    ".op",
+    ".oci",
+    ".bundle/config",
     // Registry tokens. The sandbox points NPM_CONFIG_USERCONFIG at an empty
     // file in the scratch directory, so npm never looks here.
     ".npmrc",
+    // Package index logins: pip's config (an index URL can carry a password),
+    // Yarn's registry tokens, Poetry's repository passwords.
+    ".pip/pip.conf",
+    ".config/pip/pip.conf",
+    ".yarnrc",
+    ".yarnrc.yml",
+    ".config/pypoetry/auth.toml",
+    // Cargo's per-user config can hold a registry token and a proxy URL with
+    // a password. Seatbelt denies the stat too, and cargo skips a config file
+    // it cannot stat (measured), so builds still run; settings kept there
+    // (a linker, a source mirror) do not apply inside the sandbox, as on
+    // Linux, where the file is never granted.
+    ".cargo/config.toml",
+    ".cargo/config",
+    // Docker's legacy login file, s3cmd and boto (AWS keys), Databricks
+    // tokens, rclone remotes, and the DigitalOcean, Heroku, GitLab, Helm
+    // repository and Stripe CLI logins.
+    ".dockercfg",
+    ".s3cfg",
+    ".boto",
+    ".databrickscfg",
+    ".config/rclone",
+    ".config/doctl",
+    ".config/heroku",
+    ".config/glab-cli",
+    ".config/helm",
+    ".config/stripe",
     "Library/Keychains",
     "Library/Cookies",
     "Library/Messages",
@@ -294,6 +335,7 @@ pub(super) fn profile(policy: &Resolved, home: &Path) -> (String, Vec<(String, P
         }
     }
     let mut read_denies = Vec::new();
+    let mut home_denied: Vec<PathBuf> = Vec::new();
     for (i, rel) in DENIED_HOME_READS.iter().enumerate() {
         let key = format!("DENY_READ_{i}");
         read_denies.push(format!("(subpath (param \"{key}\"))"));
@@ -307,9 +349,24 @@ pub(super) fn profile(policy: &Resolved, home: &Path) -> (String, Vec<(String, P
         {
             let real_key = format!("DENY_READ_REAL_{i}");
             read_denies.push(format!("(subpath (param \"{real_key}\"))"));
+            home_denied.push(real.clone());
             params.push((real_key, real));
         }
+        home_denied.push(path.clone());
         params.push((key, path));
+    }
+    let (inner_roots, inner_ancestors) = roots_inside_home_denies(policy, &home_denied);
+    let mut inner_reads = Vec::new();
+    for (i, root) in inner_roots.into_iter().enumerate() {
+        let key = format!("HOME_DENIED_ROOT_{i}");
+        inner_reads.push(format!("(subpath (param \"{key}\"))"));
+        params.push((key, root));
+    }
+    let mut inner_metadata = Vec::new();
+    for (i, dir) in inner_ancestors.into_iter().enumerate() {
+        let key = format!("HOME_DENIED_ANCESTOR_{i}");
+        inner_metadata.push(format!("(literal (param \"{key}\"))"));
+        params.push((key, dir));
     }
     // Another coding agent's configuration file, plus every sibling path
     // that starts with its name: `.claude.json.backup`, `.claude.json.tmp.*`
@@ -361,11 +418,28 @@ pub(super) fn profile(policy: &Resolved, home: &Path) -> (String, Vec<(String, P
         }
     }
     // After the re-allow, so no root reopens a credential store.
+    sections.extend([format!(
+        "; credential stores, browser profiles, histories\n(deny file-read*\n  {}\n)",
+        read_denies.join("\n  ")
+    )]);
+    // A root that lies strictly inside a denied home path (a project kept in
+    // `~/.claude`, whose worktrees and shared git directory sit there too) is
+    // re-allowed after the deny, or the command could not read its own tree.
+    // Only the root is reopened, plus the metadata (never the listing) of
+    // each directory between it and the denied path, which realpath(3)
+    // needs. A root that contains a denied path, such as HOME itself, is not
+    // in this list, so it never reopens a credential store.
+    if !inner_reads.is_empty() {
+        sections.push(format!(
+            "; roots inside a denied home path\n(allow file-read*\n  {}\n)",
+            inner_reads.join("\n  ")
+        ));
+        sections.push(format!(
+            "(allow file-read-metadata\n  {}\n)",
+            inner_metadata.join("\n  ")
+        ));
+    }
     sections.extend([
-        format!(
-            "; credential stores, browser profiles, histories\n(deny file-read*\n  {}\n)",
-            read_denies.join("\n  ")
-        ),
         format!("(allow file-write*\n  {}\n)", write_allows.join("\n  ")),
         socket_rules.join("\n"),
     ]);
@@ -390,6 +464,32 @@ pub(super) fn profile(policy: &Resolved, home: &Path) -> (String, Vec<(String, P
     // read-only descriptors, bypassing file-write* (codex).
     sections.push("(deny system-fcntl (fcntl-command 80 110))".to_string());
     (sections.join("\n"), params)
+}
+
+/// The writable and readable roots that lie strictly inside one of the
+/// denied home paths `denied`, and every directory from each such root's
+/// parent up to and including the denied path it lies in. A root equal to a
+/// denied path, or containing one, is not returned: it stays denied.
+fn roots_inside_home_denies(policy: &Resolved, denied: &[PathBuf]) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    let mut ancestors: Vec<PathBuf> = Vec::new();
+    for root in policy.writable.iter().chain(&policy.readable) {
+        let Some(base) = denied.iter().find(|d| root.starts_with(d) && root != *d) else {
+            continue;
+        };
+        if !roots.contains(root) {
+            roots.push(root.clone());
+        }
+        for dir in root.ancestors().skip(1) {
+            if !dir.starts_with(base) {
+                break;
+            }
+            if !ancestors.iter().any(|a| a == dir) {
+                ancestors.push(dir.to_path_buf());
+            }
+        }
+    }
+    (roots, ancestors)
 }
 
 #[cfg(test)]
@@ -442,8 +542,119 @@ mod tests {
             ".gem/credentials",
             ".codex",
             ".netrc",
+            ".m2/settings.xml",
+            ".gradle/gradle.properties",
+            ".config/containers/auth.json",
+            ".huggingface",
+            ".cache/huggingface/token",
+            ".config/op",
+            ".oci",
+            ".bundle/config",
+            ".claude",
         ] {
             assert!(DENIED_HOME_READS.contains(&rel), "{rel}");
+        }
+    }
+
+    /// Every deny-list entry reaches the generated profile as a parameter a
+    /// `file-read*` deny rule uses, after the blanket read allow.
+    #[test]
+    fn the_generated_profile_denies_every_home_credential_path() {
+        let home = Path::new("/home/u");
+        let (text, params) = profile(&resolved("/tmp/w", Network::Deny), home);
+        let allow = text.find("(allow file-read*)").expect("read allow");
+        for rel in [
+            ".m2/settings.xml",
+            ".gradle/gradle.properties",
+            ".config/containers/auth.json",
+            ".huggingface",
+            ".cache/huggingface/token",
+            ".config/op",
+            ".oci",
+            ".bundle/config",
+            ".claude",
+            ".ssh",
+            ".pip/pip.conf",
+            ".config/pip/pip.conf",
+            ".yarnrc",
+            ".yarnrc.yml",
+            ".config/pypoetry/auth.toml",
+            ".cargo/config.toml",
+            ".cargo/config",
+            ".dockercfg",
+            ".s3cfg",
+            ".boto",
+            ".databrickscfg",
+            ".config/rclone",
+            ".config/doctl",
+            ".config/heroku",
+            ".config/glab-cli",
+            ".config/helm",
+            ".config/stripe",
+        ] {
+            let (key, _) = params
+                .iter()
+                .find(|(k, v)| k.starts_with("DENY_READ_") && *v == home.join(rel))
+                .unwrap_or_else(|| panic!("{rel} is not a deny parameter"));
+            let rule = text
+                .find(&format!("(subpath (param \"{key}\"))"))
+                .unwrap_or_else(|| panic!("{rel}: no rule uses {key}"));
+            assert!(allow < rule, "{rel}: the deny must follow the allow");
+        }
+    }
+
+    /// A root strictly inside a denied home path is re-allowed after the
+    /// home deny, with metadata only for the directories above it; a root
+    /// outside one, or one containing a denied path, reopens nothing.
+    #[test]
+    fn a_root_inside_a_denied_home_path_is_readable_and_nothing_else_is() {
+        let home = Path::new("/home/u");
+        let mut policy = resolved("/home/u/.claude/p/.kgraf/wt", Network::Deny);
+        policy.readable = vec![PathBuf::from("/home/u/.claude/p/.git")];
+        let (text, params) = profile(&policy, home);
+        let key_of = |prefix: &str, path: &str| {
+            params
+                .iter()
+                .find(|(k, v)| k.starts_with(prefix) && *v == Path::new(path))
+                .map(|(k, _)| k.clone())
+        };
+        let deny = text
+            .find("; credential stores, browser profiles, histories")
+            .expect("home deny");
+        for root in ["/home/u/.claude/p/.kgraf/wt", "/home/u/.claude/p/.git"] {
+            let key = key_of("HOME_DENIED_ROOT_", root).expect(root);
+            let rule = text
+                .find(&format!("(subpath (param \"{key}\"))"))
+                .expect(root);
+            assert!(deny < rule, "{root}: the re-allow must follow the deny");
+        }
+        for dir in [
+            "/home/u/.claude/p/.kgraf",
+            "/home/u/.claude/p",
+            "/home/u/.claude",
+        ] {
+            let key = key_of("HOME_DENIED_ANCESTOR_", dir).expect(dir);
+            assert!(
+                text.contains(&format!("(literal (param \"{key}\"))")),
+                "{dir}"
+            );
+        }
+        assert!(key_of("HOME_DENIED_ANCESTOR_", "/home/u").is_none());
+        assert!(
+            !text.contains("(subpath (param \"HOME_DENIED_ANCESTOR_"),
+            "an ancestor is reopened for metadata only, never as a subtree"
+        );
+
+        for outside in ["/tmp/w", "/home/u", "/home/u/.claude"] {
+            let (text, params) = profile(&resolved(outside, Network::Deny), home);
+            assert!(
+                !params.iter().any(|(k, _)| k.starts_with("HOME_DENIED_")),
+                "{outside}"
+            );
+            assert!(
+                !text.contains("roots inside a denied home path"),
+                "{outside}"
+            );
         }
     }
 

@@ -83,7 +83,14 @@ pub enum QuestionError {
     /// An inverted or single-valued score range.
     #[error("a score needs min < max, got {min}..{max}")]
     ScoreRange { min: i32, max: i32 },
+    /// A score range with more levels than the wire format renders as labels.
+    #[error("a score range may span at most {limit} levels, got {min}..{max}")]
+    ScoreSpan { min: i32, max: i32, limit: i64 },
 }
+
+/// The most levels a score question may span. Each level is one label on the
+/// wire, so an unbounded range is an unbounded request body.
+pub const MAX_SCORE_LEVELS: i64 = 1000;
 
 impl Question {
     /// A yes/no question.
@@ -131,6 +138,13 @@ impl Question {
     ) -> Result<Self, QuestionError> {
         if min >= max {
             return Err(QuestionError::ScoreRange { min, max });
+        }
+        if i64::from(max) - i64::from(min) >= MAX_SCORE_LEVELS {
+            return Err(QuestionError::ScoreSpan {
+                min,
+                max,
+                limit: MAX_SCORE_LEVELS,
+            });
         }
         Ok(Self {
             id: id.into(),

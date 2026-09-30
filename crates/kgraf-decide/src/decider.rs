@@ -153,27 +153,6 @@ pub trait Decider: Send + Sync {
         questions: &[Question],
         token: &CallToken,
     ) -> Result<Vec<Answer>, DecideError>;
-
-    /// Answer one yes/no question, as a convenience over [`Decider::decide`].
-    async fn ask_noul(
-        &self,
-        state: &State,
-        prompt: &str,
-        token: &CallToken,
-    ) -> Result<Answer, DecideError> {
-        let question = Question::noul("q0", prompt);
-        let mut answers = self
-            .decide(state, std::slice::from_ref(&question), token)
-            .await?;
-        if answers.len() != 1 {
-            return Err(DecideError::AnswerCountMismatch {
-                backend: self.backend(),
-                asked: 1,
-                returned: answers.len(),
-            });
-        }
-        Ok(answers.remove(0))
-    }
 }
 
 /// Check a batch of answers against the questions asked.

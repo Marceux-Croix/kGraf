@@ -396,12 +396,17 @@ impl ApprovalHook for ShellApprovalHook {
             // Decision 0084: the question names the allowlist, so an
             // unattended denial (which quotes it) says what would have run.
             Decision::Prompt => HookDecision::Ask {
+                // Each argument quoted and every control character escaped:
+                // the model wrote this argv, and the user must read the call
+                // that will run, not one an escape sequence painted over it.
                 question: match self.policy.build_allowlist() {
-                    build if build.is_empty() => format!("Run `{}`?", cmd.join(" ")),
+                    build if build.is_empty() => {
+                        format!("Run `{}`?", crate::quote_argv(&cmd))
+                    }
                     build => format!(
                         "Run `{}`? It is not on the build and test allowlist, which runs \
                          without approval: {}.",
-                        cmd.join(" "),
+                        crate::quote_argv(&cmd),
                         build.describe()
                     ),
                 },
@@ -517,7 +522,8 @@ enum SubjectShape {
     Git,
     /// `find`, without the actions that run a program or write a file.
     Find,
-    /// `rg`, without `--pre` (a preprocessor program run on every file).
+    /// `rg`, without `--pre` (a preprocessor program run on every file) or
+    /// `--hostname-bin` (a program run to name the host in a hyperlink).
     Ripgrep,
     /// `cargo`, held to the build allowlist's argument rules (decision 0084).
     Cargo,
@@ -713,10 +719,13 @@ fn find_rule_subject_allowed(cmd: &[String]) -> bool {
 
 fn ripgrep_rule_subject_allowed(cmd: &[String]) -> bool {
     // ripgrep does not accept an abbreviated long option, so the exact name
-    // is enough.
-    !cmd.iter()
-        .skip(1)
-        .any(|a| a == "--pre" || a.starts_with("--pre="))
+    // is enough. Each refused option names a program ripgrep runs: `--pre`
+    // on every file, `--hostname-bin` (ripgrep 14) for a hyperlink's host.
+    !cmd.iter().skip(1).any(|a| {
+        ["--pre", "--hostname-bin"]
+            .iter()
+            .any(|opt| a == opt || a.strip_prefix(opt).is_some_and(|r| r.starts_with('=')))
+    })
 }
 
 /// Whether a persisted exact "always allow" rule may name `cmd`. True only
@@ -848,7 +857,7 @@ impl Tool for ShellTool {
                 reason: format!(
                     "`{}` requires approval (Prompt), but this ShellTool was never paired \
                      with a ShellApprovalHook; refusing rather than risk it running unasked",
-                    cmd.join(" ")
+                    crate::quote_argv(&cmd)
                 ),
             });
         }
@@ -901,7 +910,7 @@ impl Tool for ShellTool {
                 reason: format!(
                     "`{}` requires approval (Prompt), but this ShellTool was never paired \
                      with a ShellApprovalHook; refusing rather than risk it running unasked",
-                    cmd.join(" ")
+                    crate::quote_argv(&cmd)
                 ),
             });
         }
@@ -1053,9 +1062,13 @@ fn confine_on_disk(cmd: &[String], ctx: &ToolContext) -> Result<(), ToolError> {
 /// lexically by the allowlist (relative, no `..`); here it must also not leave
 /// the worktree through a symlink, resolved with the file tools' confined open.
 fn confine_manifest_on_disk(cmd: &[String], ctx: &ToolContext) -> Result<(), ToolError> {
-    let Some(manifest) = crate::execpolicy::manifest_path_of(cmd) else {
-        return Ok(());
-    };
+    for manifest in crate::execpolicy::manifest_paths_of(cmd) {
+        confine_one_manifest(manifest, ctx)?;
+    }
+    Ok(())
+}
+
+fn confine_one_manifest(manifest: &str, ctx: &ToolContext) -> Result<(), ToolError> {
     let rel = std::path::Path::new(manifest);
     let escapes = |why: String| ToolError::Access {
         tool: "shell".into(),
@@ -1327,31 +1340,33 @@ async fn run_sandboxed(
     enum Ended {
         Cancelled,
         TimedOut,
-        Exited(std::io::Result<std::process::ExitStatus>),
+        Exited,
     }
     let ended = tokio::select! {
         _ = ctx.cancel.cancelled() => Ended::Cancelled,
         () = tokio::time::sleep(timeout) => Ended::TimedOut,
-        status = child.wait() => Ended::Exited(status),
+        () = exited_unreaped(pgid) => Ended::Exited,
     };
 
     match ended {
-        Ended::Exited(status) => {
+        Ended::Exited => {
+            // A normal exit can leave background descendants in the group
+            // (`cmd &`). They would keep running and hold the worktree, so
+            // the verifier would see a tree that is not final. The group is
+            // killed while the leader is still an unreaped zombie: its pid,
+            // which is the pgid, cannot be reused until it is reaped, so the
+            // signal cannot reach an unrelated group. Output already written
+            // stays in the pipes and is drained below.
+            kill_group(pgid);
+            let status = child.wait().await;
             // The direct child is gone; do not keep blocking on its pipes
-            // in case a grandchild inherited and kept the write end open.
-            // A grace window lets normal, already-flushed output through
-            // while still bounding the wait.
+            // in case a descendant that left the group kept the write end
+            // open. A grace window lets already-written output through while
+            // still bounding the wait.
             let (stdout_bytes, stdout_trunc) =
                 drain_with_cap(&mut stdout_task, &stdout_buf, DRAIN_GRACE).await;
             let (stderr_bytes, stderr_trunc) =
                 drain_with_cap(&mut stderr_task, &stderr_buf, DRAIN_GRACE).await;
-            // A normal exit can leave background descendants in the group
-            // (`cmd &`). They would keep running and hold the worktree, so
-            // the verifier would see a tree that is not final. The group is
-            // killed once the output is drained. The leader is reaped, but
-            // its pgid stays valid while any member lives; the window
-            // before a pid could be reused is the drain grace.
-            kill_group(pgid);
             let status = status.map_err(|e| internal(format!("wait failed: {e}")))?;
             let mut output = render_output(
                 status.success(),
@@ -1406,6 +1421,44 @@ async fn run_sandboxed(
     }
 }
 
+/// Resolves once the child `pid` has exited, without reaping it
+/// (`waitid` with `WNOWAIT`): the zombie keeps its pid, and so its process
+/// group id, reserved until [`tokio::process::Child::wait`] reaps it, so the
+/// group can still be signaled safely. `None` (a child with no pid, which a
+/// just-spawned child always has) never resolves; the timeout and the
+/// cancellation still end the call.
+#[cfg(unix)]
+async fn exited_unreaped(pid: Option<u32>) {
+    let Some(pid) = pid else {
+        return std::future::pending().await;
+    };
+    let waited = tokio::task::spawn_blocking(move || {
+        loop {
+            // SAFETY: `info` is a zeroed `siginfo_t` the call writes into;
+            // `WNOWAIT` leaves the child waitable, so nothing is reaped.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let rc = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            };
+            if rc == 0 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+            {
+                // Exited, or not waitable at all (already reaped): either way
+                // the reaping `wait` that follows reports the outcome.
+                return;
+            }
+        }
+    })
+    .await;
+    // A panicked or cancelled blocking task says nothing about the child;
+    // the reaping `wait` that follows still reports it.
+    let _ = waited;
+}
+
 /// Sends SIGKILL to the sandboxed child's process group (its pgid equals its
 /// pid, see `setsid` above).
 #[cfg(unix)]
@@ -1419,28 +1472,62 @@ fn kill_group(pgid: Option<u32>) {
     }
 }
 
-/// What cargo prints when a dependency is not ready in the local cache. The
-/// sandbox has no network and cannot write `~/.cargo`, so cargo can neither
-/// download a crate nor unpack a cached `.crate` into `~/.cargo/registry/src`
-/// (measured 2026-09-28, cargo 1.95.0: "failed to unpack package ...
-/// Operation not permitted").
+/// The starts of the lines cargo prints on stderr when a dependency is not
+/// ready in the local cache: its own `error:` line, or a `Caused by:` entry
+/// (indented two spaces), or its offline-mode note. The sandbox has no network
+/// and cannot write `~/.cargo`, so cargo can neither download a crate nor
+/// unpack a cached `.crate` into `~/.cargo/registry/src` (measured 2026-09-28,
+/// cargo 1.95.0: "failed to unpack package ... Operation not permitted";
+/// 2026-09-29: "As a reminder, you're using offline mode" after a missing
+/// package).
+///
+/// Whole line starts, never a substring anywhere: every match costs one of
+/// the run's bounded dependency checks on the host, and a test or a program
+/// that merely prints "failed to download" must not spend them.
 #[cfg(unix)]
 const DEPENDENCY_NOT_READY: &[&str] = &[
-    "failed to unpack package",
-    "failed to download",
-    "--offline was specified",
-    "you're using offline mode",
+    "error: failed to unpack package",
+    "  failed to unpack package",
+    "error: failed to download",
+    "  failed to download",
+    "error: attempting to make an HTTP request, but --offline was specified",
+    "  attempting to make an HTTP request, but --offline was specified",
+    "As a reminder, you're using offline mode",
 ];
 
 /// Decision 0084: a failed allowlisted build that could not get a dependency
 /// says why and what fixes it, rather than leaving a bare cargo error.
-/// Whether a failed build's output shows a dependency that is not ready.
+/// Whether a failed build's stderr shows a dependency that is not ready.
 #[cfg(unix)]
 fn dependency_not_ready(output: &ToolOutput) -> bool {
-    output.is_error && {
-        let text = output.clone().render();
-        DEPENDENCY_NOT_READY.iter().any(|p| text.contains(p))
-    }
+    output.is_error
+        && output.parts.iter().any(|part| {
+            let OutputPart::Text { text } = part else {
+                return false;
+            };
+            let text = text.clone().into_tool_result();
+            text.strip_prefix("stderr:\n").is_some_and(|stderr| {
+                stderr
+                    .lines()
+                    .take_while(|line| !hands_over_to_another_program(line))
+                    .any(|line| DEPENDENCY_NOT_READY.iter().any(|p| line.starts_with(p)))
+            })
+        })
+}
+
+/// Whether a stderr line is where cargo's own lines stop: from here on the
+/// stream carries what another program wrote. `Running` and `Doc-tests`
+/// start a test binary or `cargo run`'s program on the same stderr, and a
+/// `--- stdout` or `--- stderr` line starts a build script's output that cargo
+/// quotes, indented, in its failure report. Dependency resolution happens
+/// before any of them, so a dependency line after one is not cargo's.
+#[cfg(unix)]
+fn hands_over_to_another_program(line: &str) -> bool {
+    let status = line.trim_start();
+    status.starts_with("Running ")
+        || status.starts_with("Doc-tests ")
+        || status == "--- stdout"
+        || status == "--- stderr"
 }
 
 #[cfg(not(unix))]
@@ -1517,12 +1604,54 @@ async fn run_external(
     timeout: Duration,
     output_cap: usize,
 ) -> Result<ToolOutput, ToolError> {
-    let outcome = tokio::select! {
-        _ = ctx.cancel.cancelled() => {
-            return Err(ToolError::Cancelled { tool: "shell".into() });
+    run_external_bounded(cmd, ctx, executor, timeout, EXTERNAL_GRACE, output_cap).await
+}
+
+/// How long past the command's own timeout the host waits for an external
+/// executor to report. The executor enforces the timeout remotely; this is
+/// the host's own bound for one that does not (a hung container runtime, a
+/// lost connection), and leaves room for its teardown.
+const EXTERNAL_GRACE: Duration = Duration::from_secs(30);
+
+/// [`run_external`] with the host-side grace as a parameter. An executor that
+/// has not reported by `timeout + grace` is dropped and the call fails with
+/// [`ToolError::Timeout`], rather than holding the worker forever.
+async fn run_external_bounded(
+    cmd: &[String],
+    ctx: &ToolContext,
+    executor: &dyn ExternalExecutor,
+    timeout: Duration,
+    grace: Duration,
+    output_cap: usize,
+) -> Result<ToolOutput, ToolError> {
+    let bound = timeout.saturating_add(grace);
+    let stopped = tokio::select! {
+        _ = ctx.cancel.cancelled() => ToolError::Cancelled { tool: "shell".into() },
+        () = tokio::time::sleep(bound) => ToolError::Timeout {
+            tool: "shell".into(),
+            after_ms: u64::try_from(bound.as_millis()).unwrap_or(u64::MAX),
+        },
+        result = executor.exec(cmd, timeout) => {
+            return render_external(result, timeout, output_cap);
         }
-        result = executor.exec(cmd, timeout) => result,
     };
+    // The exec future is dropped by now. The executor is told, so it can stop
+    // the remote command and not hand its late result to the next call; a
+    // slow teardown does not hold the worker.
+    let _ = tokio::time::timeout(ABANDON_BOUND, executor.abandon()).await;
+    Err(stopped)
+}
+
+/// How long the host waits for an external executor to take note of an
+/// abandoned command.
+const ABANDON_BOUND: Duration = Duration::from_secs(5);
+
+/// One external command's result, rendered the way a local run is.
+fn render_external(
+    outcome: Result<crate::external::ExternalOutcome, String>,
+    timeout: Duration,
+    output_cap: usize,
+) -> Result<ToolOutput, ToolError> {
     let outcome = outcome.map_err(|e| internal(format!("external executor failed: {e}")))?;
     let (stdout, stdout_trunc) = cap_bytes(outcome.stdout, output_cap);
     let (stderr, stderr_trunc) = cap_bytes(outcome.stderr, output_cap);
@@ -2490,6 +2619,17 @@ mod tests {
         fn rg_pre_refuses_a_subject_and_plain_rg_has_one() {
             assert_eq!(subject(&["rg", "--pre", "id", "x"]), None);
             assert_eq!(subject(&["rg", "--pre=id", "x"]), None);
+            assert_eq!(
+                subject(&[
+                    "rg",
+                    "--hyperlink-format={host}",
+                    "--hostname-bin",
+                    "id",
+                    "x"
+                ]),
+                None
+            );
+            assert_eq!(subject(&["rg", "--hostname-bin=id", "x"]), None);
             assert_eq!(subject(&["rg", "-n", "x"]), canonical(&["rg", "-n", "x"]));
         }
 
@@ -2853,6 +2993,29 @@ mod tests {
             }
         }
 
+        /// The approval question shows the argv the call will run: every
+        /// argument boundary visible and no control character left to
+        /// repaint the prompt. Asked both with and without an allowlist.
+        #[tokio::test]
+        async fn the_approval_question_shows_the_argv_that_will_run() {
+            let argv = ["touch", "a b", "x\r\u{1b}[2Kcargo test"];
+            for policy in [
+                ExecPolicy::default_kgraf_policy(),
+                ExecPolicy::default_kgraf_policy()
+                    .with_build_allowlist(BuildAllowlist::cargo_default()),
+            ] {
+                let (_tool, hook) = ShellTool::new(policy);
+                let HookDecision::Ask { question } = hook.review(&pending(&argv)).await else {
+                    panic!("`touch` must need approval");
+                };
+                assert!(!question.chars().any(char::is_control), "{question:?}");
+                assert!(
+                    question.contains("Run `touch 'a b' 'x\\u{d}\\u{1b}[2Kcargo test'`?"),
+                    "{question}"
+                );
+            }
+        }
+
         /// A tool not bound to a workspace runs under the narrower fallback
         /// policy, so an allowlisted command there is a plain exclusive call.
         #[tokio::test]
@@ -3124,6 +3287,66 @@ fn main() {
             assert!(fake.asked.lock().unwrap().is_empty(), "{}", out.render());
         }
 
+        /// Only cargo's own diagnostic lines on stderr ask the host: the
+        /// words anywhere else (a test's own output, stdout, mid-line) do
+        /// not spend one of the run's bounded dependency checks.
+        #[test]
+        fn only_cargo_s_own_lines_on_stderr_count_as_a_missing_dependency() {
+            let failed = |stdout: &str, stderr: &str| {
+                render_output(
+                    false,
+                    Some(101),
+                    stdout.as_bytes().to_vec(),
+                    false,
+                    stderr.as_bytes().to_vec(),
+                    false,
+                    4096,
+                )
+            };
+            for stderr in [
+                "error: failed to download from `https://index.crates.io/x`\n",
+                "error: failed to download `serde v1.0.0`\n",
+                "error: failed to unpack package `x v1.0.0`\n\nCaused by:\n  Operation not permitted\n",
+                "error: failed to get `x` as a dependency\n\nCaused by:\n  failed to download from `x`\n",
+                "error: x\n\nCaused by:\n  attempting to make an HTTP request, but --offline was specified\n",
+                "error: no matching package named `x` found\nAs a reminder, you're using offline mode (--offline) which can ...\n",
+            ] {
+                assert!(dependency_not_ready(&failed("", stderr)), "{stderr:?}");
+            }
+            for (stdout, stderr) in [
+                ("error: failed to download x\n", "error: tests failed\n"),
+                ("", "test says: failed to download the fixture\n"),
+                ("", "thread 'x' panicked: failed to unpack package\n"),
+                ("", "error[E0425]: cannot find value `failed_to_download`\n"),
+                // A test binary's own stderr, after cargo started it.
+                (
+                    "",
+                    "   Compiling x v0.1.0\n    Finished `test` profile\n     Running \
+                     unittests src/lib.rs (target/debug/deps/x-1)\nerror: failed to download x\n",
+                ),
+                // `cargo run`'s program.
+                (
+                    "",
+                    "     Running `target/debug/x`\nerror: failed to download x\n",
+                ),
+                // A build script's output, quoted by cargo under `--- stderr`.
+                (
+                    "",
+                    "error: failed to run custom build command for `x v0.1.0`\n\nCaused by:\n  \
+                     process didn't exit successfully: `build-script-build`\n  --- stderr\n  \
+                     failed to download the fixture\n",
+                ),
+            ] {
+                assert!(
+                    !dependency_not_ready(&failed(stdout, stderr)),
+                    "{stdout:?} {stderr:?}"
+                );
+            }
+            let mut ok = failed("", "error: failed to download `x`\n");
+            ok.is_error = false;
+            assert!(!dependency_not_ready(&ok), "a success never asks");
+        }
+
         /// A `--manifest-path` that passes the lexical rule but leaves the
         /// worktree through a symlink is refused on disk before the run.
         #[tokio::test]
@@ -3150,6 +3373,32 @@ fn main() {
                 .await
                 .expect_err("refused");
             assert!(err.to_string().contains("worktree"), "{err}");
+            assert!(!ShellTool::target_dir(&f.ws).exists(), "nothing ran");
+
+            // Repeated: the first names the worktree's own manifest, the
+            // second leaves through the link. Every one is checked, not
+            // only the first.
+            let repeated = [
+                "cargo",
+                "build",
+                "--manifest-path",
+                "Cargo.toml",
+                "--manifest-path=link/Cargo.toml",
+            ];
+            tool.access(&call_input(&repeated))
+                .expect("lexically fine; the disk check is at call time");
+            let err = tool
+                .call(
+                    call_input(&repeated),
+                    &ctx(f.ws.root().to_path_buf()),
+                    &CallPermit::new(),
+                )
+                .await
+                .expect_err("refused");
+            assert!(
+                matches!(err, ToolError::Access { .. }) && err.to_string().contains("worktree"),
+                "{err}"
+            );
             assert!(!ShellTool::target_dir(&f.ws).exists(), "nothing ran");
         }
 
@@ -3551,6 +3800,82 @@ fn main() {
                 .expect_err("an executor failure is an error");
             assert!(err.to_string().contains("the container is gone"), "{err}");
             assert!(!marker.exists(), "the command fell back to the host");
+        }
+
+        /// An executor that never reports, and counts the times it is told
+        /// its command was abandoned.
+        #[derive(Default)]
+        struct Hung {
+            abandoned: std::sync::atomic::AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl ExternalExecutor for Hung {
+            async fn exec(
+                &self,
+                _cmd: &[String],
+                _timeout: Duration,
+            ) -> Result<ExternalOutcome, String> {
+                std::future::pending().await
+            }
+
+            async fn abandon(&self) {
+                self.abandoned
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+
+            async fn sync_to_remote(&self) -> Result<(), String> {
+                Ok(())
+            }
+        }
+
+        /// An executor that never reports is bounded on the host: the call
+        /// fails with a timeout once the command's timeout plus the grace
+        /// has passed, instead of waiting forever, and the executor is told
+        /// its command was abandoned.
+        #[tokio::test]
+        async fn an_executor_that_never_reports_times_out_on_the_host() {
+            let hung = Hung::default();
+            let dir = tempfile::tempdir().expect("tempdir");
+            let started = std::time::Instant::now();
+            let err = run_external_bounded(
+                &["true".to_string()],
+                &ctx(dir.path().to_path_buf()),
+                &hung,
+                Duration::from_millis(50),
+                Duration::from_millis(50),
+                1024,
+            )
+            .await
+            .expect_err("a hung executor must time out");
+            assert!(
+                matches!(err, ToolError::Timeout { after_ms: 100, .. }),
+                "{err:?}"
+            );
+            assert!(started.elapsed() < Duration::from_secs(5));
+            assert_eq!(hung.abandoned.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+
+        /// A cancel while the executor runs tells it the command was
+        /// abandoned too.
+        #[tokio::test]
+        async fn a_cancel_during_an_external_command_abandons_it() {
+            let hung = Hung::default();
+            let dir = tempfile::tempdir().expect("tempdir");
+            let context = ctx(dir.path().to_path_buf());
+            context.cancel.cancel();
+            let err = run_external_bounded(
+                &["true".to_string()],
+                &context,
+                &hung,
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+                1024,
+            )
+            .await
+            .expect_err("cancelled");
+            assert!(matches!(err, ToolError::Cancelled { .. }), "{err:?}");
+            assert_eq!(hung.abandoned.load(std::sync::atomic::Ordering::SeqCst), 1);
         }
 
         /// Forbidden and prompt-without-hook gating still run for a routed

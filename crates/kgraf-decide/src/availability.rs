@@ -158,13 +158,6 @@ impl<T> Decided<T> {
         }
     }
 
-    /// Consume and return the value.
-    pub fn into_value(self) -> T {
-        match self {
-            Decided::ByModel { value, .. } | Decided::ByFallback { value, .. } => value,
-        }
-    }
-
     /// Whether a model actually judged this.
     pub fn is_judged(&self) -> bool {
         matches!(self, Decided::ByModel { .. })

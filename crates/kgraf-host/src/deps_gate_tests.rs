@@ -265,6 +265,34 @@ async fn a_grant_covers_its_own_run_only_until_it_finishes() {
     assert!(again.dependency_question().is_some());
 }
 
+/// A refusal stored after the run's start gate stops a worker's fetch even
+/// when that worker's refetcher is made later: the consent it compares against
+/// is the one the start gate read, not the file as it is when the first worker
+/// asks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refusal_stored_after_the_start_gate_stops_a_later_workers_fetch() {
+    let (_dir, mut config) = project();
+    config.dependency_fetch = RunFetch::Allow;
+    let root = config.root.clone();
+    let fake = Fake::missing(&root);
+    *fake.ready.lock().unwrap() = true;
+    let host = host_with(config, &fake);
+    let run = RunId::new("d10");
+    host.ensure_dependencies(&run, &mut |_| {}).expect("gate");
+    host.set_dependency_consent(Registry::CratesIo, Consent::Refused)
+        .expect("store");
+    // The first worker environment of the run is built only now.
+    let refetch = host.dependency_refetch(&run);
+    *fake.ready.lock().unwrap() = false;
+    let out = refetch.refetch(&root).await;
+    assert!(
+        matches!(out, kgraf_tools::RefetchOutcome::NotAllowed { .. }),
+        "{out:?}"
+    );
+    assert!(!fake.fetched());
+    host.finish_run(&run);
+}
+
 /// `Host::finish_run` stops the run's refetcher: a worker's fetch still
 /// running is killed, and no later request of that run fetches.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

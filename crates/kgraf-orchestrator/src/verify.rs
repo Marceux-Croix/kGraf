@@ -24,6 +24,7 @@ use crate::run_state::{OpenContract, VerifiedCommit};
 use kgraf_core::{AgentId, Money};
 use kgraf_runtime::{WorkerOutcome, WorkerResult};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 /// A verifier's decision on one attempt.
@@ -112,6 +113,12 @@ pub struct Attempt {
     pub result: Option<WorkerResult>,
     pub verdict: Option<Verdict>,
     pub spend: Money,
+    /// False when the ledger could not price the attempt: `spend` is then a
+    /// bound, not a measured figure.
+    pub spend_known: bool,
+    /// The verifier could not run for this attempt: its verdict is the
+    /// environment's, not a judgment of the work.
+    pub infrastructure: bool,
 }
 
 impl Attempt {
@@ -124,20 +131,25 @@ impl Attempt {
             result: None,
             verdict: None,
             spend: Money::ZERO,
+            spend_known: true,
+            infrastructure: false,
         }
     }
 }
 
-/// The winner among finished attempts: a passing verdict, then the lowest spend,
-/// then the earliest attempt. `None` when no attempt passed.
-pub fn select(attempts: &[Attempt]) -> Option<usize> {
+/// The winner among finished attempts: a passing verdict, then an attempt
+/// already merged into the integration branch (choosing another would merge a
+/// second time), then a known spend over an unknown one (an unpriced attempt's
+/// zero is not a measured cost), then the lowest spend, then the earliest
+/// attempt. `None` when no attempt passed.
+pub fn select(attempts: &[Attempt], premerged: &BTreeSet<AgentId>) -> Option<usize> {
     attempts
         .iter()
         .enumerate()
         .filter(|(_, a)| {
             a.status == AttemptStatus::Success && a.verdict.as_ref().is_some_and(Verdict::passed)
         })
-        .min_by_key(|(i, a)| (a.spend, *i))
+        .min_by_key(|(i, a)| (!premerged.contains(&a.worker), !a.spend_known, a.spend, *i))
         .map(|(i, _)| i)
 }
 
@@ -148,18 +160,9 @@ mod tests {
 
     fn result(outcome: WorkerOutcome, steps: u32, calls: usize) -> WorkerResult {
         WorkerResult {
-            task: "t".into(),
-            worker: "w".into(),
-            outcome,
-            answer: String::new(),
-            changed_paths: vec![],
-            commit: None,
             calls: (0..calls).map(|i| CallId::new(format!("c{i}"))).collect(),
             steps,
-            prefix_digest: String::new(),
-            denied: 0,
-            trace_failures: Vec::new(),
-            rationale: None,
+            ..WorkerResult::bare("t", "w", outcome)
         }
     }
 
@@ -207,9 +210,38 @@ mod tests {
                 }
             });
         }
-        assert_eq!(select(&[a.clone(), b.clone(), c.clone()]), Some(2));
+        assert_eq!(
+            select(&[a.clone(), b.clone(), c.clone()], &BTreeSet::new()),
+            Some(2)
+        );
         c.status = AttemptStatus::Stopped;
-        assert_eq!(select(&[a, b, c]), Some(0));
-        assert_eq!(select(&[]), None);
+        assert_eq!(select(&[a, b, c], &BTreeSet::new()), Some(0));
+        assert_eq!(select(&[], &BTreeSet::new()), None);
+    }
+
+    fn passing(worker: &str, spend: i64, known: bool) -> Attempt {
+        let mut a = Attempt::scattering(worker.into(), "r".into(), PathBuf::from("/w"));
+        a.status = AttemptStatus::Success;
+        a.spend = Money(spend);
+        a.spend_known = known;
+        a.verdict = Some(Verdict::Pass {
+            by: "tests".into(),
+            commit: None,
+            notices: Vec::new(),
+        });
+        a
+    }
+
+    #[test]
+    fn an_unknown_spend_never_beats_a_known_one() {
+        let attempts = [passing("w1", 0, false), passing("w2", 500, true)];
+        assert_eq!(select(&attempts, &BTreeSet::new()), Some(1));
+    }
+
+    #[test]
+    fn a_premerged_attempt_wins_over_a_cheaper_one() {
+        let attempts = [passing("w1", 900, true), passing("w2", 100, true)];
+        let premerged: BTreeSet<AgentId> = ["w1".into()].into();
+        assert_eq!(select(&attempts, &premerged), Some(0));
     }
 }

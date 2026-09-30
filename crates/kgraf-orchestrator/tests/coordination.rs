@@ -703,19 +703,24 @@ async fn a_report_reaches_dependents_as_data_and_readers_by_subscription_and_is_
     // alpha) is verified, and is still running when a is: 600 ms rounds on beta
     // against 400 ms on alpha.
     p.beta = WorkerFake::new("beta", p.stats.clone(), Duration::from_millis(600));
-    let watermark = {
+    let (watermark, extractor_changed) = {
         let g = p.graph.lock().expect("lock");
-        // An indexed Markdown file under a stale extractor stamp. The
-        // bus's named-path pass finds it and the run's trace says so.
+        // An indexed Markdown file under a stale extractor stamp. The full
+        // index pass that opens a run (the host's) owns the stamps: its
+        // report is handed to the orchestrator and the run's trace says so.
         std::fs::write(dir.path().join("NOTES.md"), "# Notes\n").expect("notes");
-        kgraf_graph::Indexer::new(&g)
-            .index_paths(&["NOTES.md".to_owned()])
-            .expect("index");
+        kgraf_graph::Indexer::new(&g).index().expect("index");
         g.set_meta("extractor_stamp/markdown", "an older extractor")
             .expect("stamp");
-        EventTail::from_now(&g).expect("tail")
+        let report = kgraf_graph::Indexer::new(&g).index().expect("full index");
+        (
+            EventTail::from_now(&g).expect("tail"),
+            report.extractor_changed,
+        )
     };
-    let o = Orchestrator::new(config(), p.services(WINDOW)).expect("orchestrator");
+    let o = Orchestrator::new(config(), p.services(WINDOW))
+        .expect("orchestrator")
+        .with_index_extractor_changes(extractor_changed);
     let report = o
         .start(RunId::new("r1"), "make a, b after it, and c".into())
         .await
@@ -813,7 +818,7 @@ async fn a_report_reaches_dependents_as_data_and_readers_by_subscription_and_is_
             TraceEvent::ExtractorChanged { changes, .. }
                 if changes.iter().any(|c| c.language == "markdown" && c.files == 1 && c.had_stamp)
         )),
-        "the bus's extractor report reached the trace"
+        "the full index's extractor report reached the trace"
     );
 }
 
@@ -924,7 +929,7 @@ async fn the_status_line_tells_a_lease_wait_from_a_dependency_block_from_the_cap
     assert!(record_of(&p).coordination.waits.is_empty());
 }
 
-/// Item 3, coordination-hardening set: a producer's rationale, once its
+/// A producer's rationale, once its
 /// contract verifies, reaches a dependent's brief as quoted data, after the
 /// shared prefix (the private remainder `start_attempt` assembles carries it,
 /// same as `interface_brief` and the mailbox's escaped messages) -- never as

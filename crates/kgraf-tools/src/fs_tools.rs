@@ -401,7 +401,10 @@ fn search_dir(dir: &cap_std::fs::Dir, label: &Path, walk: &mut Walk) {
             continue;
         };
         if file_type.is_dir() {
-            if name == ".git" {
+            // Every spelling of `.git` and kGraf's state directory, not only
+            // the ASCII `.git`: files inside are read relative to the child
+            // directory, so the read guard never sees this component.
+            if kgraf_core::paths::is_unreadable_name(&name.to_string_lossy()) {
                 continue;
             }
             // `open_dir` re-resolves `name` from `dir` with the same confined,
@@ -599,6 +602,30 @@ mod tests {
         let rendered = out.render();
         assert!(rendered.contains("one.txt:2: needle here"));
         assert!(rendered.contains("two.txt:1: another needle"));
+    }
+
+    /// Files inside `.git` or kGraf's state directory are read relative to
+    /// that directory, so the read guard never sees the parent name; the walk
+    /// itself must not enter them, whatever their spelling.
+    #[tokio::test]
+    async fn search_files_never_enters_git_or_kgraf_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for sub in [".git", ".kgraf", "nested/.haustoria"] {
+            std::fs::create_dir_all(dir.path().join(sub)).expect("seed");
+            std::fs::write(dir.path().join(sub).join("x.txt"), "needle hidden").expect("seed");
+        }
+        std::fs::write(dir.path().join("ok.txt"), "needle shown").expect("seed");
+        let out = SearchFilesTool::default()
+            .call(
+                json!({"query": "needle"}),
+                &ctx(dir.path().to_path_buf()),
+                &permit(),
+            )
+            .await
+            .expect("call");
+        let rendered = out.render();
+        assert!(rendered.contains("ok.txt:1: needle shown"), "{rendered}");
+        assert!(!rendered.contains("hidden"), "{rendered}");
     }
 
     #[tokio::test]

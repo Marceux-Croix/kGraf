@@ -33,11 +33,13 @@ fn request() -> Request {
                     id: "call_a".into(),
                     name: "read".into(),
                     input: json!({"path": "a.rs"}),
+                    signature: None,
                 },
                 Content::ToolUse {
                     id: "call_b".into(),
                     name: "read".into(),
                     input: json!({"path": "b.rs"}),
+                    signature: None,
                 },
             ],
         },

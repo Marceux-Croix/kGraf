@@ -159,6 +159,9 @@ struct Walked {
     excluded: Vec<String>,
     /// Paths the walk could not judge, which must stay in the index.
     kept: Vec<String>,
+    /// Directories the walk could not read, relative to the root. Everything
+    /// indexed under one stays: an unreadable directory is not an empty one.
+    unreadable_dirs: Vec<String>,
     /// Files over the size ceiling.
     too_large: u64,
     /// Files whose metadata could not be read.
@@ -451,17 +454,31 @@ impl<'store> Indexer<'store> {
         let root = self.store.root().to_path_buf();
 
         let mut seen_paths: Vec<String> = Vec::new();
-        let walked = self.walk(&root);
+        let mut walked = self.walk(&root);
         report.nested_repositories_skipped = walked.nested;
         report.excluded_dirs_skipped = walked.excluded;
         report.skipped_too_large += walked.too_large;
         // A path the walk could not judge (metadata error, symbolic link) stays
         // in the index as it was: not seeing a file is not the file leaving.
         seen_paths.extend(walked.kept.iter().cloned());
+        let unreadable_dirs = std::mem::take(&mut walked.unreadable_dirs);
         report.metadata_errors = walked.metadata_errors;
         report.symlinks_kept = walked.symlinks;
+        // One unreadable file or directory must not skip removal, call resolution
+        // and layout for the rest of the tree. The pass finishes and then reports
+        // the first walk error (fail loud). An unreadable file stays in the index.
+        let mut first_walk_error: Option<GraphError> = None;
         for entry in walked.files {
-            let (rel_path, bytes, mtime_ns) = entry?;
+            let (rel_path, bytes, mtime_ns) = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    if let GraphError::Io { path, .. } = &error {
+                        seen_paths.push(path.clone());
+                    }
+                    first_walk_error.get_or_insert(error);
+                    continue;
+                }
+            };
             // Only the bus's own files are left to it; a file the user put in
             // the same directory is indexed like any other.
             if self.bus_owned(&rel_path) && bytes.starts_with(BUS_FILE_TITLE.as_bytes()) {
@@ -477,6 +494,15 @@ impl<'store> Indexer<'store> {
         seen_paths.sort();
         for indexed in self.store.file_paths()? {
             if seen_paths.binary_search(&indexed).is_err() {
+                let under_unreadable = unreadable_dirs.iter().any(|dir| {
+                    dir.is_empty()
+                        || indexed
+                            .strip_prefix(dir.as_str())
+                            .is_some_and(|rest| rest.starts_with('/'))
+                });
+                if under_unreadable {
+                    continue;
+                }
                 if self.bus_owned(&indexed) && self.is_bus_file(&indexed)? {
                     // Either in the tree and left to the bus (counted above),
                     // or absent from it: kept, and counted here.
@@ -508,6 +534,9 @@ impl<'store> Indexer<'store> {
         report.edges = self.store.edge_count()?;
         report.lines = self.store.line_total()?;
         report.change_log_rows = (self.store.change_watermark()? - watermark_before).max(0) as u64;
+        if let Some(error) = first_walk_error {
+            return Err(error);
+        }
         Ok(report)
     }
 
@@ -535,9 +564,9 @@ impl<'store> Indexer<'store> {
     fn index_paths_pass(&self, paths: &[String]) -> Result<IndexReport> {
         let watermark_before = self.store.change_watermark()?;
         let mut report = IndexReport::default();
-        // The named files are re-derived now; the other files of a language whose
-        // extractor changed keep a cleared hash until the next walk re-derives them.
-        self.apply_extractor_stamps(&mut report)?;
+        // Extractor stamps are applied by the full walk only: clearing hashes here
+        // would blank every file of the language while only the named files are
+        // re-derived, leaving the rest stale until the next walk.
         let root = self
             .source_root
             .clone()
@@ -724,11 +753,17 @@ impl<'store> Indexer<'store> {
                     // A directory that cannot be walked is reported, not
                     // silently treated as empty (fail loud): a missing directory
                     // reading as "nothing yet" is one of the founding failures.
+                    // The path is stored relative, like every indexed path, and
+                    // the directory's indexed files are kept.
+                    let path = error
+                        .path()
+                        .map(&relative)
+                        .unwrap_or_else(|| "<unknown>".to_owned());
+                    if error.path().is_some() {
+                        walked.unreadable_dirs.push(path.clone());
+                    }
                     walked.files.push(Err(GraphError::Io {
-                        path: error
-                            .path()
-                            .map(|p| p.display().to_string())
-                            .unwrap_or_else(|| "<unknown>".to_owned()),
+                        path,
                         source: error
                             .into_io_error()
                             .unwrap_or_else(|| std::io::Error::other("directory walk failed")),
@@ -1191,12 +1226,87 @@ mod tests {
             "1 rust file(s) re-derived: no extractor stamp was recorded for them"
         );
 
-        // A named-path pass reports it too.
+        // A named-path pass leaves stamps and hashes alone: it would re-derive
+        // only the named files and leave the rest of the language blanked.
         store.set_meta(&key, "an older extractor").expect("meta");
         let named = indexer
             .index_paths(&["tool/run.py".to_owned()])
             .expect("paths");
-        assert_eq!(named.extractor_changed[0].language, "rust");
+        assert!(named.extractor_changed.is_empty());
+        assert_eq!(
+            store.meta(&key).expect("meta").as_deref(),
+            Some("an older extractor")
+        );
+        let hash = store
+            .file("src/lib.rs")
+            .expect("file")
+            .expect("row")
+            .content_hash;
+        assert!(!hash.is_empty(), "a named pass blanked an unnamed file");
+        // The next walk owns the stamp.
+        let walked = indexer.index().expect("walk");
+        assert_eq!(walked.extractor_changed[0].language, "rust");
+    }
+
+    /// One unreadable file does not stop removal, call resolution or layout for
+    /// the rest of the tree; the pass still reports the error afterwards.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_file_does_not_skip_the_rest_of_the_pass() {
+        use std::os::unix::fs::PermissionsExt;
+        let tree = Tree::new();
+        tree.write("src/gone.rs", "fn gone() {}\n");
+        tree.write("src/locked.rs", "fn locked() {}\n");
+        let store = tree.store();
+        Indexer::new(&store).index().expect("first");
+        fs::remove_file(tree.path().join("src/gone.rs")).expect("rm");
+        tree.write("src/caller.rs", "fn caller() { callee(); }\n");
+        tree.write("src/callee.rs", "pub fn callee() {}\n");
+        let locked = tree.path().join("src/locked.rs");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).expect("chmod");
+        if fs::read(&locked).is_ok() {
+            // Running with rights that ignore modes: nothing to prove here.
+            return;
+        }
+        let result = Indexer::new(&store).index();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o644)).expect("chmod back");
+        assert!(matches!(result, Err(GraphError::Io { .. })), "{result:?}");
+        assert!(
+            store.file("src/gone.rs").expect("file").is_none(),
+            "removal was skipped"
+        );
+        assert!(
+            store.file("src/locked.rs").expect("file").is_some(),
+            "an unreadable file left the index"
+        );
+        let caller = store.resolve_symbol("caller").expect("resolve")[0].clone();
+        let neighbors = store.neighbors(&caller.id).expect("neighbors");
+        assert!(
+            neighbors
+                .iter()
+                .any(|(n, k, _, out)| n.name == "callee" && *k == EdgeKind::Calls && *out),
+            "call resolution was skipped"
+        );
+    }
+
+    /// An index made before the source-root table existed, opened read-only,
+    /// still serves `source_of`.
+    #[test]
+    fn source_of_works_on_an_index_without_the_source_root_table() {
+        let tree = Tree::new();
+        tree.write("src/m.rs", "pub fn m() {\n    1\n}\n");
+        let db = tree.path().join("graph.db");
+        let store = GraphStore::open(&db, tree.path()).expect("open");
+        Indexer::new(&store).index().expect("index");
+        store
+            .conn()
+            .execute_batch("DROP TABLE file_source_roots;")
+            .expect("drop");
+        drop(store);
+        let reader = GraphStore::open_read_only(&db, tree.path()).expect("read-only");
+        let node = reader.resolve_symbol("m").expect("resolve")[0].clone();
+        assert!(reader.source_of(&node).expect("source").contains("1"));
+        assert_eq!(reader.file_source_root("src/m.rs").expect("root"), None);
     }
 
     #[test]

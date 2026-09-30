@@ -49,6 +49,8 @@ pub struct RunNowArgs {
     pub id: String,
     pub routes: Vec<String>,
     pub planner: Option<String>,
+    /// `--model-route kind=route:model` (decision 0089).
+    pub model_routes: Vec<String>,
     pub prices: PathBuf,
     pub max_items: usize,
     pub max_agents: usize,
@@ -64,6 +66,9 @@ pub struct RunNowArgs {
     pub shell_timeout: Option<std::time::Duration>,
     /// `--fetch-deps` / `--no-fetch-deps` (decision 0087).
     pub fetch_deps: kgraf_host::deps::RunFetch,
+    /// `--keep-worktrees` (decision 0088), this command's only source for it:
+    /// `run-now` does not read `.kgraf/run.json`.
+    pub worktrees: kgraf_host::WorktreeRetention,
 }
 
 /// Opens the graph and moves any schedule still in the old graph-meta layout onto
@@ -199,6 +204,11 @@ pub fn enable(root: &Path, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// The price table `schedule list --prices` reads, if one was given.
+fn list_price_table(prices: Option<&Path>) -> Result<Option<PriceTable>> {
+    prices.map(crate::load_price_table).transpose()
+}
+
 pub fn list(root: &Path, prices: Option<&Path>) -> Result<()> {
     let graph = open(root)?;
     let schedules = node_store::load_all(&graph).context("cannot read the schedules")?;
@@ -212,13 +222,7 @@ pub fn list(root: &Path, prices: Option<&Path>) -> Result<()> {
     // only their outcomes" - a schedule that never fails is still worth knowing ran
     // (and cost something), not just silently absent from a failures-only view.
     let ledger = crate::open_ledger(root).ok();
-    let price_table = prices
-        .map(|path| -> Result<PriceTable> {
-            let text = std::fs::read_to_string(path)
-                .with_context(|| format!("cannot read {}", path.display()))?;
-            serde_json::from_str(&text).context("the price table is not valid JSON")
-        })
-        .transpose()?;
+    let price_table = list_price_table(prices)?;
     for entry in &schedules {
         let def = &entry.definition;
         let kind = def.when();
@@ -397,7 +401,11 @@ pub fn run_now(root: &Path, args: RunNowArgs) -> Result<()> {
 /// How long a manual run's lock lasts without a renewal, and how often the
 /// holder renews it. A holder that died stops blocking the loop within the lease.
 const MANUAL_LEASE: std::time::Duration = std::time::Duration::from_secs(120);
-const MANUAL_RENEW: std::time::Duration = std::time::Duration::from_secs(30);
+const MANUAL_RENEW: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_millis(50)
+} else {
+    std::time::Duration::from_secs(30)
+};
 
 /// The manual lock on a schedule, renewed by a thread until it is dropped.
 struct ManualRunLock {
@@ -406,6 +414,9 @@ struct ManualRunLock {
     holder: String,
     stop: Option<std::sync::mpsc::Sender<()>>,
     heartbeat: Option<std::thread::JoinHandle<()>>,
+    /// Set by the heartbeat when a renewal finds the lock no longer ours. From
+    /// then on the scheduler may claim the same schedule while the run goes on.
+    lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ManualRunLock {
@@ -429,15 +440,32 @@ impl ManualRunLock {
         let (stop, wait) = std::sync::mpsc::channel::<()>();
         let (beat_path, beat_id, beat_holder) =
             (path.clone(), schedule_id.to_owned(), holder.to_owned());
+        let lost = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let beat_lost = std::sync::Arc::clone(&lost);
         let heartbeat = std::thread::spawn(move || {
-            // Its own connection: a connection is not shared across threads.
-            let Ok(claims) = ScheduleStore::open(&beat_path) else {
-                return;
-            };
+            // Its own connection: a connection is not shared across threads. An
+            // open that fails is reported and retried on the next beat: a lock
+            // that is never renewed lapses, and the run must say so.
+            let mut claims = None;
             // Ends when the sender is dropped or sends.
             while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
                 wait.recv_timeout(MANUAL_RENEW)
             {
+                if claims.is_none() {
+                    match ScheduleStore::open(&beat_path) {
+                        Ok(opened) => claims = Some(opened),
+                        Err(e) => {
+                            eprintln!(
+                                "warning: could not open the claim table to renew the run lock \
+                                 on `{beat_id}`: {e}"
+                            );
+                            continue;
+                        }
+                    }
+                }
+                let Some(claims) = claims.as_ref() else {
+                    continue;
+                };
                 match claims.renew_manual_run(
                     &beat_id,
                     &beat_holder,
@@ -446,7 +474,11 @@ impl ManualRunLock {
                 ) {
                     Ok(true) => {}
                     Ok(false) => {
-                        eprintln!("warning: the run lock on `{beat_id}` was lost");
+                        beat_lost.store(true, std::sync::atomic::Ordering::SeqCst);
+                        eprintln!(
+                            "warning: the run lock on `{beat_id}` was lost; the run's result \
+                             will be reported as a failure"
+                        );
                         return;
                     }
                     Err(e) => {
@@ -461,7 +493,13 @@ impl ManualRunLock {
             holder: holder.to_owned(),
             stop: Some(stop),
             heartbeat: Some(heartbeat),
+            lost,
         })
+    }
+
+    /// Whether the lock was lost while it was held.
+    fn was_lost(&self) -> bool {
+        self.lost.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -543,7 +581,7 @@ fn run_now_with(
 
     // The schedule's lock, held until this function returns: a disabled schedule
     // is refused here, and so is one that is already running.
-    let _lock = ManualRunLock::take(root, &args.id, &format!("run-now:{run_id}"), args.force)?;
+    let lock = ManualRunLock::take(root, &args.id, &format!("run-now:{run_id}"), args.force)?;
 
     // `run-now` never claims an occurrence
     // (this file's own module doc explains why), so without this its spend would be
@@ -585,6 +623,7 @@ fn run_now_with(
         OrchestrateArgs {
             routes: args.routes,
             planner: args.planner,
+            model_routes: args.model_routes,
             instruction: Some(tmp.path().to_path_buf()),
             resume: None,
             run: Some(run_id.clone()),
@@ -602,6 +641,7 @@ fn run_now_with(
             // Contract checks as a run has them by default: off.
             contract_checks: kgraf_host::config::defaults::contract_checks(),
             interface_review: kgraf_host::config::defaults::interface_review(),
+            worktrees: args.worktrees,
             // Sessions as a run has them by default: on (decision 0067).
             sessions: kgraf_host::config::defaults::sessions(),
             check_timeout: kgraf_host::config::defaults::check_timeout(),
@@ -643,6 +683,24 @@ fn run_now_with(
         }
     };
     let spend = spend.as_ref();
+    // A lock lost mid-run means the scheduler may have started the same schedule
+    // beside this run, and nothing here can stop the run already going. It is
+    // reported as a failure, whatever the run itself returned, and the run's own
+    // outcome is kept in the message.
+    let result = if lock.was_lost() {
+        let own = match &result {
+            Ok(()) => "the run itself completed".to_owned(),
+            Err(e) => format!("the run itself failed: {e:#}"),
+        };
+        Err(anyhow::anyhow!(
+            "the run lock on schedule `{}` was lost while run {run_id} was going, so the \
+             scheduler may have started the same schedule too ({own}); check the schedule's \
+             history before trusting either run",
+            args.id
+        ))
+    } else {
+        result
+    };
     match &result {
         Ok(()) => record(EventKind::Completed, "manual run-now", spend),
         Err(e) => record(EventKind::Failed, &format!("{e:#}"), spend),
@@ -655,10 +713,12 @@ fn run_now_with(
 /// spend is not known) and the text its label shows.
 fn run_spend(root: &Path, run_id: &str, prices: &Path) -> Result<kgraf_graph::RunSpend> {
     let ledger = crate::open_ledger(root)?;
-    let text = std::fs::read_to_string(prices)
-        .with_context(|| format!("cannot read {}", prices.display()))?;
-    let table: PriceTable =
-        serde_json::from_str(&text).context("the price table is not valid JSON")?;
+    run_spend_in(&ledger, run_id, prices)
+}
+
+/// [`run_spend`] over an open ledger.
+fn run_spend_in(ledger: &Ledger, run_id: &str, prices: &Path) -> Result<kgraf_graph::RunSpend> {
+    let table = crate::load_price_table(prices)?;
     let calls = ledger
         .calls_under_task(run_id, None)
         .context("cannot read the ledger")?;
@@ -670,7 +730,7 @@ fn run_spend(root: &Path, run_id: &str, prices: &Path) -> Result<kgraf_graph::Ru
         micros: spend.total.micros(),
         calls: calls.len() as i64,
         unpriced: spend.unknown.len() as i64,
-        text: spend_of_runs(&ledger, &[run_id.to_owned()], Some(&table))?,
+        text: spend_of_runs(ledger, &[run_id.to_owned()], Some(&table))?,
     })
 }
 
@@ -679,6 +739,28 @@ mod tests {
     use super::*;
     use kgraf_core::{Protocol, TokenUsage};
     use kgraf_schedule::ClaimOutcome;
+
+    #[test]
+    fn run_spend_never_prices_an_azure_deployment_by_a_bare_model_entry() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (ledger, path) = crate::tests::azure_call_with_bare_price_file(dir.path());
+        let spend = run_spend_in(&ledger, "run-1", &path).expect("spend");
+        assert_eq!(spend.micros, 0);
+        assert_eq!(spend.calls, 1);
+        assert_eq!(spend.unpriced, 1);
+    }
+
+    #[test]
+    fn schedule_list_never_prices_an_azure_deployment_by_a_bare_model_entry() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (ledger, path) = crate::tests::azure_call_with_bare_price_file(dir.path());
+        let table = list_price_table(Some(&path))
+            .expect("table")
+            .expect("given");
+        let report = spend_of_runs(&ledger, &["run-1".to_owned()], Some(&table)).expect("spend");
+        assert!(report.contains("1 unreconciled/unpriced"), "got {report}");
+        assert!(!report.starts_with("$1.000000"), "got {report}");
+    }
     use std::time::Duration;
 
     #[test]
@@ -1013,6 +1095,7 @@ mod tests {
             id: id.to_owned(),
             routes: vec!["ollama:llama3".to_owned()],
             planner: None,
+            model_routes: Vec::new(),
             prices: PathBuf::from("no-such-prices.json"),
             max_items: 1,
             max_agents: 1,
@@ -1023,6 +1106,7 @@ mod tests {
             force,
             shell_timeout: None,
             fetch_deps: kgraf_host::deps::RunFetch::Stored,
+            worktrees: kgraf_host::WorktreeRetention::default(),
         }
     }
 
@@ -1164,6 +1248,32 @@ mod tests {
 
         // Released: another run-now works, and the held occurrence is claimable.
         run_now_with(root, run_now_args("nightly", false), |_, _| Ok(())).expect("again");
+    }
+
+    /// A lock that is lost mid-run fails the run-now, even when the run itself
+    /// completed: the scheduler may have started the same schedule beside it.
+    #[test]
+    fn a_lost_run_lock_fails_the_run_now() {
+        let dir = tempfile::tempdir().expect("dir");
+        let root = dir.path();
+        scheduled(root);
+        let error = run_now_with(root, run_now_args("nightly", false), |_, args| {
+            let holder = format!("run-now:{}", args.run.as_deref().expect("run id"));
+            open_claims(root)
+                .expect("claims")
+                .release_manual_run("nightly", &holder)
+                .expect("take the lock away");
+            // Longer than a few renewals.
+            std::thread::sleep(Duration::from_millis(600));
+            Ok(())
+        })
+        .expect_err("a lost lock fails the run");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("lock") && text.contains("lost") && text.contains("completed"),
+            "{text}"
+        );
+        assert_eq!(events(root).last().map(String::as_str), Some("failed"));
     }
 
     #[test]

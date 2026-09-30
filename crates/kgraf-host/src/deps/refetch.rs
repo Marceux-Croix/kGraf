@@ -34,7 +34,8 @@ struct Inner {
     /// The stored consent when the run started (see [`decide_mid_run`]). A
     /// file that did not read counts as unset, so any refusal stored later
     /// wins.
-    stored_at_start: Consent,
+    /// Replaced when the run passes its start gate again ([`HostRefetch::set_consent_at_start`]).
+    stored_at_start: Mutex<Consent>,
     checkout: PathBuf,
     /// Set by [`HostRefetch::stop`] at the end of the run: kills a fetch in
     /// flight and refuses new ones.
@@ -58,12 +59,25 @@ impl HostRefetch {
         checkout: PathBuf,
     ) -> Self {
         let stored_at_start = store.get(tool.registry()).unwrap_or_default();
+        Self::with_consent_at_start(tool, store, run, checkout, stored_at_start)
+    }
+
+    /// As [`HostRefetch::new`], with the consent the run's start gate read
+    /// (not the file as it is now): a refusal stored after the run started
+    /// then still stops a worker's fetch.
+    pub fn with_consent_at_start(
+        tool: Arc<dyn DependencyTool>,
+        store: ConsentStore,
+        run: RunFetch,
+        checkout: PathBuf,
+        stored_at_start: Consent,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 tool,
                 store,
                 run,
-                stored_at_start,
+                stored_at_start: Mutex::new(stored_at_start),
                 checkout,
                 stop: Stop::default(),
                 counts: Mutex::new(Counts::default()),
@@ -71,7 +85,19 @@ impl HostRefetch {
         }
     }
 
+    /// The run passed its start gate again and read `consent`: it replaces
+    /// the consent this refetcher took at the first gate, and the bounds and
+    /// the stop of the run stay as they are.
+    pub fn set_consent_at_start(&self, consent: Consent) {
+        *self
+            .inner
+            .stored_at_start
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = consent;
+    }
+
     /// The blocking part of [`DependencyRefetch::refetch`].
+    #[cfg(test)]
     pub fn refetch_blocking(&self, worktree: &Path) -> RefetchOutcome {
         self.inner.refetch(worktree, &self.inner.stop.child())
     }
@@ -136,7 +162,11 @@ impl Inner {
                 "{why}. A new dependency cannot be added in this run; say so in your result."
             ),
         };
-        match decide_mid_run(stored, self.stored_at_start, self.run) {
+        let at_start = *self
+            .stored_at_start
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        match decide_mid_run(stored, at_start, self.run) {
             Decision::Fetch => {}
             Decision::AskFirst => {
                 return refused(format!(

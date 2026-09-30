@@ -127,7 +127,9 @@ fn event_turn(event: WorkerEvent, turns: &mut Vec<Turn>) {
         // secret split across two of them, on screen and in search. Deltas
         // were scrubbed one at a time, so a split secret is whole only in
         // the joined turn; this record was scrubbed as one string.
-        WorkerEvent::AssistantMessage { text, reasoning } => {
+        WorkerEvent::AssistantMessage {
+            text, reasoning, ..
+        } => {
             let start = turns
                 .iter()
                 .rposition(Turn::ends_a_round)
@@ -150,8 +152,7 @@ fn event_turn(event: WorkerEvent, turns: &mut Vec<Turn>) {
         WorkerEvent::ToolCallStarted {
             call_id,
             tool,
-            input,
-        } => turns.push(Turn::ToolCall {
+            input, .. } => turns.push(Turn::ToolCall {
             call_id,
             tool,
             input: serde_json::to_string_pretty(&input).unwrap_or_else(|_| input.to_string()),
@@ -187,6 +188,7 @@ fn event_turn(event: WorkerEvent, turns: &mut Vec<Turn>) {
         WorkerEvent::Context {
             prefix_digest,
             slices,
+            ..
         } => turns.push(Turn::Event(format!(
             "context: prefix {prefix_digest}, {} slice(s): {}",
             slices.len(),

@@ -43,8 +43,8 @@ pub fn now_ms() -> i64 {
 pub enum DiagEvent {
     /// The app or CLI started. `feature` merges in the launch's feature use
     /// (`kgraf-cli`'s subcommand) when the caller has one at launch time, so
-    /// a CLI invocation writes one line instead of two (review, LOW: "merge
-    /// each CLI launch and its feature record into one line"). `#[serde(default)]`
+    /// a CLI invocation writes one line instead of two, not one line for the
+    /// launch and another for its feature record. `#[serde(default)]`
     /// so an older file's bare `{"kind":"launch"}` line (written before this
     /// field existed) still parses, as `None`.
     Launch {
@@ -111,12 +111,6 @@ impl DiagEvent {
     pub fn launch_with_feature(feature: impl Into<String>) -> Self {
         Self::Launch {
             feature: Some(feature.into()),
-        }
-    }
-
-    pub fn feature_used(feature: impl Into<String>) -> Self {
-        Self::FeatureUsed {
-            feature: feature.into(),
         }
     }
 

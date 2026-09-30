@@ -17,6 +17,8 @@ kgraf-core = { path = "../kgraf-core" }
 kgraf-diag = { path = "../kgraf-diag" }
 kgraf-secrets = { path = "../kgraf-secrets" }
 kgraf-provider = { path = "../kgraf-provider" }
+# `decide` (decision 0089): the typed-decision question and answer types.
+kgraf-decide = { path = "../kgraf-decide" }
 # The shell tool runs through the isolation runner rather than a bare
 # `std::process::Command` (fail loud: never unconfined).
 kgraf-sandbox = { path = "../kgraf-sandbox" }
@@ -55,6 +57,8 @@ libc = "0.2.185"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+# Every built-in schema is converted for Vertex in `tests/vertex_schemas.rs`.
+kgraf-provider-google = { path = "../kgraf-provider-google" }
 trybuild = "1"
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 

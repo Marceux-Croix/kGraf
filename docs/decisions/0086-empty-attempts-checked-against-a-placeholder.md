@@ -27,7 +27,9 @@ unchanged content is, not whether it changed.
    whitespace are stripped, is exactly one call to `todo!` or `unimplemented!`, with nothing
    after it. `unreachable!` is not a marker: it states an invariant, and a mock of methods
    the code under test never calls is legitimately made of it. A signature is read to its
-   body, so a `;` inside an array type does not end it. Only Rust source files are
+   body, so a `;` inside an array type does not end it. The marker call counts in every
+   delimiter and path form (`todo![]`, `todo!{}`, `std::todo!()`), and comments and string or
+   character literals are masked before the scan, so a brace inside one changes nothing. Only Rust source files are
    recognized today. A file with no function bodies, or with even
    one real one, is never flagged, so a legitimately unchanged file is never mistaken for an
    abandoned placeholder.

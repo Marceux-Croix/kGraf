@@ -112,6 +112,9 @@ read; `kgraf plan --from-roadmap` with no roadmap found is an error.
 
 ## Providers, spend and the ledger
 
+[MODEL-SUPPORT.md](MODEL-SUPPORT.md) lists which routes and model kinds have run against the live
+service and which are built but untested. Read it before you choose a route.
+
 Set a route's key **in your own shell**; it is never read from a file:
 
 ```
@@ -122,18 +125,375 @@ cargo run -p kgraf-cli -- spend --prices prices.json
 cargo run -p kgraf-cli -- unreconciled
 cargo run -p kgraf-cli -- unreconciled resolve <call-id> --input 120 --output 30
 cargo run -p kgraf-cli -- unreconciled resolve <call-id> --no-charge
+cargo run -p kgraf-cli -- unreconciled resolve <call-id> --output 30 --abandoned
 cargo run -p kgraf-cli -- ledger verify
 cargo run -p kgraf-cli -- demand
 ```
 
 Every model call goes through the ledger. `spend` totals it (in dollars with a price
 table; `total unpriced` when no recorded model has a price), `unreconciled` lists calls
-whose spend is not settled, `unreconciled resolve` closes one with the usage the provider's
-own invoice shows (or `--no-charge` when the provider confirms it billed nothing), `ledger
+whose spend is not settled and shows the partial usage recorded for each (a lower bound),
+`unreconciled resolve` closes one with the usage the provider's own invoice shows (or
+`--no-charge` when the provider confirms it billed nothing). A field you leave out keeps the
+partial figure already recorded. A call listed as `in_flight` may still be live, so resolve
+refuses it unless you pass `--abandoned` to state that its process is gone. There is no bulk
+resolve: each call needs its own figure. `ledger
 verify` walks the
 hash chain, and `ledger redact <call-id> --reason ...` removes a payload captured by
 accident while the chain still verifies. `demand` reports induced demand: whether
 runs offered workflow templates started more work than runs without. It claims no saving.
+
+### AWS Bedrock
+
+The `bedrock` route speaks Bedrock's Converse and ConverseStream operations, signed with
+AWS Signature Version 4 (decision 0091). It is listed as `unverified`: it has been tested
+against recorded-shape responses only, never against the service. It takes the standard AWS
+configuration, not a `KGRAF_*_API_KEY` variable. Set it in your own shell. A Bedrock API
+key is the simplest credential; kGraf sends it as a bearer token, unsigned, and it wins over
+access keys when both are set:
+
+```
+export AWS_BEARER_TOKEN_BEDROCK=...   # a Bedrock API key; still needs a region, below
+```
+
+Or use access keys:
+
+```
+export AWS_ACCESS_KEY_ID=...
+export AWS_SECRET_ACCESS_KEY=...
+export AWS_SESSION_TOKEN=...          # only for temporary keys
+export AWS_REGION=us-east-1           # or AWS_DEFAULT_REGION, or `region` in the profile
+```
+
+Or name a profile with static keys in `~/.aws/credentials` (`AWS_PROFILE=work`;
+`AWS_SHARED_CREDENTIALS_FILE` and `AWS_CONFIG_FILE` move the files). The variables win over a
+profile. A profile that uses SSO, role assumption, a credential process or web identity is
+refused, because each needs a network exchange kGraf does not make: export temporary keys
+first, for example with `aws configure export-credentials --profile work --format env`.
+
+Credentials and region are read again on every call. `kgraf providers` shows the route, and
+a missing key or region is reported when the route is checked, before any call. The model id
+you configure is the Bedrock model id or inference profile id (for example one ending in
+`-v1:0`); the adapter refuses a model outside the set you configured before it sends anything.
+
+What to expect:
+- Input excludes cache reads and writes (additive). The reply's `totalTokens` is checked
+  against the parts; a mismatch keeps the answer and adds a `kgraf_note` to the call's raw
+  usage, because the call was billed.
+- A reply served on a service tier other than `default` (`priority`, `flex`, `reserved`), or
+  with cache writes on a TTL other than `5m`, keeps its answer and token counts, records the
+  tier in the raw usage, and shows as unpriced: the price table has one rate per model.
+- Redirects are not followed. A non-finite temperature is refused before anything is sent.
+- Blank text is never sent (the service rejects it); an empty tool result goes as
+  `(no output)`.
+- A `424` reply (an error while the model processed the request) leaves the call unreconciled,
+  since the service does not say it is unbilled.
+- The region must be lowercase letters, digits and hyphens, because it becomes part of the host
+  name.
+- A model id the price table does not list (an inference profile id such as
+  `us.anthropic...-v1:0` is a different key from the bare model id) shows as unpriced, never
+  as zero cost.
+- The service does not name the model in its reply, so a substituted model cannot be caught
+  by the model check.
+- Cache points are off for this route and cannot be turned on in configuration. They work on
+  some models only; the service rejects them on the rest.
+- A request that sets a reasoning effort is refused: Converse has no model-independent field
+  for it.
+- A private (VPC) endpoint cannot be set yet; the route uses
+  `https://bedrock-runtime.<region>.amazonaws.com`.
+## Google routes: Gemini and Vertex AI
+
+Three routes reach Google models. All three are marked `unverified` in `kgraf providers`:
+their behavior comes from Google's published references and recorded test bodies, and none
+has been run against the live service. Check the recorded raw usage on the first call.
+
+| Route | What it reaches | Credential |
+|---|---|---|
+| `gemini` | Gemini through its own `generateContent` API, with tool calling, streaming and a thinking control | `KGRAF_GOOGLE_API_KEY`, the key the `google` route also reads |
+| `vertex-gemini` | Gemini on Vertex AI | Vertex settings, below |
+| `vertex-anthropic` | Anthropic models on Vertex AI | Vertex settings, below |
+
+The `google` route is Gemini's OpenAI-compatibility layer, which ignores parameters it does not
+support. Use `gemini` when you need the thinking control or thought summaries.
+
+**Gemini with an API key.** Set the key in your own shell and pick a model id:
+
+```
+export KGRAF_GOOGLE_API_KEY=...
+cargo run -p kgraf-cli -- call --provider gemini --model gemini-2.5-flash
+```
+
+**Vertex AI (both routes).** Vertex takes an OAuth token, not an API key. Set where the
+credentials come from, the project that is billed, and the region. There is no default region:
+the region sets where data is processed and which models exist.
+
+```
+export KGRAF_VERTEX_CREDENTIALS=adc          # or metadata, gcloud, or a service-account key file path
+export KGRAF_VERTEX_PROJECT=my-project       # optional with a key file: its project_id is used
+export KGRAF_VERTEX_REGION=us-east5          # or `global`
+cargo run -p kgraf-cli -- call --provider vertex-gemini --model gemini-2.5-flash
+cargo run -p kgraf-cli -- call --provider vertex-anthropic --model <name>@<version>
+```
+
+Credential sources. kGraf uses only the one you name and never probes the others:
+
+| Value | Source |
+|---|---|
+| `adc` | the service-account key file that `GOOGLE_APPLICATION_CREDENTIALS` names, if it is set; otherwise the gcloud user credentials file (`gcloud auth application-default login`). It does not contact the metadata server and does not run `gcloud`. |
+| `metadata` | the metadata server of the Google Cloud host kGraf runs on |
+| `gcloud` | the output of `gcloud auth print-access-token` |
+| a path | a service-account key file |
+
+Other credential file types, such as `external_account` (workload identity federation) files,
+are not supported. A key file whose name is `adc`, `metadata` or `gcloud` is written `./adc`.
+Where a kGraf variable is not set, kGraf reads `GOOGLE_APPLICATION_CREDENTIALS`,
+`GOOGLE_CLOUD_PROJECT` (or `GCLOUD_PROJECT`) and `GOOGLE_CLOUD_LOCATION` (or
+`GOOGLE_CLOUD_REGION`). A missing setting fails when the route is checked, naming the variable to
+set. The account needs the Vertex AI User role, and each Anthropic model must be enabled for the
+project in Vertex AI Model Garden. The region can be a region such as `us-east5`, `global`, or
+the multi-region `us` or `eu`.
+
+Use the Anthropic model id as Vertex lists it (`name@version`, or the bare name). kGraf accepts
+the id as sent, `name-version`, and a bare name answered with its dated id, and refuses any other
+model name in a response. For Gemini, a requested alias such as `gemini-2.0-flash` may be answered
+as `gemini-2.0-flash-001`; kGraf accepts a numeric version suffix and refuses any other model name.
+
+Tool schemas: Vertex accepts an OpenAPI subset of JSON Schema. kGraf converts a tool's schema and
+refuses the call, before sending, when the schema uses a keyword the subset cannot express
+(`$ref`, `oneOf`, `allOf`, or several non-null types), an `enum` whose values are not all strings,
+an object with no properties (a free-form object), or a node with no type that has none implied.
+The error names the tool and the place in its schema. An MCP tool whose schema is free-form
+cannot be offered to a Vertex route. Function names start with a letter or an underscore, hold
+only letters, digits, underscores, dots, colons and dashes, and are limited to 64 characters on
+Vertex and 128 on the Gemini Developer API. A `-latest` model alias is refused: set the concrete
+model id it resolves to.
+
+A Vertex route that uses your `gcloud auth application-default login` credentials sends the quota
+project that `gcloud` recorded in that file (`x-goog-user-project`), so Vertex AI is billed to that
+project. Set it with `gcloud auth application-default set-quota-project`. kGraf also registers the
+secrets in the credentials file it reads (the private key, key id, refresh token and client
+secret) so they are redacted if a tool prints the file.
+
+Reasoning effort: `gemini-2.5` models take a token budget, capped at half of the output limit,
+and `gemini-3` models take a level. A level the model does not document is refused (for example
+`medium` on `gemini-3-pro-preview`, which documents `low` and `high`). A token budget below the
+model's minimum (512 on `gemini-2.5-flash-lite`, 128 on the others) is refused, so a Flash-Lite
+output limit under 1,024 tokens cannot carry a reasoning effort. A model family kGraf does not
+know is refused when an effort is set.
+
+What to expect from usage on the Gemini routes: thinking tokens are counted apart from the reply
+and shown as reasoning output; cached prompt tokens are shown as cache reads; a reported total
+above the counted parts is billed as reasoning, and a total below them stops the call and leaves
+it in `unreconciled` with the counted figures. A turn the service blocks or refuses (a safety
+block, a malformed function call) is billed and recorded, then reported as an unusable turn with
+Google's reason. Gemini 3 models require the thought signature that came with a tool call to go
+back with it. kGraf stores the signature with the tool call in the transcript, so a resumed
+session or a new worker process sends it back. A signature is valid only for the model that made
+it, so kGraf sends it only back to the same route and model. A tool call that came from another
+route or model has no usable signature, and kGraf sends Google's documented skip value for it on
+Gemini 3 models. A signature on a reply's text is kept the same way.
+
+## Azure OpenAI
+
+Two routes reach models deployed on an Azure OpenAI resource (decision 0092): `azure-openai`
+(the Chat Completions body) and `azure-openai-responses` (the Responses body). Both are marked
+`unverified` in `kgraf providers`: they have been tested against bodies written from Microsoft's
+documentation and never against the service. Set the four settings in your own shell:
+
+```
+export KGRAF_AZURE_OPENAI_API_KEY=...               # the resource's key, sent as `api-key`
+export KGRAF_AZURE_OPENAI_RESOURCE=my-resource      # the name alone: my-resource.openai.azure.com
+export KGRAF_AZURE_OPENAI_API_VERSION=v1            # or a dated version for Chat, such as 2024-10-21
+export KGRAF_AZURE_OPENAI_DEPLOYMENTS=my-chat=gpt-4o-2024-08-06,my-mini=gpt-4o-mini-2024-07-18
+cargo run -p kgraf-cli -- call --provider azure-openai --model my-chat
+```
+
+The model you pass is the **deployment name**. The service names the underlying model in its
+reply, so `KGRAF_AZURE_OPENAI_DEPLOYMENTS` maps each deployment to the exact model string the
+reply carries, dated suffix included. A deployment with no mapping fails when the route is
+built. A reply naming any other model stops the call and leaves its spend in `unreconciled`;
+the error shows both strings, so the first mismatch tells you what to write in the mapping.
+
+`v1` uses `https://<resource>.openai.azure.com/openai/v1/...` and sends the deployment as
+`model` in the body. A dated version uses the older address, with `?api-version=` on the
+request and the deployment in the path, and is available for Chat Completions only, from
+`2024-09-01-preview` on (the first version with stream usage and `max_completion_tokens`);
+a date without `-preview` must be `2024-10-21` or later. The check is a floor: a version that
+does not exist fails on the wire. The
+Responses route takes `v1` alone, because Microsoft documents the Responses body only at
+`/openai/v1/responses`. The resource must be the bare name (Foundry project hosts such as
+`*.services.ai.azure.com` are not supported), a deployment name cannot be made of dots alone,
+and the version must be `v1` or a real date such as `2024-10-21` or `2025-04-01-preview`;
+anything else is refused when the route is checked, before a request is built.
+
+What to expect:
+- Usage is inclusive, as on OpenAI. Cached prompt tokens show as cache reads and reasoning
+  tokens as reasoning output.
+- A completion the content filter cut, a prompt the filter flagged, a Responses completion
+  marked blocked, or a reply whose filters did not run (an `error` in `content_filter_results`)
+  is billed and recorded, then reported as an unusable turn with the reason (`content_filter`,
+  `prompt_filter_results` or `content_filter_results_error`). A prompt the service blocks
+  outright is an HTTP 400 that billed nothing.
+- The output limit is sent as `max_completion_tokens`, so reasoning deployments work on both
+  routes.
+- Rate limits and 429s are tracked per deployment, from the `x-ratelimit-*` headers and
+  `retry-after-ms`. A route with several deployments uses the tightest limit, and a 429 on
+  any of them lowers the route's rate.
+- Deployments that Azure updates automatically, and model-router deployments, cannot be used:
+  their replies name a model that changes, and the mapping holds one string. Deploy a fixed
+  model version and map it.
+- Cost shows as unpriced unless a price is set for the deployment. An Azure route is never
+  priced by a bare model name, since a deployment name is your own choice. Price a deployment
+  with a `<deployment>@azure-openai` entry (or `@azure-openai-responses`) in your price file.
+  `kgraf spend --prices` and `kgraf schedule list --prices` follow the same rule. The bench
+  prices each deployment from the model it is mapped to, using the vendored table's
+  `azure/<model>` entries when they exist. Those are standard-deployment rates: a data-zone,
+  regional or provisioned deployment bills differently, so set its price in your price file.
+- Microsoft Entra ID tokens and the sovereign clouds (`openai.azure.us`, `openai.azure.cn`)
+  are not supported. Only the key is.
+- Embeddings: both routes also serve the embedding kind, per deployment
+  (`--model-route embedding=azure-openai:my-embed`, with `my-embed=text-embedding-3-small` in
+  `KGRAF_AZURE_OPENAI_DEPLOYMENTS`). `v1` posts to `/openai/v1/embeddings` with the deployment
+  as `model`; a dated version posts to `/openai/deployments/<deployment>/embeddings`, and any
+  dated version is accepted for embeddings. The reply must name the mapped model, as for chat.
+  A request carries at most 2,048 texts and 300,000 tokens; a longer list is split. Prices
+  follow the same `<deployment>@<route>` rule. Unverified, as the chat routes.
+
+## Models of every kind: typed decisions, embeddings, rerank
+
+Every route has a model kind (decision 0089). `kgraf providers` lists the kinds each catalog
+route serves in its KINDS column.
+
+| Kind | What it returns | Served by | Tool |
+|---|---|---|---|
+| `generative` (default) | prose and tool calls | every route except `systemone` and `tei` | none: it runs workers and the planner |
+| `typed-decision` | a value in a declared answer space, with a probability (`/v1/systemone`) | `systemone` (local, default `http://localhost:8000`) | `decide` |
+| `embedding` | one vector per text | `openai`, `google`, `llama-cpp` (`/embeddings`); `ollama` (its native `/api/embed`); `tei` (its native `/embed`); `azure-openai`, `azure-openai-responses` (per deployment) | `embed` |
+| `rerank` | relevance scores of documents against a query | `together`, `llama-cpp` (`/rerank`); `tei` (its native `/rerank`) | `rerank` |
+
+A route serves a kind only where its vendor documents the endpoint at the route's address.
+Moonshot (`kimi`, `kimi-code`), DeepSeek, z.ai, Alibaba (`qwen`), xAI (`grok`, `grok-chat`),
+and Meta serve generative work only here. Together serves rerank but not embeddings: its
+embeddings reply carries no token count, so every call would be billed and then refused.
+Cohere's rerank endpoint is not supported: it bills in search units, not tokens. Only
+embeddings on `openai` have been checked against the live service; every other claim is
+marked unverified, and a reply field the vendor's page does not show is not relied on as
+verified.
+
+Together's rerank replies name a serving model of their own rather than the model you asked
+for (its reference shows this, with no rule relating the two), so on `together` the rerank
+reply's model name is not checked. Every other route still refuses a reply naming another
+model.
+
+`tei` is a local Text Embeddings Inference server (default `http://localhost:8080/v1`, the
+same port llama.cpp uses; run one of them elsewhere). It serves one model, so its replies
+name none and kGraf cannot check that the model answering is the one you named.
+
+`--route` and `--planner` are always generative. Declare a route of any other kind as
+`kind=route:model`, repeatable:
+
+```
+export KGRAF_OPENAI_API_KEY=...      # the openai route's own variable, as for a generative route
+cargo run -p kgraf-cli -- orchestrate --route kimi:<model> --prices prices.json \
+  --model-route embedding=openai:text-embedding-3-small \
+  --model-route rerank=llama-cpp:<reranker> \
+  --model-route typed-decision=systemone:jev-latest \
+  --instruction task.txt
+```
+
+In `.kgraf/run.json`, the same list is `model_routes`:
+
+```json
+{
+  "routes": ["kimi:<model>"],
+  "prices": "prices.json",
+  "model_routes": ["embedding=openai:text-embedding-3-small"]
+}
+```
+
+The desktop app's Settings > Providers lists every route of `run.json` with its role and kind,
+and each model route with the tool that reaches it.
+
+- **Credentials** are the route's own: an `embedding=openai:...` route reads
+  `KGRAF_OPENAI_API_KEY`; the local `systemone`, `ollama`, `llama-cpp` and `tei` routes take
+  none. A missing key fails the run's readiness check and names the variable.
+- **Accounting.** Every call is a ledger row. Embedding and rerank calls record their input
+  tokens; a typed decision records what the server reports. Add the model to the price table
+  to see its cost; without a row it is shown as unpriced, never as $0. A priced call too
+  small to cost one micro-dollar shows as $0.000001, and totals add the exact amounts before
+  rounding, so many small calls total what they cost. A reply counting zero tokens for
+  non-empty input is treated as a reply without a count: the call is kept as unreconciled,
+  never settled as free. The run's reported spend includes every model-tool call, the
+  orchestrator's own and each worker's.
+- **Use.** The planner is told the run's model routes by kind, and may call their tools
+  itself while it plans (at most four rounds and eight tool calls a round, each call on the
+  ledger as the orchestrator's; stopping the run cancels a call in flight, and a failed call
+  is listed in the run's notices). A run that declares a model route puts its tool (`decide`, `embed`,
+  `rerank`) in every worker's tool set, so any worker may call it; the tool set stays the same
+  for every contract so workers on one model share one cached prompt prefix. A contract lists
+  a tool in its `tools` where its work relies on it. Nothing calls one by default: the
+  orchestrator or a worker chooses to.
+- **`embed`** takes at most 32 texts. Given a `query`, it returns the texts ranked by cosine
+  similarity to it. Without one, it returns the vectors while they fit in 32 KB, else each
+  text's cosine similarity to every other. Models that expect a marker on queries and
+  documents (for example `query: ` and `passage: `) take it in `query_prefix` and
+  `text_prefix`. **`rerank`** takes at most 256 documents, or fewer where the route's server
+  takes fewer (32 on `tei`); the tool's description names those routes, and a longer list is
+  refused before any call.
+- **Input limits.** A longer list of texts (from the orchestrator) is split into requests of
+  at most 2,048 texts and about 100,000 tokens (32 texts on `tei`, 100 on `google`, 2,048
+  texts and 300,000 tokens on the Azure routes), each its own ledger row.
+  An empty text is refused before sending. For a text longer than the model's input limit,
+  kGraf asks Ollama and TEI to refuse it rather than cut it, and OpenAI documents a refusal. The
+  other routes document no refusal (Google's embeddings guide says it cuts an over-long input
+  without an error), and kGraf cannot see a cut the server does not report, so keep texts
+  within the model's limit there. A rerank reply with more results than
+  `top_n` is cut to the best ones.
+- **Refused, never rerouted.** A kind prefix on `--route` or `--planner`, a model route with
+  no kind, a route that does not serve its kind (`embedding=anthropic:...`), and a tool call
+  naming a route of another kind all fail with the reason. One `route:model` may be declared
+  as two kinds (`embedding=llama-cpp:m` and `rerank=llama-cpp:m`).
+- **Rate limits.** `--rate-limit ROUTE=...` also paces a model route's calls, on the same
+  limiter as that route's worker calls. An embedding or rerank model's rate-limit headers are
+  recorded under that model (OpenAI states limits per model), so they do not overwrite the
+  chat model's; the machine's capacity reads both and uses the tighter. A route's 429 replies
+  are recorded for the machine's learned rate, as for chat. Model-route calls are left out of
+  a route's round statistics, which measure worker rounds.
+- Verified live: one embeddings call of one text on the `openai` route (2026-09-29), which
+  checked the request, the model echo, the vector and the usage record. Request batching, the
+  vector-width check, per-model rate-limit records and the zero-count rule came later and are
+  tested against recorded replies only, as is every other kind and route here.
+
+### Connecting a System-One model
+
+A System-One model answers typed questions about a state you give it. kGraf speaks the
+`/v1/systemone` wire (decision 0042) to any server that serves it, and does not care which
+model or hardware sits behind it. To use one:
+
+1. Start a server that serves `POST /v1/systemone` at `http://localhost:8000`. The `systemone`
+   route's address is fixed in the catalog. To reach a server on another machine, forward its
+   port to `localhost:8000`. The route sends no credential, so put nothing on the server that
+   needs one.
+2. Declare the route: `--model-route typed-decision=systemone:<model>`, or
+   `"model_routes": ["typed-decision=systemone:<model>"]` in `.kgraf/run.json`. `<model>` is
+   sent as `model`; the server's default alias is `jev-latest`.
+3. Add the model to the price table if it has a price. Without a row its calls show as
+   unpriced. A local model can be priced at zero, which says nothing about compute.
+
+The request body is `{"state": "<text>", "model": "<model>", "questions": {"<id>": {"type":
+"noul" | "choice" | "score", "instructions": "<prompt>", "criteria": ...}}}`. The reply is
+`{"answers": {"<id>": {"type": ..., ...}}, "usage": {"input_tokens": n, "output_tokens": n}}`,
+with one answer per question id. A `noul` answer is a probability, a `choice` answer names one
+of the given options, and a `score` answer is an expectation over the given levels. An answer
+outside its declared space, or a missing or extra question id, is refused. A typed answer is
+not a verified answer.
+
+The model is used only where something calls the `decide` tool: the orchestrator while it
+plans, or a worker that lists it. No part of a run calls a decider on its own (decision 0045),
+and none supplies the collision expectation. The client exchanged a request and a reply with a real server in an earlier probe
+(decision 0045); the route itself is checked against recorded replies only.
+For code that wants a decider directly, `kgraf_decide::SystemOneClient` implements the
+`Decider` trait; `FakeDecider` stands in for tests.
 
 ## A worker, and an orchestrated run
 
@@ -156,7 +516,11 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   (default 4) and `--max-agents` (default 8).
 - A model the price table does not list still runs. The ledger keeps every call, and the
   report and `kgraf spend` name its spend as unpriced (a local model as local, unpriced),
-  never as zero dollars. Routing never refuses or skips a route for lacking a price.
+  never as zero dollars. Routing never refuses or skips a route for lacking a price. A
+  price entry named `<model>@<route>` applies to calls made on that route and wins over the
+  model's own entry. A model whose vendor bills a higher rate above an input size is priced
+  only up to that size from the bundled catalog; a larger call is reported as unpriced, not
+  costed at the base rate.
 - `orchestrate` exits non-zero unless the run completed: a run that ends blocked or
   stopped is a failure to a script or a scheduler.
 - A planner answer that is not the JSON asked for, or a plan that breaks a rule, is asked
@@ -168,6 +532,29 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   about 7 seconds cold on an 800-file repository), and reindexes a contract's files after
   its merge, so workers read graph slices without a separate `kgraf index`. A graph that is
   still empty is reported as a notice.
+- **Worker worktrees and their builds** (decision 0088). Each worker builds in its own
+  worktree, and a compiled project builds its own full build folder there (a Rust `target`
+  folder can be several gigabytes). By default kGraf deletes a worker's worktree, with the
+  build output in it, once nothing needs it: an attempt that is merged, losing, refused,
+  empty or failed, a conflict its resolver settled, and a merged writer subagent's.
+  Where it is set, one place per surface:
+  - `kgraf orchestrate` and `kgraf schedule run-now`: give `--keep-worktrees`. These commands
+    do not read `run.json`.
+  - The desktop app: Settings > General > "Delete worker worktrees after use" (on by
+    default) decides for every run the app starts, box and scheduled. It applies to runs
+    that start after the change.
+  - `run.json` does not set it: a run file with a `worktrees` key is refused, and the error
+    names the switch and the flag.
+
+  Keeping keeps every attempt's worktree and builds, for you to inspect or reuse (a merged
+  attempt's work is on the branch as well); `kgraf clean <worktree>` removes a kept one. A
+  kept attempt is never continued as live work. Conversation, gate, probe and interface-stub
+  worktrees hold no attempt and are removed either way. A worktree that a live worker, a
+  stopped run, a lost lease, a pending merge, a later part of the same work (a handoff
+  continues in its parent's worktree) or a conflict resolver still needs is never deleted,
+  whichever way this is set. A worktree that cannot be deleted stays, and the run's report
+  says which one and why (one warning each). A worker's build folder lives in the worktree's
+  scratch directory and goes with it.
 - An attempt that changes no file is accepted only when its check passes, and it is always
   reported. It is refused when a declared Rust write target holds only `todo!` or
   `unimplemented!` bodies (decision 0086; `unreachable!` is not a marker), and an attempt
@@ -191,6 +578,12 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   files), so a `.env` at the checkout root stays private. Every value in that `.env` is also
   removed from what a worker's model sees, and build and test output is scrubbed of
   key-shaped strings before the model sees it.
+- A sandboxed build cannot read your per-user cargo config (`~/.cargo/config.toml`,
+  `~/.cargo/config`) on any platform, since it can hold a registry token or a proxy
+  password; cargo skips it, so settings kept there (a linker, rustflags, a source mirror) do
+  not apply to worker builds. Put build settings in the project's own `.cargo/config.toml`.
+  Package-index logins (pip, Yarn, Poetry) and other command-line tool logins in your home
+  are unreadable too.
 - The sandbox cannot download or unpack crates. A run checks that the dependencies are in
   the local cargo cache before it starts, and fetches them outside the sandbox only with the
   project's consent (see [Set up a project](#set-up-a-project)).
@@ -292,13 +685,15 @@ cargo run -p kgraf-shell --bin kgraf-app -- --probe
   checksum file comes from the same release as the installer, so it detects a corrupt
   download and does not prove who published it; a detached signature is not built yet.
 - The app builds runs from `.kgraf/run.json`: the `orchestrate` flags as JSON
-  (`routes`, `prices` and the optional ones, snake case; unknown keys are refused). An old
+  (`routes`, `prices` and the optional ones, snake case; unknown keys are refused, and so is
+  `worktrees`, which the app's settings switch decides). An old
   file that still sets `cap_run`, `cap_task` or `cap_hour` loads, prints one notice, and the
   caps do nothing (decision 0080). There is no settings screen for routes yet, so write
   this file by hand.
   Example: `{"routes": ["kimi:<model-id>"], "prices": "prices.json"}`.
 - The settings file holds the compaction slider (5% to 95%, default 80%), the
-  background-mode switch, the caps, the theme (device, dark or light), the color
+  background-mode switch, the worker-worktree switch (`delete_worker_worktrees`, default
+  on), the caps, the theme (device, dark or light), the color
   vision mode, reduced motion, whether the guide is open, and the open projects. Two
   windows share it: each saves under a lock and keeps the projects the other opened or
   closed. An unknown key is refused, so a settings file that a newer build changed does

@@ -32,6 +32,10 @@
 //!   `content_block_stop`; concatenating and parsing them then is the only
 //!   place a tool call becomes usable.
 
+mod transport;
+
+pub use transport::{BearerSource, ModelInUrlTransport};
+
 use std::collections::HashMap;
 
 use futures_util::StreamExt;
@@ -45,10 +49,121 @@ use kgraf_provider::{
 /// The adapter's stable name.
 pub const ADAPTER: &str = "anthropic-messages";
 
+/// Cross-check a usage object against the totals a hybrid endpoint also sends.
+///
+/// Moonshot's Anthropic route sends both protocols' fields. Whether its
+/// `input_tokens` counts cache reads is not proven for a warm call, and a wrong
+/// guess would cost the cached share twice or not at all. Two checks refuse a
+/// figure that cannot be trusted, so the call is left unreconciled instead of
+/// mis-costed:
+/// - `cached_tokens` above `cache_read_input_tokens` means the cache read sits
+///   in a field this adapter does not read;
+/// - when `total_tokens` is present, the parts must sum to it under the
+///   configured protocol.
+///
+/// `usage` is the figure after `raw` was applied: for one complete object, that
+/// object alone; for a stream, the running figure merged over every event so
+/// far. A streamed event may omit fields an earlier event reported (a delta that
+/// restates only `output_tokens`), so a check on the event alone would refuse a
+/// correct stream. The claims in `raw` (`cached_tokens`, `total_tokens`) are
+/// checked only when this event carries them, against the merged figure.
+fn check_usage_consistency(
+    adapter: &'static str,
+    protocol: Protocol,
+    usage: &TokenUsage,
+    raw: &serde_json::Value,
+) -> Result<(), ProviderError> {
+    let get = |name: &str| raw.get(name).and_then(|v| v.as_u64());
+    let inconsistent = |reason: String| ProviderError::Decode {
+        adapter,
+        reason: format!("the usage object is inconsistent: {reason}"),
+    };
+    let read = usage.cache_read;
+    if let Some(cached) = get("cached_tokens")
+        && cached > read
+    {
+        return Err(inconsistent(format!(
+            "`cached_tokens` is {cached} but `cache_read_input_tokens` is {read}"
+        )));
+    }
+    if let Some(total) = get("total_tokens") {
+        // Both protocols reach the same sum once normalized: an additive input
+        // already excludes the cache counts, an inclusive one is carved down to
+        // the same figure, so input plus cache plus output is the vendor's sum.
+        let parts = usage.total();
+        if parts != total {
+            return Err(inconsistent(format!(
+                "the parts sum to {parts} under the {protocol:?} protocol but \
+                 `total_tokens` is {total}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The counted fields of a usage object as reported, with no consistency check
+/// and the raw object kept: the floor a refused call keeps on its open row.
+/// `None` when the object carries neither an input nor an output count.
+fn lower_bound_usage(protocol: Protocol, raw: &serde_json::Value) -> Option<TokenUsage> {
+    let field = |name: &str| raw.get(name).and_then(|v| v.as_u64()).unwrap_or(0);
+    raw.get("input_tokens")
+        .or_else(|| raw.get("output_tokens"))?;
+    let input = field("input_tokens");
+    let read = field("cache_read_input_tokens");
+    let write = field("cache_creation_input_tokens");
+    let output = field("output_tokens");
+    let reasoning = raw
+        .get("output_tokens_details")
+        .and_then(|d| d.get("thinking_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
+        .min(output);
+    Some(TokenUsage {
+        uncached_input: match protocol {
+            Protocol::Additive => input,
+            Protocol::Inclusive => input.saturating_sub(read.saturating_add(write)),
+        },
+        cache_read: read,
+        cache_write: write,
+        text_output: output - reasoning,
+        reasoning_output: reasoning,
+        raw: Some(raw.clone()),
+    })
+}
+
+/// Fold one streamed usage event into the running figure and check the merged
+/// result. When the check refuses, the merged figure (with the event's raw
+/// object) is recorded on `guard` first, so the open row keeps a floor.
+fn apply_stream_usage(
+    adapter: &'static str,
+    protocol: Protocol,
+    usage: &mut TokenUsage,
+    raw: &serde_json::Value,
+    guard: &StreamGuard<'_, '_>,
+) -> Result<(), ProviderError> {
+    let partial = match AnthropicAdapter::parse_usage(adapter, protocol, raw) {
+        Ok(partial) => partial,
+        Err(error) => {
+            if let Some(floor) = lower_bound_usage(protocol, raw) {
+                let mut merged = usage.clone();
+                merged.merge_cumulative_reported(&floor, reported_fields(raw));
+                guard.record_usage(&merged);
+            }
+            return Err(error);
+        }
+    };
+    merge_stream_usage(adapter, usage, partial, raw)?;
+    if let Err(error) = check_usage_consistency(adapter, protocol, usage, raw) {
+        guard.record_usage(usage);
+        return Err(error);
+    }
+    Ok(())
+}
+
 /// Which usage fields `raw` reports. An event that names a field, even at
 /// zero, replaces the earlier figure; one that omits it leaves it alone. The
-/// output split (text and reasoning) is taken together whenever
-/// `output_tokens` is present, since the reasoning share is carved out of it.
+/// reasoning share counts as reported only when the event carries
+/// `output_tokens_details.thinking_tokens`; see [`merge_stream_usage`].
 fn reported_fields(raw: &serde_json::Value) -> kgraf_core::usage::ReportedFields {
     let has = |name: &str| raw.get(name).is_some_and(|v| v.as_u64().is_some());
     kgraf_core::usage::ReportedFields {
@@ -56,8 +171,44 @@ fn reported_fields(raw: &serde_json::Value) -> kgraf_core::usage::ReportedFields
         cache_read: has("cache_read_input_tokens"),
         cache_write: has("cache_creation_input_tokens"),
         text_output: has("output_tokens"),
-        reasoning_output: has("output_tokens"),
+        reasoning_output: raw
+            .get("output_tokens_details")
+            .and_then(|d| d.get("thinking_tokens"))
+            .is_some_and(|v| v.as_u64().is_some()),
     }
+}
+
+/// Merge one streamed usage event into the running figure.
+///
+/// Reasoning is billed inside `output_tokens`, so the two output fields always
+/// sum to the latest `output_tokens`. A later event that reports `output_tokens`
+/// without the thinking split keeps the reasoning share seen earlier and carves
+/// it out of the new total, so the share is not zeroed into text output.
+fn merge_stream_usage(
+    adapter: &'static str,
+    usage: &mut TokenUsage,
+    mut partial: TokenUsage,
+    raw: &serde_json::Value,
+) -> Result<(), ProviderError> {
+    let mut fields = reported_fields(raw);
+    if fields.text_output && !fields.reasoning_output {
+        let output = partial.text_output + partial.reasoning_output;
+        let kept = usage.reasoning_output;
+        if kept > output {
+            return Err(ProviderError::Decode {
+                adapter,
+                reason: format!(
+                    "{kept} thinking tokens reported earlier against {output} output tokens \
+                     now; the usage events are inconsistent"
+                ),
+            });
+        }
+        partial.text_output = output - kept;
+        partial.reasoning_output = kept;
+        fields.reasoning_output = true;
+    }
+    usage.merge_cumulative_reported(&partial, fields);
+    Ok(())
 }
 
 /// Stop reasons that end a turn without an answer. The core has no variant for
@@ -70,12 +221,21 @@ fn unusable_stop(reason: &str) -> Option<&str> {
 /// The most cache breakpoints one request may carry on this wire.
 const MAX_CACHE_BREAKPOINTS: usize = 4;
 
+/// Blocks added by one tool round (the assistant turn plus the tool results)
+/// from which the previous tail gets its own breakpoint. The vendor's lookback
+/// is about 20 blocks; this leaves a margin.
+const LOOKBACK_ANCHOR_BLOCKS: usize = 16;
+
+/// The API version header this build sends.
+const API_VERSION: &str = "2023-06-01";
+
 /// An Anthropic-protocol client.
 pub struct AnthropicAdapter {
     config: ProviderConfig,
     http: reqwest::Client,
-    /// The API version header this build sends.
-    api_version: String,
+    /// `None` posts to `{base_url}/messages` with an API key. `Some` posts the
+    /// same body to a per-model URL with a bearer token.
+    transport: Option<ModelInUrlTransport>,
 }
 
 impl AnthropicAdapter {
@@ -103,14 +263,36 @@ impl AnthropicAdapter {
         Ok(Self {
             config,
             http,
-            api_version: "2023-06-01".to_owned(),
+            transport: None,
         })
     }
 
-    /// Override the API version header.
-    pub fn with_api_version(mut self, version: impl Into<String>) -> Self {
-        self.api_version = version.into();
+    /// Serve the Messages body through a per-model URL with bearer
+    /// authentication instead of `POST /messages` with an API key.
+    ///
+    /// The configuration's `base_url` is used only to key rate-limit
+    /// observations; requests go to the transport's URL.
+    pub fn with_transport(mut self, transport: ModelInUrlTransport) -> Self {
+        self.transport = Some(transport);
         self
+    }
+
+    /// The adapter name for the ledger and for errors raised by this instance.
+    fn adapter_name(&self) -> &'static str {
+        self.transport.as_ref().map_or(ADAPTER, |t| t.name())
+    }
+
+    /// Assert the response model is the requested one, under the transport's
+    /// spelling rule where one is set.
+    fn assert_echo(&self, requested: &str, returned: &str) -> Result<(), ProviderError> {
+        if self
+            .transport
+            .as_ref()
+            .is_some_and(|t| t.echoes(requested, returned))
+        {
+            return Ok(());
+        }
+        kgraf_provider::provider::assert_model_echo(requested, returned)
     }
 
     /// The configuration this adapter was built with.
@@ -123,10 +305,11 @@ impl AnthropicAdapter {
     /// wire field for. Sending the request with the effort dropped would look
     /// like success and silently change what was asked for (fail loud).
     fn check_request(&self, request: &Request) -> Result<(), ProviderError> {
-        self.config.check_model(ADAPTER, &request.model)?;
+        self.config
+            .check_model(self.adapter_name(), &request.model)?;
         if request.reasoning_effort.is_some() {
             return Err(ProviderError::CapabilityNotHonored {
-                adapter: ADAPTER,
+                adapter: self.adapter_name(),
                 capability: "reasoning effort",
             });
         }
@@ -145,15 +328,24 @@ impl AnthropicAdapter {
                 Content::Text {
                     text,
                     cache_breakpoint,
+                    ..
                 } => {
+                    // The service rejects an empty text block. Only a text part
+                    // that carried another vendor's token is empty here.
+                    if text.is_empty() {
+                        return None;
+                    }
                     let mut value = serde_json::json!({"type": "text", "text": text});
                     if *cache_breakpoint && honor {
                         value["cache_control"] = serde_json::json!({"type": "ephemeral"});
                     }
                     Some(value)
                 }
-                Content::ToolUse { id, name, input } => Some(serde_json::json!({
-                    "type": "tool_use", "id": id, "name": name, "input": input
+                Content::ToolUse {
+                    id, name, input, ..
+                } => Some(serde_json::json!({
+                    "type": "tool_use", "id": id, "name": name,
+                    "input": kgraf_provider::tool_arguments_object(input)
                 })),
                 Content::ToolResult {
                     tool_use_id,
@@ -203,6 +395,33 @@ impl AnthropicAdapter {
                     )
                 })
                 .count();
+            // A cache lookup checks only a bounded number of blocks before a
+            // breakpoint (about 20). A round that adds more than that (many
+            // parallel tool calls) puts the previous request's breakpoint out of
+            // reach of the new tail, so the whole history would be rewritten. An
+            // anchor on the previous tail, the last block of the message before
+            // the newest assistant turn, keeps it reachable. It costs a
+            // breakpoint, so it is placed only when the round is long and a
+            // breakpoint is free for both it and the tail.
+            let count = messages.len();
+            if count >= 3 && placed + 2 <= MAX_CACHE_BREAKPOINTS {
+                let blocks_in = |m: &serde_json::Value| {
+                    m.get("content")
+                        .and_then(|c| c.as_array())
+                        .map_or(0, Vec::len)
+                };
+                let round = blocks_in(&messages[count - 2]) + blocks_in(&messages[count - 1]);
+                if round >= LOOKBACK_ANCHOR_BLOCKS
+                    && let Some(anchor) = messages[count - 3]
+                        .get_mut("content")
+                        .and_then(|c| c.as_array_mut())
+                        .and_then(|blocks| blocks.last_mut())
+                    && anchor.get("cache_control").is_none()
+                    && anchor.get("type").and_then(|t| t.as_str()) != Some("thinking")
+                {
+                    anchor["cache_control"] = serde_json::json!({"type": "ephemeral"});
+                }
+            }
             if placed < MAX_CACHE_BREAKPOINTS
                 && let Some(last) = messages
                     .last_mut()
@@ -246,30 +465,62 @@ impl AnthropicAdapter {
         if stream {
             body["stream"] = serde_json::json!(true);
         }
+        if let Some(transport) = &self.transport {
+            // The model is in the URL; the body names the protocol version.
+            if let Some(object) = body.as_object_mut() {
+                object.remove("model");
+                object.insert(
+                    "anthropic_version".to_owned(),
+                    serde_json::json!(transport.body_version()),
+                );
+            }
+        }
         body
     }
 
-    async fn post(&self, body: &serde_json::Value) -> Result<reqwest::Response, ProviderError> {
-        let mut builder = self
-            .http
-            .post(format!("{}/messages", self.config.base_url))
-            .header("anthropic-version", &self.api_version)
-            .header("content-type", "application/json");
-        // A local endpoint takes no credential, and sending an empty header is worse
-        // than sending none: some servers reject a malformed `Authorization` outright,
-        // which presents as an auth failure against a server that has no auth.
-        if let Some(credential) = self.config.credential() {
-            builder = builder.header("x-api-key", credential);
-        }
+    async fn post(
+        &self,
+        body: &serde_json::Value,
+        model: &str,
+        stream: bool,
+    ) -> Result<reqwest::Response, ProviderError> {
+        let builder = match &self.transport {
+            Some(transport) => {
+                let token = transport.bearer().await?;
+                let builder = self
+                    .http
+                    .post(transport.url(model, stream))
+                    .header("content-type", "application/json")
+                    .bearer_auth(token);
+                match transport.quota_project() {
+                    Some(project) => builder.header("x-goog-user-project", project),
+                    None => builder,
+                }
+            }
+            None => {
+                let mut builder = self
+                    .http
+                    .post(format!("{}/messages", self.config.base_url))
+                    .header("anthropic-version", API_VERSION)
+                    .header("content-type", "application/json");
+                // A local endpoint takes no credential, and sending an empty header is worse
+                // than sending none: some servers reject a malformed `Authorization` outright,
+                // which presents as an auth failure against a server that has no auth.
+                if let Some(credential) = self.config.credential() {
+                    builder = builder.header("x-api-key", credential);
+                }
+                builder
+            }
+        };
         // Bounds only "does the provider ever start responding", not "how long
         // may the whole body take", the client no longer sets that second,
         // stream-hostile bound itself (see `new`'s doc comment).
         let response =
             match tokio::time::timeout(self.config.timeout, builder.json(body).send()).await {
-                Ok(result) => result.map_err(send_error)?,
+                Ok(result) => result.map_err(|e| send_error(self.adapter_name(), e))?,
                 Err(_) => {
                     return Err(ProviderError::Transport {
-                        adapter: ADAPTER,
+                        adapter: self.adapter_name(),
                         reason: format!(
                             "no response within {:?} of sending the request",
                             self.config.timeout
@@ -308,7 +559,7 @@ impl AnthropicAdapter {
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
             return Err(ProviderError::Http {
-                adapter: ADAPTER,
+                adapter: self.adapter_name(),
                 status: status.as_u16(),
                 body,
             });
@@ -324,11 +575,34 @@ impl AnthropicAdapter {
         protocol: Protocol,
         raw: &serde_json::Value,
     ) -> Result<TokenUsage, ProviderError> {
+        Self::normalize_usage_as(ADAPTER, protocol, raw)
+    }
+
+    /// [`Self::normalize_usage`] with errors naming `adapter`, the transport's
+    /// name where the adapter serves a different host.
+    fn normalize_usage_as(
+        adapter: &'static str,
+        protocol: Protocol,
+        raw: &serde_json::Value,
+    ) -> Result<TokenUsage, ProviderError> {
+        let usage = Self::parse_usage(adapter, protocol, raw)?;
+        check_usage_consistency(adapter, protocol, &usage, raw)?;
+        Ok(usage)
+    }
+
+    /// Parse one usage object into the normal form without the cross-checks
+    /// against `total_tokens` and `cached_tokens`. A streamed event is one part
+    /// of a running figure and is checked after the merge instead.
+    fn parse_usage(
+        adapter: &'static str,
+        protocol: Protocol,
+        raw: &serde_json::Value,
+    ) -> Result<TokenUsage, ProviderError> {
         let field = |name: &str| raw.get(name).and_then(|v| v.as_u64()).unwrap_or(0);
         // `input_tokens` absent entirely means no usage arrived, which is different
         // from a zero-token call and must not read as one.
         if raw.get("input_tokens").is_none() && raw.get("output_tokens").is_none() {
-            return Err(ProviderError::UsageMissing { adapter: ADAPTER });
+            return Err(ProviderError::UsageMissing { adapter });
         }
         // Reasoning is billed inside `output_tokens`. Anthropic itself does not report
         // the share separately; Moonshot's Anthropic route does, in
@@ -344,7 +618,7 @@ impl AnthropicAdapter {
             .unwrap_or(0);
         if reasoning > output {
             return Err(ProviderError::Decode {
-                adapter: ADAPTER,
+                adapter,
                 reason: format!(
                     "{reasoning} thinking tokens reported against {output} output tokens; \
                      the usage object is inconsistent"
@@ -360,10 +634,7 @@ impl AnthropicAdapter {
             reasoning,
             Some(raw.clone()),
         )
-        .map_err(|source| ProviderError::Usage {
-            adapter: ADAPTER,
-            source,
-        })
+        .map_err(|source| ProviderError::Usage { adapter, source })
     }
 
     fn parse_response(
@@ -375,18 +646,18 @@ impl AnthropicAdapter {
             body.get("model")
                 .and_then(|m| m.as_str())
                 .ok_or_else(|| ProviderError::Decode {
-                    adapter: ADAPTER,
+                    adapter: self.adapter_name(),
                     reason: "response has no `model` field, so the echo cannot be checked"
                         .to_owned(),
                 })?;
         // The assertion decision 0006 requires of every adapter. Three providers were
         // confirmed to silently substitute or ignore, all returning HTTP 200.
-        kgraf_provider::provider::assert_model_echo(requested_model, returned_model)?;
+        self.assert_echo(requested_model, returned_model)?;
 
-        let usage = body
-            .get("usage")
-            .ok_or(ProviderError::UsageMissing { adapter: ADAPTER })?;
-        let usage = Self::normalize_usage(self.config.protocol, usage)?;
+        let usage = body.get("usage").ok_or(ProviderError::UsageMissing {
+            adapter: self.adapter_name(),
+        })?;
+        let usage = Self::normalize_usage_as(self.adapter_name(), self.config.protocol, usage)?;
 
         let mut content = Vec::new();
         if let Some(blocks) = body.get("content").and_then(|c| c.as_array()) {
@@ -420,6 +691,7 @@ impl AnthropicAdapter {
                             .get("input")
                             .cloned()
                             .unwrap_or(serde_json::Value::Null),
+                        signature: None,
                     }),
                     // An unmodeled block type is skipped rather than guessed at; the
                     // raw usage blob and the transcript keep the evidence.
@@ -452,7 +724,7 @@ impl AnthropicAdapter {
 #[async_trait::async_trait]
 impl kgraf_provider::Provider for AnthropicAdapter {
     fn adapter(&self) -> &'static str {
-        ADAPTER
+        self.adapter_name()
     }
 
     fn protocol(&self) -> Protocol {
@@ -474,7 +746,7 @@ impl kgraf_provider::Provider for AnthropicAdapter {
         }
 
         let body = self.to_wire(request, false);
-        let http = match self.post(&body).await {
+        let http = match self.post(&body, &request.model, false).await {
             Ok(http) => http,
             Err(error) => {
                 // A connection that never opened, or a rejection before generation,
@@ -500,7 +772,7 @@ impl kgraf_provider::Provider for AnthropicAdapter {
                     .leave_unreconciled_async(request_id.as_deref())
                     .await?;
                 return Err(ProviderError::Transport {
-                    adapter: ADAPTER,
+                    adapter: self.adapter_name(),
                     reason: e.to_string(),
                 });
             }
@@ -509,7 +781,7 @@ impl kgraf_provider::Provider for AnthropicAdapter {
                     .leave_unreconciled_async(request_id.as_deref())
                     .await?;
                 return Err(ProviderError::Transport {
-                    adapter: ADAPTER,
+                    adapter: self.adapter_name(),
                     reason: format!(
                         "response body did not finish within {:?}",
                         self.config.timeout
@@ -524,7 +796,7 @@ impl kgraf_provider::Provider for AnthropicAdapter {
                     .leave_unreconciled_async(request_id.as_deref())
                     .await?;
                 return Err(ProviderError::Decode {
-                    adapter: ADAPTER,
+                    adapter: self.adapter_name(),
                     reason: e.to_string(),
                 });
             }
@@ -543,7 +815,7 @@ impl kgraf_provider::Provider for AnthropicAdapter {
                     .and_then(unusable_stop)
                 {
                     return Err(ProviderError::TurnNotUsable {
-                        adapter: ADAPTER,
+                        adapter: self.adapter_name(),
                         stop_reason: reason.to_owned(),
                     });
                 }
@@ -554,9 +826,12 @@ impl kgraf_provider::Provider for AnthropicAdapter {
                 // stays open for reconciliation rather than being written off. Usage
                 // the body already carries is kept on the open row, not dropped with
                 // the parse error.
-                let carried = parsed
-                    .get("usage")
-                    .and_then(|u| Self::normalize_usage(self.config.protocol, u).ok());
+                let carried = parsed.get("usage").and_then(|u| {
+                    Self::normalize_usage_as(self.adapter_name(), self.config.protocol, u)
+                        .ok()
+                        // A usage a consistency check refused is still a floor.
+                        .or_else(|| lower_bound_usage(self.config.protocol, u))
+                });
                 token
                     .leave_unreconciled_with_async(carried.as_ref(), request_id.as_deref())
                     .await?;
@@ -603,7 +878,7 @@ impl Streaming for AnthropicAdapter {
             return Err(error);
         }
         let body = self.to_wire(request, true);
-        let http = match self.post(&body).await {
+        let http = match self.post(&body, &request.model, true).await {
             Ok(http) => http,
             Err(error) => {
                 token.close_on_async(&error, None).await?;
@@ -631,6 +906,10 @@ impl Streaming for AnthropicAdapter {
         // once fully concatenated, so each block's text is accumulated here and
         // only turned into a [`Content`] block when it closes.
         let mut blocks: HashMap<u64, BlockAccumulator> = HashMap::new();
+        // A tool call whose input did not parse. When the turn stopped at the output
+        // ceiling the call was cut off mid-input: the block is dropped and the
+        // caller sees `MaxTokens`. Any other stop reason makes it a decode error.
+        let mut broken_tool_call: Option<ProviderError> = None;
         // Keyed by index and ordered on read, not on arrival: a block that
         // closes need not close in index order (testing flagged the
         // previous append-on-close ordering as coincidentally correct only
@@ -662,7 +941,7 @@ impl Streaming for AnthropicAdapter {
         // first was also the reason a mid-stream cancel presented as "nothing
         // happened until the connection closed": every delta, tool call and
         // usage event was withheld from `sink` until after the response ended.
-        let mut decoder = SseDecoder::new(ADAPTER);
+        let mut decoder = SseDecoder::new(self.adapter_name());
         let mut byte_stream = http.bytes_stream();
         let mut pending: std::collections::VecDeque<serde_json::Value> =
             std::collections::VecDeque::new();
@@ -683,7 +962,7 @@ impl Streaming for AnthropicAdapter {
                             // it broke, so this is the unreconciled/cancelled case,
                             // not a provably-unbilled one.
                             return Err(ProviderError::Transport {
-                                adapter: ADAPTER,
+                                adapter: self.adapter_name(),
                                 reason: e.to_string(),
                             });
                         }
@@ -701,7 +980,7 @@ impl Streaming for AnthropicAdapter {
                         }
                         Err(_) => {
                             return Err(ProviderError::Transport {
-                                adapter: ADAPTER,
+                                adapter: self.adapter_name(),
                                 reason: format!(
                                     "no data received for {:?}; the stream stalled",
                                     self.config.timeout
@@ -718,7 +997,7 @@ impl Streaming for AnthropicAdapter {
                         model = started.to_owned();
                         // Check the echo as early as the protocol allows, so a
                         // substituted model is caught before the output is consumed.
-                        kgraf_provider::provider::assert_model_echo(&request.model, started)?;
+                        self.assert_echo(&request.model, started)?;
                     }
                     if let Some(id) = message.get("id").and_then(|i| i.as_str()) {
                         stream_request_id = Some(id.to_owned());
@@ -732,8 +1011,13 @@ impl Streaming for AnthropicAdapter {
                         // `message_start` carries the input side, including cache
                         // counts. It is the half a consumer that only reads
                         // `message_delta` would miss.
-                        let partial = Self::normalize_usage(self.config.protocol, raw)?;
-                        usage.merge_cumulative_reported(&partial, reported_fields(raw));
+                        apply_stream_usage(
+                            self.adapter_name(),
+                            self.config.protocol,
+                            &mut usage,
+                            raw,
+                            &guard,
+                        )?;
                         saw_usage = true;
                         guard.record_usage(&usage);
                         sink(StreamEvent::Usage {
@@ -749,7 +1033,7 @@ impl Streaming for AnthropicAdapter {
                         // violation: silently overwriting it would discard
                         // whatever that block had already accumulated (fail loud).
                         return Err(ProviderError::Decode {
-                            adapter: ADAPTER,
+                            adapter: self.adapter_name(),
                             reason: format!(
                                 "content_block_start received twice for content \
                                  block {index}"
@@ -859,7 +1143,7 @@ impl Streaming for AnthropicAdapter {
                                 // with no sign anything was lost (fail loud).
                                 _ => {
                                     return Err(ProviderError::Decode {
-                                        adapter: ADAPTER,
+                                        adapter: self.adapter_name(),
                                         reason: format!(
                                             "thinking_delta for content block {index}, \
                                              which is not an open thinking block"
@@ -897,7 +1181,7 @@ impl Streaming for AnthropicAdapter {
                                 Some(BlockAccumulator::ToolUse { id, name, json, .. }) => {
                                     if json.len() + fragment.len() > MAX_TOOL_INPUT_BYTES {
                                         return Err(ProviderError::Decode {
-                                            adapter: ADAPTER,
+                                            adapter: self.adapter_name(),
                                             reason: format!(
                                                 "tool_use `{name}` (id `{id}`) accumulated \
                                                  more than {MAX_TOOL_INPUT_BYTES} bytes of \
@@ -923,7 +1207,7 @@ impl Streaming for AnthropicAdapter {
                                 // input (fail loud).
                                 _ => {
                                     return Err(ProviderError::Decode {
-                                        adapter: ADAPTER,
+                                        adapter: self.adapter_name(),
                                         reason: format!(
                                             "input_json_delta for content block {index}, \
                                              which is not an open tool_use block"
@@ -949,7 +1233,7 @@ impl Streaming for AnthropicAdapter {
                                 // lose text with no sign anything was lost.
                                 _ => {
                                     return Err(ProviderError::Decode {
-                                        adapter: ADAPTER,
+                                        adapter: self.adapter_name(),
                                         reason: format!(
                                             "text_delta for content block {index}, which \
                                              is not an open text block"
@@ -973,7 +1257,15 @@ impl Streaming for AnthropicAdapter {
                         // `None` only for a deliberately-skipped block type
                         // (`server_tool_use` and siblings): nothing to sink or
                         // keep, consistent with `complete` omitting it too.
-                        if let Some(block) = accumulated.finish()? {
+                        let finished = match accumulated.finish(self.adapter_name()) {
+                            Ok(finished) => finished,
+                            Err(error @ ProviderError::Decode { .. }) => {
+                                broken_tool_call.get_or_insert(error);
+                                None
+                            }
+                            Err(other) => return Err(other),
+                        };
+                        if let Some(block) = finished {
                             if let Content::ToolUse { .. } = &block {
                                 // Text and thinking blocks were already sunk
                                 // incrementally, per delta; a tool call could not
@@ -1010,8 +1302,13 @@ impl Streaming for AnthropicAdapter {
                         // Cumulative: merge field by field, taking the last value.
                         // Summing here is the common bug and would double the output
                         // count on any stream carrying two usage events.
-                        let partial = Self::normalize_usage(self.config.protocol, raw)?;
-                        usage.merge_cumulative_reported(&partial, reported_fields(raw));
+                        apply_stream_usage(
+                            self.adapter_name(),
+                            self.config.protocol,
+                            &mut usage,
+                            raw,
+                            &guard,
+                        )?;
                         saw_usage = true;
                         guard.record_usage(&usage);
                         sink(StreamEvent::Usage {
@@ -1041,7 +1338,7 @@ impl Streaming for AnthropicAdapter {
                         .and_then(|m| m.as_str())
                         .unwrap_or("(no message)");
                     return Err(ProviderError::Decode {
-                        adapter: ADAPTER,
+                        adapter: self.adapter_name(),
                         reason: format!("provider sent a stream `error` event ({kind}): {message}"),
                     });
                 }
@@ -1049,6 +1346,11 @@ impl Streaming for AnthropicAdapter {
             }
         }
 
+        if stop_reason != StopReason::MaxTokens
+            && let Some(error) = broken_tool_call.take()
+        {
+            return Err(error);
+        }
         if !saw_usage {
             // One provider states explicitly that an interrupted stream may never
             // deliver its usage chunk at all. The call billed; the row stays open
@@ -1057,7 +1359,9 @@ impl Streaming for AnthropicAdapter {
             // whatsoever, `UsageMissing` says exactly what is known and nothing
             // more, rather than characterizing the truncation like the next
             // check below, which needs a partial figure to report.
-            return Err(ProviderError::UsageMissing { adapter: ADAPTER });
+            return Err(ProviderError::UsageMissing {
+                adapter: self.adapter_name(),
+            });
         }
         if !saw_message_stop {
             // The connection closed without ever reaching `message_stop`, but
@@ -1070,7 +1374,9 @@ impl Streaming for AnthropicAdapter {
             // were final (both are defects). The guard
             // settles this as unreconciled with that figure kept as a stated
             // lower bound.
-            return Err(ProviderError::StreamTruncated { adapter: ADAPTER });
+            return Err(ProviderError::StreamTruncated {
+                adapter: self.adapter_name(),
+            });
         }
         if !blocks.is_empty() {
             // A content block that opened but never closed: `message_stop`
@@ -1079,7 +1385,7 @@ impl Streaming for AnthropicAdapter {
             // was building is not in `content`, so returning `Ok` would
             // silently hand back an incomplete answer.
             return Err(ProviderError::Decode {
-                adapter: ADAPTER,
+                adapter: self.adapter_name(),
                 reason: format!(
                     "{} content block(s) never received a content_block_stop \
                      before the stream ended",
@@ -1094,7 +1400,7 @@ impl Streaming for AnthropicAdapter {
             .await?;
         if let Some(stop_reason) = unusable_reason {
             return Err(ProviderError::TurnNotUsable {
-                adapter: ADAPTER,
+                adapter: self.adapter_name(),
                 stop_reason,
             });
         }
@@ -1158,7 +1464,7 @@ impl BlockAccumulator {
     /// unmodeled block contributes nothing to the final `content`, consistent
     /// with `complete`'s non-streaming parser silently omitting the same
     /// block types.
-    fn finish(self) -> Result<Option<Content>, ProviderError> {
+    fn finish(self, adapter: &'static str) -> Result<Option<Content>, ProviderError> {
         match self {
             BlockAccumulator::Text(text) => Ok(Some(Content::text(text))),
             BlockAccumulator::Reasoning(text) => Ok(Some(Content::Reasoning { text })),
@@ -1172,14 +1478,19 @@ impl BlockAccumulator {
                     start_input
                 } else {
                     serde_json::from_str(&json).map_err(|e| ProviderError::Decode {
-                        adapter: ADAPTER,
+                        adapter,
                         reason: format!(
                             "tool_use `{name}` (id `{id}`) accumulated invalid JSON input \
                              from its input_json_delta fragments: {e}"
                         ),
                     })?
                 };
-                Ok(Some(Content::ToolUse { id, name, input }))
+                Ok(Some(Content::ToolUse {
+                    id,
+                    name,
+                    input,
+                    signature: None,
+                }))
             }
             BlockAccumulator::Skipped => Ok(None),
         }
@@ -1199,15 +1510,15 @@ fn block_index(event: &serde_json::Value) -> u64 {
 ///
 /// Only a connection that never opened is known not to have reached the provider.
 /// A timeout or a reset after the request was written may have been billed in full.
-fn send_error(e: reqwest::Error) -> ProviderError {
+fn send_error(adapter: &'static str, e: reqwest::Error) -> ProviderError {
     if e.is_connect() || e.is_builder() {
         ProviderError::Unsent {
-            adapter: ADAPTER,
+            adapter,
             reason: e.to_string(),
         }
     } else {
         ProviderError::Transport {
-            adapter: ADAPTER,
+            adapter,
             reason: e.to_string(),
         }
     }
@@ -1578,6 +1889,32 @@ mod tests {
         text.matches("\"cache_control\"").count()
     }
 
+    /// A text block that is empty (one that carried another vendor's token in a
+    /// history that moved routes) is rejected by the service, so it is not sent.
+    #[test]
+    fn an_empty_text_block_is_not_sent() {
+        let adapter = honoring_adapter();
+        let mut request = Request::new("model-a", "hi", 10);
+        request.messages = vec![
+            kgraf_provider::Message::user("go"),
+            kgraf_provider::Message {
+                role: kgraf_provider::Role::Assistant,
+                content: vec![
+                    kgraf_provider::Content::Text {
+                        text: String::new(),
+                        cache_breakpoint: false,
+                        signature: Some(kgraf_provider::Signature::new("c2ln", "other:model")),
+                    },
+                    kgraf_provider::Content::text("answer"),
+                ],
+            },
+        ];
+        let sent = adapter.to_wire(&request, false);
+        let blocks = sent["messages"][1]["content"].as_array().expect("blocks");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["text"], "answer");
+    }
+
     #[test]
     fn the_last_block_of_the_last_message_gets_a_breakpoint_whatever_its_type() {
         let adapter = honoring_adapter();
@@ -1600,6 +1937,7 @@ mod tests {
                         id: "t1".into(),
                         name: "read".into(),
                         input: serde_json::json!({}),
+                        signature: None,
                     },
                 ],
             },
@@ -1635,6 +1973,66 @@ mod tests {
             "ephemeral"
         );
         assert_eq!(breakpoint_count(&sent), 2, "system plus the last block");
+    }
+
+    #[test]
+    fn a_long_tool_round_keeps_the_previous_tail_within_the_cache_lookback() {
+        let adapter = honoring_adapter();
+        let round = |calls: usize| {
+            let mut request = Request::new("model-a", "hi", 10);
+            let uses = (0..calls).map(|i| kgraf_provider::Content::ToolUse {
+                id: format!("t{i}"),
+                name: "read".into(),
+                input: serde_json::json!({}),
+                signature: None,
+            });
+            let results = (0..calls).map(|i| kgraf_provider::Content::ToolResult {
+                tool_use_id: format!("t{i}"),
+                content: "ok".into(),
+                is_error: false,
+            });
+            request.messages = vec![
+                kgraf_provider::Message::user("go"),
+                kgraf_provider::Message {
+                    role: kgraf_provider::Role::Assistant,
+                    content: uses.collect(),
+                },
+                kgraf_provider::Message {
+                    role: kgraf_provider::Role::User,
+                    content: results.collect(),
+                },
+            ];
+            adapter.to_wire(&request, false)
+        };
+        // 12 calls add 24 blocks: the request before ended on messages[0], which
+        // is out of a 20-block window from the new tail, so it is anchored.
+        let long = round(12);
+        assert_eq!(
+            long["messages"][0]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+        assert_eq!(breakpoint_count(&long), 2, "anchor plus tail");
+        // A short round is unchanged: only the tail.
+        assert_eq!(breakpoint_count(&round(2)), 1);
+    }
+
+    #[test]
+    fn a_tool_call_with_unparseable_arguments_is_sent_as_an_object() {
+        let adapter = honoring_adapter();
+        let mut request = Request::new("model-a", "hi", 10);
+        request.messages = vec![kgraf_provider::Message {
+            role: kgraf_provider::Role::Assistant,
+            content: vec![kgraf_provider::Content::ToolUse {
+                id: "t1".into(),
+                name: "read".into(),
+                input: json!("{not json"),
+                signature: None,
+            }],
+        }];
+        let sent = adapter.to_wire(&request, false);
+        let input = &sent["messages"][0]["content"][0]["input"];
+        assert!(input.is_object(), "{input}");
+        assert_eq!(input["unparsed_arguments"], "{not json");
     }
 
     #[test]
@@ -1978,6 +2376,53 @@ mod tests {
             )
         });
         assert!(sunk_tool_use, "the complete tool call must reach the sink");
+    }
+
+    #[tokio::test]
+    async fn a_tool_call_cut_off_at_the_output_ceiling_is_dropped_and_reports_max_tokens() {
+        // A large call cut off mid-input is not a malformed stream: the model ran out of
+        // output. The caller must see the stop reason, not a decode error, and no
+        // half-parsed call.
+        let server = MockServer::start().await;
+        let sse = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_cut\",\"model\":\"model-a\",",
+            "\"usage\":{\"input_tokens\":10,\"output_tokens\":1}}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,",
+            "\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_cut\",",
+            "\"name\":\"apply_patch\",\"input\":{}}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,",
+            "\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"patch\\\": \\\"*** Beg\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},",
+            "\"usage\":{\"output_tokens\":100}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(sse))
+            .mount(&server)
+            .await;
+
+        let adapter = AnthropicAdapter::new(config(&server.uri())).expect("adapter");
+        let ledger = Ledger::open_in_memory().expect("ledger");
+        let token = ledger
+            .begin(ADAPTER, Protocol::Additive, "model-a", "a", "t")
+            .expect("begin");
+        let response = Streaming::stream(
+            &adapter,
+            &Request::new("model-a", "hi", 100),
+            &token,
+            &mut |_| {},
+        )
+        .await
+        .expect("a cut-off call is a stop reason, not an error");
+        assert_eq!(response.stop_reason, StopReason::MaxTokens);
+        assert!(
+            !response
+                .content
+                .iter()
+                .any(|c| matches!(c, Content::ToolUse { .. })),
+            "the truncated call must not be handed back"
+        );
     }
 
     #[tokio::test]
@@ -3236,6 +3681,27 @@ mod tests {
     }
 
     #[test]
+    fn a_later_output_total_without_the_thinking_split_keeps_the_thinking_share() {
+        let mut usage = TokenUsage::default();
+        let start = json!({
+            "input_tokens": 10, "output_tokens": 30,
+            "output_tokens_details": {"thinking_tokens": 20}
+        });
+        let partial = AnthropicAdapter::normalize_usage(Protocol::Additive, &start).expect("start");
+        merge_stream_usage(ADAPTER, &mut usage, partial, &start).expect("merge");
+        assert_eq!((usage.text_output, usage.reasoning_output), (10, 20));
+
+        let delta = json!({"output_tokens": 50});
+        let partial = AnthropicAdapter::normalize_usage(Protocol::Additive, &delta).expect("delta");
+        merge_stream_usage(ADAPTER, &mut usage, partial, &delta).expect("merge");
+        assert_eq!(
+            (usage.text_output, usage.reasoning_output),
+            (30, 20),
+            "the thinking share stays and the new total is carved around it"
+        );
+    }
+
+    #[test]
     fn thinking_reported_beyond_output_is_refused() {
         let raw = json!({
             "input_tokens": 10,
@@ -3245,6 +3711,39 @@ mod tests {
         let err =
             AnthropicAdapter::normalize_usage(Protocol::Additive, &raw).expect_err("must refuse");
         assert!(matches!(err, ProviderError::Decode { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn a_hybrid_usage_object_that_cannot_be_costed_correctly_is_refused() {
+        // Cache read reported only in `cached_tokens`: the adapter would cost it
+        // at the full input rate.
+        let hidden = json!({
+            "input_tokens": 1000, "output_tokens": 54, "cache_read_input_tokens": 0,
+            "cached_tokens": 800, "total_tokens": 1054
+        });
+        let err =
+            AnthropicAdapter::normalize_usage(Protocol::Additive, &hidden).expect_err("refuse");
+        assert!(matches!(err, ProviderError::Decode { .. }), "{err:?}");
+
+        // `input_tokens` already includes the cache read, so the additive sum
+        // exceeds the vendor total.
+        let inclusive_input = json!({
+            "input_tokens": 1000, "output_tokens": 54, "cache_read_input_tokens": 800,
+            "cached_tokens": 800, "total_tokens": 1054
+        });
+        let err = AnthropicAdapter::normalize_usage(Protocol::Additive, &inclusive_input)
+            .expect_err("refuse");
+        assert!(matches!(err, ProviderError::Decode { .. }), "{err:?}");
+
+        // The same object is consistent when input excludes the cache read.
+        let additive = json!({
+            "input_tokens": 200, "output_tokens": 54, "cache_read_input_tokens": 800,
+            "cached_tokens": 800, "total_tokens": 1054
+        });
+        let usage =
+            AnthropicAdapter::normalize_usage(Protocol::Additive, &additive).expect("consistent");
+        assert_eq!(usage.cache_read, 800);
+        assert_eq!(usage.uncached_input, 200);
     }
 
     /// A streamed tool call (a `tool_use` block whose input arrives as
@@ -3313,5 +3812,105 @@ mod tests {
         )));
         let record = ledger.call(token.id()).expect("read").expect("present");
         assert_eq!(record.settlement, Settlement::Counted);
+    }
+
+    async fn stream_usage_events(events: [&str; 2]) -> (Result<Response, ProviderError>, Ledger) {
+        let server = MockServer::start().await;
+        let sse = format!(
+            "data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_u\",\"model\":\"model-a\",\"usage\":{}}}}}\n\n\
+             data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{}}}\n\n\
+             data: {{\"type\":\"message_stop\"}}\n\n",
+            events[0], events[1]
+        );
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(sse)
+                    .insert_header("content-type", "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+        let adapter = AnthropicAdapter::new(config(&server.uri())).expect("adapter");
+        let ledger = Ledger::open_in_memory().expect("ledger");
+        let result = {
+            let token = ledger
+                .begin(ADAPTER, Protocol::Additive, "model-a", "a", "t")
+                .expect("begin");
+            Streaming::stream(
+                &adapter,
+                &Request::new("model-a", "hi", 100),
+                &token,
+                &mut |_| {},
+            )
+            .await
+        };
+        (result, ledger)
+    }
+
+    /// A delta that restates only the output and the claims (`cached_tokens`,
+    /// `total_tokens`) is checked against the merged figure, so cache fields it
+    /// omits do not make a correct stream look inconsistent.
+    #[tokio::test]
+    async fn stream_usage_is_checked_on_the_merged_figure_not_per_event() {
+        let (result, ledger) = stream_usage_events([
+            r#"{"input_tokens":200,"cache_read_input_tokens":800,"cached_tokens":800,"output_tokens":1}"#,
+            r#"{"output_tokens":54,"cached_tokens":800,"total_tokens":1054}"#,
+        ])
+        .await;
+        let response = result.expect("a consistent merged stream is accepted");
+        assert_eq!(response.usage.cache_read, 800);
+        assert_eq!(response.usage.uncached_input, 200);
+        assert_eq!(response.usage.text_output, 54);
+        let rows = ledger.unreconciled().expect("open rows");
+        assert!(rows.is_empty(), "{rows:?}");
+    }
+
+    /// A stream refused on its merged total still billed: the open row keeps the
+    /// merged figure and the last raw usage object.
+    #[tokio::test]
+    async fn a_refused_stream_keeps_its_usage_and_raw_object_on_the_open_row() {
+        let (result, ledger) = stream_usage_events([
+            r#"{"input_tokens":200,"cache_read_input_tokens":800,"output_tokens":1}"#,
+            r#"{"output_tokens":54,"total_tokens":5000}"#,
+        ])
+        .await;
+        assert!(matches!(result, Err(ProviderError::Decode { .. })));
+        let rows = ledger.unreconciled().expect("open rows");
+        assert_eq!(rows.len(), 1);
+        let usage = &rows[0].usage;
+        assert_eq!(
+            (usage.uncached_input, usage.cache_read, usage.text_output),
+            (200, 800, 54)
+        );
+        assert_eq!(usage.raw.as_ref().expect("raw kept")["total_tokens"], 5000);
+    }
+
+    /// A complete response refused on its total still billed: the open row keeps
+    /// the parsed counts and the raw usage object.
+    #[tokio::test]
+    async fn a_refused_complete_call_keeps_its_usage_and_raw_object() {
+        let server = MockServer::start().await;
+        let mut refused = body("model-a");
+        refused["usage"] = json!({"input_tokens": 100, "output_tokens": 10, "total_tokens": 5});
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(refused))
+            .mount(&server)
+            .await;
+        let adapter = AnthropicAdapter::new(config(&server.uri())).expect("adapter");
+        let ledger = Ledger::open_in_memory().expect("ledger");
+        {
+            let token = ledger
+                .begin(ADAPTER, Protocol::Additive, "model-a", "a", "t")
+                .expect("begin");
+            let result = adapter
+                .complete(&Request::new("model-a", "hi", 100), &token)
+                .await;
+            assert!(result.is_err());
+        }
+        let rows = ledger.unreconciled().expect("open rows");
+        assert_eq!(rows.len(), 1);
+        let usage = &rows[0].usage;
+        assert_eq!((usage.uncached_input, usage.text_output), (100, 10));
+        assert_eq!(usage.raw.as_ref().expect("raw kept")["total_tokens"], 5);
     }
 }

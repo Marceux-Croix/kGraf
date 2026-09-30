@@ -1,0 +1,9 @@
+: Written from the streamGenerateContent reference (https://ai.google.dev/api/generate-content#method:-models.streamgeneratecontent)
+: and the function calling guide (https://ai.google.dev/gemini-api/docs/function-calling): a thought summary
+: streams first, then one complete functionCall part in the last event, which ends with STOP.
+: Not recorded from a live call.
+
+data: {"candidates":[{"content":{"role":"model","parts":[{"text":"I should look up the weather.","thought":true}]},"index":0}],"usageMetadata":{"promptTokenCount":50,"thoughtsTokenCount":6,"totalTokenCount":56},"modelVersion":"gemini-2.5-flash","responseId":"resp-s2"}
+
+data: {"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"get_current_weather","args":{"location":"Boston"}},"thoughtSignature":"c3RyZWFtZWQtc2ln"}]},"finishReason":"STOP","index":0}],"usageMetadata":{"promptTokenCount":50,"candidatesTokenCount":9,"thoughtsTokenCount":6,"totalTokenCount":65},"modelVersion":"gemini-2.5-flash","responseId":"resp-s2"}
+

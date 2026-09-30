@@ -259,10 +259,10 @@ async fn a_skip_policy_schedule_ticked_across_its_due_time_fires_exactly_once() 
 }
 
 /// One schedule failing to progress (here, a claim it cannot win) must not stop
-/// another schedule in the same tick from firing. The exact reviewer-cited defect - a
-/// cron pattern that constructs but whose backward search fails - is now refused at
-/// construction instead (see `kgraf_schedule::recurrence`'s own regression test),
-/// so it can no longer reach a tick at all; this test instead proves the tick loop's
+/// another schedule in the same tick from firing. A cron pattern that constructs
+/// but whose backward search fails was once such a case; it is now refused at
+/// construction (see `kgraf_schedule::recurrence`'s own regression test), so it
+/// can no longer reach a tick at all. This test proves the tick loop's
 /// per-schedule isolation directly, with `tick`'s `match` (not `?`) doing the work.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn one_schedule_unable_to_claim_does_not_stop_another_from_firing() {
@@ -505,7 +505,7 @@ async fn a_schedule_fires_once_across_two_app_instances() {
 /// A claim whose lease expired (the claimant crashed or hung) is reclaimed by a
 /// live loop on a later tick, and the reclaim is visible as its own event - not
 /// indistinguishable from an ordinary fresh firing, and not permanently stranded (the
-/// defect the review found: `advance_last_seen` running ahead of the claim meant a
+/// defect: `advance_last_seen` running ahead of the claim meant a
 /// crash between the two left the occurrence accounted for but never actually
 /// claimed again by anyone).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -758,7 +758,7 @@ impl OrchestratorFactory for NoCredential {
 
 /// A per-schedule credential failure - `configured()` still
 /// succeeds (the process as a whole is set up), but `ready(schedule_id)` fails - must
-/// still disable *that* schedule with the reason shown (acceptance item 3: "a
+/// still disable *that* schedule with the reason shown ("a
 /// schedule whose credential is removed disables itself"). This is the behavior the
 /// whole-process pre-check must never swallow: the fix splits `configured` from
 /// `ready` precisely so this path stays reachable.
@@ -1269,6 +1269,73 @@ async fn a_skip_policy_deferral_past_the_on_time_window_is_dropped_not_run_late(
             .occurrence_status("second", due)
             .unwrap(),
         Some("dropped".to_owned())
+    );
+}
+
+/// An occurrence set aside while a manual run held its schedule is judged by the
+/// missed-run policy when it comes back: under `Skip`, past the on-time window it is
+/// dropped, not run late; under `RunOnceOnWake` it still runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_occurrence_held_for_a_manual_run_follows_the_missed_run_policy() {
+    let dir = tempfile::tempdir().expect("dir");
+    let factory = factory(dir.path(), false);
+    let starter = scheduled_runs(factory.clone(), &["skip", "wake"]);
+    let store = ScheduleStore::open_in_memory().expect("store");
+    let due = t(1);
+    for id in ["skip", "wake"] {
+        store
+            .claim_manual_run(id, "run-now:1", due, Duration::from_secs(30), false)
+            .expect("manual");
+        assert_eq!(
+            store
+                .claim_occurrence(id, due, "a", due, Duration::from_secs(30))
+                .expect("held"),
+            ClaimOutcome::NotClaimed
+        );
+    }
+    let store = Arc::new(Mutex::new(store));
+    let mut loop_ = SchedulerLoop::new(store.clone(), starter, "a");
+    let skip = Schedule::one_shot("skip", due, "UTC")
+        .expect("valid")
+        .with_missed_run_policy(MissedRunPolicy::Skip);
+    let wake = Schedule::one_shot("wake", due, "UTC")
+        .expect("valid")
+        .with_missed_run_policy(MissedRunPolicy::RunOnceOnWake);
+    let schedules = [tracked(skip, t(0)), tracked(wake, t(0))];
+
+    let later = due + chrono::TimeDelta::minutes(30);
+    let events = drain(&mut loop_, &schedules, later).await;
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            TickEvent::Reclaimed { schedule_id, .. } | TickEvent::Started { schedule_id, .. }
+                if schedule_id == "skip"
+        )),
+        "a held Skip occurrence ran late: {events:?}"
+    );
+    assert_eq!(
+        store
+            .lock()
+            .unwrap()
+            .occurrence_status("skip", due)
+            .unwrap(),
+        Some("dropped".to_owned())
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            TickEvent::Dropped { schedule_id, due_at, .. }
+                if schedule_id == "skip" && *due_at == due
+        )),
+        "the dropped occurrence is reported, not silent: {events:?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            TickEvent::Reclaimed { schedule_id, .. } | TickEvent::Started { schedule_id, .. }
+                if schedule_id == "wake"
+        )),
+        "a held RunOnceOnWake occurrence must still run: {events:?}"
     );
 }
 

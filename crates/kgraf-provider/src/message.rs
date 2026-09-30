@@ -20,6 +20,75 @@ pub enum Role {
     Assistant,
 }
 
+/// An opaque token a provider attached to a block, kept with the history and
+/// sent back verbatim.
+///
+/// A token is valid only for the model that made it, so it carries the
+/// producer: a tag naming the adapter and model. An adapter sends a token only
+/// when the producer matches its own tag. History written before the producer
+/// was recorded holds a bare string; it reads back with no producer, which
+/// matches nothing.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct Signature {
+    pub value: String,
+    /// The adapter and model that made the token, in the adapter's own
+    /// spelling. `None` for a token whose maker was not recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub producer: Option<String>,
+}
+
+impl Signature {
+    /// A token made by `producer`.
+    pub fn new(value: impl Into<String>, producer: impl Into<String>) -> Self {
+        Self {
+            value: value.into(),
+            producer: Some(producer.into()),
+        }
+    }
+
+    /// Whether `producer` made this token.
+    pub fn is_from(&self, producer: &str) -> bool {
+        self.producer.as_deref() == Some(producer)
+    }
+}
+
+impl From<String> for Signature {
+    fn from(value: String) -> Self {
+        Self {
+            value,
+            producer: None,
+        }
+    }
+}
+
+impl From<&str> for Signature {
+    fn from(value: &str) -> Self {
+        value.to_owned().into()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Signature {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum Wire {
+            Bare(String),
+            Full {
+                value: String,
+                #[serde(default)]
+                producer: Option<String>,
+            },
+        }
+        Ok(match Wire::deserialize(deserializer)? {
+            Wire::Bare(value) => Signature {
+                value,
+                producer: None,
+            },
+            Wire::Full { value, producer } => Signature { value, producer },
+        })
+    }
+}
+
 /// One block of content.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -34,12 +103,22 @@ pub enum Content {
         /// honoring it rather than assumed to have complied.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         cache_breakpoint: bool,
+        /// The token the provider attached to this text part, kept with the
+        /// history. Absent from history written before the field existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<Signature>,
     },
     /// A tool call the model asked for.
     ToolUse {
         id: String,
         name: String,
         input: serde_json::Value,
+        /// An opaque token the provider attached to this call, kept with the
+        /// history and sent back verbatim with the call. Absent from history
+        /// written before the field existed, and from calls whose provider
+        /// attaches none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<Signature>,
     },
     /// The result of a tool call.
     ToolResult {
@@ -58,12 +137,48 @@ pub enum Content {
     Reasoning { text: String },
 }
 
+/// A tool call whose arguments did not parse as JSON keeps them as a string
+/// (the adapters store what the model emitted). Sent back in history as it
+/// stands, that string would be encoded a second time on a wire that takes
+/// arguments as JSON text, and rejected on a wire that takes an object.
+/// These helpers give each wire the right shape.
+///
+/// The arguments as the JSON text a chat-style wire carries: an unparsed string
+/// goes back verbatim, anything else is serialized.
+///
+/// A call with no arguments goes back as `{}`: an absent input, or an empty
+/// argument string (how a vendor spells "no arguments"), is not valid JSON text
+/// as it stands.
+pub fn tool_arguments_text(input: &serde_json::Value) -> String {
+    match input {
+        serde_json::Value::Null => "{}".to_owned(),
+        serde_json::Value::String(raw) if raw.trim().is_empty() => "{}".to_owned(),
+        serde_json::Value::String(raw) => raw.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// The arguments as the JSON object a block-style wire requires: an unparsed
+/// string is wrapped so its text survives and the input is still an object. A
+/// call with no arguments (an absent input, or an empty string) is the empty
+/// object, not a wrapped `null` or `""`.
+pub fn tool_arguments_object(input: &serde_json::Value) -> serde_json::Value {
+    match input {
+        serde_json::Value::Object(_) => input.clone(),
+        serde_json::Value::Null => serde_json::json!({}),
+        serde_json::Value::String(raw) if raw.trim().is_empty() => serde_json::json!({}),
+        serde_json::Value::String(raw) => serde_json::json!({ "unparsed_arguments": raw }),
+        other => serde_json::json!({ "unparsed_arguments": other.to_string() }),
+    }
+}
+
 impl Content {
     /// A plain text block with no cache breakpoint.
     pub fn text(text: impl Into<String>) -> Self {
         Content::Text {
             text: text.into(),
             cache_breakpoint: false,
+            signature: None,
         }
     }
 
@@ -72,6 +187,7 @@ impl Content {
         Content::Text {
             text: text.into(),
             cache_breakpoint: true,
+            signature: None,
         }
     }
 
@@ -147,24 +263,6 @@ impl Request {
             tools: Vec::new(),
             reasoning_effort: None,
         }
-    }
-
-    /// Whether any block in this request asks for a cache breakpoint.
-    pub fn wants_cache_control(&self) -> bool {
-        let block_wants = |content: &Content| {
-            matches!(
-                content,
-                Content::Text {
-                    cache_breakpoint: true,
-                    ..
-                }
-            )
-        };
-        self.system.iter().any(block_wants)
-            || self
-                .messages
-                .iter()
-                .any(|m| m.content.iter().any(block_wants))
     }
 }
 
@@ -262,7 +360,9 @@ impl Response {
         self.content
             .iter()
             .filter_map(|c| match c {
-                Content::ToolUse { id, name, input } => Some((id.as_str(), name.as_str(), input)),
+                Content::ToolUse {
+                    id, name, input, ..
+                } => Some((id.as_str(), name.as_str(), input)),
                 _ => None,
             })
             .collect()
@@ -272,6 +372,23 @@ impl Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_call_with_no_arguments_replays_as_an_empty_object_on_both_wires() {
+        for none in [
+            serde_json::Value::Null,
+            serde_json::json!(""),
+            serde_json::json!("  "),
+        ] {
+            assert_eq!(tool_arguments_text(&none), "{}", "{none:?}");
+            assert_eq!(tool_arguments_object(&none), serde_json::json!({}));
+        }
+        // Text that is not JSON is still preserved, not replaced.
+        assert_eq!(
+            tool_arguments_object(&serde_json::json!("{not json")),
+            serde_json::json!({"unparsed_arguments": "{not json"})
+        );
+    }
 
     #[test]
     fn content_blocks_survive_a_round_trip_without_being_joined() {
@@ -299,13 +416,33 @@ mod tests {
     }
 
     #[test]
-    fn a_request_reports_whether_it_wants_cache_control() {
-        let plain = Request::new("m", "hello", 100);
-        assert!(!plain.wants_cache_control());
+    fn a_signature_reads_from_a_bare_string_and_from_the_tagged_form() {
+        let old: Content = serde_json::from_value(serde_json::json!({
+            "type": "tool_use", "id": "1", "name": "n", "input": {}, "signature": "c2ln"
+        }))
+        .expect("history written before the producer was recorded");
+        let Content::ToolUse { signature, .. } = &old else {
+            unreachable!()
+        };
+        let signature = signature.as_ref().expect("kept");
+        assert_eq!(signature.value, "c2ln");
+        assert!(
+            !signature.is_from("any"),
+            "an unrecorded maker matches nothing"
+        );
 
-        let mut cached = Request::new("m", "hello", 100);
-        cached.system = vec![Content::cached_text("system prefix")];
-        assert!(cached.wants_cache_control());
+        let tagged = Signature::new("c2ln", "gemini-generate-content:gemini-3-pro");
+        let back: Signature =
+            serde_json::from_str(&serde_json::to_string(&tagged).expect("ser")).expect("de");
+        assert_eq!(back, tagged);
+        assert!(back.is_from("gemini-generate-content:gemini-3-pro"));
+    }
+
+    #[test]
+    fn a_text_block_without_a_signature_field_still_reads() {
+        let block: Content =
+            serde_json::from_str(r#"{"type":"text","text":"hi"}"#).expect("old history");
+        assert_eq!(block, Content::text("hi"));
     }
 
     #[test]

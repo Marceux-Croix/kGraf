@@ -132,6 +132,33 @@ fn fn_body<'a>(code: &'a str, name: &str) -> Option<&'a str> {
     None
 }
 
+/// Whether `body` binds `name` itself: `let name`, `let mut name`, a nested
+/// `fn name`, a `for name in`, or a closure parameter `|name|`. Any of these
+/// makes a later call to `name` a call to the local one.
+fn binds_locally(body: &str, name: &str) -> bool {
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+    body.match_indices(name).any(|(i, _)| {
+        let after = &body[i + name.len()..];
+        if body[..i].chars().next_back().is_some_and(is_ident)
+            || after.chars().next().is_some_and(is_ident)
+        {
+            return false;
+        }
+        let before = body[..i].trim_end();
+        let last_word = before.rsplit(|c: char| !is_ident(c)).next().unwrap_or("");
+        matches!(
+            last_word,
+            "let" | "mut" | "fn" | "for" | "ref" | "const" | "static"
+        ) || {
+            // A closure parameter: `|name|`, `|name: T|`, `|name, b|`, `|a, name|`.
+            // A name right after the closing bar (`|x| name(x)`) is a call.
+            let next = after.trim_start().chars().next();
+            (before.ends_with('|') && matches!(next, Some(':' | ',' | '|')))
+                || (before.ends_with(',') && next == Some('|'))
+        }
+    })
+}
+
 /// True when `function`'s body in `source` uses `helper` (a call, a path call
 /// such as `Self::helper(..)`, or the name passed on; a comment or string
 /// mention does not count) and contains none
@@ -143,6 +170,13 @@ pub fn body_uses(source: &str, function: &str, helper: &str, absent: &[&str]) ->
         return false;
     };
     let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+    // The helper is the item the source defines outside `function`, not a
+    // name bound inside it: a closure or nested fn of that name is the old
+    // logic under a new label.
+    let outside = code.replacen(body, "", 1);
+    if fn_body(&outside, helper).is_none() || binds_locally(body, helper) {
+        return false;
+    }
     // A whole-identifier occurrence is a use: a call, a path call, or the
     // helper passed by name (`.map(helper)`).
     let called = body.match_indices(helper).any(|(i, _)| {
@@ -225,6 +259,25 @@ mod tests {
         }
     }
 
+    /// A closure or nested fn named like the helper is the old logic under
+    /// the helper's name; only a call to the item defined outside passes.
+    #[test]
+    fn a_local_binding_named_like_the_helper_is_not_the_helper() {
+        let (f, h, a) = uses_of("refactor-shipping");
+        let closure = "pub fn total_price(price: f64, qty: u32, pct_off: f64) -> f64 {\n    let apply_discount = |p: f64, o: f64| p - p * o / 100.0;\n    apply_discount(price, pct_off) * qty as f64\n}\n";
+        assert!(!body_uses(closure, f, h, a), "no helper item at all");
+        let item = "pub fn apply_discount(p: f64, o: f64) -> f64 { p - p * o / 100.0 }\n";
+        let with_item = format!("{item}{closure}");
+        assert!(!body_uses(&with_item, f, h, a), "closure shadows the item");
+        let nested = format!(
+            "{item}pub fn total_price(price: f64, qty: u32, pct_off: f64) -> f64 {{\n    fn apply_discount(p: f64, o: f64) -> f64 {{ p - p * o / 100.0 }}\n    apply_discount(price, pct_off) * qty as f64\n}}\n"
+        );
+        assert!(!body_uses(&nested, f, h, a), "a nested fn shadows the item");
+        let mutable = with_item.replace("let apply_discount", "let mut apply_discount");
+        assert!(!body_uses(&mutable, f, h, a));
+        assert!(body_uses(SHIPPING_GOOD, f, h, a), "the real helper passes");
+    }
+
     #[test]
     fn a_mention_in_a_comment_or_string_is_not_a_call() {
         let (f, h, a) = uses_of("refactor-shipping");
@@ -235,7 +288,7 @@ mod tests {
     #[test]
     fn scanning_is_tolerant_of_layout_and_literals() {
         let (f, h, a) = uses_of("refactor-shipping");
-        let src = "pub fn   total_price (p: f64, q: u32, o: f64)\n -> f64\n{\n    let _c = '}';\n    let _s = \"}{\";\n    let _r = r#\"}\"#;\n    Self::apply_discount\n        (p, o) * q as f64\n}\n";
+        let src = "fn apply_discount(p: f64, o: f64) -> f64 { p - p * o / 100.0 }\npub fn   total_price (p: f64, q: u32, o: f64)\n -> f64\n{\n    let _c = '}';\n    let _s = \"}{\";\n    let _r = r#\"}\"#;\n    Self::apply_discount\n        (p, o) * q as f64\n}\n";
         assert!(body_uses(src, f, h, a));
         // A longer function name is not the function, a missing one is false.
         assert!(!body_uses(

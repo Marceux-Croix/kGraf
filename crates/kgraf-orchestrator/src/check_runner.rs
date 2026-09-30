@@ -181,7 +181,6 @@ pub struct SandboxRunner {
     /// that say nothing about the contract.
     compile_timeout: Duration,
     limits: ResourceLimits,
-    tail_bytes: usize,
     seq: AtomicU64,
 }
 
@@ -264,7 +263,6 @@ impl SandboxRunner {
             timeout: Duration::from_secs(600),
             compile_timeout: Duration::from_secs(600),
             limits: ResourceLimits::default(),
-            tail_bytes: DEFAULT_TAIL_BYTES,
             seq: AtomicU64::new(0),
         })
     }
@@ -290,11 +288,6 @@ impl SandboxRunner {
 
     pub fn with_limits(mut self, limits: ResourceLimits) -> Self {
         self.limits = limits;
-        self
-    }
-
-    pub fn with_tail_bytes(mut self, bytes: usize) -> Self {
-        self.tail_bytes = bytes;
         self
     }
 
@@ -647,7 +640,7 @@ impl SandboxRunner {
                 "a process the check started left its process group and is still running".into(),
             ));
         }
-        let keep = self.tail_bytes;
+        let keep = DEFAULT_TAIL_BYTES;
         let tail = blocking(move || {
             Ok(join_tail(
                 &last_bytes(&err_path, keep),

@@ -1,0 +1,134 @@
+{
+  "_fixture": {
+    "source": [
+      "https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference.html",
+      "https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ToolUseBlockStart.html",
+      "https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ToolUseBlockDelta.html",
+      "https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ReasoningContentBlockDelta.html"
+    ],
+    "provenance": "Constructed from the documented event order (contentBlockStart for tool use only, toolUse input as partial JSON string deltas, reasoningContent deltas with text then signature) and member shapes. Ids and numbers are invented. Not a live capture."
+  },
+  "events": [
+    {
+      "event": "messageStart",
+      "payload": {
+        "role": "assistant"
+      }
+    },
+    {
+      "event": "contentBlockDelta",
+      "payload": {
+        "contentBlockIndex": 0,
+        "delta": {
+          "reasoningContent": {
+            "text": "The user wants a song."
+          }
+        }
+      }
+    },
+    {
+      "event": "contentBlockDelta",
+      "payload": {
+        "contentBlockIndex": 0,
+        "delta": {
+          "reasoningContent": {
+            "signature": "c2ln"
+          }
+        }
+      }
+    },
+    {
+      "event": "contentBlockStop",
+      "payload": {
+        "contentBlockIndex": 0
+      }
+    },
+    {
+      "event": "contentBlockDelta",
+      "payload": {
+        "contentBlockIndex": 1,
+        "delta": {
+          "text": "Looking it up."
+        }
+      }
+    },
+    {
+      "event": "contentBlockStop",
+      "payload": {
+        "contentBlockIndex": 1
+      }
+    },
+    {
+      "event": "contentBlockStart",
+      "payload": {
+        "contentBlockIndex": 2,
+        "start": {
+          "toolUse": {
+            "toolUseId": "tooluse_abc123",
+            "name": "top_song"
+          }
+        }
+      }
+    },
+    {
+      "event": "contentBlockDelta",
+      "payload": {
+        "contentBlockIndex": 2,
+        "delta": {
+          "toolUse": {
+            "input": "{\"si"
+          }
+        }
+      }
+    },
+    {
+      "event": "contentBlockDelta",
+      "payload": {
+        "contentBlockIndex": 2,
+        "delta": {
+          "toolUse": {
+            "input": "gn\": \"WZ"
+          }
+        }
+      }
+    },
+    {
+      "event": "contentBlockDelta",
+      "payload": {
+        "contentBlockIndex": 2,
+        "delta": {
+          "toolUse": {
+            "input": "PZ\"}"
+          }
+        }
+      }
+    },
+    {
+      "event": "contentBlockStop",
+      "payload": {
+        "contentBlockIndex": 2
+      }
+    },
+    {
+      "event": "messageStop",
+      "payload": {
+        "stopReason": "tool_use"
+      }
+    },
+    {
+      "event": "metadata",
+      "payload": {
+        "usage": {
+          "inputTokens": 212,
+          "outputTokens": 57,
+          "totalTokens": 269,
+          "cacheReadInputTokens": 0,
+          "cacheWriteInputTokens": 0
+        },
+        "metrics": {
+          "latencyMs": 1500
+        }
+      }
+    }
+  ]
+}

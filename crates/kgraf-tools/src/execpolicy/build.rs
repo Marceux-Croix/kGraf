@@ -644,18 +644,23 @@ fn manifest_value(v: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// The `--manifest-path` value of an allowed cargo argv, if it has one, for
-/// the on-disk check.
-pub(crate) fn manifest_path_of(argv: &[String]) -> Option<&str> {
+/// Every `--manifest-path` value of an allowed cargo argv, for the on-disk
+/// check. All of them, not the first: cargo 1.95 refuses a repeated
+/// `--manifest-path`, but the check must not depend on which one a cargo
+/// version would use.
+pub(crate) fn manifest_paths_of(argv: &[String]) -> Vec<&str> {
     let own_end = argv.iter().position(|a| a == "--").unwrap_or(argv.len());
     let own = &argv[..own_end];
-    own.iter().enumerate().find_map(|(i, a)| {
-        if a == "--manifest-path" {
-            own.get(i + 1).map(String::as_str)
-        } else {
-            a.strip_prefix("--manifest-path=")
-        }
-    })
+    own.iter()
+        .enumerate()
+        .filter_map(|(i, a)| {
+            if a == "--manifest-path" {
+                own.get(i + 1).map(String::as_str)
+            } else {
+                a.strip_prefix("--manifest-path=")
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -871,23 +876,32 @@ mod tests {
     }
 
     #[test]
-    fn the_manifest_path_is_found_for_the_on_disk_check() {
+    fn every_manifest_path_is_found_for_the_on_disk_check() {
         assert_eq!(
-            manifest_path_of(&argv(&[
+            manifest_paths_of(&argv(&[
                 "cargo",
                 "build",
                 "--manifest-path",
                 "a/Cargo.toml"
             ])),
-            Some("a/Cargo.toml")
+            ["a/Cargo.toml"]
         );
         assert_eq!(
-            manifest_path_of(&argv(&["cargo", "build", "--manifest-path=b/Cargo.toml"])),
-            Some("b/Cargo.toml")
+            manifest_paths_of(&argv(&["cargo", "build", "--manifest-path=b/Cargo.toml"])),
+            ["b/Cargo.toml"]
         );
         assert_eq!(
-            manifest_path_of(&argv(&["cargo", "test", "--", "--manifest-path", "x"])),
-            None
+            manifest_paths_of(&argv(&[
+                "cargo",
+                "build",
+                "--manifest-path=a/Cargo.toml",
+                "--manifest-path",
+                "b/Cargo.toml"
+            ])),
+            ["a/Cargo.toml", "b/Cargo.toml"]
+        );
+        assert!(
+            manifest_paths_of(&argv(&["cargo", "test", "--", "--manifest-path", "x"])).is_empty()
         );
     }
 }

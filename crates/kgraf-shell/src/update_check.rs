@@ -115,6 +115,10 @@ pub enum UpdateError {
         expected: String,
         actual: String,
     },
+    #[error("the checksum file is larger than {max} bytes; refusing to read it")]
+    ChecksumFileTooLarge { max: usize },
+    #[error("could not build the HTTP client: {0}")]
+    Client(String),
     #[error("could not write {path}: {message}")]
     Io { path: PathBuf, message: String },
     #[error("could not launch the installer: {0}")]
@@ -348,15 +352,23 @@ pub const DOWNLOAD_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::f
 /// finishes as long as data keeps arriving.
 pub const DOWNLOAD_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// The most bytes read from a checksum file. A `SHA256SUMS` for a release is a
+/// few hundred bytes; more than this is not one.
+pub const MAX_CHECKSUM_BYTES: usize = 1 << 20;
+
 /// The client for [`download_and_verify`]: a connect timeout and a read-idle
 /// timeout, and no whole-request timeout (the release query keeps its own
-/// short one).
-pub fn download_client(connect: std::time::Duration, idle: std::time::Duration) -> reqwest::Client {
+/// short one). An error when it cannot be built: a default client has neither
+/// timeout, so it is never a substitute.
+pub fn download_client(
+    connect: std::time::Duration,
+    idle: std::time::Duration,
+) -> Result<reqwest::Client, UpdateError> {
     reqwest::Client::builder()
         .connect_timeout(connect)
         .read_timeout(idle)
         .build()
-        .unwrap_or_default()
+        .map_err(|e| UpdateError::Client(e.to_string()))
 }
 
 /// The download itself. Sets `created` once the destination file exists.
@@ -369,17 +381,30 @@ async fn download_steps(
 ) -> Result<(), UpdateError> {
     use tokio::io::AsyncWriteExt as _;
 
-    let checksum_body = client
+    let mut checksum_resp = client
         .get(&candidate.checksum_url)
         .header("User-Agent", user_agent())
         .send()
         .await
         .map_err(|e| UpdateError::Network(e.to_string()))?
         .error_for_status()
-        .map_err(|e| UpdateError::Http(e.status().map(|s| s.as_u16()).unwrap_or(0)))?
-        .text()
+        .map_err(|e| UpdateError::Http(e.status().map(|s| s.as_u16()).unwrap_or(0)))?;
+    // Read at most MAX_CHECKSUM_BYTES: a server that never stops must not
+    // fill memory.
+    let mut checksum_bytes = Vec::new();
+    while let Some(chunk) = checksum_resp
+        .chunk()
         .await
-        .map_err(|e| UpdateError::Network(e.to_string()))?;
+        .map_err(|e| UpdateError::Network(e.to_string()))?
+    {
+        if checksum_bytes.len() + chunk.len() > MAX_CHECKSUM_BYTES {
+            return Err(UpdateError::ChecksumFileTooLarge {
+                max: MAX_CHECKSUM_BYTES,
+            });
+        }
+        checksum_bytes.extend_from_slice(&chunk);
+    }
+    let checksum_body = String::from_utf8_lossy(&checksum_bytes).into_owned();
     let expected = parse_checksum(&checksum_body, &candidate.asset_name).ok_or_else(|| {
         UpdateError::ChecksumMissing {
             tag: candidate.tag_name.clone(),
@@ -956,12 +981,45 @@ mod tests {
             .expect_err("a whole-request timeout cuts a slow transfer");
         assert!(matches!(err, UpdateError::Network(_)), "{err}");
 
-        let client = download_client(Duration::from_secs(2), Duration::from_millis(600));
+        let client =
+            download_client(Duration::from_secs(2), Duration::from_millis(600)).expect("client");
         let dir = tempfile::tempdir().expect("tempdir");
         let path = download_and_verify(&client, &candidate, dir.path())
             .await
             .expect("steady progress is not idle");
         assert_eq!(std::fs::read(path).expect("read"), body);
+    }
+
+    /// A checksum file over the cap is refused before the installer is
+    /// fetched, and nothing is written.
+    #[tokio::test]
+    async fn an_oversized_checksum_file_is_refused_before_the_download() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/SHA256SUMS"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(vec![b'a'; MAX_CHECKSUM_BYTES + 1]),
+            )
+            .mount(&server)
+            .await;
+        let installer = Mock::given(method("GET"))
+            .and(path("/asset.tar.gz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"bytes".to_vec()))
+            .expect(0);
+        installer.mount(&server).await;
+        let mut candidate = drip_candidate(&server.uri());
+        candidate.checksum_url = format!("{}/SHA256SUMS", server.uri());
+        candidate.download_url = format!("{}/asset.tar.gz", server.uri());
+        let client = reqwest::Client::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = download_and_verify(&client, &candidate, dir.path())
+            .await
+            .expect_err("an oversized checksum file");
+        assert!(
+            matches!(err, UpdateError::ChecksumFileTooLarge { .. }),
+            "{err}"
+        );
+        assert!(!dir.path().join("asset.tar.gz").exists());
     }
 
     /// A download that stops sending fails after the idle timeout, and the
@@ -976,7 +1034,8 @@ mod tests {
             true,
         );
         let candidate = drip_candidate(&base);
-        let client = download_client(Duration::from_secs(2), Duration::from_millis(300));
+        let client =
+            download_client(Duration::from_secs(2), Duration::from_millis(300)).expect("client");
         let dir = tempfile::tempdir().expect("tempdir");
         let started = std::time::Instant::now();
         let err = download_and_verify(&client, &candidate, dir.path())

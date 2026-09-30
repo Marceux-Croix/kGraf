@@ -176,6 +176,20 @@ pub(super) fn append_arg(out: &mut Vec<u16>, arg: &[u16]) {
 /// `true` if the program is a batch file. `CreateProcess` runs those through
 /// `cmd.exe`, whose argument parsing differs from the MSVC rules (the
 /// BatBadBut class of injection); callers must invoke `cmd.exe` themselves.
+/// The name prefix of the directories the ACL check creates in a writable
+/// root, followed by `<pid>-<n>`.
+const ACL_PROBE_PREFIX: &str = ".kgraf-acl-probe-";
+
+/// The process id in an ACL probe directory's name, or `None` for any other
+/// name.
+fn acl_probe_pid(name: &str) -> Option<u32> {
+    let (pid, n) = name.strip_prefix(ACL_PROBE_PREFIX)?.split_once('-')?;
+    if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    pid.parse().ok()
+}
+
 pub(super) fn is_batch_file(program: &str) -> bool {
     let lower = program.to_ascii_lowercase();
     lower.ends_with(".bat") || lower.ends_with(".cmd")
@@ -766,8 +780,18 @@ mod imp {
         // reach the inner `.git` through inheritance.
         for root in &roots {
             let gitlink = root.join(".git");
-            if !gitlink.exists() {
-                continue;
+            // `symlink_metadata`, not `exists`: `exists` follows a link, so a
+            // dangling `.git` link or junction read as absent and was skipped
+            // instead of refused.
+            match std::fs::symlink_metadata(&gitlink) {
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(source) => {
+                    return Err(SandboxError::Io {
+                        path: gitlink,
+                        source,
+                    });
+                }
             }
             refuse_reparse(&gitlink)?;
             for sid in &caps {
@@ -810,9 +834,20 @@ mod imp {
             return Err(access_gap(root));
         }
         // A child directory created for the probe (removed after). If the tree
-        // ACE did not propagate, this fails.
-        let child = root.join(".kgraf-acl-probe");
-        std::fs::create_dir_all(&child).map_err(|source| SandboxError::Io {
+        // ACE did not propagate, this fails. A fresh name per probe, created
+        // with `create_dir` (never `create_dir_all`): two commands prepared
+        // on one root at once no longer remove each other's probe, and an
+        // entry already at that name (a planted junction) fails loud instead
+        // of being probed in its target's place.
+        sweep_stale_probes(root);
+        static PROBE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = PROBE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let child = root.join(format!(
+            "{}{}-{n}",
+            super::ACL_PROBE_PREFIX,
+            std::process::id()
+        ));
+        std::fs::create_dir(&child).map_err(|source| SandboxError::Io {
             path: child.clone(),
             source,
         })?;
@@ -822,6 +857,60 @@ mod imp {
             return Err(access_gap(&child));
         }
         Ok(())
+    }
+
+    /// Remove the probe directories a process that died mid-check left in
+    /// `root`, where they would stay as untracked entries of the worktree.
+    /// Only a probe named for a process that is no longer running is removed
+    /// (a live one, this process included, may be probing now), only a plain
+    /// directory (never a junction or link planted under that name), and only
+    /// an empty one (`remove_dir`). Best effort: a probe that cannot be
+    /// removed is left, and the check itself goes on.
+    fn sweep_stale_probes(root: &Path) {
+        use std::os::windows::fs::MetadataExt;
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(pid) = name.to_str().and_then(super::acl_probe_pid) else {
+                continue;
+            };
+            if pid == std::process::id() || process_running(pid) {
+                continue;
+            }
+            let path = entry.path();
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.is_dir() && meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+                let _ = std::fs::remove_dir(&path);
+            }
+        }
+    }
+
+    /// Whether a process with id `pid` is running now. A process that exists
+    /// but cannot be opened counts as running, so its probe is left alone.
+    fn process_running(pid: u32) -> bool {
+        use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, GetLastError};
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        // STILL_ACTIVE, the exit code of a process that has not ended.
+        const STILL_ACTIVE: u32 = 259;
+        // SAFETY: no pointers; a null result is checked before use.
+        let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if raw.is_null() {
+            // SAFETY: reads this thread's last error, set by the call above.
+            return unsafe { GetLastError() } != ERROR_INVALID_PARAMETER;
+        }
+        let Ok(handle) = owned(raw, "OpenProcess") else {
+            return true;
+        };
+        let mut code = 0u32;
+        // SAFETY: a valid process handle and a valid output pointer.
+        let ok = unsafe { GetExitCodeProcess(handle.as_raw_handle(), &mut code) };
+        ok == 0 || code == STILL_ACTIVE
     }
 
     fn access_gap(path: &Path) -> SandboxError {
@@ -1898,6 +1987,25 @@ mod tests {
             append_arg(&mut out, &a.encode_utf16().collect::<Vec<_>>());
         }
         String::from_utf16(&out).unwrap()
+    }
+
+    /// Only the ACL check's own probe names are swept, and the process id
+    /// is read from them exactly.
+    #[test]
+    fn only_acl_probe_names_are_recognized() {
+        assert_eq!(acl_probe_pid(".kgraf-acl-probe-4242-0"), Some(4242));
+        assert_eq!(acl_probe_pid(".kgraf-acl-probe-7-19"), Some(7));
+        for other in [
+            ".kgraf-acl-probe-",
+            ".kgraf-acl-probe-42",
+            ".kgraf-acl-probe-42-",
+            ".kgraf-acl-probe-x-1",
+            ".kgraf-acl-probe-42-1-extra",
+            "kgraf-acl-probe-42-1",
+            "src",
+        ] {
+            assert_eq!(acl_probe_pid(other), None, "{other}");
+        }
     }
 
     #[test]

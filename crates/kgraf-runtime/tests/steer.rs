@@ -123,6 +123,7 @@ fn response(request: &Request, round: &Round) -> Response {
             id: id.clone(),
             name: name.clone(),
             input: input.clone(),
+            signature: None,
         });
     }
     Response {

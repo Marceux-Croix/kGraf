@@ -32,6 +32,8 @@ use std::time::Duration;
 pub struct OrchestrateArgs {
     pub routes: Vec<String>,
     pub planner: Option<String>,
+    /// `--model-route kind=route:model` (decision 0089).
+    pub model_routes: Vec<String>,
     pub instruction: Option<PathBuf>,
     pub resume: Option<String>,
     pub run: Option<String>,
@@ -56,6 +58,10 @@ pub struct OrchestrateArgs {
     /// `RunConfig` into `kgraf-host`, which installs a `RoutedInterfaceReviewer`
     /// on the orchestrator next to `Host::contract_checks` (`host.rs`).
     pub interface_review: bool,
+    /// `--keep-worktrees` (decision 0088): whether a worker's worktree and its
+    /// build output are deleted after use. The flag is this command's only
+    /// source for it: the command does not read `.kgraf/run.json`.
+    pub worktrees: kgraf_host::WorktreeRetention,
     /// Every agent is an addressable session (decision 0067); on by
     /// default since a live run shows all three together
     /// (`2026-09-28-sessions-live.md`).
@@ -100,6 +106,7 @@ fn run_config(root: &Path, args: &OrchestrateArgs) -> RunConfig {
         root: root.to_path_buf(),
         routes: args.routes.clone(),
         planner: args.planner.clone(),
+        model_routes: args.model_routes.clone(),
         prices: args.prices.clone(),
         cap_run: None,
         cap_task: None,
@@ -116,6 +123,7 @@ fn run_config(root: &Path, args: &OrchestrateArgs) -> RunConfig {
         rate_limits: args.rate_limits.clone(),
         contract_checks: args.contract_checks,
         interface_review: args.interface_review,
+        worktrees: args.worktrees,
         check_timeout: args.check_timeout,
         check_compile_timeout: args.check_compile_timeout,
         shell_timeout: args.shell_timeout,
@@ -459,6 +467,7 @@ pub(crate) fn test_report(status: kgraf_orchestrator::RunStatus) -> kgraf_orches
         held: Vec::new(),
         counters: Default::default(),
         serialized_fraction: 0.0,
+        lease_measurements: Default::default(),
         spent: kgraf_core::Money::ZERO,
         budget_admitted: 0,
         contracts: Default::default(),
@@ -482,6 +491,18 @@ fn report_lines(report: &kgraf_orchestrator::RunReport) -> Vec<String> {
     out.push(format!(
         "dispatched {} (serialized {}, fraction {:.3})",
         report.counters.dispatches, report.counters.serialized, report.serialized_fraction
+    ));
+    let leases = &report.lease_measurements;
+    out.push(format!(
+        "leases     {} path(s) held by more than one agent, needless waits {}",
+        leases.serialized_paths,
+        match leases.needless_wait_fraction {
+            Some(f) => format!(
+                "{:.3} of {} handoff(s) with declared ranges",
+                f, leases.known_handoffs
+            ),
+            None => "not measured: no handoff had declared ranges on both sides".to_owned(),
+        }
     ));
     out.push(format!(
         "refusals   capacity {}, readiness {} (reservations {})",
@@ -606,6 +627,32 @@ mod tests {
     use kgraf_provider::Ledger;
     use kgraf_runtime::ContextConfig;
 
+    /// The lease measurements of decisions 0022 and 0049 are printed, and an
+    /// unmeasured share says why, rather than printing a rate of zero.
+    #[test]
+    fn the_printed_report_carries_the_lease_measurements() {
+        let mut report = test_report(kgraf_orchestrator::RunStatus::Completed);
+        report.lease_measurements = kgraf_graph::LeaseMeasurements {
+            serialized_paths: 3,
+            known_handoffs: 4,
+            needless_wait_fraction: Some(0.25),
+        };
+        let lines = report_lines(&report);
+        let line = lines
+            .iter()
+            .find(|l| l.starts_with("leases"))
+            .expect("a leases line");
+        assert!(line.contains("3 path(s)"), "{line}");
+        assert!(line.contains("0.250 of 4 handoff(s)"), "{line}");
+
+        let unmeasured = report_lines(&test_report(kgraf_orchestrator::RunStatus::Completed));
+        let line = unmeasured
+            .iter()
+            .find(|l| l.starts_with("leases"))
+            .expect("a leases line");
+        assert!(line.contains("not measured"), "{line}");
+    }
+
     /// The CLI report carries an analytics failure.
     #[test]
     fn the_printed_report_carries_an_analytics_failure() {
@@ -616,6 +663,7 @@ mod tests {
             held: Vec::new(),
             counters: Default::default(),
             serialized_fraction: 0.0,
+            lease_measurements: Default::default(),
             spent: Money::ZERO,
             budget_admitted: 0,
             contracts: Default::default(),
@@ -715,6 +763,7 @@ mod tests {
         OrchestrateArgs {
             routes: vec!["ollama:llama3".into()],
             planner: None,
+            model_routes: Vec::new(),
             instruction: None,
             resume: None,
             run: Some("r1".into()),
@@ -731,6 +780,7 @@ mod tests {
             gate_timeout: Duration::from_secs(60),
             contract_checks: true,
             interface_review: false,
+            worktrees: kgraf_host::WorktreeRetention::default(),
             sessions: true,
             check_timeout: Duration::from_secs(600),
             check_compile_timeout: Duration::from_secs(600),

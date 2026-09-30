@@ -1,0 +1,37 @@
+{
+  "_fixture": {
+    "source": [
+      "https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ToolUseBlock.html",
+      "https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Converse.html"
+    ],
+    "provenance": "Constructed from the documented member shapes (ToolUseBlock: toolUseId, name, input; stopReason tool_use), using the documented radio-station tool. Ids and numbers are invented. Not a live capture."
+  },
+  "output": {
+    "message": {
+      "role": "assistant",
+      "content": [
+        {
+          "text": "I will look that up."
+        },
+        {
+          "toolUse": {
+            "toolUseId": "tooluse_kZJMlvQmRJ6eAyJE5GIl7Q",
+            "name": "top_song",
+            "input": {
+              "sign": "WZPZ"
+            }
+          }
+        }
+      ]
+    }
+  },
+  "stopReason": "tool_use",
+  "usage": {
+    "inputTokens": 212,
+    "outputTokens": 57,
+    "totalTokens": 269
+  },
+  "metrics": {
+    "latencyMs": 1830
+  }
+}

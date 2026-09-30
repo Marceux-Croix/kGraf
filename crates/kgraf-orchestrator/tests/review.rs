@@ -30,14 +30,6 @@ fn record_of(p: &Parts) -> kgraf_orchestrator::RunStateRecord {
         .expect("record")
 }
 
-async fn until(what: &str, f: impl Fn() -> bool) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while !f() {
-        assert!(std::time::Instant::now() < deadline, "timed out: {what}");
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_plan_pinning_an_unconfigured_route_is_refused_before_any_worker_runs() {
     let dir = tempfile::tempdir().expect("dir");

@@ -30,7 +30,8 @@ pub use merge::{
     ATTEMPT_REF_PREFIX, Attempt, AttemptEvent, AttemptGroup, AttemptState, CommitOutcome,
     ConflictMessage, ConflictSide, ConflictedPath, Excluded, FinishOutcome, GeneratedKind,
     Identity, LOCKFILES, Leftovers, Limits, MergeBack, MergeConflict, MergeError, MergeOutcome,
-    Refusal, RefusalReason, SelectFailure, TrialMerge, is_python_bytecode, lockfile_manifests,
+    MergedWorktree, Refusal, RefusalReason, SelectFailure, TrialMerge, is_python_bytecode,
+    lockfile_manifests,
 };
 #[cfg(windows)]
 pub use sandbox::SandboxedChild;

@@ -17,7 +17,7 @@
 //! ```
 //!
 //! Predicate terms are `kind=`, `name=`, `name~` (regex-free prefix/substring
-//! match), `path=`, `path~`, and `qualified~`. Terms conjoin. An unparseable
+//! match), `path=`, `path~`, `qualified=` and `qualified~`. Terms conjoin. An unparseable
 //! query raises rather than degrading into a substring search over everything,
 //! because a query that silently means something else is the fail-loud rule's failure in
 //! query form.
@@ -44,6 +44,7 @@ pub struct NodePredicate {
     pub path_exact: Option<String>,
     pub path_contains: Option<String>,
     pub qualified_contains: Option<String>,
+    pub qualified_exact: Option<String>,
 }
 
 impl NodePredicate {
@@ -88,9 +89,7 @@ impl NodePredicate {
                 ("qualified", Matcher::Contains(v)) => {
                     predicate.qualified_contains = Some(v.to_owned())
                 }
-                ("qualified", Matcher::Exact(v)) => {
-                    predicate.qualified_contains = Some(v.to_owned())
-                }
+                ("qualified", Matcher::Exact(v)) => predicate.qualified_exact = Some(v.to_owned()),
                 (other, _) => {
                     return Err(GraphError::BadQuery {
                         query: whole.to_owned(),
@@ -130,6 +129,9 @@ impl NodePredicate {
                 format!("{file_alias}.path LIKE ? ESCAPE '\\'"),
                 like_for(path),
             );
+        }
+        if let Some(qualified) = &self.qualified_exact {
+            push(format!("{alias}.qualified_name = ?"), qualified.clone());
         }
         if let Some(qualified) = &self.qualified_contains {
             push(
@@ -201,16 +203,25 @@ impl Pattern {
             });
         }
         // Find a hop operator, if any. Outgoing is `-kind->`, incoming `<-kind-`.
-        if let Some(start) = trimmed.find("<-") {
+        // A `-` can also sit inside a term (`path~my-crate/`), so each candidate is
+        // tried and the first whose text names an edge kind is the operator.
+        let mut first_bad: Option<GraphError> = None;
+        for (start, _) in trimmed.match_indices("<-") {
             let rest = &trimmed[start + 2..];
-            let end = rest.find('-').ok_or_else(|| GraphError::BadQuery {
-                query: query.to_owned(),
-                reason: "unterminated `<-kind-` hop".to_owned(),
-            })?;
-            let kind = EdgeKind::parse(rest[..end].trim()).ok_or_else(|| GraphError::BadQuery {
-                query: query.to_owned(),
-                reason: format!("`{}` is not an edge kind", rest[..end].trim()),
-            })?;
+            let Some(end) = rest.find('-') else {
+                first_bad.get_or_insert(GraphError::BadQuery {
+                    query: query.to_owned(),
+                    reason: "unterminated `<-kind-` hop".to_owned(),
+                });
+                continue;
+            };
+            let Some(kind) = EdgeKind::parse(rest[..end].trim()) else {
+                first_bad.get_or_insert(GraphError::BadQuery {
+                    query: query.to_owned(),
+                    reason: format!("`{}` is not an edge kind", rest[..end].trim()),
+                });
+                continue;
+            };
             return Ok(Pattern {
                 subject: NodePredicate::parse(&trimmed[..start], query)?,
                 hop: Some((
@@ -220,14 +231,22 @@ impl Pattern {
                 )),
             });
         }
-        if let Some(start) = trimmed.find('-')
-            && let Some(arrow) = trimmed[start..].find("->")
-        {
+        for (start, _) in trimmed.match_indices('-') {
+            let Some(arrow) = trimmed[start..].find("->") else {
+                break;
+            };
+            if arrow == 0 {
+                // This `-` opens the arrow itself.
+                continue;
+            }
             let kind_text = trimmed[start + 1..start + arrow].trim();
-            let kind = EdgeKind::parse(kind_text).ok_or_else(|| GraphError::BadQuery {
-                query: query.to_owned(),
-                reason: format!("`{kind_text}` is not an edge kind"),
-            })?;
+            let Some(kind) = EdgeKind::parse(kind_text) else {
+                first_bad.get_or_insert(GraphError::BadQuery {
+                    query: query.to_owned(),
+                    reason: format!("`{kind_text}` is not an edge kind"),
+                });
+                continue;
+            };
             return Ok(Pattern {
                 subject: NodePredicate::parse(&trimmed[..start], query)?,
                 hop: Some((
@@ -236,6 +255,9 @@ impl Pattern {
                     NodePredicate::parse(&trimmed[start + arrow + 2..], query)?,
                 )),
             });
+        }
+        if let Some(error) = first_bad {
+            return Err(error);
         }
         let subject = NodePredicate::parse(trimmed, query)?;
         if subject.is_empty() {
@@ -405,6 +427,60 @@ mod tests {
         let names: Vec<_> = matches.iter().map(|m| m.node.name.clone()).collect();
         assert_eq!(names.len(), 2, "got {names:?}");
         assert!(names.contains(&"save".to_owned()));
+    }
+
+    #[test]
+    fn a_hyphen_inside_a_term_is_not_a_hop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let full = dir.path().join("my-crate/src/lib.rs");
+        fs::create_dir_all(full.parent().expect("parent")).expect("mkdir");
+        fs::write(&full, "fn caller() { callee(); }\nfn callee() {}\n").expect("write");
+        let store = GraphStore::open_in_memory(dir.path()).expect("store");
+        Indexer::new(&store).index().expect("index");
+        for query in [
+            "path~my-crate/ kind=function -calls-> name=callee",
+            "name=callee <-calls- path~my-crate/ name=caller",
+        ] {
+            let matches = Pattern::parse(query)
+                .unwrap_or_else(|e| panic!("`{query}`: {e:?}"))
+                .run(&store, 100)
+                .expect("run");
+            assert_eq!(matches.len(), 1, "`{query}` matched {matches:?}");
+        }
+        // A term with a hyphen and no hop is still a plain predicate.
+        let plain = Pattern::parse("path~my-crate/ kind=function").expect("parse");
+        assert!(plain.hop.is_none());
+    }
+
+    #[test]
+    fn qualified_equals_is_an_exact_match() {
+        let (_dir, store) = fixture();
+        let contains = Pattern::parse("qualified~Store")
+            .expect("parse")
+            .run(&store, 100)
+            .expect("run");
+        assert!(
+            contains.len() > 1,
+            "the substring covers members: {contains:?}"
+        );
+        let store_qualified = contains
+            .iter()
+            .find(|m| m.node.name == "Store")
+            .expect("class")
+            .node
+            .qualified_name
+            .clone();
+        let exact = Pattern::parse(&format!("qualified={store_qualified}"))
+            .expect("parse")
+            .run(&store, 100)
+            .expect("run");
+        assert_eq!(exact.len(), 1, "{exact:?}");
+        // A prefix of a real qualified name matches nothing under `=`.
+        let none = Pattern::parse(&format!("qualified={}", &store_qualified[..2]))
+            .expect("parse")
+            .run(&store, 100)
+            .expect("run");
+        assert!(none.is_empty(), "{none:?}");
     }
 
     #[test]

@@ -1,0 +1,48 @@
+{
+  "_fixture": {
+    "source": [
+      "https://learn.microsoft.com/en-us/azure/ai-foundry/openai/concepts/content-filter-annotations",
+      "https://learn.microsoft.com/en-us/azure/ai-services/openai/reference"
+    ],
+    "provenance": "The choices, content_filter_results and prompt_filter_results objects, the model value and the field names are copied from the annotation example on the first page. The usage counts are invented, with total_tokens set to the sum (the page's own example reports a total above its parts). prompt_tokens_details and completion_tokens_details follow the OpenAI shape that Azure serves; the cited pages do not show them. Not a live capture."
+  },
+  "choices": [
+    {
+      "content_filter_results": {
+        "hate": { "filtered": false, "severity": "safe" },
+        "protected_material_code": { "detected": false, "filtered": false },
+        "protected_material_text": { "detected": false, "filtered": false },
+        "self_harm": { "filtered": false, "severity": "safe" },
+        "sexual": { "filtered": false, "severity": "safe" },
+        "violence": { "filtered": false, "severity": "safe" }
+      },
+      "finish_reason": "stop",
+      "index": 0,
+      "message": { "content": "Example model response will be returned ", "role": "assistant" }
+    }
+  ],
+  "created": 1699386280,
+  "id": "chatcmpl-8IMI4HzcmcK6I77vpOJCPt0Vcf8zJ",
+  "model": "gpt-35-turbo-instruct",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 40,
+    "completion_tokens_details": { "reasoning_tokens": 12 },
+    "prompt_tokens": 100,
+    "prompt_tokens_details": { "cached_tokens": 64 },
+    "total_tokens": 140
+  },
+  "prompt_filter_results": [
+    {
+      "content_filter_results": {
+        "hate": { "filtered": false, "severity": "safe" },
+        "jailbreak": { "detected": false, "filtered": false },
+        "profanity": { "detected": false, "filtered": false },
+        "self_harm": { "filtered": false, "severity": "safe" },
+        "sexual": { "filtered": false, "severity": "safe" },
+        "violence": { "filtered": false, "severity": "safe" }
+      },
+      "prompt_index": 0
+    }
+  ]
+}

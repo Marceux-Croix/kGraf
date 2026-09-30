@@ -27,7 +27,7 @@ use crate::admission::{Admission, Overrun, Reservation};
 use crate::clock::Clock;
 use crate::orchestrator::{Orchestrator, OrchestratorError};
 use crate::plan::{ContractSpec, ModelCaller, sanitize_plan, validate_plan};
-use crate::run_state::{PlanItem, PlanProgress, RunStateRecord, WriteTarget};
+use crate::run_state::{PlanProgress, RunStateRecord, WriteTarget};
 use crate::sizing::{bound_tokens, dear_usage};
 use crate::store::{SharedGraph, StoreError};
 use kgraf_core::{CallId, Money, PriceTable, RunId};
@@ -125,9 +125,9 @@ fn cost_of(
 ) -> Result<Money, OrchestratorError> {
     let row = blocking(|| ledger.call(call))?;
     Ok(match row {
-        Some(r) if matches!(r.settlement, Settlement::Counted | Settlement::Cancelled) => {
-            prices.cost(&r.model, &r.usage).unwrap_or(held)
-        }
+        Some(r) if matches!(r.settlement, Settlement::Counted | Settlement::Cancelled) => prices
+            .cost_on(r.route.as_deref(), &r.model, &r.usage)
+            .unwrap_or(held),
         Some(r) if r.settlement == Settlement::Failed => Money::ZERO,
         _ => held,
     })
@@ -217,9 +217,8 @@ async fn interpret_inner(
     let overrun = held.settle(&key, actual, parts.clock.now_ms());
     charged.push(call);
     let answered = asked?;
-    // Decision 0080 removed every spend cap: an overrun (the estimate
-    // undercounted the call) is accounting only and no longer drops the
-    // answer, since nothing here enforced a limit for it to have breached.
+    // There is no spend cap (decision 0080): an overrun (the estimate
+    // undercounted the call) is accounting only and never drops the answer.
     let _ = overrun;
     finish(answered)
 }
@@ -313,18 +312,6 @@ pub(crate) fn seeded_record(
     })?;
     let mut record = RunStateRecord::new(run, plan.original_instruction(), now);
     record.source_plan = Some(plan.plan_id().to_owned());
-    record.plan_progress = Some(PlanProgress {
-        ids: specs.iter().map(|c| c.id.clone()).collect(),
-        stack: specs
-            .into_iter()
-            .rev()
-            .map(|spec| PlanItem {
-                id: spec.id.clone(),
-                spec,
-                depth: 0,
-            })
-            .collect(),
-        ..PlanProgress::default()
-    });
+    record.plan_progress = Some(PlanProgress::seeded(specs));
     Ok(record)
 }

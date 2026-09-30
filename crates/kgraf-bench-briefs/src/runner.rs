@@ -154,18 +154,24 @@ pub struct AttemptOutcome {
 }
 
 /// Whether a `Failed` worker outcome is the model's own behavior (it hit its
-/// output ceiling, ended on an unmodeled stop reason, answered inconsistently
-/// or needed an approval nobody could give) rather than a provider or ledger
+/// output ceiling, ended on an unmodeled stop reason, answered inconsistently,
+/// was refused or overran its context window (`TurnNotUsable`), paused for a
+/// server tool no route uses, or needed an approval nobody could give) rather than a provider or ledger
 /// failure. The list is the messages `kgraf_runtime`'s loop raises for the
 /// model's behavior; any other `Failed` text is treated as a fault outside
 /// the model, so an unknown message is never tallied against it.
 fn model_caused(error: &str) -> bool {
-    const MODEL_CAUSED: [&str; 5] = [
+    const MODEL_CAUSED: [&str; 8] = [
         "the output ceiling was reached",
         "unmodeled stop reason",
         "the response carries tool calls but stopped with",
         "the model stopped for a tool call and the response carries none",
         "this worker has no one to ask",
+        // `ProviderError::TurnNotUsable`: a refusal or a context window
+        // exceeded mid-turn. The call was billed; the model gave no answer.
+        "ended the turn with stop_reason",
+        "the turn produced no usable answer",
+        "the provider paused the turn for a server tool",
     ];
     MODEL_CAUSED.iter().any(|m| error.contains(m))
 }
@@ -180,8 +186,13 @@ fn unpriced_note(local: bool) -> &'static str {
 /// A worst-case bound on one attempt's cost at `model`'s price: the step
 /// budget's rounds, each at the output ceiling, priced at the output rate.
 /// `None` when the model has no recorded price.
-fn worst_case_estimate(prices: &PriceTable, model: &str, budget: &WorkerBudget) -> Option<Money> {
-    let price = prices.get(model)?;
+fn worst_case_estimate(
+    prices: &PriceTable,
+    route: &str,
+    model: &str,
+    budget: &WorkerBudget,
+) -> Option<Money> {
+    let price = prices.price_on(Some(route), model)?;
     let tokens = u64::from(budget.max_output_tokens) * u64::from(budget.step_budget);
     let micros = (tokens as i128 * price.output as i128 + 500_000) / 1_000_000;
     Some(Money::from_micros(micros as i64))
@@ -208,7 +219,7 @@ pub fn plan_attempts(
                     brief_id: brief.id.to_owned(),
                     kind: brief.kind,
                     rep,
-                    estimated_cost: worst_case_estimate(prices, model, budget),
+                    estimated_cost: worst_case_estimate(prices, route, model, budget),
                 });
             }
         }
@@ -256,6 +267,10 @@ pub async fn run_bench(
         );
     }
 
+    // Before any model call: the check harness must judge a known-good crate,
+    // or every attempt would read as a failed brief.
+    check::self_test(check::DEFAULT_TIMEOUT)
+        .context("the check harness failed its positive control; no model call was made")?;
     std::fs::create_dir_all(state_dir)
         .with_context(|| format!("cannot create {}", state_dir.display()))?;
     // Bench tallies are kept per suite version: another suite's are archived
@@ -485,7 +500,7 @@ async fn run_one(
         Some(WorkerOutcome::Failed { error }) if !model_caused(error) => Some(error.clone()),
         _ => None,
     };
-    let errored = !report.errors.is_empty() || provider_failure.is_some();
+    let mut errored = !report.errors.is_empty() || provider_failure.is_some();
     if let Some(error) = &provider_failure {
         note.get_or_insert_with(|| format!("provider or harness error: {error}"));
     }
@@ -498,7 +513,7 @@ async fn run_one(
             let scratch = attempt_root.join("check-scratch");
             std::fs::create_dir_all(&scratch)
                 .with_context(|| format!("cannot create {}", scratch.display()))?;
-            check::verify(
+            let verdict = check::verify(
                 brief,
                 &check::Attempt {
                     dir: &checked_out,
@@ -510,8 +525,23 @@ async fn run_one(
                     scratch: &scratch,
                     timeout: check::DEFAULT_TIMEOUT,
                 },
-            )
-            .with_context(|| format!("cannot run the check for {}", brief.id))?
+            );
+            match verdict {
+                Ok(check::Verdict::Satisfied) => true,
+                Ok(check::Verdict::Unsatisfied(reason)) => {
+                    note.get_or_insert_with(|| format!("the check found: {reason}"));
+                    false
+                }
+                Err(e) => {
+                    // The check could not run: a harness failure, not a
+                    // measurement of the model, so it is never tallied.
+                    errored = true;
+                    note.get_or_insert_with(|| {
+                        format!("the check could not run (harness failure): {e:#}")
+                    });
+                    false
+                }
+            }
         }
         SegmentEnd::Empty => {
             note.get_or_insert_with(|| "the worker changed nothing".to_owned());
@@ -530,20 +560,25 @@ async fn run_one(
     // No route is ever refused for price: an unpriced model
     // still runs, and its cost is `None` ("unpriced" / "local, unpriced"),
     // never a fabricated `$0` (see the module docs).
-    let cost = if prices.get(&route.model).is_some() {
-        Some(ledger.cost_for_agent(worker_id, prices).with_context(|| {
-            format!(
-                "cannot price this attempt's calls for model {}",
-                route.model
-            )
-        })?)
+    // The lookup is route-aware, as the ledger's own costing is: a deployment
+    // priced under its route-scoped key is priced, and one named like a bare-priced
+    // model is not. A price that cannot cost the calls (above a rate tier) leaves
+    // the attempt unpriced too: the calls are already paid for, so the run goes on.
+    let priced = if prices.is_priced_on(Some(&route.route), &route.model) {
+        ledger.cost_for_agent(worker_id, prices).ok()
     } else {
-        let text = unpriced_note(route.local);
-        note = Some(match note {
-            Some(existing) => format!("{existing}; {text}"),
-            None => text.to_owned(),
-        });
         None
+    };
+    let cost = match priced {
+        Some(cost) => Some(cost),
+        None => {
+            let text = unpriced_note(route.local);
+            note = Some(match note {
+                Some(existing) => format!("{existing}; {text}"),
+                None => text.to_owned(),
+            });
+            None
+        }
     };
 
     Ok(AttemptOutcome {
@@ -636,6 +671,7 @@ mod tests {
                     id: format!("c{round}-{i}"),
                     name: (*name).to_owned(),
                     input: input.clone(),
+                    signature: None,
                 });
             }
             Response {
@@ -1066,6 +1102,54 @@ mod tests {
         assert_eq!(outcomes[0].cost, None);
     }
 
+    /// A deployment priced under its route-scoped key has an estimate; the bare
+    /// model's price does not stand in for a deployment on a scoped-only route.
+    #[test]
+    fn the_estimate_is_route_aware() {
+        let mut table = prices();
+        table.require_route_scoped("scoped");
+        let price = *table.get("fake-model").expect("price");
+        table.set(PriceTable::route_key("dep", "scoped"), price);
+        let descs = [
+            ("scoped".to_owned(), "v".to_owned(), "dep".to_owned()),
+            ("scoped".to_owned(), "v".to_owned(), "fake-model".to_owned()),
+        ];
+        let plan = plan_attempts(
+            &descs,
+            &[tests_sum_brief()],
+            1,
+            &table,
+            &WorkerBudget::default(),
+        );
+        assert!(plan[0].estimated_cost.is_some(), "scoped price is used");
+        assert_eq!(plan[1].estimated_cost, None, "bare price is not");
+    }
+
+    /// A deployment named like a bare-priced model runs unpriced: no abort after
+    /// paid calls, no bare price applied.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_scoped_route_deployment_named_like_a_priced_model_runs_unpriced() {
+        let mut table = prices();
+        table.require_route_scoped("fake");
+        let provider = satisfying_provider();
+        let state = tempfile::tempdir().expect("state");
+        let outcomes = run_bench(
+            &[route(provider.clone())],
+            std::slice::from_ref(&tests_sum_brief()),
+            &table,
+            state.path(),
+            &BenchOptions {
+                reps: 1,
+                dry_run: false,
+                budget: WorkerBudget::default(),
+            },
+        )
+        .await
+        .expect("the run is not aborted for price");
+        assert_eq!(outcomes[0].cost, None);
+        assert_eq!(outcomes[0].note.as_deref(), Some("unpriced"));
+    }
+
     /// The dry-run estimate is the budget's rounds at its output ceiling,
     /// priced at the output rate: with the default budget, `kgraf worker`'s
     /// own, and with an override, the override.
@@ -1246,6 +1330,15 @@ mod error_tests {
         assert!(model_caused(
             "the provider ended the turn with an unmodeled stop reason"
         ));
+        // A refusal or a context overrun ends the turn with no answer: the
+        // model's behavior, as the runtime words it.
+        for stop_reason in ["refusal", "model_context_window_exceeded"] {
+            let e = kgraf_provider::ProviderError::TurnNotUsable {
+                adapter: "anthropic",
+                stop_reason: stop_reason.into(),
+            };
+            assert!(model_caused(&e.to_string()), "{e}");
+        }
         assert!(!model_caused("provider `x` returned HTTP 503: unavailable"));
         assert!(!model_caused("cannot open a ledger row: disk full"));
         assert!(!model_caused("something no one has seen before"));

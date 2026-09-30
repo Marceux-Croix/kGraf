@@ -39,7 +39,7 @@ own provider keys. There is no account, no hosted service and no telemetry.
 | | |
 |---|---|
 | **One orchestrator, many workers** | Decomposes an instruction into contracts, dispatches workers across providers in parallel, verifies each attempt, runs quality gates, and merges verified work onto its own branch. Your checked-out branch never moves. |
-| **Multi-provider** | Anthropic, OpenAI, Moonshot (Kimi), DeepSeek, z.ai, Qwen, xAI, Google, Llama hosts, and local Ollama or llama.cpp. `kgraf providers` shows what is verified for each route. |
+| **Multi-provider** | Anthropic, OpenAI, Moonshot (Kimi), DeepSeek, z.ai, Qwen, xAI, Google, Llama hosts, and local Ollama or llama.cpp. `kgraf providers` shows what is verified for each route, and [docs/MODEL-SUPPORT.md](docs/MODEL-SUPPORT.md) lists which routes and model kinds have run against the live service and which are built but untested. |
 | **A code knowledge graph** | Indexes Rust, Python, TypeScript, JavaScript, Go, Java, C, C++, Ruby, C#, PHP and Markdown. Agent context is assembled from graph slices, not whole-file reads. |
 | **The galaxy** | A GPU-rendered map of the project, with a stated CPU mode when there is no GPU. Work, agents and changes show on it live. |
 | **Isolated workers** | Each worker writes only in its own git worktree, inside a per-platform sandbox. Work merges back one worker at a time. |

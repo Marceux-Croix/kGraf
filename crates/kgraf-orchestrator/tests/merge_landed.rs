@@ -17,9 +17,11 @@
 //! default, `Ok(true)`) cannot be told apart from one whose merge is real, so
 //! this run's [`Workspaces`] does the real ancestry check.
 
+mod contract_support;
 mod support;
 
 use async_trait::async_trait;
+use contract_support::{commit_all, git};
 use kgraf_core::{AgentId, RunId};
 use kgraf_orchestrator::{
     Integration, OpenContract, Orchestrator, PrepareFailure, RunStatus, Workspaces,
@@ -31,31 +33,6 @@ use std::time::Duration;
 use support::*;
 
 const WINDOW: u64 = 200_000;
-
-fn git(repo: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .output()
-        .expect("git");
-    assert!(
-        out.status.success(),
-        "git {args:?}: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).trim().to_owned()
-}
-
-fn commit_all(repo: &Path) {
-    git(repo, &["init", "-q", "-b", "main"]);
-    git(repo, &["config", "user.name", "t"]);
-    git(repo, &["config", "user.email", "t@example.invalid"]);
-    git(repo, &["config", "commit.gpgsign", "false"]);
-    git(repo, &["add", "-A"]);
-    git(repo, &["commit", "-q", "-m", "base"]);
-}
 
 /// [`GitIntegration`], except every merge it accepts is immediately walked
 /// back off the branch by hand -- the fault this test reproduces -- and

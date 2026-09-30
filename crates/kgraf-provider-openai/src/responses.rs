@@ -56,11 +56,15 @@ use crate::chat::ReasoningDialect;
 /// twin, kept local to each file rather than shared, since neither module
 /// depends on the other and the OpenAI Responses and Chat Completions
 /// endpoints use the same header names on the same host).
-fn observe_rate_limit_headers(base_url: &str, http: &reqwest::Response) {
+fn observe_rate_limit_headers(
+    key: &str,
+    parse: impl Fn(&kgraf_provider::limits::HeaderGet) -> kgraf_provider::limits::ObservedLimits,
+    http: &reqwest::Response,
+) {
     let headers = http.headers().clone();
     kgraf_provider::limits::record(
-        base_url,
-        kgraf_provider::limits::parse_openai_style(&move |name: &str| {
+        key,
+        parse(&move |name: &str| {
             headers
                 .get(name)
                 .and_then(|v| v.to_str().ok())
@@ -71,7 +75,7 @@ fn observe_rate_limit_headers(base_url: &str, http: &reqwest::Response) {
     // per-machine capacity's learned rate (`kgraf_capacity::LearnedRate`),
     // read back by the shell's re-measure thread.
     if http.status().as_u16() == 429 {
-        kgraf_provider::limits::record_429_now(base_url);
+        kgraf_provider::limits::record_429_now(key);
     }
 }
 
@@ -86,9 +90,30 @@ pub struct OpenAiAdapter {
     /// Whether `output_tokens` includes or excludes the reasoning share.
     /// Defaults to [`ReasoningDialect::Inclusive`], this protocol's own shape.
     reasoning_dialect: ReasoningDialect,
+    /// Azure OpenAI transport, when set: its URL, `api-key` header, model
+    /// mapping and content-filter handling replace the defaults.
+    azure: Option<crate::azure::AzureTransport>,
 }
 
 impl OpenAiAdapter {
+    /// Record the rate-limit headers of one response. Azure limits are per
+    /// deployment, so its key names the deployment and its headers are read
+    /// with the Azure rules; every other endpoint is keyed by its base URL.
+    fn observe_limits(&self, model: &str, http: &reqwest::Response) {
+        match &self.azure {
+            Some(transport) => observe_rate_limit_headers(
+                &transport.limit_key(model),
+                kgraf_provider::limits::parse_azure_style,
+                http,
+            ),
+            None => observe_rate_limit_headers(
+                &self.config.base_url,
+                kgraf_provider::limits::parse_openai_style,
+                http,
+            ),
+        }
+    }
+
     /// Build an adapter over a configured endpoint.
     ///
     /// The configured protocol is asserted: this adapter speaks the inclusive
@@ -120,7 +145,35 @@ impl OpenAiAdapter {
             http,
             refuses_temperature_with_reasoning: false,
             reasoning_dialect: ReasoningDialect::Inclusive,
+            azure: None,
         })
+    }
+
+    /// Serve this adapter's body through Azure OpenAI.
+    ///
+    /// Every configured model must be a deployment with a configured underlying
+    /// model, or construction fails: a response could otherwise be accepted with
+    /// nothing to check its `model` against.
+    pub fn with_azure(
+        mut self,
+        transport: crate::azure::AzureTransport,
+    ) -> Result<Self, ProviderError> {
+        transport.check_models(transport.name(), &self.config.models)?;
+        self.azure = Some(transport);
+        Ok(self)
+    }
+
+    /// The name reported to the ledger: the transport's when one is set.
+    fn adapter_name(&self) -> &'static str {
+        self.azure.as_ref().map_or(ADAPTER, |t| t.name())
+    }
+
+    /// The model the response must name for a request to `requested`.
+    fn echo_target<'a>(&'a self, requested: &'a str) -> Result<&'a str, ProviderError> {
+        match &self.azure {
+            Some(transport) => transport.underlying(transport.name(), requested),
+            None => Ok(requested),
+        }
     }
 
     /// The configuration this adapter was built with.
@@ -153,13 +206,15 @@ impl OpenAiAdapter {
 
     /// Checks that run before a request leaves, and so before anything can bill.
     fn preflight(&self, request: &Request) -> Result<(), ProviderError> {
-        self.config.check_model(ADAPTER, &request.model)?;
+        self.config
+            .check_model(self.adapter_name(), &request.model)?;
+        self.echo_target(&request.model)?;
         if self.refuses_temperature_with_reasoning
             && request.temperature.is_some()
             && request.reasoning_effort.is_some()
         {
             return Err(ProviderError::CapabilityNotHonored {
-                adapter: ADAPTER,
+                adapter: self.adapter_name(),
                 capability: "temperature together with reasoning effort",
             });
         }
@@ -169,19 +224,41 @@ impl OpenAiAdapter {
     /// Issue the request and return the raw response, bounded by
     /// `config.timeout` for `send()` alone: reading the body, streaming or
     /// not, is bounded separately by the caller.
-    async fn post(&self, body: &serde_json::Value) -> Result<reqwest::Response, ProviderError> {
-        let mut builder = self
-            .http
-            .post(format!("{}/responses", self.config.base_url))
-            .json(body);
-        if let Some(credential) = self.config.credential() {
-            builder = builder.bearer_auth(credential);
-        }
+    async fn post(
+        &self,
+        body: &serde_json::Value,
+        model: &str,
+    ) -> Result<reqwest::Response, ProviderError> {
+        let builder = match &self.azure {
+            Some(transport) => {
+                let mut builder = self.http.post(transport.url(model)).json(body);
+                if let Some(query) = transport.query() {
+                    builder = builder.query(&[query]);
+                }
+                match self.config.credential() {
+                    Some(key) => builder.header(
+                        "api-key",
+                        crate::azure::key_header(self.adapter_name(), key)?,
+                    ),
+                    None => builder,
+                }
+            }
+            None => {
+                let builder = self
+                    .http
+                    .post(format!("{}/responses", self.config.base_url))
+                    .json(body);
+                match self.config.credential() {
+                    Some(credential) => builder.bearer_auth(credential),
+                    None => builder,
+                }
+            }
+        };
         let http = match tokio::time::timeout(self.config.timeout, builder.send()).await {
-            Ok(result) => result.map_err(|e| crate::send_error(ADAPTER, e))?,
+            Ok(result) => result.map_err(|e| crate::send_error(self.adapter_name(), e))?,
             Err(_) => {
                 return Err(ProviderError::Transport {
-                    adapter: ADAPTER,
+                    adapter: self.adapter_name(),
                     reason: format!(
                         "no response within {:?} of sending the request",
                         self.config.timeout
@@ -250,6 +327,7 @@ impl OpenAiAdapter {
                         id,
                         name,
                         input: args,
+                        ..
                     } => {
                         flush(&mut texts, &mut input);
                         input.push(serde_json::json!({
@@ -257,7 +335,7 @@ impl OpenAiAdapter {
                             "call_id": id,
                             "name": name,
                             // Arguments are a JSON *string* here, not an object.
-                            "arguments": args.to_string(),
+                            "arguments": kgraf_provider::tool_arguments_text(args),
                         }));
                     }
                     Content::ToolResult {
@@ -354,9 +432,20 @@ impl OpenAiAdapter {
         reasoning_dialect: ReasoningDialect,
         raw: &serde_json::Value,
     ) -> Result<TokenUsage, ProviderError> {
+        Self::normalize_usage_as(ADAPTER, protocol, reasoning_dialect, raw)
+    }
+
+    /// [`Self::normalize_usage`] with errors labeled as `adapter`, so a transport
+    /// that serves this body under its own name is named correctly.
+    fn normalize_usage_as(
+        adapter: &'static str,
+        protocol: Protocol,
+        reasoning_dialect: ReasoningDialect,
+        raw: &serde_json::Value,
+    ) -> Result<TokenUsage, ProviderError> {
         let field = |name: &str| raw.get(name).and_then(|v| v.as_u64()).unwrap_or(0);
         if raw.get("input_tokens").is_none() && raw.get("output_tokens").is_none() {
-            return Err(ProviderError::UsageMissing { adapter: ADAPTER });
+            return Err(ProviderError::UsageMissing { adapter });
         }
         let cached = raw
             .get("input_tokens_details")
@@ -371,7 +460,7 @@ impl OpenAiAdapter {
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
         crate::chat::warn_on_unrecognized_cache_key(
-            ADAPTER,
+            adapter,
             raw,
             &[
                 "input_tokens_details.cached_tokens",
@@ -396,7 +485,7 @@ impl OpenAiAdapter {
                 // to zero.
                 if reasoning > output {
                     return Err(ProviderError::Decode {
-                        adapter: ADAPTER,
+                        adapter,
                         reason: format!(
                             "{reasoning} reasoning tokens reported against {output} output \
                              tokens under the inclusive reasoning dialect; the usage object \
@@ -408,6 +497,14 @@ impl OpenAiAdapter {
             }
             ReasoningDialect::Additive => output,
         };
+        let hidden = crate::chat::unaccounted_total_tokens(
+            adapter,
+            raw,
+            field("input_tokens"),
+            output,
+            reasoning,
+            reasoning_dialect,
+        )?;
         TokenUsage::normalize(
             protocol,
             field("input_tokens"),
@@ -416,12 +513,57 @@ impl OpenAiAdapter {
             // be zero. The raw blob keeps the evidence either way.
             cache_write,
             text_output,
-            reasoning,
+            reasoning + hidden,
             Some(raw.clone()),
         )
-        .map_err(|source| ProviderError::Usage {
-            adapter: ADAPTER,
-            source,
+        .map_err(|source| ProviderError::Usage { adapter, source })
+    }
+
+    /// The strict parse of a usage object, or, when a consistency check refuses
+    /// it, its counted fields as reported with the raw object kept. A refused
+    /// call keeps this on its open row as a floor, never as the spend.
+    fn usage_or_lower_bound(
+        protocol: Protocol,
+        reasoning_dialect: ReasoningDialect,
+        raw: &serde_json::Value,
+    ) -> Option<TokenUsage> {
+        if let Ok(usage) = Self::normalize_usage(protocol, reasoning_dialect, raw) {
+            return Some(usage);
+        }
+        let field = |name: &str| raw.get(name).and_then(|v| v.as_u64()).unwrap_or(0);
+        raw.get("input_tokens")
+            .or_else(|| raw.get("output_tokens"))?;
+        let input = field("input_tokens");
+        let output = field("output_tokens");
+        let cache_read = raw
+            .get("input_tokens_details")
+            .and_then(|d| d.get("cached_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let cache_write = raw
+            .get("input_tokens_details")
+            .and_then(|d| d.get("cache_write_tokens"))
+            .or_else(|| raw.get("cache_write_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let reasoning = raw
+            .get("output_tokens_details")
+            .and_then(|d| d.get("reasoning_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        Some(TokenUsage {
+            uncached_input: match protocol {
+                Protocol::Additive => input,
+                Protocol::Inclusive => input.saturating_sub(cache_read.saturating_add(cache_write)),
+            },
+            cache_read,
+            cache_write,
+            text_output: match reasoning_dialect {
+                ReasoningDialect::Inclusive => output.saturating_sub(reasoning),
+                ReasoningDialect::Additive => output,
+            },
+            reasoning_output: reasoning,
+            raw: Some(raw.clone()),
         })
     }
 
@@ -434,16 +576,24 @@ impl OpenAiAdapter {
             body.get("model")
                 .and_then(|m| m.as_str())
                 .ok_or_else(|| ProviderError::Decode {
-                    adapter: ADAPTER,
+                    adapter: self.adapter_name(),
                     reason: "response has no `model` field, so the echo cannot be checked"
                         .to_owned(),
                 })?;
-        kgraf_provider::provider::assert_model_echo(requested_model, returned_model)?;
+        kgraf_provider::provider::assert_model_echo(
+            self.echo_target(requested_model)?,
+            returned_model,
+        )?;
 
-        let usage = body
-            .get("usage")
-            .ok_or(ProviderError::UsageMissing { adapter: ADAPTER })?;
-        let usage = Self::normalize_usage(self.config.protocol, self.reasoning_dialect, usage)?;
+        let usage = body.get("usage").ok_or(ProviderError::UsageMissing {
+            adapter: self.adapter_name(),
+        })?;
+        let usage = Self::normalize_usage_as(
+            self.adapter_name(),
+            self.config.protocol,
+            self.reasoning_dialect,
+            usage,
+        )?;
 
         let mut content = Vec::new();
         let mut stop_reason = StopReason::EndTurn;
@@ -484,6 +634,9 @@ impl OpenAiAdapter {
                             .get("arguments")
                             .and_then(|a| a.as_str())
                             .map(|a| {
+                                if a.trim().is_empty() {
+                                    return serde_json::json!({});
+                                }
                                 serde_json::from_str(a)
                                     .unwrap_or(serde_json::Value::String(a.to_owned()))
                             })
@@ -500,13 +653,14 @@ impl OpenAiAdapter {
                                 .unwrap_or_default()
                                 .to_owned(),
                             input: arguments,
+                            signature: None,
                         });
                     }
                     other => {
                         // Only function tools are ever offered, so any other item is
                         // output this adapter would otherwise drop without a word.
                         return Err(ProviderError::Decode {
-                            adapter: ADAPTER,
+                            adapter: self.adapter_name(),
                             reason: format!("unexpected output item type {other:?}"),
                         });
                     }
@@ -536,7 +690,7 @@ impl OpenAiAdapter {
 #[async_trait::async_trait]
 impl kgraf_provider::Provider for OpenAiAdapter {
     fn adapter(&self) -> &'static str {
-        ADAPTER
+        self.adapter_name()
     }
 
     fn protocol(&self) -> Protocol {
@@ -553,7 +707,7 @@ impl kgraf_provider::Provider for OpenAiAdapter {
             return Err(error);
         }
         let body = self.to_wire(request);
-        let http = match self.post(&body).await {
+        let http = match self.post(&body, &request.model).await {
             Ok(http) => http,
             Err(error) => {
                 token.close_on_async(&error, None).await?;
@@ -561,7 +715,7 @@ impl kgraf_provider::Provider for OpenAiAdapter {
             }
         };
         let status = http.status();
-        observe_rate_limit_headers(&self.config.base_url, &http);
+        self.observe_limits(&request.model, &http);
         let request_id = http
             .headers()
             .get("x-request-id")
@@ -570,7 +724,7 @@ impl kgraf_provider::Provider for OpenAiAdapter {
         if !status.is_success() {
             let text = crate::bounded_error_body(self.config.timeout, http).await;
             let error = ProviderError::Http {
-                adapter: ADAPTER,
+                adapter: self.adapter_name(),
                 status: status.as_u16(),
                 body: text,
             };
@@ -589,7 +743,7 @@ impl kgraf_provider::Provider for OpenAiAdapter {
                     .leave_unreconciled_async(request_id.as_deref())
                     .await?;
                 return Err(ProviderError::Transport {
-                    adapter: ADAPTER,
+                    adapter: self.adapter_name(),
                     reason: e.to_string(),
                 });
             }
@@ -598,7 +752,7 @@ impl kgraf_provider::Provider for OpenAiAdapter {
                     .leave_unreconciled_async(request_id.as_deref())
                     .await?;
                 return Err(ProviderError::Transport {
-                    adapter: ADAPTER,
+                    adapter: self.adapter_name(),
                     reason: format!(
                         "response body did not finish within {:?}",
                         self.config.timeout
@@ -613,7 +767,7 @@ impl kgraf_provider::Provider for OpenAiAdapter {
                     .leave_unreconciled_async(request_id.as_deref())
                     .await?;
                 return Err(ProviderError::Decode {
-                    adapter: ADAPTER,
+                    adapter: self.adapter_name(),
                     reason: e.to_string(),
                 });
             }
@@ -628,7 +782,7 @@ impl kgraf_provider::Provider for OpenAiAdapter {
                 .leave_unreconciled_async(request_id.as_deref())
                 .await?;
             return Err(ProviderError::Decode {
-                adapter: ADAPTER,
+                adapter: self.adapter_name(),
                 reason: format!(
                     "provider returned HTTP 200 with an `error` object in the body: {error}"
                 ),
@@ -642,13 +796,23 @@ impl kgraf_provider::Provider for OpenAiAdapter {
                 token
                     .settle_async(&response.usage, response.request_id.as_deref())
                     .await?;
+                // The call billed, so it settles above; the filtered turn is
+                // then refused rather than returned as an answer.
+                if self.azure.is_some()
+                    && let Some(stop_reason) = crate::azure::responses_filter(&parsed)
+                {
+                    return Err(ProviderError::TurnNotUsable {
+                        adapter: self.adapter_name(),
+                        stop_reason: stop_reason.to_owned(),
+                    });
+                }
                 Ok(response)
             }
             Err(error) => {
                 // Usage the body already carries is kept on the open row, not
                 // dropped with the parse error.
                 let carried = parsed.get("usage").and_then(|u| {
-                    Self::normalize_usage(self.config.protocol, self.reasoning_dialect, u).ok()
+                    Self::usage_or_lower_bound(self.config.protocol, self.reasoning_dialect, u)
                 });
                 token
                     .leave_unreconciled_with_async(carried.as_ref(), request_id.as_deref())
@@ -700,7 +864,7 @@ impl Streaming for OpenAiAdapter {
         let mut body = self.to_wire(request);
         body["stream"] = serde_json::json!(true);
 
-        let http = match self.post(&body).await {
+        let http = match self.post(&body, &request.model).await {
             Ok(http) => http,
             Err(error) => {
                 token.close_on_async(&error, None).await?;
@@ -708,7 +872,7 @@ impl Streaming for OpenAiAdapter {
             }
         };
         let status = http.status();
-        observe_rate_limit_headers(&self.config.base_url, &http);
+        self.observe_limits(&request.model, &http);
         let request_id = http
             .headers()
             .get("x-request-id")
@@ -717,7 +881,7 @@ impl Streaming for OpenAiAdapter {
         if !status.is_success() {
             let text = crate::bounded_error_body(self.config.timeout, http).await;
             let error = ProviderError::Http {
-                adapter: ADAPTER,
+                adapter: self.adapter_name(),
                 status: status.as_u16(),
                 body: text,
             };
@@ -729,6 +893,9 @@ impl Streaming for OpenAiAdapter {
         let mut started = false;
         let mut stream_request_id = request_id.clone();
         let mut terminal: Option<Response> = None;
+        // Set when the Azure content filter acted; raised after the call settles.
+        let mut filtered: Option<&'static str> = None;
+        let expected_model = self.echo_target(&request.model)?.to_owned();
 
         // Every exit from here on must still settle the ledger row with
         // whatever usage and request id are already known, including the
@@ -738,7 +905,7 @@ impl Streaming for OpenAiAdapter {
         // with `None`, matching `leave_unreconciled_with`'s stated contract.
         let guard = StreamGuard::new(token);
 
-        let mut decoder = kgraf_provider::SseDecoder::new(ADAPTER);
+        let mut decoder = kgraf_provider::SseDecoder::new(self.adapter_name());
         let mut byte_stream = http.bytes_stream();
         let mut pending: std::collections::VecDeque<serde_json::Value> =
             std::collections::VecDeque::new();
@@ -756,7 +923,7 @@ impl Streaming for OpenAiAdapter {
                         }
                         Ok(Some(Err(e))) => {
                             return Err(ProviderError::Transport {
-                                adapter: ADAPTER,
+                                adapter: self.adapter_name(),
                                 reason: e.to_string(),
                             });
                         }
@@ -769,7 +936,7 @@ impl Streaming for OpenAiAdapter {
                         }
                         Err(_) => {
                             return Err(ProviderError::Transport {
-                                adapter: ADAPTER,
+                                adapter: self.adapter_name(),
                                 reason: format!(
                                     "no data received for {:?}; the stream stalled",
                                     self.config.timeout
@@ -785,7 +952,7 @@ impl Streaming for OpenAiAdapter {
                     if let Some(response) = event.get("response") {
                         if let Some(returned) = response.get("model").and_then(|m| m.as_str()) {
                             model = returned.to_owned();
-                            kgraf_provider::provider::assert_model_echo(&request.model, returned)?;
+                            kgraf_provider::provider::assert_model_echo(&expected_model, returned)?;
                         }
                         if let Some(id) = response.get("id").and_then(|i| i.as_str()) {
                             stream_request_id = Some(id.to_owned());
@@ -820,7 +987,7 @@ impl Streaming for OpenAiAdapter {
                             .get("response")
                             .cloned()
                             .ok_or_else(|| ProviderError::Decode {
-                                adapter: ADAPTER,
+                                adapter: self.adapter_name(),
                                 reason: format!(
                                     "a `{}` event carried no `response` object",
                                     event["type"]
@@ -842,7 +1009,7 @@ impl Streaming for OpenAiAdapter {
                     // Usage first: a parse error (a model echo mismatch, say) must
                     // not drop the figure the event already carries.
                     if let Some(usage_raw) = object.get("usage").filter(|u| !u.is_null())
-                        && let Ok(usage) = Self::normalize_usage(
+                        && let Some(usage) = Self::usage_or_lower_bound(
                             self.config.protocol,
                             self.reasoning_dialect,
                             usage_raw,
@@ -852,6 +1019,9 @@ impl Streaming for OpenAiAdapter {
                     }
                     let response = self.parse_response(&request.model, &object)?;
                     guard.record_usage(&response.usage);
+                    if self.azure.is_some() {
+                        filtered = crate::azure::responses_filter(&object);
+                    }
                     if response.request_id.is_some() {
                         stream_request_id = response.request_id.clone();
                         guard.record_request_id(stream_request_id.as_deref());
@@ -872,7 +1042,7 @@ impl Streaming for OpenAiAdapter {
                     // on a failure path is not itself worth failing over.
                     if let Some(object) = event.get("response") {
                         if let Some(usage_raw) = object.get("usage").filter(|u| !u.is_null())
-                            && let Ok(usage) = Self::normalize_usage(
+                            && let Some(usage) = Self::usage_or_lower_bound(
                                 self.config.protocol,
                                 self.reasoning_dialect,
                                 usage_raw,
@@ -891,13 +1061,13 @@ impl Streaming for OpenAiAdapter {
                         .cloned()
                         .unwrap_or_default();
                     return Err(ProviderError::Decode {
-                        adapter: ADAPTER,
+                        adapter: self.adapter_name(),
                         reason: format!("provider sent a `response.failed` event: {error}"),
                     });
                 }
                 Some("error") => {
                     return Err(ProviderError::Decode {
-                        adapter: ADAPTER,
+                        adapter: self.adapter_name(),
                         reason: format!("provider sent a stream `error` event: {event}"),
                     });
                 }
@@ -913,7 +1083,9 @@ impl Streaming for OpenAiAdapter {
                 // usage before its terminal event, so nothing is known to
                 // keep as a partial figure; the guard settles this as
                 // `leave_unreconciled_with(None, request_id)` on drop.
-                return Err(ProviderError::StreamTruncated { adapter: ADAPTER });
+                return Err(ProviderError::StreamTruncated {
+                    adapter: self.adapter_name(),
+                });
             }
         };
 
@@ -925,6 +1097,12 @@ impl Streaming for OpenAiAdapter {
         token
             .settle_async(&response.usage, response.request_id.as_deref())
             .await?;
+        if let Some(stop_reason) = filtered {
+            return Err(ProviderError::TurnNotUsable {
+                adapter: self.adapter_name(),
+                stop_reason: stop_reason.to_owned(),
+            });
+        }
         Ok(response)
     }
 }
@@ -989,6 +1167,7 @@ mod tests {
                     id: "call_1".into(),
                     name: "read".into(),
                     input: json!({"path": "a.rs"}),
+                    signature: None,
                 },
             ],
         });

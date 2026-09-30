@@ -22,8 +22,12 @@ use crate::cost::Money;
 /// The store's file name inside the state directory.
 pub const FILE_NAME: &str = "model-profiles.json";
 
-/// The store format this build reads and writes.
-pub const STORE_VERSION: u32 = 1;
+/// The store format this build writes. Version 1 files still load: their
+/// tallies are repaired once, on that load, and written back as this version.
+pub const STORE_VERSION: u32 = 2;
+
+/// The oldest store format this build reads.
+const OLDEST_STORE_VERSION: u32 = 1;
 
 /// What a unit of work mainly asks of a model. A contract has one kind; the
 /// orchestrator assigns it at decomposition.
@@ -88,6 +92,11 @@ pub struct KindTally {
     /// the cost unknown, never zero.
     #[serde(default)]
     pub unpriced: u64,
+    /// Satisfied attempts that had a known cost. The cost per satisfied
+    /// attempt is taken over these alone, so one unpriced attempt does not
+    /// hide the cost of the priced ones for ever.
+    #[serde(default)]
+    pub priced_satisfied: u64,
 }
 
 impl KindTally {
@@ -98,7 +107,12 @@ impl KindTally {
             self.satisfied += 1;
         }
         match cost {
-            Some(c) => self.cost_micros += c.micros(),
+            Some(c) => {
+                self.cost_micros += c.micros();
+                if satisfied {
+                    self.priced_satisfied += 1;
+                }
+            }
             None => self.unpriced += 1,
         }
     }
@@ -108,12 +122,13 @@ impl KindTally {
         (self.attempts > 0).then(|| self.satisfied as f64 / self.attempts as f64)
     }
 
-    /// Total cost over satisfied attempts: cost per successful task (0008).
-    /// `None` when nothing was satisfied, since the figure is then unbounded,
-    /// and when any attempt was unpriced, since the figure is then unknown.
+    /// Total known cost over satisfied attempts with a known cost: cost per
+    /// successful task (0008). `None` when no satisfied attempt had a known
+    /// cost: the figure is then unbounded or unknown, never zero. Unpriced
+    /// attempts are left out of both sides.
     pub fn cost_per_satisfied(&self) -> Option<Money> {
-        (self.satisfied > 0 && self.unpriced == 0)
-            .then(|| Money::from_micros(self.cost_micros / self.satisfied as i64))
+        (self.priced_satisfied > 0)
+            .then(|| Money::from_micros(self.cost_micros / self.priced_satisfied as i64))
     }
 }
 
@@ -154,7 +169,9 @@ pub enum ProfileError {
         #[source]
         source: serde_json::Error,
     },
-    #[error("model profiles at {path} are version {found}; this build reads {STORE_VERSION}")]
+    #[error(
+        "model profiles at {path} are version {found}; this build reads {OLDEST_STORE_VERSION} to {STORE_VERSION}"
+    )]
     Version { path: String, found: u32 },
 }
 
@@ -193,13 +210,51 @@ impl ProfileStore {
             path: shown.clone(),
             source,
         })?;
-        if store.version != STORE_VERSION {
+        if !(OLDEST_STORE_VERSION..=STORE_VERSION).contains(&store.version) {
             return Err(ProfileError::Version {
                 path: shown,
                 found: store.version,
             });
         }
-        Ok(store)
+        Ok(store.migrated())
+    }
+
+    /// Bring a version 1 store to the current format, once.
+    ///
+    /// Earlier builds stored `Some($0)` for a live attempt the ledger could
+    /// not price. In a version 1 file, a Live tally with attempts and a total
+    /// cost of exactly zero cannot be told apart from that, and a real priced
+    /// attempt costs more than zero, so every such attempt is re-marked
+    /// unpriced. A tally that mixes real costs with a stray `$0` cannot be
+    /// recovered and is left as recorded. A version 2 file is never touched
+    /// here: a known `$0` recorded by this build stays known.
+    ///
+    /// Version 1 also did not count `priced_satisfied`. A tally with no
+    /// unpriced attempt has one per satisfied attempt; a tally with unpriced
+    /// attempts cannot say which satisfied attempts were priced, so its cost
+    /// stays unknown until new attempts are recorded.
+    fn migrated(mut self) -> Self {
+        if self.version >= STORE_VERSION {
+            return self;
+        }
+        for profile in self.profiles.values_mut() {
+            for (source, tallies) in profile.tallies.iter_mut() {
+                for t in tallies.values_mut() {
+                    if *source == Source::Live
+                        && t.attempts > 0
+                        && t.cost_micros == 0
+                        && t.unpriced == 0
+                    {
+                        t.unpriced = t.attempts;
+                    }
+                    if t.unpriced == 0 {
+                        t.priced_satisfied = t.satisfied;
+                    }
+                }
+            }
+        }
+        self.version = STORE_VERSION;
+        self
     }
 
     /// Write the store to `state_dir`, replacing the file atomically.
@@ -318,8 +373,83 @@ mod tests {
         assert_eq!(t.satisfaction_rate(), Some(0.5));
         assert_eq!(t.unpriced, 2);
         assert_eq!(t.cost_per_satisfied(), None);
+        // A priced attempt is not hidden by the unpriced ones before it.
         t.record(true, Some(Money::from_micros(90)));
-        assert_eq!(t.cost_per_satisfied(), None);
+        assert_eq!(t.cost_per_satisfied(), Some(Money::from_micros(90)));
+    }
+
+    fn store_file(dir: &Path, version: u32, cost: i64) {
+        let tally = format!(r#"{{"attempts":1,"satisfied":1,"cost_micros":{cost}}}"#);
+        let text = format!(
+            r#"{{"version":{version},"profiles":{{"m":{{"vendor":"v","tallies":{{"live":{{"tests":{tally}}},"bench":{{"tests":{tally}}}}}}}}}}}"#
+        );
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join(FILE_NAME), text).unwrap();
+    }
+
+    #[test]
+    fn loading_a_version_one_store_marks_a_zero_cost_live_tally_unpriced_once() {
+        let dir = std::env::temp_dir().join(format!("kgraf-profile-repair-{}", std::process::id()));
+        store_file(&dir, 1, 0);
+        let back = ProfileStore::load(&dir).unwrap();
+        let live = back
+            .get("m")
+            .unwrap()
+            .tally(Source::Live, TaskKind::Tests)
+            .unwrap();
+        assert_eq!(live.unpriced, 1);
+        assert_eq!(live.cost_per_satisfied(), None);
+        let bench = back
+            .get("m")
+            .unwrap()
+            .tally(Source::Bench, TaskKind::Tests)
+            .unwrap();
+        assert_eq!(bench.unpriced, 0);
+        assert_eq!(bench.cost_per_satisfied(), Some(Money::ZERO));
+        // Written back as the current version, it is not repaired again.
+        assert_eq!(back.version, STORE_VERSION);
+        back.save(&dir).unwrap();
+        let again = ProfileStore::load(&dir).unwrap();
+        assert_eq!(again, back);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_known_zero_cost_in_a_current_store_stays_known() {
+        let dir = std::env::temp_dir().join(format!("kgraf-profile-zero-{}", std::process::id()));
+        let mut store = ProfileStore::default();
+        store.record(
+            "m",
+            "v",
+            Source::Live,
+            TaskKind::Tests,
+            true,
+            Some(Money::ZERO),
+        );
+        store.save(&dir).unwrap();
+        let back = ProfileStore::load(&dir).unwrap();
+        let t = back
+            .get("m")
+            .unwrap()
+            .tally(Source::Live, TaskKind::Tests)
+            .unwrap();
+        assert_eq!(t.unpriced, 0);
+        assert_eq!(t.cost_per_satisfied(), Some(Money::ZERO));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_version_one_store_with_real_costs_keeps_them() {
+        let dir = std::env::temp_dir().join(format!("kgraf-profile-real-{}", std::process::id()));
+        store_file(&dir, 1, 90);
+        let back = ProfileStore::load(&dir).unwrap();
+        let t = back
+            .get("m")
+            .unwrap()
+            .tally(Source::Live, TaskKind::Tests)
+            .unwrap();
+        assert_eq!(t.cost_per_satisfied(), Some(Money::from_micros(90)));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -327,7 +457,8 @@ mod tests {
         let t: KindTally =
             serde_json::from_str(r#"{"attempts":1,"satisfied":1,"cost_micros":7}"#).unwrap();
         assert_eq!(t.unpriced, 0);
-        assert_eq!(t.cost_per_satisfied(), Some(Money::from_micros(7)));
+        // The store's version 1 migration fills `priced_satisfied` in.
+        assert_eq!(t.priced_satisfied, 0);
     }
 
     #[test]

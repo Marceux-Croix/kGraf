@@ -509,7 +509,7 @@ impl BoxModel {
 }
 
 /// The allow-always button's words: for an `mcp__` tool the rule covers every
-/// call to the tool (an any-call rule), and the button says so (D4).
+/// call to the tool (an any-call rule), and the button says so.
 pub fn always_label(tool: &str) -> String {
     if tool == crate::dependency_prompt::FETCH_PROMPT_TOOL {
         "Always for this project".to_owned()

@@ -18,5 +18,7 @@ blake3.workspace = true
 unicode-normalization = "0.1.25"
 
 [features]
-# `flock::Forkers`, a fork-pressure helper for other crates' lock-release tests.
+# Test helpers for other crates' tests: `flock::Forkers` (a fork-pressure helper for
+# lock-release tests, Unix only) and `session::check_session_records` (the record
+# check for session files).
 test-support = []

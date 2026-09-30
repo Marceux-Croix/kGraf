@@ -15,72 +15,23 @@
 //!
 //! Both routes here are `StallFake`: whichever the first dispatch picks
 //! stalls (the runtime's own stall detector fires well inside the step
-//! budget, mirroring `live_routing_tallies.rs`'s `StallFake`), forcing a
-//! retry. With the fix, the retry's route differs from the first attempt's,
+//! budget), forcing a retry. With the fix, the retry's route differs from the first attempt's,
 //! so both fakes see exactly one call each; without it, one fake would see
 //! both calls and the other none.
 
 mod support;
 
-use kgraf_core::{Protocol, RunId, TokenUsage};
+use kgraf_core::RunId;
 use kgraf_orchestrator::{
     DirWorkspaces, ModelCaller, ModelDecomposer, ModelGrounder, Orchestrator, RoutingPolicy,
     RunStatus, Services, SystemClock,
 };
-use kgraf_provider::{CallToken, Content, Provider, ProviderError, Request, Response, StopReason};
-use serde_json::json;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use support::*;
 
 const WINDOW: u64 = 200_000;
-
-/// A worker that always issues the identical `write_file` call: the
-/// runtime's stall detector (three identical calls in a row) turns this into
-/// `WorkerOutcome::Stalled`, never a passing verdict. Ported from
-/// `live_routing_tallies.rs::StallFake` (same crate, kept local so this test
-/// has no cross-test dependency).
-#[derive(Default)]
-struct StallFake {
-    calls: AtomicUsize,
-}
-
-#[async_trait::async_trait]
-impl Provider for StallFake {
-    fn adapter(&self) -> &'static str {
-        "fake-stall"
-    }
-
-    fn protocol(&self) -> Protocol {
-        Protocol::Additive
-    }
-
-    async fn complete(
-        &self,
-        request: &Request,
-        token: &CallToken,
-    ) -> Result<Response, ProviderError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        let usage = TokenUsage {
-            uncached_input: 100,
-            text_output: 10,
-            ..TokenUsage::default()
-        };
-        token.settle(&usage, None)?;
-        Ok(Response {
-            model: request.model.clone(),
-            content: vec![Content::ToolUse {
-                id: "t1".into(),
-                name: "write_file".into(),
-                input: json!({"path": "src/b.rs", "content": "same"}),
-            }],
-            stop_reason: StopReason::ToolUse,
-            usage,
-            request_id: None,
-        })
-    }
-}
 
 /// Builds the two-stalling-route harness and runs it once under `routing`.
 /// Returns each route's call count, in dispatch-independent (alpha, beta)

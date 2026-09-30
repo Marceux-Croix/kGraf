@@ -506,22 +506,11 @@ pub mod radius {
     pub const THUMB: CornerRadius = CornerRadius::same(8);
     pub const NAV_ENTRY: CornerRadius = CornerRadius::same(10);
     pub const MENU: CornerRadius = CornerRadius::same(12);
-    pub const TOOLTIP: CornerRadius = CornerRadius::same(4);
 }
 
-/// Motion: the cubic beziers by name, and the indicator animations.
+/// Motion: the indicator animations.
 pub mod motion {
     use std::time::Duration;
-    /// `ease_in`: cubic-bezier(0, 0, .2, 1).
-    pub const EASE_IN: [f32; 4] = [0.0, 0.0, 0.2, 1.0];
-    /// `ease_out`: cubic-bezier(.4, 0, 1, 1).
-    pub const EASE_OUT: [f32; 4] = [0.4, 0.0, 1.0, 1.0];
-    /// `ease_std`: cubic-bezier(.2, 0, 0, 1) (Material standard).
-    pub const EASE_STD: [f32; 4] = [0.2, 0.0, 0.0, 1.0];
-    /// `ease_search`: cubic-bezier(.2, 0, .6, 1).
-    pub const EASE_SEARCH: [f32; 4] = [0.2, 0.0, 0.6, 1.0];
-    /// `ease_spring`: cubic-bezier(.34, 1.56, .64, 1), the hamburger's wiggle.
-    pub const EASE_SPRING: [f32; 4] = [0.34, 1.56, 0.64, 1.0];
     /// The working dot's blink: opacity 1 to 0.3 and back over 1.6 s.
     pub const BLINK_PERIOD_S: f32 = 1.6;
     /// Redraw interval while something blinks: about 15 a second (STG-PERF-2),

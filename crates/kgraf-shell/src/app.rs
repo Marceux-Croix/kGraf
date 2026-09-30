@@ -342,7 +342,7 @@ pub struct ShellApp {
     pub(crate) chrome: ChromeState,
     /// Hosted runs being stopped because the window is quitting.
     shutdown: Option<Receiver<bool>>,
-    /// When the user last gave input (D3: attendance needs recent input).
+    /// When the user last gave input (attendance needs recent input).
     last_input: Option<Instant>,
     /// Frames whose input carried user input, and frames with none: `--measure`
     /// reports them apart, so "no repaint while idle" can be read off the second.
@@ -386,6 +386,10 @@ pub struct ShellApp {
     /// comment states (a headless test creating a `ShellApp` must never start a
     /// background thread).
     pub(crate) update: Option<crate::update_bg::UpdateHandle>,
+    /// The compaction recommendation's background read (`crate::compaction_measure`).
+    /// `None` until [`ShellApp::enable_compaction_measurement`]: a headless test
+    /// creating a `ShellApp` must never start a background thread.
+    compaction_measure: Option<crate::compaction_measure::Measurement>,
 }
 
 /// Everything `ShellApp` needs at creation.
@@ -448,6 +452,30 @@ impl ShellApp {
             capacity: parts.capacity,
             applied_parallelism: None,
             update: parts.update,
+            compaction_measure: None,
+        }
+    }
+
+    /// Starts following the compaction point measured from stored runs (decision
+    /// 0057): from the next logic pass the slider's recommendation is read from
+    /// every open project's run traces, off the UI thread.
+    pub fn enable_compaction_measurement(&mut self) {
+        self.compaction_measure
+            .get_or_insert_with(crate::compaction_measure::Measurement::default);
+    }
+
+    /// Applies a finished measurement to the slider: a slider the user has not
+    /// moved follows it, a moved one keeps its value.
+    pub(crate) fn sync_compaction_recommendation(&mut self) {
+        let Some(measure) = self.compaction_measure.as_mut() else {
+            return;
+        };
+        let workspace = &self.workspace;
+        let found = measure.poll(Instant::now(), || workspace.roots());
+        if let Some(recommendation) = found {
+            self.settings
+                .compaction
+                .update_recommendation(recommendation);
         }
     }
 
@@ -496,6 +524,31 @@ impl ShellApp {
             computed,
             &mut self.applied_parallelism,
         );
+    }
+
+    /// Runs every gate writer once: the capacity thread's sources, the
+    /// process-wide `MachineGate` (decision 0067: the slider drives the one
+    /// gate every open project shares), and each project's own `Admission`,
+    /// which needs the derived `Limits` applied to its own `AdmissionGate`.
+    /// Every open project's local ceiling tracks the slider's effective
+    /// value (`max_writers`, the free-disk bound `kgraf-capacity` measures,
+    /// stands in for the retired `max_work_items` control); the shared
+    /// `MachineGate` keeps several projects together within it.
+    pub(crate) fn sync_gates(&mut self) {
+        // Sources first, so a project opened this frame is visible to the
+        // next re-measure tick.
+        self.sync_capacity_sources();
+        self.sync_compaction_recommendation();
+        self.sync_parallelism();
+        let max_writers = self.machine_gate().limits().max_writers.max(1) as usize;
+        let effective_agents = self.settings.parallelism.effective().max(1) as usize;
+        let limits = kgraf_orchestrator::Limits::new(max_writers, effective_agents)
+            .expect("max_writers and the slider's effective value are both at least 1");
+        for proj in self.workspace.projects_mut() {
+            if let Some(i) = proj.interaction.as_mut() {
+                i.sync_parallelism(limits);
+            }
+        }
     }
 
     /// Refreshes what the re-measure thread reads for the writer bound
@@ -582,9 +635,10 @@ impl ShellApp {
             .filter(|p| p.is_dir())
             .ok_or_else(|| format!("{} is not a folder", path.display()))?;
         let background = self.settings.background_mode;
+        let worktrees = self.settings.worktree_retention();
         let opener = &self.opener;
         let i = self.workspace.open(root.clone(), || match opener {
-            Some(open) => open(&root, background),
+            Some(open) => open(&root, background, worktrees),
             None => ProjectParts::default(),
         });
         self.workspace.switch_to(i);
@@ -683,12 +737,13 @@ impl ShellApp {
         let root = Self::new_project_folder(question)?;
         std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
         let background = self.settings.background_mode;
+        let worktrees = self.settings.worktree_retention();
         let opener = &self.opener;
         let i = crate::projects::open_seeded_project(
             &mut self.workspace,
             root.clone(),
             || match opener {
-                Some(open) => open(&root, background),
+                Some(open) => open(&root, background, worktrees),
                 None => ProjectParts::default(),
             },
             question,
@@ -1160,7 +1215,7 @@ fn close_to_tray(
     intercept
 }
 
-/// How long after the last input a person counts as at the window (D3).
+/// How long after the last input a person counts as at the window.
 pub const ATTENTION_WINDOW: Duration = Duration::from_secs(60);
 
 /// Whether an event is the user's own input (pointer, key, text, scroll).
@@ -1231,6 +1286,18 @@ fn quit_step(
 
 impl eframe::App for ShellApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.logic_pass(ctx);
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        self.ui_pass(ui, frame);
+    }
+}
+
+impl ShellApp {
+    /// Everything that runs on every wake, shown or not. Apart from
+    /// `eframe::App::logic` so a test can drive it without a `Frame`.
+    fn logic_pass(&mut self, ctx: &egui::Context) {
         self.handle_tray(ctx);
         self.handle_quit_shortcut(ctx);
         self.handle_close(ctx);
@@ -1238,12 +1305,16 @@ impl eframe::App for ShellApp {
         // In `logic`, which runs on every wake: a covered window gets no `ui`
         // pass, and the capture must still time out and say so.
         self.handle_screenshot(ctx, false);
+        // The gate writers run here and not in `ui`: a hidden or covered
+        // window gets no `ui` pass, and the re-measure thread's readings and
+        // the slider's pin must still reach the gates.
+        self.sync_gates();
         // No timer repaint: the scheduler wakes the UI when its board
         // changes, and a hidden window still runs `logic` on that wake.
         self.refresh_tray_schedules();
         // A scheduled run's ask reaches the box only while a person is at the
         // window: visible, focused, and with input in the last
-        // `ATTENTION_WINDOW` (D3); otherwise it is answered unattended. A person
+        // `ATTENTION_WINDOW`; otherwise it is answered unattended. A person
         // at the window attends every open project's box: the bell and the
         // project dots route them to it.
         let now = Instant::now();
@@ -1265,7 +1336,7 @@ impl eframe::App for ShellApp {
         }
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+    fn ui_pass(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         // egui may run several passes per frame (a discarded sizing pass), each calling
         // `ui`. Only the first pass of a frame is a frame; later ones are counted apart
         // so they do not show up as near-zero frame intervals.
@@ -1377,7 +1448,7 @@ mod tests {
         );
     }
 
-    /// Coordinator finding, 2026-09-28: the slider's maximum must never come
+    /// The slider's maximum must never come
     /// from the gate's own effective limit. Machine maximum 16, the user
     /// pins the slider at 3 (the gate's effective limit becomes 3), several
     /// frames pass (each a call to `apply_parallelism` with the same
@@ -1502,7 +1573,7 @@ mod tests {
         assert!(cmds.contains(&ViewportCommand::Visible(false)), "{cmds:?}");
     }
 
-    /// D3: a person counts as at the window only while it is showing and focused
+    /// A person counts as at the window only while it is showing and focused
     /// and for `ATTENTION_WINDOW` after their last input; a repaint or a timer
     /// is not input.
     #[test]
@@ -1866,5 +1937,60 @@ mod tests {
         };
         let label = status.label();
         assert!(label.starts_with("CPU rendering: llvmpipe"), "{label}");
+    }
+
+    /// A shell with no window, no tray and no thread, holding a fixed
+    /// capacity reading.
+    fn headless_app(dir: &std::path::Path, capacity: kgraf_capacity::Capacity) -> ShellApp {
+        let settings = Settings::default();
+        ShellApp::new(AppParts {
+            store: SettingsStore::new(dir.join("settings.json"), settings.clone()),
+            settings,
+            render: RenderStatus {
+                facts: AdapterFacts {
+                    name: "test".into(),
+                    driver: String::new(),
+                    driver_info: String::new(),
+                    backend: "test".into(),
+                    device_kind: crate::adapter::DeviceKind::Cpu,
+                    surface_compatible: true,
+                },
+                path: RenderPath::Hardware,
+            },
+            tray: None,
+            clock: FrameClock::new(Instant::now()),
+            drops: Arc::new(DropCounters::default()),
+            measure: MeasureOptions::default(),
+            workspace: Workspace::default(),
+            opener: None,
+            screenshot: None,
+            machine_gate: MachineGate::new(kgraf_core::ParallelismLimits::derive(1, 1, 1)),
+            capacity: Some(crate::capacity_bg::CapacityHandle::fixed(capacity)),
+            update: None,
+        })
+    }
+
+    /// The gate writers run in `logic`, which a hidden or covered window still
+    /// gets, and not in `ui`: one `logic` pass with a fresh capacity reading
+    /// moves the process-wide gate, with no `ui` pass at all.
+    #[test]
+    fn a_logic_pass_alone_applies_the_capacity_reading_to_the_gate() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut app = headless_app(
+            dir.path(),
+            kgraf_capacity::Capacity {
+                max_agents: 12,
+                max_writers: 6,
+                exec_slots: 5,
+                bounds: Vec::new(),
+            },
+        );
+        let before = app.machine_gate().limits();
+        assert_eq!(before.max_writers, 1);
+        let ctx = egui::Context::default();
+        let _ = ctx.run_logic(&RawInput::default(), |ctx| app.logic_pass(ctx));
+        let after = app.machine_gate().limits();
+        assert_eq!(after.max_writers, 6, "the writer bound was applied");
+        assert_eq!(after.exec_slots, 5, "the exec bound was applied");
     }
 }

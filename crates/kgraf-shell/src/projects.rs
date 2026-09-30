@@ -343,7 +343,7 @@ pub struct Failure {
 }
 
 /// Most acknowledgments kept per project; the oldest leave first.
-pub const MAX_ACKED: usize = 500;
+const MAX_ACKED: usize = 500;
 
 /// Where a project's acknowledged failures are kept.
 pub fn acked_path(root: &Path) -> PathBuf {
@@ -455,7 +455,7 @@ pub struct ProjectParts {
 }
 
 /// Builds a project's parts: `(folder, background mode)`.
-pub type Opener = Box<dyn Fn(&Path, bool) -> ProjectParts>;
+pub type Opener = Box<dyn Fn(&Path, bool, kgraf_host::WorktreeRetention) -> ProjectParts>;
 
 /// A new project accepted from a question
 /// offer is seeded with the question as its starting instruction. Written

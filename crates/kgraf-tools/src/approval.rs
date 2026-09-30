@@ -619,9 +619,12 @@ fn now_ms() -> i64 {
         .unwrap_or_default()
 }
 
-/// A random key for this process. `RandomState` is seeded from the operating
-/// system's random source, so four draws give 256 bits no other process knows,
-/// without adding a random-number dependency.
+/// A random key for this process, without adding a random-number dependency.
+/// `RandomState` draws one 128-bit seed per thread from the operating
+/// system's random source and derives each later instance from it by a
+/// counter, so the four draws below fill 32 bytes but carry about 128 bits of
+/// entropy, not 256. That is ample for a key no other process knows: the
+/// seal only has to be infeasible to forge.
 fn process_seal_key() -> [u8; 32] {
     use std::sync::OnceLock;
     static KEY: OnceLock<[u8; 32]> = OnceLock::new();

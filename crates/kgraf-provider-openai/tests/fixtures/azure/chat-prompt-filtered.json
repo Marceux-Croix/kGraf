@@ -1,0 +1,28 @@
+{
+  "_fixture": {
+    "source": [
+      "https://learn.microsoft.com/en-us/azure/ai-foundry/openai/concepts/content-filter-annotations"
+    ],
+    "provenance": "The annotation shape of the cited page with the prompt's violence category marked filtered. The page shows a prompt block as an HTTP 400 error; a 200 body that reports a filtered prompt is constructed here to pin that prompt_filter_results is read. Token counts and ids are invented. Not a live capture."
+  },
+  "choices": [
+    {
+      "finish_reason": "stop",
+      "index": 0,
+      "message": { "content": "text", "role": "assistant" }
+    }
+  ],
+  "id": "chatcmpl-filtered-0002",
+  "model": "gpt-35-turbo-instruct",
+  "object": "chat.completion",
+  "usage": { "completion_tokens": 1, "prompt_tokens": 20, "total_tokens": 21 },
+  "prompt_filter_results": [
+    {
+      "content_filter_results": {
+        "hate": { "filtered": false, "severity": "safe" },
+        "violence": { "filtered": true, "severity": "high" }
+      },
+      "prompt_index": 0
+    }
+  ]
+}

@@ -170,26 +170,33 @@ const TEST_ATTRIBUTES: &[&str] = &[
 /// above it (`#[test]`, `#[tokio::test]`, `@pytest.mark`, ...), or pytest's
 /// `test_` name prefix. Its location is not a marker: a helper under
 /// `tests/` is not a test.
-fn is_test_node(store: &GraphStore, node: &NodeRecord) -> bool {
+fn is_test_node(store: &GraphStore, node: &NodeRecord) -> Result<bool, GraphError> {
     if !matches!(
         node.kind,
         NodeKind::Function | NodeKind::Method | NodeKind::Decorated
     ) {
-        return false;
+        return Ok(false);
     }
     // pytest's marker is the name.
     if node.name.starts_with("test_") {
-        return true;
+        return Ok(true);
     }
-    let Ok(text) = std::fs::read_to_string(store.root().join(&node.path)) else {
-        return false;
+    // A file indexed from another tree (a git worktree) is read from that tree, the
+    // same one the graph's own source reads use.
+    // A database error is raised: reading it as "no recorded root" would look for
+    // the file in the store's own tree and answer "not a test" without saying why.
+    let root = store
+        .file_source_root(&node.path)?
+        .unwrap_or_else(|| store.root().to_path_buf());
+    let Ok(text) = std::fs::read_to_string(root.join(&node.path)) else {
+        return Ok(false);
     };
     let lines: Vec<&str> = text.lines().collect();
     let start = (node.start_line as usize).saturating_sub(1);
     // A stale index can name a line the file no longer has: then the node is not a
     // test here.
     if start >= lines.len() {
-        return false;
+        return Ok(false);
     }
     let is_marker = |l: &str| {
         TEST_ATTRIBUTES
@@ -200,25 +207,28 @@ fn is_test_node(store: &GraphStore, node: &NodeRecord) -> bool {
     // contiguous attribute, decorator and comment lines directly above it; a blank
     // line or code ends them, so another function's `#[test]` never counts.
     if is_marker(lines[start]) {
-        return true;
+        return Ok(true);
     }
     for l in lines[..start].iter().rev() {
         let t = l.trim_start();
         let attached = t.starts_with("#[") || t.starts_with('@') || t.starts_with("//");
         if !attached {
-            return false;
+            return Ok(false);
         }
         if is_marker(l) {
-            return true;
+            return Ok(true);
         }
     }
-    false
+    Ok(false)
 }
 
 pub(crate) fn test_exists(store: &GraphStore, name: &str) -> Result<bool, GraphError> {
-    Ok(code_nodes(store, name)?
-        .iter()
-        .any(|n| is_test_node(store, n)))
+    for node in code_nodes(store, name)? {
+        if is_test_node(store, &node)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub(crate) fn path_exists(store: &GraphStore, path: &str) -> Result<bool, GraphError> {
@@ -417,6 +427,48 @@ mod tests {
         write(dir.path(), "src/lib.rs", "fn x() {}\n");
         let s = derive(&store, &item(&["exports_csv"]), &NoTestRuns).expect("derive");
         assert!(!s.tests[0].exists);
+    }
+
+    /// A database error while looking up a file's source root is raised. It is
+    /// not read as "no recorded root", which would answer "not a test".
+    #[test]
+    fn a_source_root_lookup_error_is_raised_not_read_as_no_test() {
+        let dir = tempfile::tempdir().expect("dir");
+        let db = tempfile::tempdir().expect("db");
+        write(dir.path(), "src/lib.rs", "#[test]\nfn exports_csv() {}\n");
+        let store = GraphStore::open(&db.path().join("g.db"), dir.path()).expect("store");
+        kgraf_graph::Indexer::new(&store).index().expect("index");
+        assert!(test_exists(&store, "exports_csv").expect("found"));
+        rusqlite::Connection::open(db.path().join("g.db"))
+            .expect("second connection")
+            .execute_batch(
+                "DROP TABLE file_source_roots; CREATE TABLE file_source_roots (unrelated TEXT);",
+            )
+            .expect("damage");
+        assert!(
+            test_exists(&store, "exports_csv").is_err(),
+            "a damaged lookup answered instead of failing"
+        );
+    }
+
+    /// A test indexed from another tree (a git worktree) is read from that tree,
+    /// not from the store's root, where the file may not exist.
+    #[test]
+    fn a_test_indexed_from_another_tree_is_found_there() {
+        let checkout = tempfile::tempdir().expect("checkout");
+        let other = tempfile::tempdir().expect("other");
+        let db = tempfile::tempdir().expect("db");
+        write(other.path(), "src/lib.rs", "#[test]\nfn exports_csv() {}\n");
+        let store = GraphStore::open(&db.path().join("g.db"), checkout.path()).expect("store");
+        kgraf_graph::Indexer::new(&store)
+            .with_source_root(other.path())
+            .index_paths(&["src/lib.rs".to_owned()])
+            .expect("index");
+        let s = derive(&store, &item(&["exports_csv"]), &NoTestRuns).expect("derive");
+        assert!(
+            s.tests[0].exists,
+            "the marker in the other tree was not read"
+        );
     }
 
     /// A

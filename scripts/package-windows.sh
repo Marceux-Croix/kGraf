@@ -34,7 +34,7 @@ done
 TARGET="x86_64-pc-windows-msvc"
 APP_NAME="kGraf"
 
-# --- M7: pin the whole cross-compilation toolchain, not just "whatever cargo-xwin
+# --- pin the whole cross-compilation toolchain, not just "whatever cargo-xwin
 # finds today" -----------------------------------------------------------------------
 # A pinned cargo-xwin plus pinned XWIN_* versions means a rebuild next month links
 # against the exact same MSVC CRT/SDK bytes as this one, rather than whatever Microsoft
@@ -126,7 +126,7 @@ if [[ -z "$LLVM_BIN" ]]; then
   LLVM_BIN="/opt/homebrew/opt/llvm/bin"
   [[ -x "$LLVM_BIN/llvm-rc" ]] || LLVM_BIN="/usr/local/opt/llvm/bin"
 fi
-# M7: record, and floor-check, the LLVM version actually used -- clang-cl/lld-link/
+# record, and floor-check, the LLVM version actually used -- clang-cl/lld-link/
 # llvm-rc all come from the same Homebrew `llvm` keg, so one version number covers all
 # three. A hard pin (an exact patch version) would fight Homebrew's own upgrade
 # behavior for a keg-only formula every time it revs; a floor is the practical middle
@@ -268,7 +268,7 @@ for name in egui eframe wgpu winit tray-icon arboard accesskit_windows gpu-alloc
     exit 1
   fi
 done
-# N2: the vendored (third_party/, decision 0055) LICENSE/NOTICE texts scripts/third-
+# the vendored (third_party/, decision 0055) LICENSE/NOTICE texts scripts/third-
 # party-notices.sh appends after cargo-about's own crates.io-dependency section --
 # kgraf.exe/kgraf-app.exe both link ported code from codex (the macOS seatbelt
 # policy, the Linux seccomp filter, the Windows sandbox backend) and kgraf-galaxy
@@ -370,13 +370,13 @@ if [[ "$HAVE_WIXL" -eq 1 ]]; then
   # (or an accidental revert of this comment) fails the build instead of silently
   # shipping the bug again.
   #
-  # M5: MajorUpgrade AllowSameVersionUpgrades="yes" -- rerunning the installer for the
+  # MajorUpgrade AllowSameVersionUpgrades="yes" -- rerunning the installer for the
   # exact version already present repairs/reinstalls instead of refusing with "a later
   # version is already installed" (WiX's default compares strictly greater-than
   # otherwise), which matters for this project's own iterative packaging runs during
   # development, not just an end user's upgrade path.
   #
-  # M6: the Start Menu shortcut's key path is now a real, separate HKLM registry value
+  # the Start Menu shortcut's key path is now a real, separate HKLM registry value
   # in the ShortcutComponent itself (Root="HKLM", matching InstallScope="perMachine" --
   # HKCU would silently install "per-user" registry state under a per-machine install,
   # which breaks a second user on the same machine seeing the app as already
@@ -496,7 +496,7 @@ WXSEOF
     exit 1
   }
 
-  # M5: the same-version-upgrade detection row AllowSameVersionUpgrades="yes" adds.
+  # the same-version-upgrade detection row AllowSameVersionUpgrades="yes" adds.
   echo "-- Upgrade table (expect a WIX_SAME_VERSION_UPGRADE_DETECTED row) --"
   UPGRADE_TABLE="$(msiinfo export "$MSI_PATH" Upgrade)"
   echo "$UPGRADE_TABLE"
@@ -513,7 +513,7 @@ WXSEOF
 fi
 
 # --- zip: always built, so there is always at least one artifact ----------------------
-# L8: fixed mtimes (SOURCE_DATE_EPOCH-style reproducibility) on every entry, so two
+# fixed mtimes (SOURCE_DATE_EPOCH-style reproducibility) on every entry, so two
 # runs from the same input binaries produce byte-identical zips -- `zip -X` already
 # drops extra file attributes/timestamps noise, but the entry mtimes themselves still
 # default to "now" unless told otherwise. The MSI is NOT reproducible the same way and
@@ -526,7 +526,7 @@ fi
 echo "==> Building the zip (always, so there is at least one Windows artifact even without wixl)"
 rm -f "$ZIP_PATH"
 SOURCE_DATE_EPOCH="$(git -C "$ROOT" log -1 --format=%ct 2>/dev/null || date +%s)"
-# L8: `date -r EPOCH` is BSD/macOS syntax; `date -d @EPOCH` is GNU/Linux syntax. An
+# `date -r EPOCH` is BSD/macOS syntax; `date -d @EPOCH` is GNU/Linux syntax. An
 # earlier version of this script only tried the BSD form and swallowed a failure with
 # `|| true`, so on a GNU host the zip would have silently stopped being reproducible
 # instead of failing -- exactly the silent-degradation SR "fail loud" exists to catch.

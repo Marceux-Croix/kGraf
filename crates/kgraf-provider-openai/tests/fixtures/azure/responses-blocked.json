@@ -1,0 +1,26 @@
+{
+  "_fixture": {
+    "source": [
+      "https://learn.microsoft.com/en-us/azure/ai-foundry/openai/how-to/responses"
+    ],
+    "provenance": "The content_filters entry shape (source_type, blocked, content_filter_results) from the cited page, with the completion side marked blocked and the response left incomplete. That an output block arrives as a 200 with blocked: true is constructed to pin that the field is read. Ids and counts are invented. Not a live capture."
+  },
+  "id": "resp_0002",
+  "object": "response",
+  "status": "incomplete",
+  "incomplete_details": { "reason": "content_filter" },
+  "model": "gpt-4.1-nano-2025-04-14",
+  "output": [],
+  "usage": {
+    "input_tokens": 50,
+    "output_tokens": 4,
+    "total_tokens": 54
+  },
+  "content_filters": [
+    {
+      "source_type": "completion",
+      "blocked": true,
+      "content_filter_results": { "violence": { "filtered": true, "severity": "high" } }
+    }
+  ]
+}

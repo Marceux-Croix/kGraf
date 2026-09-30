@@ -16,6 +16,36 @@ fn fresh() -> (tempfile::TempDir, GraphStore) {
     (dir, store)
 }
 
+#[cfg(unix)]
+#[test]
+fn an_unreadable_directory_keeps_the_files_indexed_under_it_and_is_reported() {
+    use std::os::unix::fs::PermissionsExt;
+    let (dir, store) = fresh();
+    write(dir.path(), "sub/deep/a.rs", "pub fn guarded() {}\n");
+    write(dir.path(), "top.rs", "pub fn top() {}\n");
+    Indexer::new(&store).index().expect("first");
+
+    let sub = dir.path().join("sub");
+    fs::set_permissions(&sub, fs::Permissions::from_mode(0o000)).expect("chmod");
+    let listing_blocked = fs::read_dir(&sub).is_err();
+    let result = Indexer::new(&store).index();
+    fs::set_permissions(&sub, fs::Permissions::from_mode(0o755)).expect("chmod back");
+    if !listing_blocked {
+        return; // running as a user who ignores permissions
+    }
+    match result {
+        Err(kgraf_graph::GraphError::Io { path, .. }) => {
+            assert_eq!(path, "sub", "the error names the relative path");
+        }
+        other => panic!("an unreadable directory must be reported: {other:?}"),
+    }
+    assert!(
+        store.file("sub/deep/a.rs").expect("file").is_some(),
+        "an unreadable directory deleted the files indexed under it"
+    );
+    assert!(store.resolve_symbol("guarded").is_ok(), "rows were deleted");
+}
+
 #[test]
 fn build_and_dist_inside_source_are_indexed_and_only_the_root_ones_are_not() {
     let (dir, store) = fresh();

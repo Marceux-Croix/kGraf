@@ -99,6 +99,37 @@ fn remove_deletes_directory_registration_and_scratch() {
     );
 }
 
+/// A worktree is not deleted under a process started in it: remove reads
+/// busy and leaves the tree and its registration in place, then succeeds
+/// once the process has ended.
+#[cfg(unix)]
+#[test]
+fn remove_refuses_while_a_process_started_in_the_worktree_runs() {
+    let f = fixture();
+    let mgr = WorkspaceManager::open(&f.repo, &f.base).unwrap();
+    let ws = mgr.create(&spec("w1")).unwrap();
+    let mut child = kgraf_sandbox::workspace_command(&ws, kgraf_sandbox::Network::Deny, "/bin/sh")
+        .unwrap()
+        .args(["-c", "sleep 30"])
+        .spawn()
+        .unwrap();
+    let root = ws.root().to_path_buf();
+    let busy = mgr.remove(ws.clone());
+    // Stop it before any assertion can fail, so no process outlives the test.
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(
+        matches!(&busy, Err(WorkspaceError::Busy { .. })),
+        "{busy:?}"
+    );
+    assert!(root.join("README").is_file(), "the tree must be left alone");
+    assert!(entry_for(&mgr.list().unwrap(), &root).is_some());
+
+    mgr.remove(ws).unwrap();
+    assert!(!root.exists());
+    assert!(entry_for(&mgr.list().unwrap(), &root).is_none());
+}
+
 #[test]
 fn remove_succeeds_after_the_worker_rewrote_its_gitlink() {
     let f = fixture();

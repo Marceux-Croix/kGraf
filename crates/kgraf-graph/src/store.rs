@@ -120,21 +120,28 @@ pub struct NodeRecord {
     pub identity_stable: bool,
 }
 
-impl NodeRecord {
-    /// How many lines the element spans.
-    pub fn line_span(&self) -> u32 {
-        self.end_line.saturating_sub(self.start_line) + 1
-    }
-}
-
 /// A handle on one project's index.
 pub struct GraphStore {
     conn: Connection,
     /// The working-tree root every stored path is relative to.
     root: std::path::PathBuf,
-    /// Set while a background pass is retrying the checkpoint a reader blocked
-    /// after [`GraphStore::clear_meta`]. See [`GraphStore::schedule_wal_scrub`].
-    wal_scrub_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The background pass retrying the checkpoint a reader blocked after
+    /// [`GraphStore::clear_meta`]. See [`GraphStore::schedule_wal_scrub`]. The
+    /// store stops and joins it on drop, so the pass never outlives the store and
+    /// its connection is closed before the store's own (the last close of a
+    /// database checkpoints the WAL).
+    wal_scrub: std::sync::Mutex<Option<WalScrub>>,
+}
+
+struct WalScrub {
+    stop: std::sync::mpsc::Sender<()>,
+    handle: std::thread::JoinHandle<bool>,
+}
+
+impl Drop for GraphStore {
+    fn drop(&mut self) {
+        self.stop_wal_scrub();
+    }
 }
 
 /// How long the background pass keeps retrying a blocked checkpoint, and how
@@ -175,7 +182,7 @@ impl GraphStore {
         Ok(Self {
             conn,
             root: root.to_path_buf(),
-            wal_scrub_pending: Default::default(),
+            wal_scrub: Default::default(),
         })
     }
 
@@ -250,7 +257,7 @@ impl GraphStore {
         let store = Self {
             conn,
             root: root.to_path_buf(),
-            wal_scrub_pending: Default::default(),
+            wal_scrub: Default::default(),
         };
         store.migrate(rebuild)?;
         Ok(store)
@@ -435,53 +442,97 @@ impl GraphStore {
     }
 
     /// Retry a checkpoint a reader blocked, on a thread of its own, until it
-    /// completes or `bound` passes. Each attempt is a non-waiting
-    /// `wal_checkpoint(TRUNCATE)` on a second connection, so no attempt holds
-    /// the writer lock while it waits for the reader: writers never stall. At
-    /// most one pass runs per store; a second request while one runs is covered
-    /// by it, because the attempt that succeeds folds in every frame present
-    /// then. Returns the thread's handle (`true` when the WAL was truncated,
-    /// `false` when the bound passed), or `None` for an in-memory index or a
-    /// pass already running.
+    /// completes, `bound` passes, or the store is dropped. Each attempt is a
+    /// non-waiting `wal_checkpoint(TRUNCATE)` on a second connection, so no
+    /// attempt holds the writer lock while it waits for the reader: writers never
+    /// stall. At most one pass runs per store; a second request while one runs is
+    /// covered by it, because the attempt that succeeds folds in every frame
+    /// present then. Returns `true` when a pass started, `false` for an in-memory
+    /// index or a pass already running.
+    ///
+    /// Dropping the store stops the pass and waits for it (at most one interval),
+    /// so a short-lived process neither loses the pass silently nor keeps a second
+    /// connection open through its own last close. The stop makes one last
+    /// attempt. A pass that ends without truncating the WAL writes KG-0208 to the
+    /// diagnostics file, with the reason.
     pub(crate) fn schedule_wal_scrub(
         &self,
         bound: std::time::Duration,
         interval: std::time::Duration,
-    ) -> Option<std::thread::JoinHandle<bool>> {
-        use std::sync::atomic::Ordering;
-        let path = self.conn.path().filter(|p| !p.is_empty())?.to_owned();
-        if self
-            .wal_scrub_pending
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return None;
+    ) -> bool {
+        let Some(path) = self
+            .conn
+            .path()
+            .filter(|p| !p.is_empty())
+            .map(str::to_owned)
+        else {
+            return false;
+        };
+        let mut slot = self.wal_scrub.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.as_ref().is_some_and(|s| !s.handle.is_finished()) {
+            return false;
         }
-        let pending = self.wal_scrub_pending.clone();
+        if let Some(finished) = slot.take() {
+            let _ = finished.handle.join();
+        }
+        let (stop, stopped) = std::sync::mpsc::channel::<()>();
         let spawned = std::thread::Builder::new()
             .name("kgraf-wal-scrub".to_owned())
             .spawn(move || {
-                let done = retry_truncate_checkpoint(std::path::Path::new(&path), bound, interval);
-                pending.store(false, Ordering::Release);
-                if !done {
-                    kgraf_diag::record(kgraf_diag::DiagEvent::error(
-                        "KG-0208",
-                        "kgraf-graph",
-                        format!(
-                            "a cleared record may still be in the WAL: a reader held an older \
-                             snapshot for {} s",
-                            bound.as_secs()
-                        ),
-                    ));
-                }
-                done
+                let outcome = retry_truncate_checkpoint(
+                    std::path::Path::new(&path),
+                    bound,
+                    interval,
+                    &stopped,
+                );
+                let reason = match &outcome {
+                    ScrubOutcome::Done => return true,
+                    ScrubOutcome::Bound => {
+                        format!("a reader held an older snapshot for {} s", bound.as_secs())
+                    }
+                    ScrubOutcome::Stopped => {
+                        "the store closed while a reader held an older snapshot".to_owned()
+                    }
+                    ScrubOutcome::Failed(why) => format!("the retry could not run: {why}"),
+                };
+                kgraf_diag::record(kgraf_diag::DiagEvent::error(
+                    "KG-0208",
+                    "kgraf-graph",
+                    format!("a cleared record may still be in the WAL: {reason}"),
+                ));
+                false
             });
         match spawned {
-            Ok(handle) => Some(handle),
-            Err(_) => {
-                self.wal_scrub_pending.store(false, Ordering::Release);
-                None
+            Ok(handle) => {
+                *slot = Some(WalScrub { stop, handle });
+                true
             }
+            Err(_) => false,
+        }
+    }
+
+    /// Wait for the running pass to end on its own; its result, or `None` when
+    /// none was started.
+    #[cfg(test)]
+    pub(crate) fn wait_wal_scrub(&self) -> Option<bool> {
+        let pass = self
+            .wal_scrub
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()?;
+        pass.handle.join().ok()
+    }
+
+    /// Stop the pass, if one runs, and wait for its thread to end.
+    fn stop_wal_scrub(&self) {
+        let pass = self
+            .wal_scrub
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(pass) = pass {
+            let _ = pass.stop.send(());
+            let _ = pass.handle.join();
         }
     }
 
@@ -728,16 +779,26 @@ impl GraphStore {
     /// The root recorded for the file at `path`, if it was indexed from a tree
     /// other than the store's root.
     pub fn file_source_root(&self, path: &str) -> Result<Option<std::path::PathBuf>> {
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT r.root FROM file_source_roots r JOIN files f ON f.id = r.file_id
-                 WHERE f.path = ?1",
-                params![path],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-            .map(std::path::PathBuf::from))
+        // An index built before the table existed, opened read-only, never ran the
+        // schema script: no table means no recorded root. The query runs first and
+        // only that one error reads as "none", so a node lookup costs one statement
+        // and any other database error still surfaces.
+        let found = self.conn.query_row(
+            "SELECT r.root FROM file_source_roots r JOIN files f ON f.id = r.file_id
+             WHERE f.path = ?1",
+            params![path],
+            |row| row.get::<_, String>(0),
+        );
+        match found {
+            Ok(root) => Ok(Some(std::path::PathBuf::from(root))),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(rusqlite::Error::SqliteFailure(_, Some(message)))
+                if message.starts_with("no such table: file_source_roots") =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Remove a file and, by cascade, its nodes and their edges.
@@ -1104,20 +1165,33 @@ impl GraphStore {
     }
 }
 
+enum ScrubOutcome {
+    Done,
+    Bound,
+    Stopped,
+    Failed(String),
+}
+
 /// Attempt `wal_checkpoint(TRUNCATE)` on a fresh connection every `interval`
-/// until one completes (`true`) or `bound` has passed, or the database cannot
-/// be opened (`false`). The busy timeout is zero, so an attempt returns at once
-/// when a reader is in the way instead of holding the writer lock.
+/// until one completes, `bound` has passed, `stopped` fires or closes, or the
+/// database cannot be opened. The connection never creates the file, and its
+/// busy timeout is zero, so an attempt returns at once when a reader is in the
+/// way instead of holding the writer lock.
 fn retry_truncate_checkpoint(
     path: &Path,
     bound: std::time::Duration,
     interval: std::time::Duration,
-) -> bool {
-    let Ok(conn) = Connection::open(path) else {
-        return false;
+    stopped: &std::sync::mpsc::Receiver<()>,
+) -> ScrubOutcome {
+    let conn = match Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
+        Ok(conn) => conn,
+        Err(error) => return ScrubOutcome::Failed(format!("open {}: {error}", path.display())),
     };
-    if conn.busy_timeout(std::time::Duration::ZERO).is_err() {
-        return false;
+    if let Err(error) = conn.busy_timeout(std::time::Duration::ZERO) {
+        return ScrubOutcome::Failed(error.to_string());
     }
     let deadline = std::time::Instant::now() + bound;
     loop {
@@ -1125,14 +1199,29 @@ fn retry_truncate_checkpoint(
             row.get::<_, i64>(0)
         });
         match busy {
-            Ok(0) => return true,
+            Ok(0) => return ScrubOutcome::Done,
             Ok(_) => {}
-            Err(_) => return false,
+            Err(error) => return ScrubOutcome::Failed(error.to_string()),
         }
         if std::time::Instant::now() >= deadline {
-            return false;
+            return ScrubOutcome::Bound;
         }
-        std::thread::sleep(interval);
+        // The wait doubles as the stop signal: a message or a closed channel
+        // ends the pass at once.
+        match stopped.recv_timeout(interval) {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                // One last attempt: a reader that let go since the previous
+                // poll (a viewer's read lasts a frame) must not read as a
+                // lapse. Only a reader still in the way is reported.
+                return match conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                    row.get::<_, i64>(0)
+                }) {
+                    Ok(0) => ScrubOutcome::Done,
+                    _ => ScrubOutcome::Stopped,
+                };
+            }
+        }
     }
 }
 
@@ -1852,13 +1941,12 @@ mod wal_scrub_tests {
         let reader = pinned(&path);
         store.set_meta("k", "small").expect("overwrite");
 
-        let long = store
-            .schedule_wal_scrub(Duration::from_secs(30), Duration::from_millis(10))
-            .expect("the first request starts a pass");
         assert!(
-            store
-                .schedule_wal_scrub(Duration::from_secs(30), Duration::from_millis(10))
-                .is_none(),
+            store.schedule_wal_scrub(Duration::from_secs(30), Duration::from_millis(10)),
+            "the first request starts a pass"
+        );
+        assert!(
+            !store.schedule_wal_scrub(Duration::from_secs(30), Duration::from_millis(10)),
             "a second request while one pass runs starts no second thread"
         );
         let started = std::time::Instant::now();
@@ -1871,26 +1959,108 @@ mod wal_scrub_tests {
         );
         // Releasing the reader lets the long pass finish and succeed.
         reader.execute_batch("COMMIT;").expect("release");
-        assert!(long.join().expect("join"), "the pass completed once freed");
+        assert_eq!(
+            store.wait_wal_scrub(),
+            Some(true),
+            "the pass completed once freed"
+        );
 
         // Held past a short bound: the pass gives up and says so.
         let reader = pinned(&path);
         store.set_meta("k", &"w".repeat(20_000)).expect("set");
         store.set_meta("k", "tiny").expect("overwrite");
-        let short = store
-            .schedule_wal_scrub(Duration::from_millis(100), Duration::from_millis(10))
-            .expect("a pass can start again after one ends");
-        assert!(!short.join().expect("join"), "the bound passed");
+        assert!(
+            store.schedule_wal_scrub(Duration::from_millis(100), Duration::from_millis(10)),
+            "a pass can start again after one ends"
+        );
+        assert_eq!(store.wait_wal_scrub(), Some(false), "the bound passed");
+        drop(reader);
+    }
+
+    /// Dropping the store ends a pass that a reader still blocks, and does so
+    /// within an interval instead of after the 30 s bound.
+    #[test]
+    fn dropping_the_store_stops_the_pass_promptly() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("graph.db");
+        let store = GraphStore::open(&path, dir.path()).expect("open");
+        store.set_meta("k", &"v".repeat(20_000)).expect("set");
+        let reader = pinned(&path);
+        store.set_meta("k", "small").expect("overwrite");
+        assert!(store.schedule_wal_scrub(Duration::from_secs(30), Duration::from_millis(10)));
+        let started = std::time::Instant::now();
+        drop(store);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "drop waited for the bound"
+        );
+        drop(reader);
+    }
+
+    /// The retry connection never creates a missing database file.
+    #[test]
+    fn the_retry_never_creates_a_missing_database() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("absent.db");
+        let (_keep, stopped) = std::sync::mpsc::channel::<()>();
+        let outcome = retry_truncate_checkpoint(
+            &path,
+            Duration::from_millis(50),
+            Duration::from_millis(10),
+            &stopped,
+        );
+        assert!(matches!(outcome, ScrubOutcome::Failed(_)));
+        assert!(!path.exists(), "the retry created the file");
+    }
+
+    /// A stop that arrives after the reader let go is not a lapse: the final
+    /// attempt truncates the WAL and the pass reports nothing.
+    #[test]
+    fn a_stop_after_the_reader_let_go_completes_instead_of_reporting_a_lapse() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("graph.db");
+        let store = GraphStore::open(&path, dir.path()).expect("open");
+        store.set_meta("k", &"v".repeat(20_000)).expect("set");
+        let reader = pinned(&path);
+        store.set_meta("k", "small").expect("overwrite");
+        let (stop, stopped) = std::sync::mpsc::channel::<()>();
+        let worker = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                retry_truncate_checkpoint(
+                    &path,
+                    Duration::from_secs(30),
+                    Duration::from_secs(10),
+                    &stopped,
+                )
+            }
+        });
+        // The first attempt finds the reader; release it, then stop the pass
+        // before its next poll.
+        std::thread::sleep(Duration::from_millis(300));
+        reader.execute_batch("COMMIT;").expect("release");
+        stop.send(()).expect("stop");
+        assert!(matches!(worker.join().expect("join"), ScrubOutcome::Done));
+
+        // A reader still in the way at the stop is a real lapse.
+        let reader = pinned(&path);
+        store.set_meta("k", &"w".repeat(20_000)).expect("set");
+        store.set_meta("k", "tiny").expect("overwrite");
+        let (stop, stopped) = std::sync::mpsc::channel::<()>();
+        stop.send(()).expect("stop");
+        let outcome = retry_truncate_checkpoint(
+            &path,
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+            &stopped,
+        );
+        assert!(matches!(outcome, ScrubOutcome::Stopped));
         drop(reader);
     }
 
     #[test]
     fn an_in_memory_index_has_no_pass() {
         let store = GraphStore::open_in_memory(Path::new(".")).expect("open");
-        assert!(
-            store
-                .schedule_wal_scrub(Duration::from_secs(1), Duration::from_millis(10))
-                .is_none()
-        );
+        assert!(!store.schedule_wal_scrub(Duration::from_secs(1), Duration::from_millis(10)));
     }
 }

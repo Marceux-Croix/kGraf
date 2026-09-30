@@ -16,7 +16,7 @@ mod rule;
 pub use build::{
     AllowlistMatch, BuildAllowlist, BuildCommand, CargoSubcommand, UnknownBuildCommand,
 };
-pub(crate) use build::{cargo_rule_subject_allowed, manifest_path_of};
+pub(crate) use build::{cargo_rule_subject_allowed, manifest_paths_of};
 pub use decision::Decision;
 pub use policy::{CommandRule, ExecPolicy, PolicyVerdict};
 pub use rule::{PatternToken, PrefixPattern};

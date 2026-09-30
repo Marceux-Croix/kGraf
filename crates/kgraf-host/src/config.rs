@@ -10,7 +10,9 @@
 
 use crate::error::{Error, NotReady, Result, ResultExt};
 use kgraf_core::PriceTable;
-use kgraf_provider::{Provider, RateLimit, RateLimited, RouteLimiter, SharedLimiterStore, key_id};
+use kgraf_provider::{
+    Provider, RateLimit, RateLimited, RouteLimiter, RouteRecorded, SharedLimiterStore, key_id,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -34,6 +36,14 @@ pub struct RunConfig {
     /// The orchestrator's own `route:model` (`--planner`); default: the first route.
     #[serde(default)]
     pub planner: Option<String>,
+    /// Routes of non-generative model kinds as `kind=route:model`
+    /// (`--model-route`, decision 0089): `typed-decision`, `embedding`,
+    /// `rerank`. They run no worker and plan nothing; the orchestrator is told
+    /// them by kind, and their tools (`decide`, `embed`, `rerank`) are offered
+    /// in every worker environment of the run. Credentials and pricing are a
+    /// route's like any other.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_routes: Vec<String>,
     /// The JSON price table (`--prices`). Relative paths in a loaded file are
     /// resolved against the file's directory.
     pub prices: PathBuf,
@@ -147,6 +157,45 @@ pub struct RunConfig {
     /// scheduled or desktop run goes by the project's stored consent.
     #[serde(skip)]
     pub dependency_fetch: crate::deps::RunFetch,
+    /// What happens to a worker's worktree, and the build output in it, once
+    /// nothing needs it (decision 0088): `Delete` (the default) or `Keep`.
+    /// One source per surface: the command's `--keep-worktrees`, and in the
+    /// desktop app its settings switch. Not in `run.json`, which only the
+    /// desktop app reads and where its switch decides; a file that sets
+    /// `worktrees` is refused ([`RunConfig::load`]) rather than ignored.
+    #[serde(skip)]
+    pub worktrees: WorktreeRetention,
+}
+
+/// The run-file key [`RunConfig::load`] refuses (decision 0088).
+const WORKTREES_KEY: &str = "worktrees";
+
+/// Whether a worker's worktree, with the build output inside it, is deleted
+/// after use (decision 0088).
+///
+/// A worktree a live worker, a stopped or resumable run, a pending merge or a
+/// conflict resolver still needs is kept whichever way this is set.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorktreeRetention {
+    /// Remove the worktree and everything in it once nothing needs it.
+    #[default]
+    Delete,
+    /// Keep worktrees and their builds on disk for the user to inspect or
+    /// reuse; the user removes them (`kgraf clean`).
+    Keep,
+}
+
+impl WorktreeRetention {
+    /// `true` for [`WorktreeRetention::Delete`].
+    pub fn deletes(self) -> bool {
+        self == Self::Delete
+    }
+
+    /// The setting as a switch: on means delete after use.
+    pub fn from_delete(delete: bool) -> Self {
+        if delete { Self::Delete } else { Self::Keep }
+    }
 }
 
 /// The command's defaults, in one place (`main.rs`'s clap attributes name the same
@@ -243,6 +292,7 @@ impl RunConfig {
             root: root.into(),
             routes,
             planner: None,
+            model_routes: Vec::new(),
             prices: prices.into(),
             cap_run: None,
             cap_task: None,
@@ -267,6 +317,7 @@ impl RunConfig {
             routing: kgraf_orchestrator::RoutingPolicy::default(),
             tbench_bridge_socket: None,
             dependency_fetch: crate::deps::RunFetch::Stored,
+            worktrees: WorktreeRetention::default(),
         }
     }
 
@@ -282,6 +333,21 @@ impl RunConfig {
     pub fn load(root: impl Into<PathBuf>, path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_step(|| format!("cannot read {}", path.display()))?;
+        // Said plainly, rather than as serde's "unknown field": the key was
+        // once documented here, and a user who set it must learn where the
+        // choice lives now.
+        if serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .is_some_and(|v| v.get(WORKTREES_KEY).is_some())
+        {
+            return Err(Error::Invalid(format!(
+                "{} sets `{WORKTREES_KEY}`, which a run file does not choose: in the desktop \
+                 app, Settings > General > \"Delete worker worktrees after use\" decides for \
+                 every run it starts, and `kgraf orchestrate` and `kgraf schedule run-now` \
+                 take `--keep-worktrees`. Remove the key.",
+                path.display()
+            )));
+        }
         let mut config: RunConfig = serde_json::from_str(&text)
             .with_step(|| format!("{} is not a run configuration", path.display()))?;
         config.root = root.into();
@@ -435,21 +501,139 @@ impl RunConfig {
             .routes
             .first()
             .ok_or_else(|| Error::Invalid("give at least one --route route:model".into()))?;
+        // Worker and planner routes do generative work only (decision 0089): a
+        // kind prefix there is refused, never read as part of the route id.
+        for spec in self.routes.iter().chain(self.planner.iter()) {
+            generative_only(spec)?;
+        }
         let planner = RouteSpec::parse(self.planner.as_deref().unwrap_or(first))?;
         let mut used = BTreeSet::from([planner.route.clone()]);
         for spec in &self.routes {
             used.insert(split_route(spec)?.0);
         }
+        // A model route is a used route too (decision 0089): `--rate-limit`
+        // paces its calls as it paces a worker's.
+        for spec in self.model_route_specs()? {
+            used.insert(spec.route.route);
+        }
         Ok((planner, used))
+    }
+
+    /// [`Self::model_routes`], parsed: each names a non-generative kind, and no
+    /// `kind=route:model` repeats.
+    pub fn model_route_specs(&self) -> Result<Vec<ModelRouteSpec>> {
+        let mut out: Vec<ModelRouteSpec> = Vec::with_capacity(self.model_routes.len());
+        for spec in &self.model_routes {
+            let parsed = ModelRouteSpec::parse(spec)?;
+            if out.contains(&parsed) {
+                return Err(Error::Invalid(format!(
+                    "model route `{spec}` is given twice"
+                )));
+            }
+            out.push(parsed);
+        }
+        Ok(out)
     }
 }
 
+/// Refuse a kind prefix on a worker or planner route.
+fn generative_only(spec: &str) -> Result<()> {
+    let (kind, rest) = kgraf_core::split_kind_prefix(spec)
+        .map_err(|e| Error::Invalid(format!("`{spec}`: {e}")))?;
+    if rest.len() == spec.len() {
+        // No prefix (an `=` inside the model name is not one).
+        return Ok(());
+    }
+    if kind.is_generative() {
+        return Err(Error::Invalid(format!(
+            "`{spec}`: --route and --planner take no kind prefix; they are generative already"
+        )));
+    }
+    Err(Error::Invalid(format!(
+        "`{spec}` names the {kind} kind, but --route and --planner run generative work only; \
+         declare a {kind} route with --model-route (`model_routes` in run.json)"
+    )))
+}
+
+/// A non-generative route: `kind=route:model` (decision 0089).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelRouteSpec {
+    pub kind: kgraf_core::ModelKind,
+    pub route: RouteSpec,
+}
+
+impl ModelRouteSpec {
+    /// Parse `kind=route:model`. A spec with no kind, or the generative kind,
+    /// is refused: generative routes are `--route` and `--planner`.
+    pub fn parse(spec: &str) -> Result<Self> {
+        let (kind, rest) = kgraf_core::split_kind_prefix(spec)
+            .map_err(|e| Error::Invalid(format!("`{spec}`: {e}")))?;
+        if kind.is_generative() {
+            return Err(Error::Invalid(format!(
+                "model route `{spec}` names no non-generative kind; write kind=route:model with \
+                 a kind of {}; generative routes go in --route",
+                kgraf_core::KINDS
+                    .iter()
+                    .filter(|k| !k.kind.is_generative())
+                    .map(|k| k.kind.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+        Ok(Self {
+            kind,
+            route: RouteSpec::parse(rest)?,
+        })
+    }
+}
+
+impl std::fmt::Display for ModelRouteSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}={}", self.kind, self.route)
+    }
+}
+
+/// Build the run's non-generative routes from the catalog, each with its own
+/// credential through `lookup`, behind its route's limiter where `--rate-limit`
+/// sets one: the same limiter the route's generative calls take, bound to the
+/// same key, so a route's embedding calls and its worker calls share one pace.
+/// A route that does not serve its kind, or has no credential, raises.
+pub(crate) fn model_routes_from(
+    specs: &[ModelRouteSpec],
+    limiters: &Limiters,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<kgraf_provider::ModelRoutes> {
+    let mut routes = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let entry = kgraf_fleet::entry(&spec.route.route).settings()?;
+        let credential = kgraf_fleet::credential_from(entry, &lookup)
+            .map_err(|e| Error::Credential(crate::error::Chained::bare(Box::new(e))))?;
+        let route =
+            kgraf_fleet::build_kind(spec.kind, &spec.route.route, &credential, &spec.route.model)
+                .settings()?;
+        routes.push(match limiters.get(&spec.route.route) {
+            Some(limiter) => {
+                limiter.bind_key(&key_id(&credential));
+                route.with_limiter(limiter.clone())
+            }
+            None => route,
+        });
+    }
+    Ok(kgraf_provider::ModelRoutes::new(routes))
+}
+
 /// Read and parse a price table, as the command did.
-pub(crate) fn read_prices(path: &Path) -> Result<PriceTable> {
-    serde_json::from_str(
+pub fn read_prices(path: &Path) -> Result<PriceTable> {
+    let mut table: PriceTable = serde_json::from_str(
         &std::fs::read_to_string(path).with_step(|| format!("cannot read {}", path.display()))?,
     )
-    .step("the price table is not valid JSON")
+    .step("the price table is not valid JSON")?;
+    // A route that names a user-chosen deployment is priced only under its
+    // `<model>@<route>` key, never by a bare model entry that may not be it.
+    for route in kgraf_fleet::route_scoped_price_routes() {
+        table.require_route_scoped(route);
+    }
+    Ok(table)
 }
 
 /// A provider route and a model on it: `route:model`.
@@ -630,8 +814,10 @@ pub(crate) fn provider_with(
     Ok(limited(provider, route, credential, limiters))
 }
 
-/// The route's limiter around a provider, when one is configured. The one place
-/// `--rate-limit` reaches a provider, so its test covers the wiring.
+/// The route's limiter around a provider, when one is configured, and a route
+/// recorder otherwise, so every call's ledger row names its route whether or not
+/// the route is limited. The one place `--rate-limit` reaches a provider, so its
+/// test covers the wiring.
 ///
 /// Binds the shared limiter's key to `key_id(credential)` (never the
 /// credential itself) before the provider it wraps can be called: a route's
@@ -649,13 +835,45 @@ pub(crate) fn limited(
             limiter.bind_key(&key_id(credential));
             Arc::new(RateLimited::new(provider, limiter.clone()))
         }
-        None => provider,
+        None => Arc::new(RouteRecorded::new(provider, route)),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Decision 0088: a run file does not choose whether worktrees are kept.
+    /// Without the key it loads with the default; with it, whatever the
+    /// value, it is refused, naming where the choice is made, never ignored.
+    /// A configuration serialized back out never carries the key.
+    #[test]
+    fn a_run_file_that_sets_worktrees_is_refused_not_ignored() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("run.json");
+        let load = |body: &str| {
+            std::fs::write(&path, body).expect("write");
+            RunConfig::load("/project", &path)
+        };
+        let base = r#""routes": ["ollama:llama3"], "prices": "p.json""#;
+        let plain = load(&format!("{{{base}}}")).expect("load");
+        assert_eq!(plain.worktrees, WorktreeRetention::Delete);
+        for value in ["\"keep\"", "\"delete\"", "\"sometimes\""] {
+            let refused = load(&format!(r#"{{{base}, "worktrees": {value}}}"#))
+                .expect_err("the key is refused")
+                .to_string();
+            assert!(
+                refused.contains("worktrees")
+                    && refused.contains("--keep-worktrees")
+                    && refused.contains("Delete worker worktrees after use"),
+                "{refused}"
+            );
+        }
+        let mut keep = plain;
+        keep.worktrees = WorktreeRetention::Keep;
+        let text = serde_json::to_string(&keep).expect("json");
+        assert!(!text.contains("worktrees"), "{text}");
+    }
 
     #[test]
     fn a_loaded_file_takes_the_commands_defaults_and_resolves_prices_beside_it() {
@@ -849,5 +1067,155 @@ mod tests {
         let mut c = RunConfig::new(dir.path(), vec!["kimi:model".into()], &prices);
         c.rate_limits = vec!["kimi=60".into()];
         let _ = c.check_configured();
+    }
+
+    /// Decision 0089: generative work never reaches a non-generative route.
+    #[test]
+    fn a_kind_prefix_on_a_worker_or_planner_route_is_refused_naming_model_route() {
+        let mut c = RunConfig::new("/p", vec!["embedding=openai:e".into()], "p.json");
+        let err = c.planner_and_used().expect_err("refused").to_string();
+        assert!(
+            err.contains("--model-route") && err.contains("embedding"),
+            "{err}"
+        );
+        c.routes = vec!["ollama:llama3".into()];
+        c.planner = Some("typed-decision=systemone:jev-latest".into());
+        assert!(c.planner_and_used().is_err());
+        c.planner = Some("generative=ollama:llama3".into());
+        assert!(
+            c.planner_and_used().is_err(),
+            "a redundant prefix is refused too"
+        );
+        c.planner = None;
+        // An `=` inside a model name is not a prefix.
+        c.routes = vec!["ollama:llama3=q4".into()];
+        c.planner_and_used().expect("plain generative route");
+    }
+
+    #[test]
+    fn a_model_route_must_name_a_non_generative_kind_once() {
+        let mut c = RunConfig::new("/p", vec!["ollama:llama3".into()], "p.json");
+        c.model_routes = vec!["openai:text-embedding-3-small".into()];
+        let err = c.model_route_specs().expect_err("no kind").to_string();
+        assert!(err.contains("typed-decision, embedding, rerank"), "{err}");
+        c.model_routes = vec!["generative=ollama:llama3".into()];
+        assert!(c.model_route_specs().is_err());
+        c.model_routes = vec!["world=ollama:m".into()];
+        assert!(
+            c.model_route_specs().is_err(),
+            "an unregistered kind raises"
+        );
+        c.model_routes = vec!["embedding=openai:e".into(), "embedding=openai:e".into()];
+        assert!(c.model_route_specs().is_err(), "a repeat raises");
+        c.model_routes = vec!["embedding=openai:e".into(), "rerank=llama-cpp:r".into()];
+        let specs = c.model_route_specs().expect("parsed");
+        assert_eq!(specs[0].kind, kgraf_core::ModelKind::EMBEDDING);
+        assert_eq!(specs[1].route.route, "llama-cpp");
+        assert_eq!(specs[1].to_string(), "rerank=llama-cpp:r");
+        // The planner check runs it too, so `check_configured` and `open` refuse.
+        c.model_routes = vec!["openai:e".into()];
+        assert!(c.planner_and_used().is_err());
+    }
+
+    #[test]
+    fn model_routes_load_from_a_run_file_and_are_left_out_when_empty() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("run.json");
+        std::fs::write(
+            &path,
+            r#"{"routes": ["ollama:llama3"], "prices": "p.json",
+                "model_routes": ["embedding=ollama:nomic-embed-text"]}"#,
+        )
+        .expect("write");
+        let loaded = RunConfig::load("/project", &path).expect("load");
+        assert_eq!(
+            loaded.model_routes,
+            vec!["embedding=ollama:nomic-embed-text"]
+        );
+        let mut plain = loaded.clone();
+        plain.model_routes.clear();
+        let text = serde_json::to_string(&plain).expect("json");
+        assert!(!text.contains("model_routes"), "{text}");
+    }
+
+    #[test]
+    fn model_routes_are_built_with_their_own_credentials_and_offer_their_tools() {
+        let specs = vec![
+            ModelRouteSpec::parse("embedding=openai:text-embedding-3-small").expect("e"),
+            ModelRouteSpec::parse("typed-decision=systemone:jev-latest").expect("d"),
+        ];
+        // No credential for the remote route: raised, naming the variable.
+        let err = model_routes_from(&specs, &Limiters::new(), |_| None).expect_err("no key");
+        assert!(matches!(err, Error::Credential(_)), "{err}");
+        let routes = model_routes_from(&specs, &Limiters::new(), |name| {
+            (name == "KGRAF_OPENAI_API_KEY").then(|| "sk-test-model-kinds-000000".to_owned())
+        })
+        .expect("built");
+        assert_eq!(
+            routes.kinds(),
+            vec![
+                kgraf_core::ModelKind::TYPED_DECISION,
+                kgraf_core::ModelKind::EMBEDDING
+            ]
+        );
+        let ledger = std::sync::Arc::new(kgraf_provider::Ledger::open_in_memory().expect("ledger"));
+        let calls = kgraf_tools::ModelCalls::new(ledger, std::sync::Arc::new(routes));
+        let names: Vec<String> = kgraf_tools::model_tools(&calls)
+            .iter()
+            .map(|t| t.name().to_owned())
+            .collect();
+        assert_eq!(names, vec!["decide", "embed"]);
+        // A route that does not serve the kind is refused at build.
+        let wrong = vec![ModelRouteSpec::parse("embedding=anthropic:m").expect("parse")];
+        assert!(
+            model_routes_from(&wrong, &Limiters::new(), |_| Some(
+                "k-000000000000000000".into()
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_rate_limit_on_a_model_route_is_accepted_and_paces_that_route() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = dir.path().join("rate-limits.sqlite3");
+        let prices = dir.path().join("prices.json");
+        let mut c = RunConfig::new(dir.path(), vec!["ollama:llama3".into()], &prices);
+        c.model_routes = vec!["embedding=tei:bge".into(), "rerank=tei:bge".into()];
+        let (_, used) = c.planner_and_used().expect("used");
+        assert!(used.contains("tei"), "{used:?}");
+        let paced = limiters(&["tei=60".into()], &used, Some(&store)).expect("limiters");
+        let routes = model_routes_from(&c.model_route_specs().expect("specs"), &paced, |_| None)
+            .expect("built");
+        assert_eq!(routes.iter().count(), 2);
+        for route in routes.iter() {
+            let limiter = route.limiter().expect("paced");
+            assert!(Arc::ptr_eq(limiter, &paced["tei"]), "one shared limiter");
+        }
+        // A limit on a route neither kind of route uses is still refused.
+        assert!(limiters(&["kimi=60".into()], &used, Some(&store)).is_err());
+    }
+
+    #[test]
+    fn readiness_names_an_unserved_kind_an_unknown_route_and_a_missing_key() {
+        use crate::host::check_model_routes;
+        let spec = |s: &str| ModelRouteSpec::parse(s).expect("parse");
+        let none = |_: &str| None;
+        let err = check_model_routes(&[spec("embedding=anthropic:m")], Some(&none))
+            .expect_err("not served");
+        assert!(
+            err.to_string().contains("does not serve embedding"),
+            "{err}"
+        );
+        assert!(matches!(
+            check_model_routes(&[spec("rerank=nowhere:m")], Some(&none)),
+            Err(NotReady::UnknownRoute { .. })
+        ));
+        assert!(matches!(
+            check_model_routes(&[spec("embedding=openai:e")], Some(&none)),
+            Err(NotReady::MissingCredential { .. })
+        ));
+        check_model_routes(&[spec("typed-decision=systemone:jev-latest")], Some(&none))
+            .expect("a local route needs no key");
     }
 }

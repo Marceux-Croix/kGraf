@@ -1,0 +1,41 @@
+{
+  "_fixture": {
+    "source": [
+      "https://learn.microsoft.com/en-us/azure/ai-foundry/openai/how-to/responses",
+      "https://platform.openai.com/docs/api-reference/responses/object"
+    ],
+    "provenance": "The content_filters array is copied from the first page's guardrail annotation example. The response object, output message and usage details follow the OpenAI Responses object that Azure serves. Model name, ids and counts are invented. Not a live capture."
+  },
+  "id": "resp_0001",
+  "object": "response",
+  "status": "completed",
+  "model": "gpt-4.1-nano-2025-04-14",
+  "output": [
+    {
+      "type": "message",
+      "id": "msg_0001",
+      "role": "assistant",
+      "status": "completed",
+      "content": [{ "type": "output_text", "text": "This is a test response.", "annotations": [] }]
+    }
+  ],
+  "usage": {
+    "input_tokens": 50,
+    "input_tokens_details": { "cached_tokens": 20 },
+    "output_tokens": 30,
+    "output_tokens_details": { "reasoning_tokens": 10 },
+    "total_tokens": 80
+  },
+  "content_filters": [
+    {
+      "source_type": "prompt",
+      "blocked": false,
+      "content_filter_results": {
+        "hate": { "filtered": false, "severity": "safe" },
+        "self_harm": { "filtered": false, "severity": "safe" },
+        "sexual": { "filtered": false, "severity": "safe" },
+        "violence": { "filtered": false, "severity": "safe" }
+      }
+    }
+  ]
+}

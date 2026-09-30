@@ -63,7 +63,7 @@ pub use storage::{
     INDEX_KEY, SCHEDULE_PREFIX, schedule_ids_from_meta_keys, schedule_key, validate_schedule_id,
 };
 pub use store::{
-    ClaimOutcome, DeferralOutcome, ExpiredClaim, ManualClaim, OccurrenceRecord, RunOutcome,
-    ScheduleStatus, ScheduleStore, TickDecision,
+    ClaimOutcome, DeferralOutcome, ExpiredClaim, HELD_FOR_MANUAL_RUN, ManualClaim,
+    OccurrenceRecord, RunOutcome, ScheduleStatus, ScheduleStore, TickDecision,
 };
 pub use timezone::parse_time_zone;

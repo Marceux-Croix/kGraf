@@ -125,53 +125,88 @@ impl UpdateHandle {
         let join = std::thread::Builder::new()
             .name("kgraf-update".to_owned())
             .spawn(move || {
-                let Ok(runtime) = tokio::runtime::Builder::new_multi_thread()
+                // However this thread ends, a check or download in flight is
+                // over; see `ThreadExit`.
+                let _exit = ThreadExit {
+                    state: state_t.clone(),
+                    wake: wake.clone(),
+                };
+                let runtime = match tokio::runtime::Builder::new_multi_thread()
                     .worker_threads(1)
                     .enable_all()
                     .build()
-                else {
-                    return;
+                {
+                    Ok(runtime) => runtime,
+                    Err(e) => {
+                        // Say so in the state, or a check that never runs
+                        // reads as "idle" for good.
+                        log::error!("update thread: the async runtime could not start: {e}");
+                        set_state(
+                            &state_t,
+                            &wake,
+                            UpdateState::Failed(format!(
+                                "the update thread could not start its runtime: {e}"
+                            )),
+                        );
+                        return;
+                    }
                 };
+                // A client that cannot be built is a failure of the check or
+                // download that needs it, said in the state; a default client
+                // has none of these timeouts and is not a substitute.
                 let client = reqwest::Client::builder()
                     .timeout(Duration::from_secs(30))
                     .build()
-                    .unwrap_or_default();
+                    .map_err(|e| UpdateError::Client(e.to_string()));
                 let download_client = update_check::download_client(
                     update_check::DOWNLOAD_CONNECT_TIMEOUT,
                     update_check::DOWNLOAD_IDLE_TIMEOUT,
                 );
                 if check_on_start {
-                    runtime.block_on(run_check(
-                        &state_t,
-                        &client,
-                        &api_base,
-                        allow_prerelease,
-                        &wake,
-                    ));
+                    match &client {
+                        Ok(client) => runtime.block_on(run_check(
+                            &state_t,
+                            client,
+                            &api_base,
+                            allow_prerelease,
+                            &wake,
+                        )),
+                        Err(e) => set_state(&state_t, &wake, UpdateState::Failed(e.to_string())),
+                    }
                 }
                 loop {
                     if stop_t.load(Ordering::Relaxed) {
                         return;
                     }
                     match rx.recv_timeout(STOP_POLL_INTERVAL) {
-                        Ok(Command::Check { allow_prerelease }) => {
-                            runtime.block_on(run_check(
+                        Ok(Command::Check { allow_prerelease }) => match &client {
+                            Ok(client) => runtime.block_on(run_check(
                                 &state_t,
-                                &client,
+                                client,
                                 &api_base,
                                 allow_prerelease,
                                 &wake,
-                            ));
-                        }
-                        Ok(Command::Install(candidate)) => {
-                            runtime.block_on(run_install(
+                            )),
+                            Err(e) => {
+                                set_state_unless_downloading(
+                                    &state_t,
+                                    &wake,
+                                    UpdateState::Failed(e.to_string()),
+                                );
+                            }
+                        },
+                        Ok(Command::Install(candidate)) => match &download_client {
+                            Ok(download_client) => runtime.block_on(run_install(
                                 &state_t,
-                                &download_client,
+                                download_client,
                                 &candidate,
                                 launcher.as_ref(),
                                 &wake,
-                            ));
-                        }
+                            )),
+                            Err(e) => {
+                                set_state(&state_t, &wake, UpdateState::Failed(e.to_string()))
+                            }
+                        },
                         Err(RecvTimeoutError::Timeout) => {}
                         Err(RecvTimeoutError::Disconnected) => return,
                     }
@@ -195,7 +230,14 @@ impl UpdateHandle {
     /// "Check now" (Settings): runs off the UI thread regardless of
     /// `Settings::check_for_updates`, since the user just explicitly asked.
     pub fn check_now(&self, allow_prerelease: bool) {
-        let _ = self.tx.send(Command::Check { allow_prerelease });
+        if self.tx.send(Command::Check { allow_prerelease }).is_err() {
+            // The thread has ended: nothing will answer this check.
+            set_state(
+                &self.state,
+                &self.wake,
+                UpdateState::Failed("the update thread is not running".to_owned()),
+            );
+        }
     }
 
     /// The consent gate. Call this only from the notice's own "Yes, download and
@@ -208,6 +250,15 @@ impl UpdateHandle {
     pub fn accept_and_install(&self, candidate: UpdateCandidate) {
         {
             let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            // A thread that ended (a panic in a download, for one) cannot
+            // finish a `Downloading` state it left behind: fail it, so the
+            // user is told and a retry is not refused for good.
+            if self.join.as_ref().is_none_or(|j| j.is_finished()) {
+                *state = UpdateState::Failed("the update thread is not running".to_owned());
+                drop(state);
+                (self.wake)();
+                return;
+            }
             if *state == UpdateState::Downloading {
                 return;
             }
@@ -249,6 +300,50 @@ fn set_state(state: &Mutex<UpdateState>, wake: &Wake, next: UpdateState) {
     wake();
 }
 
+/// [`set_state`] unless a download is in flight: only the download's own end
+/// moves the state out of `Downloading`. A check that finishes meanwhile must
+/// not overwrite it, or `accept_and_install` would take a second download.
+/// Whether the state was set.
+fn set_state_unless_downloading(
+    state: &Mutex<UpdateState>,
+    wake: &Wake,
+    next: UpdateState,
+) -> bool {
+    {
+        let mut current = state.lock().unwrap_or_else(|p| p.into_inner());
+        if *current == UpdateState::Downloading {
+            return false;
+        }
+        *current = next;
+    }
+    wake();
+    true
+}
+
+/// Ends a check or download that was in flight when the update thread exits
+/// (a panic included). Without it the state stays `Checking` or `Downloading`
+/// for good, and `accept_and_install` returns early on `Downloading`.
+struct ThreadExit {
+    state: Arc<Mutex<UpdateState>>,
+    wake: Wake,
+}
+
+impl Drop for ThreadExit {
+    fn drop(&mut self) {
+        let in_flight = {
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            let in_flight = matches!(*state, UpdateState::Checking | UpdateState::Downloading);
+            if in_flight {
+                *state = UpdateState::Failed("the update thread stopped".to_owned());
+            }
+            in_flight
+        };
+        if in_flight {
+            (self.wake)();
+        }
+    }
+}
+
 async fn run_check(
     state: &Mutex<UpdateState>,
     client: &reqwest::Client,
@@ -256,14 +351,16 @@ async fn run_check(
     allow_prerelease: bool,
     wake: &Wake,
 ) {
-    set_state(state, wake, UpdateState::Checking);
+    if !set_state_unless_downloading(state, wake, UpdateState::Checking) {
+        return;
+    }
     let outcome = check_once(client, api_base, allow_prerelease).await;
     let next = match outcome {
         Ok(Some(candidate)) => UpdateState::Available(candidate),
         Ok(None) => UpdateState::UpToDate,
         Err(e) => UpdateState::Failed(e.to_string()),
     };
-    set_state(state, wake, next);
+    set_state_unless_downloading(state, wake, next);
 }
 
 async fn check_once(
@@ -520,6 +617,96 @@ mod tests {
         )
         .expect("this test's own platform is supported")
         .remove(0)
+    }
+
+    /// A check that finishes while a download is in flight leaves `Downloading`
+    /// alone, so a second accept cannot start another download. Mechanism: the
+    /// state is `Downloading` before and after, and the check never even asks
+    /// the server.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_check_never_overwrites_a_download_in_flight() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
+        let state = Mutex::new(UpdateState::Downloading);
+        let (wake, woke) = wake_counter();
+        run_check(&state, &reqwest::Client::new(), &server.uri(), false, &wake).await;
+        assert_eq!(*state.lock().unwrap(), UpdateState::Downloading);
+        assert_eq!(woke.load(Ordering::SeqCst), 0);
+        assert!(server.received_requests().await.unwrap().is_empty());
+
+        // The same check on an idle state does run and set its result.
+        *state.lock().unwrap() = UpdateState::Idle;
+        run_check(&state, &reqwest::Client::new(), &server.uri(), false, &wake).await;
+        assert_eq!(*state.lock().unwrap(), UpdateState::UpToDate);
+    }
+
+    /// An update thread that ends with a check or download in flight leaves a
+    /// `Failed` state, not `Downloading` for good; a panic counts.
+    #[test]
+    fn a_thread_that_ends_mid_download_leaves_a_failed_state() {
+        let state = Arc::new(Mutex::new(UpdateState::Downloading));
+        let (wake, woke) = wake_counter();
+        let (s, w) = (state.clone(), wake.clone());
+        let panicked = std::thread::spawn(move || {
+            let _exit = ThreadExit { state: s, wake: w };
+            panic!("a download panicked");
+        })
+        .join();
+        assert!(panicked.is_err());
+        assert!(matches!(*state.lock().unwrap(), UpdateState::Failed(_)));
+        assert_eq!(woke.load(Ordering::SeqCst), 1);
+
+        // A state that is not in flight is left as it is.
+        *state.lock().unwrap() = UpdateState::UpToDate;
+        drop(ThreadExit {
+            state: state.clone(),
+            wake,
+        });
+        assert_eq!(*state.lock().unwrap(), UpdateState::UpToDate);
+    }
+
+    /// After the thread is gone an accept fails loud instead of returning on a
+    /// `Downloading` state nothing will ever finish.
+    #[test]
+    fn an_accept_after_the_thread_died_is_told_so_not_swallowed() {
+        let (wake, _n) = wake_counter();
+        let handle = UpdateHandle::spawn(false, false, wake);
+        handle.stop.store(true, Ordering::Relaxed);
+        wait_until(|| handle.join.as_ref().is_some_and(|j| j.is_finished()));
+        *handle.state.lock().unwrap() = UpdateState::Downloading;
+        handle.accept_and_install(UpdateCandidate {
+            version: semver::Version::new(999, 0, 0),
+            tag_name: "v999.0.0".to_owned(),
+            asset_name: "a".to_owned(),
+            download_url: "http://127.0.0.1:9/a".to_owned(),
+            checksum_name: "a.sha256".to_owned(),
+            checksum_url: "http://127.0.0.1:9/a.sha256".to_owned(),
+        });
+        assert!(
+            matches!(handle.state(), UpdateState::Failed(_)),
+            "{:?}",
+            handle.state()
+        );
+    }
+
+    /// A check asked of a thread that is gone is told so, not dropped.
+    #[test]
+    fn a_check_after_the_thread_died_is_told_so_not_dropped() {
+        let (wake, woke) = wake_counter();
+        let handle = UpdateHandle::spawn(false, false, wake);
+        handle.stop.store(true, Ordering::Relaxed);
+        wait_until(|| handle.join.as_ref().is_some_and(|j| j.is_finished()));
+        assert_eq!(handle.state(), UpdateState::Idle);
+        handle.check_now(false);
+        assert!(
+            matches!(handle.state(), UpdateState::Failed(_)),
+            "{:?}",
+            handle.state()
+        );
+        assert!(woke.load(Ordering::SeqCst) >= 1, "the UI is woken");
     }
 
     /// Drop stops the thread promptly (same guarantee `capacity_bg` gives).

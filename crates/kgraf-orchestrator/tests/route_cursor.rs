@@ -23,11 +23,12 @@ async fn trace_of(p: &Parts) -> Vec<TraceEvent> {
     log.load().await.expect("load")
 }
 
-/// A contract deferred by a transient readiness failure asks again from the
-/// same cursor: it does not lose its turn in the rotation. The first roster
-/// route is not ready once; the contract then runs on it, not on the next one.
+/// A contract whose first pick is transiently not ready asks again from the
+/// next route: the rotation moves on, so one unready route cannot hold a
+/// contract while another route is healthy. The first roster route is not
+/// ready once; the contract then runs on the next one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_deferred_contract_keeps_its_place_in_the_rotation() {
+async fn a_contract_moves_to_the_next_route_when_its_pick_is_not_ready() {
     let dir = tempfile::tempdir().expect("dir");
     let plan = plan_json(&[c("a", "make a", "src/a.rs", &[])]);
     let p = Parts::open(
@@ -52,12 +53,59 @@ async fn a_deferred_contract_keeps_its_place_in_the_rotation() {
         .await
         .expect("run");
     assert_eq!(report.status, RunStatus::Completed, "{report:?}");
-    assert!(probes.load(Ordering::SeqCst) >= 2, "the first ask deferred");
+    assert!(
+        probes.load(Ordering::SeqCst) >= 1,
+        "the first pick was probed"
+    );
     assert_eq!(
         p.stats.vendors(),
-        ["alpha".to_owned()].into(),
-        "the deferral did not move the cursor to beta"
+        ["beta".to_owned()].into(),
+        "the unready pick was left behind"
     );
+}
+
+/// A route that stays not ready is left behind: the contract's next pick moves
+/// on and runs on the healthy route, instead of waiting on the first one.
+async fn run_with_first_route_never_ready(routing: RoutingPolicy) {
+    let dir = tempfile::tempdir().expect("dir");
+    let plan = plan_json(&[c("a", "make a", "src/a.rs", &[])]);
+    let p = Parts::open(
+        dir.path(),
+        move |_| plan.clone(),
+        |_| SERVES.into(),
+        Duration::from_millis(5),
+    );
+    let mut s = p.services(WINDOW);
+    s.routes[0].readiness = Arc::new(FnProbe(Arc::new(|| {
+        Err(ReadinessFailure::Transient("never warms up".into()))
+    })));
+    let mut config = support::config();
+    config.routing = routing;
+    let report = tokio::time::timeout(
+        Duration::from_secs(20),
+        Orchestrator::new(config, s)
+            .expect("orchestrator")
+            .start(RunId::new("r1"), "make a".into()),
+    )
+    .await
+    .expect("the run must not wait on the route that never becomes ready")
+    .expect("run");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    assert_eq!(
+        p.stats.vendors(),
+        ["beta".to_owned()].into(),
+        "the work ran on the ready route"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rotation_moves_past_a_route_that_never_becomes_ready() {
+    run_with_first_route_never_ready(RoutingPolicy::Rotation).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fitness_passes_over_a_route_that_never_becomes_ready() {
+    run_with_first_route_never_ready(RoutingPolicy::Fitness).await;
 }
 
 /// Under `Fitness`, each dispatched pick moves the cursor, so the exploration

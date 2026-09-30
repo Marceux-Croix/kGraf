@@ -126,7 +126,7 @@ pub struct Offered {
 
 /// Least overlap between a finished plan's step text and an offered template's
 /// for the plan to count as a reuse of it. **Unmeasured**: a starting point
-/// chosen on the review's hand-built cases, not on recorded runs.
+/// chosen on hand-built cases, not on recorded runs.
 ///
 /// **Reuse is conservative by design.** A plan that keeps the template's nouns
 /// ("a YAML config parser" for "a TOML config parser") scores well above it; a

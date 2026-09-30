@@ -21,7 +21,8 @@
 //! a name that steers git is refused. Those are `.git` itself, `.gitmodules`,
 //! `.gitattributes`, `.gitconfig` (a repository can include it from its
 //! config), the `.githooks` hooks directory, a `.git~` name, and the
-//! NTFS short names `GIT~N`, `GITMOD~N` and `GITATT~N`. Other dot files that
+//! NTFS short names `GIT~N`, `GITMOD~N`, `GITATT~N`, `GITCON~N` and
+//! `GITHOO~N`. Other dot files that
 //! only start with `.git` (`.gitlab-ci.yml`, `.gitpod.yml`,
 //! `.git-blame-ignore-revs`, `.gitleaks.toml`, `.gitignore`, `.gitkeep`) and
 //! the `.github` folder are ordinary files that git never reads as
@@ -42,8 +43,11 @@ use std::path::{Component, Path};
 pub const MIGRATION_LOCK_NAME: &str = ".kgraf.migrating";
 use unicode_normalization::UnicodeNormalization;
 
-/// Whether `c` is a default-ignorable code point a file system may drop.
-fn ignorable(c: char) -> bool {
+/// Whether `c` is a default-ignorable code point: shown as nothing, and one a
+/// file system may drop from a name. The terminal escaping of text a model
+/// wrote uses the same set, so a name that folds equal and a name that shows
+/// equal are judged by one list.
+pub fn is_default_ignorable(c: char) -> bool {
     matches!(c,
         '\u{00AD}'
         | '\u{034F}'
@@ -83,12 +87,15 @@ fn case_fold_extra(c: char, out: &mut String) {
 /// and spaces removed. Stricter than plain lowercasing: two names that fold
 /// equal are one file on at least one common volume.
 pub fn fold_name(name: &str) -> String {
-    let first: String = name.nfkc().filter(|c| !ignorable(*c)).collect();
+    let first: String = name.nfkc().filter(|c| !is_default_ignorable(*c)).collect();
     let mut lowered = String::with_capacity(first.len());
     for c in first.to_lowercase().chars() {
         case_fold_extra(c, &mut lowered);
     }
-    let folded: String = lowered.nfkc().filter(|c| !ignorable(*c)).collect();
+    let folded: String = lowered
+        .nfkc()
+        .filter(|c| !is_default_ignorable(*c))
+        .collect();
     folded.trim_end_matches(['.', ' ']).to_owned()
 }
 
@@ -96,6 +103,17 @@ pub fn fold_name(name: &str) -> String {
 pub fn fold_path(path: &Path) -> String {
     path.components()
         .map(|c| fold_name(&c.as_os_str().to_string_lossy()))
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// A whole relative path with each component in Unicode NFC, and nothing
+/// else folded: how a case-sensitive but normalization-insensitive volume
+/// (case-sensitive APFS) compares names. An NFC and an NFD spelling of one
+/// name are one file there; `A` and `a` are two.
+pub fn normalize_path(path: &Path) -> String {
+    path.components()
+        .map(|c| c.as_os_str().to_string_lossy().nfc().collect::<String>())
         .collect::<Vec<_>>()
         .join("/")
 }
@@ -113,18 +131,24 @@ fn short_name_of(f: &str, stem: &str) -> bool {
         .is_some_and(|digits| !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()))
 }
 
-/// Why one path component is protected, or `None`. The reason names what the
-/// name is, so a refusal can say why it was refused.
-pub fn protected_name_reason(name: &str) -> Option<&'static str> {
+/// [`fold_name`] with an NTFS stream suffix dropped. A stream suffix names
+/// the same file or directory (`.git::$INDEX_ALLOCATION`, `.cargo::$DATA`);
+/// the part before the first `:` is the name, with the trailing dots and
+/// spaces NTFS drops removed again.
+fn fold_name_without_stream(name: &str) -> String {
     let folded = fold_name(name);
-    // An NTFS stream suffix names the same file or directory
-    // (`.git::$INDEX_ALLOCATION`); the part before the first `:` is the name.
-    let f = folded
+    folded
         .split(':')
         .next()
         .unwrap_or_default()
         .trim_end_matches(['.', ' '])
-        .to_owned();
+        .to_owned()
+}
+
+/// Why one path component is protected, or `None`. The reason names what the
+/// name is, so a refusal can say why it was refused.
+pub fn protected_name_reason(name: &str) -> Option<&'static str> {
+    let f = fold_name_without_stream(name);
     let f = f.as_str();
     if is_kgraf_state_name(f) {
         return Some("it is kGraf's own state, which a worker never writes");
@@ -138,6 +162,8 @@ pub fn protected_name_reason(name: &str) -> Option<&'static str> {
         || short_name_of(f, "git")
         || short_name_of(f, "gitmod")
         || short_name_of(f, "gitatt")
+        || short_name_of(f, "gitcon")
+        || short_name_of(f, "githoo")
     {
         return Some(
             "it is repository metadata that steers git (`.git`, `.gitmodules`, `.gitattributes`, `.gitconfig`, \
@@ -153,13 +179,7 @@ pub fn protected_name_reason(name: &str) -> Option<&'static str> {
 /// ordinary project text a worker may read; only writing them is refused
 /// (see [`is_protected_name`]).
 pub fn is_unreadable_name(name: &str) -> bool {
-    let folded = fold_name(name);
-    let f = folded
-        .split(':')
-        .next()
-        .unwrap_or_default()
-        .trim_end_matches(['.', ' '])
-        .to_owned();
+    let f = fold_name_without_stream(name);
     let f = f.as_str();
     is_kgraf_state_name(f) || f == ".git" || f.starts_with(".git~") || short_name_of(f, "git")
 }
@@ -191,18 +211,23 @@ fn is_kgraf_state_name(f: &str) -> bool {
 /// `.cargo/config.toml` in the folder it runs in and every parent, and rustup
 /// reads `rust-toolchain(.toml)` the same way; either can name programs that
 /// every later build runs (a `build.rustc-wrapper`, a `path` toolchain, an
-/// `[alias]`). Compared as [`fold_name`] resolves names; `CARGO~1` is the
-/// NTFS short name of `.cargo`.
+/// `[alias]`). Compared as [`fold_name`] resolves names, with an NTFS stream
+/// suffix dropped; `CARGO~N` is the NTFS short name of `.cargo`.
 pub fn is_build_config_path(path: &Path) -> bool {
     path.components().any(|c| match c {
         Component::Normal(name) => {
-            let f = fold_name(&name.to_string_lossy());
-            // `RUST-T~1.TOM` is the NTFS short name of `rust-toolchain.toml`
-            // (`RUST-T~1` for the extensionless file).
+            let f = fold_name_without_stream(&name.to_string_lossy());
+            // rustup reads exactly `rust-toolchain` and `rust-toolchain.toml`;
+            // `docs/rust-toolchain-notes.md` is an ordinary file. `RUST-T~N.TOM`
+            // is the NTFS short name of `rust-toolchain.toml` (`RUST-T~N` for
+            // the extensionless file).
             f == ".cargo"
-                || f == "cargo~1"
-                || f.starts_with("rust-toolchain")
-                || f.starts_with("rust-t~")
+                || short_name_of(&f, "cargo")
+                || f == "rust-toolchain"
+                || f == "rust-toolchain.toml"
+                || short_name_of(&f, "rust-t")
+                || f.strip_suffix(".tom")
+                    .is_some_and(|stem| short_name_of(stem, "rust-t"))
         }
         _ => false,
     })
@@ -259,6 +284,10 @@ mod tests {
             "gitmod~2",
             "GITATT~1",
             "sub/GITATT~1",
+            "GITCON~1",
+            "a/gitcon~2",
+            "GITHOO~1/pre-commit",
+            "GITCON~1::$DATA",
             ".git~1/x",
             ".git::$INDEX_ALLOCATION/config",
             ".git:$I30:$INDEX_ALLOCATION/config",
@@ -357,6 +386,18 @@ mod tests {
     }
 
     #[test]
+    fn normalize_path_joins_canonical_equivalents_but_keeps_case() {
+        assert_eq!(
+            normalize_path(Path::new("cafe\u{301}/x.rs")),
+            normalize_path(Path::new("caf\u{e9}/x.rs"))
+        );
+        assert_ne!(
+            normalize_path(Path::new("Src/a.rs")),
+            normalize_path(Path::new("src/a.rs"))
+        );
+    }
+
+    #[test]
     fn paths_compare_as_a_case_and_normalization_insensitive_volume_does() {
         assert!(same_path(Path::new("Src/Lib.RS"), Path::new("src/lib.rs")));
         // "é" precomposed and decomposed.
@@ -382,6 +423,11 @@ mod tests {
             "rust-toolchain",
             "rust-toolchain.toml",
             "crates/a/Rust-Toolchain.TOML",
+            "rust-toolchain::$DATA",
+            "rust-toolchain.toml:stream",
+            ".cargo::$INDEX_ALLOCATION/config.toml",
+            "CARGO~2/config.toml",
+            "RUST-T~3.TOM",
         ] {
             assert!(is_build_config_path(Path::new(yes)), "{yes:?}");
         }
@@ -392,6 +438,10 @@ mod tests {
             "docs/toolchain-notes.md",
             "cargo/config.toml",
             "src/toolchain.rs",
+            "docs/rust-toolchain-notes.md",
+            "rust-toolchains",
+            "rust-toolchain.toml.bak",
+            "rust-tools.md",
         ] {
             assert!(!is_build_config_path(Path::new(no)), "{no:?}");
         }

@@ -156,8 +156,7 @@ fn with_locked<T>(path: &Path, f: impl FnOnce() -> Result<T, DiagError>) -> Resu
     f()
 }
 
-/// A fault-injection hook for `tests/cross_process.rs` (re-review,
-/// 2026-09-27, item 2): a plain race between "read the file" and "rename the
+/// A fault-injection hook for `tests/cross_process.rs`: a plain race between "read the file" and "rename the
 /// trimmed copy over it" is won or lost inside a handful of syscalls, all
 /// cached on a local disk, so even 8 real OS processes hammering the file as
 /// fast as they can rarely land another process's action inside that window
@@ -390,7 +389,7 @@ mod tests {
         assert_eq!(records.len(), 1);
     }
 
-    /// The review's own repro shape: many threads (standing in for many
+    /// The original repro shape: many threads (standing in for many
     /// processes, since `std::fs` locking is per open-file-description, not
     /// per-process; the exclusive lock this test exercises is the same one
     /// two real processes would contend for) appending concurrently, with no

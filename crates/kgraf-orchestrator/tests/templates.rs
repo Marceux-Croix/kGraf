@@ -650,7 +650,7 @@ async fn skeptic_partial_seed() {
     assert_eq!(p.admission.budget().spent_run("r1"), ledger_spend(&p, "r1"));
 }
 
-/// Review item 4: a failed orchestrator call is charged at its ledger cost, not
+/// A failed orchestrator call is charged at its ledger cost, not
 /// its whole hold, so the book matches the ledger and a same-process resume
 /// still seeds what is missing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -751,7 +751,7 @@ async fn a_completed_run_without_a_plan_snapshot_records_nothing() {
     );
 }
 
-/// Review item 3 through the loop: an unreadable template is quarantined and
+/// Through the loop: an unreadable template is quarantined and
 /// reported; the run still plans and completes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_corrupt_template_is_quarantined_and_the_run_still_plans() {

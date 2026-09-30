@@ -193,6 +193,7 @@ pub(crate) fn call(id: &str, name: &str, input: Value) -> Content {
         id: id.into(),
         name: name.into(),
         input,
+        signature: None,
     }
 }
 

@@ -570,11 +570,6 @@ impl TextSurface {
         };
     }
 
-    /// Rows of the conversation on screen (tests and the report).
-    pub fn row_count(&self) -> usize {
-        self.rows.rows.len()
-    }
-
     /// Draws the panel. Returns the snippet opened this frame, if one was.
     /// `generation` changes when the corpus does (the rows are rebuilt then).
     pub fn show(
@@ -1924,9 +1919,9 @@ mod tests {
         let (steady, shapes) = frame(&mut surface);
         eprintln!(
             "40 MB conversation, {} rows: first frame {first:?} (builds rows), steady frame {steady:?}, {shapes} shapes",
-            surface.row_count()
+            surface.rows.rows.len()
         );
-        assert!(surface.row_count() > 800_000);
+        assert!(surface.rows.rows.len() > 800_000);
         assert!(shapes < 400, "only the visible rows are drawn: {shapes}");
     }
 

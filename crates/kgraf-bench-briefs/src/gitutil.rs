@@ -70,6 +70,38 @@ pub fn changed_protected(
     Ok(git(root, &args)?.lines().map(str::to_owned).collect())
 }
 
+/// The files under `pathspecs` at `commit`, as `(path, bytes)`: what the
+/// runner itself holds for each protected path, read from the repository and
+/// not from any working tree. A pathspec that matches nothing at `commit`
+/// gives no entry.
+pub fn files_at(root: &Path, commit: &str, pathspecs: &[&str]) -> Result<Vec<(String, Vec<u8>)>> {
+    if pathspecs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut args = vec!["ls-tree", "-r", "--name-only", commit, "--"];
+    args.extend_from_slice(pathspecs);
+    let mut files = Vec::new();
+    for path in git(root, &args)?.lines() {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .args(["show", &format!("{commit}:{path}")])
+            .output()
+            .with_context(|| format!("cannot run git show {commit}:{path}"))?;
+        if !out.status.success() {
+            bail!(
+                "git show {commit}:{path}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        files.push((path.to_owned(), out.stdout));
+    }
+    Ok(files)
+}
+
 /// Copy the directory `from` into `to`. Entries directly under `from` whose
 /// name is in `skip_top` are left out (a mutation copy must not carry a
 /// `target/`).

@@ -276,9 +276,9 @@ fn candidates_for(
 }
 
 fn from_tally(r: &RouteInfo, source: FigureSource, t: &KindTally) -> Candidate {
-    // `KindTally::cost_per_satisfied` is `None` both when nothing was
-    // satisfied and when any attempt was unpriced (`model_profile`'s own
-    // rule, shared with the bench's brief-following harness); either way the
+    // `KindTally::cost_per_satisfied` is `None` when no satisfied attempt had
+    // a known cost (`model_profile`'s own rule, shared with the bench's
+    // brief-following harness); either way the
     // measured cost is unknown here, which `cost_and_label` resolves the same
     // way an unmeasured route's missing price does.
     let (cost_micros, unpriced) = cost_and_label(t.cost_per_satisfied(), r.local);
@@ -613,20 +613,13 @@ pub fn choose_cluster_vendor(
 
 // -------------------------------------------------------- profile store I/O
 
-/// Load the profile store, or fail loud: a missing file is an
-/// empty store (nothing measured yet, per `model_profile`'s own rule); a file
-/// that does not parse is an error, never silently treated as empty.
-pub fn load_profiles(dir: &Path) -> Result<ProfileStore, ProfileError> {
-    ProfileStore::load(dir)
-}
-
 /// Record one live outcome and save: the one write path for
 /// `Source::Live` tallies. Called where an attempt's verdict and ledger cost
 /// are both known (`orchestrator.rs::on_verified`), never inside a forbidden
-/// finalize/integrate/announce/terminal-status path. `cost` is always
-/// `Some`: a live attempt was already billed by the ledger, so its cost is
-/// known by construction; `model_profile`'s `unpriced` count is for the
-/// bench, which can run a model the price table does not yet cover.
+/// finalize/integrate/announce/terminal-status path. `cost` is `None` when the
+/// ledger could not price the attempt (an unreconciled call, or a model the
+/// price table does not cover): the tally then counts it as unpriced and the
+/// route's cost per satisfied stays unknown, never `$0`.
 pub fn record_live(
     store: &mut ProfileStore,
     dir: &Path,
@@ -634,9 +627,9 @@ pub fn record_live(
     vendor: &str,
     kind: TaskKind,
     satisfied: bool,
-    cost: Money,
+    cost: Option<Money>,
 ) -> Result<(), ProfileError> {
-    store.record(model, vendor, Source::Live, kind, satisfied, Some(cost));
+    store.record(model, vendor, Source::Live, kind, satisfied, cost);
     store.save(dir)
 }
 
@@ -1093,8 +1086,27 @@ mod tests {
             std::env::temp_dir().join(format!("kgraf-routing-profiles-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(kgraf_core::model_profile::FILE_NAME), "{not json").unwrap();
-        let err = load_profiles(&dir).expect_err("a malformed store must not load as empty");
+        let err = ProfileStore::load(&dir).expect_err("a malformed store must not load as empty");
         assert!(matches!(err, ProfileError::Parse { .. }));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_unpriced_live_attempt_leaves_the_cost_per_satisfied_unknown() {
+        let dir =
+            std::env::temp_dir().join(format!("kgraf-routing-unpriced-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut store = ProfileStore::default();
+        record_live(&mut store, &dir, "m", "v", TaskKind::Tests, true, None).expect("record");
+        let t = *ProfileStore::load(&dir)
+            .unwrap()
+            .get("m")
+            .unwrap()
+            .tally(Source::Live, TaskKind::Tests)
+            .unwrap();
+        assert_eq!(t.satisfied, 1);
+        assert_eq!(t.unpriced, 1);
+        assert_eq!(t.cost_per_satisfied(), None);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1110,10 +1122,10 @@ mod tests {
             "v",
             TaskKind::Tests,
             true,
-            Money::from_micros(42),
+            Some(Money::from_micros(42)),
         )
         .expect("record");
-        let back = load_profiles(&dir).expect("reload");
+        let back = ProfileStore::load(&dir).expect("reload");
         let t = back
             .get("m")
             .unwrap()

@@ -351,6 +351,16 @@ pub fn record_task_writes(
     Ok(())
 }
 
+/// Tasks that have a recorded write of `path`, most recently observed first.
+pub fn task_writers(store: &GraphStore, path: &str) -> Result<Vec<String>> {
+    let conn = store.conn();
+    let mut stmt = conn.prepare(
+        "SELECT task_id FROM task_writes WHERE path = ?1 ORDER BY observed_at DESC, task_id",
+    )?;
+    let rows = stmt.query_map(params![path], |row| row.get::<_, String>(0))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 /// Record an observed collision between two tasks on one path.
 ///
 /// First-class because collisions are the training signal, and because git

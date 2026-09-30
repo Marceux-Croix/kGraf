@@ -68,6 +68,14 @@ pub trait ExternalExecutor: Send + Sync {
     /// `ctx.cancel.cancelled()`.
     async fn exec(&self, cmd: &[String], timeout: Duration) -> Result<ExternalOutcome, String>;
 
+    /// The host stopped waiting for an [`Self::exec`] and dropped its future:
+    /// the call was cancelled, or the executor did not report within the
+    /// host's own bound. Stop the command if the executor can, and make sure
+    /// no later call reads that command's result as its own. Called once,
+    /// right after the drop, and bounded by the host; the default does
+    /// nothing, for an executor whose `exec` holds no state past a drop.
+    async fn abandon(&self) {}
+
     /// Make the remote tree equal to the host tree, byte for byte, and return
     /// only when it is. Called after a host-side file write, so that the next
     /// remote command, and whatever inspects the remote afterward, sees the

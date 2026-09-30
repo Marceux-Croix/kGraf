@@ -1,0 +1,29 @@
+{
+  "_source": "Written from the function calling guide (https://ai.google.dev/gemini-api/docs/function-calling) and the thought signature guide (https://ai.google.dev/gemini-api/docs/thought-signatures): a functionCall part carries name and args, and a thoughtSignature. Not recorded from a live call.",
+  "candidates": [
+    {
+      "content": {
+        "role": "model",
+        "parts": [
+          {
+            "functionCall": {
+              "name": "get_current_weather",
+              "args": { "location": "Boston" }
+            },
+            "thoughtSignature": "c2lnbmF0dXJlLWJ5dGVz"
+          }
+        ]
+      },
+      "finishReason": "STOP",
+      "index": 0
+    }
+  ],
+  "usageMetadata": {
+    "promptTokenCount": 80,
+    "candidatesTokenCount": 12,
+    "thoughtsTokenCount": 20,
+    "totalTokenCount": 112
+  },
+  "modelVersion": "gemini-2.5-flash",
+  "responseId": "resp-0002"
+}

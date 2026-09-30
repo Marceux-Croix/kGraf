@@ -1,6 +1,5 @@
 //! Quality gates: the project's validation commands, discovered or configured,
-//! run confined in a worktree of the integration commit they pin. Moved from
-//! `kgraf-cli`'s `orchestrate_cmd.rs` without a change in behavior.
+//! run confined in a worktree of the integration commit they pin.
 
 use crate::error::{Result, ResultExt};
 use crate::workspaces::now_nanos;
@@ -20,10 +19,46 @@ use std::time::Duration;
 /// The project's validation commands: the configured ones, or those its build
 /// files declare. The runner is discovered, never invented (0019): a project
 /// with none gets no gate, and the orchestrator records that.
+///
+/// A gate that does not apply is said on stderr, never dropped silently: the
+/// pytest gate is left out, with the reason, when the project has Python
+/// tests but neither declares pytest nor has it importable.
 pub fn discover_validation_commands(root: &Path, configured: &[String]) -> Result<Vec<String>> {
-    if !configured.is_empty() {
-        return Ok(configured.to_vec());
+    let (found, notes) = discover_with(root, configured, &pytest_importable)?;
+    for note in notes {
+        eprintln!("{note}");
     }
+    Ok(found)
+}
+
+/// The Python interpreter name the platform installs.
+fn python_program() -> &'static str {
+    // Windows installs `python`, not `python3`.
+    if cfg!(windows) { "python" } else { "python3" }
+}
+
+/// Whether the interpreter can import pytest.
+fn pytest_importable() -> bool {
+    std::process::Command::new(python_program())
+        .args(["-c", "import pytest"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// [`discover_validation_commands`] with the pytest import probe injected,
+/// returning the commands and a note for each gate that does not apply.
+pub(crate) fn discover_with(
+    root: &Path,
+    configured: &[String],
+    pytest_importable: &dyn Fn() -> bool,
+) -> Result<(Vec<String>, Vec<String>)> {
+    if !configured.is_empty() {
+        return Ok((configured.to_vec(), Vec::new()));
+    }
+    let mut notes = Vec::new();
     let mut found = Vec::new();
     if root.join("Cargo.toml").is_file() {
         found.push("cargo test --workspace".to_owned());
@@ -42,7 +77,16 @@ pub fn discover_validation_commands(root: &Path, configured: &[String]) -> Resul
     // tooling in (a formatter, a docs build): the pytest gate needs Python
     // tests, or a pytest configuration, to be plausible.
     if has_python_tests(root) {
-        found.push("python3 -m pytest".to_owned());
+        if pytest_declared(root) || pytest_importable() {
+            found.push(format!("{} -m pytest", python_program()));
+        } else {
+            notes.push(format!(
+                "pytest gate not applicable: {} has Python tests, but pytest is neither declared \
+                 in its build files nor importable by `{}`; set gate commands to run them",
+                root.display(),
+                python_program()
+            ));
+        }
     }
     for name in ["Makefile", "makefile", "GNUmakefile"] {
         let path = root.join(name);
@@ -55,7 +99,27 @@ pub fn discover_validation_commands(root: &Path, configured: &[String]) -> Resul
             break;
         }
     }
-    Ok(found)
+    Ok((found, notes))
+}
+
+/// Whether the project's Python build files name pytest (a dependency, a
+/// test extra, a configuration section).
+fn pytest_declared(root: &Path) -> bool {
+    root.join("pytest.ini").is_file()
+        || [
+            "pyproject.toml",
+            "setup.py",
+            "setup.cfg",
+            "tox.ini",
+            "requirements.txt",
+            "requirements-dev.txt",
+            "requirements-test.txt",
+        ]
+        .iter()
+        .any(|f| {
+            std::fs::read_to_string(root.join(f))
+                .is_ok_and(|t| t.to_ascii_lowercase().contains("pytest"))
+        })
 }
 
 /// Whether the project at `root` has Python tests: a `tests` or `test` folder
@@ -73,8 +137,16 @@ fn has_python_tests(root: &Path) -> bool {
     {
         return true;
     }
-    // Only when the project is Python at all.
-    root.join("pyproject.toml").is_file()
+    // Only when the project is Python at all: a `pyproject.toml`, a `setup.py`
+    // or `setup.cfg`, or a `requirements.txt` says so.
+    [
+        "pyproject.toml",
+        "setup.py",
+        "setup.cfg",
+        "requirements.txt",
+    ]
+    .iter()
+    .any(|f| root.join(f).is_file())
         && ["tests", "test"]
             .iter()
             .any(|d| dir_has_python_test(&root.join(d), 3))
@@ -124,8 +196,12 @@ pub(crate) struct CommandGateRunner {
 /// sandbox denies it, and the host would read that file into the verdict text
 /// (decision 0083). Opened no-follow, non-blocking, and read only when it is
 /// a regular file with one link; anything else reads as a note saying so.
-fn read_log(log: &Path) -> String {
-    use std::io::Read;
+///
+/// Only the last `cap` bytes are read: a runaway log is bounded by seeking
+/// to its end, so it never sits whole in the host's memory. A cut log starts
+/// with a `[N bytes cut]` line.
+fn read_log(log: &Path, cap: usize) -> String {
+    use std::io::{Read, Seek, SeekFrom};
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true);
     #[cfg(unix)]
@@ -153,9 +229,34 @@ fn read_log(log: &Path) -> String {
     if !meta.is_file() || linked {
         return refused().to_owned();
     }
+    // A few bytes past `cap` let the cut land on a character boundary.
+    let keep = cap as u64 + 4;
+    let mut skipped = meta.len().saturating_sub(keep);
+    let mut reader = &file;
+    if skipped > 0 && reader.seek(SeekFrom::Start(skipped)).is_err() {
+        return refused().to_owned();
+    }
     let mut bytes = Vec::new();
-    let _ = (&file).read_to_end(&mut bytes);
-    String::from_utf8_lossy(&bytes).into_owned()
+    let _ = reader.take(keep).read_to_end(&mut bytes);
+    if skipped > 0 {
+        // The read may start inside a multi-byte character.
+        let lead = bytes
+            .iter()
+            .take(3)
+            .take_while(|b| (**b & 0xC0) == 0x80)
+            .count();
+        bytes.drain(..lead);
+        skipped += lead as u64;
+    }
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    if skipped == 0 {
+        return tail(&text, cap);
+    }
+    let mut start = text.len().saturating_sub(cap);
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("[{} bytes cut]\n{}", skipped + start as u64, &text[start..])
 }
 
 fn tail(text: &str, cap: usize) -> String {
@@ -242,32 +343,44 @@ pub(crate) fn run_confined(
         .map_err(|e| format!("cannot run `{command}`: {e}"))?;
     let started = std::time::Instant::now();
     let status = loop {
+        // Unix: the leader is only ever reaped after the group kill below, so
+        // its pid, the group id, stays reserved until every member is gone. A
+        // poll that reaped first (`try_wait`) could let a background process
+        // outlive the command.
         #[cfg(unix)]
         {
             match exited_unreaped(child.id()) {
-                Ok(true) => kill_group_until_hold_free(child.id(), ws.hold_file()),
+                Ok(true) => {
+                    kill_group_until_hold_free(child.id(), ws.hold_file());
+                    match child.wait() {
+                        Ok(status) => break Some(status),
+                        Err(e) => return Err(format!("waiting for `{command}`: {e}")),
+                    }
+                }
                 Ok(false) => {}
                 Err(e) => return Err(format!("waiting for `{command}`: {e}")),
             }
         }
+        #[cfg(not(unix))]
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
-            Ok(None) if started.elapsed() >= timeout => {
-                // The sandboxed child calls setsid() before exec, so it leads its
-                // own process group: killing the group kills everything the
-                // command started, not only the shell.
-                #[cfg(unix)]
-                // SAFETY: killpg only sends a signal to the child's own group.
-                unsafe {
-                    libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
-                }
-                let _ = child.kill();
-                let _ = child.wait();
-                break None;
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+            Ok(None) => {}
             Err(e) => return Err(format!("waiting for `{command}`: {e}")),
         }
+        if started.elapsed() >= timeout {
+            // The sandboxed child calls setsid() before exec, so it leads its
+            // own process group: killing the group kills everything the
+            // command started, not only the shell.
+            #[cfg(unix)]
+            // SAFETY: killpg only sends a signal to the child's own group.
+            unsafe {
+                libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(100));
     };
     // SIGKILL is delivered asynchronously: wait (bounded) until no member of
     // the group is left, so the caller's hold check sees the group gone.
@@ -281,9 +394,8 @@ pub(crate) fn run_confined(
             std::thread::sleep(Duration::from_millis(10));
         }
     }
-    let output = read_log(&log);
+    let mut text = read_log(&log, cap);
     let _ = std::fs::remove_file(&log);
-    let mut text = tail(&output, cap);
     match status {
         Some(s) => {
             text = format!("$ {command}\n{text}\n[{s}]");
@@ -327,7 +439,7 @@ impl GateRunner for CommandGateRunner {
                 Some(c) => c.sha.clone(),
                 None => merge_back.integration_tip().map_err(|e| e.to_string())?,
             };
-            let name = format!("gate-{}", now_nanos());
+            let name = crate::workspaces::harness_worktree_name(crate::workspaces::GATE_PREFIX);
             let ws = manager
                 .create(&WorkspaceSpec {
                     name: &name,
@@ -384,17 +496,36 @@ mod tests {
 
         let log = scratch.join("gate-1.log");
         std::os::unix::fs::symlink(outside.join("secret"), &log).expect("link");
-        let text = read_log(&log);
+        let text = read_log(&log, 1024);
         assert!(!text.contains("SECRET"), "{text}");
         assert!(text.contains("not read"), "{text}");
 
         let hard = scratch.join("gate-2.log");
         std::fs::hard_link(outside.join("secret"), &hard).expect("link");
-        assert!(!read_log(&hard).contains("SECRET"));
+        assert!(!read_log(&hard, 1024).contains("SECRET"));
 
         let plain = scratch.join("gate-3.log");
         std::fs::write(&plain, "ok\n").expect("write");
-        assert_eq!(read_log(&plain), "ok\n");
-        assert_eq!(read_log(&scratch.join("absent.log")), "");
+        assert_eq!(read_log(&plain, 1024), "ok\n");
+        assert_eq!(read_log(&scratch.join("absent.log"), 1024), "");
+    }
+
+    /// A log far larger than the cap is read from its end only: the result is
+    /// bounded, keeps the tail, and says how much was cut.
+    #[test]
+    fn a_huge_log_is_read_from_its_end_within_the_cap() {
+        use std::io::{Seek, SeekFrom, Write};
+        let dir = tempfile::tempdir().expect("dir");
+        let log = dir.path().join("gate-9.log");
+        let mut f = std::fs::File::create(&log).expect("create");
+        // A sparse 64 MiB of zeros, then a marker line at the end.
+        f.set_len(64 * 1024 * 1024).expect("len");
+        f.seek(SeekFrom::End(0)).expect("seek");
+        f.write_all("h\u{e9}llo END\n".as_bytes()).expect("write");
+        drop(f);
+        let text = read_log(&log, 4096);
+        assert!(text.len() < 4096 + 64, "{}", text.len());
+        assert!(text.starts_with("[") && text.contains("bytes cut]"));
+        assert!(text.ends_with("h\u{e9}llo END\n"));
     }
 }

@@ -123,14 +123,6 @@ impl ScheduleDefinition {
         self
     }
 
-    /// Overrides `created_at` (tests, and a caller migrating a schedule created
-    /// before this field existed and wanting a better baseline than
-    /// [`default_created_at`] than the true creation time it happens to know).
-    pub fn with_created_at(mut self, created_at: DateTime<Utc>) -> Self {
-        self.created_at = to_whole_millis(created_at);
-        self
-    }
-
     /// When this schedule fires, in words: `cron `...` in <zone>` or `once at
     /// <instant>`. Used on the work node's label and by `schedule list`.
     pub fn when(&self) -> String {

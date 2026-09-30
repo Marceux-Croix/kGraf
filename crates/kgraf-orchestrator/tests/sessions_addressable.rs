@@ -1,7 +1,7 @@
 //! Decision 0067: addressable sessions, `ask_user_question` and
 //! connections in the orchestrator, against a real `Orchestrator` (the same
 //! harness `orchestrator.rs`'s own tests use; no network). Further fixes
-//! have their own tests in `sessions_review.rs` and `sessions_restart.rs`.
+//! have their own tests in `session_question_flow.rs` and `sessions_restart.rs`.
 //!
 //! `WorkerFake`'s `HANG` instruction parks a round-1 model call, so a hung
 //! worker reaches no further boundary: these tests check persistence (the
@@ -712,7 +712,7 @@ async fn resuming_an_unknown_session_is_refused() {
 
 // ------------------------------------------------------ session end records
 
-/// Item 1: a normal run leaves one session row per attempt, with the right
+/// A normal run leaves one session row per attempt, with the right
 /// parent and outcome.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_normal_run_leaves_one_session_row_per_attempt_with_parent_and_outcome() {

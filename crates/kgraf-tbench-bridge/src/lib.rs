@@ -29,6 +29,10 @@
 //! | `{"op":"exec","cmd":[..],"timeout_sec":f}` | stdout and stderr base64, `exit_code`, `timed_out`, `error` |
 //! | `{"op":"push"}` | `{"ok":bool,"error":str or null}` |
 //!
+//! The shim keeps at most 8 MiB of each of stdout and stderr, the last bytes,
+//! with a first line saying how many were cut, so an `exec` response always
+//! fits the line bound ([`MAX_LINE_BYTES`]).
+//!
 //! # File sync
 //!
 //! The host worktree `host_root` and the container working directory are kept
@@ -132,10 +136,13 @@ impl Default for Limits {
 /// The concrete, subprocess-bridged [`ExternalExecutor`]. One instance is bound
 /// to one Unix socket (one Python shim, one live task container).
 ///
-/// A request that times out or whose response is too long leaves the stream
-/// out of step (a late response would be read as the answer to the next
-/// request), so the connection is marked broken and every later request fails
-/// at once, naming the first failure.
+/// A request that times out, or whose caller stops waiting for it, leaves the
+/// stream out of step (a late response would be read as the answer to the
+/// next request), so the connection is
+/// marked broken and every later request fails at once, naming the first
+/// failure. A response line over the bound is read to its end and dropped: that
+/// request fails and the connection stays usable. If the stream ends inside
+/// such a line, the connection is broken.
 pub struct ProcessExecutor {
     stream: Mutex<BufReader<UnixStream>>,
     limits: Limits,
@@ -204,24 +211,80 @@ impl ProcessExecutor {
                         oversized response"
                 .to_owned());
         }
+        // A caller that stops waiting (a cancel, the host's own bound, which
+        // is shorter than `exec_slack`) drops this future between the request
+        // and its response. The late response would then be read as the answer
+        // to the next request, so a drop before the end breaks the connection.
+        let pending = BreakOnDrop {
+            broken: &self.broken,
+            armed: true,
+        };
         let outcome = async {
-            write_line(&mut stream, line)
-                .await
-                .map_err(|e| format!("writing the request to the bridge socket: {e}"))?;
+            write_line(&mut stream, line).await.map_err(|e| {
+                (
+                    format!("writing the request to the bridge socket: {e}"),
+                    false,
+                )
+            })?;
             read_json_line_within(&mut stream, within, self.limits.max_line_bytes)
                 .await
-                .map_err(|e| format!("reading the bridge response: {e}"))
+                .map_err(|e| {
+                    (
+                        format!("reading the bridge response: {e}"),
+                        is_oversized(&e),
+                    )
+                })
         }
         .await;
-        if outcome.is_err() {
+        pending.disarm();
+        // An oversized line that was read to its end leaves the stream in step,
+        // so only that failure keeps the connection usable.
+        match outcome {
+            Ok(line) => Ok(line),
+            Err((message, in_step)) => {
+                if !in_step {
+                    self.broken.store(true, Ordering::Release);
+                }
+                Err(message)
+            }
+        }
+    }
+}
+
+/// Marks a connection broken when dropped while armed: a request whose
+/// response was never read.
+struct BreakOnDrop<'a> {
+    broken: &'a AtomicBool,
+    armed: bool,
+}
+
+impl BreakOnDrop<'_> {
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for BreakOnDrop<'_> {
+    fn drop(&mut self) {
+        if self.armed {
             self.broken.store(true, Ordering::Release);
         }
-        outcome
     }
 }
 
 #[async_trait]
 impl ExternalExecutor for ProcessExecutor {
+    /// The connection is broken already (the dropped request marked it).
+    /// Closing the write side ends the shim's session once the abandoned
+    /// command returns; the shim enforces the command's own timeout, and the
+    /// protocol has no request that stops a command early.
+    async fn abandon(&self) {
+        self.broken.store(true, Ordering::Release);
+        if let Ok(mut stream) = self.stream.try_lock() {
+            let _ = stream.get_mut().shutdown().await;
+        }
+    }
+
     async fn exec(&self, cmd: &[String], timeout: Duration) -> Result<ExternalOutcome, String> {
         let request = Request {
             op: "exec",
@@ -311,12 +374,67 @@ async fn read_json_line(
     if buf.last() == Some(&b'\n') {
         buf.pop();
     } else if buf.len() > max_bytes {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("the bridge response line is longer than {max_bytes} bytes"),
-        ));
+        // Read on to the end of the line without keeping it, so the next
+        // response is read from its own start. Only when the newline arrives
+        // is the stream still in step and the error an [`Oversized`] one.
+        let in_step = discard_to_newline(stream).await?;
+        return Err(if in_step {
+            io::Error::new(io::ErrorKind::InvalidData, Oversized { max_bytes })
+        } else {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "the bridge response line is longer than {max_bytes} bytes and the socket \
+                     closed before it ended"
+                ),
+            )
+        });
     }
     String::from_utf8(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// A response line longer than the bound whose end was reached and dropped:
+/// this request failed, and the connection is in step for the next.
+#[derive(Debug)]
+struct Oversized {
+    max_bytes: usize,
+}
+
+impl std::fmt::Display for Oversized {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the bridge response line is longer than {} bytes; it was discarded",
+            self.max_bytes
+        )
+    }
+}
+
+impl std::error::Error for Oversized {}
+
+fn is_oversized(e: &io::Error) -> bool {
+    e.get_ref().is_some_and(|inner| inner.is::<Oversized>())
+}
+
+/// Consume input up to and including the next newline. `false` when the
+/// stream ended first.
+async fn discard_to_newline(stream: &mut BufReader<UnixStream>) -> io::Result<bool> {
+    loop {
+        let chunk = stream.fill_buf().await?;
+        if chunk.is_empty() {
+            return Ok(false);
+        }
+        match chunk.iter().position(|&b| b == b'\n') {
+            Some(i) => {
+                stream.consume(i + 1);
+                return Ok(true);
+            }
+            None => {
+                let all = chunk.len();
+                stream.consume(all);
+            }
+        }
+    }
 }
 
 /// The lowercase hex sha256 of `bytes`.
@@ -425,6 +543,44 @@ mod tests {
         assert!(again.contains("broken"), "{again}");
     }
 
+    /// A caller that stops waiting drops an `exec` before its response. The
+    /// late response must not answer the next request: the connection is
+    /// broken, and `abandon` closes it.
+    #[tokio::test]
+    async fn a_dropped_request_breaks_the_connection() {
+        let (_dir, path) = shim(|mut stream| async move {
+            let mut line = String::new();
+            let _ = stream.read_line(&mut line).await;
+            // Answers the exec late, then answers anything after it at once.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let _ = stream.get_mut().write_all(OK).await;
+            loop {
+                line.clear();
+                match stream.read_line(&mut line).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {
+                        let _ = stream.get_mut().write_all(OK).await;
+                    }
+                }
+            }
+        })
+        .await;
+        let exec = ProcessExecutor::connect(&path, Path::new("/x"))
+            .await
+            .expect("connect");
+        let dropped = tokio::time::timeout(
+            Duration::from_millis(50),
+            exec.exec(&["true".to_owned()], Duration::from_secs(1)),
+        )
+        .await;
+        assert!(dropped.is_err(), "the exec must still be waiting");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let err = exec.sync_to_remote().await.expect_err("broken");
+        assert!(err.contains("broken"), "{err}");
+        exec.abandon().await;
+        assert!(exec.sync_to_remote().await.is_err());
+    }
+
     /// A shim that streams bytes with no newline is cut off at the bound.
     #[tokio::test]
     async fn an_endless_line_is_refused_at_the_bound() {
@@ -459,6 +615,31 @@ mod tests {
             .await
             .expect("connect");
         exec.sync_to_remote().await.expect("pushed");
+    }
+
+    /// A response line over the bound fails its own request, is read to its
+    /// end, and the next request is answered from the right place.
+    #[tokio::test]
+    async fn an_oversized_line_fails_one_request_and_keeps_the_connection() {
+        let (_dir, path) = shim(|mut stream| async move {
+            let mut line = String::new();
+            let _ = stream.read_line(&mut line).await;
+            let mut big = vec![b'a'; 5000];
+            big.push(b'\n');
+            let _ = stream.get_mut().write_all(&big).await;
+            line.clear();
+            let _ = stream.read_line(&mut line).await;
+            let _ = stream.get_mut().write_all(OK).await;
+        })
+        .await;
+        let exec = ProcessExecutor::connect_with_limits(&path, Path::new("/x"), small(5_000, 1000))
+            .await
+            .expect("connect");
+        let err = exec.sync_to_remote().await.expect_err("too long");
+        assert!(err.contains("longer than 1000 bytes"), "{err}");
+        exec.sync_to_remote()
+            .await
+            .expect("the next response is read from its own start");
     }
 
     /// The bound is exact: a line of `max` bytes passes, one more does not.

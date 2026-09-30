@@ -78,11 +78,14 @@ pub fn run(root: &Path, args: WorkerArgs) -> Result<()> {
     }
     let entry = kgraf_fleet::entry(&args.provider)?;
     let credential = kgraf_fleet::credential_from_env(entry)?;
-    let provider: Arc<dyn kgraf_provider::Provider> = Arc::from(kgraf_fleet::build(
-        &args.provider,
-        &credential,
-        vec![args.model.clone()],
-    )?);
+    let provider: Arc<dyn kgraf_provider::Provider> = Arc::new(kgraf_provider::RouteRecorded::new(
+        Arc::from(kgraf_fleet::build(
+            &args.provider,
+            &credential,
+            vec![args.model.clone()],
+        )?),
+        args.provider.clone(),
+    ));
     let mode = match args.mode.as_str() {
         "stream" => CallMode::Stream,
         "complete" => CallMode::Complete,
@@ -643,6 +646,7 @@ fn show(event: &WorkerEvent, started: std::time::Instant) {
         WorkerEvent::Context {
             prefix_digest,
             slices,
+            ..
         } => println!(
             "[context prefix {prefix_digest}, {} private slice(s)]",
             slices.len()

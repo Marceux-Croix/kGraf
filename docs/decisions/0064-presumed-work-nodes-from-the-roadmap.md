@@ -22,7 +22,7 @@ The state shown is derived each time the graph is read, from two facts: what the
 claims (a status word, or a checked task box) and whether the files and symbols the entry
 names exist in the codebase. A presumed node marked "done" whose named file is missing, or
 marked "not started" when the code already exists, shows that disagreement on the node. This
-is a claim read against the code, never a verification: it does not run tests.
+is a claim read against the code, never a verification: it does not run tests. A node whose stored record is damaged shows an unknown state and is not counted as remaining work.
 
 `kgraf index` reads a project's planning documents (files named ROADMAP, TODO, PLAN,
 MILESTONES, BACKLOG or TASKS, in Markdown, in the project root or its `docs/` folder) into

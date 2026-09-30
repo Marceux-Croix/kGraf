@@ -44,7 +44,7 @@ use kgraf_provider::crosslimit::Admission;
 use kgraf_provider::{RateLimit, SharedLimiterStore};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 /// Same rate on every key: high enough that neither the foreground
 /// measurement nor a background process is refused (`Wait`) during the run,
@@ -157,7 +157,7 @@ fn measure(path: &Path, concurrency: usize) -> Stats {
         // latency this iteration reports, so a run that hits this path shows
         // up honestly in the tail, not silently discarded.
         loop {
-            match store.check("route", "fg", limit, SystemTime::now(), LOCK_BUDGET) {
+            match store.check_now("route", "fg", limit, LOCK_BUDGET) {
                 Ok(Admission::Admitted) => return start.elapsed(),
                 Ok(Admission::Wait(_)) => panic!(
                     "the spec's rate is far above what this bench issues; a Wait means the \

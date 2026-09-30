@@ -32,13 +32,58 @@
 //!   interrupted result, so the rebuilt transcript pairs every tool use with a
 //!   result and says which ones never finished.
 //! - `Usage` counts rounds (one ledger call per round, by call id) and anchors the
-//!   context-size estimate.
+//!   context-size estimate. A report of zero (a local model, or a call that never
+//!   left) anchors nothing; a round no report covered counts its own output.
+//! - A rebuild from stored events adds a note to a tool result whose text or call
+//!   input holds a `[redacted:...]` marker: the pattern scrub that stored it may
+//!   have replaced text the live model saw whole, so the model re-reads before it
+//!   edits from that result. Each round's calls are kept as the live loop saw
+//!   them (after any approval rewrite) for replaying stall counts and writes.
 
 use crate::event::{EventSequence, SequenceError, WorkerEvent};
 use kgraf_core::budget::estimate_tokens;
 use kgraf_core::{CallId, NodeId};
 use kgraf_provider::{Content, Message, Role, StopReason};
 use std::collections::{BTreeSet, HashMap};
+
+/// The note added to a stored tool result that held a redaction marker, or
+/// whose call input did.
+pub const REDACTED_HISTORY_NOTE: &str = "\n[note: this transcript was read back from storage, \
+     where text that looked like a secret is replaced by a `[redacted:...]` marker. Re-read \
+     the file or rerun the command before editing from this result, and never copy a marker \
+     into a file or a patch.]";
+
+/// Whether `text` holds a redaction marker.
+pub(crate) fn has_redaction_marker(text: &str) -> bool {
+    text.contains("[redacted:")
+}
+
+/// One tool call of a stored round, as the live loop saw it.
+#[derive(Clone, Debug)]
+pub struct ReplayCall {
+    pub id: String,
+    pub tool: String,
+    /// The input the call ran with: after any approval rewrite.
+    pub input: serde_json::Value,
+    /// Whether the live loop counted it toward a stall: every call that was not
+    /// denied or refused before it ran.
+    pub counted: bool,
+    /// Whether it finished without error.
+    pub succeeded: bool,
+    /// The result it finished with (empty until it finished).
+    pub output: String,
+    /// Whether that result was an error.
+    pub is_error: bool,
+}
+
+impl ReplayCall {
+    /// Whether an interrupt-mode message cut the call off while it ran: it
+    /// started and may have written, and the loop treated its declared writes
+    /// as changes.
+    pub fn interrupted_by_steer(&self) -> bool {
+        self.is_error && self.output.starts_with(crate::worker::STEER_INTERRUPTED)
+    }
+}
 
 /// The result recorded for a call that started and never finished.
 pub const INTERRUPTED_RESULT: &str =
@@ -56,6 +101,8 @@ pub struct TranscriptBuilder {
     messages: Vec<Message>,
     text: String,
     reasoning: String,
+    /// The token on the round's last text part, from its `AssistantMessage`.
+    text_signature: Option<kgraf_provider::Signature>,
     pending: Option<PendingResults>,
     last_call: Option<CallId>,
     rounds: u32,
@@ -64,6 +111,18 @@ pub struct TranscriptBuilder {
     tool_calls: Vec<(String, serde_json::Value)>,
     started: HashMap<String, (String, serde_json::Value)>,
     succeeded: Vec<(String, serde_json::Value)>,
+    /// The tool calls of each round, as the live loop saw them: the input after
+    /// any approval rewrite, and whether the call was approved and succeeded.
+    replay: Vec<Vec<ReplayCall>>,
+    /// Whether the last `ToolCallStarted` belongs to the group being filled.
+    group_open: bool,
+    /// Whether the events being applied were read back from storage, where
+    /// text passed the pattern scrub that the live model copy does not.
+    from_storage: bool,
+    /// Calls (from storage) whose input carried a redaction marker.
+    marked_inputs: BTreeSet<String>,
+    /// Whether a usage report above zero anchored the round in progress.
+    round_anchored: bool,
     calls: Vec<CallId>,
     prefix_digest: Option<String>,
     slices: Option<Vec<NodeId>>,
@@ -80,6 +139,7 @@ impl TranscriptBuilder {
             messages: opening,
             text: String::new(),
             reasoning: String::new(),
+            text_signature: None,
             pending: None,
             last_call: None,
             rounds: 0,
@@ -88,6 +148,11 @@ impl TranscriptBuilder {
             tool_calls: Vec::new(),
             started: HashMap::new(),
             succeeded: Vec::new(),
+            replay: Vec::new(),
+            group_open: false,
+            from_storage: false,
+            marked_inputs: BTreeSet::new(),
+            round_anchored: false,
             calls: Vec::new(),
             prefix_digest: None,
             slices: None,
@@ -119,12 +184,19 @@ impl TranscriptBuilder {
             // text, where the individual persisted deltas might each carry an
             // un-redacted half of a secret that only matches a pattern rule
             // once whole.
-            WorkerEvent::AssistantMessage { text, reasoning } => {
+            WorkerEvent::AssistantMessage {
+                text,
+                reasoning,
+                signature,
+            } => {
                 self.text = text.clone();
                 self.reasoning = reasoning.clone();
+                self.text_signature = signature.clone();
             }
             WorkerEvent::ModelCall { call } => {
                 self.count_round(call);
+                self.round_anchored = false;
+                self.group_open = false;
                 // The loop reads `messages()` (which flushes) before it opens
                 // the call, so flushing here changes nothing the loop sent; it
                 // makes a rebuild from stored events agree on where the sent
@@ -135,26 +207,43 @@ impl TranscriptBuilder {
             WorkerEvent::Usage { call, usage } => {
                 self.count_round(call);
                 let total = usage.total_input() + usage.total_output();
-                // A zero report is a round that never reached the provider
-                // (a call cancelled before it was sent settles at zero). A real
-                // response always reads its input, so a zero must not replace
+                // A zero report is a round that never reached the provider (a
+                // call cancelled before it was sent settles at zero), or a
+                // provider that reports no usage (a local model). Either way it
+                // says nothing about the context size, so it does not replace
                 // the anchor: it would collapse the estimate to nothing and let
-                // an oversized request past the stop point.
+                // an oversized request past the stop point. A round no report
+                // anchored counts its own output instead (see `Stop`).
                 if total > 0 {
                     self.last_usage_tokens = Some(total);
                     self.tokens_since_usage = 0;
+                    self.round_anchored = true;
                 }
             }
             WorkerEvent::Stop { reason } => {
                 self.flush_results();
+                self.group_open = false;
+                if !self.round_anchored {
+                    // No usage report covered this round, so its output is in
+                    // no anchor: estimate it.
+                    self.tokens_since_usage +=
+                        estimate_tokens(&self.text) + estimate_tokens(&self.reasoning);
+                }
                 let mut content = Vec::new();
                 if !self.reasoning.is_empty() {
                     content.push(Content::Reasoning {
                         text: std::mem::take(&mut self.reasoning),
                     });
                 }
-                if !self.text.is_empty() {
-                    content.push(Content::text(std::mem::take(&mut self.text)));
+                // A signed part is kept even when its text is empty: the token
+                // is what the part carries.
+                let signature = self.text_signature.take();
+                if !self.text.is_empty() || signature.is_some() {
+                    content.push(Content::Text {
+                        text: std::mem::take(&mut self.text),
+                        cache_breakpoint: false,
+                        signature,
+                    });
                 }
                 if *reason == StopReason::ToolUse {
                     self.pending = Some(PendingResults::default());
@@ -168,8 +257,31 @@ impl TranscriptBuilder {
                 call_id,
                 tool,
                 input,
+                signature,
             } => {
                 self.tool_calls.push((tool.clone(), input.clone()));
+                if !self.round_anchored {
+                    self.tokens_since_usage +=
+                        estimate_tokens(tool) + estimate_tokens(&input.to_string());
+                }
+                if self.from_storage && has_redaction_marker(&input.to_string()) {
+                    self.marked_inputs.insert(call_id.clone());
+                }
+                if !self.group_open {
+                    self.replay.push(Vec::new());
+                    self.group_open = true;
+                }
+                if let Some(group) = self.replay.last_mut() {
+                    group.push(ReplayCall {
+                        id: call_id.clone(),
+                        tool: tool.clone(),
+                        input: input.clone(),
+                        counted: true,
+                        succeeded: false,
+                        output: String::new(),
+                        is_error: false,
+                    });
+                }
                 self.started
                     .insert(call_id.clone(), (tool.clone(), input.clone()));
                 if let Some(last) = self.messages.last_mut()
@@ -179,6 +291,7 @@ impl TranscriptBuilder {
                         id: call_id.clone(),
                         name: tool.clone(),
                         input: input.clone(),
+                        signature: signature.clone(),
                     });
                 }
                 self.pending
@@ -197,10 +310,40 @@ impl TranscriptBuilder {
                 {
                     self.succeeded.push(call);
                 }
+                if let Some(call) = self
+                    .replay
+                    .iter_mut()
+                    .rev()
+                    .flat_map(|group| group.iter_mut())
+                    .find(|call| call.id == *call_id)
+                {
+                    call.succeeded = !*is_error;
+                    call.is_error = *is_error;
+                    call.output = output.clone();
+                    // A call the approval chain or the write scope turned away
+                    // did nothing, and a call the final round refused never
+                    // reached the stall check; the live loop counted neither.
+                    // Only an error result can be one of these: a successful
+                    // result that happens to start with the same words is not.
+                    call.counted = !(*is_error
+                        && (output.starts_with(crate::worker::DENIED_PREFIX)
+                            || output.starts_with(crate::worker::REFUSED_PREFIX)
+                            || *output == crate::worker::final_round_refusal()));
+                }
+                // A result read back from storage may hold a span the pattern
+                // scrub redacted that the live model saw whole, and the call's
+                // own input may too. Say so where the model reads the result:
+                // a marker must not be copied into a file or a patch.
+                let mut output = output.clone();
+                if self.from_storage
+                    && (has_redaction_marker(&output) || self.marked_inputs.contains(call_id))
+                {
+                    output.push_str(REDACTED_HISTORY_NOTE);
+                }
                 self.pending
                     .get_or_insert_with(PendingResults::default)
                     .results
-                    .insert(call_id.clone(), (output.clone(), *is_error));
+                    .insert(call_id.clone(), (output, *is_error));
             }
             WorkerEvent::Notice { text, .. } => {
                 // The same append-only rule as `Injected`. After an
@@ -218,8 +361,10 @@ impl TranscriptBuilder {
                 }
             }
             WorkerEvent::Cancelled { .. } => {
+                self.group_open = false;
                 self.text.clear();
                 self.reasoning.clear();
+                self.text_signature = None;
                 self.flush_results();
             }
             WorkerEvent::Injected { text, .. } => {
@@ -241,23 +386,51 @@ impl TranscriptBuilder {
                 // a rebuild does not count it either. Its ledger call stays
                 // listed in `calls`, and a later report for the same call does
                 // not count it again (`count_round`).
-                if reason == crate::worker::STEER_ABANDON_BEFORE_SEND_REASON {
+                if reason == crate::worker::STEER_ABANDON_BEFORE_SEND_REASON
+                    || reason == crate::worker::CANCEL_BEFORE_SEND_REASON
+                {
                     self.rounds = self.rounds.saturating_sub(1);
                 }
                 // Clears the partial turn the way `Cancelled` does, but is not
                 // terminal: the worker keeps running past it.
+                self.group_open = false;
                 self.text.clear();
                 self.reasoning.clear();
+                self.text_signature = None;
                 self.flush_results();
             }
             WorkerEvent::Context {
                 prefix_digest,
                 slices,
+                ..
             } => {
                 self.prefix_digest = Some(prefix_digest.clone());
                 self.slices = Some(slices.clone());
             }
-            WorkerEvent::Approval { .. } => {}
+            WorkerEvent::Approval { record } => {
+                // A rewrite replaces the arguments the call runs with. The
+                // model's own turn keeps the original; the replay of what the
+                // call did follows the rewritten input.
+                if let kgraf_tools::approval::RecordedDecision::Rewritten { rewritten, .. } =
+                    &record.decision
+                {
+                    if let Some((_, input)) = self.started.get_mut(&record.call_id) {
+                        *input = rewritten.clone();
+                    }
+                    if self.from_storage && has_redaction_marker(&rewritten.to_string()) {
+                        self.marked_inputs.insert(record.call_id.clone());
+                    }
+                    if let Some(call) = self
+                        .replay
+                        .iter_mut()
+                        .rev()
+                        .flat_map(|group| group.iter_mut())
+                        .find(|call| call.id == record.call_id)
+                    {
+                        call.input = rewritten.clone();
+                    }
+                }
+            }
             // Purely informational (decision 0067):
             // never joins a message, never touches what the model sees. The
             // transcript file and the live view are the only readers
@@ -346,11 +519,6 @@ impl TranscriptBuilder {
         self.last_usage_tokens.unwrap_or(0) + self.tokens_since_usage.saturating_mul(3).div_ceil(2)
     }
 
-    /// Whether a usage figure has anchored the estimate yet.
-    pub fn has_usage(&self) -> bool {
-        self.last_usage_tokens.is_some()
-    }
-
     /// Every tool call started, in order, for stall detection on resume.
     pub fn tool_calls(&self) -> &[(String, serde_json::Value)] {
         &self.tool_calls
@@ -369,6 +537,12 @@ impl TranscriptBuilder {
     /// Every ledger call of the run, in order.
     pub fn calls(&self) -> &[CallId] {
         &self.calls
+    }
+
+    /// The tool calls of each round, in issue order, for replaying what the
+    /// earlier segments did.
+    pub fn replay_rounds(&self) -> &[Vec<ReplayCall>] {
+        &self.replay
     }
 
     /// Tool calls that finished without error, (tool, input), in finish order.
@@ -432,6 +606,7 @@ impl ResumeState {
     /// segment.
     pub fn from_events(opening: Vec<Message>, events: &[WorkerEvent]) -> Result<Self, ResumeError> {
         let mut builder = TranscriptBuilder::new(opening);
+        builder.from_storage = true;
         let mut seq = EventSequence::new();
         let mut interrupted = Vec::new();
         let mut injected = BTreeSet::new();
@@ -471,6 +646,8 @@ impl ResumeState {
         // inherit it.
         builder.text.clear();
         builder.reasoning.clear();
+        // What follows is live again: its text is not marked.
+        builder.from_storage = false;
         // Only a `Stop` counts as a completed run here (a `Cancelled` last
         // event is exactly the resumable case this function exists for). Of
         // the `Stop` reasons, `ToolUse` and `PauseTurn` do not end the run
@@ -535,7 +712,172 @@ mod tests {
             call_id: id.into(),
             tool: "read".into(),
             input: json!({"path": id}),
+            signature: None,
         }
+    }
+
+    #[test]
+    fn a_tool_call_signature_survives_the_event_log_into_the_rebuilt_history() {
+        // The events as a resumed run reads them: written to JSON and back, with
+        // the signature the provider attached to the call.
+        let mut events = tool_round("c1", &["t1"]);
+        for event in &mut events {
+            if let WorkerEvent::ToolCallStarted { signature, .. } = event {
+                *signature = Some(kgraf_provider::Signature::new("c2ln", "adapter:model"));
+            }
+        }
+        let stored: Vec<WorkerEvent> = events
+            .iter()
+            .map(|e| {
+                serde_json::from_str(&serde_json::to_string(e).expect("encode")).expect("decode")
+            })
+            .collect();
+        let mut b = TranscriptBuilder::new(vec![Message::user("go")]);
+        for event in &stored {
+            b.apply(event);
+        }
+        let messages = b.messages().to_vec();
+        let signature = messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .find_map(|c| match c {
+                Content::ToolUse { signature, .. } => signature.clone(),
+                _ => None,
+            });
+        assert_eq!(
+            signature,
+            Some(kgraf_provider::Signature::new("c2ln", "adapter:model")),
+            "the value and the producer both survive"
+        );
+    }
+
+    #[test]
+    fn a_bare_string_signature_in_an_old_event_log_still_reads() {
+        // History written before the producer was recorded holds a string.
+        let old = r#"{"type":"tool_call_started","call_id":"t1","tool":"read","input":{},"signature":"c2ln"}"#;
+        let event: WorkerEvent = serde_json::from_str(old).expect("old form");
+        assert!(matches!(
+            event,
+            WorkerEvent::ToolCallStarted { signature: Some(ref s), .. }
+                if s.value == "c2ln" && s.producer.is_none()
+        ));
+    }
+
+    fn signed_round(text: &str, signature: Option<&str>) -> Vec<WorkerEvent> {
+        vec![
+            WorkerEvent::TextDelta { text: text.into() },
+            WorkerEvent::AssistantMessage {
+                text: text.into(),
+                reasoning: String::new(),
+                signature: signature.map(|s| kgraf_provider::Signature::new(s, "adapter:model")),
+            },
+            WorkerEvent::Stop {
+                reason: StopReason::EndTurn,
+            },
+        ]
+    }
+
+    fn assistant_text_blocks(b: &mut TranscriptBuilder) -> Vec<(String, Option<String>)> {
+        b.messages()
+            .iter()
+            .filter(|m| m.role == Role::Assistant)
+            .flat_map(|m| m.content.iter())
+            .filter_map(|c| match c {
+                Content::Text {
+                    text, signature, ..
+                } => Some((text.clone(), signature.as_ref().map(|s| s.value.clone()))),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_text_signature_survives_the_event_log_into_the_rebuilt_history() {
+        let mut b = TranscriptBuilder::new(vec![Message::user("go")]);
+        for event in signed_round("the answer", Some("dGV4dA==")) {
+            // Through JSON, as a resumed run reads the log.
+            let stored: WorkerEvent =
+                serde_json::from_str(&serde_json::to_string(&event).expect("encode"))
+                    .expect("decode");
+            b.apply(&stored);
+        }
+        assert_eq!(
+            assistant_text_blocks(&mut b),
+            vec![("the answer".to_owned(), Some("dGV4dA==".to_owned()))]
+        );
+    }
+
+    #[test]
+    fn a_signature_on_an_empty_reply_keeps_the_empty_signed_block() {
+        let mut b = TranscriptBuilder::new(vec![Message::user("go")]);
+        for event in signed_round("", Some("b25seQ==")) {
+            b.apply(&event);
+        }
+        assert_eq!(
+            assistant_text_blocks(&mut b),
+            vec![(String::new(), Some("b25seQ==".to_owned()))]
+        );
+        // An unsigned empty reply still leaves no text block.
+        let mut b = TranscriptBuilder::new(vec![Message::user("go")]);
+        for event in signed_round("", None) {
+            b.apply(&event);
+        }
+        assert!(assistant_text_blocks(&mut b).is_empty());
+    }
+
+    #[test]
+    fn a_signature_does_not_leak_into_the_next_round() {
+        let mut b = TranscriptBuilder::new(vec![Message::user("go")]);
+        for event in signed_round("one", Some("czE=")) {
+            b.apply(&event);
+        }
+        for event in signed_round("two", None) {
+            b.apply(&event);
+        }
+        assert_eq!(
+            assistant_text_blocks(&mut b),
+            vec![
+                ("one".to_owned(), Some("czE=".to_owned())),
+                ("two".to_owned(), None)
+            ]
+        );
+    }
+
+    #[test]
+    fn an_assistant_message_without_a_signature_field_still_reads_and_writes_none() {
+        let old = r#"{"type":"assistant_message","text":"hi","reasoning":""}"#;
+        let event: WorkerEvent = serde_json::from_str(old).expect("old form");
+        assert!(matches!(
+            event,
+            WorkerEvent::AssistantMessage {
+                signature: None,
+                ..
+            }
+        ));
+        assert!(
+            !serde_json::to_string(&event)
+                .expect("encode")
+                .contains("signature")
+        );
+    }
+
+    #[test]
+    fn an_event_log_written_before_signatures_still_reads() {
+        let old = r#"{"type":"tool_call_started","call_id":"t1","tool":"read","input":{}}"#;
+        let event: WorkerEvent = serde_json::from_str(old).expect("old form");
+        assert!(matches!(
+            event,
+            WorkerEvent::ToolCallStarted {
+                signature: None,
+                ..
+            }
+        ));
+        // And a call with none writes no field.
+        assert!(
+            !serde_json::to_string(&event)
+                .expect("encode")
+                .contains("signature")
+        );
     }
 
     fn finished(id: &str) -> WorkerEvent {
@@ -866,6 +1208,7 @@ mod tests {
             WorkerEvent::Context {
                 prefix_digest: "d1".into(),
                 slices: vec![],
+                gitlink: None,
             },
             WorkerEvent::TextDelta {
                 text: "half an answ".into(),
@@ -881,6 +1224,7 @@ mod tests {
         events.push(WorkerEvent::Context {
             prefix_digest: "d1".into(),
             slices: vec![],
+            gitlink: None,
         });
         events.push(WorkerEvent::Injected {
             id: "msg-1".into(),
@@ -909,6 +1253,7 @@ mod tests {
         let mut events = vec![WorkerEvent::Context {
             prefix_digest: "d1".into(),
             slices: vec![],
+            gitlink: None,
         }];
         let mut killed = tool_round("c1", &["a"]);
         killed.pop(); // "a" never finishes: the kill lands mid-tool.
@@ -917,6 +1262,7 @@ mod tests {
         events.push(WorkerEvent::Context {
             prefix_digest: "d2".into(),
             slices: vec![],
+            gitlink: None,
         });
         events.push(WorkerEvent::TextDelta {
             text: "done".into(),
@@ -1043,7 +1389,6 @@ mod tests {
     #[test]
     fn the_context_estimate_is_anchored_on_usage_and_grows_with_appended_results() {
         let mut b = TranscriptBuilder::new(vec![Message::user("x".repeat(300))]);
-        assert!(!b.has_usage());
         assert!(b.context_tokens() >= 100);
         b.apply(&usage("c1", 1_000));
         assert_eq!(b.context_tokens(), 1_010);
@@ -1104,5 +1449,259 @@ mod tests {
             reason: crate::worker::STEER_ABANDON_REASON.into(),
         });
         assert_eq!(b.rounds(), 1);
+    }
+
+    fn assistant_text(text: &str) -> Vec<WorkerEvent> {
+        vec![
+            WorkerEvent::TextDelta { text: text.into() },
+            WorkerEvent::AssistantMessage {
+                text: text.into(),
+                reasoning: String::new(),
+                signature: None,
+            },
+            WorkerEvent::Stop {
+                reason: StopReason::EndTurn,
+            },
+        ]
+    }
+
+    #[test]
+    fn a_provider_that_reports_no_usage_still_has_its_output_counted() {
+        // A local model reports zero usage on every round. The estimate must
+        // still grow with what the model wrote and with the tool calls it made.
+        let mut b = TranscriptBuilder::new(vec![Message::user("go")]);
+        let start = b.context_tokens();
+        b.apply(&model_call("c1"));
+        b.apply(&zero_usage("c1"));
+        for event in assistant_text(&"answer word ".repeat(400)) {
+            b.apply(&event);
+        }
+        let after_text = b.context_tokens();
+        assert!(after_text > start + 1_000, "{start} -> {after_text}");
+
+        b.apply(&model_call("c2"));
+        b.apply(&zero_usage("c2"));
+        b.apply(&WorkerEvent::Stop {
+            reason: StopReason::ToolUse,
+        });
+        b.apply(&WorkerEvent::ToolCallStarted {
+            call_id: "t1".into(),
+            tool: "write_file".into(),
+            input: json!({"path": "a.txt", "content": "x".repeat(3_000)}),
+            signature: None,
+        });
+        assert!(b.context_tokens() > after_text + 500);
+    }
+
+    #[test]
+    fn output_covered_by_a_usage_report_is_not_counted_twice() {
+        let mut b = TranscriptBuilder::new(vec![Message::user("go")]);
+        b.apply(&model_call("c1"));
+        b.apply(&usage("c1", 5_000));
+        let anchored = b.context_tokens();
+        for event in assistant_text(&"answer word ".repeat(400)) {
+            b.apply(&event);
+        }
+        // The report's total already holds the round's output.
+        assert_eq!(b.context_tokens(), anchored);
+    }
+
+    #[test]
+    fn a_result_read_back_from_storage_that_holds_a_marker_says_to_re_read() {
+        let marker = "[redacted:generic-api-key; re-read the source for exact text]";
+        let events = vec![
+            WorkerEvent::Stop {
+                reason: StopReason::ToolUse,
+            },
+            WorkerEvent::ToolCallStarted {
+                call_id: "t1".into(),
+                tool: "read".into(),
+                input: json!({"path": "a.rs"}),
+                signature: None,
+            },
+            WorkerEvent::ToolCallFinished {
+                call_id: "t1".into(),
+                output: format!("let key = \"{marker}\";"),
+                is_error: false,
+            },
+            WorkerEvent::ToolCallStarted {
+                call_id: "t2".into(),
+                tool: "apply_patch".into(),
+                input: json!({"patch": format!("+ {marker}")}),
+                signature: None,
+            },
+            WorkerEvent::ToolCallFinished {
+                call_id: "t2".into(),
+                output: "patched".into(),
+                is_error: false,
+            },
+            WorkerEvent::ToolCallStarted {
+                call_id: "t3".into(),
+                tool: "read".into(),
+                input: json!({"path": "b.rs"}),
+                signature: None,
+            },
+            WorkerEvent::ToolCallFinished {
+                call_id: "t3".into(),
+                output: "plain".into(),
+                is_error: false,
+            },
+        ];
+        let result_text = |messages: &[Message], id: &str| -> String {
+            messages
+                .iter()
+                .flat_map(|m| m.content.iter())
+                .find_map(|c| match c {
+                    Content::ToolResult {
+                        tool_use_id,
+                        content,
+                        ..
+                    } if tool_use_id == id => Some(content.clone()),
+                    _ => None,
+                })
+                .expect("result")
+        };
+        // Stored: every call whose text or input carried a marker is noted.
+        let mut stored = TranscriptBuilder::new(vec![Message::user("go")]);
+        stored.from_storage = true;
+        for event in &events {
+            stored.apply(event);
+        }
+        let messages = stored.messages().to_vec();
+        assert!(result_text(&messages, "t1").ends_with(REDACTED_HISTORY_NOTE));
+        assert!(result_text(&messages, "t2").ends_with(REDACTED_HISTORY_NOTE));
+        assert_eq!(result_text(&messages, "t3"), "plain");
+        // Live: the model saw the text whole, so nothing is added.
+        let mut live = TranscriptBuilder::new(vec![Message::user("go")]);
+        for event in &events {
+            live.apply(event);
+        }
+        let messages = live.messages().to_vec();
+        assert!(!result_text(&messages, "t1").contains("note:"));
+    }
+
+    #[test]
+    fn a_replayed_call_uses_the_rewritten_input_and_skips_denied_calls() {
+        use kgraf_tools::approval::{ApprovalRecord, RecordedDecision};
+        let mut b = TranscriptBuilder::new(vec![Message::user("go")]);
+        b.apply(&WorkerEvent::Stop {
+            reason: StopReason::ToolUse,
+        });
+        b.apply(&WorkerEvent::ToolCallStarted {
+            call_id: "t1".into(),
+            tool: "write_file".into(),
+            input: json!({"path": "original.txt"}),
+            signature: None,
+        });
+        b.apply(&WorkerEvent::ToolCallStarted {
+            call_id: "t2".into(),
+            tool: "write_file".into(),
+            input: json!({"path": "denied.txt"}),
+            signature: None,
+        });
+        b.apply(&WorkerEvent::Approval {
+            record: ApprovalRecord {
+                call_id: "t1".into(),
+                tool: "write_file".into(),
+                decided_by: "hook".into(),
+                decision: RecordedDecision::Rewritten {
+                    original: json!({"path": "original.txt"}),
+                    rewritten: json!({"path": "rewritten.txt"}),
+                    reason: "test".into(),
+                },
+            },
+        });
+        b.apply(&finished("t1"));
+        b.apply(&WorkerEvent::ToolCallFinished {
+            call_id: "t2".into(),
+            output: format!("{}hook: no", crate::worker::DENIED_PREFIX),
+            is_error: true,
+        });
+        let rounds = b.replay_rounds();
+        assert_eq!(rounds.len(), 1);
+        assert_eq!(rounds[0][0].input, json!({"path": "rewritten.txt"}));
+        assert!(rounds[0][0].succeeded && rounds[0][0].counted);
+        assert!(!rounds[0][1].counted, "a denied call is not counted");
+        // The model's own turn keeps the input it issued.
+        let sent = b.messages().to_vec();
+        assert!(sent.iter().flat_map(|m| m.content.iter()).any(|c| matches!(
+            c,
+            Content::ToolUse { input, .. } if input == &json!({"path": "original.txt"})
+        )));
+    }
+    #[test]
+    fn a_cancel_before_the_request_leaves_costs_no_round_on_resume() {
+        let mut b = TranscriptBuilder::new(vec![Message::user("go")]);
+        b.apply(&model_call("c1"));
+        b.apply(&usage("c1", 100));
+        assert_eq!(b.rounds(), 1);
+        // The cancel landed before round 2's request was sent.
+        b.apply(&model_call("c2"));
+        b.apply(&WorkerEvent::RoundAbandoned {
+            phase: crate::event::CancelPhase::ModelStream,
+            reason: crate::worker::CANCEL_BEFORE_SEND_REASON.into(),
+        });
+        b.apply(&WorkerEvent::Cancelled {
+            phase: crate::event::CancelPhase::ModelStream,
+        });
+        b.apply(&zero_usage("c2"));
+        assert_eq!(b.rounds(), 1, "the unsent round bought no model turn");
+        // A cancel after the request left keeps its round spent.
+        b.apply(&model_call("c3"));
+        b.apply(&WorkerEvent::Cancelled {
+            phase: crate::event::CancelPhase::ModelStream,
+        });
+        assert_eq!(b.rounds(), 2);
+    }
+
+    #[test]
+    fn replay_counts_only_calls_the_live_stall_check_saw() {
+        let mut b = TranscriptBuilder::new(vec![Message::user("go")]);
+        b.apply(&WorkerEvent::Stop {
+            reason: StopReason::ToolUse,
+        });
+        for id in ["t1", "t2", "t3", "t4"] {
+            b.apply(&WorkerEvent::ToolCallStarted {
+                call_id: id.into(),
+                tool: "read_file".into(),
+                input: json!({"path": id}),
+                signature: None,
+            });
+        }
+        let result = |id: &str, output: String, is_error: bool| WorkerEvent::ToolCallFinished {
+            call_id: id.into(),
+            output,
+            is_error,
+        };
+        // A successful result that starts like a denial is still a run call.
+        b.apply(&result(
+            "t1",
+            format!("{}text a file holds", crate::worker::DENIED_PREFIX),
+            false,
+        ));
+        // The final round refuses its calls before the stall check.
+        b.apply(&result("t2", crate::worker::final_round_refusal(), true));
+        b.apply(&result(
+            "t3",
+            format!("{}hook: no", crate::worker::DENIED_PREFIX),
+            true,
+        ));
+        b.apply(&result(
+            "t4",
+            format!(
+                "{} It may have written: a.txt.",
+                crate::worker::STEER_INTERRUPTED
+            ),
+            true,
+        ));
+        let round = &b.replay_rounds()[0];
+        assert!(round[0].counted, "a success is never a denial");
+        assert!(
+            !round[1].counted,
+            "a final-round refusal never reached the check"
+        );
+        assert!(!round[2].counted);
+        assert!(round[3].counted && round[3].interrupted_by_steer());
+        assert!(!round[0].interrupted_by_steer());
     }
 }

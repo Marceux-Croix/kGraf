@@ -290,6 +290,9 @@ mod tests {
             "a/.gitconfig",
             "GITMOD~1",
             "sub/GITATT~1",
+            "GITCON~1",
+            "GITHOO~1/pre-commit",
+            "sub/githoo~2/x",
             ".git::$INDEX_ALLOCATION/config",
             // Decision 0062: the state directory under both names, however spelled.
             ".kgraf/ledger.db",

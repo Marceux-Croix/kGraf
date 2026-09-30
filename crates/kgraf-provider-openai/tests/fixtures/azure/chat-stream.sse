@@ -1,0 +1,16 @@
+: fixture source: https://learn.microsoft.com/en-us/azure/ai-foundry/openai/concepts/content-filter-annotations
+: fixture source: https://learn.microsoft.com/en-us/azure/ai-foundry/openai/concepts/content-filter
+: provenance: chunk fields follow the Chat Completions stream shape. The opening chunk carries only prompt_filter_results, with an empty id and model and no choices; that detail is not stated on the cited pages and is tolerated rather than relied on. The final usage chunk follows stream_options.include_usage. Text, ids and counts are invented. Not a live capture.
+
+data: {"id":"","object":"","created":0,"model":"","prompt_filter_results":[{"prompt_index":0,"content_filter_results":{"hate":{"filtered":false,"severity":"safe"},"violence":{"filtered":false,"severity":"safe"}}}],"choices":[]}
+
+data: {"id":"chatcmpl-stream-0001","object":"chat.completion.chunk","created":1699386280,"model":"gpt-35-turbo-instruct","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null,"content_filter_results":{}}]}
+
+data: {"id":"chatcmpl-stream-0001","object":"chat.completion.chunk","created":1699386280,"model":"gpt-35-turbo-instruct","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null,"content_filter_results":{"hate":{"filtered":false,"severity":"safe"}}}]}
+
+data: {"id":"chatcmpl-stream-0001","object":"chat.completion.chunk","created":1699386280,"model":"gpt-35-turbo-instruct","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: {"id":"chatcmpl-stream-0001","object":"chat.completion.chunk","created":1699386280,"model":"gpt-35-turbo-instruct","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}
+
+data: [DONE]
+

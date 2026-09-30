@@ -36,6 +36,8 @@ thiserror.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# Damages a table behind the store's back (reconcile tests).
+rusqlite.workspace = true
 # Compile-fail fixtures: an approval cannot be forged (tests/compile_fail/).
 trybuild.workspace = true
 tokio = { workspace = true }

@@ -181,12 +181,6 @@ impl RunStore {
         self.with(|g| Ok(g.set_meta(&key, "1")?))
     }
 
-    /// Whether a run is marked for resume.
-    pub fn is_active(&self, run: &RunId) -> Result<bool, StoreError> {
-        let key = active_key(run);
-        self.with(|g| Ok(g.meta(&key)?.is_some_and(|s| s == "1")))
-    }
-
     /// Clear a run's marker (a finished run is not resumed).
     /// Fold the WAL into graph.db and truncate it (decision 0071): old page
     /// images of rewritten run records otherwise stay in the WAL file. Best effort; see `GraphStore::checkpoint_wal`.
@@ -270,6 +264,13 @@ impl RunFiles {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl RunStore {
+        fn is_active(&self, run: &RunId) -> Result<bool, StoreError> {
+            let key = active_key(run);
+            self.with(|g| Ok(g.meta(&key)?.is_some_and(|s| s == "1")))
+        }
+    }
 
     #[test]
     fn a_record_round_trips_and_each_run_has_its_own_active_marker() {

@@ -223,24 +223,6 @@ impl LeaseRegistry<'_> {
         )?)
     }
 
-    /// Who holds a node right now, if anyone whose lease has not lapsed.
-    pub fn node_holder_of(&self, node_id: &str, now_ms: i64) -> Result<Option<NodeLeaseRecord>> {
-        Ok(self
-            .read_node_one(node_id)?
-            .filter(|l| !l.is_expired(now_ms)))
-    }
-
-    /// Everything this agent holds at node granularity.
-    pub fn held_nodes_by(&self, agent_id: &str) -> Result<Vec<NodeLeaseRecord>> {
-        let conn = self.store.conn();
-        let mut stmt = conn.prepare(
-            "SELECT node_id, agent_id, task_id, acquired_ms, expires_ms, generation
-             FROM node_leases WHERE agent_id = ?1 ORDER BY node_id",
-        )?;
-        let rows = stmt.query_map(params![agent_id], node_lease_from_row)?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-    }
-
     /// The whole node-lease list.
     pub fn all_nodes(&self) -> Result<Vec<NodeLeaseRecord>> {
         let conn = self.store.conn();
@@ -250,19 +232,6 @@ impl LeaseRegistry<'_> {
         )?;
         let rows = stmt.query_map([], node_lease_from_row)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-    }
-
-    fn read_node_one(&self, node_id: &str) -> Result<Option<NodeLeaseRecord>> {
-        Ok(self
-            .store
-            .conn()
-            .query_row(
-                "SELECT node_id, agent_id, task_id, acquired_ms, expires_ms, generation
-                 FROM node_leases WHERE node_id = ?1",
-                params![node_id],
-                node_lease_from_row,
-            )
-            .optional()?)
     }
 }
 
@@ -314,6 +283,34 @@ mod tests {
     use crate::NodeKind;
     use crate::error::GraphError;
     use crate::store::{FileRecord, GraphStore, NodeRecord};
+
+    impl LeaseRegistry<'_> {
+        /// Who holds a node right now, if anyone whose lease has not lapsed.
+        fn node_holder_of(&self, node_id: &str, now_ms: i64) -> Result<Option<NodeLeaseRecord>> {
+            let lease = self
+                .store
+                .conn()
+                .query_row(
+                    "SELECT node_id, agent_id, task_id, acquired_ms, expires_ms, generation
+                     FROM node_leases WHERE node_id = ?1",
+                    params![node_id],
+                    node_lease_from_row,
+                )
+                .optional()?;
+            Ok(lease.filter(|l| !l.is_expired(now_ms)))
+        }
+
+        /// Everything this agent holds at node granularity.
+        fn held_nodes_by(&self, agent_id: &str) -> Result<Vec<NodeLeaseRecord>> {
+            let conn = self.store.conn();
+            let mut stmt = conn.prepare(
+                "SELECT node_id, agent_id, task_id, acquired_ms, expires_ms, generation
+                 FROM node_leases WHERE agent_id = ?1 ORDER BY node_id",
+            )?;
+            let rows = stmt.query_map(params![agent_id], node_lease_from_row)?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        }
+    }
 
     fn store() -> (tempfile::TempDir, GraphStore) {
         let dir = tempfile::tempdir().expect("tempdir");

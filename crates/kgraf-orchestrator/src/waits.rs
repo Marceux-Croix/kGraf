@@ -30,7 +30,7 @@ pub enum WaitState {
     /// Eligible and admissible, refused by the work-item cap or the live-agent
     /// ceiling (0017).
     Capacity { detail: String },
-    /// A transient readiness failure (§A7).
+    /// A transient readiness failure.
     Readiness { detail: String },
     /// Held for the user; `category` never carries model or verifier text.
     Held { category: String },

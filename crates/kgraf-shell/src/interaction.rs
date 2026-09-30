@@ -257,10 +257,6 @@ pub fn parallelism_controls(
     }
 }
 
-/// The search field's hint.
-pub const SEARCH_HINT: &str =
-    "symbol, agent:, task:, status:, file:, \"phrase\", before:/after: (file time)";
-
 /// The search field's hover help. `before:` and `after:` bound a transcript by
 /// its file's last write, because transcript events carry no time.
 pub const SEARCH_HELP: &str = "Operators: agent:, symbol:, file:, task: or contract:, \
@@ -363,7 +359,7 @@ pub struct Interaction {
     pub state_dir: Option<PathBuf>,
     /// The parallelism-derived limits last applied, and the admission they
     /// were applied to: a reload replaces the host's admission, and the
-    /// limits must reach the new one (D2). `ConcurrencyCaps` filled this role
+    /// limits must reach the new one. `ConcurrencyCaps` filled this role
     /// before item 5 retired it as a user-facing control.
     applied_limits: Option<(kgraf_orchestrator::Limits, Arc<Admission>)>,
     /// The user's order for the hosted run, as last sent.
@@ -538,39 +534,6 @@ impl Interaction {
         self.plan_dirty = true;
         self.runs_generation += 1;
         true
-    }
-
-    /// The search field: always present, distinct from the orchestrator box
-    /// (0032). Results light on the graph through the galaxy's own selection and
-    /// camera; the only other output is a count, never a list.
-    pub fn search_field(
-        &mut self,
-        ui: &mut egui::Ui,
-        project: Option<&mut kgraf_galaxy::ProjectView>,
-    ) {
-        let label = ui.label("Search");
-        let resp = ui
-            .add(
-                egui::TextEdit::singleline(&mut self.search.query)
-                    .hint_text(SEARCH_HINT)
-                    .desired_width(320.0),
-            )
-            .labelled_by(label.id)
-            .on_hover_text(SEARCH_HELP);
-        if resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.search.query.clear();
-        }
-        self.run_search(Some(ui.ctx()), project);
-        let s = &self.search;
-        if let Some(e) = &s.error {
-            ui.colored_label(ui.visuals().error_fg_color, e);
-        } else if !s.ran.trim().is_empty() {
-            ui.label(
-                egui::RichText::new(results_line(&s.results, s.pending.is_some()))
-                    .small()
-                    .weak(),
-            );
-        }
     }
 
     /// Runs the query when it, the model or the runs changed, and lights the
@@ -1361,7 +1324,7 @@ mod tests {
         }
     }
 
-    /// D2: after a reload gives the host a new admission, the same limits reach it.
+    /// After a reload gives the host a new admission, the same limits reach it.
     #[test]
     fn the_limits_reach_a_reloaded_hosts_admission() {
         use crate::orchestrator_host::{HostParts, RunHousekeeping};

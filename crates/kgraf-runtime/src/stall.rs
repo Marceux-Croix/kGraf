@@ -24,6 +24,15 @@
 //! path succeeds, so identical calls only count while the workspace stays as it
 //! was. A write that fails does not reset, so a worker repeating a failing edit
 //! still stalls. Repeating one successful write is bounded by the step budget.
+//!
+//! **A masked result starts a new count.** The worker's observation masker
+//! replaces a tool result with a placeholder once it leaves the last few
+//! rounds. A worker that then repeats the call is re-reading what it can no
+//! longer see, not going in circles. A call whose previous issue is older than
+//! the masker's window ([`StallDetector::with_window`]) counts from one again, when
+//! the masker did hide that result ([`StallDetector::note_result`]; a short result
+//! is never hidden). A read-only worker, which never writes and so never resets, would otherwise
+//! reach the threshold by re-reading a masked file.
 
 use std::collections::HashMap;
 
@@ -100,7 +109,15 @@ pub struct Stall {
 #[derive(Clone, Debug)]
 pub struct StallDetector {
     threshold: u32,
-    seen: HashMap<String, u32>,
+    /// Per call digest: how many times it was issued, in which observed round
+    /// it was last issued, and whether the result of that last issue is one the
+    /// masker hides once it leaves the window (`note_result`).
+    seen: HashMap<String, (u32, u64, bool)>,
+    /// Observed rounds so far (one per [`StallDetector::observe`] call).
+    round: u64,
+    /// How many recent rounds keep their results unmasked, when results are
+    /// masked at all.
+    window: Option<u64>,
 }
 
 impl StallDetector {
@@ -111,7 +128,19 @@ impl StallDetector {
         Self {
             threshold: threshold.max(2),
             seen: HashMap::new(),
+            round: 0,
+            window: None,
         }
+    }
+
+    /// A result stays visible for `window` rounds after the round that issued
+    /// it; a call repeated later than that counts from one, but only when its
+    /// result was one the masker hides (`note_result`): a short result is never
+    /// masked, so the model still sees it and a repeat is still a loop. `None`:
+    /// results are never masked.
+    pub fn with_window(mut self, window: Option<usize>) -> Self {
+        self.window = window.map(|w| w as u64);
+        self
     }
 
     /// Forget every call seen: the workspace changed, so an identical call may
@@ -120,7 +149,17 @@ impl StallDetector {
         self.seen.clear();
     }
 
-    /// Record a round's calls, in order. Returns the first stall reached, if any.
+    /// Say whether the result of the call with `digest` (see [`call_digest`])
+    /// is one the masker hides after the window. A call whose result was not
+    /// reported here counts as not masked, so its repeats are never forgiven.
+    pub fn note_result(&mut self, digest: &str, masked_when_old: bool) {
+        if let Some(entry) = self.seen.get_mut(digest) {
+            entry.2 = masked_when_old;
+        }
+    }
+
+    /// Record one round's calls, in order (an empty round still advances the
+    /// round count that expires masked results). Returns the first stall reached, if any.
     /// Every call is counted even after a stall is found, so the counts stay a
     /// true record of the round.
     pub fn observe<'a>(
@@ -128,14 +167,27 @@ impl StallDetector {
         calls: impl IntoIterator<Item = (&'a str, &'a serde_json::Value)>,
     ) -> Option<Stall> {
         let mut stall = None;
+        self.round += 1;
         for (tool, input) in calls {
             let digest = call_digest(tool, input);
-            let count = self.seen.entry(digest.clone()).or_insert(0);
-            *count += 1;
-            if stall.is_none() && *count >= self.threshold {
+            let entry = self
+                .seen
+                .entry(digest.clone())
+                .or_insert((0, self.round, false));
+            if let Some(window) = self.window
+                && self.round - entry.1 > window
+                && entry.2
+            {
+                // The last result of this call has been masked.
+                entry.0 = 0;
+            }
+            entry.2 = false;
+            entry.0 += 1;
+            entry.1 = self.round;
+            if stall.is_none() && entry.0 >= self.threshold {
                 stall = Some(Stall {
                     call_digest: digest,
-                    repeats: *count,
+                    repeats: entry.0,
                 });
             }
         }
@@ -209,6 +261,55 @@ mod tests {
         assert_eq!(d.observe([("shell", &a)]), None);
         assert_eq!(d.observe([("shell", &a)]), None);
         assert!(d.observe([("shell", &a)]).is_some());
+    }
+
+    #[test]
+    fn a_repeat_after_the_result_was_masked_starts_a_new_count() {
+        // Results stay visible for 2 rounds. A read-only worker re-reads a file
+        // it can no longer see: never a stall, however often.
+        let mut d = StallDetector::new(3).with_window(Some(2));
+        let a = json!({"path": "src/lib.rs"});
+        let other = json!({"path": "elsewhere"});
+        let digest = call_digest("read", &a);
+        for round in 0..30 {
+            assert_eq!(d.observe([("read", &a)]), None, "round {round}");
+            d.note_result(&digest, true);
+            // Two other rounds: the result of `a` leaves the window.
+            assert_eq!(d.observe([("read", &other)]), None);
+            d.note_result(&call_digest("read", &other), true);
+            assert_eq!(d.observe([("shell", &json!({"n": round}))]), None);
+        }
+    }
+
+    #[test]
+    fn a_repeat_of_a_result_the_masker_never_hides_still_counts() {
+        // A short result is never masked: the model sees it every round, so a
+        // cycle of calls longer than the window is still a loop.
+        let mut d = StallDetector::new(3).with_window(Some(2));
+        let calls: Vec<serde_json::Value> = (0..6).map(|n| json!({ "n": n })).collect();
+        let mut stalled = false;
+        for _cycle in 0..3 {
+            for c in &calls {
+                stalled |= d.observe([("t", c)]).is_some();
+                d.note_result(&call_digest("t", c), false);
+            }
+        }
+        assert!(
+            stalled,
+            "a 6-call cycle of unmasked results reaches the threshold"
+        );
+    }
+
+    #[test]
+    fn a_repeat_while_the_result_is_visible_still_counts_with_a_window() {
+        let mut d = StallDetector::new(3).with_window(Some(2));
+        let a = json!({"path": "src/lib.rs"});
+        let other = json!({"path": "elsewhere"});
+        assert_eq!(d.observe([("read", &a)]), None);
+        assert_eq!(d.observe([("read", &other)]), None);
+        assert_eq!(d.observe([("read", &a)]), None);
+        assert_eq!(d.observe([("read", &other)]), None);
+        assert!(d.observe([("read", &a)]).is_some());
     }
 
     #[test]

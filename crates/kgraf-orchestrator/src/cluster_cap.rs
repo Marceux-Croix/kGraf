@@ -1,5 +1,5 @@
 //! At most two contracts of one coupling cluster in flight at once (decision
-//! 0082, coordination-hardening item 6).
+//! 0082).
 //!
 //! Decision 0023 measured success falling monotonically with agent count
 //! (68.6% / 46.5% / 30.0% at 2 / 3 / 4 agents) and 0012 measured cross-agent

@@ -57,6 +57,31 @@ pub struct Change {
     pub payload: Option<serde_json::Value>,
 }
 
+/// A change-log row that could not be read whole. An unknown op (a newer build
+/// wrote an op this one does not know) drops the row from the batch; a payload
+/// that is not JSON keeps the row with no payload. Either way the reader goes on
+/// and the fault is reported, so one row never stops the tail for the life of the
+/// database.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChangeFault {
+    pub seq: i64,
+    /// Milliseconds since the epoch, as the row recorded it.
+    pub ts: i64,
+    pub table: String,
+    pub reason: String,
+    /// Whether the row is still in the batch (payload fault) or was dropped.
+    pub kept: bool,
+}
+
+/// Changes read together with the rows that could not be read whole.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ChangePage {
+    pub changes: Vec<Change>,
+    pub faults: Vec<ChangeFault>,
+    /// The highest sequence number read, damaged rows included.
+    last_seq: Option<i64>,
+}
+
 /// A cursor over the change log.
 ///
 /// Holds a watermark rather than a subscription, so a UI that was closed and
@@ -64,29 +89,43 @@ pub struct Change {
 /// of missing the window it was away for.
 pub struct EventTail {
     watermark: i64,
+    faults: Vec<ChangeFault>,
 }
 
 impl EventTail {
     /// Start from the beginning of the log.
     pub fn from_start() -> Self {
-        Self { watermark: 0 }
+        Self {
+            watermark: 0,
+            faults: Vec::new(),
+        }
     }
 
     /// Start from a recorded watermark, which is what resuming looks like.
     pub fn resume_from(watermark: i64) -> Self {
-        Self { watermark }
+        Self {
+            watermark,
+            faults: Vec::new(),
+        }
     }
 
     /// Start from the current end of the log, ignoring history.
     pub fn from_now(store: &GraphStore) -> Result<Self> {
         Ok(Self {
             watermark: store.change_watermark()?,
+            faults: Vec::new(),
         })
     }
 
     /// The last sequence number this tail has delivered.
     pub fn watermark(&self) -> i64 {
         self.watermark
+    }
+
+    /// Rows `next_batch` could not read whole since the last call to this
+    /// method, drained. The caller reports them.
+    pub fn take_faults(&mut self) -> Vec<ChangeFault> {
+        std::mem::take(&mut self.faults)
     }
 
     /// The newest `limit` changes, newest first, without moving any watermark.
@@ -96,13 +135,34 @@ impl EventTail {
     /// source: the rows are the log's own. The read walks the primary key backward,
     /// so its cost follows `limit`, not the log's length.
     pub fn newest(store: &GraphStore, limit: usize) -> Result<Vec<Change>> {
+        Ok(Self::newest_page(store, limit)?.changes)
+    }
+
+    /// [`Self::newest`] with the rows that could not be read whole.
+    pub fn newest_page(store: &GraphStore, limit: usize) -> Result<ChangePage> {
         let conn = store.conn();
         let mut stmt = conn.prepare(
             "SELECT seq, ts, table_name, op, row_id, payload
              FROM change_log ORDER BY seq DESC LIMIT ?1",
         )?;
-        let rows = stmt.query_map(params![limit as i64], row_to_change)?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        let rows = stmt.query_map(params![limit as i64], read_row)?;
+        collect_page(rows)
+    }
+
+    /// Rows after `after_seq` whose op is not one the log's triggers write,
+    /// oldest first, as faults. The filtered reads ([`Self::newest_of_page`])
+    /// select by op and so never return such a row; this walks the primary key
+    /// range after `after_seq`, so its cost follows the rows written since.
+    pub fn unknown_ops_since(store: &GraphStore, after_seq: i64) -> Result<Vec<ChangeFault>> {
+        let conn = store.conn();
+        let mut stmt = conn.prepare(
+            "SELECT seq, ts, table_name, op, row_id, payload
+             FROM change_log
+             WHERE seq > ?1 AND op NOT IN ('insert', 'update', 'delete')
+             ORDER BY seq",
+        )?;
+        let rows = stmt.query_map(params![after_seq], read_row)?;
+        Ok(collect_page(rows)?.faults)
     }
 
     /// The newest `limit` changes of the given tables and operations, newest
@@ -121,28 +181,22 @@ impl EventTail {
         limit: usize,
         keep: &[(&str, &[ChangeOp])],
     ) -> Result<Vec<Change>> {
+        Ok(Self::newest_of_page(store, limit, keep)?.changes)
+    }
+
+    /// [`Self::newest_of`] with the rows that could not be read whole.
+    pub fn newest_of_page(
+        store: &GraphStore,
+        limit: usize,
+        keep: &[(&str, &[ChangeOp])],
+    ) -> Result<ChangePage> {
         let Some((sql, args)) = newest_sql(limit, keep) else {
-            return Ok(Vec::new());
+            return Ok(ChangePage::default());
         };
         let conn = store.conn();
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), row_to_change)?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-    }
-
-    /// The query plan of [`Self::newest_of`], one line per step (tests: each
-    /// part must walk the index, never scan the log).
-    #[doc(hidden)]
-    pub fn newest_of_plan(store: &GraphStore, keep: &[(&str, &[ChangeOp])]) -> Result<String> {
-        let Some((sql, args)) = newest_sql(100, keep) else {
-            return Ok(String::new());
-        };
-        let conn = store.conn();
-        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |r| {
-            r.get::<_, String>(3)
-        })?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?.join("\n"))
+        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), read_row)?;
+        collect_page(rows)
     }
 
     /// Deliver up to `limit` changes and advance the watermark past them.
@@ -157,12 +211,15 @@ impl EventTail {
             "SELECT seq, ts, table_name, op, row_id, payload
              FROM change_log WHERE seq > ?1 ORDER BY seq LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![self.watermark, limit as i64], row_to_change)?;
-        let batch = rows.collect::<rusqlite::Result<Vec<_>>>()?;
-        if let Some(last) = batch.last() {
-            self.watermark = last.seq;
+        let rows = stmt.query_map(params![self.watermark, limit as i64], read_row)?;
+        let page = collect_page(rows)?;
+        // The watermark passes a damaged row too: stopping at it would stall the
+        // tail on that row for good.
+        if let Some(last) = page.last_seq {
+            self.watermark = last;
         }
-        Ok(batch)
+        self.faults.extend(page.faults);
+        Ok(page.changes)
     }
 }
 
@@ -197,17 +254,74 @@ fn newest_sql(limit: usize, keep: &[(&str, &[ChangeOp])]) -> Option<(String, Vec
     })
 }
 
-/// One `change_log` row (columns seq, ts, table_name, op, row_id, payload).
-fn row_to_change(row: &rusqlite::Row<'_>) -> rusqlite::Result<Change> {
+/// One row as read: the change if it is usable, and the fault if it is not whole.
+struct ReadRow {
+    seq: i64,
+    change: Option<Change>,
+    fault: Option<ChangeFault>,
+}
+
+fn collect_page(rows: impl Iterator<Item = rusqlite::Result<ReadRow>>) -> Result<ChangePage> {
+    let mut page = ChangePage::default();
+    for row in rows {
+        let row = row?;
+        page.last_seq = Some(page.last_seq.map_or(row.seq, |s| s.max(row.seq)));
+        page.changes.extend(row.change);
+        page.faults.extend(row.fault);
+    }
+    Ok(page)
+}
+
+/// One `change_log` row (columns seq, ts, table_name, op, row_id, payload). The
+/// log's triggers write only insert, update and delete. Any other op text is a
+/// damaged row (or a newer build's): dropped and reported, not read as an update
+/// and not fatal to the rows around it.
+fn read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReadRow> {
+    let seq: i64 = row.get(0)?;
+    let table: String = row.get(2)?;
     let op: String = row.get(3)?;
     let payload: Option<String> = row.get(5)?;
-    Ok(Change {
-        seq: row.get(0)?,
-        ts: row.get(1)?,
-        table: row.get(2)?,
-        op: ChangeOp::parse(&op).unwrap_or(ChangeOp::Update),
-        row_id: row.get(4)?,
-        payload: payload.and_then(|p| serde_json::from_str(&p).ok()),
+    let Some(op) = ChangeOp::parse(&op) else {
+        return Ok(ReadRow {
+            seq,
+            change: None,
+            fault: Some(ChangeFault {
+                seq,
+                ts: row.get(1)?,
+                table,
+                reason: format!("change_log holds the unknown op `{op}`"),
+                kept: false,
+            }),
+        });
+    };
+    let mut fault = None;
+    let payload = match payload {
+        None => None,
+        Some(text) => match serde_json::from_str(&text) {
+            Ok(value) => Some(value),
+            Err(error) => {
+                fault = Some(ChangeFault {
+                    seq,
+                    ts: row.get(1)?,
+                    table: table.clone(),
+                    reason: format!("change_log payload is not JSON: {error}"),
+                    kept: true,
+                });
+                None
+            }
+        },
+    };
+    Ok(ReadRow {
+        seq,
+        change: Some(Change {
+            seq,
+            ts: row.get(1)?,
+            table,
+            op,
+            row_id: row.get(4)?,
+            payload,
+        }),
+        fault,
     })
 }
 
@@ -216,6 +330,20 @@ mod tests {
     use super::*;
     use crate::index::Indexer;
     use std::fs;
+
+    /// The query plan of `EventTail::newest_of`, one line per step: each part
+    /// must walk the index, never scan the log.
+    fn newest_of_plan(store: &GraphStore, keep: &[(&str, &[ChangeOp])]) -> Result<String> {
+        let Some((sql, args)) = newest_sql(100, keep) else {
+            return Ok(String::new());
+        };
+        let conn = store.conn();
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |r| {
+            r.get::<_, String>(3)
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?.join("\n"))
+    }
 
     fn tree() -> (tempfile::TempDir, GraphStore) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -369,6 +497,57 @@ mod tests {
     /// renewals) every part of the query walks the index, none scans the log,
     /// and the newest kept rows come back in time order.
     #[test]
+    fn a_change_row_with_an_unknown_op_is_skipped_and_reported_not_read_as_an_update() {
+        let (_dir, store) = tree();
+        let conn = store.conn();
+        for (op, payload) in [
+            ("insert", None),
+            ("upsert", None),
+            ("update", Some("{not json")),
+            ("update", None),
+        ] {
+            conn.execute(
+                "INSERT INTO change_log(table_name, op, row_id, payload)
+                 VALUES ('nodes', ?1, 'r1', ?2)",
+                params![op, payload],
+            )
+            .expect("insert");
+        }
+        let page = EventTail::newest_page(&store, 10).expect("page");
+        assert_eq!(
+            page.changes.len(),
+            3,
+            "the rows around the bad one are read"
+        );
+        assert_eq!(page.faults.len(), 2, "{:?}", page.faults);
+        assert!(
+            page.faults
+                .iter()
+                .any(|f| !f.kept && f.reason.contains("upsert"))
+        );
+        assert!(
+            page.faults
+                .iter()
+                .any(|f| f.kept && f.reason.contains("JSON"))
+        );
+
+        // The tail passes the damaged rows and keeps going for later rows.
+        let mut tail = EventTail::from_start();
+        let batch = tail.next_batch(&store, 100).expect("batch");
+        assert_eq!(batch.len(), 3);
+        assert_eq!(tail.watermark(), 4, "the watermark stopped at a bad row");
+        assert_eq!(tail.take_faults().len(), 2);
+        assert!(tail.take_faults().is_empty(), "faults drain");
+        conn.execute(
+            "INSERT INTO change_log(table_name, op, row_id, payload)
+             VALUES ('nodes', 'insert', 'r9', NULL)",
+            [],
+        )
+        .expect("insert");
+        assert_eq!(tail.next_batch(&store, 100).expect("batch").len(), 1);
+    }
+
+    #[test]
     fn newest_of_walks_the_index_on_a_large_log() {
         let (_dir, store) = tree();
         let conn = store.conn();
@@ -396,7 +575,7 @@ mod tests {
             ("leases", &[ChangeOp::Insert, ChangeOp::Delete]),
             ("work_nodes", &[]),
         ];
-        let plan = EventTail::newest_of_plan(&store, &keep).expect("plan");
+        let plan = newest_of_plan(&store, &keep).expect("plan");
         assert!(
             plan.contains("change_log_table_op") && !plan.contains("SCAN change_log"),
             "{plan}"

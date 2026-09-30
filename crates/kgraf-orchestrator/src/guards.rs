@@ -95,8 +95,7 @@ impl DelegationPolicy {
     }
 
     /// This policy with its depth taken from the parallelism limits (decision
-    /// 0067, point 8: the handoff depth and the subagent depth are no longer
-    /// constants). The routing table and the task bound are kept. The derived
+    /// 0067). The routing table and the task bound are kept. The derived
     /// depth is already within 3..=16; it is clamped again so a hand-built
     /// `ParallelismLimits` can never produce a policy `new` would refuse.
     pub fn with_limits(&self, limits: &kgraf_core::parallel::ParallelismLimits) -> Self {

@@ -3,9 +3,11 @@
 //! part: indexing, ingest, ranking, the brief, parsing and reconciliation. The live
 //! model call adds its own latency on top and is measured by the CLI's live run.
 //!
-//! The budget here is for a cold, unoptimized (debug) test build on a fresh graph,
-//! the slowest configuration the suite runs in. The release budget, measured with
-//! criterion, is in `benches/first_action.rs`.
+//! The test asserts the work done: files indexed, one model call, the second pass
+//! served from the cache without indexing again. The debug-build wall-clock
+//! budgets below are enforced only when `KGRAF_TIME_BUDGET` is set, since elapsed
+//! time depends on machine load. The release budget, measured with criterion, is in
+//! `benches/first_action.rs`.
 
 mod support;
 
@@ -98,10 +100,19 @@ async fn time_to_first_useful_action_on_this_repository() {
         i.brief().definitions_ranked
     );
     assert_eq!(i.first_action(), Some("interpret"));
-    assert!(
-        cold <= DEBUG_COLD_BUDGET_MS,
-        "{cold} ms > {DEBUG_COLD_BUDGET_MS} ms"
+    assert!(i.corpus().files_indexed > 0, "nothing was indexed");
+    assert_eq!(
+        i.corpus().files_reindexed,
+        i.corpus().files_indexed,
+        "a fresh graph indexes every file it sees"
     );
+    assert_eq!(model.calls(), 1, "the cold pass makes one model call");
+    if time_budget_enforced() {
+        assert!(
+            cold <= DEBUG_COLD_BUDGET_MS,
+            "{cold} ms > {DEBUG_COLD_BUDGET_MS} ms"
+        );
+    }
 
     // Self-test of the reading's inputs: this repository's own planning documents
     // lead the brief, and its declared validation command is discovered, not
@@ -133,8 +144,15 @@ async fn time_to_first_useful_action_on_this_repository() {
     eprintln!("warm first action {warm} ms: {:?}", again.timings());
     assert!(again.is_cached());
     assert_eq!(model.calls(), 1);
-    assert!(
-        warm <= DEBUG_WARM_BUDGET_MS,
-        "{warm} ms > {DEBUG_WARM_BUDGET_MS} ms"
+    assert_eq!(
+        again.corpus().files_reindexed,
+        0,
+        "the warm pass indexed a file again"
     );
+    if time_budget_enforced() {
+        assert!(
+            warm <= DEBUG_WARM_BUDGET_MS,
+            "{warm} ms > {DEBUG_WARM_BUDGET_MS} ms"
+        );
+    }
 }

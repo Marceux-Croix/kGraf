@@ -30,9 +30,6 @@ thiserror = "2"
 # for the tool-cancel grace period.
 tokio = { version = "1.53", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 tokio-util = "0.7.19"
-# Path names compared as APFS resolves them (NFC), for the forbidden-path and
-# write-scope checks; the version kgraf-sandbox already pins.
-unicode-normalization = "0.1.25"
 
 [dev-dependencies]
 # `net` and `io-util` for the silent HTTP server (tests/support/silent_http.rs).

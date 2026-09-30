@@ -45,6 +45,9 @@ pub trait RunHousekeeping: Send + Sync {
     /// A box run is starting: until its `finish_run`, the host must not be
     /// replaced (a reload would give later runs a second `Admission`).
     fn run_started(&self, _run: &RunId) {}
+    /// The user's worktree setting changed (decision 0088): runs built from now
+    /// on apply it, and so does every host this project opens later.
+    fn set_worktree_retention(&self, _retention: kgraf_host::WorktreeRetention) {}
     /// Tokens the ledger attributes to `run` and its workers, by adapter (the
     /// composer's attribution line). `None` when there is no ledger to
     /// read.
@@ -162,6 +165,9 @@ impl RunHousekeeping for crate::scheduler_bg::ProjectFactory {
     }
     fn run_started(&self, run: &RunId) {
         self.box_run_started(run);
+    }
+    fn set_worktree_retention(&self, retention: kgraf_host::WorktreeRetention) {
+        crate::scheduler_bg::ProjectFactory::set_worktree_retention(self, retention);
     }
     fn run_tokens(&self, run: &RunId) -> Option<RunTokens> {
         crate::scheduler_bg::ProjectFactory::run_tokens(self, run)
@@ -544,7 +550,7 @@ impl OrchestratorHost {
         };
         let (tx, rx) = channel();
         let wake = self.wake.clone();
-        // Counted before the build, so a reload cannot slip in between (D1).
+        // Counted before the build, so a reload cannot slip in between.
         parts.housekeeping.run_started(&run);
         let future = make(
             runtime.handle().clone(),

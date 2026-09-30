@@ -341,6 +341,20 @@ pub enum CommitOutcome {
     Refused(Box<Refusal>),
 }
 
+/// What a clean merge does with the attempt's worktree once its work is on
+/// the integration branch (decision 0088). The attempt ref is deleted either
+/// way: the branch history holds its commit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MergedWorktree {
+    /// Remove the worktree, its scratch directory and the build output in
+    /// both.
+    #[default]
+    Remove,
+    /// Leave the worktree and its scratch directory, with their builds, on
+    /// disk for the user; `WorkspaceManager::clean` removes it later.
+    Keep,
+}
+
 /// Result of merging one committed attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MergeOutcome {

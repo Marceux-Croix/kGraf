@@ -25,7 +25,7 @@
 use crate::orchestrator::SessionError;
 use kgraf_core::AgentId;
 use kgraf_runtime::AskResolver;
-use kgraf_session::approval_store::PersistedAllowStore;
+use kgraf_session::approval_store::{FileStamp, PersistedAllowStore, file_stamp, stamp_unchanged};
 use kgraf_tools::ToolRegistry;
 use kgraf_tools::approval::{PausedCall, UserAnswer};
 use std::collections::BTreeMap;
@@ -85,8 +85,8 @@ pub enum DeskNotice {
         worker: String,
         after: std::time::Duration,
     },
-    /// The allow-rule file changed and could not be read again; the rules read
-    /// before stay in force.
+    /// The allow-rule file changed or could not be examined, and could not be
+    /// read again. No rule applies until it can be read: calls are asked about.
     RulesUnreadable { reason: String },
 }
 
@@ -98,8 +98,10 @@ pub enum AskError {
 }
 
 /// The project's persisted allow rules, as the CLI keeps them. The file is read
-/// again whenever its length or modification time changes (a rule added at the
-/// CLI's terminal, or by hand, is seen at the next ask).
+/// again whenever its stamp (modification time, length, inode) changed or is too
+/// young to trust, by the same rule the persisted-rule hook uses (a rule added at
+/// the CLI's terminal, or by hand, is seen at the next ask, and a revoked one stops
+/// allowing). A file that cannot be read allows nothing.
 pub struct DeskRules {
     store: Mutex<Loaded>,
     path: std::path::PathBuf,
@@ -108,15 +110,13 @@ pub struct DeskRules {
     registry: Arc<ToolRegistry>,
 }
 
-/// A file's length and modification time.
-type Stamp = Option<(u64, Option<std::time::SystemTime>)>;
-/// The store as read, and the stamp of the file it was read from.
-type Loaded = (PersistedAllowStore, Stamp);
-
-fn file_stamp(path: &std::path::Path) -> Stamp {
-    std::fs::metadata(path)
-        .ok()
-        .map(|m| (m.len(), m.modified().ok()))
+/// The store as last read, the stamp of the file it was read from (`None`: not
+/// read yet, or the last read failed), and whether that read succeeded. While it
+/// has not, no rule applies.
+struct Loaded {
+    store: PersistedAllowStore,
+    stamp: Option<Option<FileStamp>>,
+    readable: bool,
 }
 
 impl DeskRules {
@@ -130,9 +130,15 @@ impl DeskRules {
         let path = path.into();
         let workspace_root = workspace_root.into();
         let (store, _) = PersistedAllowStore::open(&path, &workspace_root)?;
-        let stamp = file_stamp(&path);
+        // Taken after the read, so a write in between shows as a change. A stamp
+        // that cannot be taken leaves none, which forces a read at the first ask.
+        let stamp = file_stamp(&path).ok();
         Ok(Self {
-            store: Mutex::new((store, stamp)),
+            store: Mutex::new(Loaded {
+                store,
+                stamp,
+                readable: true,
+            }),
             path,
             workspace_root,
             project: project.into(),
@@ -148,16 +154,36 @@ impl DeskRules {
             .permission_subject(&call.input)
     }
 
-    /// The store, read again first when the file changed on disk. A reload that
-    /// fails keeps the rules already read and says why.
+    /// The store, read again first when the file changed on disk (or cannot be
+    /// trusted as unchanged). A file that cannot be examined or read again fails
+    /// closed: the rules read before are not kept in force, no rule applies until a
+    /// read succeeds, and the reason is returned.
     fn fresh(&self) -> (std::sync::MutexGuard<'_, Loaded>, Option<String>) {
         let mut g = self.store.lock().unwrap_or_else(|p| p.into_inner());
-        let now = file_stamp(&self.path);
+        let now = match file_stamp(&self.path) {
+            Ok(now) => now,
+            Err(e) => {
+                g.readable = false;
+                g.stamp = None;
+                return (
+                    g,
+                    Some(format!("the allow rules could not be examined: {e}")),
+                );
+            }
+        };
         let mut problem = None;
-        if now != g.1 {
+        if !stamp_unchanged(g.stamp.as_ref(), &now) {
             match PersistedAllowStore::open(&self.path, &self.workspace_root) {
-                Ok((store, _)) => *g = (store, now),
-                Err(e) => problem = Some(format!("the allow rules could not be read again: {e}")),
+                Ok((store, _)) => {
+                    g.store = store;
+                    g.stamp = Some(now);
+                    g.readable = true;
+                }
+                Err(e) => {
+                    g.readable = false;
+                    g.stamp = None;
+                    problem = Some(format!("the allow rules could not be read again: {e}"));
+                }
             }
         }
         (g, problem)
@@ -166,9 +192,13 @@ impl DeskRules {
     fn covering(&self, paused: &PausedCall) -> (Option<String>, Option<String>) {
         let subject = self.subject(paused);
         let (g, problem) = self.fresh();
-        let note =
-            g.0.matching_rule(&self.project, &paused.call().tool, subject.as_deref())
-                .map(|r| r.note.clone());
+        let note = if g.readable {
+            g.store
+                .matching_rule(&self.project, &paused.call().tool, subject.as_deref())
+                .map(|r| r.note.clone())
+        } else {
+            None
+        };
         (note, problem)
     }
 
@@ -179,26 +209,33 @@ impl DeskRules {
     fn record(&self, paused: &PausedCall) -> Result<String, String> {
         let tool = paused.call().tool.clone();
         let subject = self.subject(paused);
-        let (mut g, _) = self.fresh();
+        let (mut g, problem) = self.fresh();
+        // Writing from a store that could not be read would replace the file with
+        // what was read before it went bad.
+        if let Some(problem) = problem {
+            return Err(problem);
+        }
         let covers = match subject {
             Some(subject) => {
-                g.0.allow_exact(
-                    self.project.clone(),
-                    tool,
-                    subject.clone(),
-                    "allowed always in the orchestrator box",
-                )
-                .map_err(|e| e.to_string())?;
+                g.store
+                    .allow_exact(
+                        self.project.clone(),
+                        tool,
+                        subject.clone(),
+                        "allowed always in the orchestrator box",
+                    )
+                    .map_err(|e| e.to_string())?;
                 subject
             }
             None if tool.starts_with("mcp__") => {
-                g.0.allow_any_call(
-                    self.project.clone(),
-                    tool.clone(),
-                    "allowed always in the orchestrator box",
-                    kgraf_session::approval_store::ConfirmAllowAnyCall,
-                )
-                .map_err(|e| e.to_string())?;
+                g.store
+                    .allow_any_call(
+                        self.project.clone(),
+                        tool.clone(),
+                        "allowed always in the orchestrator box",
+                        kgraf_session::approval_store::ConfirmAllowAnyCall,
+                    )
+                    .map_err(|e| e.to_string())?;
                 format!("any call to {tool}")
             }
             None => {
@@ -207,8 +244,9 @@ impl DeskRules {
                 ));
             }
         };
-        // Our own write is not a change to read again.
-        g.1 = file_stamp(&self.path);
+        // Our own write is not a change to read again. A young stamp is read again
+        // at the next ask regardless.
+        g.stamp = file_stamp(&self.path).ok();
         Ok(covers)
     }
 }

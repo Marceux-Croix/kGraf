@@ -23,21 +23,6 @@ use support::*;
 
 const WINDOW: u64 = 200_000;
 
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("time")
-        .as_millis() as i64
-}
-
-async fn until(what: &str, f: impl Fn() -> bool) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while !f() {
-        assert!(std::time::Instant::now() < deadline, "timed out: {what}");
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-}
-
 async fn trace_of(p: &Parts) -> Vec<TraceEvent> {
     TraceLog::open(&p.dir.join("runs").join("r1").join("trace.jsonl"))
         .await
@@ -117,7 +102,7 @@ impl Workspaces for Recording {
     }
 }
 
-/// Item 1 and the orchestrator half of item 3. A pass voided by a lost lease
+/// A pass voided by a lost lease
 /// is verified again: the second verification gets the next number (so its
 /// attempt ref cannot collide with the first's), the worker's worktree is kept
 /// rather than discarded, and the re-dispatch hands `prepare` the handle
@@ -189,7 +174,7 @@ async fn a_voided_pass_is_verified_again_under_the_next_number_in_its_kept_workt
     );
 }
 
-/// Item 2, the orchestrator's side: every attempt runs in the environment the
+/// Every attempt runs in the environment the
 /// factory built for its own worktree, which is closed after the worker ends;
 /// a factory failure fails the attempt loudly, never falling back to the
 /// route's environment.
@@ -397,7 +382,7 @@ async fn an_owner_from_before_a_reboot_is_taken_over() {
     assert_eq!(report.status, RunStatus::Completed, "{report:?}");
 }
 
-/// Item 4. A run whose owner process died is resumed at once: its run lease
+/// A run whose owner process died is resumed at once: its run lease
 /// (and the dead owner's contract leases) are taken over instead of waited
 /// out for the 120 s TTL. The owner is named by PID and start time, so a PID
 /// reused by another process does not keep the run; a live owner does.
@@ -559,7 +544,7 @@ async fn an_owner_from_another_machine_or_namespace_is_never_taken_over() {
     }
 }
 
-/// Item 5. Conversation files are written in the worktree the workspaces
+/// Conversation files are written in the worktree the workspaces
 /// provide (the integration branch's), indexed from there, and committed from
 /// there; the graph's root, the user's checkout, gets nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -705,7 +690,7 @@ impl GateRunner for AlwaysPassGate {
     }
 }
 
-/// Second review item 8: a worktree whose attempt was merged before the kill
+/// A worktree whose attempt was merged before the kill
 /// (reopen retired it, `AlreadyMerged`) counts as verified: no model round,
 /// no redo, no retry used, and the merge commit is the verified one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -794,7 +779,7 @@ async fn an_attempt_merged_before_the_kill_counts_as_verified() {
     );
 }
 
-/// Second review item 10: a worktree that cannot be provided (a refused
+/// A worktree that cannot be provided (a refused
 /// reopen, an unreadable tree) is an environment failure: counted there,
 /// retried with backoff, never charged to max_retries.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -982,5 +967,69 @@ async fn a_busy_worktree_is_waited_for_by_the_same_worker() {
         *seen.lock().expect("lock"),
         vec!["r1-a-r0-a0".to_owned(); 3],
         "the same worker each time: its worktree is not replaced"
+    );
+}
+
+/// Directories whose release "fails to remove" one worktree, as a provider
+/// reports through `take_problems`.
+struct FailsToRemove {
+    dirs: DirWorkspaces,
+    problem: Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl Workspaces for FailsToRemove {
+    async fn prepare(
+        &self,
+        contract: &OpenContract,
+        worker: &AgentId,
+    ) -> Result<PathBuf, kgraf_orchestrator::PrepareFailure> {
+        self.dirs.prepare(contract, worker).await
+    }
+
+    async fn release(&self, workspace: &Path, _keep: bool) {
+        self.problem.lock().expect("lock").push(format!(
+            "worktree {} could not be removed: access refused",
+            workspace.display()
+        ));
+    }
+
+    fn take_problems(&self) -> Vec<String> {
+        std::mem::take(&mut *self.problem.lock().expect("lock"))
+    }
+}
+
+/// A worktree the provider could not remove after use reaches the run's
+/// report as a warning naming the worktree, not only a line on stderr.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worktree_that_could_not_be_removed_is_a_warning_in_the_report() {
+    let dir = tempfile::tempdir().expect("dir");
+    let plan = plan_json(&[c("a", "make a", "src/a.rs", &[])]);
+    let p = Parts::open(
+        dir.path(),
+        move |_| plan.clone(),
+        |_| SERVES.into(),
+        Duration::from_millis(5),
+    );
+    let mut services = p.services(WINDOW);
+    services.workspaces = Arc::new(FailsToRemove {
+        dirs: DirWorkspaces {
+            base: dir.path().join("worktrees"),
+        },
+        problem: Mutex::new(Vec::new()),
+    });
+    let report = Orchestrator::new(config(), services)
+        .expect("orchestrator")
+        .start(RunId::new("r1"), "make a".into())
+        .await
+        .expect("run");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.contains("r1-a-r0-a0") && w.contains("could not be removed")),
+        "{:?}",
+        report.warnings
     );
 }

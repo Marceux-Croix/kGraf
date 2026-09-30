@@ -212,8 +212,19 @@ const HOME_READS: &[&str] = &[
     ".cargo/git",
     ".rustup",
     ".npm",
-    ".cache",
-    ".local",
+    // Not `~/.cache` itself: it holds tokens (`~/.cache/huggingface/token`)
+    // beside the package caches. Only the caches build tools read.
+    ".cache/pip",
+    ".cache/uv",
+    ".cache/go-build",
+    ".cache/pnpm",
+    ".cache/yarn",
+    // The compiler cache, node-gyp's downloaded headers, and pre-commit's
+    // hook checkouts. None stores a login: sccache's storage credentials
+    // live in its config under `~/.config`, which is not granted.
+    ".cache/sccache",
+    ".cache/node-gyp",
+    ".cache/pre-commit",
     ".nvm",
     ".pyenv",
     ".gitconfig",
@@ -229,6 +240,14 @@ const HOME_READS: &[&str] = &[
     ".local/lib",
     ".local/share/uv",
     ".local/share/pnpm",
+    // Version managers' and installers' toolchain trees: installed runtimes,
+    // application virtualenvs and seed wheels. Their tokens, where they take
+    // any, are read from `~/.config` or the environment, not from here.
+    ".local/share/mise",
+    ".local/share/fnm",
+    ".local/share/pipx",
+    ".local/share/virtualenv",
+    ".local/share/rustup",
 ];
 
 // Files cargo reads in every ancestor of the directory it runs in, relative
@@ -874,12 +893,34 @@ mod tests {
         std::fs::write(home.join(".local/share/keyrings/login"), "FAKE-KEYRING").unwrap();
         std::fs::write(home.join(".local/share/uv/tool"), "ok").unwrap();
         std::fs::write(home.join(".local/bin/tool"), "ok").unwrap();
+        std::fs::create_dir_all(home.join(".cache/huggingface")).unwrap();
+        std::fs::create_dir_all(home.join(".cache/pip")).unwrap();
+        std::fs::write(home.join(".cache/huggingface/token"), "FAKE-HF").unwrap();
+        std::fs::write(home.join(".cache/pip/wheel"), "ok").unwrap();
         let policy = policy(&work, Some(&home), Network::Deny);
         assert_refused(&policy, &home.join(".config/git/credentials"));
         assert_refused(&policy, &home.join(".local/share/keyrings/login"));
+        assert_refused(&policy, &home.join(".cache/huggingface/token"));
+        assert_read(&policy, &home.join(".cache/pip/wheel"), "ok");
         assert_read(&policy, &home.join(".config/git/config"), "[user]\n");
         assert_read(&policy, &home.join(".local/share/uv/tool"), "ok");
         assert_read(&policy, &home.join(".local/bin/tool"), "ok");
+        // Toolchain trees that version managers and build caches keep.
+        for rel in [
+            ".local/share/mise/installs/node/bin/node",
+            ".local/share/fnm/node-versions/v1/node",
+            ".local/share/pipx/venvs/tool/bin/tool",
+            ".local/share/virtualenv/wheel/seed.whl",
+            ".local/share/rustup/toolchains/stable/bin/rustc",
+            ".cache/sccache/0/entry",
+            ".cache/node-gyp/20/include/node.h",
+            ".cache/pre-commit/repo/hook.py",
+        ] {
+            let path = home.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "ok").unwrap();
+            assert_read(&policy, &path, "ok");
+        }
         // Never granted, so unreadable on this backend by construction.
         for rel in [
             ".vault-token",
@@ -887,6 +928,12 @@ mod tests {
             ".terraform.d/c",
             ".gem/credentials",
             ".codex/auth.json",
+            ".claude/.credentials.json",
+            ".m2/settings.xml",
+            ".gradle/gradle.properties",
+            ".config/containers/auth.json",
+            ".oci/config",
+            ".bundle/config",
         ] {
             let path = home.join(rel);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();

@@ -205,7 +205,7 @@ if [[ ! -f "$ROOT/THIRD_PARTY_NOTICES.md" ]]; then
   echo "THIRD_PARTY_NOTICES.md is missing; run scripts/third-party-notices.sh first" >&2
   exit 1
 fi
-# N2: this bundle links ported code from codex (the macOS seatbelt policy) and a
+# this bundle links ported code from codex (the macOS seatbelt policy) and a
 # rerun re_renderer-derived shader (kgraf-galaxy); scripts/third-party-notices.sh
 # appends both vendored directories' LICENSE/NOTICE text after cargo-about's own
 # crates.io-dependency section -- check for it specifically, not just that the file

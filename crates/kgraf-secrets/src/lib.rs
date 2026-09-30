@@ -100,6 +100,7 @@ pub const SECRET_NAME_NEEDLES: &[&str] = &[
     "auth",
     "pat",
     "dsn",
+    "pwd",
 ];
 
 /// Needles long enough to be matched inside a word, so a name written without
@@ -117,6 +118,8 @@ pub const SECRET_NAME_SUBSTRINGS: &[&str] = &[
     "passwd",
     "passphrase",
     "credential",
+    "authorization",
+    "webhook",
 ];
 
 /// Words that contain a [`SECRET_NAME_SUBSTRINGS`] entry but name something
@@ -178,8 +181,36 @@ fn name_words(name: &str) -> Vec<String> {
     words
 }
 
+/// Words that, before a final `url` or `uri`, mark a data-store or broker
+/// address (`REDIS_URL`, `MONGODB_URI`, `CELERY_BROKER_URL`): these usually
+/// carry a password in the userinfo part.
+const CONNECTION_STORE_WORDS: &[&str] = &[
+    "db",
+    "database",
+    "redis",
+    "mongo",
+    "mongodb",
+    "postgres",
+    "postgresql",
+    "mysql",
+    "mariadb",
+    "amqp",
+    "rabbitmq",
+    "broker",
+    "sqlalchemy",
+    "celery",
+    "cache",
+    "queue",
+    "kafka",
+    "elasticsearch",
+];
+
 fn classify_name(name: &str) -> NameClass {
     let words = name_words(name);
+    // `PWD` alone is the shell's working directory, not a password.
+    if words.len() == 1 && words[0] == "pwd" {
+        return NameClass::Ordinary;
+    }
     let credential = words.iter().any(|word| {
         SECRET_NAME_NEEDLES.contains(&word.as_str())
             || (!NOT_SECRET_WORDS.contains(&word.as_str())
@@ -189,7 +220,13 @@ fn classify_name(name: &str) -> NameClass {
         return NameClass::Credential;
     }
     let pair = |a: &str, b: &str| words.windows(2).any(|w| w[0] == a && w[1] == b);
+    let store_address = words.len() > 1
+        && words.last().is_some_and(|w| w == "url" || w == "uri")
+        && words[..words.len() - 1]
+            .iter()
+            .any(|w| CONNECTION_STORE_WORDS.contains(&w.as_str()));
     if pair("database", "url")
+        || store_address
         || pair("connection", "string")
         || words
             .iter()
@@ -234,6 +271,104 @@ fn is_literal_placeholder(value: &str) -> bool {
         || lower.chars().all(|c| c == 'x' || c == '*')
         || (lower.starts_with('<') && lower.ends_with('>'))
         || (lower.starts_with("${") && lower.ends_with('}'))
+}
+
+/// Words that mark a variable as a setting about a credential rather than the
+/// credential itself (`AUTH_ENABLED`, `TOKEN_TTL`, `SESSION_TIMEOUT`,
+/// `USE_AUTH`). Only under such a name is a switch, a small number or a
+/// duration taken as a setting; under `DB_PASSWORD` or `SESSION_SECRET` the
+/// same value is a secret.
+const SETTING_NAME_WORDS: &[&str] = &[
+    "ttl",
+    "enabled",
+    "enable",
+    "disabled",
+    "disable",
+    "timeout",
+    "expiry",
+    "expires",
+    "expiration",
+    "lifetime",
+    "duration",
+    "interval",
+    "required",
+    "optional",
+    "mode",
+    "max",
+    "min",
+    "limit",
+    "count",
+    "retries",
+    "retry",
+    "size",
+    "length",
+    "age",
+    "delay",
+    "seconds",
+    "minutes",
+    "hours",
+    "days",
+    "ms",
+    "flag",
+    "verify",
+    "use",
+    "skip",
+    "no",
+    "with",
+    "without",
+    "allow",
+    "is",
+    "has",
+    "debug",
+];
+
+/// Whether `name` says the variable is a setting (see [`SETTING_NAME_WORDS`]).
+fn is_setting_name(name: &str) -> bool {
+    name_words(name)
+        .iter()
+        .any(|w| SETTING_NAME_WORDS.contains(&w.as_str()))
+}
+
+/// Whether `value` is a switch, a small count or a duration: a setting that
+/// can sit under a setting name ([`is_setting_name`]) and is never a secret.
+/// Digits alone count as a setting only under 8 digits, so an all-digit
+/// password of 8 or more still registers.
+fn is_setting_value(value: &str) -> bool {
+    const SWITCHES: &[&str] = &[
+        "true", "false", "yes", "no", "on", "off", "enabled", "disabled", "none", "null", "nil",
+        "auto", "required", "optional",
+    ];
+    let lower = value.to_ascii_lowercase();
+    if SWITCHES.contains(&lower.as_str()) {
+        return true;
+    }
+    let digits = lower.chars().take_while(char::is_ascii_digit).count();
+    let (number, unit) = lower.split_at(digits);
+    if number.is_empty() || number.len() >= 8 {
+        return false;
+    }
+    matches!(
+        unit,
+        "" | "ms"
+            | "s"
+            | "sec"
+            | "secs"
+            | "m"
+            | "min"
+            | "mins"
+            | "h"
+            | "hr"
+            | "hrs"
+            | "d"
+            | "day"
+            | "days"
+            | "hour"
+            | "hours"
+            | "minute"
+            | "minutes"
+            | "second"
+            | "seconds"
+    )
 }
 
 /// `generic-api-key`'s own entropy floor (bits per byte of the captured
@@ -293,8 +428,7 @@ fn is_placeholder(value: &str) -> bool {
             || value.chars().all(|c| c.is_ascii_uppercase() || sep(c)))
 }
 
-/// Why `value` is an ordinary configuration value rather than a key (final
-/// review, A): a date, a short number, an absolute path, a URL with no
+/// Why `value` is an ordinary configuration value rather than a key: a date, a short number, an absolute path, a URL with no
 /// userinfo (a credential inside a URL is the URL rules' job), or a cloud
 /// region. Registered, any of these would be redacted from model input too.
 fn ordinary_value(value: &str) -> Option<&'static str> {
@@ -563,7 +697,9 @@ impl Scrubber {
     /// A credential-named value is registered whatever its shape (see
     /// `register_credential_named`): `POSTGRES_PASSWORD=postgres`
     /// and a webhook URL are secrets. It is refused only when empty, under
-    /// [`MIN_CREDENTIAL_NAMED_LEN`] or an unfilled template, and a refusal is
+    /// [`MIN_CREDENTIAL_NAMED_LEN`], an unfilled template, or a plain setting
+    /// under a setting name (a switch, a number under 8 digits, a duration under
+    /// `AUTH_ENABLED` or `TOKEN_TTL`), and a refusal is
     /// said with the variable name, never the value. A connection-string name
     /// (`DATABASE_URL`) and a pattern-matched value under an ordinary name go
     /// through the general checks of [`Scrubber::register_exact_secret`],
@@ -574,20 +710,35 @@ impl Scrubber {
     /// sandbox keeps the file unreadable, and this keeps the values out of
     /// every tool result, transcript and trace should one appear anyway.
     pub fn register_dotenv(&self, text: &str) -> usize {
-        dotenv_pairs(text)
-            .filter_map(|(name, value)| {
-                if classify_name(name) == NameClass::Credential {
-                    Some(self.register_credential_named(name, value))
-                } else if !self.pattern_spans(value).is_empty() {
-                    // A connection string (`DATABASE_URL`) is registered only
-                    // when the value itself carries a credential.
-                    Some(self.register("dotenv", value, false))
-                } else {
-                    None
-                }
-            })
-            .filter(|outcome| *outcome == Registration::Registered)
-            .count()
+        // The byte range of the last multi-line value and whether a pattern rule
+        // matched it: its body lines follow it in `dotenv_pairs`, and they
+        // register with it even under an ordinary name, where no pattern
+        // matches one line of a key on its own.
+        let mut whole: Option<(usize, usize, bool)> = None;
+        let mut registered = 0;
+        for (name, value) in dotenv_pairs(text) {
+            let start = value.as_ptr() as usize;
+            let end = start + value.len();
+            let body_of_matched = whole.is_some_and(|(s, e, matched)| {
+                matched && start >= s && end <= e && (start, end) != (s, e)
+            });
+            if value.contains('\n') {
+                whole = Some((start, end, !self.pattern_spans(value).is_empty()));
+            }
+            let outcome = if classify_name(name) == NameClass::Credential {
+                Some(self.register_credential_named(name, value))
+            } else if body_of_matched || !self.pattern_spans(value).is_empty() {
+                // A connection string (`DATABASE_URL`) is registered only
+                // when the value itself carries a credential.
+                Some(self.register("dotenv", value, false))
+            } else {
+                None
+            };
+            if outcome == Some(Registration::Registered) {
+                registered += 1;
+            }
+        }
+        registered
     }
 
     /// Register the value of a credential-named variable. The name already
@@ -610,6 +761,13 @@ impl Scrubber {
         if is_literal_placeholder(value) {
             self.refuse(name, value, "it looks like a placeholder");
             return Registration::Placeholder;
+        }
+        // A setting under a credential-like setting name (`AUTH_ENABLED=true`,
+        // `TOKEN_TTL=3600`, `SESSION_TIMEOUT=30s`) is not a secret; registered,
+        // its value would be cut out of every unrelated text that has it. The
+        // same value under `DB_PASSWORD` is a secret and registers.
+        if is_setting_name(name) && is_setting_value(value) {
+            return Registration::Ordinary;
         }
         self.insert_exact("dotenv", value)
     }
@@ -1195,36 +1353,137 @@ pub fn register_dotenv_file(path: &std::path::Path) -> std::io::Result<usize> {
     }
 }
 
+/// Whether a body line of a multi-line value looks like a piece of a secret: a
+/// long run of base64 or URL-safe characters with no spaces, not an armor line
+/// and not a word. A structure line such as `"type": "service_account",` is
+/// not, so it is never cut out of unrelated text.
+fn is_secret_shaped_line(line: &str) -> bool {
+    line.len() >= 16
+        && !line.starts_with("-----")
+        && line.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'_' | b'-' | b'.' | b'~')
+        })
+        && !is_placeholder(line)
+        && entropy::shannon_entropy(line) >= min_exact_secret_entropy(line.len())
+}
+
+/// Add a value, and for a multi-line one each secret-shaped body line as well
+/// (see [`is_secret_shaped_line`]): a tool may print one line of a key, and
+/// the whole value would not match it. Armor lines (`-----BEGIN ...-----`)
+/// are ordinary text and stay out.
+fn push_dotenv_value<'a>(pairs: &mut Vec<(&'a str, &'a str)>, name: &'a str, value: &'a str) {
+    pairs.push((name, value));
+    if value.contains('\n') {
+        for line in value.lines().map(str::trim) {
+            if is_secret_shaped_line(line) {
+                pairs.push((name, line));
+            }
+        }
+    }
+}
+
+/// Whether a line reads as `NAME=value`: an identifier, `=`, and a value that
+/// is not empty and does not start with `=`. A base64 line that ends in `=` or
+/// `==` is not one.
+fn is_assignment_line(line: &str) -> bool {
+    let line = line.trim();
+    let line = line.strip_prefix("export ").unwrap_or(line);
+    let Some((name, value)) = line.split_once('=') else {
+        return false;
+    };
+    let name = name.trim();
+    let value = value.trim();
+    name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+        && !value.is_empty()
+        && !value.starts_with('=')
+}
+
+/// The start offset of the first line in `text[from..limit]` that is an
+/// assignment (see [`is_assignment_line`]).
+fn next_assignment(text: &str, from: usize, limit: usize) -> Option<usize> {
+    let mut at = from;
+    while at < limit {
+        let end = text[at..].find('\n').map_or(text.len(), |i| at + i);
+        if is_assignment_line(&text[at..end]) {
+            return Some(at);
+        }
+        at = end + 1;
+    }
+    None
+}
+
 /// The `(name, value)` pairs of a dotenv file's `NAME=value` lines: `export `
 /// prefixes dropped, lines without `=` and comment lines skipped. A value
 /// that opens with a quote ends at its *matching* closing quote -- whatever
 /// follows, quoted or not, is discarded, since a quoted value cannot contain
-/// an unescaped quote of its own kind and gitleaks-shaped dotenv writers
-/// never escape one. An unquoted value keeps everything up to a literal
-/// ` #` (a `#` with no leading space is common inside a URL fragment or a
-/// password, so it is not treated as a comment marker there).
-fn dotenv_pairs(text: &str) -> impl Iterator<Item = (&str, &str)> {
-    text.lines().filter_map(|line| {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            return None;
+/// an unescaped quote of its own kind and dotenv writers never escape one.
+/// A quoted value may span lines (a PEM private key): it runs to the closing
+/// quote on a later line, newlines kept. An unterminated quote yields both the rest of its
+/// line and the rest of the file, so no line of a key is left out. An unquoted value keeps
+/// everything up to a literal ` #` (a `#` with no leading space is common
+/// inside a URL fragment or a password, so it is not treated as a comment
+/// marker there).
+fn dotenv_pairs(text: &str) -> Vec<(&str, &str)> {
+    let mut pairs = Vec::new();
+    let mut pos = 0;
+    while pos < text.len() {
+        let line_end = text[pos..].find('\n').map_or(text.len(), |i| pos + i);
+        let line = &text[pos..line_end];
+        let after_line = (line_end + 1).min(text.len());
+        let trimmed = line.trim();
+        let trimmed = trimmed.strip_prefix("export ").unwrap_or(trimmed);
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            pos = after_line;
+            continue;
         }
-        let line = line.strip_prefix("export ").unwrap_or(line);
-        let (name, raw_value) = line.split_once('=')?;
+        let Some((name, raw_value)) = trimmed.split_once('=') else {
+            pos = after_line;
+            continue;
+        };
         let name = name.trim();
         let raw_value = raw_value.trim();
-        let value = match raw_value.chars().next() {
+        match raw_value.chars().next() {
             Some(quote @ ('"' | '\'')) => {
-                let rest = &raw_value[quote.len_utf8()..];
-                match rest.find(quote) {
-                    Some(end) => &rest[..end],
-                    None => rest,
+                // `raw_value` is a suffix of `text`, so its offset is exact.
+                let value_start = raw_value.as_ptr() as usize - text.as_ptr() as usize;
+                let body_start = value_start + quote.len_utf8();
+                let close = text[body_start..].find(quote).map(|i| body_start + i);
+                // A closing quote further on does not close this value when an
+                // assignment line sits between them: that quote belongs to the
+                // next pair (`A="x` then `B_TOKEN="y"`), and taking it would
+                // swallow that pair.
+                let stray = next_assignment(text, after_line, close.unwrap_or(text.len()));
+                match (close, stray) {
+                    (Some(close), None) => {
+                        push_dotenv_value(&mut pairs, name, &text[body_start..close]);
+                        // Resume after the line the closing quote is on.
+                        pos = text[close..]
+                            .find('\n')
+                            .map_or(text.len(), |i| close + i + 1);
+                    }
+                    (_, stray) => {
+                        // Unterminated: keep the first line's remainder (a
+                        // stray quote) and the lines up to the next assignment
+                        // (a key whose closing quote is missing), then read on
+                        // from that assignment.
+                        let stop = stray.unwrap_or(text.len());
+                        pairs.push((name, raw_value[quote.len_utf8()..].trim_end()));
+                        push_dotenv_value(&mut pairs, name, text[body_start..stop].trim_end());
+                        pos = stop.max(after_line);
+                    }
                 }
             }
-            _ => raw_value.split(" #").next().unwrap_or(raw_value).trim(),
-        };
-        Some((name, value))
-    })
+            _ => {
+                let value = raw_value.split(" #").next().unwrap_or(raw_value).trim();
+                pairs.push((name, value));
+                pos = after_line;
+            }
+        }
+    }
+    pairs
 }
 
 /// The model-facing path with the process-wide scrubber (see
@@ -1855,7 +2114,7 @@ mod tests {
                 "keyword `{keyword}` did not redact {text:?}, got {out:?}"
             );
         }
-        // The specific mutation the review found unhandled: `password` with
+        // A mutation that once slipped through: `password` with
         // its shorter, elided spelling, both live in the same alternation
         // (`passw(?:or)?d`).
         let value = filler(24);
@@ -1952,9 +2211,8 @@ mod tests {
         );
     }
 
-    /// The persist path's false-positive regression, from the security
-    /// review's own list of real matches under the pre-fix design (every one
-    /// a `generic-api-key` hit). With the entropy gate and allowlist restored,
+    /// The persist path's false-positive regression: real lines that matched
+    /// under the earlier design (every one a `generic-api-key` hit). With the entropy gate and allowlist restored,
     /// none of these lines redact.
     #[test]
     fn persist_path_false_positive_regression_list_stays_unchanged() {
@@ -2426,6 +2684,166 @@ mod tests {
         }
     }
 
+    /// A switch, a small count or a duration under a credential-like name is a
+    /// setting: it is not registered, so the text `true` or `3600` is never cut
+    /// out of unrelated output.
+    #[test]
+    fn settings_under_credential_like_names_are_not_registered() {
+        let s = fresh();
+        let text = "AUTH_ENABLED=true\nTOKEN_TTL=3600\nSESSION_SECRET_TIMEOUT=30s\n\
+                    SECRET_ROTATION_DAYS=90\nAPI_KEY_REQUIRED=yes\nTOKEN_EXPIRY=15min\n";
+        assert_eq!(s.register_dotenv(text), 0);
+        let shown = "flag true, ttl 3600, timeout 30s, 90 days, yes, 15min";
+        assert_eq!(s.scrub_model_facing(shown), shown);
+    }
+
+    /// An unclosed quote must not swallow the next pair: a later quote on
+    /// another pair's line is not its closing quote.
+    #[test]
+    fn an_unclosed_quote_does_not_hide_the_next_pair() {
+        let s = fresh();
+        let secret = "N7qZ2wLp9RxK4mBt6Vc3Yd8S";
+        let text = format!("A_KEY=\"never closed\nB_TOKEN=\"{secret}\"\n");
+        s.register_dotenv(&text);
+        let shown = format!("seen: {secret}");
+        let out = s.scrub_model_facing(&shown);
+        assert!(!out.contains(secret), "{out}");
+    }
+
+    /// A PEM key whose closing quote is missing still registers its body
+    /// lines, and a pair after it is still read.
+    #[test]
+    fn an_unclosed_quote_keeps_key_lines_and_the_next_pair() {
+        let s = fresh();
+        let secret = "N7qZ2wLp9RxK4mBt6Vc3Yd8S";
+        let text = format!(
+            "DEPLOY_KEY=\"-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n-----END PRIVATE KEY-----\nB_TOKEN=\"{secret}\"\n"
+        );
+        s.register_dotenv(&text);
+        let shown = format!("MIIEvQIBADANBgkqhkiG9w0BAQEFAASC and {secret}");
+        let out = s.scrub_model_facing(&shown);
+        assert!(!out.contains("MIIEvQIBADANBg"), "{out}");
+        assert!(!out.contains(secret), "{out}");
+    }
+
+    /// Under a password or secret name a number or a duration is a secret;
+    /// under a setting name it is not.
+    #[test]
+    fn numeric_values_register_under_secret_names_only() {
+        let s = fresh();
+        assert_eq!(
+            s.register_dotenv("DB_PASSWORD=123456\nSESSION_SECRET=4711d\n"),
+            2
+        );
+        let out = s.scrub_model_facing("a 123456 b 4711d c");
+        assert!(!out.contains("123456") && !out.contains("4711d"), "{out}");
+        let t = fresh();
+        assert_eq!(
+            t.register_dotenv(
+                "TOKEN_TTL=3600\nSESSION_TIMEOUT=30s\nAUTH_ENABLED=true\nUSE_AUTH=1234\n"
+            ),
+            0
+        );
+        let text = "ttl 3600 and 30s and true and 1234";
+        assert_eq!(t.scrub_model_facing(text), text);
+    }
+
+    /// Body lines of a pattern-matched multi-line value under an ordinary
+    /// name are registered one by one.
+    #[test]
+    fn body_lines_of_a_pattern_matched_value_register_under_an_ordinary_name() {
+        let s = fresh();
+        let text = "SOME_BLOB=\"-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\nKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj\n-----END PRIVATE KEY-----\"\n";
+        assert_eq!(s.register_dotenv(text), 3, "whole value and two body lines");
+        let out = s.scrub_model_facing("only KcwggSjAgEAAoIBAQC7VJTUt9Us8cKj here");
+        assert!(!out.contains("KcwggSjAgEAAoIB"), "{out}");
+    }
+
+    /// Structure lines of a multi-line credential are not cut out of other
+    /// text; the secret-shaped line still is.
+    #[test]
+    fn structure_lines_of_a_json_credential_stay_unredacted() {
+        let s = fresh();
+        let text = "SERVICE_ACCOUNT_KEY='{\n  \"type\": \"service_account\",\n  \"project_id\": \"my-project-12345\",\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n}'\n";
+        s.register_dotenv(text);
+        let plain = "the file says \"type\": \"service_account\", and \"project_id\": \"my-project-12345\",";
+        assert_eq!(s.scrub_model_facing(plain), plain);
+        let out = s.scrub_model_facing("MIIEvQIBADANBgkqhkiG9w0BAQEFAASC");
+        assert!(!out.contains("MIIEvQ"), "{out}");
+    }
+
+    /// The same names keep real tokens: a random token, a word password and a
+    /// long all-digit password are registered and redacted.
+    #[test]
+    fn secret_shaped_values_under_credential_names_stay_registered() {
+        for (name, value) in [
+            ("API_TOKEN", "N7qZ2wLp9RxK4mBt6Vc3Yd8S"),
+            ("DB_PASSWORD", "postgres"),
+            ("PIN_SECRET", "12345678"),
+            ("AUTH_TOKEN", "3600abcdef"),
+        ] {
+            let s = fresh();
+            assert_eq!(s.register_dotenv(&format!("{name}={value}\n")), 1, "{name}");
+            let shown = format!("log {value} end");
+            assert!(s.scrub_model_facing(&shown).contains("redacted"), "{name}");
+        }
+    }
+
+    /// A quoted value that spans lines (a PEM key) is registered whole, and a
+    /// line of it is not left as the only part kept; the pair after it is
+    /// still read.
+    #[test]
+    fn a_multi_line_quoted_dotenv_value_is_registered_whole() {
+        let s = fresh();
+        let key = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\nKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj\n-----END PRIVATE KEY-----";
+        let text = format!("DEPLOY_KEY=\"{key}\"\nOTHER_TOKEN=N7qZ2wLp9RxK4mBt6Vc3Yd8S\n");
+        assert_eq!(
+            s.register_dotenv(&text),
+            4,
+            "whole value, two body lines, next pair"
+        );
+        let shown = format!("cat: {key} done");
+        let out = s.scrub_model_facing(&shown);
+        assert!(!out.contains("MIIEvQIBADANBg"), "{out}");
+        assert!(!out.contains("KcwggSjAgEAAoIB"), "{out}");
+        let pairs = dotenv_pairs(&text);
+        assert_eq!(pairs[0], ("DEPLOY_KEY", key));
+        assert!(pairs.contains(&("OTHER_TOKEN", "N7qZ2wLp9RxK4mBt6Vc3Yd8S")));
+    }
+
+    /// A quote that never closes still registers every line of the key after
+    /// it.
+    #[test]
+    fn an_unterminated_quote_registers_the_key_lines_after_it() {
+        let s = fresh();
+        let text = "DEPLOY_KEY=\"-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n-----END PRIVATE KEY-----\n";
+        assert!(s.register_dotenv(text) >= 2);
+        let out = s.scrub_model_facing("printed MIIEvQIBADANBgkqhkiG9w0BAQEFAASC only");
+        assert!(!out.contains("MIIEvQ"), "{out}");
+    }
+
+    /// Names the first lists missed: `Authorization`, a `*_PWD`, a webhook and
+    /// a data-store address are credential-shaped; `PWD` (the working
+    /// directory) and an ordinary `*_URL` are not.
+    #[test]
+    fn more_credential_names_are_recognized() {
+        for name in [
+            "AUTHORIZATION",
+            "HTTP_AUTHORIZATION",
+            "DB_PWD",
+            "SLACK_WEBHOOK",
+            "WEBHOOK_URL",
+            "REDIS_URL",
+            "MONGODB_URI",
+            "CELERY_BROKER_URL",
+        ] {
+            assert!(name_is_credential_shaped(name), "{name}");
+        }
+        for name in ["PWD", "HOMEPAGE_URL", "OPENAI_BASE_URL", "OLDPWD", "AUTHOR"] {
+            assert!(!name_is_credential_shaped(name), "{name}");
+        }
+    }
+
     /// A value that matches a pattern rule on its own is registered even
     /// under an ordinary-looking name ("or when a gitleaks pattern
     /// rule matches the value").
@@ -2503,7 +2921,7 @@ mod tests {
         }
     }
 
-    /// B, the reviewer's test: a registered secret that starts inside a
+    /// A registered secret that starts inside a
     /// pattern match must not leak its tail. Overlapping spans are merged.
     #[test]
     fn an_overlapping_registered_secret_leaks_no_tail() {

@@ -439,7 +439,12 @@ fn roadmap_anchors(store: &GraphStore) -> Result<BTreeMap<String, String>, Inter
     let mut map = BTreeMap::new();
     for p in store.presumed_nodes()? {
         if p.origin.source_kind == ROADMAP && p.gone_ms.is_none() && p.node.kind == WorkKind::Item {
-            for a in body_of(&p.node)?.anchors {
+            // A damaged body names no anchors; `views` reports the damage, and one
+            // bad node must not stop the reading from being presumed.
+            let Ok(body) = body_of(&p.node) else {
+                continue;
+            };
+            for a in body.anchors {
                 map.entry(a).or_insert_with(|| p.node.id.clone());
             }
         }
@@ -620,7 +625,10 @@ pub(crate) fn adopt_for_plan(
             if p.adopted.is_some() || p.node.kind != WorkKind::Item {
                 continue;
             }
-            let b = body_of(&p.node)?;
+            // A damaged body matches nothing; `views` reports it.
+            let Ok(b) = body_of(&p.node) else {
+                continue;
+            };
             let from_reading = p.origin.source_kind == READING
                 && b.reading_plan.as_deref() == Some(plan_id)
                 && b.item_id.as_deref() == Some(w.id.as_str());
@@ -648,6 +656,9 @@ pub enum PresumedState {
     /// Not started: the document says so (or says nothing) and nothing it names
     /// exists.
     Remaining,
+    /// The stored record is damaged, so nothing about it can be derived. It is
+    /// neither remaining nor done, and no roll-up counts it as either.
+    Unknown,
 }
 
 impl PresumedState {
@@ -656,6 +667,7 @@ impl PresumedState {
             PresumedState::Done => "presumed done",
             PresumedState::Partial => "presumed partly done",
             PresumedState::Remaining => "presumed remaining",
+            PresumedState::Unknown => "presumed, state unknown",
         }
     }
 }
@@ -804,14 +816,28 @@ pub fn views(store: &GraphStore) -> Result<Vec<PresumedView>, InterpretError> {
     let stored = store.presumed_nodes()?;
     let mut out: Vec<PresumedView> = Vec::with_capacity(stored.len());
     for p in &stored {
-        let mut body = body_of(&p.node)?;
+        // One damaged body is shown as damaged, on its own row; it does not
+        // hide every other node of every plan.
+        let (mut body, damage) = match body_of(&p.node) {
+            Ok(body) => (body, None),
+            Err(error) => (Body::default(), Some(error.to_string())),
+        };
         // The document's claim lives in the presumed row; a row
         // from before that column keeps the one in its body.
         if let Some(c) = claim_of_name(&p.origin.claim) {
             body.claim = c;
             body.claim_text = p.origin.claim_text.clone();
         }
-        let (state, present, missing, detail) = if p.node.kind == WorkKind::Item {
+        let (state, present, missing, detail) = if let Some(damage) = damage {
+            (
+                PresumedState::Unknown,
+                Vec::new(),
+                Vec::new(),
+                Some(format!(
+                    "its stored body is damaged, so what it names is unknown: {damage}"
+                )),
+            )
+        } else if p.node.kind == WorkKind::Item {
             derive(store, &body, &p.origin.source_kind)?
         } else {
             (PresumedState::Remaining, Vec::new(), Vec::new(), None)
@@ -884,9 +910,22 @@ pub fn views(store: &GraphStore) -> Result<Vec<PresumedView>, InterpretError> {
                     .collect()
             })
             .unwrap_or_default();
-        out[g].state = if !states.is_empty() && states.iter().all(|s| *s == PresumedState::Done) {
+        // A damaged child is unknown, not remaining work: it does not make a
+        // group remaining, and it keeps a group from reading as done.
+        let known: Vec<PresumedState> = states
+            .iter()
+            .copied()
+            .filter(|s| *s != PresumedState::Unknown)
+            .collect();
+        let has_unknown = known.len() != states.len();
+        out[g].state = if !states.is_empty() && known.is_empty() {
+            PresumedState::Unknown
+        } else if !has_unknown
+            && !known.is_empty()
+            && known.iter().all(|s| *s == PresumedState::Done)
+        {
             PresumedState::Done
-        } else if states.iter().all(|s| *s == PresumedState::Remaining) {
+        } else if !has_unknown && known.iter().all(|s| *s == PresumedState::Remaining) {
             PresumedState::Remaining
         } else {
             PresumedState::Partial

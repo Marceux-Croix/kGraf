@@ -55,11 +55,6 @@ impl TokenBudget {
         self.limit.saturating_sub(self.spent)
     }
 
-    /// Whether `text` would still fit.
-    pub fn would_fit(&self, text: &str) -> bool {
-        estimate_tokens(text) <= self.remaining()
-    }
-
     /// Commit `text` to the budget if it fits, reporting whether it did.
     ///
     /// Returns `false` and changes nothing when it does not fit, so a caller
@@ -125,6 +120,5 @@ mod tests {
             assert!(accepted < 1000, "budget failed to terminate");
         }
         assert!(budget.spent() <= budget.limit());
-        assert!(!budget.would_fit(item));
     }
 }

@@ -216,6 +216,15 @@ impl PersistedAllowStore {
         Ok((store, report))
     }
 
+    /// Re-read the rules from disk, so a rule another process revoked (or
+    /// added) is seen by this handle. On an error the handle keeps its rules
+    /// and the error is returned; a caller that gates on the rules should treat
+    /// it as "no rule covers this".
+    pub fn reload(&mut self) -> Result<(), SessionError> {
+        self.file = Self::read_store_file(&self.path)?;
+        Ok(())
+    }
+
     /// The `shell` rules that name a command no rule may name any more, so
     /// they can never match: [`kgraf_tools::ShellTool`] reports a subject
     /// only for an argv [`kgraf_tools::shell::exact_rule_allowable`] accepts,
@@ -821,25 +830,51 @@ struct HookSnapshot {
     stamp: Option<Option<FileStamp>>,
 }
 
-/// What tells one version of the store file from the next.
+/// What tells one version of the store file from the next. Every reader of the
+/// rules file (this hook, the orchestrator's ask desk) decides "unchanged" with
+/// [`stamp_unchanged`], so they cannot disagree about it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct FileStamp {
+pub struct FileStamp {
     modified: Option<SystemTime>,
     len: u64,
     inode: u64,
+    /// The file changed within [`RACY_STAMP_WINDOW`] of this check. Two
+    /// writes in one clock tick (a coarse filesystem timestamp) can leave the
+    /// same time and length, and a freed inode can be reused by the next
+    /// rename, so a stamp this young does not prove the file is unchanged.
+    recent: bool,
 }
 
-fn file_stamp(path: &Path) -> Result<Option<FileStamp>, SessionError> {
+/// How old a modification time must be before the stamp is trusted.
+const RACY_STAMP_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Whether a read taken when the file had the stamp `read_at` still describes the
+/// file, whose stamp is `now`. `read_at` is `None` before any read. A stamp of a
+/// file that changed recently is never trusted: the same length, time and inode do
+/// not prove the same bytes.
+pub fn stamp_unchanged(read_at: Option<&Option<FileStamp>>, now: &Option<FileStamp>) -> bool {
+    read_at == Some(now) && !now.as_ref().is_some_and(|s| s.recent)
+}
+
+/// The stamp of the file at `path`: `None` when it does not exist, an error when
+/// it cannot be examined.
+pub fn file_stamp(path: &Path) -> Result<Option<FileStamp>, SessionError> {
     match std::fs::metadata(path) {
         Ok(meta) => {
             #[cfg(unix)]
             let inode = std::os::unix::fs::MetadataExt::ino(&meta);
             #[cfg(not(unix))]
             let inode = 0;
+            let modified = meta.modified().ok();
+            // No readable time, or one in the future: not trusted.
+            let recent = modified
+                .and_then(|m| SystemTime::now().duration_since(m).ok())
+                .is_none_or(|age| age < RACY_STAMP_WINDOW);
             Ok(Some(FileStamp {
-                modified: meta.modified().ok(),
+                modified,
                 len: meta.len(),
                 inode,
+                recent,
             }))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -882,7 +917,7 @@ impl PersistedAllowHook {
     fn current(&self) -> Result<std::sync::MutexGuard<'_, HookSnapshot>, SessionError> {
         let mut snapshot = self.store.lock().unwrap_or_else(|p| p.into_inner());
         let now = file_stamp(&snapshot.store.path)?;
-        if snapshot.stamp.as_ref() != Some(&now) {
+        if !stamp_unchanged(snapshot.stamp.as_ref(), &now) {
             // A missing file reads as no rules.
             snapshot.store.file = PersistedAllowStore::read_store_file(&snapshot.store.path)?;
             snapshot.stamp = Some(now);
@@ -1259,6 +1294,50 @@ mod tests {
         assert!(
             matches!(review().await, Verdict::Run(_)),
             "a rule added meanwhile applies"
+        );
+    }
+
+    /// A rewrite in the same clock tick that leaves the modification time,
+    /// length and inode as they were (a coarse timestamp, an in-place write)
+    /// is still read: a stamp that young is not trusted.
+    #[test]
+    fn a_rewrite_that_keeps_the_file_stamp_is_still_read_again() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("allow.json");
+        let (mut store, _) = PersistedAllowStore::open(&path, &outside_workspace()).expect("open");
+        store
+            .allow_any_call("proj-a", "test-command-tool", "test", ConfirmAllowAnyCall)
+            .expect("allow");
+        // A modification time in the future is never trusted as proof of "unchanged",
+        // so the outcome does not depend on how long the test takes to run.
+        let modified = SystemTime::now() + std::time::Duration::from_secs(3600);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open in place")
+            .set_modified(modified)
+            .expect("set the time");
+        let hook = PersistedAllowHook::new(store, "proj-a", Arc::new(ToolRegistry::new()));
+        assert!(
+            hook.matching_rule("test-command-tool", None)
+                .expect("read")
+                .is_some(),
+            "the rule applies at first"
+        );
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open in place");
+        let text = std::fs::read_to_string(&path).expect("read");
+        let changed = text.replace("test-command-tool", "test-command-toom");
+        assert_eq!(text.len(), changed.len());
+        std::io::Write::write_all(&mut &file, changed.as_bytes()).expect("write");
+        file.set_modified(modified).expect("restore the time");
+        assert!(
+            hook.matching_rule("test-command-tool", None)
+                .expect("read again")
+                .is_none(),
+            "the rewritten file is read, not the stamp trusted"
         );
     }
 

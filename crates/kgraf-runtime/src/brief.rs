@@ -120,6 +120,8 @@ pub enum WorkerOutcome {
 /// measured number: it bounds what a dependent contract's brief later quotes.
 pub const RATIONALE_WORD_CAP: usize = 250;
 
+/// Appended where the word cap cut a rationale field.
+const RATIONALE_CUT_MARK: &str = " [rationale cut at the word cap]";
 /// The markers a worker's final answer wraps a rationale in (`parse_rationale`).
 /// Plain text, not a tool call: reasoning blocks never cross models or vendors
 /// (0005), so a rationale has to be something the model writes into its
@@ -165,13 +167,17 @@ impl Rationale {
             &mut self.counterpart_assumptions,
         ] {
             if budget == 0 {
-                *field = String::new();
+                // The cap was spent exactly by an earlier field, or a cut
+                // spent it: a later field with text is marked, never blanked.
+                if !field.trim().is_empty() {
+                    *field = RATIONALE_CUT_MARK.trim().to_owned();
+                }
                 continue;
             }
             let words: Vec<&str> = field.split_whitespace().collect();
             if words.len() > budget {
                 let mut kept = words[..budget].join(" ");
-                kept.push_str(" [rationale cut at the word cap]");
+                kept.push_str(RATIONALE_CUT_MARK);
                 *field = kept;
                 budget = 0;
             } else {
@@ -265,6 +271,32 @@ pub struct WorkerResult {
     pub rationale: Option<Rationale>,
 }
 
+impl WorkerResult {
+    /// A result that carries an outcome and nothing else: no answer, changes,
+    /// commit or calls, and no rounds used. For a worker that never ran or
+    /// never reported; set the fields it does have with struct update.
+    pub fn bare(
+        task: impl Into<TaskId>,
+        worker: impl Into<AgentId>,
+        outcome: WorkerOutcome,
+    ) -> Self {
+        Self {
+            task: task.into(),
+            worker: worker.into(),
+            outcome,
+            answer: String::new(),
+            changed_paths: Vec::new(),
+            commit: None,
+            calls: Vec::new(),
+            steps: 0,
+            prefix_digest: String::new(),
+            denied: 0,
+            trace_failures: Vec::new(),
+            rationale: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,21 +368,18 @@ mod tests {
     #[test]
     fn a_result_round_trips_through_json() {
         let result = WorkerResult {
-            task: "t1".into(),
-            worker: "w1".into(),
-            outcome: WorkerOutcome::Stalled {
-                call_digest: "abc".into(),
-                repeats: 3,
-            },
-            answer: String::new(),
             changed_paths: vec![PathBuf::from("src/lib.rs")],
-            commit: None,
             calls: vec![CallId::new("c1")],
             steps: 4,
             prefix_digest: "d".into(),
-            denied: 0,
-            trace_failures: vec![],
-            rationale: None,
+            ..WorkerResult::bare(
+                "t1",
+                "w1",
+                WorkerOutcome::Stalled {
+                    call_digest: "abc".into(),
+                    repeats: 3,
+                },
+            )
         };
         let text = serde_json::to_string(&result).expect("ser");
         assert!(text.contains(r#""outcome":"stalled""#));
@@ -414,7 +443,22 @@ mod tests {
         );
         let r = parse_rationale(&answer).expect("parsed");
         assert!(r.decisions.ends_with("[rationale cut at the word cap]"));
-        assert_eq!(r.alternatives_rejected, "");
-        assert_eq!(r.counterpart_assumptions, "");
+        // The later fields had text; they are marked as cut, not blanked.
+        assert_eq!(r.alternatives_rejected, "[rationale cut at the word cap]");
+        assert_eq!(r.counterpart_assumptions, "[rationale cut at the word cap]");
+    }
+
+    #[test]
+    fn a_field_that_spends_the_cap_exactly_does_not_blank_the_next_one() {
+        let exact = "word ".repeat(RATIONALE_WORD_CAP);
+        let answer = format!(
+            "<<<RATIONALE>>>\nDecisions: {exact}\nAlternatives rejected: a real alternative.\n\
+             <<<END RATIONALE>>>"
+        );
+        let r = parse_rationale(&answer).expect("parsed");
+        assert_eq!(r.decisions.split_whitespace().count(), RATIONALE_WORD_CAP);
+        assert!(!r.decisions.contains("cut"), "the first field fits");
+        assert_eq!(r.alternatives_rejected, "[rationale cut at the word cap]");
+        assert_eq!(r.counterpart_assumptions, "", "an empty field stays empty");
     }
 }

@@ -72,11 +72,30 @@ pub enum ManifestError {
     /// A zero or absurd size.
     #[error("manifest `{id}` declares an implausible size of {size_bytes} bytes")]
     ImplausibleSize { id: String, size_bytes: u64 },
+    /// The id names the cache directory, so it must be one plain path component.
+    #[error(
+        "manifest id `{id}` is not a plain name (letters, digits, `.`, `_`, `-`; no separators)"
+    )]
+    BadId { id: String },
 }
 
 impl ModelManifest {
     /// Check a manifest before anything is fetched.
     pub fn validate(&self) -> Result<(), ManifestError> {
+        // The id is joined into the cache path, and a failed verification deletes
+        // the file at that path: a separator or `..` would reach outside the cache.
+        let id_ok = !self.id.is_empty()
+            && self.id.len() <= 64
+            && !self.id.starts_with('.')
+            && self
+                .id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+        if !id_ok {
+            return Err(ManifestError::BadId {
+                id: self.id.clone(),
+            });
+        }
         let digest_ok = self.sha256.len() == 64
             && self.sha256.chars().all(|c| c.is_ascii_hexdigit())
             && self.sha256.chars().all(|c| !c.is_ascii_uppercase());
@@ -144,21 +163,25 @@ impl InstallState {
     /// startup would read hundreds of megabytes for a check that only matters after a
     /// fetch, and a size check catches the realistic corruption, a truncated or
     /// interrupted download.
+    ///
+    /// A manifest whose id is not a plain name is refused, since the id names the
+    /// directory under `cache_dir`.
     pub fn inspect(
         manifest: ModelManifest,
         cache_dir: &std::path::Path,
         choice: InstallChoice,
-    ) -> Self {
+    ) -> Result<Self, ManifestError> {
+        manifest.validate()?;
         let path = cache_dir.join(&manifest.id).join("weights.bin");
         let installed = std::fs::metadata(&path)
             .map(|meta| meta.is_file() && meta.len() == manifest.size_bytes)
             .unwrap_or(false);
-        Self {
+        Ok(Self {
             manifest,
             path,
             installed,
             choice,
-        }
+        })
     }
 
     /// The absence this state implies, or `None` when the model is present.
@@ -203,19 +226,44 @@ pub fn verify_and_keep(
     manifest: &ModelManifest,
     path: &std::path::Path,
 ) -> Result<(), VerifyError> {
-    let bytes = std::fs::read(path).map_err(|source| VerifyError::Unreadable {
+    use std::io::Read;
+    let unreadable = |source| VerifyError::Unreadable {
         path: path.display().to_string(),
         source,
-    })?;
-    if bytes.len() as u64 != manifest.size_bytes {
-        let actual = bytes.len() as u64;
+    };
+    // The size is judged from metadata first: a wrong-sized file is never read.
+    let actual = std::fs::metadata(path).map_err(unreadable)?.len();
+    if actual != manifest.size_bytes {
         let _ = std::fs::remove_file(path);
         return Err(VerifyError::WrongSize {
             expected: manifest.size_bytes,
             actual,
         });
     }
-    let digest = sha256_hex(&bytes);
+    // Hashed in blocks, so memory stays flat for a multi-gigabyte model. The read
+    // is capped one byte past the declared size, so a file that grows while it
+    // is read is caught as a wrong size, not hashed without bound.
+    let file = std::fs::File::open(path).map_err(unreadable)?;
+    let mut reader = file.take(manifest.size_bytes + 1);
+    let mut hasher = Sha256::new();
+    let mut block = vec![0u8; 1 << 20];
+    let mut read_total = 0u64;
+    loop {
+        let n = reader.read(&mut block).map_err(unreadable)?;
+        if n == 0 {
+            break;
+        }
+        read_total += n as u64;
+        hasher.update(&block[..n]);
+    }
+    if read_total != manifest.size_bytes {
+        let _ = std::fs::remove_file(path);
+        return Err(VerifyError::WrongSize {
+            expected: manifest.size_bytes,
+            actual: read_total,
+        });
+    }
+    let digest = hasher.finish_hex();
     if digest != manifest.sha256 {
         let _ = std::fs::remove_file(path);
         return Err(VerifyError::DigestMismatch {
@@ -241,37 +289,70 @@ pub enum VerifyError {
     DigestMismatch { expected: String, actual: String },
 }
 
-/// SHA-256 as lowercase hex.
-///
 /// Hand-rolled rather than adding a dependency: the whole algorithm is sixty lines, it is
 /// used in exactly one place, and a supply-chain dependency in the path that verifies
-/// downloads is the wrong trade.
-fn sha256_hex(bytes: &[u8]) -> String {
-    const K: [u32; 64] = [
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
-        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
-        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
-        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
-        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
-        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
-        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
-        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
-        0xc67178f2,
-    ];
-    let mut h: [u32; 8] = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
-        0x5be0cd19,
-    ];
-    let mut message = bytes.to_vec();
-    let bit_len = (bytes.len() as u64) * 8;
-    message.push(0x80);
-    while message.len() % 64 != 56 {
-        message.push(0);
-    }
-    message.extend_from_slice(&bit_len.to_be_bytes());
+/// downloads is the wrong trade. Input is consumed in 64-byte blocks as it arrives.
+struct Sha256 {
+    h: [u32; 8],
+    block: [u8; 64],
+    filled: usize,
+    total_bytes: u64,
+}
 
-    for chunk in message.chunks(64) {
+const SHA256_K: [u32; 64] = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+];
+
+impl Sha256 {
+    fn new() -> Self {
+        Self {
+            h: [
+                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+                0x5be0cd19,
+            ],
+            block: [0; 64],
+            filled: 0,
+            total_bytes: 0,
+        }
+    }
+
+    fn update(&mut self, mut input: &[u8]) {
+        self.total_bytes += input.len() as u64;
+        while !input.is_empty() {
+            let take = (64 - self.filled).min(input.len());
+            self.block[self.filled..self.filled + take].copy_from_slice(&input[..take]);
+            self.filled += take;
+            input = &input[take..];
+            if self.filled == 64 {
+                let block = self.block;
+                self.compress(&block);
+                self.filled = 0;
+            }
+        }
+    }
+
+    fn finish_hex(mut self) -> String {
+        let bit_len = self.total_bytes * 8;
+        // Padding goes through `update`'s buffer without counting toward the length.
+        let mut pad = vec![0x80u8];
+        while (self.filled + pad.len()) % 64 != 56 {
+            pad.push(0);
+        }
+        pad.extend_from_slice(&bit_len.to_be_bytes());
+        let total = self.total_bytes;
+        self.update(&pad);
+        self.total_bytes = total;
+        self.h.iter().map(|word| format!("{word:08x}")).collect()
+    }
+
+    fn compress(&mut self, chunk: &[u8; 64]) {
         let mut w = [0u32; 64];
         for (i, word) in chunk.chunks(4).enumerate() {
             w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
@@ -284,14 +365,14 @@ fn sha256_hex(bytes: &[u8]) -> String {
                 .wrapping_add(w[i - 7])
                 .wrapping_add(s1);
         }
-        let mut v = h;
+        let mut v = self.h;
         for i in 0..64 {
             let s1 = v[4].rotate_right(6) ^ v[4].rotate_right(11) ^ v[4].rotate_right(25);
             let ch = (v[4] & v[5]) ^ ((!v[4]) & v[6]);
             let t1 = v[7]
                 .wrapping_add(s1)
                 .wrapping_add(ch)
-                .wrapping_add(K[i])
+                .wrapping_add(SHA256_K[i])
                 .wrapping_add(w[i]);
             let s0 = v[0].rotate_right(2) ^ v[0].rotate_right(13) ^ v[0].rotate_right(22);
             let maj = (v[0] & v[1]) ^ (v[0] & v[2]) ^ (v[1] & v[2]);
@@ -305,16 +386,22 @@ fn sha256_hex(bytes: &[u8]) -> String {
             v[1] = v[0];
             v[0] = t1.wrapping_add(t2);
         }
-        for i in 0..8 {
-            h[i] = h[i].wrapping_add(v[i]);
+        for (h, v) in self.h.iter_mut().zip(v) {
+            *h = h.wrapping_add(v);
         }
     }
-    h.iter().map(|word| format!("{word:08x}")).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SHA-256 as lowercase hex.
+    fn sha256_hex(bytes: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        hasher.finish_hex()
+    }
 
     fn manifest() -> ModelManifest {
         ModelManifest {
@@ -417,6 +504,35 @@ mod tests {
     }
 
     #[test]
+    fn a_manifest_id_that_could_leave_the_cache_is_refused() {
+        for bad in [
+            "",
+            "..",
+            "../x",
+            "a/b",
+            "a\\b",
+            ".hidden",
+            "x y",
+            &"a".repeat(65),
+        ] {
+            let mut m = manifest();
+            m.id = bad.to_owned();
+            assert!(
+                matches!(m.validate(), Err(ManifestError::BadId { .. })),
+                "`{bad}` was accepted"
+            );
+            assert!(
+                InstallState::inspect(
+                    m,
+                    std::path::Path::new("/nonexistent"),
+                    InstallChoice::Unasked
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn a_valid_manifest_passes() {
         manifest().validate().expect("valid");
     }
@@ -432,6 +548,41 @@ mod tests {
         assert_eq!(
             sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn a_streamed_digest_matches_the_one_shot_digest_across_block_edges() {
+        for len in [0usize, 1, 55, 56, 57, 63, 64, 65, 119, 120, 128, 1000] {
+            let data: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
+            let mut streamed = Sha256::new();
+            for piece in data.chunks(13) {
+                streamed.update(piece);
+            }
+            assert_eq!(streamed.finish_hex(), sha256_hex(&data), "length {len}");
+        }
+        // A million 'a' bytes: the published vector, in uneven pieces.
+        let mut hasher = Sha256::new();
+        let block = [b'a'; 1000];
+        for _ in 0..1000 {
+            hasher.update(&block);
+        }
+        assert_eq!(
+            hasher.finish_hex(),
+            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+        );
+    }
+
+    #[test]
+    fn a_file_the_wrong_size_is_never_read() {
+        // A path that cannot be read as a file but reports a size: a directory has
+        // metadata and a length, and a read would fail, so a wrong-size verdict here
+        // proves the size was judged from metadata alone.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = verify_and_keep(&manifest(), dir.path()).expect_err("must reject");
+        assert!(
+            matches!(err, VerifyError::WrongSize { .. }),
+            "read before the size check: {err:?}"
         );
     }
 
@@ -482,7 +633,8 @@ mod tests {
     #[test]
     fn a_missing_model_is_not_installed_and_is_offered_once() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let state = InstallState::inspect(manifest(), dir.path(), InstallChoice::Unasked);
+        let state =
+            InstallState::inspect(manifest(), dir.path(), InstallChoice::Unasked).expect("valid");
         assert!(!state.installed);
         assert!(state.should_offer());
         assert_eq!(state.absence(), Some(Absence::NotInstalled));
@@ -492,7 +644,8 @@ mod tests {
     fn a_declined_model_is_not_offered_again() {
         // Encouragement that repeats is nagging. The answer is remembered.
         let dir = tempfile::tempdir().expect("tempdir");
-        let state = InstallState::inspect(manifest(), dir.path(), InstallChoice::Declined);
+        let state =
+            InstallState::inspect(manifest(), dir.path(), InstallChoice::Declined).expect("valid");
         assert!(!state.should_offer());
         assert_eq!(state.absence(), Some(Absence::Declined));
     }
@@ -505,7 +658,8 @@ mod tests {
         let path = dir.path().join("example");
         std::fs::create_dir_all(&path).expect("mkdir");
         std::fs::write(path.join("weights.bin"), vec![0u8; 100]).expect("write");
-        let state = InstallState::inspect(manifest(), dir.path(), InstallChoice::Accepted);
+        let state =
+            InstallState::inspect(manifest(), dir.path(), InstallChoice::Accepted).expect("valid");
         assert!(!state.installed);
         assert_eq!(state.absence(), Some(Absence::NotInstalled));
     }
@@ -518,6 +672,7 @@ mod tests {
             std::path::Path::new("/nonexistent"),
             InstallChoice::Unasked,
         )
+        .expect("valid")
         .offer();
         assert!(text.contains("800 MB"), "{text}");
         assert!(text.contains("Apache-2.0"), "{text}");

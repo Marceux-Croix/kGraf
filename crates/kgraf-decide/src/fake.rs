@@ -139,7 +139,12 @@ impl Decider for FakeDecider {
                 (AnswerSpace::Score { min, max }, mode) => {
                     let value = match mode {
                         Mode::AlwaysFirst => *min,
-                        _ => min + ((unit * (max - min) as f64).round() as i32),
+                        _ => {
+                            let span = i64::from(*max) - i64::from(*min);
+                            (i64::from(*min) + (unit * span as f64).round() as i64)
+                                .clamp(i64::from(*min), i64::from(*max))
+                                as i32
+                        }
                     };
                     Answer::Score {
                         value: value.clamp(*min, *max),

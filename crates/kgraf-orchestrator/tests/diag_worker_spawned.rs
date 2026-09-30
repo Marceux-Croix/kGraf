@@ -1,5 +1,5 @@
-//! `WorkerSpawned` is recorded only once a worker attempt actually starts
-//! (2026-09-27 re-review, item 4): `try_dispatch`'s admission, cost estimate,
+//! `WorkerSpawned` is recorded only once a worker attempt actually starts:
+//! `try_dispatch`'s admission, cost estimate,
 //! lease acquisition and budget reservation, and `start_attempt`'s own
 //! workspace preparation and route lookup, can all still fail or defer a
 //! contract before any worker runs. An earlier version of this recorded the

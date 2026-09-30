@@ -1,4 +1,4 @@
-//! Readiness before capacity (review §A7).
+//! Readiness before capacity.
 //!
 //! Ported from LibreChat's scheduled-run admission rule,
 //! `packages/api/src/schedules/README.md` and `capacity.ts`, commit

@@ -10,6 +10,7 @@ pub mod flock;
 pub mod ids;
 pub mod legacy;
 pub mod litellm;
+pub mod model_kind;
 pub mod model_profile;
 pub mod palette;
 pub mod parallel;
@@ -18,10 +19,13 @@ pub mod session;
 pub mod usage;
 
 pub use budget::{TokenBudget, estimate_tokens};
-pub use cost::{CostError, ModelPrice, Money, PriceTable};
+pub use cost::{CostError, ExactMoney, ModelPrice, Money, PriceTable};
 pub use ids::{AgentId, CallId, FileId, NodeId, RunId, TaskId};
 pub use litellm::{
     LiteLlmCatalog, LoadError as LiteLlmLoadError, ModelInfo, UnmappedEntry, UnmappedReason,
+};
+pub use model_kind::{
+    KINDS, KindError, KindSpec, ModelKind, is_non_generative_call_kind, split_kind_prefix,
 };
 pub use parallel::ParallelismLimits;
 pub use usage::{Protocol, TokenUsage, UsageError};

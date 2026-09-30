@@ -87,6 +87,14 @@ pub fn print_states(views: &[PresumedView], source: &str) {
         adopted,
         disputed
     );
+    // A damaged record is neither remaining nor done: named on its own line.
+    let unknown = count(PresumedState::Unknown);
+    if unknown > 0 {
+        println!(
+            "           {unknown} with a damaged stored record, so their state is unknown \
+             (`kgraf plan` lists them)"
+        );
+    }
 }
 
 /// Print what [`presumed::retire_missing`] retired.

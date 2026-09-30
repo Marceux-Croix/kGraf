@@ -147,7 +147,7 @@ mod verifier;
 pub mod worker;
 mod workspaces;
 
-pub use config::{RouteSpec, RunConfig};
+pub use config::{ModelRouteSpec, RouteSpec, RunConfig, WorktreeRetention};
 pub use error::{Error, NotReady, Result};
 pub use gates::discover_validation_commands;
 pub use host::{

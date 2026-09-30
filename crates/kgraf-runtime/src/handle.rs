@@ -314,20 +314,7 @@ mod tests {
     use std::time::Duration;
 
     fn result(outcome: WorkerOutcome) -> WorkerResult {
-        WorkerResult {
-            task: "t".into(),
-            worker: "w".into(),
-            outcome,
-            answer: String::new(),
-            changed_paths: vec![],
-            commit: None,
-            calls: vec![],
-            steps: 0,
-            prefix_digest: String::new(),
-            denied: 0,
-            trace_failures: vec![],
-            rationale: None,
-        }
+        WorkerResult::bare("t", "w", outcome)
     }
 
     fn delta(text: &str) -> WorkerEvent {

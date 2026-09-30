@@ -126,6 +126,19 @@ impl WriteLease {
     }
 }
 
+/// The lease measurements of decision 0022 (serialization is a measured cost) and
+/// 0049 (the share of waits whose declared ranges did not overlap).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct LeaseMeasurements {
+    /// Paths that more than one agent held, one after another.
+    pub serialized_paths: u64,
+    /// Handoffs between two agents where both grants declared a range.
+    pub known_handoffs: u64,
+    /// The share of those handoffs whose ranges did not overlap; `None` with no
+    /// handoff to judge.
+    pub needless_wait_fraction: Option<f64>,
+}
+
 /// One row of the registry, as anyone may read it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LeaseRecord {
@@ -300,21 +313,6 @@ impl<'store> LeaseRegistry<'store> {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    /// How many distinct paths have ever been leased more than once.
-    ///
-    /// The serialization measurement decision 0022's acceptance criterion asks for: the
-    /// observed rate should land near the repository's base collision rate rather than
-    /// near one, and an experiment established that every prevented collision is a serialized
-    /// pair, so this is the cost side of the mechanism and must be visible.
-    pub fn serialized_path_count(&self) -> Result<u64> {
-        Ok(self.store.conn().query_row(
-            "SELECT COUNT(*) FROM (SELECT path FROM lease_history
-             GROUP BY path HAVING COUNT(DISTINCT agent_id) > 1)",
-            [],
-            |row| row.get::<_, i64>(0),
-        )? as u64)
-    }
-
     /// Decision 0049's needless-wait fraction: of the grants that serialized behind a
     /// different agent's prior grant on the same path, the share whose declared ranges
     /// did not actually overlap.
@@ -329,13 +327,40 @@ impl<'store> LeaseRegistry<'store> {
     /// Returns `None` when there are no handoffs with both ranges known, rather than a
     /// division by zero pretending to be a rate.
     pub fn needless_wait_fraction(&self) -> Result<Option<f64>> {
-        let (known, needless): (i64, i64) = self.store.conn().query_row(
-            "WITH ordered AS (
+        Ok(self.measurements("")?.needless_wait_fraction)
+    }
+
+    /// The lease measurements decision 0022 says must be visible, over the grants
+    /// whose agent id starts with `holder_prefix` (a run's id and a slash scopes them
+    /// to one run; the empty prefix is every grant). A handoff is counted only
+    /// between two grants inside the prefix.
+    ///
+    /// - `serialized_paths`: paths that agents of the prefix held one after another,
+    ///   so a second agent waited behind a first: the serialization cost.
+    /// - `known_handoffs`, `needless_wait_fraction`: see
+    ///   [`Self::needless_wait_fraction`].
+    pub fn measurements(&self, holder_prefix: &str) -> Result<LeaseMeasurements> {
+        let conn = self.store.conn();
+        let serialized: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM (
+                 SELECT path FROM lease_history
+                 WHERE substr(agent_id, 1, length(?1)) = ?1
+                 GROUP BY path HAVING COUNT(DISTINCT agent_id) > 1)",
+            params![holder_prefix],
+            |row| row.get(0),
+        )?;
+        let (known, needless): (i64, i64) = conn.query_row(
+            "WITH scoped AS (
+                 SELECT id, path, agent_id, range_start, range_end
+                 FROM lease_history
+                 WHERE substr(agent_id, 1, length(?1)) = ?1
+             ),
+             ordered AS (
                  SELECT agent_id, range_start, range_end,
                         LAG(agent_id) OVER (PARTITION BY path ORDER BY id) AS prev_agent,
                         LAG(range_start) OVER (PARTITION BY path ORDER BY id) AS prev_start,
                         LAG(range_end) OVER (PARTITION BY path ORDER BY id) AS prev_end
-                 FROM lease_history
+                 FROM scoped
              ),
              handoffs AS (
                  SELECT * FROM ordered
@@ -352,13 +377,14 @@ impl<'store> LeaseRegistry<'store> {
                        AND (range_start > prev_end OR prev_start > range_end)
                  )
              FROM handoffs",
-            [],
+            params![holder_prefix],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        if known == 0 {
-            return Ok(None);
-        }
-        Ok(Some(needless as f64 / known as f64))
+        Ok(LeaseMeasurements {
+            serialized_paths: serialized as u64,
+            known_handoffs: known as u64,
+            needless_wait_fraction: (known > 0).then(|| needless as f64 / known as f64),
+        })
     }
 
     fn read_one(&self, path: &str) -> Result<Option<LeaseRecord>> {
@@ -708,10 +734,48 @@ mod tests {
             .acquire_all("agent-b", "t2", &paths(&["shared.rs"]), &[], 2_000)
             .expect("acquire");
         assert_eq!(
-            registry.serialized_path_count().expect("count"),
+            registry.measurements("").expect("count").serialized_paths,
             1,
             "only shared.rs was held by two agents"
         );
+    }
+
+    /// A run's measurements count only that run's grants: a handoff between one
+    /// run's agent and another run's agent is neither run's serialization.
+    #[test]
+    fn measurements_are_scoped_to_the_runs_own_grants() {
+        let (_dir, store) = store();
+        let registry = LeaseRegistry::new(&store).with_ttl_ms(10);
+        let grant = |agent: &str, path: &str, range: (u32, u32)| {
+            registry
+                .acquire_all(agent, "t", &paths(&[path]), &[Some(range)], 1_000)
+                .expect("acquire");
+            registry.release_all(agent).expect("release");
+        };
+        // Run r1: two agents hand `x.rs` over with disjoint ranges.
+        grant("r1/a@1", "x.rs", (1, 10));
+        grant("r1/b@1", "x.rs", (50, 60));
+        // Run r2 takes `x.rs` next, overlapping r1/b's range, and `y.rs` alone.
+        grant("r2/a@1", "x.rs", (55, 70));
+        grant("r2/a@1", "y.rs", (1, 5));
+
+        let r1 = registry.measurements("r1/").expect("r1");
+        assert_eq!(r1.serialized_paths, 1);
+        assert_eq!(r1.known_handoffs, 1);
+        assert_eq!(r1.needless_wait_fraction, Some(1.0));
+
+        let r2 = registry.measurements("r2/").expect("r2");
+        assert_eq!(
+            r2.serialized_paths, 0,
+            "r2 alone never waited behind itself"
+        );
+        assert_eq!(r2.known_handoffs, 0);
+        assert_eq!(r2.needless_wait_fraction, None);
+
+        let all = registry.measurements("").expect("all");
+        assert_eq!(all.serialized_paths, 1, "x.rs was held by three agents");
+        assert_eq!(all.known_handoffs, 2);
+        assert_eq!(all.needless_wait_fraction, Some(0.5));
     }
 
     #[test]

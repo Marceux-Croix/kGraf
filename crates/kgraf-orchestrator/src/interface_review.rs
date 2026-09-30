@@ -1,6 +1,5 @@
-//! Cross-vendor review of a producer's diff at the contract surface (kGraf
-//! coordination-hardening item 7; decision 0079, building on 0012, 0024, 0026, 0029,
-//! 0035 to 0037).
+//! Cross-vendor review of a producer's diff at the contract surface (decision
+//! 0079, building on 0012, 0024, 0026, 0029, 0035 to 0037).
 //!
 //! When a producer attempt has passed its gate, and before it is counted verified,
 //! one review call goes to a model on a **cross-vendor consumer's route**: a

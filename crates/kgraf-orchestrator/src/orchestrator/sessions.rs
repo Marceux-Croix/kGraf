@@ -1081,9 +1081,6 @@ fn e_to_session(e: SteerError) -> SessionError {
         SteerError::Empty => SessionError::Empty,
         SteerError::Stopped => SessionError::Stopped,
         SteerError::NotPersisted(s) => SessionError::NotPersisted(s),
-        SteerError::RuntimeCannotInject(w) => {
-            SessionError::Refused(format!("runtime cannot inject for {w}"))
-        }
     }
 }
 

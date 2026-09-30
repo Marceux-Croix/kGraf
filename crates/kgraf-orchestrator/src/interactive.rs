@@ -214,33 +214,46 @@ impl InteractiveRun {
         self.client.send(kind, text, now_ms)
     }
 
-    /// `/compact`, answered later as [`RunEvent::Compacted`].
-    pub fn compact(&self, target: Option<String>) {
+    /// Run `call` against the handle off the caller's thread, then post
+    /// `event(result)` and wake the UI.
+    fn spawn_reply<T, Fut>(
+        &self,
+        call: impl FnOnce(OrchestratorHandle) -> Fut + Send + 'static,
+        event: impl FnOnce(T) -> RunEvent + Send + 'static,
+    ) where
+        T: Send + 'static,
+        Fut: std::future::Future<Output = T> + Send + 'static,
+    {
         let handle = self.handle.clone();
         let tx = self.events_tx.clone();
         let wake = self.wake.clone();
         self.runtime.spawn(async move {
-            let result = handle.compact(target.clone()).await;
-            let _ = tx.send(RunEvent::Compacted { target, result });
+            let result = call(handle).await;
+            let _ = tx.send(event(result));
             wake();
         });
+    }
+
+    /// `/compact`, answered later as [`RunEvent::Compacted`].
+    pub fn compact(&self, target: Option<String>) {
+        let t = target.clone();
+        self.spawn_reply(
+            move |h| async move { h.compact(t).await },
+            move |result| RunEvent::Compacted { target, result },
+        );
     }
 
     /// The user's order (0014), answered later as [`RunEvent::Ordered`].
     pub fn set_order(&self, contracts: Vec<String>) {
-        let handle = self.handle.clone();
-        let tx = self.events_tx.clone();
-        let wake = self.wake.clone();
-        self.runtime.spawn(async move {
-            let result = handle.set_order(contracts).await;
-            let _ = tx.send(RunEvent::Ordered(result));
-            wake();
-        });
+        self.spawn_reply(
+            move |h| async move { h.set_order(contracts).await },
+            RunEvent::Ordered,
+        );
     }
 
     /// Send a note, redirect, answer or message to one session directly
-    /// (decision 0067, point 2): the exception route beside the orchestrator
-    /// box. Answered later as [`RunEvent::SessionSent`].
+    /// (decision 0067): the exception route beside the orchestrator box.
+    /// Answered later as [`RunEvent::SessionSent`].
     pub fn send_to_session(
         &self,
         session: AgentId,
@@ -248,64 +261,48 @@ impl InteractiveRun {
         mode: InjectMode,
         text: String,
     ) {
-        let handle = self.handle.clone();
-        let tx = self.events_tx.clone();
-        let wake = self.wake.clone();
         let name = session.to_string();
-        self.runtime.spawn(async move {
-            let result = handle.send_to_session(session, kind, mode, text).await;
-            let _ = tx.send(RunEvent::SessionSent {
+        self.spawn_reply(
+            move |h| async move { h.send_to_session(session, kind, mode, text).await },
+            move |result| RunEvent::SessionSent {
                 session: name,
                 result,
-            });
-            wake();
-        });
+            },
+        );
     }
 
     /// Stop one session's attempt directly. Answered later as
     /// [`RunEvent::SessionStopped`].
     pub fn stop_session(&self, session: AgentId) {
-        let handle = self.handle.clone();
-        let tx = self.events_tx.clone();
-        let wake = self.wake.clone();
         let name = session.to_string();
-        self.runtime.spawn(async move {
-            let result = handle.stop_session(session).await;
-            let _ = tx.send(RunEvent::SessionStopped {
+        self.spawn_reply(
+            move |h| async move { h.stop_session(session).await },
+            move |result| RunEvent::SessionStopped {
                 session: name,
                 result,
-            });
-            wake();
-        });
+            },
+        );
     }
 
     /// Resume a session directly. Answered later as [`RunEvent::SessionResumed`].
     pub fn resume_session(&self, session: AgentId) {
-        let handle = self.handle.clone();
-        let tx = self.events_tx.clone();
-        let wake = self.wake.clone();
         let name = session.to_string();
-        self.runtime.spawn(async move {
-            let result = handle.resume_session(session).await;
-            let _ = tx.send(RunEvent::SessionResumed {
+        self.spawn_reply(
+            move |h| async move { h.resume_session(session).await },
+            move |result| RunEvent::SessionResumed {
                 session: name,
                 result,
-            });
-            wake();
-        });
+            },
+        );
     }
 
-    /// Answer a worker's `ask_user_question` (decision 0067, point 4).
+    /// Answer a worker's `ask_user_question` (decision 0067).
     /// Answered later as [`RunEvent::QuestionAnswered`].
     pub fn answer_question(&self, question: u64, answer: String) {
-        let handle = self.handle.clone();
-        let tx = self.events_tx.clone();
-        let wake = self.wake.clone();
-        self.runtime.spawn(async move {
-            let result = handle.answer_question(question, answer).await;
-            let _ = tx.send(RunEvent::QuestionAnswered { question, result });
-            wake();
-        });
+        self.spawn_reply(
+            move |h| async move { h.answer_question(question, answer).await },
+            move |result| RunEvent::QuestionAnswered { question, result },
+        );
     }
 
     /// Questions waiting for the user right now (for the box's pinned

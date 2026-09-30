@@ -150,6 +150,11 @@ pub struct OpenContract {
     /// backoff; past the bound the contract is held, saying why.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub environment_failures: u32,
+    /// Consecutive rounds whose verifier could not run. The verifier's fault,
+    /// not the model's: never counted toward `failures`. Retried with backoff;
+    /// past the bound the contract is held, saying why.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub verifier_failures: u32,
     /// Workers replaced because their worktree could not be provided (a
     /// refused reopen): part of the next worker's id, so it gets a fresh
     /// worktree. Not a model failure.
@@ -262,6 +267,7 @@ impl OpenContract {
             worktrees: BTreeMap::new(),
             verifications: 0,
             environment_failures: 0,
+            verifier_failures: 0,
             renewals: 0,
             retry_at_ms: None,
             redirects: Vec::new(),
@@ -519,6 +525,26 @@ pub struct PlanProgress {
     /// Kept here so a plan resumed between model calls keeps them.
     #[serde(default)]
     pub interfaces: Vec<crate::checks::InterfaceContract>,
+}
+
+impl PlanProgress {
+    /// The state before any spec is sized: every spec on the stack (the first
+    /// one on top) at depth 0, and its id taken.
+    pub fn seeded(specs: Vec<ContractSpec>) -> Self {
+        Self {
+            ids: specs.iter().map(|s| s.id.clone()).collect(),
+            stack: specs
+                .into_iter()
+                .rev()
+                .map(|spec| PlanItem {
+                    id: spec.id.clone(),
+                    spec,
+                    depth: 0,
+                })
+                .collect(),
+            ..Self::default()
+        }
+    }
 }
 
 /// A record that cannot be resumed from.

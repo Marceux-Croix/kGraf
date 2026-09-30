@@ -1,0 +1,75 @@
+{
+  "_fixture": {
+    "source": "https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference.html",
+    "provenance": "The event order and the metadata line are the documented partial ConverseStream response (section 'ConverseStream response'). The documented elision is filled with a contentBlockStop; messageStop carries the documented max_tokens. Each event is framed with the event-stream marshaller in the tests. Not a live capture."
+  },
+  "events": [
+    {
+      "event": "messageStart",
+      "payload": {
+        "role": "assistant"
+      }
+    },
+    {
+      "event": "contentBlockDelta",
+      "payload": {
+        "delta": {
+          "text": ""
+        },
+        "contentBlockIndex": 0
+      }
+    },
+    {
+      "event": "contentBlockDelta",
+      "payload": {
+        "delta": {
+          "text": " Title"
+        },
+        "contentBlockIndex": 0
+      }
+    },
+    {
+      "event": "contentBlockDelta",
+      "payload": {
+        "delta": {
+          "text": ":"
+        },
+        "contentBlockIndex": 0
+      }
+    },
+    {
+      "event": "contentBlockDelta",
+      "payload": {
+        "delta": {
+          "text": " The"
+        },
+        "contentBlockIndex": 0
+      }
+    },
+    {
+      "event": "contentBlockStop",
+      "payload": {
+        "contentBlockIndex": 0
+      }
+    },
+    {
+      "event": "messageStop",
+      "payload": {
+        "stopReason": "max_tokens"
+      }
+    },
+    {
+      "event": "metadata",
+      "payload": {
+        "usage": {
+          "inputTokens": 47,
+          "outputTokens": 20,
+          "totalTokens": 67
+        },
+        "metrics": {
+          "latencyMs": 100.0
+        }
+      }
+    }
+  ]
+}

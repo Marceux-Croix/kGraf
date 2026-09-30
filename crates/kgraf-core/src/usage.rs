@@ -159,7 +159,8 @@ impl TokenUsage {
         self.total() == 0
     }
 
-    /// Merge a streaming usage delta into this one.
+    /// Merge a streaming usage delta into this one, taking exactly the fields
+    /// `reported` names, including a reported zero.
     ///
     /// Anthropic's streaming usage arrives across two events and **the delta is
     /// cumulative**, so the correct operation is to take the last value seen
@@ -167,16 +168,9 @@ impl TokenUsage {
     /// carries only output tokens is true of the legacy examples and false of
     /// the current schema, so every field is merged, not just the output ones.
     ///
-    /// A zero in `delta` is read as "not reported" here, since a normalized
-    /// delta cannot tell an absent field from a reported zero. A caller that
-    /// can tell uses [`Self::merge_cumulative_reported`], so a later event's
-    /// explicit zero is taken rather than left as the earlier, larger figure.
-    pub fn merge_cumulative(&mut self, delta: &TokenUsage) {
-        self.merge_cumulative_reported(delta, ReportedFields::nonzero(delta));
-    }
-
-    /// [`Self::merge_cumulative`], taking exactly the fields `reported` names,
-    /// including a reported zero.
+    /// A normalized delta cannot tell an absent field from a reported zero, so
+    /// the caller says which fields the event carried; a later event's explicit
+    /// zero is then taken rather than left as the earlier, larger figure.
     pub fn merge_cumulative_reported(&mut self, delta: &TokenUsage, reported: ReportedFields) {
         fn take_last(target: &mut u64, seen: u64, reported: bool) {
             if reported {
@@ -219,19 +213,6 @@ pub struct ReportedFields {
     pub cache_write: bool,
     pub text_output: bool,
     pub reasoning_output: bool,
-}
-
-impl ReportedFields {
-    /// Every field whose value in `usage` is nonzero.
-    pub fn nonzero(usage: &TokenUsage) -> Self {
-        Self {
-            uncached_input: usage.uncached_input > 0,
-            cache_read: usage.cache_read > 0,
-            cache_write: usage.cache_write > 0,
-            text_output: usage.text_output > 0,
-            reasoning_output: usage.reasoning_output > 0,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -282,15 +263,28 @@ mod tests {
     fn cumulative_stream_deltas_are_taken_not_summed() {
         // Two events carrying a cumulative output count must end at 40, not 60.
         let mut usage = TokenUsage::default();
-        usage.merge_cumulative(&TokenUsage {
-            uncached_input: 100,
-            text_output: 20,
-            ..TokenUsage::default()
-        });
-        usage.merge_cumulative(&TokenUsage {
-            text_output: 40,
-            ..TokenUsage::default()
-        });
+        usage.merge_cumulative_reported(
+            &TokenUsage {
+                uncached_input: 100,
+                text_output: 20,
+                ..TokenUsage::default()
+            },
+            ReportedFields {
+                uncached_input: true,
+                text_output: true,
+                ..ReportedFields::default()
+            },
+        );
+        usage.merge_cumulative_reported(
+            &TokenUsage {
+                text_output: 40,
+                ..TokenUsage::default()
+            },
+            ReportedFields {
+                text_output: true,
+                ..ReportedFields::default()
+            },
+        );
         assert_eq!(usage.text_output, 40);
         // The field absent from the second event survives the merge.
         assert_eq!(usage.uncached_input, 100);
@@ -316,9 +310,6 @@ mod tests {
         assert_eq!(usage.cache_read, 0, "an explicit zero is taken");
         assert_eq!(usage.uncached_input, 100, "an unreported field survives");
         assert_eq!(usage.text_output, 20);
-        // The plain merge still reads a zero as not reported.
-        usage.merge_cumulative(&TokenUsage::default());
-        assert_eq!(usage.uncached_input, 100);
     }
 
     #[test]

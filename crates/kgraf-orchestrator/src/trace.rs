@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
 
-/// A recognized loop shape (question 4).
+/// A recognized loop shape.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LoopKind {
@@ -50,7 +50,7 @@ pub enum DeferReason {
     Lease,
     /// The work-item cap or live-agent ceiling (0017).
     Capacity,
-    /// A transient readiness failure (§A7).
+    /// A transient readiness failure.
     Readiness,
 }
 
@@ -87,6 +87,11 @@ pub enum TraceEvent {
         peak_context_tokens: u64,
         projected_tokens: u64,
         stop_tokens: u64,
+        /// The route's effective window, so peak context reads as a share of
+        /// it. Zero in a trace written before the field existed, and for a
+        /// worker whose window is not known.
+        #[serde(default)]
+        window_tokens: u64,
         sizing_miss: bool,
         calls: Vec<String>,
         spend_micros: i64,
@@ -123,10 +128,10 @@ pub enum TraceEvent {
         contract: String,
         lookup: String,
     },
-    /// The message bus's named-path index found languages whose extractor
-    /// changed since their files were indexed (decision 0065): those
-    /// files are re-derived by the next full `kgraf index`. Recorded so the
-    /// report the bus's pass returns is not dropped.
+    /// The full index pass that opened the run found languages whose
+    /// extractor changed since their files were indexed (decision 0065): the
+    /// pass re-derived those files although their bytes did not change.
+    /// Recorded so the report of that pass is not dropped.
     ExtractorChanged {
         at_ms: i64,
         changes: Vec<kgraf_graph::ExtractorChange>,
@@ -534,7 +539,7 @@ impl TraceLog {
     }
 }
 
-/// Detects the non-identical loop shapes of question 4 across attempts.
+/// Detects the non-identical loop shapes across attempts.
 #[derive(Clone, Debug, Default)]
 pub struct LoopDetector {
     /// Per lineage root, the change-set fingerprint of each finished attempt.
@@ -646,7 +651,7 @@ mod tests {
 
     /// `TraceLog::record` scrubs both a registered exact secret and a
     /// gitleaks-shaped pattern secret out of every free-text trace field,
-    /// covering the fields the review named (a verdict's `reason`/`detail`,
+    /// covering these fields (a verdict's `reason`/`detail`,
     /// a gate's `detail`, a report's `note`, a message's `detail`).
     #[tokio::test]
     async fn record_scrubs_a_registered_key_and_a_pattern_secret_from_every_free_text_field() {

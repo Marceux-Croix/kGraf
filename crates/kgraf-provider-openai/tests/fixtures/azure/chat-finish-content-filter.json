@@ -1,0 +1,38 @@
+{
+  "_fixture": {
+    "source": [
+      "https://learn.microsoft.com/en-us/azure/ai-foundry/openai/concepts/content-filter",
+      "https://learn.microsoft.com/en-us/azure/ai-foundry/openai/concepts/content-filter-annotations"
+    ],
+    "provenance": "A completion the filter cut: finish_reason content_filter on a choice, as the first page describes (scenarios 2 and 5), with the annotation shape of the second page and a filtered hate category. The message carries no content because the page states that a filtered non-streaming completion returns none. Token counts and ids are invented. Not a live capture."
+  },
+  "choices": [
+    {
+      "content_filter_results": {
+        "hate": { "filtered": true, "severity": "medium" },
+        "self_harm": { "filtered": false, "severity": "safe" },
+        "sexual": { "filtered": false, "severity": "safe" },
+        "violence": { "filtered": false, "severity": "safe" }
+      },
+      "finish_reason": "content_filter",
+      "index": 0,
+      "message": { "role": "assistant" }
+    }
+  ],
+  "created": 1699386280,
+  "id": "chatcmpl-filtered-0001",
+  "model": "gpt-35-turbo-instruct",
+  "object": "chat.completion",
+  "usage": { "completion_tokens": 9, "prompt_tokens": 20, "total_tokens": 29 },
+  "prompt_filter_results": [
+    {
+      "content_filter_results": {
+        "hate": { "filtered": false, "severity": "safe" },
+        "self_harm": { "filtered": false, "severity": "safe" },
+        "sexual": { "filtered": false, "severity": "safe" },
+        "violence": { "filtered": false, "severity": "safe" }
+      },
+      "prompt_index": 0
+    }
+  ]
+}

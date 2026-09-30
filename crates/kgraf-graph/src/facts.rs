@@ -61,18 +61,6 @@ pub struct Fact {
     pub episode_count: u64,
 }
 
-impl Fact {
-    /// Whether the fact was true at `t` (valid time only).
-    pub fn valid_at_time(&self, t: i64) -> bool {
-        self.valid_at <= t && self.invalid_at.is_none_or(|end| t < end)
-    }
-
-    /// Whether the fact is open: not closed in valid time and not superseded.
-    pub fn is_open(&self) -> bool {
-        self.invalid_at.is_none() && self.expired_at.is_none()
-    }
-}
-
 /// A fact to assert.
 #[derive(Clone, Debug)]
 pub struct NewFact<'a> {
@@ -254,44 +242,6 @@ impl GraphStore {
         })
     }
 
-    /// Close an open fact: it stopped being true at `at`, with no replacement.
-    /// Closing a closed fact, or closing before it became valid, is an error.
-    /// The read and the update are one transaction.
-    pub fn close_fact(&self, id: i64, at: i64, now_ms: i64) -> Result<Fact> {
-        let tx = immediate(self.conn())?;
-        let mut fact = tx
-            .query_row(
-                &format!("SELECT {COLUMNS} FROM facts WHERE id = ?1"),
-                params![id],
-                row_fact,
-            )
-            .optional()?
-            .ok_or_else(|| GraphError::Fact {
-                id,
-                reason: "no such fact".into(),
-            })?;
-        if !fact.is_open() {
-            return Err(GraphError::Fact {
-                id,
-                reason: "already closed".into(),
-            });
-        }
-        if at < fact.valid_at {
-            return Err(GraphError::Fact {
-                id,
-                reason: format!("closing at {at} precedes valid_at {}", fact.valid_at),
-            });
-        }
-        tx.execute(
-            "UPDATE facts SET invalid_at = ?2, expired_at = ?3 WHERE id = ?1",
-            params![id, at, now_ms],
-        )?;
-        tx.commit()?;
-        fact.invalid_at = Some(at);
-        fact.expired_at = Some(now_ms);
-        Ok(fact)
-    }
-
     /// One fact by id.
     pub fn fact(&self, id: i64) -> Result<Option<Fact>> {
         Ok(self
@@ -328,20 +278,19 @@ impl GraphStore {
             .query_map(params![predicate, subject_prefix], row_fact)?
             .collect::<rusqlite::Result<_>>()?)
     }
-
-    /// Facts about a subject and predicate that were true at `t` (valid time).
-    pub fn facts_valid_at(&self, subject: &str, predicate: &str, t: i64) -> Result<Vec<Fact>> {
-        Ok(self
-            .fact_history(subject, predicate)?
-            .into_iter()
-            .filter(|f| f.valid_at_time(t))
-            .collect())
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn is_open(f: &Fact) -> bool {
+        f.invalid_at.is_none() && f.expired_at.is_none()
+    }
+
+    fn valid_at_time(f: &Fact, t: i64) -> bool {
+        f.valid_at <= t && f.invalid_at.is_none_or(|end| t < end)
+    }
 
     fn store() -> GraphStore {
         GraphStore::open_in_memory(std::path::Path::new(".")).expect("store")
@@ -381,7 +330,13 @@ mod tests {
         // Not deleted: the history has both, and each answers for its own time.
         let history = g.fact_history("template:t1", "standing").expect("history");
         assert_eq!(history.len(), 2);
-        let at = |t| g.facts_valid_at("template:t1", "standing", t).expect("at");
+        let at = |t| -> Vec<Fact> {
+            history
+                .iter()
+                .filter(|f| valid_at_time(f, t))
+                .cloned()
+                .collect()
+        };
         assert_eq!(at(150)[0].object, "verified");
         assert_eq!(at(300)[0].object, "failed");
         assert!(at(50).is_empty());
@@ -424,7 +379,7 @@ mod tests {
             .assert_fact(&new("failed", 200, "run-2"), 210)
             .expect("new");
         assert!(later.invalidated.is_empty());
-        assert!(later.fact.is_open());
+        assert!(is_open(&later.fact));
     }
 
     #[test]
@@ -445,23 +400,6 @@ mod tests {
     }
 
     #[test]
-    fn closing_is_explicit_and_refused_twice() {
-        let g = store();
-        let f = g
-            .assert_fact(&new("verified", 100, "run-1"), 100)
-            .expect("a");
-        let closed = g.close_fact(f.fact.id, 400, 410).expect("close");
-        assert_eq!(closed.invalid_at, Some(400));
-        assert!(g.close_fact(f.fact.id, 500, 510).is_err(), "already closed");
-        assert!(g.fact(f.fact.id).expect("read").is_some(), "never deleted");
-        let other = g.assert_fact(&new("failed", 900, "run-3"), 900).expect("b");
-        assert!(
-            g.close_fact(other.fact.id, 800, 910).is_err(),
-            "before valid_at"
-        );
-    }
-
-    #[test]
     fn an_equal_valid_at_is_a_tie_the_later_assertion_wins() {
         let g = store();
         let a = g
@@ -470,7 +408,7 @@ mod tests {
         let b = g.assert_fact(&new("failed", 100, "run-2"), 101).expect("b");
         assert_eq!(b.invalidated.len(), 1, "the tie closes the earlier row");
         assert_eq!(b.invalidated[0].id, a.fact.id);
-        assert!(b.fact.is_open());
+        assert!(is_open(&b.fact));
         let open = g.open_facts("standing", "template:").expect("open");
         assert_eq!(open.len(), 1, "never two open facts for one subject");
         assert_eq!(open[0].object, "failed");

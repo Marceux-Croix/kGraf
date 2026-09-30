@@ -58,9 +58,12 @@
 //! file write. Git checkouts do not create hard links, so a normal worktree has
 //! none; a count above 1 is either a deliberate setup or an attack.
 //!
-//! Off Unix there is no link count in `cap_std`'s portable metadata, so the
-//! check is not made there; that is a stated gap (fail loud), the same one
-//! `apply_patch::paths_are_same_file` documents.
+//! Off Unix the hard-link refusal is not made: `cap_std`'s portable metadata
+//! has no link count on stable Rust (its Windows count needs the unstable
+//! `windows_by_handle`), so [`link_count`] reports `1` there. This is a known
+//! gap, not a checked one: on Windows a file hard-linked to one outside the
+//! workspace can be written through. Closing it needs the count read from the
+//! open handle (`GetFileInformationByHandle`), verified on a Windows host.
 
 use crate::error::{AccessError, ToolError};
 use cap_std::ambient_authority;
@@ -171,6 +174,123 @@ pub(crate) fn refuses_git_or_kgraf(tool: &str, rel: &Path) -> Result<(), ToolErr
     Ok(())
 }
 
+/// Symbolic links followed while resolving one path, at most; a longer chain
+/// is refused as a loop. Matches Linux's own `MAXSYMLINKS`.
+const MAX_LINK_HOPS: usize = 40;
+
+/// One step of a path being resolved: up one level, or into a named entry.
+enum Step {
+    Up,
+    Name(std::ffi::OsString),
+}
+
+/// `path` as resolution steps; `None` for an absolute path.
+fn steps_of(path: &Path) -> Option<std::collections::VecDeque<Step>> {
+    use std::path::Component;
+    let mut steps = std::collections::VecDeque::new();
+    for c in path.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => steps.push_back(Step::Up),
+            Component::Normal(n) => steps.push_back(Step::Name(n.to_owned())),
+            Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(steps)
+}
+
+/// `rel` with every symbolic link inside the workspace followed, resolved
+/// lexically against the directory holding each link: the path an open will
+/// actually reach. The component guards above are lexical, so a link
+/// `g -> .git` makes `g/config` look ordinary while every open through it
+/// reaches `.git/config`; checking the resolved path as well closes that.
+///
+/// A link whose target is absolute or climbs above the workspace is refused
+/// here as an escape (the confined open would refuse it too). A component
+/// that does not exist ends the lookups: nothing beyond it can be a link.
+/// The resolution and the later open are two steps; a link swapped in
+/// between needs a process writing this tree concurrently, and the shell
+/// tool, the one tool that could, declares exclusive access.
+pub(crate) fn resolve_links(tool: &str, dir: &Dir, rel: &Path) -> Result<PathBuf, ToolError> {
+    let escape = || ToolError::Access {
+        tool: tool.into(),
+        source: AccessError::Escapes {
+            path: format!("{}: a link in it leaves the workspace", rel.display()),
+        },
+    };
+    let mut pending = steps_of(rel).ok_or_else(escape)?;
+    let mut resolved = PathBuf::new();
+    let mut hops = 0;
+    let mut missing = false;
+    while let Some(step) = pending.pop_front() {
+        let name = match step {
+            Step::Up => {
+                if !resolved.pop() {
+                    return Err(escape());
+                }
+                continue;
+            }
+            Step::Name(name) => name,
+        };
+        let candidate = resolved.join(&name);
+        if missing {
+            resolved = candidate;
+            continue;
+        }
+        match dir.symlink_metadata(&candidate) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                hops += 1;
+                if hops > MAX_LINK_HOPS {
+                    return Err(escape());
+                }
+                let target = dir
+                    .read_link_contents(&candidate)
+                    .map_err(|e| open_error(tool, rel, e))?;
+                let mut expanded = steps_of(&target).ok_or_else(escape)?;
+                expanded.extend(pending);
+                pending = expanded;
+            }
+            Ok(_) => resolved = candidate,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                missing = true;
+                resolved = candidate;
+            }
+            Err(e) => return Err(open_error(tool, rel, e)),
+        }
+    }
+    Ok(resolved)
+}
+
+fn through_link(tool: &str, rel: &Path, resolved: &Path) -> ToolError {
+    ToolError::Access {
+        tool: tool.into(),
+        source: AccessError::Escapes {
+            path: format!(
+                "{}: a link in it resolves to {}, repository metadata or kGraf's own state, \
+                 always refused",
+                rel.display(),
+                resolved.display()
+            ),
+        },
+    }
+}
+
+/// The read guard on `rel` and on `rel` with its in-workspace links followed.
+fn guard_read(tool: &str, dir: &Dir, rel: &Path) -> Result<(), ToolError> {
+    refuses_git_dir_or_kgraf(tool, rel)?;
+    let resolved = resolve_links(tool, dir, rel)?;
+    refuses_git_dir_or_kgraf(tool, &resolved).map_err(|_| through_link(tool, rel, &resolved))
+}
+
+/// The write guard on `rel` and on `rel` with its in-workspace links
+/// followed: a link to `.gitmodules` or into `.git` is refused, not written
+/// through. Also the check a planning pass runs before anything is written.
+pub(crate) fn guard_write(tool: &str, dir: &Dir, rel: &Path) -> Result<(), ToolError> {
+    refuses_git_or_kgraf(tool, rel)?;
+    let resolved = resolve_links(tool, dir, rel)?;
+    refuses_git_or_kgraf(tool, &resolved).map_err(|_| through_link(tool, rel, &resolved))
+}
+
 /// Classify a `cap_std` open or metadata failure: an attempted escape (a
 /// symlink resolving outside the workspace, refused by `Dir` itself) is
 /// reported as [`ToolError::Access`]; anything else is [`ToolError::Internal`].
@@ -269,7 +389,7 @@ impl AllowedHardlinkReads {
 }
 
 /// The number of hard links to the inode `meta` describes. `1` off Unix, where
-/// the portable metadata has no count (see the module docs).
+/// the portable metadata has no count: the known gap the module docs state.
 fn link_count(meta: &cap_std::fs::Metadata) -> u64 {
     #[cfg(unix)]
     {
@@ -321,7 +441,7 @@ pub(crate) fn check_readable(
     rel: &Path,
     allow_hard_link: bool,
 ) -> Result<(), ToolError> {
-    refuses_git_dir_or_kgraf(tool, rel)?;
+    guard_read(tool, dir, rel)?;
     let file = dir
         .open_with(rel, &read_only_nonblocking())
         .map_err(|e| open_error(tool, rel, e))?;
@@ -346,7 +466,7 @@ pub(crate) fn read_capped(
     max_bytes: u64,
     allow_hard_link: bool,
 ) -> Result<Vec<u8>, ToolError> {
-    refuses_git_dir_or_kgraf(tool, rel)?;
+    guard_read(tool, dir, rel)?;
     let file = dir
         .open_with(rel, &read_only_nonblocking())
         .map_err(|e| open_error(tool, rel, e))?;
@@ -398,7 +518,7 @@ pub(crate) fn open_dir_confined(
     dir: &cap_std::fs::Dir,
     rel: &Path,
 ) -> Result<cap_std::fs::Dir, ToolError> {
-    refuses_git_dir_or_kgraf(tool, rel)?;
+    guard_read(tool, dir, rel)?;
     dir.open_dir(rel).map_err(|e| open_error(tool, rel, e))
 }
 
@@ -409,7 +529,7 @@ pub(crate) fn metadata_if_exists(
     dir: &Dir,
     rel: &Path,
 ) -> Result<Option<cap_std::fs::Metadata>, ToolError> {
-    refuses_git_dir_or_kgraf(tool, rel)?;
+    guard_read(tool, dir, rel)?;
     match dir.metadata(rel) {
         Ok(meta) => Ok(Some(meta)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -425,7 +545,7 @@ pub(crate) fn write_confined(
     rel: &Path,
     contents: &[u8],
 ) -> Result<(), ToolError> {
-    refuses_git_or_kgraf(tool, rel)?;
+    guard_write(tool, dir, rel)?;
     if let Some(parent) = rel.parent().filter(|p| !p.as_os_str().is_empty()) {
         dir.create_dir_all(parent)
             .map_err(|e| open_error(tool, parent, e))?;
@@ -471,7 +591,7 @@ pub(crate) fn write_confined(
 /// directory, a path that does not resolve to a plain file, and a hard-linked
 /// file.
 pub(crate) fn remove_file_confined(tool: &str, dir: &Dir, rel: &Path) -> Result<(), ToolError> {
-    refuses_git_or_kgraf(tool, rel)?;
+    guard_write(tool, dir, rel)?;
     let meta = dir.metadata(rel).map_err(|e| open_error(tool, rel, e))?;
     if !meta.is_file() {
         return Err(not_a_regular_file(tool, rel));
@@ -868,6 +988,69 @@ mod tests {
         let dir = AllowedHardlinkReads::new([PathBuf::from("vendor/data")]).expect("valid");
         assert!(dir.permits(Path::new("vendor/data/blob.bin")));
         assert!(!dir.permits(Path::new("vendor/database")));
+    }
+
+    /// A link inside the workspace is followed before the guard decides: a
+    /// read through a link into `.git` or `.kgraf` is refused, a link to an
+    /// ordinary file still works, and a link to `.gitmodules` reads but never
+    /// writes.
+    #[cfg(unix)]
+    #[test]
+    fn the_guards_follow_links_inside_the_workspace() {
+        let (root, dir) = workspace();
+        let r = root.path();
+        std::fs::create_dir_all(r.join(".git")).expect("git");
+        std::fs::write(r.join(".git/config"), "[core]\n").expect("seed");
+        std::fs::create_dir_all(r.join(".kgraf")).expect("state");
+        std::fs::write(r.join(".kgraf/ledger.db"), "x").expect("seed");
+        std::fs::write(r.join(".gitmodules"), "m").expect("seed");
+        std::fs::write(r.join("plain.txt"), "plain").expect("seed");
+        std::fs::create_dir_all(r.join("a/b")).expect("dirs");
+        std::os::unix::fs::symlink(".git", r.join("g")).expect("link");
+        std::os::unix::fs::symlink("../../.kgraf", r.join("a/b/k")).expect("link");
+        std::os::unix::fs::symlink("../.gitmodules", r.join("a/mods")).expect("link");
+        std::os::unix::fs::symlink("../plain.txt", r.join("a/p")).expect("link");
+        std::os::unix::fs::symlink("loop2", r.join("loop1")).expect("link");
+        std::os::unix::fs::symlink("loop1", r.join("loop2")).expect("link");
+
+        for refused in ["g/config", "a/b/k/ledger.db", "loop1"] {
+            assert!(
+                matches!(
+                    read_capped("t", &dir, Path::new(refused), MAX_READ_BYTES, false),
+                    Err(ToolError::Access { .. })
+                ),
+                "{refused}"
+            );
+        }
+        assert!(matches!(
+            open_dir_confined("t", &dir, Path::new("g")),
+            Err(ToolError::Access { .. })
+        ));
+        assert_eq!(
+            read_capped_to_string("t", &dir, Path::new("a/p"), MAX_READ_BYTES, false)
+                .expect("an ordinary link reads"),
+            "plain"
+        );
+        assert_eq!(
+            read_capped_to_string("t", &dir, Path::new("a/mods"), MAX_READ_BYTES, false)
+                .expect("repository text reads through a link"),
+            "m"
+        );
+        assert!(matches!(
+            write_confined("t", &dir, Path::new("a/mods"), b"evil"),
+            Err(ToolError::Access { .. })
+        ));
+        assert!(matches!(
+            write_confined("t", &dir, Path::new("g/hooks/pre-commit"), b"evil"),
+            Err(ToolError::Access { .. })
+        ));
+        write_confined("t", &dir, Path::new("a/p"), b"changed").expect("ordinary write");
+        assert_eq!(
+            std::fs::read_to_string(r.join("plain.txt")).unwrap(),
+            "changed"
+        );
+        assert_eq!(std::fs::read_to_string(r.join(".gitmodules")).unwrap(), "m");
+        assert!(!r.join(".git/hooks").exists());
     }
 
     #[test]

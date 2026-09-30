@@ -191,7 +191,9 @@ fn split_tools(s: &str) -> Vec<String> {
 
 /// The files bundled with a skill, relative to its directory. An entry the walk
 /// cannot read is an error naming it: leaving it out would drop that file from
-/// the bundle hash, and two skills that differ only there would read as one.
+/// the bundle hash, and two skills that differ only there would read as one. A
+/// symbolic link is a bundled entry too: it is listed, and hashed by its target
+/// text without being followed.
 fn bundled_files(dir: &Path) -> Result<Vec<String>, String> {
     let mut files = Vec::new();
     for entry in walkdir::WalkDir::new(dir) {
@@ -201,7 +203,7 @@ fn bundled_files(dir: &Path) -> Result<Vec<String>, String> {
                 .map_or_else(|| dir.display().to_string(), |p| p.display().to_string());
             format!("cannot read {at} in the skill bundle: {e}")
         })?;
-        if !entry.file_type().is_file() {
+        if !entry.file_type().is_file() && !entry.path_is_symlink() {
             continue;
         }
         let Ok(rel) = entry.path().strip_prefix(dir) else {
@@ -226,7 +228,23 @@ fn skill_hash(dir: &Path, skill_md: &str, files: &[String]) -> Result<String, St
     };
     add("SKILL.md", skill_md.as_bytes());
     for rel in files {
-        let bytes = std::fs::read(dir.join(rel)).map_err(|e| format!("cannot read {rel}: {e}"))?;
+        let full = dir.join(rel);
+        let is_link = std::fs::symlink_metadata(&full)
+            .map_err(|e| format!("cannot read {rel}: {e}"))?
+            .file_type()
+            .is_symlink();
+        if is_link {
+            // The link's own text, never the file it points at, so a link that
+            // dangles or points outside the bundle still hashes.
+            let target =
+                std::fs::read_link(&full).map_err(|e| format!("cannot read {rel}: {e}"))?;
+            add(
+                rel,
+                format!("symlink:{}", target.to_string_lossy()).as_bytes(),
+            );
+            continue;
+        }
+        let bytes = std::fs::read(&full).map_err(|e| format!("cannot read {rel}: {e}"))?;
         add(rel, &bytes);
     }
     Ok(hasher.finalize().to_hex().to_string())
@@ -267,6 +285,23 @@ mod tests {
         std::fs::write(dir.join("refs/a.md"), "b").expect("edit");
         let (edited, _) = read(&candidate(&dir)).expect("read");
         assert_ne!(skill.hash, edited.hash);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_in_the_bundle_is_listed_and_changes_the_hash() {
+        let root = tempfile::tempdir().expect("dir");
+        let dir = skill_dir(root.path());
+        let (plain, _) = read(&candidate(&dir)).expect("read");
+        std::os::unix::fs::symlink("a.md", dir.join("refs/link.md")).expect("link");
+        let (linked, _) = read(&candidate(&dir)).expect("read");
+        assert_eq!(linked.files, ["refs/a.md", "refs/link.md"]);
+        assert_ne!(plain.hash, linked.hash, "the link was left out of the hash");
+        // Re-pointing it changes the hash; a dangling target still hashes.
+        std::fs::remove_file(dir.join("refs/link.md")).expect("rm");
+        std::os::unix::fs::symlink("gone.md", dir.join("refs/link.md")).expect("link");
+        let (repointed, _) = read(&candidate(&dir)).expect("dangling link still reads");
+        assert_ne!(linked.hash, repointed.hash);
     }
 
     #[cfg(unix)]

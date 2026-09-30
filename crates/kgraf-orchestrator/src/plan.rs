@@ -68,8 +68,16 @@ pub struct PlanRequest {
     pub notes: Vec<String>,
     /// Files the graph knows, to declare write sets against.
     pub known_files: Vec<String>,
-    /// Configured routes.
+    /// Configured routes. Generative only: a contract runs on one of these.
     pub routes: Vec<String>,
+    /// The run's routes of other kinds, one line per kind
+    /// (`kgraf_provider::ModelRoutes::summary_lines`, decision 0089). Their
+    /// tools are in every worker's tool set.
+    pub model_routes: Vec<String>,
+    /// The same routes, callable by the planning model itself: when set, the
+    /// decomposition request offers their tools, and each call the model makes
+    /// is run and accounted before it answers (decision 0089).
+    pub model_calls: Option<Arc<crate::model_kinds::ModelKindCalls>>,
     /// Tools the routes offer.
     pub tools: Vec<String>,
     /// Workflow templates mined from earlier verified runs, as quoted data blocks
@@ -619,6 +627,120 @@ impl ModelCaller {
     ) -> (Result<String, PlanError>, Option<CallId>) {
         let mut request = Request::new(self.model.clone(), user, self.max_output_tokens);
         request.system = vec![kgraf_provider::Content::text(system)];
+        let (result, call) = self.complete_once(kind, &request).await;
+        (result.map(|response| response.text()), call)
+    }
+
+    /// Ask with the run's model tools offered (decision 0089): each tool call
+    /// the model makes is run through `tools`, attributed to the orchestrator
+    /// and accounted, and its result sent back, until the model answers
+    /// without one. Every round is its own ledger row, all returned; the tool
+    /// calls' rows are logged on `tools` ([`ModelKindCalls::take_calls`]).
+    ///
+    /// Bounded: at most [`MAX_MODEL_TOOL_CALLS_PER_ROUND`] tool calls run per
+    /// round (the rest are answered as not run), and after
+    /// [`MAX_MODEL_TOOL_ROUNDS`] rounds the model is told no tool calls
+    /// remain. A tool call in that last round is refused unrun. The provider
+    /// seam has no `tool_choice`, so the last round still lists the tools (a
+    /// history holding tool calls needs them listed on some wires); the
+    /// instruction and the refusal bound it instead.
+    ///
+    /// [`ModelKindCalls::take_calls`]: crate::model_kinds::ModelKindCalls::take_calls
+    pub(crate) async fn ask_with_model_tools(
+        &self,
+        kind: &str,
+        system: &str,
+        user: String,
+        tools: &crate::model_kinds::ModelKindCalls,
+    ) -> Result<(String, Vec<CallId>), PlanError> {
+        use kgraf_provider::{Content, Message, Role};
+        let mut request = Request::new(self.model.clone(), user, self.max_output_tokens);
+        request.system = vec![Content::text(system)];
+        request.tools = tools.tool_definitions();
+        let mut calls = Vec::new();
+        for round in 0..=MAX_MODEL_TOOL_ROUNDS {
+            let (result, call) = self.complete_once(kind, &request).await;
+            calls.extend(call);
+            // A failed round carries its own call; the failure is charged with
+            // every round's.
+            let response = result.map_err(|e| match e {
+                PlanError::Attributed { error, .. } => PlanError::Attributed {
+                    calls: calls.clone(),
+                    error,
+                },
+                e => PlanError::attributed(calls.clone(), e),
+            })?;
+            let uses: Vec<(String, String, serde_json::Value)> = response
+                .content
+                .iter()
+                .filter_map(|c| match c {
+                    Content::ToolUse {
+                        id, name, input, ..
+                    } => Some((id.clone(), name.clone(), input.clone())),
+                    _ => None,
+                })
+                .collect();
+            if uses.is_empty() {
+                return Ok((response.text(), calls));
+            }
+            if round == MAX_MODEL_TOOL_ROUNDS {
+                return Err(PlanError::attributed(
+                    calls,
+                    PlanError::BadOutput {
+                        reason: format!(
+                            "still calling model tools after {MAX_MODEL_TOOL_ROUNDS} rounds; \
+                             answer with the JSON asked for"
+                        ),
+                        excerpt: String::new(),
+                    },
+                ));
+            }
+            request.messages.push(Message {
+                role: Role::Assistant,
+                content: response.content.clone(),
+            });
+            let mut results = Vec::with_capacity(uses.len() + 1);
+            for (n, (id, name, input)) in uses.into_iter().enumerate() {
+                // Every tool call gets a result, or the next request is
+                // refused by the provider; the ones over the cap are not run.
+                let output = if n >= MAX_MODEL_TOOL_CALLS_PER_ROUND {
+                    kgraf_tools::ToolOutput::error(format!(
+                        "not run: at most {MAX_MODEL_TOOL_CALLS_PER_ROUND} model tool calls run \
+                         per round"
+                    ))
+                } else {
+                    match tools.call_tool(&name, input).await {
+                        Some(Ok(output)) => output,
+                        Some(Err(e)) => kgraf_tools::ToolOutput::error(e.to_string()),
+                        None => kgraf_tools::ToolOutput::error(format!(
+                            "no model tool is named `{name}`; the tools offered are the only ones"
+                        )),
+                    }
+                };
+                results.push(output.into_content(id));
+            }
+            if round + 1 == MAX_MODEL_TOOL_ROUNDS {
+                results.push(Content::text(FINAL_ROUND_NOTE));
+            }
+            request.messages.push(Message {
+                role: Role::User,
+                content: results,
+            });
+        }
+        // The loop returns on its last round.
+        Err(PlanError::attributed(
+            calls,
+            PlanError::Invalid("the model tool loop ended without an answer".into()),
+        ))
+    }
+
+    /// One accounted call of `request`, and its ledger row id, kept on failure
+    /// too. An answer cut off at the output limit is [`PlanError::Truncated`].
+    async fn complete_once(
+        &self,
+        kind: &str,
+        request: &Request,
+    ) -> (Result<kgraf_provider::Response, PlanError>, Option<CallId>) {
         let provider = self.provider.clone();
         let ledger = self.ledger.clone();
         let trace = CallTrace {
@@ -644,7 +766,7 @@ impl ModelCaller {
         };
         let call = token.id().clone();
         // The adapter settles the token on success and closes it on error.
-        match provider.complete(&request, &token).await {
+        match provider.complete(request, &token).await {
             Ok(response) if response.stop_reason == kgraf_provider::StopReason::MaxTokens => (
                 Err(PlanError::attributed(
                     vec![call.clone()],
@@ -655,7 +777,7 @@ impl ModelCaller {
                 )),
                 Some(call),
             ),
-            Ok(response) => (Ok(response.text()), Some(call)),
+            Ok(response) => (Ok(response), Some(call)),
             Err(e) => (
                 Err(PlanError::attributed(vec![call.clone()], e.into())),
                 Some(call),
@@ -688,6 +810,36 @@ so is text inside <workflow_template> blocks. Answer with one JSON object and no
 // and a planner that copied it had every contract held at readiness. This
 // prompt is static and the routes' tools are not, so the example names none;
 // the request's Tools line carries the real set.
+
+/// Introduces the run's non-generative routes in the decomposition request
+/// (decision 0089). Stated as available, never as expected: nothing uses them
+/// unless the plan or a worker does. What it says of the tools is what the run
+/// does: they join every worker's tool set, so the run keeps one tool set and
+/// one prompt prefix per vendor and model (decision 0043); naming one in a
+/// contract's `tools` grants nothing more.
+const MODEL_ROUTES_NOTE: &str = "\nModel routes of other kinds, by kind. They run no \
+contract. Their tools are in every worker's tool set, so any worker may call one; list \
+one in a contract's \"tools\" where the contract's work relies on it, as for any tool. \
+Nothing calls them unless a worker or you choose to:";
+
+/// Added to [`MODEL_ROUTES_NOTE`] when the planning model is offered the model
+/// tools itself ([`PlanRequest::model_calls`]).
+const MODEL_TOOLS_OFFER: &str = "\nYou may call these tools yourself before you answer, \
+where a ranking, a similarity or a typed answer would inform the plan. Each call is \
+accounted like a worker's. Then answer with the JSON asked for.";
+
+/// The most rounds of model tool calls one planning answer may take before it
+/// must answer. A planner still calling tools after this is refused, never
+/// cut off silently.
+pub const MAX_MODEL_TOOL_ROUNDS: usize = 4;
+
+/// The most model tool calls run in one round. One answer holding fifty tool
+/// calls would otherwise make fifty paid calls before the next round.
+pub const MAX_MODEL_TOOL_CALLS_PER_ROUND: usize = 8;
+
+/// Sent with the tool results before the last round.
+const FINAL_ROUND_NOTE: &str = "No model tool calls remain. Answer now with the JSON asked \
+for; a tool call in this answer is refused and not run.";
 
 /// Appended to the decomposition request when the run checks interface
 /// contracts ([`PlanRequest::interfaces`]). The fields are
@@ -741,6 +893,20 @@ impl Decomposer for ModelDecomposer {
         user.push_str(&request.instruction);
         user.push_str("\n\nRoutes: ");
         user.push_str(&request.routes.join(", "));
+        let model_calls = request
+            .model_calls
+            .as_ref()
+            .filter(|_| !request.model_routes.is_empty());
+        if !request.model_routes.is_empty() {
+            user.push_str(MODEL_ROUTES_NOTE);
+            for line in &request.model_routes {
+                user.push_str("\n- ");
+                user.push_str(line);
+            }
+            if model_calls.is_some() {
+                user.push_str(MODEL_TOOLS_OFFER);
+            }
+        }
         user.push_str("\nTools: ");
         user.push_str(&request.tools.join(", "));
         if !request.known_files.is_empty() {
@@ -767,20 +933,29 @@ impl Decomposer for ModelDecomposer {
         if request.interfaces {
             user.push_str(INTERFACES_REQUEST);
         }
-        let (text, call) = self.0.ask("decompose", DECOMPOSE_SYSTEM, user).await?;
-        let contracts =
-            parse_plan(&text).map_err(|e| PlanError::attributed(vec![call.clone()], e))?;
+        let (text, calls) = match model_calls {
+            Some(tools) => {
+                self.0
+                    .ask_with_model_tools("decompose", DECOMPOSE_SYSTEM, user, tools)
+                    .await?
+            }
+            None => {
+                let (text, call) = self.0.ask("decompose", DECOMPOSE_SYSTEM, user).await?;
+                (text, vec![call])
+            }
+        };
+        let contracts = parse_plan(&text).map_err(|e| PlanError::attributed(calls.clone(), e))?;
         // Parsed only when asked: a run without contract checks never takes an
         // interface it would not check.
         let interfaces = if request.interfaces {
-            parse_interfaces(&text).map_err(|e| PlanError::attributed(vec![call.clone()], e))?
+            parse_interfaces(&text).map_err(|e| PlanError::attributed(calls.clone(), e))?
         } else {
             Vec::new()
         };
         Ok(PlanOutput {
             contracts,
             interfaces,
-            calls: vec![call],
+            calls,
         })
     }
 }
@@ -1435,6 +1610,8 @@ mod tests {
                 notes: vec![],
                 known_files: vec![],
                 routes: vec![],
+                model_routes: vec![],
+                model_calls: None,
                 tools: vec![],
                 templates: vec![],
                 interfaces: true,
@@ -1538,6 +1715,8 @@ mod tests {
                 notes: vec![],
                 known_files: vec![],
                 routes: vec!["a".into()],
+                model_routes: vec![],
+                model_calls: None,
                 tools: registry.names().map(str::to_owned).collect(),
                 templates: vec![],
                 interfaces: false,
@@ -1551,6 +1730,474 @@ mod tests {
             crate::readiness::check_tools(std::iter::empty(), &c.tools)
                 .unwrap_or_else(|e| panic!("contract `{}` on a tool-less route: {e}", c.id));
         }
+    }
+
+    /// Records the user turn it was sent and answers with a one-contract plan.
+    struct RecordsTheRequest(std::sync::Mutex<String>);
+
+    #[async_trait::async_trait]
+    impl Provider for RecordsTheRequest {
+        fn adapter(&self) -> &'static str {
+            "records-the-request"
+        }
+        fn protocol(&self) -> kgraf_core::Protocol {
+            kgraf_core::Protocol::Additive
+        }
+        async fn complete(
+            &self,
+            request: &Request,
+            token: &kgraf_provider::CallToken,
+        ) -> Result<kgraf_provider::Response, kgraf_provider::ProviderError> {
+            *self.0.lock().expect("lock") = format!("{:?}", request.messages);
+            let usage = kgraf_core::TokenUsage {
+                uncached_input: 1,
+                text_output: 1,
+                ..Default::default()
+            };
+            token.settle(&usage, None)?;
+            Ok(kgraf_provider::Response {
+                model: request.model.clone(),
+                content: vec![kgraf_provider::Content::text(
+                    "{\"contracts\":[{\"id\":\"c1\",\"instruction\":\"x\",\"acceptance\":\"y\"}]}",
+                )],
+                stop_reason: kgraf_provider::StopReason::EndTurn,
+                usage,
+                request_id: None,
+            })
+        }
+    }
+
+    /// A planner that calls the `rerank` tool once, `rounds` times over, then
+    /// answers with a plan. Records every request it gets.
+    struct CallsRerankFirst {
+        rounds: usize,
+        requests: std::sync::Mutex<Vec<Request>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for CallsRerankFirst {
+        fn adapter(&self) -> &'static str {
+            "calls-rerank-first"
+        }
+        fn protocol(&self) -> kgraf_core::Protocol {
+            kgraf_core::Protocol::Additive
+        }
+        async fn complete(
+            &self,
+            request: &Request,
+            token: &kgraf_provider::CallToken,
+        ) -> Result<kgraf_provider::Response, kgraf_provider::ProviderError> {
+            let round = {
+                let mut seen = self.requests.lock().expect("lock");
+                seen.push(request.clone());
+                seen.len()
+            };
+            let usage = kgraf_core::TokenUsage {
+                uncached_input: 10,
+                text_output: 5,
+                ..Default::default()
+            };
+            token.settle(&usage, None)?;
+            let (content, stop_reason) = if round <= self.rounds {
+                (
+                    vec![kgraf_provider::Content::ToolUse {
+                        id: format!("t{round}"),
+                        name: "rerank".into(),
+                        input: serde_json::json!({
+                            "query": "which file parses the graph",
+                            "documents": ["parser.rs", "ui.rs"]
+                        }),
+                        signature: None,
+                    }],
+                    kgraf_provider::StopReason::ToolUse,
+                )
+            } else {
+                (
+                    vec![kgraf_provider::Content::text(
+                        "{\"contracts\":[{\"id\":\"c1\",\"instruction\":\"x\",\"acceptance\":\"y\"}]}",
+                    )],
+                    kgraf_provider::StopReason::EndTurn,
+                )
+            };
+            Ok(kgraf_provider::Response {
+                model: request.model.clone(),
+                content,
+                stop_reason,
+                usage,
+                request_id: None,
+            })
+        }
+    }
+
+    struct FirstIsBest;
+
+    #[async_trait::async_trait]
+    impl kgraf_provider::Reranker for FirstIsBest {
+        fn adapter(&self) -> &'static str {
+            "first-is-best"
+        }
+        fn protocol(&self) -> kgraf_core::Protocol {
+            kgraf_core::Protocol::Inclusive
+        }
+        async fn rerank(
+            &self,
+            _model: &str,
+            _query: &str,
+            documents: &[String],
+            _top_n: Option<usize>,
+            token: &kgraf_provider::CallToken,
+        ) -> Result<kgraf_provider::Ranking, kgraf_provider::ProviderError> {
+            let usage = kgraf_core::TokenUsage {
+                uncached_input: 7,
+                ..Default::default()
+            };
+            token.settle_async(&usage, None).await?;
+            Ok(kgraf_provider::Ranking {
+                results: (0..documents.len())
+                    .map(|index| kgraf_provider::Ranked {
+                        index,
+                        score: 1.0 / (index as f64 + 1.0),
+                    })
+                    .collect(),
+                usage,
+            })
+        }
+    }
+
+    fn rerank_calls(ledger: Arc<Ledger>) -> Arc<crate::model_kinds::ModelKindCalls> {
+        let reranker: Arc<dyn kgraf_provider::Reranker> = Arc::new(FirstIsBest);
+        let routes = kgraf_provider::ModelRoutes::new(vec![kgraf_provider::ModelRoute::new(
+            "local:r",
+            kgraf_core::ModelKind::RERANK,
+            "first-is-best",
+            kgraf_core::Protocol::Inclusive,
+            "r",
+            reranker,
+        )]);
+        Arc::new(crate::model_kinds::ModelKindCalls::new(
+            kgraf_tools::ModelCalls::new(ledger, Arc::new(routes)),
+            "r",
+        ))
+    }
+
+    fn tool_request(calls: Arc<crate::model_kinds::ModelKindCalls>) -> PlanRequest {
+        PlanRequest {
+            instruction: "do it".into(),
+            split_reason: None,
+            notes: vec![],
+            known_files: vec![],
+            routes: vec!["anthropic:m".into()],
+            model_routes: calls.summary_lines().expect("lines"),
+            model_calls: Some(calls),
+            tools: vec!["rerank".into()],
+            templates: vec![],
+            interfaces: false,
+        }
+    }
+
+    /// Decision 0089: the orchestrator's own model may call a model route
+    /// while it plans, and the call is accounted to the orchestrator.
+    #[tokio::test]
+    async fn the_planner_may_call_a_model_tool_itself_and_the_call_is_ledgered_to_it() {
+        let dir = tempfile::tempdir().expect("dir");
+        let ledger = Arc::new(Ledger::open(&dir.path().join("l.db")).expect("ledger"));
+        let provider = Arc::new(CallsRerankFirst {
+            rounds: 1,
+            requests: std::sync::Mutex::new(Vec::new()),
+        });
+        let d = ModelDecomposer(ModelCaller {
+            provider: provider.clone(),
+            ledger: ledger.clone(),
+            model: "m".into(),
+            max_output_tokens: 1_000,
+            agent: "orchestrator:r".into(),
+            task: "r".into(),
+        });
+        let out = d
+            .decompose(&tool_request(rerank_calls(ledger.clone())))
+            .await
+            .expect("plan");
+        assert_eq!(out.contracts.len(), 1);
+        assert_eq!(
+            out.calls.len(),
+            2,
+            "both planning rounds are the plan's cost"
+        );
+
+        let requests = provider.requests.lock().expect("lock").clone();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0]
+                .tools
+                .iter()
+                .map(|t| t.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["rerank"]
+        );
+        assert!(
+            format!("{:?}", requests[0].messages).contains("You may call these tools yourself")
+        );
+        // The second round carries the tool's result back.
+        let result = requests[1]
+            .messages
+            .last()
+            .and_then(|m| m.content.first())
+            .cloned();
+        match result {
+            Some(kgraf_provider::Content::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            }) => {
+                assert_eq!(tool_use_id, "t1");
+                assert!(!is_error, "{content}");
+                assert!(content.contains("\"results\""), "{content}");
+            }
+            other => panic!("expected a tool result, got {other:?}"),
+        }
+
+        let rows = ledger.calls().expect("rows");
+        let rerank: Vec<_> = rows
+            .iter()
+            .filter(|r| r.adapter == "first-is-best")
+            .collect();
+        assert_eq!(rerank.len(), 1);
+        assert_eq!(rerank[0].agent_id, "orchestrator:r");
+        assert_eq!(rerank[0].trace.role.as_deref(), Some("orchestrator"));
+        assert_eq!(rerank[0].settlement, kgraf_provider::Settlement::Counted);
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r.trace.kind.as_deref() == Some("decompose"))
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn a_planner_that_keeps_calling_model_tools_is_refused_not_cut_off() {
+        let dir = tempfile::tempdir().expect("dir");
+        let ledger = Arc::new(Ledger::open(&dir.path().join("l.db")).expect("ledger"));
+        let provider = Arc::new(CallsRerankFirst {
+            rounds: usize::MAX,
+            requests: std::sync::Mutex::new(Vec::new()),
+        });
+        let d = ModelDecomposer(ModelCaller {
+            provider: provider.clone(),
+            ledger: ledger.clone(),
+            model: "m".into(),
+            max_output_tokens: 1_000,
+            agent: "orchestrator:r".into(),
+            task: "r".into(),
+        });
+        let err = d
+            .decompose(&tool_request(rerank_calls(ledger)))
+            .await
+            .expect_err("refused");
+        assert!(err.reaskable(), "{err}");
+        assert!(
+            err.to_string().contains("still calling model tools"),
+            "{err}"
+        );
+        assert_eq!(
+            err.calls().map(<[CallId]>::len),
+            Some(MAX_MODEL_TOOL_ROUNDS + 1)
+        );
+        // The last round was told no tool calls remain, and its tool call
+        // was refused unrun: one rerank row per earlier round only.
+        let requests = provider.requests.lock().expect("lock").clone();
+        let last = requests.last().expect("a last round");
+        assert!(
+            format!("{:?}", last.messages.last()).contains("No model tool calls remain"),
+            "{:?}",
+            last.messages.last()
+        );
+        assert!(
+            !format!("{:?}", requests[MAX_MODEL_TOOL_ROUNDS - 1].messages.last())
+                .contains("No model tool calls remain"),
+            "only the last round is told"
+        );
+    }
+
+    /// One answer with many tool calls: only the first
+    /// [`MAX_MODEL_TOOL_CALLS_PER_ROUND`] run (and are paid); every call still
+    /// gets a result, and the rows the calls opened are logged for the run's
+    /// spend.
+    #[tokio::test]
+    async fn at_most_the_per_round_cap_of_tool_calls_run_and_their_rows_are_logged() {
+        struct ManyToolUses(std::sync::Mutex<Vec<Request>>);
+
+        #[async_trait::async_trait]
+        impl Provider for ManyToolUses {
+            fn adapter(&self) -> &'static str {
+                "many-tool-uses"
+            }
+            fn protocol(&self) -> kgraf_core::Protocol {
+                kgraf_core::Protocol::Additive
+            }
+            async fn complete(
+                &self,
+                request: &Request,
+                token: &kgraf_provider::CallToken,
+            ) -> Result<kgraf_provider::Response, kgraf_provider::ProviderError> {
+                let first = {
+                    let mut seen = self.0.lock().expect("lock");
+                    seen.push(request.clone());
+                    seen.len() == 1
+                };
+                let usage = kgraf_core::TokenUsage {
+                    uncached_input: 10,
+                    text_output: 5,
+                    ..Default::default()
+                };
+                token.settle(&usage, None)?;
+                let content = if first {
+                    (0..20)
+                        .map(|i| kgraf_provider::Content::ToolUse {
+                            id: format!("t{i}"),
+                            name: "rerank".into(),
+                            input: serde_json::json!({"query": "q", "documents": ["a", "b"]}),
+                            signature: None,
+                        })
+                        .collect()
+                } else {
+                    vec![kgraf_provider::Content::text(
+                        "{\"contracts\":[{\"id\":\"c1\",\"instruction\":\"x\",\"acceptance\":\"y\"}]}",
+                    )]
+                };
+                Ok(kgraf_provider::Response {
+                    model: request.model.clone(),
+                    content,
+                    stop_reason: kgraf_provider::StopReason::EndTurn,
+                    usage,
+                    request_id: None,
+                })
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("dir");
+        let ledger = Arc::new(Ledger::open(&dir.path().join("l.db")).expect("ledger"));
+        let provider = Arc::new(ManyToolUses(std::sync::Mutex::new(Vec::new())));
+        let calls = rerank_calls(ledger.clone());
+        let d = ModelDecomposer(ModelCaller {
+            provider: provider.clone(),
+            ledger: ledger.clone(),
+            model: "m".into(),
+            max_output_tokens: 1_000,
+            agent: "orchestrator:r".into(),
+            task: "r".into(),
+        });
+        d.decompose(&tool_request(calls.clone()))
+            .await
+            .expect("plan");
+        let rows = ledger.calls().expect("rows");
+        let reranks: Vec<CallId> = rows
+            .iter()
+            .filter(|r| r.adapter == "first-is-best")
+            .map(|r| r.id.clone())
+            .collect();
+        assert_eq!(reranks.len(), MAX_MODEL_TOOL_CALLS_PER_ROUND);
+        assert_eq!(calls.take_calls(), reranks, "every tool row is logged");
+        let requests = provider.0.lock().expect("lock").clone();
+        let results = &requests[1].messages.last().expect("results").content;
+        assert_eq!(results.len(), 20, "every tool call gets a result");
+        let not_run = results
+            .iter()
+            .filter(|c| matches!(c, kgraf_provider::Content::ToolResult { is_error: true, content, .. } if content.contains("not run")))
+            .count();
+        assert_eq!(not_run, 20 - MAX_MODEL_TOOL_CALLS_PER_ROUND);
+    }
+
+    /// A model tool call that fails reaches the run's notices, not only the
+    /// planning model.
+    #[tokio::test]
+    async fn a_failed_model_tool_call_is_kept_as_a_notice() {
+        let ledger = Arc::new(Ledger::open_in_memory().expect("ledger"));
+        let calls = rerank_calls(ledger);
+        let out = calls
+            .call_tool("rerank", serde_json::json!({"query": "q", "documents": []}))
+            .await
+            .expect("a model tool");
+        assert!(out.is_err() || out.as_ref().is_ok_and(|o| o.is_error));
+        let failures = calls.take_failures();
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(failures[0].contains("`rerank`"), "{failures:?}");
+        assert!(calls.take_failures().is_empty());
+    }
+
+    /// The run's stop cancels a model tool call the planner is making.
+    #[tokio::test]
+    async fn a_model_tool_call_is_cancelled_by_the_run_stop_token() {
+        let ledger = Arc::new(Ledger::open_in_memory().expect("ledger"));
+        let stop = kgraf_tools::CancellationToken::new();
+        let calls = (*rerank_calls(ledger))
+            .clone()
+            .with_cancel(stop.child_token());
+        stop.cancel();
+        let out = calls
+            .call_tool(
+                "rerank",
+                serde_json::json!({"query": "q", "documents": ["a"]}),
+            )
+            .await
+            .expect("a model tool");
+        assert!(
+            matches!(out, Err(kgraf_tools::ToolError::Cancelled { .. })),
+            "{out:?}"
+        );
+    }
+
+    /// Decision 0089: the planner is told the run's routes of every kind, by
+    /// kind, and told nothing about them when the run has none.
+    #[tokio::test]
+    async fn the_planner_is_told_the_model_routes_by_kind_only_when_there_are_some() {
+        let dir = tempfile::tempdir().expect("dir");
+        let ledger = Arc::new(Ledger::open(&dir.path().join("l.db")).expect("ledger"));
+        let provider = Arc::new(RecordsTheRequest(std::sync::Mutex::new(String::new())));
+        let d = ModelDecomposer(ModelCaller {
+            provider: provider.clone(),
+            ledger,
+            model: "m".into(),
+            max_output_tokens: 1_000,
+            agent: "orchestrator:r".into(),
+            task: "r".into(),
+        });
+        let request = |model_routes: Vec<String>| PlanRequest {
+            instruction: "do it".into(),
+            split_reason: None,
+            notes: vec![],
+            known_files: vec![],
+            routes: vec!["anthropic:m".into()],
+            model_routes,
+            model_calls: None,
+            tools: vec!["embed".into()],
+            templates: vec![],
+            interfaces: false,
+        };
+        d.decompose(&request(vec![
+            "embedding: openai:text-embedding-3-small (tools embed; one vector per text)".into(),
+        ]))
+        .await
+        .expect("plan");
+        let sent = provider.0.lock().expect("lock").clone();
+        assert!(
+            sent.contains("Model routes of other kinds, by kind"),
+            "{sent}"
+        );
+        assert!(
+            sent.contains("embedding: openai:text-embedding-3-small"),
+            "{sent}"
+        );
+        // What the run does: the tools are in every worker's tool set.
+        assert!(sent.contains("in every worker's tool set"), "{sent}");
+        assert!(!sent.contains("only by naming"), "{sent}");
+        // Offered to the planner itself only when it can call them.
+        assert!(
+            !sent.contains("You may call these tools yourself"),
+            "{sent}"
+        );
+        d.decompose(&request(vec![])).await.expect("plan");
+        let sent = provider.0.lock().expect("lock").clone();
+        assert!(!sent.contains("Model routes of other kinds"), "{sent}");
     }
 
     #[test]

@@ -1,0 +1,36 @@
+{
+  "_fixture": {
+    "source": [
+      "https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_TokenUsage.html",
+      "https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html"
+    ],
+    "provenance": "Constructed from the documented TokenUsage members (cacheReadInputTokens, cacheWriteInputTokens, cacheDetails) and the documented rule that inputTokens counts only non-cached tokens. The numbers are invented. Not a live capture."
+  },
+  "output": {
+    "message": {
+      "role": "assistant",
+      "content": [
+        {
+          "text": "ok"
+        }
+      ]
+    }
+  },
+  "stopReason": "end_turn",
+  "usage": {
+    "inputTokens": 50,
+    "outputTokens": 100,
+    "totalTokens": 1150,
+    "cacheReadInputTokens": 900,
+    "cacheWriteInputTokens": 100,
+    "cacheDetails": [
+      {
+        "inputTokens": 100,
+        "ttl": "5m"
+      }
+    ]
+  },
+  "metrics": {
+    "latencyMs": 900
+  }
+}

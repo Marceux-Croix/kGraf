@@ -111,3 +111,30 @@ returns its output so far.
   would silently replace the first. It keeps CRLF line endings and the final-newline state.
 - **Path names fold the way the volume does** when the tool guard and the overlap check
   compare them.
+- **The tool guards follow links inside the worktree**, so a link to `.git` or `.gitmodules`
+  cannot be written through, and `apply_patch` checks every path it writes before it plans
+  any hunk. The NTFS short names `GITCON~N` and `GITHOO~N` are protected too.
+- **Narrower reads, more denies.** On Linux `~/.local` and `~/.cache` are no longer granted
+  whole; on macOS more credential files are denied (Maven, Gradle, Podman, Hugging Face,
+  1Password CLI, Oracle Cloud, Bundler, `~/.claude`). A sandbox root strictly inside a
+  denied home path is re-allowed after the deny, so a project kept there still builds.
+- **The status read after a sandboxed build uses the git directory recorded at start**,
+  with hooks and fsmonitor off, and is refused if `<worktree>/.git` has changed.
+- **A worktree is not removed under a running process.**
+- **The approval question quotes each argument and escapes control characters.**
+- **`apply_patch` keeps each line's own ending** in a file with mixed endings.
+- **The host-side status read runs no program a command planted.** `git status` runs a clean
+  filter for a changed file and enters populated submodules, so the read ignores submodules,
+  allows no fetch, and runs only on a gitlink at the worktree root whose git directories lie
+  outside the root. A resume checks the gitlink recorded when the worker first started.
+- **More denies and grants.** On macOS, pip, Yarn and Poetry index logins, cargo's per-user
+  config (settings kept there do not apply inside the sandbox) and more command-line tool
+  logins are denied. On Linux, version-manager toolchain trees and build caches that hold no
+  login are readable.
+- **The approval text escapes every blank or hidden character**, including tag characters,
+  fillers, variation selectors and typographic spaces, in the tool name and rule note too.
+- **`apply_patch` compares the files hunks reach**, so a link and its target are one file.
+- **An abandoned external command is reported to its executor**, and a late response is never
+  read as the answer to the next request.
+- **A missing-dependency line counts only while cargo itself writes stderr.**
+- **Windows ACL probe directories a dead process left in a worktree root are removed.**

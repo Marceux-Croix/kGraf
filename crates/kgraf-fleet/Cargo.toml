@@ -10,12 +10,17 @@ authors.workspace = true
 
 [dependencies]
 kgraf-core.workspace = true
+kgraf-decide.workspace = true
 kgraf-provider.workspace = true
 kgraf-provider-anthropic.workspace = true
 kgraf-provider-openai.workspace = true
+kgraf-provider-bedrock.workspace = true
+kgraf-provider-google.workspace = true
 kgraf-secrets.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
+tempfile.workspace = true
+serde_json.workspace = true

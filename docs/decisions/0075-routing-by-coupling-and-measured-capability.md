@@ -83,4 +83,8 @@ every call, and reports name the spend as unpriced, or as local, unpriced. The s
 says `total unpriced` when no recorded model has a price, never zero dollars. The rotation
 cursor advances only when a route is used, a route that lacks a contract's required tool is
 skipped, and an infrastructure failure (a provider outage, a rate limit) is not counted against
-a route's live satisfaction tally.
+a route's live satisfaction tally. A live attempt the ledger cannot price is recorded as
+unpriced, never as a known zero, and a profile store written with such a zero is repaired on
+load. A pick found transiently not ready also moves the cursor (and, under `Fitness`, is passed
+over for that contract), so one unready route does not hold a contract while another is
+healthy.

@@ -588,11 +588,13 @@ mod tests {
                 call_id: "1".into(),
                 tool: "read_file".into(),
                 input: serde_json::json!({"path": "./src/a.rs"}),
+                signature: None,
             },
             WorkerEvent::ToolCallStarted {
                 call_id: "2".into(),
                 tool: "search_files".into(),
                 input: serde_json::json!({"paths": ["src/b.rs", ""]}),
+                signature: None,
             },
             WorkerEvent::TextDelta {
                 text: "path: src/c.rs".into(),

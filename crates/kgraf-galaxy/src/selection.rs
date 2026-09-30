@@ -271,26 +271,6 @@ pub fn instance_for(
     }
 }
 
-/// Node instances for the scene under `selection`, in slot order, at the scene's
-/// positions.
-pub fn build_instances(scene: &Scene, selection: Option<&Selection>) -> Vec<NodeInstance> {
-    scene
-        .nodes()
-        .iter()
-        .enumerate()
-        .map(|(i, n)| {
-            instance_for(
-                scene,
-                i as u32,
-                selection,
-                n.position,
-                1.0,
-                Tints::default(),
-            )
-        })
-        .collect()
-}
-
 /// Whether an edge touches an agent or a work item.
 pub fn is_overlay(scene: &Scene, e: &EdgeInput) -> bool {
     scene.population(e.source) != Population::Code || scene.population(e.target) != Population::Code
@@ -327,24 +307,6 @@ pub fn unselected_edge(
             density,
         },
     ]
-}
-
-/// Edge vertices for the scene under `selection` and `budget`, at the scene's
-/// positions. See [`build_edges_at`].
-pub fn build_edges(
-    scene: &Scene,
-    selection: Option<&Selection>,
-    budget: RenderBudget,
-    drawn: impl Fn(u32) -> bool,
-) -> Vec<EdgeVertex> {
-    build_edges_at(
-        scene,
-        selection,
-        budget,
-        drawn,
-        |i| scene.nodes()[i as usize].position,
-        crate::palette::Palette::default().selection,
-    )
 }
 
 /// Edge vertices for the scene under `selection` and `budget`, positioned by `pos`,
@@ -451,6 +413,44 @@ pub fn code_edge_count(scene: &Scene) -> usize {
 mod tests {
     use super::*;
     use crate::scene::{NodeInput, SceneInput};
+
+    /// Node instances for the scene under `selection`, in slot order, at the scene's
+    /// positions.
+    fn build_instances(scene: &Scene, selection: Option<&Selection>) -> Vec<NodeInstance> {
+        scene
+            .nodes()
+            .iter()
+            .enumerate()
+            .map(|(i, n)| {
+                instance_for(
+                    scene,
+                    i as u32,
+                    selection,
+                    n.position,
+                    1.0,
+                    Tints::default(),
+                )
+            })
+            .collect()
+    }
+
+    /// Edge vertices for the scene under `selection` and `budget`, at the scene's
+    /// positions.
+    fn build_edges(
+        scene: &Scene,
+        selection: Option<&Selection>,
+        budget: RenderBudget,
+        drawn: impl Fn(u32) -> bool,
+    ) -> Vec<EdgeVertex> {
+        build_edges_at(
+            scene,
+            selection,
+            budget,
+            drawn,
+            |i| scene.nodes()[i as usize].position,
+            crate::palette::Palette::default().selection,
+        )
+    }
 
     /// 0 - 1 - 2 - 3, plus 4 isolated.
     fn chain() -> Scene {

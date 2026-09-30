@@ -73,7 +73,7 @@ use safe_git::{SafeGit, Target};
 pub use state::{
     ATTEMPT_REF_PREFIX, Attempt, AttemptEvent, AttemptGroup, AttemptState, CommitOutcome,
     ConflictMessage, ConflictSide, ConflictedPath, FinishOutcome, Identity, Leftovers, Limits,
-    MergeConflict, MergeError, MergeOutcome, Refusal, RefusalReason, SelectFailure,
+    MergeConflict, MergeError, MergeOutcome, MergedWorktree, Refusal, RefusalReason, SelectFailure,
 };
 
 /// Retries of the integration-branch compare-and-swap when another process
@@ -681,10 +681,14 @@ impl MergeBack {
             .git
             .ok(&wt, &[], ["rev-parse", &format!("{base}^{{tree}}")], None)?;
         if tree == base_tree {
-            attempt.advance(AttemptEvent::NoChanges)?;
+            // Checked, removed, then recorded: `Empty` is final, so a removal
+            // that fails (a process still running in the worktree) must leave
+            // the attempt `Working` for the caller to commit again later.
+            attempt.state.next(AttemptEvent::NoChanges)?;
             if !keep_empty {
                 self.manager.remove(attempt.workspace.clone())?;
             }
+            attempt.advance(AttemptEvent::NoChanges)?;
             return Ok(CommitOutcome::Empty);
         }
         let env = self.identity_env();
@@ -848,7 +852,7 @@ impl MergeBack {
     ///    case-only rename on a case-insensitive volume shows up only then)
     ///    and restored from the snapshot: the index is set to the snapshot's
     ///    tree with `read-tree -m`, which keeps the cached stat data of entries
-    ///    that match (P1), then `checkout-index` writes the listed files.
+    ///    that match, then `checkout-index` writes the listed files.
     ///
     /// Rounds repeat until one finds nothing. Anything still there after the
     /// last round is an error, never ignored (fail loud): a worktree that is
@@ -939,6 +943,18 @@ impl MergeBack {
     /// Merged or Conflicted). On a clean merge the workspace and attempt ref
     /// are removed; on a conflict both are kept and the branch does not move.
     pub fn merge(&self, attempt: &mut Attempt) -> Result<MergeOutcome, MergeError> {
+        self.merge_then(attempt, MergedWorktree::Remove)
+    }
+
+    /// [`Self::merge`], with the user's choice of what a clean merge does
+    /// with the attempt's worktree and its build output (decision 0088). The
+    /// attempt ref is deleted either way; a conflict keeps both, as in
+    /// [`Self::merge`].
+    pub fn merge_then(
+        &self,
+        attempt: &mut Attempt,
+        after: MergedWorktree,
+    ) -> Result<MergeOutcome, MergeError> {
         let AttemptState::Committed { commit } = attempt.state.clone() else {
             return Err(MergeError::InvalidTransition {
                 from: attempt.state.label(),
@@ -1031,12 +1047,16 @@ impl MergeBack {
             attempt.advance(AttemptEvent::Merged {
                 merge_commit: merge_commit.clone(),
             })?;
-            // Upstream `merge --delete`: the environment has served its purpose.
-            self.retire(attempt, Some(&commit))
-                .map_err(|source| MergeError::CleanupFailed {
-                    merge_commit: merge_commit.clone(),
-                    source: Box::new(source),
-                })?;
+            // Upstream `merge --delete`: the environment has served its
+            // purpose, unless the user keeps worktrees and their builds.
+            let retired = match after {
+                MergedWorktree::Remove => self.retire(attempt, Some(&commit)),
+                MergedWorktree::Keep => self.delete_attempt_ref(attempt, &commit),
+            };
+            retired.map_err(|source| MergeError::CleanupFailed {
+                merge_commit: merge_commit.clone(),
+                source: Box::new(source),
+            })?;
             return Ok(MergeOutcome::Merged {
                 merge_commit,
                 integration_before: tip,
@@ -1182,17 +1202,23 @@ impl MergeBack {
     /// the workspace.
     fn retire(&self, attempt: &Attempt, commit: Option<&str>) -> Result<(), MergeError> {
         if let Some(commit) = commit {
-            self.git.ok(
-                &Target::Repo,
-                &[],
-                ["update-ref", "-d", &attempt.attempt_ref(), commit],
-                None,
-            )?;
+            self.delete_attempt_ref(attempt, commit)?;
         }
         // WorkspaceManager::remove runs `worktree unlock/remove --force
         // --force/prune` from the main repository. None of those runs a hook
         // or reads the worktree's index, so they need no override here.
         self.manager.remove(attempt.workspace.clone())?;
+        Ok(())
+    }
+
+    /// Delete the attempt ref, only if it still names `commit`.
+    fn delete_attempt_ref(&self, attempt: &Attempt, commit: &str) -> Result<(), MergeError> {
+        self.git.ok(
+            &Target::Repo,
+            &[],
+            ["update-ref", "-d", &attempt.attempt_ref(), commit],
+            None,
+        )?;
         Ok(())
     }
 

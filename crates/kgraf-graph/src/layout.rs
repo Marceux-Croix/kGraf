@@ -197,9 +197,7 @@ pub fn cluster_center(directory: &str) -> (f32, f32) {
 /// The cluster a directory belongs to: its first three components.
 ///
 /// `crates/kgraf-graph/src/layout` and `crates/kgraf-graph/src` share
-/// a cluster, so a deep tree does not scatter across the ring. Two nodes whose
-/// directories share this key are "same-cluster" for edge intensity too
-/// ([`density::edge_intensity`]).
+/// a cluster, so a deep tree does not scatter across the ring.
 pub fn cluster_key(directory: &str) -> &str {
     match directory.match_indices('/').nth(CLUSTER_KEY_COMPONENTS - 1) {
         Some((i, _)) => &directory[..i],

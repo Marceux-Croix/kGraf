@@ -44,8 +44,10 @@ removed unpacked sources.
    run, and the names of those crates go to the registry.
 5. **The fetch never runs on the project's or the worktree's own files.** It runs in a private
    mirror of every `Cargo.toml` (and the root `Cargo.lock`), each with an empty `src/lib.rs`
-   beside it. The mirror is read through a directory capability that cannot leave the source,
-   skips every symlink and hidden folder, and is bounded; a worktree's cargo configuration and
+   beside it and an empty file for every other target the manifest names, so `cargo metadata`
+   does not fail on a missing target file. Cargo runs in its own process group, which is
+   killed at a timeout, a cancel and the command's exit, and when kGraf is interrupted. The mirror is read through a directory capability that
+   cannot leave the source, skips every symlink and hidden folder, and is bounded; a worktree's cargo configuration and
    toolchain file are never copied. Cargo writes its lockfile into the mirror, not the
    checkout, and no host process writes into a worktree. `cargo fetch` runs no build script
    (measured). A manifest path that leaves the project (a `path`, `workspace` or member entry
@@ -108,3 +110,12 @@ a project whose user allowed it, for dependency downloads only.
   check says it could not decide and the run goes on with a notice. A crates.io index
   configured as a git index is refused by the git defense; the default sparse index is not
   affected.
+
+## Amendments (2026-09-29)
+
+- **The mid-run trigger is cargo's own lines on stderr.** A refetch is asked for only when a
+  line of the failed build's stderr starts as cargo's missing-dependency diagnostics do (its
+  `error: failed to download` or `error: failed to unpack package` line, the same words as a
+  `Caused by:` entry, the `--offline was specified` cause, or its offline-mode note). The
+  words anywhere else (a test's own output, stdout, mid-line) no longer spend one of the
+  run's bounded checks.

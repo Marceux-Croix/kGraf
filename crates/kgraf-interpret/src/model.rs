@@ -533,12 +533,6 @@ pub enum Verifiability {
     Unverifiable { reason: String, needs: String },
 }
 
-impl Verifiability {
-    pub fn is_mechanical(&self) -> bool {
-        matches!(self, Verifiability::Mechanical { .. })
-    }
-}
-
 /// Assess one criterion against the declared commands (discovered ones, plus
 /// proposed ones the user accepted by name).
 pub fn assess_criterion(criterion: &Criterion, declared: &BTreeSet<String>) -> Verifiability {
@@ -809,9 +803,11 @@ mod tests {
                 command: s.to_owned(),
             })
         };
-        assert!(
-            assess_criterion(&c(cmd("cargo  test --workspace"), None), &declared).is_mechanical()
-        );
+        let mechanical = |v: Verifiability| matches!(v, Verifiability::Mechanical { .. });
+        assert!(mechanical(assess_criterion(
+            &c(cmd("cargo  test --workspace"), None),
+            &declared
+        )));
         match assess_criterion(&c(cmd("npm test"), None), &declared) {
             Verifiability::Unverifiable { reason, .. } => assert!(reason.contains("npm test")),
             v => panic!("{v:?}"),
@@ -823,13 +819,16 @@ mod tests {
             Verifiability::Unverifiable { needs, .. } => assert_eq!(needs, "a designer's review"),
             v => panic!("{v:?}"),
         }
-        assert!(!assess_criterion(&c(None, None), &declared).is_mechanical());
+        assert!(!mechanical(assess_criterion(&c(None, None), &declared)));
         let path = |p: &str| Some(Check::Path { path: p.to_owned() });
-        assert!(!assess_criterion(&c(path("../etc"), None), &declared).is_mechanical());
+        assert!(!mechanical(assess_criterion(
+            &c(path("../etc"), None),
+            &declared
+        )));
         let symbol = Some(Check::Symbol {
             name: "Ledger".into(),
         });
-        assert!(assess_criterion(&c(symbol, None), &declared).is_mechanical());
+        assert!(mechanical(assess_criterion(&c(symbol, None), &declared)));
     }
 
     /// Decision 0013: a constraint's `forbidden_paths` is validated the same

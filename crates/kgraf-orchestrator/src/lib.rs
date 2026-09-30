@@ -80,6 +80,7 @@ mod intake;
 mod interactive;
 pub mod interface_review;
 mod message_tool;
+pub mod model_kinds;
 pub mod occupancy;
 mod orchestrator;
 pub mod pairing;
@@ -161,6 +162,7 @@ pub use interface_review::{
     ConsumerRoute, Finding, InterfaceReviewer, ReviewContext, ReviewOutcome, ReviewRecord,
     RoutedInterfaceReviewer,
 };
+pub use model_kinds::ModelKindCalls;
 pub use orchestrator::sessions::{
     AnswerOutput, AnswerRequest, ConnectionRequest, ConnectionVerdict, JudgeOutput, JudgeRequest,
     QuestionAnswerer, SESSION_CALL_TIMEOUT, SessionNoticeSink,
@@ -205,7 +207,9 @@ pub use scheduler_loop::{
     DEFAULT_LEASE, DEFAULT_ON_TIME_WINDOW, SchedulerLoop, TickEvent, TrackedSchedule,
 };
 pub use session_tools::{SESSION_TOOL_NAMES, SessionLine, session_tools};
-pub use sizing::{ORCHESTRATOR_AGENT_PREFIX, Projection, ProjectionSource, Sizer, dear_usage};
+pub use sizing::{
+    ORCHESTRATOR_AGENT_PREFIX, Projection, ProjectionSource, Sizer, dear_usage, dear_usage_on,
+};
 pub use speculation::{
     ConflictKind, Round, SPECULATION_GATE, SpeculationCost, SpeculativeConflict, Trial,
     ValidationCache, speculate,

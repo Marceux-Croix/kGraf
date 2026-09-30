@@ -585,7 +585,7 @@ async fn port_notes_are_data_and_status_questions_are_answered_read_only() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn steering_is_persisted_for_the_orchestrator_and_refused_for_a_running_worker() {
+async fn steering_is_persisted_for_the_orchestrator() {
     let dir = tempfile::tempdir().expect("dir");
     let plan = plan_json(&[
         c("a", "make a", "src/a.rs", &[]),
@@ -602,10 +602,6 @@ async fn steering_is_persisted_for_the_orchestrator_and_refused_for_a_running_wo
     let run = tokio::spawn(o.start(RunId::new("r1"), "make a".into()));
     tokio::time::sleep(Duration::from_millis(50)).await;
     handle.steer("prefer small functions").await.expect("steer");
-    assert!(matches!(
-        handle.steer_worker("r1-a-r0-a0").await,
-        Err(kgraf_orchestrator::SteerError::RuntimeCannotInject(_))
-    ));
     let status = handle.status().await.expect("status");
     assert_eq!(status.in_flight, vec!["a".to_owned()]);
     let report = run.await.expect("join").expect("run");

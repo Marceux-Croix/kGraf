@@ -941,7 +941,7 @@ crate and the orchestrator.
 | `kgraf-core` | ids, the token-usage normal form, money, budgets |
 | `kgraf-graph` | chunker, SQLite store, queries, slices, co-change, leases, temporal facts, work nodes, repo-map ranking |
 | `kgraf-provider` | the provider seam, the ledger, the shared streaming decoder, rate limits |
-| `kgraf-provider-anthropic`, `kgraf-provider-openai` | one adapter crate per wire protocol |
+| `kgraf-provider-anthropic`, `kgraf-provider-openai`, `kgraf-provider-bedrock`, `kgraf-provider-google` | one adapter crate per wire protocol |
 | `kgraf-fleet` | the route catalog and credentials by environment variable |
 | `kgraf-decide` | the typed-decision seam; no weights ship |
 | `kgraf-instructions` | the instruction and skill inventory |
@@ -1004,7 +1004,12 @@ dependency missing from the local cargo cache is fetched by the host, outside
 the sandbox, only with the project's consent, checked at every run start
 before anything is built (decision 0087). An attempt that changed no file is
 refused when a declared Rust write target holds only placeholder bodies, and
-every accepted empty attempt carries a notice (decision 0086). A retry of an
+every accepted empty attempt carries a notice (decision 0086). A worker's
+worktree and its build output are deleted once nothing needs them, unless the
+user chose to keep every attempt's; a worktree a resume, a live worker, a
+pending merge or an open contract (a handoff child continuing in it, a resolver
+citing it) needs is kept either way, and each failed removal is one warning in
+the report (decision 0088). A retry of an
 unpinned contract does not repeat the route that just failed (decision 0085). A
 model with no price entry is never refused (decision 0075): the ledger keeps
 every call, and reports show its spend as unpriced. A planner answer that is not

@@ -27,12 +27,13 @@
 //! separately whether *this* tick is close enough to real time to count as the
 //! schedule's normal, on-time firing:
 //!
-//! - **On time**: the gap since the schedule was last *evaluated* at all
-//!   ([`ScheduleStore::last_evaluated_at`], not `last_seen` - see that method's own
-//!   doc for why the two must be kept apart: `last_seen` only ever advances to an
-//!   occurrence that was actually claimed, so a `Skip`-policy schedule that has never
-//!   yet fired would otherwise always measure its gap from its own creation time) is
-//!   within [`SchedulerLoop::on_time_window`]. Both policies fire.
+//! - **On time**: the occurrence's own due time is within
+//!   [`SchedulerLoop::on_time_window`] of `now`. The gap is measured from the
+//!   occurrence, not from the last tick: a heartbeat-based gap called an
+//!   occurrence missed by hours "on time" as long as the loop itself had ticked
+//!   recently. The candidate occurrence is searched for after `last_seen`, or after
+//!   the schedule's creation time when nothing has been claimed yet. Both policies
+//!   fire.
 //! - **Not on time** (a real gap: the app was closed, a tick was skipped for far
 //!   longer than the window): `RunOnceOnWake` still fires (its whole purpose);
 //!   `Skip` drops it.
@@ -423,6 +424,24 @@ impl SchedulerLoop {
             if self.is_pending(&id, expired.due_at) {
                 continue;
             }
+            // An occurrence set aside for a manual run skipped the policy check
+            // when it fell due. Under `Skip`, one that is now outside the on-time
+            // window is a missed run: dropped, never run late.
+            if expired.held_for_manual_run
+                && tracked.schedule.missed_run_policy == MissedRunPolicy::Skip
+                && now.signed_duration_since(expired.due_at) > self.on_time_window
+            {
+                self.lock_store()
+                    .drop_held_for_manual_run(&id, expired.due_at, now)?;
+                events.push(TickEvent::Dropped {
+                    schedule_id: id.clone(),
+                    due_at: expired.due_at,
+                    detail: "held for a manual run, and past the on-time window under Skip \
+                             when it came back; dropped, not run late"
+                        .to_owned(),
+                });
+                continue;
+            }
             let claim = self.lock_store().claim_occurrence(
                 &id,
                 expired.due_at,
@@ -539,7 +558,7 @@ impl SchedulerLoop {
                         generation,
                     },
                 );
-                // D3: a retry that finally succeeds is its own event, never
+                // A retry that finally succeeds is its own event, never
                 // `Reclaimed` - it was not abandoned, it was capacity-limited - and
                 // never `Deferred`, which means not started.
                 events.push(if deferred_count > 0 {

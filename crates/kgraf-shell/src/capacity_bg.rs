@@ -207,6 +207,19 @@ impl CapacityHandle {
         }
     }
 
+    /// A handle that holds one fixed reading and runs no thread (tests: the
+    /// gate writers read `latest()` without a measurement on this machine).
+    #[cfg(test)]
+    pub(crate) fn fixed(capacity: Capacity) -> Self {
+        Self {
+            stop: Arc::new(AtomicBool::new(false)),
+            latest: Arc::new(Mutex::new(Some(capacity))),
+            volumes: Volumes::default(),
+            projects: Projects::default(),
+            join: None,
+        }
+    }
+
     /// The most recently accepted capacity, for the Settings breakdown
     /// (`None` until the first reading is accepted, which happens at once:
     /// [`kgraf_capacity::Hysteresis::observe`]'s first call always commits).

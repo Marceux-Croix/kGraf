@@ -74,7 +74,9 @@ use crate::run_state::{
     AdmittedLease, ContractStatus, GroundingRecord, GroundingTrigger, OpenContract, PlanItem,
     PlanProgress, PlannedDispatch, RecordedNote, RunStateRecord, RunStatus, WriteTarget,
 };
-use crate::sizing::{ORCHESTRATOR_AGENT_PREFIX, Projection, Sizer, bound_tokens, dear_usage};
+use crate::sizing::{
+    ORCHESTRATOR_AGENT_PREFIX, Projection, Sizer, bound_tokens, dear_usage, dear_usage_on,
+};
 use crate::store::{RunFiles, RunStore, SharedGraph, StoreError};
 use crate::stub_land::{stub_left_in_place, stub_left_in_place_failure};
 use crate::trace::{DeferReason, LoopDetector, LoopKind, TraceEvent, TraceLog};
@@ -120,6 +122,7 @@ pub const DEFAULT_MAX_CONTRACTS_PER_PLAN: usize = 32;
 pub const DEFAULT_MAX_SPLITS: u32 = 8;
 
 /// One vendor and model workers can be dispatched to.
+#[derive(Clone)]
 pub struct Route {
     pub name: String,
     /// The vendor of the route's model, as the provider catalog names it
@@ -139,6 +142,18 @@ pub struct Route {
     /// gates eligibility on its own, only the Interface and satisfaction
     /// floors do that, for every route alike.
     pub local: bool,
+}
+
+/// Each declared node id of a write set, to the file it lives in.
+fn node_paths(writes: &[WriteTarget]) -> BTreeMap<String, String> {
+    writes
+        .iter()
+        .filter_map(|w| {
+            w.node
+                .as_ref()
+                .map(|n| (n.as_str().to_owned(), w.path.clone()))
+        })
+        .collect()
 }
 
 impl Route {
@@ -198,15 +213,38 @@ pub trait Workspaces: Send + Sync {
         contract: &OpenContract,
         worker: &AgentId,
     ) -> Result<PathBuf, PrepareFailure>;
+    /// The worktree `workspace` that `contract` inherited (a handoff child
+    /// continues in its parent's, decision 0067), ready for its next attempt:
+    /// the same path, reopened with its work when this process no longer holds
+    /// it (an earlier attempt released it, or a resume), from
+    /// `contract.worktrees[<its file name>]`. Never a fresh worktree in its
+    /// place: one that is gone or not intact is refused. The default, for
+    /// plain directories, has nothing to reopen.
+    async fn adopt(
+        &self,
+        _contract: &OpenContract,
+        workspace: &Path,
+    ) -> Result<PathBuf, PrepareFailure> {
+        Ok(workspace.to_path_buf())
+    }
     /// What to record so a later process can reopen `workspace` ([`Self::prepare`]);
     /// opaque to the orchestrator. `None`: nothing to record.
     async fn handle(&self, _workspace: &Path) -> Option<String> {
         None
     }
     /// Done with a worktree for now. `keep`: the worktree stays, because it is
-    /// the verified winner or because its worker will be continued (a voided
-    /// pass, a stop); otherwise an unmerged attempt in it is discarded.
+    /// the verified winner, because its worker will be continued (a voided
+    /// pass, a stop), or because an open contract still names it (a handoff
+    /// child continues in it, a resolver cites it); otherwise an unmerged
+    /// attempt in it is discarded. The orchestrator passes `keep = false` only
+    /// once no open contract names the worktree.
     async fn release(&self, workspace: &Path, keep: bool);
+    /// Worktrees or attempts [`Self::release`] could not remove, since the last
+    /// call: the run's report shows each as a warning, so a removal that failed
+    /// is never silent. A provider that removes nothing has none.
+    fn take_problems(&self) -> Vec<String> {
+        Vec::new()
+    }
     /// Merge the verified, selected attempt in `workspace` into the integration
     /// branch. A conflict is returned, never resolved by this call: only a
     /// dispatched resolver worker, or a plain re-dispatch, decides what a
@@ -218,11 +256,15 @@ pub trait Workspaces: Send + Sync {
     ) -> Result<Integration, String> {
         Ok(Integration::Unversioned)
     }
-    /// A conflict at `workspace` is settled (0073): a resolver merged its fix,
+    /// A conflict at `workspace` is settled (0073): `resolver` merged its fix,
     /// or the contract gave up. The attempt a provider kept across the
-    /// conflict (if any) can now be discarded. A provider that keeps nothing
-    /// across a conflict does nothing here.
-    async fn discard_conflict(&self, _workspace: &Path) {}
+    /// conflict (if any) can now be discarded; the orchestrator calls this
+    /// once no open contract names `workspace`. `resolver.worktrees` holds
+    /// what [`Self::handle`] recorded for `workspace` at the conflict, so a
+    /// provider in a later process (the run stopped before the resolver
+    /// settled) can still find it. A provider that keeps nothing across a
+    /// conflict does nothing here.
+    async fn discard_conflict(&self, _resolver: &OpenContract, _workspace: &Path) {}
     /// A fresh worktree at the integration tip for the message bus to append
     /// conversation files in and index them from (0026), so they are never
     /// written into the user's checkout. `None`: there is no integration branch,
@@ -581,13 +623,6 @@ impl kgraf_diag::DiagCode for OrchestratorError {
 /// Why a steer was refused.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum SteerError {
-    /// The runtime has no tool-batch-boundary injection, so a steer to a running
-    /// worker would be drained without reaching it; refused rather than dropping
-    /// the user's words (review §B6).
-    #[error(
-        "worker `{0}` cannot be steered: the runtime cannot inject a user turn at a tool-batch boundary"
-    )]
-    RuntimeCannotInject(String),
     #[error("the steer is empty")]
     Empty,
     #[error("the orchestrator has stopped")]
@@ -682,10 +717,6 @@ enum Control {
     Stop,
     Steer {
         text: String,
-        reply: oneshot::Sender<Result<(), SteerError>>,
-    },
-    SteerWorker {
-        worker: String,
         reply: oneshot::Sender<Result<(), SteerError>>,
     },
     Status(oneshot::Sender<StatusReport>),
@@ -807,6 +838,17 @@ const MAX_PLAN_REASKS: u32 = 2;
 /// its own).
 const READINESS_REPORT_EVERY: u32 = 20;
 
+/// When the unpriced models were last read, and what the read returned.
+type UnpricedRead = (i64, Result<Vec<String>, String>);
+
+/// How long a status reply may reuse the last read of the unpriced models.
+const UNPRICED_READ_TTL_MS: i64 = 5_000;
+
+/// Ticks (500 ms by default, so 20 minutes) after which a contract still
+/// waiting on a route that is not ready is held with the reason, instead of
+/// waiting without end. Measured in time from the first failed check.
+const READINESS_GIVE_UP_TICKS: i64 = 2400;
+
 enum LoopMsg {
     Finished(Box<Finished>),
     Verified {
@@ -855,11 +897,16 @@ enum LoopMsg {
 #[derive(Clone)]
 pub struct OrchestratorHandle {
     tx: mpsc::Sender<LoopMsg>,
+    /// Cancelled by [`Self::stop`] before the loop reads the stop: a model
+    /// tool call the planner is making is not a worker the loop can notify,
+    /// and the loop does not read messages while it awaits the planner.
+    stop_token: kgraf_tools::CancellationToken,
 }
 
 impl OrchestratorHandle {
     /// Stop the run: cancel every worker; the record stays resumable.
     pub async fn stop(&self) {
+        self.stop_token.cancel();
         let _ = self.tx.send(LoopMsg::Control(Control::Stop)).await;
     }
 
@@ -870,19 +917,6 @@ impl OrchestratorHandle {
         self.tx
             .send(LoopMsg::Control(Control::Steer {
                 text: text.into(),
-                reply,
-            }))
-            .await
-            .map_err(|_| SteerError::Stopped)?;
-        rx.await.map_err(|_| SteerError::Stopped)?
-    }
-
-    /// Steer a running worker. Refused: see [`SteerError::RuntimeCannotInject`].
-    pub async fn steer_worker(&self, worker: impl Into<String>) -> Result<(), SteerError> {
-        let (reply, rx) = oneshot::channel();
-        self.tx
-            .send(LoopMsg::Control(Control::SteerWorker {
-                worker: worker.into(),
                 reply,
             }))
             .await
@@ -1102,6 +1136,10 @@ pub struct RunReport {
     /// Contracts that waited on a lease, over contracts dispatched: the
     /// serialized fraction the acceptance report shows.
     pub serialized_fraction: f64,
+    /// This run's lease measurements (decisions 0022 and 0049): paths its agents
+    /// held one after another and the share of those waits whose declared ranges
+    /// did not overlap.
+    pub lease_measurements: kgraf_graph::LeaseMeasurements,
     /// Settled spend of this run, unreconciled calls at their worst case.
     pub spent: Money,
     /// Reservations made (accounting only; decision 0080 removed
@@ -1123,6 +1161,81 @@ pub struct RunReport {
     /// for example "the check generated Cargo.lock; commit it". Not failures;
     /// nothing they name was merged.
     pub notices: Vec<String>,
+}
+
+/// How long a release waits for a worker that ignores its cancel before it
+/// stops holding the worker's slot and hold, and says so.
+const RELEASE_WAIT_BOUND: Duration = Duration::from_secs(120);
+
+/// Wait for a worker's task to end (its `ended` sender drops), at most
+/// [`RELEASE_WAIT_BOUND`]. After the bound the caller releases anyway: this
+/// prints a notice and records a KG-0499 diagnostics event, because spend
+/// after that point is in the ledger but not in the budget.
+async fn wait_for_end(rx: oneshot::Receiver<()>, who: &str) {
+    // Err means the sender dropped: the task ended. Elapsed means it ignored
+    // the cancel for the whole bound.
+    if tokio::time::timeout(RELEASE_WAIT_BOUND, rx).await.is_ok() {
+        return;
+    }
+    let text = format!(
+        "{who} did not stop within {} s of its cancel; its slot and hold are released \
+         now, and any spend after this point is in the ledger but not in the budget",
+        RELEASE_WAIT_BOUND.as_secs()
+    );
+    eprintln!("kgraf-orchestrator: {text}");
+    kgraf_diag::record(kgraf_diag::DiagEvent::error(
+        "KG-0499",
+        "kgraf-orchestrator",
+        text,
+    ));
+}
+
+/// The exact spend of an agent's calls not yet charged, read from the ledger.
+/// A call whose cost is unknown (an unpriced route, an unreconciled call) is
+/// never counted as a known zero: the hold stands in when it is larger than the
+/// known part (an upper bound). A failed read charges the hold too and prints
+/// the error, so an agent with no hold and an unreadable ledger is reported,
+/// not silently zero.
+fn exact_agent_spend(
+    ledger: &kgraf_provider::Ledger,
+    prices: &kgraf_core::PriceTable,
+    task: &str,
+    agent: &AgentId,
+    charged: &BTreeSet<CallId>,
+    held: Money,
+) -> Money {
+    let read = ledger
+        .calls_under_task(task, Some(agent.as_str()))
+        .and_then(|calls| {
+            let ids: Vec<CallId> = calls
+                .into_iter()
+                .filter(|c| c.agent_id == agent.as_str())
+                .map(|c| c.id)
+                .filter(|id| !charged.contains(id))
+                .collect();
+            ledger.spend_of(&ids, prices)
+        });
+    match read {
+        Ok(spend) if spend.unknown.is_empty() || spend.total >= held => {
+            if !spend.unknown.is_empty() {
+                eprintln!(
+                    "kgraf-orchestrator: {} call(s) of `{agent}` have unknown spend (unpriced or \
+                     unreconciled); the {} recorded is a lower bound, not the total",
+                    spend.unknown.len(),
+                    spend.total
+                );
+            }
+            spend.total
+        }
+        Ok(_) => held,
+        Err(e) => {
+            eprintln!(
+                "kgraf-orchestrator: the spend of `{agent}` could not be read ({e}); \
+                 its hold of {held} is charged instead"
+            );
+            held
+        }
+    }
 }
 
 /// One contract's attempts in flight, and what they hold.
@@ -1163,9 +1276,28 @@ struct InFlight {
     /// paths on the same worker its parent runs as. Empty (refuses nothing)
     /// until a subagent fences paths on it.
     fences: BTreeMap<AgentId, ScopeFence>,
+    /// Ends when a worker's detached task ends (the sender is dropped with it).
+    /// Removed when its result reaches the loop. What is left at drop is a
+    /// worker still winding down after its cancel.
+    ended: BTreeMap<AgentId, oneshot::Receiver<()>>,
+    run: String,
+    task: String,
+    clock: Arc<dyn Clock>,
+    /// Read at drop to settle each running worker at its exact spend.
+    ledger: Arc<Ledger>,
+    prices: PriceTable,
+    /// Calls already charged to the budget when the flight began.
+    charged: BTreeSet<CallId>,
 }
 
 impl Drop for InFlight {
+    /// A flight dropped with workers still running keeps its slot and holds
+    /// until each worker's task has ended (at most [`RELEASE_WAIT_BOUND`]),
+    /// then returns the slot and settles each worker that ran at its exact
+    /// ledger spend, stamped when the worker ended. Releasing at once would
+    /// free a slot for a new worker while the old one still writes, and would
+    /// drop spend from the hourly total; settling at the hold would add too
+    /// little for a worker whose estimate was low or zero.
     fn drop(&mut self) {
         if self.admitted.is_none() && self.reservations.is_empty() {
             return;
@@ -1173,11 +1305,56 @@ impl Drop for InFlight {
         for n in self.cancels.values() {
             n.notify_one();
         }
-        if let Some(a) = self.admitted.take() {
-            self.admission.gate().release(a);
-        }
-        for (_, r) in std::mem::take(&mut self.reservations) {
-            self.admission.budget().release(r);
+        let admitted = self.admitted.take();
+        let mut reservations = std::mem::take(&mut self.reservations);
+        let ended = std::mem::take(&mut self.ended);
+        let admission = self.admission.clone();
+        let (run, task, clock) = (self.run.clone(), self.task.clone(), self.clock.clone());
+        let (ledger, prices, charged) = (
+            self.ledger.clone(),
+            self.prices.clone(),
+            std::mem::take(&mut self.charged),
+        );
+        let finish = move |ran: BTreeSet<AgentId>| {
+            if let Some(a) = admitted {
+                admission.gate().release(a);
+            }
+            for worker in &ran {
+                let r = reservations.remove(worker);
+                let held = r.as_ref().map_or(Money::ZERO, Reservation::amount);
+                let spend = exact_agent_spend(&ledger, &prices, &task, worker, &charged, held);
+                // Read the clock after the ledger read: the spend belongs to
+                // the hour in which the worker ended, not the hour of the drop.
+                let at = clock.now_ms();
+                let mut budget = admission.budget();
+                match r {
+                    Some(r) => {
+                        let _ = budget.settle(r, &run, &task, spend, at);
+                    }
+                    None => budget.record_spend(&run, &task, spend, at),
+                }
+            }
+            for (_, r) in reservations {
+                admission.budget().release(r);
+            }
+        };
+        let ran: BTreeSet<AgentId> = ended.keys().cloned().collect();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) if !ended.is_empty() => {
+                handle.spawn(async move {
+                    // Wait for all workers at once, so the bound holds for the
+                    // flight and not per worker.
+                    let mut waits = tokio::task::JoinSet::new();
+                    for (worker, rx) in ended {
+                        waits.spawn(async move {
+                            wait_for_end(rx, &format!("worker `{worker}`")).await;
+                        });
+                    }
+                    while waits.join_next().await.is_some() {}
+                    finish(ran);
+                });
+            }
+            _ => finish(BTreeSet::new()),
         }
     }
 }
@@ -1377,6 +1554,12 @@ pub struct Orchestrator {
     /// `None`: the setting has no reviewer to call, refused and recorded per
     /// attempt rather than silently inert.
     interface_reviewer: Option<Arc<dyn crate::interface_review::InterfaceReviewer>>,
+    /// The run's routes of non-generative kinds (decision 0089). `None`: the
+    /// run declares none.
+    model_kinds: Option<Arc<crate::model_kinds::ModelKindCalls>>,
+    /// Cancelled by the run's stop ([`OrchestratorHandle::stop`]); the
+    /// orchestrator's own model tool calls run under a child of it.
+    stop_token: kgraf_tools::CancellationToken,
     /// Orchestrator calls already reserved and settled in this process before the
     /// run opened (the interpretation call, `intake.rs`): the open does not charge
     /// them to the budget a second time.
@@ -1401,6 +1584,9 @@ pub struct Orchestrator {
     pub(crate) session_call_timeout: Duration,
     /// Where session notices are shown besides the trace and the report.
     pub(crate) session_notices: Option<sessions::SessionNoticeSink>,
+    /// The full index pass's extractor report, traced once the run opens
+    /// ([`Self::with_index_extractor_changes`]).
+    index_extractor_changes: Vec<kgraf_graph::ExtractorChange>,
 }
 
 impl Orchestrator {
@@ -1425,12 +1611,15 @@ impl Orchestrator {
             gate_runner: None,
             attempt_envs: None,
             interface_reviewer: None,
+            model_kinds: None,
+            stop_token: kgraf_tools::CancellationToken::new(),
             precharged: Mutex::new(BTreeSet::new()),
             question_desk: Arc::new(crate::asks::QuestionDesk::default()),
             question_answerer: None,
             question_timeout: crate::asks::QuestionAttendance::Unattended.timeout(),
             session_call_timeout: sessions::SESSION_CALL_TIMEOUT,
             session_notices: None,
+            index_extractor_changes: Vec::new(),
         })
     }
 
@@ -1472,11 +1661,41 @@ impl Orchestrator {
         self
     }
 
+    /// The run's routes of non-generative kinds (decision 0089): listed by
+    /// kind in every decomposition request, so the planner may grant their
+    /// tools to a contract, and callable by the orchestrator itself through
+    /// [`Self::model_kinds`]. Nothing calls them by default.
+    pub fn with_model_kinds(mut self, calls: Arc<crate::model_kinds::ModelKindCalls>) -> Self {
+        // A copy that shares the call log and notices, with the run's stop
+        // as its cancel token.
+        self.model_kinds = Some(Arc::new(
+            (*calls).clone().with_cancel(self.stop_token.child_token()),
+        ));
+        self
+    }
+
+    /// The run's non-generative routes, for the orchestrator's own calls.
+    pub fn model_kinds(&self) -> Option<&Arc<crate::model_kinds::ModelKindCalls>> {
+        self.model_kinds.as_ref()
+    }
+
     /// Gate every major node with the project's validation commands (0018,
     /// 0019). Without a runner, or with one that discovered no commands, the run
     /// has no gates and its record says so.
     pub fn with_gate_runner(mut self, runner: Arc<dyn crate::gates::GateRunner>) -> Self {
         self.gate_runner = Some(runner);
+        self
+    }
+
+    /// The extractor changes the full index pass reported when the run was
+    /// opened: recorded in the run's trace, so the report is not dropped. The
+    /// full walk owns the extractor stamps; a named-path index never applies
+    /// them, so this is the only source of the report.
+    pub fn with_index_extractor_changes(
+        mut self,
+        changes: Vec<kgraf_graph::ExtractorChange>,
+    ) -> Self {
+        self.index_extractor_changes = changes;
         self
     }
 
@@ -1523,6 +1742,7 @@ impl Orchestrator {
     pub fn handle(&self) -> OrchestratorHandle {
         OrchestratorHandle {
             tx: self.tx.clone(),
+            stop_token: self.stop_token.clone(),
         }
     }
 
@@ -1635,17 +1855,34 @@ struct RunLoop {
     /// Transient readiness deferrals so far, per waiting contract: a wait with
     /// no end is reported periodically, not once.
     readiness_waits: BTreeMap<String, u32>,
+    /// When each waiting contract was first found not ready: the give-up is
+    /// measured in time from here, not in dispatch attempts, since any loop
+    /// message runs a dispatch pass.
+    readiness_since: BTreeMap<String, i64>,
+    /// Routes a fresh pick found transiently not ready, per contract: passed
+    /// over by the next pick so a contract does not keep choosing the same
+    /// route. Cleared at dispatch.
+    not_ready_routes: BTreeMap<String, BTreeSet<String>>,
+    /// The last read of the run's unpriced models, and when. A status reply
+    /// reuses it for `UNPRICED_READ_TTL_MS` instead of pricing every counted
+    /// call in the ledger on each request; the final report always reads fresh.
+    unpriced_cache: Mutex<Option<UnpricedRead>>,
     /// Earliest time a deferred contract could proceed without another event.
     wake_at: Option<i64>,
     coord: coord::CoordRuntime,
     contracts: Option<contract_hooks::Desk>,
     attempt_envs: Option<Arc<dyn AttemptEnvs>>,
     interface_reviewer: Option<Arc<dyn crate::interface_review::InterfaceReviewer>>,
+    /// See `Orchestrator::model_kinds`.
+    model_kinds: Option<Arc<crate::model_kinds::ModelKindCalls>>,
     frugal: frugality::FrugalRuntime,
     /// Notices verifiers returned with passing verdicts, deduplicated (the
     /// same generated lockfile is seen by every attempt): reported with the
     /// run, each also traced once per verdict.
     notices: BTreeSet<String>,
+    /// Worktrees that could not be removed after use (`Workspaces::take_problems`),
+    /// reported as warnings with the run.
+    workspace_problems: Vec<String>,
     /// Decision 0067, point 4: see `Orchestrator::question_desk`.
     question_desk: Arc<crate::asks::QuestionDesk>,
     /// Decision 0067, point 4: see `Orchestrator::question_answerer`.
@@ -1773,6 +2010,19 @@ fn acquire_run_lease(
     Ok(reg.acquire_all(holder, task, &keys, &[], now)?)
 }
 
+/// A loop dropped without `shutdown` or `release_on_error` (its future was
+/// dropped or aborted) still returns the process-wide slots it holds: gate
+/// flights, the speculation slot and the children's admissions. Each release
+/// takes what it frees, so this is a no-op after a normal end. Flights release
+/// through their own `Drop`.
+impl Drop for RunLoop {
+    fn drop(&mut self) {
+        self.release_gate_flights();
+        self.release_speculation_slot();
+        self.release_subagents_on_error();
+    }
+}
+
 impl RunLoop {
     async fn open(
         o: Orchestrator,
@@ -1788,12 +2038,16 @@ impl RunLoop {
             gate_runner,
             attempt_envs,
             interface_reviewer,
+            model_kinds,
+            // Cancelled by the handle, which is the only sender of a stop.
+            stop_token: _,
             precharged,
             question_desk,
             question_answerer,
             question_timeout,
             session_call_timeout,
             session_notices,
+            index_extractor_changes,
         } = o;
         // The check setting is the run's: kept in the record, and a resume with
         // another one is refused before anything is written.
@@ -1928,15 +2182,20 @@ impl RunLoop {
             route_cursor: 0,
             deferred_logged: BTreeSet::new(),
             readiness_waits: BTreeMap::new(),
+            readiness_since: BTreeMap::new(),
+            not_ready_routes: BTreeMap::new(),
+            unpriced_cache: Mutex::new(None),
             wake_at: None,
             coord: coord::CoordRuntime::new(gate_runner),
             frugal: frugality::FrugalRuntime::new(),
             notices: BTreeSet::new(),
+            workspace_problems: Vec::new(),
             subagents: subagents::Subagents::default(),
             spec: speculate::SpecRuntime::default(),
             contracts,
             attempt_envs,
             interface_reviewer,
+            model_kinds,
             question_desk,
             question_answerer,
             sessions_rt: sessions::SessionRuntime::new(
@@ -1959,6 +2218,14 @@ impl RunLoop {
             .await?;
         }
         me.seed_spend(&calls)?;
+        if !index_extractor_changes.is_empty() {
+            let at_ms = me.now();
+            me.trace(TraceEvent::ExtractorChanged {
+                at_ms,
+                changes: index_extractor_changes,
+            })
+            .await?;
+        }
         if resumed {
             me.on_resume().await?;
         }
@@ -1976,7 +2243,12 @@ impl RunLoop {
         let prefix = format!("{run}/");
         let agent = format!("orchestrator:{run}");
         // Per task, what the ledger says this run spent, with each call's time.
-        let mut by_task: BTreeMap<String, Vec<(Money, i64, String)>> = BTreeMap::new();
+        // Each call's exact cost is kept, and a task's calls are apportioned
+        // from their sum rounded once: rounding each small call up to a
+        // micro-dollar would seed many embedding calls at several times their
+        // cost.
+        let mut exact: BTreeMap<String, Vec<(kgraf_core::cost::ExactMoney, i64, String)>> =
+            BTreeMap::new();
         for c in calls {
             if !(c.task_id.starts_with(&prefix) || c.agent_id == agent || c.task_id == run) {
                 continue;
@@ -1987,20 +2259,28 @@ impl RunLoop {
             }
             // An unpriced call's cost is unknown: it is not charged as `$0`
             // here, and the report lists its model as unpriced.
-            let cost = match c.settlement {
-                Settlement::Counted | Settlement::Cancelled => {
-                    self.s.prices.cost(&c.model, &c.usage).ok()
-                }
-                Settlement::Failed => Some(Money::ZERO),
-                Settlement::Unreconciled => self.worst_case(&c.model),
+            let Some(cost) = self.ledger_cost(c) else {
+                continue;
             };
-            let Some(cost) = cost else { continue };
             let at = c.finished_ms.unwrap_or(c.started_ms);
-            by_task
+            exact
                 .entry(c.task_id.clone())
                 .or_default()
                 .push((cost, at, c.id.to_string()));
         }
+        let by_task: BTreeMap<String, Vec<(Money, i64, String)>> = exact
+            .into_iter()
+            .map(|(task, calls)| {
+                let amounts: Vec<_> = calls.iter().map(|(cost, _, _)| *cost).collect();
+                let shares = kgraf_core::cost::ExactMoney::apportion(&amounts);
+                let calls = calls
+                    .into_iter()
+                    .zip(shares)
+                    .map(|((_, at, id), share)| (share, at, id))
+                    .collect();
+                (task, calls)
+            })
+            .collect();
         // Idempotent: the budget is per process, so a resume in the process that
         // ran the run already holds (part of) this spend. Only what the book does
         // not yet hold is added, per task; a task the book has never seen is
@@ -2024,10 +2304,132 @@ impl RunLoop {
         Ok(())
     }
 
+    /// What one ledger row charges the run, exactly, by the rule a resume
+    /// seeds with: a settled call at its price, a failed one at zero, an
+    /// unreconciled one at its worst case. `None` when its cost is unknown (an
+    /// unpriced model): never charged as $0.
+    fn ledger_cost(&self, c: &kgraf_provider::CallRecord) -> Option<kgraf_core::cost::ExactMoney> {
+        match c.settlement {
+            Settlement::Counted | Settlement::Cancelled => self
+                .s
+                .prices
+                .cost_exact_on(c.route.as_deref(), &c.model, &c.usage)
+                .ok(),
+            Settlement::Failed => Some(kgraf_core::cost::ExactMoney::ZERO),
+            Settlement::Unreconciled => self
+                .worst_case(c.route.as_deref(), &c.model)
+                .map(kgraf_core::cost::ExactMoney::from_money),
+        }
+    }
+
+    /// Charge the orchestrator's own model-tool calls (decision 0089) to the
+    /// run, as its planner calls are charged, and keep their failures as
+    /// notices. Charged by [`Self::ledger_cost`], the rule a resume seeds by,
+    /// and marked seeded, so the run's spend already holds them when a resume
+    /// reads the ledger. A call on an unpriced model is noted, not charged.
+    fn settle_model_tool_calls(&mut self) -> Result<(), OrchestratorError> {
+        let Some(kinds) = self.model_kinds.clone() else {
+            return Ok(());
+        };
+        for notice in kinds.take_failures() {
+            self.notices.insert(notice);
+        }
+        let ids = kinds.take_calls();
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let ledger = self.s.ledger.clone();
+        let records = match blocking(|| {
+            ids.iter()
+                .map(|id| ledger.call(id))
+                .collect::<Result<Vec<_>, _>>()
+        }) {
+            Ok(records) => records,
+            Err(e) => {
+                // Unknown, not zero: said, and planning goes on.
+                self.notices.insert(format!(
+                    "the orchestrator's model-tool spend could not be read from the ledger \
+                     ({e}); it is not in the run's spend"
+                ));
+                return Ok(());
+            }
+        };
+        let mut charged = Vec::new();
+        for record in records.into_iter().flatten() {
+            if !self.seeded.insert(record.id.clone()) {
+                continue;
+            }
+            match self.ledger_cost(&record) {
+                Some(cost) => charged.push((
+                    record.id.to_string(),
+                    cost,
+                    record.finished_ms.unwrap_or(record.started_ms),
+                )),
+                None => self.note_unpriced(&record.model),
+            }
+        }
+        let amounts: Vec<_> = charged.iter().map(|(_, cost, _)| *cost).collect();
+        let shares = kgraf_core::cost::ExactMoney::apportion(&amounts);
+        let run = self.run_id();
+        let mut budget = self.s.admission.budget();
+        for ((call, _, at), share) in charged.iter().zip(shares) {
+            budget.record_call_spend(call, &run, &run, share, *at);
+        }
+        Ok(())
+    }
+
+    /// A worker's model-tool calls (rows under its task, attributed to it,
+    /// whose call kind is a non-generative one) not yet charged, and what they
+    /// charge by [`Self::ledger_cost`], summed exactly and rounded once. A call
+    /// on an unpriced model is noted, not charged.
+    fn worker_model_tool_spend(
+        &mut self,
+        worker: &AgentId,
+        task: &str,
+        charged: &[CallId],
+    ) -> Result<(Vec<CallId>, Money), OrchestratorError> {
+        // A run with no model route gives its workers no model tool.
+        if self.model_kinds.is_none() {
+            return Ok((Vec::new(), Money::ZERO));
+        }
+        let ledger = self.s.ledger.clone();
+        let rows = match blocking(|| ledger.calls_under_task(task, None)) {
+            Ok(rows) => rows,
+            Err(e) => {
+                // Unknown, not zero: said, and the worker's own spend still
+                // settles.
+                self.notices.insert(format!(
+                    "the model-tool spend of {worker} could not be read from the ledger ({e}); \
+                     it is not in the run's spend"
+                ));
+                return Ok((Vec::new(), Money::ZERO));
+            }
+        };
+        let mut ids = Vec::new();
+        let mut total = kgraf_core::cost::ExactMoney::ZERO;
+        for row in rows {
+            let tool_row = row.agent_id == worker.as_str()
+                && row
+                    .trace
+                    .kind
+                    .as_deref()
+                    .is_some_and(kgraf_core::is_non_generative_call_kind);
+            if !tool_row || charged.contains(&row.id) || self.seeded.contains(&row.id) {
+                continue;
+            }
+            match self.ledger_cost(&row) {
+                Some(cost) => total += cost,
+                None => self.note_unpriced(&row.model),
+            }
+            ids.push(row.id);
+        }
+        Ok((ids, total.to_money()))
+    }
+
     /// The most one call on `model` can cost: the largest context a route on it
     /// may send (its stop point) and a full output.
     /// `None` when the model has no price: the cost is unknown.
-    fn worst_case(&self, model: &str) -> Option<Money> {
+    fn worst_case(&self, route: Option<&str>, model: &str) -> Option<Money> {
         let (input, output) = match self.s.routes.iter().find(|r| r.model() == model) {
             Some(r) => (
                 r.context.worker_stop_tokens(),
@@ -2051,7 +2453,11 @@ impl RunLoop {
         };
         self.s
             .prices
-            .cost(model, &dear_usage(&self.s.prices, model, input, output))
+            .cost_on(
+                route,
+                model,
+                &dear_usage_on(&self.s.prices, route, model, input, output),
+            )
             .ok()
     }
 
@@ -2145,6 +2551,17 @@ impl RunLoop {
         self.s.routes.iter().find(|r| r.name == name)
     }
 
+    /// The run's non-generative routes, one line per kind, for the planner.
+    /// A kind without its registry row raises rather than being left out.
+    fn model_route_lines(&self) -> Result<Vec<String>, PlanError> {
+        match &self.model_kinds {
+            Some(m) => m
+                .summary_lines()
+                .map_err(|e| PlanError::Invalid(e.to_string())),
+            None => Ok(Vec::new()),
+        }
+    }
+
     fn tools(&self) -> Vec<String> {
         let mut t: BTreeSet<String> = BTreeSet::new();
         for r in &self.s.routes {
@@ -2199,21 +2616,43 @@ impl RunLoop {
     /// accounting only and never refuses a call: an unpriced model holds zero and
     /// its spend is reported as unpriced.
     fn reserve_call(&mut self, basis: &CostBasis, input_tokens: u64) -> Reservation {
-        // `None`: the model is unpriced. The call is still made and ledgered;
-        // its hold is zero and its spend is reported as unpriced.
-        let estimate = self
-            .s
-            .prices
-            .cost(
-                &basis.model,
-                &dear_usage(
-                    &self.s.prices,
+        self.reserve_rounds(basis, input_tokens, 0)
+    }
+
+    /// [`Self::reserve_call`] for a call that may take `extra_rounds` more
+    /// rounds (a planner offered model tools): round `r` resends the input
+    /// plus `r` earlier answers and their tool results, each at most
+    /// [`crate::plan::MAX_MODEL_TOOL_CALLS_PER_ROUND`] results of
+    /// `kgraf_tools::MAX_EMBED_RESULT_BYTES` (about four bytes a token). Each
+    /// round is priced at its own size, as the ledger prices it.
+    fn reserve_rounds(
+        &mut self,
+        basis: &CostBasis,
+        input_tokens: u64,
+        extra_rounds: usize,
+    ) -> Reservation {
+        let output = u64::from(basis.max_output_tokens);
+        let tool_results = (crate::plan::MAX_MODEL_TOOL_CALLS_PER_ROUND
+            * kgraf_tools::MAX_EMBED_RESULT_BYTES
+            / 4) as u64;
+        let round_cost = |round: u64| {
+            let input = input_tokens + round * (output + tool_results);
+            self.s
+                .prices
+                .cost(
                     &basis.model,
-                    input_tokens,
-                    u64::from(basis.max_output_tokens),
-                ),
-            )
-            .ok();
+                    &dear_usage(&self.s.prices, &basis.model, input, output),
+                )
+                .ok()
+        };
+        // `None`: the model is unpriced. The call is still made and ledgered;
+        // its hold is zero and its spend is reported as unpriced. A later
+        // round the table cannot price (above a rate tier) is held at the
+        // first round's cost rather than turning a priced model unpriced.
+        let estimate = round_cost(0).map(|first| {
+            (1..=extra_rounds as u64)
+                .fold(first, |sum, round| sum + round_cost(round).unwrap_or(first))
+        });
         if estimate.is_none() {
             self.note_unpriced(&basis.model);
         }
@@ -2238,7 +2677,7 @@ impl RunLoop {
     ) -> Result<(), OrchestratorError> {
         let held = reservation.amount();
         let actual = match calls {
-            Some(c) => self.spend_of(c, held)?,
+            Some(c) => self.spend_of(c, held)?.0,
             None => held,
         };
         let run = self.run_id();
@@ -2258,9 +2697,9 @@ impl RunLoop {
         Ok(())
     }
 
-    /// A settlement above its hold: counted and noted for the owner. Decision
-    /// 0080 removed every spend cap, so an overrun no longer pauses dispatch;
-    /// it is purely an accounting fact (the estimate undercounted the call).
+    /// A settlement above its hold: counted and noted for the owner. There is
+    /// no spend cap (decision 0080), so an overrun never pauses dispatch; it is
+    /// an accounting fact (the estimate undercounted the call).
     async fn on_overrun(&mut self, o: crate::admission::Overrun) -> Result<(), OrchestratorError> {
         self.record.counters.overruns += 1;
         self.notices.insert(format!(
@@ -2292,9 +2731,11 @@ impl RunLoop {
             match self.decompose_once(&request, note_ids, outer).await {
                 Err(OrchestratorError::Plan(e)) if e.reaskable() && reasks < MAX_PLAN_REASKS => {
                     reasks += 1;
-                    self.notices.insert(format!(
+                    // The refusal can quote the model's own output: scrubbed
+                    // before it is shown or persisted.
+                    self.notices.insert(kgraf_secrets::scrub_persist_owned(format!(
                         "the planner's answer was refused ({e}); asking again ({reasks} of {MAX_PLAN_REASKS})"
-                    ));
+                    )));
                     request.notes.push(format!(
                         "<plan_refused>\nYour previous answer was refused: {}\nAnswer again with \
                          one corrected JSON object.\n</plan_refused>",
@@ -2332,8 +2773,19 @@ impl RunLoop {
                 .sum::<u64>()
             + 1_000;
         let basis = self.s.decomposer.cost_basis();
-        let reservation = self.reserve_call(&basis, input);
+        // With model tools offered, one decomposition is up to
+        // `MAX_MODEL_TOOL_ROUNDS + 1` planner calls, each resending the
+        // conversation so far; the hold covers them all, so a planner that uses
+        // its rounds does not settle over its estimate.
+        let tool_rounds = if request.model_calls.is_some() && !request.model_routes.is_empty() {
+            crate::plan::MAX_MODEL_TOOL_ROUNDS
+        } else {
+            0
+        };
+        let reservation = self.reserve_rounds(&basis, input, tool_rounds);
         let out = self.s.decomposer.decompose(request).await;
+        // The planner's own model-tool calls, settled now whatever the answer.
+        self.settle_model_tool_calls()?;
         match out {
             Ok(out) => {
                 self.settle_call(reservation, Some(&out.calls))?;
@@ -2403,7 +2855,7 @@ impl RunLoop {
         })
     }
 
-    /// Resolve slice names to graph nodes; an empty lookup is traced (question 5)
+    /// Resolve slice names to graph nodes; an empty lookup is traced
     /// and the slice is not given.
     async fn resolve_slices(
         &mut self,
@@ -2503,6 +2955,8 @@ impl RunLoop {
                             notes,
                             known_files: known_files.clone(),
                             routes: self.roster(),
+                            model_routes: self.model_route_lines()?,
+                            model_calls: self.model_kinds.clone(),
                             tools: self.tools(),
                             templates,
                             interfaces: false,
@@ -2513,17 +2967,7 @@ impl RunLoop {
                     .await?;
                 let p = PlanProgress {
                     interfaces,
-                    ids: specs.iter().map(|s| s.id.clone()).collect(),
-                    stack: specs
-                        .into_iter()
-                        .rev()
-                        .map(|spec| PlanItem {
-                            id: spec.id.clone(),
-                            spec,
-                            depth: 0,
-                        })
-                        .collect(),
-                    ..PlanProgress::default()
+                    ..PlanProgress::seeded(specs)
                 };
                 self.record.plan_progress = Some(p.clone());
                 self.save()?;
@@ -2560,6 +3004,8 @@ impl RunLoop {
                             notes: Vec::new(),
                             known_files: known_files.clone(),
                             routes: self.roster(),
+                            model_routes: self.model_route_lines()?,
+                            model_calls: self.model_kinds.clone(),
                             tools: self.tools(),
                             // Templates describe whole instructions, not splits.
                             templates: Vec::new(),
@@ -2699,22 +3145,36 @@ impl RunLoop {
     /// spend is unknown, not zero: it is charged `unknown_as` (the hold) instead.
     ///
     /// One ledger query for all of `calls`, not one per id.
-    fn spend_of(&self, calls: &[CallId], unknown_as: Money) -> Result<Money, OrchestratorError> {
+    ///
+    /// Returns the amount to charge and whether it is the real figure. It is
+    /// not when any call is unknown: the amount then only bounds the spend,
+    /// and must not be recorded as a measured cost.
+    fn spend_of(
+        &self,
+        calls: &[CallId],
+        unknown_as: Money,
+    ) -> Result<(Money, bool), OrchestratorError> {
         let ids: Vec<CallId> = calls
             .iter()
             .filter(|c| !self.seeded.contains(*c))
             .cloned()
             .collect();
+        // A call charged already (a resumed attempt, a retry after a verifier
+        // outage) is not charged again, so the amount below is only the part
+        // not yet charged: not the attempt's whole cost, and never a
+        // measured figure for a routing tally.
+        let partial = ids.len() < calls.len();
         if ids.is_empty() {
-            return Ok(Money::ZERO);
+            return Ok((Money::ZERO, !partial));
         }
         let ledger = self.s.ledger.clone();
         let prices = &self.s.prices;
         let spend = blocking(|| ledger.spend_of(&ids, prices))?;
+        let known = spend.unknown.is_empty() && !partial;
         if !spend.unknown.is_empty() && unknown_as > spend.total {
-            return Ok(unknown_as);
+            return Ok((unknown_as, false));
         }
-        Ok(spend.total)
+        Ok((spend.total, known))
     }
 
     // ------------------------------------------------------------- resume
@@ -2814,7 +3274,14 @@ impl RunLoop {
         match planned {
             Ok(_) => self.run().await,
             Err(e) => {
-                self.shutdown()?;
+                // The planning error is the one the caller needs: a failure to
+                // release is printed, never returned in its place.
+                if let Err(release) = self.shutdown() {
+                    eprintln!(
+                        "kgraf-orchestrator: a run that failed to plan could not release all \
+                         it held: {release}"
+                    );
+                }
                 // A run that never got a plan is still measured.
                 if let Err(analytics) = self.close_frugality(true).await {
                     return Err(OrchestratorError::WithAnalyticsFailure {
@@ -2845,6 +3312,13 @@ impl RunLoop {
     async fn run(mut self) -> Result<RunReport, OrchestratorError> {
         if let Err(e) = self.run_loop().await {
             self.release_on_error();
+            // A run that failed after planning is still measured.
+            if let Err(analytics) = self.close_frugality(false).await {
+                return Err(OrchestratorError::WithAnalyticsFailure {
+                    error: Box::new(e),
+                    analytics: analytics.to_string(),
+                });
+            }
             return Err(e);
         }
         self.shutdown()?;
@@ -3057,7 +3531,23 @@ impl RunLoop {
     /// name them (`unpriced_label`), read from the ledger. Their spend is not
     /// in `spent`, and never counted as `$0`. `Err` carries a ledger failure,
     /// which a report shows as a warning instead of hiding it.
-    fn unpriced_models(&self) -> Result<Vec<String>, String> {
+    fn unpriced_models(&self, fresh: bool) -> Result<Vec<String>, String> {
+        let now = self.now();
+        if !fresh
+            && let Ok(cache) = self.unpriced_cache.lock()
+            && let Some((at, read)) = cache.as_ref()
+            && now.saturating_sub(*at) < UNPRICED_READ_TTL_MS
+        {
+            return read.clone();
+        }
+        let read = self.read_unpriced_models();
+        if let Ok(mut cache) = self.unpriced_cache.lock() {
+            *cache = Some((now, read.clone()));
+        }
+        read
+    }
+
+    fn read_unpriced_models(&self) -> Result<Vec<String>, String> {
         let ledger = self.s.ledger.clone();
         let prices = self.s.prices.clone();
         let run = self.run_id();
@@ -3079,8 +3569,11 @@ impl RunLoop {
         let c = self.record.counters;
         let run = self.run_id();
         let mut warnings = self.frugal.warnings.clone();
+        self.workspace_problems
+            .extend(self.s.workspaces.take_problems());
+        warnings.extend(self.workspace_problems.iter().cloned());
         let mut notices: Vec<String> = self.notices.iter().cloned().collect();
-        match self.unpriced_models() {
+        match self.unpriced_models(true) {
             Ok(m) if m.is_empty() => {}
             Ok(m) => notices.push(format!(
                 "spend on unpriced models is not in the total: {}",
@@ -3088,6 +3581,18 @@ impl RunLoop {
             )),
             Err(e) => warnings.push(format!("unpriced spend could not be read: {e}")),
         }
+        let lease_measurements = match self.s.graph.lock() {
+            Ok(g) => LeaseRegistry::new(&g)
+                .measurements(&format!("{run}/"))
+                .unwrap_or_else(|e| {
+                    warnings.push(format!("lease measurements could not be read: {e}"));
+                    Default::default()
+                }),
+            Err(_) => {
+                warnings.push("lease measurements could not be read: the index lock failed".into());
+                Default::default()
+            }
+        };
         RunReport {
             run: self.record.run.clone(),
             status: self.record.status.clone(),
@@ -3099,6 +3604,7 @@ impl RunLoop {
             } else {
                 c.serialized as f64 / c.dispatches as f64
             },
+            lease_measurements,
             spent: self.s.admission.budget().spent_run(&run),
             budget_admitted: c.budget_admitted,
             contracts: self
@@ -3267,9 +3773,11 @@ impl RunLoop {
     /// `None` when a recorded or pinned route is not configured: it is never
     /// silently replaced. A fresh pick does not move the rotation cursor
     /// itself: [`Self::commit_route_pick`] does, once a dispatch (or a recorded
-    /// handshake route) really uses it, so a contract deferred by readiness,
-    /// a lease or a slot asks again from the same cursor instead of skewing
-    /// the rotation (and, under `Fitness`, the exploration share) each tick.
+    /// handshake route) really uses it, or when the pick is found transiently
+    /// not ready, so a contract deferred by a lease or a slot asks again from
+    /// the same cursor instead of skewing the rotation (and, under `Fitness`,
+    /// the exploration share) each tick, while a route that is not ready is
+    /// left behind (`not_ready_routes` under `Fitness`).
     /// Routes that lack a tool the contract names are passed over.
     /// `c.route` only counts here when `c.route_pinned` says
     /// it is a genuine pin (decision 0085): the same field also holds the
@@ -3360,6 +3868,15 @@ impl RunLoop {
             .into_iter()
             .filter(|r| self.route_offers(&r.name, &c.tools))
             .collect();
+        // A route this contract found transiently not ready is passed over,
+        // unless that leaves nothing to pick.
+        let skip = self.not_ready_routes.get(&c.contract);
+        let ready: Vec<routing::RouteInfo> = infos
+            .iter()
+            .filter(|r| skip.is_none_or(|s| !s.contains(&r.name)))
+            .cloned()
+            .collect();
+        let infos = if ready.is_empty() { infos } else { ready };
         let profiles = self.s.profiles.lock().ok()?;
         let (kind, defaulted) = match c.task_kind {
             Some(k) => (k, false),
@@ -3451,13 +3968,47 @@ impl RunLoop {
     /// already calls `route_at(base, 0)` (always attempt zero, so escalation
     /// could never apply to it) is untouched.
     fn attempt_route(&mut self, c: &OpenContract, base: usize, attempt: usize) -> String {
-        let rotated = self.route_at(base, attempt);
+        // Every attempt's route must offer the tools the contract names, not
+        // only the base route: the first route from the rotated position on
+        // that does, else the rotated one (readiness then holds the contract
+        // with the missing tool named).
+        let names = self.roster();
+        let n = names.len().max(1);
+        // A route this contract found transiently not ready is passed over
+        // for every attempt, not only the first, unless that leaves nothing.
+        // Only a fresh pick is: a pin or a recorded route is never replaced.
+        let skip = if Self::route_is_fresh(c) {
+            self.not_ready_routes.get(&c.contract)
+        } else {
+            None
+        };
+        let skipped = |name: &str| skip.is_some_and(|s| s.contains(name));
+        let offering = |name: &&String| self.route_offers(name, &c.tools);
+        let rotated = (0..n)
+            .map(|k| &names[(base + attempt + k) % n])
+            .find(|name| offering(name) && !skipped(name))
+            .or_else(|| {
+                (0..n)
+                    .map(|k| &names[(base + attempt + k) % n])
+                    .find(|name| offering(name))
+            })
+            .cloned()
+            .unwrap_or_else(|| self.route_at(base, attempt));
         if attempt == 0 || self.config.routing != routing::RoutingPolicy::Fitness {
             return rotated;
         }
-        let names = self.roster();
         let base_route = names[base % names.len()].clone();
-        let infos = self.route_infos();
+        let offered: Vec<routing::RouteInfo> = self
+            .route_infos()
+            .into_iter()
+            .filter(|r| self.route_offers(&r.name, &c.tools))
+            .collect();
+        let ready: Vec<routing::RouteInfo> = offered
+            .iter()
+            .filter(|r| !skipped(&r.name) || r.name == base_route)
+            .cloned()
+            .collect();
+        let infos = if ready.is_empty() { offered } else { ready };
         let Ok(profiles) = self.s.profiles.lock() else {
             return rotated;
         };
@@ -3755,8 +4306,23 @@ impl RunLoop {
             };
             if let Err(failure) = ready {
                 self.record.counters.readiness_failures += 1;
-                let detail = format!("route `{r}`: {failure}");
-                if failure.is_transient() {
+                // A transient failure can carry a provider's response body.
+                let detail = kgraf_secrets::scrub_persist_owned(format!("route `{r}`: {failure}"));
+                let waits_so_far = self.readiness_waits.get(id).copied().unwrap_or(0);
+                let now = self.now();
+                let since = *self.readiness_since.entry(id.to_owned()).or_insert(now);
+                let give_up_ms =
+                    (self.config.tick.as_millis() as i64).max(1) * READINESS_GIVE_UP_TICKS;
+                if failure.is_transient() && now - since < give_up_ms {
+                    // A fresh pick moves on: the next one starts at the next
+                    // route (Rotation) or passes this route over (Fitness).
+                    if Self::route_is_fresh(&contract) {
+                        self.not_ready_routes
+                            .entry(id.to_owned())
+                            .or_default()
+                            .insert(r.clone());
+                        self.commit_route_pick();
+                    }
                     self.wake_at = Some(self.now() + self.config.tick.as_millis() as i64);
                     // `defer` traces the first deferral only. A wait with no
                     // end (a route that never becomes ready) is traced again,
@@ -3769,7 +4335,11 @@ impl RunLoop {
                     if waits.is_multiple_of(READINESS_REPORT_EVERY) {
                         let at = self.now();
                         let detail = format!("still not ready after {waits} checks: {detail}");
-                        self.notices.insert(format!("contract {id}: {detail}"));
+                        // The notice carries no count: repeats are one entry.
+                        self.notices
+                            .insert(kgraf_secrets::scrub_persist_owned(format!(
+                                "contract {id}: still not ready: {failure}"
+                            )));
                         self.trace(TraceEvent::Deferred {
                             at_ms: at,
                             contract: id.to_owned(),
@@ -3781,6 +4351,14 @@ impl RunLoop {
                         self.defer(id, DeferReason::Readiness, detail).await?;
                     }
                 } else {
+                    self.readiness_waits.remove(id);
+                    self.readiness_since.remove(id);
+                    self.not_ready_routes.remove(id);
+                    let detail = if failure.is_transient() {
+                        format!("not ready after {waits_so_far} checks: {detail}")
+                    } else {
+                        detail
+                    };
                     self.submit_report(&contract, None, ReportKind::NeedsInput, "readiness failed");
                     self.hold(id, detail);
                     self.save()?;
@@ -3788,6 +4366,11 @@ impl RunLoop {
                 return Ok(());
             }
         }
+
+        // Every route answered: an earlier wait is over, so a later outage
+        // is timed from its own first failed check.
+        self.readiness_waits.remove(id);
+        self.readiness_since.remove(id);
 
         // Cluster cap before admission (decision 0082): a coupled contract
         // waits its turn without spending a work-item slot on a dispatch that
@@ -3824,11 +4407,53 @@ impl RunLoop {
         }) = &admitted
             && *ceiling >= 1
             && *requested > *ceiling
-            && contract.workers.is_empty()
         {
+            // A resumed flight wider than the ceiling (the slider went down
+            // while the run was stopped) is cut the same way: the recorded
+            // workers past the ceiling are dropped from the flight and their
+            // attempts queue again as fresh ones.
             let (requested, ceiling) = (*requested, *ceiling);
-            workers.truncate(ceiling);
+            let dropped: Vec<AgentId> = workers.split_off(ceiling.min(workers.len()));
             routes.truncate(ceiling);
+            // Each dropped worker's worktree is reopened from its record and
+            // released for discard, and its session ends: nothing else
+            // would ever release them once the record forgets the worker.
+            for w in &dropped {
+                match self.s.workspaces.prepare(&contract, w).await {
+                    Ok(path) => self.s.workspaces.release(&path, false).await,
+                    Err(e) => {
+                        self.notices.insert(format!(
+                            "contract {id}: the worktree of dropped worker {w} could not be \
+                             reopened to discard it: {e}"
+                        ));
+                    }
+                }
+                // A worker that never started has no session to end.
+                let has_session = self
+                    .s
+                    .graph
+                    .lock()
+                    .ok()
+                    .and_then(|g| g.session_by_id(w).ok().flatten())
+                    .is_some();
+                if has_session && let Err(e) = self.retire_session(w, SessionOutcome::Cancelled) {
+                    eprintln!(
+                        "kgraf-orchestrator: a dropped worker's session could not be retired: \
+                         worker {w}: {e}"
+                    );
+                }
+            }
+            if let Some(c) = self.record.contract_mut(id) {
+                let inherited = inherited_key(c);
+                c.worktrees.retain(|w, _| {
+                    workers.iter().any(|k| k.as_str() == w) || Some(w) == inherited.as_ref()
+                });
+                // Queued attempts get ids no dropped worker had, so none
+                // reopens a dropped worker's transcript or worktree.
+                if !dropped.is_empty() {
+                    c.renewals += 1;
+                }
+            }
             queued = attempts_total.saturating_sub(workers.len() as u32);
             self.notices.insert(format!(
                 "contract {id}: {requested} parallel attempts exceed the ceiling of {ceiling} \
@@ -3874,10 +4499,13 @@ impl RunLoop {
             .project(&model, base, self.config.step_budget, &context);
         // An unpriced model's spend is unknown, not refused: the hold is zero
         // and the report names the model as unpriced.
-        let estimate = match self
-            .sizer
-            .estimate_cost(&self.s.prices, &model, &projection, max_out)
-        {
+        let estimate = match self.sizer.estimate_cost(
+            &self.s.prices,
+            Some(routes[0].as_str()),
+            &model,
+            &projection,
+            max_out,
+        ) {
             Ok(e) => e,
             Err(_) => {
                 self.note_unpriced(&model);
@@ -3903,6 +4531,13 @@ impl RunLoop {
             renew_workers: false,
             injectors: BTreeMap::new(),
             fences: BTreeMap::new(),
+            ended: BTreeMap::new(),
+            run: self.run_id().to_string(),
+            task: contract.task.as_str().to_owned(),
+            clock: self.s.clock.clone(),
+            ledger: self.s.ledger.clone(),
+            prices: self.s.prices.clone(),
+            charged: self.seeded.clone(),
         };
 
         // Leases: the whole write set, atomically, under the lineage root.
@@ -3941,6 +4576,8 @@ impl RunLoop {
         }
         self.deferred_logged.retain(|(c, _)| c != id);
         self.readiness_waits.remove(id);
+        self.readiness_since.remove(id);
+        self.not_ready_routes.remove(id);
         self.note_wait(id, crate::waits::WaitState::Running);
 
         // Record the dispatch before any worker exists, so a crash after this
@@ -4025,20 +4662,13 @@ impl RunLoop {
         // A file leased whole covers its nodes; asking for both would block on
         // itself.
         let whole: BTreeSet<String> = paths.iter().cloned().collect();
-        let node_files: BTreeMap<String, String> = writes
-            .iter()
-            .filter_map(|w| {
-                w.node
-                    .as_ref()
-                    .map(|n| (n.as_str().to_owned(), w.path.clone()))
-            })
-            .collect();
+        let node_files = node_paths(writes);
         nodes.retain(|n| node_files.get(n).is_none_or(|p| !whole.contains(p)));
         (paths, nodes)
     }
 
     /// Acquire the contract's write set through combined admission. A declared
-    /// node the graph no longer has is traced (question 5) and leased as its file;
+    /// node the graph no longer has is traced and leased as its file;
     /// a node whose identity is unstable is leased as its file (0050 rule 4).
     async fn acquire_leases(
         &mut self,
@@ -4087,15 +4717,7 @@ impl RunLoop {
                     self.record
                         .admitted_leases
                         .retain(|l| l.agent.as_str() != holder);
-                    let node_path: BTreeMap<String, String> = contract
-                        .writes
-                        .iter()
-                        .filter_map(|w| {
-                            w.node
-                                .as_ref()
-                                .map(|n| (n.as_str().to_owned(), w.path.clone()))
-                        })
-                        .collect();
+                    let node_path = node_paths(&contract.writes);
                     let mut held = Vec::new();
                     for l in paths {
                         self.record.admitted_leases.push(AdmittedLease {
@@ -4163,22 +4785,17 @@ impl RunLoop {
         worker: AgentId,
         route_name: String,
     ) {
-        let fail = |worker: &AgentId, reason: String| WorkerResult {
-            task: contract.task.clone(),
-            worker: worker.clone(),
-            outcome: WorkerOutcome::Failed { error: reason },
-            answer: String::new(),
-            changed_paths: Vec::new(),
-            commit: None,
-            calls: Vec::new(),
-            steps: 0,
-            prefix_digest: String::new(),
-            denied: 0,
-            trace_failures: Vec::new(),
-            rationale: None,
+        let fail = |worker: &AgentId, reason: String| {
+            WorkerResult::bare(
+                contract.task.clone(),
+                worker.clone(),
+                WorkerOutcome::Failed { error: reason },
+            )
         };
+        // An inherited worktree is adopted, never replaced: it holds the
+        // handoff parent's work, which no fresh worktree has.
         let workspace = match &contract.workspace {
-            Some(w) if contract.attempts == 1 => Ok(w.clone()),
+            Some(w) if contract.attempts == 1 => self.s.workspaces.adopt(contract, w).await,
             _ => self.s.workspaces.prepare(contract, &worker).await,
         };
         let mut attempt = Attempt::scattering(worker.clone(), route_name.clone(), PathBuf::new());
@@ -4237,9 +4854,8 @@ impl RunLoop {
                 return;
             }
         }
-        // Item 3, coordination-hardening set: a dependency's rationale is
-        // appended last, after the interface section, still inside the
-        // private remainder assembled here (0043).
+        // A dependency's rationale is appended last, after the interface
+        // section, still inside the private remainder assembled here (0043).
         // Decision 0084: a retry's brief carries why the last round was
         // refused, last, as data.
         let instruction = self.brief_with_inbox(contract, &worker)
@@ -4252,17 +4868,7 @@ impl RunLoop {
         };
         let route_env = route.env.clone();
         // Per-attempt environments are built off the loop, in the worker's task.
-        let attempt_env = self.attempt_envs.clone().map(|envs| {
-            let route = Route {
-                name: route.name.clone(),
-                vendor: route.vendor.clone(),
-                env: route.env.clone(),
-                context: route.context.clone(),
-                readiness: route.readiness.clone(),
-                local: route.local,
-            };
-            (envs, route)
-        });
+        let attempt_env = self.attempt_envs.clone().map(|envs| (envs, route.clone()));
         let brief = WorkerBrief {
             task: contract.task.clone(),
             worker: worker.clone(),
@@ -4284,6 +4890,8 @@ impl RunLoop {
         let path = self.files.worker_transcript(worker.as_str());
         let cancel = Arc::new(Notify::new());
         flight.cancels.insert(worker.clone(), cancel.clone());
+        let (ended_tx, ended_rx) = oneshot::channel::<()>();
+        flight.ended.insert(worker.clone(), ended_rx);
         // Decision 0067: created here, at dispatch, on the loop, so
         // `send_to_session` and a subagent's fence can reach this attempt from
         // the moment it is admitted, not only once its task happens to have
@@ -4319,8 +4927,8 @@ impl RunLoop {
         // Local-only diagnostics (decision 0069): one
         // `WorkerSpawned` naming the route (`route:model`, already public in
         // the routing catalog, never a credential), right before the worker's
-        // task is actually spawned. Moved here (2026-09-27 re-review, item 4)
-        // from the dispatch loop that calls `start_attempt`: workspace
+        // task is actually spawned. It sits here, not
+        // in the dispatch loop that calls `start_attempt`: workspace
         // preparation and the route lookup above can each still fail and
         // return before this point, and the earlier position recorded a
         // spawn for those too. Additive: `record` is a no-op unless a binary
@@ -4386,26 +4994,15 @@ impl RunLoop {
             let (result, peak_context) = match finished {
                 Ok(r) => r,
                 Err(e) => (
-                    WorkerResult {
-                        task: "".into(),
-                        worker: worker.clone(),
-                        outcome: WorkerOutcome::Failed { error: e },
-                        answer: String::new(),
-                        changed_paths: Vec::new(),
-                        commit: None,
-                        calls: Vec::new(),
-                        steps: 0,
-                        prefix_digest: String::new(),
-                        denied: 0,
-                        trace_failures: Vec::new(),
-                        rationale: None,
-                    },
+                    WorkerResult::bare("", worker.clone(), WorkerOutcome::Failed { error: e }),
                     0,
                 ),
             };
             (result, peak_context, env_failure)
         });
         tokio::spawn(async move {
+            // Dropped when this task ends, by any path.
+            let _ended = ended_tx;
             let mut spend_unknown = false;
             let (result, peak_context, env_failure) = match task.await {
                 Ok(v) => v,
@@ -4443,18 +5040,12 @@ impl RunLoop {
                     };
                     (
                         WorkerResult {
-                            task: "".into(),
-                            worker: panic_worker.clone(),
-                            outcome: WorkerOutcome::Failed { error: msg.clone() },
-                            answer: String::new(),
-                            changed_paths: Vec::new(),
-                            commit: None,
                             calls,
-                            steps: 0,
-                            prefix_digest: String::new(),
-                            denied: 0,
-                            trace_failures: Vec::new(),
-                            rationale: None,
+                            ..WorkerResult::bare(
+                                "",
+                                panic_worker.clone(),
+                                WorkerOutcome::Failed { error: msg.clone() },
+                            )
                         },
                         0,
                         Some(msg),
@@ -4492,16 +5083,24 @@ impl RunLoop {
         let run = self.run_id();
         let idx = flight.attempts.iter().position(|a| a.worker == f.worker);
         let reservation = flight.reservations.remove(&f.worker);
+        flight.ended.remove(&f.worker);
         let held_amount = reservation
             .as_ref()
             .map(Reservation::amount)
             .unwrap_or(Money::ZERO);
-        let spend = if f.spend_unknown {
+        let (spend, spend_known) = if f.spend_unknown {
             // Not readable: unknown, charged at the hold.
-            held_amount.max(self.spend_of(&f.result.calls, held_amount)?)
+            let (s, _) = self.spend_of(&f.result.calls, held_amount)?;
+            (held_amount.max(s), false)
         } else {
             self.spend_of(&f.result.calls, held_amount)?
         };
+        // The worker's embed, rerank and decide tool calls are its spend too
+        // (decision 0089), but not rounds on its route: added to the charge,
+        // left out of `spend_known`, which feeds the route's measured cost.
+        let (tool_calls, tool_spend) =
+            self.worker_model_tool_spend(&f.worker, contract.task.as_str(), &f.result.calls)?;
+        let spend = spend + tool_spend;
         let overrun = {
             let mut budget = self.s.admission.budget();
             match reservation {
@@ -4516,6 +5115,7 @@ impl RunLoop {
         // worker that carries its earlier calls, so its next result lists them
         // again; marking them keeps that result from charging them twice.
         self.seeded.extend(f.result.calls.iter().cloned());
+        self.seeded.extend(tool_calls);
         if let Some(o) = overrun {
             self.on_overrun(o).await?;
         }
@@ -4563,6 +5163,13 @@ impl RunLoop {
                 }
             }
         }
+        // A brief whose pinned context cannot fit repeats on every attempt: tell
+        // the user what to change, once per attempt, beside the failure count.
+        if let WorkerOutcome::Failed { error } = &f.result.outcome
+            && error.starts_with(PINNED_CONTEXT_PREFIX)
+        {
+            self.submit_report(&contract, Some(&f.worker), ReportKind::Stuck, error);
+        }
         let route_name = idx
             .map(|i| flight.attempts[i].route.clone())
             .unwrap_or_default();
@@ -4573,6 +5180,10 @@ impl RunLoop {
         let stop_tokens = self
             .route(&route_name)
             .map(|r| r.context.worker_stop_tokens())
+            .unwrap_or(0);
+        let window_tokens = self
+            .route(&route_name)
+            .map(|r| r.context.effective_window())
             .unwrap_or(0);
         let handed_back = matches!(f.result.outcome, WorkerOutcome::HandedBack { .. });
         self.trace(TraceEvent::WorkerFinished {
@@ -4586,6 +5197,7 @@ impl RunLoop {
             peak_context_tokens: f.peak_context,
             projected_tokens: flight.projection.tokens,
             stop_tokens,
+            window_tokens,
             sizing_miss: handed_back,
             calls: f.result.calls.iter().map(|c| c.to_string()).collect(),
             spend_micros: spend.micros(),
@@ -4593,7 +5205,7 @@ impl RunLoop {
         .await?;
         self.trace_spend().await?;
 
-        // Loop shapes (question 4).
+        // Loop shapes.
         if let WorkerOutcome::Stalled {
             call_digest,
             repeats,
@@ -4633,8 +5245,10 @@ impl RunLoop {
             let a = &mut flight.attempts[i];
             a.status = status;
             a.spend = spend;
+            a.spend_known = spend_known;
             a.result = Some(f.result.clone());
         }
+        self.record_write_set(&f.contract, &f.result.changed_paths, now);
         // Merged before the kill: verified by the merge that already happened.
         if let Some(commit) = &f.merged {
             if let Some(i) = idx {
@@ -4674,6 +5288,15 @@ impl RunLoop {
                     .coordination
                     .integration_tip
                     .get_or_insert_with(|| commit.clone());
+                // Merged before the kill from the worktree this contract
+                // inherited (a handoff child): that work is on the branch, so
+                // any contract still continuing in it starts from the tip, as
+                // after `integrate_winner`'s merge.
+                if let Some(inherited) = contract.workspace.clone() {
+                    for c in &mut self.record.open_contracts {
+                        stop_inheriting(c, &inherited);
+                    }
+                }
             }
             return self.finish_attempt(contract, flight).await;
         }
@@ -4947,7 +5570,7 @@ impl RunLoop {
                         contract.task_kind,
                         &route,
                         false,
-                        spend,
+                        spend_known.then_some(spend),
                     );
                 }
                 let note = format!("{} ({})", outcome_name(other), f.worker);
@@ -4969,7 +5592,7 @@ impl RunLoop {
         kind: Option<kgraf_core::model_profile::TaskKind>,
         route: &str,
         satisfied: bool,
-        spend: Money,
+        spend: Option<Money>,
     ) {
         let Some((model, vendor)) = self
             .route(route)
@@ -5023,25 +5646,23 @@ impl RunLoop {
         // route, its pin, or its handshake route): never the stateful
         // round-robin cursor `route_base` uses at dispatch, so this lookup
         // never perturbs another contract's routing.
-        let consumers = self
-            .record
-            .open_contracts
-            .iter()
-            .filter(|c| c.depends_on.iter().any(|d| d == &contract.contract))
-            .filter_map(|c| {
-                let route = c
-                    .worker_routes
-                    .first()
-                    .or(c.route.as_ref())
-                    .or(c.handshake_route.as_ref())?;
-                let vendor = self.route(route)?.vendor.clone();
-                Some(crate::interface_review::ConsumerRoute {
-                    contract: c.contract.clone(),
-                    route: route.clone(),
-                    vendor,
+        let consumers =
+            crate::interface_review::consumers_of(&contract.contract, &self.record.open_contracts)
+                .into_iter()
+                .filter_map(|c| {
+                    let route = c
+                        .worker_routes
+                        .first()
+                        .or(c.route.as_ref())
+                        .or(c.handshake_route.as_ref())?;
+                    let vendor = self.route(route)?.vendor.clone();
+                    Some(crate::interface_review::ConsumerRoute {
+                        contract: c.contract.clone(),
+                        route: route.clone(),
+                        vendor,
+                    })
                 })
-            })
-            .collect();
+                .collect();
         let symbols = contract
             .slices
             .iter()
@@ -5187,7 +5808,7 @@ impl RunLoop {
                 contract.task_kind,
                 &attempt.route,
                 passed,
-                attempt.spend,
+                attempt.spend_known.then_some(attempt.spend),
             );
         }
         let at = self.now();
@@ -5230,6 +5851,7 @@ impl RunLoop {
         );
         if let Some(a) = flight.attempts.iter_mut().find(|a| a.worker == worker) {
             a.verdict = Some(verdict);
+            a.infrastructure = infrastructure;
         }
         self.finish_attempt(contract, flight).await
     }
@@ -5299,17 +5921,22 @@ impl RunLoop {
         self.finalize_ordinary(contract, flight).await
     }
 
-    async fn finalize_ordinary(
-        &mut self,
-        contract: OpenContract,
-        mut flight: InFlight,
-    ) -> Result<(), OrchestratorError> {
+    /// Return a finished flight's admission slot and budget holds.
+    fn return_holds(&self, flight: &mut InFlight) {
         if let Some(a) = flight.admitted.take() {
             self.s.admission.gate().release(a);
         }
         for (_, r) in std::mem::take(&mut flight.reservations) {
             self.s.admission.budget().release(r);
         }
+    }
+
+    async fn finalize_ordinary(
+        &mut self,
+        contract: OpenContract,
+        mut flight: InFlight,
+    ) -> Result<(), OrchestratorError> {
+        self.return_holds(&mut flight);
         let id = contract.contract.clone();
         let holder = self.holder(&contract);
 
@@ -5320,7 +5947,7 @@ impl RunLoop {
 
         // The leases must still be ours at the moment a result is accepted, not
         // just at the last renewal tick.
-        if select(&flight.attempts).is_some() && !flight.lease_lost {
+        if select(&flight.attempts, &flight.premerged).is_some() && !flight.lease_lost {
             let lost = self.keeper.renew_holder_now(&holder)?;
             if !lost.is_empty() {
                 flight.lease_lost = true;
@@ -5341,7 +5968,7 @@ impl RunLoop {
         let mut integrated = true;
         // An attempt merged before the kill is already on the branch.
         if !flight.lease_lost
-            && let Some(winner) = select(&flight.attempts)
+            && let Some(winner) = select(&flight.attempts, &flight.premerged)
             && !flight.premerged.contains(&flight.attempts[winner].worker)
         {
             let ws = flight.attempts[winner].workspace.clone();
@@ -5353,7 +5980,7 @@ impl RunLoop {
                     detail,
                     commit,
                 } => {
-                    let resolver = self.resolver_contract(
+                    let mut resolver = self.resolver_contract(
                         &contract,
                         &tip,
                         &paths,
@@ -5361,6 +5988,17 @@ impl RunLoop {
                         commit.as_deref(),
                         ws.clone(),
                     );
+                    // The kept attempt's worktree, recorded under its name in
+                    // the resolver: a run stopped before the resolver settles
+                    // keeps it named (startup cleanup spares it, its attempt
+                    // ref is not swept), and the process that resumes the run
+                    // finds it again to settle it (`discard_conflict`).
+                    if let (Some(name), Some(handle)) = (
+                        ws.file_name().and_then(|n| n.to_str()),
+                        self.s.workspaces.handle(&ws).await,
+                    ) {
+                        resolver.worktrees.insert(name.to_owned(), handle);
+                    }
                     self.note_wait(
                         &id,
                         WaitState::Resolver {
@@ -5368,13 +6006,14 @@ impl RunLoop {
                         },
                     );
                     if let Some(c) = self.record.contract_mut(&id) {
-                        c.workers.clear();
-                        c.worktrees.clear();
-                        c.worker_routes.clear();
+                        forget_workers(c);
                     }
                     self.record.open_contracts.push(resolver);
                     for (i, a) in flight.attempts.iter().enumerate() {
-                        self.s.workspaces.release(&a.workspace, i == winner).await;
+                        // The winner is kept for its resolver (0073), which now
+                        // names it; a loser only while an open contract does.
+                        let keep = i == winner || worktree_in_use(&self.record, &a.workspace);
+                        self.s.workspaces.release(&a.workspace, keep).await;
                         let outcome = if i == winner {
                             SessionOutcome::Completed
                         } else {
@@ -5398,7 +6037,7 @@ impl RunLoop {
         }
         if integrated
             && !flight.lease_lost
-            && let Some(winner) = select(&flight.attempts)
+            && let Some(winner) = select(&flight.attempts, &flight.premerged)
         {
             let w = &flight.attempts[winner];
             if let Some(Verdict::Pass {
@@ -5409,7 +6048,8 @@ impl RunLoop {
                 self.record.last_verified_commit = Some(commit.clone());
             }
             for (i, a) in flight.attempts.iter().enumerate() {
-                self.s.workspaces.release(&a.workspace, i == winner).await;
+                let keep = i == winner || worktree_in_use(&self.record, &a.workspace);
+                self.s.workspaces.release(&a.workspace, keep).await;
             }
             // Decision 0067: every attempt's worker id
             // ends here, whichever way -- the winner's session completed,
@@ -5432,9 +6072,8 @@ impl RunLoop {
             self.announce_verified(&contract, result.as_ref()).await?;
             self.clear_wait(&id);
             if let Some(open) = self.record.contract(&id) {
-                // Item 3, coordination-hardening set: the winning attempt's
-                // rationale, if it gave one, travels with the closed
-                // contract so a later dependent's brief can quote it.
+                // The winning attempt's rationale, if it gave one, travels with
+                // the closed contract so a later dependent's brief can quote it.
                 let closed = crate::coordination::ClosedContract::of(
                     open,
                     crate::coordination::Closure::Verified,
@@ -5466,17 +6105,19 @@ impl RunLoop {
 
         // A lost lease is not the attempt's failure: it goes back to Planned with
         // its workers, and resumes their transcripts once the lease is retaken.
+        // A verifier that could not run says nothing about the work either: a
+        // round whose every attempt ended that way is retried without counting
+        // toward `failures`, bounded by `verifier_failures`.
+        let verifier_down = !flight.lease_lost
+            && !flight.attempts.is_empty()
+            && flight.attempts.iter().all(|a| a.infrastructure);
         let not_a_failure = flight.lease_lost
+            || verifier_down
             || flight
                 .attempts
                 .iter()
                 .all(|a| matches!(a.status, AttemptStatus::Empty | AttemptStatus::Stopped));
         let failures = contract.failures + 1;
-        // Workers that will be continued keep their worktrees, reopened by the
-        // next dispatch; a failed attempt's worktree is discarded.
-        for a in &flight.attempts {
-            self.s.workspaces.release(&a.workspace, not_a_failure).await;
-        }
         let max_retries = self.config.max_retries;
         self.clear_wait(&id);
         // Decision 0067: retired *before* the
@@ -5509,28 +6150,37 @@ impl RunLoop {
         // Decision 0084: what the verifier said about this round's refused
         // attempts, for the next fresh attempt's brief (`refusal_brief`).
         let refusal = last_refusal(&flight.attempts);
+        let backoff = (self.config.tick.as_millis() as i64).max(1);
+        let retry_now = self.now();
         if let Some(c) = self.record.contract_mut(&id) {
-            if !not_a_failure {
-                c.failures = failures;
-                c.last_refusal = refusal;
-                c.workers.clear();
-                c.worktrees.clear();
-                c.worker_routes.clear();
-            } else if flight.renew_workers {
-                // A worktree that could not be provided (a refused reopen)
-                // would be refused again: the retry is a fresh worker in a
-                // fresh worktree. Not the model's failure, so `failures` and
-                // max_retries are untouched; `renewals` keeps the id new.
-                c.renewals += 1;
-                c.workers.clear();
-                c.worktrees.clear();
-                c.worker_routes.clear();
+            if verifier_down {
+                c.verifier_failures += 1;
+                let shift = c.verifier_failures.min(10);
+                c.retry_at_ms = Some(retry_now + (backoff << shift).min(60_000));
+            } else if flight.attempts.iter().any(|a| a.verdict.is_some()) {
+                c.verifier_failures = 0;
             }
             if !integrated {
                 // Re-dispatched from the current integration tip, in a fresh
-                // worktree: the conflicting one is gone.
+                // worktree: the refused one is not continued. Cleared before
+                // the workers are forgotten, so the handle of a worktree it
+                // inherited goes too.
                 c.workspace = None;
                 c.base = None;
+            }
+            if !not_a_failure {
+                c.failures = failures;
+                c.last_refusal = refusal;
+                forget_workers(c);
+            } else if flight.renew_workers {
+                // A worktree that could not be provided (a refused reopen)
+                // would be refused again: the retry is a fresh worker in a
+                // fresh worktree (an inherited one is adopted again, and a
+                // refusal repeats until the environment bound holds the
+                // contract). Not the model's failure, so `failures` and
+                // max_retries are untouched; `renewals` keeps the id new.
+                c.renewals += 1;
+                forget_workers(c);
             }
             c.status = if let Some(session) = c.stopped_by_user.first() {
                 // Decision 0067, point 2: a user stop outranks every other
@@ -5546,6 +6196,13 @@ impl RunLoop {
                 ContractStatus::Held {
                     reason: format!("{failures} attempts failed verification or did not complete"),
                 }
+            } else if c.verifier_failures > MAX_ENVIRONMENT_RETRIES {
+                ContractStatus::Held {
+                    reason: format!(
+                        "the verifier could not run {} times in a row; fix it and resume",
+                        c.verifier_failures
+                    ),
+                }
             } else if c.environment_failures > MAX_ENVIRONMENT_RETRIES {
                 ContractStatus::Held {
                     reason: format!(
@@ -5557,6 +6214,16 @@ impl RunLoop {
             } else {
                 ContractStatus::Planned
             };
+        }
+        // Workers that will be continued keep their worktrees, reopened by the
+        // next dispatch. A failed attempt's worktree is discarded, unless an
+        // open contract still names it: a handoff child's retry, or a later
+        // child of the same handoff, continues in the worktree the child
+        // inherited, which holds the handoff parent's work. Released after
+        // the record above says who still names it.
+        for a in &flight.attempts {
+            let keep = not_a_failure || worktree_in_use(&self.record, &a.workspace);
+            self.s.workspaces.release(&a.workspace, keep).await;
         }
         self.release_leases_if_unused(&holder)?;
         self.save()
@@ -5584,6 +6251,21 @@ impl RunLoop {
             .chain(self.record.split_contracts.iter().cloned())
             .collect();
         let policy = self.delegation_policy();
+        // The worktree the children continue in, recorded in each under its
+        // own name ([`inherited_key`]), so a child's retry, or a resume in a
+        // later process, reopens it with the parent's work
+        // ([`Workspaces::adopt`]). The live handle, else the one the parent
+        // recorded (its own worker's, or the one it inherited).
+        let inherited_name = workspace
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_owned);
+        let inherited_handle = match self.s.workspaces.handle(&workspace).await {
+            Some(h) => Some(h),
+            None => inherited_name
+                .as_ref()
+                .and_then(|n| parent.worktrees.get(n).cloned()),
+        };
         for (i, item) in handoff.remaining.iter().enumerate() {
             if item.trim().is_empty() {
                 continue;
@@ -5628,9 +6310,14 @@ impl RunLoop {
                     );
                     self.hold(&parent.contract, reason);
                     if let Some(c) = self.record.contract_mut(&parent.contract) {
-                        c.workers.clear();
-                        c.worktrees.clear();
-                        c.worker_routes.clear();
+                        // The parent's worktree holds its work so far: kept,
+                        // named by the held parent, whose next attempt
+                        // continues in it rather than starting over.
+                        c.workspace = Some(workspace.clone());
+                        if let (Some(name), Some(handle)) = (&inherited_name, &inherited_handle) {
+                            c.worktrees.insert(name.clone(), handle.clone());
+                        }
+                        forget_workers(c);
                     }
                     return self.save();
                 }
@@ -5665,6 +6352,9 @@ impl RunLoop {
             );
             child.slices = parent.slices.clone();
             child.workspace = Some(workspace.clone());
+            if let (Some(name), Some(handle)) = (&inherited_name, &inherited_handle) {
+                child.worktrees.insert(name.clone(), handle.clone());
+            }
             prev = Some(cid);
             children.push(child);
         }
@@ -5673,6 +6363,12 @@ impl RunLoop {
                 &parent.contract,
                 "the handoff listed nothing remaining".into(),
             );
+            if let Some(c) = self.record.contract_mut(&parent.contract) {
+                c.workspace = Some(workspace.clone());
+                if let (Some(name), Some(handle)) = (&inherited_name, &inherited_handle) {
+                    c.worktrees.insert(name.clone(), handle.clone());
+                }
+            }
             return self.save();
         };
         // Dependents of the parent now wait for its last child.
@@ -5907,9 +6603,6 @@ impl RunLoop {
                 let r = self.persist_note("box", InboundKind::Note, &text, None);
                 let _ = reply.send(r);
             }
-            Control::SteerWorker { worker, reply } => {
-                let _ = reply.send(Err(SteerError::RuntimeCannotInject(worker)));
-            }
             Control::Status(reply) => {
                 let _ = reply.send(self.status());
             }
@@ -6108,7 +6801,7 @@ impl RunLoop {
         let waiting = self.wait_line();
         // One read of the board serves the text and the figures.
         let occupancy = self.frugal.board.snapshot();
-        let unpriced = match self.unpriced_models() {
+        let unpriced = match self.unpriced_models(false) {
             Ok(m) if m.is_empty() => String::new(),
             Ok(m) => format!(" (not counting {})", m.join(", ")),
             Err(_) => " (unpriced spend unreadable)".to_owned(),
@@ -6172,6 +6865,56 @@ fn held_category(reason: &str) -> &'static str {
     }
 }
 
+/// The key under which `c` records the worktree it inherited (`c.workspace`,
+/// a handoff parent's): the worktree's own name, its last path component. The
+/// provider reopens it from `c.worktrees[<this key>]` ([`Workspaces::adopt`]),
+/// and startup cleanup and `kgraf clean` read the same key as a name a run
+/// still needs.
+pub(crate) fn inherited_key(c: &OpenContract) -> Option<String> {
+    c.workspace
+        .as_deref()
+        .and_then(Path::file_name)
+        .and_then(|n| n.to_str())
+        .map(str::to_owned)
+}
+
+/// Forget `c`'s workers, so its next attempt gets fresh ones, but not the
+/// recorded handle of the worktree it inherited: that worktree is not a
+/// worker's, and the next attempt continues in it.
+pub(crate) fn forget_workers(c: &mut OpenContract) {
+    let inherited = inherited_key(c);
+    c.workers.clear();
+    c.worktrees.retain(|k, _| Some(k) == inherited.as_ref());
+    c.worker_routes.clear();
+}
+
+/// `c` stops continuing in `workspace`, with the handle it recorded for it:
+/// the work in that worktree is on the integration branch (merged, or it
+/// changed nothing), so `c`'s next attempt starts fresh from the tip, which
+/// holds it.
+pub(crate) fn stop_inheriting(c: &mut OpenContract, workspace: &Path) {
+    if c.workspace.as_deref() != Some(workspace) {
+        return;
+    }
+    if let Some(key) = inherited_key(c) {
+        c.worktrees.remove(&key);
+    }
+    c.workspace = None;
+}
+
+/// Whether an open contract of `record` still names `workspace`: a handoff
+/// child (or its retry, or a later child of the same handoff) continues in it
+/// (`workspace`), or a conflict resolver cites the attempt kept in it
+/// (`resolver_source`). Such a worktree is released with `keep = true`; the
+/// last contract to stop naming it releases it for good.
+pub(crate) fn worktree_in_use(record: &RunStateRecord, workspace: &Path) -> bool {
+    !workspace.as_os_str().is_empty()
+        && record.open_contracts.iter().any(|c| {
+            c.workspace.as_deref() == Some(workspace)
+                || c.resolver_source.as_deref() == Some(workspace)
+        })
+}
+
 /// The worker's instruction: the contract verbatim, then its acceptance and scope.
 /// The verifier's reasons for a round's refused attempts, joined, scrubbed for
 /// storage (decision 0071) and capped from the end at
@@ -6198,6 +6941,10 @@ fn last_refusal(attempts: &[Attempt]) -> Option<String> {
         joined
     })
 }
+
+/// Starts the failure text of an attempt that could not run a single round
+/// because its pinned context reaches the worker's stop point.
+const PINNED_CONTEXT_PREFIX: &str = "pinned context too large: ";
 
 /// The tag a verifier's refusal reason is quoted in, as data, in a fresh
 /// attempt's brief (decision 0084). The worker's system prompt names it.
@@ -6236,8 +6983,7 @@ fn brief_text(c: &OpenContract) -> String {
 }
 
 /// The winning attempt's rationale, labeled with the model and worker that
-/// wrote it (item 3, coordination-hardening set; 0026: derived text is
-/// labeled), for `ClosedContract` to carry to a dependent contract's brief.
+/// wrote it (0026: derived text is labeled), for `ClosedContract` to carry to a dependent contract's brief.
 /// `None` when the worker gave none: recorded as absent, never fabricated.
 ///
 /// Scrubbed again here (decision 0071), belt-and-braces with the scrub the
@@ -6402,6 +7148,13 @@ async fn run_attempt(
             result.trace_failures.extend(torn_note);
             return Ok((result, peak));
         }
+        // The prefix and opening messages alone reach the worker's stop point,
+        // so every attempt with this brief fails the same way. Tagged so the
+        // completion path reports it to the user with the fix, instead of
+        // leaving it a plain failed attempt.
+        Err(e @ WorkerError::PinnedContextTooLarge { .. }) => {
+            return Err(format!("{PINNED_CONTEXT_PREFIX}{e}"));
+        }
         Err(e) => return Err(format!("spawn: {e}")),
     };
     // Decision 0067: fills the slot the loop created at dispatch, so
@@ -6562,23 +7315,21 @@ fn completed_from(brief: &WorkerBrief, events: &[WorkerEvent]) -> WorkerResult {
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-    // Rebuilt from the transcript, same as the answer above (item 3,
-    // coordination-hardening set): a rebuild is not the worker loop that
-    // parsed it live, so it parses it again here rather than losing it.
+    // Rebuilt from the transcript, same as the answer above: a rebuild is not
+    // the worker loop that parsed it live, so it parses it again here rather
+    // than losing it.
     let rationale = kgraf_runtime::parse_rationale(&answer);
     WorkerResult {
-        task: brief.task.clone(),
-        worker: brief.worker.clone(),
-        outcome: WorkerOutcome::Completed,
         answer,
         changed_paths,
-        commit: None,
         steps: calls.len() as u32,
         calls,
-        prefix_digest: String::new(),
-        denied: 0,
-        trace_failures: Vec::new(),
         rationale,
+        ..WorkerResult::bare(
+            brief.task.clone(),
+            brief.worker.clone(),
+            WorkerOutcome::Completed,
+        )
     }
 }
 
@@ -6586,8 +7337,188 @@ fn completed_from(brief: &WorkerBrief, events: &[WorkerEvent]) -> WorkerResult {
 mod tests {
     use super::*;
 
-    /// Every `diag_code` branch resolves to a real glossary entry (review,
-    /// 2026-09-27 re-review, item 3). One instance per named branch, plus one
+    fn bare_flight(admission: Arc<Admission>) -> InFlight {
+        InFlight {
+            admission,
+            admitted: None,
+            reservations: BTreeMap::new(),
+            attempts: Vec::new(),
+            cancels: BTreeMap::new(),
+            running: 0,
+            queued: 0,
+            projection: Projection {
+                base_tokens: 0,
+                tokens: 0,
+                rounds: 0,
+                target_tokens: 0,
+                source: crate::sizing::ProjectionSource::UnmeasuredDefault,
+            },
+            estimate: Money::ZERO,
+            handed_back: None,
+            lease_lost: false,
+            premerged: BTreeSet::new(),
+            renew_workers: false,
+            injectors: BTreeMap::new(),
+            fences: BTreeMap::new(),
+            ended: BTreeMap::new(),
+            run: "r".into(),
+            task: "r/a".into(),
+            clock: Arc::new(crate::clock::SystemClock),
+            ledger: Arc::new(Ledger::open_in_memory().expect("ledger")),
+            prices: PriceTable::new(),
+            charged: BTreeSet::new(),
+        }
+    }
+
+    /// A price table that prices model `m` at one micro-dollar per input token.
+    fn prices_for_m() -> PriceTable {
+        let mut prices = PriceTable::new();
+        prices.set(
+            "m",
+            kgraf_core::ModelPrice {
+                uncached_input: 1_000_000,
+                cache_read: 0,
+                cache_write: 0,
+                output: 0,
+                reasoning: 0,
+            },
+        );
+        prices
+    }
+
+    /// Record one settled call of `worker` on `model` under task `r/a`.
+    fn ledger_call(ledger: &Ledger, worker: &str, model: &str, input: u64) {
+        let token = ledger
+            .begin(
+                "probe",
+                kgraf_core::Protocol::Additive,
+                model,
+                worker,
+                "r/a",
+            )
+            .expect("begin");
+        token
+            .settle(
+                &TokenUsage {
+                    uncached_input: input,
+                    ..TokenUsage::default()
+                },
+                None,
+            )
+            .expect("settle");
+    }
+
+    /// Drop a flight whose one worker holds `hold` and has not ended; return
+    /// the sender that ends the worker, and the admission.
+    fn dropped_flight_with_running_worker(
+        mut flight: InFlight,
+        admission: &Arc<Admission>,
+        worker: &str,
+        hold: Money,
+    ) -> oneshot::Sender<()> {
+        flight.admitted = Some(admission.gate().try_admit(1).unwrap());
+        let worker = AgentId::new(worker);
+        let r = admission.budget().reserve("r", "r/a", hold, 0, true);
+        flight.reservations.insert(worker.clone(), r);
+        let (ended_tx, ended_rx) = oneshot::channel::<()>();
+        flight.ended.insert(worker, ended_rx);
+        drop(flight);
+        ended_tx
+    }
+
+    async fn wait_for_release(admission: &Arc<Admission>) {
+        for _ in 0..100 {
+            if admission.gate().in_flight() == (0, 0) {
+                // The slot returns before the spend is booked; let it finish.
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A flight dropped while its worker still runs keeps the slot and the
+    /// hold until the worker's task ends, and then settles the worker at its
+    /// spend instead of releasing the hold.
+    #[tokio::test]
+    async fn a_dropped_flight_keeps_its_slot_and_hold_until_the_worker_ends() {
+        let admission = Admission::new(crate::admission::Limits::new(4, 4).unwrap());
+        let mut flight = bare_flight(admission.clone());
+        flight.prices = prices_for_m();
+        ledger_call(&flight.ledger, "w1", "m", 700);
+        let hold = Money::from_micros(700);
+        let ended_tx = dropped_flight_with_running_worker(flight, &admission, "w1", hold);
+        tokio::task::yield_now().await;
+        assert_eq!(
+            admission.gate().in_flight(),
+            (1, 1),
+            "the worker still runs"
+        );
+        assert_eq!(admission.budget().held(), hold, "its hold stands");
+
+        drop(ended_tx);
+        wait_for_release(&admission).await;
+        assert_eq!(admission.gate().in_flight(), (0, 0), "the slot came back");
+        assert_eq!(admission.budget().held(), Money::ZERO);
+        assert_eq!(
+            admission.budget().spent_run("r"),
+            hold,
+            "the worker's spend was booked, not dropped"
+        );
+    }
+
+    /// A worker that spent more than its hold (a zero estimate here) settles
+    /// at the exact ledger spend, and the spend is stamped when the worker
+    /// ended, not when the release was requested.
+    #[tokio::test]
+    async fn a_dropped_flight_settles_a_worker_at_its_exact_spend_stamped_at_its_end() {
+        let admission = Admission::new(crate::admission::Limits::new(4, 4).unwrap());
+        let clock = Arc::new(crate::clock::ManualClock::new(0));
+        let mut flight = bare_flight(admission.clone());
+        flight.prices = prices_for_m();
+        flight.clock = clock.clone();
+        ledger_call(&flight.ledger, "w1", "m", 5_000);
+        ledger_call(&flight.ledger, "w1", "m", 2_000);
+        // Another worker's call under the same task is not this worker's spend.
+        ledger_call(&flight.ledger, "w2", "m", 90_000);
+        let ended_tx =
+            dropped_flight_with_running_worker(flight, &admission, "w1", Money::from_micros(100));
+        // The worker ends more than an hour after the release was requested.
+        let end = 2 * 3_600_000;
+        clock.set(end);
+        drop(ended_tx);
+        wait_for_release(&admission).await;
+        let spend = Money::from_micros(7_000);
+        assert_eq!(admission.budget().spent_run("r"), spend);
+        assert_eq!(admission.budget().spent_task("r/a"), spend);
+        assert_eq!(
+            admission.budget().spent_last_hour(end),
+            spend,
+            "stamped at the worker's end"
+        );
+    }
+
+    /// A worker on an unpriced route is not recorded as a known zero: its
+    /// hold, an upper bound, stands in for the cost that cannot be read.
+    #[tokio::test]
+    async fn a_dropped_flight_never_records_an_unpriced_worker_as_a_known_zero() {
+        let admission = Admission::new(crate::admission::Limits::new(4, 4).unwrap());
+        let mut flight = bare_flight(admission.clone());
+        flight.prices = prices_for_m();
+        ledger_call(&flight.ledger, "w1", "unpriced", 8_000);
+        let hold = Money::from_micros(900);
+        let ended_tx = dropped_flight_with_running_worker(flight, &admission, "w1", hold);
+        drop(ended_tx);
+        wait_for_release(&admission).await;
+        assert_eq!(admission.budget().held(), Money::ZERO);
+        assert_eq!(
+            admission.budget().spent_run("r"),
+            hold,
+            "the unknown cost is bounded by the hold, not booked as $0"
+        );
+    }
+
+    /// Every `diag_code` branch resolves to a real glossary entry. One instance per named branch, plus one
     /// unnamed variant for the catch-all.
     #[test]
     fn every_diag_code_branch_names_a_real_glossary_entry() {
@@ -6680,6 +7611,7 @@ mod tests {
         new.push(WorkerEvent::AssistantMessage {
             text: format!("settled {marker}"),
             reasoning: String::new(),
+            signature: None,
         });
         new.push(WorkerEvent::Stop {
             reason: kgraf_provider::StopReason::EndTurn,
@@ -6690,7 +7622,7 @@ mod tests {
         );
     }
 
-    /// Item 3, coordination-hardening set: `rationale_of` scrubs a secret out
+    /// `rationale_of` scrubs a secret out
     /// of the winning attempt's rationale before it is persisted onto a
     /// `ClosedContract`, the same rule the rest of this module's persisted
     /// text follows (decision 0071) -- belt-and-braces with the worker
@@ -6705,22 +7637,13 @@ mod tests {
             PathBuf::from("/nonexistent"),
         );
         let mut result = WorkerResult {
-            task: "t1".into(),
-            worker: AgentId::new("w1"),
-            outcome: WorkerOutcome::Completed,
-            answer: String::new(),
-            changed_paths: Vec::new(),
-            commit: None,
-            calls: Vec::new(),
             steps: 1,
-            prefix_digest: String::new(),
-            denied: 0,
-            trace_failures: Vec::new(),
             rationale: Some(kgraf_runtime::Rationale {
                 decisions: format!("used the key {token} to fetch the schema."),
                 alternatives_rejected: "none.".into(),
                 counterpart_assumptions: "none.".into(),
             }),
+            ..WorkerResult::bare("t1", AgentId::new("w1"), WorkerOutcome::Completed)
         };
         let r = rationale_of(&attempt, Some(&result)).expect("a rationale");
         assert!(!r.decisions.contains(&token), "{}", r.decisions);
@@ -6815,7 +7738,7 @@ mod tests {
         assert!(nodes.is_empty());
     }
 
-    /// The review's sleep scenario: the wall clock jumps past every expiry while
+    /// Sleep scenario: the wall clock jumps past every expiry while
     /// the monotonic timer barely moves (a laptop lid closed). The keeper renews
     /// on the first poll after the jump, not a whole renewal period later.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6869,5 +7792,64 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         task.abort();
+    }
+
+    /// Decision 0088 with 0067: a worktree a handoff child inherited is in use
+    /// while any open contract continues in it, or a resolver cites it; the
+    /// last one to stop naming it frees it.
+    #[test]
+    fn a_shared_worktree_is_in_use_until_no_open_contract_names_it() {
+        let ws = PathBuf::from("/wt/r1-big-r0-a0");
+        let mut record = RunStateRecord::new(RunId::new("r1"), "i", 0);
+        let mut first = OpenContract::planned("big.h1", "t".into(), "rest", "ok");
+        first.workspace = Some(ws.clone());
+        let mut second = OpenContract::planned("big.h1.h1", "t".into(), "rest", "ok");
+        second.workspace = Some(ws.clone());
+        record.open_contracts = vec![first, second];
+        assert!(worktree_in_use(&record, &ws));
+        stop_inheriting(&mut record.open_contracts[0], &ws);
+        assert!(
+            worktree_in_use(&record, &ws),
+            "a later child still names it"
+        );
+        record.open_contracts.remove(1);
+        assert!(!worktree_in_use(&record, &ws), "the last user is done");
+
+        let mut resolver = OpenContract::planned("big.resolver1", "t".into(), "fix", "ok");
+        resolver.resolver_source = Some(ws.clone());
+        record.open_contracts.push(resolver);
+        assert!(worktree_in_use(&record, &ws), "a resolver cites it");
+        assert!(
+            !worktree_in_use(&record, Path::new("")),
+            "an attempt that never got a worktree names nothing"
+        );
+    }
+
+    /// A retry forgets its workers, never the handle of the worktree it
+    /// inherited; a contract that stops inheriting drops that handle too.
+    #[test]
+    fn forgetting_workers_keeps_the_inherited_worktrees_handle() {
+        let ws = PathBuf::from("/wt/r1-big-r0-a0");
+        let mut c = OpenContract::planned("big.h1", "t".into(), "rest", "ok");
+        c.workspace = Some(ws.clone());
+        c.workers = vec![AgentId::new("r1-big.h1-r0-a0")];
+        c.worktrees
+            .insert("r1-big-r0-a0".into(), "inherited".into());
+        c.worktrees.insert("r1-big.h1-r0-a0".into(), "own".into());
+        forget_workers(&mut c);
+        assert!(c.workers.is_empty());
+        assert_eq!(
+            c.worktrees.keys().collect::<Vec<_>>(),
+            vec!["r1-big-r0-a0"],
+            "only the inherited handle is kept"
+        );
+        stop_inheriting(&mut c, Path::new("/wt/elsewhere"));
+        assert_eq!(
+            c.workspace.as_deref(),
+            Some(ws.as_path()),
+            "another worktree"
+        );
+        stop_inheriting(&mut c, &ws);
+        assert!(c.workspace.is_none() && c.worktrees.is_empty());
     }
 }

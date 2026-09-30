@@ -113,7 +113,7 @@ pub enum Closure {
 }
 
 /// A verified contract's own account of its reasons, labeled with the model
-/// and worker that wrote it (item 3, coordination-hardening set; decision
+/// and worker that wrote it (decision
 /// 0026: derived text is labeled as another model's, never presented as the
 /// reader's own reasoning). Carried on `ClosedContract` so a dependent
 /// contract, dispatched after this one closes, can quote it -- the
@@ -143,7 +143,7 @@ pub struct ClosedContract {
     #[serde(default)]
     pub worker_routes: Vec<String>,
     /// The winning attempt's own account of its reasons, when it gave one
-    /// (item 3, coordination-hardening set). `None` for a closure that never
+    /// `None` for a closure that never
     /// carried a `WorkerResult` (`Superseded`), for a worker that omitted the
     /// block, and for every record from before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]

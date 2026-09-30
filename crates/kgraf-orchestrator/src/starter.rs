@@ -4,7 +4,7 @@
 //!
 //! Readiness runs first and a readiness failure returns its typed class, so the
 //! claim table disables a schedule that cannot succeed as configured and counts a
-//! transient failure toward its threshold (review §A7). Concurrent scheduled runs
+//! transient failure toward its threshold. Concurrent scheduled runs
 //! are capped; a start over the cap is a transient failure, not a queued surprise.
 //! A run that passes starts in the background with a run id derived from the
 //! schedule and the due time, so a re-delivered occurrence (claiming is

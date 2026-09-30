@@ -32,13 +32,6 @@ use std::sync::{Arc, Mutex};
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NeutralPrefixEncoder;
 
-impl NeutralPrefixEncoder {
-    /// The prefix bytes of a request as it will be handed to the adapter.
-    pub fn encode_request(&self, request: &Request) -> Result<Vec<u8>, PrefixError> {
-        encode(&request.tools, &request.system)
-    }
-}
-
 impl PrefixEncoder for NeutralPrefixEncoder {
     fn adapter(&self) -> &'static str {
         "neutral-request"
@@ -608,7 +601,7 @@ mod tests {
         let request = snap.request(vec![Message::user("brief")], 100, None);
         snap.check(&request).expect("same prefix");
         assert_eq!(
-            NeutralPrefixEncoder.encode_request(&request).expect("enc"),
+            encode(&request.tools, &request.system).expect("enc"),
             NeutralPrefixEncoder
                 .encode_prefix(snap.prefix())
                 .expect("enc"),

@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use kgraf_galaxy::ProjectModel;
 use kgraf_graph::snapshot::{ProjectIndex, open_existing};
-use kgraf_graph::{Change, ChangeOp, EventTail};
+use kgraf_graph::{Change, ChangeFault, ChangeOp, EventTail};
 
 /// How often the watch reads the log's watermark.
 pub const POLL: Duration = Duration::from_millis(500);
@@ -307,8 +307,9 @@ impl ActivityWatch {
                 let mut last: Option<Result<i64, String>> = None;
                 let mut watermark: Option<i64> = None;
                 let mut store = None;
+                let mut faults = Vec::new();
                 while !flag.load(Ordering::SeqCst) {
-                    let now = read(&root, &mut store, &mut watermark);
+                    let now = read(&root, &mut store, &mut watermark, &mut faults);
                     let update = match (&last, now) {
                         (_, Ok(None)) => None,
                         (Some(Ok(a)), Ok(Some((b, _)))) if *a == b => None,
@@ -347,9 +348,11 @@ fn read(
     root: &Path,
     store: &mut Option<kgraf_graph::GraphStore>,
     watermark: &mut Option<i64>,
+    faults: &mut Vec<ChangeFault>,
 ) -> Result<Option<(i64, Vec<ActivityRow>)>, String> {
     if store.is_none() {
         *watermark = None;
+        faults.clear();
         *store = match open_existing(root).map_err(|e| e.to_string())? {
             ProjectIndex::Ready(s) => Some(s),
             ProjectIndex::Missing { db_path } => {
@@ -373,16 +376,48 @@ fn read(
             if *watermark == Some(w) {
                 return Ok(None);
             }
-            *watermark = Some(w);
-            let rows = EventTail::newest_of(s, ROWS, &SHOWN)?;
-            let key = rows.first().map_or(0, |c| c.seq);
-            Ok(Some((key, rows.iter().map(describe).collect())))
+            let scanned = watermark.replace(w).unwrap_or(0);
+            let page = EventTail::newest_of_page(s, ROWS, &SHOWN)?;
+            // The filtered read never returns a row with an op this build does
+            // not know, so those rows are read separately, once each, and kept.
+            faults.extend(EventTail::unknown_ops_since(s, scanned)?);
+            let mut seen: std::collections::HashSet<i64> = faults.iter().map(|f| f.seq).collect();
+            // Payload faults come with the shown rows; a row seen again on a later
+            // poll is not listed twice.
+            let mut all: Vec<&ChangeFault> = faults.iter().collect();
+            all.extend(page.faults.iter().filter(|f| seen.insert(f.seq)));
+            all.sort_by_key(|f| std::cmp::Reverse(f.seq));
+            all.truncate(ROWS);
+            let key = page
+                .changes
+                .first()
+                .map_or(0, |c| c.seq)
+                .max(all.first().map_or(0, |f| f.seq));
+            let mut lines: Vec<ActivityRow> = page.changes.iter().map(describe).collect();
+            // A row that could not be read whole is shown, not dropped quietly.
+            lines.extend(all.into_iter().map(fault_row));
+            lines.sort_by_key(|r| std::cmp::Reverse(r.seq));
+            Ok(Some((key, lines)))
         })
         .map_err(|e| e.to_string());
     if result.is_err() {
         *store = None;
     }
     result
+}
+
+/// The card's line for a change-log row that could not be read whole.
+fn fault_row(f: &ChangeFault) -> ActivityRow {
+    ActivityRow {
+        seq: f.seq,
+        ts_ms: f.ts,
+        who: "indexer".to_owned(),
+        text: format!(
+            "unreadable change-log row {} ({}): {}",
+            f.seq, f.table, f.reason
+        ),
+        target: Target::None,
+    }
 }
 
 /// `HH:MM:SS` in local time.
@@ -435,5 +470,54 @@ mod tests {
         ));
         assert_eq!(r.text, "removed function a::b");
         assert_eq!(r.target, Target::None);
+    }
+
+    /// An unreadable change-log row reaches the card as a line, through the
+    /// same read the watch thread makes. A row with an op this build does not
+    /// know is one the filtered read never returns, so it needs its own path.
+    #[test]
+    fn an_unreadable_change_log_row_is_a_line_on_the_card() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = kgraf_graph::snapshot::graph_db_path(dir.path());
+        std::fs::create_dir_all(db.parent().expect("parent")).expect("mkdir");
+        let _store = kgraf_graph::GraphStore::open(&db, dir.path()).expect("graph");
+        let raw = rusqlite::Connection::open(&db).expect("raw");
+        raw.execute(
+            "INSERT INTO change_log(table_name, op, row_id, payload)
+                 VALUES ('work_nodes', 'upsert', 'w1', NULL),
+                        ('work_nodes', 'insert', 'w2', '{not json')",
+            [],
+        )
+        .expect("insert");
+        let (mut open, mut watermark, mut faults) = (None, None, Vec::new());
+        let (_, rows) = read(dir.path(), &mut open, &mut watermark, &mut faults)
+            .expect("read")
+            .expect("rows");
+        let unreadable = |rows: &[ActivityRow]| {
+            rows.iter()
+                .filter(|r| r.text.starts_with("unreadable change-log row"))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let bad = unreadable(&rows);
+        assert_eq!(bad.len(), 2, "{rows:?}");
+        assert!(bad.iter().any(|r| r.text.contains("`upsert`")));
+        assert!(bad.iter().any(|r| r.text.contains("not JSON")));
+        assert!(bad.iter().all(|r| r.ts_ms > 0), "the row's own time");
+
+        // A later poll does not list the dropped row twice, and a new bad row
+        // changes the update key so the card redraws.
+        let first_key = rows.first().map(|r| r.seq).expect("row");
+        raw.execute(
+            "INSERT INTO change_log(table_name, op, row_id, payload)
+                 VALUES ('work_nodes', 'merge', 'w3', NULL)",
+            [],
+        )
+        .expect("insert");
+        let (key, rows) = read(dir.path(), &mut open, &mut watermark, &mut faults)
+            .expect("read")
+            .expect("rows");
+        assert!(key > first_key);
+        assert_eq!(unreadable(&rows).len(), 3, "{rows:?}");
     }
 }

@@ -229,17 +229,21 @@ impl RunLoop {
             outcome: outcome.name().to_owned(),
             detail,
         });
+        if matches!(outcome, Integration::Merged { .. } | Integration::Empty) {
+            // Children continuing in this worktree (a handoff re-split) now
+            // start from the tip, which holds this work (or, for an empty
+            // attempt, everything the worktree had): the worktree is spent.
+            for c in &mut self.record.open_contracts {
+                super::stop_inheriting(c, workspace);
+            }
+        }
         if let Integration::Merged { commit } = &outcome {
             self.record.coordination.integration_tip = Some(commit.clone());
             self.advance_check_base(commit)?;
-            // Children continuing in this worktree (a handoff re-split) now start
-            // from the tip, which holds this work: the worktree is merged and gone.
-            for c in &mut self.record.open_contracts {
-                if c.workspace.as_deref() == Some(workspace) {
-                    c.workspace = None;
-                }
-            }
             self.reindex_merged(contract, workspace, at);
+        }
+        if let Integration::Conflict { paths, .. } = &outcome {
+            self.record_conflict_collisions(contract, paths, at);
         }
         if !outcome.accepted() {
             self.record.coordination.integration_rejections += 1;
@@ -268,6 +272,82 @@ impl RunLoop {
             .integration
             .insert(contract.contract.clone(), outcome);
         Ok(IntegrateOutcome::Accepted)
+    }
+
+    /// The task id the co-change tables use for a contract: scoped to the run, so
+    /// two runs' contracts named alike stay apart.
+    fn cochange_task(&self, contract: &str) -> String {
+        format!("{}/{contract}", self.record.run.as_str())
+    }
+
+    /// Record the write set an attempt finished with (decision 0020). Every
+    /// attempt counts, the winner and the losers and the ones that failed:
+    /// work later discarded is what review strips out of git history. A failed
+    /// write is traced, never fatal.
+    pub(super) fn record_write_set(&mut self, contract: &str, changed: &[PathBuf], at: i64) {
+        if changed.is_empty() {
+            return;
+        }
+        let task = self.cochange_task(contract);
+        let paths: Vec<String> = changed
+            .iter()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .collect();
+        let graph = self.s.graph.clone();
+        let result: Result<(), StoreError> = blocking(move || {
+            let g = graph.lock().map_err(|_| StoreError::Poisoned)?;
+            kgraf_graph::cochange::record_task_writes(&g, &task, &paths, at)
+                .map_err(StoreError::from)
+        });
+        if let Err(e) = result {
+            self.queue(TraceEvent::Notice {
+                at_ms: at,
+                contract: contract.to_owned(),
+                worker: String::new(),
+                detail: format!("the attempt's write set was not recorded: {e}"),
+            });
+        }
+    }
+
+    /// A merge conflict on `paths` between `contract` and the contracts of this
+    /// run already on the integration branch that wrote the same path: one
+    /// collision per pair and path (decision 0020). A conflict with a path no
+    /// other contract of the run wrote (a change made outside the run) has no
+    /// second task, so nothing is recorded for it.
+    fn record_conflict_collisions(&mut self, contract: &OpenContract, paths: &[String], at: i64) {
+        let run = self.record.run.as_str().to_owned();
+        let task = self.cochange_task(&contract.contract);
+        let landed: Vec<String> = self
+            .record
+            .verified_contracts
+            .iter()
+            .map(|c| format!("{run}/{c}"))
+            .collect();
+        let paths = paths.to_vec();
+        let graph = self.s.graph.clone();
+        let result: Result<u64, StoreError> = blocking(move || {
+            let g = graph.lock().map_err(|_| StoreError::Poisoned)?;
+            let mut recorded = 0;
+            for path in &paths {
+                for other in kgraf_graph::cochange::task_writers(&g, path)? {
+                    if other != task && landed.contains(&other) {
+                        kgraf_graph::cochange::record_collision(
+                            &g, &task, &other, path, "textual", at,
+                        )?;
+                        recorded += 1;
+                    }
+                }
+            }
+            Ok(recorded)
+        });
+        if let Err(e) = result {
+            self.queue(TraceEvent::Notice {
+                at_ms: at,
+                contract: contract.contract.clone(),
+                worker: String::new(),
+                detail: format!("the merge conflict was not recorded as a collision: {e}"),
+            });
+        }
     }
 
     /// After a merge, bring the graph's record of `contract`'s written paths up
@@ -304,28 +384,23 @@ impl RunLoop {
         }
         let graph = self.s.graph.clone();
         let root = workspace.to_path_buf();
-        let result: Result<kgraf_graph::IndexReport, StoreError> = blocking(move || {
+        let result: Result<(), StoreError> = blocking(move || {
             let g = graph.lock().map_err(|_| StoreError::Poisoned)?;
             kgraf_graph::Indexer::new(&g)
                 .with_source_root(&root)
                 .index_paths(&paths)
+                .map(|_| ())
                 .map_err(StoreError::from)
         });
-        match result {
-            Ok(report) => {
-                if !report.extractor_changed.is_empty() {
-                    self.queue(TraceEvent::ExtractorChanged {
-                        at_ms: at,
-                        changes: report.extractor_changed,
-                    });
-                }
-            }
-            Err(e) => self.queue(TraceEvent::Notice {
+        // A named-path index applies no extractor stamps, so its report has
+        // no extractor changes to carry: the full walk owns them.
+        if let Err(e) = result {
+            self.queue(TraceEvent::Notice {
                 at_ms: at,
                 contract: contract.contract.clone(),
                 worker: String::new(),
                 detail: format!("reindex after merge failed, a later index will catch it up: {e}"),
-            }),
+            });
         }
     }
 
@@ -431,12 +506,7 @@ impl RunLoop {
         mut flight: InFlight,
         original: String,
     ) -> Result<(), OrchestratorError> {
-        if let Some(a) = flight.admitted.take() {
-            self.s.admission.gate().release(a);
-        }
-        for (_, r) in std::mem::take(&mut flight.reservations) {
-            self.s.admission.budget().release(r);
-        }
+        self.return_holds(&mut flight);
         let id = contract.contract.clone();
         let holder = self.holder(&contract);
         // Leaves `original` Dispatched with the resolver still open (a
@@ -457,7 +527,7 @@ impl RunLoop {
                 "resolver {id} settled but the contract it resolves, {original}, is no longer open"
             )));
         }
-        let winner = select(&flight.attempts);
+        let winner = select(&flight.attempts, &flight.premerged);
         let mut accepted = false;
         if let Some(w) = winner
             && !flight.lease_lost
@@ -472,7 +542,10 @@ impl RunLoop {
             }
         }
         for (i, a) in flight.attempts.iter().enumerate() {
-            self.s.workspaces.release(&a.workspace, false).await;
+            // A resolver starts a fresh worktree of its own, which nothing
+            // else names; the check holds the rule every release follows.
+            let keep = super::worktree_in_use(&self.record, &a.workspace);
+            self.s.workspaces.release(&a.workspace, keep).await;
             let outcome = if accepted && Some(i) == winner {
                 SessionOutcome::Completed
             } else {
@@ -491,9 +564,6 @@ impl RunLoop {
         // A resolver never retries in place, win or lose: it is dropped
         // either way, and `original` alone carries the outcome forward.
         self.record.open_contracts.retain(|c| c.contract != id);
-        if let Some(source) = &contract.resolver_source {
-            self.s.workspaces.discard_conflict(source).await;
-        }
         let at = self.now();
         if accepted {
             // The gate machinery pins a commit only once every contract it
@@ -541,9 +611,7 @@ impl RunLoop {
             if let Some(c) = self.record.contract_mut(&original) {
                 c.workspace = None;
                 c.base = None;
-                c.workers.clear();
-                c.worktrees.clear();
-                c.worker_routes.clear();
+                super::forget_workers(c);
                 // A failed resolver counts as a failed attempt of `original`
                 // (0018's own bookkeeping this fallback re-enters): past
                 // `max_retries` it holds instead of looping forever, and the
@@ -570,6 +638,21 @@ impl RunLoop {
                     "resolver {id} did not merge; {original} is re-dispatched from the new tip"
                 ),
             });
+        }
+        // The conflicted attempt is superseded either way (0073). When the
+        // resolver merged, a contract that continued in its worktree (a later
+        // child of the same handoff) starts from the tip, which now holds the
+        // fix. The attempt is discarded once no open contract names its
+        // worktree; one still named stays for the contract that continues in it.
+        if let Some(source) = &contract.resolver_source {
+            if accepted {
+                for c in &mut self.record.open_contracts {
+                    super::stop_inheriting(c, source);
+                }
+            }
+            if !super::worktree_in_use(&self.record, source) {
+                self.s.workspaces.discard_conflict(&contract, source).await;
+            }
         }
         self.save()
     }
@@ -707,6 +790,19 @@ impl RunLoop {
         gates::held(&self.record.coordination.gates)
     }
 
+    /// Mark a gate held with `reason`.
+    fn hold_gate(&mut self, id: &str, reason: String) {
+        if let Some(g) = self
+            .record
+            .coordination
+            .gates
+            .iter_mut()
+            .find(|g| g.id == id)
+        {
+            g.status = GateStatus::Held { reason };
+        }
+    }
+
     /// Dispatch every ready gate like a contract: a work-item slot first
     /// (0019), then the run, off the loop.
     pub(super) async fn dispatch_gates(&mut self) -> Result<(), OrchestratorError> {
@@ -772,28 +868,11 @@ impl RunLoop {
                         superseded.join("; ")
                     )
                 };
-                // Fix, decision-0071 known gap: `superseded`'s "why" comes from
-                // `built_on_superseded` (the interface book, which can quote a
-                // re-grounding verdict or a tool's own text), so this gate's
-                // held reason is persist-scrubbed at its one write point into
-                // the run record, the same as `Orchestrator::hold`'s contract
-                // reason and `gates::decide`'s waive reason -- previously only
-                // the parallel `TraceEvent::Gate` copy below was scrubbed
-                // (generically, at trace-write time), leaving this copy, which
-                // `held()`/`terminal_status()` read back out of the run
-                // record, unscrubbed.
+                // Persist-scrubbed at the one write point into the run record:
+                // `superseded`'s "why" can quote a re-grounding verdict or a
+                // tool's own text.
                 let reason = kgraf_secrets::scrub_persist_owned(reason);
-                if let Some(g) = self
-                    .record
-                    .coordination
-                    .gates
-                    .iter_mut()
-                    .find(|g| g.id == id)
-                {
-                    g.status = GateStatus::Held {
-                        reason: reason.clone(),
-                    };
-                }
+                self.hold_gate(&id, reason.clone());
                 self.queue(TraceEvent::Gate {
                     at_ms: at,
                     gate: id.clone(),
@@ -814,17 +893,10 @@ impl RunLoop {
             }
             if versioned && tip.is_none() {
                 self.s.admission.gate().release(admitted);
-                if let Some(g) = self
-                    .record
-                    .coordination
-                    .gates
-                    .iter_mut()
-                    .find(|g| g.id == id)
-                {
-                    g.status = GateStatus::Held {
-                        reason: "refused: no integration commit is recorded for this run".into(),
-                    };
-                }
+                self.hold_gate(
+                    &id,
+                    "refused: no integration commit is recorded for this run".into(),
+                );
                 self.save()?;
                 continue;
             }
@@ -1273,7 +1345,7 @@ impl RunLoop {
             let indexed = kgraf_graph::Indexer::new(&g)
                 .with_source_root(&root)
                 .index_paths(&files)?;
-            let changes = indexed.extractor_changed;
+            drop(indexed);
             let mut nodes = Vec::new();
             // One file per recipient, in order; the node is found by its exact
             // heading text, which is built only from sanitized ids.
@@ -1289,9 +1361,9 @@ impl RunLoop {
                     }
                 }
             }
-            Ok::<_, OrchestratorError>((root, files, nodes, changes))
+            Ok::<_, OrchestratorError>((root, files, nodes))
         });
-        let (root, files, nodes, changes) = match written {
+        let (root, files, nodes) = match written {
             Ok(w) => w,
             Err(e) => {
                 if let Some(r) = &comms_root {
@@ -1300,9 +1372,6 @@ impl RunLoop {
                 return Err(e);
             }
         };
-        if !changes.is_empty() {
-            self.queue(TraceEvent::ExtractorChanged { at_ms: at, changes });
-        }
         // Versioned with the work (0026): the same files go onto the integration
         // branch. A failure is counted, traced and reported, never silent.
         let message = format!("kgraf: agent message {}", env.id);

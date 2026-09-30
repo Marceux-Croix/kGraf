@@ -66,6 +66,10 @@ pub struct ModelInfo {
     /// The model's context window, in tokens. Decision 0057's effective
     /// window is the lesser of this and a run-level cap.
     pub context_window: u64,
+    /// The lowest input size above which the entry lists different rates (its
+    /// `*_above_<N>k_tokens` fields). The five rates above are the base rates
+    /// only, so a call larger than this is not costed from them.
+    pub tier_threshold: Option<u64>,
 }
 
 /// Why one vendored entry could not become a [`ModelInfo`].
@@ -170,21 +174,9 @@ impl LiteLlmCatalog {
         self.models.get(model)
     }
 
-    /// The context window for one model, if it was mapped.
-    ///
-    /// The accessor decision 0057's effective-window calculation reads.
-    pub fn context_window(&self, model: &str) -> Option<u64> {
-        self.models.get(model).map(|info| info.context_window)
-    }
-
     /// Every mapped model's id.
     pub fn models(&self) -> impl Iterator<Item = &str> {
         self.models.keys().map(String::as_str)
-    }
-
-    /// How many entries mapped.
-    pub fn mapped_count(&self) -> usize {
-        self.models.len()
     }
 
     /// [`Self::to_price_table`], plus a bare-id entry for each `(model,
@@ -205,6 +197,9 @@ impl LiteLlmCatalog {
             }
             if let Some(info) = self.models.get(&format!("{provider}/{model}")) {
                 table.set((*model).to_owned(), info.price);
+                if let Some(t) = info.tier_threshold {
+                    table.set_tier_threshold((*model).to_owned(), t);
+                }
             }
         }
         table
@@ -215,12 +210,15 @@ impl LiteLlmCatalog {
     /// This is the loader's output in kGraf's existing price-table type,
     /// as `crates/kgraf-provider/src/accounting.rs` already consumes it.
     /// The context window has no home in `PriceTable` and is dropped here;
-    /// callers that need it read [`Self::context_window`] on the catalog
-    /// directly.
+    /// callers that need it read [`ModelInfo::context_window`] via
+    /// [`Self::get`].
     pub fn to_price_table(&self) -> PriceTable {
         let mut table = PriceTable::new();
         for (model, info) in &self.models {
             table.set(model.clone(), info.price);
+            if let Some(t) = info.tier_threshold {
+                table.set_tier_threshold(model.clone(), t);
+            }
         }
         table
     }
@@ -302,7 +300,24 @@ fn map_entry(entry: &Value) -> Result<ModelInfo, UnmappedReason> {
     Ok(ModelInfo {
         price,
         context_window,
+        tier_threshold: tier_threshold(entry),
     })
+}
+
+/// The lowest `<N>k` in the entry's `*_above_<N>k_tokens` rate fields. Fields
+/// for another service tier (`..._priority`, `..._batches`, `..._flex`) and the
+/// one-hour cache-write rate do not end in `_tokens` after the size, so they do
+/// not match.
+fn tier_threshold(entry: &Value) -> Option<u64> {
+    entry
+        .as_object()?
+        .keys()
+        .filter(|key| key.contains("_cost_per_token_above_") || key.contains("_token_cost_above_"))
+        .filter_map(|key| {
+            let size = key.rsplit("_above_").next()?.strip_suffix("k_tokens")?;
+            size.parse::<u64>().ok().map(|k| k * 1_000)
+        })
+        .min()
 }
 
 #[cfg(test)]
@@ -320,9 +335,40 @@ mod tests {
     fn loads_the_vendored_file_without_erroring() {
         let catalog = LiteLlmCatalog::load(vendored_bytes()).expect("vendored file must parse");
         assert!(
-            catalog.mapped_count() > 1000,
+            catalog.models().count() > 1000,
             "expected thousands of chat-priced models"
         );
+    }
+
+    #[test]
+    fn a_tiered_entry_carries_its_lowest_threshold_and_other_tiers_are_ignored() {
+        let entry = serde_json::json!({
+            "input_cost_per_token_above_272k_tokens": 1e-5,
+            "input_cost_per_token_above_200k_tokens": 6e-6,
+            "cache_read_input_token_cost_above_200k_tokens": 6e-7,
+            "input_cost_per_token_above_200k_tokens_priority": 1e-5,
+            "cache_creation_input_token_cost_above_1hr": 1e-5,
+        });
+        assert_eq!(tier_threshold(&entry), Some(200_000));
+        assert_eq!(
+            tier_threshold(&serde_json::json!({"input_cost_per_token": 1e-6})),
+            None
+        );
+        // The vendored file has tiered entries, and the price table refuses a
+        // call above the tier instead of costing it at the base rate.
+        let catalog = LiteLlmCatalog::load(vendored_bytes()).expect("vendored file");
+        let table = catalog.to_price_table();
+        let tiered = catalog
+            .models
+            .iter()
+            .find(|(_, info)| info.tier_threshold.is_some())
+            .expect("a tiered model");
+        let threshold = tiered.1.tier_threshold.expect("threshold");
+        let over = crate::usage::TokenUsage {
+            uncached_input: threshold + 1,
+            ..crate::usage::TokenUsage::default()
+        };
+        assert!(table.cost(tiered.0, &over).is_err());
     }
 
     #[test]
@@ -348,7 +394,6 @@ mod tests {
         assert_eq!(info.price.output, 10_000_000);
         assert_eq!(info.price.reasoning, 10_000_000);
         assert_eq!(info.context_window, 128_000);
-        assert_eq!(catalog.context_window("gpt-4o"), Some(128_000));
     }
 
     #[test]
@@ -453,7 +498,7 @@ mod tests {
         let raw: Value = serde_json::from_slice(bytes).expect("vendored file is valid JSON");
         let total = raw.as_object().expect("top level is an object").len();
         let catalog = LiteLlmCatalog::load(bytes).expect("vendored file must parse");
-        assert_eq!(catalog.mapped_count() + catalog.unmapped.len(), total);
+        assert_eq!(catalog.models().count() + catalog.unmapped.len(), total);
     }
 
     #[test]

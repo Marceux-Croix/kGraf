@@ -181,7 +181,24 @@ impl RuleOrPromptResolver {
     }
 }
 
+/// The line said when a persisted rule covers a call. The tool name comes
+/// from an MCP server and the note from the rules file, so both are escaped
+/// before they reach the terminal.
+fn allowed_by_rule_line(tool: &str, note: &str) -> String {
+    format!(
+        "[approval] {}: allowed by a persisted rule ({})",
+        kgraf_tools::terminal_safe(tool),
+        kgraf_tools::terminal_safe(note)
+    )
+}
+
 fn prompt(question: &str, tool: &str) -> std::io::Result<Choice> {
+    // A model or an MCP server wrote parts of both; escape sequences in them
+    // must not repaint the prompt the user answers.
+    let (question, tool) = (
+        kgraf_tools::terminal_safe(question),
+        kgraf_tools::terminal_safe(tool),
+    );
     let mut err = std::io::stderr().lock();
     // For an MCP tool, `a` records a rule for every call to the tool; say so,
     // with the same words as the orchestrator box's button.
@@ -210,13 +227,23 @@ impl AskResolver for RuleOrPromptResolver {
         let tool = paused.call().tool.clone();
         let subject = self.subject(paused);
         let covered = {
-            let store = self.store.lock().unwrap_or_else(|p| p.into_inner());
-            store
-                .matching_rule(&self.project, &tool, subject.as_deref())
-                .map(|rule| rule.note.clone())
+            let mut store = self.store.lock().unwrap_or_else(|p| p.into_inner());
+            // Re-read the file: `kgraf allow --revoke` in another process
+            // takes effect on the next call, not at the next start. A file
+            // that cannot be read covers nothing (the call is asked about),
+            // never the stale rules.
+            match store.reload() {
+                Ok(()) => store
+                    .matching_rule(&self.project, &tool, subject.as_deref())
+                    .map(|rule| rule.note.clone()),
+                Err(e) => {
+                    eprintln!("[approval] the allow rules could not be read: {e}");
+                    None
+                }
+            }
         };
         if let Some(note) = covered {
-            eprintln!("[approval] {tool}: allowed by a persisted rule ({note})");
+            eprintln!("{}", allowed_by_rule_line(&tool, &note));
             return UserAnswer::Allow;
         }
         let Attendance::Terminal { timeout } = self.attendance else {
@@ -274,8 +301,9 @@ impl AskResolver for RuleOrPromptResolver {
             Ok(Ok(Choice::Always)) => {
                 let Some(subject) = subject else {
                     eprintln!(
-                        "[approval] {tool} reports no exact subject for this call, so no rule \
-                         can name it; allowed once"
+                        "[approval] {} reports no exact subject for this call, so no rule \
+                         can name it; allowed once",
+                        kgraf_tools::terminal_safe(&tool)
                     );
                     return UserAnswer::Allow;
                 };
@@ -389,6 +417,51 @@ mod tests {
         }
     }
 
+    /// A rule revoked in the file after the resolver was built no longer
+    /// allows the call: the next ask reads the file again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_revoked_rule_stops_allowing_without_a_restart() {
+        let (shell, hook) = ShellTool::new(ExecPolicy::default_kgraf_policy());
+        let mut registry = ToolRegistry::new();
+        registry
+            .register_builtin(Arc::new(shell), Exposure::Prefix)
+            .expect("register");
+        let registry = Arc::new(registry);
+        let chain = ApprovalChain::new(vec![Arc::new(hook)]);
+        let paused = paused(&registry, &chain).await;
+        let subject = registry
+            .get("shell")
+            .and_then(|t| t.tool().permission_subject(&paused.call().input))
+            .expect("a subject for touch x");
+        let dir = tempfile::tempdir().expect("dir");
+        let elsewhere = tempfile::tempdir().expect("elsewhere");
+        let path = dir.path().join("rules.json");
+        let (mut writer, _) = PersistedAllowStore::open(&path, elsewhere.path()).expect("store");
+        writer
+            .allow_exact("p", "shell", subject, "test")
+            .expect("rule");
+        let (store, _) = PersistedAllowStore::open(&path, elsewhere.path()).expect("store");
+        let resolver = RuleOrPromptResolver::new(
+            store,
+            "p",
+            registry,
+            Attendance::Terminal {
+                timeout: Duration::from_secs(5),
+            },
+        )
+        .with_prompter(Arc::new(|_, _| Ok(Choice::No)));
+        assert!(matches!(resolver.answer(&paused).await, UserAnswer::Allow));
+        // Revoked by another process: the file no longer holds the rule.
+        let text = std::fs::read_to_string(&path).expect("read");
+        let mut json: serde_json::Value = serde_json::from_str(&text).expect("json");
+        json["rules"] = serde_json::json!([]);
+        std::fs::write(&path, json.to_string()).expect("write");
+        assert!(matches!(
+            resolver.answer(&paused).await,
+            UserAnswer::Deny { .. }
+        ));
+    }
+
     /// The terminal prompt had no timeout, so an unanswered
     /// ask held the worker forever. A prompter that never answers in time is
     /// now a denial at the timeout.
@@ -429,5 +502,17 @@ mod tests {
             UserAnswer::Deny { reason } => assert!(reason.contains("no answer"), "{reason}"),
             UserAnswer::Allow => panic!("an unanswered prompt must deny"),
         }
+    }
+
+    /// A tool name or rule note holding an escape sequence or a hidden
+    /// character is shown escaped, not interpreted by the terminal.
+    #[test]
+    fn a_persisted_rule_line_escapes_the_tool_and_the_note() {
+        let line = allowed_by_rule_line("mcp__x\u{1b}[2K", "ok\r\u{E0041}");
+        assert!(!line.contains('\u{1b}'), "{line}");
+        assert!(!line.contains('\r'), "{line}");
+        assert!(!line.contains('\u{E0041}'), "{line}");
+        assert!(line.contains("mcp__x\\u{1b}[2K"), "{line}");
+        assert!(line.contains("ok\\u{d}\\u{e0041}"), "{line}");
     }
 }

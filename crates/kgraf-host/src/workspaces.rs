@@ -1,15 +1,15 @@
 //! Git worktrees for a run: one per worker, the integration branch, startup
-//! cleanup, and `kgraf clean`. Moved from `kgraf-cli`'s
-//! `orchestrate_cmd.rs` without a change in behavior.
+//! cleanup, and `kgraf clean`.
 
+use crate::config::WorktreeRetention;
 use crate::error::{Error, Result, ResultExt};
 use kgraf_graph::GraphStore;
 use kgraf_orchestrator::{
     ChildMerge, Integration, OpenContract, PrepareFailure, RunStore, Workspaces,
 };
 use kgraf_sandbox::{
-    Attempt, FinishOutcome, MergeBack, MergeOutcome, ReopenSpec, Workspace, WorkspaceManager,
-    WorkspaceSpec,
+    Attempt, FinishOutcome, MergeBack, MergeOutcome, MergedWorktree, ReopenSpec, Workspace,
+    WorkspaceManager, WorkspaceSpec,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -228,19 +228,66 @@ pub(crate) fn clean_in(root: &Path, base: &Path, name: &str, force: bool) -> Res
 }
 
 /// Startup cleanup (0056): what dead processes left under the worktree base is
-/// removed (conversation and probe worktrees, worktrees a record dropped),
-/// except a worktree some run record still names, which a resume reopens.
-/// Worktrees of live processes (another run in progress) are never touched.
+/// removed (conversation, probe, gate and interface-stub worktrees, worktrees a
+/// record dropped), except a worktree some run record still names, which a
+/// resume reopens. Worktrees of live processes (another run in progress) are
+/// never touched.
+///
+/// With [`WorktreeRetention::Keep`] (decision 0088) a worker's attempt
+/// worktree (a worker's or a writer subagent's) is kept too, whether or not a
+/// record names it. The worktrees kGraf makes for itself
+/// ([`is_harness_worktree`]) are still removed: they hold no worker's
+/// attempt.
 pub(crate) fn clean_stale_worktrees(
     manager: &WorkspaceManager,
     store: &RunStore,
+    retention: WorktreeRetention,
 ) -> Result<Vec<kgraf_sandbox::OrphanRemoval>> {
     let referenced = store
         .referenced_worktrees()
         .step("cannot read the run records")?;
     manager
-        .startup_keeping(&|name| referenced.contains(name))
+        .startup_keeping(&|name| keeps_at_startup(retention, name, &referenced))
         .step("cannot clean the worktree base")
+}
+
+/// Whether startup cleanup leaves the worktree `name` alone (see
+/// [`clean_stale_worktrees`]).
+fn keeps_at_startup(
+    retention: WorktreeRetention,
+    name: &str,
+    referenced: &BTreeSet<String>,
+) -> bool {
+    referenced.contains(name) || (!retention.deletes() && !is_harness_worktree(name))
+}
+
+/// A conversation worktree ([`Workspaces::open_comms`]).
+pub(crate) const COMMS_PREFIX: &str = "comms-";
+/// A worktree a gate runs its commands in (`gates::CommandGateRunner`).
+pub(crate) const GATE_PREFIX: &str = "gate-";
+/// A worktree that probes the sandbox (`assembler`).
+pub(crate) const PROBE_PREFIX: &str = "probe-";
+
+/// The name of a worktree kGraf makes for itself at `now_nanos()`.
+pub(crate) fn harness_worktree_name(prefix: &str) -> String {
+    format!("{prefix}{}", now_nanos())
+}
+
+/// Whether `name` is a worktree kGraf makes for itself rather than a worker's
+/// attempt: a conversation, gate or probe worktree (`<prefix><nanos>`), or an
+/// interface-stub landing (`stub-<id>-v<version>`, `GitStubLander`). A worker's
+/// worktree never matches: its name ends in `-a<n>` (`<run>-<contract>-r<n>...
+/// -a<n>`), a writer subagent's in `.s<n>`.
+pub(crate) fn is_harness_worktree(name: &str) -> bool {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let stamped = [COMMS_PREFIX, GATE_PREFIX, PROBE_PREFIX]
+        .iter()
+        .any(|p| name.strip_prefix(p).is_some_and(digits));
+    let stub = name
+        .strip_prefix("stub-")
+        .and_then(|rest| rest.rsplit_once("-v"))
+        .is_some_and(|(id, version)| !id.is_empty() && digits(version));
+    stamped || stub
 }
 
 /// The run's integration branch, `kgraf/<run>`, created at the checkout's
@@ -352,14 +399,40 @@ pub(crate) struct GitWorkspaces {
     /// not discarded at conflict time so a resolver's brief can cite the
     /// commit and the attempt's own fresh worktree can read it. Settled by
     /// `discard_conflict` once a resolver merges the fix or the contract
-    /// gives up; an unsettled entry is still swept by `sweep_refs` like any
-    /// other attempt ref at the end of the run.
+    /// gives up. While a run record names the worktree as a resolver's source,
+    /// `sweep_refs` keeps its attempt ref, so a resolver resumed by a later
+    /// process can still read the commit; that process settles it by name.
     conflicted: Mutex<BTreeMap<PathBuf, Attempt>>,
+    /// Whether a released worktree that nothing needs is removed with its
+    /// build output (decision 0088).
+    retention: WorktreeRetention,
+    /// Worktrees and attempts that could not be removed, for the orchestrator
+    /// to show in the run's report ([`Workspaces::take_problems`]). Shared
+    /// with the removals that run on a blocking thread or on drop.
+    problems: Problems,
+}
+
+/// Where each failed removal or discard is recorded, once, for the run's
+/// report (decision 0088: fail loud).
+#[derive(Clone, Default)]
+pub(crate) struct Problems(Arc<Mutex<Vec<String>>>);
+
+impl Problems {
+    pub(crate) fn push(&self, text: String) {
+        eprintln!("{text}");
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).push(text);
+    }
+
+    fn take(&self) -> Vec<String> {
+        std::mem::take(&mut *self.0.lock().unwrap_or_else(|p| p.into_inner()))
+    }
 }
 
 impl GitWorkspaces {
     pub(crate) fn new(manager: Arc<WorkspaceManager>, merge_back: Arc<MergeBack>) -> Self {
         Self {
+            retention: WorktreeRetention::default(),
+            problems: Problems::default(),
             manager,
             merge_back,
             live: Mutex::new(BTreeMap::new()),
@@ -368,6 +441,160 @@ impl GitWorkspaces {
             touched: Mutex::new(BTreeSet::new()),
             conflicted: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// The worktree policy this run applies when it releases a worktree
+    /// (decision 0088).
+    pub(crate) fn with_retention(mut self, retention: WorktreeRetention) -> Self {
+        self.retention = retention;
+        self
+    }
+
+    /// The policy this provider applies (tests).
+    #[cfg(test)]
+    pub(crate) fn retention(&self) -> WorktreeRetention {
+        self.retention
+    }
+
+    fn problem(&self, text: String) {
+        self.problems.push(text);
+    }
+
+    /// Settle an attempt that will never be merged: a losing or failed one,
+    /// one merge-back refused, a conflict its resolver settled. Its attempt
+    /// refs are deleted either way. Under [`WorktreeRetention::Delete`] its
+    /// worktree goes with it, build output included (merge-back's discard);
+    /// under [`WorktreeRetention::Keep`] the worktree stays for the user, and
+    /// without its refs nothing can reopen it as live work (a reopen needs
+    /// HEAD at its base or at a commit an attempt ref names). A failure is
+    /// reported once, naming the worktree.
+    async fn retire_unmerged(&self, attempt: Attempt) {
+        let merge_back = self.merge_back.clone();
+        let deletes = self.retention.deletes();
+        let failed = tokio::task::spawn_blocking(move || {
+            let mut attempt = attempt;
+            let root = attempt.workspace().root().display().to_string();
+            if deletes {
+                merge_back.discard(&mut attempt).err().map(|e| {
+                    format!(
+                        "attempt {root} could not be discarded: {e}; its worktree stays, and \
+                         `kgraf clean` removes it"
+                    )
+                })
+            } else {
+                merge_back
+                    .sweep_attempt_refs(&[attempt.name().to_owned()])
+                    .err()
+                    .map(|e| {
+                        format!(
+                            "the attempt refs of the kept worktree {root} were not deleted: {e}"
+                        )
+                    })
+            }
+        })
+        .await;
+        match failed {
+            Ok(Some(text)) => self.problem(text),
+            Ok(None) => {}
+            Err(e) => self.problem(format!("settling an attempt did not finish: {e}")),
+        }
+    }
+
+    /// Remove a worktree this process holds, with its build output, under
+    /// [`WorktreeRetention::Delete`]; under `Keep`, or when it is already
+    /// gone, nothing. A failure is reported once.
+    async fn remove_unless_kept(&self, ws: Workspace) {
+        if !self.retention.deletes() || !ws.root().exists() {
+            return;
+        }
+        let manager = self.manager.clone();
+        let root = ws.root().to_path_buf();
+        match tokio::task::spawn_blocking(move || manager.remove(ws)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => self.problem(format!(
+                "worktree {} could not be removed: {e}; `kgraf clean` removes it",
+                root.display()
+            )),
+            Err(e) => self.problem(format!(
+                "removing worktree {} did not finish: {e}",
+                root.display()
+            )),
+        }
+    }
+
+    /// The worktree `name` under this run's base, as this process holds it,
+    /// or reopened with its work from the handle `contract` recorded for it
+    /// (`contract.worktrees[name]`). `None` when it does not exist on disk.
+    async fn reopen_recorded(
+        &self,
+        contract: &OpenContract,
+        name: &str,
+        inherited: bool,
+    ) -> std::result::Result<Option<PathBuf>, PrepareFailure> {
+        // What happens next, said with the refusal: a worker's own worktree
+        // is replaced by a fresh one, an inherited one never is.
+        const INHERITED: &str = "it holds the handoff parent's work, which no fresh worktree \
+                                 has, so the contract is retried after a backoff and held if \
+                                 it stays refused";
+        let (unrecorded, refused) = if inherited {
+            (INHERITED, INHERITED)
+        } else {
+            (
+                "the attempt starts over with a fresh worker",
+                "the contract is retried after a backoff with a fresh worker in a fresh \
+                 worktree",
+            )
+        };
+        if let Some(ws) = self.live().values().find(|w| w.name() == name) {
+            return Ok(Some(ws.root().to_path_buf()));
+        }
+        let path = self.manager.base().join(name);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let recorded = contract
+            .worktrees
+            .get(name)
+            .map(|h| serde_json::from_str::<WorktreeHandle>(h));
+        let handle = match recorded {
+            Some(Ok(h)) => h,
+            Some(Err(e)) => {
+                return Err(format!("the recorded worktree is unreadable: {e}").into());
+            }
+            None => {
+                return Err(format!(
+                    "worktree {} was left with no recorded gitlink and cannot be \
+                     reopened; {unrecorded}",
+                    path.display()
+                )
+                .into());
+            }
+        };
+        let manager = self.manager.clone();
+        let owned = name.to_owned();
+        let branch = format!("refs/heads/{}", self.merge_back.integration_branch());
+        let ws = tokio::task::spawn_blocking(move || {
+            manager.reopen(&ReopenSpec {
+                name: &owned,
+                gitlink: &handle.gitlink,
+                base: &handle.base,
+                integration: Some(&branch),
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| match e {
+            kgraf_sandbox::WorkspaceError::AlreadyMerged { commit, .. } => {
+                PrepareFailure::AlreadyMerged { commit }
+            }
+            busy @ kgraf_sandbox::WorkspaceError::Busy { .. } => PrepareFailure::Busy(format!(
+                "{busy}; the same worker is retried after a backoff, so its work is kept"
+            )),
+            other => PrepareFailure::Unavailable(format!("{other}; {refused}")),
+        })?;
+        let root = ws.root().to_path_buf();
+        self.live().insert(root.clone(), ws);
+        Ok(Some(root))
     }
 
     /// At the end of a run: delete the attempt refs of every worktree this
@@ -386,11 +613,23 @@ impl GitWorkspaces {
         record: Option<&kgraf_orchestrator::RunStateRecord>,
         referenced: impl FnOnce() -> Result<BTreeSet<String>>,
     ) -> Result<Vec<String>> {
+        // A worktree an open contract still names keeps its attempt refs: a
+        // worker's own, the one a handoff child inherited (its retry reopens
+        // it at the ref's commit), and a conflicted attempt a resolver cites.
+        let name_of = |p: &Path| p.file_name().and_then(|n| n.to_str()).map(str::to_owned);
         let still: BTreeSet<String> = record
             .map(|r| {
                 r.open_contracts
                     .iter()
-                    .flat_map(|c| c.workers.iter().map(|w| w.to_string()))
+                    .flat_map(|c| {
+                        c.workers
+                            .iter()
+                            .map(|w| w.to_string())
+                            .chain(c.worktrees.keys().cloned())
+                            .chain(c.workspace.as_deref().and_then(name_of))
+                            .chain(c.resolver_source.as_deref().and_then(name_of))
+                            .collect::<Vec<_>>()
+                    })
                     .collect()
             })
             .unwrap_or_default();
@@ -451,70 +690,23 @@ impl GitWorkspaces {
 impl Workspaces for GitWorkspaces {
     async fn prepare(
         &self,
-        _contract: &OpenContract,
+        contract: &OpenContract,
         worker: &kgraf_core::AgentId,
     ) -> std::result::Result<PathBuf, PrepareFailure> {
-        if let Some(ws) = self.live().values().find(|w| w.name() == worker.as_str()) {
-            return Ok(ws.root().to_path_buf());
-        }
         self.touched
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .insert(worker.to_string());
-        let path = self.manager.base().join(worker.as_str());
-        if path.exists() {
-            let recorded = _contract
-                .worktrees
-                .get(worker.as_str())
-                .map(|h| serde_json::from_str::<WorktreeHandle>(h));
-            let handle = match recorded {
-                Some(Ok(h)) => h,
-                Some(Err(e)) => {
-                    return Err(format!("the recorded worktree is unreadable: {e}").into());
-                }
-                None => {
-                    return Err(format!(
-                        "worktree {} was left with no recorded gitlink and cannot be \
-                         reopened; the attempt starts over with a fresh worker",
-                        path.display()
-                    )
-                    .into());
-                }
-            };
-            let manager = self.manager.clone();
-            let name = worker.to_string();
-            let branch = format!("refs/heads/{}", self.merge_back.integration_branch());
-            let ws = tokio::task::spawn_blocking(move || {
-                manager.reopen(&ReopenSpec {
-                    name: &name,
-                    gitlink: &handle.gitlink,
-                    base: &handle.base,
-                    integration: Some(&branch),
-                })
-            })
-            .await
-            .map_err(|e| e.to_string())?
-            .map_err(|e| match e {
-                kgraf_sandbox::WorkspaceError::AlreadyMerged { commit, .. } => {
-                    PrepareFailure::AlreadyMerged { commit }
-                }
-                busy @ kgraf_sandbox::WorkspaceError::Busy { .. } => PrepareFailure::Busy(format!(
-                    "{busy}; the same worker is retried after a backoff, so its work \
-                         is kept"
-                )),
-                other => PrepareFailure::Unavailable(format!(
-                    "{other}; the contract is retried after a backoff with a fresh worker \
-                     in a fresh worktree"
-                )),
-            })?;
-            let root = ws.root().to_path_buf();
-            self.live().insert(root.clone(), ws);
+        if let Some(root) = self
+            .reopen_recorded(contract, worker.as_str(), false)
+            .await?
+        {
             return Ok(root);
         }
         let manager = self.manager.clone();
         let merge_back = self.merge_back.clone();
         let name = worker.to_string();
-        let pinned = _contract.base.clone();
+        let pinned = contract.base.clone();
         let ws = tokio::task::spawn_blocking(move || {
             // The current integration tip, read now: it holds every attempt
             // merged so far. A remediation starts from its gate's failed commit.
@@ -538,6 +730,41 @@ impl Workspaces for GitWorkspaces {
         Ok(root)
     }
 
+    /// The worktree a handoff child inherited (decision 0067): the one this
+    /// process holds, or reopened with the parent's work from the handle the
+    /// child recorded under the worktree's name. Refused, never replaced,
+    /// when it is outside this run's worktree base, gone, or not intact.
+    async fn adopt(
+        &self,
+        contract: &OpenContract,
+        workspace: &Path,
+    ) -> std::result::Result<PathBuf, PrepareFailure> {
+        let name = workspace
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|_| workspace.parent() == Some(self.manager.base()))
+            .ok_or_else(|| {
+                PrepareFailure::Unavailable(format!(
+                    "the inherited worktree {} is not a worktree of this run",
+                    workspace.display()
+                ))
+            })?
+            .to_owned();
+        self.touched
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(name.clone());
+        self.reopen_recorded(contract, &name, true)
+            .await?
+            .ok_or_else(|| {
+                PrepareFailure::Unavailable(format!(
+                    "the inherited worktree {} is gone; it held the handoff parent's work, \
+                     so no fresh worktree replaces it",
+                    workspace.display()
+                ))
+            })
+    }
+
     async fn handle(&self, workspace: &Path) -> Option<String> {
         let ws = self.get(workspace)?;
         serde_json::to_string(&WorktreeHandle {
@@ -547,14 +774,22 @@ impl Workspaces for GitWorkspaces {
         .ok()
     }
 
-    /// The winner was merged (and retired) by `integrate`; a kept worktree
-    /// stays on disk for its worker to be continued in (reopened by
-    /// `prepare`). A committed loser is discarded with its worktree and attempt
-    /// ref. A worktree whose acceptance command failed was committed (the
-    /// snapshot comes before the check) but never registered here, so it is
-    /// left for inspection; its attempt ref goes in the end-of-run sweep.
+    /// The winner was merged by `integrate`, which removed its worktree with
+    /// the merge under [`WorktreeRetention::Delete`] and left it, with its
+    /// builds, under [`WorktreeRetention::Keep`]. A worktree released with
+    /// `keep` stays on disk as it is: its worker will be continued in it
+    /// (reopened by `prepare`), an open contract still names it (a handoff
+    /// child adopts it, a resolver cites it), or it is the merged winner.
+    ///
+    /// Otherwise the attempt in it is settled for good, under the run's policy
+    /// (decision 0088). A committed attempt (a loser, a failed check, a merge
+    /// merge-back refused) has its attempt refs deleted, and its worktree is
+    /// removed under `Delete` and kept under `Keep`. A worktree never committed
+    /// (a worker that failed, an empty attempt) is removed under `Delete` and
+    /// kept under `Keep`. A removal or discard that fails is reported once
+    /// ([`Workspaces::take_problems`]), never dropped.
     async fn release(&self, workspace: &Path, keep: bool) {
-        self.live().remove(workspace);
+        let live = self.live().remove(workspace);
         self.empty
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -562,16 +797,20 @@ impl Workspaces for GitWorkspaces {
         if keep {
             return;
         }
-        let loser = self.committed().remove(workspace);
-        if let Some(mut attempt) = loser {
-            let merge_back = self.merge_back.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                if let Err(e) = merge_back.discard(&mut attempt) {
-                    eprintln!("merge-back could not discard {}: {e}", attempt.name());
-                }
-            })
-            .await;
+        let committed = self.committed().remove(workspace);
+        if let Some(attempt) = committed {
+            // The discard removes the worktree too: a failure is one report,
+            // and the worktree it left is not removed a second time.
+            self.retire_unmerged(attempt).await;
+            return;
         }
+        if let Some(ws) = live {
+            self.remove_unless_kept(ws).await;
+        }
+    }
+
+    fn take_problems(&self) -> Vec<String> {
+        self.problems.take()
     }
 
     async fn integrate(
@@ -585,6 +824,12 @@ impl Workspaces for GitWorkspaces {
             .unwrap_or_else(|p| p.into_inner())
             .remove(workspace)
         {
+            // Nothing to merge. The verifier left the worktree for this
+            // call: it goes now under `Delete`, and stays under `Keep`.
+            let live = self.live().remove(workspace);
+            if let Some(ws) = live {
+                self.remove_unless_kept(ws).await;
+            }
             return Ok(Integration::Empty);
         }
         let taken = self.committed().remove(workspace);
@@ -595,74 +840,165 @@ impl Workspaces for GitWorkspaces {
             ));
         };
         let merge_back = self.merge_back.clone();
-        // `Ok` carries the attempt back out on a conflict (0073): kept, not
+        // Decision 0088: under `Keep` the merged worktree stays with its
+        // builds; under `Delete` merge-back removes it with the merge.
+        let after = if self.retention.deletes() {
+            MergedWorktree::Remove
+        } else {
+            MergedWorktree::Keep
+        };
+        // The attempt comes back out on a conflict (0073): kept, not
         // discarded, so a resolver's fresh worktree can read its commit; the
         // caller below stores it under `workspace` for `discard_conflict` to
         // settle once the resolver (or the plain fallback) is done with it.
-        let result = tokio::task::spawn_blocking(move || match merge_back.merge(&mut attempt) {
-            Ok(MergeOutcome::Merged { merge_commit, .. }) => (
-                Ok(Integration::Merged {
-                    commit: merge_commit,
-                }),
-                None,
-            ),
-            Ok(MergeOutcome::Conflicted(c)) => {
-                // Never auto-resolved by kGraf itself (0018's original rule):
-                // a resolver worker, or nobody, decides what the conflicted
-                // paths become. The attempt is kept, not discarded, until
-                // that is settled (0073).
-                let commit = Some(c.attempt_commit.clone());
-                let outcome = Integration::Conflict {
-                    tip: c.integration_tip.clone(),
-                    paths: c
-                        .paths
-                        .iter()
-                        .map(|p| p.path.clone())
-                        .chain(c.collisions.iter().flatten().cloned())
-                        .collect(),
-                    detail: c
-                        .messages
-                        .iter()
-                        .map(|m| m.kind.clone())
-                        .collect::<Vec<_>>()
-                        .join("; "),
-                    commit,
-                };
-                (Ok(outcome), Some(attempt))
+        // A merge merge-back refused comes back out too, for `release` to
+        // settle once no open contract names the worktree.
+        let result =
+            tokio::task::spawn_blocking(move || match merge_back.merge_then(&mut attempt, after) {
+                Ok(MergeOutcome::Merged { merge_commit, .. }) => (
+                    Ok(Integration::Merged {
+                        commit: merge_commit,
+                    }),
+                    Back::Settled,
+                ),
+                Ok(MergeOutcome::Conflicted(c)) => {
+                    // Never auto-resolved by kGraf itself (0018's original rule):
+                    // a resolver worker, or nobody, decides what the conflicted
+                    // paths become. The attempt is kept, not discarded, until
+                    // that is settled (0073).
+                    let commit = Some(c.attempt_commit.clone());
+                    let outcome = Integration::Conflict {
+                        tip: c.integration_tip.clone(),
+                        paths: c
+                            .paths
+                            .iter()
+                            .map(|p| p.path.clone())
+                            .chain(c.collisions.iter().flatten().cloned())
+                            .collect(),
+                        detail: c
+                            .messages
+                            .iter()
+                            .map(|m| m.kind.clone())
+                            .collect::<Vec<_>>()
+                            .join("; "),
+                        commit,
+                    };
+                    (Ok(outcome), Back::Conflicted(attempt))
+                }
+                // The work is on the branch; only the worktree's removal
+                // failed. A merge, never a refusal that would redo it.
+                Err(kgraf_sandbox::MergeError::CleanupFailed {
+                    merge_commit,
+                    source,
+                }) => {
+                    let root = attempt.workspace().root().display().to_string();
+                    (
+                        Ok(Integration::Merged {
+                            commit: merge_commit,
+                        }),
+                        Back::Problem(format!(
+                            "the attempt in {root} merged, but the cleanup after the merge \
+                             failed: {source}; `kgraf clean` removes the worktree"
+                        )),
+                    )
+                }
+                Err(e) => (Err(format!("merge-back: {e}")), Back::Refused(attempt)),
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+        let (outcome, back) = result;
+        match back {
+            Back::Settled => {}
+            Back::Conflicted(attempt) => {
+                self.conflicted
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .insert(workspace.to_path_buf(), attempt);
             }
-            Err(e) => {
-                let _ = merge_back.discard(&mut attempt);
-                (Err(format!("merge-back: {e}")), None)
+            Back::Refused(attempt) => {
+                self.committed().insert(workspace.to_path_buf(), attempt);
             }
-        })
-        .await
-        .map_err(|e| e.to_string())?;
-        let (outcome, kept) = result;
-        if let Some(attempt) = kept {
-            self.conflicted
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .insert(workspace.to_path_buf(), attempt);
+            Back::Problem(text) => self.problem(text),
         }
         outcome
     }
 
     /// The conflicted attempt kept at `workspace` (0073) is settled: a
-    /// resolver merged its fix, or the contract gave up and falls back to a
-    /// plain re-dispatch. Either way it is superseded, never merged itself:
-    /// discard its ref and worktree once, whichever happened. A `workspace`
-    /// with nothing kept (already settled, or never conflicted) is a no-op.
-    async fn discard_conflict(&self, workspace: &Path) {
+    /// resolver merged its fix, or the contract gave up. Either way it is
+    /// superseded, never merged itself: its attempt refs go, and its worktree
+    /// is removed under [`WorktreeRetention::Delete`] and kept under `Keep`
+    /// ([`GitWorkspaces::retire_unmerged`]). The orchestrator calls this once
+    /// no open contract names the worktree.
+    ///
+    /// A conflict kept by an earlier process, or by an earlier run of this one
+    /// (a run stopped before its resolver settled, then resumed), is settled
+    /// by the worktree's name the same way: under `Delete` the worktree is
+    /// reopened from the handle `resolver` recorded for it and removed (a
+    /// worktree whose lock names a live owner, this process included, is not
+    /// removed by name alone), or removed by name when its owner is gone. A
+    /// `workspace` outside this run's base, or with nothing left, is a no-op.
+    /// A failure is reported once.
+    async fn discard_conflict(&self, resolver: &OpenContract, workspace: &Path) {
         let kept = self
             .conflicted
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(workspace);
-        let Some(mut attempt) = kept else {
+        if let Some(attempt) = kept {
+            self.retire_unmerged(attempt).await;
+            return;
+        }
+        let Some(name) = workspace
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|_| workspace.parent() == Some(self.manager.base()))
+            .map(str::to_owned)
+        else {
             return;
         };
+        let deletes = self.retention.deletes();
+        // Reopened before the refs go: a reopen needs the attempt ref that
+        // names the worktree's HEAD.
+        let mut reopen_failed = None;
+        if deletes && let Err(e) = self.reopen_recorded(resolver, &name, false).await {
+            reopen_failed = Some(e.to_string());
+        }
+        let held = self.take_live(&name);
+        let manager = self.manager.clone();
         let merge_back = self.merge_back.clone();
-        let _ = tokio::task::spawn_blocking(move || merge_back.discard(&mut attempt)).await;
+        let failed = tokio::task::spawn_blocking(move || {
+            let mut failed = Vec::new();
+            if let Err(e) = merge_back.sweep_attempt_refs(std::slice::from_ref(&name)) {
+                failed.push(format!(
+                    "the attempt refs of the settled conflict {name} were not deleted: {e}"
+                ));
+            }
+            if !deletes {
+                return failed;
+            }
+            let removed = match held {
+                Some(ws) => manager.remove(ws).map_err(|e| e.to_string()),
+                None if manager.base().join(&name).exists() => {
+                    manager.clean(&name).map(|_| ()).map_err(|e| e.to_string())
+                }
+                None => Ok(()),
+            };
+            if let Err(e) = removed {
+                let reopen = reopen_failed
+                    .map(|r| format!(" (it could not be reopened either: {r})"))
+                    .unwrap_or_default();
+                failed.push(format!(
+                    "worktree {name} of a settled conflict could not be removed: {e}{reopen}; \
+                     `kgraf clean` removes it"
+                ));
+            }
+            failed
+        })
+        .await;
+        match failed {
+            Ok(texts) => texts.into_iter().for_each(|t| self.problem(t)),
+            Err(e) => self.problem(format!("settling a conflict did not finish: {e}")),
+        }
     }
 
     /// A fresh worktree of the integration tip for the bus to write in.
@@ -671,7 +1007,7 @@ impl Workspaces for GitWorkspaces {
         let merge_back = self.merge_back.clone();
         let ws = tokio::task::spawn_blocking(move || {
             let tip = merge_back.integration_tip().map_err(|e| e.to_string())?;
-            let name = format!("comms-{}", now_nanos());
+            let name = harness_worktree_name(COMMS_PREFIX);
             manager
                 .create(&WorkspaceSpec {
                     name: &name,
@@ -687,16 +1023,23 @@ impl Workspaces for GitWorkspaces {
         Ok(Some(root))
     }
 
+    /// A conversation worktree holds no build and no work once its files are
+    /// gone: removed under either policy. A failure is reported once.
     async fn discard_comms(&self, root: &Path) {
         let taken = self.live().remove(root);
         if let Some(ws) = taken {
             let manager = self.manager.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                if let Err(e) = manager.remove(ws) {
-                    eprintln!("could not remove a conversation worktree: {e}");
-                }
-            })
-            .await;
+            let shown = root.display().to_string();
+            match tokio::task::spawn_blocking(move || manager.remove(ws)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => self.problem(format!(
+                    "conversation worktree {shown} could not be removed: {e}; `kgraf clean` \
+                     removes it"
+                )),
+                Err(e) => self.problem(format!(
+                    "removing conversation worktree {shown} did not finish: {e}"
+                )),
+            }
         }
     }
 
@@ -724,10 +1067,22 @@ impl Workspaces for GitWorkspaces {
         let guard = RemoveOnDrop {
             manager: self.manager.clone(),
             ws: Some(ws.clone()),
+            problems: self.problems.clone(),
         };
+        let problems = self.problems.clone();
         tokio::task::spawn_blocking(move || {
             let _guard = guard;
             let mut attempt = merge_back.attempt(ws).map_err(|e| e.to_string())?;
+            // A conversation attempt that is not merged is discarded now (no
+            // resolver for a conversation file): a failed discard is reported.
+            let discard = |attempt: &mut Attempt| {
+                if let Err(e) = merge_back.discard(attempt) {
+                    problems.push(format!(
+                        "conversation attempt {} could not be discarded: {e}",
+                        attempt.workspace().root().display()
+                    ));
+                }
+            };
             match merge_back.finish(&mut attempt, &message, &files) {
                 Ok(FinishOutcome::Merged { merge_commit, .. }) => Ok(Integration::Merged {
                     commit: merge_commit,
@@ -736,7 +1091,7 @@ impl Workspaces for GitWorkspaces {
                 Ok(FinishOutcome::Conflicted(c)) => {
                     // No resolver for a conversation file (0073 is for a
                     // worker's attempt): discarded immediately, as before.
-                    let _ = merge_back.discard(&mut attempt);
+                    discard(&mut attempt);
                     Ok(Integration::Conflict {
                         tip: c.integration_tip.clone(),
                         paths: c.paths.iter().map(|p| p.path.clone()).collect(),
@@ -745,13 +1100,13 @@ impl Workspaces for GitWorkspaces {
                     })
                 }
                 Ok(FinishOutcome::Refused(r)) => {
-                    let _ = merge_back.discard(&mut attempt);
+                    discard(&mut attempt);
                     Ok(Integration::Refused {
                         detail: format!("{:?}", r.reasons),
                     })
                 }
                 Err(e) => {
-                    let _ = merge_back.discard(&mut attempt);
+                    discard(&mut attempt);
                     Err(e.to_string())
                 }
             }
@@ -911,7 +1266,8 @@ impl Workspaces for GitWorkspaces {
             if !child::has_result(manager.repo(), &name) {
                 return Ok(None);
             }
-            child::merge(&manager, &parent_ws, None, &name, &writes).map(Some)
+            // No live worktree here, so nothing for the policy to keep.
+            child::merge(&manager, &parent_ws, None, &name, &writes, false).map(Some)
         })
         .await
         .map_err(|e| e.to_string())?
@@ -941,14 +1297,25 @@ impl Workspaces for GitWorkspaces {
         };
         let manager = self.manager.clone();
         let writes = writes.to_vec();
+        // Decision 0088: under `Keep` a merged child's worktree stays with its
+        // builds, like a merged attempt's.
+        let keep = !self.retention.deletes();
         let merged = tokio::task::spawn_blocking(move || {
-            child::merge(&manager, &parent_ws, child_ws.as_ref(), &name, &writes)
+            child::merge(
+                &manager,
+                &parent_ws,
+                child_ws.as_ref(),
+                &name,
+                &writes,
+                keep,
+            )
         })
         .await
         .map_err(|e| e.to_string())??;
         if matches!(merged, ChildMerge::Merged { .. } | ChildMerge::Empty { .. }) {
             // Merged: the child's worktree is spent (`child::merge` removed
-            // it). Anything else keeps both worktrees as they are.
+            // it, or kept it for the user). Anything else keeps both
+            // worktrees as they are.
             self.live().remove(child);
         }
         Ok(merged)
@@ -1521,13 +1888,15 @@ pub(crate) mod child {
     /// Merge the child's declared writes into the parent's worktree.
     /// `child_ws` is the child's live worktree; `None` after a crash that
     /// followed an earlier merge's snapshot, when the recorded result is
-    /// applied again.
+    /// applied again. Once merged, the child's worktree is removed with its
+    /// build output, unless `keep_worktree` (decision 0088's `Keep`).
     pub(crate) fn merge(
         manager: &WorkspaceManager,
         parent: &Workspace,
         child_ws: Option<&Workspace>,
         child: &str,
         writes: &[String],
+        keep_worktree: bool,
     ) -> Result<ChildMerge, String> {
         let repo = manager.repo();
         let checkpoint = resolve(repo, &ref_of(child, "checkpoint"))
@@ -1704,12 +2073,13 @@ pub(crate) mod child {
         // be removed is a warning on the result, never an error that would
         // tell the parent nothing was applied. Startup cleanup removes it.
         let warning = match child_ws {
-            Some(ws) => manager.remove(ws.clone()).err().map(|e| {
+            Some(ws) if !keep_worktree => manager.remove(ws.clone()).err().map(|e| {
                 format!("subagent `{child}` merged, but its worktree could not be removed: {e}")
             }),
-            None => None,
+            _ => None,
         };
-        // The handle goes with the worktree: nothing may reopen what is gone.
+        // The handle goes, kept worktree or not: nothing may reopen a spent
+        // child as live work (a kept one stays only for the user to inspect).
         // `checkpoint` and `result` stay, so the merge can be re-applied (and
         // audited) from the refs alone, until the contract closes.
         let _ = git(
@@ -1786,21 +2156,41 @@ pub(crate) mod child {
     }
 }
 
-/// Removes a worktree when dropped, unless merge-back already has.
+/// Removes a worktree when dropped, unless merge-back already has. A
+/// removal that fails is reported once.
 struct RemoveOnDrop {
     manager: Arc<WorkspaceManager>,
     ws: Option<Workspace>,
+    problems: Problems,
 }
 
 impl Drop for RemoveOnDrop {
     fn drop(&mut self) {
         if let Some(ws) = self.ws.take()
             && ws.root().exists()
-            && let Err(e) = self.manager.remove(ws)
         {
-            eprintln!("could not remove a conversation worktree: {e}");
+            let root = ws.root().display().to_string();
+            if let Err(e) = self.manager.remove(ws) {
+                self.problems.push(format!(
+                    "conversation worktree {root} could not be removed: {e}; `kgraf clean` \
+                     removes it"
+                ));
+            }
         }
     }
+}
+
+/// What `integrate` hands back from merge-back's blocking call besides the
+/// outcome.
+enum Back {
+    /// Nothing is left to settle.
+    Settled,
+    /// A conflict, kept for its resolver (0073).
+    Conflicted(Attempt),
+    /// Merge-back refused the merge: the attempt is settled by `release`.
+    Refused(Attempt),
+    /// Merged, with a failure to report.
+    Problem(String),
 }
 
 /// What the run record keeps per worker so a later process can reopen its
@@ -2143,6 +2533,7 @@ mod child_tests {
             Some(&old_ws),
             name,
             &w(&[]),
+            false,
         );
         assert!(!refs_under(&f.root, &child::ref_of(name, "result")).is_empty());
         // The parent moves on.
@@ -2669,5 +3060,48 @@ mod child_tests {
             other => panic!("expected a merge with a warning, got {other:?}"),
         }
         assert_eq!(read(&p.join("q.txt")), "q\n", "the child's work landed");
+    }
+
+    /// Decision 0088: a merged writer subagent's worktree, with what it built,
+    /// goes under `Delete` and stays under `Keep`, where it can never be
+    /// reopened as live work.
+    #[tokio::test]
+    async fn a_merged_childs_worktree_and_build_follow_the_policy() {
+        for (retention, stays) in [
+            (WorktreeRetention::Delete, false),
+            (WorktreeRetention::Keep, true),
+        ] {
+            let f = fixture();
+            let ws = Arc::new(
+                GitWorkspaces::new(f.ws.manager.clone(), f.ws.merge_back.clone())
+                    .with_retention(retention),
+            );
+            let p = parent(&f, &ws, "r1-k-r0-a0");
+            let c = ws
+                .prepare_child(&p, &id("r1-k-r0-a0.s1"))
+                .await
+                .expect("child");
+            std::fs::write(c.join("new.txt"), "child\n").expect("write");
+            let build = c.join("target").join("blob");
+            std::fs::create_dir_all(build.parent().expect("parent")).expect("mkdir");
+            std::fs::write(&build, "build").expect("write");
+            let merged = ws
+                .merge_child(&p, &c, &w(&["new.txt"]))
+                .await
+                .expect("merge");
+            assert!(
+                matches!(merged, ChildMerge::Merged { warning: None, .. }),
+                "{merged:?}"
+            );
+            assert_eq!(read(&p.join("new.txt")), "child\n", "{retention:?}");
+            assert_eq!(c.exists(), stays, "{retention:?}");
+            assert_eq!(build.exists(), stays, "{retention:?}");
+            if stays {
+                assert!(
+                    ws.reopen_child(&p, &id("r1-k-r0-a0.s1")).await.is_err(),
+                    "a spent child is never reopened as live work"
+                );
+            }
+        }
     }
 }

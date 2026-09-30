@@ -454,6 +454,7 @@ pub fn fold_presumed(
             PresumedState::Done => WorkState::PresumedDone,
             PresumedState::Partial => WorkState::PresumedPartial,
             PresumedState::Remaining => WorkState::PresumedRemaining,
+            PresumedState::Unknown => WorkState::PresumedUnknown,
         };
         let mut label = format!("{title}: {}", state.word());
         if !v.claim_text.is_empty() {
@@ -494,6 +495,7 @@ pub fn fold_presumed(
             PresumedState::Done => WorkState::PresumedDone,
             PresumedState::Partial => WorkState::PresumedPartial,
             PresumedState::Remaining => WorkState::PresumedRemaining,
+            PresumedState::Unknown => WorkState::PresumedUnknown,
         };
         plan.push(PlanNode {
             key: key.clone(),

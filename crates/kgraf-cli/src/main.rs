@@ -277,6 +277,13 @@ enum Command {
         /// `--route`.
         #[arg(long)]
         planner: Option<String>,
+        /// A route of another model kind as `kind=route:model`, for example
+        /// `embedding=openai:text-embedding-3-small`, `rerank=llama-cpp:bge-reranker`
+        /// or `typed-decision=systemone:jev-latest` (decision 0089). Repeatable.
+        /// It runs no worker; the orchestrator is told it by kind and workers may
+        /// call its tool (`embed`, `rerank`, `decide`). Nothing calls it by default.
+        #[arg(long = "model-route")]
+        model_routes: Vec<String>,
         /// A text file holding the instruction, verbatim.
         #[arg(long, conflicts_with = "resume")]
         instruction: Option<PathBuf>,
@@ -338,6 +345,13 @@ enum Command {
         /// and reported, never a silent pass or block. Off by default.
         #[arg(long)]
         interface_review: bool,
+        /// Keep every worker's worktree, with the build output in it, after
+        /// its attempt is merged or discarded, so builds can be inspected or
+        /// reused. Without it, a worktree nothing needs any more is deleted
+        /// (decision 0088). A worktree a stopped or resumable run needs is
+        /// kept either way; `kgraf clean` removes a kept one.
+        #[arg(long)]
+        keep_worktrees: bool,
         /// Make every agent an addressable session: registers
         /// `ask_user_question`, `spawn_subagent`, `send_message` and
         /// `request_connection` in every worker environment. On by default;
@@ -551,6 +565,13 @@ enum ScheduleAction {
         /// `--route`.
         #[arg(long)]
         planner: Option<String>,
+        /// A route of another model kind as `kind=route:model`, for example
+        /// `embedding=openai:text-embedding-3-small`, `rerank=llama-cpp:bge-reranker`
+        /// or `typed-decision=systemone:jev-latest` (decision 0089). Repeatable.
+        /// It runs no worker; the orchestrator is told it by kind and workers may
+        /// call its tool (`embed`, `rerank`, `decide`). Nothing calls it by default.
+        #[arg(long = "model-route")]
+        model_routes: Vec<String>,
         /// A JSON price table covering every model used.
         #[arg(long)]
         prices: PathBuf,
@@ -587,6 +608,10 @@ enum ScheduleAction {
         /// are not in the local cache stops before it starts.
         #[arg(long)]
         no_fetch_deps: bool,
+        /// Keep every worker's worktree and its build output after use
+        /// (decision 0088); see `kgraf orchestrate --keep-worktrees`.
+        #[arg(long)]
+        keep_worktrees: bool,
     },
 }
 
@@ -613,7 +638,11 @@ enum UnreconciledAction {
     /// shows for it. Counts in the call's own protocol: for an inclusive route
     /// `--input` is the prompt total, for an additive route it excludes cache
     /// reads and writes. Use `--no-charge` when the provider confirms it billed
-    /// nothing. A call is resolved once; the event is chained like any settle.
+    /// nothing. A field left out keeps the partial figure already recorded for
+    /// the call. A call still marked in flight may be live; resolving it needs
+    /// `--abandoned`, which states that the process that made it is gone. A call is
+    /// resolved once; the event is chained like any settle. There is no bulk form:
+    /// each call needs the provider's own figure or a `--no-charge` statement.
     Resolve {
         /// The ledger call id, as printed by `kgraf unreconciled`.
         call_id: String,
@@ -632,6 +661,11 @@ enum UnreconciledAction {
         output: Option<u64>,
         #[arg(long)]
         reasoning: Option<u64>,
+        /// The call is still marked in flight and its process is gone. Without
+        /// this flag an in-flight call is refused, because a live call would
+        /// settle over the figure stated here.
+        #[arg(long)]
+        abandoned: bool,
     },
 }
 
@@ -813,6 +847,7 @@ fn main() -> Result<()> {
                     cache_write,
                     output,
                     reasoning,
+                    abandoned,
                 }),
         } => {
             let ledger = open_ledger(&root)?;
@@ -823,6 +858,7 @@ fn main() -> Result<()> {
                 cache_write,
                 output,
                 reasoning,
+                abandoned,
             };
             println!("{}", resolve_unreconciled(&ledger, &call_id, usage)?);
             Ok(())
@@ -876,6 +912,7 @@ fn main() -> Result<()> {
         Command::Orchestrate {
             routes,
             planner,
+            model_routes,
             instruction,
             resume,
             run,
@@ -892,6 +929,7 @@ fn main() -> Result<()> {
             gate_timeout,
             contract_checks,
             interface_review,
+            keep_worktrees,
             sessions,
             check_timeout,
             check_compile_timeout,
@@ -915,6 +953,7 @@ fn main() -> Result<()> {
             orchestrate_cmd::OrchestrateArgs {
                 routes,
                 planner,
+                model_routes,
                 instruction,
                 resume,
                 run,
@@ -931,6 +970,7 @@ fn main() -> Result<()> {
                 gate_timeout: std::time::Duration::from_secs(gate_timeout),
                 contract_checks,
                 interface_review,
+                worktrees: kgraf_host::WorktreeRetention::from_delete(!keep_worktrees),
                 sessions,
                 check_timeout: std::time::Duration::from_secs(check_timeout),
                 check_compile_timeout: std::time::Duration::from_secs(check_compile_timeout),
@@ -1027,6 +1067,7 @@ fn main() -> Result<()> {
                 id,
                 routes,
                 planner,
+                model_routes,
                 prices,
                 max_items,
                 max_agents,
@@ -1038,12 +1079,14 @@ fn main() -> Result<()> {
                 shell_timeout,
                 fetch_deps,
                 no_fetch_deps,
+                keep_worktrees,
             } => schedule_cmd::run_now(
                 &root,
                 schedule_cmd::RunNowArgs {
                     id,
                     routes,
                     planner,
+                    model_routes,
                     prices,
                     max_items,
                     max_agents,
@@ -1054,6 +1097,7 @@ fn main() -> Result<()> {
                     force,
                     shell_timeout: shell_timeout.map(std::time::Duration::from_secs),
                     fetch_deps: fetch_choice(fetch_deps, no_fetch_deps),
+                    worktrees: kgraf_host::WorktreeRetention::from_delete(!keep_worktrees),
                 },
             ),
         },
@@ -1165,16 +1209,25 @@ fn diag_code_for(err: &anyhow::Error) -> (&'static str, &'static str) {
 /// not be presented as though it had been.
 fn providers(verified_only: bool) -> Result<()> {
     use kgraf_fleet::{CATALOG, Confidence};
+    // Decision 0089: each route's model kinds, as `--route` (generative) and
+    // `--model-route kind=route:model` (the others) take them.
+    let kinds = |entry: &kgraf_fleet::Entry| {
+        kgraf_fleet::kinds_served(entry)
+            .iter()
+            .map(|k| k.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
+    };
     println!(
-        "{:<15} {:<26} {:<24} {:<10} {:<11} CACHE",
-        "ID", "VENDOR", "WIRE", "USAGE", "CONFIDENCE"
+        "{:<15} {:<26} {:<24} {:<10} {:<11} {:<12} KINDS",
+        "ID", "VENDOR", "WIRE", "USAGE", "CONFIDENCE", "CACHE"
     );
     for entry in CATALOG {
         if verified_only && entry.confidence != Confidence::Verified {
             continue;
         }
         println!(
-            "{:<15} {:<26} {:<24} {:<10} {:<11} {}",
+            "{:<15} {:<26} {:<24} {:<10} {:<11} {:<12} {}",
             entry.id,
             entry.vendor,
             entry.wire.as_str(),
@@ -1185,6 +1238,7 @@ fn providers(verified_only: bool) -> Result<()> {
             } else {
                 "-"
             },
+            kinds(entry),
         );
     }
     println!();
@@ -1208,7 +1262,13 @@ fn providers(verified_only: bool) -> Result<()> {
         "No route lists model names: model identifiers change faster than a release, and\n\
          a stale list routes to a cheap tier that answers plausibly. Supply the models\n\
          you mean to use; an adapter refuses anything outside that set before the\n\
-         request leaves."
+         request leaves.\n\
+         \n\
+         KINDS is what each route can serve. A generative route is a --route or the\n\
+         --planner; any other kind is declared as --model-route kind=route:model. A\n\
+         route lists a kind only where its vendor documents the endpoint, and calls it\n\
+         with the route's own key. Verified: embedding on the openai route. Unverified:\n\
+         rerank and typed-decision everywhere, and embedding on every other route."
     );
     Ok(())
 }
@@ -1227,9 +1287,17 @@ fn call(
     record: Option<&Path>,
     prompt: &str,
 ) -> Result<()> {
+    use kgraf_provider::Provider as _;
     let entry = kgraf_fleet::entry(provider_id)?;
     let credential = kgraf_fleet::credential_from_env(entry)?;
-    let provider = kgraf_fleet::build(provider_id, &credential, vec![model.to_owned()])?;
+    let provider = kgraf_provider::RouteRecorded::new(
+        std::sync::Arc::from(kgraf_fleet::build(
+            provider_id,
+            &credential,
+            vec![model.to_owned()],
+        )?),
+        provider_id,
+    );
     let ledger = open_ledger(root)?;
     let request = kgraf_provider::Request::new(model, prompt, max_tokens);
 
@@ -1715,6 +1783,23 @@ fn demand(root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Read a `--prices` file through the host's reader, which marks the routes priced
+/// only under their route-scoped key. Every command that prices a ledger reads it
+/// here, so none prices such a route by a bare model entry.
+pub(crate) fn load_price_table(path: &Path) -> Result<kgraf_core::cost::PriceTable> {
+    Ok(kgraf_host::config::read_prices(path)?)
+}
+
+/// The ledger's total under the price file at `path`, and the models with calls
+/// it could not price.
+fn cost_from_file(
+    ledger: &kgraf_provider::Ledger,
+    path: &Path,
+) -> Result<(kgraf_core::cost::Money, Vec<String>)> {
+    let table = load_price_table(path)?;
+    ledger.total_cost(&table).context("cannot derive cost")
+}
+
 fn spend(root: &Path, prices: Option<&Path>) -> Result<()> {
     let ledger = open_ledger(root)?;
     let by_model = ledger.usage_by_model().context("cannot read the ledger")?;
@@ -1732,20 +1817,27 @@ fn spend(root: &Path, prices: Option<&Path>) -> Result<()> {
         );
     }
     if let Some(path) = prices {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("cannot read {}", path.display()))?;
-        let table: kgraf_core::cost::PriceTable =
-            serde_json::from_str(&text).context("the price table is not valid JSON")?;
-        let (total, unpriced) = ledger.total_cost(&table).context("cannot derive cost")?;
+        let (total, unpriced) = cost_from_file(&ledger, path)?;
+        // A model that has a price but had calls refused above a rate tier is
+        // partly costed: the total is incomplete, not unknown.
+        let priced_models = by_model
+            .iter()
+            .filter(|(m, _)| !unpriced.contains(m))
+            .count();
         println!(
             "\n{}",
-            total_line(&total.to_string(), by_model.len(), unpriced.len())
+            total_line(
+                &total.to_string(),
+                by_model.len(),
+                priced_models,
+                !unpriced.is_empty()
+            )
         );
         if !unpriced.is_empty() {
-            // Not costed at zero. An unpriced model is reported so the total is
-            // known to be incomplete.
+            // Not costed at zero. Calls that could not be costed are reported so
+            // the total is known to be incomplete.
             println!(
-                "unpriced models (excluded from the total): {}",
+                "models with calls left out of the total (no price, or above a rate tier): {}",
                 unpriced.join(", ")
             );
         }
@@ -1763,15 +1855,32 @@ fn spend(root: &Path, prices: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
-/// The `kgraf spend` total line. When every recorded model is unpriced the
+/// The `kgraf spend` total line. When no recorded model has a price the
 /// sum is not zero dollars, it is unknown, so the line says `unpriced` and
-/// never a zero amount.
-fn total_line(total: &str, models: usize, unpriced: usize) -> String {
-    if models > 0 && unpriced >= models {
+/// never a zero amount. When some calls were left out, the line says the
+/// total is partial.
+fn total_line(total: &str, models: usize, priced_models: usize, incomplete: bool) -> String {
+    if models > 0 && priced_models == 0 {
         "total unpriced (no recorded model has a price)".to_owned()
+    } else if incomplete {
+        format!("total {total} (partial: some calls could not be costed)")
     } else {
         format!("total {total}")
     }
+}
+
+/// The state name a listing shows for an open call.
+fn open_state(ledger: &Ledger, call: &kgraf_provider::CallRecord) -> Result<&'static str> {
+    Ok(
+        if ledger
+            .is_in_flight(&call.id)
+            .context("cannot read the ledger")?
+        {
+            "in_flight"
+        } else {
+            "unreconciled"
+        },
+    )
 }
 
 fn unreconciled(root: &Path) -> Result<()> {
@@ -1782,25 +1891,49 @@ fn unreconciled(root: &Path) -> Result<()> {
         return Ok(());
     }
     for call in &open {
+        // A record reads an in_flight row as unreconciled; the ledger is the
+        // only place that tells the two apart, and `resolve` needs the difference.
+        let state = open_state(&ledger, call)?;
         println!(
-            "{}  {}  agent {}  task {}  request {}",
+            "{}  {}  {}  agent {}  task {}  request {}",
             call.id,
             call.model,
+            state,
             call.agent_id,
             call.task_id,
             call.request_id.as_deref().unwrap_or("<none>")
         );
+        // The recorded figure is a lower bound (a partial stream, or zero).
+        println!("    {}", usage_line(&call.usage));
     }
     println!(
         "\n{} call(s) billed without a recorded usage figure. These are holes in the \
-         accounting, not zero-cost calls.",
+         accounting, not zero-cost calls. The usage shown is a lower bound.",
         open.len()
+    );
+    println!(
+        "Close one with `kgraf unreconciled resolve <call-id>`. There is no bulk \
+         resolve: each call needs its own figure from the provider, or --no-charge. \
+         A call shown as in_flight needs --abandoned."
     );
     Ok(())
 }
 
+/// One line of usage figures, in the normal form.
+fn usage_line(usage: &kgraf_core::TokenUsage) -> String {
+    format!(
+        "usage (lower bound): input {} cache r {} w {} output {} reasoning {}",
+        usage.uncached_input,
+        usage.cache_read,
+        usage.cache_write,
+        usage.text_output,
+        usage.reasoning_output
+    )
+}
+
 /// The usage figures given to `kgraf unreconciled resolve`.
 struct ResolvedUsage {
+    abandoned: bool,
     no_charge: bool,
     input: Option<u64>,
     cache_read: Option<u64>,
@@ -1829,14 +1962,45 @@ fn resolve_unreconciled(ledger: &Ledger, call_id: &str, given: ResolvedUsage) ->
         .iter()
         .find(|c| c.id.as_str() == call_id)
         .with_context(|| format!("`{call_id}` is not an open call; see `kgraf unreconciled`"))?;
+    if ledger
+        .is_in_flight(&call.id)
+        .context("cannot read the ledger")?
+        && !given.abandoned
+    {
+        bail!(
+            "`{call_id}` is still in flight and may be live; a live call would settle over \
+             a figure stated now. If its process is gone, repeat with --abandoned"
+        );
+    }
+    // A field the caller leaves out keeps the figure already recorded (a partial
+    // stream's lower bound), and the raw payload is kept, so a resolve that
+    // states only the output does not zero the input. `--no-charge` states zero
+    // for every field.
+    let kept = &call.usage;
+    let pick = |stated: Option<u64>, recorded: u64| {
+        if given.no_charge {
+            0
+        } else {
+            stated.unwrap_or(recorded)
+        }
+    };
+    let read = pick(given.cache_read, kept.cache_read);
+    let write = pick(given.cache_write, kept.cache_write);
+    let reported_input = pick(
+        given.input,
+        match call.protocol {
+            kgraf_core::Protocol::Additive => kept.uncached_input,
+            kgraf_core::Protocol::Inclusive => kept.uncached_input + read + write,
+        },
+    );
     let usage = kgraf_core::TokenUsage::normalize(
         call.protocol,
-        given.input.unwrap_or(0),
-        given.cache_read.unwrap_or(0),
-        given.cache_write.unwrap_or(0),
-        given.output.unwrap_or(0),
-        given.reasoning.unwrap_or(0),
-        None,
+        reported_input,
+        read,
+        write,
+        pick(given.output, kept.text_output),
+        pick(given.reasoning, kept.reasoning_output),
+        kept.raw.clone(),
     )
     .context("the stated usage is inconsistent for this route's protocol")?;
     ledger
@@ -1912,6 +2076,47 @@ fn ledger_redact(root: &Path, call_id: &str, reason: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// A price file that names only a bare model, and a ledger with one call on
+    /// the Azure route to a deployment named like that model.
+    pub(crate) fn azure_call_with_bare_price_file(dir: &Path) -> (kgraf_provider::Ledger, PathBuf) {
+        use kgraf_core::{Protocol, TokenUsage};
+        let ledger = kgraf_provider::Ledger::open_in_memory().expect("ledger");
+        {
+            let token = ledger
+                .begin("azure", Protocol::Additive, "gpt-4o", "a", "run-1")
+                .expect("begin");
+            token
+                .record_route_async("azure-openai")
+                .wait()
+                .expect("route");
+            token
+                .settle(
+                    &TokenUsage {
+                        uncached_input: 1_000_000,
+                        ..TokenUsage::default()
+                    },
+                    None,
+                )
+                .expect("settle");
+        }
+        let path = dir.join("prices.json");
+        std::fs::write(
+            &path,
+            r#"{"gpt-4o": {"uncached_input": 1000000, "cache_read": 0, "cache_write": 0, "output": 0, "reasoning": 0}}"#,
+        )
+        .expect("write");
+        (ledger, path)
+    }
+
+    #[test]
+    fn spend_never_prices_an_azure_deployment_by_a_bare_model_entry() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (ledger, path) = azure_call_with_bare_price_file(dir.path());
+        let (total, unpriced) = cost_from_file(&ledger, &path).expect("cost");
+        assert_eq!(total.micros(), 0);
+        assert_eq!(unpriced, vec!["gpt-4o".to_owned()]);
+    }
+
     /// The most specific code in the chain wins: `InterpretError::Ingest(#[from] IngestError)` is
     /// itself in `diag_code_for`'s downcast list (it has its own catch-all, for a chain that
     /// carries an `InterpretError` with no `IngestError` behind it), so stopping at the first match
@@ -1982,6 +2187,107 @@ mod tests {
         assert!(run_now.is_err(), "run-now refuses both too");
     }
 
+    /// Decision 0088: worktrees are deleted after use unless `--keep-worktrees`
+    /// is given, on both commands.
+    #[test]
+    fn keep_worktrees_is_a_flag_of_both_commands_and_off_by_default() {
+        let kept = |args: &[&str]| {
+            let cli = Cli::try_parse_from(args.iter().copied()).expect("parse");
+            match cli.command {
+                Command::Orchestrate { keep_worktrees, .. } => keep_worktrees,
+                Command::Schedule {
+                    action: ScheduleAction::RunNow { keep_worktrees, .. },
+                } => keep_worktrees,
+                _ => panic!("unexpected command"),
+            }
+        };
+        let orch = [
+            "kgraf",
+            "orchestrate",
+            "--route",
+            "ollama:llama3",
+            "--prices",
+            "p.json",
+        ];
+        let now = [
+            "kgraf",
+            "schedule",
+            "run-now",
+            "s1",
+            "--route",
+            "ollama:llama3",
+            "--prices",
+            "p.json",
+        ];
+        for base in [&orch[..], &now[..]] {
+            assert!(!kept(base), "deleting is the default");
+            let with: Vec<&str> = base.iter().copied().chain(["--keep-worktrees"]).collect();
+            assert!(kept(&with));
+        }
+    }
+
+    /// Decision 0089: `--model-route` is repeatable on both run commands and
+    /// absent by default.
+    #[test]
+    fn model_routes_are_taken_by_both_run_commands() {
+        let orch = Cli::try_parse_from([
+            "kgraf",
+            "orchestrate",
+            "--route",
+            "ollama:llama3",
+            "--prices",
+            "p.json",
+            "--model-route",
+            "embedding=openai:text-embedding-3-small",
+            "--model-route",
+            "typed-decision=systemone:jev-latest",
+        ])
+        .expect("parse");
+        let Command::Orchestrate { model_routes, .. } = orch.command else {
+            panic!("not orchestrate");
+        };
+        assert_eq!(
+            model_routes,
+            vec![
+                "embedding=openai:text-embedding-3-small",
+                "typed-decision=systemone:jev-latest"
+            ]
+        );
+        let now = Cli::try_parse_from([
+            "kgraf",
+            "schedule",
+            "run-now",
+            "s1",
+            "--route",
+            "ollama:llama3",
+            "--prices",
+            "p.json",
+            "--model-route",
+            "rerank=llama-cpp:r",
+        ])
+        .expect("parse");
+        let Command::Schedule {
+            action: ScheduleAction::RunNow { model_routes, .. },
+        } = now.command
+        else {
+            panic!("not run-now");
+        };
+        assert_eq!(model_routes, vec!["rerank=llama-cpp:r"]);
+        let plain = Cli::try_parse_from([
+            "kgraf",
+            "orchestrate",
+            "--route",
+            "ollama:llama3",
+            "--prices",
+            "p.json",
+        ])
+        .expect("parse");
+        let Command::Orchestrate { model_routes, .. } = plain.command else {
+            panic!("not orchestrate");
+        };
+        assert!(model_routes.is_empty());
+    }
+
     /// `kgraf orchestrate`'s defaults are the host's (`RunConfig::new`,
     /// `RunConfig::load`), so a run the shell builds from a file with only the
     /// required fields is the run the command builds from only the required flags.
@@ -2049,13 +2355,22 @@ mod tests {
     #[test]
     fn the_spend_total_says_unpriced_when_no_model_has_a_price() {
         assert_eq!(
-            total_line("$0.000000", 2, 2),
+            total_line("$0.000000", 2, 0, true),
             "total unpriced (no recorded model has a price)"
         );
-        // Partly priced: the total stands and the unpriced models are listed
-        // beneath it by the caller.
-        assert_eq!(total_line("$1.500000", 2, 1), "total $1.500000");
-        assert_eq!(total_line("$0.000000", 0, 0), "total $0.000000");
+        // Partly priced: the total stands, marked partial, and the models with
+        // left-out calls are listed beneath it by the caller.
+        assert_eq!(
+            total_line("$1.500000", 2, 1, true),
+            "total $1.500000 (partial: some calls could not be costed)"
+        );
+        // A priced model with calls refused above a rate tier is not unpriced.
+        assert_eq!(
+            total_line("$1.500000", 1, 1, true),
+            "total $1.500000 (partial: some calls could not be costed)"
+        );
+        assert_eq!(total_line("$1.500000", 2, 2, false), "total $1.500000");
+        assert_eq!(total_line("$0.000000", 0, 0, false), "total $0.000000");
     }
 
     fn open_call(ledger: &Ledger, protocol: kgraf_core::Protocol) -> String {
@@ -2069,6 +2384,7 @@ mod tests {
 
     fn stated(input: Option<u64>, output: Option<u64>, no_charge: bool) -> ResolvedUsage {
         ResolvedUsage {
+            abandoned: false,
             no_charge,
             input,
             cache_read: None,
@@ -2111,6 +2427,105 @@ mod tests {
         assert!(resolve_unreconciled(&ledger, &id, stated(Some(1), None, false)).is_err());
         // An unknown id is refused.
         assert!(resolve_unreconciled(&ledger, "nope", stated(None, None, true)).is_err());
+    }
+
+    /// A field the resolve leaves out keeps the partial figure recorded for the
+    /// call, and the raw payload survives.
+    #[test]
+    fn resolve_keeps_unstated_fields_and_the_raw_payload() {
+        let ledger = Ledger::open_in_memory().expect("ledger");
+        let token = ledger
+            .begin(
+                "t",
+                kgraf_core::Protocol::Additive,
+                "model-a",
+                "agent",
+                "task",
+            )
+            .expect("begin");
+        let id = token.id().as_str().to_owned();
+        let partial = kgraf_core::TokenUsage {
+            uncached_input: 700,
+            cache_read: 300,
+            text_output: 5,
+            raw: Some(serde_json::json!({"partial": true})),
+            ..kgraf_core::TokenUsage::default()
+        };
+        token
+            .leave_unreconciled_with(Some(&partial), None)
+            .expect("leave open");
+        resolve_unreconciled(&ledger, &id, stated(None, Some(40), false)).expect("resolve");
+        let record = ledger
+            .call(&kgraf_core::CallId::new(id))
+            .expect("read")
+            .expect("present");
+        assert_eq!(record.usage.uncached_input, 700);
+        assert_eq!(record.usage.cache_read, 300);
+        assert_eq!(record.usage.text_output, 40);
+        assert_eq!(record.usage.raw, partial.raw);
+    }
+
+    /// The listing tells a call that may be live from one that ended without
+    /// usage, because `resolve` treats them differently.
+    #[test]
+    fn the_listing_names_an_in_flight_call_in_flight() {
+        let ledger = Ledger::open_in_memory().expect("ledger");
+        let ended = open_call(&ledger, kgraf_core::Protocol::Inclusive);
+        let live = ledger
+            .begin(
+                "t",
+                kgraf_core::Protocol::Inclusive,
+                "model-a",
+                "agent",
+                "task",
+            )
+            .expect("begin");
+        let rows = ledger.unreconciled().expect("open");
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            let expected = if row.id.as_str() == ended {
+                "unreconciled"
+            } else {
+                assert_eq!(row.id.as_str(), live.id().as_str());
+                "in_flight"
+            };
+            assert_eq!(open_state(&ledger, row).expect("state"), expected);
+        }
+    }
+
+    /// A call still in flight may be live: resolve refuses it without
+    /// `--abandoned`, and a live settle cannot then overwrite the resolve.
+    #[test]
+    fn resolve_refuses_an_in_flight_call_unless_abandoned() {
+        let ledger = Ledger::open_in_memory().expect("ledger");
+        let token = ledger
+            .begin(
+                "t",
+                kgraf_core::Protocol::Additive,
+                "model-a",
+                "agent",
+                "task",
+            )
+            .expect("begin");
+        let id = token.id().as_str().to_owned();
+        let err = resolve_unreconciled(&ledger, &id, stated(Some(5), Some(1), false))
+            .expect_err("in flight is refused");
+        assert!(err.to_string().contains("--abandoned"), "{err}");
+        assert!(ledger.is_in_flight(token.id()).expect("state"));
+
+        let abandoned = ResolvedUsage {
+            abandoned: true,
+            ..stated(Some(5), Some(1), false)
+        };
+        resolve_unreconciled(&ledger, &id, abandoned).expect("resolve abandoned");
+        assert!(
+            token
+                .settle(&kgraf_core::TokenUsage::default(), None)
+                .is_err(),
+            "a late settle must not overwrite the resolved figure"
+        );
+        let record = ledger.call(token.id()).expect("read").expect("present");
+        assert_eq!(record.usage.uncached_input, 5);
     }
 
     #[test]

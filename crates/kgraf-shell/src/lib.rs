@@ -10,6 +10,7 @@ pub mod app;
 pub mod app_dirs;
 pub mod capacity_bg;
 pub mod chrome;
+pub mod compaction_measure;
 pub mod dependency_prompt;
 pub mod diag;
 pub mod error;
@@ -123,6 +124,7 @@ pub fn run(opts: LaunchOptions) -> Result<(), ShellError> {
 pub fn open_project_parts(
     project: &Path,
     background_mode: bool,
+    worktrees: kgraf_host::WorktreeRetention,
     with_scheduler: bool,
     wake: kgraf_orchestrator::Wake,
 ) -> ProjectParts {
@@ -150,6 +152,7 @@ pub fn open_project_parts(
     let router = Arc::new(kgraf_orchestrator::AskRouter::new(desk.clone()));
     let factory = Arc::new(
         scheduler_bg::ProjectFactory::for_project(project.to_path_buf())
+            .with_worktree_retention(worktrees)
             .with_ask_resolver(router.clone()),
     );
     let scheduler = with_scheduler.then(|| {
@@ -373,6 +376,7 @@ pub fn run_with_host(
                     None => open_project_parts(
                         root,
                         settings.background_mode,
+                        settings.worktree_retention(),
                         with_scheduler,
                         wake.clone(),
                     ),
@@ -381,10 +385,16 @@ pub fn run_with_host(
             settings.projects = workspace.roots();
             settings.active_project = workspace.active().map(|p| p.root.clone());
             let opener_wake = wake.clone();
-            let opener: projects::Opener = Box::new(move |root, background| {
-                open_project_parts(root, background, with_scheduler, opener_wake.clone())
+            let opener: projects::Opener = Box::new(move |root, background, worktrees| {
+                open_project_parts(
+                    root,
+                    background,
+                    worktrees,
+                    with_scheduler,
+                    opener_wake.clone(),
+                )
             });
-            Ok(Box::new(ShellApp::new(AppParts {
+            let mut app = ShellApp::new(AppParts {
                 settings,
                 store,
                 render,
@@ -398,7 +408,9 @@ pub fn run_with_host(
                 machine_gate,
                 capacity,
                 update,
-            })))
+            });
+            app.enable_compaction_measurement();
+            Ok(Box::new(app))
         }),
     )
     .map_err(|e| ShellError::Window(e.to_string()))

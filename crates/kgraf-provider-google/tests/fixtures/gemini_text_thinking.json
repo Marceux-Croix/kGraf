@@ -1,0 +1,26 @@
+{
+  "_source": "Written from the GenerateContentResponse reference (https://ai.google.dev/api/generate-content#v1beta.GenerateContentResponse), the usage fields in https://ai.google.dev/gemini-api/docs/tokens, and the thought summaries in https://ai.google.dev/gemini-api/docs/thinking. Not recorded from a live call.",
+  "candidates": [
+    {
+      "content": {
+        "role": "model",
+        "parts": [
+          { "text": "Let me think about it.", "thought": true },
+          { "text": "The answer is 42." }
+        ]
+      },
+      "finishReason": "STOP",
+      "index": 0
+    }
+  ],
+  "usageMetadata": {
+    "promptTokenCount": 100,
+    "cachedContentTokenCount": 40,
+    "candidatesTokenCount": 20,
+    "thoughtsTokenCount": 30,
+    "totalTokenCount": 150,
+    "promptTokensDetails": [{ "modality": "TEXT", "tokenCount": 100 }]
+  },
+  "modelVersion": "gemini-2.5-flash",
+  "responseId": "resp-0001"
+}

@@ -44,6 +44,9 @@ pub fn key_path(diagnostics_path: &Path) -> PathBuf {
 /// the attempt, never its own candidate unless that is what was persisted.
 pub fn load_or_create(path: &Path) -> std::io::Result<[u8; KEY_LEN]> {
     if let Some(key) = read_key(path) {
+        // A key that an older version or another tool left readable by
+        // others is tightened, not trusted as it is.
+        tighten(path)?;
         return Ok(key);
     }
     let mut candidate = [0u8; KEY_LEN];
@@ -61,29 +64,79 @@ pub fn load_or_create(path: &Path) -> std::io::Result<[u8; KEY_LEN]> {
     let published = publish(&tmp, path);
     let _ = std::fs::remove_file(&tmp);
     published?;
-    read_key(path).ok_or_else(|| std::io::Error::other("the diagnostics key was not persisted"))
+    let key = read_key_settled(path)
+        .ok_or_else(|| std::io::Error::other("the diagnostics key was not persisted"))?;
+    tighten(path)?;
+    Ok(key)
+}
+
+/// Owner-only permissions on an existing key file. An error when they cannot
+/// be set: a key others can read makes the hashed paths reversible.
+fn tighten(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)?.permissions().mode() & 0o777;
+        if mode != 0o600 {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+/// [`read_key`], waiting a few milliseconds for a key that another process
+/// is in the middle of writing (the file exists and is not yet whole).
+fn read_key_settled(path: &Path) -> Option<[u8; KEY_LEN]> {
+    for _ in 0..10 {
+        if let Some(key) = read_key(path) {
+            return Some(key);
+        }
+        if !path.exists() {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    None
 }
 
 /// Link `tmp` to `path` unless `path` holds a valid key already. A file of
 /// the wrong size is removed once and the link retried. A filesystem that
-/// cannot hard-link falls back to `rename`, and the caller's read-back
-/// still returns the persisted key.
+/// cannot hard-link falls back to `rename` ([`publish_by_rename`]), and the
+/// caller's read-back still returns the persisted key.
 fn publish(tmp: &Path, path: &Path) -> std::io::Result<()> {
     for _ in 0..2 {
         match std::fs::hard_link(tmp, path) {
             Ok(()) => return Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                if read_key(path).is_some() {
+                // A file that is not a whole key yet may be another process's
+                // key in the middle of being written: give it a moment before
+                // it is called wrong.
+                if read_key_settled(path).is_some() {
                     return Ok(());
                 }
                 let _ = std::fs::remove_file(path);
             }
-            Err(_) => return std::fs::rename(tmp, path),
+            Err(_) => return publish_by_rename(tmp, path),
         }
     }
     Err(std::io::Error::other(
         "could not publish the diagnostics key",
     ))
+}
+
+/// Publish `tmp` at `path` with an atomic `rename`, for a filesystem that
+/// cannot hard-link. A reader never sees a partial file, and a file that is not
+/// a whole key (a zero-byte or truncated leftover) is replaced, not kept. A
+/// valid key already at `path` is kept. Two first runs that both pass the check
+/// can still both rename; the caller's read-back returns what won, and this
+/// path exists only where no atomic no-replace publish is available.
+fn publish_by_rename(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    if read_key_settled(path).is_some() {
+        return Ok(());
+    }
+    std::fs::rename(tmp, path)
 }
 
 /// Create `path` with owner-only permissions and write `bytes`. The key makes
@@ -147,6 +200,42 @@ mod tests {
         std::fs::write(&path, b"too short").unwrap();
         let key = load_or_create(&path).unwrap();
         assert_eq!(key.len(), KEY_LEN);
+    }
+
+    /// The link-free fallback keeps a valid published key, and replaces a
+    /// zero-byte or truncated file instead of failing on it forever.
+    #[test]
+    fn the_link_free_fallback_keeps_a_valid_key_and_repairs_a_bad_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("diagnostics.key");
+        let winner = load_or_create(&path).unwrap();
+        let tmp = dir.path().join("candidate");
+        write_private(&tmp, &[7u8; KEY_LEN]).unwrap();
+        publish_by_rename(&tmp, &path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), winner, "a valid key stays");
+
+        for bad in [&b""[..], &b"short"[..]] {
+            std::fs::write(&path, bad).unwrap();
+            write_private(&tmp, &[7u8; KEY_LEN]).unwrap();
+            publish_by_rename(&tmp, &path).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), vec![7u8; KEY_LEN]);
+            assert!(!tmp.exists(), "the candidate was renamed into place");
+        }
+    }
+
+    /// A key file left readable by others is tightened when it is loaded.
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_key_with_open_permissions_is_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("diagnostics.key");
+        std::fs::write(&path, [3u8; KEY_LEN]).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let key = load_or_create(&path).unwrap();
+        assert_eq!(key, [3u8; KEY_LEN], "the key itself is kept");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     /// Threads that all find no key at once end with one key: the one on disk.

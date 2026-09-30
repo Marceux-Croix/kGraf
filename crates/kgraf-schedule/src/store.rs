@@ -133,7 +133,14 @@ fn to_chrono_duration(
 pub struct ExpiredClaim {
     pub due_at: DateTime<Utc>,
     pub deferred_count: u32,
+    /// The occurrence was set aside because a manual run held the schedule
+    /// ([`HELD_FOR_MANUAL_RUN`]), not because a claimant crashed. It has had no
+    /// missed-run policy check since it fell due.
+    pub held_for_manual_run: bool,
 }
+
+/// The claimant recorded on an occurrence set aside for a manual run.
+pub const HELD_FOR_MANUAL_RUN: &str = "held-for-manual-run";
 
 /// The result of a claim attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -350,14 +357,14 @@ impl ScheduleStore {
         if self.manual_lock_holder(schedule_id, now_millis)?.is_some() {
             self.conn.execute(
                 "UPDATE occurrences
-                 SET status = 'claimed', claimant = 'held-for-manual-run',
+                 SET status = 'claimed', claimant = ?4,
                      claimed_at_millis = ?1, lease_expires_at_millis = ?1 - 1
                  WHERE schedule_id = ?2 AND due_at_millis = ?3 AND ?3 <= ?1
                    AND status = 'pending'
                    AND NOT EXISTS (
                        SELECT 1 FROM schedules s WHERE s.schedule_id = ?2 AND s.disabled = 1
                    )",
-                params![now_millis, schedule_id, due_millis],
+                params![now_millis, schedule_id, due_millis, HELD_FOR_MANUAL_RUN],
             )?;
             return Ok(ClaimOutcome::NotClaimed);
         }
@@ -481,8 +488,9 @@ impl ScheduleStore {
         outcome
     }
 
-    /// Extend a manual run's lock. `false` when `holder` no longer holds it (the
-    /// lease lapsed and another claim took over, or the row is gone).
+    /// Extend a manual run's lock. `false` when `holder` no longer holds it: the
+    /// row is gone, or the lease had already lapsed as of `now`. A lapsed lease may
+    /// already have let the scheduler claim the schedule, so it is not revived.
     pub fn renew_manual_run(
         &self,
         schedule_id: &str,
@@ -493,8 +501,8 @@ impl ScheduleStore {
         let expires = now + to_chrono_duration(lease, "manual run lease")?;
         let updated = self.conn.execute(
             "UPDATE manual_locks SET lease_expires_at_millis = ?1
-             WHERE schedule_id = ?2 AND holder = ?3",
-            params![to_millis(expires), schedule_id, holder],
+             WHERE schedule_id = ?2 AND holder = ?3 AND lease_expires_at_millis >= ?4",
+            params![to_millis(expires), schedule_id, holder, to_millis(now)],
         )?;
         Ok(updated == 1)
     }
@@ -751,22 +759,6 @@ impl ScheduleStore {
         Ok(())
     }
 
-    /// The occurrence's status, for tests and diagnostics.
-    pub fn occurrence_claimant(
-        &self,
-        schedule_id: &str,
-        due_at: DateTime<Utc>,
-    ) -> Result<Option<String>, ScheduleError> {
-        self.conn
-            .query_row(
-                "SELECT claimant FROM occurrences WHERE schedule_id = ?1 AND due_at_millis = ?2",
-                params![schedule_id, to_millis(due_at)],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(ScheduleError::from)
-    }
-
     /// What `Schedule::resolve_wake`'s `last_seen` argument was, the last time a
     /// scheduler loop evaluated this schedule. `None` before the first evaluation
     /// ever - `resolve_wake`'s own "nothing missed by definition" case.
@@ -828,23 +820,6 @@ impl ScheduleStore {
         millis
             .map(|m| from_millis(m, "schedules.last_evaluated_millis"))
             .transpose()
-    }
-
-    /// Records that this schedule was ticked as of `now`, whatever the tick decided.
-    /// Monotonic, like [`advance_last_seen`](Self::advance_last_seen).
-    pub fn advance_last_evaluated_at(
-        &self,
-        schedule_id: &str,
-        now: DateTime<Utc>,
-    ) -> Result<(), ScheduleError> {
-        self.register_schedule(schedule_id)?;
-        self.conn.execute(
-            "UPDATE schedules SET last_evaluated_millis = ?1
-             WHERE schedule_id = ?2
-               AND (last_evaluated_millis IS NULL OR last_evaluated_millis < ?1)",
-            params![to_millis(now), schedule_id],
-        )?;
-        Ok(())
     }
 
     /// Reads `last_seen`, lets `decide` turn it into an occurrence to claim (or
@@ -970,16 +945,23 @@ impl ScheduleStore {
         now: DateTime<Utc>,
     ) -> Result<Vec<ExpiredClaim>, ScheduleError> {
         let mut stmt = self.conn.prepare(
-            "SELECT due_at_millis, deferred_count FROM occurrences
+            "SELECT due_at_millis, deferred_count, COALESCE(claimant, '') = ?3 FROM occurrences
              WHERE schedule_id = ?1 AND status = 'claimed' AND lease_expires_at_millis < ?2
              ORDER BY due_at_millis",
         )?;
-        let rows = stmt.query_map(params![schedule_id, to_millis(now)], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
-        })?;
+        let rows = stmt.query_map(
+            params![schedule_id, to_millis(now), HELD_FOR_MANUAL_RUN],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, bool>(2)?,
+                ))
+            },
+        )?;
         let mut out = Vec::new();
         for row in rows {
-            let (millis, deferred_count) = row?;
+            let (millis, deferred_count, held_for_manual_run) = row?;
             out.push(ExpiredClaim {
                 due_at: from_millis(millis, "occurrences.due_at_millis")?,
                 // carried back so a caller can
@@ -988,9 +970,34 @@ impl ScheduleStore {
                 // reported as different `TickEvent`s (`Reclaimed` vs `Deferred`), not
                 // collapsed into one just because both are found through this scan.
                 deferred_count: deferred_count as u32,
+                held_for_manual_run,
             });
         }
         Ok(out)
+    }
+
+    /// End an occurrence that was set aside for a manual run and is now past the
+    /// on-time window under `MissedRunPolicy::Skip`: settled as `dropped`, never
+    /// run late. Only a row still held for a manual run with an expired lease
+    /// changes; `false` when it was reclaimed or settled in the meantime.
+    pub fn drop_held_for_manual_run(
+        &self,
+        schedule_id: &str,
+        due_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<bool, ScheduleError> {
+        let updated = self.conn.execute(
+            "UPDATE occurrences SET status = 'dropped'
+             WHERE schedule_id = ?1 AND due_at_millis = ?2 AND status = 'claimed'
+               AND claimant = ?3 AND lease_expires_at_millis < ?4",
+            params![
+                schedule_id,
+                to_millis(due_at),
+                HELD_FOR_MANUAL_RUN,
+                to_millis(now)
+            ],
+        )?;
+        Ok(updated == 1)
     }
 
     /// Records the run id `start_run` actually started for this occurrence,
@@ -1321,6 +1328,22 @@ mod tests {
         Utc.with_ymd_and_hms(2026, 1, 1, h, m, s).unwrap()
     }
 
+    fn occurrence_claimant(
+        store: &ScheduleStore,
+        schedule_id: &str,
+        due_at: DateTime<Utc>,
+    ) -> Option<String> {
+        store
+            .conn
+            .query_row(
+                "SELECT claimant FROM occurrences WHERE schedule_id = ?1 AND due_at_millis = ?2",
+                params![schedule_id, to_millis(due_at)],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap()
+    }
+
     /// Claim and unwrap the `(generation, lease_expires_at)` pair, panicking (test-only)
     /// if the claim did not succeed.
     fn claim(
@@ -1357,7 +1380,7 @@ mod tests {
             ClaimOutcome::Claimed { generation: 1, .. }
         ));
         assert_eq!(
-            store.occurrence_claimant("s1", t(9, 0, 0)).unwrap(),
+            occurrence_claimant(&store, "s1", t(9, 0, 0)),
             Some("worker-a".to_string())
         );
     }
@@ -1385,7 +1408,7 @@ mod tests {
             .unwrap();
         assert_eq!(second, ClaimOutcome::NotClaimed);
         assert_eq!(
-            store.occurrence_claimant("s1", t(9, 0, 0)).unwrap(),
+            occurrence_claimant(&store, "s1", t(9, 0, 0)),
             Some("worker-a".to_string())
         );
     }
@@ -1417,7 +1440,7 @@ mod tests {
             ClaimOutcome::Claimed { generation: 2, .. }
         ));
         assert_eq!(
-            store.occurrence_claimant("s1", t(9, 0, 0)).unwrap(),
+            occurrence_claimant(&store, "s1", t(9, 0, 0)),
             Some("worker-b".to_string())
         );
     }
@@ -1894,7 +1917,7 @@ mod tests {
         );
 
         let store = ScheduleStore::open(&db_path).unwrap();
-        let claimant = store.occurrence_claimant("race-schedule", due).unwrap();
+        let claimant = occurrence_claimant(&store, "race-schedule", due);
         assert!(
             claimant == Some("worker-a".to_string()) || claimant == Some("worker-b".to_string())
         );
@@ -2013,6 +2036,7 @@ mod tests {
             vec![ExpiredClaim {
                 due_at: due,
                 deferred_count: 0,
+                held_for_manual_run: false,
             }]
         );
 
@@ -2252,6 +2276,7 @@ mod tests {
             vec![ExpiredClaim {
                 due_at: due,
                 deferred_count: 1,
+                held_for_manual_run: false,
             }],
             "a deferred occurrence must be findable on the very next scan, not only after a full lease"
         );
@@ -2570,6 +2595,76 @@ mod tests {
             !store
                 .renew_manual_run("s", "someone-else", later, LEASE)
                 .expect("renew")
+        );
+    }
+
+    /// A lapsed manual lock is not revived by a late renewal: the scheduler may
+    /// already have claimed the schedule.
+    #[test]
+    fn a_lapsed_manual_lock_is_not_renewed() {
+        let store = ScheduleStore::open_in_memory().expect("store");
+        let now = t(9, 0, 0);
+        store
+            .claim_manual_run("s", "run-now:1", now, LEASE, false)
+            .expect("manual");
+        let live = now + chrono::Duration::seconds(30);
+        assert!(
+            store
+                .renew_manual_run("s", "run-now:1", live, LEASE)
+                .expect("renew")
+        );
+        let lapsed = live + chrono::Duration::seconds(LEASE.as_secs() as i64 + 1);
+        assert!(matches!(
+            store
+                .claim_occurrence("s", t(9, 0, 30), "loop-a", lapsed, LEASE)
+                .expect("claim"),
+            ClaimOutcome::Claimed { .. }
+        ));
+        assert!(
+            !store
+                .renew_manual_run("s", "run-now:1", lapsed, LEASE)
+                .expect("renew"),
+            "a lapsed lock was renewed over a live scheduled claim"
+        );
+    }
+
+    /// An occurrence set aside for a manual run is marked so the loop can apply
+    /// the missed-run policy when it comes back, and `drop_held_for_manual_run`
+    /// settles it without running it.
+    #[test]
+    fn an_occurrence_held_for_a_manual_run_can_be_dropped_later() {
+        let store = ScheduleStore::open_in_memory().expect("store");
+        let now = t(9, 0, 0);
+        store
+            .claim_manual_run("s", "run-now:1", now, LEASE, false)
+            .expect("manual");
+        let due = t(9, 0, 10);
+        let held_at = t(9, 0, 20);
+        assert_eq!(
+            store
+                .claim_occurrence("s", due, "loop-a", held_at, LEASE)
+                .expect("claim"),
+            ClaimOutcome::NotClaimed
+        );
+        let later = t(9, 30, 0);
+        let expired = store.expired_claims("s", later).expect("scan");
+        assert_eq!(expired.len(), 1);
+        assert!(expired[0].held_for_manual_run);
+        assert!(
+            store
+                .drop_held_for_manual_run("s", due, later)
+                .expect("drop")
+        );
+        assert!(store.expired_claims("s", later).expect("scan").is_empty());
+        assert_eq!(
+            store.occurrence_status("s", due).expect("status"),
+            Some("dropped".to_owned())
+        );
+        // A second drop finds nothing to change.
+        assert!(
+            !store
+                .drop_held_for_manual_run("s", due, later)
+                .expect("drop")
         );
     }
 }

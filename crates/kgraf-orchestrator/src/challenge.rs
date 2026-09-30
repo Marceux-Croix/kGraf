@@ -1553,7 +1553,7 @@ mod tests {
     fn an_omission_must_name_a_real_file_and_is_checked_against_the_read_set() {
         let book = ContractBook::new(vec![ic()], 2).expect("book");
         let r = root();
-        // P5: a garbage item never forces an overturn.
+        // A garbage item never forces an overturn.
         let garbage = challenge(
             Evidence::NotConsulted {
                 item: "zzz-nonexistent".into(),
@@ -1620,7 +1620,7 @@ mod tests {
                 &[who("w1", "a", "c")],
             )
         };
-        // P6: a one-character quote is not evidence.
+        // A one-character quote is not evidence.
         assert!(resolve_by_lookup(&book, &q("docs/rule.md", "E"), r.path()).is_err());
         match resolution(
             resolve_by_lookup(

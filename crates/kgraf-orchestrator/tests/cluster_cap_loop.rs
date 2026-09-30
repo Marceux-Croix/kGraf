@@ -1,5 +1,5 @@
 //! At most two contracts of one coupling cluster in flight at once (decision
-//! 0082, coordination-hardening item 6). The pure cap arithmetic is unit
+//! 0082). The pure cap arithmetic is unit
 //! tested in `cluster_cap.rs`; this exercises it against the real dispatch
 //! loop, real leases and a real co-change graph.
 //!

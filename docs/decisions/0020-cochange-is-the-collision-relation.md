@@ -135,3 +135,14 @@ on the consumer, and is exactly what a probe should sweep. Discarding the
 weight makes that sweep impossible.
 
 **Compute it in kGraf, keep every pair, carry the weight.** Chosen.
+
+## Amendment (2026-09-29): observed write sets and collisions are recorded
+
+The orchestrator now writes what the decision names as a source. When an attempt
+finishes, its changed paths are recorded as that contract's write set, for every
+attempt: the one merged, the ones that lost, and the ones that failed. When a
+contract's merge into the integration branch conflicts on a path that another
+contract of the same run already merged, one collision per pair and path is
+recorded with kind `textual`. A conflict on a path no other contract of the run
+wrote has no second task, so nothing is recorded for it. `kgraf cochange` folds the
+write sets into the relation and reports the collision count.

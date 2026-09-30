@@ -8,10 +8,10 @@
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use kgraf_bench_briefs::{
-    BenchOptions, RouteHandle, WorkerBudget, apply_override, brief, default_price_table_for,
-    report, run_bench, suite_store, unpriced_warning,
+    BenchOptions, RouteHandle, ScopedPrice, WorkerBudget, apply_override, brief,
+    default_price_table_for_routes, report, run_bench, suite_store, unpriced_warning,
 };
-use kgraf_core::cost::Money;
+use kgraf_core::cost::{Money, PriceTable};
 use kgraf_host::worker::config::{
     DEFAULT_CONTEXT_WINDOW_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_STEP_BUDGET,
 };
@@ -110,7 +110,23 @@ fn main() -> Result<()> {
             kgraf_fleet::litellm_provider(&spec.route).map(|p| (spec.model.as_str(), p))
         })
         .collect();
-    let mut prices = default_price_table_for(&provider_ids)?;
+    // An Azure deployment is priced through the model it is mapped to, under the
+    // route-scoped key; a route with no mapping in the environment stays unpriced.
+    let scoped: Vec<ScopedPrice> = args
+        .routes
+        .iter()
+        .filter_map(|spec| {
+            let entry = kgraf_fleet::entry(&spec.route).ok()?;
+            let deployments = kgraf_fleet::azure_deployments(entry, kgraf_core::legacy::env_var)?;
+            let (_, underlying) = deployments.into_iter().find(|(d, _)| *d == spec.model)?;
+            Some(ScopedPrice {
+                route: spec.route.clone(),
+                model: spec.model.clone(),
+                litellm_key: kgraf_fleet::azure_litellm_key(&underlying),
+            })
+        })
+        .collect();
+    let mut prices = default_price_table_for_routes(&provider_ids, &scoped)?;
     if let Some(path) = &args.prices {
         apply_override(&mut prices, path)?;
     }
@@ -159,7 +175,30 @@ fn main() -> Result<()> {
     // Prices are looked up by exact model key; a near miss runs unpriced, and
     // this says so before any call, naming the keys it may have meant.
     for spec in &args.routes {
-        if let Some(warning) = unpriced_warning(&prices, &spec.model) {
+        if kgraf_fleet::route_scoped_price_only(&spec.route) {
+            if !prices.is_priced_on(Some(&spec.route), &spec.model) {
+                eprintln!(
+                    "warning: deployment `{}` on `{}` has no price entry, so its cost is reported \
+                     as unpriced. Azure deployments are priced only under `{}` (from the model \
+                     the deployment is mapped to, or --prices).",
+                    spec.model,
+                    spec.route,
+                    PriceTable::route_key(&spec.model, &spec.route)
+                );
+            } else {
+                // The vendored `azure/<model>` entry is the standard deployment
+                // rate. Data-zone, regional and provisioned deployments bill
+                // differently, and a deployment's type is not in the mapping.
+                eprintln!(
+                    "note: deployment `{}` on `{}` is priced as a standard deployment of its \
+                     mapped model. A data-zone, regional or provisioned deployment bills \
+                     differently: set `{}` with --prices.",
+                    spec.model,
+                    spec.route,
+                    PriceTable::route_key(&spec.model, &spec.route)
+                );
+            }
+        } else if let Some(warning) = unpriced_warning(&prices, &spec.model) {
             eprintln!("{warning}");
         }
     }

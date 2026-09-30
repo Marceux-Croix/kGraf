@@ -178,6 +178,7 @@ impl FakeModel {
                         id: format!("t{round}"),
                         name: name.into(),
                         input,
+                        signature: None,
                     }],
                     true,
                 )

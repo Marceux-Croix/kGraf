@@ -477,11 +477,6 @@ impl WorkspaceManager {
 
     /// Remove tagged entries whose directory is gone or whose owner is dead,
     /// then unregistered directories under the base.
-    pub fn clean_orphans(&self) -> Result<Vec<OrphanRemoval>, WorkspaceError> {
-        let _lock = self.exclusive()?;
-        self.clean_orphans_locked(&|_| false)
-    }
-
     fn clean_orphans_locked(
         &self,
         referenced: &dyn Fn(&str) -> bool,
@@ -950,11 +945,38 @@ impl WorkspaceManager {
     /// Remove a workspace: unlock, force-remove, delete scratch, and verify
     /// that neither the directory nor the registration remains. The branch,
     /// if any, is kept; merge-back owns branch lifecycle.
+    ///
+    /// [`WorkspaceError::Busy`] while a process started in the worktree still
+    /// runs (the same hold and session check as [`Self::quiesce`]): deleting
+    /// the tree under a live writer would let it recreate files in a path
+    /// git no longer tracks. The hold is kept exclusively until the removal
+    /// is done, so no sandboxed process can start meanwhile. A busy
+    /// worktree stays registered and locked by this process; startup cleanup
+    /// removes it once its processes have ended.
     pub fn remove(&self, ws: Workspace) -> Result<(), WorkspaceError> {
         let _lock = self.shared()?;
         let _guard = self.guard(&ws.root)?;
+        let _held = self.quiet_retrying(&ws.root, &ws.hold)?;
         self.purge(&ws.root)?;
         remove_dir_if_exists(&ws.scratch)
+    }
+
+    /// [`Self::quiet`], retried for up to about one second while it reads
+    /// busy: a command that has just been stopped can still hold its shared
+    /// lock for a moment while the kernel tears its processes down.
+    fn quiet_retrying(&self, path: &Path, hold: &Path) -> Result<HeldLock, WorkspaceError> {
+        const TRIES: u32 = 40;
+        const PAUSE: std::time::Duration = std::time::Duration::from_millis(25);
+        let mut tries = 0;
+        loop {
+            match self.quiet(path, hold, true) {
+                Err(WorkspaceError::Busy { .. }) if tries + 1 < TRIES => {
+                    tries += 1;
+                    std::thread::sleep(PAUSE);
+                }
+                other => return other,
+            }
+        }
     }
 
     /// Unlock, remove and prune one path, then verify the outcome. Upstream

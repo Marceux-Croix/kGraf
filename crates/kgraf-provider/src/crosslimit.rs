@@ -600,9 +600,10 @@ impl SharedLimiterStore {
     }
 
     /// Check and, if admitted, reserve one slot for `route`+`key`, as of
-    /// `now`, waiting for the write lock for at most `budget`. Synchronous:
-    /// for tests, the bench and `crosslimit-hammer`, none of which have
-    /// anything else in-process contending for the connection.
+    /// the caller-supplied `now`, waiting for the write lock for at most
+    /// `budget`. Synchronous. `now` is fixed before the wait, so this is for
+    /// tests that need a chosen instant; real-time callers use
+    /// [`Self::check_now`].
     /// [`RouteLimiter::acquire`](crate::ratelimit::RouteLimiter::acquire)
     /// uses [`Self::check_bounded`] instead.
     pub fn check(
@@ -623,6 +624,37 @@ impl SharedLimiterStore {
             .saturating_duration_since(Instant::now())
             .max(Duration::from_millis(1));
         Self::run_check(&conn, &self.path, route, key, limit, &|| now, remaining)
+    }
+
+    /// [`Self::check`] with the wall clock read after the write lock is held, as
+    /// the async path does. `check` takes `now` before it waits, so under
+    /// contention the instant it carries can be older than a decision another
+    /// caller already stored. Use this whenever the time is the real one.
+    pub fn check_now(
+        &self,
+        route: &str,
+        key: &str,
+        limit: crate::RateLimit,
+        budget: Duration,
+    ) -> Result<Admission, CrossLimitError> {
+        let conn_arc = self.connection_for(route)?;
+        let deadline = Instant::now() + budget;
+        let conn = lock_until(&conn_arc, deadline).ok_or_else(|| CrossLimitError::LockTimeout {
+            route: route.to_owned(),
+            budget_ms: budget.as_millis() as u64,
+        })?;
+        let remaining = deadline
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_millis(1));
+        Self::run_check(
+            &conn,
+            &self.path,
+            route,
+            key,
+            limit,
+            &SystemTime::now,
+            remaining,
+        )
     }
 
     /// [`Self::check`], but bounds the in-process wait for the route's
@@ -893,6 +925,24 @@ mod tests {
         assert_eq!(a.len(), 16);
         assert_eq!(a, key_id("sk-real-secret-value"));
         assert_ne!(a, key_id("sk-a-different-value"));
+    }
+
+    #[test]
+    fn check_now_reads_the_clock_under_the_lock_and_behaves_like_check() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = SharedLimiterStore::open(&dir.path().join("shared.sqlite3")).expect("open");
+        assert_eq!(
+            store
+                .check_now("route", "key", limit("60"), BUDGET)
+                .expect("first"),
+            Admission::Admitted
+        );
+        assert!(matches!(
+            store
+                .check_now("route", "key", limit("60"), BUDGET)
+                .expect("second"),
+            Admission::Wait(_)
+        ));
     }
 
     #[test]

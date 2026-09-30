@@ -1,0 +1,11 @@
+: fixture source: https://learn.microsoft.com/en-us/azure/ai-foundry/openai/concepts/content-filter (scenario 5, a streamed generation whose last chunk has finish_reason content_filter)
+: provenance: chunk fields follow the Chat Completions stream shape; text, ids and counts are invented. Not a live capture.
+
+data: {"id":"chatcmpl-stream-0002","object":"chat.completion.chunk","created":1699386280,"model":"gpt-35-turbo-instruct","choices":[{"index":0,"delta":{"role":"assistant","content":"Partial"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-stream-0002","object":"chat.completion.chunk","created":1699386280,"model":"gpt-35-turbo-instruct","choices":[{"index":0,"delta":{},"finish_reason":"content_filter","content_filter_results":{"violence":{"filtered":true,"severity":"medium"}}}]}
+
+data: {"id":"chatcmpl-stream-0002","object":"chat.completion.chunk","created":1699386280,"model":"gpt-35-turbo-instruct","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}
+
+data: [DONE]
+

@@ -214,28 +214,50 @@ fn written_paths(hunk: &Hunk) -> Result<Vec<PathBuf>, ToolError> {
 /// compared as the file system resolves them (`fold_path`), so a case or
 /// normalization twin counts as the same path. A hunk that moves a file onto
 /// its own path names it once.
-fn refuse_repeated_paths(hunks: &[Hunk]) -> Result<(), ToolError> {
+///
+/// `resolve` maps each path to the file it reaches: the identity before the
+/// workspace is open, and the path with its in-workspace links followed once
+/// it is, so two hunks on `a` and on a link `b -> a` are one file too.
+fn refuse_repeated_paths(
+    hunks: &[Hunk],
+    resolve: impl Fn(&Path) -> Result<PathBuf, ToolError>,
+) -> Result<(), ToolError> {
     let mut seen = std::collections::HashSet::new();
     for hunk in hunks {
         let mut own = std::collections::HashSet::new();
         for path in written_paths(hunk)? {
-            let key = kgraf_core::paths::fold_path(&path);
+            let resolved = resolve(&path)?;
+            let key = kgraf_core::paths::fold_path(&resolved);
             if own.insert(key.clone()) && !seen.insert(key) {
+                let named = if resolved == path {
+                    path.display().to_string()
+                } else {
+                    format!(
+                        "{} (a link that reaches {})",
+                        path.display(),
+                        resolved.display()
+                    )
+                };
                 return Err(ToolError::InvalidInput {
                     tool: "apply_patch".into(),
                     reason: format!(
-                        "{} is named in more than one hunk. Each hunk is matched against the \
-                         file as it is now, so a second hunk on one path would overwrite the \
-                         first. Put every change to one path in a single Update File hunk \
+                        "{named} is named in more than one hunk. Each hunk is matched against \
+                         the file as it is now, so a second hunk on one file would overwrite \
+                         the first. Put every change to one file in a single Update File hunk \
                          (several @@ chunks are allowed) and send a separate patch for a \
-                         delete followed by an add.",
-                        path.display()
+                         delete followed by an add."
                     ),
                 });
             }
         }
     }
     Ok(())
+}
+
+/// The lexical form of [`refuse_repeated_paths`], for use before the
+/// workspace is open.
+fn lexical(path: &Path) -> Result<PathBuf, ToolError> {
+    Ok(path.to_path_buf())
 }
 
 #[async_trait::async_trait]
@@ -282,10 +304,11 @@ impl Tool for ApplyPatchTool {
     /// time, since `access()` has no filesystem to resolve a symlink against.
     fn access(&self, input: &Value) -> Result<Access, ToolError> {
         let hunks = parse(input)?;
-        refuse_repeated_paths(&hunks)?;
+        refuse_repeated_paths(&hunks, lexical)?;
         let mut access = Access::none();
         for hunk in &hunks {
             for path in written_paths(hunk)? {
+                fs_safety::refuses_git_or_kgraf("apply_patch", &path)?;
                 access = access
                     .write_path(&path)
                     .map_err(|source| ToolError::Access {
@@ -352,8 +375,22 @@ fn apply_all(
     root: &Path,
     cancel: &CancellationToken,
 ) -> Result<ToolOutput, ToolError> {
-    refuse_repeated_paths(hunks)?;
+    refuse_repeated_paths(hunks, lexical)?;
     let dir = fs_safety::open_workspace("apply_patch", root)?;
+    // Again with links followed: a hunk on a link and a hunk on its target
+    // name one file, and both would plan from its old content.
+    refuse_repeated_paths(hunks, |path| {
+        fs_safety::resolve_links("apply_patch", &dir, path)
+    })?;
+    // The write guard runs on every written path before any hunk is planned:
+    // planning reads through the read guard, which lets `.gitmodules` through,
+    // so without this a protected path late in the patch would be refused only
+    // at commit, after earlier hunks had written.
+    for hunk in hunks {
+        for path in written_paths(hunk)? {
+            fs_safety::guard_write("apply_patch", &dir, &path)?;
+        }
+    }
 
     let mut planned = Vec::with_capacity(hunks.len());
     for hunk in hunks {
@@ -503,11 +540,22 @@ fn paths_are_same_file(dir: &Dir, a: &Path, dest: &Path) -> Result<bool, ToolErr
     Ok(matches!((a_id, dest_id), (Some(a), Some(b)) if a == b))
 }
 
+/// Off Unix there is no file identity in `cap_std`'s portable metadata. A
+/// move between two spellings the file system may resolve to one file (a
+/// case-only rename on a case-insensitive volume, the Windows default) is
+/// refused rather than guessed: written and then deleted, it would lose the
+/// file. A symbolic-link alias is not detected here (a known gap; creating a
+/// link on Windows needs a privilege a worker does not normally hold).
 #[cfg(not(unix))]
-fn paths_are_same_file(_dir: &Dir, _a: &Path, _dest: &Path) -> Result<bool, ToolError> {
-    // No portable inode-identity check off Unix; the lexical check (`dest ==
-    // path`) still applies. Documented gap, not a silent one (fail loud):
-    // kGraf does not build for a non-Unix target today.
+fn paths_are_same_file(_dir: &Dir, a: &Path, dest: &Path) -> Result<bool, ToolError> {
+    if kgraf_core::paths::same_path(a, dest) {
+        return Err(internal(format!(
+            "moving {} to {} changes only how the name is spelled; that cannot be checked \
+             on this platform, so rename it through a temporary name in two patches",
+            a.display(),
+            dest.display()
+        )));
+    }
     Ok(false)
 }
 
@@ -619,6 +667,51 @@ mod tests {
                 "one\ntwo\n",
                 "{label}: nothing may be written"
             );
+        }
+    }
+
+    /// A hunk on a link and a hunk on its target name one file: both would
+    /// plan from its old content and the second write would drop the first.
+    /// A link to a directory counts the same way.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_link_and_its_target_in_two_hunks_are_refused() {
+        for (label, body) in [
+            (
+                "file link",
+                "*** Update File: a.txt\n@@\n-one\n+ONE\n*** Update File: b.txt\n@@\n-two\n+TWO",
+            ),
+            (
+                "directory link",
+                "*** Update File: src/a.txt\n@@\n-one\n+ONE\n*** Update File: lnk/a.txt\n@@\n-two\n+TWO",
+            ),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir(dir.path().join("src")).expect("src");
+            std::fs::write(dir.path().join("a.txt"), "one\ntwo\n").expect("seed");
+            std::fs::write(dir.path().join("src/a.txt"), "one\ntwo\n").expect("seed");
+            std::os::unix::fs::symlink("a.txt", dir.path().join("b.txt")).expect("link");
+            std::os::unix::fs::symlink("src", dir.path().join("lnk")).expect("link");
+            let err = ApplyPatchTool
+                .call(
+                    wrap(body),
+                    &ctx(dir.path().to_path_buf()),
+                    &crate::CallPermit::new(),
+                )
+                .await
+                .expect_err(label);
+            assert!(
+                err.to_string().contains("more than one hunk")
+                    && err.to_string().contains("a link that reaches"),
+                "{label}: {err}"
+            );
+            for file in ["a.txt", "src/a.txt"] {
+                assert_eq!(
+                    std::fs::read_to_string(dir.path().join(file)).expect("read"),
+                    "one\ntwo\n",
+                    "{label}: nothing may be written"
+                );
+            }
         }
     }
 
@@ -979,5 +1072,98 @@ mod tests {
             "must warn a model away from unified-diff syntax by name"
         );
         assert!(d.contains("*** Begin Patch"), "must name the outer markers");
+    }
+
+    /// A protected path in a later hunk is refused before the first hunk
+    /// writes. Planning reads through the read guard, which lets
+    /// `.gitmodules` through, so the write guard must run up front.
+    #[tokio::test]
+    async fn a_protected_path_in_a_later_hunk_writes_nothing() {
+        let tool = ApplyPatchTool;
+        let first = "*** Update File: a.txt\n@@\n-one\n+ONE\n";
+        for (label, second) in [
+            ("add", "*** Add File: .gitmodules\n+[submodule \"x\"]"),
+            ("update", "*** Update File: .gitmodules\n@@\n-old\n+new"),
+            ("delete", "*** Delete File: .gitmodules"),
+            (
+                "move destination",
+                "*** Update File: b.txt\n*** Move to: .gitattributes\n@@\n-x\n+y",
+            ),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            std::fs::write(dir.path().join("a.txt"), "one\n").expect("seed");
+            std::fs::write(dir.path().join("b.txt"), "x\n").expect("seed");
+            std::fs::write(dir.path().join(".gitmodules"), "old\n").expect("seed");
+            let input = wrap(&format!("{first}{second}"));
+            assert!(
+                matches!(tool.access(&input), Err(ToolError::Access { .. })),
+                "{label}: access must refuse"
+            );
+            let err = tool
+                .call(
+                    input,
+                    &ctx(dir.path().to_path_buf()),
+                    &crate::CallPermit::new(),
+                )
+                .await
+                .expect_err(label);
+            assert!(matches!(err, ToolError::Access { .. }), "{label}: {err}");
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("a.txt")).expect("read"),
+                "one\n",
+                "{label}: the first hunk must not have written"
+            );
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join(".gitmodules")).expect("read"),
+                "old\n",
+                "{label}"
+            );
+            assert!(dir.path().join("b.txt").exists(), "{label}");
+            assert!(!dir.path().join(".gitattributes").exists(), "{label}");
+        }
+    }
+
+    /// A link inside the workspace to `.git` or to `.gitmodules` passes every
+    /// lexical check; the guard follows it and refuses the write.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_write_through_an_in_workspace_link_to_git_metadata_is_refused() {
+        let tool = ApplyPatchTool;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir(root.join(".git")).expect("git dir");
+        std::fs::write(root.join(".git/config"), "[core]\n").expect("seed");
+        std::fs::write(root.join(".gitmodules"), "old\n").expect("seed");
+        std::fs::create_dir(root.join("sub")).expect("sub");
+        std::os::unix::fs::symlink(".git", root.join("g")).expect("link");
+        std::os::unix::fs::symlink("../.gitmodules", root.join("sub/m")).expect("link");
+        std::os::unix::fs::symlink("g", root.join("chain")).expect("link");
+        for body in [
+            "*** Update File: g/config\n@@\n-[core]\n+[core]\n+\tfsmonitor = evil",
+            "*** Add File: g/hooks/pre-commit\n+evil",
+            "*** Add File: chain/config\n+evil",
+            "*** Update File: sub/m\n@@\n-old\n+new",
+            "*** Delete File: sub/m",
+        ] {
+            let err = tool
+                .call(
+                    wrap(body),
+                    &ctx(root.to_path_buf()),
+                    &crate::CallPermit::new(),
+                )
+                .await
+                .expect_err(body);
+            assert!(matches!(err, ToolError::Access { .. }), "{body}: {err}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.join(".git/config")).expect("read"),
+            "[core]\n"
+        );
+        assert!(!root.join(".git/hooks").exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join(".gitmodules")).expect("read"),
+            "old\n"
+        );
+        assert!(root.join("sub/m").exists(), "the link itself must survive");
     }
 }

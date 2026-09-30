@@ -1,6 +1,6 @@
-//! Decision 0067: one test per review finding, each
+//! Decision 0067: questions, answers and messages between sessions, each
 //! against a real `Orchestrator` over the shared fakes (no network). The
-//! finding each test covers is named in its doc comment. Kill-and-resume
+//! behavior each test covers is named in its doc comment. Kill-and-resume
 //! tests are in `sessions_restart.rs`.
 
 mod support;

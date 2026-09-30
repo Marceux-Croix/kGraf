@@ -56,7 +56,7 @@ struct Factory {
     /// only reachable when the orchestrator's services register it
     /// (`kgraf_orchestrator::session_tools`) and its `SessionLine` is bound
     /// to the built orchestrator's own handle -- exactly `with_tools` does in
-    /// `kgraf-orchestrator/tests/sessions_review.rs`, replicated here so a
+    /// `kgraf-orchestrator/tests/session_question_flow.rs`, replicated here so a
     /// worker's own tool call, not `OrchestratorHandle::ask_question`
     /// directly, is what raises the question this file's own test answers.
     session_line: Option<kgraf_orchestrator::SessionLine>,
@@ -510,7 +510,10 @@ fn tick_until(
     what: &str,
     mut done: impl FnMut(&mut Workspace) -> bool,
 ) {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    // Each wait is on the workspace's own state, which a tick advances. The
+    // bound only turns a broken mechanism into a failure: a passing run never
+    // waits on it, so a loaded machine cannot expire it.
+    let deadline = Instant::now() + Duration::from_secs(300);
     while !done(w) {
         assert!(Instant::now() < deadline, "never: {what}");
         w.tick(ctx);

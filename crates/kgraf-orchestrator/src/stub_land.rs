@@ -1,10 +1,10 @@
 //! Stubs land on the integration branch first (decision 0081).
 //!
-//! Today an interface contract's checks (stub-compile, vacuity, handshake:
+//! An interface contract's checks (stub-compile, vacuity, handshake:
 //! `checks.rs`) prove the consumers compile against a trivial stub of the
-//! producer side, but nothing commits that stub anywhere: every worker's
-//! worktree still branches from the plain integration tip, which does not yet
-//! agree with the interface. A consumer written first builds against a brief,
+//! producer side, but they commit that stub nowhere: without this step every
+//! worker's worktree branches from the plain integration tip, which does not
+//! yet agree with the interface. A consumer written first builds against a brief,
 //! not against code, until the producer happens to land -- exactly the
 //! commitment-failure class decision 0023 measured at 32 percent of
 //! concurrent multi-agent failures.
@@ -16,9 +16,8 @@
 //! every party's worktree, created after this point, starts from a tip that
 //! already compiles against the interface.
 //!
-//! **Security (binding, from the owner's other session on `child::snapshot`,
-//! `trial_merge` and `commit_landed`): reuse the merge-back path, not a new
-//! git path.** [`GitStubLander`] never runs a bespoke git command; it writes
+//! **Security: reuse the merge-back path, not a new git path.**
+//! [`GitStubLander`] never runs a bespoke git command; it writes
 //! the stub's declared files into a throwaway worktree branched from the
 //! integration tip and carries them through [`kgraf_sandbox::MergeBack`]
 //! exactly as a worker's own attempt is carried (`worker/workspace.rs` in
@@ -40,8 +39,7 @@
 //! (Apache-2.0, already ported into `kgraf-sandbox::merge`) commits only a
 //! worker's own finished environment.
 //!
-//! **Security hardening (2026-09-28, review of `544c335..9f3f05c`).** The
-//! throwaway worktree is checked out at the integration tip, which can hold
+//! **Symbolic links.** The throwaway worktree is checked out at the integration tip, which can hold
 //! symbolic links a worker committed (merge-back's prescan skips links, then
 //! `add -A` records them). So before any byte is written: every component of
 //! every stub path is inspected without following links and a link anywhere
@@ -506,15 +504,10 @@ pub fn stub_left_in_place<'a>(
 /// [`CheckFailure`](crate::checks::CheckFailure) for a producer that left a
 /// stub in place at verification, in the same shape a mechanical check
 /// failure takes (0037: the artifact named, `check_failed`'s existing
-/// hold/report path). Not wired to a live call site in this worktree: the
-/// call needs the interface's stub content at the point a producer's
-/// delivery becomes final (`orchestrator.rs::finalize_ordinary`), which is
-/// orchestrator run-state the verifier (`kgraf-host::CommandVerifier`) does
-/// not carry today (`OpenContract` has no interface linkage) -- the same gap
-/// 0076 recorded for its own step 3 and left as the next build's work rather
-/// than widen this one's blast radius into `finalize`/`OpenContract`'s
-/// serialized shape. [`stub_left_in_place`] is complete and tested standalone;
-/// wiring this in is that next step.
+/// hold/report path). The orchestrator calls it where a producer's delivery
+/// becomes final, because it holds the interface's stub content there; the
+/// verifier (`kgraf-host::CommandVerifier`) does not, since `OpenContract`
+/// has no interface linkage.
 pub fn stub_left_in_place_failure(
     ic: &InterfaceContract,
     left: &[&str],
@@ -564,67 +557,196 @@ pub fn stub_left_in_place_failure(
 /// stub (a comment, a renamed unused argument) still clears the file, the
 /// same narrow limit [`stub_left_in_place`] itself accepts (0081's own
 /// docs).
+///
+/// Bodies inside `impl Trait for Type` blocks count as placeholders only
+/// when no function body sits outside such a block and the file has no item
+/// besides `use`, `mod`, `type` and trait impls: error types with derived
+/// traits, data types or macro calls next to a mock of unimplemented methods
+/// are a finished file, not an abandoned stub. A file over
+/// [`MAX_SCANNED_BYTES`] is never a placeholder.
 pub fn is_placeholder_source(path: &str, content: &str) -> bool {
-    if !path.ends_with(".rs") {
+    if !path.ends_with(".rs") || content.len() > MAX_SCANNED_BYTES {
         return false;
     }
-    let bodies = rust_fn_bodies(content);
-    !bodies.is_empty() && bodies.iter().all(|b| is_placeholder_body(b))
+    let scan = scan_source(&mask_non_code(content));
+    let placeholders = |bodies: &[String]| bodies.iter().all(|b| is_placeholder_body(b));
+    if !scan.free.is_empty() {
+        return placeholders(&scan.free) && placeholders(&scan.trait_impl);
+    }
+    // Only trait impl bodies: a mock or an adapter written next to real items
+    // (error types, data types, macro calls) is a finished file whose methods
+    // are unused. Alone, in a file of `use`, `mod` and `type` items, they are
+    // an abandoned stub.
+    !scan.trait_impl.is_empty() && !scan.real_items && placeholders(&scan.trait_impl)
 }
 
-/// A line-comment strip, not a lexer: good enough for a placeholder body,
-/// which never legitimately contains a string literal holding `//`.
-fn strip_line_comments(s: &str) -> String {
-    s.lines()
-        .map(|line| match line.find("//") {
-            Some(i) => &line[..i],
-            None => line,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+/// `src` with the inside of every comment, string, raw string and character
+/// literal replaced by spaces (newlines kept), so the result has the same
+/// byte length and offsets but no brace, quote, `fn ` or macro name that came
+/// from text. A scan of the result sees only code. Lifetimes (`'a`) are not
+/// character literals and stay.
+fn mask_non_code(src: &str) -> String {
+    let b = src.as_bytes();
+    let mut out = b.to_vec();
+    let blank = |out: &mut [u8], from: usize, to: usize| {
+        for byte in &mut out[from..to] {
+            if *byte != b'\n' {
+                *byte = b' ';
+            }
+        }
+    };
+    let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'/' if b.get(i + 1) == Some(&b'/') => {
+                let end = src[i..].find('\n').map_or(b.len(), |n| i + n);
+                blank(&mut out, i, end);
+                i = end;
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                // Block comments nest.
+                let mut depth = 1;
+                let mut j = i + 2;
+                while j < b.len() && depth > 0 {
+                    if b[j] == b'/' && b.get(j + 1) == Some(&b'*') {
+                        depth += 1;
+                        j += 2;
+                    } else if b[j] == b'*' && b.get(j + 1) == Some(&b'/') {
+                        depth -= 1;
+                        j += 2;
+                    } else {
+                        j += 1;
+                    }
+                }
+                blank(&mut out, i, j);
+                i = j;
+            }
+            b'r' if (i == 0
+                || !is_ident(b[i - 1])
+                || (b[i - 1] == b'b' && (i < 2 || !is_ident(b[i - 2]))))
+                && raw_string_end(b, i).is_some() =>
+            {
+                let end = raw_string_end(b, i).unwrap_or(b.len());
+                blank(&mut out, i + 1, end);
+                i = end;
+            }
+            b'"' => {
+                let mut j = i + 1;
+                while j < b.len() && b[j] != b'"' {
+                    j += if b[j] == b'\\' { 2 } else { 1 };
+                }
+                let end = (j + 1).min(b.len());
+                blank(&mut out, i + 1, j.min(b.len()));
+                i = end;
+            }
+            b'\'' => {
+                // A character literal is `'\..'` or one char then `'`;
+                // anything else is a lifetime or a label.
+                let rest = &src[i + 1..];
+                let end = match rest.chars().next() {
+                    Some('\\') => rest[1..].chars().next().and_then(|esc| {
+                        // The escaped character (maybe `'`) never closes it.
+                        let from = 1 + esc.len_utf8();
+                        rest[from..].find('\'').map(|n| i + 1 + from + n + 1)
+                    }),
+                    Some(c) if c != '\'' && rest[c.len_utf8()..].starts_with('\'') => {
+                        Some(i + 1 + c.len_utf8() + 1)
+                    }
+                    _ => None,
+                };
+                match end {
+                    Some(end) => {
+                        blank(&mut out, i + 1, end - 1);
+                        i = end;
+                    }
+                    None => i += 1,
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    // Only ASCII spaces replaced bytes, and whole literals at a time, so
+    // multi-byte characters are either untouched or replaced entirely.
+    String::from_utf8(out).unwrap_or_else(|_| src.to_owned())
+}
+
+/// For a raw string that starts with the `r` at `at` (`r"..."`, `r#"..."#`),
+/// the offset just past its closing quote and hashes.
+fn raw_string_end(b: &[u8], at: usize) -> Option<usize> {
+    let mut j = at + 1;
+    let mut hashes = 0;
+    while b.get(j) == Some(&b'#') {
+        hashes += 1;
+        j += 1;
+    }
+    if b.get(j) != Some(&b'"') {
+        return None;
+    }
+    j += 1;
+    while j < b.len() {
+        if b[j] == b'"'
+            && b[j + 1..]
+                .iter()
+                .take(hashes)
+                .filter(|c| **c == b'#')
+                .count()
+                == hashes
+        {
+            return Some(j + 1 + hashes);
+        }
+        j += 1;
+    }
+    Some(b.len())
 }
 
 /// The macros a placeholder body is one call to. `unreachable!` is not one:
 /// it states an invariant, and a mock or a trait impl of a method the code
 /// under test never calls legitimately consists of nothing else.
-const PLACEHOLDER_MACROS: [&str; 2] = ["todo!", "unimplemented!"];
+const PLACEHOLDER_MACROS: [&str; 2] = ["todo", "unimplemented"];
 
-/// True when the body is exactly one call to a [`PLACEHOLDER_MACROS`] macro,
-/// with an optional trailing `;` and nothing else: `todo!(); real()` is real
-/// work after a placeholder call, not a placeholder.
+/// True when the body (already masked by [`mask_non_code`]) is exactly one
+/// call to a [`PLACEHOLDER_MACROS`] macro, with an optional `return` before
+/// it, an optional trailing `;` and nothing else: `todo!(); real()` is real
+/// work after a placeholder call, not a placeholder. Any delimiter counts
+/// (`todo!()`, `todo![]`, `todo!{}`), and the macro may be named by a path
+/// (`std::todo!`, `::core::unimplemented!`).
 fn is_placeholder_body(body: &str) -> bool {
-    let stripped = strip_line_comments(body);
-    let t = stripped.trim();
+    let t = body.trim();
+    let t = match t.strip_prefix("return") {
+        Some(rest) if rest.starts_with(|c: char| c.is_whitespace()) => rest.trim_start(),
+        _ => t,
+    };
     let t = t.strip_suffix(';').map_or(t, str::trim_end);
+    let mut t = t.strip_prefix("::").map_or(t, str::trim_start);
+    // A `std::` or `core::` root, with spaces allowed around `::`.
+    for root in ["std", "core"] {
+        if let Some(rest) = t.strip_prefix(root).map(str::trim_start)
+            && let Some(rest) = rest.strip_prefix("::")
+        {
+            t = rest.trim_start();
+            break;
+        }
+    }
     PLACEHOLDER_MACROS.iter().any(|name| {
         t.strip_prefix(name)
             .map(str::trim_start)
-            .is_some_and(|rest| rest.starts_with('(') && closes_at_end(rest))
+            .and_then(|rest| rest.strip_prefix('!'))
+            .map(str::trim_start)
+            .is_some_and(|rest| rest.starts_with(['(', '[', '{']) && closes_at_end(rest))
     })
 }
 
-/// True when the `(` that starts `text` is closed by the last character of
-/// `text` and by no earlier one. String literals (with escapes) are skipped so
-/// a `)` inside a message does not count.
+/// True when the delimiter that starts `text` is closed by the last
+/// character of `text` and by no earlier one. `text` is masked, so no quote
+/// or comment can hide a delimiter.
 fn closes_at_end(text: &str) -> bool {
     let mut depth = 0usize;
-    let mut in_str = false;
-    let mut escaped = false;
     for (i, c) in text.char_indices() {
-        if in_str {
-            match c {
-                _ if escaped => escaped = false,
-                '\\' => escaped = true,
-                '"' => in_str = false,
-                _ => {}
-            }
-            continue;
-        }
         match c {
-            '"' => in_str = true,
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => {
+                depth = depth.saturating_sub(1);
                 if depth == 0 {
                     return i + c.len_utf8() == text.len();
                 }
@@ -658,51 +780,226 @@ fn signature_end(content: &str, from: usize) -> Option<usize> {
     None
 }
 
-/// Every top-level `fn ... { ... }` body in a Rust source file, found by a
-/// brace-matching scan rather than a parse: this call site only asks whether
-/// every body found is a placeholder, never compiles or lints the file, and
-/// a stub file is short and plain enough that a scan finds its bodies
-/// reliably. A signature with no body (a trait method declaration, ending in
-/// `;`) is skipped rather than treated as a placeholder or as disqualifying
-/// one: it is not a body a worker could have implemented at this file.
-fn rust_fn_bodies(content: &str) -> Vec<String> {
+/// The largest source file [`is_placeholder_source`] scans. A stub is a few
+/// lines; a file this size is real code.
+const MAX_SCANNED_BYTES: usize = 4 * 1024 * 1024;
+
+/// What [`scan_source`] found in a Rust source file.
+#[derive(Default)]
+struct Scan {
+    /// Function bodies outside `impl Trait for Type` blocks: free functions,
+    /// inherent methods, default methods of a trait definition.
+    free: Vec<String>,
+    /// Function bodies inside `impl Trait for Type` blocks.
+    trait_impl: Vec<String>,
+    /// An item other than a function, `use`, `mod`, `type`, `extern crate` or
+    /// trait impl: a struct, enum, trait, constant, static, macro call or
+    /// inherent impl. Real code lives next to it.
+    real_items: bool,
+}
+
+/// The bodies and the item kinds of a Rust source file (masked by
+/// [`mask_non_code`], so a brace in a literal or comment cannot unbalance the
+/// scan), found by a brace-matching scan of the items rather than a parse:
+/// this call site only asks whether the bodies found are placeholders, never
+/// compiles or lints the file. A signature with no body (a trait method
+/// declaration, ending in `;`) is skipped rather than treated as a
+/// placeholder or as disqualifying one. Functions nested in another
+/// function's body are part of that body.
+fn scan_source(masked: &str) -> Scan {
+    let mut scan = Scan::default();
+    scan_items(masked, &mut scan);
+    scan
+}
+
+/// The keyword that names the item starting `text`, after any visibility and
+/// qualifiers (`pub(crate) unsafe extern "C" fn` gives `fn`). `extern crate`
+/// gives `extern_crate` and an `extern` block `extern_block`.
+fn item_keyword(text: &str) -> &str {
+    let mut rest = text.trim_start();
+    loop {
+        let end = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        let word = &rest[..end];
+        let after = rest[end..].trim_start();
+        match word {
+            "pub" => {
+                rest = match after.strip_prefix('(') {
+                    Some(inner) => inner.split_once(')').map_or("", |(_, r)| r).trim_start(),
+                    None => after,
+                };
+            }
+            "unsafe" | "async" | "default" | "safe" => rest = after,
+            "const" => {
+                let next = after.split(|c: char| !c.is_ascii_alphanumeric()).next();
+                if matches!(next, Some("fn" | "unsafe" | "async" | "extern")) {
+                    rest = after;
+                } else {
+                    return "const";
+                }
+            }
+            "extern" => {
+                // The ABI string is masked to spaces between its quotes.
+                let after = match after.strip_prefix('"') {
+                    Some(s) => s.split_once('"').map_or("", |(_, r)| r).trim_start(),
+                    None => after,
+                };
+                if after.starts_with("crate") {
+                    return "extern_crate";
+                }
+                if after.starts_with('{') {
+                    return "extern_block";
+                }
+                rest = after;
+            }
+            _ => return word,
+        }
+    }
+}
+
+/// The byte of the first `{` or `;` outside `(..)` and `[..]` from `from`:
+/// the end of an item header that is not a function signature.
+fn header_end(content: &str, from: usize) -> Option<usize> {
+    let mut nest = 0usize;
+    for (k, &b) in content.as_bytes().iter().enumerate().skip(from) {
+        match b {
+            b'(' | b'[' => nest += 1,
+            b')' | b']' => nest = nest.saturating_sub(1),
+            b'{' | b';' if nest == 0 => return Some(k),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The byte after the `}` that closes the `{` at `open`.
+fn block_end(content: &str, open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (k, &b) in content.as_bytes().iter().enumerate().skip(open) {
+        match b {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(k + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Whether an `impl` header (`impl<T> Trait for Type`) names a trait: a
+/// `for` that is a word of its own and does not open a higher-ranked bound
+/// (`for<'a>`).
+fn is_trait_impl(header: &str) -> bool {
+    let b = header.as_bytes();
+    let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    header.match_indices("for").any(|(at, _)| {
+        (at == 0 || !word(b[at - 1]))
+            && b.get(at + 3).is_none_or(|&c| !word(c))
+            && !header[at + 3..].trim_start().starts_with('<')
+    })
+}
+
+fn scan_items(content: &str, scan: &mut Scan) {
     let bytes = content.as_bytes();
-    let mut bodies = Vec::new();
     let mut i = 0;
-    while let Some(rel) = content[i..].find("fn ") {
-        let start = i + rel;
-        if start > 0 {
-            let prev = bytes[start - 1];
-            if prev.is_ascii_alphanumeric() || prev == b'_' {
-                i = start + 3;
+    // A shape this scan cannot follow is real code as far as it can tell: it
+    // never lets a file read as a placeholder.
+    let unparsed = |scan: &mut Scan| {
+        scan.real_items = true;
+        scan.free.push("<unparsed>".to_owned());
+    };
+    while i < bytes.len() {
+        if bytes[i].is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        // Attributes: `#[..]` and `#![..]`.
+        if bytes[i] == b'#' {
+            let mut j = i + 1;
+            if bytes.get(j) == Some(&b'!') {
+                j += 1;
+            }
+            while bytes.get(j).is_some_and(u8::is_ascii_whitespace) {
+                j += 1;
+            }
+            if bytes.get(j) == Some(&b'[') {
+                let mut depth = 0usize;
+                let mut k = j;
+                while k < bytes.len() {
+                    match bytes[k] {
+                        b'[' => depth += 1,
+                        b']' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    k += 1;
+                }
+                i = k + 1;
                 continue;
             }
         }
-        let Some(marker) = signature_end(content, start + 3) else {
-            break;
+        let kw = item_keyword(&content[i..]);
+        let end = if kw == "fn" {
+            let kw_at = content[i..].find("fn").map_or(i, |n| i + n);
+            signature_end(content, kw_at + 2)
+        } else {
+            header_end(content, i)
         };
-        if bytes[marker] == b';' {
-            i = marker + 1;
+        let Some(end) = end else {
+            unparsed(scan);
+            return;
+        };
+        let header = &content[i..end];
+        if bytes[end] == b';' {
+            match kw {
+                "use" | "type" | "mod" | "extern_crate" | "fn" => {}
+                _ => scan.real_items = true,
+            }
+            i = end + 1;
             continue;
         }
-        let body_start = marker + 1;
-        let mut depth = 1usize;
-        let mut j = body_start;
-        while j < bytes.len() && depth > 0 {
-            match bytes[j] {
-                b'{' => depth += 1,
-                b'}' => depth -= 1,
-                _ => {}
+        let Some(after) = block_end(content, end) else {
+            unparsed(scan);
+            return;
+        };
+        let inner = &content[end + 1..after - 1];
+        match kw {
+            "fn" => scan.free.push(inner.to_owned()),
+            "mod" => scan_items(inner, scan),
+            "impl" => {
+                let mut sub = Scan::default();
+                scan_items(inner, &mut sub);
+                if is_trait_impl(&header[header.find("impl").map_or(0, |n| n + 4)..]) {
+                    scan.trait_impl.extend(sub.free);
+                } else {
+                    scan.real_items = true;
+                    scan.free.extend(sub.free);
+                }
             }
-            j += 1;
+            "trait" => {
+                scan.real_items = true;
+                scan_items(inner, scan);
+            }
+            _ => scan.real_items = true,
         }
-        if depth != 0 {
-            break;
+        i = after;
+        // `const X: T = { .. };` and a macro call `m! { .. };` end in `;`.
+        while bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
+            i += 1;
         }
-        bodies.push(content[body_start..j - 1].to_string());
-        i = j;
+        if bytes.get(i) == Some(&b';') {
+            i += 1;
+        }
     }
-    bodies
 }
 
 /// Every write target in `writes` (repository-relative paths) whose content,
@@ -715,7 +1012,11 @@ pub fn placeholder_writes_left_in_place<'a>(
 ) -> Vec<&'a str> {
     writes
         .into_iter()
-        .filter(|path| read(path).is_some_and(|content| is_placeholder_source(path, &content)))
+        // Only `.rs` files can be one: the others are never read.
+        .filter(|path| {
+            path.ends_with(".rs")
+                && read(path).is_some_and(|content| is_placeholder_source(path, &content))
+        })
         .collect()
 }
 
@@ -732,8 +1033,32 @@ pub fn placeholder_left_in_place_reason(left: &[&str]) -> String {
          0086), never verified as if it were the work",
         if left.len() == 1 { "" } else { "s" },
         if left.len() == 1 { "holds" } else { "hold" },
-        left.join(", ")
+        left.iter()
+            .map(|p| plain_path(p))
+            .collect::<Vec<_>>()
+            .join(", ")
     )
+}
+
+/// A path as a reason prints it: control characters, line and paragraph
+/// separators, and bidirectional overrides become `?`. A worker can name a
+/// file with them, and the reason reaches a terminal and the next brief.
+fn plain_path(path: &str) -> String {
+    path.chars()
+        .map(|c| {
+            let altering = c.is_control()
+                || matches!(
+                    c,
+                    '\u{061C}'
+                        | '\u{200B}'..='\u{200F}'
+                        | '\u{2028}'..='\u{202E}'
+                        | '\u{2060}'..='\u{2064}'
+                        | '\u{2066}'..='\u{2069}'
+                        | '\u{FEFF}'
+                );
+            if altering { '?' } else { c }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1395,6 +1720,82 @@ mod tests {
     }
 
     #[test]
+    fn every_delimiter_and_path_form_of_a_placeholder_call_is_one() {
+        for body in [
+            "todo![]",
+            "todo!{}",
+            "unimplemented![]",
+            "unimplemented!{ }",
+            "std::todo!()",
+            "core::unimplemented!(\"x\")",
+            "::std::todo!{}",
+            "todo ! ()",
+            "return todo!()",
+            "return std::todo!();",
+            "todo![\"a\"];",
+        ] {
+            assert!(
+                is_placeholder_source("src/lib.rs", &format!("fn f() {{ {body} }}\n")),
+                "{body}"
+            );
+        }
+        for body in [
+            "unreachable![]",
+            "std::unreachable!()",
+            "returns todo!()",
+            "my::todo!()",
+            "todo!{} + 1",
+        ] {
+            assert!(
+                !is_placeholder_source("src/lib.rs", &format!("fn f() {{ {body} }}\n")),
+                "{body}"
+            );
+        }
+    }
+
+    /// A brace in a character, string, raw string or comment is not code: it
+    /// must not unbalance the scan, or the real body after it is lost and a
+    /// file with real work is refused as a placeholder.
+    #[test]
+    fn braces_in_literals_and_comments_do_not_unbalance_the_scan() {
+        let real = [
+            "fn a() { todo!() }\nfn b() -> char { '{' }\n",
+            "fn a() { todo!() }\nfn b() -> char { '\\'' }\nfn c() -> &'static str { \"}}\" }\n",
+            "fn a() { todo!() }\nfn b() -> &'static str { r#\"} \" }\"# }\n",
+            "fn a() { todo!() }\nfn b() -> u8 { /* } { */ 1 } // }\n",
+            "fn a() { todo!() }\nfn b() -> u8 { /* /* } */ } */ 2 }\n",
+            "fn a() { todo!() }\nfn b() -> &'static str { \"fn c() { todo!() }\" }\n",
+            "fn a() { todo!() }\nfn b() -> char { '\\u{7d}' }\n",
+            "fn a() { todo!() }\nfn b<'a>(x: &'a str) -> &'a str { x }\n",
+            "fn a() { todo!() }\nfn b() -> &'static [u8] { b\"}\" }\n",
+        ];
+        for src in real {
+            assert!(!is_placeholder_source("src/lib.rs", src), "{src}");
+        }
+        // Text that only looks like code does not make a body real, and a
+        // commented-out or quoted `fn` is not a body.
+        for src in [
+            "// fn real() -> u8 { 1 }\nfn a() { todo!() }\n",
+            "fn a() { /* { */ todo!() /* } */ }\n",
+            "fn a() { todo!(\"}\") }\nfn b() { unimplemented!() }\n",
+        ] {
+            assert!(is_placeholder_source("src/lib.rs", src), "{src}");
+        }
+    }
+
+    #[test]
+    fn the_placeholder_reason_prints_paths_without_control_or_bidi_characters() {
+        let reason =
+            placeholder_left_in_place_reason(&["src/\u{1b}[31ma\u{202E}.rs", "b\u{2028}.rs"]);
+        assert!(
+            !reason.contains('\u{1b}') && !reason.contains('\u{202E}'),
+            "{reason:?}"
+        );
+        assert!(!reason.contains('\u{2028}'), "{reason:?}");
+        assert!(reason.contains("src/?[31ma?.rs, b?.rs"), "{reason}");
+    }
+
+    #[test]
     fn a_paren_inside_a_message_does_not_end_the_call() {
         assert!(is_placeholder_source(
             "src/lib.rs",
@@ -1424,7 +1825,9 @@ mod tests {
             "fn f<T: Into<[u8; 4]>>(x: T) where T: Copy { todo!() }\n"
         ));
         assert_eq!(
-            rust_fn_bodies("trait T { fn d(x: [u8; 4]); fn e(&self) -> u8 { 1 } }").len(),
+            scan_source("trait T { fn d(x: [u8; 4]); fn e(&self) -> u8 { 1 } }")
+                .free
+                .len(),
             1
         );
     }
@@ -1469,6 +1872,65 @@ mod tests {
             "src/lib.rs",
             "pub struct Config {\n    pub port: u16,\n}\n\ntrait Parse {\n    fn parse(s: &str) -> Self;\n}\n"
         ));
+    }
+
+    /// A finished file with a mock or an adapter whose unused trait methods
+    /// are `unimplemented!()` next to real items is not an abandoned stub.
+    #[test]
+    fn trait_impl_placeholders_next_to_real_items_are_not_a_placeholder() {
+        for src in [
+            "#[derive(Debug)]\npub enum E { A }\n\
+             impl std::fmt::Display for E {\n    fn fmt(&self, f: &mut F) -> R { unimplemented!() }\n}\n",
+            "pub struct Mock { n: u8 }\n\
+             impl<T: Clone> Backend for Mock {\n    fn get(&self) { todo!() }\n}\n",
+            "const N: usize = 4;\nimpl Backend for Mock { fn get(&self) { unimplemented!() } }\n",
+            "macro_rules! m { () => {}; }\nm!();\n\
+             impl Backend for Mock { fn get(&self) { todo!() } }\n",
+            "#[cfg(target_arch = \"s390x\")]\nmod arch {\n    pub struct S;\n    \
+             impl Backend for S { fn get(&self) { todo!() } }\n}\n",
+        ] {
+            assert!(!is_placeholder_source("src/lib.rs", src), "{src}");
+        }
+    }
+
+    /// The same bodies with nothing real next to them, or free functions
+    /// and inherent methods that are placeholders, are still an abandoned stub.
+    #[test]
+    fn abandoned_stubs_are_still_placeholders() {
+        for src in [
+            "use std::fmt;\ntype R = u8;\nmod inner;\n\
+             impl Backend for Mock { fn get(&self) { todo!() } }\n",
+            "pub struct Repo;\nimpl Repo {\n    pub fn new() -> Self { todo!() }\n}\n",
+            "pub struct Repo;\nfn free() { unimplemented!() }\n\
+             impl Backend for Repo { fn get(&self) { todo!() } }\n",
+            "mod inner {\n    pub fn a() { todo!() }\n}\n",
+            "trait T { fn d(&self); fn e(&self) { todo!() } }\n",
+        ] {
+            assert!(is_placeholder_source("src/lib.rs", src), "{src}");
+        }
+        // One real body anywhere, in a trait impl too, clears the file.
+        assert!(!is_placeholder_source(
+            "src/lib.rs",
+            "fn free() { todo!() }\nimpl Backend for Repo { fn get(&self) -> u8 { 1 } }\n"
+        ));
+    }
+
+    /// A file over the scan cap is real code, and is never scanned.
+    #[test]
+    fn a_file_over_the_scan_cap_is_never_a_placeholder() {
+        let big = format!("fn f() {{ todo!() }}\n{}", " ".repeat(MAX_SCANNED_BYTES));
+        assert!(!is_placeholder_source("src/lib.rs", &big));
+    }
+
+    /// Only `.rs` paths are read at all.
+    #[test]
+    fn a_non_rust_path_is_not_read_for_the_placeholder_check() {
+        let read = |p: &str| -> Option<String> {
+            assert!(p.ends_with(".rs"), "{p} was read");
+            Some("fn f() { todo!() }".into())
+        };
+        let left = placeholder_writes_left_in_place(["big.bin", "a.rs", "notes.md"], read);
+        assert_eq!(left, vec!["a.rs"]);
     }
 
     #[test]

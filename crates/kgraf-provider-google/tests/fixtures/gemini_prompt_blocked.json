@@ -1,0 +1,10 @@
+{
+  "_source": "Written from PromptFeedback in the GenerateContentResponse reference (https://ai.google.dev/api/generate-content#PromptFeedback): a blocked prompt has no candidates and a blockReason. Not recorded from a live call.",
+  "promptFeedback": { "blockReason": "PROHIBITED_CONTENT" },
+  "usageMetadata": {
+    "promptTokenCount": 12,
+    "totalTokenCount": 12
+  },
+  "modelVersion": "gemini-2.5-flash",
+  "responseId": "resp-0003"
+}

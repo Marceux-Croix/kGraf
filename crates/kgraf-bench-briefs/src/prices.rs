@@ -39,9 +39,51 @@ pub fn default_price_table() -> Result<PriceTable> {
 /// route's own provider is tried; see
 /// [`kgraf_core::litellm::LiteLlmCatalog::to_price_table_for_providers`].
 pub fn default_price_table_for(wanted: &[(&str, &str)]) -> Result<PriceTable> {
+    default_price_table_for_routes(wanted, &[])
+}
+
+/// A model served on a route that is priced only under its route-scoped key: an
+/// Azure deployment and the model the account owner mapped it to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScopedPrice {
+    /// The catalog route id.
+    pub route: String,
+    /// The name a request carries (the deployment name).
+    pub model: String,
+    /// The vendored table's key for the model behind it (`azure/<model>`).
+    pub litellm_key: String,
+}
+
+/// [`default_price_table_for`], plus a route-scoped price (`<model>@<route>`) for
+/// each [`ScopedPrice`] whose `litellm_key` the vendored table has.
+///
+/// A route in [`kgraf_fleet::route_scoped_price_routes`] is never priced by a bare
+/// model entry: a deployment named like a catalog model can serve another one. A
+/// scoped price the table lacks leaves that deployment unpriced, never guessed.
+/// The vendored `azure/<model>` entry is the standard deployment rate: the
+/// deployment type (data-zone, regional, provisioned) is not known here, so a
+/// user entry in `--prices` is the way to price one of those.
+pub fn default_price_table_for_routes(
+    wanted: &[(&str, &str)],
+    scoped: &[ScopedPrice],
+) -> Result<PriceTable> {
     let catalog = LiteLlmCatalog::load(VENDORED)
         .context("kGraf's vendored litellm price table does not parse")?;
-    Ok(catalog.to_price_table_for_providers(wanted))
+    let mut table = catalog.to_price_table_for_providers(wanted);
+    for route in kgraf_fleet::route_scoped_price_routes() {
+        table.require_route_scoped(route);
+    }
+    for entry in scoped {
+        let Some(info) = catalog.get(&entry.litellm_key) else {
+            continue;
+        };
+        let key = PriceTable::route_key(&entry.model, &entry.route);
+        table.set(key.clone(), info.price);
+        if let Some(threshold) = info.tier_threshold {
+            table.set_tier_threshold(key, threshold);
+        }
+    }
+    Ok(table)
 }
 
 /// Read a JSON price table at `path` (the same shape `kgraf orchestrate
@@ -177,6 +219,58 @@ mod tests {
         assert!(warning.contains("empty"), "{warning}");
     }
 
+    fn scoped(route: &str, model: &str, underlying: &str) -> ScopedPrice {
+        ScopedPrice {
+            route: route.to_owned(),
+            model: model.to_owned(),
+            litellm_key: kgraf_fleet::azure_litellm_key(underlying),
+        }
+    }
+
+    #[test]
+    fn an_azure_deployment_named_like_a_catalog_model_is_not_priced_by_the_bare_key() {
+        // `gpt-4o` is a bare catalog key; a deployment called `gpt-4o` may serve
+        // anything.
+        let table = default_price_table_for_routes(&[], &[]).expect("table");
+        assert!(table.get("gpt-4o").is_some());
+        assert!(!table.is_priced_on(Some("azure-openai"), "gpt-4o"));
+        assert!(!table.is_priced_on(Some("azure-openai-responses"), "gpt-4o"));
+        assert!(table.is_priced_on(Some("openai"), "gpt-4o"));
+    }
+
+    #[test]
+    fn an_azure_deployment_is_priced_through_its_mapped_model_under_a_scoped_key() {
+        let underlying = kgraf_fleet::azure_litellm_key("gpt-4o-2024-08-06");
+        let catalog = LiteLlmCatalog::load(VENDORED).expect("catalog");
+        let listed = catalog
+            .get(&underlying)
+            .expect("the vendored table lists it");
+        let table = default_price_table_for_routes(
+            &[],
+            &[
+                scoped("azure-openai", "gpt-4o", "gpt-4o-2024-08-06"),
+                // No such model: stays unpriced, never priced by a near key.
+                scoped("azure-openai", "mystery", "no-such-model-2099"),
+            ],
+        )
+        .expect("table");
+        assert!(table.is_priced_on(Some("azure-openai"), "gpt-4o"));
+        assert!(!table.is_priced_on(Some("azure-openai"), "mystery"));
+        let usage = kgraf_core::TokenUsage {
+            uncached_input: 1_000_000,
+            ..kgraf_core::TokenUsage::default()
+        };
+        let cost = table
+            .cost_on(Some("azure-openai"), "gpt-4o", &usage)
+            .expect("priced");
+        assert_eq!(
+            cost.0, listed.price.uncached_input,
+            "the mapped model's rate"
+        );
+        // The other Azure route is a different key and stays unpriced.
+        assert!(!table.is_priced_on(Some("azure-openai-responses"), "gpt-4o"));
+    }
+
     #[test]
     fn a_route_with_a_known_provider_prices_a_prefix_only_model() {
         assert!(
@@ -194,6 +288,35 @@ mod tests {
     fn the_vendored_table_loads_and_prices_a_known_model() {
         let table = default_price_table().expect("vendored table");
         assert!(table.get("gpt-4o").is_some());
+    }
+
+    #[test]
+    fn a_flat_override_of_a_tiered_model_is_not_refused_above_the_tier() {
+        let mut base = default_price_table().expect("vendored table");
+        let huge = kgraf_core::TokenUsage {
+            uncached_input: 100_000_000,
+            ..kgraf_core::TokenUsage::default()
+        };
+        let tiered = base
+            .models()
+            .find(|m| base.cost(m, &huge).is_err())
+            .expect("the vendored table has a tiered model")
+            .to_owned();
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("prices.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                tiered.clone(): {
+                    "uncached_input": 1, "cache_read": 1, "cache_write": 1,
+                    "output": 1, "reasoning": 1
+                }
+            })
+            .to_string(),
+        )
+        .expect("write");
+        apply_override(&mut base, &path).expect("override");
+        assert!(base.cost(&tiered, &huge).is_ok());
     }
 
     #[test]

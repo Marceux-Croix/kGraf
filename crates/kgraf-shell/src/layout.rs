@@ -74,6 +74,8 @@ type CrateChips = (PathBuf, u64, Vec<(String, String)>);
 pub struct RunJson {
     pub routes: Vec<String>,
     pub planner: Option<String>,
+    /// Routes of other model kinds, `kind=route:model` (decision 0089).
+    pub model_routes: Vec<String>,
     pub error: Option<String>,
 }
 
@@ -328,18 +330,21 @@ pub fn read_run_json(root: &Path) -> RunJson {
             };
         }
     };
+    let strings = |v: &serde_json::Value, key: &str| -> Vec<String> {
+        v.get(key)
+            .and_then(|r| r.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
     match serde_json::from_str::<serde_json::Value>(&text) {
         Ok(v) => RunJson {
-            routes: v
-                .get("routes")
-                .and_then(|r| r.as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|x| x.as_str().map(str::to_owned))
-                        .collect()
-                })
-                .unwrap_or_default(),
+            routes: strings(&v, "routes"),
             planner: v.get("planner").and_then(|x| x.as_str()).map(str::to_owned),
+            model_routes: strings(&v, "model_routes"),
             error: None,
         },
         Err(e) => RunJson {
@@ -513,34 +518,10 @@ impl ShellApp {
             eprintln!("warning: {said}");
             self.chrome.notice = Some((said, Instant::now()));
         }
-        // Decision 0067: the parallelism slider drives the one
-        // process-wide `MachineGate` every open project shares, so this runs
-        // once per frame here rather than once per project (`sync_parallelism`,
-        // just below, still runs per project: each project's own `Admission`
-        // needs the derived `Limits` applied to its own `AdmissionGate`, even
-        // though the value they all receive is the same one).
-        // `sync_capacity_sources` refreshes what the re-measure thread reads
-        // (every open project's root and routes) before the slider's own
-        // sync, so a project opened this frame is visible to the next tick.
-        self.sync_capacity_sources();
-        self.sync_parallelism();
-        // Decision 0067: `ConcurrencyCaps` is
-        // retired as a user limit. Every open project's own local ceiling
-        // now tracks the slider's effective value directly (`max_writers`,
-        // the free-disk bound `kgraf-capacity` already measures, stands in
-        // for the retired `max_work_items` control -- design, "Consequences":
-        // "`Limits` keeps `max_work_items` internally, set from
-        // `max_writers`"), so raising the slider really does raise what one
-        // project alone may hold; the shared `MachineGate` is what then
-        // keeps several projects together from exceeding it.
-        let max_writers = self.machine_gate().limits().max_writers.max(1) as usize;
-        let effective_agents = self.settings.parallelism.effective().max(1) as usize;
-        let parallelism_limits = kgraf_orchestrator::Limits::new(max_writers, effective_agents)
-            .expect("max_writers and the slider's effective value are both at least 1");
+        // The gate writers (`sync_capacity_sources`, `sync_parallelism` and
+        // each project's own `sync_parallelism`) run in `App::logic`, not
+        // here: a hidden or covered window gets no `ui` pass.
         for proj in self.workspace.projects_mut() {
-            if let Some(i) = proj.interaction.as_mut() {
-                i.sync_parallelism(parallelism_limits);
-            }
             // Work status on the graph, from the run records (taken only once the
             // galaxy exists, so the first frame's overlay is not lost).
             if let (Some(g), Some(i)) = (proj.galaxy.as_mut(), proj.interaction.as_mut())
@@ -2984,9 +2965,53 @@ impl ShellApp {
             ui.label(RichText::new("No tray icon in this session; closing quits.").color(p.text_2));
         }
         separator(ui, p);
+        self.settings_worktrees(ui, p);
+        separator(ui, p);
         self.settings_updates(ui, p);
         if let Some(err) = &self.store.last_error {
             ui.colored_label(p.danger, format!("Settings not saved: {err}"));
+        }
+    }
+
+    /// The worker-worktree switch (decision 0088). A setting row: a label, then
+    /// its description below in the secondary color (CMP-SET-1), stating the
+    /// effect and the fixed exception in plain words (TXT-5, TXT-7: no saving is
+    /// claimed, only what is deleted). A change reaches every open project's
+    /// host at once and applies to the runs built after it.
+    fn settings_worktrees(&mut self, ui: &mut Ui, p: &Palette) {
+        ui.label(
+            RichText::new("Worker worktrees")
+                .font(theme::bold(14.0))
+                .color(p.text),
+        );
+        ui.label(
+            RichText::new(
+                "Each worker builds in its own worktree inside the project, and a compiled \
+                 project builds its own full build folder there (a Rust target folder can be \
+                 several gigabytes). On: a worktree and its builds are deleted once nothing \
+                 needs them. Off: every worker's worktree stays, with its builds, until you \
+                 remove it. A worktree a live worker, a stopped run, a pending merge or a \
+                 later part of the same work needs is never deleted. Applies to every run \
+                 the app starts after the change.",
+            )
+            .small()
+            .color(p.text_2),
+        );
+        let toggled = ui
+            .checkbox(
+                &mut self.settings.delete_worker_worktrees,
+                "Delete worker worktrees after use",
+            )
+            .changed();
+        if toggled {
+            let retention = self.settings.worktree_retention();
+            for proj in self.workspace.projects() {
+                if let Some(i) = &proj.interaction
+                    && let Some(h) = i.host().housekeeping()
+                {
+                    h.set_worktree_retention(retention);
+                }
+            }
         }
     }
 
@@ -3155,12 +3180,23 @@ impl ShellApp {
         if let Some(e) = &rj.error {
             ui.label(RichText::new(e).small().color(p.danger));
         }
-        let mut all: Vec<(String, &str)> =
-            rj.routes.iter().map(|r| (r.clone(), "worker")).collect();
+        // (route, role and kind, generative): the reasoning line applies to a
+        // generative route only.
+        let mut all: Vec<(String, String, bool)> = rj
+            .routes
+            .iter()
+            .map(|r| (r.clone(), role_line("worker", r), true))
+            .collect();
         if let Some(pl) = &rj.planner {
-            all.insert(0, (pl.clone(), "orchestrator"));
+            all.insert(0, (pl.clone(), role_line("orchestrator", pl), true));
         }
-        for (route, role) in all {
+        // Decision 0089: routes of other kinds, shown with their kind and the
+        // tool that reaches them.
+        all.extend(rj.model_routes.iter().map(|spec| {
+            let (route, line) = model_route_row(spec);
+            (route, line, false)
+        }));
+        for (route, role, generative) in all {
             ui.horizontal(|ui| {
                 let (rect, _) = ui.allocate_exact_size(vec2(32.0, 32.0), Sense::hover());
                 let letter = route.chars().find(|c| c.is_alphanumeric()).unwrap_or('?');
@@ -3178,11 +3214,13 @@ impl ShellApp {
                             .color(p.text),
                     );
                     ui.label(RichText::new(role).small().color(p.text_2));
-                    ui.label(
-                        RichText::new(reasoning_line(&route))
-                            .small()
-                            .color(p.text_2),
-                    );
+                    if generative {
+                        ui.label(
+                            RichText::new(reasoning_line(&route))
+                                .small()
+                                .color(p.text_2),
+                        );
+                    }
                 });
             })
             .response
@@ -3203,6 +3241,38 @@ impl ShellApp {
 }
 
 // ---------------------------------------------------------------- helpers
+
+/// The role line under a generative route: its role and its kind (decision
+/// 0089). A worker or planner route that names another kind is flagged, since
+/// a run refuses it.
+fn role_line(role: &str, route: &str) -> String {
+    match kgraf_core::split_kind_prefix(route) {
+        Ok((_, rest)) if rest.len() == route.len() => {
+            format!("{role}, {}", kgraf_core::ModelKind::GENERATIVE)
+        }
+        Ok((kind, _)) => format!(
+            "{role}, {kind}: refused; a {role} route takes no kind prefix (declare other kinds \
+             in model_routes)"
+        ),
+        Err(e) => format!("{role}, {e}"),
+    }
+}
+
+/// One `model_routes` row: the spec as written, and its kind with the tool
+/// that reaches it, or why the spec is not usable.
+fn model_route_row(spec: &str) -> (String, String) {
+    let line = match kgraf_core::split_kind_prefix(spec) {
+        Ok((kind, _)) if kind.is_generative() => {
+            "no kind: write kind=route:model; generative routes go in routes".to_owned()
+        }
+        Ok((kind, _)) => match kind.spec() {
+            Ok(spec) => format!("{kind}, reached through the {} tool", spec.tools.join(", ")),
+            Err(e) => e.to_string(),
+        },
+        Err(e) => e.to_string(),
+    };
+    (spec.to_owned(), line)
+}
 
 /// The reasoning-visibility line under one route (Settings > Providers,
 /// design 0067 point 9). `route` is `id` or `id:model`, as
@@ -3757,6 +3827,39 @@ mod tests {
         assert_eq!(git_branch(wt.path()).as_deref(), Some("feature"));
         std::fs::write(dir.path().join(".git/HEAD"), "0123abcd\n").expect("write");
         assert_eq!(git_branch(dir.path()), None, "detached");
+    }
+
+    /// Decision 0089: the model list shows each route's kind, and a spec a run
+    /// would refuse says why.
+    #[test]
+    fn the_model_list_shows_each_routes_kind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join(".kgraf")).expect("mkdir");
+        std::fs::write(
+            run_json_path(dir.path()),
+            r#"{"routes": ["ollama:llama3"], "planner": "anthropic:m",
+                "model_routes": ["embedding=openai:text-embedding-3-small",
+                                 "typed-decision=systemone:jev-latest"]}"#,
+        )
+        .expect("write");
+        let rj = read_run_json(dir.path());
+        assert_eq!(rj.model_routes.len(), 2);
+        assert_eq!(role_line("worker", &rj.routes[0]), "worker, generative");
+        assert_eq!(
+            model_route_row(&rj.model_routes[0]).1,
+            "embedding, reached through the embed tool"
+        );
+        assert_eq!(
+            model_route_row(&rj.model_routes[1]).1,
+            "typed-decision, reached through the decide tool"
+        );
+        assert!(role_line("worker", "rerank=llama-cpp:r").contains("refused"));
+        assert!(model_route_row("openai:e").1.starts_with("no kind"));
+        assert!(
+            model_route_row("world=openai:e")
+                .1
+                .contains("unknown model kind")
+        );
     }
 
     #[test]

@@ -47,6 +47,33 @@ fn credential_paths_are_unreadable_and_secrets_are_scrubbed() {
         ".claude.json.backup",
         ".claude.json.tmp.482913",
         ".claude/backups/2026-09-28.json",
+        ".claude/.credentials.json",
+        ".m2/settings.xml",
+        ".m2/settings-security.xml",
+        ".gradle/gradle.properties",
+        ".config/containers/auth.json",
+        ".huggingface/token",
+        ".cache/huggingface/token",
+        ".config/op/config",
+        ".oci/config",
+        ".bundle/config",
+        ".pip/pip.conf",
+        ".config/pip/pip.conf",
+        ".yarnrc",
+        ".yarnrc.yml",
+        ".config/pypoetry/auth.toml",
+        ".cargo/config.toml",
+        ".cargo/config",
+        ".dockercfg",
+        ".s3cfg",
+        ".boto",
+        ".databrickscfg",
+        ".config/rclone/rclone.conf",
+        ".config/doctl/config.yaml",
+        ".config/heroku/config.json",
+        ".config/glab-cli/config.yml",
+        ".config/helm/repositories.yaml",
+        ".config/stripe/config.toml",
     ];
     for rel in denied.iter().chain(["notes.txt"].iter()) {
         let path = home.path().join(rel);
@@ -99,6 +126,20 @@ fn credential_paths_are_unreadable_and_secrets_are_scrubbed() {
     std::fs::write(&git_config, "[user]\n").unwrap();
     let out = cat(&git_config);
     assert!(out.status.success(), "{out:?}");
+    // Control: the build caches beside the denied files stay readable.
+    for cache in [
+        ".m2/repository/a.pom",
+        ".gradle/caches/a.bin",
+        ".cache/huggingface/hub/m",
+        ".cargo/registry/cache/a.crate",
+        ".config/pypoetry/config.toml",
+    ] {
+        let path = home.path().join(cache);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "cache").unwrap();
+        let out = cat(&path);
+        assert!(out.status.success(), "{cache}: {out:?}");
+    }
     // Control: an ordinary file in the same HOME stays readable.
     let out = cat(&home.path().join("notes.txt"));
     assert!(out.status.success(), "{out:?}");
@@ -119,4 +160,39 @@ fn credential_paths_are_unreadable_and_secrets_are_scrubbed() {
     }
     assert!(env.contains("KGRAF_PASSED_SECRET=passed-on-purpose"));
     assert!(env.contains("PATH="), "scrub removed ordinary variables");
+
+    // A project kept inside a denied home directory: its worktree root is
+    // readable and resolvable from inside the sandbox, while the credential
+    // file beside it and the directory's listing stay denied.
+    let inner = home.path().join(".claude/project/wt");
+    std::fs::create_dir_all(&inner).unwrap();
+    std::fs::write(inner.join("src.txt"), "project text").unwrap();
+    let inner = std::fs::canonicalize(&inner).unwrap();
+    let inner_policy = SandboxPolicy::new(vec![inner.clone()], Network::Deny);
+    let run = |program: &str, args: &[&Path]| {
+        sandboxed_command(&inner_policy, program, &inner)
+            .unwrap()
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let out = run("/bin/cat", &[&inner.join("src.txt")]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "project text");
+    let out = run("/bin/pwd", &[Path::new("-P")]);
+    assert!(out.status.success(), "the root must resolve: {out:?}");
+    let out = run(
+        "/bin/cat",
+        &[&home.path().join(".claude/.credentials.json")],
+    );
+    assert!(
+        !out.status.success(),
+        "credentials readable beside the root"
+    );
+    assert!(!String::from_utf8_lossy(&out.stdout).contains(FAKE));
+    let out = run("/bin/ls", &[&home.path().join(".claude")]);
+    assert!(
+        !out.status.success(),
+        "the denied directory listed: {out:?}"
+    );
 }

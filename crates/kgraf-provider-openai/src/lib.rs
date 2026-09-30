@@ -19,15 +19,27 @@
 //! models**, and reading it as an instruction about "the OpenAI adapter" leaves every
 //! compatible vendor unreachable. Decision 0041 records the correction.
 //!
+//! [`embeddings`] adds the embedding and rerank kinds (decision 0089) on the same
+//! endpoints: `POST /embeddings` and the common `POST /rerank` shape.
+//!
 //! Both adapters normalize to the same six-field usage form under the **inclusive**
 //! convention, and both assert that the response model equals the requested one.
 //! What they do not share is the wire shape or the usage field names, which is
 //! exactly why they are separate types rather than one type with a flag.
 
+pub mod azure;
 pub mod chat;
+pub mod embeddings;
 pub mod responses;
 
+#[cfg(test)]
+mod azure_tests;
+
+pub use azure::{AzureSettings, AzureSettingsError, AzureTransport};
 pub use chat::{ChatCompletionsAdapter, ReasoningDialect, StreamedUsageLocation, UsageDialect};
+pub use embeddings::{
+    EMBEDDINGS_ADAPTER, EchoRule, OpenAiEmbeddings, OpenAiRerank, RERANK_ADAPTER,
+};
 pub use responses::OpenAiAdapter;
 
 /// Read a non-success response's body for the error message, bounded by

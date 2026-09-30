@@ -47,14 +47,14 @@ pub mod work_schedule;
 pub use chunk::{Chunk, NodeKind, chunk_source};
 pub use cochange::{CoChangePair, CoChangeStats};
 pub use error::{GraphError, Result};
-pub use events::{Change, ChangeOp, EventTail};
+pub use events::{Change, ChangeFault, ChangeOp, ChangePage, EventTail};
 pub use facts::{Assertion, Fact, NewFact};
 pub use index::{BUS_FILE_TITLE, BUS_OWNED_DIRS, ExtractorChange, IndexReport, Indexer};
 pub use lang::{Language, Tier};
 pub use layout::{Position, position_for};
 pub use leases::{
-    Acquisition, Conflict, LeaseRecord, LeaseRegistry, MixedAcquisition, NodeAcquisition,
-    NodeConflict, NodeLease, NodeLeaseRecord, WriteLease,
+    Acquisition, Conflict, LeaseMeasurements, LeaseRecord, LeaseRegistry, MixedAcquisition,
+    NodeAcquisition, NodeConflict, NodeLease, NodeLeaseRecord, WriteLease,
 };
 pub use presumed::{PresumedNode, PresumedOrigin, PresumedSync, StoredPresumed};
 pub use query::{EdgeDirection, NodePredicate, Pattern, QueryMatch};

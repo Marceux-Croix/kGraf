@@ -233,3 +233,12 @@ orderings in seconds, but took its file sets from actual historical
 changesets, which is knowledge not available in advance. Its own future work
 names automating that as the open problem. Prediction is the hard part and
 scheduling is a solved component if it is ever needed.
+
+## Amendment (2026-09-29): the lease measurements are reported
+
+The run report and the `kgraf orchestrate` report now carry the run's lease
+measurements: the paths its agents held one after another (the serialization the
+decision calls a measured cost) and the share of those handoffs, where both grants
+declared a range, whose ranges did not overlap. The share is not reported when no
+handoff had ranges on both sides, rather than shown as zero. Both are counted over
+the run's own grants only.

@@ -132,18 +132,41 @@ impl SystemOneClient {
     /// their indices. A caller's `min..=max` becomes that list here, and
     /// [`Self::score_from_wire`] maps the answer back, so a `Score` question means the
     /// same thing on every backend.
-    fn score_levels(min: i32, max: i32) -> Vec<String> {
-        (min..=max).map(|level| level.to_string()).collect()
+    ///
+    /// A range that spans more than [`crate::MAX_SCORE_LEVELS`] levels, or is
+    /// inverted, is refused here even when the question was built without the
+    /// constructor (the answer space is a public enum).
+    fn score_levels(min: i32, max: i32) -> Result<Vec<String>, DecideError> {
+        let span = i64::from(max) - i64::from(min);
+        if !(1..crate::MAX_SCORE_LEVELS).contains(&span) {
+            return Err(DecideError::Decode {
+                backend: BACKEND,
+                reason: format!("a score range {min}..{max} is not a usable level list"),
+            });
+        }
+        Ok((min..=max).map(|level| level.to_string()).collect())
     }
 
-    /// Map an expectation over level indices back onto the caller's range.
-    fn score_from_wire(min: i32, max: i32, wire: f64) -> i32 {
+    /// Map an expectation over level indices back onto the caller's range. A
+    /// value that is not a finite index inside the levels is an error, not a
+    /// clamped score: the server was told the levels, so an index outside them is
+    /// a fault to report.
+    fn score_from_wire(question: &str, min: i32, max: i32, wire: f64) -> Result<i32, DecideError> {
         if !wire.is_finite() {
-            return min;
+            return Err(DecideError::Decode {
+                backend: BACKEND,
+                reason: format!("score answer for `{question}` is not a finite number"),
+            });
         }
         let index = wire.round();
-        let span = (max - min) as f64;
-        (min as f64 + index.clamp(0.0, span)) as i32
+        let span = i64::from(max) - i64::from(min);
+        if index < 0.0 || index > span as f64 {
+            return Err(DecideError::OutsideAnswerSpace {
+                backend: BACKEND,
+                question: question.to_owned(),
+            });
+        }
+        Ok((i64::from(min) + index as i64) as i32)
     }
 
     /// The request body for a batch.
@@ -173,7 +196,7 @@ impl SystemOneClient {
                     wire.insert("type".into(), "score".into());
                     wire.insert(
                         "criteria".into(),
-                        serde_json::json!(Self::score_levels(*min, *max)),
+                        serde_json::json!(Self::score_levels(*min, *max)?),
                     );
                 }
             }
@@ -315,7 +338,7 @@ impl SystemOneClient {
                         }
                     })?;
                     Answer::Score {
-                        value: Self::score_from_wire(*min, *max, wire),
+                        value: Self::score_from_wire(&question.id, *min, *max, wire)?,
                         confidence,
                     }
                 }
@@ -346,7 +369,11 @@ impl Decider for SystemOneClient {
         questions: &[Question],
         token: &CallToken,
     ) -> Result<Vec<Answer>, DecideError> {
-        verify_state_size(BACKEND, state, self.state_token_limit)?;
+        // The token is open before the call: every early return closes its row.
+        if let Err(error) = verify_state_size(BACKEND, state, self.state_token_limit) {
+            token.fail_async().await?;
+            return Err(error);
+        }
         // A malformed batch never reaches the wire, and never opens a ledger row it
         // would then have to close.
         let body = match self.to_wire(state, questions) {
@@ -786,12 +813,52 @@ mod tests {
     }
 
     #[test]
-    fn a_score_out_of_the_servers_own_level_range_is_clamped_not_wrapped() {
-        // Defensive, because a value outside the declared space is the one thing this
-        // model class is claimed to be incapable of (fail loud).
-        assert_eq!(SystemOneClient::score_from_wire(1, 5, 99.0), 5);
-        assert_eq!(SystemOneClient::score_from_wire(1, 5, -4.0), 1);
-        assert_eq!(SystemOneClient::score_from_wire(1, 5, f64::NAN), 1);
+    fn a_score_outside_the_declared_levels_is_an_error_not_a_clamped_score() {
+        // A value outside the declared space is the one thing this model class is
+        // claimed to be incapable of (fail loud): it is reported, not repaired.
+        assert!(matches!(
+            SystemOneClient::score_from_wire("q", 1, 5, 99.0),
+            Err(DecideError::OutsideAnswerSpace { .. })
+        ));
+        assert!(matches!(
+            SystemOneClient::score_from_wire("q", 1, 5, -4.0),
+            Err(DecideError::OutsideAnswerSpace { .. })
+        ));
+        assert!(matches!(
+            SystemOneClient::score_from_wire("q", 1, 5, f64::NAN),
+            Err(DecideError::Decode { .. })
+        ));
+        assert_eq!(
+            SystemOneClient::score_from_wire("q", 1, 5, 3.4).expect("in range"),
+            4
+        );
+        assert_eq!(
+            SystemOneClient::score_from_wire("q", i32::MIN, i32::MAX - 1, 2.0).expect("wide"),
+            i32::MIN + 2
+        );
+    }
+
+    #[test]
+    fn a_score_range_past_the_level_limit_is_refused_before_the_wire() {
+        assert!(matches!(
+            Question::score("s", "rate", 0, 1000),
+            Err(crate::QuestionError::ScoreSpan { .. })
+        ));
+        assert!(matches!(
+            Question::score("s", "rate", i32::MIN, i32::MAX),
+            Err(crate::QuestionError::ScoreSpan { .. })
+        ));
+        // A question built around the constructor is refused by the encoder.
+        let client = SystemOneClient::new("http://localhost:8000", 8192).expect("client");
+        let raw = Question {
+            id: "s".into(),
+            prompt: "rate".into(),
+            space: AnswerSpace::Score {
+                min: i32::MIN,
+                max: i32::MAX,
+            },
+        };
+        assert!(client.to_wire(&state(), &[raw]).is_err());
     }
 
     #[tokio::test]
@@ -807,6 +874,15 @@ mod tests {
             .await
             .expect_err("must refuse");
         assert!(matches!(err, DecideError::StateTooLarge { .. }));
+        assert_eq!(
+            ledger
+                .call(token.id())
+                .expect("read")
+                .expect("present")
+                .settlement,
+            Settlement::Failed,
+            "a refused state left its ledger row open"
+        );
         assert!(
             server
                 .received_requests()

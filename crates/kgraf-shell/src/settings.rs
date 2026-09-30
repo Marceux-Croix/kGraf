@@ -1,7 +1,7 @@
 //! The settings surface's model: configuration only, never work state (0017).
 //!
 //! It carries the compaction slider (0057 addendum 2), the background-mode switch
-//! (0052) and the concurrency caps (0017). Anything that describes work in flight
+//! (0052), the concurrency caps (0017) and the worker-worktree switch (0088). Anything that describes work in flight
 //! belongs on the graph, not here.
 
 use std::io::Write as _;
@@ -363,6 +363,19 @@ pub struct Settings {
     pub check_for_updates: bool,
     /// Offer a prerelease as an update too, not only a full release. Off by default.
     pub allow_prerelease_updates: bool,
+    /// Delete a worker's worktree, with the build output in it, once its attempt is
+    /// merged or discarded and nothing needs it (decision 0088). **On by default**: a
+    /// Rust `target/` folder can be several gigabytes for each worktree. Off keeps
+    /// every worktree and its builds for the user to inspect or reuse. A worktree a
+    /// live worker, a stopped run or a pending merge needs is kept either way.
+    pub delete_worker_worktrees: bool,
+}
+
+impl Settings {
+    /// The switch as the host takes it.
+    pub fn worktree_retention(&self) -> kgraf_host::WorktreeRetention {
+        kgraf_host::WorktreeRetention::from_delete(self.delete_worker_worktrees)
+    }
 }
 
 impl Default for Settings {
@@ -382,6 +395,7 @@ impl Default for Settings {
             active_project: None,
             check_for_updates: false,
             allow_prerelease_updates: false,
+            delete_worker_worktrees: true,
         }
     }
 }
@@ -432,6 +446,8 @@ struct SettingsFile {
     /// same default a fresh install gets.
     check_for_updates: Option<bool>,
     allow_prerelease_updates: Option<bool>,
+    /// Absent (an older settings file) means on, the default (decision 0088).
+    delete_worker_worktrees: Option<bool>,
 }
 
 impl Settings {
@@ -518,6 +534,9 @@ impl Settings {
         if let Some(b) = file.allow_prerelease_updates {
             settings.allow_prerelease_updates = b;
         }
+        if let Some(b) = file.delete_worker_worktrees {
+            settings.delete_worker_worktrees = b;
+        }
         Ok(settings)
     }
 
@@ -543,6 +562,7 @@ impl Settings {
             active_project: self.active_project.clone(),
             check_for_updates: Some(self.check_for_updates),
             allow_prerelease_updates: Some(self.allow_prerelease_updates),
+            delete_worker_worktrees: Some(self.delete_worker_worktrees),
         };
         toml::to_string(&file).map_err(|e| ShellError::Config(e.to_string()))
     }
@@ -964,6 +984,33 @@ mod tests {
         let loaded = Settings::load(&path).expect("load");
         assert!(loaded.check_for_updates);
         assert!(loaded.allow_prerelease_updates);
+    }
+
+    /// Decision 0088: on by default (a fresh file, and an older one written
+    /// before the key existed), and a chosen value round-trips as the host's
+    /// policy.
+    #[test]
+    fn worker_worktree_deletion_defaults_on_and_round_trips_as_the_hosts_policy() {
+        use kgraf_host::WorktreeRetention;
+        let fresh = Settings::from_toml_str("").expect("valid");
+        assert!(fresh.delete_worker_worktrees);
+        assert_eq!(fresh.worktree_retention(), WorktreeRetention::Delete);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.toml");
+        let keep = Settings {
+            delete_worker_worktrees: false,
+            ..Settings::default()
+        };
+        keep.save(&path).expect("save");
+        let loaded = Settings::load(&path).expect("load");
+        assert!(!loaded.delete_worker_worktrees);
+        assert_eq!(loaded.worktree_retention(), WorktreeRetention::Keep);
+        assert!(
+            std::fs::read_to_string(&path)
+                .expect("read")
+                .contains("delete_worker_worktrees = false")
+        );
     }
 
     #[test]

@@ -53,8 +53,8 @@
 //!   any settled row with **no** chain event as forged, nothing re-backfills a
 //!   hand-inserted row into looking legitimate on a later reopen
 //!   (`atk_inserted_row_laundered_by_backfill`).
-//! - Trace writes ([`CallToken::record_first_token`],
-//!   [`CallToken::record_tool_round`]) are refused once a row is no longer
+//! - Trace writes ([`CallToken::record_first_token_async`],
+//!   [`CallToken::record_tool_round_async`]) are refused once a row is no longer
 //!   `in_flight`, so a call cannot be mutated after the event that chained it
 //!   (`atk_trace_after_settle`).
 //! - Finally, a plain hash chain cannot detect its own tail being cut off:
@@ -110,7 +110,7 @@
 //! connections. [`Ledger`]'s doc comment states what that preserves; the chain,
 //! redaction, the anchor, back-fill gating and `verify` above are unchanged by it.
 
-use kgraf_core::cost::{Money, PriceTable};
+use kgraf_core::cost::{ExactMoney, Money, PriceTable};
 use kgraf_core::{CallId, Protocol, TokenUsage};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::BTreeMap;
@@ -133,6 +133,17 @@ pub enum LedgerError {
     /// Cost could not be derived.
     #[error("cannot derive cost")]
     Cost(#[from] kgraf_core::cost::CostError),
+
+    /// A settlement or reconciliation named a call whose state does not allow it:
+    /// a settle needs an `in_flight` row, a reconcile an `unreconciled` or
+    /// `in_flight` one. Refused so a resolve cannot overwrite a counted row and a
+    /// late settle cannot overwrite a reconciled figure.
+    #[error("call `{call}` is `{state}`; {wanted}")]
+    WrongState {
+        call: String,
+        state: String,
+        wanted: &'static str,
+    },
 
     /// A call named for redaction does not exist, is not settled yet, or has no
     /// chain event yet to preserve.
@@ -273,11 +284,11 @@ pub struct CallRecord {
     pub trace: CallTrace,
     /// Set once the row's payload has been redacted.
     pub redacted: bool,
-    /// The catalog route id this call was made on (decision 0067), written by [`crate::ratelimit::RateLimited`] once it
+    /// The catalog route id this call was made on (decision 0067), written by [`crate::ratelimit::RateLimited`] (a
+    /// limited route) or [`crate::ratelimit::RouteRecorded`] (any other) once it
     /// knows it, distinct from `adapter` (the wire adapter constant, which
     /// several different routes can share). `None` for a call made without
-    /// going through a `RateLimited` wrapper (most test fixtures, and a call
-    /// on a route with no configured rate limit at all).
+    /// going through either wrapper (most test fixtures).
     pub route: Option<String>,
 }
 
@@ -297,10 +308,10 @@ pub struct CallTrace {
     /// The role this call played (free text, same reasoning as `kind`).
     pub role: Option<String>,
     /// Milliseconds from `started_ms` to the first output token, set by
-    /// [`CallToken::record_first_token`] once streaming begins.
+    /// [`CallToken::record_first_token_async`] once streaming begins.
     pub ttft_ms: Option<i64>,
     /// The ordered tool list of each round, appended one round at a time by
-    /// [`CallToken::record_tool_round`].
+    /// [`CallToken::record_tool_round_async`].
     pub tool_rounds: Vec<Vec<String>>,
     /// The graph slice ids the call was given as context.
     pub given_slice_ids: Vec<String>,
@@ -347,7 +358,7 @@ pub struct McpCallRecord {
     pub call: McpCall,
 }
 
-/// What [`Ledger::usage_by`] and [`Ledger::spend_by`] group on.
+/// What [`Ledger::spend_by`] groups on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GroupBy {
     /// The agent the spend is attributed to.
@@ -369,15 +380,6 @@ pub enum GroupKey {
     HourStartMs(i64),
 }
 
-/// Counted and cancelled usage of one group on one model.
-#[derive(Clone, Debug, PartialEq)]
-pub struct UsageGroup {
-    pub key: GroupKey,
-    pub model: String,
-    pub calls: u64,
-    pub usage: TokenUsage,
-}
-
 /// The spend of one group, across models.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SpendGroup {
@@ -388,18 +390,6 @@ pub struct SpendGroup {
     /// Models in this group the price table cannot price; their spend is not in
     /// `cost`, and is not zero.
     pub unpriced: Vec<String>,
-}
-
-/// Unaccounted calls on one model.
-#[derive(Clone, Debug, PartialEq)]
-pub struct UnreconciledGroup {
-    pub model: String,
-    /// Unreconciled plus in-flight calls.
-    pub calls: u64,
-    /// Of `calls`, how many are still in flight.
-    pub in_flight: u64,
-    /// The usage those rows carry: a floor, never the spend.
-    pub lower_bound: TokenUsage,
 }
 
 /// One task's usage history on one model, for sizing.
@@ -465,11 +455,6 @@ impl<'ledger> CallToken<'ledger> {
     /// streaming loop must not fail because a metric arrived late, but it must
     /// not lose the fact either, so it counts and reports the refusal rather
     /// than this method swallowing it.
-    pub fn record_first_token(&self, ttft_ms: i64) -> Result<(), LedgerError> {
-        self.record_first_token_async(ttft_ms).wait()
-    }
-
-    /// [`Self::record_first_token`], submitted now and acknowledged later.
     ///
     /// Operations from one token reach the writer in submission order, so a
     /// time to first token submitted before the settlement is applied before it,
@@ -487,20 +472,16 @@ impl<'ledger> CallToken<'ledger> {
     /// Record the catalog route id this call was made on (decision 0067), so [`Ledger::route_round_stats`] can group by the
     /// route a user actually configured rather than by the wire adapter
     /// several routes can share. Never called by a bare `Ledger::begin`
-    /// caller directly: [`crate::ratelimit::RateLimited`] (every production
-    /// route) calls this once it knows its own route, right after minting
-    /// the token; a call made without going through a `RateLimited` wrapper
+    /// caller directly: [`crate::ratelimit::RateLimited`] (a limited route) and
+    /// [`crate::ratelimit::RouteRecorded`] (an unlimited one) call this once
+    /// they know their own route, right after the token is minted; a call made
+    /// without going through either wrapper
     /// (most test fixtures) simply leaves this `NULL`, which
     /// `route_round_stats` and `kgraf-capacity` both already treat as
     /// "unmeasured" rather than as an error. Unlike
-    /// [`Self::record_first_token`], setting the same route again is not
+    /// [`Self::record_first_token_async`], setting the same route again is not
     /// refused (a rebuilt provider for one route re-binds its
     /// `RouteLimiter` and records the same route on every call it wraps).
-    pub fn record_route(&self, route: &str) -> Result<(), LedgerError> {
-        self.record_route_async(route).wait()
-    }
-
-    /// [`Self::record_route`], submitted now and acknowledged later.
     pub fn record_route_async(&self, route: &str) -> LedgerAck<()> {
         self.ledger.submit(
             Op::Route {
@@ -514,12 +495,7 @@ impl<'ledger> CallToken<'ledger> {
     /// Append one round's ordered tool list. Called once per round, in order, so
     /// the stored `tool_rounds` array is the round sequence itself, not a set.
     /// Refused once the row has settled, for the same reason as
-    /// [`Self::record_first_token`], whose note on the result applies here too.
-    pub fn record_tool_round(&self, tools: &[String]) -> Result<(), LedgerError> {
-        self.record_tool_round_async(tools).wait()
-    }
-
-    /// [`Self::record_tool_round`], submitted now and acknowledged later.
+    /// [`Self::record_first_token_async`], whose note on the result applies here too.
     pub fn record_tool_round_async(&self, tools: &[String]) -> LedgerAck<()> {
         self.ledger.submit(
             Op::ToolRound {
@@ -1582,7 +1558,7 @@ impl Ledger {
     ///
     /// `ttft_ms` and `tool_rounds` are not arguments here because neither is known
     /// until after the call is issued; set them with
-    /// [`CallToken::record_first_token`] and [`CallToken::record_tool_round`]
+    /// [`CallToken::record_first_token_async`] and [`CallToken::record_tool_round_async`]
     /// before the token settles.
     pub fn begin_traced(
         &self,
@@ -1710,6 +1686,19 @@ impl Ledger {
         self.submit(Op::Mcp { call: call.clone() }, Done::mcp)
     }
 
+    /// Whether a call is still marked `in_flight`. [`CallRecord`] reads such a row
+    /// as unreconciled, so this is the one way to tell a call that may be live
+    /// from one that ended without usage.
+    pub fn is_in_flight(&self, id: &CallId) -> Result<bool, LedgerError> {
+        self.read(|conn| {
+            Ok(conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM calls WHERE id = ?1 AND settlement = 'in_flight')",
+                params![id.as_str()],
+                |row| row.get(0),
+            )?)
+        })
+    }
+
     /// One call by id.
     pub fn call(&self, id: &CallId) -> Result<Option<CallRecord>, LedgerError> {
         self.read(|conn| {
@@ -1726,7 +1715,7 @@ impl Ledger {
     /// Every call, oldest first.
     ///
     /// A full scan. For a total or a per-group figure use the SQL aggregates
-    /// ([`Self::usage_by`], [`Self::spend_by`], [`Self::usage_by_task`],
+    /// ([`Self::spend_by`], [`Self::usage_by_task`],
     /// [`Self::spend_of`]) instead of folding this in Rust.
     pub fn calls(&self) -> Result<Vec<CallRecord>, LedgerError> {
         self.read(|conn| {
@@ -1749,9 +1738,10 @@ impl Ledger {
     /// mixed unrelated routes' round times together and, in practice, never
     /// matched any real route id at all (`route_capacity_inputs` was calling
     /// this with the route id, which the `adapter` column never contains).
-    /// `route` is written by [`crate::ratelimit::RateLimited`] once it knows
-    /// its own route, separately from `begin`; a call made without going
-    /// through a `RateLimited` wrapper leaves it `NULL` and is correctly
+    /// `route` is written by [`crate::ratelimit::RateLimited`] or
+    /// [`crate::ratelimit::RouteRecorded`] once it knows its own route,
+    /// separately from `begin`; a call made without going
+    /// through either wrapper leaves it `NULL` and is correctly
     /// excluded here, the same as a route with too few rounds.
     ///
     /// **Approximation, stated plainly.** The design describes `T_r` as "the
@@ -1765,7 +1755,13 @@ impl Ledger {
     /// consecutive `started_ms` values within each agent's own calls on this
     /// route, then the median of those per-agent medians across agents.
     /// Only settled, counted calls are read: a refused, failed or open call
-    /// carries no usage and would drag both medians toward zero.
+    /// carries no usage and would drag both medians toward zero. A
+    /// non-generative call (an embedding, rerank or decision request, told by
+    /// its `call_kind`: `kgraf_core::is_non_generative_call_kind`) is left out
+    /// too: it shares the route's limiter, and so its `route`, but it is not a
+    /// round, and its short time and small token count would make the route
+    /// look faster and cheaper per round than its workers are, which would let
+    /// capacity admit more of them than the route can serve.
     /// `tok_r` is the median of `usage.uncached_input + usage.cache_read +
     /// usage.cache_write + usage.total_output()` across every counted call on
     /// the route. Both are
@@ -1779,6 +1775,15 @@ impl Ledger {
             let rows = stmt.query_map(rusqlite::params![route], record_from_row)?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
         })?;
+        let calls: Vec<CallRecord> = calls
+            .into_iter()
+            .filter(|c| {
+                !c.trace
+                    .kind
+                    .as_deref()
+                    .is_some_and(kgraf_core::is_non_generative_call_kind)
+            })
+            .collect();
         let rounds = calls.len();
         if rounds < ROUTE_STATS_MIN_ROUNDS {
             return Ok(RouteRoundStats {
@@ -1886,30 +1891,6 @@ impl Ledger {
         })
     }
 
-    /// Unaccounted calls summed per model, in SQL: how many, how many are still
-    /// in flight, and the usage they carry, which is a **lower bound** (a partial
-    /// figure from a broken stream, or zero), never a spend figure.
-    pub fn unreconciled_by_model(&self) -> Result<Vec<UnreconciledGroup>, LedgerError> {
-        self.read(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT model, COUNT(*), SUM(settlement = 'in_flight'),
-                        SUM(uncached_input), SUM(cache_read), SUM(cache_write),
-                        SUM(text_output), SUM(reasoning_output)
-                 FROM calls WHERE settlement IN ('unreconciled', 'in_flight')
-                 GROUP BY model ORDER BY model",
-            )?;
-            let rows = stmt.query_map([], |row| {
-                Ok(UnreconciledGroup {
-                    model: row.get(0)?,
-                    calls: row.get::<_, i64>(1)? as u64,
-                    in_flight: row.get::<_, i64>(2)? as u64,
-                    lower_bound: usage_from_sums(row, 3)?,
-                })
-            })?;
-            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-        })
-    }
-
     /// Total usage across counted and cancelled calls, per model.
     ///
     /// Unreconciled calls are deliberately excluded from the total and reported
@@ -1931,57 +1912,42 @@ impl Ledger {
         })
     }
 
-    /// Counted and cancelled usage grouped by `key` and model, summed in SQL.
-    /// Unreconciled calls are excluded, as in [`Self::usage_by_model`].
-    pub fn usage_by(&self, key: GroupBy) -> Result<Vec<UsageGroup>, LedgerError> {
-        let key_sql = group_key_sql(key);
-        self.read(|conn| {
-            let mut stmt = conn.prepare(&format!(
-                "SELECT {key_sql} AS k, model, COUNT(*),
-                        SUM(uncached_input), SUM(cache_read), SUM(cache_write),
-                        SUM(text_output), SUM(reasoning_output)
-                 FROM calls WHERE settlement IN ('counted', 'cancelled')
-                 GROUP BY k, model ORDER BY k, model"
-            ))?;
-            let rows = stmt.query_map([], |row| {
-                let key = match key {
-                    GroupBy::Hour => GroupKey::HourStartMs(row.get(0)?),
-                    GroupBy::Agent | GroupBy::Run => GroupKey::Name(row.get(0)?),
-                };
-                Ok(UsageGroup {
-                    key,
-                    model: row.get(1)?,
-                    calls: row.get::<_, i64>(2)? as u64,
-                    usage: usage_from_sums(row, 3)?,
-                })
-            })?;
-            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-        })
-    }
-
     /// Spend grouped by `key`, priced **per call** and summed (see
     /// [`Self::for_each_counted`] for why). A model the table cannot price is
     /// named in the group's `unpriced`, never costed at zero.
+    ///
+    /// **The groups need not sum to [`Self::total_cost`].** Each group's exact
+    /// sum is rounded on its own, so a group that spent anything is never
+    /// shown as $0. Rounding per group instead of once can put the groups'
+    /// sum above the total by less than one micro-dollar per group, never
+    /// below it by more than half a micro-dollar per group. A caller that needs
+    /// shares summing to a total apportions the exact amounts instead
+    /// (`kgraf_core::cost::ExactMoney::apportion`).
     pub fn spend_by(
         &self,
         key: GroupBy,
         prices: &PriceTable,
     ) -> Result<Vec<SpendGroup>, LedgerError> {
-        let mut groups: BTreeMap<GroupKey, SpendGroup> = BTreeMap::new();
-        self.for_each_counted(group_key_sql(key), None, |k, model, usage| {
+        let mut groups: BTreeMap<GroupKey, (SpendGroup, ExactMoney)> = BTreeMap::new();
+        self.for_each_counted(group_key_sql(key), None, |k, model, route, usage| {
             let key = match key {
                 GroupBy::Hour => GroupKey::HourStartMs(k.as_i64()?),
                 GroupBy::Agent | GroupBy::Run => GroupKey::Name(k.as_str()?.to_owned()),
             };
-            let group = groups.entry(key.clone()).or_insert_with(|| SpendGroup {
-                key,
-                cost: Money::ZERO,
-                calls: 0,
-                unpriced: Vec::new(),
+            let (group, exact) = groups.entry(key.clone()).or_insert_with(|| {
+                (
+                    SpendGroup {
+                        key,
+                        cost: Money::ZERO,
+                        calls: 0,
+                        unpriced: Vec::new(),
+                    },
+                    ExactMoney::ZERO,
+                )
             });
             group.calls += 1;
-            match prices.cost(model, usage) {
-                Ok(cost) => group.cost += cost,
+            match prices.cost_exact_on(route, model, usage) {
+                Ok(cost) => *exact += cost,
                 Err(_) => {
                     if !group.unpriced.iter().any(|m| m == model) {
                         group.unpriced.push(model.to_owned());
@@ -1990,20 +1956,29 @@ impl Ledger {
             }
             Ok(())
         })?;
-        Ok(groups.into_values().collect())
+        Ok(groups
+            .into_values()
+            .map(|(mut group, exact)| {
+                group.cost = exact.to_money();
+                group
+            })
+            .collect())
     }
 
     /// Visit every counted or cancelled call (optionally only one agent's), with
     /// the value of `key_sql` for its row, its model and its usage.
     ///
-    /// **The one rounding rule for spend.** [`PriceTable::cost`] rounds each
-    /// usage field to the nearest micro-dollar, so pricing a sum of calls and
-    /// summing per-call prices can differ by a few micro-dollars. Spend is
-    /// priced per call and summed everywhere ([`Self::spend_of`],
-    /// [`Self::total_cost`], [`Self::cost_for_agent`], [`Self::spend_by`]),
-    /// matching the ledger's one row per call, so every total agrees with the
-    /// sum of its calls. The rows are streamed from a read connection, never
-    /// under the write lock.
+    /// **The one rounding rule for spend.** Every total ([`Self::spend_of`],
+    /// [`Self::total_cost`], [`Self::cost_for_agent`], [`Self::spend_by`])
+    /// prices each call exactly in pico-dollars
+    /// ([`PriceTable::cost_exact_on`]), sums those, and rounds once
+    /// ([`ExactMoney::to_money`]). Each call is still priced at its own size
+    /// (a tier applies per call). A total therefore never loses the calls too
+    /// small to show one micro-dollar each: a thousand ten-token embedding
+    /// calls total their real cost, not zero. A single call shown alone rounds
+    /// up to one micro-dollar rather than to $0, so a list of such calls can
+    /// sum to more than its total by under one micro-dollar per call. The
+    /// rows are streamed from a read connection, never under the write lock.
     fn for_each_counted(
         &self,
         key_sql: &str,
@@ -2011,12 +1986,13 @@ impl Ledger {
         mut visit: impl FnMut(
             rusqlite::types::ValueRef<'_>,
             &str,
+            Option<&str>,
             &TokenUsage,
         ) -> Result<(), rusqlite::types::FromSqlError>,
     ) -> Result<(), LedgerError> {
         self.read(|conn| {
             let mut stmt = conn.prepare(&format!(
-                "SELECT {key_sql}, model,
+                "SELECT {key_sql}, model, route,
                         uncached_input, cache_read, cache_write, text_output, reasoning_output
                  FROM calls
                  WHERE settlement IN ('counted', 'cancelled') AND (?1 IS NULL OR agent_id = ?1)"
@@ -2024,8 +2000,9 @@ impl Ledger {
             let mut rows = stmt.query(params![agent])?;
             while let Some(row) = rows.next()? {
                 let model: String = row.get(1)?;
-                let usage = usage_from_sums(row, 2)?;
-                visit(row.get_ref(0)?, &model, &usage).map_err(|e| {
+                let route: Option<String> = row.get(2)?;
+                let usage = usage_from_sums(row, 3)?;
+                visit(row.get_ref(0)?, &model, route.as_deref(), &usage).map_err(|e| {
                     rusqlite::Error::FromSqlConversionFailure(
                         0,
                         rusqlite::types::Type::Null,
@@ -2087,16 +2064,22 @@ impl Ledger {
     pub fn spend_of(&self, ids: &[CallId], prices: &PriceTable) -> Result<SpendOf, LedgerError> {
         let wanted = serde_json::to_string(&ids.iter().map(CallId::as_str).collect::<Vec<_>>())
             .map_err(|_| LedgerError::Internal("cannot encode the call ids"))?;
-        let rows: BTreeMap<String, (String, String, TokenUsage)> = self.read(|conn| {
+        type Row = (String, String, Option<String>, TokenUsage);
+        let rows: BTreeMap<String, Row> = self.read(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, settlement, model,
+                "SELECT id, settlement, model, route,
                         uncached_input, cache_read, cache_write, text_output, reasoning_output
                  FROM calls WHERE id IN (SELECT value FROM json_each(?1))",
             )?;
             let rows = stmt.query_map(params![wanted], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
-                    (row.get(1)?, row.get(2)?, usage_from_sums(row, 3)?),
+                    (
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        usage_from_sums(row, 4)?,
+                    ),
                 ))
             })?;
             Ok(rows.collect::<rusqlite::Result<BTreeMap<_, _>>>()?)
@@ -2105,20 +2088,22 @@ impl Ledger {
             total: Money::ZERO,
             unknown: Vec::new(),
         };
+        let mut exact = ExactMoney::ZERO;
         for id in ids {
             match rows.get(id.as_str()) {
-                Some((settlement, model, usage))
+                Some((settlement, model, route, usage))
                     if settlement == "counted" || settlement == "cancelled" =>
                 {
-                    match prices.cost(model, usage) {
-                        Ok(cost) => out.total += cost,
+                    match prices.cost_exact_on(route.as_deref(), model, usage) {
+                        Ok(cost) => exact += cost,
                         Err(_) => out.unknown.push(id.clone()),
                     }
                 }
-                Some((settlement, _, _)) if settlement == "failed" => {}
+                Some((settlement, _, _, _)) if settlement == "failed" => {}
                 _ => out.unknown.push(id.clone()),
             }
         }
+        out.total = exact.to_money();
         Ok(out)
     }
 
@@ -2128,10 +2113,10 @@ impl Ledger {
     /// Returns the total and the models that could not be costed (sorted),
     /// rather than costing an unknown model at zero.
     pub fn total_cost(&self, prices: &PriceTable) -> Result<(Money, Vec<String>), LedgerError> {
-        let mut total = Money::ZERO;
+        let mut total = ExactMoney::ZERO;
         let mut unpriced = std::collections::BTreeSet::new();
-        self.for_each_counted("NULL", None, |_, model, usage| {
-            match prices.cost(model, usage) {
+        self.for_each_counted("NULL", None, |_, model, route, usage| {
+            match prices.cost_exact_on(route, model, usage) {
                 Ok(cost) => total += cost,
                 Err(_) => {
                     unpriced.insert(model.to_owned());
@@ -2139,7 +2124,7 @@ impl Ledger {
             }
             Ok(())
         })?;
-        Ok((total, unpriced.into_iter().collect()))
+        Ok((total.to_money(), unpriced.into_iter().collect()))
     }
 
     /// Spend attributed to one agent, priced per call (see
@@ -2149,11 +2134,11 @@ impl Ledger {
         agent_id: &str,
         prices: &PriceTable,
     ) -> Result<Money, LedgerError> {
-        let mut total = Money::ZERO;
+        let mut total = ExactMoney::ZERO;
         let mut failed: Option<kgraf_core::cost::CostError> = None;
-        self.for_each_counted("NULL", Some(agent_id), |_, model, usage| {
+        self.for_each_counted("NULL", Some(agent_id), |_, model, route, usage| {
             if failed.is_none() {
-                match prices.cost(model, usage) {
+                match prices.cost_exact_on(route, model, usage) {
                     Ok(cost) => total += cost,
                     Err(e) => failed = Some(e),
                 }
@@ -2162,7 +2147,7 @@ impl Ledger {
         })?;
         match failed {
             Some(e) => Err(e.into()),
-            None => Ok(total),
+            None => Ok(total.to_money()),
         }
     }
 
@@ -2519,13 +2504,26 @@ fn apply_op(conn: &Connection, tip: &mut Tip, op: &Op) -> Result<Done, LedgerErr
             usage,
             request_id,
         } => {
-            let fields =
-                apply_settlement(conn, id, *settlement, usage.as_ref(), request_id.as_deref())?;
+            let fields = apply_settlement(
+                conn,
+                id,
+                *settlement,
+                SettleFrom::InFlight,
+                usage.as_ref(),
+                request_id.as_deref(),
+            )?;
             append_chain(conn, tip, "settle", id, &content_digest(&fields), None)?;
             Ok(Done::Unit)
         }
         Op::Reconcile { id, usage } => {
-            let fields = apply_settlement(conn, id, Settlement::Counted, Some(usage), None)?;
+            let fields = apply_settlement(
+                conn,
+                id,
+                Settlement::Counted,
+                SettleFrom::Open,
+                Some(usage),
+                None,
+            )?;
             append_chain(conn, tip, "reconcile", id, &content_digest(&fields), None)?;
             Ok(Done::Unit)
         }
@@ -2637,7 +2635,7 @@ fn apply_begin(
 
 /// Set the time to first token for a call that has not settled yet. Refused
 /// (rather than silently ignored) once the row is no longer `in_flight`: see
-/// [`CallToken::record_first_token`] for why the caller still treats that
+/// [`CallToken::record_first_token_async`] for why the caller still treats that
 /// refusal as best-effort.
 fn apply_ttft(conn: &Connection, id: &CallId, ttft_ms: i64) -> Result<(), LedgerError> {
     let changed = conn
@@ -2724,10 +2722,22 @@ fn apply_tool_round(conn: &Connection, id: &CallId, tools: &[String]) -> Result<
 /// Apply a settlement's field values to `calls` and return the row's new raw
 /// fields. The identity and trace fields are unchanged by a settlement and not
 /// in hand here, so the row is read back once (the accepted remainder).
+/// The states a settlement write may start from. The UPDATE carries the
+/// predicate, so a resolve racing a live settle cannot overwrite it.
+#[derive(Clone, Copy)]
+enum SettleFrom {
+    /// A live call settling: only an `in_flight` row.
+    InFlight,
+    /// A reconcile: an `unreconciled` row, or an `in_flight` one the caller has
+    /// decided is abandoned.
+    Open,
+}
+
 fn apply_settlement(
     conn: &Connection,
     id: &CallId,
     settlement: Settlement,
+    from: SettleFrom,
     usage: Option<&TokenUsage>,
     request_id: Option<&str>,
 ) -> Result<RawFields, LedgerError> {
@@ -2737,28 +2747,51 @@ fn apply_settlement(
     let raw_hash = hash_raw_usage(raw_usage.as_deref());
     let finished_ms = now_ms();
 
-    conn.prepare_cached(
-        "UPDATE calls SET settlement = ?2,
+    let changed = conn
+        .prepare_cached(
+            "UPDATE calls SET settlement = ?2,
                           uncached_input = ?3, cache_read = ?4, cache_write = ?5,
                           text_output = ?6, reasoning_output = ?7,
                           raw_usage = ?8, raw_hash = ?9,
                           request_id = COALESCE(?10, request_id),
                           finished_ms = ?11
-         WHERE id = ?1",
-    )?
-    .execute(params![
-        id.as_str(),
-        settlement.as_str(),
-        usage.uncached_input as i64,
-        usage.cache_read as i64,
-        usage.cache_write as i64,
-        usage.text_output as i64,
-        usage.reasoning_output as i64,
-        raw_usage,
-        raw_hash,
-        request_id,
-        finished_ms,
-    ])?;
+         WHERE id = ?1 AND settlement IN (?12, ?13)",
+        )?
+        .execute(params![
+            id.as_str(),
+            settlement.as_str(),
+            usage.uncached_input as i64,
+            usage.cache_read as i64,
+            usage.cache_write as i64,
+            usage.text_output as i64,
+            usage.reasoning_output as i64,
+            raw_usage,
+            raw_hash,
+            request_id,
+            finished_ms,
+            "in_flight",
+            match from {
+                SettleFrom::InFlight => "in_flight",
+                SettleFrom::Open => "unreconciled",
+            },
+        ])?;
+    if changed == 0 {
+        let state = raw_row(conn, id)?.map(|r| r.settlement);
+        return Err(match state {
+            None => LedgerError::NotRedactable {
+                call: id.to_string(),
+                reason: "no such call",
+            },
+            Some(state) => LedgerError::WrongState {
+                call: id.to_string(),
+                state,
+                wanted: match from {
+                    SettleFrom::InFlight => "only an in-flight call can be settled",
+                    SettleFrom::Open => "only an open call can be reconciled",
+                },
+            },
+        });
+    }
 
     // The request id may have been `COALESCE`d against the prior value; the
     // read-back reflects that.
@@ -3815,6 +3848,7 @@ fn sqlite_io_error(err: std::io::Error) -> LedgerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kgraf_core::ModelKind;
     use kgraf_core::cost::ModelPrice;
     use serde_json::json;
 
@@ -4056,6 +4090,54 @@ mod tests {
         );
     }
 
+    /// A reconcile only closes an open row, and a settle only an in-flight one.
+    /// The UPDATE carries the predicate, so neither overwrites a settled figure.
+    #[test]
+    fn settlement_writes_are_refused_from_the_wrong_state() {
+        let ledger = Ledger::open_in_memory().expect("ledger");
+
+        // Reconcile of a counted row fails and leaves the counted figures.
+        let counted = ledger
+            .begin("test", Protocol::Additive, "m", "a", "t")
+            .expect("begin");
+        counted.settle(&usage(), None).expect("settle");
+        let counted_id = counted.id().clone();
+        let err = ledger
+            .reconcile(&counted_id, &TokenUsage::default())
+            .expect_err("counted is not open");
+        assert!(matches!(err, LedgerError::WrongState { .. }), "{err:?}");
+        assert_eq!(
+            ledger
+                .call(&counted_id)
+                .expect("read")
+                .expect("row")
+                .usage
+                .cache_read,
+            900
+        );
+
+        // A settle that arrives after a reconcile fails, and the reconciled
+        // figures stay. The token is dropped without settling, so the row is
+        // in flight until the reconcile.
+        let live = ledger
+            .begin("test", Protocol::Additive, "m", "a", "t")
+            .expect("begin");
+        let live_id = live.id().clone();
+        assert!(ledger.is_in_flight(&live_id).expect("state"));
+        ledger
+            .reconcile(&live_id, &usage())
+            .expect("reconcile in flight");
+        assert!(!ledger.is_in_flight(&live_id).expect("state"));
+        let late = live
+            .settle(&TokenUsage::default(), None)
+            .expect_err("late settle must fail");
+        assert!(matches!(late, LedgerError::WrongState { .. }), "{late:?}");
+        let row = ledger.call(&live_id).expect("read").expect("row");
+        assert_eq!(row.usage.cache_read, 900);
+        assert_eq!(row.settlement, Settlement::Counted);
+        assert!(ledger.verify().expect("verify").ok);
+    }
+
     #[test]
     fn settling_twice_is_refused() {
         let ledger = Ledger::open_in_memory().expect("ledger");
@@ -4065,6 +4147,47 @@ mod tests {
         token.settle(&usage(), None).expect("first");
         let err = token.settle(&usage(), None).expect_err("second must fail");
         assert!(matches!(err, LedgerError::AlreadySettled { .. }));
+    }
+
+    /// The same model id on two routes is costed by each call's own route.
+    #[test]
+    fn a_route_specific_price_applies_to_calls_made_on_that_route() {
+        let ledger = Ledger::open_in_memory().expect("ledger");
+        for route in ["metered", "subscription"] {
+            let token = ledger
+                .begin("test", Protocol::Additive, "m", "a", "t")
+                .expect("begin");
+            token.record_route_async(route).wait().expect("route");
+            token.settle(&usage(), None).expect("settle");
+        }
+        let base = ModelPrice {
+            uncached_input: 3_000_000,
+            cache_read: 300_000,
+            cache_write: 3_750_000,
+            output: 15_000_000,
+            reasoning: 15_000_000,
+        };
+        let mut prices = PriceTable::new();
+        prices.set("m", base);
+        let (both, _) = ledger.total_cost(&prices).expect("cost");
+        prices.set(
+            PriceTable::route_key("m", "subscription"),
+            ModelPrice {
+                uncached_input: 0,
+                cache_read: 0,
+                cache_write: 0,
+                output: 0,
+                reasoning: 0,
+            },
+        );
+        let (one, unpriced) = ledger.total_cost(&prices).expect("cost");
+        assert!(unpriced.is_empty());
+        // Totals are summed exactly and rounded once.
+        let exact = prices
+            .cost_exact_on(Some("metered"), "m", &usage())
+            .expect("x");
+        assert_eq!(one, exact.to_money());
+        assert_eq!(both, (exact + exact).to_money());
     }
 
     #[test]
@@ -4687,11 +4810,11 @@ mod tests {
             .expect("begin");
         token.settle(&usage(), None).expect("settle");
         assert!(matches!(
-            token.record_tool_round(&["late".to_owned()]),
+            token.record_tool_round_async(&["late".to_owned()]).wait(),
             Err(LedgerError::NotInFlight { .. })
         ));
         assert!(matches!(
-            token.record_first_token(5),
+            token.record_first_token_async(5).wait(),
             Err(LedgerError::NotInFlight { .. })
         ));
         let report = ledger.verify().expect("verify");
@@ -4722,7 +4845,8 @@ mod tests {
             ),
         );
         let err = token
-            .record_tool_round(&["x".to_owned()])
+            .record_tool_round_async(&["x".to_owned()])
+            .wait()
             .expect_err("corrupt tool_rounds must be refused, not defaulted to empty");
         assert!(matches!(err, LedgerError::CorruptTrace { .. }));
         let still_corrupt: String = ledger
@@ -4927,8 +5051,8 @@ mod tests {
     fn every_spend_total_prices_per_call_and_agrees_with_spend_of() {
         let ledger = Ledger::open_in_memory().expect("ledger");
         let mut prices = price_m();
-        // 0.333333 micro-dollars per token: one token per call rounds to zero
-        // per call, while ten tokens priced as a sum round to three.
+        // 0.333333 micro-dollars per token: one token per call is under half a
+        // micro-dollar, which a total must neither drop nor round up per call.
         prices.set(
             "tiny",
             ModelPrice {
@@ -4985,11 +5109,21 @@ mod tests {
                 .fold(Money::ZERO, |a, g| a + g.cost);
             assert_eq!(sum, per_call.total, "{key:?}");
         }
-        // The tiny calls cost zero each; priced as a sum they would not.
+        // The five tiny calls total their exact 1.67 micro-dollars, rounded
+        // once to 2: not 0 (each dropped) and not 5 (each shown alone, where
+        // a priced call reads as one micro-dollar rather than $0).
         let tiny: Vec<CallId> = ids.iter().step_by(2).cloned().collect();
         assert_eq!(
             ledger.spend_of(&tiny, &prices).expect("tiny").total,
-            Money::ZERO
+            Money::from_micros(2)
+        );
+        let one_tiny = TokenUsage {
+            uncached_input: 1,
+            ..TokenUsage::default()
+        };
+        assert_eq!(
+            prices.cost("tiny", &one_tiny).expect("one"),
+            Money::from_micros(1)
         );
     }
 
@@ -5447,8 +5581,12 @@ mod tests {
             counted.clone(),
         ];
         let spend = ledger.spend_of(&ids, &prices).expect("spend");
-        let one = prices.cost("m", &usage()).expect("price");
-        assert_eq!(spend.total, one + one, "a listed-twice id is counted twice");
+        let one = prices.cost_exact_on(None, "m", &usage()).expect("price");
+        assert_eq!(
+            spend.total,
+            (one + one).to_money(),
+            "a listed-twice id is counted twice"
+        );
         assert_eq!(spend.unknown, vec![open, unpriced, missing]);
         assert_eq!(
             ledger.spend_of(&[], &prices).expect("empty"),
@@ -5457,6 +5595,84 @@ mod tests {
                 unknown: vec![]
             }
         );
+    }
+
+    #[test]
+    fn tiny_priced_calls_total_their_real_cost_not_zero() {
+        let ledger = Ledger::open_in_memory().expect("ledger");
+        let mut prices = PriceTable::new();
+        // $0.02 per million input tokens.
+        prices.set(
+            "e",
+            kgraf_core::ModelPrice {
+                uncached_input: 20_000,
+                cache_read: 0,
+                cache_write: 0,
+                output: 0,
+                reasoning: 0,
+            },
+        );
+        let ten = TokenUsage {
+            uncached_input: 10,
+            ..TokenUsage::default()
+        };
+        let mut ids = Vec::new();
+        for _ in 0..1_000 {
+            let t = ledger
+                .begin("test", Protocol::Inclusive, "e", "w1", "r1/c1")
+                .expect("begin");
+            t.settle(&ten, None).expect("settle");
+            ids.push(t.id().clone());
+        }
+        // 1,000 x 10 tokens x $0.02 per million = $0.0002 = 200 micro-dollars.
+        let expected = Money::from_micros(200);
+        assert_eq!(ledger.total_cost(&prices).expect("total").0, expected);
+        assert_eq!(ledger.spend_of(&ids, &prices).expect("of").total, expected);
+        assert_eq!(
+            ledger.cost_for_agent("w1", &prices).expect("agent"),
+            expected
+        );
+        let groups = ledger.spend_by(GroupBy::Agent, &prices).expect("by");
+        assert_eq!(groups[0].cost, expected);
+        // One such call alone is priced, so it is never shown as $0.
+        assert_eq!(prices.cost("e", &ten).expect("one"), Money::from_micros(1));
+    }
+
+    #[test]
+    fn groups_each_show_their_small_spend_and_exceed_the_total_by_under_a_micro_each() {
+        let ledger = Ledger::open_in_memory().expect("ledger");
+        let mut prices = PriceTable::new();
+        prices.set(
+            "e",
+            ModelPrice {
+                uncached_input: 20_000,
+                cache_read: 0,
+                cache_write: 0,
+                output: 0,
+                reasoning: 0,
+            },
+        );
+        // Ten tokens at $0.02 per million: a fifth of a micro-dollar per call.
+        let ten = TokenUsage {
+            uncached_input: 10,
+            ..TokenUsage::default()
+        };
+        for agent in ["a", "b", "c"] {
+            let t = ledger
+                .begin("test", Protocol::Inclusive, "e", agent, "r/t")
+                .expect("begin");
+            t.settle(&ten, None).expect("settle");
+        }
+        let groups = ledger.spend_by(GroupBy::Agent, &prices).expect("by");
+        assert!(groups.iter().all(|g| g.cost == Money::from_micros(1)));
+        let summed: i64 = groups.iter().map(|g| g.cost.micros()).sum();
+        let total = ledger.total_cost(&prices).expect("total").0.micros();
+        assert_eq!(total, 1, "0.6 micro-dollars rounds once to one");
+        assert!(summed >= total && summed - total < groups.len() as i64);
+        // Apportioned, the same exact amounts sum to the total.
+        let exact = prices.cost_exact_on(None, "e", &ten).expect("price");
+        let shares = ExactMoney::apportion(&[exact, exact, exact]);
+        assert_eq!(shares.iter().map(|m| m.micros()).sum::<i64>(), total);
     }
 
     #[test]
@@ -5486,8 +5702,8 @@ mod tests {
             .begin("test", Protocol::Additive, "m", "w9", "r3")
             .expect("b");
 
-        let one = prices.cost("m", &usage()).expect("price");
-        let times = |n: u64| (0..n).fold(Money::ZERO, |acc, _| acc + one);
+        let one = prices.cost_exact_on(None, "m", &usage()).expect("price");
+        let times = |n: u64| (0..n).fold(ExactMoney::ZERO, |acc, _| acc + one).to_money();
         let by_run = ledger.spend_by(GroupBy::Run, &prices).expect("run");
         assert_eq!(
             by_run
@@ -5517,15 +5733,6 @@ mod tests {
             };
             assert_eq!(ms % 3_600_000, 0);
         }
-
-        let open = ledger.unreconciled_by_model().expect("open");
-        assert_eq!(open.len(), 1);
-        assert_eq!((open[0].calls, open[0].in_flight), (2, 1));
-        assert_eq!(open[0].lower_bound.uncached_input, usage().uncached_input);
-        assert_eq!(
-            open[0].calls as usize,
-            ledger.unreconciled().expect("rows").len()
-        );
 
         let under = ledger
             .calls_under_task("r1", Some("orchestrator:r1"))
@@ -5723,7 +5930,7 @@ mod tests {
             let token = ledger
                 .begin("r", Protocol::Additive, "m", "agent-a", "task")
                 .expect("begin");
-            token.record_route("r").expect("record route");
+            token.record_route_async("r").wait().expect("record route");
             token
                 .settle(
                     &TokenUsage {
@@ -5752,7 +5959,7 @@ mod tests {
             let token = ledger
                 .begin("r", Protocol::Additive, "m", "agent-a", "task")
                 .expect("begin");
-            token.record_route("r").expect("record route");
+            token.record_route_async("r").wait().expect("record route");
             token
                 .settle(
                     &TokenUsage {
@@ -5769,7 +5976,10 @@ mod tests {
         let other = ledger
             .begin("other-route", Protocol::Additive, "m", "agent-a", "task")
             .expect("begin");
-        other.record_route("other-route").expect("record route");
+        other
+            .record_route_async("other-route")
+            .wait()
+            .expect("record route");
         other
             .settle(
                 &TokenUsage {
@@ -5803,7 +6013,7 @@ mod tests {
             let token = ledger
                 .begin("r", Protocol::Additive, "m", "agent-a", "task")
                 .expect("begin");
-            token.record_route("r").expect("record route");
+            token.record_route_async("r").wait().expect("record route");
             token
                 .settle(
                     &TokenUsage {
@@ -5822,18 +6032,69 @@ mod tests {
             let token = ledger
                 .begin("r", Protocol::Additive, "m", "agent-a", "task")
                 .expect("begin");
-            token.record_route("r").expect("record route");
+            token.record_route_async("r").wait().expect("record route");
             token.fail().expect("fail");
         }
         let open = ledger
             .begin("r", Protocol::Additive, "m", "agent-a", "task")
             .expect("begin");
-        open.record_route("r").expect("record route");
+        open.record_route_async("r").wait().expect("record route");
         open.leave_unreconciled(None).expect("leave open");
 
         let stats = ledger.route_round_stats("r").expect("stats");
         assert_eq!(stats.rounds, ROUTE_STATS_MIN_ROUNDS, "counted calls only");
         assert_eq!(stats.tokens_per_round, Some(1_011), "cache write included");
+    }
+
+    /// An embedding, rerank or decision call on a route shares its limiter and
+    /// its `route`, but it is not a round: counted with the route's worker
+    /// rounds, a flood of small fast ones would pull both medians down and
+    /// make capacity admit more workers than the route can serve.
+    #[test]
+    fn route_round_stats_leaves_out_non_generative_calls_on_the_route() {
+        let ledger = Ledger::open_in_memory().expect("ledger");
+        let settle = |kind: &str, input: u64| {
+            let token = ledger
+                .begin_traced(
+                    "r",
+                    Protocol::Inclusive,
+                    "m",
+                    "agent-a",
+                    "task",
+                    CallTrace {
+                        kind: Some(kind.to_owned()),
+                        ..CallTrace::default()
+                    },
+                )
+                .expect("begin");
+            token.record_route_async("r").wait().expect("record route");
+            token
+                .settle(
+                    &TokenUsage {
+                        uncached_input: input,
+                        ..TokenUsage::default()
+                    },
+                    None,
+                )
+                .expect("settle");
+        };
+        for _ in 0..ROUTE_STATS_MIN_ROUNDS {
+            settle("worker_round", 1_000);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        for kind in [
+            ModelKind::EMBEDDING,
+            ModelKind::RERANK,
+            ModelKind::TYPED_DECISION,
+        ] {
+            for _ in 0..(ROUTE_STATS_MIN_ROUNDS * 2) {
+                settle(kind.call_kind(), 5);
+            }
+        }
+        let stats = ledger.route_round_stats("r").expect("stats");
+        assert_eq!(stats.rounds, ROUTE_STATS_MIN_ROUNDS, "worker rounds only");
+        assert_eq!(stats.tokens_per_round, Some(1_000));
+        assert!(stats.round_ms.is_some_and(|ms| ms >= 1), "{stats:?}");
     }
 
     /// Decision 0067: two catalog routes that speak
@@ -5853,7 +6114,10 @@ mod tests {
             let token = ledger
                 .begin(ADAPTER, Protocol::Inclusive, "m", "agent-a", "task")
                 .expect("begin");
-            token.record_route("kimi").expect("record route");
+            token
+                .record_route_async("kimi")
+                .wait()
+                .expect("record route");
             token
                 .settle(
                     &TokenUsage {
@@ -5873,7 +6137,10 @@ mod tests {
             let token = ledger
                 .begin(ADAPTER, Protocol::Inclusive, "m", "agent-b", "task")
                 .expect("begin");
-            token.record_route("other-vendor").expect("record route");
+            token
+                .record_route_async("other-vendor")
+                .wait()
+                .expect("record route");
             token
                 .settle(
                     &TokenUsage {

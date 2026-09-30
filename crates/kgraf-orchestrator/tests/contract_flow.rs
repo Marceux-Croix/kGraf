@@ -682,7 +682,7 @@ async fn a_handshake_mismatch_holds_the_parties_with_the_statements_recorded() {
     ));
 }
 
-/// Review finding 4: a party the run does not know skipped the handshake.
+/// a party the run does not know skipped the handshake.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unknown_party_is_an_artifact_failure() {
     let dir = tempfile::tempdir().expect("dir");
@@ -735,7 +735,7 @@ async fn a_runner_that_can_read_the_run_directory_is_refused() {
     assert!(refused.is_err());
 }
 
-/// Review finding 11: checks ran on the loop, so a stop waited for them and no
+/// checks ran on the loop, so a stop waited for them and no
 /// other contract dispatched meanwhile.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn slow_checks_run_off_the_loop_other_work_dispatches_and_stop_is_prompt() {
@@ -1117,7 +1117,7 @@ async fn a_review_overturns_only_with_a_verbatim_passage_and_a_recompute_is_mech
     assert_eq!(report.contracts.reviews, 2);
 }
 
-/// Review finding 6: a supersession withdraws work building against the old
+/// a supersession withdraws work building against the old
 /// version and holds it, rather than letting it be accepted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_supersede_withdraws_running_parties_and_holds_them_individually() {

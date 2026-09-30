@@ -358,11 +358,11 @@ async fn a_gone_roadmap_node_is_not_adopted() {
 }
 
 /// End to end: a 20,000-row roadmap with a detail heading per row is
-/// read, synced and derived in bounded time, and a re-read writes nothing. The
-/// bound is generous for a slow machine; before the fix the parse alone took
-/// 202 s in a debug build.
+/// read, synced and derived, and a re-read writes nothing. Before the fix the parse
+/// alone took 202 s in a debug build, so a quadratic regression shows as a test that
+/// does not finish. The elapsed time is checked only under `KGRAF_TIME_BUDGET`.
 #[test]
-fn a_large_roadmap_is_presumed_in_bounded_time() {
+fn a_large_roadmap_is_presumed_and_a_re_read_writes_nothing() {
     let dir = tempfile::tempdir().expect("dir");
     let db = tempfile::tempdir().expect("db");
     let n = 20_000;
@@ -384,8 +384,11 @@ fn a_large_roadmap_is_presumed_in_bounded_time() {
     let started = std::time::Instant::now();
     assert!(!presume(&s, 2).sync.wrote());
     let again = started.elapsed();
-    let bound = std::time::Duration::from_secs(60);
-    assert!(first < bound && again < bound, "{first:?}, {again:?}");
+    eprintln!("large roadmap: first read {first:?}, re-read {again:?}");
+    if time_budget_enforced() {
+        let bound = std::time::Duration::from_secs(60);
+        assert!(first < bound && again < bound, "{first:?}, {again:?}");
+    }
 }
 
 #[test]
@@ -403,7 +406,7 @@ fn a_document_with_no_structure_yields_no_items_and_says_so() {
 }
 
 #[test]
-fn a_damaged_node_body_is_an_error_not_an_item_with_no_claim() {
+fn a_damaged_node_body_is_shown_as_damaged_and_hides_no_other_node() {
     let (_dir, _db, s) = fixture();
     presume(&s, 100);
     let mut node = s
@@ -415,10 +418,62 @@ fn a_damaged_node_body_is_an_error_not_an_item_with_no_claim() {
     node.body = "{not json".into();
     s.put_work(&[node], &[]).expect("edit");
 
-    let error = presumed::views(&s).expect_err("a damaged body must raise");
-    let text = error.to_string();
+    // The damage is shown on that node's own row, in words; every other node
+    // still reads, and a re-read still succeeds.
+    let views = presumed::views(&s).expect("one damaged body does not hide the rest");
+    let bad = views.iter().find(|v| v.id == id("2")).expect("damaged row");
+    let detail = bad.detail.as_deref().unwrap_or_default();
     assert!(
-        text.contains(&id("2")) && text.contains("not valid JSON"),
-        "{text}"
+        detail.contains("damaged")
+            && detail.contains(&id("2"))
+            && detail.contains("not valid JSON"),
+        "{detail}"
     );
+    assert_eq!(
+        bad.state,
+        PresumedState::Unknown,
+        "a damaged body is not remaining work"
+    );
+    let good = views.iter().find(|v| v.id == id("1")).expect("item 1");
+    assert!(good.detail.is_none() || !good.detail.as_deref().unwrap_or("").contains("damaged"));
+    presume(&s, 300);
+}
+
+/// A damaged item is unknown, not remaining work: it does not turn its group into
+/// "remaining", and a group of only damaged items is unknown too.
+#[test]
+fn a_damaged_item_is_not_counted_as_remaining_in_its_group() {
+    let dir = tempfile::tempdir().expect("dir");
+    let db = tempfile::tempdir().expect("db");
+    write(
+        dir.path(),
+        "ROADMAP.md",
+        "# Demo\n\n## Phases\n\n| Milestone | Description | Status |\n|---|---|---|\n\
+         | 1 | A | Not started |\n| 2 | B | Not started |\n",
+    );
+    let s = store(dir.path(), db.path());
+    index(&s);
+    presume(&s, 100);
+    let group = format!("{P}/component/phases");
+    assert_eq!(state(&s, &group).state, PresumedState::Remaining);
+
+    let damage = |which: &str| {
+        let mut node = s
+            .work_nodes(P)
+            .expect("nodes")
+            .into_iter()
+            .find(|n| n.id == id(which))
+            .expect("item");
+        node.body = "{not json".into();
+        s.put_work(&[node], &[]).expect("edit");
+    };
+    damage("1");
+    assert_eq!(state(&s, &id("1")).state, PresumedState::Unknown);
+    assert_eq!(
+        state(&s, &group).state,
+        PresumedState::Partial,
+        "one damaged item of two is not remaining"
+    );
+    damage("2");
+    assert_eq!(state(&s, &group).state, PresumedState::Unknown);
 }

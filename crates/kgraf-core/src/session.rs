@@ -11,15 +11,10 @@
 //! outcome, ...) is derived at read time from those rows together with the live
 //! event stream (0007), and that derivation is not this crate's job.
 //!
-//! [`MemorySessionRecords`] is a real, working
-//! implementation (there is nothing to stub: it is just a map), used by tests
-//! here and by any host that has not opened a graph store yet. The durable
-//! implementation is `kgraf-graph`'s `SharedSessions`.
+//! The implementation is `kgraf-graph`'s `SharedSessions`.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
 
 /// A session id is the existing worker [`crate::AgentId`] (decision 0067,
 /// point 1): the orchestrator, each worker attempt, each handoff child and
@@ -226,8 +221,7 @@ pub enum SessionStoreError {
 pub type SessionLifecycle = (Option<(SessionOutcome, i64)>, Option<i64>);
 
 /// Where session, inbox and connection facts are read and written. Implemented
-/// by [`MemorySessionRecords`] here and by `kgraf-graph`'s `SharedSessions`,
-/// so `kgraf-runtime` and `kgraf-orchestrator` depend on this trait, not
+/// by `kgraf-graph`'s `SharedSessions`, so `kgraf-runtime` and `kgraf-orchestrator` depend on this trait, not
 /// on a graph store.
 pub trait SessionRecords: Send + Sync {
     fn upsert_session(&self, s: &SessionFacts) -> Result<(), SessionStoreError>;
@@ -268,154 +262,8 @@ pub trait SessionRecords: Send + Sync {
     ) -> Result<Vec<ConnectionFacts>, SessionStoreError>;
 }
 
-#[derive(Debug, Default)]
-struct MemoryState {
-    sessions: BTreeMap<SessionId, SessionFacts>,
-    /// Recorded, not read back through `SessionFacts` (see the module docs):
-    /// kept so a second `end_session` on the same id is at least observable in
-    /// a debugger, and so future units have somewhere to read it from without
-    /// widening this map's value type again.
-    ended: BTreeMap<SessionId, (SessionOutcome, i64)>,
-    paused: BTreeMap<SessionId, Option<i64>>,
-    inbox: Vec<InboxItem>,
-    connections: BTreeMap<String, ConnectionFacts>,
-}
-
-/// An in-memory [`SessionRecords`]: for tests, and for a host that has not
-/// opened a graph store yet. Not durable.
-#[derive(Debug, Default)]
-pub struct MemorySessionRecords(Mutex<MemoryState>);
-
-impl MemorySessionRecords {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    fn lock(&self) -> Result<std::sync::MutexGuard<'_, MemoryState>, SessionStoreError> {
-        self.0
-            .lock()
-            .map_err(|_| SessionStoreError::Store("the memory session store is poisoned".into()))
-    }
-}
-
-impl SessionRecords for MemorySessionRecords {
-    fn upsert_session(&self, s: &SessionFacts) -> Result<(), SessionStoreError> {
-        self.lock()?.sessions.insert(s.id.clone(), s.clone());
-        Ok(())
-    }
-
-    fn end_session(
-        &self,
-        id: &SessionId,
-        outcome: SessionOutcome,
-        at_ms: i64,
-    ) -> Result<(), SessionStoreError> {
-        let mut state = self.lock()?;
-        if !state.sessions.contains_key(id) {
-            return Err(SessionStoreError::Unknown(id.to_string()));
-        }
-        state.ended.insert(id.clone(), (outcome, at_ms));
-        Ok(())
-    }
-
-    fn set_paused(&self, id: &SessionId, paused_ms: Option<i64>) -> Result<(), SessionStoreError> {
-        let mut state = self.lock()?;
-        if !state.sessions.contains_key(id) {
-            return Err(SessionStoreError::Unknown(id.to_string()));
-        }
-        state.paused.insert(id.clone(), paused_ms);
-        Ok(())
-    }
-
-    fn lifecycle(&self, id: &SessionId) -> Result<Option<SessionLifecycle>, SessionStoreError> {
-        let state = self.lock()?;
-        if !state.sessions.contains_key(id) {
-            return Ok(None);
-        }
-        let ended = state.ended.get(id).cloned();
-        let paused = state.paused.get(id).copied().flatten();
-        Ok(Some((ended, paused)))
-    }
-
-    fn session(&self, id: &SessionId) -> Result<Option<SessionFacts>, SessionStoreError> {
-        Ok(self.lock()?.sessions.get(id).cloned())
-    }
-
-    fn sessions_of_run(&self, run: &crate::RunId) -> Result<Vec<SessionFacts>, SessionStoreError> {
-        Ok(self
-            .lock()?
-            .sessions
-            .values()
-            .filter(|s| &s.run == run)
-            .cloned()
-            .collect())
-    }
-
-    fn children(&self, id: &SessionId) -> Result<Vec<SessionFacts>, SessionStoreError> {
-        Ok(self
-            .lock()?
-            .sessions
-            .values()
-            .filter(|s| s.parent.as_ref() == Some(id))
-            .cloned()
-            .collect())
-    }
-
-    fn push_inbox(&self, item: &InboxItem) -> Result<(), SessionStoreError> {
-        self.lock()?.inbox.push(item.clone());
-        Ok(())
-    }
-
-    fn mark_delivered(&self, item: &str, seq: u64, at_ms: i64) -> Result<(), SessionStoreError> {
-        let mut state = self.lock()?;
-        match state.inbox.iter_mut().find(|i| i.id == item) {
-            Some(row) if row.delivered.is_some() => Err(SessionStoreError::Store(format!(
-                "inbox item `{item}` was already marked delivered"
-            ))),
-            Some(row) => {
-                row.delivered = Some((seq, at_ms));
-                Ok(())
-            }
-            None => Err(SessionStoreError::Unknown(item.to_owned())),
-        }
-    }
-
-    fn undelivered(&self, session: &SessionId) -> Result<Vec<InboxItem>, SessionStoreError> {
-        Ok(self
-            .lock()?
-            .inbox
-            .iter()
-            .filter(|i| &i.session == session && i.delivered.is_none())
-            .cloned()
-            .collect())
-    }
-
-    fn inbox_item(&self, id: &str) -> Result<Option<InboxItem>, SessionStoreError> {
-        Ok(self.lock()?.inbox.iter().find(|i| i.id == id).cloned())
-    }
-
-    fn upsert_connection(&self, c: &ConnectionFacts) -> Result<(), SessionStoreError> {
-        self.lock()?.connections.insert(c.id.clone(), c.clone());
-        Ok(())
-    }
-
-    fn connections_of(
-        &self,
-        session: &SessionId,
-    ) -> Result<Vec<ConnectionFacts>, SessionStoreError> {
-        Ok(self
-            .lock()?
-            .connections
-            .values()
-            .filter(|c| &c.a == session || &c.b == session)
-            .cloned()
-            .collect())
-    }
-}
-
-/// Exercises every [`SessionRecords`] method against `r`, so a durable
-/// implementation (`SharedSessions`) is checked against the same contract
-/// [`MemorySessionRecords`] is.
+/// Exercises every [`SessionRecords`] method against `r`, so an implementation
+/// (`SharedSessions`) is checked against the contract.
 #[cfg(any(test, feature = "test-support"))]
 pub fn check_session_records(r: &dyn SessionRecords) {
     let run = crate::RunId::new("run-1");
@@ -581,11 +429,6 @@ pub fn check_session_records(r: &dyn SessionRecords) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn check_session_records_passes_against_the_memory_store() {
-        check_session_records(&MemorySessionRecords::default());
-    }
 
     #[test]
     fn connection_id_is_canonical_whichever_order_it_is_named_in() {

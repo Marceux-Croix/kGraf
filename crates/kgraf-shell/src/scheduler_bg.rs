@@ -100,8 +100,14 @@ pub struct ProjectFactory {
     /// Who answers approval asks of every run of an opened host (the box's desk).
     asks: Option<Arc<dyn kgraf_runtime::AskResolver>>,
     /// Box runs in flight (started, not yet finished): like scheduled runs, they
-    /// hold a `run.json` reload back (D1).
+    /// hold a `run.json` reload back.
     box_runs: Mutex<std::collections::BTreeSet<RunId>>,
+    /// The user's worktree setting (decision 0088), the only source of the
+    /// policy for every run the app starts, box and scheduled alike:
+    /// `run.json` cannot set it (`RunConfig::load` refuses the key). Applied
+    /// to every host this factory opens and pushed to the one open now.
+    /// `None` (a factory with no setting given) leaves the default, `Delete`.
+    worktrees: Mutex<Option<kgraf_host::WorktreeRetention>>,
 }
 
 /// The file a host was opened from: its content hash only. A touch that
@@ -130,6 +136,23 @@ impl ProjectFactory {
             hosts: Mutex::new(Hosts::default()),
             asks: None,
             box_runs: Mutex::new(std::collections::BTreeSet::new()),
+            worktrees: Mutex::new(None),
+        }
+    }
+
+    /// Every host this factory opens applies `retention` to its runs
+    /// (decision 0088: the user's setting is the app's one source for it).
+    pub fn with_worktree_retention(self, retention: kgraf_host::WorktreeRetention) -> Self {
+        *self.worktrees.lock().unwrap_or_else(|p| p.into_inner()) = Some(retention);
+        self
+    }
+
+    /// The user's setting changed: the open host applies it to the runs it
+    /// builds from now on, and a host opened later starts with it.
+    pub fn set_worktree_retention(&self, retention: kgraf_host::WorktreeRetention) {
+        *self.worktrees.lock().unwrap_or_else(|p| p.into_inner()) = Some(retention);
+        if let Some(host) = self.host() {
+            host.set_worktree_retention(retention);
         }
     }
 
@@ -233,6 +256,7 @@ impl ProjectFactory {
             }),
             asks: None,
             box_runs: Mutex::new(std::collections::BTreeSet::new()),
+            worktrees: Mutex::new(None),
         }
     }
 
@@ -261,7 +285,7 @@ impl ProjectFactory {
     /// host stays and the returned text says the change waits.
     pub fn refresh(&self, active: usize) -> Option<String> {
         // Box runs in flight hold the reload back too: replacing the host under
-        // one would give later runs a second `Admission` (D1).
+        // one would give later runs a second `Admission`.
         let active = active + self.box_runs().len();
         let path = self.config_path();
         let mut hosts = self.hosts();
@@ -297,8 +321,12 @@ impl ProjectFactory {
         }
         // Taken before the load: a change during it is seen by the next refresh.
         let fingerprint = Self::fingerprint(&path);
+        let user_worktrees = *self.worktrees.lock().unwrap_or_else(|p| p.into_inner());
         let host = RunConfig::load(&self.project, &path)
-            .and_then(|config| {
+            .and_then(|mut config| {
+                if let Some(retention) = user_worktrees {
+                    config.worktrees = retention;
+                }
                 config.check_configured()?;
                 Host::open(config)
             })
@@ -1234,11 +1262,11 @@ fn describe_event(event: &TickEvent) -> (String, bool) {
         // it must not mark it failing on the board any more than a `Started` or
         // `Reclaimed` firing would.
         TickEvent::Deferred { schedule_id, .. } => (schedule_id.clone(), false),
-        // D1 (round 4): a lost lease is an anomaly about this instance's own claim,
+        // A lost lease is an anomaly about this instance's own claim,
         // not proof the run itself failed - the same reasoning `ClockAnomaly` already
         // gets.
         TickEvent::LeaseLost { schedule_id, .. } => (schedule_id.clone(), false),
-        // D3 (round 4): a drop is the same "missed, not late, not a failure" outcome
+        // A drop is the same "missed, not late, not a failure" outcome
         // `Skip` already applies elsewhere.
         TickEvent::Dropped { schedule_id, .. } => (schedule_id.clone(), false),
         // A bookkeeping warning about spend attribution, not about
@@ -1379,9 +1407,15 @@ mod tests {
         drop(graph);
 
         let handle = SchedulerHandle::spawn(project.clone(), false);
-        // The loop's first iteration runs with no initial sleep; a few STOP_POLL
-        // intervals is generous headroom for it to have run at least once.
-        std::thread::sleep(Duration::from_millis(400));
+        // The loop's first iteration runs with no initial sleep. Poll until it
+        // has moved the schedule onto its node (a deadline, not a fixed
+        // sleep, so a slow machine does not fail the test).
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while (!handle.board().snapshot().suspended || handle.board().plan_nodes().is_empty())
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
         let summary = handle.board().snapshot();
         assert!(summary.suspended, "got {summary:?}");
         assert!(
@@ -1569,6 +1603,7 @@ mod tests {
                             id: "p1".into(),
                             name: "apply_patch".into(),
                             input: serde_json::json!({ "patch": patch }),
+                            signature: None,
                         }],
                         StopReason::ToolUse,
                     )
@@ -1730,7 +1765,7 @@ mod tests {
         let graph =
             kgraf_graph::GraphStore::open(&root.join(".kgraf/graph.db"), &root).expect("graph");
         // `Utc::now()` has sub-millisecond digits; schedule instants are cut to
-        // whole milliseconds, so the deferral is kept, not given up (finding).
+        // whole milliseconds, so the deferral is kept, not given up.
         let now = Utc::now();
         let defs: Vec<ScheduleDefinition> = ["first", "second"]
             .iter()
@@ -2079,6 +2114,44 @@ mod tests {
         assert_eq!(branch, "kgraf/from-file", "the build made the run's branch");
     }
 
+    /// Decision 0088: in the app, the user's setting is the one source of the
+    /// worktree policy. It reaches the host the factory opens and the host
+    /// already open; a factory given no setting leaves the default; and a
+    /// `run.json` that tries to set it is refused, saying where the choice is
+    /// made, never silently overridden.
+    #[test]
+    fn the_users_worktree_setting_is_the_apps_one_source_of_the_policy() {
+        use kgraf_host::WorktreeRetention::{Delete, Keep};
+        let dir = configured_project(1.0);
+        let rt = multi_thread();
+
+        let plain = ProjectFactory::for_project(dir.path());
+        rt.block_on(plain.configured()).expect("configured");
+        assert_eq!(plain.host().expect("host").worktree_retention(), Delete);
+
+        let keeping = ProjectFactory::for_project(dir.path()).with_worktree_retention(Keep);
+        rt.block_on(keeping.configured()).expect("configured");
+        let host = keeping.host().expect("host");
+        assert_eq!(host.worktree_retention(), Keep, "the setting reaches it");
+        keeping.set_worktree_retention(Delete);
+        assert_eq!(host.worktree_retention(), Delete, "and a change reaches it");
+
+        let path = dir.path().join(".kgraf").join(RUN_CONFIG_FILE);
+        let mut json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
+        json["worktrees"] = "keep".into();
+        std::fs::write(&path, json.to_string()).expect("write");
+        let refused = ProjectFactory::for_project(dir.path()).with_worktree_retention(Delete);
+        let err = rt
+            .block_on(refused.configured())
+            .expect_err("the key is refused");
+        assert!(
+            matches!(&err, ReadinessFailure::MissingConfiguration(m)
+                if m.contains("worktrees") && m.contains("Delete worker worktrees after use")),
+            "{err}"
+        );
+    }
+
     /// An MCP server in `worker.json` that does not answer fails the build
     /// as transient; through `ScheduledRuns` that counts toward the pause
     /// threshold and does not disable the schedule.
@@ -2138,7 +2211,7 @@ mod tests {
         );
     }
 
-    /// D1: a box run in flight holds a `run.json` reload back exactly as a
+    /// A box run in flight holds a `run.json` reload back exactly as a
     /// scheduled run does (the tray says it applies after the active run ends),
     /// so no second host, and no second `Admission`, appears under it.
     #[test]

@@ -353,7 +353,9 @@ mod tests {
         let path = dir.path().join("diag.jsonl");
         let writer = DiagWriter::start(path.clone(), store::DEFAULT_CAP_BYTES);
         writer.record(DiagEvent::launch());
-        writer.record(DiagEvent::feature_used("index"));
+        writer.record(DiagEvent::FeatureUsed {
+            feature: "index".into(),
+        });
         writer.flush_for_test();
         let records = store::read_all(&path).unwrap();
         assert_eq!(records.len(), 2);
@@ -386,7 +388,9 @@ mod tests {
         // happens to a nonzero drop count on the *next* write, not about
         // reproducing the race that produces one.
         writer.dropped.fetch_add(3, Ordering::Relaxed);
-        writer.record(DiagEvent::feature_used("index"));
+        writer.record(DiagEvent::FeatureUsed {
+            feature: "index".into(),
+        });
         writer.flush_for_test();
         let records = store::read_all(&path).unwrap();
         assert!(

@@ -1,0 +1,16 @@
+{
+  "_fixture": {
+    "source": [
+      "https://learn.microsoft.com/en-us/azure/ai-foundry/openai/how-to/embeddings",
+      "https://raw.githubusercontent.com/Azure/azure-rest-api-specs/main/specification/cognitiveservices/data-plane/OpenAIInference/stable/2024-10-21/inference.json"
+    ],
+    "note": "The reply schema of POST /deployments/{deployment-id}/embeddings in the 2024-10-21 specification: object, model, data[].{index, object, embedding} and usage.{prompt_tokens, total_tokens}, all required. The vector values are the first three of the specification's own example (examples/embeddings.json), whose abridged body omits model and object; this fixture carries them because the schema requires them. The model is the underlying model, as the Azure chat reply names it. Not recorded from the live service."
+  },
+  "object": "list",
+  "model": "text-embedding-3-small",
+  "data": [
+    {"index": 0, "object": "embedding", "embedding": [-0.012838088, -0.007421397, -0.017617522]},
+    {"index": 1, "object": "embedding", "embedding": [0.004, 0.02, -0.03]}
+  ],
+  "usage": {"prompt_tokens": 8, "total_tokens": 8}
+}

@@ -362,7 +362,8 @@ pub fn is_remediation(gates: &[GateNode], contract: &str) -> bool {
 }
 
 /// Record the user's decision about a held or failed gate. `Retry` sends it
-/// back to pending with [`DEFAULT_MAX_REMEDIATIONS`] more remediations allowed;
+/// back to pending, with [`DEFAULT_MAX_REMEDIATIONS`] more remediations allowed
+/// when it had used them all;
 /// `Waive` makes it count as passed. Either is kept, with who and why.
 pub fn decide(
     gates: &mut [GateNode],
@@ -387,7 +388,11 @@ pub fn decide(
     }
     match decision {
         GateDecision::Retry => {
-            g.allowance += DEFAULT_MAX_REMEDIATIONS;
+            // Only a gate that used its remediations gets more. A gate held by a
+            // runner error spent none, so a retry leaves its allowance alone.
+            if g.remediations.len() as u32 >= DEFAULT_MAX_REMEDIATIONS + g.allowance {
+                g.allowance += DEFAULT_MAX_REMEDIATIONS;
+            }
             g.status = GateStatus::Pending;
         }
         GateDecision::Waive => {
@@ -702,6 +707,30 @@ mod tests {
             }
             other => panic!("expected Held, got {other:?}"),
         }
+        // Retrying a gate held for a runner error grants no remediations,
+        // however often it is retried.
+        for at in [6, 7] {
+            decide(
+                &mut gates,
+                ROOT_GATE,
+                GateDecision::Retry,
+                "user",
+                "fixed",
+                at,
+            )
+            .unwrap();
+            record_verdict(
+                &mut gates,
+                ROOT_GATE,
+                Err("still down".into()),
+                None,
+                at,
+                2,
+                "r",
+                &|_| true,
+            );
+        }
+        assert_eq!(gates[0].allowance, 0);
     }
 
     #[test]
@@ -784,6 +813,7 @@ mod tests {
         assert_eq!(gates[0].status, GateStatus::Pending);
         let fix3 = record_verdict(&mut gates, ROOT_GATE, fail(), None, 9, 2, "r", &|_| true);
         assert!(fix3.is_some(), "a fresh allowance");
+        assert_eq!(gates[0].allowance, DEFAULT_MAX_REMEDIATIONS);
         assert!(matches!(
             decide(&mut gates, "gate:none", GateDecision::Waive, "user", "x", 9),
             Err(GateDecisionError::NoGate(_))

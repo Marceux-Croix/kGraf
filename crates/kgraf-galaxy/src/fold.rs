@@ -634,13 +634,6 @@ impl Tally {
         self.of(NoticeKind::Failed) + self.of(NoticeKind::NeedsInput)
     }
 
-    /// The most urgent counted kind, if any.
-    pub fn most_urgent(&self) -> Option<NoticeKind> {
-        [NoticeKind::Failed, NoticeKind::NeedsInput]
-            .into_iter()
-            .find(|&k| self.of(k) > 0)
-    }
-
     /// The counted notices in words, by what they are, most urgent first: "1 failed
     /// gate, 2 approvals" (the owner's example).
     pub fn words(&self) -> String {
@@ -1043,11 +1036,9 @@ mod tests {
         assert_eq!(b1.at, Carrier::Node(1));
         assert_eq!(b1.tally.counts, [1, 2, 1, 0]);
         assert_eq!(b1.tally.attention(), 3, "working is data, not counted");
-        assert_eq!(b1.tally.most_urgent(), Some(NoticeKind::Failed));
         assert_eq!(b1.tally.words(), "1 failed gate, 2 approvals");
         assert_eq!(b1.sources.len(), 4);
         assert_eq!(badges[1].at, Carrier::Node(2));
-        assert_eq!(badges[1].tally.most_urgent(), Some(NoticeKind::Failed));
 
         let open = resolve(&h, live, &a, &HashMap::from([(1, true)]));
         let badges = aggregate(&notices, at(&open));
@@ -1071,7 +1062,6 @@ mod tests {
         assert_eq!(g[0].at, Carrier::Group(3));
         assert_eq!(total(&[]).attention(), 0);
         assert_eq!(total(&g).words(), "1 held for you");
-        assert_eq!(Tally::default().most_urgent(), None);
         assert_eq!(Tally::default().words(), "");
     }
 

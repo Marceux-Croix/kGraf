@@ -46,10 +46,12 @@ pub mod external;
 mod fs_safety;
 mod fs_tools;
 mod graph_slice;
+pub mod model_tools;
 mod name;
 mod output;
 mod registry;
 pub mod shell;
+mod terminal;
 mod untrusted;
 
 pub(crate) use access::normalize_relative;
@@ -61,10 +63,16 @@ pub use external::{ExternalExecutor, ExternalOutcome, SyncedWrites, remote_polic
 pub use fs_safety::AllowedHardlinkReads;
 pub use fs_tools::{ListDirectoryTool, ReadFileTool, SearchFilesTool};
 pub use graph_slice::{DEFAULT_SLICE_BUDGET, GraphSliceTool};
+pub use model_tools::{
+    Attribution, CallLog, Called, DECIDE_TOOL, EMBED_TOOL, MAX_EMBED_RESULT_BYTES, MAX_EMBED_TEXTS,
+    MAX_RERANK_DOCUMENTS, MODEL_TOOLS, ModelCallError, ModelCalls, ModelToolFactory, Opened,
+    RERANK_TOOL, model_tools, run_model_tool,
+};
 pub use name::{MAX_WIRE_NAME_CHARS, MCP_PREFIX, QualifiedName};
 pub use output::{BinarySummary, OutputPart, ToolOutput};
 pub use registry::{DiscoveredTools, Exposure, RegisteredTool, ToolRegistry, ToolView};
 pub use shell::{ExecGate, ShellApprovalHook, ShellTool};
+pub use terminal::{quote_argv, terminal_safe};
 pub use untrusted::UntrustedText;
 
 use kgraf_core::{AgentId, TaskId};
