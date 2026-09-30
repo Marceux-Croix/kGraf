@@ -306,6 +306,15 @@ pub trait Workspaces: Send + Sync {
     async fn integration_tip(&self) -> Result<Option<String>, String> {
         Ok(None)
     }
+    /// A directory holding the integration tip's files, brought up to the
+    /// current tip by this call and kept for the rest of the run. After a
+    /// merge the graph indexes the merged files from it and reads them back
+    /// from it (slices), because the winner's own worktree may be removed by
+    /// the merge (decision 0088). `None`: this provider keeps no such tree,
+    /// and the merged worktree itself is read, so it must outlive the merge.
+    async fn integration_view(&self) -> Result<Option<PathBuf>, String> {
+        Ok(None)
+    }
     /// A commit of an in-flight worktree as it stands, for speculative merge
     /// (0074). Must leave the worktree, its index and its HEAD untouched and
     /// create no ref. `None`: this provider keeps no versioned worktrees.
@@ -863,6 +872,54 @@ fn cluster_cap_check(
 /// How many times the planner is asked again after a refused plan, on top of
 /// the first ask.
 const MAX_PLAN_REASKS: u32 = 2;
+
+/// How many times the whole plan is sent back to the planner when the
+/// pre-dispatch checks of its interfaces hold it before any work started
+/// (`RunLoop::replan`). The re-plan is one more ask, taken as it is: with
+/// [`MAX_PLAN_REASKS`], the top-level plan is asked for at most four times.
+pub(crate) const MAX_REPLANS: u32 = 1;
+
+/// A re-plan's contracts and interfaces under ids of their own (`re<n>.`),
+/// with dependencies and parties renamed to match. The held plan's
+/// interfaces stay registered under their ids (the book keeps an interface
+/// once registered), so a new contract reusing an old id would be bound, and
+/// held, by the old plan's failed interface.
+fn renamed_for_replan(
+    specs: Vec<ContractSpec>,
+    interfaces: Vec<crate::checks::InterfaceContract>,
+    replan: u32,
+) -> (Vec<ContractSpec>, Vec<crate::checks::InterfaceContract>) {
+    let rename = |id: &str| format!("re{replan}.{id}");
+    let local: BTreeMap<String, String> = specs
+        .iter()
+        .map(|s| (s.id.clone(), rename(&s.id)))
+        .collect();
+    let specs = specs
+        .into_iter()
+        .map(|mut s| {
+            s.id = rename(&s.id);
+            for d in &mut s.depends_on {
+                if let Some(r) = local.get(d.as_str()) {
+                    d.clone_from(r);
+                }
+            }
+            s
+        })
+        .collect();
+    let interfaces = interfaces
+        .into_iter()
+        .map(|mut ic| {
+            ic.id = rename(&ic.id);
+            for p in &mut ic.parties {
+                if let Some(r) = local.get(p.as_str()) {
+                    p.clone_from(r);
+                }
+            }
+            ic
+        })
+        .collect();
+    (specs, interfaces)
+}
 
 /// A contract that keeps waiting for a transiently unready route is traced
 /// again, and noticed, every this many checks (the first check is traced on
@@ -2764,12 +2821,24 @@ impl RunLoop {
     /// run with the last refusal.
     async fn decompose(
         &mut self,
-        mut request: PlanRequest,
+        request: PlanRequest,
         note_ids: &[String],
         outer: &BTreeSet<String>,
     ) -> Result<(Vec<ContractSpec>, Vec<crate::checks::InterfaceContract>), OrchestratorError> {
+        self.decompose_from(request, note_ids, outer, 0).await
+    }
+
+    /// [`Self::decompose`] with `reasks` re-asks already spent. A re-plan
+    /// ([`Self::replan`]) starts at [`MAX_PLAN_REASKS`]: one ask, taken as it
+    /// is, which the pre-dispatch gate then checks.
+    async fn decompose_from(
+        &mut self,
+        mut request: PlanRequest,
+        note_ids: &[String],
+        outer: &BTreeSet<String>,
+        mut reasks: u32,
+    ) -> Result<(Vec<ContractSpec>, Vec<crate::checks::InterfaceContract>), OrchestratorError> {
         request.interfaces = self.contracts.is_some();
-        let mut reasks = 0;
         loop {
             let last_ask = reasks >= MAX_PLAN_REASKS;
             match self
@@ -2966,6 +3035,26 @@ impl RunLoop {
         names: &[String],
         from: Option<String>,
     ) -> Result<(Vec<NodeId>, u64), OrchestratorError> {
+        let (nodes, tokens, missing) = self.lookup_slices(names, from)?;
+        for name in missing {
+            let at = self.now();
+            self.trace(TraceEvent::EmptyGraphLookup {
+                at_ms: at,
+                contract: contract.to_owned(),
+                lookup: name,
+            })
+            .await?;
+        }
+        Ok((nodes, tokens))
+    }
+
+    /// [`Self::resolve_slices`] without the trace: the nodes found, their
+    /// tokens, and the names that found none.
+    fn lookup_slices(
+        &self,
+        names: &[String],
+        from: Option<String>,
+    ) -> Result<(Vec<NodeId>, u64, Vec<String>), OrchestratorError> {
         let graph = self.s.graph.clone();
         let names_owned = names.to_vec();
         let resolved: Vec<(String, Option<(String, u64)>)> = blocking(|| {
@@ -2999,24 +3088,76 @@ impl RunLoop {
         })?;
         let mut nodes = Vec::new();
         let mut tokens = 0;
+        let mut missing = Vec::new();
         for (name, found) in resolved {
             match found {
                 Some((id, t)) => {
                     nodes.push(NodeId::new(id));
                     tokens += t;
                 }
-                None => {
-                    let at = self.now();
-                    self.trace(TraceEvent::EmptyGraphLookup {
-                        at_ms: at,
-                        contract: contract.to_owned(),
-                        lookup: name,
-                    })
-                    .await?;
-                }
+                None => missing.push(name),
             }
         }
-        Ok((nodes, tokens))
+        Ok((nodes, tokens, missing))
+    }
+
+    /// Resolve `contract`'s slices against the graph as it is at dispatch, and
+    /// record them. Planning resolved them by name to node ids, but a node id
+    /// hashes its symbol's signature, so a predecessor's merge that renames a
+    /// parameter gives the symbol a new id and the planned one names nothing.
+    /// Names are resolved again; one that no longer resolves is an empty
+    /// lookup. A contract with no names (an older record, a corpus intake)
+    /// keeps the recorded ids the graph still holds, and each one it no longer
+    /// holds is an empty lookup. Either way a vanished symbol costs a slice,
+    /// never the spawn. The empty lookups are traced only when the resolved
+    /// slices differ from the recorded ones: a contract that waits (capacity,
+    /// leases) passes here on every dispatch round, and a name planning
+    /// already traced as empty is not traced again each round.
+    async fn refresh_slices(
+        &mut self,
+        contract: OpenContract,
+    ) -> Result<OpenContract, OrchestratorError> {
+        let (nodes, missing) = if !contract.slice_names.is_empty() {
+            let (nodes, _, missing) =
+                self.lookup_slices(&contract.slice_names, contract.slice_from.clone())?;
+            (nodes, missing)
+        } else if contract.slices.is_empty() {
+            return Ok(contract);
+        } else {
+            let graph = self.s.graph.clone();
+            let ids = contract.slices.clone();
+            let held: Vec<(NodeId, bool)> = blocking(move || {
+                let g = graph.lock().map_err(|_| StoreError::Poisoned)?;
+                ids.into_iter()
+                    .map(|n| Ok((n.clone(), g.node(n.as_str())?.is_some())))
+                    .collect::<Result<Vec<_>, OrchestratorError>>()
+            })?;
+            let (kept, gone): (Vec<_>, Vec<_>) = held.into_iter().partition(|(_, p)| *p);
+            (
+                kept.into_iter().map(|(n, _)| n).collect(),
+                gone.into_iter().map(|(n, _)| n.to_string()).collect(),
+            )
+        };
+        if nodes == contract.slices {
+            return Ok(contract);
+        }
+        for name in missing {
+            let at = self.now();
+            self.trace(TraceEvent::EmptyGraphLookup {
+                at_ms: at,
+                contract: contract.contract.clone(),
+                lookup: name,
+            })
+            .await?;
+        }
+        if let Some(c) = self.record.contract_mut(&contract.contract) {
+            c.slices.clone_from(&nodes);
+        }
+        self.save()?;
+        Ok(OpenContract {
+            slices: nodes,
+            ..contract
+        })
     }
 
     /// Tokens of a brief before its transcript, bounded from above: the prefix's
@@ -3052,10 +3193,17 @@ impl RunLoop {
                 if self.stop_requested() {
                     return Ok(false);
                 }
-                let (notes, note_ids) = self.pending_notes();
+                let (mut notes, note_ids) = self.pending_notes();
+                // A re-plan sends the held plan's check failures back, as one
+                // more ask taken as it is (`replan`).
+                let replan = self.record.replan_note.clone();
+                if let Some(note) = &replan {
+                    notes.push(kgraf_secrets::model_copy(note).into_owned());
+                }
+                let first_reask = if replan.is_some() { MAX_PLAN_REASKS } else { 0 };
                 let templates = self.template_offers().await?;
                 let (specs, interfaces) = self
-                    .decompose(
+                    .decompose_from(
                         PlanRequest {
                             instruction: kgraf_secrets::model_copy(
                                 &self.record.original_instruction,
@@ -3073,8 +3221,14 @@ impl RunLoop {
                         },
                         &note_ids,
                         &BTreeSet::new(),
+                        first_reask,
                     )
                     .await?;
+                let (specs, interfaces) = if self.record.replans > 0 {
+                    renamed_for_replan(specs, interfaces, self.record.replans)
+                } else {
+                    (specs, interfaces)
+                };
                 let p = PlanProgress {
                     interfaces,
                     ..PlanProgress::seeded(specs)
@@ -3097,7 +3251,29 @@ impl RunLoop {
                     .project(route.model(), base, self.config.step_budget, &route.context);
             let may_split = item.depth < self.config.max_split_depth
                 && progress.splits < self.config.max_splits;
-            if !projection.fits() && may_split {
+            // The prefix and the projected growth are in every child too: when
+            // they alone are over the target, no split fits, so none is asked.
+            let fixed = self.base_tokens(route, "", 0);
+            let split_helps = projection.split_can_fit(fixed);
+            if !projection.fits() && may_split && !split_helps {
+                let at = self.now();
+                self.trace(TraceEvent::Notice {
+                    at_ms: at,
+                    contract: item.id.clone(),
+                    worker: String::new(),
+                    detail: format!(
+                        "not split: projected {} tokens exceed the plan target of {} ({:?}), \
+                         but the worker prefix and projected growth alone are {} tokens, which \
+                         every split child would carry too",
+                        projection.tokens,
+                        projection.target_tokens,
+                        projection.source,
+                        projection.unsplittable_tokens(fixed)
+                    ),
+                })
+                .await?;
+            }
+            if !projection.fits() && may_split && split_helps {
                 if self.stop_requested() {
                     progress.stack.push(item);
                     self.record.plan_progress = Some(progress);
@@ -3198,6 +3374,9 @@ impl RunLoop {
                 Vec::new(),
             );
             contract.slices = nodes;
+            // Kept by name too: dispatch resolves them again (`refresh_slices`).
+            contract.slice_names = item.spec.slices.clone();
+            contract.slice_from = item.spec.writes.first().map(|w| w.path.clone());
             progress.accepted.push((item.spec, contract));
         }
         // Dependencies naming a split contract now name its leaves (recursively).
@@ -3510,6 +3689,12 @@ impl RunLoop {
                 if !self.contract_jobs_busy()
                     && let Some(status) = self.terminal_status()
                 {
+                    // A plan its interface checks held before any work
+                    // started goes back to the planner once before the run
+                    // ends on the hold.
+                    if matches!(status, RunStatus::Blocked { .. }) && self.replan().await? {
+                        continue;
+                    }
                     self.record.status = status;
                     break;
                 }
@@ -3579,6 +3764,84 @@ impl RunLoop {
         // branch that moved after the fact (a force-reset, a bug upstream, a
         // provider that lied) rather than trusting bookkeeping alone.
         self.verify_completion_landed().await
+    }
+
+    /// Send a plan that its interfaces' pre-dispatch checks held before any
+    /// work started back to the planner with the checks' failures, once
+    /// ([`MAX_REPLANS`]), instead of ending the run on the hold. `true`: a new
+    /// plan replaced the held one (or a stop arrived while planning), and the
+    /// loop goes on.
+    ///
+    /// The failures are ones the planner's re-asks never saw: a handshake runs
+    /// only at the gate, and the last ask's plan is taken without its
+    /// mechanical checks. The re-plan is one ask, taken as it is, under ids of
+    /// its own ([`renamed_for_replan`]); the gate checks it as it checks any
+    /// plan, and a hold on it ends the run. A re-plan the planner answers
+    /// with a plan that is refused outright leaves the held plan, and the run
+    /// ends on its hold, with the refusal noticed.
+    async fn replan(&mut self) -> Result<bool, OrchestratorError> {
+        if self.record.replans >= MAX_REPLANS || self.record.source_plan.is_some() {
+            return Ok(false);
+        }
+        let Some(failures) = self.replan_failures() else {
+            return Ok(false);
+        };
+        let note = format!(
+            "<plan_refused>\nYour plan was refused before any work started: the pre-dispatch \
+             checks of its interfaces failed.\n{}\nPlan the whole instruction again, correcting \
+             these failures, and answer with one JSON object.\n</plan_refused>",
+            failures.replace('<', "&lt;")
+        );
+        let held = (
+            std::mem::take(&mut self.record.open_contracts),
+            self.record.coordination.gates.clone(),
+            self.record.coordination.base_commit.clone(),
+        );
+        self.record.replans += 1;
+        self.record.replan_note = Some(kgraf_secrets::intake(&note));
+        self.record.coordination.waits.clear();
+        self.record.planned = false;
+        self.record.plan_progress = None;
+        let detail = kgraf_secrets::scrub_persist_owned(format!(
+            "the plan was held before any work started; planning again ({} of \
+             {MAX_REPLANS}) with the failures: {failures}",
+            self.record.replans
+        ));
+        self.notices.insert(detail.clone());
+        let at = self.now();
+        self.trace(TraceEvent::Notice {
+            at_ms: at,
+            contract: String::new(),
+            worker: String::new(),
+            detail,
+        })
+        .await?;
+        self.save()?;
+        match self.plan().await {
+            Ok(planned) => {
+                self.record.replan_note = None;
+                if !planned {
+                    self.stopping = true;
+                }
+                self.save()?;
+                Ok(true)
+            }
+            Err(e) => {
+                let (open, gates, base) = held;
+                self.record.open_contracts = open;
+                self.record.coordination.gates = gates;
+                self.record.coordination.base_commit = base;
+                self.record.planned = true;
+                self.record.plan_progress = None;
+                self.record.replan_note = None;
+                self.notices
+                    .insert(kgraf_secrets::scrub_persist_owned(format!(
+                        "the re-plan was refused, so the held plan stands: {e}"
+                    )));
+                self.save()?;
+                Ok(false)
+            }
+        }
     }
 
     /// `Completed` means every verified contract's commit is on
@@ -4343,6 +4606,7 @@ impl RunLoop {
         if !self.reground(&contract).await? {
             return Ok(());
         }
+        let contract = self.refresh_slices(contract).await?;
 
         let attempts_total = contract.attempts.max(1);
         // Beam's throttle, and never more at once than the ceiling could admit.
@@ -6537,6 +6801,8 @@ impl RunLoop {
                 deps,
             );
             child.slices = parent.slices.clone();
+            child.slice_names = parent.slice_names.clone();
+            child.slice_from = parent.slice_from.clone();
             child.workspace = Some(workspace.clone());
             if let (Some(name), Some(handle)) = (&inherited_name, &inherited_handle) {
                 child.worktrees.insert(name.clone(), handle.clone());

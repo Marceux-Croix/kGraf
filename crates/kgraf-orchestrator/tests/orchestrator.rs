@@ -457,6 +457,44 @@ async fn a_contract_projected_over_the_plan_target_is_split_before_dispatch() {
     );
 }
 
+/// A split cannot shrink the worker prefix or the projected transcript
+/// growth: every child carries both. When they alone are over the plan target
+/// (here a 30,000-token window gives a 12,000-token target, and the unmeasured
+/// growth of six rounds is 12,500), splitting a one-line brief only multiplies
+/// planner calls. The contract is dispatched unsplit, with a notice that gives
+/// the numbers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_brief_whose_fixed_part_alone_is_over_the_target_is_not_split() {
+    let dir = tempfile::tempdir().expect("dir");
+    let plan = plan_json(&[c("a", "make a", "src/a.rs", &[])]);
+    let p = Parts::open(
+        dir.path(),
+        move |_| plan.clone(),
+        |_| SERVES.into(),
+        Duration::from_millis(5),
+    );
+    let o = Orchestrator::new(config(), p.services(30_000)).expect("orchestrator");
+    let report = o
+        .start(RunId::new("r1"), "make a".into())
+        .await
+        .expect("run");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    assert_eq!(p.planner.calls(), 1, "the plan only, no split");
+    assert_eq!(report.verified, vec!["a".to_owned()]);
+    let events = kgraf_orchestrator::TraceLog::open(&dir.path().join("runs/r1/trace.jsonl"))
+        .await
+        .expect("trace")
+        .load()
+        .await
+        .expect("load");
+    assert!(
+        events.iter().any(|e| matches!(e,
+            kgraf_orchestrator::TraceEvent::Notice { contract, detail, .. }
+                if contract == "a" && detail.contains("not split") && detail.contains("12000"))),
+        "{events:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn re_grounding_holds_a_step_that_no_longer_serves_the_original_instruction() {
     let dir = tempfile::tempdir().expect("dir");

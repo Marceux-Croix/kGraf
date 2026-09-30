@@ -72,3 +72,27 @@ choice is the user's.
   Stop the process, then run `kgraf clean`.
 - A `run.json` written with the `worktrees` key must drop it.
 
+
+## Amendment (2026-09-30): the graph reads merged files from the integration view
+
+Under `Delete`, merge-back removed the winner's worktree during the merge, and the reindex
+that followed read that missing tree. The indexer took each missing file for a deleted one,
+so every merged file and its nodes left the graph, and the first dependent contract failed
+at spawn on a slice node that no longer existed.
+
+- **An integration view.** `Workspaces::integration_view` gives a tree holding the
+  integration tip's files. `GitWorkspaces` keeps one detached worktree per run (name
+  `view-<nanos>`, a kGraf-made worktree that startup cleanup removes), made at the first
+  call and moved in place to each new tip (`git checkout --detach`, attributes read from the
+  tip). One tree moved in place keeps every file's recorded source root valid across merges
+  and rewrites only changed files; a fresh worktree per merge would check out the whole
+  repository each time and orphan the roots recorded for earlier merges. It holds no build
+  and no worker's work. Dropped with the run's `GitWorkspaces`: removed under `Delete`, left
+  under `Keep`.
+- **The reindex after a merge reads the view**, under both settings, and slices of merged
+  code read it back. A provider without a view (plain directories) has its merged worktree
+  read, as before, and must keep it.
+- **The indexer refuses a missing root.** `Indexer::index_paths` returns an error when its
+  source root (or the store's root) is not an existing directory, and reads and removes
+  nothing. A walk of a missing root already errored and kept every file.
+- The merged worktree's removal under `Delete` is unchanged: it happens with the merge.

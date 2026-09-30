@@ -125,6 +125,10 @@ pub(super) struct Desk {
     /// recompute running off the loop). Another from the same lineage on the
     /// same interface is refused meanwhile.
     open: std::collections::BTreeSet<(String, String)>,
+    /// Interfaces the run was given before planning, not written by the
+    /// planner: a re-plan cannot change them, so their failures are never
+    /// sent back to the planner.
+    seeded: std::collections::BTreeSet<String>,
 }
 
 /// One start of an interface's mechanical checks, tracked until the loop
@@ -249,6 +253,7 @@ impl CheckStarts {
 
 impl Desk {
     pub(super) fn new(c: ContractChecks) -> Result<Self, String> {
+        let seeded = c.interfaces.iter().map(|ic| ic.id.clone()).collect();
         Ok(Self {
             book: ContractBook::new(c.interfaces, c.max_supersessions)?,
             runner: c.runner,
@@ -263,6 +268,7 @@ impl Desk {
             mechanical: BTreeMap::new(),
             jobs: Vec::new(),
             open: std::collections::BTreeSet::new(),
+            seeded,
         })
     }
 
@@ -920,6 +926,58 @@ impl RunLoop {
         })
         .await?;
         self.save()
+    }
+
+    /// The failures a re-plan sends back to the planner, or `None` when the
+    /// run's holds are not the planner's to correct by planning again.
+    ///
+    /// Only a plan nothing has acted on yet is re-planned: no contract ever
+    /// dispatched or verified, no merge onto the integration branch, and no
+    /// interface stub landed on it, so dropping the plan loses no work and
+    /// leaves no trace of it on the branch. Every open contract is planned or
+    /// held, and at least one is held by a failed pre-dispatch check (any
+    /// stage: artifact, stub-compile, vacuity, handshake) of an interface the
+    /// planner wrote. An interface the run was given before planning is not
+    /// the planner's: a plan bound by one is never re-planned.
+    pub(super) fn replan_failures(&self) -> Option<String> {
+        let desk = self.contracts.as_ref()?;
+        let untouched = self.record.counters.dispatches == 0
+            && self.record.verified_contracts.is_empty()
+            && self.in_flight.is_empty()
+            && self.record.coordination.integration_tip.is_none();
+        if !untouched {
+            return None;
+        }
+        let mut failures: BTreeMap<String, String> = BTreeMap::new();
+        for c in &self.record.open_contracts {
+            match &c.status {
+                ContractStatus::Planned => {}
+                ContractStatus::Held { .. } => {}
+                _ => return None,
+            }
+            for id in desk.book.interfaces_of(&c.contract) {
+                // A re-plan renames every contract, which would unbind an
+                // interface the run was given: such a plan is never re-planned.
+                if desk.book.stub_landed(&id) || desk.seeded.contains(&id) {
+                    return None;
+                }
+                if let (Some(ic), Some(InterfaceState::Failed { failure })) =
+                    (desk.book.get(&id), desk.book.state(&id))
+                {
+                    failures.insert(ic.label(), failure.to_string());
+                }
+            }
+        }
+        if failures.is_empty() {
+            return None;
+        }
+        Some(
+            failures
+                .into_iter()
+                .map(|(label, failure)| format!("interface {label}: {failure}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
     }
 
     /// Ask each open party for its statement, independently, and compare.

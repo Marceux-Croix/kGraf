@@ -712,7 +712,26 @@ impl<'store> Indexer<'store> {
     /// A file over the size ceiling is treated as the walk treats it: not
     /// indexed, and removed from the index if it was there
     /// ([`IndexReport::skipped_too_large`] counts it here).
+    ///
+    /// The tree the files are read from must be a directory that exists. A
+    /// missing one (a worktree removed before its files were read) is an
+    /// error: a file absent because its whole tree is gone was not deleted,
+    /// and nothing is read or removed.
     pub fn index_paths(&self, paths: &[String]) -> Result<IndexReport> {
+        let root = self
+            .source_root
+            .as_deref()
+            .unwrap_or_else(|| self.store.root());
+        if !root.is_dir() {
+            return Err(GraphError::Io {
+                path: root.display().to_string(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "the tree to index from is not a directory that exists; no file was read \
+                     and none was removed",
+                ),
+            });
+        }
         let guard = InProgress::start(self.store)?;
         let report = self.index_paths_pass(paths)?;
         guard.clear()?;
@@ -1714,6 +1733,66 @@ mod tests {
                 .index_paths(&["notes.bin".to_owned()])
                 .is_err()
         );
+    }
+
+    /// A source root that does not exist (a worktree removed before its files
+    /// were read) is an error, never every named file deleted: the file, its
+    /// nodes and the change log are as they were.
+    #[test]
+    fn a_missing_source_root_is_an_error_and_deletes_nothing() {
+        let tree = Tree::new();
+        tree.write("src/a.rs", "pub fn a(x: u8) -> u8 {\n    x\n}\n");
+        let store = tree.store();
+        Indexer::new(&store)
+            .index_paths(&["src/a.rs".to_owned()])
+            .expect("indexed");
+        let nodes = store.nodes_in_file("src/a.rs").expect("nodes").len();
+        assert!(nodes > 0);
+        let watermark = store.change_watermark().expect("watermark");
+        let gone = tree.path().join("removed-worktree");
+        let result = Indexer::new(&store)
+            .with_source_root(&gone)
+            .index_paths(&["src/a.rs".to_owned()]);
+        let err = result.expect_err("a missing source root must fail");
+        assert!(
+            matches!(&err, GraphError::Io { source, .. }
+                if source.kind() == std::io::ErrorKind::NotFound),
+            "{err:?}"
+        );
+        assert!(store.file("src/a.rs").expect("file").is_some());
+        assert_eq!(store.nodes_in_file("src/a.rs").expect("nodes").len(), nodes);
+        assert_eq!(store.change_watermark().expect("watermark"), watermark);
+        // A file root, not a directory, is refused the same way.
+        tree.write("not-a-dir", "x");
+        assert!(
+            Indexer::new(&store)
+                .with_source_root(tree.path().join("not-a-dir"))
+                .index_paths(&["src/a.rs".to_owned()])
+                .is_err()
+        );
+        assert_eq!(store.change_watermark().expect("watermark"), watermark);
+    }
+
+    /// A walk of a store root that no longer exists is an error and removes
+    /// no file: a vanished tree is not every file deleted.
+    #[test]
+    fn a_walk_of_a_missing_root_is_an_error_and_deletes_nothing() {
+        let parent = Tree::new();
+        let root = parent.path().join("checkout");
+        fs::create_dir_all(root.join("src")).expect("mkdir");
+        fs::write(root.join("src/a.rs"), "pub fn a() {}\n").expect("write");
+        let store = GraphStore::open_in_memory(&root).expect("store");
+        Indexer::new(&store).index().expect("walk");
+        let watermark = store.change_watermark().expect("watermark");
+        fs::remove_dir_all(&root).expect("remove root");
+        assert!(Indexer::new(&store).index().is_err());
+        assert!(
+            Indexer::new(&store)
+                .index_paths(&["src/a.rs".to_owned()])
+                .is_err()
+        );
+        assert!(store.file("src/a.rs").expect("file").is_some());
+        assert_eq!(store.change_watermark().expect("watermark"), watermark);
     }
 
     /// A file that exists only in another checkout (the run's integration

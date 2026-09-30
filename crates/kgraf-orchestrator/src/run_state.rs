@@ -81,9 +81,22 @@ pub struct OpenContract {
     /// Contracts that must be verified first.
     #[serde(default)]
     pub depends_on: Vec<String>,
-    /// Graph nodes for the worker's private slices.
+    /// Graph nodes for the worker's private slices, as last resolved. Resolved
+    /// again from `slice_names` at each dispatch: a node id hashes the
+    /// symbol's signature, so a predecessor's merge that renames a parameter
+    /// gives the symbol a new id.
     #[serde(default)]
     pub slices: Vec<NodeId>,
+    /// The slice names the plan gave, resolved at dispatch against the graph
+    /// as it is then. A name that no longer resolves is an empty lookup,
+    /// traced, and gives no slice. Empty: `slices` is used as recorded, less
+    /// any node the graph no longer holds.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub slice_names: Vec<String>,
+    /// The file a crate-relative slice name (`crate::X`) resolves from: the
+    /// contract's first declared write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slice_from: Option<String>,
     /// Tools the brief needs; readiness checks the route discovered them.
     #[serde(default)]
     pub tools: Vec<String>,
@@ -287,6 +300,8 @@ impl OpenContract {
             writes: Vec::new(),
             depends_on: Vec::new(),
             slices: Vec::new(),
+            slice_names: Vec::new(),
+            slice_from: None,
             tools: Vec::new(),
             route: None,
             route_pinned: false,
@@ -513,6 +528,15 @@ pub struct RunStateRecord {
     /// reason. The run reports them as unverified, never as plainly done.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub unverified: BTreeMap<String, String>,
+    /// Times the whole plan was sent back to the planner because the
+    /// pre-dispatch checks of its interfaces held it before any work started
+    /// (at most once).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub replans: u32,
+    /// The check failures a re-plan sends back to the planner, kept until the
+    /// re-plan is taken so a resume in between still sends them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replan_note: Option<String>,
 }
 
 /// A run's contract-check setting, as its record keeps it.
@@ -676,6 +700,8 @@ impl RunStateRecord {
             parent_run: None,
             consumer_tests: crate::consumer_tests::ConsumerTestBook::default(),
             unverified: BTreeMap::new(),
+            replans: 0,
+            replan_note: None,
         }
     }
 

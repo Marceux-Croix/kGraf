@@ -54,6 +54,21 @@ impl Projection {
     pub fn fits(&self) -> bool {
         self.tokens <= self.target_tokens
     }
+
+    /// The projected tokens no split removes: `fixed_base`, the part of the
+    /// base every child carries too (the worker prefix), plus the projected
+    /// transcript growth, which is the same for every block on the model.
+    pub fn unsplittable_tokens(&self, fixed_base: u64) -> u64 {
+        fixed_base.saturating_add(self.tokens.saturating_sub(self.base_tokens))
+    }
+
+    /// Whether a split can bring a child under the plan target: only when the
+    /// part no split removes is under it by itself. Otherwise every child is
+    /// over the target too, and a split only multiplies planner calls,
+    /// interfaces and handshake parties.
+    pub fn split_can_fit(&self, fixed_base: u64) -> bool {
+        self.unsplittable_tokens(fixed_base) < self.target_tokens
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -331,6 +346,23 @@ mod tests {
         // 100,000-token ceiling, 80% point, half of it.
         assert_eq!(p.target_tokens, 40_000);
         assert!(p.fits());
+    }
+
+    /// A 64,000-token window gives a 25,600-token target; ten unmeasured
+    /// rounds project 22,500 tokens of growth. With a 4,200-token prefix no
+    /// child of a split can fit, whatever the instruction; with a 1,000-token
+    /// prefix a large instruction can be split under it.
+    #[test]
+    fn a_split_helps_only_when_the_unsplittable_part_is_under_the_target() {
+        let window = ContextConfig::for_model(64_000).expect("config");
+        let one_line = Sizer::default().project("m", 4_200 + 10, 20, &window);
+        assert_eq!(one_line.target_tokens, 25_600);
+        assert!(!one_line.fits());
+        assert_eq!(one_line.unsplittable_tokens(4_200), 26_700);
+        assert!(!one_line.split_can_fit(4_200));
+        let large = Sizer::default().project("m", 1_000 + 30_000, 20, &window);
+        assert!(!large.fits());
+        assert!(large.split_can_fit(1_000));
     }
 
     #[test]

@@ -1684,8 +1684,10 @@ async fn a_plan_missing_an_interface_field_is_asked_again() {
 }
 
 /// A planner that keeps answering the failing plan is asked twice more, then
-/// its plan is taken and the interface's parties are held on the failure, as
-/// a failed pre-dispatch check always held them.
+/// its plan is taken and the gate holds it on the failure. Nothing has
+/// started, so the plan goes back to the planner once more with the check's
+/// failure (a re-plan); the planner answers the same failing plan, and the
+/// run ends on the hold: four asks in all, never more.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn after_two_re_asks_a_failing_interface_is_held() {
     let dir = tempfile::tempdir().expect("dir");
@@ -1705,8 +1707,144 @@ async fn after_two_re_asks_a_failing_interface_is_held() {
         matches!(report.status, RunStatus::Blocked { .. }),
         "{report:?}"
     );
-    assert_eq!(rig.parts.planner.prompts().len(), 3, "one ask, two re-asks");
+    let prompts = rig.parts.planner.prompts();
+    assert_eq!(prompts.len(), 4, "one ask, two re-asks, one re-plan");
+    assert!(
+        prompts[3].contains("before any work started")
+            && prompts[3].contains("StubCompile check failed")
+            && prompts[3].contains("load_config"),
+        "the re-plan carries the gate's failure: {}",
+        prompts[3]
+    );
+    assert_eq!(
+        report.contracts.stub_compile_failures, 2,
+        "the plan and its re-plan were each held once: {report:?}"
+    );
+    assert!(
+        worker_requests(&rig.parts).is_empty(),
+        "no worker was spent"
+    );
+}
+
+/// The plan taken on the last ask fails its stub-compile check at the gate.
+/// Nothing has started, so it goes back to the planner with the compiler's
+/// output; the re-planned contracts are checked, registered under ids of
+/// their own and dispatched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_plan_the_gate_holds_before_any_work_is_re_planned_once_with_the_failure() {
+    let dir = tempfile::tempdir().expect("dir");
+    let failing = plan_with(&stub_compile_failing_ic());
+    let passing = plan_with(&py_ic());
+    let rig = Rig::with_planner(
+        dir.path(),
+        move |prompt: &str| {
+            if prompt.contains("before any work started") {
+                passing.clone()
+            } else {
+                failing.clone()
+            }
+        },
+        |prompt| agreeing(&prompt.replace("`re1.", "`")),
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    let report = rig
+        .orchestrator(vec![])
+        .start(RunId::new("r1"), "parse the config".into())
+        .await
+        .expect("run");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    for party in ["re1.prod", "re1.cons"] {
+        assert!(report.verified.iter().any(|v| v == party), "{report:?}");
+    }
+    let prompts = rig.parts.planner.prompts();
+    assert_eq!(prompts.len(), 4, "three asks, then one re-plan");
+    assert!(prompts[3].contains("load_config"), "{}", prompts[3]);
     assert_eq!(report.contracts.stub_compile_failures, 1, "{report:?}");
+}
+
+/// A handshake runs only at the gate, after planning, so no re-ask ever sent
+/// its failure back. The parties of the first plan disagree; nothing has
+/// started, so the plan goes back to the planner with the finding, and the
+/// re-planned parties agree and dispatch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_handshake_failure_before_any_work_is_sent_back_to_the_planner_once() {
+    let dir = tempfile::tempdir().expect("dir");
+    let rig = Rig::new(
+        dir.path(),
+        plan_with(&py_ic()),
+        |prompt| {
+            if prompt.contains("You are party `cons`") {
+                serde_json::json!({
+                    "expect": ["I assume `parse_config` returns `Optional[Config]`"],
+                    "touch": ["consumer.py"]
+                })
+                .to_string()
+            } else {
+                agreeing(&prompt.replace("`re1.", "`"))
+            }
+        },
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    let report = rig
+        .orchestrator(vec![])
+        .start(RunId::new("r1"), "parse the config".into())
+        .await
+        .expect("run");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    assert_eq!(report.contracts.handshake_failures, 1, "{report:?}");
+    for party in ["re1.prod", "re1.cons"] {
+        assert!(report.verified.iter().any(|v| v == party), "{report:?}");
+    }
+    let prompts = rig.parts.planner.prompts();
+    assert_eq!(prompts.len(), 2, "the plan, then one re-plan");
+    assert!(
+        prompts[1].contains("Handshake check failed") && prompts[1].contains("Optional[Config]"),
+        "the re-plan carries the finding: {}",
+        prompts[1]
+    );
+}
+
+/// Parties that keep disagreeing: the plan and its one re-plan are both held,
+/// and the run ends on the hold without a third plan or any worker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_handshake_that_keeps_failing_is_held_after_one_re_plan() {
+    let dir = tempfile::tempdir().expect("dir");
+    let rig = Rig::new(
+        dir.path(),
+        plan_with(&py_ic()),
+        |prompt| {
+            if prompt.contains("You are party `cons`")
+                || prompt.contains("You are party `re1.cons`")
+            {
+                serde_json::json!({
+                    "expect": ["I assume `parse_config` returns `Optional[Config]`"],
+                    "touch": ["consumer.py"]
+                })
+                .to_string()
+            } else {
+                agreeing(&prompt.replace("`re1.", "`"))
+            }
+        },
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    let report = rig
+        .orchestrator(vec![])
+        .start(RunId::new("r1"), "parse the config".into())
+        .await
+        .expect("run");
+    assert!(
+        matches!(report.status, RunStatus::Blocked { .. }),
+        "{report:?}"
+    );
+    assert_eq!(
+        rig.parts.planner.prompts().len(),
+        2,
+        "one plan, one re-plan"
+    );
+    assert_eq!(report.contracts.handshake_failures, 2, "{report:?}");
     assert!(
         worker_requests(&rig.parts).is_empty(),
         "no worker was spent"

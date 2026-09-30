@@ -124,3 +124,19 @@ real implementers of one symbol, are replayed verbatim as test fixtures.
 
 On the fixtures, the two coherent plans hold nothing (warnings only), and the three
 implementers still hold on the double provision, with no overlap between them.
+
+## Amendment (2026-09-30): a negated assumption about a third party
+
+A coherent plan was held on a false contradiction: a test writer expected "I assume
+`c1.c2.c2` does not change the `parse_duration` interface.", and the implementer provided
+"I will provide the public `parse_duration` function using its existing signature." The
+two agree. Party ids are set aside when a sentence is read, so the expectation had no
+anchors of its own, and "not" against no negation read as the opposite behavior. The
+recorded handshake is replayed verbatim as a test fixture.
+
+- **A negated expectation is compared with a provision only when it is about the provider:**
+  it names the providing party, backticked or not, or it names no party. An assumption
+  naming only other parties says what they leave alone, which the provider's sentence does
+  not state the opposite of. Different numbers follow the same rule. `disagree` (a claim the
+  provider does not state) is unchanged: a claim about the symbol is about the symbol,
+  whoever the sentence names.

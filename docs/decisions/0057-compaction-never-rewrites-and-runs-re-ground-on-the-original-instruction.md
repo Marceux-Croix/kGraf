@@ -155,3 +155,21 @@ outcome and is left out) the recommendation is the highest point, in steps of 5 
 up to which the workers whose peak stayed at or under it completed at 90 percent or better
 (over at least 10 workers). With no such point the recommendation stays the unmeasured
 default. A slider the user has not moved follows the result; a moved slider keeps its value.
+
+## Amendment (2026-09-30): a split only when a child could fit; slices resolve at dispatch
+
+- **A split is asked for only when a child could fit the plan target.** Every split child
+  carries the worker prefix and the projected transcript growth (unmeasured: nine rounds of
+  2,500 tokens). With a 64,000-token window the target is 25,600, so a one-function brief
+  projected about 26,800 and was split to the depth limit: three planner calls for one
+  contract, then several writers of one symbol and a handshake hold. The planner now splits
+  only when the part no split removes is under the target; otherwise the contract is
+  dispatched unsplit, and a trace `notice` gives the projection, the target and that part.
+  The route's window is still the one the run is given (`--window`): replacing an explicit
+  window with a catalog value would ignore a parameter the user set.
+- **Slices are resolved by name at dispatch.** A node id hashes the symbol's signature, so
+  a predecessor that renames a parameter (`_order` to `order`) gives the symbol a new id at
+  its merge, and the plan-time id named nothing. A contract keeps its slice names and the
+  file they resolve from, and dispatch resolves them again. A name that no longer resolves
+  is a traced `empty_graph_lookup`, as at planning; a record with ids only keeps the ids the
+  graph still holds and traces the rest. Neither fails the spawn.

@@ -1286,6 +1286,17 @@ fn contradicts(a: &str, b: &str, mine: &BTreeSet<String>, theirs: &BTreeSet<Stri
     (same_anchors && negated(a) != negated(b)) || (!na.is_empty() && !nb.is_empty() && na != nb)
 }
 
+/// The parties a sentence names, backticked or not: a party id written as
+/// one word, with sentence punctuation around it trimmed.
+fn named_parties<'p>(text: &str, parties: &[&'p str]) -> BTreeSet<&'p str> {
+    text.split(|c: char| c.is_whitespace() || c == '`' || c == ',' || c == ';')
+        .map(|w| {
+            w.trim_matches(|c: char| matches!(c, '.' | ':' | '!' | '?' | '(' | ')' | '"' | '\''))
+        })
+        .filter_map(|w| parties.iter().copied().find(|p| *p == w))
+        .collect()
+}
+
 /// What the interface's own files state: the stub, reference, consumer and
 /// test files and the check commands, which stub-compile and vacuity already
 /// hold the parties to. An expectation these state is guaranteed by the
@@ -1669,11 +1680,24 @@ pub fn compare_handshake_ordered(
                     providing: (*p).to_owned(),
                     provides: (*t).to_owned(),
                 });
-            } else if same
-                .iter()
-                .all(|(_, t, theirs)| contradicts(text, t, &mine, theirs))
-            {
-                let (p, t, _) = same[0];
+            } else if let Some((p, t, _)) = {
+                // Opposite behavior is read only against a provision the
+                // expectation is about: one whose party it names, or any,
+                // when it names none. "I assume `c1.c2.c2` does not change
+                // `x`" says what a third party leaves alone; the provider's
+                // "I provide `x` unchanged" is not its opposite.
+                let named = named_parties(text, &party_ids);
+                let about: Vec<&Provision<'_>> = same
+                    .iter()
+                    .map(|x| **x)
+                    .filter(|(p, _, _)| named.is_empty() || named.contains(p))
+                    .collect();
+                (!about.is_empty()
+                    && about
+                        .iter()
+                        .all(|(_, t, theirs)| contradicts(text, t, &mine, theirs)))
+                .then(|| about[0])
+            } {
                 findings.push(HandshakeFinding::Contradict {
                     symbol: sym.to_owned(),
                     expecting: s.party.clone(),

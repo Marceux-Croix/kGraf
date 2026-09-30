@@ -1,9 +1,11 @@
 //! A merge makes a new symbol sliceable for the next contract: once a
 //! contract's attempt is accepted onto the integration branch
-//! (`Coord::integrate_winner`), the code it wrote is indexed from its own
-//! worktree (`Coord::reindex_merged`), so a later contract's planner slices
-//! and `graph_slice` tool see it immediately, not only after a separate
-//! `kgraf index` pass.
+//! (`Coord::integrate_winner`), the code it wrote is indexed from the run's
+//! integration view, or from its own worktree when the provider keeps no view
+//! (`Coord::reindex_merged`), so a later contract's planner slices and
+//! `graph_slice` tool see it immediately, not only after a separate
+//! `kgraf index` pass. A tree that is gone is a traced failure, never a
+//! deletion.
 
 mod support;
 
@@ -117,4 +119,112 @@ async fn a_merge_makes_its_new_symbol_sliceable() {
         "the slice does not carry the merged function: {}",
         slice.render()
     );
+}
+
+/// Run one contract writing `src/a.rs` against `integration`; the merge
+/// removes the winner's worktree, as merge-back does under the default
+/// worktree policy (decision 0088).
+async fn run_with_removal(
+    dir: &std::path::Path,
+    integration: std::sync::Arc<FakeIntegration>,
+    source: &str,
+) -> (Parts, Vec<kgraf_orchestrator::TraceEvent>) {
+    let plan = plan_json(&[c("a", "make a", "src/a.rs", &[])]);
+    let p = Parts::open(
+        dir,
+        move |_| plan.clone(),
+        |_| SERVES.into(),
+        Duration::from_millis(5),
+    );
+    p.alpha.set_content(source);
+    p.beta.set_content(source);
+    integration
+        .remove_on_merge
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut services = p.services(WINDOW);
+    services.workspaces = integration.clone();
+    let report = Orchestrator::new(config(), services)
+        .expect("orchestrator")
+        .start(RunId::new("r1"), "build a".into())
+        .await
+        .expect("run");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    assert_eq!(report.verified, vec!["a".to_owned()]);
+    let events = kgraf_orchestrator::TraceLog::open(&dir.join("runs/r1/trace.jsonl"))
+        .await
+        .expect("trace")
+        .load()
+        .await
+        .expect("load");
+    (p, events)
+}
+
+/// The merge removed the winner's worktree: the merged file is indexed from
+/// the integration view, stays in the graph, and its slice reads from the
+/// view, which outlives the merge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_merge_that_removes_its_worktree_keeps_the_merged_file_in_the_graph() {
+    let dir = tempfile::tempdir().expect("dir");
+    let integration = FakeIntegration::new(dir.path().join("worktrees"));
+    let view = dir.path().join("view");
+    *integration.view.lock().expect("lock") = Some(view.clone());
+    let source = "pub fn a(x: u8) -> u8 {\n    x + 42\n}\n";
+    let (p, _) = run_with_removal(dir.path(), integration.clone(), source).await;
+    let g = p.graph.lock().expect("lock");
+    assert!(
+        g.file("src/a.rs").expect("file").is_some(),
+        "the merged file is in the graph"
+    );
+    assert!(g.resolve_symbol("a").is_ok(), "its function resolves");
+    assert_eq!(
+        g.file_source_root("src/a.rs").expect("root").as_deref(),
+        Some(view.as_path()),
+        "the file is read from the view"
+    );
+    let slice = kgraf_graph::slice::slice_for_symbol(&g, "a", 2_000).expect("sliceable");
+    assert!(slice.render().contains("x + 42"), "{}", slice.render());
+}
+
+/// With no view and the worktree removed by the merge, the tree to read is
+/// gone: the reindex fails and says so, and the file the graph already held
+/// is kept, never deleted as if the merge had removed it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_merge_whose_tree_is_gone_deletes_nothing_and_says_so() {
+    let dir = tempfile::tempdir().expect("dir");
+    std::fs::create_dir_all(dir.path().join("src")).expect("mkdir");
+    std::fs::write(dir.path().join("src/a.rs"), "pub fn before() {}\n").expect("write");
+    {
+        let g = GraphStoreProbe::open(dir.path());
+        kgraf_graph::Indexer::new(&g)
+            .index_paths(&["src/a.rs".to_owned()])
+            .expect("index");
+    }
+    let integration = FakeIntegration::new(dir.path().join("worktrees"));
+    let (p, events) = run_with_removal(
+        dir.path(),
+        integration,
+        "pub fn a(x: u8) -> u8 {\n    x\n}\n",
+    )
+    .await;
+    let g = p.graph.lock().expect("lock");
+    assert!(
+        g.file("src/a.rs").expect("file").is_some(),
+        "the file is kept"
+    );
+    assert!(g.resolve_symbol("before").is_ok(), "its nodes are kept");
+    assert!(
+        events.iter().any(|e| matches!(e,
+            kgraf_orchestrator::TraceEvent::Notice { detail, .. }
+                if detail.contains("reindex after merge failed"))),
+        "the failed reindex is traced: {events:?}"
+    );
+}
+
+/// The graph file the run opens, for indexing before it starts.
+struct GraphStoreProbe;
+
+impl GraphStoreProbe {
+    fn open(dir: &std::path::Path) -> kgraf_graph::GraphStore {
+        kgraf_graph::GraphStore::open(&dir.join("graph.db"), dir).expect("graph")
+    }
 }

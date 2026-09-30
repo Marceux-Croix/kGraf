@@ -162,3 +162,29 @@ existing bounded re-ask before any hold.
   the base already tracks, with different content (it would make the check validate a
   rewrite of the project's own test); and stub, consumer or test files naming one path with
   different content (overlaid in one tree, the later would silently win).
+
+## Amendment (2026-09-30): a plan held before any work goes back to the planner once
+
+A handshake runs only at the pre-dispatch gate, after planning, and the plan taken on the
+last ask is not pre-checked, so these failures never reached the planner. The gate held the
+parties, and with nothing else to do the run ended blocked.
+
+- **When the run would end on a hold, and nothing has acted on the plan**, the whole plan
+  goes back to the planner once with the failures of every held interface, a handshake's
+  findings included. "Nothing has acted" means: no contract dispatched or verified, no
+  merge onto the integration branch, no interface stub landed, and no interface the run was
+  given before planning binds the plan. The orchestrator ends any run whose remaining
+  contracts are all held, interactive or not, so the rule applies to every run mode; a run
+  from an approved plan is never re-planned (its plan is the user's).
+- **The re-plan is one ask, taken as it is**: no re-ask, and the gate checks it as any
+  plan. A hold on it ends the run. The bound: the two re-asks of the first plan stay; the
+  re-plan adds one ask, so the top-level plan is asked for at most four times. A re-plan
+  answer refused outright (for example, invalid JSON) leaves the held plan, and the run
+  ends on its hold with the refusal noticed.
+- **The re-plan's contracts and interfaces get ids of their own** (`re1.c1`, `re1.i1`). The
+  held plan's interfaces stay registered under their ids, because the book keeps an
+  interface once registered; a new contract reusing an old id would be bound, and held, by
+  the old plan's failed interface.
+- **Recorded:** `replans` and, until the re-plan is taken, `replan_note` in the run record,
+  so a resume in between still sends the failures; a notice and a trace `notice` event name
+  the failures.

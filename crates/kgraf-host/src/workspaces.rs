@@ -267,6 +267,8 @@ pub(crate) const COMMS_PREFIX: &str = "comms-";
 pub(crate) const GATE_PREFIX: &str = "gate-";
 /// A worktree that probes the sandbox (`assembler`).
 pub(crate) const PROBE_PREFIX: &str = "probe-";
+/// The run's integration view ([`Workspaces::integration_view`]).
+pub(crate) const VIEW_PREFIX: &str = "view-";
 
 /// The name of a worktree kGraf makes for itself at `now_nanos()`.
 pub(crate) fn harness_worktree_name(prefix: &str) -> String {
@@ -274,13 +276,14 @@ pub(crate) fn harness_worktree_name(prefix: &str) -> String {
 }
 
 /// Whether `name` is a worktree kGraf makes for itself rather than a worker's
-/// attempt: a conversation, gate or probe worktree (`<prefix><nanos>`), or an
+/// attempt: a conversation, gate, probe or integration-view worktree
+/// (`<prefix><nanos>`), or an
 /// interface-stub landing (`stub-<id>-v<version>`, `GitStubLander`). A worker's
 /// worktree never matches: its name ends in `-a<n>` (`<run>-<contract>-r<n>...
 /// -a<n>`), a writer subagent's in `.s<n>`.
 pub(crate) fn is_harness_worktree(name: &str) -> bool {
     let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
-    let stamped = [COMMS_PREFIX, GATE_PREFIX, PROBE_PREFIX]
+    let stamped = [COMMS_PREFIX, GATE_PREFIX, PROBE_PREFIX, VIEW_PREFIX]
         .iter()
         .any(|p| name.strip_prefix(p).is_some_and(digits));
     let stub = name
@@ -410,6 +413,74 @@ pub(crate) struct GitWorkspaces {
     /// to show in the run's report ([`Workspaces::take_problems`]). Shared
     /// with the removals that run on a blocking thread or on drop.
     problems: Problems,
+    /// The run's integration view, made at the first
+    /// [`Workspaces::integration_view`] call. An async lock: the call holds
+    /// it while git moves the tree, so two callers never move it at once.
+    view: tokio::sync::Mutex<Option<IntegrationView>>,
+}
+
+/// A detached worktree at the integration tip that the graph reads merged
+/// files from for the rest of the run ([`Workspaces::integration_view`]).
+///
+/// One tree per run, moved in place to each new tip (`git checkout
+/// --detach`), so a file's recorded source root stays valid across merges and
+/// only the changed files are rewritten; a fresh worktree per merge would
+/// check out the whole repository each time and orphan the roots the graph
+/// recorded for earlier merges. It holds no build and no worker's work.
+/// Dropped with the run's [`GitWorkspaces`]: removed under
+/// [`WorktreeRetention::Delete`], left under `Keep` (startup cleanup removes
+/// it as a kGraf-made worktree either way).
+pub(crate) struct IntegrationView {
+    manager: Arc<WorkspaceManager>,
+    ws: Option<Workspace>,
+    /// The commit the tree is checked out at.
+    head: String,
+    remove: bool,
+    problems: Problems,
+}
+
+impl IntegrationView {
+    fn root(&self) -> Option<PathBuf> {
+        self.ws.as_ref().map(|w| w.root().to_path_buf())
+    }
+
+    /// Move the tree to `tip`. Attributes are read from `tip`, a commit on the
+    /// integration branch, never from the tree's own files.
+    fn advance(&mut self, tip: &str) -> std::result::Result<(), String> {
+        let ws = self
+            .ws
+            .as_ref()
+            .ok_or_else(|| "the integration view was removed".to_owned())?;
+        let admin = child::admin_of(ws)?;
+        child::git(
+            self.manager.repo(),
+            Some(child::Wt {
+                admin: &admin,
+                work: ws.root(),
+                attr: tip,
+            }),
+            None,
+            &["checkout", "--quiet", "--force", "--detach", tip],
+            None,
+        )?;
+        self.head = tip.to_owned();
+        Ok(())
+    }
+}
+
+impl Drop for IntegrationView {
+    fn drop(&mut self) {
+        let Some(ws) = self.ws.take() else { return };
+        if !self.remove || !ws.root().exists() {
+            return;
+        }
+        let root = ws.root().display().to_string();
+        if let Err(e) = self.manager.remove(ws) {
+            self.problems.push(format!(
+                "integration view {root} could not be removed: {e}; `kgraf clean` removes it"
+            ));
+        }
+    }
 }
 
 /// Where each failed removal or discard is recorded, once, for the run's
@@ -440,6 +511,7 @@ impl GitWorkspaces {
             empty: Mutex::new(BTreeSet::new()),
             touched: Mutex::new(BTreeSet::new()),
             conflicted: Mutex::new(BTreeMap::new()),
+            view: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -841,7 +913,9 @@ impl Workspaces for GitWorkspaces {
         };
         let merge_back = self.merge_back.clone();
         // Decision 0088: under `Keep` the merged worktree stays with its
-        // builds; under `Delete` merge-back removes it with the merge.
+        // builds; under `Delete` merge-back removes it with the merge. The
+        // graph never reads it after the merge: it reads the integration
+        // view (`integration_view`), which holds the tip either way.
         let after = if self.retention.deletes() {
             MergedWorktree::Remove
         } else {
@@ -1121,6 +1195,66 @@ impl Workspaces for GitWorkspaces {
             .await
             .map_err(|e| e.to_string())?
             .map_err(|e| e.to_string())
+    }
+
+    /// The run's [`IntegrationView`], made at the tip on the first call and
+    /// moved to the current tip on each later one. A view git could not move
+    /// is dropped (removed under `Delete`) and made again at the tip; a view
+    /// that cannot be made is an error, never an older tree passed off as
+    /// the tip.
+    async fn integration_view(&self) -> std::result::Result<Option<PathBuf>, String> {
+        let mut slot = self.view.lock().await;
+        let current = slot.take();
+        let manager = self.manager.clone();
+        let merge_back = self.merge_back.clone();
+        let problems = self.problems.clone();
+        let remove = self.retention.deletes();
+        let (view, outcome) = tokio::task::spawn_blocking(move || {
+            let tip = match merge_back.integration_tip() {
+                Ok(tip) => tip,
+                Err(e) => return (current, Err(e.to_string())),
+            };
+            let moved = match current {
+                Some(v) if v.head == tip => return (Some(v), Ok(())),
+                Some(mut v) => match v.advance(&tip) {
+                    Ok(()) => Some(v),
+                    Err(e) => {
+                        problems.push(format!(
+                            "the integration view could not be moved to {tip}, so it is \
+                             made again: {e}"
+                        ));
+                        None
+                    }
+                },
+                None => None,
+            };
+            if let Some(v) = moved {
+                return (Some(v), Ok(()));
+            }
+            let name = harness_worktree_name(VIEW_PREFIX);
+            match manager.create(&WorkspaceSpec {
+                name: &name,
+                base: &tip,
+                branch: None,
+            }) {
+                Ok(ws) => (
+                    Some(IntegrationView {
+                        manager: manager.clone(),
+                        ws: Some(ws),
+                        head: tip,
+                        remove,
+                        problems,
+                    }),
+                    Ok(()),
+                ),
+                Err(e) => (None, Err(e.to_string())),
+            }
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+        *slot = view;
+        outcome?;
+        Ok(slot.as_ref().and_then(IntegrationView::root))
     }
 
     async fn commit_landed(&self, commit: &str) -> std::result::Result<bool, String> {
@@ -1417,7 +1551,7 @@ pub(crate) mod child {
     /// that reads a worktree (with `--attr-source` pinned to its trusted
     /// tree); without it, the command runs in the shared repository. `index`
     /// replaces the worktree's own index.
-    fn git(
+    pub(crate) fn git(
         repo: &Path,
         tree: Option<Wt<'_>>,
         index: Option<&Path>,
@@ -1492,7 +1626,7 @@ pub(crate) mod child {
     /// The worktree's admin directory, taken from the gitlink recorded when it
     /// was created (never from the worker-writable `.git` file), after
     /// checking that file still says the same.
-    fn admin_of(ws: &Workspace) -> Result<PathBuf, String> {
+    pub(crate) fn admin_of(ws: &Workspace) -> Result<PathBuf, String> {
         ws.verify_gitlink().map_err(|e| e.to_string())?;
         let target = ws
             .gitlink()

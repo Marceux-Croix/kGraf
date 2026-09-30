@@ -528,14 +528,22 @@ The mechanical checks also run on each planner answer: an interface that is
 incomplete, or fails stub-compile or vacuity, refuses the answer with the
 check's failure (the compiler's error lines come first in a check's kept
 output), and the planner is asked again, at most twice; the last answer is
-taken and the gate holds on the same failure. A contract test may not
-replace a file the project already tracks, and the stub, consumer and test
-files may not name one path with different content. In the handshake, a
-provision counts only from a party that writes the symbol's stub file; a
-shared touch is an overlap only between parties no dependency orders; an
-expectation the interface's own files state is not a disagreement with a
-silent provider. A sentence bound to no surface symbol is recorded as a
-warning and holds nothing.
+taken and the gate holds on the same failure. When the gate holds a plan
+that nothing has acted on yet (no dispatch, no merge, no stub landed, no
+interface the run was given), and the run would end on that hold, the whole
+plan goes back to the planner once with the checks' failures, a handshake's
+included (decision 0031, amended). The re-plan is one ask, taken as it is,
+under ids of its own (`re1.`); a hold on it ends the run, so the top-level
+plan is asked for at most four times. A contract test may not replace a
+file the project already tracks, and the stub, consumer and test files may
+not name one path with different content. In the handshake, a provision
+counts only from a party that writes the symbol's stub file; a shared touch
+is an overlap only between parties no dependency orders; an expectation the
+interface's own files state is not a disagreement with a silent provider; a
+negated expectation is compared with a provision only when it names the
+providing party or names no party, so an assumption about a third party is
+not read as the provider's opposite (decision 0078, amended). A sentence
+bound to no surface symbol is recorded as a warning and holds nothing.
 
 ### Message bus
 
@@ -1058,9 +1066,22 @@ files. It takes leases on what it writes, and the change log turns those
 leases into live edges from the agent to the nodes it holds. It returns a
 compact structured result. Where the item was attempted more than once, a
 verifier selects the winner, and verified work merges onto the run's branch.
-After an accepted merge the contract's written paths are reindexed, so the
-next contract's slices see them. **Not built yet:** reindexing triggered
-directly by a worker's edits before its merge is accepted.
+After an accepted merge the contract's written paths are reindexed from the
+run's integration view, one detached worktree at the integration tip that
+the host moves to each new tip and keeps for the run, so the next contract's
+slices see them. The winner's own worktree is not read, because under the
+default worktree retention (decision 0088) the merge removes it. The indexer
+refuses a source root that does not exist, so a vanished tree is a traced
+failure, never every merged file deleted. A contract keeps its slice names,
+and dispatch resolves them again against the graph as it is then: a node id
+hashes the symbol's signature, so a predecessor that renames a parameter
+gives the symbol a new id. A name that no longer resolves is a traced empty
+lookup, not a failed spawn. A contract whose projected block is over the
+plan target is split only when a child could fit: every child carries the
+worker prefix and the projected transcript growth, so when those alone are
+over the target the contract is dispatched unsplit, with a notice that gives
+the numbers. **Not built yet:** reindexing triggered directly by a worker's
+edits before its merge is accepted.
 
 A worker builds and tests its own work. A declared allowlist of build and
 test commands runs without approval in the sandbox with the network off

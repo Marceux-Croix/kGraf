@@ -45,6 +45,9 @@ pub struct Stats {
     /// When each worker's first request arrived: the moment of dispatch as a
     /// provider sees it.
     pub first_requests: Mutex<Vec<Instant>>,
+    /// Every text of each worker's opening message (the instruction, then its
+    /// slices), joined, as the first round sent it.
+    pub openings: Mutex<Vec<String>>,
 }
 
 impl Stats {
@@ -246,6 +249,19 @@ impl Provider for WorkerFake {
                 .lock()
                 .expect("lock")
                 .push(Instant::now());
+            let opening = request
+                .messages
+                .iter()
+                .find(|m| m.role == Role::User)
+                .map(|m| {
+                    m.content
+                        .iter()
+                        .filter_map(Content::as_text)
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default();
+            self.stats.openings.lock().expect("lock").push(opening);
         }
         self.stats.requests.lock().expect("lock").push((
             self.vendor.to_owned(),
@@ -909,6 +925,12 @@ pub struct FakeIntegration {
     /// Contracts whose attempts change nothing: integrated as
     /// `Integration::Empty`, the tip unmoved.
     pub empty_for: Mutex<std::collections::BTreeSet<String>>,
+    /// Remove the winner's worktree with the merge, as merge-back does under
+    /// the default worktree policy (decision 0088).
+    pub remove_on_merge: AtomicBool,
+    /// The integration view (`Workspaces::integration_view`): each merge
+    /// copies the contract's written files into it. `None`: no view.
+    pub view: Mutex<Option<PathBuf>>,
     next: AtomicUsize,
 }
 
@@ -924,8 +946,30 @@ impl FakeIntegration {
             conflicts_discarded: Mutex::new(Vec::new()),
             conflict_detail: Mutex::new("CONFLICT (content)".into()),
             empty_for: Mutex::new(Default::default()),
+            remove_on_merge: AtomicBool::new(false),
+            view: Mutex::new(None),
             next: AtomicUsize::new(1),
         })
+    }
+
+    /// What a merge does to the trees besides moving the tip: the written
+    /// files reach the view, and the worktree goes when asked to.
+    fn land(&self, contract: &OpenContract, workspace: &Path) {
+        if let Some(view) = self.view.lock().expect("lock").clone() {
+            for w in &contract.writes {
+                let from = workspace.join(&w.path);
+                let to = view.join(&w.path);
+                if from.exists() {
+                    std::fs::create_dir_all(to.parent().expect("parent")).expect("mkdir");
+                    std::fs::copy(&from, &to).expect("copy into the view");
+                } else if to.exists() {
+                    std::fs::remove_file(&to).expect("remove from the view");
+                }
+            }
+        }
+        if self.remove_on_merge.load(Ordering::SeqCst) {
+            std::fs::remove_dir_all(workspace).expect("remove the merged worktree");
+        }
     }
 
     fn commit(&self) -> String {
@@ -998,7 +1042,16 @@ impl kgraf_orchestrator::Workspaces for FakeIntegration {
             .lock()
             .expect("lock")
             .push((contract.contract.clone(), commit.clone()));
+        self.land(contract, workspace);
         Ok(kgraf_orchestrator::Integration::Merged { commit })
+    }
+
+    async fn integration_view(&self) -> Result<Option<PathBuf>, String> {
+        let view = self.view.lock().expect("lock").clone();
+        if let Some(v) = &view {
+            std::fs::create_dir_all(v).map_err(|e| e.to_string())?;
+        }
+        Ok(view)
     }
 
     async fn commit_comms(

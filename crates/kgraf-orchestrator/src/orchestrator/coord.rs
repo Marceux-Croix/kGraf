@@ -243,7 +243,7 @@ impl RunLoop {
         if let Integration::Merged { commit } = &outcome {
             self.record.coordination.integration_tip = Some(commit.clone());
             self.advance_check_base(commit)?;
-            self.reindex_merged(contract, workspace, at);
+            self.reindex_merged(contract, workspace, at).await;
         }
         if let Integration::Conflict { paths, .. } = &outcome {
             self.record_conflict_collisions(contract, paths, at);
@@ -426,16 +426,18 @@ impl RunLoop {
     /// to date, so the next contract's planner slices see the code this one
     /// just landed instead of a stale reading from before the merge.
     ///
-    /// Reads from `workspace`, the winning attempt's own worktree, not a fresh
-    /// checkout of the integration branch: with disjoint writes (no two open
-    /// contracts ever declare the same path), that worktree's content for its
-    /// own declared paths is exactly what the integration branch now holds for
-    /// them, the moment `integrate_winner` accepts the merge. Indexing it
-    /// directly needs no extra checkout, mirroring the message bus's own
-    /// `with_source_root` reindex just above ([`Self::write_comms`]).
+    /// Reads from the run's integration view ([`Workspaces::integration_view`]),
+    /// a tree at the integration tip that lives for the rest of the run, not
+    /// from `workspace`, the winning attempt's own worktree: under the default
+    /// worktree policy (decision 0088) the merge has already removed that
+    /// worktree, and a missing file there would read as a deleted one. A
+    /// provider without a view (plain directories) has its merged `workspace`
+    /// read instead, which it keeps. The indexer refuses a tree that does not
+    /// exist, so a vanished root is a traced failure, never every merged file
+    /// deleted.
     ///
-    /// The graph records that worktree as each file's source root, so a slice of
-    /// the merged code reads it from there (hash verified) until the change
+    /// The graph records the tree read as each file's source root, so a slice
+    /// of the merged code reads it from there (hash verified) until the change
     /// reaches the checkout the store describes; a walk of the checkout then
     /// clears the record.
     ///
@@ -444,7 +446,7 @@ impl RunLoop {
     /// `kgraf index` walk, exactly as everywhere else the incremental indexer
     /// runs. A failed reindex does not undo the merge or block the run: it is
     /// traced, never silent, and the next full index catches it up.
-    fn reindex_merged(&mut self, contract: &OpenContract, workspace: &Path, at: i64) {
+    async fn reindex_merged(&mut self, contract: &OpenContract, workspace: &Path, at: i64) {
         let paths: Vec<String> = contract
             .writes
             .iter()
@@ -454,8 +456,23 @@ impl RunLoop {
         if paths.is_empty() {
             return;
         }
+        let root = match self.s.workspaces.integration_view().await {
+            Ok(Some(view)) => view,
+            Ok(None) => workspace.to_path_buf(),
+            Err(e) => {
+                self.queue(TraceEvent::Notice {
+                    at_ms: at,
+                    contract: contract.contract.clone(),
+                    worker: String::new(),
+                    detail: format!(
+                        "reindex after merge failed, a later index will catch it up: the \
+                         integration tree could not be prepared: {e}"
+                    ),
+                });
+                return;
+            }
+        };
         let graph = self.s.graph.clone();
-        let root = workspace.to_path_buf();
         let result: Result<(), StoreError> = blocking(move || {
             let g = graph.lock().map_err(|_| StoreError::Poisoned)?;
             kgraf_graph::Indexer::new(&g)

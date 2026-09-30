@@ -1,0 +1,128 @@
+{
+  "interface": {
+    "id": "c1.i1",
+    "version": 1,
+    "parties": [
+      "c1.c1.c1",
+      "c1.c2.c1",
+      "c1.c2.c2"
+    ],
+    "symbols": [
+      "parse_duration"
+    ],
+    "stub": [
+      {
+        "path": "src/lib.rs",
+        "content": "pub fn parse_duration(input: &str) -> Result<u64, String> {\n    let _ = input;\n    Ok(0)\n}\n"
+      }
+    ],
+    "wrong": [],
+    "reference": [
+      {
+        "path": "src/lib.rs",
+        "content": "pub fn parse_duration(input: &str) -> Result<u64, String> {\n    let (digits, multiplier) = if let Some(digits) = input.strip_suffix('s') {\n        (digits, 1u64)\n    } else if let Some(digits) = input.strip_suffix('m') {\n        (digits, 60u64)\n    } else {\n        return Err(\"invalid duration\".to_string());\n    };\n\n    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {\n        return Err(\"invalid duration\".to_string());\n    }\n    let value = digits\n        .parse::<u64>()\n        .map_err(|_| \"integer overflow\".to_string())?;\n    value\n        .checked_mul(multiplier)\n        .ok_or_else(|| \"duration overflow\".to_string())\n}\n"
+      }
+    ],
+    "consumer": [],
+    "tests": [
+      {
+        "path": "tests/parse_duration.rs",
+        "content": "use fx_interface_duration::parse_duration;\n\n#[test]\nfn parses_seconds_and_minutes() {\n    assert_eq!(parse_duration(\"7s\"), Ok(7));\n    assert_eq!(parse_duration(\"3m\"), Ok(180));\n    assert_eq!(parse_duration(\"0s\"), Ok(0));\n}\n\n#[test]\nfn rejects_malformed_inputs() {\n    for input in [\"\", \"s\", \"m\", \"1\", \"1h\", \"-1s\", \"+1s\", \"1 s\", \"1ss\", \"١s\"] {\n        assert!(parse_duration(input).is_err(), \"accepted {input:?}\");\n    }\n}\n\n#[test]\nfn rejects_integer_parse_overflow() {\n    assert!(parse_duration(\"18446744073709551616s\").is_err());\n}\n\n#[test]\nfn rejects_minute_multiplication_overflow() {\n    let minutes = (u64::MAX / 60 + 1).to_string() + \"m\";\n    assert!(parse_duration(&minutes).is_err());\n}\n"
+      }
+    ],
+    "compile": [
+      "cargo",
+      "test",
+      "--no-run"
+    ],
+    "test": [
+      "cargo",
+      "test",
+      "--test",
+      "parse_duration"
+    ],
+    "consulted": [],
+    "replaces": [
+      "src/lib.rs"
+    ]
+  },
+  "handshake": [
+    {
+      "party": "c1.c1.c1",
+      "provide": [
+        "I will provide the public `parse_duration` function using its existing signature."
+      ],
+      "expect": [
+        "I assume `c1.c2.c1` and `c1.c2.c2` provide no additional symbols required by this change."
+      ],
+      "consume": [
+        "I assume callers use `parse_duration` according to its existing public signature."
+      ],
+      "touch": [
+        "src/lib.rs"
+      ]
+    },
+    {
+      "party": "c1.c2.c1",
+      "provide": [],
+      "expect": [
+        "I assume `c1.c1.c1` provides the public `parse_duration` API.",
+        "I assume `c1.c2.c2` does not change the `parse_duration` interface."
+      ],
+      "consume": [
+        "I assume the tests consume `parse_duration`."
+      ],
+      "touch": [
+        "tests/parse_duration.rs"
+      ]
+    },
+    {
+      "party": "c1.c2.c2",
+      "provide": [
+        "I will provide tests in `tests/parse_duration_errors.rs`."
+      ],
+      "expect": [
+        "I assume `c1.c1.c1` or `c1.c2.c1` provides the public `parse_duration` API."
+      ],
+      "consume": [
+        "I assume `parse_duration` returns an error for malformed input, integer parse overflow, and minute multiplication overflow."
+      ],
+      "touch": [
+        "tests/parse_duration_errors.rs"
+      ]
+    }
+  ],
+  "recorded_findings": [
+    {
+      "finding": "unanchored",
+      "party": "c1.c2.c2",
+      "text": "I will provide tests in `tests/parse_duration_errors.rs`."
+    },
+    {
+      "finding": "contradict",
+      "symbol": "parse_duration",
+      "expecting": "c1.c2.c1",
+      "expects": "I assume `c1.c2.c2` does not change the `parse_duration` interface.",
+      "providing": "c1.c1.c1",
+      "provides": "I will provide the public `parse_duration` function using its existing signature."
+    }
+  ],
+  "writes": {
+    "c1.c1.c1": [
+      {
+        "path": "src/lib.rs"
+      }
+    ],
+    "c1.c2.c1": [
+      {
+        "path": "tests/parse_duration.rs"
+      }
+    ],
+    "c1.c2.c2": [
+      {
+        "path": "tests/parse_duration_errors.rs"
+      }
+    ]
+  },
+  "depends_on": {}
+}

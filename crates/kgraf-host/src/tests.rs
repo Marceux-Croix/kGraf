@@ -438,6 +438,77 @@ async fn a_verified_attempt_is_merged_and_the_next_attempt_starts_from_the_new_t
     assert!(!r.root.join("one.txt").exists());
 }
 
+/// Under the default worktree policy the merge removes the winner's worktree
+/// (decision 0088). The integration view holds what it merged: the graph
+/// indexes the merged file from the view, keeps it, and reads its slice from
+/// there; the view follows the tip across merges at the same path; and it is
+/// removed with the run's workspaces.
+#[tokio::test]
+async fn merged_files_stay_in_the_graph_after_the_merge_removes_the_worktree() {
+    let r = repo();
+    assert!(r.workspaces.retention().deletes(), "the default deletes");
+    let c = named("a.rs", "w-one");
+    let ws = r.workspaces.prepare(&c, &"w-one".into()).await.expect("ws");
+    std::fs::write(ws.join("a.rs"), "pub fn a(x: u8) -> u8 {\n    x + 42\n}\n").expect("write");
+    let verdict = verifier(&r, "true")
+        .verify(&c, &ws, &result())
+        .await
+        .expect("ran");
+    assert!(verdict.passed(), "{verdict:?}");
+    let merged = r.workspaces.integrate(&c, &ws).await.expect("integrate");
+    assert!(matches!(merged, Integration::Merged { .. }), "{merged:?}");
+    assert!(!ws.exists(), "the merge removed the winner's worktree");
+
+    let view = r
+        .workspaces
+        .integration_view()
+        .await
+        .expect("view")
+        .expect("a git provider keeps an integration view");
+    let graph = GraphStore::open_in_memory(&r.root).expect("graph");
+    kgraf_graph::Indexer::new(&graph)
+        .with_source_root(&view)
+        .index_paths(&["a.rs".to_owned()])
+        .expect("indexed from the view");
+    assert!(graph.file("a.rs").expect("file").is_some());
+    let slice = kgraf_graph::slice::slice_for_symbol(&graph, "a", 2_000).expect("slice");
+    assert!(slice.render().contains("x + 42"), "{}", slice.render());
+
+    // A second merge: the same view, now at the new tip, with both files.
+    let second = finish(&r, "w-two", "b.rs", "pub fn b() {}\n").await;
+    assert!(matches!(second, Integration::Merged { .. }), "{second:?}");
+    let again = r
+        .workspaces
+        .integration_view()
+        .await
+        .expect("view")
+        .expect("view");
+    assert_eq!(again, view, "one view per run, moved to the tip");
+    assert!(view.join("b.rs").is_file() && view.join("a.rs").is_file());
+    let slice = kgraf_graph::slice::slice_for_symbol(&graph, "a", 2_000).expect("slice");
+    assert!(slice.render().contains("x + 42"), "{}", slice.render());
+    let name = view.file_name().and_then(|n| n.to_str()).expect("name");
+    assert!(
+        is_harness_worktree(name),
+        "startup cleanup removes a stale view: {name}"
+    );
+
+    drop(r.workspaces);
+    assert!(!view.exists(), "the view goes with the run's workspaces");
+}
+
+/// Under `Keep` the view is left on disk with the run's other worktrees.
+#[tokio::test]
+async fn under_keep_the_integration_view_outlives_the_run() {
+    let r = repo();
+    let keep = GitWorkspaces::new(r.workspaces.manager.clone(), r.merge_back.clone())
+        .with_retention(WorktreeRetention::Keep);
+    let view = keep.integration_view().await.expect("view").expect("view");
+    assert!(view.join("README").is_file(), "the view holds the tip");
+    drop(keep);
+    assert!(view.exists(), "kept under Keep");
+}
+
 /// A live-run defect: a run reported `Completed`, and a
 /// contract reported verified, when the merge-back its own record claimed
 /// landed was not actually on `kgraf/<run>` (a redirected worker's change
@@ -5600,6 +5671,7 @@ fn harness_worktree_names_never_match_a_workers() {
         harness_worktree_name(COMMS_PREFIX),
         harness_worktree_name(GATE_PREFIX),
         harness_worktree_name(PROBE_PREFIX),
+        harness_worktree_name(VIEW_PREFIX),
         "stub-api_parse-v2".to_owned(),
         "stub-a.b-v10".to_owned(),
     ] {
@@ -5608,6 +5680,7 @@ fn harness_worktree_names_never_match_a_workers() {
     for name in [
         "r1-c1-r0-a0",
         "gate-7-c1-r0-a0",
+        "view-c1-r0-a0",
         "comms-run-big.h1-r1n2-a1",
         "stub-api-v2-c1-r0-a0",
         "r1-c1-r0-a0.s3",

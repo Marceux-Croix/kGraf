@@ -530,7 +530,9 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   stopped is a failure to a script or a scheduler.
 - A planner answer that is not the JSON asked for, or a plan that breaks a rule, is asked
   for again (at most twice, each ask on the ledger) with the refusal as a note, before the
-  run stops.
+  run stops. A plan that the interface checks hold before any work started (a handshake
+  mismatch, or a check the last answer failed) is sent back to the planner once with the
+  failures before the run ends on the hold; the re-planned contracts are named `re1.<id>`.
 - `--rate-limit ROUTE=RPM[/BURST][@MAX_WAIT_MS]` limits one route's call rate; a call that
   would wait too long fails loudly.
 - Every run indexes the working tree before it starts (incremental: about 65 ms warm and

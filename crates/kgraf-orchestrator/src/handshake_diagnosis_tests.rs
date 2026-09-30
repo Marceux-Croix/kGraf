@@ -889,3 +889,66 @@ fn only_findings_between_parties_hold() {
     ];
     assert!(hold.iter().all(HandshakeFinding::holds));
 }
+
+/// A test writer assumes another test writer "does not change the
+/// `parse_duration` interface", and the implementer provides it "using its
+/// existing signature": the two agree. The negated assumption names a third
+/// party, not the provider, so it is not read as the opposite of the
+/// provider's sentence. The statements are the record's, verbatim; no
+/// dependency wait was recorded, so no order is given.
+#[test]
+fn a_negated_assumption_about_a_third_party_does_not_contradict_the_provider() {
+    let r = replay(include_str!(
+        "../tests/fixtures/handshake/negated-assumption-about-a-third-party.json"
+    ));
+    assert!(
+        r.recorded_findings.iter().any(|f| matches!(f,
+            HandshakeFinding::Contradict { expecting, .. } if expecting == "c1.c2.c1")),
+        "the record held on a contradiction"
+    );
+    let now = replayed(&r);
+    assert_eq!(holding(&now), vec![], "{now:#?}");
+    assert!(
+        now.iter().any(
+            |f| matches!(f, HandshakeFinding::Unanchored { party, .. } if party == "c1.c2.c2")
+        ),
+        "the unanchored provision is still a warning: {now:#?}"
+    );
+}
+
+/// REAL companion: a negated expectation that names the provider, or names no
+/// party, is still compared with the provision and still contradicts it.
+#[test]
+fn a_negated_assumption_about_the_provider_or_no_party_still_contradicts() {
+    let ic = InterfaceContract {
+        symbols: vec!["parse_duration".into()],
+        ..tax_ic("c1.i1", &["c1.c1.c1", "c1.c2.c1", "c1.c2.c2"])
+    };
+    let provides = "I will provide `parse_duration`, which returns an error for empty input.";
+    for expects in [
+        "I assume `c1.c1.c1` provides `parse_duration` that never returns an error for empty input.",
+        "I assume c1.c1.c1 provides `parse_duration` that never returns an error for empty input.",
+        "I assume `parse_duration` never returns an error for empty input.",
+    ] {
+        let f = compare_handshake(
+            &ic,
+            &[
+                statement("c1.c1.c1", &[provides], &[], &[]),
+                statement("c1.c2.c1", &[], &[expects], &[]),
+                statement(
+                    "c1.c2.c2",
+                    &["I provide no contract symbols of my own."],
+                    &[],
+                    &[],
+                ),
+            ],
+            &BTreeMap::new(),
+        );
+        assert!(
+            f.iter().any(|x| matches!(x,
+                HandshakeFinding::Contradict { expecting, providing, .. }
+                    if expecting == "c1.c2.c1" && providing == "c1.c1.c1")),
+            "{expects}: {f:#?}"
+        );
+    }
+}
