@@ -13,6 +13,10 @@
 //!   and task (decision 0051). A tool a server lists that cannot be registered is
 //!   reported, and the rest register (reported, not dropped).
 //! - **Masking**: the runtime's default, `kgraf-session`'s reduction library.
+//! - **Skills** (decision 0053): with [`Assembly::skills`] holding a skill the
+//!   model may invoke, the `skill` tool joins the built-ins, the prefix lists
+//!   the model-invocable skills, and the runtime puts each worker's
+//!   `allowed-tools` policy on its approval chain.
 //! - **Approval asks**: [`super::ask::RuleOrPromptResolver`].
 //!
 //! **kGraf's state is unreadable to the shell.** The shell tool denies
@@ -60,6 +64,7 @@ use kgraf_runtime::{
 };
 use kgraf_sandbox::Workspace;
 use kgraf_session::approval_store::PersistedAllowStore;
+use kgraf_session::skills::{SkillCatalog, SkillSession};
 use kgraf_tools::approval::{ApprovalChain, ApprovalHook, HookDecision, PendingCall};
 use kgraf_tools::execpolicy::ExecPolicy;
 use kgraf_tools::{
@@ -158,6 +163,13 @@ pub struct Assembly {
     /// user's consent (decision 0087). `None` for `kgraf worker`: a failed
     /// build keeps decision 0084's hint alone.
     pub dependency_refetch: Option<Arc<dyn kgraf_tools::DependencyRefetch>>,
+    /// The project's skills (decision 0053), read once per run from its
+    /// inventory ([`kgraf_session::skills::SkillCatalog::load`]) so every
+    /// environment of the run lists the same catalog in its prefix. With at
+    /// least one skill the model may invoke, the environment gets the `skill`
+    /// tool and each worker's `allowed-tools` policy. `None`, or no skill the
+    /// model may invoke: no tool and an empty catalog, the prefix unchanged.
+    pub skills: Option<Arc<SkillCatalog>>,
 }
 
 /// The environment variable that tells a stdio MCP server the worktree it
@@ -555,6 +567,14 @@ pub async fn assemble(a: Assembly) -> Result<Assembled> {
         None => Arc::new(NoSlices),
     };
     builtins.extend(a.extra_tools.iter().cloned());
+    let skills = a
+        .skills
+        .as_ref()
+        .filter(|catalog| !catalog.model_catalog().is_empty())
+        .map(|catalog| SkillSession::new(catalog.clone()));
+    if let Some(session) = &skills {
+        builtins.push(session.tool());
+    }
     if let Some(line) = &a.session_line {
         // Decision 0067, behind the host's `sessions` flag: every session tool
         // answers "not built yet" until the session line is wired up.
@@ -614,7 +634,10 @@ pub async fn assemble(a: Assembly) -> Result<Assembled> {
             model: a.model,
             system: vec![Content::text(SYSTEM_PROMPT)],
             tools: registry.prefix_definitions(),
-            skill_catalog: vec![],
+            skill_catalog: skills
+                .as_ref()
+                .map(|s| s.model_catalog())
+                .unwrap_or_default(),
             slice_pool: vec![],
             mcp_instructions,
         },
@@ -625,6 +648,7 @@ pub async fn assemble(a: Assembly) -> Result<Assembled> {
     let mut env = WorkerEnv::new(a.ledger, a.provider, registry.clone(), prefix);
     env.prefixes = a.prefixes;
     env.slices = slices;
+    env.skills = skills;
     // The hook and the tool come from one `ShellTool::new`: one command policy.
     // MCP calls are reviewed too: deny unless a persisted rule allows them.
     env.approval = ApprovalChain::new(vec![Arc::new(shell_hook), Arc::new(McpApprovalHook)]);
@@ -683,6 +707,32 @@ pub fn state_read_denies(
         }
     }
     Ok(denies)
+}
+
+/// The project's skills for a run (decision 0053): the inventory
+/// `kgraf instructions` wrote in `state_dir`, or `None` when there is none. An
+/// inventory that exists and cannot be read is an error.
+///
+/// A Terminal-Bench bridge run (`tbench_bridge` set) reads no skills: a
+/// benchmark measures the brief alone, on the prefix and tool list every
+/// recorded run was measured with, so a skill inventory in the benchmark's
+/// state directory must not change them. Said on stderr when an inventory is
+/// there, so the skipped skills are not a silent difference.
+pub fn run_skills(
+    state_dir: &std::path::Path,
+    tbench_bridge: Option<&std::path::Path>,
+) -> std::result::Result<Option<Arc<SkillCatalog>>, kgraf_session::SessionError> {
+    if tbench_bridge.is_some() {
+        let inventory = SkillCatalog::inventory_path(state_dir);
+        if inventory.exists() {
+            eprintln!(
+                "kgraf: a Terminal-Bench bridge run lists no skills; the skill inventory at {} is not read",
+                inventory.display()
+            );
+        }
+        return Ok(None);
+    }
+    Ok(SkillCatalog::load(state_dir)?.map(Arc::new))
 }
 
 /// Where a project's persisted allow rules live: the dispatching repository's

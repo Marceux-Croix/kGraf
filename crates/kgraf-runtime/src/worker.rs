@@ -133,6 +133,7 @@ use futures_util::stream::FuturesUnordered;
 use kgraf_core::{CallId, TokenUsage};
 use kgraf_provider::accounting::CallTrace;
 use kgraf_provider::{Content, Ledger, Provider, Request, Response, StopReason, StreamEvent};
+use kgraf_session::skills::{SKILL_TOOL, SkillRestriction, SkillSession, WorkerSkills};
 use kgraf_tools::approval::{
     ApprovalChain, ApprovalLog, ApprovalRecord, ApprovedCall, PausedCall, PendingCall, UserAnswer,
     Verdict,
@@ -212,6 +213,11 @@ pub struct WorkerEnv {
     pub slices: Arc<dyn SliceSource>,
     pub masker: Arc<dyn ObservationMasker>,
     pub settings: LoopSettings,
+    /// The environment's skills (decision 0053): the catalog the prefix lists
+    /// and the `skill` tool's state. Each worker spawned here gets its own
+    /// `allowed-tools` policy on its approval chain. `None`: no skills, and
+    /// the prefix must list none.
+    pub skills: Option<Arc<SkillSession>>,
 }
 
 impl WorkerEnv {
@@ -235,6 +241,7 @@ impl WorkerEnv {
             slices: Arc::new(crate::context::NoSlices),
             masker: Arc::new(SessionMasker::default()),
             settings: LoopSettings::default(),
+            skills: None,
         }
     }
 }
@@ -255,9 +262,28 @@ pub enum WorkerError {
     #[error("adapter `{adapter}` does not stream, and the loop is set to stream")]
     StreamingUnavailable { adapter: &'static str },
     #[error(
-        "the brief activates skills {skills:?}, and skills are not wired into the loop yet; refused rather than ignored"
+        "the brief activates skills {skills:?}; a brief cannot activate skills (a worker activates one with the `skill` tool), refused rather than ignored"
     )]
     SkillsUnsupported { skills: Vec<String> },
+    /// The prefix's skill catalog is not the environment's, or the environment
+    /// has skills and no `skill` tool: the model would be offered skills that
+    /// cannot be activated, or activate skills whose restrictions no policy
+    /// enforces.
+    #[error("the environment's skills do not match its prefix: {0}")]
+    SkillsMismatch(String),
+    /// A skill an earlier segment activated cannot be activated again on
+    /// resume, as the transcript recorded it: it is gone, the model may no
+    /// longer invoke it, or it changed. Refused rather than resumed without
+    /// its restriction, or with a different one.
+    #[error(
+        "cannot re-activate skill `{name}` that the transcript activated: {reason}. Restore the \
+         skill as it was when the worker activated it, or start the work again as a new run"
+    )]
+    SkillReplay { name: String, reason: String },
+    /// The restrictions a subagent inherits from its parent cannot be read.
+    /// Refused rather than started with none.
+    #[error("cannot apply the skill restrictions inherited from the parent: {0}")]
+    InheritedSkills(String),
     #[error(transparent)]
     Slice(#[from] SliceError),
     #[error(transparent)]
@@ -322,6 +348,11 @@ pub struct SpawnOptions {
     /// fences every path. `None`: no fence at all (tests, and `kgraf worker`'s
     /// unorchestrated single attempt).
     pub fence: Option<ScopeFence>,
+    /// The `allowed-tools` restrictions of the agent that spawned this worker
+    /// (decision 0053): a subagent is restricted as its parent was when it
+    /// spawned it, before any skill of its own. Applied whether or not this
+    /// environment has skills. Empty for a worker nothing spawned.
+    pub inherited_skills: Vec<SkillRestriction>,
 }
 
 /// Check a brief against its environment and start its worker on the current
@@ -372,6 +403,7 @@ async fn prepare(
     if env.prefix.tools() != env.tools.prefix_definitions().as_slice() {
         return Err(WorkerError::ToolsNotInPrefix);
     }
+    check_skills(env)?;
     if env.settings.call_mode == CallMode::Stream && env.provider.capabilities().streaming.is_none()
     {
         return Err(WorkerError::StreamingUnavailable {
@@ -424,6 +456,40 @@ async fn prepare(
             stop: brief.context.worker_stop_tokens(),
         });
     }
+    // Decision 0053: this worker's own `allowed-tools` policy, on its own
+    // chain, starting from what it inherits from the agent that spawned it. A
+    // resumed worker re-activates, in order, every skill its earlier segments
+    // activated, at the version each activation recorded, so a restart neither
+    // lifts a restriction nor swaps it for an edited one.
+    let mut approval = options.approval.unwrap_or_else(|| env.approval.clone());
+    let inherited = &options.inherited_skills;
+    let worker_skills = match &env.skills {
+        Some(skills) => {
+            let policy = skills
+                .attach_inheriting(brief.worker.as_str(), inherited)
+                .map_err(|e| WorkerError::InheritedSkills(e.to_string()))?;
+            replay_skills(Some(skills), brief.worker.as_str(), &builder)?;
+            Some(policy)
+        }
+        // No skill tool here, so only the inherited restrictions apply, and a
+        // transcript that activated a skill cannot be resumed.
+        None => {
+            replay_skills(None, brief.worker.as_str(), &builder)?;
+            if inherited.is_empty() {
+                None
+            } else {
+                Some(
+                    WorkerSkills::inheriting(brief.worker.as_str(), inherited)
+                        .map_err(|e| WorkerError::InheritedSkills(e.to_string()))?,
+                )
+            }
+        }
+    };
+    if let Some(policy) = &worker_skills {
+        approval = approval.with_policy(Arc::new(policy.clone()));
+    }
+    // Checked after the skills: a changed skill also changes the prefix, and the
+    // skill check names the skill and what to do.
     // Fail loud: a transcript resumed on a different prefix or different slices would
     // continue a conversation the model never had.
     if let Some(stored) = builder.prefix_digest()
@@ -580,10 +646,11 @@ async fn prepare(
     // refused as a duplicate too.
     steering.seed_delivered(delivered);
     handle.set_spawn_duplicates(already_delivered, listed_twice);
+    handle.set_skills(worker_skills);
     let worker = Worker {
         git_at_start,
         env: env.clone(),
-        approval: options.approval.unwrap_or_else(|| env.approval.clone()),
+        approval,
         budget: StepBudget::new(brief.step_budget, rounds_used),
         brief,
         seq: EventSequence::new(),
@@ -605,6 +672,70 @@ async fn prepare(
         steering,
     };
     Ok((worker, endpoint, handle))
+}
+
+/// Re-activate, in order, every skill the transcript's earlier segments
+/// activated, each at the version its activation result recorded. With no
+/// skills in this environment, any activation refuses the resume.
+fn replay_skills(
+    skills: Option<&SkillSession>,
+    worker: &str,
+    builder: &TranscriptBuilder,
+) -> Result<(), WorkerError> {
+    // The `skill` tool's access is a barrier, so no two activations overlap and
+    // the start order is the activation order.
+    let activations = builder
+        .replay_rounds()
+        .iter()
+        .flatten()
+        .filter(|call| call.tool == SKILL_TOOL && call.succeeded);
+    for call in activations {
+        let name = call
+            .input
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let Some(skills) = skills else {
+            return Err(WorkerError::SkillReplay {
+                name: name.to_owned(),
+                reason: "this run has no skills the model may invoke".into(),
+            });
+        };
+        let recorded = kgraf_session::skills::recorded_hash(&call.output);
+        skills
+            .reactivate(worker, name, recorded)
+            .map_err(|e| WorkerError::SkillReplay {
+                name: name.to_owned(),
+                reason: e.to_string(),
+            })?;
+    }
+    Ok(())
+}
+
+/// The environment's skills agree with its prefix and registry: the prefix
+/// lists exactly the skills the model may activate, and an environment with
+/// skills registers the `skill` tool.
+fn check_skills(env: &WorkerEnv) -> Result<(), WorkerError> {
+    let listed = &env.prefix.prefix().skill_catalog;
+    match &env.skills {
+        None if listed.is_empty() => Ok(()),
+        None => Err(WorkerError::SkillsMismatch(
+            "the prefix lists skills and the environment has none to activate".into(),
+        )),
+        Some(skills) => {
+            if *listed != skills.model_catalog() {
+                return Err(WorkerError::SkillsMismatch(
+                    "the prefix's skill catalog is not the environment's".into(),
+                ));
+            }
+            if env.tools.get(SKILL_TOOL).is_none() {
+                return Err(WorkerError::SkillsMismatch(format!(
+                    "the environment has skills and no `{SKILL_TOOL}` tool"
+                )));
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Why a run stops early.
@@ -1877,7 +2008,7 @@ impl Worker {
         // The select below sees either only when it next runs, and a call
         // started in between would run after the user asked the round to stop.
         if !self.stopping(ep) {
-            start_ready(
+            self.denied += start_ready(
                 &mut calls,
                 &waits,
                 &done,
@@ -1886,6 +2017,7 @@ impl Worker {
                 registry,
                 &contexts,
                 self.fence.as_ref(),
+                &self.approval,
                 &progress_tx,
             );
         }
@@ -1967,7 +2099,7 @@ impl Worker {
             // The emit above can wait for a bulk slot, which is exactly when
             // an interrupt can arrive: checked after it, not before.
             if !self.stopping(ep) {
-                start_ready(
+                self.denied += start_ready(
                     &mut calls,
                     &waits,
                     &done,
@@ -1976,6 +2108,7 @@ impl Worker {
                     registry,
                     &contexts,
                     self.fence.as_ref(),
+                    &self.approval,
                     &progress_tx,
                 );
             }
@@ -2319,14 +2452,16 @@ fn declares_writes(access: &kgraf_tools::Access) -> bool {
     access.is_exclusive() || !access.writes_paths().is_empty() || !access.writes_nodes().is_empty()
 }
 
-/// Start every call whose earlier conflicting calls are done.
+/// Start every call whose earlier conflicting calls are done. Returns how
+/// many calls the approval chain's policies denied as they started.
 ///
-/// 9 arguments: the round's own per-call state (`calls`/`waits`/`done`/`writes`,
-/// one slice per call), plus `running`/`registry`/`contexts`/`progress_tx` and
-/// the subagent scope `fence` (decision 0067). A bundling struct was considered and
-/// rejected: every field here is borrowed with its own lifetime or mutability
-/// from `execute`'s own locals, so a struct would only rename the same borrows
-/// one level removed, not reduce them.
+/// 10 arguments: the round's own per-call state (`calls`/`waits`/`done`/`writes`,
+/// one slice per call), plus `running`/`registry`/`contexts`/`progress_tx`, the
+/// subagent scope `fence` (decision 0067), and the worker's approval `chain`,
+/// whose policies are checked again as each call starts (decision 0053). A
+/// bundling struct was considered and rejected: every field here is borrowed
+/// with its own lifetime or mutability from `execute`'s own locals, so a struct
+/// would only rename the same borrows one level removed, not reduce them.
 #[allow(clippy::too_many_arguments)]
 fn start_ready<'a>(
     calls: &mut [Option<ApprovedCall>],
@@ -2337,13 +2472,31 @@ fn start_ready<'a>(
     registry: &'a ToolRegistry,
     contexts: &'a RoundContexts,
     fence: Option<&ScopeFence>,
+    chain: &ApprovalChain,
     progress_tx: &tokio::sync::mpsc::UnboundedSender<(String, Option<String>)>,
-) {
+) -> u32 {
+    let mut denied = 0;
     for (j, slot) in calls.iter_mut().enumerate() {
         if !waits[j].iter().all(|&i| done[i]) {
             continue;
         }
         if let Some(call) = slot.take() {
+            // Decision 0053: the approval chain's policies are checked again
+            // as the call starts. A skill activated by an earlier call of this
+            // round narrowed the worker's `allowed-tools` after this call was
+            // approved; the `skill` tool's access is a barrier, so this call
+            // started only after the activation finished. Recorded as the
+            // approval chain records a denial: counted, and with its prefix.
+            if let Err(refusal) = chain.recheck(registry, &call) {
+                denied += 1;
+                let id = call.call_id().to_owned();
+                let tool = call.tool().to_owned();
+                let output = format!("{DENIED_PREFIX}{}: {}", refusal.by, refusal.reason);
+                running.push(Box::pin(async move {
+                    (j, id, tool, Ok(ToolOutput::error(output)))
+                }));
+                continue;
+            }
             // Decision 0067: the fence is checked again at the moment the
             // call starts, not only when the round was approved. Every call of
             // a round is approved before any runs, so a round of
@@ -2389,6 +2542,7 @@ fn start_ready<'a>(
             }));
         }
     }
+    denied
 }
 
 /// What a stream delivered before it ended or was cancelled.

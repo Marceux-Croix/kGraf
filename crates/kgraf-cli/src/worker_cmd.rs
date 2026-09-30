@@ -490,6 +490,13 @@ fn drive(d: DriveArgs<'_>) -> Result<kgraf_runtime::WorkerResult> {
             machine_gate: None,
             external_executor,
             dependency_refetch: None,
+            // Decision 0053: the project's skills, from the inventory
+            // `kgraf instructions` wrote; none for a Terminal-Bench bridge run.
+            skills: kgraf_cli::worker::assemble::run_skills(
+                state,
+                args.tbench_bridge_socket.as_deref(),
+            )
+            .context("cannot read the project's skill inventory")?,
         })
     })();
     let assembly = match prepared {

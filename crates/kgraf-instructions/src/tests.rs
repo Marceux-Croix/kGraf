@@ -297,6 +297,47 @@ fn a_rerun_over_unchanged_input_writes_nothing() {
     );
 }
 
+/// The new text replaces the file by rename, never by rewriting it in place:
+/// a second name for the old file still reads the old text (an in-place
+/// write would change it too), and no temporary file is left behind.
+#[test]
+fn a_changed_inventory_replaces_the_file_whole() {
+    let dir = TempDir::new().expect("tmp");
+    let out = dir.path().join(INVENTORY_FILE);
+    write_if_changed(&out, "old").expect("write");
+    let old_name = dir.path().join("old-link");
+    fs::hard_link(&out, &old_name).expect("link");
+    write_if_changed(&out, "new").expect("write");
+    assert_eq!(fs::read_to_string(&out).expect("read"), "new");
+    assert_eq!(fs::read_to_string(&old_name).expect("read"), "old");
+    let mut names: Vec<String> = fs::read_dir(dir.path())
+        .expect("list")
+        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec![INVENTORY_FILE.to_owned(), "old-link".to_owned()]
+    );
+}
+
+#[test]
+fn an_inventory_loads_back_and_a_missing_one_is_none_and_a_broken_one_an_error() {
+    let dir = TempDir::new().expect("tmp");
+    write(dir.path(), "CLAUDE.md", "rules\n");
+    let out = dir.path().join(INVENTORY_FILE);
+    assert!(Inventory::load(&out).expect("absent").is_none());
+    let inventory = build_folder(dir.path());
+    let text = serde_json::to_string_pretty(&inventory).expect("json");
+    write_if_changed(&out, &text).expect("write");
+    assert_eq!(Inventory::load(&out).expect("load"), Some(inventory));
+    fs::write(&out, "{not json").expect("write");
+    assert!(matches!(
+        Inventory::load(&out),
+        Err(InstructionsError::Config { .. })
+    ));
+}
+
 #[test]
 fn config_round_trips_and_imports_are_recorded_once() {
     let dir = TempDir::new().expect("tmp");

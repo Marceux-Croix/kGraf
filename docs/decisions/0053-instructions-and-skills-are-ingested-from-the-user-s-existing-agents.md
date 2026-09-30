@@ -55,3 +55,55 @@ supporting a new agent is adding a row, not a code change.
 
 **Reactivation trigger.** A vendor documenting a public API for account-level instructions or
 skills. Then a fetcher is added, verified against that vendor's real, running service.
+
+## Amendments (2026-09-30)
+
+- **The controls reach the worker loop.** A worker environment is built with the project's
+  skills, and the frontmatter controls are enforced on its tool calls:
+  - **Source.** A run reads the project's inventory (`.kgraf/inventory.json`, written by
+    `kgraf instructions scan`) once, when it is built, so every environment of the run
+    carries the same catalog and the shared prefix stays byte-identical per vendor and
+    model (decision 0043). A missing inventory means no skills; an inventory that cannot be
+    read fails the run.
+  - **Activation.** A worker environment with at least one skill the model may invoke gets a
+    `skill` tool and lists those skills (name and description) in the shared prefix. The tool
+    refuses an unknown skill and a skill marked `disable-model-invocation`; such a skill is
+    not listed. A successful activation returns the body as the tool result, in a
+    `<skill_instructions>` block tagged with the skill's name and content hash.
+  - **Enforcement.** Each worker's approval chain carries a policy bound to that worker. An
+    activated skill with `allowed-tools` narrows it, and a call outside the allowed set is
+    refused with the skill's name in the result the model reads. The policy is checked at
+    approval and again when each call starts: a round's calls are all approved before any
+    runs, and the `skill` call serializes against the rest of its round, so a call issued
+    after an activation in the same round is refused too. The `skill` tool is itself subject
+    to an active restriction. Several active skills intersect.
+  - **Resume.** A resumed worker re-activates, from its transcript, every skill its earlier
+    segments activated, so a restart does not lift a restriction. Each is re-activated only
+    at the content hash its activation result recorded: a skill edited, removed or made not
+    model-invocable since refuses the resume, naming the skill and the two ways on (restore
+    the skill as it was, or start a new run). Resuming on the current version instead would
+    change the restriction under a worker mid-task.
+  - **Subagents.** A subagent a restricted worker spawns inherits the restrictions its parent
+    holds at that moment, whatever route the child runs on, and its own activations narrow
+    further. The inherited set (skill, hash, `allowed-tools` entries) is kept in the spawn
+    record, so a restarted child is restricted the same way without the inventory. A spawn
+    from a worker whose policy is not known yet is refused, never started unrestricted.
+  - **Write scopes.** The `skill` call orders against the rest of its round and declares
+    no writes, so a worker with a write scope or a fence (every orchestrated worker and
+    subagent) can activate a skill; declaring it as a call that may write anywhere refused
+    it there.
+  - **Denials.** A call refused when it starts is recorded as a denial at approval is: the
+    same result prefix, and counted in the worker's denials.
+  - **Catalog text.** A skill's name and description are written into the shared prefix on
+    one line each, with line breaks and other control characters escaped, so a description
+    cannot write lines that read as further catalog entries.
+  - **Benchmark runs.** A Terminal-Bench bridge run (`--tbench-bridge-socket`) reads no
+    skills, so a benchmark keeps the prefix and tool list its recorded runs were measured
+    with; an inventory in its state directory is reported on stderr as not read.
+  - **Inventory writes.** `kgraf instructions` writes the inventory to a temporary file and
+    renames it into place, so a run reading it never sees a partial file.
+  - **Unchanged without skills.** With no inventory, or none the model may invoke, no tool is
+    added and the catalog is empty, so the prefix digest does not change.
+  - **Where skills can be activated.** Workers only, through the `skill` tool. The
+    orchestrator's own model calls (intake and planning) carry no tools, so no skill can be
+    activated there. A brief that names skills is still refused.

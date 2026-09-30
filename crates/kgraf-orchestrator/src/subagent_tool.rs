@@ -117,6 +117,12 @@ pub enum SpawnRefusal {
     Stopped,
     #[error("the tool is not bound to an orchestrator")]
     Unbound,
+    /// The caller's skill restrictions are not known yet (its worker is still
+    /// starting), so a child could not inherit them (decision 0053).
+    #[error(
+        "your skill restrictions are not known yet, so a subagent could not inherit them; try again"
+    )]
+    SkillsUnknown,
 }
 
 /// How a finished child's work came back to its parent.

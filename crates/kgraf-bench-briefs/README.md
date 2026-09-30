@@ -135,3 +135,19 @@ price prints "local, unpriced" instead of plain "unpriced" -- decision 0041
 holds a local model is not special-cased to free, so this is informational,
 not a claim about its real cost. A local route the price table *does* cover
 is costed exactly like a hosted one.
+
+## Judging an attempt made outside kGraf
+
+`kgraf-bench-check` applies the suite's own check to a directory that another harness edited, so a baseline (aider, for
+example) and kGraf's worker are judged by the same code. The caller copies a brief's fixture into a repository, commits
+it, lets the other harness edit the files, commits the result, and passes the repository, the fixture commit and the
+attempt commit:
+
+```
+kgraf-bench-check --brief impl-fizzbuzz --repo <dir> --base <fixture commit> --commit HEAD
+```
+
+It runs `check::verify` (protected paths against the fixture commit, build inputs refused, tests in the sandbox, mutants
+for a `Tests` brief) and prints one JSON line. Exit status 0 is satisfied, 1 is not satisfied, 2 means the check could not
+run (a harness fault, not a measurement). `--list` prints the suite (ids, kinds, versions, instruction text, protected paths,
+fixture directories and the suite hash) as JSON, and `--self-test` runs the positive control.

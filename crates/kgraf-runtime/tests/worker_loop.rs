@@ -1789,7 +1789,7 @@ async fn silent_degradations_are_refused() {
         Err(WorkerError::StreamingUnavailable { .. })
     ));
 
-    // Skills the loop does not wire yet are refused, not ignored.
+    // A brief cannot activate skills (a worker uses the `skill` tool): refused, not ignored.
     let env = Arc::new(env_with(
         Fake::new(true, |_| Round::answer("x")),
         vec![],
@@ -3720,4 +3720,406 @@ async fn a_resumed_history_marks_a_call_whose_stored_text_was_redacted() {
             )
         });
     assert!(note, "the stored result says to re-read: {request:#?}");
+}
+
+// ---------------------------------------------------------------- skills (decision 0053)
+
+/// The content hash of the `no-writes` skill in [`no_writes_catalog`]: a full
+/// blake3 hex digest, as a real inventory records.
+const NO_WRITES_HASH: &str = "4b1c7d6e0f3a92858e5b1f0c2d7a6e3940b8c1d2e3f4a5b6c7d8e9f0a1b2c3d4";
+
+/// A skill catalog with `no-writes`, whose `allowed-tools` admits only the
+/// `skill` tool, read the way a run reads the project's inventory.
+fn no_writes_catalog() -> Arc<kgraf_session::skills::SkillCatalog> {
+    no_writes_catalog_at(NO_WRITES_HASH)
+}
+
+/// [`no_writes_catalog`] with the skill at another version.
+fn no_writes_catalog_at(hash: &str) -> Arc<kgraf_session::skills::SkillCatalog> {
+    catalog_of(json!([{
+        "name": "no-writes",
+        "description": "look, do not touch",
+        "frontmatter": {},
+        "body": "Do not write files.",
+        "files": [],
+        "allowed_tools": ["skill"],
+        "disable_model_invocation": false,
+        "user_invocable": true,
+        "hash": hash,
+        "sources": [],
+    }]))
+}
+
+/// A catalog of `skills`, read through an inventory file.
+fn catalog_of(skills: Value) -> Arc<kgraf_session::skills::SkillCatalog> {
+    let dir = tempfile::tempdir().expect("dir");
+    let inventory = json!({
+        "layers": [],
+        "skills": skills,
+        "conflicts": [],
+        "problems": [],
+    });
+    std::fs::write(dir.path().join("inventory.json"), inventory.to_string()).expect("write");
+    Arc::new(
+        kgraf_session::skills::SkillCatalog::load(dir.path())
+            .expect("load")
+            .expect("present"),
+    )
+}
+
+/// An environment with `WriteFile`, the `skill` tool and the catalog listed
+/// in its prefix, as the host assembles one.
+fn env_with_skills(provider: Arc<Fake>) -> WorkerEnv {
+    env_with_catalog(provider, no_writes_catalog())
+}
+
+/// [`env_with_skills`] over `catalog`.
+fn env_with_catalog(
+    provider: Arc<Fake>,
+    catalog: Arc<kgraf_session::skills::SkillCatalog>,
+) -> WorkerEnv {
+    let session = kgraf_session::skills::SkillSession::new(catalog);
+    let mut registry = ToolRegistry::new();
+    registry
+        .register_builtin(Arc::new(WriteFile), Exposure::Prefix)
+        .expect("register");
+    registry
+        .register_builtin(session.tool(), Exposure::Prefix)
+        .expect("register");
+    let prefix = PrefixSnapshot::new(
+        SharedPrefix {
+            vendor: "fake-vendor".into(),
+            model: MODEL.into(),
+            system: vec![Content::text("You are a kGraf worker.")],
+            tools: registry.prefix_definitions(),
+            skill_catalog: session.model_catalog(),
+            slice_pool: vec![],
+            mcp_instructions: vec![],
+        },
+        &NeutralPrefixEncoder,
+    )
+    .expect("snapshot");
+    let ledger = Arc::new(Ledger::open_in_memory().expect("ledger"));
+    let mut env = WorkerEnv::new(ledger, provider, Arc::new(registry), prefix);
+    env.prefixes = Arc::new(PrefixRegistry::new());
+    env.settings.call_mode = CallMode::Complete;
+    env.skills = Some(session);
+    env
+}
+
+fn finished_output(events: &[WorkerEvent], id: &str) -> (String, bool) {
+    events
+        .iter()
+        .find_map(|e| match e {
+            WorkerEvent::ToolCallFinished {
+                call_id,
+                output,
+                is_error,
+            } if call_id == id => Some((output.clone(), *is_error)),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("call {id} finished"))
+}
+
+/// A restriction survives a restart: the resumed segment re-activates the
+/// skill its first segment activated, and a write it attempts is refused.
+#[tokio::test]
+async fn a_resumed_worker_keeps_the_skill_restriction_its_earlier_segment_activated() {
+    let worktree = tempfile::tempdir().expect("worktree");
+    let provider = Fake::new(false, |request| match round_of(request) {
+        0 => Round::tool(vec![("t0", "skill", json!({"name": "no-writes"}))]),
+        1 => Round::tool(vec![("t1", "skill", json!({"name": "no-writes"}))]),
+        2 => Round::tool(vec![(
+            "t2",
+            "write_file",
+            json!({"path": "b", "content": "b"}),
+        )]),
+        _ => Round::answer("done"),
+    });
+    let env = Arc::new(env_with_skills(provider));
+    let handle = spawn_worker(
+        env.clone(),
+        brief("w1", "look", worktree.path(), 2),
+        SpawnOptions::default(),
+    )
+    .await
+    .expect("spawn");
+    let (events, first) = with_timeout(drain(handle)).await.expect("in time");
+    assert_eq!(first.outcome, WorkerOutcome::BudgetExhausted);
+    let (activated, is_error) = finished_output(&events, "t0");
+    assert!(
+        !is_error && activated.contains("Do not write files."),
+        "{activated}"
+    );
+
+    let handle = spawn_worker(
+        env.clone(),
+        brief("w1", "look", worktree.path(), 6),
+        SpawnOptions {
+            resume_from: Some(events),
+            ..SpawnOptions::default()
+        },
+    )
+    .await
+    .expect("resume");
+    let (events, resumed) = with_timeout(drain(handle)).await.expect("in time");
+    assert_eq!(resumed.outcome, WorkerOutcome::Completed);
+    let (refused, is_error) = finished_output(&events, "t2");
+    assert!(is_error, "{refused}");
+    assert!(
+        refused.contains("not permitted by skill `no-writes`"),
+        "{refused}"
+    );
+    assert!(!worktree.path().join("b").exists(), "the refused write ran");
+}
+
+/// Without the resume, the same environment lets a fresh worker write: the
+/// restriction is the worker's, not the environment's.
+#[tokio::test]
+async fn a_skill_restriction_is_per_worker() {
+    let worktree = tempfile::tempdir().expect("worktree");
+    let provider = Fake::new(false, |request| match round_of(request) {
+        0 if instruction_of(request) == "look" => {
+            Round::tool(vec![("t0", "skill", json!({"name": "no-writes"}))])
+        }
+        0 => Round::tool(vec![(
+            "t0",
+            "write_file",
+            json!({"path": "c", "content": "c"}),
+        )]),
+        _ => Round::answer("done"),
+    });
+    let env = Arc::new(env_with_skills(provider));
+    let restricted = spawn_worker(
+        env.clone(),
+        brief("w1", "look", worktree.path(), 4),
+        SpawnOptions::default(),
+    )
+    .await
+    .expect("spawn");
+    let (_, first) = with_timeout(drain(restricted)).await.expect("in time");
+    assert_eq!(first.outcome, WorkerOutcome::Completed);
+    let other = spawn_worker(
+        env,
+        brief("w2", "write", worktree.path(), 4),
+        SpawnOptions::default(),
+    )
+    .await
+    .expect("spawn");
+    let (events, _) = with_timeout(drain(other)).await.expect("in time");
+    let (written, is_error) = finished_output(&events, "t0");
+    assert!(!is_error, "{written}");
+    assert!(worktree.path().join("c").exists());
+}
+
+/// A prefix that lists skills the environment cannot activate, and an
+/// environment with skills but no `skill` tool, are refused at spawn.
+#[tokio::test]
+async fn an_environment_whose_skills_and_prefix_disagree_is_refused() {
+    let dir = tempfile::tempdir().expect("dir");
+    let provider = Fake::new(false, |_| Round::answer("x"));
+    let mut env = env_with_skills(provider.clone());
+    env.skills = None;
+    assert!(matches!(
+        spawn_worker(
+            Arc::new(env),
+            brief("w1", "x", dir.path(), 3),
+            SpawnOptions::default()
+        )
+        .await,
+        Err(WorkerError::SkillsMismatch(_))
+    ));
+    let mut env = env_with(provider, vec![], CallMode::Complete);
+    env.skills = Some(kgraf_session::skills::SkillSession::new(no_writes_catalog()));
+    assert!(matches!(
+        spawn_worker(
+            Arc::new(env),
+            brief("w1", "x", dir.path(), 3),
+            SpawnOptions::default()
+        )
+        .await,
+        Err(WorkerError::SkillsMismatch(_))
+    ));
+}
+
+/// The first segment of a worker that activated `no-writes`, for a resume.
+async fn events_of_a_restricted_segment(worktree: &Path) -> Vec<WorkerEvent> {
+    let provider = Fake::new(false, |request| match round_of(request) {
+        0 => Round::tool(vec![("t0", "skill", json!({"name": "no-writes"}))]),
+        _ => Round::tool(vec![("t1", "skill", json!({"name": "no-writes"}))]),
+    });
+    let handle = spawn_worker(
+        Arc::new(env_with_skills(provider)),
+        brief("w1", "look", worktree, 2),
+        SpawnOptions::default(),
+    )
+    .await
+    .expect("spawn");
+    let (events, first) = with_timeout(drain(handle)).await.expect("in time");
+    assert_eq!(first.outcome, WorkerOutcome::BudgetExhausted);
+    events
+}
+
+/// A resume re-activates a skill only at the version the transcript
+/// recorded: an edited skill, a removed one, or one the model may no longer
+/// invoke refuses the resume, naming the skill and what to do.
+#[tokio::test]
+async fn a_resume_after_the_skill_changed_is_refused_with_the_fix() {
+    let worktree = tempfile::tempdir().expect("worktree");
+    let events = events_of_a_restricted_segment(worktree.path()).await;
+    let answer = || Fake::new(false, |_| Round::answer("done"));
+    let resume = |env: WorkerEnv| {
+        let events = events.clone();
+        let root = worktree.path().to_path_buf();
+        async move {
+            spawn_worker(
+                Arc::new(env),
+                brief("w1", "look", &root, 6),
+                SpawnOptions {
+                    resume_from: Some(events),
+                    ..SpawnOptions::default()
+                },
+            )
+            .await
+        }
+    };
+    let edited = no_writes_catalog_at("9999aaaa");
+    let refusal = match resume(env_with_catalog(answer(), edited)).await {
+        Err(e @ WorkerError::SkillReplay { .. }) => e.to_string(),
+        other => panic!("an edited skill must refuse the resume: {other:?}"),
+    };
+    assert!(refusal.contains("`no-writes`"), "{refusal}");
+    assert!(refusal.contains(NO_WRITES_HASH), "{refusal}");
+    assert!(refusal.contains("9999aaaa"), "{refusal}");
+    assert!(
+        refusal.contains("Restore the skill") && refusal.contains("new run"),
+        "{refusal}"
+    );
+
+    let other = catalog_of(json!([{
+        "name": "other",
+        "description": "d",
+        "frontmatter": {},
+        "body": "b",
+        "files": [],
+        "allowed_tools": null,
+        "disable_model_invocation": false,
+        "user_invocable": true,
+        "hash": "abcd",
+        "sources": [],
+    }]));
+    assert!(matches!(
+        resume(env_with_catalog(answer(), other)).await,
+        Err(WorkerError::SkillReplay { .. })
+    ));
+
+    // A run with no skills at all: the removed inventory is named, not
+    // reported as a different prefix.
+    match resume(env_with(
+        answer(),
+        vec![Arc::new(WriteFile)],
+        CallMode::Complete,
+    ))
+    .await
+    {
+        Err(e @ WorkerError::SkillReplay { .. }) => {
+            assert!(e.to_string().contains("`no-writes`"), "{e}");
+        }
+        other => panic!("a run without skills must refuse the resume: {other:?}"),
+    }
+
+    // The same version resumes.
+    let handle = resume(env_with_skills(answer())).await.expect("resume");
+    let (_, resumed) = with_timeout(drain(handle)).await.expect("in time");
+    assert_eq!(resumed.outcome, WorkerOutcome::Completed);
+}
+
+/// The version a resume is checked against survives the scrub a stored
+/// transcript passes through.
+#[tokio::test]
+async fn the_recorded_skill_version_survives_the_transcript_scrub() {
+    let worktree = tempfile::tempdir().expect("worktree");
+    let events = events_of_a_restricted_segment(worktree.path()).await;
+    let (output, is_error) = finished_output(&events, "t0");
+    assert!(!is_error, "{output}");
+    let stored = kgraf_secrets::scrub_persist(&output);
+    assert_eq!(
+        kgraf_session::skills::recorded_hash(&stored),
+        Some(NO_WRITES_HASH)
+    );
+}
+
+/// A call the skill's restriction refuses as it starts (the activation ran
+/// earlier in the same round) is recorded as the approval chain records a
+/// denial: with its prefix, and counted.
+#[tokio::test]
+async fn a_call_refused_as_it_starts_is_a_counted_denial() {
+    let worktree = tempfile::tempdir().expect("worktree");
+    let provider = Fake::new(false, |request| match round_of(request) {
+        0 => Round::tool(vec![
+            ("t0", "skill", json!({"name": "no-writes"})),
+            ("t1", "write_file", json!({"path": "d", "content": "d"})),
+        ]),
+        _ => Round::answer("done"),
+    });
+    let handle = spawn_worker(
+        Arc::new(env_with_skills(provider)),
+        brief("w1", "look", worktree.path(), 4),
+        SpawnOptions::default(),
+    )
+    .await
+    .expect("spawn");
+    let (events, result) = with_timeout(drain(handle)).await.expect("in time");
+    let (refused, is_error) = finished_output(&events, "t1");
+    assert!(is_error, "{refused}");
+    assert!(
+        refused.starts_with("ERROR: denied by skills:allowed-tools: "),
+        "{refused}"
+    );
+    assert_eq!(result.denied, 1);
+    assert!(!worktree.path().join("d").exists(), "the refused write ran");
+}
+
+/// A subagent's inherited restriction applies even where the environment has
+/// no skills of its own, and the handle exposes what its own children inherit.
+#[tokio::test]
+async fn inherited_restrictions_apply_in_an_environment_without_skills() {
+    let worktree = tempfile::tempdir().expect("worktree");
+    let provider = Fake::new(false, |request| match round_of(request) {
+        0 => Round::tool(vec![(
+            "t0",
+            "write_file",
+            json!({"path": "e", "content": "e"}),
+        )]),
+        _ => Round::answer("done"),
+    });
+    let inherited = vec![kgraf_session::skills::SkillRestriction {
+        skill: "no-writes".into(),
+        hash: NO_WRITES_HASH.into(),
+        allowed_tools: vec!["skill".into()],
+    }];
+    let handle = spawn_worker(
+        Arc::new(env_with(
+            provider,
+            vec![Arc::new(WriteFile)],
+            CallMode::Complete,
+        )),
+        brief("w1.s1", "write", worktree.path(), 4),
+        SpawnOptions {
+            inherited_skills: inherited.clone(),
+            ..SpawnOptions::default()
+        },
+    )
+    .await
+    .expect("spawn");
+    let policy = handle.skills().expect("a policy");
+    assert_eq!(policy.restrictions(), inherited);
+    let (events, _) = with_timeout(drain(handle)).await.expect("in time");
+    let (refused, is_error) = finished_output(&events, "t0");
+    assert!(is_error, "{refused}");
+    assert!(
+        refused.contains("not permitted by skill `no-writes`"),
+        "{refused}"
+    );
+    assert!(!worktree.path().join("e").exists(), "the refused write ran");
 }

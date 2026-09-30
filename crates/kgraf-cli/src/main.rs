@@ -1407,19 +1407,21 @@ fn instructions(root: &Path, action: InstructionsAction) -> Result<()> {
     use kgraf_instructions::Config;
     let dir = state_dir(root)?;
     let config_path = dir.join("instruction-sources.json");
-    let inventory_path = dir.join("inventory.json");
+    let inventory_path = dir.join(kgraf_instructions::INVENTORY_FILE);
     let mut config = Config::load(&config_path)?;
 
     match action {
         InstructionsAction::Show => {
-            let text = std::fs::read_to_string(&inventory_path).with_context(|| {
-                format!(
-                    "no inventory at {}; run `kgraf instructions scan` first",
-                    inventory_path.display()
-                )
-            })?;
-            let inventory: kgraf_instructions::Inventory =
-                serde_json::from_str(&text).context("the inventory is not valid")?;
+            // The error names the path and says whether the file could not be
+            // read or is not a valid inventory.
+            let inventory = kgraf_instructions::Inventory::load(&inventory_path)
+                .context("cannot read the inventory")?
+                .with_context(|| {
+                    format!(
+                        "no inventory at {}; run `kgraf instructions scan` first",
+                        inventory_path.display()
+                    )
+                })?;
             print_inventory(&inventory, true);
             return Ok(());
         }

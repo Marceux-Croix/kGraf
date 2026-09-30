@@ -98,6 +98,15 @@ pub trait CallPolicy: Send + Sync {
     fn check(&self, tool: &QualifiedName, subject: Option<&str>) -> Result<(), String>;
 }
 
+/// A policy refused an approved call when it started
+/// ([`ApprovalChain::recheck`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PolicyRefusal {
+    /// The policy that refused, or `registry` for a tool no longer registered.
+    pub by: String,
+    pub reason: String,
+}
+
 /// What happens to an ask when nobody is there to answer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AskPolicy {
@@ -317,6 +326,38 @@ impl ApprovalChain {
         }
         field(&mut h, format!("{:?}", self.ask_policy).as_bytes());
         h.finalize().to_hex().to_string()
+    }
+
+    /// Check an approved call against every policy again, on the input it will
+    /// run with. The runtime calls this when the call starts, because a policy
+    /// can narrow between approval and start: every call of a round is approved
+    /// before any runs, so a skill activated by an earlier call of the same
+    /// round narrows the policy after a later call was approved (decision 0053).
+    /// A chain with no policies checks nothing.
+    pub fn recheck(
+        &self,
+        registry: &crate::registry::ToolRegistry,
+        call: &ApprovedCall,
+    ) -> Result<(), PolicyRefusal> {
+        if self.policies.is_empty() {
+            return Ok(());
+        }
+        let Some(registered) = registry.get(&call.tool) else {
+            return Err(PolicyRefusal {
+                by: "registry".into(),
+                reason: format!("no tool named `{}`", call.tool),
+            });
+        };
+        let subject = registered.tool().permission_subject(&call.input);
+        for policy in &self.policies {
+            policy
+                .check(registered.name(), subject.as_deref())
+                .map_err(|reason| PolicyRefusal {
+                    by: policy.name().to_owned(),
+                    reason,
+                })?;
+        }
+        Ok(())
     }
 
     /// Review a call from the first hook.
@@ -954,6 +995,51 @@ mod tests {
             .expect("review");
         assert!(matches!(verdict, Verdict::Denied { ref by, .. } if by == "skill:git"));
         assert!(f.ran().is_empty());
+    }
+
+    /// A policy that refuses every call once closed.
+    struct Closable(Arc<std::sync::atomic::AtomicBool>);
+
+    impl CallPolicy for Closable {
+        fn name(&self) -> &str {
+            "closable"
+        }
+        fn fingerprint(&self) -> String {
+            "closable".into()
+        }
+        fn check(&self, _tool: &QualifiedName, _subject: Option<&str>) -> Result<(), String> {
+            if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+                Err("closed".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_recheck_refuses_an_approved_call_the_policy_narrowed_since() {
+        let f = Fixture::new();
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let c = chain(vec![]).with_policy(Arc::new(Closable(closed.clone())));
+        let mut log = MemoryApprovalLog::default();
+        let Verdict::Run(approved) = c
+            .review(f.view(), call(json!({"cmd": "git status"})), &mut log)
+            .await
+            .expect("review")
+        else {
+            panic!("open policy approves");
+        };
+        assert_eq!(c.recheck(&f.registry, &approved), Ok(()));
+        closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            c.recheck(&f.registry, &approved),
+            Err(PolicyRefusal {
+                by: "closable".into(),
+                reason: "closed".into(),
+            })
+        );
+        // No policy: nothing to recheck.
+        assert_eq!(chain(vec![]).recheck(&f.registry, &approved), Ok(()));
     }
 
     #[tokio::test]

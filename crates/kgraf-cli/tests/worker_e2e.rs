@@ -464,6 +464,7 @@ fn assembly_for(
         machine_gate: None,
         external_executor: None,
         dependency_refetch: None,
+        skills: None,
     }
 }
 

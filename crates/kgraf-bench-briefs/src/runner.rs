@@ -435,6 +435,9 @@ async fn run_one(
         machine_gate: None,
         external_executor: None,
         dependency_refetch: None,
+        // A benchmark runs the brief alone: no skills, so the prefix and the
+        // tool list stay the ones every recorded run was measured with.
+        skills: None,
     };
     let worker_brief = WorkerBrief {
         task: worker_id.into(),

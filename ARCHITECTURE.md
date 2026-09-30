@@ -395,8 +395,10 @@ cached and not only the system prompt.
   (decision 0053).
   - Only the catalog of names and descriptions sits in the prefix; bodies
     load on demand.
-  - A skill's declared allowed tools are enforced by filtering the worker's
-    tool set, never by asking the model.
+  - A skill's declared allowed tools are enforced by the runtime, never by
+    asking the model: a call outside the list is refused on the worker's
+    approval chain. The tool definitions stay in the shared prefix
+    unfiltered. A subagent inherits its parent's restrictions.
 
 A pre-tool hook can allow, ask or deny a call. The loop always holds its last
 round back for an answer. Every call's trace records what it was given as

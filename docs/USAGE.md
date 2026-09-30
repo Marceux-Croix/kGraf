@@ -771,6 +771,37 @@ others) and `SKILL.md` skills your other coding agents already use into one inve
 It reports conflicts and malformed files and never silently picks between two variants;
 `instructions choose` resolves a conflict.
 
+Workers use the skills in that inventory (`.kgraf/inventory.json`). `worker` and
+`orchestrate` read it once, when the run starts; run `instructions scan` again to pick up
+changes for the next run. An inventory that exists and cannot be read stops the run. A
+Terminal-Bench run (`--tbench-bridge-socket`) reads no skills, and says so on stderr when
+an inventory is there.
+
+- **Listing.** Every worker's prompt lists each skill by name and description, and the
+  worker gets a `skill` tool to activate one. The skill's instructions come back as that
+  tool's result.
+- **`disable-model-invocation: true`.** The skill is not listed, and the `skill` tool
+  refuses it.
+- **`allowed-tools`.** Once a worker activates such a skill, kGraf refuses every call to a
+  tool outside the list. The worker sees the refusal and the skill's name as the call's
+  result. The restriction lasts for the rest of that worker's run, a resumed run included,
+  and applies to that worker and the subagents it spawns while restricted. Two active
+  skills allow only the tools both list.
+  Entries name kGraf's tools (`read_file`, `list_directory`, `search_files`,
+  `apply_patch`, `shell`, `graph_slice`, `skill`, `mcp__<server>__<tool>`), with a
+  trailing `*` for a prefix (`mcp__git*`) and `mcp__<server>` for all of a server's
+  tools. An entry naming another agent's tool (`Read`, `Bash`) matches nothing here, so
+  a skill written only for another agent refuses every call; edit its list to use these
+  names.
+- **Resuming after a skill changed.** A resumed worker re-activates its skills at the
+  version it activated. If you edited, removed or disabled one of them since, the resume
+  stops and names the skill: restore the skill as it was, or start the work again as a new
+  run.
+- **No skills.** With no inventory, or none a worker may invoke, workers get no `skill`
+  tool and their prompt is unchanged.
+
+The orchestrator's own planning calls use no tools, so skills apply to workers only.
+
 ## Linux sandbox: cargo files above a worktree
 
 A worktree lies inside your checkout (`<checkout>/.kgraf/worktrees/<name>`). Cargo run

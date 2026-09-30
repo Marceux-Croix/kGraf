@@ -1422,6 +1422,15 @@ impl Host {
         // orchestrator's handle once it exists, exactly as `line` above is.
         let session_line = self.session_line();
         let dependency_refetch = self.dependency_refetch(&run);
+        // Decision 0053: the project's skills, read once for the whole run so
+        // every environment lists the same catalog in its prefix (0043). An
+        // inventory that exists and cannot be read fails the build. A
+        // Terminal-Bench bridge run reads none (`run_skills`).
+        let skills = crate::worker::assemble::run_skills(
+            &self.state,
+            self.config.tbench_bridge_socket.as_deref(),
+        )
+        .step("cannot read the project's skill inventory")?;
         let assembler = Arc::new(AttemptAssembler {
             root: root.to_path_buf(),
             state: self.state.clone(),
@@ -1444,6 +1453,7 @@ impl Host {
             machine_gate: self.machine_gate.clone(),
             tbench_bridge_socket: self.config.tbench_bridge_socket.clone(),
             dependency_refetch,
+            skills,
         });
         Ok(BuildBase {
             run,

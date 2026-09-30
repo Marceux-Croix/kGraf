@@ -36,13 +36,35 @@
 //! policy (codex-rs `execpolicy/`), not here.
 //!
 //! **Several active skills intersect.** Each one narrows; none widens.
+//!
+//! **In the worker loop.** [`SkillSession`] is one worker environment's skills:
+//! its catalog, the `skill` tool the model activates a skill with
+//! ([`SkillSession::tool`]), and one [`WorkerSkills`] policy per worker
+//! ([`SkillSession::attach`]), which the runtime puts on that worker's approval
+//! chain. The tool activates for the worker named in its `ToolContext`, and
+//! refuses a worker with no attached policy, so a skill is never active where
+//! its `allowed-tools` is not enforced. The tool declares a barrier access,
+//! so the calls after it in a round wait for it, and the runtime checks the
+//! policy again when each of them starts
+//! (`kgraf_tools::approval::ApprovalChain::recheck`).
+//!
+//! **Subagents and resumes.** A subagent starts from its parent's
+//! restrictions as data ([`SkillRestriction`], [`SkillSession::attach_inheriting`]),
+//! since it may run in another environment with its own session. A resumed
+//! worker re-activates its skills with [`SkillSession::reactivate`], only at the
+//! content hash its activation result recorded ([`recorded_hash`]).
 
 use crate::SessionError;
-use kgraf_instructions::{Inventory, Skill};
+use kgraf_instructions::{INVENTORY_FILE, Inventory, Skill};
 use kgraf_tools::approval::{ApprovedCall, CallPolicy};
-use kgraf_tools::{MCP_PREFIX, QualifiedName, ToolContext, ToolOutput, ToolRegistry};
+use kgraf_tools::{
+    Access, CallPermit, MCP_PREFIX, QualifiedName, Tool, ToolContext, ToolDefinition, ToolError,
+    ToolOutput, ToolRegistry,
+};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 /// Who is invoking a skill.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,6 +93,21 @@ impl SkillCatalog {
     /// absent from `Inventory::skills`, so they are absent here (0053).
     pub fn from_inventory(inventory: &Inventory) -> Result<Self, SessionError> {
         Self::from_skills(inventory.skills.iter().cloned())
+    }
+
+    /// The catalog of the project's inventory in `state_dir` (the file
+    /// `kgraf instructions` writes), or `None` when there is no inventory. An
+    /// inventory that exists and cannot be read is an error.
+    pub fn load(state_dir: &Path) -> Result<Option<Self>, SessionError> {
+        match Inventory::load(&Self::inventory_path(state_dir))? {
+            Some(inventory) => Self::from_inventory(&inventory).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Where [`Self::load`] reads the inventory in `state_dir`.
+    pub fn inventory_path(state_dir: &Path) -> std::path::PathBuf {
+        state_dir.join(INVENTORY_FILE)
     }
 
     /// A catalog of the given skills. Two with one name are refused, not merged.
@@ -137,6 +174,7 @@ impl SkillCatalog {
             name: skill.name.clone(),
             hash: skill.hash.clone(),
             body: skill.body.clone(),
+            allowed_entries: skill.allowed_tools.clone(),
             allowed,
         })
     }
@@ -148,6 +186,8 @@ pub struct ActiveSkill {
     name: String,
     hash: String,
     body: String,
+    /// The `allowed-tools` entries as written, for the activation result.
+    allowed_entries: Option<Vec<String>>,
     allowed: Option<Vec<ToolPattern>>,
 }
 
@@ -281,11 +321,33 @@ pub(crate) fn word_boundary_prefix(subject: &str, prefix: &str) -> bool {
             .is_some_and(|rest| rest.starts_with(char::is_whitespace))
 }
 
+/// One skill's `allowed-tools` restriction as data: what a subagent inherits
+/// from its parent and what the spawn record keeps, so a restarted child is
+/// restricted the same way without reading the inventory again (decision 0053).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillRestriction {
+    /// The skill that restricts.
+    pub skill: String,
+    /// The content hash of the skill version that was activated.
+    pub hash: String,
+    /// Its `allowed-tools` entries, as written.
+    pub allowed_tools: Vec<String>,
+}
+
+/// One restricting skill on a policy.
+#[derive(Clone, Debug)]
+struct Layer {
+    skill: String,
+    hash: String,
+    entries: Vec<String>,
+    patterns: Vec<ToolPattern>,
+}
+
 /// The tool restrictions of every skill active on one worker.
 #[derive(Clone, Debug, Default)]
 pub struct ToolPolicy {
-    /// One layer per restricting skill: (skill name, its patterns).
-    layers: Vec<(String, Vec<ToolPattern>)>,
+    /// One layer per restricting skill, in activation order.
+    layers: Vec<Layer>,
 }
 
 impl ToolPolicy {
@@ -297,18 +359,62 @@ impl ToolPolicy {
     /// Narrow the policy by an activated skill. A skill without `allowed-tools`
     /// leaves it unchanged.
     pub fn restrict(&mut self, skill: &ActiveSkill) {
-        if let Some(patterns) = &skill.allowed {
-            self.layers.push((skill.name.clone(), patterns.clone()));
+        if let (Some(patterns), Some(entries)) = (&skill.allowed, &skill.allowed_entries) {
+            self.layers.push(Layer {
+                skill: skill.name.clone(),
+                hash: skill.hash.clone(),
+                entries: entries.clone(),
+                patterns: patterns.clone(),
+            });
         }
+    }
+
+    /// Narrow the policy by restrictions taken from another policy (a
+    /// parent's). An entry that does not parse refuses the whole set, and the
+    /// policy is left unchanged: a restriction is never dropped.
+    pub fn inherit(&mut self, restrictions: &[SkillRestriction]) -> Result<(), SessionError> {
+        let mut layers = Vec::with_capacity(restrictions.len());
+        for r in restrictions {
+            let patterns = r
+                .allowed_tools
+                .iter()
+                .map(|e| {
+                    ToolPattern::parse(e).ok_or_else(|| SessionError::BadAllowedTools {
+                        skill: r.skill.clone(),
+                        entry: e.clone(),
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            layers.push(Layer {
+                skill: r.skill.clone(),
+                hash: r.hash.clone(),
+                entries: r.allowed_tools.clone(),
+                patterns,
+            });
+        }
+        self.layers.extend(layers);
+        Ok(())
+    }
+
+    /// Every restriction on the policy, in activation order.
+    pub fn restrictions(&self) -> Vec<SkillRestriction> {
+        self.layers
+            .iter()
+            .map(|l| SkillRestriction {
+                skill: l.skill.clone(),
+                hash: l.hash.clone(),
+                allowed_tools: l.entries.clone(),
+            })
+            .collect()
     }
 
     /// Whether a call is permitted: every layer must permit it.
     pub fn check(&self, tool: &QualifiedName, subject: Option<&str>) -> Result<(), SessionError> {
-        for (skill, patterns) in &self.layers {
-            if !patterns.iter().any(|p| p.permits(tool, subject)) {
+        for layer in &self.layers {
+            if !layer.patterns.iter().any(|p| p.permits(tool, subject)) {
                 return Err(SessionError::ToolRefused {
                     tool: tool.wire(),
-                    skill: skill.clone(),
+                    skill: layer.skill.clone(),
                 });
             }
         }
@@ -342,11 +448,314 @@ impl CallPolicy for ToolPolicy {
     }
 
     fn fingerprint(&self) -> String {
-        format!("{:?}", self.layers)
+        format!("{:?}", self.restrictions())
     }
 
     fn check(&self, tool: &QualifiedName, subject: Option<&str>) -> Result<(), String> {
         ToolPolicy::check(self, tool, subject).map_err(|e| e.to_string())
+    }
+}
+
+/// The wire name of the tool the model activates a skill with.
+pub const SKILL_TOOL: &str = "skill";
+
+/// One worker environment's skills, and the skills each of its workers
+/// activated.
+///
+/// Per-worker state is keyed by worker id because the `skill` tool is one
+/// registry entry shared by every worker of the environment; each worker's
+/// entry is a weak reference to the policy its approval chain holds, so it
+/// goes when that chain does.
+pub struct SkillSession {
+    catalog: Arc<SkillCatalog>,
+    workers: Mutex<HashMap<String, Weak<Mutex<ToolPolicy>>>>,
+}
+
+impl std::fmt::Debug for SkillSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SkillSession")
+            .field("skills", &self.catalog.skills.keys().collect::<Vec<_>>())
+            .finish_non_exhaustive()
+    }
+}
+
+impl SkillSession {
+    /// A session over `catalog`, with no worker attached.
+    pub fn new(catalog: Arc<SkillCatalog>) -> Arc<Self> {
+        Arc::new(Self {
+            catalog,
+            workers: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// The entries the shared prefix lists (skills the model may invoke).
+    pub fn model_catalog(&self) -> Vec<CatalogEntry> {
+        self.catalog.model_catalog()
+    }
+
+    /// The `skill` tool for this session's environment.
+    pub fn tool(self: &Arc<Self>) -> Arc<dyn Tool> {
+        Arc::new(SkillTool {
+            session: self.clone(),
+        })
+    }
+
+    /// Start `worker` with no active skill and return the policy its approval
+    /// chain must carry. Replaces whatever an earlier run of that worker id
+    /// left: a worker's restrictions are its transcript's, re-activated by the
+    /// runtime on a resume.
+    pub fn attach(&self, worker: &str) -> WorkerSkills {
+        let skills = WorkerSkills {
+            worker: worker.to_owned(),
+            policy: Arc::new(Mutex::new(ToolPolicy::unrestricted())),
+        };
+        self.register(&skills);
+        skills
+    }
+
+    /// [`Self::attach`], starting from restrictions the worker inherits (a
+    /// subagent's, from its parent). Refused when an inherited entry does not
+    /// parse.
+    pub fn attach_inheriting(
+        &self,
+        worker: &str,
+        inherited: &[SkillRestriction],
+    ) -> Result<WorkerSkills, SessionError> {
+        let skills = WorkerSkills::inheriting(worker, inherited)?;
+        self.register(&skills);
+        Ok(skills)
+    }
+
+    fn register(&self, skills: &WorkerSkills) {
+        // A poisoned map lock means a panic mid-insert elsewhere; the map is
+        // still a valid map, and the entry below overwrites this worker's.
+        let mut workers = self.workers.lock().unwrap_or_else(PoisonError::into_inner);
+        workers.retain(|_, w| w.strong_count() > 0);
+        workers.insert(skills.worker.clone(), Arc::downgrade(&skills.policy));
+    }
+
+    /// Re-activate `name` for `worker` on a resume, as its transcript
+    /// recorded it. `recorded` is the content hash the transcript's activation
+    /// result names ([`recorded_hash`]). Refused when the transcript names no
+    /// hash, or when the skill changed since: the restriction would not be
+    /// the one the worker ran under.
+    pub fn reactivate(
+        &self,
+        worker: &str,
+        name: &str,
+        recorded: Option<&str>,
+    ) -> Result<ActiveSkill, SessionError> {
+        let Some(recorded) = recorded else {
+            return Err(SessionError::SkillVersionUnrecorded {
+                name: name.to_owned(),
+            });
+        };
+        let current = self
+            .catalog
+            .skills
+            .get(name)
+            .ok_or_else(|| SessionError::UnknownSkill {
+                name: name.to_owned(),
+            })?;
+        if current.hash != recorded {
+            return Err(SessionError::SkillVersionChanged {
+                name: name.to_owned(),
+                recorded: recorded.to_owned(),
+                current: current.hash.clone(),
+            });
+        }
+        self.activate(worker, name)
+    }
+
+    /// Activate `name` for `worker` as the model, narrowing the worker's policy
+    /// by the skill's `allowed-tools`. Refused for a worker with no attached
+    /// policy, and for a skill the model may not invoke.
+    pub fn activate(&self, worker: &str, name: &str) -> Result<ActiveSkill, SessionError> {
+        let policy = self
+            .workers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(worker)
+            .and_then(Weak::upgrade)
+            .ok_or_else(|| SessionError::NoSkillPolicy {
+                name: name.to_owned(),
+                worker: worker.to_owned(),
+            })?;
+        let active = self.catalog.activate(name, Invoker::Model)?;
+        policy
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .restrict(&active);
+        Ok(active)
+    }
+}
+
+/// One worker's skill restrictions, as a policy on its approval chain.
+///
+/// The fingerprint is the worker id alone, not the current restrictions: the
+/// chain checks every policy live, after the last hook of a review and again
+/// after an answered ask, and the runtime checks again when the call starts, so
+/// a restriction added while a call waits still applies to it.
+#[derive(Clone, Debug)]
+pub struct WorkerSkills {
+    worker: String,
+    policy: Arc<Mutex<ToolPolicy>>,
+}
+
+impl WorkerSkills {
+    /// A policy for `worker` that starts from inherited restrictions and is
+    /// registered with no [`SkillSession`]: for a subagent whose environment
+    /// has no skills of its own, so only the inherited restrictions apply.
+    pub fn inheriting(worker: &str, inherited: &[SkillRestriction]) -> Result<Self, SessionError> {
+        let mut policy = ToolPolicy::unrestricted();
+        policy.inherit(inherited)?;
+        Ok(Self {
+            worker: worker.to_owned(),
+            policy: Arc::new(Mutex::new(policy)),
+        })
+    }
+
+    /// The names of the skills that restrict this worker, in activation order.
+    pub fn restricting(&self) -> Vec<String> {
+        self.restrictions().into_iter().map(|r| r.skill).collect()
+    }
+
+    /// This worker's restrictions now, in activation order: what a subagent
+    /// it spawns inherits.
+    pub fn restrictions(&self) -> Vec<SkillRestriction> {
+        self.policy
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .restrictions()
+    }
+}
+
+impl CallPolicy for WorkerSkills {
+    fn name(&self) -> &str {
+        "skills:allowed-tools"
+    }
+
+    fn fingerprint(&self) -> String {
+        format!("skills of worker {}", self.worker)
+    }
+
+    fn check(&self, tool: &QualifiedName, subject: Option<&str>) -> Result<(), String> {
+        self.policy
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .check(tool, subject)
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// The tool the model activates a skill with. Its result carries the body,
+/// tagged with the skill's name and content hash (0053), in the worker's
+/// private remainder.
+struct SkillTool {
+    session: Arc<SkillSession>,
+}
+
+const SKILL_TOOL_DESCRIPTION: &str = "Activate a skill from the list of skills available by name \
+in the system prompt. The result holds the skill's instructions. A skill that lists allowed tools \
+restricts you to those tools for the rest of the run: a call to any other tool is refused.";
+
+/// The start of the tag an activation result wraps the skill body in. The
+/// runtime reads the activated version back from it on a resume
+/// ([`recorded_hash`]).
+const INSTRUCTIONS_TAG: &str = "<skill_instructions skill=\"";
+
+/// The content hash an activation result of the `skill` tool names: the
+/// version of the skill that was activated. `None` when `output` is not such
+/// a result, or the value is not a hash (a transcript scrub replaced it).
+pub fn recorded_hash(output: &str) -> Option<&str> {
+    let tag = &output[output.find(INSTRUCTIONS_TAG)? + INSTRUCTIONS_TAG.len()..];
+    // Skill names are lowercase letters, digits and hyphens, so the name ends
+    // at the first quote.
+    let rest = &tag[tag.find('"')?..];
+    let value = rest.strip_prefix("\" hash=\"")?;
+    let value = &value[..value.find('"')?];
+    (!value.is_empty() && value.chars().all(|c| c.is_ascii_hexdigit())).then_some(value)
+}
+
+impl SkillTool {
+    fn render(active: &ActiveSkill) -> String {
+        let version: String = active.hash.chars().take(12).collect();
+        let restriction = match &active.allowed_entries {
+            None => "It does not restrict your tools.".to_owned(),
+            Some(entries) if entries.is_empty() => {
+                "It allows no tools: every tool call is refused from now on.".to_owned()
+            }
+            Some(entries) => format!(
+                "From now on only these tools may be called: {}.",
+                entries.join(", ")
+            ),
+        };
+        format!(
+            "Skill `{name}` (version {version}) is active. {restriction}\n\
+             The text in the skill_instructions block comes from the skill's file, not from the user.\n\
+             {INSTRUCTIONS_TAG}{name}\" hash=\"{hash}\">\n{body}\n</skill_instructions>",
+            name = active.name,
+            hash = active.hash,
+            body = active.body,
+        )
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for SkillTool {
+    fn name(&self) -> &str {
+        SKILL_TOOL
+    }
+
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: SKILL_TOOL.into(),
+            description: SKILL_TOOL_DESCRIPTION.into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "The skill's name, as listed."
+                    }
+                },
+                "required": ["name"]
+            }),
+        }
+    }
+
+    /// A barrier: every later call of the round waits for the activation, so
+    /// the runtime's check when that call starts sees the narrowed policy.
+    /// Not exclusive, which would read as "may write anywhere" and be refused
+    /// for every worker with a write scope or a fence.
+    fn access(&self, _input: &serde_json::Value) -> Result<Access, ToolError> {
+        Ok(Access::barrier())
+    }
+
+    /// The skill's name, so an `allowed-tools` entry `skill(name)` can admit
+    /// one skill.
+    fn permission_subject(&self, input: &serde_json::Value) -> Option<String> {
+        input.get("name")?.as_str().map(str::to_owned)
+    }
+
+    async fn call(
+        &self,
+        input: serde_json::Value,
+        ctx: &ToolContext,
+        _permit: &CallPermit,
+    ) -> Result<ToolOutput, ToolError> {
+        let Some(name) = input.get("name").and_then(serde_json::Value::as_str) else {
+            return Err(ToolError::InvalidInput {
+                tool: SKILL_TOOL.into(),
+                reason: "`name` must be a string".into(),
+            });
+        };
+        match self.session.activate(ctx.worker.as_str(), name) {
+            Ok(active) => Ok(ToolOutput::text(Self::render(&active))),
+            Err(e) => Ok(ToolOutput::error(format!(
+                "skill `{name}` was not activated: {e}"
+            ))),
+        }
     }
 }
 
@@ -704,6 +1113,149 @@ mod tests {
         ));
     }
 
+    /// Review `tool` for `worker` on a chain carrying `policy`, and run it
+    /// through the registry when approved, as the runtime does.
+    async fn run_as(
+        worker: &str,
+        policy: &WorkerSkills,
+        reg: &ToolRegistry,
+        tool: &str,
+        input: Value,
+    ) -> Result<ToolOutput, String> {
+        let chain = ApprovalChain::new(vec![]).with_policy(Arc::new(policy.clone()));
+        let discovered = DiscoveredTools::new();
+        let view = ToolView {
+            registry: reg,
+            discovered: &discovered,
+        };
+        let mut log = MemoryApprovalLog::default();
+        let mut call = pending(tool, input);
+        call.worker = worker.into();
+        match chain
+            .review(view, call, &mut log)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            Verdict::Run(approved) => {
+                let mut ctx = ctx();
+                ctx.worker = worker.into();
+                reg.execute(approved, &ctx).await.map_err(|e| e.to_string())
+            }
+            other => Err(format!("{other:?}")),
+        }
+    }
+
+    fn session_registry(session: &Arc<SkillSession>) -> (ToolRegistry, Arc<AtomicUsize>) {
+        let (mut reg, _, bash_calls) = registry();
+        reg.register_builtin(session.tool(), Exposure::Prefix)
+            .expect("skill tool");
+        (reg, bash_calls)
+    }
+
+    #[tokio::test]
+    async fn a_skill_activated_through_the_tool_restricts_only_its_own_worker() {
+        let session = SkillSession::new(Arc::new(
+            SkillCatalog::from_skills([skill("edit-only", Some(&["Edit"]), false)])
+                .expect("catalog"),
+        ));
+        let (reg, bash_calls) = session_registry(&session);
+        let w1 = session.attach("w1");
+        let w2 = session.attach("w2");
+
+        let out = run_as("w1", &w1, &reg, SKILL_TOOL, json!({"name": "edit-only"}))
+            .await
+            .expect("activation runs");
+        assert!(!out.is_error);
+        let text = out.render();
+        assert!(text.contains("edit-only body"), "{text}");
+        assert!(
+            text.contains("only these tools may be called: Edit"),
+            "{text}"
+        );
+        assert!(
+            text.contains("<skill_instructions skill=\"edit-only\""),
+            "{text}"
+        );
+        assert_eq!(w1.restricting(), vec!["edit-only"]);
+
+        let refused = run_as("w1", &w1, &reg, "Bash", json!({"cmd": "ls"})).await;
+        let reason = refused.expect_err("w1 is restricted");
+        assert!(reason.contains("edit-only"), "{reason}");
+        assert_eq!(bash_calls.load(Ordering::SeqCst), 0, "refused tool ran");
+
+        run_as("w2", &w2, &reg, "Bash", json!({"cmd": "ls"}))
+            .await
+            .expect("w2 is not restricted");
+        assert_eq!(bash_calls.load(Ordering::SeqCst), 1);
+        assert!(w2.restricting().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_skill_tool_refuses_a_skill_the_model_may_not_invoke_and_restricts_nothing() {
+        let session = SkillSession::new(Arc::new(
+            SkillCatalog::from_skills([skill("deploy", Some(&["Edit"]), true)]).expect("catalog"),
+        ));
+        assert!(session.model_catalog().is_empty());
+        let (reg, _) = session_registry(&session);
+        let w1 = session.attach("w1");
+        let out = run_as("w1", &w1, &reg, SKILL_TOOL, json!({"name": "deploy"}))
+            .await
+            .expect("the tool answers");
+        assert!(out.is_error);
+        let text = out.render();
+        assert!(text.contains("disable-model-invocation"), "{text}");
+        assert!(!text.contains("deploy body"), "{text}");
+        assert!(w1.restricting().is_empty());
+    }
+
+    #[test]
+    fn a_skill_is_never_activated_for_a_worker_without_an_attached_policy() {
+        let session = SkillSession::new(Arc::new(
+            SkillCatalog::from_skills([skill("edit-only", Some(&["Edit"]), false)])
+                .expect("catalog"),
+        ));
+        assert!(matches!(
+            session.activate("w1", "edit-only"),
+            Err(SessionError::NoSkillPolicy { .. })
+        ));
+        // A policy whose chain is gone does not count as attached.
+        drop(session.attach("w1"));
+        assert!(matches!(
+            session.activate("w1", "edit-only"),
+            Err(SessionError::NoSkillPolicy { .. })
+        ));
+        let held = session.attach("w1");
+        session.activate("w1", "edit-only").expect("attached");
+        // A second attach starts the worker again, unrestricted.
+        let again = session.attach("w1");
+        assert_eq!(held.restricting(), vec!["edit-only"]);
+        assert!(again.restricting().is_empty());
+    }
+
+    #[test]
+    fn a_catalog_loads_from_the_state_directory_and_is_none_without_an_inventory() {
+        let dir = tempfile::tempdir().expect("dir");
+        assert!(SkillCatalog::load(dir.path()).expect("absent").is_none());
+        let inventory = Inventory {
+            skills: vec![skill("one", None, false)],
+            ..Inventory::default()
+        };
+        std::fs::write(
+            dir.path().join(INVENTORY_FILE),
+            serde_json::to_string(&inventory).expect("json"),
+        )
+        .expect("write");
+        let catalog = SkillCatalog::load(dir.path())
+            .expect("load")
+            .expect("present");
+        assert_eq!(catalog.model_catalog()[0].name, "one");
+        std::fs::write(dir.path().join(INVENTORY_FILE), "[").expect("write");
+        assert!(matches!(
+            SkillCatalog::load(dir.path()),
+            Err(SessionError::Inventory(_))
+        ));
+    }
+
     #[test]
     fn a_catalog_builds_from_an_inventory() {
         let inventory = Inventory {
@@ -712,5 +1264,123 @@ mod tests {
         };
         let catalog = SkillCatalog::from_inventory(&inventory).expect("catalog");
         assert_eq!(catalog.model_catalog().len(), 1);
+    }
+
+    /// A skill whose content hash is hex, as a real inventory's is.
+    fn versioned(name: &str, allowed: &[&str], hash: &str) -> Skill {
+        let mut s = skill(name, Some(allowed), false);
+        s.hash = hash.into();
+        s
+    }
+
+    #[tokio::test]
+    async fn a_worker_attached_with_inherited_restrictions_is_restricted_by_them() {
+        let parent_session = SkillSession::new(Arc::new(
+            SkillCatalog::from_skills([versioned("edit-only", &["Edit"], "abc123")])
+                .expect("catalog"),
+        ));
+        let parent = parent_session.attach("p");
+        parent_session.activate("p", "edit-only").expect("activate");
+        let inherited = parent.restrictions();
+        assert_eq!(
+            inherited,
+            vec![SkillRestriction {
+                skill: "edit-only".into(),
+                hash: "abc123".into(),
+                allowed_tools: vec!["Edit".into()],
+            }]
+        );
+
+        // The child's environment has its own session, with no skill active.
+        let child_session = SkillSession::new(Arc::new(SkillCatalog::default()));
+        let (reg, bash_calls) = session_registry(&child_session);
+        let child = child_session
+            .attach_inheriting("p.s1", &inherited)
+            .expect("attach");
+        let refused = run_as("p.s1", &child, &reg, "Bash", json!({"cmd": "ls"})).await;
+        assert!(
+            refused.expect_err("inherited").contains("edit-only"),
+            "the child is refused by the parent's skill"
+        );
+        assert_eq!(bash_calls.load(Ordering::SeqCst), 0, "refused tool ran");
+        // A grandchild inherits the child's restrictions, inherited ones included.
+        assert_eq!(child.restrictions(), inherited);
+
+        // With no session at all, the inherited restriction still applies.
+        let detached = WorkerSkills::inheriting("p.s2", &inherited).expect("detached");
+        let (reg, bash_calls) = session_registry(&child_session);
+        assert!(
+            run_as("p.s2", &detached, &reg, "Bash", json!({"cmd": "ls"}))
+                .await
+                .is_err()
+        );
+        assert_eq!(bash_calls.load(Ordering::SeqCst), 0, "refused tool ran");
+    }
+
+    #[test]
+    fn an_unreadable_inherited_entry_is_refused_not_dropped() {
+        let bad = [SkillRestriction {
+            skill: "odd".into(),
+            hash: "abc".into(),
+            allowed_tools: vec!["Bash(".into()],
+        }];
+        assert!(matches!(
+            WorkerSkills::inheriting("w", &bad),
+            Err(SessionError::BadAllowedTools { .. })
+        ));
+        let session = SkillSession::new(Arc::new(SkillCatalog::default()));
+        assert!(matches!(
+            session.attach_inheriting("w", &bad),
+            Err(SessionError::BadAllowedTools { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_activation_result_records_the_version_a_resume_is_checked_against() {
+        let session = SkillSession::new(Arc::new(
+            SkillCatalog::from_skills([versioned("edit-only", &["Edit"], "0a1b2c3d4e5f")])
+                .expect("catalog"),
+        ));
+        let (reg, _) = session_registry(&session);
+        let w1 = session.attach("w1");
+        let out = run_as("w1", &w1, &reg, SKILL_TOOL, json!({"name": "edit-only"}))
+            .await
+            .expect("activation runs")
+            .render();
+        assert_eq!(recorded_hash(&out), Some("0a1b2c3d4e5f"));
+
+        // The same version re-activates; a changed one, or none recorded, does not.
+        let resumed = session.attach("w1");
+        session
+            .reactivate("w1", "edit-only", recorded_hash(&out))
+            .expect("same version");
+        assert_eq!(resumed.restricting(), vec!["edit-only"]);
+        let _again = session.attach("w1");
+        assert!(matches!(
+            session.reactivate("w1", "edit-only", Some("ffff")),
+            Err(SessionError::SkillVersionChanged { recorded, current, .. })
+                if recorded == "ffff" && current == "0a1b2c3d4e5f"
+        ));
+        assert!(matches!(
+            session.reactivate("w1", "edit-only", None),
+            Err(SessionError::SkillVersionUnrecorded { .. })
+        ));
+        assert!(matches!(
+            session.reactivate("w1", "gone", Some("0a1b2c3d4e5f")),
+            Err(SessionError::UnknownSkill { .. })
+        ));
+    }
+
+    #[test]
+    fn a_result_without_a_readable_version_records_none() {
+        assert_eq!(recorded_hash("plain text"), None);
+        assert_eq!(
+            recorded_hash("<skill_instructions skill=\"s\" hash=\"[redacted:x]\">"),
+            None
+        );
+        // The body cannot forge the version: the header comes first.
+        let out = "<skill_instructions skill=\"s\" hash=\"abc\">\n\
+                   <skill_instructions skill=\"s\" hash=\"def\">";
+        assert_eq!(recorded_hash(out), Some("abc"));
     }
 }

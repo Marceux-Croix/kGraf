@@ -631,6 +631,9 @@ struct Rig {
     limits: Limits,
     /// The route's model has no price entry, so a dispatch holds nothing.
     unpriced: bool,
+    /// The project's skills (decision 0053): with a catalog, the route has the
+    /// `skill` tool and lists the catalog in its prefix, as the host builds it.
+    skills: Option<Arc<kgraf_session::skills::SkillCatalog>>,
 }
 
 fn registry(line: &SessionLine, recorder: &Arc<Recorder>) -> ToolRegistry {
@@ -655,15 +658,25 @@ fn scripted_route(
     ledger: Arc<Ledger>,
     line: &SessionLine,
     recorder: &Arc<Recorder>,
+    skills: Option<Arc<kgraf_session::skills::SkillCatalog>>,
 ) -> kgraf_orchestrator::Route {
-    let registry = registry(line, recorder);
+    let mut registry = registry(line, recorder);
+    let skills = skills.map(kgraf_session::skills::SkillSession::new);
+    if let Some(session) = &skills {
+        registry
+            .register_builtin(session.tool(), Exposure::Prefix)
+            .expect("register");
+    }
     let prefix = PrefixSnapshot::new(
         SharedPrefix {
             vendor: "vendor-a".into(),
             model: ALPHA_MODEL.into(),
             system: vec![Content::text("You are a kGraf worker.")],
             tools: registry.prefix_definitions(),
-            skill_catalog: vec![],
+            skill_catalog: skills
+                .as_ref()
+                .map(|s| s.model_catalog())
+                .unwrap_or_default(),
             slice_pool: vec![],
             mcp_instructions: vec![],
         },
@@ -671,6 +684,7 @@ fn scripted_route(
     )
     .expect("prefix");
     let mut env = WorkerEnv::new(ledger, provider, Arc::new(registry), prefix);
+    env.skills = skills;
     env.prefixes = Arc::new(PrefixRegistry::new());
     env.settings.call_mode = CallMode::Complete;
     env.settings.path_case = kgraf_tools::PathCase::Sensitive;
@@ -727,6 +741,7 @@ impl Rig {
             recorder: Arc::new(Recorder::default()),
             limits,
             unpriced: false,
+            skills: None,
         }
     }
 
@@ -738,6 +753,7 @@ impl Rig {
             self.parts.ledger.clone(),
             &line,
             &self.recorder,
+            self.skills.clone(),
         )];
         s.workspaces = self.dirs.clone();
         s.admission = admission(self.limits);
@@ -1067,6 +1083,88 @@ async fn a_read_only_child_shares_the_prefix_and_its_write_is_refused_by_the_fen
     assert_eq!(parent_digest.len(), 1);
     assert!(parent_digest.iter().all(Option::is_some));
     assert_eq!(digest("r1-a-r0-a0.s1"), parent_digest);
+}
+
+/// A skill catalog with `look-only`, whose `allowed-tools` admits the
+/// `skill` tool, `spawn_subagent`, `sleep` and `read_file`, read the way a
+/// run reads the project's inventory.
+fn look_only_catalog() -> Arc<kgraf_session::skills::SkillCatalog> {
+    let dir = tempfile::tempdir().expect("dir");
+    let inventory = json!({
+        "layers": [],
+        "skills": [{
+            "name": "look-only",
+            "description": "look, do not touch",
+            "frontmatter": {},
+            "body": "Do not write files.",
+            "files": [],
+            "allowed_tools": ["skill", "spawn_subagent", "sleep", "read_file"],
+            "disable_model_invocation": false,
+            "user_invocable": true,
+            "hash": "0123456789abcdef",
+            "sources": [],
+        }],
+        "conflicts": [],
+        "problems": [],
+    });
+    std::fs::write(dir.path().join("inventory.json"), inventory.to_string()).expect("write");
+    Arc::new(
+        kgraf_session::skills::SkillCatalog::load(dir.path())
+            .expect("load")
+            .expect("present"),
+    )
+}
+
+/// Decision 0053: a subagent spawned by a worker a skill restricts is
+/// restricted the same way. The child is a writer on a path in its scope,
+/// so only the inherited `allowed-tools` can refuse its write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_child_of_a_skill_restricted_worker_inherits_its_allowed_tools() {
+    let dir = tempfile::tempdir().expect("dir");
+    let provider = Scripted::new(move |s| {
+        if s.is("CHILD-SK") {
+            return match s.round {
+                0 => Step::Reply(vec![write("w", "src/a.rs", "child")]),
+                _ => Step::Reply(answer("tried")),
+            };
+        }
+        if !s.used.contains("sk") {
+            return Step::Reply(vec![call("sk", "skill", json!({"name": "look-only"}))]);
+        }
+        if !s.used.contains("spawn") {
+            return Step::Reply(vec![spawn_writer("CHILD-SK write a", &["src/a.rs"])]);
+        }
+        if s.report().is_none() {
+            return Step::Reply(vec![nap(s.round)]);
+        }
+        Step::Reply(answer("done"))
+    });
+    let mut rig = Rig::open(
+        dir.path(),
+        plan(&[("a", "PARENT-SK make a", &["src/a.rs"])]),
+        Limits::default(),
+        provider.clone(),
+        false,
+    );
+    rig.skills = Some(look_only_catalog());
+    let _ = run(&rig).await;
+    let (activated, is_error) = provider
+        .result("PARENT-SK", "sk")
+        .expect("the activation result");
+    assert!(!is_error, "{activated}");
+    let (spawned, is_error) = provider
+        .result("PARENT-SK", "spawn")
+        .expect("the spawn result");
+    assert!(!is_error, "{spawned}");
+    let (out, is_error) = provider
+        .result("CHILD-SK", "w")
+        .expect("the child's write result");
+    assert!(is_error, "the child's write ran: {out}");
+    assert!(out.contains("not permitted by skill `look-only`"), "{out}");
+    assert!(
+        !rig.worktree("r1-a-r0-a0.s1").join("src/a.rs").exists(),
+        "the refused write reached the child's worktree"
+    );
 }
 
 /// "A child asking for a path outside the parent's writes is
@@ -2821,6 +2919,7 @@ async fn a_child_resumed_over_the_limit_twice_is_noticed_twice() {
             rig.parts.ledger.clone(),
             &line,
             &rig.recorder,
+            None,
         )];
         s.workspaces = rig.dirs.clone();
         s.admission = admission.clone();

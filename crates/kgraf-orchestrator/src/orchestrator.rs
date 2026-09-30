@@ -1272,6 +1272,9 @@ struct InFlight {
     /// slot before the worker's task spawns and the task fills it after
     /// `spawn_worker` returns; empty until then.
     injectors: BTreeMap<AgentId, Arc<OnceLock<Injector>>>,
+    /// Each attempt's skill policy (decision 0053), set with its injector: a
+    /// subagent it spawns inherits the restrictions it holds at that moment.
+    skills: BTreeMap<AgentId, SkillsSlot>,
     /// Each attempt's [`ScopeFence`] (decision 0067, point 5): held here, next
     /// to `cancels`, so a subagent tool bound to this worker's round can fence
     /// paths on the same worker its parent runs as. Empty (refuses nothing)
@@ -4546,6 +4549,7 @@ impl RunLoop {
             premerged: BTreeSet::new(),
             renew_workers: false,
             injectors: BTreeMap::new(),
+            skills: BTreeMap::new(),
             fences: BTreeMap::new(),
             ended: BTreeMap::new(),
             run: self.run_id().to_string(),
@@ -4916,6 +4920,8 @@ impl RunLoop {
         // `send_to_session` reports `Unknown` or waits, never panics.
         let fence = ScopeFence::default();
         let injector_slot: Arc<OnceLock<Injector>> = Arc::new(OnceLock::new());
+        let skills_slot: SkillsSlot = Arc::new(OnceLock::new());
+        flight.skills.insert(worker.clone(), skills_slot.clone());
         flight.fences.insert(worker.clone(), fence.clone());
         // The worker's session row (relative transcript path, parent the
         // orchestrator or the handed-back session) and its adopted children
@@ -4993,6 +4999,11 @@ impl RunLoop {
                         board,
                         fence,
                         injector_slot,
+                        AttemptSkills {
+                            slot: skills_slot,
+                            // A contract's worker inherits nothing.
+                            inherited: Vec::new(),
+                        },
                         graph,
                         None,
                     )
@@ -7042,11 +7053,24 @@ fn input_tokens(u: &TokenUsage) -> u64 {
     u.uncached_input + u.cache_read + u.cache_write
 }
 
+/// A worker's skill policy (decision 0053), filled once its handle exists
+/// (`None` inside: the worker has no policy, so nothing restricts it). Empty
+/// until then, and a spawn from a worker whose slot is empty is refused rather
+/// than started unrestricted.
+pub(crate) type SkillsSlot = Arc<OnceLock<Option<kgraf_session::skills::WorkerSkills>>>;
+
+/// What `run_attempt` needs for a worker's skills: the slot it fills and the
+/// restrictions the worker inherits from the agent that spawned it.
+pub(crate) struct AttemptSkills {
+    pub(crate) slot: SkillsSlot,
+    pub(crate) inherited: Vec<kgraf_session::skills::SkillRestriction>,
+}
+
 /// Run one worker to its end: open (or continue) its transcript, spawn it
 /// (resuming from the transcript when there is one), forward every event to the
 /// transcript, and return its result and peak context.
 ///
-/// Nine positional arguments (two over clippy's default): each is a
+/// Ten positional arguments (three over clippy's default): each is a
 /// distinct piece of per-attempt state the dispatch site already holds
 /// separately (`InFlight`'s own maps keyed by worker, not a single struct);
 /// grouping them into a new type here would only move the naming, not
@@ -7060,6 +7084,7 @@ async fn run_attempt(
     board: Arc<crate::occupancy::OccupancyBoard>,
     fence: ScopeFence,
     injector_slot: Arc<OnceLock<Injector>>,
+    skills: AttemptSkills,
     graph: SharedGraph,
     parent_call: Option<CallId>,
 ) -> Result<(WorkerResult, u64), String> {
@@ -7151,6 +7176,7 @@ async fn run_attempt(
             parent_call,
             fence: Some(fence),
             injections,
+            inherited_skills: skills.inherited,
             ..SpawnOptions::default()
         },
     )
@@ -7190,6 +7216,9 @@ async fn run_attempt(
     }
     let injector = handle.injector();
     let _ = injector_slot.set(injector);
+    // Decision 0053: set once, like the injector; a subagent spawned from
+    // here on inherits what this policy holds when it spawns.
+    let _ = skills.slot.set(handle.skills());
     let mut broken: Option<String> = None;
     // Live occupancy: on the board while this attempt runs.
     let on_board = crate::occupancy::OnBoard::new(
@@ -7375,6 +7404,7 @@ mod tests {
             premerged: BTreeSet::new(),
             renew_workers: false,
             injectors: BTreeMap::new(),
+            skills: BTreeMap::new(),
             fences: BTreeMap::new(),
             ended: BTreeMap::new(),
             run: "r".into(),

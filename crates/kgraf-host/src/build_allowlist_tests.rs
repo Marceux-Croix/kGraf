@@ -50,6 +50,7 @@ async fn one_shell_call(
         machine_gate: test_machine_gate(),
         tbench_bridge_socket: None,
         dependency_refetch: crate::deps::inert_refetch(),
+        skills: None,
     };
     let context = ContextConfig::for_model(200_000).expect("context");
     let ws = worktree(r, worker).await;

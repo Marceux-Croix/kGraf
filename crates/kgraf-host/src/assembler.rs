@@ -76,6 +76,10 @@ pub(crate) struct AttemptAssembler {
     /// The run's dependency refetcher (decision 0087;
     /// `Assembly::dependency_refetch`).
     pub(crate) dependency_refetch: Arc<dyn kgraf_tools::DependencyRefetch>,
+    /// The project's skills, read once when the run is built
+    /// (`Assembly::skills`), so the route probes and every attempt list the
+    /// same catalog.
+    pub(crate) skills: Option<Arc<kgraf_session::skills::SkillCatalog>>,
 }
 
 impl AttemptAssembler {
@@ -163,6 +167,7 @@ impl AttemptAssembler {
             machine_gate: Some(self.machine_gate.clone()),
             external_executor,
             dependency_refetch: Some(self.dependency_refetch.clone()),
+            skills: self.skills.clone(),
         })
     }
 

@@ -1078,6 +1078,7 @@ async fn each_attempt_gets_a_shell_bound_to_its_own_worktree() {
         machine_gate: test_machine_gate(),
         tbench_bridge_socket: None,
         dependency_refetch: crate::deps::inert_refetch(),
+        skills: None,
     };
     let context = ContextConfig::for_model(200_000).expect("context");
     let mut seen = Vec::new();
@@ -1246,6 +1247,7 @@ async fn a_session_tool_call_with_the_flag_on_answers_as_an_error() {
         machine_gate: test_machine_gate(),
         tbench_bridge_socket: None,
         dependency_refetch: crate::deps::inert_refetch(),
+        skills: None,
     };
     let context = ContextConfig::for_model(200_000).expect("context");
     let ws = worktree(&r, "w-ask").await;
@@ -1349,6 +1351,7 @@ async fn the_assembled_prefix_digest_with_the_flag_off_is_pinned() {
         machine_gate: test_machine_gate(),
         tbench_bridge_socket: None,
         dependency_refetch: crate::deps::inert_refetch(),
+        skills: None,
     };
     let context = ContextConfig::for_model(200_000).expect("context");
     let ws = worktree(&r, "w-off").await;
@@ -1461,6 +1464,7 @@ async fn an_mcp_tool_allowed_with_kgraf_allow_runs_in_an_unattended_delegate() {
             machine_gate: test_machine_gate(),
             tbench_bridge_socket: None,
             dependency_refetch: crate::deps::inert_refetch(),
+            skills: None,
         }
     };
     let context = ContextConfig::for_model(200_000).expect("context");
@@ -3935,6 +3939,7 @@ async fn a_host_resolver_answers_the_attempts_asks() {
             machine_gate: test_machine_gate(),
             tbench_bridge_socket: None,
             dependency_refetch: crate::deps::inert_refetch(),
+            skills: None,
         }),
         asks: allow.clone(),
     };
@@ -6093,4 +6098,340 @@ async fn attempt_refs_of_a_worktree_an_open_contract_names_are_kept() {
         .sweep_refs(Some(&record), || Ok(Default::default()))
         .expect("sweep");
     assert_eq!(attempt_refs(&r, "w-kept"), "", "nothing names it: swept");
+}
+
+/// Decision 0053: a skill's `allowed-tools` and `disable-model-invocation` are
+/// enforced by the runtime. These run a real worker loop through the host's
+/// attempt assembler, with the skills read from the project's inventory file.
+mod skill_enforcement {
+    use super::*;
+    use kgraf_provider::{Content, Role, StopReason};
+
+    /// One scripted round: the tool calls the fake model issues.
+    type Round = Vec<(&'static str, serde_json::Value)>;
+
+    /// A fake model that issues one scripted round of tool calls per round,
+    /// then answers, and keeps every request it was sent.
+    struct Scripted {
+        rounds: Vec<Round>,
+        requests: Mutex<Vec<kgraf_provider::Request>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for Scripted {
+        fn adapter(&self) -> &'static str {
+            "fake"
+        }
+        fn protocol(&self) -> kgraf_core::Protocol {
+            kgraf_core::Protocol::Additive
+        }
+        async fn complete(
+            &self,
+            request: &kgraf_provider::Request,
+            token: &kgraf_provider::CallToken,
+        ) -> std::result::Result<kgraf_provider::Response, kgraf_provider::ProviderError> {
+            let usage = kgraf_core::TokenUsage {
+                uncached_input: 5,
+                text_output: 1,
+                ..Default::default()
+            };
+            token.settle(&usage, None)?;
+            self.requests.lock().expect("lock").push(request.clone());
+            let round = request
+                .messages
+                .iter()
+                .filter(|m| m.role == Role::Assistant)
+                .count();
+            let (content, stop_reason) = match self.rounds.get(round) {
+                Some(calls) => (
+                    calls
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (name, input))| Content::ToolUse {
+                            id: format!("c{round}-{i}"),
+                            name: (*name).into(),
+                            input: input.clone(),
+                            signature: None,
+                        })
+                        .collect(),
+                    StopReason::ToolUse,
+                ),
+                None => (vec![Content::text("done")], StopReason::EndTurn),
+            };
+            Ok(kgraf_provider::Response {
+                model: request.model.clone(),
+                content,
+                stop_reason,
+                usage,
+                request_id: None,
+            })
+        }
+        fn capabilities(&self) -> kgraf_provider::capability::Capabilities<'_> {
+            kgraf_provider::capability::Capabilities::none()
+        }
+    }
+
+    /// One skill as the inventory file stores it.
+    fn skill_json(name: &str, allowed: Option<&[&str]>, disable_model: bool) -> serde_json::Value {
+        serde_json::json!({
+            "name": name,
+            "description": format!("{name} description"),
+            "frontmatter": {},
+            "body": format!("{name} instructions"),
+            "files": [],
+            "allowed_tools": allowed,
+            "disable_model_invocation": disable_model,
+            "user_invocable": true,
+            "hash": format!("{name}-hash-0123456789"),
+            "sources": [],
+        })
+    }
+
+    /// Writes the project's inventory: `reader` restricts to `read_file`;
+    /// `hidden` may not be invoked by the model.
+    fn write_inventory(state: &Path) {
+        let inventory = serde_json::json!({
+            "layers": [],
+            "skills": [
+                skill_json("hidden", None, true),
+                skill_json("reader", Some(&["read_file"]), false),
+            ],
+            "conflicts": [],
+            "problems": [],
+        });
+        std::fs::write(
+            state.join("inventory.json"),
+            serde_json::to_string_pretty(&inventory).expect("json"),
+        )
+        .expect("write inventory");
+    }
+
+    /// What one run left: each finished call's (id, output, is_error), the
+    /// requests the model saw, and the environment's tool names.
+    struct Ran {
+        finished: Vec<(String, String, bool)>,
+        requests: Vec<kgraf_provider::Request>,
+        tools: Vec<String>,
+    }
+
+    impl Ran {
+        fn result(&self, id: &str) -> (&str, bool) {
+            let (_, output, is_error) = self
+                .finished
+                .iter()
+                .find(|(c, _, _)| c == id)
+                .unwrap_or_else(|| panic!("call {id} finished: {:?}", self.finished));
+            (output.as_str(), *is_error)
+        }
+
+        fn system_text(&self, index: usize) -> String {
+            self.requests[index]
+                .system
+                .iter()
+                .filter_map(|c| match c {
+                    Content::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+    }
+
+    /// Runs one worker with `rounds` through the attempt assembler.
+    async fn run(with_inventory: bool, rounds: Vec<Round>) -> Ran {
+        let r = repo();
+        let state = r._dir.path().join("state");
+        std::fs::create_dir_all(&state).expect("state");
+        if with_inventory {
+            write_inventory(&state);
+        }
+        let ledger = Arc::new(Ledger::open(&state.join("ledger.db")).expect("ledger"));
+        let provider = Arc::new(Scripted {
+            rounds,
+            requests: Mutex::new(Vec::new()),
+        });
+        let mut routes = BTreeMap::new();
+        routes.insert(
+            "fake:m".to_owned(),
+            RouteParts {
+                provider: provider.clone(),
+                vendor: "fake (fake)".into(),
+                vendor_name: "fake".into(),
+                model: "m".into(),
+            },
+        );
+        let assembler = AttemptAssembler {
+            root: r.root.clone(),
+            state: state.clone(),
+            graph_path: state.join("graph.db"),
+            indexed: false,
+            ledger: ledger.clone(),
+            config: WorkerConfig::default(),
+            max_output_tokens: 1_000,
+            read_denies: vec![state.clone()],
+            workspaces: r.workspaces.clone(),
+            routes,
+            extra_tools: Vec::new(),
+            session_line: None,
+            prefixes: Arc::new(kgraf_runtime::PrefixRegistry::new()),
+            machine_gate: test_machine_gate(),
+            tbench_bridge_socket: None,
+            dependency_refetch: crate::deps::inert_refetch(),
+            // Read from the state directory as `Host::build_base` does.
+            skills: crate::worker::assemble::run_skills(&state, None).expect("inventory"),
+        };
+        let context = ContextConfig::for_model(200_000).expect("context");
+        let ws = worktree(&r, "w-skill").await;
+        let route = Route {
+            name: "fake:m".into(),
+            vendor: "fake".into(),
+            env: Arc::new(kgraf_runtime::WorkerEnv::new(
+                ledger.clone(),
+                provider.clone(),
+                Arc::new(kgraf_tools::ToolRegistry::new()),
+                assemble_prefix(),
+            )),
+            context: context.clone(),
+            readiness: Arc::new(kgraf_orchestrator::AlwaysReady),
+            local: false,
+        };
+        let built = assembler
+            .build(&route, &ws, &"w-skill".into(), &"r9/c-skill".into())
+            .await
+            .expect("built");
+        let tools: Vec<String> = built.env.tools.names().map(str::to_owned).collect();
+        let brief = kgraf_runtime::WorkerBrief {
+            task: "r9/c-skill".into(),
+            worker: "w-skill".into(),
+            instruction: "read the readme".into(),
+            workspace_root: ws.clone(),
+            model: "m".into(),
+            slices: vec![],
+            skills: vec![],
+            step_budget: 8,
+            context,
+            write_scope: None,
+        };
+        let mut handle = kgraf_runtime::spawn_worker(
+            built.env.clone(),
+            brief,
+            kgraf_runtime::SpawnOptions::default(),
+        )
+        .await
+        .expect("spawn");
+        let mut finished = Vec::new();
+        while let Some(ev) = handle.next_event().await {
+            if let kgraf_runtime::WorkerEvent::ToolCallFinished {
+                call_id,
+                output,
+                is_error,
+            } = ev
+            {
+                finished.push((call_id, output, is_error));
+            }
+        }
+        if let Some(closer) = built.closer {
+            closer.close().await;
+        }
+        let requests = provider.requests.lock().expect("lock").clone();
+        Ran {
+            finished,
+            requests,
+            tools,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_active_skill_refuses_a_tool_outside_its_allowed_tools() {
+        let ran = run(
+            true,
+            vec![
+                // Activation and an out-of-set call in one round: the call
+                // starts after the activation and is refused.
+                vec![
+                    ("skill", serde_json::json!({"name": "reader"})),
+                    ("list_directory", serde_json::json!({"path": "."})),
+                ],
+                // A later round: still refused; the allowed tool runs.
+                vec![
+                    ("list_directory", serde_json::json!({"path": "."})),
+                    ("read_file", serde_json::json!({"path": "README"})),
+                ],
+            ],
+        )
+        .await;
+        let (activated, is_error) = ran.result("c0-0");
+        assert!(!is_error, "{activated}");
+        assert!(activated.contains("reader instructions"), "{activated}");
+        for id in ["c0-1", "c1-0"] {
+            let (output, is_error) = ran.result(id);
+            assert!(is_error, "{id} must be refused: {output}");
+            assert!(
+                output.contains("not permitted by skill `reader`"),
+                "{id}: {output}"
+            );
+        }
+        let (read, is_error) = ran.result("c1-1");
+        assert!(!is_error, "read_file is in the allowed set: {read}");
+        assert!(read.contains("hello"), "{read}");
+        // The catalog is in the shared prefix, the same bytes in every request.
+        let first = ran.system_text(0);
+        assert!(first.contains("reader: reader description"), "{first}");
+        for i in 1..ran.requests.len() {
+            assert_eq!(ran.system_text(i), first, "request {i}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_skill_the_model_may_not_invoke_is_not_listed_and_cannot_be_activated() {
+        let ran = run(
+            true,
+            vec![
+                vec![("skill", serde_json::json!({"name": "hidden"}))],
+                vec![("list_directory", serde_json::json!({"path": "."}))],
+            ],
+        )
+        .await;
+        let (output, is_error) = ran.result("c0-0");
+        assert!(is_error, "{output}");
+        assert!(output.contains("hidden"), "{output}");
+        assert!(!output.contains("hidden instructions"), "{output}");
+        // The refused activation restricts nothing.
+        let (listed, is_error) = ran.result("c1-0");
+        assert!(!is_error, "{listed}");
+        let first = ran.system_text(0);
+        assert!(first.contains("reader: reader description"), "{first}");
+        assert!(!first.contains("hidden"), "{first}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn with_no_inventory_there_is_no_skill_tool_and_no_catalog() {
+        let ran = run(
+            false,
+            vec![vec![("list_directory", serde_json::json!({"path": "."}))]],
+        )
+        .await;
+        assert!(!ran.tools.iter().any(|t| t == "skill"), "{:?}", ran.tools);
+        let (listed, is_error) = ran.result("c0-0");
+        assert!(!is_error, "{listed}");
+        assert!(!ran.system_text(0).contains("Skills available"));
+    }
+
+    /// A Terminal-Bench bridge run reads no skills, so a benchmark's prefix and
+    /// tool list do not change with an inventory in its state directory.
+    #[test]
+    fn a_tbench_bridge_run_reads_no_skills() {
+        let dir = tempfile::tempdir().expect("dir");
+        write_inventory(dir.path());
+        let socket = dir.path().join("bridge.sock");
+        assert!(
+            crate::worker::assemble::run_skills(dir.path(), Some(&socket))
+                .expect("read")
+                .is_none()
+        );
+        let catalog = crate::worker::assemble::run_skills(dir.path(), None)
+            .expect("read")
+            .expect("an inventory");
+        assert!(!catalog.model_catalog().is_empty());
+    }
 }

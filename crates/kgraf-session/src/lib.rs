@@ -59,6 +59,34 @@ pub enum SessionError {
     #[error("tool `{tool}` is not permitted by skill `{skill}`'s allowed-tools")]
     ToolRefused { tool: String, skill: String },
 
+    /// The project's skill inventory exists and cannot be read. Refused rather
+    /// than run with no skills: a restriction the user ingested must not vanish.
+    #[error("cannot read the skill inventory: {0}")]
+    Inventory(#[from] kgraf_instructions::InstructionsError),
+
+    /// A skill was activated for a worker whose approval chain carries no skill
+    /// policy, so its `allowed-tools` would not be enforced.
+    #[error(
+        "skill `{name}` cannot be activated for worker `{worker}`: no skill policy is attached to its approval chain"
+    )]
+    NoSkillPolicy { name: String, worker: String },
+
+    /// A resumed transcript activated a skill that has changed since, so its
+    /// `allowed-tools` may not be the restriction the worker ran under.
+    #[error(
+        "skill `{name}` changed since the transcript activated it (version {recorded}, now {current})"
+    )]
+    SkillVersionChanged {
+        name: String,
+        recorded: String,
+        current: String,
+    },
+
+    /// A resumed transcript activated a skill and its result does not say
+    /// which version, so the restriction cannot be checked against it.
+    #[error("the transcript does not record which version of skill `{name}` it activated")]
+    SkillVersionUnrecorded { name: String },
+
     /// The tool itself failed to run.
     #[error(transparent)]
     Tool(#[from] ToolError),

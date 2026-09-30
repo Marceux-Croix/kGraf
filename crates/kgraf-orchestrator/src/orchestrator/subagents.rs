@@ -125,6 +125,10 @@ struct SpawnFacts {
     /// never started, and whatever it left is discarded.
     #[serde(default)]
     preparing: bool,
+    /// The parent's skill restrictions when it spawned the child (decision
+    /// 0053): kept here so a restarted child is restricted the same way.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    skills: Vec<kgraf_session::skills::SkillRestriction>,
 }
 
 /// One live child (running, or adopted and waiting for a slot).
@@ -140,6 +144,9 @@ struct LiveChild {
     /// the one its own writer children fence paths on.
     fence: ScopeFence,
     injector: Arc<OnceLock<Injector>>,
+    /// The child's own skill policy, set with its injector: its children
+    /// inherit from it.
+    skills: SkillsSlot,
     /// The fence on the parent over this child's paths (writer only).
     parent_guard: Option<FenceGuard>,
     admitted: Option<Admitted>,
@@ -246,6 +253,8 @@ struct ParentView {
     /// The parent's session depth: 1 for a worker.
     session_depth: u32,
     reservation: Money,
+    /// The parent's skill policy slot: what a child inherits.
+    skills: SkillsSlot,
 }
 
 enum Slot {
@@ -402,6 +411,7 @@ impl RunLoop {
                 fence: c.fence.clone(),
                 lineage: c.facts.lineage.clone(),
                 session_depth: 1 + c.facts.depth,
+                skills: c.skills.clone(),
                 reservation: c
                     .reservation
                     .as_ref()
@@ -429,6 +439,9 @@ impl RunLoop {
                 fence: fence.clone(),
                 lineage: vec![(id.to_string(), contract.instruction.clone())],
                 session_depth: 1,
+                // Inserted at dispatch with the fence; an empty slot refuses
+                // the spawn rather than start the child unrestricted.
+                skills: f.skills.get(id).cloned().unwrap_or_default(),
                 reservation: f
                     .reservations
                     .get(id)
@@ -663,6 +676,7 @@ impl RunLoop {
                     cancel: Arc::new(Notify::new()),
                     fence,
                     injector: Arc::new(OnceLock::new()),
+                    skills: Arc::new(OnceLock::new()),
                     parent_guard,
                     admitted: None,
                     reservation: None,
@@ -973,6 +987,15 @@ impl RunLoop {
         let Some(p) = self.parent_view(&parent) else {
             return Err(SpawnRefusal::UnknownParent(parent.to_string()));
         };
+        // Decision 0053: the child is restricted as its parent is now. A
+        // parent whose policy is not known yet is refused, never guessed.
+        let inherited = match p.skills.get() {
+            Some(policy) => policy
+                .as_ref()
+                .map(kgraf_session::skills::WorkerSkills::restrictions)
+                .unwrap_or_default(),
+            None => return Err(SpawnRefusal::SkillsUnknown),
+        };
         let mut writes: Vec<String> = Vec::new();
         for w in request.writes.iter().map(|w| w.trim()) {
             if !w.is_empty() && !writes.iter().any(|x| x == w) {
@@ -1083,6 +1106,7 @@ impl RunLoop {
             parent_call: self.last_call_of(&parent, &p.task).map(|c| c.to_string()),
             settled: false,
             preparing: true,
+            skills: inherited,
         };
         // Durable before anything exists: a kill from here on leaves a
         // record that says what to clean up.
@@ -1153,6 +1177,7 @@ impl RunLoop {
                 cancel: Arc::new(Notify::new()),
                 fence,
                 injector: Arc::new(OnceLock::new()),
+                skills: Arc::new(OnceLock::new()),
                 parent_guard,
                 admitted: Some(admitted),
                 reservation: Some(reservation),
@@ -1279,6 +1304,12 @@ impl RunLoop {
                 c.contract.clone(),
             )
         };
+        // A fresh slot at every start: a restarted child's policy is its new
+        // worker's, which its own children inherit from.
+        let skills = AttemptSkills {
+            slot: Arc::new(OnceLock::new()),
+            inherited: facts.skills.clone(),
+        };
         let Some(route) = self.route(&facts.route) else {
             return Err(format!("route `{}` is not configured", facts.route));
         };
@@ -1314,6 +1345,7 @@ impl RunLoop {
         if let Some(c) = self.subagents.live.get_mut(id) {
             c.running = true;
             c.ended = Some(ended_rx);
+            c.skills = skills.slot.clone();
         }
         // Local-only diagnostics (decision 0069), after this function's one
         // early failure (the route lookup), as `start_attempt` records it.
@@ -1351,6 +1383,7 @@ impl RunLoop {
                         board,
                         fence,
                         injector,
+                        skills,
                         graph,
                         parent_call,
                     )
@@ -2288,9 +2321,42 @@ mod tests {
             parent_call: None,
             settled: false,
             preparing: false,
+            skills: Vec::new(),
         };
         let text = serde_json::to_string(&SpawnRecord { subagent: facts }).expect("json");
         assert!(serde_json::from_str::<SpawnRecord>(&text).is_ok());
+    }
+
+    /// The parent's restrictions survive the record, so a restarted child is
+    /// restricted the same way; a record written before they were kept reads
+    /// as one with none.
+    #[test]
+    fn a_spawn_record_keeps_the_restrictions_the_child_inherited() {
+        let restriction = kgraf_session::skills::SkillRestriction {
+            skill: "look-only".into(),
+            hash: "abc".into(),
+            allowed_tools: vec!["read_file".into()],
+        };
+        let facts = SpawnFacts {
+            parent: "w".into(),
+            task: "t".into(),
+            route: "alpha".into(),
+            writes: Vec::new(),
+            read_only: true,
+            depth: 1,
+            lineage: vec![("w".into(), "x".into())],
+            parent_call: None,
+            settled: false,
+            preparing: false,
+            skills: vec![restriction.clone()],
+        };
+        let text = serde_json::to_string(&SpawnRecord { subagent: facts }).expect("json");
+        let back: SpawnRecord = serde_json::from_str(&text).expect("read back");
+        assert_eq!(back.subagent.skills, vec![restriction]);
+        let older = r#"{"subagent":{"parent":"w","task":"t","route":"alpha","writes":[],
+            "read_only":true,"depth":1,"lineage":[["w","x"]],"parent_call":null}}"#;
+        let back: SpawnRecord = serde_json::from_str(older).expect("older record");
+        assert!(back.subagent.skills.is_empty());
     }
 
     /// A failed run settles a running child against its exact ledger spend, not

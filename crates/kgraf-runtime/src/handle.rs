@@ -82,6 +82,7 @@ pub fn worker_channel(worker: AgentId, bulk_capacity: usize) -> (WorkerHandle, W
             steering: steering.clone(),
             already_delivered: Vec::new(),
             listed_twice: Vec::new(),
+            skills: None,
         },
         WorkerEndpoint {
             worker,
@@ -106,6 +107,8 @@ pub struct WorkerHandle {
     already_delivered: Vec<String>,
     /// Ids `SpawnOptions::injections` named more than once (extra copies).
     listed_twice: Vec<String>,
+    /// The worker's `allowed-tools` policy (decision 0053), when it has one.
+    skills: Option<kgraf_session::skills::WorkerSkills>,
 }
 
 impl std::fmt::Debug for WorkerHandle {
@@ -155,6 +158,17 @@ impl WorkerHandle {
     ) {
         self.already_delivered = already_delivered;
         self.listed_twice = listed_twice;
+    }
+
+    pub(crate) fn set_skills(&mut self, skills: Option<kgraf_session::skills::WorkerSkills>) {
+        self.skills = skills;
+    }
+
+    /// The worker's skill restrictions (decision 0053), live: activations the
+    /// worker makes later show in it. What a subagent it spawns inherits.
+    /// `None`: the worker has no skill policy, so nothing restricts it.
+    pub fn skills(&self) -> Option<kgraf_session::skills::WorkerSkills> {
+        self.skills.clone()
     }
 
     /// Cancel the worker. Returns at once; the worker emits `Cancelled`, settles

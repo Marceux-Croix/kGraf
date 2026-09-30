@@ -74,6 +74,8 @@ pub struct Access {
     /// Decision 0084: an exclusive call whose writes the OS sandbox confines
     /// to the worktree and its scratch directory ([`Access::sandboxed_build`]).
     sandboxed_build: bool,
+    /// Orders against every other call, and writes nothing ([`Access::barrier`]).
+    barrier: bool,
 }
 
 impl Access {
@@ -105,6 +107,25 @@ impl Access {
             sandboxed_build: true,
             ..Self::default()
         }
+    }
+
+    /// Writes nothing, and conflicts with every other call as an exclusive
+    /// one does, so the calls after it in a round start only once it has
+    /// finished. For a tool whose effect is on the worker's own state rather
+    /// than on files or nodes (the `skill` tool narrows the worker's
+    /// `allowed-tools`, and later calls must see that). Not exclusive: a
+    /// worker with a write scope or a fence may run it, since it writes
+    /// nothing.
+    pub fn barrier() -> Self {
+        Self {
+            barrier: true,
+            ..Self::default()
+        }
+    }
+
+    /// Whether this is [`Access::barrier`].
+    pub fn is_barrier(&self) -> bool {
+        self.barrier
     }
 
     /// Whether this is [`Access::sandboxed_build`].
@@ -163,10 +184,11 @@ impl Access {
 
     /// Whether the two calls must not run at the same time.
     ///
-    /// They conflict when either is exclusive, or when one writes something the
-    /// other reads or writes. Two reads never conflict. The relation is symmetric.
+    /// They conflict when either is exclusive or a barrier, or when one writes
+    /// something the other reads or writes. Two reads never conflict. The
+    /// relation is symmetric.
     pub fn conflicts_with(&self, other: &Access, case: PathCase) -> bool {
-        if self.exclusive || other.exclusive {
+        if self.exclusive || other.exclusive || self.barrier || other.barrier {
             return true;
         }
         self.writes_against(other, case) || other.writes_against(self, case)
@@ -409,5 +431,16 @@ mod tests {
         assert!(Access::none().conflicts_with(&ex, S));
         assert!(ex.conflicts_with(&Access::exclusive(), S));
         assert!(!Access::none().conflicts_with(&Access::none(), S));
+    }
+
+    #[test]
+    fn a_barrier_orders_against_everything_and_declares_no_writes() {
+        let barrier = Access::barrier();
+        let read = Access::none().read_path("a").expect("path");
+        assert!(barrier.conflicts_with(&Access::none(), S));
+        assert!(read.conflicts_with(&barrier, S));
+        assert!(barrier.conflicts_with(&Access::barrier(), S));
+        assert!(!barrier.is_exclusive());
+        assert!(barrier.writes_paths().is_empty() && barrier.writes_nodes().is_empty());
     }
 }

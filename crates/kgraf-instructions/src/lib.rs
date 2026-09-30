@@ -45,7 +45,8 @@ pub enum InstructionsError {
         #[source]
         source: std::io::Error,
     },
-    /// kGraf's own configuration file is not valid.
+    /// A file kGraf itself writes (its configuration or the inventory) is not
+    /// valid JSON of the expected shape, or could not be written as JSON.
     #[error("cannot parse {path}")]
     Config {
         path: PathBuf,
@@ -120,6 +121,34 @@ pub struct Inventory {
     pub skills: Vec<Skill>,
     pub conflicts: Vec<Conflict>,
     pub problems: Vec<Problem>,
+}
+
+/// The inventory's file name in kGraf's state directory. `kgraf instructions`
+/// writes it; a run reads it for the skill catalog (decision 0053).
+pub const INVENTORY_FILE: &str = "inventory.json";
+
+impl Inventory {
+    /// Read an inventory written by [`write_if_changed`], or `None` when the file
+    /// does not exist. A file that exists and cannot be read or parsed is an
+    /// error, never an empty inventory: skills the user ingested must not vanish
+    /// silently.
+    pub fn load(path: &Path) -> Result<Option<Self>, InstructionsError> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => {
+                serde_json::from_str(&text)
+                    .map(Some)
+                    .map_err(|source| InstructionsError::Config {
+                        path: path.to_owned(),
+                        source,
+                    })
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(source) => Err(InstructionsError::Io {
+                path: path.to_owned(),
+                source,
+            }),
+        }
+    }
 }
 
 /// The user's choices and imported folders, kept between runs.
@@ -305,20 +334,36 @@ pub(crate) fn hash_hex(bytes: &[u8]) -> String {
 
 /// Write `text` to `path` only if it differs, so a rerun over unchanged input
 /// touches nothing.
+///
+/// Atomic: the text goes to a temporary file in the same directory, which is
+/// flushed to disk and renamed over `path`. A run reads the inventory while
+/// `kgraf instructions` may be writing it, and a crash mid-write must not leave
+/// a truncated file that fails every later run; a reader sees the old file or
+/// the new one, never part of one.
 pub fn write_if_changed(path: &Path, text: &str) -> Result<(), InstructionsError> {
+    use std::io::Write;
     if std::fs::read_to_string(path).is_ok_and(|existing| existing == text) {
         return Ok(());
     }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|source| InstructionsError::Io {
-            path: parent.to_owned(),
-            source,
-        })?;
-    }
-    std::fs::write(path, text).map_err(|source| InstructionsError::Io {
-        path: path.to_owned(),
-        source,
-    })
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let io = |at: &Path| {
+        let at = at.to_owned();
+        move |source| InstructionsError::Io { path: at, source }
+    };
+    std::fs::create_dir_all(parent).map_err(io(parent))?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(io(parent))?;
+    temp.write_all(text.as_bytes()).map_err(io(temp.path()))?;
+    temp.as_file().sync_all().map_err(io(temp.path()))?;
+    // On failure the temporary file is removed when the error drops it.
+    temp.persist(path)
+        .map_err(|e| InstructionsError::Io {
+            path: path.to_owned(),
+            source: e.error,
+        })
+        .map(drop)
 }
 
 #[cfg(test)]
