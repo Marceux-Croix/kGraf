@@ -90,6 +90,7 @@ mod port;
 mod question_route;
 mod readiness;
 mod reports;
+mod review_desk;
 pub mod routing;
 mod run_state;
 pub mod scheduler_loop;
@@ -195,22 +196,27 @@ pub use question_route::{
 };
 pub use readiness::{AlwaysReady, FnProbe, ReadinessFailure, ReadinessProbe, check_tools};
 pub use reports::{Delivery, Recipient, ReportError, ReportKind, ReportQueue, WorkerReport};
+pub use review_desk::{
+    PermissionRequestView, PlanAnswer, PlanItemView, PlanView, ReviewDesk, ReviewError,
+};
 pub use routing::{
     CLUSTER_COCHANGE_MIN_COUNT, EXPLORATION_EVERY, FigureSource, INTERFACE_FLOOR,
     LIVE_MIN_ATTEMPTS, RouteInfo, RoutePick, RoutingPolicy,
 };
 pub use run_state::{
     AdmittedLease, ContractCheckSettings, ContractStatus, GroundingRecord, GroundingTrigger,
-    OpenContract, PlanItem, PlanProgress, PlannedDispatch, RUN_STATE_SCHEMA_VERSION, RecordedNote,
-    RunCounters, RunStateError, RunStateRecord, RunStatus, VerifiedCommit, WriteTarget,
+    OpenContract, PendingPermission, PlanApproval, PlanItem, PlanProgress, PlannedDispatch,
+    RUN_STATE_SCHEMA_VERSION, RecordedNote, RunCounters, RunStateError, RunStateRecord, RunStatus,
+    VerifiedCommit, WriteTarget,
 };
 pub use scheduler_loop::{
     DEFAULT_LEASE, DEFAULT_ON_TIME_WINDOW, SchedulerLoop, TickEvent, TrackedSchedule,
 };
 pub use session_tools::{SESSION_TOOL_NAMES, SessionLine, session_tools};
 pub use shortfall::{
-    GrantCeiling, GrantRecord, MAX_SHORTFALL_REDISPATCHES, SHORTFALL_TAG, SHORTFALL_TOOL,
-    ShortfallDecision, ShortfallKind, ShortfallTool, unverified_reason, vacuous_check,
+    Authority, Grant, GrantRecord, MAX_SHORTFALL_REDISPATCHES, RequestScope, SHORTFALL_TAG,
+    SHORTFALL_TOOL, ShortfallDecision, ShortfallKind, ShortfallTool, unverified_reason,
+    vacuous_check,
 };
 pub use sizing::{
     ORCHESTRATOR_AGENT_PREFIX, Projection, ProjectionSource, Sizer, dear_usage, dear_usage_on,

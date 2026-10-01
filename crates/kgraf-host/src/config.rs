@@ -165,20 +165,32 @@ pub struct RunConfig {
     /// `worktrees` is refused ([`RunConfig::load`]) rather than ignored.
     #[serde(skip)]
     pub worktrees: WorktreeRetention,
-    /// `--may-grant` (decision 0093): the shell programs the orchestrator may
-    /// grant a contract after a worker's permission shortfall without asking.
-    /// Empty by default. Operator-only: never in `run.json`, which a
-    /// process other than the operator's command line could write.
+    /// `--approve-plan` (decision 0094): with plan review on, approve the
+    /// plan without showing it. Command line only: never in `run.json`.
     #[serde(skip)]
-    pub may_grant: Vec<String>,
-    /// `--container-sandbox` (decision 0093): this run's commands execute in a
-    /// disposable container, so workers' shell commands are not held to the
-    /// command policy or the write scope's shell rule. Operator-only, never
-    /// in `run.json`; the command also requires the environment variable
-    /// `KGRAF_CONTAINER_SANDBOX=1`.
-    #[serde(skip)]
-    pub container_sandbox: bool,
+    pub approve_plan: bool,
 }
+
+/// Keys a run file may not set (decision 0094): the permission mode, its
+/// allow set and rules, plan review and the bypass switches are the user's
+/// alone, set from the desktop control, the user-level permissions file or
+/// the command line. A project file a worker could write never sets them.
+pub const USER_ONLY_KEYS: &[&str] = &[
+    "permission_mode",
+    "mode",
+    "permissions",
+    "allow",
+    "deny",
+    "ask",
+    "plan_review",
+    "approve_plan",
+    "bypass",
+    "allow_bypass",
+    "disable_bypass",
+    "bypass_warning_accepted",
+    "may_grant",
+    "container_sandbox",
+];
 
 /// The run-file key [`RunConfig::load`] refuses (decision 0088).
 const WORKTREES_KEY: &str = "worktrees";
@@ -331,8 +343,7 @@ impl RunConfig {
             tbench_bridge_socket: None,
             dependency_fetch: crate::deps::RunFetch::Stored,
             worktrees: WorktreeRetention::default(),
-            may_grant: Vec::new(),
-            container_sandbox: false,
+            approve_plan: false,
         }
     }
 
@@ -360,6 +371,22 @@ impl RunConfig {
                  app, Settings > General > \"Delete worker worktrees after use\" decides for \
                  every run it starts, and `kgraf orchestrate` and `kgraf schedule run-now` \
                  take `--keep-worktrees`. Remove the key.",
+                path.display()
+            )));
+        }
+        if let Some(key) = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|v| {
+                USER_ONLY_KEYS
+                    .iter()
+                    .find(|k| v.get(**k).is_some())
+                    .copied()
+            })
+        {
+            return Err(Error::Invalid(format!(
+                "{} sets `{key}`, which only you set: permission settings come from the \
+                 desktop's permission control, the user-level permissions file, or the command \
+                 line, never from a project file a worker could write. Remove the key.",
                 path.display()
             )));
         }

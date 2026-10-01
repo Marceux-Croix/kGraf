@@ -80,6 +80,8 @@ pub(crate) struct AttemptAssembler {
     /// (`Assembly::skills`), so the route probes and every attempt list the
     /// same catalog.
     pub(crate) skills: Option<Arc<kgraf_session::skills::SkillCatalog>>,
+    /// The user's live permission control (decision 0094).
+    pub(crate) permissions: Arc<kgraf_tools::PermissionControl>,
 }
 
 impl AttemptAssembler {
@@ -168,6 +170,7 @@ impl AttemptAssembler {
             external_executor,
             dependency_refetch: Some(self.dependency_refetch.clone()),
             skills: self.skills.clone(),
+            permissions: self.permissions.clone(),
         })
     }
 

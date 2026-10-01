@@ -79,6 +79,7 @@ pub fn pending_ask(question: &ConsentQuestion) -> PendingAsk {
             question.project.display(),
             question.detail
         ),
+        raised_at_ms: 0,
     }
 }
 

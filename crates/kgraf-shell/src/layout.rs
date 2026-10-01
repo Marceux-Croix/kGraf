@@ -1954,6 +1954,21 @@ impl ShellApp {
         }
         let (model, host) = i.box_and_host();
         crate::orchestrator_box::show_styled(ui, model, host, worker.as_deref(), &opts);
+        // Decision 0094: the plan waiting for review lights what its contracts
+        // write on the graph (CMP-CHIP-2's selection on the stage), once per
+        // change; it clears when the plan is answered.
+        let highlight = model.perm.take_highlight();
+        if let Some(paths) = highlight
+            && let Some(view) = proj.galaxy.as_mut()
+        {
+            let slots = view
+                .model()
+                .map(|m| crate::permission_bar::slots_for_paths(m, &paths))
+                .unwrap_or_default();
+            if let Some(v) = view.view_mut() {
+                v.galaxy_mut().select_set(&slots);
+            }
+        }
         if let Some(key) = dismissed
             && let Err(e) = proj.dismiss(&key)
         {
@@ -2967,6 +2982,8 @@ impl ShellApp {
         separator(ui, p);
         self.settings_worktrees(ui, p);
         separator(ui, p);
+        self.settings_permissions(ui, p);
+        separator(ui, p);
         self.settings_updates(ui, p);
         if let Some(err) = &self.store.last_error {
             ui.colored_label(p.danger, format!("Settings not saved: {err}"));
@@ -3011,6 +3028,58 @@ impl ShellApp {
                 {
                     h.set_worktree_retention(retention);
                 }
+            }
+        }
+    }
+
+    /// The Allow Bypass switch (decision 0094): configuration only (CMP-DLG-6).
+    /// The mode itself is chosen in the orchestrator box's dropdown; Bypass is
+    /// offered there only with this on, and its first use shows a warning.
+    /// Turning it off while in Bypass returns the mode to Manual at once.
+    fn settings_permissions(&mut self, ui: &mut Ui, p: &Palette) {
+        ui.label(
+            RichText::new("Permissions")
+                .font(theme::bold(14.0))
+                .color(p.text),
+        );
+        let Some(perm) = self.permissions.clone() else {
+            ui.label(
+                RichText::new("No permission settings were loaded in this window.")
+                    .small()
+                    .color(p.text_2),
+            );
+            return;
+        };
+        let settings = perm.control.settings();
+        ui.label(
+            RichText::new(
+                "The permission mode is chosen in the orchestrator box. Bypass grants every \
+                 request without asking, except your deny and ask rules and deleting system \
+                 paths, and offers no protection against prompt injection. Off: the box does \
+                 not offer Bypass. Deny and ask rules, and disable_bypass, are set in the \
+                 user-level permissions.toml.",
+            )
+            .small()
+            .color(p.text_2),
+        );
+        if settings.disable_bypass {
+            ui.label(
+                RichText::new("Bypass is disabled in permissions.toml (disable_bypass = true).")
+                    .small()
+                    .color(p.text_2),
+            );
+            return;
+        }
+        let mut allow = settings.allow_bypass;
+        if ui.checkbox(&mut allow, "Allow Bypass mode").changed() {
+            perm.control.set_allow_bypass(allow);
+            if let Some(path) = &perm.file
+                && let Err(e) = perm.control.settings().save(path)
+            {
+                self.chrome.notice = Some((
+                    format!("The permission setting was not saved: {e}"),
+                    Instant::now(),
+                ));
             }
         }
     }

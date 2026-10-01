@@ -174,6 +174,11 @@ pub struct Assembly {
     /// tool and each worker's `allowed-tools` policy. `None`, or no skill the
     /// model may invoke: no tool and an empty catalog, the prefix unchanged.
     pub skills: Option<Arc<SkillCatalog>>,
+    /// The user's live permission control (decision 0094): the shell's
+    /// policy reads its mode on every call, the user-rules hook enforces its
+    /// deny and ask rules and the critical-path limit, and the ask resolver
+    /// routes each ask by its mode.
+    pub permissions: Arc<kgraf_tools::PermissionControl>,
 }
 
 /// The environment variable that tells a stdio MCP server the worktree it
@@ -518,14 +523,15 @@ pub async fn assemble(a: Assembly) -> Result<Assembled> {
     } else {
         a.exec_policy.clone()
     };
-    // Decision 0093: the contract's granted programs and the operator's
-    // container setting, from the host only (never the file, a model or the
-    // route). Either runs a command as a confined one, which a declared write
-    // scope accepts; a `forbid` rule still wins.
+    // Decision 0093: the contract's granted programs, from the host only
+    // (never the file, a model or the route). Decision 0094: the user's live
+    // permission mode, read on every call (Bypass, Auto's allow set, Accept
+    // edits' file programs). Either runs a command as a confined one, which a
+    // declared write scope accepts; a `forbid` rule still wins.
     let policy = base_policy
         .with_build_allowlist(a.config.build_allowlist().clone())
         .with_granted_programs(a.config.granted_programs().iter().cloned())
-        .with_unrestricted_shell(a.config.container_sandbox());
+        .with_permissions(a.permissions.clone());
     // Decision 0084: a checkout-root `.env` usually holds the user's vendor
     // keys. Its values join the process-wide scrubber, so none reaches a
     // model, a transcript or a trace even if a command prints it. Never
@@ -662,12 +668,26 @@ pub async fn assemble(a: Assembly) -> Result<Assembled> {
     env.skills = skills;
     // The hook and the tool come from one `ShellTool::new`: one command policy.
     // MCP calls are reviewed too: deny unless a persisted rule allows them.
-    env.approval = ApprovalChain::new(vec![Arc::new(shell_hook), Arc::new(McpApprovalHook)]);
-    env.asks = Some(Arc::new(RuleOrPromptResolver::new(
-        a.allow_store,
-        a.project,
-        registry,
-        a.attendance,
+    // Decision 0094: the user's rules and the critical-path limit run last,
+    // on the input every earlier hook left, so no hook gets past them.
+    env.approval = ApprovalChain::new(vec![
+        Arc::new(shell_hook),
+        Arc::new(McpApprovalHook),
+        Arc::new(kgraf_tools::PermissionRulesHook::new(
+            a.permissions.clone(),
+            Some(a.workspace.root().to_path_buf()),
+        )),
+    ]);
+    let attended = matches!(a.attendance, Attendance::Terminal { .. });
+    env.asks = Some(Arc::new(kgraf_runtime::ModeResolver::new(
+        Arc::new(RuleOrPromptResolver::new(
+            a.allow_store,
+            a.project,
+            registry,
+            a.attendance,
+        )),
+        a.permissions.clone(),
+        attended,
     )));
     env.settings.call_mode = a.call_mode;
     env.settings.max_output_tokens = a.max_output_tokens;

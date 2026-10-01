@@ -168,6 +168,25 @@ pub enum TraceEvent {
         why: String,
         resolution: String,
     },
+    /// A permission event (decision 0094): a mode change, a plan-review
+    /// change, a grant (by a mode, the orchestrator or the user), a request
+    /// asked of the user, or a denial. `contract` and `worker` are empty for
+    /// a mode change.
+    Permission {
+        at_ms: i64,
+        contract: String,
+        worker: String,
+        what: String,
+        detail: String,
+    },
+    /// The plan was shown for review, or answered (decision 0094):
+    /// `outcome` is `shown`, `approved`, `rejected` or `changed`.
+    PlanReview {
+        at_ms: i64,
+        revision: u32,
+        outcome: String,
+        detail: String,
+    },
     /// A contract accepted on a check that says nothing about the work
     /// (decision 0093): reported unverified, never plainly done.
     Unverified {
@@ -430,6 +449,30 @@ fn scrub_trace_fields(event: TraceEvent) -> TraceEvent {
             need: s(need),
             why: s(why),
             resolution: s(resolution),
+        },
+        TraceEvent::Permission {
+            at_ms,
+            contract,
+            worker,
+            what,
+            detail,
+        } => TraceEvent::Permission {
+            at_ms,
+            contract,
+            worker,
+            what,
+            detail: s(detail),
+        },
+        TraceEvent::PlanReview {
+            at_ms,
+            revision,
+            outcome,
+            detail,
+        } => TraceEvent::PlanReview {
+            at_ms,
+            revision,
+            outcome,
+            detail: s(detail),
         },
         TraceEvent::Unverified {
             at_ms,

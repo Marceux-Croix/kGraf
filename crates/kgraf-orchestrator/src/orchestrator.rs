@@ -114,6 +114,12 @@ mod connections;
 // Subagents (decision 0067, point 5).
 mod subagents;
 // Speculative merge across in-flight branches (decision 0074).
+/// The user's permission mode in the loop: waiting requests, grants, and
+/// their records (decision 0094).
+mod permission_hooks;
+/// Show the plan and wait for the user's yes before any worker starts
+/// (decision 0094).
+mod plan_review;
 /// A worker's shortfall report, and the grant, amendment or hold that
 /// answers it (decision 0093).
 mod shortfall_hooks;
@@ -520,11 +526,10 @@ pub struct OrchestratorConfig {
     /// `0` is floored to `1` at the check (`cluster_cap::effective_cap`),
     /// never silently stalling a run.
     pub max_in_flight_per_cluster: usize,
-    /// What the orchestrator may grant a contract after a worker's permission
-    /// shortfall without asking (decision 0093): set by the operator only,
-    /// never by a model. Empty by default: nothing beyond the configured
-    /// policy is granted, and every permission shortfall holds for the user.
-    pub grant_ceiling: crate::shortfall::GrantCeiling,
+    /// Approve the plan without showing it when plan review is on (decision
+    /// 0094, `--approve-plan`): the one way a run nobody attends may start
+    /// with plan review on. The approval is recorded and traced.
+    pub approve_plan: bool,
 }
 
 impl Default for OrchestratorConfig {
@@ -545,7 +550,7 @@ impl Default for OrchestratorConfig {
             interface_review: false,
             routing: crate::routing::RoutingPolicy::default(),
             max_in_flight_per_cluster: crate::cluster_cap::DEFAULT_MAX_IN_FLIGHT_PER_CLUSTER,
-            grant_ceiling: crate::shortfall::GrantCeiling::none(),
+            approve_plan: false,
         }
     }
 }
@@ -643,6 +648,12 @@ pub enum OrchestratorError {
     /// settled but the contract it resolves is no longer open.
     #[error("internal invariant violated: {0}")]
     Invariant(String),
+    /// Decision 0094: plan review is on and nobody can approve the plan.
+    #[error(
+        "plan review is on, and this run has nobody to approve the plan: start it from the \
+         orchestrator box, turn plan review off, or pass --approve-plan"
+    )]
+    PlanReviewUnattended,
 }
 
 impl kgraf_diag::DiagCode for OrchestratorError {
@@ -1682,6 +1693,9 @@ pub struct Orchestrator {
     /// The full index pass's extractor report, traced once the run opens
     /// ([`Self::with_index_extractor_changes`]).
     index_extractor_changes: Vec<kgraf_graph::ExtractorChange>,
+    /// The user's live permission mode, the desk the box reads, and whether
+    /// a person attends (decision 0094).
+    pub(crate) perms: permission_hooks::PermissionParts,
 }
 
 impl Orchestrator {
@@ -1715,7 +1729,22 @@ impl Orchestrator {
             session_call_timeout: sessions::SESSION_CALL_TIMEOUT,
             session_notices: None,
             index_extractor_changes: Vec::new(),
+            perms: permission_hooks::PermissionParts::default(),
         })
+    }
+
+    /// Run under the user's live permission control (decision 0094): its mode
+    /// decides who answers a worker's permission request, and its plan-review
+    /// option holds dispatch until the user approves the plan. Without one the
+    /// run is Manual with no rules.
+    pub fn with_permissions(mut self, control: Arc<kgraf_tools::PermissionControl>) -> Self {
+        self.perms.control = control;
+        self
+    }
+
+    /// Where this run's permission requests and plan wait for the user.
+    pub fn review_desk(&self) -> Arc<crate::review_desk::ReviewDesk> {
+        self.perms.desk.clone()
     }
 
     /// Try to answer a worker's `ask_user_question` from the run record before
@@ -1731,6 +1760,9 @@ impl Orchestrator {
     /// the user. The default is unattended.
     pub fn with_question_attendance(mut self, attendance: crate::asks::QuestionAttendance) -> Self {
         self.question_timeout = attendance.timeout();
+        // Decision 0094: a person in the box can answer permission requests
+        // and approve a plan; with nobody, what would ask is denied.
+        self.perms.attended = attendance == crate::asks::QuestionAttendance::Box;
         self
     }
 
@@ -1869,11 +1901,12 @@ impl Orchestrator {
         run: RunId,
         instruction: String,
     ) -> Result<RunReport, OrchestratorError> {
+        self.check_plan_review()?;
         let now = self.services.clock.now_ms();
         let record = RunStateRecord::new(run, instruction, now);
         let mut state = RunLoop::open(self, record, false).await?;
         let planned = state.plan().await;
-        state.run_after(planned).await
+        state.run_reviewed(planned).await
     }
 
     /// Run a plan the user approved, to its end. The plan is seeded into
@@ -1886,10 +1919,11 @@ impl Orchestrator {
         run: RunId,
         plan: kgraf_interpret::ApprovedPlan,
     ) -> Result<RunReport, OrchestratorError> {
+        self.check_plan_review()?;
         let record = crate::intake::seeded_record(&self, run, &plan)?;
         let mut state = RunLoop::open(self, record, false).await?;
         let planned = state.plan().await;
-        state.run_after(planned).await
+        state.run_reviewed(planned).await
     }
 
     /// Resume a run from its record.
@@ -1904,13 +1938,16 @@ impl Orchestrator {
             return Err(OrchestratorError::AlreadyCompleted(run.to_string()));
         }
         let planned = record.planned;
+        if record.plan_approved.is_none() {
+            self.check_plan_review()?;
+        }
         let mut state = RunLoop::open(self, record, true).await?;
         let result = if planned {
             Ok(true)
         } else {
             state.plan().await
         };
-        state.run_after(result).await
+        state.run_reviewed(result).await
     }
 }
 
@@ -1993,6 +2030,8 @@ struct RunLoop {
     subagents: subagents::Subagents,
     /// Speculative merge rounds (decision 0074).
     spec: speculate::SpecRuntime,
+    /// The user's permission mode and the review desk (decision 0094).
+    perms: permission_hooks::PermissionRuntime,
 }
 
 fn run_lease_key(run: &RunId) -> String {
@@ -2147,6 +2186,7 @@ impl RunLoop {
             session_call_timeout,
             session_notices,
             index_extractor_changes,
+            perms,
         } = o;
         // The check setting is the run's: kept in the record, and a resume with
         // another one is refused before anything is written.
@@ -2303,6 +2343,7 @@ impl RunLoop {
                 session_notices,
                 session_call_timeout,
             ),
+            perms: permission_hooks::PermissionRuntime::new(perms),
         };
         if let Some(torn) = torn_trace {
             let at = me.now();
@@ -3703,9 +3744,11 @@ impl RunLoop {
                 Some(m) => Some(m),
                 None => {
                     let tick = self.config.tick;
+                    let permissions = self.perms.waiter();
                     tokio::select! {
                         m = self.rx.recv() => m,
                         () = tokio::time::sleep(tick) => None,
+                        () = permissions => None,
                     }
                 }
             };
@@ -3754,6 +3797,7 @@ impl RunLoop {
             let now = self.now();
             self.s.admission.budget().renew_due(now);
             self.subagent_tick().await?;
+            self.pump_permissions().await?;
         }
         // The run's own end: `Completed` claims every verified
         // contract's commit is on `kgraf/<run>`. Everything upstream of here
@@ -4036,6 +4080,10 @@ impl RunLoop {
         if self.record.open_contracts.iter().any(|c| {
             !c.stopped_by_user.is_empty() && matches!(c.status, ContractStatus::Held { .. })
         }) {
+            return None;
+        }
+        // Decision 0094: a permission request waits for a person who is there.
+        if self.permission_wait_keeps_run() {
             return None;
         }
         let held = self.held();
@@ -7078,10 +7126,11 @@ impl RunLoop {
                 crate::challenge::ContractControl::Shortfall {
                     worker,
                     kind,
+                    scope,
                     need,
                     why,
                 } => {
-                    let answer = self.on_shortfall(worker, kind, need, why).await?;
+                    let answer = self.on_shortfall(worker, kind, scope, need, why).await?;
                     let _ = reply.send(answer);
                 }
                 other => self.on_contract_control(other, reply).await?,

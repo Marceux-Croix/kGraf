@@ -222,7 +222,8 @@ pub struct OpenContract {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gate_commands: Vec<String>,
     /// Shell programs granted to this contract after a worker's permission
-    /// shortfall, each within the operator's ceiling (decision 0093). Every
+    /// shortfall, each under the user's permission mode (decisions 0093 and
+    /// 0094). Every
     /// fresh attempt's shell allows them, and its brief names them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub granted_programs: Vec<String>,
@@ -246,6 +247,37 @@ pub struct OpenContract {
     /// once the reporting attempt has finished.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shortfall_hold: Option<String>,
+    /// A permission request waiting for the user (decision 0094): the
+    /// contract is held until the user grants or denies it, or until a mode
+    /// change grants or refuses it. Persisted, so a resumed run asks again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_permission: Option<PendingPermission>,
+}
+
+/// One permission request waiting for the user (decision 0094).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingPermission {
+    /// The desk's id for it, unique within the run.
+    pub id: u64,
+    pub scope: crate::shortfall::RequestScope,
+    /// The program or path asked for.
+    pub subject: String,
+    /// The worker whose report asked, and its words (scrubbed, capped).
+    pub worker: String,
+    pub need: String,
+    pub why: String,
+    pub question: String,
+    pub raised_at_ms: i64,
+}
+
+/// The user's yes to a run's plan (decision 0094's plan review).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanApproval {
+    pub at_ms: i64,
+    /// `user`, or `--approve-plan` for a run approved on the command line.
+    pub by: String,
+    /// How many plans were shown before this one was approved.
+    pub revision: u32,
 }
 
 /// The longest [`OpenContract::last_refusal`] kept, in characters, from the
@@ -329,6 +361,7 @@ impl OpenContract {
             shortfall_redispatches: 0,
             shortfall_workers: Vec::new(),
             shortfall_hold: None,
+            pending_permission: None,
         }
     }
 
@@ -511,6 +544,11 @@ pub struct RunStateRecord {
     /// (decision 0064). A record from before the field reads as none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_plan: Option<String>,
+    /// The user's yes to this run's plan, when plan review was on (decision
+    /// 0094). With plan review on and this absent, no worker starts; a
+    /// resumed run shows the plan again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_approved: Option<PlanApproval>,
     /// The run that started this one (decision 0067), reserved for runs
     /// started by other runs: `None` for a top-level run and for every record
     /// from before this field existed.
@@ -697,6 +735,7 @@ impl RunStateRecord {
             contract_checks: ContractCheckSettings::default(),
             worker_challenges: BTreeMap::new(),
             source_plan: None,
+            plan_approved: None,
             parent_run: None,
             consumer_tests: crate::consumer_tests::ConsumerTestBook::default(),
             unverified: BTreeMap::new(),

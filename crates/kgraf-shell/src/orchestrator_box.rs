@@ -193,6 +193,33 @@ pub trait BoxBackend {
     fn decline_question_offer(&mut self, _id: u64) -> Result<(), String> {
         Err("no such offer".to_owned())
     }
+
+    /// The user's live permission control and its file (decision 0094), for
+    /// the dropdown and the plan-review switch. `None`: the bar is not drawn.
+    fn permissions(&self) -> Option<crate::permission_bar::PermissionUi> {
+        None
+    }
+
+    /// Permission requests raised by workers' shortfalls, waiting for the
+    /// user (decision 0094).
+    fn pending_permissions(&self) -> Vec<kgraf_orchestrator::PermissionRequestView> {
+        Vec::new()
+    }
+
+    /// Grant or deny one waiting permission request.
+    fn answer_permission(&mut self, _id: u64, _grant: bool) -> Result<(), String> {
+        Err("no run in this window".to_owned())
+    }
+
+    /// The plan waiting for the user's yes (decision 0094's plan review).
+    fn pending_plan(&self) -> Option<kgraf_orchestrator::PlanView> {
+        None
+    }
+
+    /// Approve, reject or change the waiting plan.
+    fn answer_plan(&mut self, _answer: kgraf_orchestrator::PlanAnswer) -> Result<(), String> {
+        Err("no run in this window".to_owned())
+    }
 }
 
 /// One question-routing offer pending an answer, as
@@ -263,6 +290,9 @@ pub struct BoxModel {
     /// counters, so the same id number could otherwise mean two different
     /// pending choices.
     confirming_offer: Option<(u64, bool)>,
+    /// The permission controls, the grouped requests and the plan review
+    /// (decision 0094).
+    pub perm: crate::permission_bar::PermissionBar,
 }
 
 impl BoxModel {
@@ -900,9 +930,35 @@ pub fn show_styled(
     model.absorb(backend);
     let state = backend.state();
 
-    // Pinned cards, two to a row.
+    // Decision 0094: the permission-mode dropdown and the plan-review switch,
+    // then the plan waiting for the user's yes, then the permission requests,
+    // grouped by when they were raised. All inside the box: no new panel.
+    let mut said = Vec::new();
+    let perm_ui = backend.permissions();
+    crate::permission_bar::draw_bar(ui, &mut model.perm, perm_ui.as_ref(), &p, &mut said);
+    let plan = backend.pending_plan();
+    if let Some(plan) = &plan {
+        crate::permission_bar::draw_plan(ui, &mut model.perm, backend, plan, &p, &mut said);
+    }
+    model.perm.update_highlight(plan.as_ref());
+
+    // Pinned cards. A worker's ask alone in its group keeps its own card
+    // (allow once, allow always, deny), two to a row; a group of requests
+    // raised together is one card (CMP-CARD-4: stable order, oldest first).
     let asks = backend.pending_asks();
-    for pair in asks.chunks(2) {
+    let requests = backend.pending_permissions();
+    let mut singles: Vec<PendingAsk> = Vec::new();
+    let mut grouped = Vec::new();
+    for group in crate::permission_bar::groups(&asks, &requests) {
+        match group.as_slice() {
+            [crate::permission_bar::PermissionItem::Ask(ask)] => singles.push(ask.clone()),
+            _ => grouped.push(group),
+        }
+    }
+    for group in &grouped {
+        crate::permission_bar::draw_group(ui, &mut model.perm, backend, group, &p, &mut said);
+    }
+    for pair in singles.chunks(2) {
         ui.columns(2, |cols| {
             for (col, ask) in cols.iter_mut().zip(pair) {
                 let rect =
@@ -913,6 +969,9 @@ pub fn show_styled(
             }
         });
         ui.add_space(8.0);
+    }
+    for line in said {
+        model.say(line);
     }
 
     // Pinned question cards (design 0067, point 4). Empty on every backend
@@ -1164,6 +1223,11 @@ pub(crate) mod tests {
         pub routed: Vec<String>,
         pub offers: Vec<QuestionOffer>,
         pub offer_answers: Vec<(u64, bool)>,
+        pub requests: Vec<kgraf_orchestrator::PermissionRequestView>,
+        pub permission_answers: Vec<(u64, bool)>,
+        pub plan: Option<kgraf_orchestrator::PlanView>,
+        pub plan_answers: Vec<kgraf_orchestrator::PlanAnswer>,
+        pub perm_ui: Option<crate::permission_bar::PermissionUi>,
     }
 
     impl BoxBackend for Recorder {
@@ -1218,6 +1282,25 @@ pub(crate) mod tests {
         }
         fn decline_question_offer(&mut self, id: u64) -> Result<(), String> {
             self.offer_answers.push((id, false));
+            Ok(())
+        }
+        fn permissions(&self) -> Option<crate::permission_bar::PermissionUi> {
+            self.perm_ui.clone()
+        }
+        fn pending_permissions(&self) -> Vec<kgraf_orchestrator::PermissionRequestView> {
+            self.requests.clone()
+        }
+        fn answer_permission(&mut self, id: u64, grant: bool) -> Result<(), String> {
+            self.permission_answers.push((id, grant));
+            self.requests.retain(|r| r.id != id);
+            Ok(())
+        }
+        fn pending_plan(&self) -> Option<kgraf_orchestrator::PlanView> {
+            self.plan.clone()
+        }
+        fn answer_plan(&mut self, answer: kgraf_orchestrator::PlanAnswer) -> Result<(), String> {
+            self.plan_answers.push(answer);
+            self.plan = None;
             Ok(())
         }
     }
@@ -1381,6 +1464,7 @@ pub(crate) mod tests {
             question: "run `git push`?".into(),
             asked_by: "shell".into(),
             input: "{}".into(),
+            raised_at_ms: 0,
         };
         m.answer(&mut b, &ask, AskAnswer::AllowAlways);
         assert_eq!(b.answered, [(4, AskAnswer::AllowAlways)]);
@@ -1441,6 +1525,7 @@ pub(crate) mod tests {
             question: "run `git push`?".into(),
             asked_by: "shell".into(),
             input: "{\"command\":[\"git\",\"push\"]}".into(),
+            raised_at_ms: 0,
         };
         let mut h = harness(Recorder {
             asks: vec![ask(3)],
@@ -1638,5 +1723,90 @@ pub(crate) mod tests {
         submit(&mut m, &mut b, "no host yet", None);
         assert!(b.sent.is_empty());
         assert_eq!(m.attachments().len(), 1, "kept for the next attempt");
+    }
+
+    fn perm_ui(dir: &std::path::Path) -> crate::permission_bar::PermissionUi {
+        crate::permission_bar::PermissionUi {
+            control: std::sync::Arc::new(kgraf_tools::PermissionControl::manual()),
+            file: Some(dir.join("permissions.toml")),
+        }
+    }
+
+    /// Decision 0094, through the real widgets: the plan waits in the box, and
+    /// Approve plan answers it; the plan-review switch sits beside the mode
+    /// and changes the live control.
+    #[test]
+    fn the_plan_is_approved_in_the_box_and_the_review_switch_changes_the_control() {
+        use egui_kittest::kittest::Queryable;
+        let dir = tempfile::tempdir().expect("dir");
+        let ui = perm_ui(dir.path());
+        let control = ui.control.clone();
+        let plan = kgraf_orchestrator::PlanView {
+            run: "r1".into(),
+            revision: 1,
+            items: vec![kgraf_orchestrator::PlanItemView {
+                contract: "a".into(),
+                instruction: "write a.txt".into(),
+                acceptance: "a.txt exists".into(),
+                depends_on: vec![],
+                writes: vec!["a.txt".into()],
+                slices: vec![],
+                route: None,
+            }],
+        };
+        let mut h = harness(Recorder {
+            plan: Some(plan),
+            perm_ui: Some(ui),
+            ..running()
+        });
+        h.run();
+        h.get_by_label_contains("Plan 1 for review");
+        h.get_by_label_contains("writes a.txt");
+        h.get_by_label("Review the plan before workers start")
+            .click();
+        h.run();
+        assert!(control.plan_review(), "the switch reached the live control");
+        h.get_by_label("Approve plan").click();
+        h.run();
+        assert_eq!(
+            h.state().1.plan_answers,
+            [kgraf_orchestrator::PlanAnswer::Approve]
+        );
+        assert_eq!(
+            h.state_mut().0.perm.take_highlight(),
+            Some(vec![]),
+            "the plan's highlight clears once it is answered"
+        );
+    }
+
+    /// Two requests raised together are one card; Deny all confirms first,
+    /// then answers both.
+    #[test]
+    fn requests_raised_together_are_one_card_answered_all_at_once() {
+        use egui_kittest::kittest::Queryable;
+        let request = |id: u64, at: i64| kgraf_orchestrator::PermissionRequestView {
+            id,
+            run: "r1".into(),
+            contract: format!("c{id}"),
+            worker: format!("w{id}"),
+            scope: kgraf_orchestrator::RequestScope::Command,
+            subject: "python3".into(),
+            why: "x".into(),
+            question: format!("grant python3 to c{id}?"),
+            raised_at_ms: at,
+        };
+        let mut h = harness(Recorder {
+            requests: vec![request(1, 0), request(2, 500)],
+            ..running()
+        });
+        h.run();
+        h.get_by_label("2 permission requests, raised together");
+        h.get_by_label("Deny all").click();
+        h.run();
+        assert!(h.state().1.permission_answers.is_empty(), "nothing yet");
+        h.get_by_label_contains("Denies all 2 requests");
+        h.get_by_label("Confirm").click();
+        h.run();
+        assert_eq!(h.state().1.permission_answers, [(1, false), (2, false)]);
     }
 }

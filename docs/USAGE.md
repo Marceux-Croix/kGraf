@@ -582,26 +582,55 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   says otherwise, for attended workers too, and a cargo command that breaks an argument rule
   is refused outright, not asked about.
 - A worker whose call is refused by policy, or whose instruction lacks something it needs, is
-  told to report it and stop (`report_shortfall`, decision 0093). What the orchestrator does:
-  - `--may-grant PROGRAM` (repeatable, on `orchestrate`): a program the orchestrator may grant
-    to that one contract without asking, an exact `argv[0]` such as `python3`. The next attempt
-    is a fresh worker whose shell runs it under the contract's write scope, in the sandbox;
-    the verifier still refuses a commit that changes a file outside the declared writes.
-    Without `--may-grant` nothing is granted, and the contract is held with a message that
-    names the program and the flag that would allow it. Rerun with it to continue.
-  - An instructions report amends the contract once: the next attempt's brief carries the
-    report. A second one holds the contract for you.
-  - A contract is re-dispatched at most twice for shortfalls; a grant that did not help holds.
-  - Every grant and hold is in the run's trace (`shortfall` events), and each grant is kept on
-    the contract with the worker that asked for it and why.
-- `--container-sandbox` (on `orchestrate`) says this run's commands execute in a disposable
-  container. Workers' shell commands then run without approval and under a write scope,
-  except the few the policy forbids; a skill's `allowed-tools` still applies. It needs
-  `KGRAF_CONTAINER_SANDBOX=1` in the environment as well: the flag alone stops the command
-  before it starts, and the variable alone does nothing. The command prints
-  `kgraf: CONTAINER SANDBOX ON` to stderr. Neither this nor `--may-grant` can be set in
-  `.kgraf/worker.json` or `.kgraf/run.json`; only the command line sets them, and a scheduled
-  run uses neither. Never use it on a machine you care about.
+  told to report it and stop (`report_shortfall`, decision 0093). Your permission mode decides
+  what happens next (see "Permission modes" below). An instructions report amends the contract
+  once: the next attempt's brief carries the report, and a second one holds the contract for
+  you. A contract is re-dispatched at most twice for shortfalls; a grant that did not help
+  holds. Every grant and hold is in the run's trace (`shortfall` and `permission` events), and
+  each grant is kept on the contract with who asked, why, and who granted it.
+- Permission modes (decision 0094). One setting decides who answers a permission request past
+  the base policy, for a worker's approval ask and for a shortfall report alike:
+  - **Manual**: you answer every request.
+  - **Accept edits**: file edits are granted (a file tool, a contract's write scope widened to a
+    file it needs, and `mkdir`, `touch`, `mv`, `cp`); commands, network and MCP tools ask you.
+  - **Auto**: what your allow set names is granted (`[allow] programs`, `tools`, `paths` in
+    `permissions.toml`, or `--allow PROGRAM` and `--allow-path PATH`); anything else asks you.
+  - **Orchestrator decides**: the orchestrator grants or refuses each request against its
+    contract and never asks you. It refuses after two re-dispatches, when a grant did not help,
+    for a tool, and for a path outside the repository or one no worker may write.
+  - **Bypass**: everything is granted without asking: workers' shell commands run under a write
+    scope, except the few the policy forbids. It offers no protection against prompt injection
+    or unintended actions.
+
+  In every mode, Bypass included: your deny rules block (`deny = ["shell(curl*)"]`, or
+  `--deny`), your ask rules ask (`ask = [...]`, or `--ask`), deleting the filesystem root, a
+  top-level directory or your home directory is refused, deleting the workspace itself or its
+  `.git` asks, every hook runs, and the OS sandbox stays on. A run nobody attends (the command
+  line, a scheduled run) denies whatever would ask, and the hold says how to allow it. In the
+  app, a request waits in the orchestrator box until you answer it; requests raised within 2 s
+  of each other arrive as one card, with Grant and Deny on each and Grant all and Deny all.
+
+  Only you set the mode: the dropdown at the top of the orchestrator box, the user-level
+  `permissions.toml` (in kGraf's configuration directory, beside the app's `settings.toml`; set
+  `KGRAF_PERMISSIONS_PATH` or pass `--permissions-file` to use another), or
+  `--permission-mode` on `kgraf orchestrate`. A change applies at once, to running workers and
+  to requests already waiting. `.kgraf/run.json` and `.kgraf/worker.json` refuse every
+  permission key, and a `permissions.toml` inside the project is refused. Bypass is offered in
+  the app only after you turn on "Allow Bypass mode" in Settings, and its first use asks you to
+  accept a warning; `disable_bypass = true` in `permissions.toml` refuses it everywhere; and it
+  is refused when kGraf runs as root unless `KGRAF_CONTAINER_SANDBOX=1` says the process runs
+  in a disposable container. On the command line, `--container-sandbox` (with that variable) is
+  another name for `--permission-mode bypass`, `--may-grant` is another name for `--allow`, and
+  `--allow` given without a mode selects Auto. The command prints a `BYPASS PERMISSION MODE`
+  notice to stderr whenever a run starts in Bypass.
+- Plan review (decision 0094). Turn on "Review the plan before workers start" beside the mode
+  dropdown (or `plan_review = true` in `permissions.toml`, or `--plan-review`). After planning,
+  the plan waits in the orchestrator box: each contract with what it waits on, writes and
+  reads, and the graph lights what it writes (hover a contract to light its own). Approve plan
+  dispatches it; Change plan sends your note to the planner and shows a new plan; Reject plan
+  ends the run with nothing dispatched. Turning review off while a plan waits approves it. A run
+  nobody can approve (the command line, a scheduled run) is refused before anything is planned,
+  unless `--approve-plan` approves the plan for you.
 - A contract whose check always passes (`--verify true`, `:`, `exit 0`), or whose worker
   finished after a policy refused a call it never ran, is printed as `unverified <id>:
   <reason>` after the `verified` line. The run still completes; the line says the check did

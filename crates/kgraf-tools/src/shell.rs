@@ -411,7 +411,13 @@ impl ApprovalHook for ShellApprovalHook {
                     ),
                 },
             },
-            Decision::Allow => HookDecision::Allow,
+            Decision::Allow => {
+                // Decision 0094: a command the user's permission mode let
+                // run is a grant, and every grant is recorded.
+                self.policy
+                    .record_mode_grant(call.worker.as_str(), &cmd, &verdict);
+                HookDecision::Allow
+            }
         }
     }
 }

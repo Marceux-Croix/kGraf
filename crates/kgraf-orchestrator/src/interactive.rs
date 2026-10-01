@@ -91,6 +91,8 @@ pub struct InteractiveRun {
     events: Receiver<RunEvent>,
     wake: Wake,
     finished: bool,
+    /// Permission requests and the plan waiting for the user (decision 0094).
+    review: Arc<crate::review_desk::ReviewDesk>,
 }
 
 impl std::fmt::Debug for InteractiveRun {
@@ -165,6 +167,8 @@ impl InteractiveRun {
             }));
         let (port, client) = channel_port("box", wake.clone());
         let handle = orchestrator.handle();
+        let review = orchestrator.review_desk();
+        review.set_wake(wake.clone());
         // attach_port spawns its reader on the current runtime; make that `runtime`
         // whichever runtime awaited this. No await follows, so the guard is safe.
         let _guard = runtime.enter();
@@ -191,6 +195,7 @@ impl InteractiveRun {
             events,
             wake,
             finished: false,
+            review,
         })
     }
 
@@ -313,6 +318,34 @@ impl InteractiveRun {
         let handle = self.handle.clone();
         self.runtime
             .block_on(async move { handle.pending_questions().await })
+    }
+
+    /// Permission requests waiting for the user (decision 0094), oldest
+    /// first. Never blocks on the loop.
+    pub fn pending_permissions(&self) -> Vec<crate::review_desk::PermissionRequestView> {
+        self.review.pending_permissions()
+    }
+
+    /// Grant or deny one waiting permission request; the loop applies it.
+    pub fn answer_permission(
+        &self,
+        id: u64,
+        grant: bool,
+    ) -> Result<(), crate::review_desk::ReviewError> {
+        self.review.answer_permission(id, grant)
+    }
+
+    /// The plan waiting for the user's yes, if plan review holds it.
+    pub fn pending_plan(&self) -> Option<crate::review_desk::PlanView> {
+        self.review.pending_plan()
+    }
+
+    /// Approve, reject or change the waiting plan; the loop applies it.
+    pub fn answer_plan(
+        &self,
+        answer: crate::review_desk::PlanAnswer,
+    ) -> Result<(), crate::review_desk::ReviewError> {
+        self.review.answer_plan(answer)
     }
 
     /// Stop the run: its workers are cancelled and its record stays resumable.

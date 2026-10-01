@@ -47,6 +47,7 @@ mod handle;
 mod inject;
 mod masking;
 mod paths;
+mod permission_resolver;
 mod prefix;
 mod rebuild;
 mod settle;
@@ -76,6 +77,7 @@ pub use masking::{DEFAULT_KEEP_RECENT, NoMasking, ObservationMasker, SessionMask
 pub use paths::{
     fold_name, fold_path, forbidden_path, is_build_config_path, is_protected_name, same_path,
 };
+pub use permission_resolver::ModeResolver;
 pub use prefix::{
     McpInstructions, PrefixDigest, PrefixEncoder, PrefixError, PrefixSlice, SharedPrefix,
 };

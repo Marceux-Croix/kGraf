@@ -390,6 +390,8 @@ pub struct ShellApp {
     /// `None` until [`ShellApp::enable_compaction_measurement`]: a headless test
     /// creating a `ShellApp` must never start a background thread.
     compaction_measure: Option<crate::compaction_measure::Measurement>,
+    /// The user's live permission control (decision 0094).
+    pub(crate) permissions: Option<crate::permission_bar::PermissionUi>,
 }
 
 /// Everything `ShellApp` needs at creation.
@@ -419,6 +421,9 @@ pub struct AppParts {
     /// The update-check thread, already spawned by the caller (see
     /// [`ShellApp::update`]'s doc comment).
     pub update: Option<crate::update_bg::UpdateHandle>,
+    /// The user's live permission control (decision 0094), for the settings
+    /// surface's Allow Bypass switch. `None` in tests that build no control.
+    pub permissions: Option<crate::permission_bar::PermissionUi>,
 }
 
 impl ShellApp {
@@ -452,6 +457,7 @@ impl ShellApp {
             capacity: parts.capacity,
             applied_parallelism: None,
             update: parts.update,
+            permissions: parts.permissions,
             compaction_measure: None,
         }
     }
@@ -1967,6 +1973,7 @@ mod tests {
             machine_gate: MachineGate::new(kgraf_core::ParallelismLimits::derive(1, 1, 1)),
             capacity: Some(crate::capacity_bg::CapacityHandle::fixed(capacity)),
             update: None,
+            permissions: None,
         })
     }
 

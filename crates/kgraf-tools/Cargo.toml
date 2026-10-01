@@ -35,6 +35,13 @@ kgraf-graph = { path = "../kgraf-graph" }
 # (security-critical path resolution is reused, not hand-rolled).
 cap-std = "4.0.3"
 async-trait = "0.1"
+# Splits a `sh -c` script into words so the user's rules and the
+# critical-path limit see every command it runs (decision 0094). MIT OR
+# Apache-2.0; already in the lockfile.
+shlex = "2.0.1"
+# The user-level permissions file (decision 0094), read by the command line
+# and the desktop alike.
+toml = "1.1.6"
 blake3 = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

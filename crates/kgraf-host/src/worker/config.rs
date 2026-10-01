@@ -165,10 +165,6 @@ pub struct WorkerConfig {
     /// Decision 0093: programs granted to one contract, within the operator's
     /// ceiling. Never read from the file: set per attempt by the host.
     granted_programs: Vec<String>,
-    /// Decision 0093: the run's container is the sandbox, so the shell runs
-    /// any command a `forbid` rule does not refuse. Never read from the file:
-    /// only the operator's command line sets it.
-    container_sandbox: bool,
 }
 
 /// No MCP servers, no hard-linked reads, the cargo build and test allowlist,
@@ -181,7 +177,6 @@ impl Default for WorkerConfig {
             build_allowlist: BuildAllowlist::cargo_default(),
             shell_timeout: kgraf_tools::shell::DEFAULT_TIMEOUT,
             granted_programs: Vec::new(),
-            container_sandbox: false,
         }
     }
 }
@@ -233,7 +228,6 @@ impl WorkerConfig {
             build_allowlist,
             shell_timeout,
             granted_programs: Vec::new(),
-            container_sandbox: false,
         })
     }
 
@@ -280,19 +274,6 @@ impl WorkerConfig {
         self
     }
 
-    /// Whether the run's container is the sandbox (decision 0093).
-    pub fn container_sandbox(&self) -> bool {
-        self.container_sandbox
-    }
-
-    /// This configuration for a run whose commands execute in a disposable
-    /// container (decision 0093, `--container-sandbox`). Only the operator's
-    /// command line reaches this; the file cannot set it.
-    pub fn with_container_sandbox(mut self, on: bool) -> Self {
-        self.container_sandbox = on;
-        self
-    }
-
     /// This configuration with another shell timeout: a `--shell-timeout`
     /// flag, which wins over the file.
     pub fn with_shell_timeout(mut self, timeout: Duration) -> Self {
@@ -331,15 +312,20 @@ impl WorkerConfig {
 mod tests {
     use super::*;
 
-    /// Decision 0093: the worker file cannot raise what a worker may run: it
-    /// has no key for a grant or for the container setting, and an unknown
-    /// key fails the load rather than being ignored.
+    /// Decisions 0093 and 0094: the worker file cannot raise what a worker
+    /// may run: it has no key for a grant, a permission mode, Bypass or plan
+    /// review, and an unknown key fails the load rather than being ignored.
     #[test]
-    fn the_file_cannot_grant_programs_or_turn_on_the_container_sandbox() {
+    fn the_file_cannot_grant_programs_or_set_the_permission_mode() {
         for text in [
             r#"{"container_sandbox": true}"#,
             r#"{"granted_programs": ["python3"]}"#,
             r#"{"grant_ceiling": ["python3"]}"#,
+            r#"{"permission_mode": "bypass"}"#,
+            r#"{"mode": "bypass"}"#,
+            r#"{"allow_bypass": true}"#,
+            r#"{"plan_review": false}"#,
+            r#"{"allow": {"programs": ["python3"]}}"#,
         ] {
             assert!(
                 matches!(parse(text), Err(WorkerConfigError::Parse { .. })),
@@ -347,7 +333,6 @@ mod tests {
             );
         }
         let config = parse("{}").expect("valid");
-        assert!(!config.container_sandbox());
         assert!(config.granted_programs().is_empty());
     }
 

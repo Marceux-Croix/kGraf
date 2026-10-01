@@ -13,6 +13,7 @@
 mod deps_cmd;
 mod diag_cmd;
 mod orchestrate_cmd;
+mod permissions_cli;
 mod plan_cmd;
 mod schedule_cmd;
 mod worker_cmd;
@@ -445,19 +446,47 @@ enum Command {
         /// are not in the local cache stops before it starts.
         #[arg(long)]
         no_fetch_deps: bool,
-        /// A shell program (an exact argv[0], for example `python3`) the
-        /// orchestrator may grant a contract when a worker reports that a
-        /// policy refused a command it needs (decision 0093). Repeatable.
-        /// Without it nothing is granted, and such a report holds the
-        /// contract for you.
-        #[arg(long = "may-grant", value_name = "PROGRAM")]
-        may_grant: Vec<String>,
-        /// This run's commands execute in a disposable container: workers'
-        /// shell commands are not held to the command policy or to the write
-        /// scope's shell rule (a few forbidden shapes stay refused, and the
-        /// verifier still refuses writes outside a contract's declared
-        /// files). Also requires `KGRAF_CONTAINER_SANDBOX=1` in the
-        /// environment. Never use it on a machine you care about.
+        /// Who answers a permission request past the base policy (decision
+        /// 0094): manual (you), accept-edits (file edits granted), auto (your
+        /// allow set granted), orchestrator-decides (the orchestrator grants
+        /// or refuses, never asks), or bypass (everything granted except your
+        /// deny and ask rules and deleting system paths). Overrides the
+        /// user-level permissions file. With nobody at the terminal, what
+        /// would ask is denied.
+        #[arg(long, value_name = "MODE", value_parser = parse_mode)]
+        permission_mode: Option<kgraf_tools::PermissionMode>,
+        /// A shell program (an exact argv[0], for example `python3`) the Auto
+        /// permission mode grants without asking. Repeatable. Given without
+        /// `--permission-mode`, the run is in Auto. `--may-grant` is its older
+        /// name.
+        #[arg(long = "allow", visible_alias = "may-grant", value_name = "PROGRAM")]
+        allow: Vec<String>,
+        /// A repository path (exact, or a prefix ending in `*`) a contract's
+        /// write scope may be widened to in the Auto permission mode.
+        #[arg(long = "allow-path", value_name = "PATH")]
+        allow_path: Vec<String>,
+        /// A rule that blocks matching calls in every permission mode, Bypass
+        /// included: `TOOL` or `TOOL(PATTERN)`, for example `shell(curl*)`.
+        #[arg(long = "deny", value_name = "RULE")]
+        deny: Vec<String>,
+        /// A rule that asks about matching calls in every permission mode;
+        /// with nobody to answer, they are denied.
+        #[arg(long = "ask", value_name = "RULE")]
+        ask: Vec<String>,
+        /// The user-level permissions file to read instead of the default
+        /// (`permissions.toml` in kGraf's per-user configuration directory).
+        #[arg(long, value_name = "FILE")]
+        permissions_file: Option<PathBuf>,
+        /// Show the plan and wait for your yes before any worker starts. With
+        /// nobody to approve, the run is refused unless `--approve-plan`.
+        #[arg(long)]
+        plan_review: bool,
+        /// With plan review on, approve the plan without showing it.
+        #[arg(long)]
+        approve_plan: bool,
+        /// The Bypass permission mode for a run whose commands execute in a
+        /// disposable container. Also requires `KGRAF_CONTAINER_SANDBOX=1` in
+        /// the environment. Never use it on a machine you care about.
         #[arg(long)]
         container_sandbox: bool,
     },
@@ -748,6 +777,11 @@ fn feature_name(command: &Command) -> &'static str {
 
 /// This run's answer about fetching dependencies, from the two flags (clap
 /// refuses both at once).
+/// `--permission-mode`'s value (decision 0094).
+fn parse_mode(s: &str) -> std::result::Result<kgraf_tools::PermissionMode, String> {
+    s.parse()
+}
+
 fn fetch_choice(fetch: bool, no_fetch: bool) -> kgraf_host::deps::RunFetch {
     use kgraf_host::deps::RunFetch;
     match (fetch, no_fetch) {
@@ -963,7 +997,14 @@ fn main() -> Result<()> {
             tbench_bridge_socket,
             fetch_deps,
             no_fetch_deps,
-            may_grant,
+            permission_mode,
+            allow,
+            allow_path,
+            deny,
+            ask,
+            permissions_file,
+            plan_review,
+            approve_plan,
             container_sandbox,
         } => orchestrate_cmd::run(
             &root,
@@ -1005,8 +1046,17 @@ fn main() -> Result<()> {
                 routing,
                 tbench_bridge_socket,
                 fetch_deps: fetch_choice(fetch_deps, no_fetch_deps),
-                may_grant,
-                container_sandbox,
+                permissions: permissions_cli::PermissionArgs {
+                    mode: permission_mode,
+                    allow,
+                    allow_paths: allow_path,
+                    deny,
+                    ask,
+                    container_sandbox,
+                    plan_review,
+                    permissions_file,
+                },
+                approve_plan,
             },
         ),
         Command::Instructions { action } => instructions(&root, action),

@@ -23,6 +23,9 @@ kgraf-graph.workspace = true
 # `kgraf diag show`/`export` (decision 0069): the local-only
 # usage-and-error file, never sent anywhere.
 kgraf-diag.workspace = true
+# The per-user configuration directory, for the user-level permissions file
+# (decision 0094), resolved as the desktop resolves it.
+directories.workspace = true
 # The run construction `kgraf orchestrate` is a thin layer over, and the
 # `worker` module (re-exported as `kgraf_cli::worker`).
 kgraf-host.workspace = true

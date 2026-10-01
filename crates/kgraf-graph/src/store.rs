@@ -1977,6 +1977,23 @@ CREATE TRIGGER IF NOT EXISTS work_schedules_ad AFTER DELETE ON work_schedules BE
     INSERT INTO change_log(table_name, op, row_id, payload)
     VALUES ('work_schedules', 'delete', OLD.id, json_object('node_id', OLD.node_id));
 END;
+-- Permission events (decision 0094): every permission-mode change and every
+-- grant a mode, the orchestrator or the user made. Append-only facts; the
+-- activity card shows them from the change log.
+CREATE TABLE IF NOT EXISTS permission_events (
+    seq     INTEGER PRIMARY KEY AUTOINCREMENT,
+    at_ms   INTEGER NOT NULL,
+    run_id  TEXT,
+    agent   TEXT,
+    event   TEXT NOT NULL,
+    line    TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS permission_events_ai AFTER INSERT ON permission_events BEGIN
+    INSERT INTO change_log(table_name, op, row_id, payload)
+    VALUES ('permission_events', 'insert', NEW.seq,
+            json_object('event', NEW.event, 'agent', NEW.agent, 'run_id', NEW.run_id,
+                        'line', NEW.line));
+END;
 CREATE TRIGGER IF NOT EXISTS work_schedule_history_ai AFTER INSERT ON work_schedule_history BEGIN
     INSERT INTO change_log(table_name, op, row_id, payload)
     VALUES ('work_schedule_history', 'insert', NEW.seq,

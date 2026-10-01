@@ -108,6 +108,9 @@ pub struct ProjectFactory {
     /// to every host this factory opens and pushed to the one open now.
     /// `None` (a factory with no setting given) leaves the default, `Delete`.
     worktrees: Mutex<Option<kgraf_host::WorktreeRetention>>,
+    /// The user's live permission control (decision 0094): every host this
+    /// factory opens runs under it, box and scheduled runs alike.
+    permissions: Option<crate::permission_bar::PermissionUi>,
 }
 
 /// The file a host was opened from: its content hash only. A touch that
@@ -137,7 +140,20 @@ impl ProjectFactory {
             asks: None,
             box_runs: Mutex::new(std::collections::BTreeSet::new()),
             worktrees: Mutex::new(None),
+            permissions: None,
         }
+    }
+
+    /// Every host this factory opens runs under the user's permission control
+    /// (decision 0094).
+    pub fn with_permissions(mut self, permissions: crate::permission_bar::PermissionUi) -> Self {
+        self.permissions = Some(permissions);
+        self
+    }
+
+    /// The user's permission control, if one was given.
+    pub fn permissions(&self) -> Option<crate::permission_bar::PermissionUi> {
+        self.permissions.clone()
     }
 
     /// Every host this factory opens applies `retention` to its runs
@@ -257,6 +273,7 @@ impl ProjectFactory {
             asks: None,
             box_runs: Mutex::new(std::collections::BTreeSet::new()),
             worktrees: Mutex::new(None),
+            permissions: None,
         }
     }
 
@@ -332,6 +349,10 @@ impl ProjectFactory {
             })
             .map(|host| match &self.asks {
                 Some(asks) => host.with_ask_resolver(asks.clone()),
+                None => host,
+            })
+            .map(|host| match &self.permissions {
+                Some(p) => host.with_permissions(p.control.clone()),
                 None => host,
             })
             .map_err(|e| {

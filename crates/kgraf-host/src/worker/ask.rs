@@ -226,7 +226,13 @@ impl AskResolver for RuleOrPromptResolver {
     async fn answer(&self, paused: &PausedCall) -> UserAnswer {
         let tool = paused.call().tool.clone();
         let subject = self.subject(paused);
-        let covered = {
+        // Decision 0094: an ask from the user's own rules or the
+        // critical-path limit is never covered by a persisted allow rule, and
+        // `a` never records one for it.
+        let hard = paused.asked_by() == kgraf_tools::permissions::PERMISSION_RULES_HOOK;
+        let covered = if hard {
+            None
+        } else {
             let mut store = self.store.lock().unwrap_or_else(|p| p.into_inner());
             // Re-read the file: `kgraf allow --revoke` in another process
             // takes effect on the next call, not at the next start. A file
@@ -280,6 +286,13 @@ impl AskResolver for RuleOrPromptResolver {
         };
         match choice {
             Ok(Ok(Choice::Once)) => UserAnswer::Allow,
+            Ok(Ok(Choice::Always)) if hard => {
+                eprintln!(
+                    "[approval] a rule of yours or the critical-path limit asked about this \
+                     call; an allow rule cannot cover it, so it is allowed once"
+                );
+                UserAnswer::Allow
+            }
             Ok(Ok(Choice::Always)) if subject.is_none() && tool.starts_with("mcp__") => {
                 // An MCP tool reports no subject: the rule covers the tool.
                 let recorded = {

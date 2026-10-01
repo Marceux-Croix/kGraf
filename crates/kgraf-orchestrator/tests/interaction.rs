@@ -669,6 +669,61 @@ async fn a_rule_added_on_disk_is_seen_at_the_next_ask() {
     );
 }
 
+/// Decision 0094: an ask from the user's own rules or the critical-path
+/// limit is never covered by a persisted allow rule. Attended it waits for
+/// the person; unattended it is denied, though the same call with an
+/// ordinary ask is allowed by the rule.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_allow_rule_never_covers_a_hard_ask() {
+    use kgraf_session::approval_store::PersistedAllowStore;
+    let state = tempfile::tempdir().expect("state");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let desk = shell_desk(state.path(), workspace.path());
+    {
+        let (mut store, _) =
+            PersistedAllowStore::open(state.path().join("allow-rules.json"), workspace.path())
+                .expect("store");
+        store
+            .allow_exact("proj", "shell", "[\"git\",\"push\"]", "allowed before")
+            .expect("rule");
+    }
+    let mut hard = serde_json::to_value(paused_cmd(&["git", "push"])).expect("json");
+    hard["asked_by"] = kgraf_tools::permissions::PERMISSION_RULES_HOOK.into();
+    let hard: kgraf_tools::approval::PausedCall = serde_json::from_value(hard).expect("paused");
+    assert!(matches!(
+        desk.answer_unattended(&hard),
+        kgraf_tools::approval::UserAnswer::Deny { .. }
+    ));
+    assert_eq!(
+        desk.answer_unattended(&paused_cmd(&["git", "push"])),
+        kgraf_tools::approval::UserAnswer::Allow
+    );
+    let waiting = {
+        let desk = desk.clone();
+        tokio::spawn(async move { AskResolver::answer(&*desk, &hard).await })
+    };
+    for _ in 0..200 {
+        if !desk.pending().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let pending = desk.pending();
+    assert_eq!(pending.len(), 1, "the hard ask waits for the person");
+    desk.answer(pending[0].id, kgraf_orchestrator::AskAnswer::AllowAlways)
+        .expect("answer");
+    assert_eq!(
+        waiting.await.expect("join"),
+        kgraf_tools::approval::UserAnswer::Allow
+    );
+    assert!(
+        desk.take_notices()
+            .iter()
+            .any(|n| matches!(n, DeskNotice::RuleNotRecorded { .. })),
+        "allow always records no rule for a hard ask"
+    );
+}
+
 /// A rule revoked by an in-place rewrite that keeps the file's length and
 /// modification time stops allowing at the next ask: the desk uses the same
 /// stamp as the persisted-rule hook (inode, and no trust in a young or future

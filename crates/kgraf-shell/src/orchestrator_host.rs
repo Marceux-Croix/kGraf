@@ -71,6 +71,12 @@ pub trait RunHousekeeping: Send + Sync {
     fn host(&self) -> Option<Arc<kgraf_host::Host>> {
         None
     }
+
+    /// The user's live permission control and its file (decision 0094),
+    /// shared by every run this host builds. `None` for `FixedAdmission`.
+    fn permissions(&self) -> Option<crate::permission_bar::PermissionUi> {
+        None
+    }
 }
 
 /// Tokens attributed to one run, from the ledger.
@@ -179,6 +185,9 @@ impl RunHousekeeping for crate::scheduler_bg::ProjectFactory {
     }
     fn host(&self) -> Option<Arc<kgraf_host::Host>> {
         crate::scheduler_bg::ProjectFactory::host(self)
+    }
+    fn permissions(&self) -> Option<crate::permission_bar::PermissionUi> {
+        crate::scheduler_bg::ProjectFactory::permissions(self)
     }
 }
 
@@ -1085,6 +1094,40 @@ impl BoxBackend for OrchestratorHost {
     /// once, reused after) and dispatches under it through `start`, the same
     /// path `/run` uses. Also records the offer's resolution (fix,
     /// 2026-09-28) on the same node the offer itself was recorded on.
+    fn permissions(&self) -> Option<crate::permission_bar::PermissionUi> {
+        self.parts
+            .as_ref()
+            .and_then(|p| p.housekeeping.permissions())
+    }
+
+    fn pending_permissions(&self) -> Vec<kgraf_orchestrator::PermissionRequestView> {
+        match &self.slot {
+            Slot::Running(r) => r.pending_permissions(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn answer_permission(&mut self, id: u64, grant: bool) -> Result<(), String> {
+        match &self.slot {
+            Slot::Running(r) => r.answer_permission(id, grant).map_err(|e| e.to_string()),
+            _ => Err("no run in this window".to_owned()),
+        }
+    }
+
+    fn pending_plan(&self) -> Option<kgraf_orchestrator::PlanView> {
+        match &self.slot {
+            Slot::Running(r) => r.pending_plan(),
+            _ => None,
+        }
+    }
+
+    fn answer_plan(&mut self, answer: kgraf_orchestrator::PlanAnswer) -> Result<(), String> {
+        match &self.slot {
+            Slot::Running(r) => r.answer_plan(answer).map_err(|e| e.to_string()),
+            _ => Err("no run in this window".to_owned()),
+        }
+    }
+
     fn decline_question_offer(&mut self, id: u64) -> Result<(), String> {
         let Some(pos) = self.offers.iter().position(|o| o.id == id) else {
             return Err("no such offer".to_owned());

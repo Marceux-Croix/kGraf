@@ -49,6 +49,7 @@ mod graph_slice;
 pub mod model_tools;
 mod name;
 mod output;
+pub mod permissions;
 mod registry;
 mod schema_lint;
 pub mod shell;
@@ -71,6 +72,10 @@ pub use model_tools::{
 };
 pub use name::{MAX_WIRE_NAME_CHARS, MCP_PREFIX, QualifiedName};
 pub use output::{BinarySummary, OutputPart, ToolOutput};
+pub use permissions::{
+    ModeSource, PermissionControl, PermissionEvent, PermissionMode, PermissionRulesHook,
+    PermissionSettings,
+};
 pub use registry::{DiscoveredTools, Exposure, RegisteredTool, ToolRegistry, ToolView};
 pub use schema_lint::untyped_schema_nodes;
 pub use shell::{ExecGate, ShellApprovalHook, ShellTool};

@@ -184,3 +184,10 @@ returns its output so far.
   `--container-sandbox` (with `KGRAF_CONTAINER_SANDBOX=1`). The verifier's scope check on the
   commit still refuses undeclared writes, a fence still refuses them, and a `forbid` rule still
   wins. Neither can be set in the worker configuration or by a model. The default is unchanged.
+
+## Amendment: the ways past point 3 are the permission modes (decision 0094)
+
+- The `--may-grant` ceiling and `--container-sandbox` are replaced by the user's permission mode:
+  Auto's allow set, Accept edits' file programs, a grant on a shortfall, and Bypass each run a
+  command as a confined, granted one; the verifier's scope check, a fence and a `forbid` rule
+  still apply, and the user's deny and ask rules apply in every mode.

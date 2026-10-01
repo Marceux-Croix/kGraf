@@ -627,6 +627,7 @@ pub(crate) mod tests {
             question: "run it?".into(),
             asked_by: "shell".into(),
             input: "{}".into(),
+            raised_at_ms: 0,
         };
         let asks = vec![
             ask(1, "r1/v"),
@@ -705,6 +706,7 @@ pub(crate) mod tests {
             question: "run it?".into(),
             asked_by: "shell".into(),
             input: "{}".into(),
+            raised_at_ms: 0,
         };
         let asks = vec![ask(1, "r1/a"), ask(2, "r1/h"), ask(3, "r1/gate/failed")];
         let runs = [stored(r)];
@@ -932,6 +934,7 @@ pub(crate) mod tests {
             question: "run it?".into(),
             asked_by: "shell".into(),
             input: "{}".into(),
+            raised_at_ms: 0,
         }];
         let nodes = plan_nodes(&[stored(r)], &asks, None);
         let get = |k: &str| {
@@ -1032,6 +1035,7 @@ pub(crate) mod tests {
             question: "run it?".into(),
             asked_by: "shell".into(),
             input: "{}".into(),
+            raised_at_ms: 0,
         }];
         let notes = agent_notes(&[stored(r)], &corpus, &asks);
         assert_eq!(

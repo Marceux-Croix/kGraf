@@ -51,6 +51,22 @@ pub struct PendingAsk {
     pub asked_by: String,
     /// The call's arguments, as pretty JSON, verbatim.
     pub input: String,
+    /// When the ask was raised, in milliseconds since the epoch: the box
+    /// groups requests raised close together (decision 0094).
+    pub raised_at_ms: i64,
+}
+
+impl kgraf_tools::permissions::Raised for PendingAsk {
+    fn raised_at_ms(&self) -> i64 {
+        self.raised_at_ms
+    }
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// The user's answer in the box.
@@ -364,7 +380,14 @@ impl AskDesk {
             .reply
             .send(reply)
             .map_err(|_| AskError::Unknown(id))?;
-        if always {
+        if always && is_hard(&waiting.paused) {
+            self.state().notices.push(DeskNotice::RuleNotRecorded {
+                tool,
+                reason: "a rule of yours or the critical-path limit asked about this call, and \
+                         an allow rule cannot cover it; allowed once"
+                    .into(),
+            });
+        } else if always {
             let notice = match &self.rules {
                 None => DeskNotice::RuleNotRecorded {
                     tool,
@@ -426,7 +449,15 @@ fn pending_of(id: u64, paused: &PausedCall) -> PendingAsk {
         question: scrub(paused.question()),
         asked_by: paused.asked_by().to_owned(),
         input: scrub(&input),
+        raised_at_ms: now_ms(),
     }
+}
+
+/// An ask from the user's own rules or the critical-path limit (decision
+/// 0094): no persisted allow rule covers it, allow always records none for
+/// it, and a run nobody attends denies it.
+fn is_hard(paused: &PausedCall) -> bool {
+    paused.asked_by() == kgraf_tools::permissions::PERMISSION_RULES_HOOK
 }
 
 fn scrub(text: &str) -> String {
@@ -450,7 +481,7 @@ impl AskDesk {
         paused: &PausedCall,
         timeout: std::time::Duration,
     ) -> UserAnswer {
-        if let Some(rules) = &self.rules {
+        if let Some(rules) = self.rules.as_ref().filter(|_| !is_hard(paused)) {
             let (note, problem) = rules.covering(paused);
             if let Some(reason) = problem {
                 self.state()
@@ -514,7 +545,7 @@ impl AskDesk {
     /// wording. Never waits and never shows an ask in the box.
     pub fn answer_unattended(&self, paused: &PausedCall) -> UserAnswer {
         let tool = paused.call().tool.clone();
-        if let Some(rules) = &self.rules {
+        if let Some(rules) = self.rules.as_ref().filter(|_| !is_hard(paused)) {
             let (note, problem) = rules.covering(paused);
             if let Some(reason) = problem {
                 self.state()

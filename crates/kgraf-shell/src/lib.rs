@@ -21,6 +21,7 @@ pub mod layout;
 pub mod metrics;
 pub mod orchestrator_box;
 pub mod orchestrator_host;
+pub mod permission_bar;
 pub mod presume_bg;
 pub mod probe;
 pub mod projects;
@@ -127,6 +128,7 @@ pub fn open_project_parts(
     worktrees: kgraf_host::WorktreeRetention,
     with_scheduler: bool,
     wake: kgraf_orchestrator::Wake,
+    permissions: Option<permission_bar::PermissionUi>,
 ) -> ProjectParts {
     if !project.is_dir() {
         return ProjectParts {
@@ -150,11 +152,15 @@ pub fn open_project_parts(
     // Asks route by run origin: box runs to the desk, scheduled runs unattended
     // unless a person is at the window.
     let router = Arc::new(kgraf_orchestrator::AskRouter::new(desk.clone()));
-    let factory = Arc::new(
-        scheduler_bg::ProjectFactory::for_project(project.to_path_buf())
-            .with_worktree_retention(worktrees)
-            .with_ask_resolver(router.clone()),
-    );
+    let factory = scheduler_bg::ProjectFactory::for_project(project.to_path_buf())
+        .with_worktree_retention(worktrees)
+        .with_ask_resolver(router.clone());
+    // Decision 0094: one permission control for the process, from the
+    // user-level file beside the settings file.
+    let factory = Arc::new(match permissions {
+        Some(p) => factory.with_permissions(p),
+        None => factory,
+    });
     let scheduler = with_scheduler.then(|| {
         scheduler_bg::SchedulerHandle::spawn_with(
             project.to_path_buf(),
@@ -300,6 +306,20 @@ pub fn run_with_host(
     } = opts;
     // The store holds what the file holds now, so restoring the project list
     // below (a change) is written back once.
+    // Decision 0094: the user-level permissions file sits beside the settings
+    // file (or where `KGRAF_PERMISSIONS_PATH` says), outside every project.
+    let permissions_path = std::env::var_os(kgraf_tools::permissions::PERMISSIONS_PATH_ENV)
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            settings_path.with_file_name(kgraf_tools::permissions::PERMISSIONS_FILE_NAME)
+        });
+    let (permissions, permissions_notice) =
+        permission_bar::PermissionUi::load(Some(permissions_path));
+    if let Some(notice) = &permissions_notice {
+        log::warn!("{notice}");
+        diag::print_err(&format!("kgraf-app: {notice}\n"));
+    }
     let store = SettingsStore::new(settings_path, settings.clone());
 
     eframe::run_native(
@@ -379,12 +399,14 @@ pub fn run_with_host(
                         settings.worktree_retention(),
                         with_scheduler,
                         wake.clone(),
+                        Some(permissions.clone()),
                     ),
                 },
             );
             settings.projects = workspace.roots();
             settings.active_project = workspace.active().map(|p| p.root.clone());
             let opener_wake = wake.clone();
+            let opener_permissions = permissions.clone();
             let opener: projects::Opener = Box::new(move |root, background, worktrees| {
                 open_project_parts(
                     root,
@@ -392,6 +414,7 @@ pub fn run_with_host(
                     worktrees,
                     with_scheduler,
                     opener_wake.clone(),
+                    Some(opener_permissions.clone()),
                 )
             });
             let mut app = ShellApp::new(AppParts {
@@ -408,6 +431,7 @@ pub fn run_with_host(
                 machine_gate,
                 capacity,
                 update,
+                permissions: Some(permissions.clone()),
             });
             app.enable_compaction_measurement();
             Ok(Box::new(app))

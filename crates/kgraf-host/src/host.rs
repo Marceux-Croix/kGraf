@@ -201,6 +201,11 @@ pub struct Host {
     /// `Admission` needing to expose its own internals for that purpose.
     machine_gate: Arc<MachineGate>,
     asks: Option<Arc<dyn AskResolver>>,
+    /// The user's live permission mode, rules and plan-review option
+    /// (decision 0094): read by every attempt's shell and ask resolver, the
+    /// user-rules hook, and the orchestrator. Manual with no rules unless the
+    /// embedding process sets one ([`Host::with_permissions`]).
+    permissions: Arc<kgraf_tools::PermissionControl>,
     /// Routes served by a provider the embedding process gave
     /// ([`Host::with_route_provider`]) instead of `kgraf_fleet`.
     in_process: BTreeMap<String, Arc<dyn Provider>>,
@@ -405,12 +410,8 @@ impl Host {
             // Decision 0079; the reviewer itself is bound in `run`.
             interface_review: config.interface_review,
             routing: config.routing,
-            // Decision 0093: the operator's `--may-grant`, checked here so a
-            // bad entry fails the open, not the first shortfall.
-            grant_ceiling: kgraf_orchestrator::GrantCeiling::programs(
-                config.may_grant.iter().cloned(),
-            )
-            .map_err(|e| Error::Invalid(format!("--may-grant: {e}")))?,
+            // Decision 0094: `--approve-plan`, the command line's only.
+            approve_plan: config.approve_plan,
             ..OrchestratorConfig::default()
         };
         // Decision 0075: loaded once here, so a malformed store fails loud at
@@ -454,6 +455,7 @@ impl Host {
             admission,
             machine_gate: gate,
             asks: None,
+            permissions: Arc::new(kgraf_tools::PermissionControl::manual()),
             in_process: BTreeMap::new(),
             ended: Mutex::new(BTreeMap::new()),
             notices: Mutex::new(Vec::new()),
@@ -693,6 +695,19 @@ impl Host {
     pub fn with_ask_resolver(mut self, asks: Arc<dyn AskResolver>) -> Self {
         self.asks = Some(asks);
         self
+    }
+
+    /// Run every later run under the user's live permission control
+    /// (decision 0094). Only the user's surfaces build one: the desktop
+    /// control and its user-level file, or the command line.
+    pub fn with_permissions(mut self, control: Arc<kgraf_tools::PermissionControl>) -> Self {
+        self.permissions = control;
+        self
+    }
+
+    /// The live permission control runs of this host use.
+    pub fn permissions(&self) -> &Arc<kgraf_tools::PermissionControl> {
+        &self.permissions
     }
 
     /// Serve `route` with `provider`, built by the embedding process, instead of a
@@ -1396,9 +1411,6 @@ impl Host {
             Some(timeout) => worker_config.with_shell_timeout(timeout),
             None => worker_config,
         };
-        // Decision 0093: only the operator's `--container-sandbox` reaches
-        // this; the worker file cannot set it.
-        let worker_config = worker_config.with_container_sandbox(self.config.container_sandbox);
         let mut parts = BTreeMap::new();
         for spec in &self.config.routes {
             let (route, model) = split_route(spec)?;
@@ -1491,6 +1503,7 @@ impl Host {
             tbench_bridge_socket: self.config.tbench_bridge_socket.clone(),
             dependency_refetch,
             skills,
+            permissions: self.permissions.clone(),
         });
         Ok(BuildBase {
             run,
@@ -1598,9 +1611,15 @@ impl Host {
             profiles_dir: self.state.clone(),
         };
         let envs: Arc<dyn AttemptEnvs> = match &self.asks {
+            // Decision 0094: the mode answers first; the host's surface (the
+            // box's router, which denies what nobody attends) answers the rest.
             Some(asks) => Arc::new(ResolverOverride {
                 inner: assembler,
-                asks: asks.clone(),
+                asks: Arc::new(kgraf_runtime::ModeResolver::new(
+                    asks.clone(),
+                    self.permissions.clone(),
+                    true,
+                )),
             }),
             None => assembler,
         };
@@ -1612,6 +1631,7 @@ impl Host {
         // Wired for every run: without session tools no worker can
         // ask, so nothing is called.
         let orchestrator = Orchestrator::new(self.orchestrator_config.clone(), services)?
+            .with_permissions(self.permissions.clone())
             .with_index_extractor_changes(extractor_changed)
             .with_attempt_envs(envs)
             .with_question_answerer(Arc::new(ModelAnswerer(self.caller(&run)?)));

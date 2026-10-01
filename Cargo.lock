@@ -3564,6 +3564,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "clap",
+ "directories",
  "embed-resource",
  "escargot",
  "kgraf-core",
@@ -4160,10 +4161,12 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "shlex",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tokio-util",
+ "toml 1.1.6+spec-1.1.0",
  "trybuild",
 ]
 

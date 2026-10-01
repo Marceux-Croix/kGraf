@@ -1150,6 +1150,7 @@ async fn each_attempt_gets_a_shell_bound_to_its_own_worktree() {
         tbench_bridge_socket: None,
         dependency_refetch: crate::deps::inert_refetch(),
         skills: None,
+        permissions: Arc::new(kgraf_tools::PermissionControl::manual()),
     };
     let context = ContextConfig::for_model(200_000).expect("context");
     let mut seen = Vec::new();
@@ -1319,6 +1320,7 @@ async fn a_session_tool_call_with_the_flag_on_answers_as_an_error() {
         tbench_bridge_socket: None,
         dependency_refetch: crate::deps::inert_refetch(),
         skills: None,
+        permissions: Arc::new(kgraf_tools::PermissionControl::manual()),
     };
     let context = ContextConfig::for_model(200_000).expect("context");
     let ws = worktree(&r, "w-ask").await;
@@ -1423,6 +1425,7 @@ async fn the_assembled_prefix_digest_with_the_flag_off_is_pinned() {
         tbench_bridge_socket: None,
         dependency_refetch: crate::deps::inert_refetch(),
         skills: None,
+        permissions: Arc::new(kgraf_tools::PermissionControl::manual()),
     };
     let context = ContextConfig::for_model(200_000).expect("context");
     let ws = worktree(&r, "w-off").await;
@@ -1538,6 +1541,7 @@ async fn an_mcp_tool_allowed_with_kgraf_allow_runs_in_an_unattended_delegate() {
             tbench_bridge_socket: None,
             dependency_refetch: crate::deps::inert_refetch(),
             skills: None,
+            permissions: Arc::new(kgraf_tools::PermissionControl::manual()),
         }
     };
     let context = ContextConfig::for_model(200_000).expect("context");
@@ -4049,6 +4053,7 @@ async fn a_host_resolver_answers_the_attempts_asks() {
             tbench_bridge_socket: None,
             dependency_refetch: crate::deps::inert_refetch(),
             skills: None,
+            permissions: Arc::new(kgraf_tools::PermissionControl::manual()),
         }),
         asks: allow.clone(),
     };
@@ -6434,6 +6439,7 @@ mod skill_enforcement {
             dependency_refetch: crate::deps::inert_refetch(),
             // Read from the state directory as `Host::build_base` does.
             skills: crate::worker::assemble::run_skills(&state, None).expect("inventory"),
+            permissions: Arc::new(kgraf_tools::PermissionControl::manual()),
         };
         let context = ContextConfig::for_model(200_000).expect("context");
         let ws = worktree(&r, "w-skill").await;

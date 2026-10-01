@@ -107,3 +107,18 @@ the operator allowed in advance.
   cannot refuses a grant rather than dropping it.
 - Open: whether an instructions report should go to the planner before the user, and whether an
   MCP tool refused under a scope should be grantable. Both hold today.
+
+## Amendment: the ceiling is the permission mode (decision 0094)
+
+- The operator ceiling is replaced by the user's permission mode. `--may-grant P` is now
+  `--allow P`, a program in the Auto mode's allow set; given alone it selects Auto, and the
+  program runs at once with no shortfall round trip. Orchestrator decides grants any command or
+  file-scope request and refuses without asking; Manual and Accept edits ask the user for what
+  they do not grant; with nobody attending, what would ask is denied and the hold names how to
+  allow it. A report may name a scope (command, file, tool); a file grant adds the path to the
+  contract's declared writes.
+- A request the mode would ask about waits on the contract and in the orchestrator box, grouped
+  with requests raised alongside it, until the user answers or a mode change settles it.
+- The container setting is the Bypass mode: `--container-sandbox`, still with
+  `KGRAF_CONTAINER_SANDBOX=1`, selects `--permission-mode bypass`, which keeps the limits listed
+  in decision 0094. The Terminal-Bench bridge selects Bypass.

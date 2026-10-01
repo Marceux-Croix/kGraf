@@ -1086,16 +1086,22 @@ edits before its merge is accepted.
 A worker builds and tests its own work. A declared allowlist of build and
 test commands runs without approval in the sandbox with the network off
 (decision 0084); under a write scope nothing else that can write runs, unless
-the operator granted it. A worker refused by policy, or short of
-instructions, reports it with `report_shortfall` and stops; the orchestrator
-grants the program to that contract only within the operator's `--may-grant`
-ceiling (empty by default), amends the contract once for an instructions
-report, and otherwise holds it with a question for the user, at most two
-re-dispatches per contract. `--container-sandbox` (with
-`KGRAF_CONTAINER_SANDBOX=1`) lifts the shell's command policy for a run inside
-a disposable container. A contract accepted on a check that always passes, or
-after a refusal its worker never retried, is reported unverified (decision
-0093). A dependency missing from the local cargo cache is fetched by the host, outside
+the user's permission mode grants it. A worker refused by policy, or short
+of instructions, reports it with `report_shortfall` and stops (decision 0093);
+the user's permission mode decides what happens (decision 0094). The mode is
+one live setting that only the user sets, from the box's dropdown, the
+user-level `permissions.toml` or the command line: Manual asks the user,
+Accept edits grants file edits, Auto grants the user's allow set, Orchestrator
+decides lets the orchestrator grant or refuse each request without asking, and
+Bypass grants everything. A mode change reaches running workers and waiting
+requests at once, and requests raised within 2 s of each other are answered as
+one group in the box. The user's deny and ask rules and the refusal to delete
+system paths hold in every mode; a run nobody attends denies what would ask.
+An instructions report amends the contract once; at most two re-dispatches per
+contract for shortfalls. With plan review on, no worker starts until the user
+approves the plan in the box. A contract accepted on a check that always
+passes, or after a refusal its worker never retried, is reported unverified
+(decision 0093). A dependency missing from the local cargo cache is fetched by the host, outside
 the sandbox, only with the project's consent, checked at every run start
 before anything is built (decision 0087). An attempt that changed no file is
 refused when a declared Rust write target holds only placeholder bodies, and

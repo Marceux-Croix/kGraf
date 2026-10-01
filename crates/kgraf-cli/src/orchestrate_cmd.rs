@@ -95,36 +95,12 @@ pub struct OrchestrateArgs {
     pub tbench_bridge_socket: Option<PathBuf>,
     /// `--fetch-deps` / `--no-fetch-deps` (decision 0087).
     pub fetch_deps: kgraf_host::deps::RunFetch,
-    /// `--may-grant` (decision 0093): the grant ceiling.
-    pub may_grant: Vec<String>,
-    /// `--container-sandbox` (decision 0093), checked by
-    /// [`container_sandbox`] against its environment variable.
-    pub container_sandbox: bool,
-}
-
-/// The environment variable `--container-sandbox` also requires (decision
-/// 0093): a second, separate statement that the run's commands execute in a
-/// disposable container, which the harness that made the container sets.
-pub const CONTAINER_SANDBOX_ENV: &str = "KGRAF_CONTAINER_SANDBOX";
-
-/// Printed to stderr when the container setting is on, so no log of the run
-/// hides it.
-pub const CONTAINER_SANDBOX_NOTICE: &str = "kgraf: CONTAINER SANDBOX ON: workers' shell commands \
-     are not held to the command policy or the write scope's shell rule. Use only inside a \
-     disposable container.";
-
-/// Whether the container setting is on (decision 0093): the flag and
-/// `KGRAF_CONTAINER_SANDBOX=1` together. The flag without the variable fails
-/// loud; the variable alone turns nothing on.
-pub fn container_sandbox(flag: bool, env: Option<&str>) -> Result<bool> {
-    match (flag, env) {
-        (false, _) => Ok(false),
-        (true, Some("1")) => Ok(true),
-        (true, _) => bail!(
-            "--container-sandbox also needs {CONTAINER_SANDBOX_ENV}=1 in the environment: set it \
-             only where this run's commands execute in a disposable container"
-        ),
-    }
+    /// The permission flags (decision 0094): the mode, the allow set, the
+    /// rules, plan review and the user-level file, built into one control by
+    /// [`crate::permissions_cli::control`].
+    pub permissions: crate::permissions_cli::PermissionArgs,
+    /// `--approve-plan` (decision 0094).
+    pub approve_plan: bool,
 }
 
 /// The per-project part of the flags, as the host takes it. What is per
@@ -165,8 +141,7 @@ fn run_config(root: &Path, args: &OrchestrateArgs) -> RunConfig {
         routing: args.routing,
         tbench_bridge_socket: args.tbench_bridge_socket.clone(),
         dependency_fetch: args.fetch_deps,
-        may_grant: args.may_grant.clone(),
-        container_sandbox: args.container_sandbox,
+        approve_plan: args.approve_plan,
     }
 }
 
@@ -237,13 +212,10 @@ fn print_notice(n: Notice) {
 }
 
 pub fn run(root: &Path, args: OrchestrateArgs) -> Result<()> {
-    if container_sandbox(
-        args.container_sandbox,
-        std::env::var(CONTAINER_SANDBOX_ENV).ok().as_deref(),
-    )? {
-        eprintln!("{CONTAINER_SANDBOX_NOTICE}");
-    }
-    let host = Host::open(run_config(root, &args))?;
+    // Decision 0094: the user-level permissions file and this command's
+    // flags, the only sources of the mode. Bypass is announced on stderr.
+    let permissions = crate::permissions_cli::control(root, &args.permissions)?;
+    let host = Host::open(run_config(root, &args))?.with_permissions(permissions);
     let run_id = match (&args.resume, &args.run) {
         (Some(r), _) => RunId::new(r.clone()),
         (None, Some(r)) => RunId::new(r.clone()),
@@ -915,22 +887,8 @@ mod tests {
             routing: kgraf_orchestrator::RoutingPolicy::default(),
             tbench_bridge_socket: None,
             fetch_deps: kgraf_host::deps::RunFetch::Stored,
-            may_grant: Vec::new(),
-            container_sandbox: false,
-        }
-    }
-
-    /// Decision 0093: the container setting needs the operator's flag and the
-    /// environment variable together; the flag alone fails loud, and the
-    /// variable alone turns nothing on.
-    #[test]
-    fn the_container_sandbox_needs_the_flag_and_the_variable() {
-        assert!(container_sandbox(true, Some("1")).expect("on"));
-        assert!(!container_sandbox(false, Some("1")).expect("off"));
-        assert!(!container_sandbox(false, None).expect("off"));
-        for env in [None, Some("0"), Some("true"), Some("")] {
-            let err = container_sandbox(true, env).expect_err("refused");
-            assert!(err.to_string().contains(CONTAINER_SANDBOX_ENV), "{err}");
+            permissions: Default::default(),
+            approve_plan: false,
         }
     }
 

@@ -1440,6 +1440,8 @@ pub enum ContractControl {
     Shortfall {
         worker: AgentId,
         kind: crate::shortfall::ShortfallKind,
+        /// What a permission report asks for (decision 0094).
+        scope: crate::shortfall::RequestScope,
         need: String,
         why: String,
     },

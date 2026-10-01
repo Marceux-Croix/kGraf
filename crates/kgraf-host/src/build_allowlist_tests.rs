@@ -18,6 +18,26 @@ async fn one_shell_call(
     argv: serde_json::Value,
     write_scope: Option<Vec<PathBuf>>,
 ) -> (String, bool) {
+    one_shell_call_under(
+        r,
+        config,
+        Arc::new(kgraf_tools::PermissionControl::manual()),
+        worker,
+        argv,
+        write_scope,
+    )
+    .await
+}
+
+/// [`one_shell_call`] under the user's permission control `permissions`.
+async fn one_shell_call_under(
+    r: &Repo,
+    config: WorkerConfig,
+    permissions: Arc<kgraf_tools::PermissionControl>,
+    worker: &str,
+    argv: serde_json::Value,
+    write_scope: Option<Vec<PathBuf>>,
+) -> (String, bool) {
     let state = r._dir.path().join(format!("state-{worker}"));
     std::fs::create_dir_all(&state).expect("state");
     let ledger = Arc::new(Ledger::open(&state.join("ledger.db")).expect("ledger"));
@@ -51,6 +71,7 @@ async fn one_shell_call(
         tbench_bridge_socket: None,
         dependency_refetch: crate::deps::inert_refetch(),
         skills: None,
+        permissions,
     };
     let context = ContextConfig::for_model(200_000).expect("context");
     let ws = worktree(r, worker).await;
@@ -155,17 +176,33 @@ async fn under_a_write_scope_only_the_allowlisted_build_runs() {
     assert!(out.contains("--config"), "{out}");
 }
 
-/// Decision 0093: with the operator's container setting, a command off the
-/// allowlist runs under a declared write scope (the verifier still judges the
-/// committed attempt); a `forbid` rule still refuses. Without it, the same
-/// command is refused, as above.
+fn bypass_with(rules: kgraf_tools::permissions::UserRules) -> Arc<kgraf_tools::PermissionControl> {
+    Arc::new(
+        kgraf_tools::PermissionControl::new(
+            kgraf_tools::PermissionSettings {
+                mode: kgraf_tools::PermissionMode::Bypass,
+                rules,
+                ..kgraf_tools::PermissionSettings::default()
+            },
+            kgraf_tools::ModeSource::CommandLine,
+            kgraf_tools::permissions::ProcessFacts::default(),
+        )
+        .expect("bypass"),
+    )
+}
+
+/// Decision 0094: in Bypass a command off the allowlist runs under a
+/// declared write scope (the verifier still judges the committed attempt); a
+/// `forbid` rule still refuses. Without it, the same command is refused, as
+/// above.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn with_the_container_sandbox_a_command_off_the_allowlist_runs_under_a_scope() {
+async fn in_bypass_a_command_off_the_allowlist_runs_under_a_scope() {
     let (r, _denies) = lockless_crate();
-    let config = WorkerConfig::default().with_container_sandbox(true);
-    let (out, is_error) = one_shell_call(
+    let bypass = bypass_with(Default::default());
+    let (out, is_error) = one_shell_call_under(
         &r,
-        config.clone(),
+        WorkerConfig::default(),
+        bypass.clone(),
         "w-box-touch",
         serde_json::json!(["touch", "src/lib.rs"]),
         scope(),
@@ -173,9 +210,10 @@ async fn with_the_container_sandbox_a_command_off_the_allowlist_runs_under_a_sco
     .await;
     assert!(!is_error, "{out}");
     assert!(out.contains("exit status: 0"), "{out}");
-    let (out, is_error) = one_shell_call(
+    let (out, is_error) = one_shell_call_under(
         &r,
-        config,
+        WorkerConfig::default(),
+        bypass,
         "w-box-forbid",
         serde_json::json!(["rm", "-rf", "/"]),
         scope(),
@@ -186,6 +224,56 @@ async fn with_the_container_sandbox_a_command_off_the_allowlist_runs_under_a_sco
         out.contains("refuses to remove the filesystem root"),
         "{out}"
     );
+}
+
+/// Decision 0094, the limits Bypass does not lift, through the real chain
+/// and shell: the user's deny rule refuses a command Bypass would run;
+/// deleting a system path is refused; an ask rule's ask, with nobody
+/// attending, is denied. The same `touch` without the rule runs (above).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bypass_still_honors_deny_rules_system_paths_and_denies_a_headless_ask() {
+    use kgraf_tools::permissions::{Rule, UserRules};
+    let (r, _denies) = lockless_crate();
+    let rules = UserRules {
+        deny: vec![Rule::parse("shell(touch*)").expect("rule")],
+        ask: vec![Rule::parse("shell(git status*)").expect("rule")],
+    };
+    let bypass = bypass_with(rules);
+    let (out, is_error) = one_shell_call_under(
+        &r,
+        WorkerConfig::default(),
+        bypass.clone(),
+        "w-bp-deny",
+        serde_json::json!(["touch", "src/lib.rs"]),
+        scope(),
+    )
+    .await;
+    assert!(is_error, "{out}");
+    assert!(out.contains("your deny rule `shell(touch*)`"), "{out}");
+    // A harmless command whichever way it went: `/usr` is not empty, and the
+    // sandbox confines writes. The limit refuses it before it runs.
+    let (out, is_error) = one_shell_call_under(
+        &r,
+        WorkerConfig::default(),
+        bypass.clone(),
+        "w-bp-system",
+        serde_json::json!(["rmdir", "/usr"]),
+        None,
+    )
+    .await;
+    assert!(is_error, "{out}");
+    assert!(out.contains("refused in every permission mode"), "{out}");
+    let (out, is_error) = one_shell_call_under(
+        &r,
+        WorkerConfig::default(),
+        bypass,
+        "w-bp-ask",
+        serde_json::json!(["git", "status"]),
+        None,
+    )
+    .await;
+    assert!(is_error, "{out}");
+    assert!(out.contains("Nobody attends"), "{out}");
 }
 
 /// Decision 0093: a program granted to the contract runs under its write

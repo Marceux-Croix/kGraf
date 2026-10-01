@@ -44,9 +44,10 @@ pub struct PolicyVerdict {
     /// approval and, from a workspace-bound shell tool, run as a sandboxed
     /// build that a worker with a declared write scope may issue.
     pub build: bool,
-    /// Allowed by an operator grant (decision 0093): a program the run's
-    /// operator ceiling let the orchestrator grant to this contract, or any
-    /// command when the run's container is the sandbox. From a
+    /// Allowed by a grant: a program granted to this contract after a
+    /// shortfall (decision 0093), one the user's permission mode grants, or
+    /// any command in Bypass or when the run's container is the sandbox
+    /// (decision 0094). From a
     /// workspace-bound shell tool it runs as a confined command, like a
     /// build, which a worker with a declared write scope may issue.
     pub granted: bool,
@@ -61,11 +62,24 @@ pub struct ExecPolicy {
     /// Decision 0084: empty unless the caller sets one.
     build: BuildAllowlist,
     /// Decision 0093: programs (an exact `argv[0]`) granted to this
-    /// contract by the orchestrator, within the operator's ceiling.
+    /// contract after a shortfall, under the user's permission mode (0094).
     granted: std::collections::BTreeSet<String>,
     /// Decision 0093: the run's container is the sandbox, so every command
     /// that no `forbid` rule refuses runs without approval.
     unrestricted: bool,
+    /// Decision 0094: the user's live permission mode, read on every
+    /// evaluation, so a mode change reaches a running worker's next command.
+    live: Option<LivePermissions>,
+}
+
+/// The live permission control, shared; `Debug` names only the mode.
+#[derive(Clone)]
+struct LivePermissions(std::sync::Arc<crate::permissions::PermissionControl>);
+
+impl std::fmt::Debug for LivePermissions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "LivePermissions({})", self.0.mode())
+    }
 }
 
 impl ExecPolicy {
@@ -77,12 +91,42 @@ impl ExecPolicy {
             build: BuildAllowlist::empty(),
             granted: std::collections::BTreeSet::new(),
             unrestricted: false,
+            live: None,
+        }
+    }
+
+    /// Read the user's permission mode on every evaluation (decision 0094):
+    /// in Bypass every command no `forbid` rule refuses runs as a confined,
+    /// granted command; in Auto the allow set's programs do; in Accept edits
+    /// the common file programs do. The mode is read per call, so a change
+    /// reaches a running worker's next command. The tool's description does
+    /// not change with it: the shared prefix stays byte-identical (0043).
+    pub fn with_permissions(
+        mut self,
+        control: std::sync::Arc<crate::permissions::PermissionControl>,
+    ) -> Self {
+        self.live = Some(LivePermissions(control));
+        self
+    }
+
+    /// Record, on the live control, that the user's mode let `worker` run
+    /// `argv`'s program (decision 0094: every grant is recorded). A verdict
+    /// the mode did not decide (the allowlist, a contract's grant, a rule)
+    /// records nothing.
+    pub fn record_mode_grant(&self, worker: &str, argv: &[String], verdict: &PolicyVerdict) {
+        let Some(live) = &self.live else { return };
+        let Some(program) = argv.first() else { return };
+        if !verdict.granted || self.unrestricted || self.granted.contains(program) {
+            return;
+        }
+        if live.0.shell_unrestricted() || live.0.policy_grants_program(program).is_some() {
+            live.0.record_grant(worker, &format!("`{program}`"), "mode");
         }
     }
 
     /// Allow these programs without approval (decision 0093): each is an
-    /// exact `argv[0]`, granted to one contract by the orchestrator within
-    /// the operator's ceiling. A `forbid` rule and a refused build argument
+    /// exact `argv[0]`, granted to one contract after a shortfall under the
+    /// user's permission mode (0094). A `forbid` rule and a refused build argument
     /// still win. Set from the run's configuration only, never by a model.
     pub fn with_granted_programs(mut self, programs: impl IntoIterator<Item = String>) -> Self {
         self.granted.extend(programs);
@@ -199,7 +243,14 @@ impl ExecPolicy {
                 // (or allowed unconfined) into a confined allow. A read-only
                 // command keeps its own classification and confinement.
                 let listed = argv.first().is_some_and(|p| self.granted.contains(p));
-                if verdict.read_only || !(self.unrestricted || listed) {
+                let live = self.live.as_ref();
+                let bypass = live.is_some_and(|l| l.0.shell_unrestricted());
+                let by_mode = argv
+                    .first()
+                    .and_then(|p| live.and_then(|l| l.0.policy_grants_program(p)));
+                if verdict.read_only
+                    || !(self.unrestricted || listed || bypass || by_mode.is_some())
+                {
                     return verdict;
                 }
                 PolicyVerdict {
@@ -207,7 +258,11 @@ impl ExecPolicy {
                     read_only: false,
                     matched_prefix: verdict.matched_prefix,
                     reason: Some(if listed {
-                        "granted to this contract within the operator's ceiling".into()
+                        "granted to this contract under the permission mode".into()
+                    } else if let Some(why) = by_mode {
+                        why.into()
+                    } else if bypass {
+                        "the Bypass permission mode".into()
                     } else {
                         "the run's container is the sandbox".into()
                     }),
@@ -385,6 +440,49 @@ mod tests {
         assert_eq!(forbidden.decision, Decision::Forbidden);
         let read_only = policy.evaluate(&argv(&["ls"]));
         assert!(read_only.read_only && !read_only.granted);
+    }
+
+    /// Decision 0094: the policy reads the live mode on every evaluation. One
+    /// policy value, built once, answers differently after each mode change:
+    /// Manual asks, Auto grants its allow set, Accept edits grants the file
+    /// programs, Bypass grants everything, and a `forbid` rule wins in all.
+    #[test]
+    fn the_live_mode_changes_the_verdict_of_a_policy_already_built() {
+        use crate::permissions::{AllowSet, ModeSource, PermissionControl, PermissionMode};
+        let control = std::sync::Arc::new(PermissionControl::manual());
+        let policy = ExecPolicy::default_kgraf_policy().with_permissions(control.clone());
+        let py = argv(&["python3", "fetch.py"]);
+        let mk = argv(&["mkdir", "out"]);
+        assert_eq!(policy.evaluate(&py).decision, Decision::Prompt);
+        control.set_allow(
+            AllowSet::default()
+                .with_programs(["python3"])
+                .expect("allow"),
+        );
+        control
+            .set_mode(PermissionMode::Auto, ModeSource::CommandLine)
+            .expect("auto");
+        let v = policy.evaluate(&py);
+        assert!(v.decision == Decision::Allow && v.granted, "{v:?}");
+        assert_eq!(policy.evaluate(&mk).decision, Decision::Prompt);
+        control
+            .set_mode(PermissionMode::AcceptEdits, ModeSource::CommandLine)
+            .expect("edits");
+        assert_eq!(policy.evaluate(&py).decision, Decision::Prompt);
+        assert!(policy.evaluate(&mk).granted);
+        control
+            .set_mode(PermissionMode::Bypass, ModeSource::CommandLine)
+            .expect("bypass");
+        let v = policy.evaluate(&argv(&["curl", "https://example.com"]));
+        assert!(v.decision == Decision::Allow && v.granted, "{v:?}");
+        assert_eq!(
+            policy.evaluate(&argv(&["git", "push", "--force"])).decision,
+            Decision::Forbidden
+        );
+        control
+            .set_mode(PermissionMode::Manual, ModeSource::UserInterface)
+            .expect("manual");
+        assert_eq!(policy.evaluate(&py).decision, Decision::Prompt);
     }
 
     /// Decision 0093: with the container as the sandbox, any command runs

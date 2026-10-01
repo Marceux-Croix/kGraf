@@ -438,6 +438,7 @@ async fn run_one(
         // A benchmark runs the brief alone: no skills, so the prefix and the
         // tool list stay the ones every recorded run was measured with.
         skills: None,
+        permissions: std::sync::Arc::new(kgraf_tools::PermissionControl::manual()),
     };
     let worker_brief = WorkerBrief {
         task: worker_id.into(),

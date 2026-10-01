@@ -497,6 +497,7 @@ fn drive(d: DriveArgs<'_>) -> Result<kgraf_runtime::WorkerResult> {
                 args.tbench_bridge_socket.as_deref(),
             )
             .context("cannot read the project's skill inventory")?,
+            permissions: crate::permissions_cli::control(root, &Default::default())?,
         })
     })();
     let assembly = match prepared {
