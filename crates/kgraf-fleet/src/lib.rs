@@ -601,12 +601,17 @@ pub const CATALOG: &[Entry] = &[
         shares_credential_with: None,
         confidence: Confidence::Documented,
         streamed_usage: Some((StreamedUsageLocation::TopLevelChunk, Confidence::Unverified)),
-        reasoning_visibility: ReasoningVisibility::None,
+        // Full: a thinking model's text arrives whole as `reasoning` (streamed
+        // `delta.reasoning`, buffered `message.reasoning`), recorded live with
+        // qwen3.6:35b. A model that does not think returns none, which a session
+        // shows as observed rather than as a catalog error.
+        reasoning_visibility: ReasoningVisibility::Full,
         reasoning_dialect: ReasoningDialect::Inclusive,
-        note: "Self-hosted, no credential. Reports prompt and completion tokens with \
-               no cache split, which is correct rather than missing: there is no \
-               server-side prompt cache to report. Cost derives to zero only if the \
-               price table says so, which for a local model it should.",
+        note: "Self-hosted, no credential. Reports prompt and completion tokens and, \
+               on recent builds, `prompt_tokens_details.cached_tokens` for a reused \
+               prompt prefix. A thinking model's text arrives as `reasoning` and is \
+               kept. Cost derives to zero only if the price table says so, which for \
+               a local model it should.",
     },
     Entry {
         id: "llama-cpp",

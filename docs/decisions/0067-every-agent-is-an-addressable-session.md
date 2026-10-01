@@ -112,3 +112,12 @@ event is appended between rounds, like an injection, and refused mid-stream or
 mid-tool-round; everything before it stays in the transcript. A user's request to compact
 one session travels on the same queue as steering (`Injector::request_compaction`) and is
 taken at the next boundary; a session that has compacted refuses a second request.
+
+## Amendment (2026-10-01): thinking text sent as `reasoning`
+
+The table above names `reasoning_content` as the Chat Completions field. Servers disagree on
+the name: Ollama, OpenRouter and recent vLLM send `reasoning` (streamed `delta.reasoning`,
+buffered `message.reasoning`). The chat adapter reads both; when both are present,
+`reasoning_content` is taken and the text is carried once. Before this, a thinking model on
+Ollama had its tokens counted and its text dropped. The `ollama` catalog entry now declares
+full visibility, from a recorded live stream and a recorded buffered answer.

@@ -884,6 +884,12 @@ an inventory is there.
   tools. An entry naming another agent's tool (`Read`, `Bash`) matches nothing here, so
   a skill written only for another agent refuses every call; edit its list to use these
   names.
+  When the permission mode would also ask about or refuse such a call, the worker sees the
+  skill's refusal, which names the mode's verdict too, and you are not asked. A worker can
+  always call `report_shortfall`, whatever its skills list. A permission report for a
+  command or tool its skill refuses holds the contract with the skill's name, since no
+  permission grant lifts a skill's `allowed-tools`: edit the skill's list or the
+  instruction, then run the work again.
 - **Resuming after a skill changed.** A resumed worker re-activates its skills at the
   version it activated. If you edited, removed or disabled one of them since, the resume
   stops and names the skill: restore the skill as it was, or start the work again as a new
@@ -1048,6 +1054,12 @@ Behavior that differs from earlier builds. Each item names the decision that hol
 - A planner answer that sends an optional list as `null` (`"depends_on": null`) is read as
   empty. A field of the wrong type is still refused, and the refusal names the field
   (`contracts[0].depends_on: ...`).
+- A planner answer that gives a contract's acceptance as a list of strings is read as those
+  criteria, in order, one per line in the worker's brief. A contract's acceptance is text
+  the worker reads; kGraf does not run it. The command that checks each attempt is
+  `--verify`, narrowed to the contract's own tests where the runner allows. Any other type
+  (null, a number, an object, a list that holds a non-string) is still refused, and the
+  refusal names the field.
 - Each worktree a run leaves on disk (a held contract's attempt kept for `--resume`, retention,
   a conflict) gets a `kept` line in the run output with how to resume or remove it. kGraf's own
   `.kgraf/worktrees/.holds` and `.kgraf/worktrees/.scratch` are removed at the end of a run that
@@ -1070,6 +1082,12 @@ Behavior that differs from earlier builds. Each item names the decision that hol
   reason that names the worktree and the transcript (0095).
 - Every worker's tool list now includes `recall_history`, so a worker transcript recorded by
   an earlier build cannot be resumed; start that work again (0095).
+- A contract whose named graph slices all find nothing, or that names none, is given the
+  top-level symbols of the files it declares it writes (at most 8, about 4,000 tokens
+  together). The trace has a `notice` naming the files, and each name that found nothing is
+  still an `empty_graph_lookup`. The run report has a `slices` line: the dispatches given
+  slices, how many of those took the declared files' symbols, and the named lookups that
+  found nothing. A run that gave no worker a slice says so on that line.
 - kGraf's own git runs no hook, filter, merge driver or diff driver from your repository or
   config, and reaches no remote (see "kGraf's own git"). A file stored through git-lfs or
   git-crypt is committed by kGraf in its stored form, and a file with a configured merge

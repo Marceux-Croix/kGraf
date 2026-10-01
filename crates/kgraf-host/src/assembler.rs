@@ -80,6 +80,9 @@ pub(crate) struct AttemptAssembler {
     /// (`Assembly::skills`), so the route probes and every attempt list the
     /// same catalog.
     pub(crate) skills: Option<Arc<kgraf_session::skills::SkillCatalog>>,
+    /// Every attempt's skill session is registered here, the directory the
+    /// run's `report_shortfall` reads a worker's restrictions from.
+    pub(crate) skill_directory: Arc<kgraf_session::skills::SkillDirectory>,
     /// The user's live permission control (decision 0094).
     pub(crate) permissions: Arc<kgraf_tools::PermissionControl>,
 }
@@ -205,7 +208,11 @@ impl AttemptAssembler {
         assembly.config = assembly
             .config
             .with_granted_programs(granted.iter().cloned());
-        assemble(assembly).await.map_err(|e| format!("{e:#}"))
+        let assembled = assemble(assembly).await.map_err(|e| format!("{e:#}"))?;
+        if let Some(session) = &assembled.env.skills {
+            self.skill_directory.register(session);
+        }
+        Ok(assembled)
     }
 }
 

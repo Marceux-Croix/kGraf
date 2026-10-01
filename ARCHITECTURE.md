@@ -439,7 +439,12 @@ worker at its next boundary, once.
   - A skill's declared allowed tools are enforced by the runtime, never by
     asking the model: a call outside the list is refused on the worker's
     approval chain. The tool definitions stay in the shared prefix
-    unfiltered. A subagent inherits its parent's restrictions.
+    unfiltered. A subagent inherits its parent's restrictions. When a
+    permission hook would ask about or deny a call a skill also refuses, the
+    skill's refusal is reported, naming the hook's verdict, and nobody is
+    asked. `report_shortfall` is never restricted, and a permission report a
+    worker's skill refuses holds its contract with the skill's name (decision
+    0053 amendment).
 
 A pre-tool hook can allow, ask or deny a call. The loop always holds its last
 round back for an answer. Every call's trace records what it was given as
@@ -1125,7 +1130,7 @@ failure, never every merged file deleted. A contract keeps its slice names,
 and dispatch resolves them again against the graph as it is then: a node id
 hashes the symbol's signature, so a predecessor that renames a parameter
 gives the symbol a new id. A name that no longer resolves is a traced empty
-lookup, not a failed spawn. A contract whose projected block is over the
+lookup, not a failed spawn. When none of a contract's named slices resolve, or it names none, it is given the top-level symbols of the files it declares it writes (at most 8, about 4,000 tokens together), traced as a notice; the run report's `slices` line counts the dispatches that had slices, those that took the declared files' symbols, and the named lookups that found nothing. A contract whose projected block is over the
 plan target is split only when a child could fit: every child carries the
 worker prefix and the projected transcript growth, so when those alone are
 over the target the contract is dispatched unsplit, with a notice that gives

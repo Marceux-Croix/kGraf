@@ -1455,6 +1455,10 @@ pub enum ContractControl {
         scope: crate::shortfall::RequestScope,
         need: String,
         why: String,
+        /// The worker's active skill refusing what the report asks for, as
+        /// kGraf found it (never the worker's words): a permission grant
+        /// cannot lift a skill's `allowed-tools` (decision 0053).
+        skill_refusal: Option<String>,
     },
 }
 

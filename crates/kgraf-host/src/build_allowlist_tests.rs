@@ -71,6 +71,7 @@ async fn one_shell_call_under(
         tbench_bridge_socket: None,
         dependency_refetch: crate::deps::inert_refetch(),
         skills: None,
+        skill_directory: Default::default(),
         permissions,
     };
     let context = ContextConfig::for_model(200_000).expect("context");

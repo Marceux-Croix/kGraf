@@ -85,8 +85,13 @@ Notes on single rows:
   per-model rate-limit header recording were added after it. Recorded replies test those.
 - `anthropic`: plain call, streamed call, tool round trip, prompt caching (cold write, then
   warm read), rate-limit headers, and a note injected after tool results all passed.
-- `ollama`: the exchange used the model `qwen2.5-coder:7b`. That model returned its tool call
-  as plain text. See "Known limits".
+- `ollama`: the first exchange used the model `qwen2.5-coder:7b`. That model returned its tool
+  call as plain text. See "Known limits". A later streamed call and a buffered call with
+  `qwen3.6:35b` are recorded in `crates/kgraf-provider-openai/tests/fixtures/`. Ollama sends a
+  thinking model's text as `reasoning` (streamed `delta.reasoning`, buffered
+  `message.reasoning`), not as `reasoning_content`. The chat adapter reads both names, so the
+  thinking text is kept in the transcript. The buffered call also reported
+  `prompt_tokens_details.cached_tokens`, which the adapter records as cache reads.
 - `systemone`: the route has no live exchange. The typed-decision client itself talked to a
   real local server once, in the probe recorded under decision
   [0045](decisions/0045-the-local-decider-loses-to-the-frontier-and-the-seam-stays.md). That does not verify
@@ -228,3 +233,6 @@ otherwise.
 
 - 2026-09-29: first version.
 - 2026-09-30: buffered calls scale their time bound with the output cap (see Known limits).
+- 2026-10-01: the chat adapter reads thinking text sent as `reasoning` as well as
+  `reasoning_content` (Ollama, OpenRouter, recent vLLM); the `ollama` route declares full
+  reasoning visibility.

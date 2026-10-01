@@ -1456,9 +1456,13 @@ impl Host {
         // (`report_shortfall`), with or without contract checks; bound to the
         // orchestrator once it is built, as `line` is.
         let shortfall_line = ContractLine::new();
-        extra_tools.push(Arc::new(kgraf_orchestrator::ShortfallTool::new(
-            shortfall_line.clone(),
-        )));
+        // Each attempt's skill session registers here, so a permission report
+        // a worker's skill refuses carries the skill's refusal (decision 0053).
+        let skill_directory = kgraf_session::skills::SkillDirectory::new();
+        extra_tools.push(Arc::new(
+            kgraf_orchestrator::ShortfallTool::new(shortfall_line.clone())
+                .with_skills(skill_directory.clone()),
+        ));
         // Decision 0089: the run's non-generative routes, each built with its
         // own credential. Their tools join every environment of the run (so the
         // prefix stays one per vendor and model, 0043); none is called unless
@@ -1513,6 +1517,7 @@ impl Host {
             tbench_bridge_socket: self.config.tbench_bridge_socket.clone(),
             dependency_refetch,
             skills,
+            skill_directory,
             permissions: self.permissions.clone(),
         });
         Ok(BuildBase {

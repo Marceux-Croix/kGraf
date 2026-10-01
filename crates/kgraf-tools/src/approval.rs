@@ -495,21 +495,39 @@ impl ApprovalChain {
                     call.input = input;
                     rewritten = true;
                 }
+                // A policy (a skill's `allowed-tools`) is the more specific
+                // restriction: when it refuses the call too, its refusal is
+                // the one reported, naming the hook's as well, so the worker
+                // learns what actually restricts it. Checked on the input as
+                // it stands; the call will not run, so no later rewrite can
+                // change the outcome.
                 HookDecision::Deny { reason } => {
+                    if let Some((policy, refusal)) = self.policy_refusal(registered, &call.input) {
+                        let both = format!("{refusal}; `{by}` also refused it: {reason}");
+                        return deny(log, &call, &policy, both).await;
+                    }
                     return deny(log, &call, &by, reason).await;
                 }
+                // Asking the user about a call a policy refuses anyway wastes
+                // their answer and, in a run nobody attends, turns into a
+                // denial that never names the policy. The policy refuses it
+                // first. A later hook could in principle rewrite the input
+                // into one the policy permits; asking would not run that
+                // rewrite before the answer either, so refusing here loses
+                // nothing the ask would have had.
                 HookDecision::Ask { question } => {
+                    if let Some((policy, refusal)) = self.policy_refusal(registered, &call.input) {
+                        let both = format!("{refusal}; `{by}` would also have asked to run it");
+                        return deny(log, &call, &policy, both).await;
+                    }
                     return self
                         .ask(log, call, by, question, index + 1, rewritten)
                         .await;
                 }
             }
         }
-        let subject = registered.tool().permission_subject(&call.input);
-        for policy in &self.policies {
-            if let Err(reason) = policy.check(registered.name(), subject.as_deref()) {
-                return deny(log, &call, policy.name(), reason).await;
-            }
+        if let Some((policy, reason)) = self.policy_refusal(registered, &call.input) {
+            return deny(log, &call, &policy, reason).await;
         }
         let access = match registered.tool().access(&call.input) {
             Ok(a) => a,
@@ -522,6 +540,25 @@ impl ApprovalChain {
             access,
             rewritten,
         }))
+    }
+
+    /// The first policy that refuses `input` for `registered`: its name and
+    /// reason.
+    fn policy_refusal(
+        &self,
+        registered: &crate::registry::RegisteredTool,
+        input: &serde_json::Value,
+    ) -> Option<(String, String)> {
+        if self.policies.is_empty() {
+            return None;
+        }
+        let subject = registered.tool().permission_subject(input);
+        self.policies.iter().find_map(|policy| {
+            policy
+                .check(registered.name(), subject.as_deref())
+                .err()
+                .map(|reason| (policy.name().to_owned(), reason))
+        })
     }
 
     async fn ask(
@@ -995,6 +1032,79 @@ mod tests {
             .expect("review");
         assert!(matches!(verdict, Verdict::Denied { ref by, .. } if by == "skill:git"));
         assert!(f.ran().is_empty());
+    }
+
+    /// A hook asks about a call a policy refuses anyway: nobody is asked, and
+    /// the refusal names the policy (the more specific restriction) and says
+    /// the hook would have asked too. Before, the ask came first, a run with
+    /// nobody attending denied it, and the worker never learned a skill
+    /// restricted the call.
+    #[tokio::test]
+    async fn an_ask_on_a_call_a_policy_refuses_is_the_policys_refusal() {
+        let f = Fixture::new();
+        let c = chain(vec![ask_hook()]).with_policy(Arc::new(GitOnly));
+        let mut log = MemoryApprovalLog::default();
+        let verdict = c
+            .review(f.view(), call(json!({"cmd": "wc -l x"})), &mut log)
+            .await
+            .expect("review");
+        match verdict {
+            Verdict::Denied { by, reason } => {
+                assert_eq!(by, "skill:git");
+                assert!(reason.contains("only git commands"), "{reason}");
+                assert!(reason.contains("`ask` would also have asked"), "{reason}");
+            }
+            other => panic!("expected the policy's refusal, got {other:?}"),
+        }
+        assert!(
+            !log.records
+                .iter()
+                .any(|r| matches!(r.decision, RecordedDecision::Asked { .. })),
+            "nobody is asked about a call that cannot run: {:?}",
+            log.records
+        );
+        // A call the policy permits is still asked about.
+        let verdict = c
+            .review(f.view(), call(json!({"cmd": "git status"})), &mut log)
+            .await
+            .expect("review");
+        assert!(matches!(verdict, Verdict::Ask(_)), "{verdict:?}");
+    }
+
+    /// A hook denies a call a policy refuses too: the refusal names both, the
+    /// policy first.
+    #[tokio::test]
+    async fn a_deny_on_a_call_a_policy_refuses_names_both() {
+        let f = Fixture::new();
+        let c = chain(vec![Arc::new(Fixed(
+            "mode",
+            HookDecision::Deny {
+                reason: "not on the allowlist".into(),
+            },
+        ))])
+        .with_policy(Arc::new(GitOnly));
+        let mut log = MemoryApprovalLog::default();
+        let verdict = c
+            .review(f.view(), call(json!({"cmd": "wc -l x"})), &mut log)
+            .await
+            .expect("review");
+        match verdict {
+            Verdict::Denied { by, reason } => {
+                assert_eq!(by, "skill:git");
+                assert!(
+                    reason.starts_with("only git commands")
+                        && reason.contains("`mode` also refused it: not on the allowlist"),
+                    "{reason}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        // A deny the policy would permit stays the hook's own.
+        let verdict = c
+            .review(f.view(), call(json!({"cmd": "git push"})), &mut log)
+            .await
+            .expect("review");
+        assert!(matches!(verdict, Verdict::Denied { ref by, .. } if by == "mode"));
     }
 
     /// A policy that refuses every call once closed.

@@ -1203,6 +1203,7 @@ async fn each_attempt_gets_a_shell_bound_to_its_own_worktree() {
         tbench_bridge_socket: None,
         dependency_refetch: crate::deps::inert_refetch(),
         skills: None,
+        skill_directory: Default::default(),
         permissions: Arc::new(kgraf_tools::PermissionControl::manual()),
     };
     let context = ContextConfig::for_model(200_000).expect("context");
@@ -1373,6 +1374,7 @@ async fn a_session_tool_call_with_the_flag_on_answers_as_an_error() {
         tbench_bridge_socket: None,
         dependency_refetch: crate::deps::inert_refetch(),
         skills: None,
+        skill_directory: Default::default(),
         permissions: Arc::new(kgraf_tools::PermissionControl::manual()),
     };
     let context = ContextConfig::for_model(200_000).expect("context");
@@ -1478,6 +1480,7 @@ async fn the_assembled_prefix_digest_with_the_flag_off_is_pinned() {
         tbench_bridge_socket: None,
         dependency_refetch: crate::deps::inert_refetch(),
         skills: None,
+        skill_directory: Default::default(),
         permissions: Arc::new(kgraf_tools::PermissionControl::manual()),
     };
     let context = ContextConfig::for_model(200_000).expect("context");
@@ -1598,6 +1601,7 @@ async fn an_mcp_tool_allowed_with_kgraf_allow_runs_in_an_unattended_delegate() {
             tbench_bridge_socket: None,
             dependency_refetch: crate::deps::inert_refetch(),
             skills: None,
+            skill_directory: Default::default(),
             permissions: Arc::new(kgraf_tools::PermissionControl::manual()),
         }
     };
@@ -4260,6 +4264,7 @@ async fn a_host_resolver_answers_the_attempts_asks() {
             tbench_bridge_socket: None,
             dependency_refetch: crate::deps::inert_refetch(),
             skills: None,
+            skill_directory: Default::default(),
             permissions: Arc::new(kgraf_tools::PermissionControl::manual()),
         }),
         asks: allow.clone(),
@@ -6584,6 +6589,9 @@ mod skill_enforcement {
         finished: Vec<(String, String, bool)>,
         requests: Vec<kgraf_provider::Request>,
         tools: Vec<String>,
+        /// After each finished call, what the run's skill directory said the
+        /// worker's skills refuse of a `wc` shell command.
+        directory_refusals: Vec<Option<String>>,
     }
 
     impl Ran {
@@ -6651,6 +6659,7 @@ mod skill_enforcement {
             dependency_refetch: crate::deps::inert_refetch(),
             // Read from the state directory as `Host::build_base` does.
             skills: crate::worker::assemble::run_skills(&state, None).expect("inventory"),
+            skill_directory: Default::default(),
             permissions: Arc::new(kgraf_tools::PermissionControl::manual()),
         };
         let context = ContextConfig::for_model(200_000).expect("context");
@@ -6693,6 +6702,8 @@ mod skill_enforcement {
         .await
         .expect("spawn");
         let mut finished = Vec::new();
+        let shell = kgraf_tools::QualifiedName::builtin("shell").expect("name");
+        let mut directory_refusals = Vec::new();
         while let Some(ev) = handle.next_event().await {
             if let kgraf_runtime::WorkerEvent::ToolCallFinished {
                 call_id,
@@ -6700,6 +6711,12 @@ mod skill_enforcement {
                 is_error,
             } = ev
             {
+                // Asked while the worker runs, as `report_shortfall` would be.
+                directory_refusals.push(assembler.skill_directory.refusal_for(
+                    "w-skill",
+                    &shell,
+                    Some("wc"),
+                ));
                 finished.push((call_id, output, is_error));
             }
         }
@@ -6711,6 +6728,7 @@ mod skill_enforcement {
             finished,
             requests,
             tools,
+            directory_refusals,
         }
     }
 
@@ -6753,6 +6771,45 @@ mod skill_enforcement {
         for i in 1..ran.requests.len() {
             assert_eq!(ran.system_text(i), first, "request {i}");
         }
+    }
+
+    /// A shell call both the active skill and the permission mode refuse:
+    /// the skill's refusal is the one the worker reads, naming the mode's as
+    /// well, and nobody is asked. The run's skill directory knows the
+    /// worker's restriction, which a `report_shortfall` carries.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_call_both_a_skill_and_the_mode_refuse_names_the_skill() {
+        let ran = run(
+            true,
+            vec![
+                vec![("skill", serde_json::json!({"name": "reader"}))],
+                vec![(
+                    "shell",
+                    serde_json::json!({"command": ["wc", "-l", "README"]}),
+                )],
+            ],
+        )
+        .await;
+        let (output, is_error) = ran.result("c1-0");
+        assert!(is_error, "{output}");
+        assert!(
+            output.contains("denied by skills:allowed-tools")
+                && output.contains("not permitted by skill `reader`"),
+            "the skill's refusal comes first: {output}"
+        );
+        assert!(
+            output.contains("would also have asked") || output.contains("also refused it"),
+            "the mode's verdict is named too: {output}"
+        );
+        assert!(!output.contains("denied by user"), "{output}");
+        let after_activation = ran.directory_refusals.last().expect("calls finished");
+        assert!(
+            after_activation
+                .as_deref()
+                .is_some_and(|r| r.contains("reader")),
+            "the run's skill directory holds the worker's restriction: {:?}",
+            ran.directory_refusals
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -122,6 +122,13 @@ mod tests {
         assert_eq!(capability_of("shell", &serde_json::json!({})), "shell");
     }
 
+    /// The tool every refusal names is the one skills never restrict; a
+    /// rename on one side only would refuse the report the refusal asks for.
+    #[test]
+    fn the_shortfall_tool_is_never_restricted_by_a_skill() {
+        assert!(kgraf_session::skills::NEVER_RESTRICTED.contains(&SHORTFALL_TOOL));
+    }
+
     #[test]
     fn only_a_policy_denial_counts() {
         assert!(is_policy_denial("ask-policy", "unattended"));

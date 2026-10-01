@@ -408,8 +408,12 @@ impl ToolPolicy {
             .collect()
     }
 
-    /// Whether a call is permitted: every layer must permit it.
+    /// Whether a call is permitted: every layer must permit it. The built-in
+    /// tools in [`NEVER_RESTRICTED`] are always permitted.
     pub fn check(&self, tool: &QualifiedName, subject: Option<&str>) -> Result<(), SessionError> {
+        if tool.server().is_none() && NEVER_RESTRICTED.contains(&tool.wire().as_str()) {
+            return Ok(());
+        }
         for layer in &self.layers {
             if !layer.patterns.iter().any(|p| p.permits(tool, subject)) {
                 return Err(SessionError::ToolRefused {
@@ -458,6 +462,14 @@ impl CallPolicy for ToolPolicy {
 
 /// The wire name of the tool the model activates a skill with.
 pub const SKILL_TOOL: &str = "skill";
+
+/// Built-in tools no skill's `allowed-tools` restricts. `report_shortfall`
+/// runs nothing and changes nothing: it tells the orchestrator what the worker
+/// lacks, and every policy refusal tells the worker to call it. Restricting it
+/// would leave a worker that a skill refused with no way to say so except to
+/// work around the refusal. The `skill` tool is not here: decision 0053 keeps
+/// it subject to an active restriction.
+pub const NEVER_RESTRICTED: &[&str] = &["report_shortfall"];
 
 /// One worker environment's skills, and the skills each of its workers
 /// activated.
@@ -567,6 +579,25 @@ impl SkillSession {
         self.activate(worker, name)
     }
 
+    /// Why `worker`'s active skills refuse `tool` with `subject`, if they do:
+    /// the refusal text names the skill. `None` for a worker this session does
+    /// not hold, or whose skills permit the call.
+    pub fn refusal_for(
+        &self,
+        worker: &str,
+        tool: &QualifiedName,
+        subject: Option<&str>,
+    ) -> Option<String> {
+        let policy = self
+            .workers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(worker)
+            .and_then(Weak::upgrade)?;
+        let policy = policy.lock().unwrap_or_else(PoisonError::into_inner);
+        policy.check(tool, subject).err().map(|e| e.to_string())
+    }
+
     /// Activate `name` for `worker` as the model, narrowing the worker's policy
     /// by the skill's `allowed-tools`. Refused for a worker with no attached
     /// policy, and for a skill the model may not invoke.
@@ -587,6 +618,55 @@ impl SkillSession {
             .unwrap_or_else(PoisonError::into_inner)
             .restrict(&active);
         Ok(active)
+    }
+}
+
+/// The skill sessions of one run's worker environments, so a run-wide tool
+/// (`report_shortfall`) can ask what a given worker's skills refuse. Passed
+/// explicitly to the tool and to the code that builds each environment; holds
+/// weak references, so an environment's session goes when the environment
+/// does.
+#[derive(Debug, Default)]
+pub struct SkillDirectory {
+    sessions: Mutex<Vec<Weak<SkillSession>>>,
+}
+
+impl SkillDirectory {
+    /// An empty directory.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Add an environment's session.
+    pub fn register(&self, session: &Arc<SkillSession>) {
+        let mut sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
+        sessions.retain(|s| s.strong_count() > 0);
+        if !sessions
+            .iter()
+            .any(|s| std::ptr::eq(s.as_ptr(), Arc::as_ptr(session)))
+        {
+            sessions.push(Arc::downgrade(session));
+        }
+    }
+
+    /// [`SkillSession::refusal_for`] across every live session: worker ids
+    /// are unique within a run, so at most one session holds the worker.
+    pub fn refusal_for(
+        &self,
+        worker: &str,
+        tool: &QualifiedName,
+        subject: Option<&str>,
+    ) -> Option<String> {
+        let sessions: Vec<Arc<SkillSession>> = self
+            .sessions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect();
+        sessions
+            .iter()
+            .find_map(|s| s.refusal_for(worker, tool, subject))
     }
 }
 
@@ -1068,6 +1148,26 @@ mod tests {
         assert!(ToolPattern::parse("").is_none());
     }
 
+    /// `report_shortfall` runs nothing: it tells the orchestrator what the
+    /// worker lacks. A skill that does not list it must not leave a refused
+    /// worker with no way to say so, since every refusal tells the worker to
+    /// call it. Only the built-in is exempt; an MCP tool of that name is not.
+    #[test]
+    fn reporting_a_shortfall_is_never_restricted_by_a_skill() {
+        let catalog = SkillCatalog::from_skills([skill("none", Some(&[]), false)]).expect("c");
+        let mut policy = ToolPolicy::unrestricted();
+        policy.restrict(&catalog.activate("none", Invoker::Model).expect("activate"));
+        let report = QualifiedName::builtin("report_shortfall").expect("name");
+        assert!(policy.check(&report, None).is_ok());
+        let mcp = QualifiedName::mcp("srv", "report_shortfall").expect("name");
+        assert!(policy.check(&mcp, None).is_err());
+        let edit = QualifiedName::builtin("Edit").expect("name");
+        assert!(
+            policy.check(&edit, None).is_err(),
+            "everything else stays refused"
+        );
+    }
+
     #[test]
     fn an_empty_allowed_tools_list_permits_nothing() {
         let catalog = SkillCatalog::from_skills([skill("none", Some(&[]), false)]).expect("c");
@@ -1188,6 +1288,37 @@ mod tests {
             .expect("w2 is not restricted");
         assert_eq!(bash_calls.load(Ordering::SeqCst), 1);
         assert!(w2.restricting().is_empty());
+    }
+
+    /// A run-wide directory answers what one worker's skills refuse, naming
+    /// the skill, and nothing for a worker no skill restricts.
+    #[test]
+    fn the_directory_names_the_skill_that_refuses_a_workers_call() {
+        let session = SkillSession::new(Arc::new(
+            SkillCatalog::from_skills([skill("edit-only", Some(&["Edit"]), false)])
+                .expect("catalog"),
+        ));
+        let directory = SkillDirectory::new();
+        directory.register(&session);
+        directory.register(&session);
+        let _w1 = session.attach("w1");
+        let _w2 = session.attach("w2");
+        session.activate("w1", "edit-only").expect("activate");
+        let bash = QualifiedName::builtin("Bash").expect("name");
+        let edit = QualifiedName::builtin("Edit").expect("name");
+        let refusal = directory
+            .refusal_for("w1", &bash, Some("ls"))
+            .expect("w1's skill refuses Bash");
+        assert!(refusal.contains("edit-only"), "{refusal}");
+        assert_eq!(directory.refusal_for("w1", &edit, None), None);
+        assert_eq!(directory.refusal_for("w2", &bash, Some("ls")), None);
+        assert_eq!(directory.refusal_for("nobody", &bash, None), None);
+        drop(session);
+        assert_eq!(
+            directory.refusal_for("w1", &bash, None),
+            None,
+            "a dropped environment's session is gone"
+        );
     }
 
     #[tokio::test]

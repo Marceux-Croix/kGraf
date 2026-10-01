@@ -132,6 +132,18 @@ pub const DEFAULT_MAX_CONTRACTS_PER_PLAN: usize = 32;
 /// Default cap on split calls in one run's decomposition.
 pub const DEFAULT_MAX_SPLITS: u32 = 8;
 
+/// Most symbols a contract is given from its declared files when no named
+/// slice resolves ([`Orchestrator::write_file_slices`]).
+const WRITE_SLICE_MAX_NODES: usize = 8;
+/// Estimated tokens those symbols may take together. Kept small (an eighth of
+/// a 32k window) because the worker can still read more with its tools; this
+/// is a starting point from the graph, not the whole file.
+const WRITE_SLICE_TOKENS: u64 = 4_000;
+/// The bound one slice renders at: the worker's per-slice budget
+/// (`GraphSlices::new(.., 2_000)` in the host), so a symbol larger than that
+/// counts at the bound.
+const WRITE_SLICE_EACH_TOKENS: u64 = 2_000;
+
 /// One vendor and model workers can be dispatched to.
 #[derive(Clone)]
 pub struct Route {
@@ -3113,6 +3125,7 @@ impl RunLoop {
     ) -> Result<(Vec<NodeId>, u64), OrchestratorError> {
         let (nodes, tokens, missing) = self.lookup_slices(names, from)?;
         for name in missing {
+            self.record.counters.empty_slice_lookups += 1;
             let at = self.now();
             self.trace(TraceEvent::EmptyGraphLookup {
                 at_ms: at,
@@ -3177,6 +3190,93 @@ impl RunLoop {
         Ok((nodes, tokens, missing))
     }
 
+    /// The slices a contract gets when none of its named slices resolve (or it
+    /// names none): the top-level symbols of the files it declares it writes,
+    /// in file order, at most [`WRITE_SLICE_MAX_NODES`] and
+    /// [`WRITE_SLICE_TOKENS`] together. The worker edits those files anyway,
+    /// and the graph is the context source, so a planner that wrote a
+    /// placeholder name or none at all still leaves the worker graph context
+    /// instead of a whole-file read. Returns the nodes, their tokens and the
+    /// files they came from; empty when the graph knows none of the files.
+    fn write_file_slices(
+        &self,
+        writes: &[crate::run_state::WriteTarget],
+    ) -> Result<(Vec<NodeId>, u64, Vec<String>), OrchestratorError> {
+        if writes.is_empty() {
+            return Ok((Vec::new(), 0, Vec::new()));
+        }
+        let graph = self.s.graph.clone();
+        let paths: Vec<String> = writes.iter().map(|w| w.path.clone()).collect();
+        blocking(move || {
+            let g = graph.lock().map_err(|_| StoreError::Poisoned)?;
+            let mut nodes = Vec::new();
+            let mut tokens = 0u64;
+            let mut files = Vec::new();
+            'files: for path in &paths {
+                let in_file = g.nodes_in_file(path)?;
+                let Some(root) = in_file
+                    .iter()
+                    .find(|n| n.kind == kgraf_graph::NodeKind::File)
+                else {
+                    continue;
+                };
+                let root_id = root.id.clone();
+                let mut took = false;
+                for n in in_file
+                    .iter()
+                    .filter(|n| n.parent_id.as_deref() == Some(root_id.as_str()))
+                {
+                    if nodes.len() >= WRITE_SLICE_MAX_NODES {
+                        break 'files;
+                    }
+                    // A slice renders at most the per-slice budget, so a large
+                    // symbol counts at that bound rather than its full size.
+                    let t = g
+                        .source_of(n)
+                        .map(|s| estimate_tokens(&s))
+                        .unwrap_or(0)
+                        .min(WRITE_SLICE_EACH_TOKENS);
+                    if tokens + t > WRITE_SLICE_TOKENS {
+                        continue;
+                    }
+                    tokens += t;
+                    nodes.push(NodeId::new(n.id.clone()));
+                    took = true;
+                }
+                if took {
+                    files.push(path.clone());
+                }
+            }
+            Ok::<_, OrchestratorError>((nodes, tokens, files))
+        })
+    }
+
+    /// Trace that a contract's slices came from its declared files, and why.
+    async fn trace_write_slices(
+        &mut self,
+        contract: &str,
+        count: usize,
+        files: &[String],
+        named: usize,
+    ) -> Result<(), OrchestratorError> {
+        let why = if named == 0 {
+            "the plan named no slice".to_owned()
+        } else {
+            format!("none of the {named} named slice(s) is in the graph")
+        };
+        let at = self.now();
+        self.trace(TraceEvent::Notice {
+            at_ms: at,
+            contract: contract.to_owned(),
+            worker: String::new(),
+            detail: format!(
+                "slices from declared files: {count} symbol(s) of {} ({why})",
+                files.join(", ")
+            ),
+        })
+        .await
+    }
+
     /// Resolve `contract`'s slices against the graph as it is at dispatch, and
     /// record them. Planning resolved them by name to node ids, but a node id
     /// hashes its symbol's signature, so a predecessor's merge that renames a
@@ -3189,16 +3289,20 @@ impl RunLoop {
     /// slices differ from the recorded ones: a contract that waits (capacity,
     /// leases) passes here on every dispatch round, and a name planning
     /// already traced as empty is not traced again each round.
+    ///
+    /// When nothing named resolves (or nothing was named), the contract gets
+    /// its declared files' symbols instead ([`Self::write_file_slices`]),
+    /// traced as a notice; `slices_from_writes` records which it was.
     async fn refresh_slices(
         &mut self,
         contract: OpenContract,
     ) -> Result<OpenContract, OrchestratorError> {
-        let (nodes, missing) = if !contract.slice_names.is_empty() {
+        let (named_nodes, missing) = if !contract.slice_names.is_empty() {
             let (nodes, _, missing) =
                 self.lookup_slices(&contract.slice_names, contract.slice_from.clone())?;
             (nodes, missing)
-        } else if contract.slices.is_empty() {
-            return Ok(contract);
+        } else if contract.slices.is_empty() || contract.slices_from_writes {
+            (Vec::new(), Vec::new())
         } else {
             let graph = self.s.graph.clone();
             let ids = contract.slices.clone();
@@ -3214,24 +3318,57 @@ impl RunLoop {
                 gone.into_iter().map(|(n, _)| n.to_string()).collect(),
             )
         };
-        if nodes == contract.slices {
+        // What the named slices resolved to last time: none when the recorded
+        // slices came from the declared files.
+        let previous_named: &[NodeId] = if contract.slices_from_writes {
+            &[]
+        } else {
+            &contract.slices
+        };
+        let named_changed = named_nodes != previous_named;
+        let (nodes, from_writes) = if named_nodes.is_empty() {
+            let (nodes, _, files) = self.write_file_slices(&contract.writes)?;
+            if nodes.is_empty() {
+                (nodes, None)
+            } else {
+                (nodes, Some(files))
+            }
+        } else {
+            (named_nodes, None)
+        };
+        if nodes == contract.slices && from_writes.is_some() == contract.slices_from_writes {
             return Ok(contract);
         }
-        for name in missing {
-            let at = self.now();
-            self.trace(TraceEvent::EmptyGraphLookup {
-                at_ms: at,
-                contract: contract.contract.clone(),
-                lookup: name,
-            })
+        if named_changed {
+            for name in missing {
+                self.record.counters.empty_slice_lookups += 1;
+                let at = self.now();
+                self.trace(TraceEvent::EmptyGraphLookup {
+                    at_ms: at,
+                    contract: contract.contract.clone(),
+                    lookup: name,
+                })
+                .await?;
+            }
+        }
+        if let Some(files) = &from_writes {
+            self.trace_write_slices(
+                &contract.contract,
+                nodes.len(),
+                files,
+                contract.slice_names.len(),
+            )
             .await?;
         }
+        let slices_from_writes = from_writes.is_some();
         if let Some(c) = self.record.contract_mut(&contract.contract) {
             c.slices.clone_from(&nodes);
+            c.slices_from_writes = slices_from_writes;
         }
         self.save()?;
         Ok(OpenContract {
             slices: nodes,
+            slices_from_writes,
             ..contract
         })
     }
@@ -3317,9 +3454,15 @@ impl RunLoop {
         let run = self.run_id();
         while let Some(item) = progress.stack.pop() {
             let from = item.spec.writes.first().map(|w| w.path.clone());
-            let (nodes, slice_tokens) = self
+            let (nodes, mut slice_tokens) = self
                 .resolve_slices(&item.id, &item.spec.slices, from)
                 .await?;
+            // Sized with what dispatch will give: the declared files' symbols
+            // when no named slice resolved (`refresh_slices` gives and traces
+            // them; nothing is recorded here, so the notice is traced once).
+            if nodes.is_empty() {
+                slice_tokens = self.write_file_slices(&item.spec.writes)?.1;
+            }
             let route = self.sizing_route(item.spec.route.as_deref());
             let base = self.base_tokens(route, &item.spec.instruction, slice_tokens);
             let projection =
@@ -5185,6 +5328,12 @@ impl RunLoop {
             }
         }
         self.record.counters.dispatches += 1;
+        if !contract.slices.is_empty() {
+            self.record.counters.sliced_dispatches += 1;
+            if contract.slices_from_writes {
+                self.record.counters.slices_from_writes += 1;
+            }
+        }
         self.since_reground += 1;
         if Self::route_is_fresh(&contract) {
             self.commit_route_pick();
@@ -7343,8 +7492,11 @@ impl RunLoop {
                     scope,
                     need,
                     why,
+                    skill_refusal,
                 } => {
-                    let answer = self.on_shortfall(worker, kind, scope, need, why).await?;
+                    let answer = self
+                        .on_shortfall(worker, kind, scope, need, why, skill_refusal)
+                        .await?;
                     let _ = reply.send(answer);
                 }
                 other => self.on_contract_control(other, reply).await?,

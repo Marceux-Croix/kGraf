@@ -107,3 +107,23 @@ skills. Then a fetcher is added, verified against that vendor's real, running se
   - **Where skills can be activated.** Workers only, through the `skill` tool. The
     orchestrator's own model calls (intake and planning) carry no tools, so no skill can be
     activated there. A brief that names skills is still refused.
+
+## Amendment: a skill's refusal comes first and is carried by a shortfall report
+
+- **A skill's refusal comes first.** When a permission hook (the command policy, the
+  permission mode) would ask about or deny a call that an active skill's `allowed-tools`
+  also refuses, the skill's refusal is the one recorded and shown, and it names the hook's
+  verdict too ("... not permitted by skill `x`'s allowed-tools; `shell-command-policy`
+  would also have asked to run it"). Nobody is asked about a call that cannot run. Before,
+  the ask came first; in a run nobody attends it became a denial that never named the
+  skill, so the worker could not tell what restricted it.
+- **Reporting a shortfall is never restricted.** `report_shortfall` runs nothing and every
+  policy refusal tells the worker to call it, so no skill's `allowed-tools` restricts the
+  built-in (an MCP tool of that name is restricted as any other). The `skill` tool stays
+  restricted, as above.
+- **The report carries the skill.** Each attempt's skill session is registered in a
+  run-wide directory that `report_shortfall` reads. A permission report whose command
+  (as a `shell` subject) or tool the reporting worker's active skill refuses carries that
+  refusal to the orchestrator, which holds the contract with the skill's name: no
+  permission grant lifts a skill's `allowed-tools`, so a grant would only start an attempt
+  the same skill refuses again.

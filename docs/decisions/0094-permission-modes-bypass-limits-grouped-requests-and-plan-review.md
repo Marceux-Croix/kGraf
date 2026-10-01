@@ -522,3 +522,16 @@ the four Seatbelt tests fail; with the directories above a frozen file not froze
 replacement-directory and config tests fail. Not run: the Linux and Windows paths (no cross
 toolchain with a C sysroot on the development machine); their code refuses the freeze and
 degrades as described.
+
+## Amendment: a call a skill refuses is not put to the user
+
+The approval chain checks the run's policies (a skill's `allowed-tools`, decision 0053) not
+only after the last hook but also when a hook asks or denies. A call a policy refuses is
+never put to the user: it is denied by that policy, and the reason names the hook that
+would have asked or that denied it. A call the policies permit is asked about or denied
+exactly as before. The permission mode is unchanged; only which refusal is reported, and
+whether a doomed call raises a request, changed.
+
+The Bypass notice is unchanged: `kgraf orchestrate` prints it on stderr at start whenever
+the run's mode is Bypass, whether the flag or the user's permissions file set it. A test
+runs the binary both ways and checks stderr.

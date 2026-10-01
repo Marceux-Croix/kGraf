@@ -1,0 +1,26 @@
+{
+    "id": "chatcmpl-304",
+    "object": "chat.completion",
+    "created": 1790857735,
+    "model": "qwen3.6:35b",
+    "system_fingerprint": "fp_ollama",
+    "choices": [
+        {
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "5",
+                "reasoning": "Here's a thinking process:\n\n1.  **Analyze User Input:** The user asks \"What is 2+3?\" and specifies \"Answer with one number.\"\n2.  **Calculate:** 2 + 3 = 5\n3.  **Check Constraint:** The user wants exactly one number as the answer.\n4.  **Formulate Response:** Just output \"5\". No extra text, to strictly follow the constraint.\n5.  **Final Output Generation:** 5\u2705"
+            },
+            "finish_reason": "stop"
+        }
+    ],
+    "usage": {
+        "prompt_tokens": 22,
+        "prompt_tokens_details": {
+            "cached_tokens": 18
+        },
+        "completion_tokens": 109,
+        "total_tokens": 131
+    }
+}

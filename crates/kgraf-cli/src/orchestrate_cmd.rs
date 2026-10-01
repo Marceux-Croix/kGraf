@@ -579,6 +579,22 @@ fn report_lines(report: &kgraf_orchestrator::RunReport) -> Vec<String> {
         "misses     {} (hand-backs and stop-point compactions)",
         report.counters.sizing_misses
     ));
+    // The graph is the context source: whether workers actually got slices is
+    // printed, so a run that gave none is visible without reading the ledger.
+    let n = &report.counters;
+    out.push(if n.dispatches > 0 && n.sliced_dispatches == 0 {
+        format!(
+            "slices     no worker was given a graph slice in {} dispatch(es); {} named lookup(s) \
+             found nothing",
+            n.dispatches, n.empty_slice_lookups
+        )
+    } else {
+        format!(
+            "slices     given in {} of {} dispatch(es), {} from declared files; {} named \
+             lookup(s) found nothing",
+            n.sliced_dispatches, n.dispatches, n.slices_from_writes, n.empty_slice_lookups
+        )
+    });
     if report.contract_checks.enabled {
         let c = &report.contracts;
         out.push(format!(
@@ -770,6 +786,35 @@ mod tests {
             .expect("runtime");
         let from_file = rt.block_on(plan_refusal_lines(&path));
         assert_eq!(from_file.len(), 3, "{from_file:?}");
+    }
+
+    /// Graph slice use is printed: how many dispatches were given a slice,
+    /// how many of those from the declared files, and how many named lookups
+    /// found nothing. A run that gave none says so in words.
+    #[test]
+    fn the_printed_report_says_how_many_dispatches_had_graph_slices() {
+        let mut report = test_report(kgraf_orchestrator::RunStatus::Completed);
+        report.counters.dispatches = 3;
+        report.counters.sliced_dispatches = 2;
+        report.counters.slices_from_writes = 1;
+        report.counters.empty_slice_lookups = 4;
+        let lines = report_lines(&report);
+        let line = lines
+            .iter()
+            .find(|l| l.starts_with("slices"))
+            .expect("a slices line");
+        assert!(line.contains("2 of 3 dispatch(es)"), "{line}");
+        assert!(line.contains("1 from declared files"), "{line}");
+        assert!(line.contains("4 named lookup(s) found nothing"), "{line}");
+
+        report.counters.sliced_dispatches = 0;
+        report.counters.slices_from_writes = 0;
+        let lines = report_lines(&report);
+        let line = lines
+            .iter()
+            .find(|l| l.starts_with("slices"))
+            .expect("a slices line");
+        assert!(line.contains("no worker was given a graph slice"), "{line}");
     }
 
     /// The lease measurements of decisions 0022 and 0049 are printed, and an

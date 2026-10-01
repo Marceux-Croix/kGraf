@@ -60,3 +60,64 @@ fn the_former_log_variable_is_used_with_one_warning() {
     assert!(stderr.contains("HAUSTORIA_LOG is ignored"), "{stderr}");
     assert!(!stderr.contains("has no effect"), "{stderr}");
 }
+
+/// Decision 0094: a run in Bypass announces it on stderr at start, whatever
+/// set the mode: the flag, or the user's permissions file with no flag. The
+/// notice is written before anything else the run does, so a run that then
+/// fails (here: the directory is not a git repository) has still announced it.
+/// A run not in Bypass prints no notice.
+#[test]
+fn a_bypass_run_announces_it_on_stderr_from_either_source() {
+    let project = tempfile::tempdir().expect("project");
+    let home = tempfile::tempdir().expect("home");
+    let bypass_file = home.path().join("bypass.toml");
+    std::fs::write(&bypass_file, "mode = \"bypass\"\n").expect("write");
+    let manual_file = home.path().join("manual.toml");
+    std::fs::write(&manual_file, "mode = \"manual\"\n").expect("write");
+    let run = |file: &std::path::Path, extra: &[&str]| {
+        let mut args = vec![
+            "-C".to_owned(),
+            project.path().to_string_lossy().into_owned(),
+            "orchestrate".to_owned(),
+            "--instruction".to_owned(),
+            "do nothing".to_owned(),
+            "--route".to_owned(),
+            "ollama:none".to_owned(),
+            "--prices".to_owned(),
+            home.path()
+                .join("prices.json")
+                .to_string_lossy()
+                .into_owned(),
+        ];
+        args.extend(extra.iter().map(|s| (*s).to_owned()));
+        Command::new(env!("CARGO_BIN_EXE_kgraf"))
+            .env("KGRAF_DIAG_DISABLE", "1")
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", home.path())
+            .env("XDG_DATA_HOME", home.path())
+            .env("KGRAF_PERMISSIONS_PATH", file)
+            .env_remove("KGRAF_CONTAINER_SANDBOX")
+            .args(&args)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run kgraf")
+    };
+    let notice = "BYPASS PERMISSION MODE";
+    for (label, out) in [
+        ("flag", run(&manual_file, &["--permission-mode", "bypass"])),
+        ("user file", run(&bypass_file, &[])),
+    ] {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(
+            stderr.matches(notice).count(),
+            1,
+            "{label}: one notice on stderr: {stderr}"
+        );
+        assert!(!stdout.contains(notice), "{label}: not on stdout: {stdout}");
+        assert!(!stderr.contains("panicked"), "{label}: {stderr}");
+    }
+    let out = run(&manual_file, &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains(notice), "manual: no notice: {stderr}");
+}

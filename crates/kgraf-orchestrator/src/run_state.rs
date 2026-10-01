@@ -97,6 +97,11 @@ pub struct OpenContract {
     /// contract's first declared write.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slice_from: Option<String>,
+    /// `slices` are the top-level symbols of the declared write files, given
+    /// because no named slice resolved (or none was named), not slices the
+    /// plan named. Counted apart in the run report.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub slices_from_writes: bool,
     /// Tools the brief needs; readiness checks the route discovered them.
     #[serde(default)]
     pub tools: Vec<String>,
@@ -334,6 +339,7 @@ impl OpenContract {
             slices: Vec::new(),
             slice_names: Vec::new(),
             slice_from: None,
+            slices_from_writes: false,
             tools: Vec::new(),
             route: None,
             route_pinned: false,
@@ -474,6 +480,14 @@ pub struct RunCounters {
     /// that could not be provided (a refused reopen, an unreadable tree, git
     /// failing). Not model attempts: never counted toward `max_retries`.
     pub environment_failures: u64,
+    /// Dispatches whose workers were given at least one graph slice.
+    pub sliced_dispatches: u64,
+    /// Of those, dispatches given the declared files' symbols because no
+    /// named slice resolved or none was named.
+    pub slices_from_writes: u64,
+    /// Slice names the plan gave that found nothing in the graph, each traced
+    /// as an `empty_graph_lookup`.
+    pub empty_slice_lookups: u64,
 }
 
 /// How the run stands.

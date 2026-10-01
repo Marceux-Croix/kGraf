@@ -889,30 +889,41 @@ impl Parts {
             agent: format!("orchestrator:{run}"),
             task: run.to_owned(),
         };
+        let mut routes = vec![
+            route_with(
+                "alpha",
+                "vendor-a",
+                ALPHA_MODEL,
+                self.alpha.clone(),
+                self.ledger.clone(),
+                window,
+                extra,
+            ),
+            route_with(
+                "beta",
+                "vendor-b",
+                BETA_MODEL,
+                self.beta.clone(),
+                self.ledger.clone(),
+                window,
+                extra,
+            ),
+        ];
+        // Workers render slices from the run's graph, as the host wires them
+        // whenever the graph has nodes; an empty graph gives no slice either way.
+        for r in &mut routes {
+            if let Some(env) = Arc::get_mut(&mut r.env) {
+                env.slices = Arc::new(kgraf_runtime::GraphSlices::new(
+                    GraphStore::open(&self.dir.join("graph.db"), &self.dir).expect("graph"),
+                    2_000,
+                ));
+            }
+        }
         Services {
             graph: self.graph.clone(),
             ledger: self.ledger.clone(),
             prices: prices(),
-            routes: vec![
-                route_with(
-                    "alpha",
-                    "vendor-a",
-                    ALPHA_MODEL,
-                    self.alpha.clone(),
-                    self.ledger.clone(),
-                    window,
-                    extra,
-                ),
-                route_with(
-                    "beta",
-                    "vendor-b",
-                    BETA_MODEL,
-                    self.beta.clone(),
-                    self.ledger.clone(),
-                    window,
-                    extra,
-                ),
-            ],
+            routes,
             decomposer: Arc::new(ModelDecomposer(caller(self.planner.clone(), "r1"))),
             grounder: Arc::new(ModelGrounder(caller(self.grounder.clone(), "r1"))),
             verifier: self.verifier.clone(),

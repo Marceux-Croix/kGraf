@@ -375,6 +375,24 @@ fn is_tool_use(content: &Content) -> bool {
     matches!(content, Content::ToolUse { .. })
 }
 
+/// The chain-of-thought text a message or stream delta carries, if any.
+///
+/// Servers in this family disagree on the field name: DeepSeek, Kimi and
+/// llama.cpp send `reasoning_content`; Ollama (recorded live, fixture
+/// `tests/fixtures/2026-10-01-ollama-qwen3.6-chat-stream.sse`), OpenRouter and
+/// recent vLLM send `reasoning`. Both are read. When both are present (a
+/// server mid-rename may send the same text twice) `reasoning_content` wins,
+/// so the text is never carried twice. Only a string is read: OpenRouter's
+/// structured `reasoning_details` array is a different field.
+fn reasoning_field(object: &serde_json::Value) -> Option<&str> {
+    ["reasoning_content", "reasoning"].iter().find_map(|name| {
+        object
+            .get(*name)
+            .and_then(|r| r.as_str())
+            .filter(|r| !r.is_empty())
+    })
+}
+
 /// Map a `finish_reason` onto kGraf's stop reasons.
 ///
 /// A vendor may report `stop` on a turn that carries tool calls (Gemini's
@@ -955,11 +973,7 @@ impl ChatCompletionsAdapter {
         // Several vendors in this family put chain-of-thought in a sibling field.
         // It is carried as reasoning rather than merged into the text, so a caller
         // can tell the difference.
-        if let Some(reasoning) = message
-            .get("reasoning_content")
-            .and_then(|r| r.as_str())
-            .filter(|r| !r.is_empty())
-        {
+        if let Some(reasoning) = reasoning_field(&message) {
             content.push(Content::Reasoning {
                 text: reasoning.to_owned(),
             });
@@ -1498,11 +1512,7 @@ impl Streaming for ChatCompletionsAdapter {
 
             if let Some(choice) = choice {
                 let delta = choice.get("delta").cloned().unwrap_or_default();
-                if let Some(reasoning) = delta
-                    .get("reasoning_content")
-                    .and_then(|r| r.as_str())
-                    .filter(|r| !r.is_empty())
-                {
+                if let Some(reasoning) = reasoning_field(&delta) {
                     // Collected, not only sunk: a previous version sank each
                     // fragment to the caller's live-display sink but never
                     // accumulated it, so a consumer reading the returned
@@ -3350,5 +3360,159 @@ mod tests {
             "finish_reason \"length\""
         );
         assert_eq!(settlement, Settlement::Counted);
+    }
+
+    #[tokio::test]
+    async fn an_ollama_stream_recorded_live_keeps_its_thinking_text() {
+        // Replays `tests/fixtures/2026-10-01-ollama-qwen3.6-chat-stream.sse`,
+        // recorded from a real Ollama server (model qwen3.6:35b) over its
+        // OpenAI-compatible endpoint. Ollama streams thinking as
+        // `delta.reasoning`, not `delta.reasoning_content`; a previous version
+        // read only the latter, so the thinking text vanished from transcripts
+        // while its tokens were still counted.
+        let sse = include_str!("../tests/fixtures/2026-10-01-ollama-qwen3.6-chat-stream.sse");
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(sse))
+            .mount(&server)
+            .await;
+        // Ollama's catalog entry: Inclusive protocol, Details dialect, usage on
+        // a trailing top-level chunk.
+        let adapter_config = ProviderConfig::new(
+            ADAPTER,
+            server.uri(),
+            "test-key",
+            vec!["qwen3.6:35b".into()],
+            Protocol::Inclusive,
+        )
+        .expect("config");
+        let adapter = ChatCompletionsAdapter::new(adapter_config, UsageDialect::Details)
+            .expect("adapter")
+            .streaming_usage_from(StreamedUsageLocation::TopLevelChunk);
+        let ledger = Ledger::open_in_memory().expect("ledger");
+        let token = ledger
+            .begin(ADAPTER, Protocol::Inclusive, "qwen3.6:35b", "w", "t")
+            .expect("begin");
+        let mut events = Vec::new();
+        let r = Streaming::stream(
+            &adapter,
+            &Request::new("qwen3.6:35b", "hi", 200),
+            &token,
+            &mut |e| events.push(e),
+        )
+        .await;
+        drop(token);
+        let response = r.expect("stream");
+        assert_eq!(response.text(), "5", "thinking must not leak into text");
+        let reasoning: Vec<&str> = response
+            .content
+            .iter()
+            .filter_map(|c| match c {
+                Content::Reasoning { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            reasoning.len(),
+            1,
+            "one joined block: {:?}",
+            response.content
+        );
+        assert!(
+            reasoning[0].starts_with("Here's a thinking process:")
+                && reasoning[0].contains("2 + 3 = 5"),
+            "the whole streamed thinking must be kept: {:?}",
+            reasoning[0]
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                StreamEvent::Delta {
+                    content: Content::Reasoning { .. }
+                }
+            )),
+            "the live sink must see the thinking too"
+        );
+        assert_eq!(response.usage.total_output(), 107);
+    }
+
+    #[test]
+    fn an_ollama_response_recorded_live_keeps_its_thinking_text() {
+        // `tests/fixtures/2026-10-01-ollama-qwen3.6-chat-complete.json`, a real
+        // non-streamed Ollama answer: thinking arrives as `message.reasoning`.
+        let body: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/2026-10-01-ollama-qwen3.6-chat-complete.json"
+        ))
+        .expect("fixture");
+        let adapter_config = ProviderConfig::new(
+            ADAPTER,
+            "https://example.invalid",
+            "test-key",
+            vec!["qwen3.6:35b".into()],
+            Protocol::Inclusive,
+        )
+        .expect("config");
+        let adapter =
+            ChatCompletionsAdapter::new(adapter_config, UsageDialect::Details).expect("adapter");
+        let response = adapter.parse_response("qwen3.6:35b", &body).expect("parse");
+        assert_eq!(response.text(), "5");
+        // Ollama reports a reused prompt prefix as `cached_tokens` (18 of 22).
+        assert_eq!(response.usage.cache_read, 18);
+        assert_eq!(response.usage.uncached_input, 4);
+        assert_eq!(response.usage.total_output(), 109);
+        assert!(
+            response.content.iter().any(|c| matches!(
+                c,
+                Content::Reasoning { text } if text.starts_with("Here's a thinking process:")
+            )),
+            "message.reasoning must be carried: {:?}",
+            response.content
+        );
+    }
+
+    #[test]
+    fn a_message_carrying_both_reasoning_names_yields_one_block() {
+        // A server may send both names while it renames the field; the text
+        // must not be carried twice.
+        let adapter =
+            ChatCompletionsAdapter::new(config("https://example.invalid"), UsageDialect::Details)
+                .expect("adapter");
+        let mut body = details_body("compatible-model");
+        body["choices"][0]["message"] = json!({
+            "role": "assistant",
+            "reasoning_content": "same thought",
+            "reasoning": "same thought",
+            "content": "the answer"
+        });
+        let response = adapter
+            .parse_response("compatible-model", &body)
+            .expect("parse");
+        let blocks: Vec<_> = response
+            .content
+            .iter()
+            .filter(|c| matches!(c, Content::Reasoning { .. }))
+            .collect();
+        assert_eq!(blocks.len(), 1, "{:?}", response.content);
+    }
+
+    #[tokio::test]
+    async fn a_delta_carrying_both_reasoning_names_is_collected_once() {
+        let sse = concat!(
+            "data: {\"id\":\"c\",\"model\":\"compatible-model\",\"choices\":\
+             [{\"index\":0,\"delta\":{\"reasoning_content\":\"think\",\"reasoning\":\"think\"}}]}\n\n",
+            "data: {\"id\":\"c\",\"model\":\"compatible-model\",\"choices\":\
+             [{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}],\
+             \"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n",
+        );
+        let (r, _, _) = probe(sse).await;
+        let response = r.expect("stream");
+        assert!(
+            response
+                .content
+                .iter()
+                .any(|c| matches!(c, Content::Reasoning { text } if text == "think")),
+            "{:?}",
+            response.content
+        );
     }
 }

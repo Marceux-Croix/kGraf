@@ -15,7 +15,9 @@
 
 use super::*;
 use crate::challenge::ContractReply;
-use crate::shortfall::{RequestScope, ShortfallDecision, ShortfallKind, decide, stored};
+use crate::shortfall::{
+    RequestScope, ShortfallDecision, ShortfallKind, decide, skill_hold_reason, stored,
+};
 
 impl RunLoop {
     pub(super) async fn on_shortfall(
@@ -25,6 +27,7 @@ impl RunLoop {
         scope: RequestScope,
         need: String,
         why: String,
+        skill_refusal: Option<String>,
     ) -> Result<ContractReply, OrchestratorError> {
         let Some(contract_id) = self
             .in_flight
@@ -67,6 +70,15 @@ impl RunLoop {
                 }
             }
             other => other,
+        };
+        // A skill's `allowed-tools` is not the permission mode's to lift: a
+        // grant would start a fresh attempt the same skill refuses again. The
+        // contract is held, naming the skill.
+        let decision = match (kind, skill_refusal) {
+            (ShortfallKind::Permission, Some(refusal)) => ShortfallDecision::Hold {
+                reason: skill_hold_reason(&refusal),
+            },
+            _ => decision,
         };
         let now = self.now();
         let request = match &decision {

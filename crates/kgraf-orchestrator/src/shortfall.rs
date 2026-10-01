@@ -36,12 +36,15 @@ use crate::challenge::{ContractControl, ContractReply};
 use crate::challenge_tool::ContractLine;
 use crate::run_state::OpenContract;
 use kgraf_runtime::WorkerResult;
+use kgraf_session::skills::SkillDirectory;
+use kgraf_tools::QualifiedName;
 use kgraf_tools::permissions::{AllowSet, FILE_EDIT_PROGRAMS, PermissionMode};
 use kgraf_tools::{
     Access, CallPermit, Tool, ToolContext, ToolDefinition, ToolError, ToolOutput, UntrustedText,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 pub use kgraf_runtime::SHORTFALL_TOOL;
 
@@ -439,12 +442,56 @@ pub(crate) fn stored(text: &str) -> String {
 /// as given.
 pub struct ShortfallTool {
     line: ContractLine,
+    skills: Option<Arc<SkillDirectory>>,
 }
 
 impl ShortfallTool {
     pub fn new(line: ContractLine) -> Self {
-        Self { line }
+        Self { line, skills: None }
     }
+
+    /// Look up the reporting worker's active skills in `skills`, so a
+    /// permission report a skill refuses carries that refusal to the
+    /// orchestrator ([`skill_refusal`]).
+    pub fn with_skills(mut self, skills: Arc<SkillDirectory>) -> Self {
+        self.skills = Some(skills);
+        self
+    }
+}
+
+/// What the reporting worker's skills refuse of a permission report, if they
+/// refuse it: a command's program as a `shell` subject, or a tool by name. A
+/// file widening is a write scope, not a tool, so no skill is asked about it.
+pub fn skill_refusal(
+    skills: &SkillDirectory,
+    worker: &str,
+    kind: ShortfallKind,
+    scope: RequestScope,
+    need: &str,
+) -> Option<String> {
+    if kind != ShortfallKind::Permission {
+        return None;
+    }
+    let need = need.trim();
+    match scope {
+        RequestScope::Command => {
+            let shell = QualifiedName::builtin("shell").ok()?;
+            skills.refusal_for(worker, &shell, Some(need))
+        }
+        RequestScope::Tool => {
+            let tool = QualifiedName::parse(need).ok()?;
+            skills.refusal_for(worker, &tool, None)
+        }
+        RequestScope::File => None,
+    }
+}
+
+/// The held reason for a permission report a skill refuses.
+pub fn skill_hold_reason(refusal: &str) -> String {
+    format!(
+        "{refusal}; a permission grant cannot lift a skill's allowed-tools, so the contract is \
+         held: change the skill's allowed-tools, or the instruction"
+    )
 }
 
 /// `deny_unknown_fields`: the input is the report, and nothing else. A field
@@ -518,12 +565,22 @@ impl Tool for ShortfallTool {
                  and say in your answer what you need and why.",
             ));
         };
+        let skill_refusal = self.skills.as_deref().and_then(|skills| {
+            skill_refusal(
+                skills,
+                ctx.worker.as_str(),
+                input.kind,
+                input.scope,
+                &input.need,
+            )
+        });
         let control = ContractControl::Shortfall {
             worker: ctx.worker.clone(),
             kind: input.kind,
             scope: input.scope,
             need: input.need,
             why: input.why,
+            skill_refusal,
         };
         tokio::select! {
             reply = handle.contract(control) => Ok(match reply {
@@ -549,9 +606,97 @@ impl Tool for ShortfallTool {
 mod tests {
     use super::*;
     use kgraf_core::TaskId;
+    use kgraf_session::skills::{SkillCatalog, SkillSession};
 
     fn contract() -> OpenContract {
         OpenContract::planned("c1", TaskId::new("t"), "do it", "it is done")
+    }
+
+    /// A session whose worker `w1` activated `read-only-audit`, which allows
+    /// only reading tools: the shape of a canary run where both the skill and
+    /// the permission mode refused a shell call.
+    fn restricted() -> (Arc<SkillSession>, Arc<SkillDirectory>, impl Sized) {
+        let skill = serde_json::from_value(serde_json::json!({
+            "name": "read-only-audit",
+            "description": "audit",
+            "frontmatter": {},
+            "body": "read only",
+            "files": [],
+            "allowed_tools": ["read_file", "list_directory"],
+            "disable_model_invocation": false,
+            "user_invocable": true,
+            "hash": "h",
+            "sources": [],
+        }))
+        .expect("skill");
+        let session = SkillSession::new(Arc::new(
+            SkillCatalog::from_skills([skill]).expect("catalog"),
+        ));
+        let worker = session.attach("w1");
+        session.activate("w1", "read-only-audit").expect("activate");
+        let directory = SkillDirectory::new();
+        directory.register(&session);
+        (session, directory, worker)
+    }
+
+    #[test]
+    fn a_permission_report_a_skill_refuses_carries_the_skills_refusal() {
+        let (_session, skills, _w) = restricted();
+        let command = skill_refusal(
+            &skills,
+            "w1",
+            ShortfallKind::Permission,
+            RequestScope::Command,
+            "wc",
+        )
+        .expect("the skill refuses shell");
+        assert!(command.contains("read-only-audit"), "{command}");
+        let tool = skill_refusal(
+            &skills,
+            "w1",
+            ShortfallKind::Permission,
+            RequestScope::Tool,
+            "apply_patch",
+        )
+        .expect("the skill refuses apply_patch");
+        assert!(tool.contains("apply_patch"), "{tool}");
+        assert_eq!(
+            skill_refusal(
+                &skills,
+                "w1",
+                ShortfallKind::Permission,
+                RequestScope::Tool,
+                "read_file"
+            ),
+            None,
+            "a tool the skill allows is the mode's question"
+        );
+        assert_eq!(
+            skill_refusal(
+                &skills,
+                "w2",
+                ShortfallKind::Permission,
+                RequestScope::Command,
+                "wc"
+            ),
+            None,
+            "another worker is not restricted"
+        );
+        assert_eq!(
+            skill_refusal(
+                &skills,
+                "w1",
+                ShortfallKind::Instructions,
+                RequestScope::Command,
+                "wc"
+            ),
+            None
+        );
+        let held = skill_hold_reason(&command);
+        assert!(
+            held.contains("read-only-audit") && held.contains("cannot lift"),
+            "{held}"
+        );
     }
 
     fn authority(mode: PermissionMode, attended: bool) -> Authority {
