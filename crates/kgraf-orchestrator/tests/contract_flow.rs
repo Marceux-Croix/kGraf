@@ -682,6 +682,84 @@ async fn a_handshake_mismatch_holds_the_parties_with_the_statements_recorded() {
     ));
 }
 
+/// A hold is attributable to a model pair: each handshake statement names the
+/// route its party runs on and the model that stated it, the check event that
+/// holds the parties names every party's route and model, and the run record
+/// keeps the hold with the same parties.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_handshake_hold_names_each_partys_route_and_model() {
+    let dir = tempfile::tempdir().expect("dir");
+    let rig = Rig::new(
+        dir.path(),
+        plan_json(&parties_plan(false)),
+        |prompt| {
+            if prompt.contains("You are party `prod`") {
+                agreeing(prompt)
+            } else {
+                serde_json::json!({
+                    "expect": ["I assume `parse_config` returns `Optional[Config]`"],
+                    "touch": ["consumer.py"]
+                })
+                .to_string()
+            }
+        },
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    let _ = rig
+        .orchestrator(vec![py_ic()])
+        .start(RunId::new("r1"), "parse the config".into())
+        .await
+        .expect("run");
+    let route_model = |route: &str| match route {
+        "alpha" => ALPHA_MODEL,
+        "beta" => BETA_MODEL,
+        other => panic!("unexpected route {other}"),
+    };
+    let events = rig.contract_events().await;
+    let Some(ContractEvent::CheckFailed {
+        handshake,
+        parties,
+        held,
+        ..
+    }) = events.last()
+    else {
+        panic!("{events:?}")
+    };
+    assert_eq!(handshake.len(), 2);
+    for st in handshake {
+        assert!(!st.route.is_empty(), "{st:?}");
+        // The rig's handshaker is one model for every party: the statement
+        // names that model, the one that actually stated it.
+        assert_eq!(st.model, PLAN_MODEL, "{st:?}");
+    }
+    let mut named: Vec<(&str, &str, &str)> = parties
+        .iter()
+        .map(|p| (p.party.as_str(), p.route.as_str(), p.model.as_str()))
+        .collect();
+    named.sort();
+    assert_eq!(named.len(), 2, "{parties:?}");
+    for (party, route, model) in &named {
+        assert_eq!(*model, route_model(route), "{party}");
+        let stated = handshake
+            .iter()
+            .find(|s| s.party == *party)
+            .expect("stated");
+        assert_eq!(stated.route, *route, "the statement's route is the party's");
+    }
+    assert_ne!(named[0].1, named[1].1, "the parties run on two routes");
+    assert!(!held.is_empty());
+    let record = kgraf_orchestrator::RunStore::new(rig.parts.graph.clone())
+        .load(&RunId::new("r1"))
+        .expect("load")
+        .expect("record");
+    let hold = record.check_holds.last().expect("a recorded hold");
+    assert_eq!(hold.interface, "config");
+    assert_eq!(hold.stage, "handshake");
+    assert_eq!(&hold.held, held);
+    assert_eq!(&hold.parties, parties);
+}
+
 /// An assumption that names no contract symbol cannot be compared with any
 /// other party's statement: it is recorded with the pass as a warning, and both
 /// parties dispatch.

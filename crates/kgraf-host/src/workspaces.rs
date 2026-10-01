@@ -184,10 +184,61 @@ pub(crate) fn now_nanos() -> u128 {
 /// refused without `force`, saying which run. A live owner or a process still
 /// running in it is refused by the sandbox (`WorkspaceError::Busy`), with its
 /// reason.
+///
+/// Kept worktrees live in two places under the state directory
+/// ([`WORKTREE_BASES`]): an orchestrated run's under `worktrees`, and
+/// `kgraf worker`'s under `workspaces` (decision 0088). `name` is looked up
+/// in both; `worktrees/<name>` or `workspaces/<name>` names one. A name in
+/// neither is refused listing every kept worktree in both; a name in both is
+/// refused until the caller says which.
 pub fn clean(root: &Path, name: &str, force: bool) -> Result<PathBuf> {
     let state = state_dir(root)?;
-    clean_in(root, &state.join("worktrees"), name, force)
+    let (only, leaf) = match name.split_once('/') {
+        Some((base, leaf)) if WORKTREE_BASES.contains(&base) => (Some(base), leaf),
+        _ => (None, name),
+    };
+    let git = kgraf_sandbox::git::Git::discover().step("cannot find git")?;
+    let entries = git
+        .worktree_list(root)
+        .step("cannot list the repository's worktrees")?;
+    let mut found = Vec::new();
+    let mut kept = Vec::new();
+    for base in WORKTREE_BASES {
+        let dir = state.join(base);
+        let canonical = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+        let mut names: Vec<String> = entries
+            .iter()
+            .filter(|e| e.path.parent() == Some(canonical.as_path()))
+            .filter_map(|e| e.path.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .collect();
+        names.sort();
+        if only.is_none_or(|o| o == *base) && names.iter().any(|n| n == leaf) {
+            found.push((*base, dir));
+        }
+        kept.extend(names.into_iter().map(|n| format!("{base}/{n}")));
+    }
+    match found.as_slice() {
+        [(_, dir)] => clean_in(root, dir, leaf, force),
+        [] => Err(Error::Invalid(format!(
+            "no worktree named {name} under .kgraf/worktrees (runs) or .kgraf/workspaces \
+             (kgraf worker); kept worktrees: {}",
+            if kept.is_empty() {
+                "none".to_owned()
+            } else {
+                kept.join(", ")
+            }
+        ))),
+        _ => Err(Error::Invalid(format!(
+            "a worktree named {leaf} exists under both .kgraf/worktrees and .kgraf/workspaces; \
+             name one: `kgraf clean worktrees/{leaf}` or `kgraf clean workspaces/{leaf}`"
+        ))),
+    }
 }
+
+/// The directories under the state directory that hold worktrees kGraf
+/// makes and may keep: an orchestrated run's (`worktrees`) and
+/// `kgraf worker`'s (`workspaces`).
+pub const WORKTREE_BASES: &[&str] = &["worktrees", "workspaces"];
 
 pub(crate) fn clean_in(root: &Path, base: &Path, name: &str, force: bool) -> Result<PathBuf> {
     let state = state_dir(root)?;

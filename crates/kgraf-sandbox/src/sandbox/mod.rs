@@ -82,7 +82,44 @@ pub struct SandboxPolicy {
     /// `~/.cargo`.
     #[cfg_attr(not(unix), allow(dead_code))]
     user_cargo_home: Option<PathBuf>,
+    /// Git directories made writable whose configuration stays read-only
+    /// ([`Self::with_frozen_git_config`]).
+    frozen_git: Vec<FrozenGit>,
 }
+
+/// A writable git directory whose configuration files stay read-only
+/// (decision 0094). See [`SandboxPolicy::with_frozen_git_config`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrozenGit {
+    /// The shared git directory (`git rev-parse --git-common-dir`).
+    pub common_dir: PathBuf,
+    /// Further files git reads configuration from that may lie under a
+    /// writable root: every `include.path` and `includeIf.*.path` target,
+    /// existing or not.
+    pub files: Vec<PathBuf>,
+}
+
+/// The files, relative to a frozen git directory, that decide which programs
+/// git runs: the shared config, the per-worktree config of the main
+/// worktree, the info attributes (they select drivers), and in each worktree
+/// admin directory the `commondir` pointer (it names the directory whose
+/// config git reads) and its per-worktree config; each with the lock file
+/// git writes it through. `*` is one path segment of any name. Every
+/// directory above an entry (`info`, `worktrees`, `worktrees/*`) is frozen as
+/// a directory entry too, so it cannot be renamed away and replaced by one
+/// built elsewhere; writes inside it stay allowed.
+pub const FROZEN_GIT_FILES: &[&str] = &[
+    "config",
+    "config.lock",
+    "config.worktree",
+    "config.worktree.lock",
+    "info/attributes",
+    "info/attributes.lock",
+    "worktrees/*/commondir",
+    "worktrees/*/commondir.lock",
+    "worktrees/*/config.worktree",
+    "worktrees/*/config.worktree.lock",
+];
 
 impl SandboxPolicy {
     /// Writes allowed only beneath `writable_roots` (plus `/dev/null`).
@@ -99,6 +136,7 @@ impl SandboxPolicy {
             ancestor_limit: None,
             hold: None,
             user_cargo_home: None,
+            frozen_git: Vec::new(),
         }
     }
 
@@ -151,6 +189,27 @@ impl SandboxPolicy {
     /// keeps that directory read-only.
     pub fn with_writable_root(mut self, dir: PathBuf) -> Self {
         self.writable_roots.push(dir);
+        self
+    }
+
+    /// Decision 0094: inside `common_dir`, made writable with
+    /// [`Self::with_writable_root`], keep every [`FROZEN_GIT_FILES`] entry and
+    /// each of `files` read-only: no write, creation, deletion, rename or
+    /// link. On a case-insensitive volume a name spelled in another case is
+    /// denied too, existing or not: Seatbelt compares names the way the
+    /// volume does (measured). kGraf's own git lists the configuration and
+    /// then runs with every driver and hook it found neutralized; with these
+    /// files frozen, a command running while kGraf's git runs cannot add one
+    /// between the two. A configuration write goes through the locked
+    /// protected-write path instead.
+    ///
+    /// Enforced on macOS ([`IsolationStrength::git_config_freezable`]). The
+    /// Linux and Windows backends cannot deny a file inside a writable
+    /// directory, and refuse a policy that asks
+    /// ([`SandboxError::PolicyNotEnforceable`]) rather than run with the
+    /// configuration writable.
+    pub fn with_frozen_git_config(mut self, common_dir: PathBuf, files: Vec<PathBuf>) -> Self {
+        self.frozen_git.push(FrozenGit { common_dir, files });
         self
     }
 
@@ -313,6 +372,20 @@ impl SandboxPolicy {
             home: home_dir(),
             ancestor_limit: self.ancestor_limit.as_deref().map(resolve).transpose()?,
             cargo_homes: cargo_homes(),
+            frozen_git: self
+                .frozen_git
+                .iter()
+                .map(|f| {
+                    Ok(FrozenGit {
+                        common_dir: resolve(&f.common_dir)?,
+                        files: f
+                            .files
+                            .iter()
+                            .map(|p| resolve_lenient(p))
+                            .collect::<Result<_, SandboxError>>()?,
+                    })
+                })
+                .collect::<Result<_, SandboxError>>()?,
         })
     }
 }
@@ -364,6 +437,40 @@ struct Resolved {
     /// root is read (Linux and macOS).
     #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
     cargo_homes: Option<Vec<PathBuf>>,
+    /// See [`SandboxPolicy::with_frozen_git_config`]: the git directory
+    /// canonical, each file with its existing ancestors canonical. Enforced
+    /// on macOS; the other backends refuse a non-empty list.
+    frozen_git: Vec<FrozenGit>,
+}
+
+/// `path` with its deepest existing ancestor canonical and the rest
+/// appended as written, so a file that does not exist yet still matches the
+/// resolved paths Seatbelt compares.
+fn resolve_lenient(path: &Path) -> Result<PathBuf, SandboxError> {
+    if !path.is_absolute() {
+        return Err(SandboxError::InvalidPolicy(format!(
+            "path {} is not absolute",
+            path.display()
+        )));
+    }
+    let mut rest = Vec::new();
+    let mut cur = path;
+    loop {
+        if let Ok(real) = std::fs::canonicalize(cur) {
+            let mut out = real;
+            for part in rest.iter().rev() {
+                out.push(part);
+            }
+            return Ok(out);
+        }
+        match (cur.parent(), cur.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_owned());
+                cur = parent;
+            }
+            _ => return Ok(path.to_path_buf()),
+        }
+    }
 }
 
 fn resolve(path: &Path) -> Result<PathBuf, SandboxError> {
@@ -508,6 +615,11 @@ pub struct IsolationStrength {
     /// worker cannot rewrite its gitlink. Where false, call
     /// [`Workspace::verify_gitlink`] before host-side git operations.
     pub gitlink_protected: bool,
+    /// [`SandboxPolicy::with_frozen_git_config`] is enforceable: the backend
+    /// can keep single files inside a writable directory read-only. Where
+    /// false, decision 0094's Bypass shell runs with the git directory
+    /// read-only instead.
+    pub git_config_freezable: bool,
     /// What the backend does not stop, in words for the interface.
     pub gaps: &'static str,
 }
@@ -780,6 +892,18 @@ pub fn sandboxed_command(
         let resolved = policy.resolved()?;
         #[cfg(windows)]
         let mut cmd = Command::new(program.as_ref());
+        // Linux and Windows cannot keep one file inside a writable directory
+        // read-only; run nothing rather than leave the git config writable.
+        #[cfg(not(target_os = "macos"))]
+        if !resolved.frozen_git.is_empty() {
+            return Err(SandboxError::PolicyNotEnforceable {
+                #[cfg(windows)]
+                backend: windows::BACKEND_NAME,
+                #[cfg(target_os = "linux")]
+                backend: linux::BACKEND_NAME,
+                what: "a read-only git configuration inside a writable git directory",
+            });
+        }
         #[cfg(windows)]
         let prepared = {
             if !policy.accept_partial {

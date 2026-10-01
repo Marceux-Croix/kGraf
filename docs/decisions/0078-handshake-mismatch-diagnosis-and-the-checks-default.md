@@ -140,3 +140,31 @@ recorded handshake is replayed verbatim as a test fixture.
   not state the opposite of. Different numbers follow the same rule. `disagree` (a claim the
   provider does not state) is unchanged: a claim about the symbol is about the symbol,
   whoever the sentence names.
+
+## Amendment: a hold names the models of its parties
+
+Handshake statements and contract-check events named parties, never their routes or models, so
+an interface hold could not be tied to the models that caused it.
+
+- **Each handshake statement** (`HandshakeStatement`) carries `route`, the route its party runs
+  on as the request named it, and `model`, the model that stated it: the handshaker's caller
+  (`ModelHandshaker`, `RoutedHandshaker`), or the route's model when a handshaker does not say.
+  Both are set by kGraf after the answer is parsed (`parse_handshake` clears them), never read
+  from the model's text, like `party`.
+- **Each check event** that names parties (`ChecksPassed`, `CheckFailed`, `CheckNotRun`) carries
+  `parties`: every party of the interface, held or not, with the route it runs on (its recorded
+  worker route, else its assigned or pinned route, else the route its handshake was asked on) and
+  that route's model. A party with no route yet (verified before the run, or a route that is not
+  configured) has both empty. Reading them picks no route.
+- **The run record** keeps every hold a check placed (`RunStateRecord::check_holds`): the
+  interface and version, the failed stage (`artifact`, `stub_compile`, `vacuity`, `handshake`,
+  `stub_land`, or `not_run`), the contracts held and the same `parties`. A check that held
+  nothing adds no entry.
+- **Older records** read with the fields empty (`serde(default)`); nothing is rewritten.
+
+Tests: `contract_flow.rs` `a_handshake_hold_names_each_partys_route_and_model` (a mismatch on
+two routes: each statement names its route and the model that stated it, the `CheckFailed`
+event names both parties with their routes and models on different routes, and the run record's
+last `check_holds` entry holds the same parties and held contracts); `checks.rs`
+`a_party_states_its_handshake_on_its_own_route` (a routed statement names `b:mb` and `mb`, and a
+model's answer naming a route or a model is cleared).

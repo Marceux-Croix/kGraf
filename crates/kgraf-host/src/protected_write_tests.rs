@@ -17,7 +17,8 @@ enum Worker {
     /// then writes `a.txt`.
     Good,
     /// Writes garbage into `refs/heads/main` with a shell command, then
-    /// writes `a.txt`.
+    /// writes `a.txt`. Run on macOS only (see its test).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     CorruptsRef,
     /// Writes a `.kgraf/worker.json` the host would refuse to load, then
     /// writes `a.txt`.
@@ -25,7 +26,8 @@ enum Worker {
     /// Tries the ledger and the trace, then writes `a.txt`.
     Books,
     /// Deletes the object of its `HEAD` commit and every pack with a shell
-    /// git command, then writes `a.txt`.
+    /// git command, then writes `a.txt`. Run on macOS only.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     DeletesObjects,
 }
 
@@ -279,6 +281,10 @@ async fn bypass_writes_to_git_and_settings_land_and_are_recorded() {
 /// Bypass: a shell command that writes garbage into `refs/heads/main` is
 /// caught when it ends; the ref is restored, every attempt fails with the
 /// check's output, nothing is merged, and the repository passes fsck.
+// A shell command writes the repository directory only where the sandbox
+// can keep its configuration files read-only (macOS); elsewhere it runs
+// read-only and this corruption cannot happen.
+#[cfg(target_os = "macos")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bypass_restores_a_corrupted_ref_and_fails_the_attempt() {
     let r = run(
@@ -327,6 +333,8 @@ async fn bypass_restores_a_corrupted_ref_and_fails_the_attempt() {
 /// attempt's object snapshot, every attempt fails with the check's output,
 /// nothing is merged, the repository passes fsck, and no snapshot is left
 /// in the state directory.
+// macOS only, as above.
+#[cfg(target_os = "macos")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bypass_restores_deleted_objects_and_fails_the_attempt() {
     let r = run(

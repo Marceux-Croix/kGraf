@@ -95,6 +95,9 @@ pub(super) const STRENGTH: IsolationStrength = IsolationStrength {
     // The deny ACE and the Low integrity level are applied, but neither has
     // been verified on Windows.
     gitlink_protected: false,
+    // A deny ACE on a file inside a writable root is bypassed by
+    // FILE_DELETE_CHILD on its parent, and none is verified on Windows.
+    git_config_freezable: false,
     gaps: "reads are not confined: the Low integrity level blocks writes up, not reads, so \
            %USERPROFILE%\\.ssh, browser profiles, the Credential Manager API and every file \
            the user can read stay readable; a Low process can also open the (Medium) harness \

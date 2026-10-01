@@ -98,11 +98,27 @@ impl Tool for ReadFileTool {
             MAX_READ_BYTES,
             self.hard_links.permits(path),
         )?;
+        register_if_secrets_file(path, &bytes);
         let mime = mime_guess_from_extension(path);
         Ok(ToolOutput {
             parts: vec![OutputPart::from_bytes(&bytes, mime.as_deref())],
             is_error: false,
         })
+    }
+}
+
+/// Decision 0071: a worker read a file named like a secrets file (`.env`,
+/// `.env.*`, `*.env`, `secrets.json`, ...; `kgraf_secrets::is_secrets_file_name`),
+/// so its credential values join the record scrubber before the result is
+/// taken in: transcripts, traces and run records lose them. The model-facing
+/// path is unchanged: the worker reads the file it asked for, values
+/// included. Called before the bytes become a tool result.
+pub(crate) fn register_if_secrets_file(path: &Path, bytes: &[u8]) {
+    let named = path
+        .file_name()
+        .is_some_and(|n| kgraf_secrets::is_secrets_file_name(&n.to_string_lossy()));
+    if named && let Ok(text) = std::str::from_utf8(bytes) {
+        kgraf_secrets::register_records_only(text);
     }
 }
 
@@ -440,6 +456,8 @@ fn search_dir(dir: &cap_std::fs::Dir, label: &Path, walk: &mut Walk) {
             }
             Err(_) => continue,
         };
+        // A match line can quote a secrets file's value (decision 0071).
+        register_if_secrets_file(Path::new(&name), text.as_bytes());
         let relative = child_label.display().to_string();
         for (index, line) in text.lines().enumerate() {
             if line.contains(&walk.query) {
@@ -470,6 +488,31 @@ mod tests {
 
     fn permit() -> CallPermit {
         CallPermit::new()
+    }
+
+    /// Decision 0071: a search that reads a secrets file adds its values to
+    /// the record scrubber; the match the model reads keeps the value.
+    #[tokio::test]
+    async fn a_search_through_a_secrets_file_scrubs_its_values_from_records() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = "kGrafMarkerSearch3Vd8Mx1Qh";
+        std::fs::create_dir_all(dir.path().join("deploy")).expect("dir");
+        std::fs::write(
+            dir.path().join("deploy/ci.env"),
+            format!("SERVICE_TOKEN={marker}\n"),
+        )
+        .expect("seed");
+        let out = SearchFilesTool::default()
+            .call(
+                json!({"query": "SERVICE_TOKEN"}),
+                &ctx(dir.path().to_path_buf()),
+                &permit(),
+            )
+            .await
+            .expect("call");
+        let text = out.render();
+        assert!(text.contains(marker), "{text}");
+        assert!(!kgraf_secrets::scrub_persist(&text).contains(marker));
     }
 
     #[tokio::test]

@@ -479,8 +479,7 @@ and agent messages) adds gitleaks-derived pattern rules, with a generic
 credential rule additionally gated by entropy and gitleaks' own allowlist. A
 persist-path marker is self-describing, since resuming a run rebuilds
 context from the persisted, pattern-scrubbed transcript rather than from what
-the live model actually saw. kGraf's own configured credentials register
-into the shared registry that backs both paths. A transcript file holds a
+the live model actually saw. kGraf's own configured credentials register into the shared registry that backs both paths. A secrets file a worker reads (`.env`, `.env.*`, `*.env`, `secrets.json` and the like, at any depth, through `read_file`, `search_files` or a shell command that names it) adds its credential values to a records-only registry that only the persist path reads: transcripts, traces and run records lose them, and the worker still reads the file (decision 0071). A transcript file holds a
 round's settled message, never its streamed deltas, so a secret split across
 two deltas is never written; the model is shown an in-memory registry-only
 copy of intake text; redactions are recorded as kinds and counts; deleted run
@@ -570,8 +569,7 @@ is an overlap only between parties no dependency orders; an expectation the
 interface's own files state is not a disagreement with a silent provider; a
 negated expectation is compared with a provision only when it names the
 providing party or names no party, so an assumption about a third party is
-not read as the provider's opposite (decision 0078, amended). A sentence
-bound to no surface symbol is recorded as a warning and holds nothing.
+not read as the provider's opposite (decision 0078, amended). A sentence bound to no surface symbol is recorded as a warning and holds nothing. Each statement names its party's route and the model that stated it, each check event names every party's route and model, and the run record keeps every hold a check placed with the same parties (`check_holds`), so a hold is attributable to a model pair (0078 amendment).
 
 ### Message bus
 
@@ -1126,8 +1124,7 @@ requests at once, and requests raised within 2 s of each other are answered as
 one group in the box. The user's deny and ask rules and the refusal to delete
 system paths hold in every mode; a run nobody attends denies what would ask.
 In Bypass only, a worker may also write the repository's git directory
-(`.git/<path>`, resolved as git resolves it; through `apply_patch`, and
-through any shell command) and kGraf's settings
+(`.git/<path>`, resolved as git resolves it; through `apply_patch`, and on macOS through any shell command, whose sandbox keeps the git configuration files read-only; elsewhere through `apply_patch` only) and kGraf's settings
 (`.kgraf/run.json`, `.kgraf/worker.json`), each write behind a bounded
 snapshot and an integrity check that runs before the call returns, with
 `git fsck --connectivity-only` when an object file went missing and when the
@@ -1150,10 +1147,7 @@ monitor, credential helpers, signing and every transport off, no submodule
 recursion, and the inherited `GIT_*` environment removed but the identity.
 Builtin attributes and the identity are kept, so results stay byte-correct; a
 filtered path (git-lfs) is stored in its committed form, and a path with a
-configured merge driver conflicts when both sides change it. The config
-listing that prepares a command runs inside the same shared hold of the
-repository lock as the command, so a Bypass git window cannot change the
-config between the two. The user's own git still honors everything.
+configured merge driver conflicts when both sides change it. The config listing that prepares a command runs inside the same shared hold of the repository lock as the command, so a protected write through `apply_patch` cannot change the config between the two. A Bypass shell command holds no lock, so its sandbox keeps the configuration files read-only (`config`, `config.worktree`, `info/attributes`, each worktree's `commondir`, every include target, and the directories above them); where the sandbox cannot freeze single files (Linux, Windows), a Bypass shell command keeps the git directory read-only and says why (decision 0094). The user's own git still honors everything.
 
 and fails the attempt, so it is never merged. A shell command runs without a
 lock, in parallel with other workers' commands: its git files and the object
@@ -1181,8 +1175,7 @@ every accepted empty attempt carries a notice (decision 0086). A worker's
 worktree and its build output are deleted once nothing needs them, unless the
 user chose to keep every attempt's; a worktree a resume, a live worker, a
 pending merge or an open contract (a handoff child continuing in it, a resolver
-citing it) needs is kept either way, and each failed removal is one warning in
-the report (decision 0088). A retry of an
+citing it) needs is kept either way, and each failed removal is one warning in the report (decision 0088); `kgraf clean <name>` removes a kept one from `.kgraf/worktrees` (runs) or `.kgraf/workspaces` (`kgraf worker`). A retry of an
 unpinned contract does not repeat the route that just failed (decision 0085). A
 model with no price entry is never refused (decision 0075): the ledger keeps
 every call, and reports show its spend as unpriced. A planner answer that is not

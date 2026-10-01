@@ -1017,16 +1017,31 @@ impl Tool for ShellTool {
         // change found there is checked (under the repository lock), before
         // the call returns, so no later git operation meets an unchecked
         // write. Outside Bypass the git directory stays read-only.
+        //
+        // The git directory is made writable only with its configuration
+        // files frozen in the sandbox (`with_frozen_git_config`): kGraf's own
+        // git lists the configuration and then runs with every driver and
+        // hook it found neutralized, so a command that could write the
+        // configuration between the two could make kGraf's git run a program.
+        // A backend that cannot freeze single files (Linux, Windows) keeps
+        // the git directory read-only and says so.
         let mut window = None;
         let mut read_only_note = None;
-        if let Some(guard) = &self.protected {
+        let freezable = kgraf_sandbox::platform_isolation().is_ok_and(|s| s.git_config_freezable);
+        if !freezable && self.protected.as_ref().is_some_and(|g| g.bypass()) {
+            read_only_note = Some(format!(
+                "\n[the repository's git directory stayed read-only for this command: {FREEZE_UNAVAILABLE}]"
+            ));
+        } else if let Some(guard) = &self.protected {
             let g = guard.clone();
             match tokio::task::spawn_blocking(move || g.before_shell())
                 .await
                 .map_err(|e| internal(format!("protected-write snapshot task failed: {e}")))?
             {
                 Ok(Some(w)) => {
-                    policy = policy.with_writable_root(w.root().to_path_buf());
+                    policy = policy
+                        .with_writable_root(w.root().to_path_buf())
+                        .with_frozen_git_config(w.root().to_path_buf(), w.frozen_files().to_vec());
                     window = Some((guard.clone(), w));
                 }
                 Ok(None) => {}
@@ -1046,7 +1061,12 @@ impl Tool for ShellTool {
                 }
             }
         }
+        register_named_secrets_files(&cmd, &ctx.workspace_root);
         let output = run_sandboxed(&cmd, ctx, &policy, &env, self.timeout, self.output_cap).await;
+        let output = match output {
+            Ok(out) if window.is_some() => Ok(with_frozen_config_note(out)),
+            other => other,
+        };
         if let Some((guard, w)) = window {
             let checked = tokio::task::spawn_blocking(move || guard.after_shell(w))
                 .await
@@ -1094,6 +1114,89 @@ impl Tool for ShellTool {
         };
         Ok(scrub_build_output(output))
     }
+}
+
+/// Decision 0071: every secrets file a command names in its words
+/// (`cat config/.env.local`, `sh -c 'source .env.test'`,
+/// `--env-file=deploy/prod.env`) is read from the worktree, confined to it,
+/// and its values join the record scrubber before the command runs, so its
+/// output is scrubbed from transcripts, traces and run records. The output
+/// the model reads is unchanged. A file the command reads without naming it
+/// (`grep -r`, a glob, a script that opens it) is not seen here; `read_file`
+/// and `search_files` register what they read themselves.
+fn register_named_secrets_files(cmd: &[String], workspace_root: &std::path::Path) {
+    let mut dir = None;
+    for word in cmd {
+        let tokens = word.split(|c: char| c.is_whitespace() || "'\"`;|&<>()=$,".contains(c));
+        for token in tokens.filter(|t| !t.is_empty()) {
+            let rel = std::path::Path::new(token);
+            let named = rel
+                .file_name()
+                .is_some_and(|n| kgraf_secrets::is_secrets_file_name(&n.to_string_lossy()));
+            let confined = !rel.is_absolute()
+                && rel.components().all(|c| {
+                    matches!(
+                        c,
+                        std::path::Component::Normal(_) | std::path::Component::CurDir
+                    )
+                });
+            if !named || !confined {
+                continue;
+            }
+            if dir.is_none() {
+                dir = crate::fs_safety::open_workspace("shell", workspace_root).ok();
+            }
+            let Some(d) = dir.as_ref() else {
+                return;
+            };
+            if let Ok(bytes) = crate::fs_safety::read_capped(
+                "shell",
+                d,
+                rel,
+                crate::fs_safety::MAX_READ_BYTES,
+                false,
+            ) {
+                crate::fs_tools::register_if_secrets_file(rel, &bytes);
+            }
+        }
+    }
+}
+
+/// Why a Bypass command runs with the git directory read-only on a backend
+/// without [`kgraf_sandbox::IsolationStrength::git_config_freezable`].
+const FREEZE_UNAVAILABLE: &str = "this platform's sandbox cannot keep the repository's git \
+     configuration read-only inside a writable git directory, and kGraf's own git must never \
+     read a configuration a command changed while it ran; write `.git/...` paths with \
+     apply_patch, which checks each write (decision 0094)";
+
+/// What a Bypass command reads when it failed on a frozen configuration file.
+pub const FROZEN_CONFIG_NOTE: &str = "\n[the repository's git configuration files (`config`, \
+     `config.worktree`, `info/attributes`, each worktree's `commondir`, and every include target) \
+     stay read-only to shell commands so kGraf's own git never runs a program a command \
+     configured; write them with apply_patch as `.git/config` and the like, which checks each \
+     write (decision 0094)]";
+
+/// A failed command whose output shows git refused a configuration write,
+/// or the sandbox refused a write to a frozen file, gets
+/// [`FROZEN_CONFIG_NOTE`].
+fn with_frozen_config_note(mut out: ToolOutput) -> ToolOutput {
+    if !out.is_error {
+        return out;
+    }
+    let text = out.clone().render();
+    let lower = text.to_ascii_lowercase();
+    let config_refused = lower.contains("could not lock config file")
+        || lower.contains("error: could not write config file")
+        || ((lower.contains("operation not permitted") || lower.contains("permission denied"))
+            && ["config", "attributes", "commondir"]
+                .iter()
+                .any(|w| lower.contains(w)));
+    if config_refused {
+        out.parts.push(crate::OutputPart::Text {
+            text: crate::UntrustedText::new(FROZEN_CONFIG_NOTE),
+        });
+    }
+    out
 }
 
 fn internal(reason: impl Into<String>) -> ToolError {
@@ -3845,6 +3948,7 @@ fn main() {
         /// In Bypass, a git command in the worktree writes the shared
         /// repository's `info/exclude` through the real sandbox; the write
         /// is checked and kept.
+        #[cfg(target_os = "macos")]
         #[tokio::test]
         async fn bypass_lets_a_shell_command_write_the_git_directory() {
             let f = fixture(PLAIN_BUILD_RS);
@@ -3874,6 +3978,7 @@ fn main() {
         /// A shell command that writes garbage into a ref is caught when it
         /// ends: the ref is put back, the call is an error with the check,
         /// and the attempt's guard holds the failure.
+        #[cfg(target_os = "macos")]
         #[tokio::test]
         async fn bypass_restores_a_ref_a_shell_command_corrupted() {
             let f = fixture(PLAIN_BUILD_RS);
@@ -3909,6 +4014,7 @@ fn main() {
         /// repository's pack and a loose object is caught when it ends; both
         /// are restored from the object snapshot, the call is an error, the
         /// repository passes fsck and the attempt's guard holds the failure.
+        #[cfg(target_os = "macos")]
         #[tokio::test]
         async fn bypass_restores_objects_a_shell_command_deleted() {
             let f = fixture(PLAIN_BUILD_RS);
@@ -3983,6 +4089,221 @@ fn main() {
             assert!(guard.finish().is_err());
         }
 
+        /// Decision 0071: a shell command that names a secrets file deeper
+        /// than the checkout root adds its values to the record scrubber
+        /// before it runs. The command's output still carries the value (the
+        /// model-facing path is unchanged); the persist scrub removes it.
+        #[tokio::test]
+        async fn a_shell_read_of_a_secrets_file_is_scrubbed_from_records_only() {
+            let f = fixture(PLAIN_BUILD_RS);
+            let marker = "kGrafMarkerShell5Lb2Xs7Kd";
+            std::fs::create_dir_all(f.ws.root().join("config")).expect("dir");
+            std::fs::write(
+                f.ws.root().join("config/.env.test"),
+                format!("API_SECRET={marker}\nPORT=8080\n"),
+            )
+            .expect("env");
+            let (tool, _hook) = bound_tool(&f.ws);
+            let out = tool
+                .call(
+                    call_input(&["sh", "-c", "cat 'config/.env.test'"]),
+                    &ctx(f.ws.root().to_path_buf()),
+                    &CallPermit::new(),
+                )
+                .await
+                .expect("ran");
+            let text = out.render();
+            assert!(text.contains(marker), "the worker reads it: {text}");
+            let stored = kgraf_secrets::scrub_persist(&text);
+            assert!(!stored.contains(marker), "{stored}");
+            assert!(stored.contains("PORT=8080"), "{stored}");
+        }
+
+        /// A repository armed for the listing-to-command race: `m.txt`
+        /// differs on branches `b1` and `b2`, and the info attributes select
+        /// merge driver `evil` for every path, which no config defines yet.
+        /// Returns the main checkout and the marker the driver would leave.
+        fn armed_merge(f: &Fixture) -> (std::path::PathBuf, std::path::PathBuf) {
+            let repo = f._tmp.path().join("repo");
+            let commit = |msg: &str| {
+                git(&repo, &["add", "."]);
+                git(
+                    &repo,
+                    &[
+                        "-c",
+                        "user.name=t",
+                        "-c",
+                        "user.email=t@t",
+                        "commit",
+                        "-q",
+                        "-m",
+                        msg,
+                    ],
+                );
+            };
+            std::fs::write(repo.join("m.txt"), "base\n").expect("m");
+            commit("base");
+            for (branch, text) in [("b1", "one\n"), ("b2", "two\n")] {
+                git(&repo, &["checkout", "-q", "-b", branch, "main"]);
+                std::fs::write(repo.join("m.txt"), text).expect("m");
+                commit(branch);
+            }
+            git(&repo, &["checkout", "-q", "main"]);
+            std::fs::write(
+                f.ws.git_common_dir().join("info/attributes"),
+                "* merge=evil\n",
+            )
+            .expect("attributes");
+            (repo, f._tmp.path().join("driver-ran"))
+        }
+
+        /// kGraf's own merge of `b1` and `b2`, built now: its configuration
+        /// listing runs here, its command when the caller runs it.
+        fn kgraf_merge(repo: &Path) -> Command {
+            let pre = kgraf_core::host_git::dash_c(repo);
+            let mut cmd = kgraf_core::host_git::command(
+                &kgraf_core::host_git::Invocation::in_dir(&pre),
+                &["merge-tree", "--write-tree", "b1", "b2"],
+            )
+            .expect("hardened merge");
+            cmd.stdin(std::process::Stdio::null());
+            cmd
+        }
+
+        /// Decision 0094, the listing-to-command gap, with the race forced:
+        /// kGraf lists the configuration for a merge, then a Bypass shell
+        /// command (through the real sandbox) writes a merge driver into the
+        /// config, then kGraf's merge runs. The write is refused, so the
+        /// driver never runs. The control shows the driver does run under
+        /// plain git once defined, so no marker means the gap is closed, not
+        /// that the fixture was inert.
+        #[tokio::test]
+        async fn a_bypass_command_cannot_add_a_driver_between_kgraf_listing_and_command() {
+            let f = fixture(PLAIN_BUILD_RS);
+            let (repo, marker) = armed_merge(&f);
+            let driver = format!("touch '{}'; exit 1", marker.display());
+            let control = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["-c", &format!("merge.evil.driver={driver}")])
+                .args(["merge-tree", "--write-tree", "b1", "b2"])
+                .env_remove("GIT_DIR")
+                .output()
+                .expect("control");
+            assert!(
+                marker.exists(),
+                "control: plain git ran the driver: {control:?}"
+            );
+            std::fs::remove_file(&marker).expect("reset");
+
+            let mut merge = kgraf_merge(&repo);
+            let (tool, guard) = guarded_tool(&f, crate::PermissionMode::Bypass);
+            let script = format!("git config merge.evil.driver \"{driver}\"");
+            let out = tool
+                .call(
+                    call_input(&["sh", "-c", &script]),
+                    &ctx(f.ws.root().to_path_buf()),
+                    &CallPermit::new(),
+                )
+                .await
+                .expect("ran");
+            let is_error = out.is_error;
+            let text = out.render();
+            assert!(is_error, "the config write was refused: {text}");
+            assert!(
+                text.contains("apply_patch"),
+                "it says where the write goes: {text}"
+            );
+            let merged = merge.output().expect("kgraf merge");
+            assert!(
+                !marker.exists(),
+                "kGraf's merge ran a driver the worker configured: {text}\n{merged:?}"
+            );
+            let config =
+                std::fs::read_to_string(f.ws.git_common_dir().join("config")).expect("config");
+            assert!(!config.contains("evil"), "{config}");
+            guard.finish().expect("the repository stands");
+        }
+
+        /// The same race run for real: a Bypass command keeps writing and
+        /// removing the driver while kGraf runs merge after merge, each
+        /// listing then running. No merge ever runs it.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_bypass_command_racing_kgraf_merges_never_gets_a_driver_run() {
+            let f = fixture(PLAIN_BUILD_RS);
+            let (repo, marker) = armed_merge(&f);
+            let (tool, guard) = guarded_tool(&f, crate::PermissionMode::Bypass);
+            let script = format!(
+                "i=0; while [ $i -lt 60 ]; do \
+                 git config merge.evil.driver \"touch '{}'\" 2>/dev/null; \
+                 git config --unset merge.evil.driver 2>/dev/null; i=$((i+1)); done; true",
+                marker.display()
+            );
+            let merges = tokio::task::spawn_blocking(move || {
+                for _ in 0..30 {
+                    let _ = kgraf_merge(&repo).output().expect("kgraf merge");
+                }
+            });
+            let (c, permit) = (ctx(f.ws.root().to_path_buf()), CallPermit::new());
+            let (out, merged) = tokio::join!(
+                tool.call(call_input(&["sh", "-c", &script]), &c, &permit),
+                merges
+            );
+            merged.expect("merges ran");
+            let text = out.expect("ran").render();
+            assert!(!marker.exists(), "a merge ran the worker's driver: {text}");
+            guard.finish().expect("the repository stands");
+        }
+
+        /// Where the sandbox cannot freeze single files (Linux, Windows), a
+        /// Bypass command runs with the git directory read-only and its
+        /// output says why, instead of running with the configuration
+        /// writable.
+        #[cfg(not(target_os = "macos"))]
+        #[tokio::test]
+        async fn bypass_without_a_freezable_sandbox_keeps_the_git_directory_read_only() {
+            let f = fixture(PLAIN_BUILD_RS);
+            let (tool, guard) = guarded_tool(&f, crate::PermissionMode::Bypass);
+            let exclude = f.ws.git_common_dir().join("info/exclude");
+            let before = std::fs::read(&exclude).unwrap_or_default();
+            let script = format!("printf x >> '{}'", exclude.display());
+            let out = tool
+                .call(
+                    call_input(&["sh", "-c", &script]),
+                    &ctx(f.ws.root().to_path_buf()),
+                    &CallPermit::new(),
+                )
+                .await
+                .expect("ran");
+            let text = out.render();
+            assert!(text.contains("stayed read-only"), "{text}");
+            assert!(text.contains("apply_patch"), "{text}");
+            assert_eq!(std::fs::read(&exclude).unwrap_or_default(), before);
+            guard.finish().expect("the repository stands");
+        }
+
+        /// Through the real sandbox, the note: a Bypass git command that
+        /// fails on the frozen configuration is told where such a write goes.
+        #[cfg(target_os = "macos")]
+        #[tokio::test]
+        async fn a_frozen_config_write_says_where_the_write_goes() {
+            let f = fixture(PLAIN_BUILD_RS);
+            let (tool, guard) = guarded_tool(&f, crate::PermissionMode::Bypass);
+            let out = tool
+                .call(
+                    call_input(&["sh", "-c", "git config user.name someone"]),
+                    &ctx(f.ws.root().to_path_buf()),
+                    &CallPermit::new(),
+                )
+                .await
+                .expect("ran");
+            let is_error = out.is_error;
+            let text = out.render();
+            assert!(is_error, "{text}");
+            assert!(text.contains(FROZEN_CONFIG_NOTE.trim()), "{text}");
+            guard.finish().expect("the repository stands");
+        }
+
         /// Outside Bypass the git directory stays read-only in the sandbox.
         #[tokio::test]
         async fn other_modes_keep_the_git_directory_read_only() {
@@ -4043,6 +4364,7 @@ fn main() {
         /// whose words name git: a script that runs git (no word of the
         /// command says `git`) moves a ref, and the change is checked and
         /// kept.
+        #[cfg(target_os = "macos")]
         #[tokio::test]
         async fn bypass_lets_a_script_that_runs_git_indirectly_write_the_git_directory() {
             let f = fixture(PLAIN_BUILD_RS);
@@ -4132,7 +4454,14 @@ fn main() {
             let words = ["sh", "-c", "echo built > out.txt"];
             let c = ctx(f.ws.root().to_path_buf());
             let mut median = Vec::new();
-            for tool in [&plain, &guarded, &plain, &guarded] {
+            // Measured once while the fixture's config files are within the
+            // racy margin (the configuration file scan runs on every call),
+            // then again once they are settled (the scan is cached).
+            let settle = kgraf_core::host_git::INCLUDE_SCAN_RACY + Duration::from_millis(300);
+            for (i, tool) in [&plain, &guarded, &plain, &guarded].into_iter().enumerate() {
+                if i == 2 {
+                    tokio::time::sleep(settle).await;
+                }
                 let mut times = Vec::new();
                 for _ in 0..30 {
                     let start = std::time::Instant::now();
@@ -4148,8 +4477,9 @@ fn main() {
                 median.push(times[times.len() / 2]);
             }
             println!(
-                "shell call, median of 30: without the guard {:?} / {:?}, with it {:?} / {:?}",
-                median[0], median[2], median[1], median[3]
+                "shell call, median of 30: racy files: without the guard {:?}, with it {:?}; \
+                 settled files: without {:?}, with {:?}",
+                median[0], median[1], median[2], median[3]
             );
             guard.finish().expect("stands");
         }

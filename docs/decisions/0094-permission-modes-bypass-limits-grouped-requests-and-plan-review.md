@@ -421,3 +421,104 @@ command now runs without the lock, that premise no longer holds: a Bypass comman
 repository configuration between the listing and the command, so a filter, driver or hook it adds
 in that interval could run in kGraf's own git. The gap is open until kGraf's git stops depending on
 a listing taken in a separate process.
+
+## Amendment: a Bypass command's sandbox keeps the git configuration read-only
+
+This closes the gap the Correction above names. Mechanisms:
+`kgraf_sandbox::SandboxPolicy::with_frozen_git_config` (`FROZEN_GIT_FILES`),
+`kgraf_core::host_git::IncludeScan`, `kgraf_tools::protected::ShellWindow::frozen_files` and the
+shell tool.
+
+- **What is frozen.** Inside the shared git directory a Bypass command may write: `config`,
+  `config.worktree`, `info/attributes`, each worktree admin directory's `commondir` and
+  `config.worktree`, and the lock file git writes each through; every include target
+  (`include.path` and `includeIf.<condition>.path`, whatever the condition, found recursively,
+  existing or not) that lies under a sandbox writable root; and every directory above each of
+  them, below its root (`info`, `worktrees`, `worktrees/<name>`, an include target's
+  directories). Frozen means no write, creation, deletion, rename or link. Everything else in the
+  git directory stays writable: refs, objects, logs, `HEAD`, the index, `packed-refs`,
+  `info/exclude`, `hooks`.
+- **Why each.** `config` and `config.worktree` define drivers and config hooks. `info/attributes`
+  selects drivers. `commondir` names the directory whose `config` git reads, so pointing it at a
+  planted repository replaces the whole configuration. An include target adds configuration, and
+  git skips a missing one silently, so creating it later counts. A directory above a frozen file
+  is frozen because Seatbelt checks a directory rename against the directory's own path, not the
+  files inside: renaming `worktrees/<name>` away and moving in a copy built elsewhere would swap
+  `commondir` without writing it (measured).
+- **Why this closes the gap.** kGraf's git lists the configuration and runs the command it
+  prepared inside one shared hold of the repository lock. With these files frozen, the only other
+  writers are a protected write through `apply_patch`, which holds the lock exclusively, and the
+  user. The listing therefore reads the configuration the command reads.
+- **Not frozen: `hooks`.** kGraf's git sets `core.hooksPath` to the null device, so the
+  repository's hooks directory never runs for kGraf; a worker's `pre-commit install` keeps
+  working.
+- **What a Bypass command can no longer do.** Write the repository configuration: `git config`,
+  `git remote add`, `git branch --set-upstream-to`, a tracking `checkout -b`, the config part of
+  `git branch -d` and `-m`, and `git worktree add`, `move`, `remove` and `prune`. Such a command
+  fails with git's own message, and its output gets a note saying the write goes through
+  `apply_patch` as `.git/config`, which checks it under the exclusive lock.
+- **Platforms.**
+  - macOS (Seatbelt): enforced. Each frozen path is an anchored `regex` in a `deny file-write*`
+    after the writable-root allow (measured: write, append, create, rename onto, rename away,
+    unlink, hard link, chmod and write through a symlink all refused, writes beside them
+    allowed). On a case-insensitive volume a name spelled in another case is refused too,
+    existing or not: Seatbelt compares names the way the volume does (measured).
+  - Linux (Landlock grants whole hierarchies; a read-only bind mount over a file cannot stop the
+    directory above it being renamed away) and Windows (a deny ACE on a file is bypassed by
+    `FILE_DELETE_CHILD` on its parent, and nothing is verified there):
+    `IsolationStrength::git_config_freezable` is false. A Bypass shell command there runs with
+    the git directory read-only and says why; git directory writes go through `apply_patch`. A
+    policy that asks for the freeze is refused (`SandboxError::PolicyNotEnforceable`) rather than
+    run without it. This narrows the previous amendment ("every Bypass shell command writes the
+    git directory") on Linux and Windows: degraded and said, never silently open.
+- **The include scan.** One hardened git process (`git config --includes --show-origin -z
+  --list`, with the fixed overrides of `host_git`) per scan, plus one per include target git did
+  not read itself (missing, or behind a condition that did not hold for the shared directory).
+  Cached per attempt and read again only when a file it read changed (length, times, inode) or
+  was written within 3 s, the racy margin the git-file pre-state uses. A scan that fails leaves
+  the git directory read-only for that command, with the reason.
+- **Measured** (macOS, debug build, median of 30 whole sandboxed shell calls): 15.0 ms without the
+  guard; 17.7 ms with it while the configuration files are settled (cached scan); 22.1 ms while
+  they are within the racy margin (a scan on every call).
+- **Options considered.**
+  - (a) kGraf's git reads a configuration snapshot it controls. No such mechanism exists: git
+    reads `$GIT_COMMON_DIR/config` whenever it finds a repository, and there is no
+    `GIT_CONFIG_NOLOCAL`. `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT` and `--config-env` add
+    command-scope entries above the repository configuration and do not remove it; `includeIf`
+    adds files; `extensions.worktreeConfig` adds `config.worktree`. Pointing `GIT_DIR` or
+    `GIT_COMMON_DIR` at a kGraf-owned directory moves the refs and `packed-refs` with it.
+    Rejected: not possible.
+  - (b) A configuration hash and time checked right before the exec and after the exit, failing
+    and quarantining the run on a change. The window between the check and git's own read stays,
+    git reads the configuration again in processes it starts (`worktree add` runs a checkout),
+    and a check after the exit sees a program after it ran. Detection, not prevention. Rejected.
+  - (c) Freeze the files in the sandbox. Chosen: it prevents the write instead of detecting it,
+    and the only cost is that configuration writes take the `apply_patch` path.
+  - Also rejected: an exclusive lock for each Bypass command (the queueing the previous amendment
+    removed), and neutralizing drivers by attribute (config hooks need no attribute, and
+    `info/attributes` is in the git directory).
+- **Limits.** A Bypass command cannot change the repository configuration through the shell.
+  Linux and Windows Bypass shells lose git directory writes. The scan does not see a global or
+  system configuration file created during a run (such a file lies outside every writable root).
+  `objects/info/alternates` is not frozen: it names object directories, not programs.
+
+Evidence: `kgraf-sandbox` (`macos.rs`: the profile denies every frozen path and its directories,
+an include target under a writable root, none outside one, after the writable-root allow;
+`tests/frozen_git_macos.rs`, through the real Seatbelt: 21 ways to change the config, a
+per-worktree config, a `commondir`, the info attributes or an include target are refused with
+EPERM and the files are unchanged; a replacement admin directory cannot be moved in; refs,
+`info/exclude` and a commit inside the sandbox still work, and `git config` fails; without the
+freeze the same `git config` lands). `kgraf-core` (`host_git/includes.rs`: includes found
+whatever their condition, relative and nested, a missing target listed, the cache bypassed while
+racy and refreshed on a change). `kgraf-tools` (`shell.rs`: kGraf lists the configuration for a
+merge, a Bypass command then writes a merge driver into the config through the real sandbox,
+then kGraf's merge runs, and the driver never runs, with a control showing plain git runs it; the
+same race run live, a command writing and removing the driver 60 times while kGraf runs 30
+merges, never runs it; a frozen config write's output names `apply_patch`; on Linux and Windows
+a Bypass command keeps the git directory read-only and says why). `kgraf-host`: the hosted
+corrupted-ref and deleted-object tests run on macOS only, where a shell command still writes the
+git directory. Mutation checks: with the freeze rules not emitted, both race tests and three of
+the four Seatbelt tests fail; with the directories above a frozen file not frozen, the
+replacement-directory and config tests fail. Not run: the Linux and Windows paths (no cross
+toolchain with a C sysroot on the development machine); their code refuses the freeze and
+degrades as described.

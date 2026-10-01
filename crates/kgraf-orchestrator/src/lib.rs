@@ -133,8 +133,8 @@ pub use check_runner::{
 pub use checks::{
     CANARY, CheckError, CheckFailure, CheckRun, CheckStage, FileOverlay, HandshakeFinding,
     HandshakeRequest, HandshakeStatement, Handshaker, InterfaceContract, ModelHandshaker,
-    RoutedHandshaker, RunResult, SandboxRunner, anchors, check_mechanical, compare_handshake,
-    compare_handshake_ordered, ordered_pairs, parse_handshake,
+    PartyModel, RoutedHandshaker, RunResult, SandboxRunner, anchors, check_mechanical,
+    compare_handshake, compare_handshake_ordered, ordered_pairs, parse_handshake,
 };
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use cluster_cap::{ClusterCapHold, DEFAULT_MAX_IN_FLIGHT_PER_CLUSTER};
@@ -205,10 +205,10 @@ pub use routing::{
     LIVE_MIN_ATTEMPTS, RouteInfo, RoutePick, RoutingPolicy,
 };
 pub use run_state::{
-    AdmittedLease, ContractCheckSettings, ContractStatus, GroundingRecord, GroundingTrigger,
-    OpenContract, PendingPermission, PlanApproval, PlanItem, PlanProgress, PlannedDispatch,
-    RUN_STATE_SCHEMA_VERSION, RecordedNote, RunCounters, RunStateError, RunStateRecord, RunStatus,
-    VerifiedCommit, WriteTarget,
+    AdmittedLease, CheckHold, ContractCheckSettings, ContractStatus, GroundingRecord,
+    GroundingTrigger, OpenContract, PendingPermission, PlanApproval, PlanItem, PlanProgress,
+    PlannedDispatch, RUN_STATE_SCHEMA_VERSION, RecordedNote, RunCounters, RunStateError,
+    RunStateRecord, RunStatus, VerifiedCommit, WriteTarget,
 };
 pub use scheduler_loop::{
     DEFAULT_LEASE, DEFAULT_ON_TIME_WINDOW, SchedulerLoop, TickEvent, TrackedSchedule,

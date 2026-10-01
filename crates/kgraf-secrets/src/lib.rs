@@ -560,6 +560,10 @@ pub struct Scrubber {
     /// for two related credentials) must not shadow the longer, more specific
     /// replacement.
     exact: RwLock<Vec<(String, String)>>,
+    /// (kind, value), longest first, read by the persist path only: the
+    /// values of secrets files a worker read
+    /// ([`Scrubber::register_records_only`]).
+    records_only: RwLock<Vec<(String, String)>>,
     /// Values already refused, so each refusal is said once, not on every
     /// provider build. Placeholders by definition, not credentials.
     refused: Mutex<Vec<String>>,
@@ -642,6 +646,7 @@ impl Scrubber {
             set,
             compiled,
             exact: RwLock::new(Vec::new()),
+            records_only: RwLock::new(Vec::new()),
             refused: Mutex::new(Vec::new()),
             refusal_sink: Mutex::new(None),
             pending_refusals: Mutex::new(Vec::new()),
@@ -679,7 +684,7 @@ impl Scrubber {
     /// carrying on with a lock that is provably still consistent (`Vec::push`
     /// and the sort below cannot panic on this data).
     pub fn register_exact_secret(&self, kind: &str, value: &str) -> Registration {
-        self.register(kind, value, true)
+        self.register(kind, value, true, Target::Both)
     }
 
     /// Register a dotenv file's text (`NAME=value` lines, `export ` prefixes,
@@ -710,13 +715,32 @@ impl Scrubber {
     /// sandbox keeps the file unreadable, and this keeps the values out of
     /// every tool result, transcript and trace should one appear anyway.
     pub fn register_dotenv(&self, text: &str) -> usize {
+        self.register_pairs(dotenv_pairs(text), Target::Both)
+    }
+
+    /// The values of a secrets file a worker read (decision 0071): every
+    /// pair [`Scrubber::register_dotenv`] would register, read from dotenv,
+    /// YAML (`name: value`), TOML or ini (`name = value`) and JSON
+    /// (`"name": "value"`) lines, joins a registry the persist path alone
+    /// reads: records (transcripts, traces, run records) lose the values, and
+    /// the model-facing path is unchanged, so the worker still reads the file
+    /// it asked for. Returns how many were newly registered.
+    pub fn register_records_only(&self, text: &str) -> usize {
+        let mut pairs = dotenv_pairs(text);
+        pairs.extend(lenient_pairs(text));
+        self.register_pairs(pairs, Target::Records)
+    }
+
+    /// Register `pairs` (name, value), each a slice of one file's text, as
+    /// [`Scrubber::register_dotenv`] describes, into `target`.
+    fn register_pairs<'t>(&self, pairs: Vec<(&'t str, &'t str)>, target: Target) -> usize {
         // The byte range of the last multi-line value and whether a pattern rule
         // matched it: its body lines follow it in `dotenv_pairs`, and they
         // register with it even under an ordinary name, where no pattern
         // matches one line of a key on its own.
         let mut whole: Option<(usize, usize, bool)> = None;
         let mut registered = 0;
-        for (name, value) in dotenv_pairs(text) {
+        for (name, value) in pairs {
             let start = value.as_ptr() as usize;
             let end = start + value.len();
             let body_of_matched = whole.is_some_and(|(s, e, matched)| {
@@ -726,11 +750,11 @@ impl Scrubber {
                 whole = Some((start, end, !self.pattern_spans(value).is_empty()));
             }
             let outcome = if classify_name(name) == NameClass::Credential {
-                Some(self.register_credential_named(name, value))
+                Some(self.register_credential_named(name, value, target))
             } else if body_of_matched || !self.pattern_spans(value).is_empty() {
                 // A connection string (`DATABASE_URL`) is registered only
                 // when the value itself carries a credential.
-                Some(self.register("dotenv", value, false))
+                Some(self.register("dotenv", value, false, target))
             } else {
                 None
             };
@@ -749,7 +773,7 @@ impl Scrubber {
     /// [`MIN_CREDENTIAL_NAMED_LEN`], and a literal placeholder
     /// ([`is_literal_placeholder`]). A refusal is said with the variable name
     /// only, never the value.
-    fn register_credential_named(&self, name: &str, value: &str) -> Registration {
+    fn register_credential_named(&self, name: &str, value: &str, target: Target) -> Registration {
         let value = value.trim();
         if value.is_empty() {
             return Registration::TooShort;
@@ -769,10 +793,10 @@ impl Scrubber {
         if is_setting_name(name) && is_setting_value(value) {
             return Registration::Ordinary;
         }
-        self.insert_exact("dotenv", value)
+        self.insert_exact("dotenv", value, target)
     }
 
-    fn register(&self, kind: &str, value: &str, report: bool) -> Registration {
+    fn register(&self, kind: &str, value: &str, report: bool, target: Target) -> Registration {
         let value = value.trim();
         let len = value.chars().count();
         if len < MIN_EXACT_SECRET_LEN {
@@ -796,11 +820,21 @@ impl Scrubber {
             }
             return outcome;
         }
-        self.insert_exact(kind, value)
+        self.insert_exact(kind, value, target)
     }
 
-    fn insert_exact(&self, kind: &str, value: &str) -> Registration {
-        let mut secrets = self.exact.write().unwrap_or_else(|e| e.into_inner());
+    fn insert_exact(&self, kind: &str, value: &str, target: Target) -> Registration {
+        if target == Target::Records {
+            let both = self.exact.read().unwrap_or_else(|e| e.into_inner());
+            if both.iter().any(|(_, v)| v == value) {
+                return Registration::AlreadyKnown;
+            }
+        }
+        let list = match target {
+            Target::Both => &self.exact,
+            Target::Records => &self.records_only,
+        };
+        let mut secrets = list.write().unwrap_or_else(|e| e.into_inner());
         if secrets.iter().any(|(_, v)| v == value) {
             return Registration::AlreadyKnown;
         }
@@ -887,6 +921,7 @@ impl Scrubber {
 
     fn persist_spans(&self, text: &str) -> Vec<(usize, usize, String)> {
         let mut spans = self.exact_spans(text);
+        spans.extend(self.record_spans(text));
         spans.extend(self.pattern_spans(text));
         spans
     }
@@ -1078,7 +1113,19 @@ impl Scrubber {
     /// so this and [`Scrubber::pattern_spans`] can be merged and resolved by
     /// one call to [`apply_spans`]).
     fn exact_spans(&self, text: &str) -> Vec<(usize, usize, String)> {
-        let secrets = self.exact.read().unwrap_or_else(|e| e.into_inner());
+        spans_of(&self.exact, text)
+    }
+
+    /// The spans of values registered for records only
+    /// ([`Scrubber::register_records_only`]).
+    fn record_spans(&self, text: &str) -> Vec<(usize, usize, String)> {
+        spans_of(&self.records_only, text)
+    }
+}
+
+fn spans_of(list: &RwLock<Vec<(String, String)>>, text: &str) -> Vec<(usize, usize, String)> {
+    {
+        let secrets = list.read().unwrap_or_else(|e| e.into_inner());
         if secrets.is_empty() {
             return Vec::new();
         }
@@ -1093,7 +1140,9 @@ impl Scrubber {
         }
         spans
     }
+}
 
+impl Scrubber {
     /// Every pattern-rule match in `text` that survives `generic-api-key`'s
     /// extra gate (every other rule's own structural regex is the only gate).
     fn pattern_spans(&self, text: &str) -> Vec<(usize, usize, String)> {
@@ -1342,6 +1391,81 @@ pub fn register_exact_secret(kind: &str, value: &str) -> Registration {
     global().register_exact_secret(kind, value)
 }
 
+/// Which registry a registration joins.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Target {
+    /// Both paths: a secret kGraf holds or the checkout-root `.env`.
+    Both,
+    /// The persist path only: a secrets file a worker read.
+    Records,
+}
+
+/// Whether a file name is a secrets file whose values a worker's read adds to
+/// the record scrubber ([`register_records_only`]): `.env`, `.env.<anything>`,
+/// `<anything>.env`, and common secrets file names (`.envrc`, `.secrets`,
+/// `.dev.vars`, `secrets.{json,yaml,yml,toml}`, `credentials.json`).
+pub fn is_secrets_file_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower == ".env"
+        || lower.starts_with(".env.")
+        || (lower.ends_with(".env") && lower.len() > ".env".len())
+        || matches!(
+            lower.as_str(),
+            ".envrc"
+                | ".secrets"
+                | ".dev.vars"
+                | "secrets.json"
+                | "secrets.yaml"
+                | "secrets.yml"
+                | "secrets.toml"
+                | "credentials.json"
+        )
+}
+
+/// `name: value`, `name = value` and `"name": "value"` pairs, one per line,
+/// for secrets files that are not dotenv (YAML, TOML, ini, flat JSON). A line
+/// whose value opens a nested object or list gives no pair.
+fn lenient_pairs(text: &str) -> Vec<(&str, &str)> {
+    let mut pairs = Vec::new();
+    for line in text.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') || t.starts_with("//") || t.starts_with(';') {
+            continue;
+        }
+        let t = t.strip_prefix("export ").unwrap_or(t);
+        let t = t.strip_prefix("- ").unwrap_or(t);
+        let Some(sep) = t.find(['=', ':']) else {
+            continue;
+        };
+        let name = t[..sep].trim().trim_matches(|c| c == '"' || c == '\'');
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        {
+            continue;
+        }
+        let mut value = t[sep + 1..].trim().trim_end_matches(',').trim();
+        for q in ['"', '\''] {
+            if value.len() >= 2 && value.starts_with(q) && value.ends_with(q) {
+                value = &value[1..value.len() - 1];
+            }
+        }
+        if value.is_empty() || value.starts_with('{') || value.starts_with('[') {
+            continue;
+        }
+        pairs.push((name, value));
+    }
+    pairs
+}
+
+/// Add a secrets file's values to the process-wide record scrubber (see
+/// [`Scrubber::register_records_only`]): records lose them, models keep
+/// them. Never logged.
+pub fn register_records_only(text: &str) -> usize {
+    global().register_records_only(text)
+}
+
 /// Register a dotenv file's values with the process-wide scrubber (see
 /// [`Scrubber::register_dotenv`]). A missing file registers nothing; any
 /// other read error is returned. The values are never logged.
@@ -1569,6 +1693,68 @@ mod tests {
     /// and length are not entropy-gated (see `rules::PatternRule::entropy`'s
     /// doc) and keep using a repeated character, which is easier to read and
     /// exercises the same code path just as well.
+    /// A secrets file a worker read: its credential values are scrubbed from
+    /// records (the persist path) and left on the model-facing path, in
+    /// dotenv, YAML, TOML and JSON spellings; ordinary settings stay.
+    #[test]
+    fn a_secrets_files_values_are_scrubbed_from_records_only() {
+        let s = fresh();
+        let dot = "kGrafMarkerDot7Qz9xLp2Vt";
+        let yaml = "kGrafMarkerYaml4Hs8Nw3Rb";
+        let toml = "kGrafMarkerToml6Jc1Ud5Ye";
+        let json = "kGrafMarkerJson2Fk7Gm9Wa";
+        let text = format!(
+            "export API_TOKEN={dot}\nLOG_LEVEL=debug\nservice_password: \"{yaml}\"\n\
+             db_secret = '{toml}'\n  \"clientSecret\": \"{json}\",\n"
+        );
+        assert_eq!(s.register_records_only(&text), 4);
+        for marker in [dot, yaml, toml, json] {
+            let line = format!("the worker printed {marker} here");
+            assert!(!s.scrub_persist(&line).contains(marker), "{marker}");
+            assert_eq!(
+                s.scrub_model_facing(&line),
+                line,
+                "model copy keeps {marker}"
+            );
+        }
+        assert!(s.scrub_persist("LOG_LEVEL=debug").contains("debug"));
+        // The stored copy of a read is scrubbed, its model copy is not.
+        let read = format!("API_TOKEN={dot}");
+        let stored = s.intake(&read);
+        assert!(!stored.contains(dot), "{stored}");
+        assert_eq!(s.model_copy(&stored), read);
+    }
+
+    #[test]
+    fn secrets_file_names_are_recognized() {
+        for yes in [
+            ".env",
+            ".env.local",
+            ".env.production",
+            "prod.env",
+            ".envrc",
+            "secrets.json",
+            "secrets.yaml",
+            "secrets.yml",
+            "secrets.toml",
+            ".secrets",
+            "credentials.json",
+            ".dev.vars",
+        ] {
+            assert!(is_secrets_file_name(yes), "{yes}");
+        }
+        for no in [
+            "env.rs",
+            "environment.md",
+            "README.md",
+            ".envoy.yaml",
+            "src",
+            "Cargo.toml",
+        ] {
+            assert!(!is_secrets_file_name(no), "{no}");
+        }
+    }
+
     fn filler(n: usize) -> String {
         const ALPHABET: &[u8] = b"aB3xZ9qM7wK1pL5vN2tR8yH4jC6dF0sG";
         (0..n)

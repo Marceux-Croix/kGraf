@@ -859,6 +859,59 @@ async fn clean_refuses_a_worktree_a_record_names_unless_forced() {
     assert!(!ws.exists());
 }
 
+/// `kgraf clean` finds a kept worktree wherever kGraf keeps one: an
+/// orchestrated run's under `.kgraf/worktrees` and `kgraf worker`'s under
+/// `.kgraf/workspaces` (decision 0088). A name in neither is refused,
+/// listing every kept worktree in both; a name in both must say which.
+#[tokio::test]
+async fn clean_finds_kept_worktrees_of_runs_and_of_kgraf_worker() {
+    let r = repo();
+    let state = crate::state_dir(&r.root).expect("state");
+    let make = |base: &str, name: &str| {
+        let mgr = kgraf_sandbox::WorkspaceManager::open(&r.root, &state.join(base)).expect("mgr");
+        let ws = mgr
+            .create(&kgraf_sandbox::WorkspaceSpec {
+                name,
+                base: "HEAD",
+                branch: None,
+            })
+            .expect("worktree");
+        let root = ws.root().to_path_buf();
+        // Released as a finished `kgraf worker` leaves a kept worktree.
+        drop(ws);
+        kill_owner(&r, &root);
+        root
+    };
+    let run_kept = make("worktrees", "w-run");
+    let worker_kept = make("workspaces", "w-worker");
+    let twin_run = make("worktrees", "twin");
+    let twin_worker = make("workspaces", "twin");
+
+    let err = crate::clean(&r.root, "nope", false).expect_err("unknown");
+    let text = format!("{err:#}");
+    for want in [
+        ".kgraf/worktrees",
+        ".kgraf/workspaces",
+        "worktrees/w-run",
+        "workspaces/w-worker",
+    ] {
+        assert!(text.contains(want), "{want} missing: {text}");
+    }
+    let both = crate::clean(&r.root, "twin", false).expect_err("ambiguous");
+    assert!(format!("{both:#}").contains("workspaces/twin"), "{both:#}");
+    assert!(twin_run.exists() && twin_worker.exists());
+
+    assert_eq!(
+        crate::clean(&r.root, "w-worker", false).expect("worker's"),
+        std::fs::canonicalize(&worker_kept).unwrap_or(worker_kept.clone())
+    );
+    assert!(!worker_kept.exists());
+    assert!(crate::clean(&r.root, "w-run", false).is_ok());
+    assert!(!run_kept.exists());
+    assert!(crate::clean(&r.root, "workspaces/twin", false).is_ok());
+    assert!(!twin_worker.exists() && twin_run.exists());
+}
+
 /// Relock a worktree as a killed process leaves it.
 fn kill_owner(r: &Repo, root: &Path) {
     let path = root.to_str().expect("utf-8");

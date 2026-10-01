@@ -357,6 +357,7 @@ fn a_python_signature_agrees_and_a_changed_return_type_disagrees() {
             .collect(),
         consume: vec![],
         touch: vec![],
+        ..Default::default()
     };
     let prod = st(
         "prod",
@@ -432,6 +433,7 @@ fn statement(
         expect: own(expect),
         consume: own(consume),
         touch: vec![],
+        ..Default::default()
     }
 }
 

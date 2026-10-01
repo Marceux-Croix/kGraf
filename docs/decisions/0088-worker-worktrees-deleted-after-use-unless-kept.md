@@ -96,3 +96,22 @@ at spawn on a slice node that no longer existed.
   source root (or the store's root) is not an existing directory, and reads and removes
   nothing. A walk of a missing root already errored and kept every file.
 - The merged worktree's removal under `Delete` is unchanged: it happens with the merge.
+
+## Amendment: `kgraf clean` finds the worktrees `kgraf worker` keeps
+
+- **Two places hold kept worktrees** under the state directory: an orchestrated run's under
+  `.kgraf/worktrees`, and `kgraf worker`'s under `.kgraf/workspaces`
+  (`kgraf_host::WORKTREE_BASES`). `kgraf clean <name>` looked only in the first, so a worktree
+  `kgraf worker` kept could not be removed with it.
+- **`kgraf clean <name>` looks in both.** The repository's registered worktrees are listed once
+  (`git worktree list`, the host runner) and matched by directory. A name found in one is
+  removed there with the checks as before (a run record naming it needs `--force`; a live owner
+  or a process still running in it is refused). A name found in both is refused until the user
+  names one: `kgraf clean worktrees/<name>` or `kgraf clean workspaces/<name>`. A name found in
+  neither is refused, listing every kept worktree in both as `worktrees/<name>` and
+  `workspaces/<name>` (or `none`).
+
+Tests: `kgraf-host` `clean_finds_kept_worktrees_of_runs_and_of_kgraf_worker` (kept worktrees in
+both places: an unknown name is refused listing all four, a name in both is refused naming the
+two forms, each is removed from its own place, and the prefixed form removes only that one),
+`clean_refuses_a_worktree_a_record_names_unless_forced` (unchanged).

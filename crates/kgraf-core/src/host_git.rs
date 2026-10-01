@@ -63,18 +63,29 @@
 //! filtered. The user's own git is untouched and still honors every hook,
 //! filter and driver.
 //!
-//! The listing and the command are two processes. Every caller that runs
-//! git on a repository takes the repository's lock ([`crate::repo_lock`],
-//! shared) before calling [`command`] and holds it until the command exits,
-//! so both run in one hold. A Bypass shell command that can write the config
-//! runs only inside an exclusive hold, so it cannot write between them
-//! (decision 0094).
+//! The listing and the command are two processes, so nothing may change the
+//! configuration between them (decision 0094):
+//!
+//! - A protected write through `apply_patch` holds the repository's lock
+//!   exclusively, and every caller that runs git on a repository takes it
+//!   shared ([`crate::repo_lock`]) before calling [`command`] and holds it
+//!   until the command exits, so the listing and the command run in one
+//!   hold that such a write cannot enter.
+//! - A Bypass shell command holds no lock while it runs. Its sandbox keeps
+//!   every file git reads configuration from read-only (the repository's
+//!   `config`, `config.worktree`, `info/attributes`, each worktree's
+//!   `commondir`, and every include target [`IncludeScan`] finds), so it
+//!   cannot write between them either. Where the sandbox cannot do that, the
+//!   command runs with the git directory read-only.
 
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
+
+mod includes;
+pub use includes::{IncludeScan, RACY as INCLUDE_SCAN_RACY};
 
 /// The oldest git whose `GIT_CONFIG_COUNT` carries the overrides.
 pub const MIN_GIT: (u32, u32) = (2, 31);

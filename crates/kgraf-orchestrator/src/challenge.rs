@@ -49,7 +49,7 @@
 
 use crate::checks::{
     CheckError, CheckFailure, CheckRun, CheckStage, FileOverlay, HandshakeFinding,
-    HandshakeStatement, InterfaceContract, SandboxRunner, check_mechanical,
+    HandshakeStatement, InterfaceContract, PartyModel, SandboxRunner, check_mechanical,
 };
 use crate::plan::{CostBasis, ModelCaller, PlanError, valid_write_path};
 use crate::run_state::WriteTarget;
@@ -288,6 +288,10 @@ pub enum ContractEvent {
         /// kept so the record shows what the comparison could not read.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         warnings: Vec<crate::checks::HandshakeFinding>,
+        /// Every party's route and model (0078). A record from before the
+        /// field reads as empty.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        parties: Vec<PartyModel>,
     },
     CheckFailed {
         interface: String,
@@ -298,12 +302,18 @@ pub enum ContractEvent {
         #[serde(default)]
         handshake: Vec<HandshakeStatement>,
         held: Vec<String>,
+        /// Every party's route and model, held ones included (0078).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        parties: Vec<PartyModel>,
     },
     CheckNotRun {
         interface: String,
         version: u32,
         error: String,
         held: Vec<String>,
+        /// Every party's route and model, held ones included (0078).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        parties: Vec<PartyModel>,
     },
     Inadequate {
         interface: String,
@@ -592,6 +602,7 @@ impl ContractBook {
                 version,
                 error,
                 held,
+                ..
             } => {
                 c.checks_not_run += 1;
                 if let Some(e) = self.entries.get_mut(interface)
@@ -1769,6 +1780,7 @@ mod tests {
             handshake: vec![],
             handshake_skipped: None,
             warnings: vec![],
+            parties: Vec::new(),
         });
         let mut other = ic();
         other.symbols = vec!["elsewhere".into()];
@@ -1833,6 +1845,7 @@ mod tests {
                 findings: vec![],
                 handshake: vec![],
                 held: vec!["p".into(), "c".into()],
+                parties: Vec::new(),
             },
             ContractEvent::Challenged {
                 interface: "config".into(),
@@ -1938,6 +1951,7 @@ mod tests {
             findings: vec![],
             handshake: vec![],
             held: vec!["p".into(), "c".into()],
+            parties: Vec::new(),
         });
         assert_eq!(book.counters().stub_land_failures, 1);
         assert_eq!(book.counters().stub_compile_failures, 0);

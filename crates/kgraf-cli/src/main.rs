@@ -501,10 +501,14 @@ enum Command {
         #[arg(long)]
         revoke: bool,
     },
-    /// Remove a stranded worktree (its owner was on another machine or in
-    /// another PID namespace, so nothing removes it on its own). Refused while
-    /// its owner runs here or any process started in it runs.
+    /// Remove a kept or stranded worktree (a kept one stays by the retention
+    /// setting; a stranded one's owner was on another machine or in another
+    /// PID namespace, so nothing removes it on its own). Looked up under both
+    /// `.kgraf/worktrees` (runs) and `.kgraf/workspaces` (`kgraf worker`).
+    /// Refused while its owner runs here or any process started in it runs.
     Clean {
+        /// The worktree's name, or `worktrees/<name>` / `workspaces/<name>`
+        /// when both directories hold one by that name.
         worktree: String,
         /// Remove it even though a run record still names it for a resume
         /// (the resume then starts that worker over).

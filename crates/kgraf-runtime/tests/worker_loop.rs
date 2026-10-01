@@ -1470,6 +1470,62 @@ async fn a_registered_secret_a_tool_prints_is_absent_from_the_next_request_and_e
     }
 }
 
+/// Decision 0071: a worker that reads a secrets file deeper than the
+/// checkout root (`config/.env.local`) with the real `read_file` tool still
+/// sees its value (the model-facing path is unchanged), and no persisted
+/// event keeps it: the read added the file's values to the record scrubber.
+#[tokio::test]
+async fn a_secrets_file_a_worker_reads_is_scrubbed_from_its_transcript_only() {
+    let dir = tempfile::tempdir().expect("dir");
+    let marker = "kGrafMarkerRead8Tq3Wv6Zn1Pc";
+    std::fs::create_dir_all(dir.path().join("config")).expect("dir");
+    std::fs::write(
+        dir.path().join("config/.env.local"),
+        format!("DB_PASSWORD={marker}\nLOG_LEVEL=info\n"),
+    )
+    .expect("env");
+    let provider = Fake::new(false, move |request| {
+        if round_of(request) == 0 {
+            Round::tool(vec![(
+                "t0",
+                "read_file",
+                json!({"path": "config/.env.local"}),
+            )])
+        } else {
+            Round::answer(&format!("the password is {marker}"))
+        }
+    });
+    let read: Arc<dyn Tool> = Arc::new(kgraf_tools::ReadFileTool::default());
+    let env = env_with(provider.clone(), vec![read], CallMode::Complete);
+    let handle = spawn_worker(
+        Arc::new(env),
+        brief("w1", "read the env file", dir.path(), 8),
+        SpawnOptions::default(),
+    )
+    .await
+    .expect("spawn");
+    let (events, result) = with_timeout(drain(handle)).await.expect("in time");
+    assert_eq!(result.outcome, WorkerOutcome::Completed);
+    let last = provider.requests().last().cloned().expect("a request");
+    assert!(
+        format!("{last:?}").contains(marker),
+        "the worker reads the file it asked for"
+    );
+    for event in &events {
+        assert!(
+            !format!("{event:?}").contains(marker),
+            "the value must not survive into any persisted event: {event:?}"
+        );
+    }
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, WorkerEvent::ToolCallFinished { output, .. }
+            if output.contains("LOG_LEVEL=info"))),
+        "ordinary settings stay: {events:#?}"
+    );
+}
+
 /// A *pattern*-shaped secret (not registered) is
 /// redacted on the persist path but, by design (decision 0071), is
 /// left alone on the model-facing path -- the model still sees whatever a

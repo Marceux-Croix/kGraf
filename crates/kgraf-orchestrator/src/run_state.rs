@@ -582,6 +582,27 @@ pub struct RunStateRecord {
     /// pre-compaction history.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub compactions: Vec<CompactionRecord>,
+    /// Holds placed by pre-dispatch interface checks, in order, each with
+    /// the route and model of every party (decision 0078). A record from
+    /// before the field reads as empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub check_holds: Vec<CheckHold>,
+}
+
+/// A hold a pre-dispatch interface check placed, with the route and model of
+/// every party of the interface (decision 0078), so a hold is attributable
+/// to a model pair from the run record alone.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckHold {
+    pub interface: String,
+    pub version: u32,
+    /// The failed check's stage (`artifact`, `stub_compile`, `vacuity`,
+    /// `handshake`, `stub_land`), or `not_run` when the checks could not run.
+    pub stage: String,
+    /// The contracts the check held.
+    pub held: Vec<String>,
+    /// Every party of the interface, held or not.
+    pub parties: Vec<crate::checks::PartyModel>,
 }
 
 /// One worker compaction, as the run record keeps it (decision 0095).
@@ -761,6 +782,7 @@ impl RunStateRecord {
             replans: 0,
             replan_note: None,
             compactions: Vec::new(),
+            check_holds: Vec::new(),
         }
     }
 

@@ -42,6 +42,15 @@
 //!   time. Each git process kGraf runs on the repository holds the lock
 //!   shared, as before. Outside Bypass a command runs with the git directory
 //!   read-only.
+//! - *Frozen configuration.* Inside that writable directory, the sandbox
+//!   keeps the files git reads configuration from read-only
+//!   ([`ShellWindow::frozen_files`], [`kgraf_sandbox::FROZEN_GIT_FILES`]):
+//!   kGraf's own git lists the configuration and then runs with every driver
+//!   and hook it found neutralized, so a command that could change it between
+//!   the two could make kGraf's git run a program. A configuration write goes
+//!   through `apply_patch`, under the exclusive lock. A sandbox that cannot
+//!   freeze single files (Linux, Windows) gets no shell window: the command
+//!   runs with the git directory read-only and says why.
 //! - *Shell pre-state,* before each Bypass command, without a lock: the git
 //!   files a restore needs (the shared `config`, `HEAD`, `packed-refs`,
 //!   `shallow`, every file under `refs/` and `info/`, each worktree admin
@@ -199,6 +208,7 @@ pub struct WriteWindow {
 #[must_use = "pass the window to after_shell, which checks the command's git changes"]
 pub struct ShellWindow {
     root: PathBuf,
+    frozen: Vec<PathBuf>,
     open: Option<OpenShell>,
 }
 
@@ -222,6 +232,16 @@ impl ShellWindow {
     /// The shared git directory, to add as a sandbox writable root.
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The repository's configuration files beyond the fixed set
+    /// ([`kgraf_sandbox::FROZEN_GIT_FILES`]): every config file git lists and
+    /// every include target, existing or not. The sandbox keeps these and
+    /// the fixed set read-only ([`kgraf_sandbox::SandboxPolicy::with_frozen_git_config`]),
+    /// so the command cannot add a driver or hook while kGraf's own git runs
+    /// between its configuration listing and its command.
+    pub fn frozen_files(&self) -> &[PathBuf] {
+        &self.frozen
     }
 }
 
@@ -324,6 +344,9 @@ struct State {
     /// What it found when the attempt's first window opened, for the
     /// end-of-attempt check.
     first_baseline: Option<BTreeSet<String>>,
+    /// The repository's configuration files, cached until one changes
+    /// (decision 0094: a Bypass command's sandbox keeps them read-only).
+    includes: kgraf_core::host_git::IncludeScan,
 }
 
 /// One attempt's guard over protected writes. Shared by its `apply_patch`
@@ -793,6 +816,22 @@ impl ProtectedWrites {
             return Ok(None);
         }
         self.settle_abandoned_locked();
+        // First, before anything is registered: without the list of files
+        // to keep read-only, the git directory is not made writable at all.
+        let frozen = {
+            let exe = self.git_exe.clone().ok_or_else(|| {
+                WindowError::Unprotected(
+                    "git is not on PATH, so the repository's configuration files cannot be listed"
+                        .to_owned(),
+                )
+            })?;
+            let mut st = self.state();
+            st.includes.files(&exe, &self.common_dir).map_err(|e| {
+                WindowError::Unprotected(format!(
+                    "the repository's configuration files cannot be listed: {e}"
+                ))
+            })?
+        };
         let mut st = self.state();
         if st.shell_baseline.is_none() {
             let baseline: BTreeSet<String> = self
@@ -829,6 +868,7 @@ impl ProtectedWrites {
         let id = windows::open(&self.common_dir, &self.worker, pre.clone());
         Ok(Some(ShellWindow {
             root: self.common_dir.clone(),
+            frozen,
             open: Some(OpenShell {
                 id,
                 pre,

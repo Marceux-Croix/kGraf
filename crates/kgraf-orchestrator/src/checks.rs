@@ -702,6 +702,29 @@ pub struct HandshakeStatement {
     /// What I will touch: paths (0022's write scope).
     #[serde(default)]
     pub touch: Vec<String>,
+    /// The route the party runs on, as the request named it. Set by the
+    /// orchestrator, never read from the model, so a hold this statement
+    /// causes names the model pair (0078).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub route: String,
+    /// The model that stated it: the handshaker's caller, or, for a
+    /// handshaker that does not say, the route's model. Set by kGraf, never
+    /// read from the model's answer.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub model: String,
+}
+
+/// The route and model one party of an interface runs on, recorded on every
+/// check event and every recorded hold, so a hold is attributable to the
+/// models of its parties (0078). Empty `route` and `model`: the party has no
+/// route yet (verified before this run, or its route is not configured).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartyModel {
+    pub party: String,
+    #[serde(default)]
+    pub route: String,
+    #[serde(default)]
+    pub model: String,
 }
 
 /// A mechanical disagreement between handshake statements.
@@ -1888,6 +1911,8 @@ async fn ask_statement(
         let mut statement =
             parse_handshake(&text).map_err(|e| PlanError::attributed(vec![call.clone()], e))?;
         statement.party = request.party.clone();
+        statement.route = request.route.clone();
+        statement.model = caller.model.clone();
         Ok((statement, Some(call)))
     }
 }
@@ -1901,6 +1926,8 @@ pub fn parse_handshake(text: &str) -> Result<HandshakeStatement, PlanError> {
             excerpt: text.chars().take(200).collect(),
         })?;
     s.party.clear();
+    s.route.clear();
+    s.model.clear();
     Ok(s)
 }
 
@@ -1945,6 +1972,7 @@ mod tests {
             expect: expect.iter().map(|s| (*s).to_owned()).collect(),
             consume: vec![],
             touch: touch.iter().map(|s| (*s).to_owned()).collect(),
+            ..Default::default()
         }
     }
 
@@ -2023,6 +2051,11 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(Some(&calls[0].id), call.as_ref());
         assert_eq!(calls[0].model, "mb", "the party's own model was called");
+        // The statement names its route and the model that stated it (0078),
+        // and a model's answer cannot set either.
+        assert_eq!((s.route.as_str(), s.model.as_str()), ("b:mb", "mb"));
+        let forged = parse_handshake(r#"{"route":"x","model":"y","provide":[]}"#).expect("parse");
+        assert!(forged.route.is_empty() && forged.model.is_empty());
         assert!(
             h.state(&request("c:mc")).await.is_err(),
             "no substitute model"

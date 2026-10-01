@@ -115,6 +115,7 @@ const PARTIAL: IsolationStrength = IsolationStrength {
     unix_sockets_confined: false,
     network_deniable: false,
     gitlink_protected: false,
+    git_config_freezable: false,
     gaps: "seccomp is unavailable, so connect() to existing unix sockets is not \
            blocked (D-Bus, docker.sock, ssh-agent; the Docker daemon can write \
            anywhere); network is not blocked; signals to other processes are not \
@@ -141,6 +142,10 @@ fn strength_for(c: LinuxConfinement) -> IsolationStrength {
         unix_sockets_confined: true,
         network_deniable: true,
         gitlink_protected: c.namespaces,
+        // Landlock grants whole hierarchies and cannot deny one file under
+        // a writable root; a read-only bind mount cannot stop the directory
+        // above it being renamed away and replaced.
+        git_config_freezable: false,
         gaps: Box::leak(gaps(c).into_boxed_str()),
     }
 }

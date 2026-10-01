@@ -37,6 +37,7 @@ pub(super) const STRENGTH: IsolationStrength = IsolationStrength {
     unix_sockets_confined: true,
     network_deniable: true,
     gitlink_protected: true,
+    git_config_freezable: true,
     gaps: "reads outside the credential deny list are allowed (source code in other \
            repositories, most of $HOME), apart from the checkout a worktree was made \
            from, whose files other than its cargo files can be stat()ed but not read; \
@@ -461,10 +462,77 @@ pub(super) fn profile(policy: &Resolved, home: &Path) -> (String, Vec<(String, P
     sections.push("(deny mach-lookup (xpc-service-name-prefix \"\"))".to_string());
     // Write denies last so no broader allow reopens them.
     sections.extend(write_denies);
+    let frozen = frozen_git_regexes(policy);
+    if !frozen.is_empty() {
+        let mut rules = Vec::new();
+        for (i, regex) in frozen.into_iter().enumerate() {
+            let key = format!("FROZEN_GIT_{i}");
+            rules.push(format!("(regex (param \"{key}\"))"));
+            params.push((key, PathBuf::from(regex)));
+        }
+        sections.push(format!(
+            "; git configuration inside a writable git directory (decision 0094)\n\
+             (deny file-write*\n  {}\n)",
+            rules.join("\n  ")
+        ));
+    }
     // F_MAKECOMPRESSED (80) and F_TRANSFEREXTENTS (110) mutate files through
     // read-only descriptors, bypassing file-write* (codex).
     sections.push("(deny system-fcntl (fcntl-command 80 110))".to_string());
     (sections.join("\n"), params)
+}
+
+/// The anchored regexes for every frozen git file and every directory
+/// above it, up to (not including) the root it lies in. Freezing the
+/// directories too stops a command from renaming one away and moving in a
+/// replacement built elsewhere holding its own config; a write inside such a
+/// directory is another path and stays allowed. A listed file outside every
+/// writable root is already read-only and gets no rule.
+fn frozen_git_regexes(policy: &Resolved) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |root: &Path, segments: &[String]| {
+        let base = regex_escape(&root.display().to_string());
+        for end in 1..=segments.len() {
+            let regex = format!("^{base}/{}$", segments[..end].join("/"));
+            if !out.contains(&regex) {
+                out.push(regex);
+            }
+        }
+    };
+    for frozen in &policy.frozen_git {
+        for entry in super::FROZEN_GIT_FILES {
+            let segments: Vec<String> = entry
+                .split('/')
+                .map(|seg| {
+                    if seg == "*" {
+                        "[^/]+".to_string()
+                    } else {
+                        regex_escape(seg)
+                    }
+                })
+                .collect();
+            push(&frozen.common_dir, &segments);
+        }
+        for file in &frozen.files {
+            let Some(root) = policy
+                .writable
+                .iter()
+                .filter(|r| file.starts_with(r) && file != *r)
+                .max_by_key(|r| r.components().count())
+            else {
+                continue;
+            };
+            let Ok(rel) = file.strip_prefix(root) else {
+                continue;
+            };
+            let segments: Vec<String> = rel
+                .components()
+                .map(|c| regex_escape(&c.as_os_str().to_string_lossy()))
+                .collect();
+            push(root, &segments);
+        }
+    }
+    out
 }
 
 /// The writable and readable roots that lie strictly inside one of the
@@ -507,7 +575,57 @@ mod tests {
             home: Some(PathBuf::from("/home/u")),
             ancestor_limit: None,
             cargo_homes: None,
+            frozen_git: vec![],
         }
+    }
+
+    /// Decision 0094: every frozen git file and the directories above it get
+    /// an anchored deny, a `*` segment matching one name; an
+    /// include target under a writable root is frozen with its directories
+    /// below that root; one outside every root gets no rule.
+    #[test]
+    fn the_frozen_git_configuration_gets_denies_with_its_directories() {
+        let mut r = resolved("/w/repo/.git", Network::Deny);
+        r.writable.push(PathBuf::from("/w/tree"));
+        r.frozen_git = vec![super::super::FrozenGit {
+            common_dir: PathBuf::from("/w/repo/.git"),
+            files: vec![
+                PathBuf::from("/w/tree/conf/extra.cfg"),
+                PathBuf::from("/elsewhere/x.cfg"),
+            ],
+        }];
+        let (text, params) = profile(&r, Path::new("/home/u"));
+        let frozen: Vec<String> = params
+            .iter()
+            .filter(|(k, _)| k.starts_with("FROZEN_GIT_"))
+            .map(|(_, v)| v.display().to_string())
+            .collect();
+        let c = "^/w/repo/\\.git/";
+        for want in [
+            format!("{c}config$"),
+            format!("{c}config\\.lock$"),
+            format!("{c}config\\.worktree$"),
+            format!("{c}info$"),
+            format!("{c}info/attributes$"),
+            format!("{c}worktrees$"),
+            format!("{c}worktrees/[^/]+$"),
+            format!("{c}worktrees/[^/]+/commondir$"),
+            format!("{c}worktrees/[^/]+/config\\.worktree$"),
+            "^/w/tree/conf$".to_string(),
+            "^/w/tree/conf/extra\\.cfg$".to_string(),
+        ] {
+            assert!(frozen.contains(&want), "missing {want} in {frozen:#?}");
+        }
+        assert!(!frozen.iter().any(|f| f.contains("elsewhere")));
+        assert!(
+            !frozen
+                .iter()
+                .any(|f| f == "^/w/tree$" || f == "^/w/repo/\\.git$")
+        );
+        assert!(text.contains("(deny file-write*\n  (regex (param \"FROZEN_GIT_0\"))"));
+        // After the writable-root allow, so nothing reopens them.
+        let allow = text.find("(allow file-write*\n  (subpath").expect("allow");
+        assert!(text.find("FROZEN_GIT_0").expect("deny") > allow);
     }
 
     /// A symlinked credential directory is denied at its target, and the

@@ -890,12 +890,14 @@ mod tests {
                 findings: Vec::new(),
                 handshake: Vec::new(),
                 held: vec![t("held")],
+                parties: Vec::new(),
             }),
             contract(ContractEvent::CheckNotRun {
                 interface: "i".into(),
                 version: 1,
                 error: t("error"),
                 held: Vec::new(),
+                parties: Vec::new(),
             }),
             contract(ContractEvent::Inadequate {
                 interface: "i".into(),
@@ -999,6 +1001,7 @@ mod tests {
                 version: 1,
                 error: secret.clone(),
                 held: Vec::new(),
+                parties: Vec::new(),
             }),
             counters: crate::challenge::ContractCounters::default(),
         });

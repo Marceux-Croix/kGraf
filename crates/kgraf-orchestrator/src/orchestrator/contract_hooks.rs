@@ -42,7 +42,7 @@ use crate::challenge::{
 };
 use crate::checks::{
     CheckFailure, CheckRun, CheckStage, FileOverlay, HandshakeFinding, HandshakeRequest,
-    HandshakeStatement, Handshaker, InterfaceContract, SandboxRunner, check_mechanical,
+    HandshakeStatement, Handshaker, InterfaceContract, PartyModel, SandboxRunner, check_mechanical,
     compare_handshake_ordered, ordered_pairs,
 };
 use crate::consumer_tests::{self, ConsumerTestKey, ConsumerTestOutcome};
@@ -387,6 +387,59 @@ impl RunLoop {
         held
     }
 
+    /// Every party of `ic` with the route it runs on and that route's model
+    /// (decision 0078), without picking a route for a party that has none:
+    /// its recorded worker route, its assigned or pinned route, or the route
+    /// its handshake was asked on; empty when there is none.
+    fn party_models(&self, ic: &InterfaceContract) -> Vec<PartyModel> {
+        ic.parties
+            .iter()
+            .map(|p| {
+                let route = self
+                    .record
+                    .contract(p)
+                    .and_then(|c| {
+                        c.worker_routes
+                            .first()
+                            .or(c.route.as_ref())
+                            .or(c.handshake_route.as_ref())
+                            .cloned()
+                    })
+                    .unwrap_or_default();
+                let model = self
+                    .route(&route)
+                    .map(|r| r.model().to_owned())
+                    .unwrap_or_default();
+                PartyModel {
+                    party: p.clone(),
+                    route,
+                    model,
+                }
+            })
+            .collect()
+    }
+
+    /// Keep a check's hold in the run record with every party's route and
+    /// model (decision 0078). A check that held nothing is not a hold.
+    fn record_check_hold(
+        &mut self,
+        ic: &InterfaceContract,
+        stage: String,
+        held: &[String],
+        parties: &[PartyModel],
+    ) {
+        if held.is_empty() {
+            return;
+        }
+        self.record.check_holds.push(crate::run_state::CheckHold {
+            interface: ic.id.clone(),
+            version: ic.version,
+            stage,
+            held: held.to_vec(),
+            parties: parties.to_vec(),
+        });
+    }
+
     /// Release every open contract held under interface `id`.
     fn release_parties(&mut self, id: &str) -> Vec<String> {
         let mut released = Vec::new();
@@ -621,11 +674,14 @@ impl RunLoop {
                 Ok(t) => t,
                 Err(error) => {
                     let held = self.hold_parties(&ic, &format!("handshake could not run: {error}"));
+                    let parties = self.party_models(&ic);
+                    self.record_check_hold(&ic, "not_run".into(), &held, &parties);
                     self.contract_event(ContractEvent::CheckNotRun {
                         interface: ic.id.clone(),
                         version: ic.version,
                         error,
                         held,
+                        parties,
                     })
                     .await?;
                     self.save()?;
@@ -652,6 +708,7 @@ impl RunLoop {
             if let Some(d) = self.contracts.as_mut() {
                 d.mechanical.remove(&key);
             }
+            let parties = self.party_models(&ic);
             self.contract_event(ContractEvent::ChecksPassed {
                 interface: ic.id.clone(),
                 version: ic.version,
@@ -659,6 +716,7 @@ impl RunLoop {
                 handshake: statements,
                 handshake_skipped: skipped,
                 warnings,
+                parties,
             })
             .await?;
             // 0081: land the interface's stub onto the integration branch
@@ -908,6 +966,12 @@ impl RunLoop {
         handshake: Vec<HandshakeStatement>,
     ) -> Result<(), OrchestratorError> {
         let held = self.hold_parties(ic, &failure.to_string());
+        let parties = self.party_models(ic);
+        let stage = serde_json::to_value(failure.stage)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .unwrap_or_default();
+        self.record_check_hold(ic, stage, &held, &parties);
         if let Some(first) = self.first_open_party(ic) {
             self.submit_report(
                 &first,
@@ -923,6 +987,7 @@ impl RunLoop {
             findings,
             handshake,
             held,
+            parties,
         })
         .await?;
         self.save()
@@ -1046,9 +1111,21 @@ impl RunLoop {
             let input = estimate_tokens(&request.brief) + 600;
             let reservation = self.reserve_call(&basis, input);
             match handshaker.state(&request).await {
-                Ok((statement, call)) => {
+                Ok((mut statement, call)) => {
                     let calls: Vec<CallId> = call.into_iter().collect();
                     self.settle_call(reservation, Some(&calls))?;
+                    // Set here, whatever the handshaker did: the route the
+                    // party runs on, and the model that stated it (the
+                    // route's model when the handshaker does not say), so a
+                    // hold names the model pair (0078).
+                    statement.party = request.party.clone();
+                    if statement.model.is_empty() {
+                        statement.model = self
+                            .route(&request.route)
+                            .map(|r| r.model().to_owned())
+                            .unwrap_or_default();
+                    }
+                    statement.route = request.route.clone();
                     statements.push(statement);
                 }
                 Err(e) => {
@@ -1203,11 +1280,14 @@ impl RunLoop {
                     Err(error) => {
                         let held =
                             self.hold_parties(&ic, &format!("checks could not run: {error}"));
+                        let parties = self.party_models(&ic);
+                        self.record_check_hold(&ic, "not_run".into(), &held, &parties);
                         self.contract_event(ContractEvent::CheckNotRun {
                             interface,
                             version,
                             error,
                             held,
+                            parties,
                         })
                         .await?;
                         self.save()?;

@@ -554,7 +554,7 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
     names the switch and the flag.
 
   Keeping keeps every attempt's worktree and builds, for you to inspect or reuse (a merged
-  attempt's work is on the branch as well); `kgraf clean <worktree>` removes a kept one. A
+  attempt's work is on the branch as well); `kgraf clean <worktree>` removes a kept one. It looks in both places kGraf keeps worktrees, `.kgraf/worktrees` for runs and `.kgraf/workspaces` for `kgraf worker`; when both hold the name, say which (`kgraf clean workspaces/<name>`), and an unknown name is refused with the list of kept worktrees. A
   kept attempt is never continued as live work. Conversation, gate, probe and interface-stub
   worktrees hold no attempt and are removed either way. A worktree that a live worker, a
   stopped run, a lost lease, a pending merge, a later part of the same work (a handoff
@@ -601,8 +601,7 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   - **Bypass**: everything is granted without asking: workers' shell commands run under a write
     scope, except the few the policy forbids. It offers no protection against prompt injection
     or unintended actions. Workers may also write the repository's git directory (a patch to
-    `.git/info/exclude`, `.git/config` or a ref, or any shell command) and kGraf's
-    settings files `.kgraf/run.json` and `.kgraf/worker.json`. Before the first such write,
+    `.git/info/exclude`, `.git/config` or a ref, or, on macOS, any shell command) and kGraf's settings files `.kgraf/run.json` and `.kgraf/worker.json`. Before the first such write,
     kGraf copies the refs, config and index (at most 32 MiB) or the settings file; after each
     write it checks that the repository still reads (every ref resolves, the config parses,
     and `git fsck --connectivity-only` when the attempt ends) and that the settings file still
@@ -614,7 +613,7 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
     while another worker's command also ran; cause not exclusive"). The ledger, the trace, run records, transcripts, the graph and the rest of
     `.kgraf` stay refused in every mode, as do `.git/objects`, the `.git` link file,
     `.gitconfig` and a nested `.git`. In Bypass only, workers may also write `.gitattributes`,
-    `.gitmodules` and files under `.githooks`. These are ordinary files of your project: a
+    `.gitmodules` and files under `.githooks`. A shell command never writes the repository's git configuration, even in Bypass: `config`, `config.worktree`, `info/attributes`, each worktree's `commondir` and every file the config includes stay read-only in its sandbox, so `git config`, `git remote add`, a tracking `git checkout -b` and `git worktree add` fail there, and the command's output says to write `.git/config` with a patch instead. That keeps a command from adding a driver or hook while kGraf's own git runs. On Linux and Windows the sandbox cannot keep single files read-only, so in Bypass a shell command runs with the whole git directory read-only and says so; patches to `.git/...` still work. These are ordinary files of your project: a
     contract must declare them like any file, the verifier checks them against that list, and
     they merge as plain data, with no copy taken first (git history keeps every version).
     kGraf's own git never runs what they select (see "kGraf's own git" below), but your git
@@ -659,8 +658,7 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   is refused: those files can change what cargo runs whatever its arguments say.
 - On macOS a sandboxed build cannot read the rest of the checkout it runs in (only its cargo
   files), so a `.env` at the checkout root stays private. Every value in that `.env` is also
-  removed from what a worker's model sees, and build and test output is scrubbed of
-  key-shaped strings before the model sees it.
+  removed from what a worker's model sees, and build and test output is scrubbed of key-shaped strings before the model sees it. A secrets file a worker reads anywhere in its worktree (`.env`, `.env.local`, `prod.env`, `.envrc`, `secrets.json` and the like, with `read_file`, `search_files`, or a shell command that names it) has its credential values removed from the worker's transcript, the trace and the run record; the worker's model still sees the file as it is.
 - A sandboxed build cannot read your per-user cargo config (`~/.cargo/config.toml`,
   `~/.cargo/config`, or the one in `$CARGO_HOME`) on macOS or Linux, since it can hold a
   registry token or a proxy password. kGraf passes its build settings in for you: a source
@@ -693,8 +691,7 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   another's code, the planner also writes an interface contract: a stub, a reference, the
   consumer's expectations and a test. Before the first worker starts, the sandbox checks
   it: the consumer and the test compile against the stub, the test fails against the stub
-  and passes against the reference, and the two parties' handshakes agree. A contract that
-  fails is held, with the file that failed named. A contract whose compiler or test runner
+  and passes against the reference, and the two parties' handshakes agree. A contract that fails is held, with the file that failed named. Each handshake and each check names every party's route and model, and the run record keeps each hold with them, so you can see which models disagreed. A contract whose compiler or test runner
   is not installed is held too, with the program named. A worker can challenge a contract
   with the `challenge_contract` tool; the answer names the artifact that settled it, or
   says it is judgment.
