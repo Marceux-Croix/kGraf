@@ -129,6 +129,9 @@ impl RunLoop {
                     ("plan_review_changed", String::new())
                 }
                 kgraf_tools::PermissionEvent::Granted { worker, .. } => ("granted", worker.clone()),
+                kgraf_tools::PermissionEvent::ProtectedWrite { worker, .. } => {
+                    ("protected_write", worker.clone())
+                }
             };
             // A worker's ask granted by the mode belongs to this run only if
             // the worker is one of its own.

@@ -145,6 +145,15 @@ impl SandboxPolicy {
         self
     }
 
+    /// An extra writable root (and so a readable one). Decision 0094's Bypass
+    /// mode adds the repository's git directory here, so a worker's git
+    /// commands can write refs, config and the index; every other policy
+    /// keeps that directory read-only.
+    pub fn with_writable_root(mut self, dir: PathBuf) -> Self {
+        self.writable_roots.push(dir);
+        self
+    }
+
     /// An extra read-only root. Needed where reads are allowlisted (Linux);
     /// on macOS reads are open apart from the credential deny list, and on
     /// Windows reads are not confined.

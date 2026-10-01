@@ -5305,6 +5305,9 @@ mod build_allowlist;
 #[path = "shortfall_tests.rs"]
 mod shortfall;
 
+#[path = "protected_write_tests.rs"]
+mod protected_write;
+
 /// A run's index pass does not hold the host's shared graph lock: another
 /// run's loop takes that lock for its session and lease calls, and holding it
 /// for a large project's whole pass stalls that loop. With the lock held

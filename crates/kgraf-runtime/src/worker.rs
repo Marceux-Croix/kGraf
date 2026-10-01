@@ -218,6 +218,11 @@ pub struct WorkerEnv {
     /// `allowed-tools` policy on its approval chain. `None`: no skills, and
     /// the prefix must list none.
     pub skills: Option<Arc<SkillSession>>,
+    /// The attempt's protected-write guard (decision 0094): in Bypass, a
+    /// write to `.git` or kGraf's settings that it admits passes the scope
+    /// check, and a failed integrity check fails the worker. `None`: every
+    /// protected path is refused, in every mode.
+    pub protected_writes: Option<Arc<kgraf_tools::ProtectedWrites>>,
 }
 
 impl WorkerEnv {
@@ -242,6 +247,7 @@ impl WorkerEnv {
             masker: Arc::new(SessionMasker::default()),
             settings: LoopSettings::default(),
             skills: None,
+            protected_writes: None,
         }
     }
 }
@@ -940,10 +946,23 @@ impl Worker {
         }
         for path in access.writes_paths() {
             if let Some(why) = kgraf_core::paths::forbidden_reason(path) {
-                return Some(format!(
-                    "{} is not writable by a worker: {why}",
-                    path.display()
-                ));
+                // Decision 0094: in Bypass the guard admits `.git` and
+                // kGraf's settings. They lie outside the worktree's files, so
+                // the declared write scope (repository files) does not apply.
+                let admitted = match &self.env.protected_writes {
+                    Some(guard) => guard.admit(path).map(|r| r.map(|_| ())),
+                    None => Some(Err(why)),
+                };
+                match admitted {
+                    Some(Ok(())) => continue,
+                    Some(Err(why)) => {
+                        return Some(format!(
+                            "{} is not writable by a worker: {why}",
+                            path.display()
+                        ));
+                    }
+                    None => {}
+                }
             }
             if let Some(scope) = &self.brief.write_scope {
                 let inside = scope.iter().any(|s| crate::paths::same_path(s, path));
@@ -994,6 +1013,28 @@ impl Worker {
                 String::new(),
             ),
         };
+        // Decision 0094: the attempt's protected writes get their full check
+        // (fsck over the shared repository) before the result leaves, so a
+        // failed check fails the worker and nothing of it is merged.
+        let (outcome, answer) = match self.env.protected_writes.clone() {
+            None => (outcome, answer),
+            Some(guard) => match tokio::task::spawn_blocking(move || guard.finish()).await {
+                Ok(Ok(())) => (outcome, answer),
+                Ok(Err(check)) => {
+                    let error = match outcome {
+                        WorkerOutcome::Failed { error } => format!("{error}\n{check}"),
+                        _ => check,
+                    };
+                    (WorkerOutcome::Failed { error }, String::new())
+                }
+                Err(e) => (
+                    WorkerOutcome::Failed {
+                        error: format!("the protected-write check did not finish: {e}"),
+                    },
+                    String::new(),
+                ),
+            },
+        };
         // Persist-scrubbed: the answer is stored
         // in the run record and shown in the shell, the same sinks as the
         // transcript, and reaches this point through no path
@@ -1017,7 +1058,7 @@ impl Worker {
             worker: self.brief.worker.clone(),
             outcome,
             answer,
-            changed_paths: self.changed.iter().cloned().collect(),
+            changed_paths: self.worktree_changes(),
             commit: None,
             calls: std::mem::take(&mut self.calls),
             steps: self.budget.used(),
@@ -1484,6 +1525,23 @@ impl Worker {
         }
     }
 
+    /// The changed paths that are worktree files: a protected write
+    /// (decision 0094) lands in the git or state directory, not in the
+    /// worktree, so it is left out.
+    fn worktree_changes(&self) -> Vec<PathBuf> {
+        self.changed
+            .iter()
+            .filter(|p| {
+                !self
+                    .env
+                    .protected_writes
+                    .as_ref()
+                    .is_some_and(|g| g.wrote(p))
+            })
+            .cloned()
+            .collect()
+    }
+
     fn hand_back(&self, context_tokens: u64) -> WorkerOutcome {
         let stop = self.brief.context.worker_stop_tokens();
         WorkerOutcome::HandedBack {
@@ -1494,7 +1552,7 @@ impl Worker {
                      stop point ({context_tokens} of {stop} tokens). Instruction: {}",
                     self.brief.instruction
                 )],
-                files_touched: self.changed.iter().cloned().collect(),
+                files_touched: self.worktree_changes(),
                 context_tokens,
             },
         }

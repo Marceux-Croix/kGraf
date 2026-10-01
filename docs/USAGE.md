@@ -600,7 +600,17 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
     for a tool, and for a path outside the repository or one no worker may write.
   - **Bypass**: everything is granted without asking: workers' shell commands run under a write
     scope, except the few the policy forbids. It offers no protection against prompt injection
-    or unintended actions.
+    or unintended actions. Workers may also write the repository's git directory (a patch to
+    `.git/info/exclude`, `.git/config` or a ref, or a `git` command in the shell) and kGraf's
+    settings files `.kgraf/run.json` and `.kgraf/worker.json`. Before the first such write,
+    kGraf copies the refs, config and index (at most 32 MiB) or the settings file; after each
+    write it checks that the repository still reads (every ref resolves, the config parses,
+    and `git fsck --connectivity-only` when the attempt ends) and that the settings file still
+    loads. A write that fails its check is put back, and the attempt fails with the check's
+    output and is not merged; every write, kept or put back, shows in the run's trace and the
+    activity card. The ledger, the trace, run records, transcripts, the graph and the rest of
+    `.kgraf` stay refused in every mode, as do `.git/objects`, the `.git` link file,
+    `.gitattributes`, `.gitmodules` and `.githooks`.
 
   In every mode, Bypass included: your deny rules block (`deny = ["shell(curl*)"]`, or
   `--deny`), your ask rules ask (`ask = [...]`, or `--ask`), deleting the filesystem root, a

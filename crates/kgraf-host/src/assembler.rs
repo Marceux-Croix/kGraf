@@ -143,6 +143,16 @@ impl AttemptAssembler {
             };
         let path_case = kgraf_tools::detect_path_case(ws.root())
             .step("cannot probe the worktree's filesystem case behavior")?;
+        // Decision 0094: one guard per attempt, so its snapshot, checks and
+        // failure belong to this attempt alone.
+        let protected_writes = kgraf_tools::ProtectedWrites::for_workspace(
+            self.permissions.clone(),
+            worker,
+            &ws,
+            self.state.clone(),
+            settings_check(self.root.clone()),
+        )
+        .map_err(Error::Invalid)?;
         Ok(Assembly {
             ledger: self.ledger.clone(),
             provider: parts.provider.clone(),
@@ -171,6 +181,7 @@ impl AttemptAssembler {
             dependency_refetch: Some(self.dependency_refetch.clone()),
             skills: self.skills.clone(),
             permissions: self.permissions.clone(),
+            protected_writes: Some(Arc::new(protected_writes)),
         })
     }
 
@@ -196,6 +207,22 @@ impl AttemptAssembler {
             .with_granted_programs(granted.iter().cloned());
         assemble(assembly).await.map_err(|e| format!("{e:#}"))
     }
+}
+
+/// The check a worker's write to kGraf's settings must pass (decision
+/// 0094): the parser the host loads each file with, so a file that would no
+/// longer load (or that names a permission setting, which no project file may)
+/// is restored.
+pub(crate) fn settings_check(root: PathBuf) -> kgraf_tools::protected::SettingsCheck {
+    Arc::new(move |name: &str, path: &Path| match name {
+        "run.json" => crate::config::RunConfig::load(root.clone(), path)
+            .map(|_| ())
+            .map_err(|e| format!("{e:#}")),
+        "worker.json" => WorkerConfig::load(path)
+            .map(|_| ())
+            .map_err(|e| e.to_string()),
+        other => Err(format!("`{other}` is not one of kGraf's settings files")),
+    })
 }
 
 /// Closes an attempt's MCP connections after its worker ends.

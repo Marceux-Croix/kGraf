@@ -179,6 +179,11 @@ pub struct Assembly {
     /// deny and ask rules and the critical-path limit, and the ask resolver
     /// routes each ask by its mode.
     pub permissions: Arc<kgraf_tools::PermissionControl>,
+    /// The attempt's protected-write guard (decision 0094), shared by its
+    /// `apply_patch`, its shell and its worker loop. `None`: every protected
+    /// path stays refused in every mode (a worker run outside an
+    /// orchestrated attempt).
+    pub protected_writes: Option<Arc<kgraf_tools::ProtectedWrites>>,
 }
 
 /// The environment variable that tells a stdio MCP server the worktree it
@@ -561,7 +566,16 @@ pub async fn assemble(a: Assembly) -> Result<Assembled> {
                 executor.clone(),
             ))
         }
-        None => Arc::new(ApplyPatchTool),
+        None => {
+            // Decision 0094: in Bypass the guard admits `.git` and kGraf's
+            // settings; with a remote executor no host repository is near.
+            if let Some(guard) = &a.protected_writes {
+                shell = shell.with_protected_writes(guard.clone());
+                Arc::new(ApplyPatchTool::with_protected_writes(guard.clone()))
+            } else {
+                Arc::new(ApplyPatchTool)
+            }
+        }
     };
     if let Some(refetch) = &a.dependency_refetch {
         shell = shell.with_dependency_refetch(refetch.clone());
@@ -666,6 +680,9 @@ pub async fn assemble(a: Assembly) -> Result<Assembled> {
     env.prefixes = a.prefixes;
     env.slices = slices;
     env.skills = skills;
+    if a.external_executor.is_none() {
+        env.protected_writes = a.protected_writes.clone();
+    }
     // The hook and the tool come from one `ShellTool::new`: one command policy.
     // MCP calls are reviewed too: deny unless a persisted rule allows them.
     // Decision 0094: the user's rules and the critical-path limit run last,

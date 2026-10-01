@@ -34,12 +34,14 @@
 //! its own thread and its result is discarded).
 
 pub(crate) mod parser;
+mod protected;
 mod replace;
 mod seek_sequence;
 mod streaming_parser;
 
 pub use parser::parse_patch;
 pub use parser::{Hunk, ParseError, UpdateFileChunk};
+pub use protected::ProtectedApplyPatch;
 
 use crate::fs_safety::{self, MAX_READ_BYTES};
 use crate::{Access, CallPermit, Tool, ToolContext, ToolDefinition, ToolError, ToolOutput};

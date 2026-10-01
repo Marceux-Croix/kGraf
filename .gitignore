@@ -32,3 +32,9 @@ dist/
 
 # Python bytecode
 __pycache__/
+
+# Super canary rounds: dev evidence, never committed (canary/README.md)
+/canary/runs/
+
+# Super canary fixtures carry their own isolated home with a skills folder.
+!/canary/fixtures/**/.claude/

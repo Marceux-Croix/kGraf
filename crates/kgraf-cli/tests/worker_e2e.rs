@@ -466,6 +466,7 @@ fn assembly_for(
         dependency_refetch: None,
         skills: None,
         permissions: std::sync::Arc::new(kgraf_tools::PermissionControl::manual()),
+        protected_writes: None,
     }
 }
 

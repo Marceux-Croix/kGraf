@@ -439,6 +439,7 @@ async fn run_one(
         // tool list stay the ones every recorded run was measured with.
         skills: None,
         permissions: std::sync::Arc::new(kgraf_tools::PermissionControl::manual()),
+        protected_writes: None,
     };
     let worker_brief = WorkerBrief {
         task: worker_id.into(),

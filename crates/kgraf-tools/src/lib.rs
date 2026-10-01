@@ -50,6 +50,7 @@ pub mod model_tools;
 mod name;
 mod output;
 pub mod permissions;
+pub mod protected;
 mod registry;
 mod schema_lint;
 pub mod shell;
@@ -58,7 +59,7 @@ mod untrusted;
 
 pub(crate) use access::normalize_relative;
 pub use access::{Access, PathCase, detect_path_case};
-pub use apply_patch::ApplyPatchTool;
+pub use apply_patch::{ApplyPatchTool, ProtectedApplyPatch};
 pub use dependency_refetch::{DependencyRefetch, RefetchOutcome};
 pub use error::{AccessError, ApprovalError, RegistryError, ToolError};
 pub use external::{ExternalExecutor, ExternalOutcome, SyncedWrites, remote_policy};
@@ -76,6 +77,7 @@ pub use permissions::{
     ModeSource, PermissionControl, PermissionEvent, PermissionMode, PermissionRulesHook,
     PermissionSettings,
 };
+pub use protected::ProtectedWrites;
 pub use registry::{DiscoveredTools, Exposure, RegisteredTool, ToolRegistry, ToolView};
 pub use schema_lint::untyped_schema_nodes;
 pub use shell::{ExecGate, ShellApprovalHook, ShellTool};

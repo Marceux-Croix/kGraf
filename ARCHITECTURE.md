@@ -1097,6 +1097,13 @@ Bypass grants everything. A mode change reaches running workers and waiting
 requests at once, and requests raised within 2 s of each other are answered as
 one group in the box. The user's deny and ask rules and the refusal to delete
 system paths hold in every mode; a run nobody attends denies what would ask.
+In Bypass only, a worker may also write the repository's git directory
+(`.git/<path>`, resolved as git resolves it) and kGraf's settings
+(`.kgraf/run.json`, `.kgraf/worker.json`), each write behind a bounded
+snapshot and an integrity check that runs before the call returns, with
+`git fsck --connectivity-only` when the attempt ends; a failed check restores
+the snapshot and fails the attempt, so it is never merged. The ledger, trace,
+run records, transcripts and graph stay refused in every mode.
 An instructions report amends the contract once; at most two re-dispatches per
 contract for shortfalls. With plan review on, no worker starts until the user
 approves the plan in the box. A contract accepted on a check that always

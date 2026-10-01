@@ -498,6 +498,7 @@ fn drive(d: DriveArgs<'_>) -> Result<kgraf_runtime::WorkerResult> {
             )
             .context("cannot read the project's skill inventory")?,
             permissions: crate::permissions_cli::control(root, &Default::default())?,
+            protected_writes: None,
         })
     })();
     let assembly = match prepared {

@@ -112,3 +112,52 @@ the plan and say yes before any worker starts.
   Tools are not grantable to one attempt, and no attempt can turn the network on.
 - A mode change made while no run is in flight is kept in the user file but not in any
   project's change log.
+
+## Amendment: Bypass writes the git directory and kGraf's settings, behind a snapshot and a check
+
+Point 4 left a worker's write to `.git` and `.kgraf` refused in Bypass. Bypass now allows the
+git directory and kGraf's settings, as Claude Code's bypass allows its protected paths, with a
+snapshot and an integrity check around every such write. kGraf's own books stay refused.
+
+- **The split.** In Bypass only, a worker may write:
+  - `.git/<path>`, resolved as git resolves it (`git rev-parse --git-path`, against the admin
+    directory recorded when the worktree was made, never the gitlink file on disk): `HEAD` and
+    `index` land in the worktree's admin directory, `config`, `info/exclude` and `refs/...` in
+    the shared repository. Through `apply_patch` (a patch holding only protected hunks) and
+    through the shell, whose sandbox gets the shared git directory as an extra writable root.
+  - `.kgraf/run.json` and `.kgraf/worker.json`, kGraf's settings, through `apply_patch` only
+    (the state directory holds every worker's worktree, so it is never a sandbox writable root).
+
+  Refused in every mode, Bypass included: the spend ledger, the trace, run records, worker
+  transcripts, the graph database, the schedule, the persisted allow rules, the worktrees and
+  the rest of `.kgraf`; `.git` itself and `.git/objects` (objects are not snapshotted, so a
+  faulty write there could not be restored); `.gitattributes`, `.gitmodules`, `.githooks`,
+  `.gitconfig` and a nested `.git`; any path that leaves the worktree. Every other mode refuses
+  every protected path as before. The deletion limits of point 4 are unchanged.
+- **Snapshot,** before the first write to an area in an attempt and again after each passing
+  check: for git, copies of the shared `config`, `HEAD`, `packed-refs`, `shallow`, every file
+  under `refs/` and `info/`, each worktree admin directory's `HEAD`, `gitdir` and `commondir`,
+  and this worktree's `index`, at most 32 MiB in total (over it, no protected git write is made,
+  and the tool says why); for a settings file, its bytes or its absence, at most 1 MiB. A
+  `git bundle` copies objects, which are append-only and far larger, and holds neither config
+  nor the index, so it was not used.
+- **Check,** right after each protected write and after each Bypass shell command that changed
+  a snapshotted file, before the call returns: the config parses, `git for-each-ref` reports no
+  broken ref, each ref and `HEAD` names an existing object or is symbolic, the worktree's `HEAD`
+  resolves to a commit and its index reads. When the attempt ends, `git fsck
+  --connectivity-only` over the shared repository is added; the run's branches and integration
+  view are refs and worktrees of that repository, so the check covers them. A settings file is
+  checked by the parser the host loads it with, which also refuses a permission key. A
+  problem the per-write check already found before the attempt's first git write is the
+  repository's own and is not counted against a write. A patch that deletes a protected path
+  is refused, as a deletion inside `.git` asks in every mode when the shell does it.
+- **On a failed check,** the snapshot is restored (first the changed files that are invalid on
+  their own, so a ref another worker's merge moved meanwhile is kept, then every changed file if
+  the check still fails), the call returns the check's output, and the worker's result is
+  failed with it, so the attempt is never merged. A passing write is kept. Every write is
+  recorded with its worker, path, mode and outcome (`kept`, or `restored:` with the check's
+  output) in the trace and in the graph's permission events.
+- **Limits.** Objects are not restored; a check that finds a corrupt object fails the attempt
+  and says so. Another worker's git operation that runs during this worker's shell command is
+  not serialized against it. `kgraf worker run`, outside an orchestrated attempt, refuses every
+  protected path.

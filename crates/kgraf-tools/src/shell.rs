@@ -213,6 +213,10 @@ pub struct ShellTool {
     /// Who fetches a dependency a failed build could not get (decision
     /// 0087). `None` keeps decision 0084's hint alone.
     refetch: Option<std::sync::Arc<dyn crate::DependencyRefetch>>,
+    /// The attempt's protected-write guard (decision 0094). In Bypass, a
+    /// command also gets the repository's git directory as a writable root,
+    /// snapshotted before and checked after it runs.
+    protected: Option<std::sync::Arc<crate::ProtectedWrites>>,
 }
 
 impl ShellTool {
@@ -235,6 +239,7 @@ impl ShellTool {
             exec_gate: None,
             external: None,
             refetch: None,
+            protected: None,
         };
         (tool, ShellApprovalHook::new(policy))
     }
@@ -258,6 +263,7 @@ impl ShellTool {
             exec_gate: None,
             external: None,
             refetch: None,
+            protected: None,
         }
     }
 
@@ -345,6 +351,14 @@ impl ShellTool {
         refetch: std::sync::Arc<dyn crate::DependencyRefetch>,
     ) -> Self {
         self.refetch = Some(refetch);
+        self
+    }
+
+    /// Bind the attempt's protected-write guard (decision 0094): in Bypass,
+    /// each command may write the repository's git directory, behind the
+    /// guard's snapshot and check. Other modes are unchanged.
+    pub fn with_protected_writes(mut self, guard: std::sync::Arc<crate::ProtectedWrites>) -> Self {
+        self.protected = Some(guard);
         self
     }
 
@@ -997,7 +1011,57 @@ impl Tool for ShellTool {
             }
             None => None,
         };
-        let output = run_sandboxed(&cmd, ctx, &policy, &env, self.timeout, self.output_cap).await?;
+        // Decision 0094: in Bypass, the git directory is writable for this
+        // command, snapshotted first and checked after, before the call
+        // returns, so no later git operation meets an unchecked write.
+        let mut guarded = None;
+        let mut read_only_note = None;
+        if let Some(guard) = &self.protected {
+            let g = guard.clone();
+            match tokio::task::spawn_blocking(move || g.before_shell())
+                .await
+                .map_err(|e| internal(format!("protected-write snapshot task failed: {e}")))?
+            {
+                Ok(Some(root)) => {
+                    policy = policy.with_writable_root(root);
+                    guarded = Some(guard.clone());
+                }
+                Ok(None) => {}
+                // Run as in every other mode, the git directory read-only,
+                // and say so: a write that could not be restored is not made.
+                Err(e) => {
+                    read_only_note = Some(format!(
+                        "\n[the repository's git directory stayed read-only for this command: {e}]"
+                    ));
+                }
+            }
+        }
+        let output = run_sandboxed(&cmd, ctx, &policy, &env, self.timeout, self.output_cap).await;
+        if let Some(guard) = guarded {
+            let checked = tokio::task::spawn_blocking(move || guard.after_shell())
+                .await
+                .map_err(|e| internal(format!("protected-write check task failed: {e}")))?;
+            if let Err(check) = checked {
+                let mut out = match output {
+                    Ok(out) => out,
+                    Err(e) => ToolOutput::error(e.to_string()),
+                };
+                out.is_error = true;
+                out.parts.insert(
+                    0,
+                    crate::OutputPart::Text {
+                        text: crate::UntrustedText::new(format!("{check}\n\ncommand output:\n")),
+                    },
+                );
+                return Ok(out);
+            }
+        }
+        let mut output = output?;
+        if let Some(note) = read_only_note {
+            output.parts.push(crate::OutputPart::Text {
+                text: crate::UntrustedText::new(note),
+            });
+        }
         if !verdict.build {
             return Ok(output);
         }
@@ -3738,6 +3802,125 @@ fn main() {
             )
             .expect("changed");
             assert!(tool.access(&call_input(&["cargo", "check"])).is_err());
+        }
+
+        /// Decision 0094: a shell tool with the attempt's protected-write
+        /// guard, its policy reading the live mode.
+        fn guarded_tool(
+            f: &Fixture,
+            mode: crate::PermissionMode,
+        ) -> (ShellTool, std::sync::Arc<crate::ProtectedWrites>) {
+            let control = crate::protected::tests::control(mode);
+            let state = f._tmp.path().join("state");
+            std::fs::create_dir_all(&state).expect("state");
+            let guard = std::sync::Arc::new(
+                crate::ProtectedWrites::for_workspace(
+                    control.clone(),
+                    "w1",
+                    &f.ws,
+                    state,
+                    crate::protected::tests::json_check(),
+                )
+                .expect("guard"),
+            );
+            let policy = ExecPolicy::default_kgraf_policy().with_permissions(control);
+            let (tool, _hook) = ShellTool::new(policy);
+            (
+                tool.with_workspace(f.ws.clone())
+                    .with_protected_writes(guard.clone()),
+                guard,
+            )
+        }
+
+        /// In Bypass, a git command in the worktree writes the shared
+        /// repository's `info/exclude` through the real sandbox; the write
+        /// is checked and kept.
+        #[tokio::test]
+        async fn bypass_lets_a_shell_command_write_the_git_directory() {
+            let f = fixture(PLAIN_BUILD_RS);
+            let (tool, guard) = guarded_tool(&f, crate::PermissionMode::Bypass);
+            let script = "printf '/scratch/\\n' >> \"$(git rev-parse --git-path info/exclude)\"";
+            let out = tool
+                .call(
+                    call_input(&["sh", "-c", script]),
+                    &ctx(f.ws.root().to_path_buf()),
+                    &CallPermit::new(),
+                )
+                .await
+                .expect("ran");
+            let is_error = out.is_error;
+            let text = out.render();
+            assert!(!is_error, "{text}");
+            let exclude = f.ws.git_common_dir().join("info/exclude");
+            assert!(
+                std::fs::read_to_string(&exclude)
+                    .expect("exclude")
+                    .ends_with("/scratch/\n"),
+                "{text}"
+            );
+            guard.finish().expect("the repository passes fsck");
+        }
+
+        /// A shell command that writes garbage into a ref is caught when it
+        /// ends: the ref is put back, the call is an error with the check,
+        /// and the attempt's guard holds the failure.
+        #[tokio::test]
+        async fn bypass_restores_a_ref_a_shell_command_corrupted() {
+            let f = fixture(PLAIN_BUILD_RS);
+            let (tool, guard) = guarded_tool(&f, crate::PermissionMode::Bypass);
+            let main = f.ws.git_common_dir().join("refs/heads/main");
+            let before = std::fs::read(&main).expect("ref");
+            let script = format!("echo garbage > '{}'", main.display());
+            let out = tool
+                .call(
+                    call_input(&["sh", "-c", &script]),
+                    &ctx(f.ws.root().to_path_buf()),
+                    &CallPermit::new(),
+                )
+                .await
+                .expect("ran");
+            let is_error = out.is_error;
+            let text = out.render();
+            assert!(is_error, "{text}");
+            assert!(text.contains("integrity check"), "{text}");
+            assert_eq!(std::fs::read(&main).expect("ref"), before);
+            assert!(guard.finish().is_err());
+            let fsck = Command::new("git")
+                .arg("--git-dir")
+                .arg(f.ws.git_common_dir())
+                .args(["fsck", "--connectivity-only", "--no-dangling"])
+                .env_remove("GIT_DIR")
+                .output()
+                .expect("fsck");
+            assert!(fsck.status.success());
+        }
+
+        /// Outside Bypass the git directory stays read-only in the sandbox.
+        #[tokio::test]
+        async fn other_modes_keep_the_git_directory_read_only() {
+            let f = fixture(PLAIN_BUILD_RS);
+            let (tool, _guard) = guarded_tool(&f, crate::PermissionMode::Manual);
+            let exclude = f.ws.git_common_dir().join("info/exclude");
+            let before = std::fs::read(&exclude).unwrap_or_default();
+            let script = format!("printf x >> '{}'", exclude.display());
+            let out = tool
+                .call(
+                    call_input(&["sh", "-c", &script]),
+                    &ctx(f.ws.root().to_path_buf()),
+                    &CallPermit::new(),
+                )
+                .await
+                .expect("ran");
+            let text = out.render();
+            // macOS says "not permitted"; Linux's read-only bind or Landlock
+            // says "Read-only file system" or "Permission denied".
+            assert!(
+                ["not permitted", "Read-only", "Permission denied"]
+                    .iter()
+                    .any(|w| text.contains(w)),
+                "the sandbox refused it: {text}"
+            );
+            assert_eq!(std::fs::read(&exclude).unwrap_or_default(), before);
         }
     }
 

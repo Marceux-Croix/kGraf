@@ -121,7 +121,7 @@ impl Workspace {
     /// from the gitlink recorded at creation, never from the file on disk
     /// (the worker can write that file). Host-side git passes it as
     /// `--git-dir`, so a later swap of `<root>/.git` cannot redirect git.
-    pub(crate) fn admin_dir(&self) -> Option<PathBuf> {
+    pub fn admin_dir(&self) -> Option<PathBuf> {
         let target = Path::new(self.gitlink.strip_prefix("gitdir:")?.trim());
         // git 2.48+ can write relative gitlinks (worktree.useRelativePaths).
         Some(if target.is_absolute() {

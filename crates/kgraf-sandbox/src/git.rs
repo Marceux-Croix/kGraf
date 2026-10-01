@@ -17,7 +17,7 @@ use crate::error::WorkspaceError;
 /// Environment variables that redirect git away from `-C <dir>`. They are set
 /// inside git hooks (this repository's own hooks run the test suite), so an
 /// inherited value would point every command at the wrong repository.
-const GIT_REDIRECT_ENV: &[&str] = &[
+pub const GIT_REDIRECT_ENV: &[&str] = &[
     "GIT_DIR",
     "GIT_WORK_TREE",
     "GIT_INDEX_FILE",

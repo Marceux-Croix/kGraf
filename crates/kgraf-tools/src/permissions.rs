@@ -602,6 +602,17 @@ pub enum PermissionEvent {
         mode: PermissionMode,
         by: String,
     },
+    /// A worker's write to a protected path, allowed in Bypass only
+    /// ([`crate::protected`]): which worker, the path as the worker named it,
+    /// the mode, and what became of it: `kept` after its integrity check
+    /// passed, or `restored: <check output>` when the check failed and the
+    /// snapshot was put back.
+    ProtectedWrite {
+        worker: String,
+        path: String,
+        mode: PermissionMode,
+        outcome: String,
+    },
 }
 
 impl PermissionEvent {
@@ -625,6 +636,15 @@ impl PermissionEvent {
                 mode,
                 by,
             } => format!("granted {subject} to {worker} ({}, by {by})", mode.label()),
+            Self::ProtectedWrite {
+                worker,
+                path,
+                mode,
+                outcome,
+            } => format!(
+                "protected write to {path} by {worker} ({}): {outcome}",
+                mode.label()
+            ),
         }
     }
 }
@@ -840,6 +860,26 @@ impl PermissionControl {
         };
         Self::push(&mut s, event.clone());
         Some(event)
+    }
+
+    /// Record a worker's write to a protected path and what became of it
+    /// (decision 0094). Every write is recorded, not once per worker: each is
+    /// a change to the repository's or kGraf's own files.
+    pub fn record_protected_write(
+        &self,
+        worker: &str,
+        path: &str,
+        outcome: &str,
+    ) -> PermissionEvent {
+        let mut s = self.state();
+        let event = PermissionEvent::ProtectedWrite {
+            worker: worker.to_owned(),
+            path: path.to_owned(),
+            mode: s.settings.mode,
+            outcome: outcome.to_owned(),
+        };
+        Self::push(&mut s, event.clone());
+        event
     }
 
     /// Events after sequence number `after`, oldest first, with their
