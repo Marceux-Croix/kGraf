@@ -13,6 +13,7 @@ pub mod legacy;
 pub mod litellm;
 pub mod model_kind;
 pub mod model_profile;
+pub mod output_limit;
 pub mod palette;
 pub mod parallel;
 pub mod paths;

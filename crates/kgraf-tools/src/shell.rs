@@ -508,6 +508,24 @@ fn parse_command(input: &Value) -> Result<(Vec<String>, bool), ToolError> {
         .collect::<Result<_, _>>()?;
     match cmd.as_slice() {
         [line] if line.trim().contains(char::is_whitespace) => one_line(line),
+        // `["cargo test", "--workspace", "-q"]`: the first element holds the
+        // program and its leading words. Its words go in front of the rest, so
+        // the policy sees `cargo test --workspace -q`, not a program named
+        // `cargo test`. With shell syntax in that element it is refused, as a
+        // one-string line is: it cannot be split without running something
+        // else than it says.
+        [first, rest @ ..] if first.trim().contains(char::is_whitespace) => {
+            let Some(mut words) = crate::execpolicy::split_command_line(first) else {
+                return Err(bad(
+                    "the first `command` element holds spaces or shell syntax and is not a \
+                     program name; give the program and each argument as its own array \
+                     element (`[\"cargo\", \"test\", \"--workspace\"]`), or, for shell syntax, \
+                     `[\"sh\", \"-c\", \"<line>\"]`, which needs approval",
+                ));
+            };
+            words.extend(rest.iter().cloned());
+            Ok((words, true))
+        }
         _ => Ok((cmd, false)),
     }
 }
@@ -516,8 +534,8 @@ fn parse_command(input: &Value) -> Result<(Vec<String>, bool), ToolError> {
 /// output, so the model learns the form.
 fn split_note(cmd: &[String]) -> String {
     format!(
-        "\n[kgraf: the command was given as one string; it ran as {} arguments, {}. Give each \
-         argument as its own array element.]",
+        "\n[kgraf: the command was given as one string or with spaces in its first element; it \
+         ran as {} arguments, {}. Give each argument as its own array element.]",
         cmd.len(),
         crate::quote_argv(cmd)
     )
@@ -3312,6 +3330,37 @@ mod tests {
                 text.contains("ran as 3 arguments"),
                 "the split is said: {text}"
             );
+        }
+
+        /// `["cargo test", "--workspace", "-q"]`: the first element's words are
+        /// split off and put before the rest, the split is said, and the policy
+        /// judges the real argv. Before, the program was named `cargo test` and
+        /// refused. Shell syntax in that element is refused.
+        #[tokio::test]
+        async fn a_first_element_holding_words_is_split_before_the_other_arguments() {
+            let f = fixture(PLAIN_BUILD_RS);
+            let (tool, hook) = bound_tool(&f.ws);
+            let input = json!({"command": ["cargo test", "--workspace", "-q"]});
+            let (argv, split) = parse_command(&input).expect("parsed");
+            assert!(split);
+            assert_eq!(argv, ["cargo", "test", "--workspace", "-q"]);
+            let access = tool.access(&input).expect("access");
+            assert!(access.is_sandboxed_build());
+            let call = PendingCall {
+                input: input.clone(),
+                ..pending(&["unused"])
+            };
+            assert_eq!(hook.review(&call).await, HookDecision::Allow);
+            let note = split_note(&argv);
+            assert!(note.contains("ran as 4 arguments"), "{note}");
+            let err =
+                parse_command(&json!({"command": ["cargo test && x", "-q"]})).expect_err("refused");
+            assert!(err.to_string().contains("shell syntax"), "{err}");
+            // A first element without spaces is untouched.
+            let (argv, split) =
+                parse_command(&json!({"command": ["touch", "a b"]})).expect("parsed");
+            assert!(!split);
+            assert_eq!(argv, ["touch", "a b"]);
         }
 
         /// A one-string command that holds shell syntax is refused with the

@@ -57,7 +57,12 @@ pub struct RunNowArgs {
     pub max_items: usize,
     pub max_agents: usize,
     pub steps: u32,
+    /// The user setting or the default (`run-now` has no flag for it).
+    pub max_checkpoints: u32,
     pub max_tokens: u32,
+    /// The orchestrator's output cap: the user setting or the default
+    /// (`run-now` has no flag for it).
+    pub planner_max_tokens: u32,
     pub window: u64,
     /// `--verify`; without it, the first validation command the project's build
     /// files declare.
@@ -641,6 +646,7 @@ fn run_now_with(
             max_items: args.max_items,
             max_agents: args.max_agents,
             steps: args.steps,
+            max_checkpoints: args.max_checkpoints,
             max_tokens: args.max_tokens,
             window: args.window,
             point: None,
@@ -658,7 +664,7 @@ fn run_now_with(
             check_compile_timeout: kgraf_host::config::defaults::check_compile_timeout(),
             shell_timeout: args.shell_timeout,
             fetch_deps: args.fetch_deps,
-            planner_max_tokens: kgraf_host::config::defaults::planner_max_tokens(),
+            planner_max_tokens: args.planner_max_tokens,
             retry_gate: None,
             waive_gate: None,
             gate_note: None,
@@ -1132,7 +1138,9 @@ mod tests {
             max_items: 1,
             max_agents: 1,
             steps: 1,
+            max_checkpoints: kgraf_host::limits::DEFAULT_MAX_CHECKPOINTS,
             max_tokens: 16,
+            planner_max_tokens: 8_192,
             window: 1000,
             verify: Some("true".to_owned()),
             force,

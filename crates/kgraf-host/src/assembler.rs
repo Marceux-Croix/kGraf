@@ -50,6 +50,8 @@ pub(crate) struct AttemptAssembler {
     pub(crate) ledger: Arc<Ledger>,
     pub(crate) config: WorkerConfig,
     pub(crate) max_output_tokens: u32,
+    /// The run's `RunConfig::max_checkpoints` (decision 0096).
+    pub(crate) max_checkpoints: u32,
     pub(crate) read_denies: Vec<PathBuf>,
     pub(crate) workspaces: Arc<GitWorkspaces>,
     pub(crate) routes: BTreeMap<String, RouteParts>,
@@ -83,6 +85,9 @@ pub(crate) struct AttemptAssembler {
     /// Every attempt's skill session is registered here, the directory the
     /// run's `report_shortfall` reads a worker's restrictions from.
     pub(crate) skill_directory: Arc<kgraf_session::skills::SkillDirectory>,
+    /// Every attempt's worker mirrors its policy refusals here, the
+    /// directory the run's `report_shortfall` grounds a report in.
+    pub(crate) refusal_directory: Arc<kgraf_runtime::RefusalDirectory>,
     /// The user's live permission control (decision 0094).
     pub(crate) permissions: Arc<kgraf_tools::PermissionControl>,
 }
@@ -173,6 +178,7 @@ impl AttemptAssembler {
             attendance: Attendance::Unattended,
             call_mode: CallMode::Complete,
             max_output_tokens: self.max_output_tokens,
+            max_checkpoints: self.max_checkpoints,
             path_case,
             read_denies: self.read_denies.clone(),
             mcp_home: self.state.join("mcp-home"),
@@ -185,6 +191,7 @@ impl AttemptAssembler {
             skills: self.skills.clone(),
             permissions: self.permissions.clone(),
             protected_writes: Some(Arc::new(protected_writes)),
+            refusals: Some(self.refusal_directory.clone()),
         })
     }
 

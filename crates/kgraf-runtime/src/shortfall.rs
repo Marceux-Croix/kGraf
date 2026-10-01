@@ -4,7 +4,7 @@
 //! A worker whose call is refused by a policy (its write scope, the command
 //! policy, a skill's `allowed-tools`, an unattended approval, a fence) used to
 //! see only the refusal, and could then guess: a benchmark worker refused
-//! `python3` wrote an empty answer that its vacuous check accepted. Two
+//! `python3` wrote an empty answer that its vacuous check accepted. Three
 //! things change here:
 //!
 //! - **The refusal says how to report it.** Its text ends with
@@ -12,15 +12,25 @@
 //!   environment offers it) instead of working around the refusal.
 //! - **The result lists the refusals.** [`RefusedCalls`] records each policy
 //!   refusal by its capability ([`capability_of`]: the program for a shell
-//!   call, the tool name otherwise) and whether a later call of the same
+//!   call, the tool name otherwise), the policy that refused it, the path a
+//!   write-scope refusal named, and whether a later call of the same
 //!   capability ran without error. The orchestrator reports an attempt that
 //!   finished with an unretried refusal as unverified.
+//! - **A report is grounded in the record.** While the worker runs, its
+//!   refusals are mirrored into a [`RefusalDirectory`] the run's
+//!   `report_shortfall` reads, so the orchestrator decides on what a policy
+//!   actually refused, never on the worker's prose (decision 0093, amended
+//!   2026-10-01).
 //!
 //! A refusal that is not a policy's (malformed input, a path outside the
-//! worktree, an unknown tool) is not recorded: the call was wrong, not
-//! forbidden, and retrying it correctly is the worker's own business.
+//! worktree, an unknown tool) is not recorded as one: the call was wrong, not
+//! forbidden, and retrying it correctly is the worker's own business. The
+//! last such input error is kept, so an answer to a report it caused can
+//! quote it back.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, PoisonError};
 
 /// The worker tool that reports a shortfall to the orchestrator. Defined here
 /// so the refusal text can name it; the orchestrator crate implements it.
@@ -39,6 +49,21 @@ pub struct RefusedCall {
     /// Whether a later call of the same tool and capability ran without error.
     #[serde(default)]
     pub retried_ok: bool,
+    /// The policy that refused it: the approval chain's `by` (a hook, a skill
+    /// as `skill:<name>`, the ask policy), or empty for a write-scope or fence
+    /// refusal.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub by: String,
+    /// The repository path a write-scope refusal named.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+impl RefusedCall {
+    /// The skill that refused this call, if a skill's `allowed-tools` did.
+    pub fn skill(&self) -> Option<&str> {
+        self.by.strip_prefix("skill:")
+    }
 }
 
 /// The capability a call exercises, for matching a refusal to a later retry:
@@ -55,11 +80,13 @@ pub fn capability_of(tool: &str, input: &serde_json::Value) -> String {
 }
 
 /// Whether a denial names a policy, not a malformed or misplaced call. The
-/// approval chain's `access` step refuses invalid input and paths outside the
-/// worktree; it is a policy only when it quotes the command policy.
+/// approval chain's `access` step refuses paths outside the worktree; it is a
+/// policy only when it quotes the command policy. Input the tool could not
+/// read ([`kgraf_tools::INVALID_INPUT`]) and an unknown tool (`registry`) are
+/// never a policy's. Every other `by` is a hook or a policy by name.
 pub(crate) fn is_policy_denial(by: &str, reason: &str) -> bool {
     match by {
-        "registry" => false,
+        "registry" | kgraf_tools::INVALID_INPUT => false,
         "access" => reason.contains("forbidden by command policy"),
         _ => true,
     }
@@ -69,8 +96,8 @@ pub(crate) fn is_policy_denial(by: &str, reason: &str) -> bool {
 pub fn refusal_hint(can_report: bool) -> &'static str {
     if can_report {
         " If your instruction cannot be done without this call, do not work around it or \
-         guess an answer: call report_shortfall with kind \"permission\", naming the command \
-         or tool you need and why, then stop."
+         guess an answer: call report_shortfall with kind \"permission\", naming in need \
+         exactly one program, repository path or tool that was refused, and why, then stop."
     } else {
         " If your instruction cannot be done without this call, do not work around it or \
          guess an answer: stop, and say in your answer which command or tool you needed and \
@@ -78,41 +105,142 @@ pub fn refusal_hint(can_report: bool) -> &'static str {
     }
 }
 
+/// What one running worker's policies refused so far, as `report_shortfall`
+/// reads it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RefusalRecord {
+    /// The policy refusals, in order.
+    pub refused: Vec<RefusedCall>,
+    /// The newest call refused for malformed input, as the worker saw it:
+    /// not a policy refusal, kept so an answer can quote it back.
+    pub last_input_error: Option<String>,
+}
+
+/// The refusal records of a run's running workers, by worker id, so a
+/// run-wide tool (`report_shortfall`) can read what refused the worker that
+/// calls it. A worker's entry is written by its own loop and removed when it
+/// finishes; worker ids are unique within a run.
+#[derive(Debug, Default)]
+pub struct RefusalDirectory {
+    workers: Mutex<HashMap<String, RefusalRecord>>,
+}
+
+impl RefusalDirectory {
+    /// An empty directory.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// `worker`'s record so far; empty for a worker with none.
+    pub fn record_of(&self, worker: &str) -> RefusalRecord {
+        self.workers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(worker)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Replace `worker`'s record. In a run its own loop is the only writer.
+    pub fn set_record(&self, worker: &str, record: RefusalRecord) {
+        self.workers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(worker.to_owned(), record);
+    }
+
+    fn forget(&self, worker: &str) {
+        self.workers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(worker);
+    }
+}
+
 /// The policy refusals of one worker run, in order, and which were retried
-/// successfully.
-#[derive(Clone, Debug, Default)]
+/// successfully; mirrored into the run's [`RefusalDirectory`] when it has one.
+#[derive(Debug, Default)]
 pub(crate) struct RefusedCalls {
-    calls: Vec<RefusedCall>,
+    record: RefusalRecord,
+    /// The tool whose malformed input `record.last_input_error` quotes.
+    input_error_tool: Option<String>,
+    mirror: Option<(Arc<RefusalDirectory>, String)>,
 }
 
 impl RefusedCalls {
-    pub(crate) fn refused(&mut self, tool: &str, capability: String, reason: String) {
-        self.calls.push(RefusedCall {
-            tool: tool.to_owned(),
-            capability,
-            reason,
-            retried_ok: false,
-        });
-    }
-
-    /// A call of `tool` exercising `capability` ran without error: every
-    /// earlier refusal of the same capability was retried successfully.
-    pub(crate) fn ran_ok(&mut self, tool: &str, capability: &str) {
-        for c in &mut self.calls {
-            if c.tool == tool && c.capability == capability {
-                c.retried_ok = true;
-            }
+    /// Calls of `worker`, mirrored into `directory`.
+    pub(crate) fn mirrored(directory: Option<Arc<RefusalDirectory>>, worker: &str) -> Self {
+        Self {
+            mirror: directory.map(|d| (d, worker.to_owned())),
+            ..Self::default()
         }
     }
 
+    fn publish(&self) {
+        if let Some((directory, worker)) = &self.mirror {
+            directory.set_record(worker, self.record.clone());
+        }
+    }
+
+    pub(crate) fn refused(&mut self, call: RefusedCall) {
+        self.record.refused.push(call);
+        self.publish();
+    }
+
+    /// A call of `tool` was refused for malformed input, with this text.
+    pub(crate) fn input_error(&mut self, tool: &str, text: String) {
+        self.record.last_input_error = Some(text);
+        self.input_error_tool = Some(tool.to_owned());
+        self.publish();
+    }
+
+    /// A call of `tool` exercising `capability` ran without error: every
+    /// earlier refusal of the same capability was retried successfully, and
+    /// an input error of the same tool was fixed.
+    pub(crate) fn ran_ok(&mut self, tool: &str, capability: &str) {
+        let mut changed = false;
+        for c in &mut self.record.refused {
+            if c.tool == tool && c.capability == capability && !c.retried_ok {
+                c.retried_ok = true;
+                changed = true;
+            }
+        }
+        if self.input_error_tool.as_deref() == Some(tool) {
+            self.record.last_input_error = None;
+            self.input_error_tool = None;
+            changed = true;
+        }
+        if changed {
+            self.publish();
+        }
+    }
+
+    /// The refusals, for the result; the worker is finished, so its
+    /// directory entry is removed.
     pub(crate) fn take(&mut self) -> Vec<RefusedCall> {
-        std::mem::take(&mut self.calls)
+        if let Some((directory, worker)) = &self.mirror {
+            directory.forget(worker);
+        }
+        self.record.last_input_error = None;
+        self.input_error_tool = None;
+        std::mem::take(&mut self.record.refused)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn refusal(capability: &str) -> RefusedCall {
+        RefusedCall {
+            tool: "shell".into(),
+            capability: capability.into(),
+            reason: "refused".into(),
+            retried_ok: false,
+            by: "ask-policy".into(),
+            path: None,
+        }
+    }
 
     #[test]
     fn a_shell_capability_is_its_program_and_another_tool_is_its_name() {
@@ -142,16 +270,54 @@ mod tests {
             "invalid input for tool `shell`"
         ));
         assert!(!is_policy_denial("registry", "no tool named `x`"));
+        // A malformed patch is the caller's mistake, whatever its text says.
+        assert!(!is_policy_denial(
+            kgraf_tools::INVALID_INPUT,
+            "invalid input for tool `apply_patch`: invalid patch: The first line of the patch \
+             must be '*** Begin Patch'"
+        ));
     }
 
     #[test]
     fn a_later_successful_call_of_the_same_capability_retries_the_refusal() {
         let mut r = RefusedCalls::default();
-        r.refused("shell", "python3".into(), "refused".into());
-        r.refused("shell", "curl".into(), "refused".into());
+        r.refused(refusal("python3"));
+        r.refused(refusal("curl"));
         r.ran_ok("shell", "python3");
         let calls = r.take();
         assert!(calls[0].retried_ok);
         assert!(!calls[1].retried_ok);
+    }
+
+    /// The directory sees each refusal and input error while the worker
+    /// runs, sees a fixed input error cleared, and forgets the worker when it
+    /// finishes.
+    #[test]
+    fn the_directory_mirrors_a_running_worker_and_forgets_a_finished_one() {
+        let directory = RefusalDirectory::new();
+        let mut r = RefusedCalls::mirrored(Some(directory.clone()), "w1");
+        r.refused(refusal("python3"));
+        r.input_error("apply_patch", "ERROR: invalid call: bad patch".into());
+        let seen = directory.record_of("w1");
+        assert_eq!(seen.refused.len(), 1);
+        assert_eq!(
+            seen.last_input_error.as_deref(),
+            Some("ERROR: invalid call: bad patch")
+        );
+        assert_eq!(directory.record_of("w2"), RefusalRecord::default());
+        r.ran_ok("apply_patch", "apply_patch");
+        assert_eq!(directory.record_of("w1").last_input_error, None);
+        r.ran_ok("shell", "python3");
+        assert!(directory.record_of("w1").refused[0].retried_ok);
+        assert_eq!(r.take().len(), 1);
+        assert_eq!(directory.record_of("w1"), RefusalRecord::default());
+    }
+
+    #[test]
+    fn a_skill_refusal_names_its_skill() {
+        let mut c = refusal("python3");
+        assert_eq!(c.skill(), None);
+        c.by = "skill:read-only-audit".into();
+        assert_eq!(c.skill(), Some("read-only-audit"));
     }
 }

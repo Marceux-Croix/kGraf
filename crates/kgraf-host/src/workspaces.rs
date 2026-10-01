@@ -853,6 +853,10 @@ impl GitWorkspaces {
 
 #[async_trait::async_trait]
 impl Workspaces for GitWorkspaces {
+    fn repo_root(&self) -> Option<PathBuf> {
+        Some(self.manager.repo().to_path_buf())
+    }
+
     async fn prepare(
         &self,
         contract: &OpenContract,

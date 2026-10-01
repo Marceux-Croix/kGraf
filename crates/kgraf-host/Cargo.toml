@@ -67,6 +67,8 @@ cap-std = "4.0.3"
 # Decision 0087: the root manifest's `[patch]` and `[replace]` tables, read
 # before a fetch. Same version kgraf-shell uses, already in Cargo.lock.
 toml = "1.1.6"
+# `limits::UserLimits::default_path`: the per-user settings file the desktop writes.
+directories.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 # `migrate`: the migration lock's file identity (volume serial and file index,

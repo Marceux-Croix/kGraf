@@ -147,11 +147,11 @@ struct RawWorkerConfig {
 /// `kgraf worker`'s default number of model rounds, including the final
 /// answer round. The command's `--budget` flag and the brief bench both read
 /// it, so a bench attempt runs a worker as the command does.
-pub const DEFAULT_STEP_BUDGET: u32 = 12;
+pub const DEFAULT_STEP_BUDGET: u32 = crate::limits::DEFAULT_ROUNDS_SINGLE_WORKER;
 /// `kgraf worker`'s default output ceiling per round (`--max-tokens`).
-pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 4096;
+pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = crate::limits::DEFAULT_WORKER_MAX_TOKENS;
 /// `kgraf worker`'s default model context window in tokens (`--window`).
-pub const DEFAULT_CONTEXT_WINDOW_TOKENS: u64 = 128_000;
+pub const DEFAULT_CONTEXT_WINDOW_TOKENS: u64 = crate::limits::DEFAULT_WINDOW;
 
 /// A validated worker configuration.
 #[derive(Clone, Debug)]

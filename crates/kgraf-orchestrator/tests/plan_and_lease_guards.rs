@@ -43,7 +43,9 @@ async fn a_plan_declaring_repository_metadata_in_any_spelling_is_refused() {
             .await
             .expect_err("refused");
         assert!(
-            matches!(&err, OrchestratorError::Plan(PlanError::Invalid(m)) if m.contains("not a relative path inside the repository")),
+            matches!(&err, OrchestratorError::Plan(PlanError::Invalid(m))
+                if m.contains("names protected state")
+                    && !m.contains("not a relative path inside the repository")),
             "{path:?}: {err}"
         );
         assert!(p.stats.requests().is_empty());

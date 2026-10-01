@@ -41,6 +41,8 @@ pub struct OrchestrateArgs {
     pub max_items: usize,
     pub max_agents: usize,
     pub steps: u32,
+    /// Most progress checkpoints per worker (decision 0096).
+    pub max_checkpoints: u32,
     pub max_tokens: u32,
     pub window: u64,
     pub point: Option<u8>,
@@ -119,6 +121,7 @@ fn run_config(root: &Path, args: &OrchestrateArgs) -> RunConfig {
         max_items: args.max_items,
         max_agents: args.max_agents,
         steps: args.steps,
+        max_checkpoints: args.max_checkpoints,
         max_tokens: args.max_tokens,
         window: args.window,
         point: args.point,
@@ -207,6 +210,9 @@ fn notice_line(n: &Notice) -> String {
              command runs on the merged result as a root gate{}",
             if *added_gate { " (added)" } else { "" }
         ),
+        Notice::OutputCapClamped { which, clamp } => {
+            format!("clamped    {}", clamp.sentence(which))
+        }
         Notice::GraphEmpty { root, files_seen } => format!(
             "graph      empty after indexing {} ({files_seen} file(s) seen): no graph slices \
              for this run, likely no supported language in the tree",
@@ -576,8 +582,14 @@ fn report_lines(report: &kgraf_orchestrator::RunReport) -> Vec<String> {
     // Decision 0095: a worker that compacted at its stop point is a sizing miss
     // as a hand-back is, one per worker.
     out.push(format!(
-        "misses     {} (hand-backs and stop-point compactions)",
+        "misses     {} (hand-backs, stop-point compactions and workers past their round budget)",
         report.counters.sizing_misses
+    ));
+    // Decision 0096: the round budget is a checkpoint.
+    out.push(format!(
+        "rounds     {} worker(s) ran past their round budget on measured progress; {} stopped \
+         by a checkpoint (no progress twice in a row, or the ceiling)",
+        report.counters.round_extensions, report.counters.checkpoint_stops
     ));
     // The graph is the context source: whether workers actually got slices is
     // printed, so a run that gave none is visible without reading the ledger.
@@ -962,6 +974,7 @@ mod tests {
             max_items: 4,
             max_agents: 8,
             steps: 5,
+            max_checkpoints: kgraf_host::limits::DEFAULT_MAX_CHECKPOINTS,
             max_tokens: 256,
             window: 128_000,
             point: None,
@@ -976,7 +989,7 @@ mod tests {
             check_timeout: Duration::from_secs(600),
             check_compile_timeout: Duration::from_secs(600),
             shell_timeout: None,
-            planner_max_tokens: 8_192,
+            planner_max_tokens: kgraf_host::limits::DEFAULT_PLANNER_MAX_TOKENS,
             retry_gate: None,
             waive_gate: None,
             gate_note: None,

@@ -97,6 +97,7 @@ old one rather than editing it.
 | [0086](0086-empty-attempts-checked-against-a-placeholder.md) | An empty attempt is refused when its declared write target is still a placeholder, and every accepted empty attempt is reported | Accepted |
 | [0087](0087-dependencies-fetched-on-the-host-with-consent.md) | Dependencies are fetched on the host, outside the sandbox, with the user's per-project consent | Accepted |
 | [0088](0088-worker-worktrees-deleted-after-use-unless-kept.md) | Worker worktrees and their builds are deleted after use unless the user chooses to keep them | Accepted |
+| [0096](0096-the-round-budget-is-a-progress-checkpoint.md) | The round budget is a progress checkpoint, not a wall: a worker producing measured results keeps going, sloppy work is stopped | Accepted |
 | [0095](0095-a-worker-that-cannot-hand-back-is-compacted-once-by-the-runtime.md) | A worker that cannot hand back is compacted once by the runtime, with a notice it cannot suppress and a recall tool over its full earlier history | Accepted |
 | [0094](0094-permission-modes-bypass-limits-grouped-requests-and-plan-review.md) | Permission modes set only by the user; the limits Bypass keeps; grouped permission requests; plan review before dispatch | Accepted |
 | [0093](0093-a-worker-reports-a-shortfall-and-the-orchestrator-grants-within-the-operator-ceiling.md) | A worker reports a permission or instruction shortfall; the orchestrator grants within the operator's ceiling, amends, or asks the user; a run inside a disposable container may lift the shell policy | Accepted |

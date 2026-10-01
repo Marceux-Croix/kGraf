@@ -7,8 +7,10 @@
 //! Auto, Accept edits and Bypass let the command run with nothing to report;
 //! Bypass still honors a deny rule. Plan review holds dispatch until the
 //! user's yes, re-plans on a change, and fails loud with nobody to approve.
-//! A grant that did not help holds rather than repeating; a worker that
-//! finished after a refusal it never retried is reported unverified. The
+//! A report nothing refused is answered and the worker continues; three
+//! such reports end the attempt as stuck; a file another contract owns is
+//! answered, never granted, even in Bypass. A worker that finished after a
+//! refusal it never retried is reported unverified. The
 //! model is a script; the host, the orchestrator, the worker loop, the
 //! approval chain, the shell tool and the sandbox are real. A child of
 //! `tests.rs`, for its fixtures.
@@ -27,8 +29,13 @@ enum Worker {
     /// Runs `cp`; if refused, reports the shortfall; with a grant, runs `cp`
     /// and answers.
     ReportsThenRuns,
-    /// Reports a `cp` shortfall on its first round, grant or not.
+    /// Runs `cp`, then reports a `cp` shortfall whether or not it ran.
     AlwaysReports,
+    /// Reports a `cp` shortfall every round without running anything.
+    Baseless,
+    /// Contract `a` writes `b.txt` (contract `b`'s file), is refused,
+    /// reports it, then writes its own `a.txt`; contract `b` writes `b.txt`.
+    EditsSibling,
     /// Runs `cp`, is refused, then writes the file with apply_patch anyway
     /// and answers: the worker that guesses.
     RefusedThenWrites,
@@ -85,10 +92,18 @@ fn report() -> serde_json::Value {
 }
 
 fn patch() -> serde_json::Value {
+    add_file("a.txt")
+}
+
+fn add_file(path: &str) -> serde_json::Value {
     serde_json::json!({
-        "patch": "*** Begin Patch\n*** Add File: a.txt\n+copied\n*** End Patch"
+        "patch": format!("*** Begin Patch\n*** Add File: {path}\n+copied\n*** End Patch")
     })
 }
+
+/// The two-contract plan of [`Worker::EditsSibling`]; the markers tell the
+/// scripted worker which contract's brief it reads.
+const SIBLING_PLAN: &str = r#"{"contracts":[{"id":"a","instruction":"TASK-A: write a.txt","acceptance":"a.txt exists","writes":[{"path":"a.txt"}],"tools":[]},{"id":"b","instruction":"TASK-B: write b.txt","acceptance":"b.txt exists","writes":[{"path":"b.txt"}],"tools":[]}]}"#;
 
 #[async_trait::async_trait]
 impl Provider for Script {
@@ -111,9 +126,11 @@ impl Provider for Script {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner()) = format!("{system}{:?}", request.messages);
             (
-                vec![Content::text(
-                    r#"{"contracts":[{"id":"a","instruction":"copy README.md to a.txt","acceptance":"a.txt exists","writes":[{"path":"a.txt"}],"tools":[]}]}"#,
-                )],
+                vec![Content::text(if self.worker == Worker::EditsSibling {
+                    SIBLING_PLAN
+                } else {
+                    r#"{"contracts":[{"id":"a","instruction":"copy README.md to a.txt","acceptance":"a.txt exists","writes":[{"path":"a.txt"}],"tools":[]}]}"#
+                })],
                 StopReason::EndTurn,
             )
         } else if system.contains("still serves") {
@@ -144,9 +161,33 @@ impl Provider for Script {
                 (Worker::ReportsThenRuns, false, 1) if !seen.contains("exit status: 0") => {
                     Some(tool(kgraf_runtime::SHORTFALL_TOOL, report(), round))
                 }
-                (Worker::AlwaysReports, _, 0) => {
+                (Worker::AlwaysReports, _, 0) => Some(tool("shell", cp(), round)),
+                (Worker::AlwaysReports, _, 1) => {
                     Some(tool(kgraf_runtime::SHORTFALL_TOOL, report(), round))
                 }
+                // Each report worded anew: identical calls would end the
+                // attempt through the stall check before this bound.
+                (Worker::Baseless, _, r) if r < 6 => {
+                    let mut input = report();
+                    input["why"] = format!("attempt {r}: cp is needed").into();
+                    Some(tool(kgraf_runtime::SHORTFALL_TOOL, input, round))
+                }
+                (Worker::EditsSibling, _, r) if seen.contains("TASK-A") => match r {
+                    0 => Some(tool("apply_patch", add_file("b.txt"), round)),
+                    1 => Some(tool(
+                        kgraf_runtime::SHORTFALL_TOOL,
+                        serde_json::json!({
+                            "kind": "permission",
+                            "scope": "file",
+                            "need": "write access to b.txt",
+                            "why": "the integration needs b.txt changed too"
+                        }),
+                        round,
+                    )),
+                    2 => Some(tool("apply_patch", add_file("a.txt"), round)),
+                    _ => None,
+                },
+                (Worker::EditsSibling, _, 0) => Some(tool("apply_patch", add_file("b.txt"), round)),
                 (Worker::RefusedThenWrites, _, 0) => Some(tool("shell", cp(), round)),
                 (Worker::RefusedThenWrites, _, 1) => Some(tool("apply_patch", patch(), round)),
                 (Worker::Writes, _, 0) => Some(tool("apply_patch", patch(), round)),
@@ -523,10 +564,10 @@ async fn a_mode_change_releases_a_waiting_request() {
     );
 }
 
-/// Bounded: a grant that did not help is not granted again; the second
-/// report holds.
+/// A report after the granted command ran is grounded in nothing: it is
+/// answered, not granted again or held, and the worker goes on to finish.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_grant_that_did_not_help_holds_instead_of_repeating() {
+async fn a_report_nothing_refused_is_answered_and_the_worker_finishes() {
     let (report, trace, script) = run(
         Worker::AlwaysReports,
         control(kgraf_tools::PermissionMode::OrchestratorDecides),
@@ -534,15 +575,84 @@ async fn a_grant_that_did_not_help_holds_instead_of_repeating() {
         "sf-bound",
     )
     .await;
-    let kgraf_orchestrator::RunStatus::Blocked { reason } = &report.status else {
-        panic!("{report:?}\n{trace}");
-    };
-    assert!(reason.contains("did not help"), "{reason}");
+    assert_eq!(
+        report.status,
+        kgraf_orchestrator::RunStatus::Completed,
+        "{report:?}\n{trace}"
+    );
     let lines = shortfall_lines(&trace);
     assert_eq!(lines.len(), 2, "{trace}");
     assert!(lines[0].contains("granted `cp`"), "{}", lines[0]);
-    assert!(lines[1].contains("held:"), "{}", lines[1]);
+    assert!(lines[1].contains("answered:"), "{}", lines[1]);
+    assert!(lines[1].contains("no policy refused `cp`"), "{}", lines[1]);
     assert_eq!(script.attempts.load(Ordering::SeqCst), 2);
+}
+
+/// A worker that keeps reporting what nothing refused cannot loop: two
+/// reports are answered, the third stops it, and the attempt is stuck,
+/// counted a failure. Nothing is granted or held in any attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn baseless_reports_are_answered_twice_then_the_attempt_is_stuck() {
+    let (report, trace, script) = run(
+        Worker::Baseless,
+        control(kgraf_tools::PermissionMode::Bypass),
+        "test -f a.txt",
+        "sf-baseless",
+    )
+    .await;
+    // Each stuck attempt counts toward the contract's failures, so the
+    // retries run out and the run blocks; were it not a failure, the
+    // contract would be re-dispatched without end.
+    let kgraf_orchestrator::RunStatus::Blocked { reason } = &report.status else {
+        panic!("{report:?}\n{trace}");
+    };
+    let lines = shortfall_lines(&trace);
+    let attempts = script.attempts.load(Ordering::SeqCst);
+    assert!(
+        attempts > 1,
+        "retried after a stuck attempt: {reason}\n{trace}"
+    );
+    assert_eq!(lines.len(), 3 * attempts, "{trace}");
+    for (i, line) in lines.iter().enumerate() {
+        let want = if i % 3 == 2 { "stopped:" } else { "answered:" };
+        assert!(line.contains(want), "line {i}: {line}");
+    }
+    assert!(!trace.contains("granted `cp`"), "{trace}");
+    assert!(
+        trace.contains(r#""kind":"stuck""#) || trace.contains("ends as stuck"),
+        "{trace}"
+    );
+}
+
+/// Disjoint writes hold in Bypass: contract `a`'s worker is refused
+/// `b.txt`, reports it, and is told the file belongs to contract `b`; it is
+/// not granted, and the worker goes on to write its own file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bypass_answers_a_sibling_contracts_file_and_never_grants_it() {
+    let (report, trace, _) = run(
+        Worker::EditsSibling,
+        control(kgraf_tools::PermissionMode::Bypass),
+        "test -f a.txt -o -f b.txt",
+        "sf-sibling",
+    )
+    .await;
+    assert_eq!(
+        report.status,
+        kgraf_orchestrator::RunStatus::Completed,
+        "{report:?}\n{trace}"
+    );
+    let lines = shortfall_lines(&trace);
+    assert_eq!(lines.len(), 1, "{trace}");
+    assert!(lines[0].contains("belongs to contract `b`"), "{}", lines[0]);
+    assert!(lines[0].contains("answered:"), "{}", lines[0]);
+    assert!(
+        !trace.contains("writes to `b.txt`"),
+        "never granted\n{trace}"
+    );
+    assert!(
+        report.verified.contains(&"a".to_owned()) && report.verified.contains(&"b".to_owned()),
+        "{report:?}"
+    );
 }
 
 /// A worker that finished after a refusal it never retried, or a contract

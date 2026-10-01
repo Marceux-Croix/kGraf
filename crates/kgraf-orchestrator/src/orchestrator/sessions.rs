@@ -139,6 +139,8 @@ struct Asking {
 pub(super) struct SessionRuntime {
     /// How long a question waits for the user.
     pub(super) question_timeout: Duration,
+    /// The run is known to be unattended: a question is answered at once.
+    pub(super) unattended: bool,
     /// How long one paid session call may run ([`SESSION_CALL_TIMEOUT`]).
     pub(super) call_timeout: Duration,
     /// Where session notices go besides the trace and the report: the box's
@@ -212,11 +214,13 @@ where
 impl SessionRuntime {
     pub(super) fn new(
         question_timeout: Duration,
+        unattended: bool,
         notice_sink: Option<SessionNoticeSink>,
         call_timeout: Duration,
     ) -> Self {
         Self {
             question_timeout,
+            unattended,
             call_timeout,
             notice_sink,
             asking: BTreeMap::new(),
@@ -251,6 +255,15 @@ pub(super) fn no_answer_text(after: Duration) -> String {
          continue.",
         after.as_secs()
     )
+}
+
+/// The answer to a question in a run known to be unattended: given at once,
+/// never after a wait, and it tells the worker what to do instead.
+pub(super) fn unattended_answer_text() -> String {
+    "Nobody is attached to this run to answer questions, and the orchestrator could not answer \
+     this from the run record. State the assumption you make instead, in your answer, and \
+     continue."
+        .to_owned()
 }
 
 /// `SessionRecords` over this run's own graph store.
@@ -728,6 +741,21 @@ impl RunLoop {
         reply: oneshot::Sender<Result<String, SessionError>>,
     ) {
         if reply.is_closed() {
+            return;
+        }
+        if self.sessions_rt.unattended {
+            let text = unattended_answer_text();
+            self.record_answer(&session, InboxSource::Orchestrator, &text);
+            let contract = self.contract_of(&session).unwrap_or_default();
+            self.session_notice(
+                &contract,
+                session.as_str(),
+                format!(
+                    "{session}'s question was answered at once: this run is unattended, so \
+                     the worker was told to state its assumption"
+                ),
+            );
+            let _ = reply.send(Ok(text));
             return;
         }
         let deadline = std::time::Instant::now() + self.sessions_rt.question_timeout;

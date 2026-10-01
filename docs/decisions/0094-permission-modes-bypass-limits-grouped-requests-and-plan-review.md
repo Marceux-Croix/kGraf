@@ -535,3 +535,24 @@ whether a doomed call raises a request, changed.
 The Bypass notice is unchanged: `kgraf orchestrate` prints it on stderr at start whenever
 the run's mode is Bypass, whether the flag or the user's permissions file set it. A test
 runs the binary both ways and checks stderr.
+
+## Amendment (2026-10-01): no grant is made against a deny or an ask rule
+
+Under Bypass with the ask rule `shell(python3*)`, a worker's report was granted `python3`
+(`mode:bypass`), and the next worker met the same ask rule, unanswered, again: `decide` read
+the mode and the allow set, never the user's rules. The rules hook enforces them on every call
+in every mode, so such a grant cannot help, and it skips the question the user asked to be put.
+
+- `Authority` carries the user's rules (`rules`), read from the permission control with the mode.
+- Before any mode grants a program or a path, `decide` checks
+  `kgraf_tools::permissions::rule_on_grant`: a rule that would reach some call the grant allows
+  (a `shell` rule whose pattern's first word is the program, or whose one-word prefix pattern
+  matches it; a file rule whose pattern matches the path; a rule with no pattern on the tool).
+  A deny rule holds the contract in every mode, naming the rule. An ask rule asks the user when
+  a person attends, and with nobody attending holds, naming the rule. Deny wins over ask.
+- A request waiting for the user is re-decided the same way after a mode or rule change.
+
+Evidence: `kgraf-tools` (`permissions.rs`: `a_grant_meets_the_rule_its_calls_would_meet`),
+`kgraf-orchestrator` (`shortfall.rs`: `an_ask_rule_blocks_a_bypass_grant`, which also checks a
+deny rule under Bypass, Orchestrator decides and Auto with the program in the allow set), and
+`kgraf-host` (`shortfall_tests.rs`: `bypass_still_honors_a_deny_rule_through_a_hosted_run`).

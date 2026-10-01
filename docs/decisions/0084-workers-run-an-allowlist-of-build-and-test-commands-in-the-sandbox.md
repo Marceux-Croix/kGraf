@@ -242,3 +242,20 @@ worker may run each such form as well: at build time kGraf reads the tree and ad
 single-part narrowed command (one per test file, or per cargo package) to the allowlist,
 exactly, beside the command as configured. A test file a worker adds later is not in that
 list; the worker can still run the whole command, and the verifier runs the new file's tests.
+
+## Amendment (2026-10-01): two forms of a model's tool call are repaired, and said
+
+- A shell `command` array whose first element holds the program and its leading words
+  (`["cargo test", "--workspace", "-q"]`) is split: the words go before the other elements,
+  the policy judges the real argv, and the output says it was split. With shell syntax in
+  that element the call is refused with the way to write it. Before, the program was named
+  `cargo test` and refused.
+- An `apply_patch` patch whose first non-blank line is a file header (`*** Add File:`,
+  `*** Update File:`, `*** Delete File:`) and that lacks `*** Begin Patch` is applied as if it
+  had the envelope (and the end line, when that is missing too). The result carries "note: the
+  patch had no '*** Begin Patch' line; it was applied as if it had". Any other malformed patch
+  is still refused, and the tool description states the rule. The description is part of the
+  shared prefix, so this resets the prompt cache once.
+
+Tests: `a_first_element_holding_words_is_split_before_the_other_arguments`,
+`a_patch_without_its_envelope_is_applied_and_the_result_says_so`.

@@ -632,11 +632,11 @@ async fn a_resume_records_the_earlier_segments_last_tool_round() {
         )]),
         _ => Round::answer("done"),
     });
-    let env = Arc::new(env_with(
-        provider,
-        vec![Arc::new(WriteFile)],
-        CallMode::Stream,
-    ));
+    let mut env = env_with(provider, vec![Arc::new(WriteFile)], CallMode::Stream);
+    // The old wall (decision 0096): the write in round 1 is progress, and a
+    // gate allowed past its first checkpoint would grant another block.
+    env.settings.max_checkpoints = 1;
+    let env = Arc::new(env);
     let handle = spawn_worker(
         env.clone(),
         brief("w1", "write", worktree.path(), 2),
@@ -2656,6 +2656,79 @@ async fn a_policy_refusal_says_how_to_report_it_and_is_listed_on_the_result() {
     assert!(result.refused.is_empty(), "{:?}", result.refused);
 }
 
+/// A malformed patch is the worker's mistake, not a permission refusal: its
+/// result says so and does not read "denied by", it is not listed as a
+/// policy refusal, and the run's refusal directory holds it as the last
+/// input error while the worker runs. A write outside the declared scope is
+/// listed with its path, by the scope (no `by`).
+#[tokio::test]
+async fn a_malformed_patch_is_an_invalid_call_not_a_policy_refusal() {
+    let worktree = tempfile::tempdir().expect("worktree");
+    let directory = kgraf_runtime::RefusalDirectory::new();
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let (seen_in, dir_in) = (seen.clone(), directory.clone());
+    let provider = Fake::new(true, move |request| match round_of(request) {
+        0 => Round::tool(vec![(
+            "t1",
+            "apply_patch",
+            json!({"patch": "--- a/discount_flat/src/lib.rs\n+++ b/discount_flat/src/lib.rs"}),
+        )]),
+        1 => {
+            *seen_in.lock().expect("lock") = Some(dir_in.record_of("w1"));
+            Round::tool(vec![(
+                "t2",
+                "apply_patch",
+                json!({"patch": "*** Begin Patch\n*** Add File: checkout/src/lib.rs\n+x\n*** End Patch"}),
+            )])
+        }
+        _ => Round::answer("done"),
+    });
+    let mut env = env_with(
+        provider.clone(),
+        vec![
+            Arc::new(kgraf_tools::ApplyPatchTool),
+            Arc::new(ShortfallStandIn),
+        ],
+        CallMode::Stream,
+    );
+    env.refusals = Some(directory.clone());
+    let mut b = brief("w1", "edit it", worktree.path(), 6);
+    b.write_scope = Some(vec![std::path::PathBuf::from("discount_flat/src/lib.rs")]);
+    let handle = spawn_worker(Arc::new(env), b, SpawnOptions::default())
+        .await
+        .expect("spawn");
+    let (events, result) = with_timeout(drain(handle)).await.expect("in time");
+    let (output, is_error) = finished_output(&events, "t1");
+    assert!(is_error);
+    assert!(output.starts_with("ERROR: invalid call: "), "{output}");
+    assert!(
+        output.contains("This is not a permission refusal"),
+        "{output}"
+    );
+    assert!(!output.contains("denied by"), "{output}");
+    assert!(!output.contains("report_shortfall"), "{output}");
+    let record = seen.lock().expect("lock").clone().expect("read mid-run");
+    assert!(record.refused.is_empty(), "{record:?}");
+    assert!(
+        record
+            .last_input_error
+            .as_deref()
+            .is_some_and(|e| e.contains("Begin Patch")),
+        "{record:?}"
+    );
+    assert_eq!(result.refused.len(), 1, "{:?}", result.refused);
+    assert_eq!(
+        result.refused[0].path.as_deref(),
+        Some("checkout/src/lib.rs")
+    );
+    assert_eq!(result.refused[0].by, "");
+    assert_eq!(
+        directory.record_of("w1"),
+        kgraf_runtime::RefusalRecord::default(),
+        "a finished worker is forgotten"
+    );
+}
+
 /// Declares what an allowlisted build from a workspace-bound shell tool
 /// declares (decision 0084): exclusive, confined by the sandbox.
 struct SandboxedBuild;
@@ -2869,6 +2942,98 @@ async fn a_second_output_ceiling_stop_in_a_row_fails_the_run() {
     }
     assert_eq!(provider.requests().len(), 2);
     assert_eq!(result.steps, 2);
+}
+
+/// A turn with no tool call and no visible text (a plan only in the model's
+/// reasoning) is not a completed attempt: it is dropped, the model is told to
+/// continue, and the notice round is counted.
+#[tokio::test]
+async fn an_empty_turn_gets_one_notice_round_and_is_not_completed() {
+    let dir = tempfile::tempdir().expect("dir");
+    let sent = AtomicUsize::new(0);
+    let provider = Fake::new(false, move |_| match sent.fetch_add(1, Ordering::SeqCst) {
+        0 => Round::answer(""),
+        _ => Round::answer("done after the notice"),
+    });
+    let env = Arc::new(env_with(provider.clone(), vec![], CallMode::Complete));
+    let handle = spawn_worker(
+        env,
+        brief("w1", "task", dir.path(), 6),
+        SpawnOptions::default(),
+    )
+    .await
+    .expect("spawn");
+    let (events, result) = with_timeout(drain(handle)).await.expect("in time");
+    assert_eq!(result.outcome, WorkerOutcome::Completed);
+    assert_eq!(result.answer, "done after the notice");
+    assert_eq!(result.steps, 2, "the notice round is counted");
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    let last = requests[1].messages.last().expect("last message");
+    assert!(
+        last.content.iter().any(|c| c
+            .as_text()
+            .is_some_and(|t| t.contains("without calling a tool or giving an answer"))),
+        "{last:?}"
+    );
+    assert!(events.iter().any(|e| matches!(
+        e,
+        WorkerEvent::Notice {
+            kind: NoticeKind::EmptyTurn,
+            ..
+        }
+    )));
+}
+
+/// A second empty turn in a row ends the attempt as failed, naming the cause.
+#[tokio::test]
+async fn two_empty_turns_in_a_row_fail_the_attempt() {
+    let dir = tempfile::tempdir().expect("dir");
+    let provider = Fake::new(false, |_| Round::answer("  \n"));
+    let env = Arc::new(env_with(provider.clone(), vec![], CallMode::Complete));
+    let handle = spawn_worker(
+        env,
+        brief("w1", "task", dir.path(), 6),
+        SpawnOptions::default(),
+    )
+    .await
+    .expect("spawn");
+    let (_, result) = with_timeout(drain(handle)).await.expect("in time");
+    match &result.outcome {
+        WorkerOutcome::Failed { error } => {
+            assert!(error.contains("no tool call and no answer"), "{error}");
+            assert!(
+                error.contains("EndTurn"),
+                "the stop reason is named: {error}"
+            );
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    assert_eq!(provider.requests().len(), 2, "one notice round, no third");
+}
+
+/// A turn with a tool call between two empty turns resets the count: only two
+/// empty turns in a row fail.
+#[tokio::test]
+async fn a_tool_call_between_empty_turns_resets_the_empty_turn_count() {
+    let dir = tempfile::tempdir().expect("dir");
+    let sent = AtomicUsize::new(0);
+    let provider = Fake::new(false, move |_| match sent.fetch_add(1, Ordering::SeqCst) {
+        0 | 2 => Round::answer(""),
+        1 => Round::tool(vec![("t1", "list_directory", json!({"path": "."}))]),
+        _ => Round::answer("finished"),
+    });
+    let env = Arc::new(env_with(provider, vec![], CallMode::Complete));
+    let handle = spawn_worker(
+        env,
+        brief("w1", "task", dir.path(), 8),
+        SpawnOptions::default(),
+    )
+    .await
+    .expect("spawn");
+    let (_, result) = with_timeout(drain(handle)).await.expect("in time");
+    assert_eq!(result.outcome, WorkerOutcome::Completed, "{result:?}");
+    assert_eq!(result.answer, "finished");
 }
 
 /// Decision 0084: a subagent's fence still refuses a sandboxed build, which

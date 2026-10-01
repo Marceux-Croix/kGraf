@@ -524,6 +524,18 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   `<name>.spec.ts`, or a file in a `test` folder), and `cargo test --workspace` (the package
   of each file). A script such as `sh check.sh`, a command that already selects tests, a
   contract whose files have no test, and a gate remediation run the command whole.
+- A worker's round budget (`worker --budget`, default 12; orchestrated workers 30) is a
+  checkpoint, not a wall (decision 0096). Near the end of each block of that many rounds,
+  kGraf measures what the worker did since the last checkpoint: files changed on net, its
+  own test, build or check runs getting better, and no sloppy pattern (the same error over
+  and over, failed patches piling up, writing a file and putting it back, the same call with
+  the same result). A worker that is making progress keeps going with another block, in the
+  same conversation. One block without progress after a productive one is allowed; a second
+  ends the attempt as stuck, and the orchestrator retries it, then holds the contract. A
+  worker that never shows progress stops at its budget as before, and no worker runs more
+  than `max_checkpoints` blocks (default 10; 1 is the old fixed limit; see "Run limits"). What the model says about its progress is never read. `worker` prints
+  each checkpoint; `orchestrate` reports workers that ran past their budget as
+  `rounds` and counts each once as a sizing miss.
 - An attempt that changed none of its contract's declared files is not verified, even when
   `--verify` passes: the check passed on the tree as dispatched, which proves nothing. It is
   retried with the reason, then held.
@@ -544,6 +556,37 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   run stops. A plan that the interface checks hold before any work started (a handshake
   mismatch, or a check the last answer failed) is sent back to the planner once with the
   failures before the run ends on the hold; the re-planned contracts are named `re1.<id>`.
+- **Run limits.** Five limits are global settings, each with a slider in Settings > General
+  and a key in the user-level `settings.toml`: rounds in one block per worker
+  (`rounds_per_worker`, 4 to 200), the most blocks a worker may be granted while it makes
+  measured progress (`max_checkpoints`, 1 to 50; 1 means the old fixed round limit), the output cap of one worker reply (`worker_max_tokens`,
+  1,024 to 131,072), the output cap of one orchestrator call (`planner_max_tokens`, 4,096 to
+  131,072) and the context window assumed for models (`context_window`, 8,192 to
+  1,000,000). A flag outranks the setting, and the setting outranks the built-in default:
+
+  | Limit | Flag | Built-in default |
+  | --- | --- | --- |
+  | Rounds per worker | `--steps` (`orchestrate`, `schedule run-now`), `--budget` (`worker`) | 30 for an orchestrated worker, 12 for `kgraf worker` |
+  | Most round blocks per worker | `--max-checkpoints` (`orchestrate`, `worker`) | 10 |
+  | Worker reply cap | `--max-tokens` | 16,384 |
+  | Orchestrator call cap | `--planner-max-tokens` (`orchestrate`) | 32,768 |
+  | Context window | `--window` | 128,000 |
+
+  One setting covers rounds for both commands: a single `kgraf worker` run is one probe, not a
+  share of a plan, so it keeps its own smaller default until you set a value. The commands
+  print each effective value and where it came from (flag, user setting or built-in
+  default) as `limits` lines on stderr. In the app, a limit reaches runs started after the
+  change. A key in `.kgraf/run.json` counts as a flag for that project. A settings value
+  outside the bounds, or not a whole number, stops the command with the key named; the
+  command line reads `KGRAF_SETTINGS_PATH` when set, otherwise the app's settings file.
+  A single worker still uses at most 100,000 tokens of the window (decision 0057), so a
+  window above that changes the orchestrator's view only.
+- **Output caps are clamped to the model.** A cap above what a model supports (from the
+  bundled model catalog) is lowered for that run and the run says so on a `clamped` line,
+  never silently. Workers rotate across routes, so the worker cap is the lowest limit among
+  them. A model the catalog does not list has no known limit, and the cap goes to the
+  provider as set. Settings shows the same note under a slider when an open project's route
+  would lower it.
 - `--rate-limit ROUTE=RPM[/BURST][@MAX_WAIT_MS]` limits one route's call rate; a call that
   would wait too long fails loudly.
 - Every run indexes the working tree before it starts (incremental: about 65 ms warm and
@@ -594,11 +637,20 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   is refused outright, not asked about.
 - A worker whose call is refused by policy, or whose instruction lacks something it needs, is
   told to report it and stop (`report_shortfall`, decision 0093). Your permission mode decides
-  what happens next (see "Permission modes" below). An instructions report amends the contract
+  what happens next (see "Permission modes" below). A permission report is decided on what a
+  policy actually refused that worker, never on its wording: the program, file or tool it
+  names must be one of its recorded refusals. A call that failed on malformed input (a patch
+  that does not start with `*** Begin Patch`, say) is not a refusal; the worker is told to fix
+  and retry it. A report that names nothing refused, names several things, asks for a file the
+  contract already writes, or asks for a file another contract owns is answered to the worker,
+  which keeps working: nothing is granted or held, in any mode. A worker answered twice that
+  reports again is stopped and its attempt counts as a failure. A grant your deny or ask rule
+  would meet again is never made: a deny rule holds the contract, and an ask rule asks you (or,
+  with nobody attending, holds it, naming the rule). An instructions report amends the contract
   once: the next attempt's brief carries the report, and a second one holds the contract for
   you. A contract is re-dispatched at most twice for shortfalls; a grant that did not help
-  holds. Every grant and hold is in the run's trace (`shortfall` and `permission` events), and
-  each grant is kept on the contract with who asked, why, and who granted it.
+  holds. Every grant, hold and answer is in the run's trace (`shortfall` and `permission`
+  events), and each grant is kept on the contract with who asked, why, and who granted it.
 - Permission modes (decision 0094). One setting decides who answers a permission request past
   the base policy, for a worker's approval ask and for a shortfall report alike:
   - **Manual**: you answer every request.
@@ -707,9 +759,9 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   with the `challenge_contract` tool; the answer names the artifact that settled it, or
   says it is judgment.
 - `--check-timeout` and `--check-compile-timeout` (600 seconds each) bound one check run.
-  `--planner-max-tokens` (8192) is the output limit of each orchestrator call. An answer
-  cut off at that limit fails and names the flag; interface contracts carry whole files,
-  so they may need more.
+  `--planner-max-tokens` (default 32,768) is the output limit of each orchestrator call. An
+  answer cut off at that limit fails and names the flag; interface contracts carry whole
+  files, so they may need more. See "Run limits" below for where the default comes from.
 - One Rust interface costs about 12.5 seconds of checks and one Python interface about
   5.4 seconds on a small project. The run report says whether checks were on.
 
@@ -792,7 +844,8 @@ cargo run -p kgraf-shell --bin kgraf-app -- --probe
   caps do nothing (decision 0080). There is no settings screen for routes yet, so write
   this file by hand.
   Example: `{"routes": ["kimi:<model-id>"], "prices": "prices.json"}`.
-- The settings file holds the compaction slider (5% to 95%, default 80%), the
+- The settings file holds the compaction slider (5% to 95%, default 80%), the five run
+  limits (see "Run limits"), the
   background-mode switch, the worker-worktree switch (`delete_worker_worktrees`, default
   on), the caps, the theme (device, dark or light), the color
   vision mode, reduced motion, whether the guide is open, and the open projects. Two
@@ -887,7 +940,8 @@ an inventory is there.
   When the permission mode would also ask about or refuse such a call, the worker sees the
   skill's refusal, which names the mode's verdict too, and you are not asked. A worker can
   always call `report_shortfall`, whatever its skills list. A permission report for a
-  command or tool its skill refuses holds the contract with the skill's name, since no
+  command or tool its skill refused holds the contract with the skill's name, however the
+  report words it, since no
   permission grant lifts a skill's `allowed-tools`: edit the skill's list or the
   instruction, then run the work again.
 - **Resuming after a skill changed.** A resumed worker re-activates its skills at the
@@ -1044,11 +1098,30 @@ Behavior that differs from earlier builds. Each item names the decision that hol
   it is held with a reason naming the route. The run output has a `notice` line for each route
   that failed, and the trace has `route_fault`, `rerouted` and `route_recovered` records
   (0075).
-- A worker's shell command written as one string (`["cargo test --workspace"]`) runs as its
-  words when it holds no shell syntax, and the output says so. One with shell syntax (`&&`,
+- A worker's shell command written as one string (`["cargo test --workspace"]`), or with the
+  program and its leading words in the first element (`["cargo test", "--workspace", "-q"]`),
+  runs as its words when it holds no shell syntax, and the output says so. One with shell syntax (`&&`,
   quotes, `$`) is refused with the way to write it. The build commands run without approval
   with their usual options: `--workspace`, `-p`, `--test`, `--release`, `--no-run` and the
   others the shell tool's description lists (0084).
+- A worker's `apply_patch` patch that starts with a file header (`*** Add File:`,
+  `*** Update File:`, `*** Delete File:`) and lacks `*** Begin Patch` is applied as if it had
+  the envelope, and the result says so. Any other malformed patch is refused.
+- A worker turn with no tool call and no visible answer (a plan only in the model's reasoning)
+  is not a finished attempt: the worker is told to continue, once. A second empty turn in a
+  row fails the attempt, and the failure names the stop reason (0096).
+- Every worker brief says what its attempt is judged by. When `--verify` cannot be narrowed to
+  the contract's tests (`cargo build --workspace`, a script), the brief names the whole command,
+  calls the contract's Acceptance line advisory, and says failures in other contracts' unfinished
+  code are not the worker's to fix (0018).
+- A planner answer is repaired where its intent is certain, with a notice in the run output: a
+  task-kind word in a contract's `route` (`implementation`) is read as no route, and an absolute
+  write path inside the repository becomes the relative path. A write to `.kgraf` or `.git` is
+  refused with a reason that names protected state (0085).
+- A run started from the command line or a schedule is unattended: a worker's `ask_user_question`
+  that the orchestrator cannot answer from the run record gets an answer at once, telling the
+  worker to state its assumption, instead of waiting 60 s (0067). A run started from the
+  orchestrator box still waits for you.
 - Workers are told that kGraf commits their worktree after its check, and the planner no
   longer writes acceptance that asks a worker to commit.
 - A planner answer that sends an optional list as `null` (`"depends_on": null`) is read as

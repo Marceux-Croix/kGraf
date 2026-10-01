@@ -215,11 +215,17 @@ pub(crate) fn variants(command: &str, root: &Path) -> Vec<String> {
     }
 }
 
-/// The text a worker's brief carries about its check, or `None` when the whole
-/// command runs (the brief then says nothing new).
+/// The text a worker's brief carries about its check. A narrowed check names
+/// its own commands. A whole check (a command kGraf cannot narrow, such as
+/// `cargo build --workspace`) still names the command, so the worker knows what
+/// it is judged by; the contract's own Acceptance line is advisory then.
 pub(crate) fn brief(scope: &Scope, whole: &str) -> Option<String> {
     let Scope::Narrowed { parts, selected } = scope else {
-        return None;
+        return Some(format!(
+            "\n\nYour attempt is accepted when `{whole}` passes in your worktree. The \
+             Acceptance line of your contract is advisory. Failures in other contracts' \
+             unfinished code (stubs such as `todo!()`) are not yours to fix."
+        ));
     };
     Some(format!(
         "\n\nYour attempt is accepted when this passes in your worktree: `{}`. It runs the \
@@ -887,6 +893,17 @@ mod tests {
             "{text}"
         );
         assert!(text.contains(whole), "{text}");
-        assert!(brief(&Scope::Whole { why: String::new() }, whole).is_none());
+    }
+
+    #[test]
+    fn a_whole_check_brief_names_the_command_and_calls_acceptance_advisory() {
+        let text = brief(
+            &Scope::Whole { why: String::new() },
+            "cargo build --workspace",
+        )
+        .expect("a whole check is stated too");
+        assert!(text.contains("`cargo build --workspace` passes"), "{text}");
+        assert!(text.contains("advisory"), "{text}");
+        assert!(text.contains("not yours to fix"), "{text}");
     }
 }

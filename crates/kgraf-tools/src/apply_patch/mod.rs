@@ -98,6 +98,9 @@ const APPLY_PATCH_DESCRIPTION: &str = concat!(
     "with no prefix is invalid, even if it matches the file exactly. Include a few ",
     "unchanged context lines around each change so the matcher can place it.\n",
     "- A Delete File hunk has no body lines: just the header.\n",
+    "- Write the `*** Begin Patch` and `*** End Patch` lines. A patch that starts ",
+    "with a file header and has no `*** Begin Patch` line is applied as if it had ",
+    "one, and the result says so; any other malformed patch is refused.\n",
     "- Never use unified-diff syntax (`--- a/file`, `+++ b/file`, `@@ -1,3 +1,3 @@` ",
     "with line numbers, `/dev/null`); this is not that format.\n",
     "\n",
@@ -147,8 +150,66 @@ fn patch_text(input: &Value) -> Result<&str, ToolError> {
     Ok(patch)
 }
 
+/// The leniency stated in the result of a call whose patch had no envelope.
+const ENVELOPE_NOTE: &str =
+    "note: the patch had no '*** Begin Patch' line; it was applied as if it had";
+
+/// `patch` with a missing `*** Begin Patch` / `*** End Patch` envelope
+/// supplied, and whether it was changed. Models often send the hunks alone.
+/// Only a patch whose first non-blank line is a file header
+/// (`*** Add File:`, `*** Update File:`, `*** Delete File:`) is repaired, so
+/// the intent is certain; a missing end marker is added with it. Anything else
+/// (a patch that starts some other way, or one that has its begin line and
+/// lacks its end line) goes to the parser unchanged and is refused there.
+fn with_envelope(patch: &str) -> (std::borrow::Cow<'_, str>, bool) {
+    let first = patch.lines().map(str::trim).find(|l| !l.is_empty());
+    let headed = first.is_some_and(|l| {
+        ["*** Add File:", "*** Update File:", "*** Delete File:"]
+            .iter()
+            .any(|h| l.starts_with(h))
+    });
+    if !headed {
+        return (std::borrow::Cow::Borrowed(patch), false);
+    }
+    let body = patch.trim();
+    let end = if body.lines().last().map(str::trim) == Some(parser::END_PATCH_MARKER) {
+        String::new()
+    } else {
+        format!("\n{}", parser::END_PATCH_MARKER)
+    };
+    (
+        std::borrow::Cow::Owned(format!("{}\n{body}{end}", parser::BEGIN_PATCH_MARKER)),
+        true,
+    )
+}
+
+/// Whether `input`'s patch is one [`with_envelope`] repairs.
+fn envelope_supplied(input: &Value) -> bool {
+    input
+        .get("patch")
+        .and_then(Value::as_str)
+        .is_some_and(|p| with_envelope(p).1)
+}
+
+/// `result` with [`ENVELOPE_NOTE`] added to a completed call, when `supplied`.
+fn noting_envelope(
+    result: Result<ToolOutput, ToolError>,
+    supplied: bool,
+) -> Result<ToolOutput, ToolError> {
+    match result {
+        Ok(mut out) if supplied => {
+            out.parts.push(crate::OutputPart::Text {
+                text: crate::UntrustedText::new(ENVELOPE_NOTE),
+            });
+            Ok(out)
+        }
+        other => other,
+    }
+}
+
 fn parse(input: &Value) -> Result<Vec<Hunk>, ToolError> {
-    let hunks = parse_patch(patch_text(input)?).map_err(|e| ToolError::InvalidInput {
+    let (text, _) = with_envelope(patch_text(input)?);
+    let hunks = parse_patch(&text).map_err(|e| ToolError::InvalidInput {
         tool: "apply_patch".into(),
         reason: e.to_string(),
     })?;
@@ -339,13 +400,15 @@ impl Tool for ApplyPatchTool {
         if hunks.is_empty() {
             return Ok(ToolOutput::error("the patch made no changes"));
         }
+        let supplied = envelope_supplied(&input);
         let root = ctx.workspace_root.clone();
         let cancel = ctx.cancel.clone();
         let task = tokio::task::spawn_blocking(move || apply_all(&hunks, &root, &cancel));
-        tokio::select! {
+        let result = tokio::select! {
             _ = ctx.cancel.cancelled() => Err(ToolError::Cancelled { tool: "apply_patch".into() }),
             result = task => result.map_err(|e| internal(format!("apply task failed: {e}")))?,
-        }
+        };
+        noting_envelope(result, supplied)
     }
 }
 
@@ -610,6 +673,67 @@ mod tests {
 
     fn wrap(body: &str) -> Value {
         json!({ "patch": format!("*** Begin Patch\n{body}\n*** End Patch") })
+    }
+
+    /// A patch that starts with a file header and has no envelope is applied as
+    /// if it had one, and the result says so; one that starts any other way
+    /// stays refused.
+    #[tokio::test]
+    async fn a_patch_without_its_envelope_is_applied_and_the_result_says_so() {
+        let tool = ApplyPatchTool;
+        for (patch, why) in [
+            (
+                "*** Add File: a.txt\n+one\n+two",
+                "no begin and no end line",
+            ),
+            (
+                "\n  *** Add File: a.txt\n+one\n+two\n*** End Patch\n",
+                "no begin line, leading blank lines",
+            ),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let input = json!({ "patch": patch });
+            tool.access(&input).expect("access");
+            let out = tool
+                .call(
+                    input,
+                    &ctx(dir.path().to_path_buf()),
+                    &crate::CallPermit::new(),
+                )
+                .await
+                .expect(why);
+            assert!(!out.is_error, "{why}");
+            let text = out.render();
+            assert!(
+                text.contains("note: the patch had no '*** Begin Patch' line"),
+                "{why}: {text}"
+            );
+            let written = std::fs::read_to_string(dir.path().join("a.txt")).expect("written");
+            assert_eq!(written, "one\ntwo\n", "{why}");
+        }
+        // A patch with its envelope carries no note.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = tool
+            .call(
+                wrap("*** Add File: a.txt\n+one"),
+                &ctx(dir.path().to_path_buf()),
+                &crate::CallPermit::new(),
+            )
+            .await
+            .expect("call");
+        assert!(!out.render().contains("note:"));
+        // Malformed beyond the missing envelope stays an error.
+        for bad in [
+            "just some text",
+            "*** Begin Patch\n*** Add File: a.txt\n+one",
+            "--- a/x\n+++ b/x\n*** Add File: a.txt\n+one",
+        ] {
+            let err = tool.access(&json!({ "patch": bad })).expect_err("refused");
+            assert!(
+                matches!(err, ToolError::InvalidInput { .. }),
+                "{bad}: {err}"
+            );
+        }
     }
 
     #[tokio::test]

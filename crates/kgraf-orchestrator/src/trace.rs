@@ -120,6 +120,16 @@ pub enum TraceEvent {
         worker: String,
         notice: kgraf_runtime::CompactionNotice,
     },
+    /// A worker reached a round checkpoint (decision 0096): every checkpoint
+    /// it reached, with the measurement and verdict of each. `extended` is
+    /// the sizing signal: the worker ran past its planned round budget.
+    WorkerCheckpoints {
+        at_ms: i64,
+        contract: String,
+        worker: String,
+        extended: bool,
+        blocks: kgraf_runtime::RoundBlocks,
+    },
     /// Question 3.
     Regrounding {
         at_ms: i64,
@@ -165,8 +175,12 @@ pub enum TraceEvent {
         detail: String,
     },
     /// A worker reported that it cannot do its brief as given, and how the
-    /// orchestrator resolved it (decision 0093): `granted ...`, `amended ...`
-    /// or `held for the user: ...`. `kind` is `permission` or `instructions`.
+    /// orchestrator resolved it (decision 0093): `granted ...`, `the contract
+    /// was amended ...`, `waiting for the user: ...`, `held: ...`,
+    /// `answered: ...` (nothing granted or held; the worker continues) or
+    /// `stopped: ...` (the attempt is stuck). `kind` is `permission` or
+    /// `instructions`; for a grounded permission report `need` is the refused
+    /// subject and `why` ends with the worker's own words.
     Shortfall {
         at_ms: i64,
         contract: String,
@@ -669,6 +683,30 @@ fn scrub_trace_fields(event: TraceEvent) -> TraceEvent {
                 contract,
                 worker,
                 notice,
+            }
+        }
+        // The measurement is structured; only an improvement line quotes a
+        // command's first words.
+        TraceEvent::WorkerCheckpoints {
+            at_ms,
+            contract,
+            worker,
+            extended,
+            mut blocks,
+        } => {
+            for checkpoint in &mut blocks.checkpoints {
+                checkpoint.measure.checks_improved =
+                    std::mem::take(&mut checkpoint.measure.checks_improved)
+                        .into_iter()
+                        .map(s)
+                        .collect();
+            }
+            TraceEvent::WorkerCheckpoints {
+                at_ms,
+                contract,
+                worker,
+                extended,
+                blocks,
             }
         }
         TraceEvent::RouteFault {

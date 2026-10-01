@@ -121,3 +121,13 @@ buffered `message.reasoning`). The chat adapter reads both; when both are presen
 `reasoning_content` is taken and the text is carried once. Before this, a thinking model on
 Ollama had its tokens counted and its text dropped. The `ollama` catalog entry now declares
 full visibility, from a recorded live stream and a recorded buffered answer.
+
+## Amendment (2026-10-01): a run known to be unattended answers a question at once
+
+An unanswered `ask_user_question` waited the unattended timeout (60 s) even when nobody could
+answer. A run is now known to be unattended when the host says so
+(`Orchestrator::with_question_attendance(Unattended)`; the host does this for every run, and
+a box run then sets `Box`). A question the orchestrator cannot answer from the run record is
+then answered at once with a recorded text that says nobody is attached and tells the worker
+to state its assumption, and a session notice says so. A run whose attendance was never
+declared keeps the timed wait. Test: `a_known_unattended_run_answers_a_question_at_once`.

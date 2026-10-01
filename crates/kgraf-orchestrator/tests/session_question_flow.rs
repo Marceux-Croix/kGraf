@@ -880,6 +880,50 @@ async fn an_unanswered_question_times_out_with_the_recorded_no_answer_text() {
     let _ = run.await.expect("join");
 }
 
+/// A run known to be unattended answers a question the orchestrator cannot
+/// answer at once, not after the 60 s unattended timeout, and records the
+/// answer; no question stays on the desk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_known_unattended_run_answers_a_question_at_once() {
+    let dir = tempfile::tempdir().expect("dir");
+    let p = parts(
+        dir.path(),
+        &[c("a", "make a HANG", "src/a.rs", &[])],
+        Duration::from_millis(5),
+    );
+    hang(&p);
+    let o = Orchestrator::new(config(), p.services(WINDOW))
+        .expect("orchestrator")
+        .with_question_answerer(Arc::new(Fake::default()))
+        .with_question_attendance(QuestionAttendance::Unattended);
+    let handle = o.handle();
+    let run = tokio::spawn(o.start(RunId::new("r1"), "make a".into()));
+    wait_hang(&p).await;
+    let worker = AgentId::new("r1-a-r0-a0");
+    let started = Instant::now();
+    let text = tokio::time::timeout(
+        Duration::from_secs(20),
+        handle.ask_question(worker.clone(), "which file?".into()),
+    )
+    .await
+    .expect("answered well before the 60 s timeout")
+    .expect("a result, not an error");
+    assert!(started.elapsed() < Duration::from_secs(20));
+    assert!(text.contains("Nobody is attached"), "{text}");
+    assert!(text.contains("State the assumption"), "{text}");
+    let recorded = sessions(&p).undelivered(&worker).expect("inbox");
+    assert!(
+        recorded
+            .iter()
+            .any(|i| i.kind == InboxKind::Answer && i.text == text),
+        "the answer is recorded: {recorded:?}"
+    );
+    assert!(handle.pending_questions().await.is_empty());
+    unhang(&p);
+    handle.stop().await;
+    let _ = run.await.expect("join");
+}
+
 /// The attendance rule never waits forever.
 #[test]
 fn a_box_run_waits_the_box_timeout_and_any_other_the_scheduled_one() {

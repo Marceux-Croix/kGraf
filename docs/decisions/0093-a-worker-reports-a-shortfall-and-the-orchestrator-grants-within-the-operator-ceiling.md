@@ -122,3 +122,56 @@ the operator allowed in advance.
 - The container setting is the Bypass mode: `--container-sandbox`, still with
   `KGRAF_CONTAINER_SANDBOX=1`, selects `--permission-mode bypass`, which keeps the limits listed
   in decision 0094. The Terminal-Bench bridge selects Bypass.
+
+## Amendment (2026-10-01): a report is grounded in the worker's recorded refusals
+
+Live local-model runs showed `decide` acting on the worker's words. A malformed `apply_patch`
+came back as `denied by access: invalid input ...`; the worker read it as a permission
+refusal, reported a need of "write access to discount_flat/src/lib.rs via apply_patch tool",
+and the first word became a file grant of `write`. A list of four sibling contracts' files was
+held as "writes to `checkout/src/lib.rs,`". Under Orchestrator decides, the prose "running
+arbitrary Python code (e.g., python3 -c ...)" granted the program `running` and paid for a
+re-dispatch that changed nothing. A skill hold never named the skill when the need was a
+sentence, because the tool name was parsed from the whole need.
+
+- **Malformed input is not a refusal.** The approval chain labels a call whose input the tool
+  cannot read `invalid-input` (`kgraf_tools::INVALID_INPUT`), not `access`. The worker sees
+  `ERROR: invalid call: <reason>; fix the call and retry. This is not a permission refusal.`,
+  with no reporting hint, and the call is not recorded as a policy refusal. The worker loop
+  keeps its newest input error.
+- **The record is readable while the worker runs.** Each policy refusal carries the policy
+  that refused it (`by`, `skill:<name>` for a skill) and, for a write-scope refusal, the path.
+  The worker loop mirrors its record into the run's `RefusalDirectory`, which
+  `report_shortfall` reads by the calling worker's id.
+- **`ground` resolves the subject from the record.** The candidates are the unretried
+  refusals of the report's scope: shell programs (command), refused paths (file), other tools
+  (tool). A `need` that is one clean token must name a candidate; prose or a list picks the one
+  candidate it mentions, or the only candidate when it mentions none. The decision, the trace
+  and a request to the user name the grounded subject; the worker's words are kept after its
+  reason.
+- **A report that grounds nothing is answered, not decided.** With no matching refusal the
+  worker is told that nothing was granted or held, shown the refusals on record and its last
+  input error, and keeps working. A need naming several refused subjects is answered as invalid
+  input: name exactly one. A file the contract already declares is answered "you may write it";
+  a file another contract of the run declares is answered "it belongs to contract X; do not
+  edit it", with the contract's acceptance check. Neither file case is granted in any mode,
+  Bypass and Orchestrator decides included (disjoint writes).
+- **Answers are bounded.** A worker is answered at most `MAX_ANSWERED_SHORTFALLS` (2) times; its
+  next report that grounds nothing stops it, the trace records `stopped: ...`, a `stuck` report
+  is raised, and the attempt ends as an error that counts toward the contract's failures, as a
+  stalled attempt does. `OpenContract` records the answers (`shortfall_answers`) and the
+  stopped workers (`shortfall_stuck`); a worker's entries go when its attempt finishes.
+- **A skill hold names the skill from the record.** `skill_refusal` asks the live skills about
+  the grounded subject, and falls back to the worker's newest unretried skill refusal of that
+  same subject.
+- **The trace's `resolution`** reads `granted ...`, `the contract was amended ...`, `waiting for
+  the user: ...`, `held: ...`, `answered: ...` or `stopped: ...`.
+
+Evidence, through the real tool and the real run loop: `kgraf-tools` (`approval.rs`:
+`malformed_input_is_denied_as_invalid_input_not_by_access`); `kgraf-runtime` (`worker_loop.rs`:
+`a_malformed_patch_is_an_invalid_call_not_a_policy_refusal`; `shortfall.rs`: the directory
+mirrors a running worker and forgets a finished one); `kgraf-orchestrator` (`shortfall.rs`: one
+test per case above, each driving `ShortfallTool` with a recorded refusal set, plus grounding,
+path and skill tests); `kgraf-host` (`shortfall_tests.rs`: a report after the granted command
+ran is answered and the worker finishes; baseless reports are answered twice, then the attempt
+is stuck; Bypass answers a sibling contract's file and never grants it).

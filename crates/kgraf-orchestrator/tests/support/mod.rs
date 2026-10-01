@@ -332,6 +332,22 @@ impl Provider for WorkerFake {
             ..TokenUsage::default()
         };
         let (content, stop) = match (round, write_path(&instruction)) {
+            // `LONGRUN`: ten rounds, each writing new content to the path,
+            // then the answer: longer than `config()`'s six-round budget, and
+            // progress the runtime measures at every checkpoint (decision
+            // 0096).
+            (r, Some(path)) if instruction.contains("LONGRUN") && r < 10 => (
+                vec![
+                    Content::text("writing"),
+                    Content::ToolUse {
+                        id: format!("t{r}"),
+                        name: "write_file".into(),
+                        input: json!({"path": path, "content": format!("{} v{r}", self.vendor)}),
+                        signature: None,
+                    },
+                ],
+                StopReason::ToolUse,
+            ),
             (0, Some(path)) => {
                 let written = self
                     .content

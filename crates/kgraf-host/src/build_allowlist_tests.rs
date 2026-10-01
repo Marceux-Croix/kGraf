@@ -61,6 +61,7 @@ async fn one_shell_call_under(
         ledger: ledger.clone(),
         config,
         max_output_tokens: 1_000,
+        max_checkpoints: crate::limits::DEFAULT_MAX_CHECKPOINTS,
         read_denies: vec![state.clone()],
         workspaces: r.workspaces.clone(),
         routes,
@@ -72,6 +73,7 @@ async fn one_shell_call_under(
         dependency_refetch: crate::deps::inert_refetch(),
         skills: None,
         skill_directory: Default::default(),
+        refusal_directory: Default::default(),
         permissions,
     };
     let context = ContextConfig::for_model(200_000).expect("context");

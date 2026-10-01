@@ -531,6 +531,13 @@ impl ApprovalChain {
         }
         let access = match registered.tool().access(&call.input) {
             Ok(a) => a,
+            // Malformed input is the caller's mistake, not a policy's: it is
+            // labeled apart so the worker is not told a permission refused it
+            // (a worker that read "denied by access" asked for write access
+            // instead of fixing its patch).
+            Err(e @ crate::error::ToolError::InvalidInput { .. }) => {
+                return deny(log, &call, INVALID_INPUT, e.to_string()).await;
+            }
             Err(e) => return deny(log, &call, "access", e.to_string()).await,
         };
         Ok(Verdict::Run(ApprovedCall {
@@ -658,6 +665,11 @@ impl ApprovalChain {
 }
 
 const ASK_POLICY: &str = "ask-policy";
+
+/// The `by` of a [`Verdict::Denied`] for a call whose input the tool could
+/// not read (its `access` returned [`ToolError::InvalidInput`]). No policy
+/// refused it; the call is malformed and the caller should fix and retry it.
+pub const INVALID_INPUT: &str = "invalid-input";
 
 async fn deny(
     log: &mut dyn ApprovalLog,
@@ -1387,5 +1399,61 @@ mod tests {
             .await
             .expect("review");
         assert!(matches!(verdict, Verdict::Denied { ref by, .. } if by == "access"));
+    }
+
+    /// Input the tool cannot read is denied as invalid input, never as an
+    /// access or policy refusal.
+    #[tokio::test]
+    async fn malformed_input_is_denied_as_invalid_input_not_by_access() {
+        struct Strict;
+        #[async_trait::async_trait]
+        impl Tool for Strict {
+            fn name(&self) -> &str {
+                "shell"
+            }
+            fn definition(&self) -> ToolDefinition {
+                ToolDefinition {
+                    name: "shell".into(),
+                    description: "strict".into(),
+                    input_schema: json!({"type": "object"}),
+                }
+            }
+            fn access(&self, _input: &Value) -> Result<Access, ToolError> {
+                Err(ToolError::InvalidInput {
+                    tool: "shell".into(),
+                    reason: "The first line of the patch must be '*** Begin Patch'".into(),
+                })
+            }
+            async fn call(
+                &self,
+                _input: Value,
+                _ctx: &ToolContext,
+                _permit: &CallPermit,
+            ) -> Result<ToolOutput, ToolError> {
+                unreachable!("never approved")
+            }
+        }
+        let mut registry = ToolRegistry::new();
+        registry
+            .register_builtin(Arc::new(Strict), Exposure::Prefix)
+            .expect("strict");
+        let discovered = DiscoveredTools::new();
+        let view = ToolView {
+            registry: &registry,
+            discovered: &discovered,
+        };
+        let mut log = MemoryApprovalLog::default();
+        let verdict = chain(vec![])
+            .review(view, call(json!({"patch": "oops"})), &mut log)
+            .await
+            .expect("review");
+        let Verdict::Denied { by, reason } = verdict else {
+            panic!("{verdict:?}");
+        };
+        assert_eq!(by, INVALID_INPUT);
+        assert!(
+            reason.starts_with("invalid input for tool `shell`"),
+            "{reason}"
+        );
     }
 }

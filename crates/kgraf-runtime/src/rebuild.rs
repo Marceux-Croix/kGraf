@@ -341,13 +341,14 @@ impl TranscriptBuilder {
                     call.is_error = *is_error;
                     call.output = output.clone();
                     // A call the approval chain or the write scope turned away
-                    // did nothing, and a call the final round refused never
+                    // (denied, refused, or invalid input) did nothing, and a call the final round refused never
                     // reached the stall check; the live loop counted neither.
                     // Only an error result can be one of these: a successful
                     // result that happens to start with the same words is not.
                     call.counted = !(*is_error
                         && (output.starts_with(crate::worker::DENIED_PREFIX)
                             || output.starts_with(crate::worker::REFUSED_PREFIX)
+                            || output.starts_with(crate::worker::INVALID_CALL_PREFIX)
                             || *output == crate::worker::final_round_refusal()));
                 }
                 // A result read back from storage may hold a span the pattern
@@ -458,6 +459,11 @@ impl TranscriptBuilder {
             WorkerEvent::Waiting { .. } | WorkerEvent::Resumed { .. } => {}
             // Persist-only redaction counts (decision 0071): never model input.
             WorkerEvent::Redacted { .. } => {}
+            // Decision 0096: the loop's measurement, never model input. The
+            // worker reads the checkpoints from the stored events on resume
+            // (`ProgressGate::resume`); the grace notice, when there is one,
+            // is its own `Notice` event.
+            WorkerEvent::Checkpoint { .. } => {}
             WorkerEvent::Compacted { notice, summary } => {
                 // Results held for the next turn belong to the history the
                 // summary replaced; the loop compacts only between rounds,

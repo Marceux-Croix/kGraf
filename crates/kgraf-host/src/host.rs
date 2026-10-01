@@ -125,6 +125,36 @@ pub enum Notice {
     /// as a root gate on the merged result (`added_gate`: it was not one of
     /// the gate commands already, so it was added).
     AcceptanceNarrowed { command: String, added_gate: bool },
+    /// An output cap was above what a model supports, so it was lowered for
+    /// this run. `which` is `worker` (the cap is the smallest limit among the
+    /// worker routes, which rotate) or `orchestrator`.
+    OutputCapClamped {
+        which: &'static str,
+        clamp: crate::limits::OutputClamp,
+    },
+}
+
+/// The output caps of a run, lowered to the models' supported limits: the
+/// worker cap (the smallest limit among the worker routes, which rotate), the
+/// orchestrator cap, and one notice for each that was lowered.
+fn output_caps(
+    config: &RunConfig,
+    routes: &[RouteSpec],
+    planner: &RouteSpec,
+) -> (u32, u32, Vec<Notice>) {
+    let (worker_cap, worker_clamp) = crate::limits::clamp_output(
+        config.max_tokens,
+        routes.iter().map(|r| (r.route.as_str(), r.model.as_str())),
+    );
+    let (planner_cap, planner_clamp) = crate::limits::clamp_output(
+        config.planner_max_tokens,
+        [(planner.route.as_str(), planner.model.as_str())],
+    );
+    let notices = [("worker", worker_clamp), ("orchestrator", planner_clamp)]
+        .into_iter()
+        .filter_map(|(which, c)| c.map(|clamp| Notice::OutputCapClamped { which, clamp }))
+        .collect();
+    (worker_cap, planner_cap, notices)
 }
 
 /// How a prepared run begins.
@@ -219,6 +249,15 @@ pub struct Host {
     ended: Mutex<BTreeMap<RunId, RunEnd>>,
     /// Notices of builds nobody was there to print ([`HostFactory`]).
     notices: Mutex<Vec<Notice>>,
+    /// The output cap of a worker reply and of an orchestrator call after each
+    /// was lowered to the supported output limit of the models it goes to
+    /// (`crate::limits::clamp_output`). Equal to the configured cap when no
+    /// model's limit is lower or known.
+    worker_cap: u32,
+    planner_cap: u32,
+    /// One [`Notice::OutputCapClamped`] per cap that was lowered, said at each
+    /// run's startup.
+    clamp_notices: Vec<Notice>,
     /// Runs whose synchronous build (`build_base`) is executing on a blocking
     /// thread. A build that outlives `prepare_blocking`'s time bound keeps
     /// running there after its task is aborted, so a retry for the same run
@@ -445,6 +484,7 @@ impl Host {
             .map(|s| RouteSpec::parse(s))
             .collect::<Result<Vec<_>>>()?;
         let worktrees = Mutex::new(config.worktrees);
+        let (worker_cap, planner_cap, clamp_notices) = output_caps(&config, &routes, &planner);
         Ok(Self {
             config,
             state,
@@ -464,6 +504,9 @@ impl Host {
             in_process: BTreeMap::new(),
             ended: Mutex::new(BTreeMap::new()),
             notices: Mutex::new(Vec::new()),
+            worker_cap,
+            planner_cap,
+            clamp_notices,
             base_builds: Arc::default(),
             index_pass: Mutex::new(()),
             build_timeout: DEFAULT_BUILD_TIMEOUT,
@@ -475,6 +518,23 @@ impl Host {
             dependency_questions: Mutex::new(BTreeMap::new()),
             worktrees,
         })
+    }
+
+    /// What lowering `worker` and `planner` output caps to these routes'
+    /// models would say: `("worker" | "orchestrator", sentence)` per cap that is
+    /// above a model's supported limit. The desktop shows it next to a slider before a run starts.
+    pub fn output_clamp_notes(&self, worker: u32, planner: u32) -> Vec<(&'static str, String)> {
+        let mut config = self.config.clone();
+        config.max_tokens = worker;
+        config.planner_max_tokens = planner;
+        output_caps(&config, &self.routes, &self.planner)
+            .2
+            .iter()
+            .filter_map(|n| match n {
+                Notice::OutputCapClamped { which, clamp } => Some((*which, clamp.sentence(which))),
+                _ => None,
+            })
+            .collect()
     }
 
     /// The worktree policy in force for runs built from now on.
@@ -754,6 +814,12 @@ impl Host {
             )),
             None => provider_for(route, model, &self.limiters),
         }
+    }
+
+    /// The output caps in force: a worker reply's and an orchestrator call's,
+    /// after the models' supported limits were applied.
+    pub fn output_caps(&self) -> (u32, u32) {
+        (self.worker_cap, self.planner_cap)
     }
 
     pub fn config(&self) -> &RunConfig {
@@ -1050,7 +1116,7 @@ impl Host {
             provider: self.provider(&self.planner.route, &self.planner.model)?,
             ledger: self.ledger.clone(),
             model: self.planner.model.clone(),
-            max_output_tokens: self.config.planner_max_tokens,
+            max_output_tokens: self.planner_cap,
             agent: agent.to_owned(),
             task: task.to_owned(),
         })
@@ -1135,7 +1201,7 @@ impl Host {
             interfaces: Vec::new(),
             runner: Arc::new(runner),
             handshaker: Arc::new(RoutedHandshaker {
-                routes: model_routes(self.config.planner_max_tokens),
+                routes: model_routes(self.planner_cap),
             }),
             reviewer: Arc::new(ModelReviewer(self.caller(run)?)),
             max_supersessions: DEFAULT_MAX_SUPERSESSIONS,
@@ -1144,7 +1210,7 @@ impl Host {
             // 0076: each consumer writes its own test of what it expects from
             // the producer, on the same per-route models as the handshake.
             consumer_test_writer: Some(Arc::new(RoutedConsumerTestWriter {
-                routes: model_routes(self.config.planner_max_tokens),
+                routes: model_routes(self.planner_cap),
             })),
             stub_lander: stub_lander.clone(),
         };
@@ -1227,6 +1293,10 @@ impl Host {
             WorkspaceManager::open(&self.config.root, &self.state.join("worktrees"))
                 .step("cannot open the worktree manager")?,
         );
+        // A lowered output cap is said at every run's start, never silently.
+        for clamp in &self.clamp_notices {
+            notices(clamp.clone());
+        }
         for removed in clean_stale_worktrees(
             &manager,
             &RunStore::new(self.graph.clone()),
@@ -1459,9 +1529,15 @@ impl Host {
         // Each attempt's skill session registers here, so a permission report
         // a worker's skill refuses carries the skill's refusal (decision 0053).
         let skill_directory = kgraf_session::skills::SkillDirectory::new();
+        // Each attempt's worker mirrors its policy refusals here, so a report
+        // is grounded in what a policy refused, not in the worker's words.
+        let refusal_directory = kgraf_runtime::RefusalDirectory::new();
         extra_tools.push(Arc::new(
-            kgraf_orchestrator::ShortfallTool::new(shortfall_line.clone())
-                .with_skills(skill_directory.clone()),
+            kgraf_orchestrator::ShortfallTool::new(
+                shortfall_line.clone(),
+                refusal_directory.clone(),
+            )
+            .with_skills(skill_directory.clone()),
         ));
         // Decision 0089: the run's non-generative routes, each built with its
         // own credential. Their tools join every environment of the run (so the
@@ -1503,7 +1579,8 @@ impl Host {
             indexed: index_report.nodes > 0,
             ledger: self.ledger.clone(),
             config: worker_config,
-            max_output_tokens: self.config.max_tokens,
+            max_output_tokens: self.worker_cap,
+            max_checkpoints: self.config.max_checkpoints,
             read_denies: read_denies.clone(),
             workspaces: workspaces.clone(),
             routes: parts,
@@ -1518,6 +1595,7 @@ impl Host {
             dependency_refetch,
             skills,
             skill_directory,
+            refusal_directory,
             permissions: self.permissions.clone(),
         });
         Ok(BuildBase {
@@ -1650,6 +1728,10 @@ impl Host {
             .with_permissions(self.permissions.clone())
             .with_index_extractor_changes(extractor_changed)
             .with_attempt_envs(envs)
+            // Known unattended until a box run says otherwise
+            // (`InteractiveRun::start` sets `Box` on the built orchestrator): a
+            // question nobody can answer is answered at once, not after a wait.
+            .with_question_attendance(kgraf_orchestrator::QuestionAttendance::Unattended)
             .with_question_answerer(Arc::new(ModelAnswerer(self.caller(&run)?)));
         // Decision 0089: the planner is told the run's model routes by kind,
         // and the orchestrator may call them itself.
@@ -1723,11 +1805,7 @@ impl Host {
                     .map(|(name, (provider, model))| {
                         (
                             name.clone(),
-                            (
-                                provider.clone(),
-                                model.clone(),
-                                self.config.planner_max_tokens,
-                            ),
+                            (provider.clone(), model.clone(), self.planner_cap),
                         )
                     })
                     .collect(),
@@ -1991,7 +2069,7 @@ impl Host {
         model: &str,
     ) -> Result<kgraf_core::Money> {
         let input = self.context.effective_window();
-        let output = u64::from(self.config.max_tokens.max(self.config.planner_max_tokens));
+        let output = u64::from(self.worker_cap.max(self.planner_cap));
         let cost = |r: Option<&str>, m: &str| {
             prices.cost_on(
                 r,

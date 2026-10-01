@@ -10,8 +10,8 @@
 //! does not change with the mode (decision 0043).
 
 use super::{
-    ApplyPatchTool, Hunk, apply_all_names, internal, lexical, parse, refuse_repeated_paths,
-    written_paths,
+    ApplyPatchTool, Hunk, apply_all_names, envelope_supplied, internal, lexical, noting_envelope,
+    parse, refuse_repeated_paths, written_paths,
 };
 use crate::fs_safety;
 use crate::protected::{Area, ProtectedWrites, Target};
@@ -286,13 +286,16 @@ impl Tool for ProtectedApplyPatch {
         let Some(protected) = self.split(&hunks)? else {
             return ApplyPatchTool.call(input, ctx, permit).await;
         };
+        let supplied = envelope_supplied(&input);
         let guard = self.guard.clone();
         let cancel = ctx.cancel.clone();
         // Not raced against the cancel: a write that started must reach its
         // check, or it would be left unchecked.
-        tokio::task::spawn_blocking(move || apply_protected(&guard, protected, &cancel))
-            .await
-            .map_err(|e| internal(format!("apply task failed: {e}")))?
+        let result =
+            tokio::task::spawn_blocking(move || apply_protected(&guard, protected, &cancel))
+                .await
+                .map_err(|e| internal(format!("apply task failed: {e}")))?;
+        noting_envelope(result, supplied)
     }
 }
 

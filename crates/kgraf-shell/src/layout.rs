@@ -2961,6 +2961,8 @@ impl ShellApp {
             slider.return_to_recommendation();
         }
         separator(ui, p);
+        self.settings_run_limits(ui, p);
+        separator(ui, p);
         let toggled = ui
             .checkbox(
                 &mut self.settings.background_mode,
@@ -2988,6 +2990,102 @@ impl ShellApp {
         if let Some(err) = &self.store.last_error {
             ui.colored_label(p.danger, format!("Settings not saved: {err}"));
         }
+    }
+
+    /// The five global run limits as sliders. They apply to every run the app
+    /// starts, from the next run (a host reopens when no run is active), and to
+    /// `kgraf` commands that are given no flag. A cap above what a model of an
+    /// open project supports is lowered for that run, and the note under the
+    /// slider says so before the run starts (the same sentence a run reports).
+    fn settings_run_limits(&mut self, ui: &mut Ui, p: &Palette) {
+        ui.label(
+            RichText::new("Run limits")
+                .font(theme::bold(14.0))
+                .color(p.text),
+        );
+        let worker = self.settings.limits.worker_max_tokens.value() as u32;
+        let planner = self.settings.limits.planner_max_tokens.value() as u32;
+        let mut worker_notes = Vec::new();
+        let mut planner_notes = Vec::new();
+        for proj in self.workspace.projects() {
+            let Some(host) = proj
+                .interaction
+                .as_ref()
+                .and_then(|i| i.host().housekeeping())
+                .and_then(|h| h.host())
+            else {
+                continue;
+            };
+            for (which, sentence) in host.output_clamp_notes(worker, planner) {
+                let notes = if which == "worker" {
+                    &mut worker_notes
+                } else {
+                    &mut planner_notes
+                };
+                let line = format!("{}: {sentence}", proj.name());
+                if !notes.contains(&line) {
+                    notes.push(line);
+                }
+            }
+        }
+        let limits = &mut self.settings.limits;
+        crate::interaction::limit_slider_row(
+            ui,
+            p,
+            "Model rounds per worker",
+            "The rounds in one block. A worker that makes measured progress is given another \
+             block of this size (see the next limit); one that does not ends at the block's \
+             end with a final answer.",
+            &mut limits.rounds,
+            false,
+            &[],
+        );
+        crate::interaction::limit_slider_row(
+            ui,
+            p,
+            "Most round blocks per worker",
+            "The most blocks of rounds one worker may be given while it keeps making \
+             progress. 1 means the old fixed round limit: no extension.",
+            &mut limits.max_checkpoints,
+            false,
+            &[],
+        );
+        crate::interaction::limit_slider_row(
+            ui,
+            p,
+            "Worker reply cap (tokens)",
+            "The most output tokens one worker reply may have.",
+            &mut limits.worker_max_tokens,
+            true,
+            &worker_notes,
+        );
+        crate::interaction::limit_slider_row(
+            ui,
+            p,
+            "Orchestrator reply cap (tokens)",
+            "The most output tokens one orchestrator call may have: planning, re-grounding \
+             and reviews. An answer cut off at it fails the run, naming this limit.",
+            &mut limits.planner_max_tokens,
+            true,
+            &planner_notes,
+        );
+        crate::interaction::limit_slider_row(
+            ui,
+            p,
+            "Context window assumed (tokens)",
+            "The window assumed for models. A single worker uses at most 100,000 tokens of it.",
+            &mut limits.window,
+            true,
+            &[],
+        );
+        ui.label(
+            RichText::new(
+                "Applies to runs started after the change, and to kgraf commands given no \
+                 flag. A flag on the command line outranks it.",
+            )
+            .small()
+            .color(p.text_2),
+        );
     }
 
     /// The worker-worktree switch (decision 0088). A setting row: a label, then

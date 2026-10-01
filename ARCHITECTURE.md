@@ -456,7 +456,8 @@ that labels the action on the graph at no extra model call.
 the run record in one reserved, accounted call; the user is asked only when
 it cannot. A question waits for the user a bounded amount of time (longer in
 an unattended run, shorter otherwise), then returns a recorded no-answer
-result that tells the worker to state its assumption instead.
+result that tells the worker to state its assumption instead. A run the host declares
+unattended answers at once with that result instead of waiting.
 
 A worker receives a narrow brief and returns a compact structured result, so
 the orchestrator does not receive the worker's intermediate tokens. The
@@ -472,7 +473,9 @@ observation masking, and persisted allow rules. An unattended worker is
 denied an MCP tool until an explicit allow rule is recorded. **Not built
 yet:** the deferred tool-search tool and the per-call intent argument.
 
-**Loop behavior worth knowing.** A successful write starts a new stall count, so edit and test cycles, and re-reads after a change, do not end a run as stalled. Observation masking keeps the last N rounds of tool results, every block of a round together. A resume replays only calls that succeeded. A paused turn fails loud. A stop at the output ceiling gets one counted continuation round, then fails. `apply_patch` refuses a patch that names one path in two hunks, and its mismatch hints name the nearest match. A shell command's output is bounded as it is read, so a chatty command cannot grow host memory, and the command's process group is killed after a normal exit so background children do not hold the worktree.
+**Loop behavior worth knowing.** A successful write starts a new stall count, so edit and test cycles, and re-reads after a change, do not end a run as stalled. Observation masking keeps the last N rounds of tool results, every block of a round together. A resume replays only calls that succeeded. A paused turn fails loud. A stop at the output ceiling gets one counted continuation round, then fails. A turn with no tool call and no visible answer (a plan only in the model's reasoning) gets one counted notice round, and a second one in a row fails the attempt. A patch that starts with a file header and lacks `*** Begin Patch` is applied as if it had one, and the result says so. `apply_patch` refuses a patch that names one path in two hunks, and its mismatch hints name the nearest match. A shell command's output is bounded as it is read, so a chatty command cannot grow host memory, and the command's process group is killed after a normal exit so background children do not hold the worktree.
+
+**The round budget is a progress checkpoint (decision 0096).** A brief's round budget is one block. Where the loop would warn that three rounds remain, it measures the block instead (`kgraf-runtime/src/progress.rs`): files whose content changed on net (blake3 against the last checkpoint, the content captured before the block's first write, or git's dirty list), check runs whose pass, fail or error counts improved (cargo test and nextest, pytest, unittest, `node --test`, jest, vitest, cargo and `tsc` errors, else the exit status), and sloppy patterns (one identical error 3 times, failed writes outnumbering successes, write-then-revert, an identical call and result 3 times). Model text is never read. A progressing block gives the same worker another block in the same conversation; a block without progress after a productive one gets one grace block and a notice; a second idle checkpoint ends the attempt `BudgetExhausted` with no answer round; a worker that never progressed meets the old wall (the warning, then the final answer round), and so does one at the ceiling (`LoopSettings::max_checkpoints`, 10). Each checkpoint is a `WorkerEvent::Checkpoint` the resume reads back, and the result's `round_blocks`. The context check runs first at every boundary, so a full context still hands back or compacts. The orchestrator counts an extended worker as one sizing miss, traces `worker_checkpoints`, and counts `round_extensions` and `checkpoint_stops`.
 
 **Transcript secret scrubbing (decision 0071).** Every event that can carry a
 tool's or a model's free-form text is scrubbed on two independent paths.
@@ -766,6 +769,14 @@ pre-flight by refusing a spawn, never by killing one after the cost is
 incurred. A node held back by the cap is a third visible reason, alongside
 blocked and colliding.
 
+**Run limits are the user's global settings** (decision 0017, amended). Rounds per
+worker, the worker reply cap, the orchestrator call cap and the assumed context window
+are sliders in Settings and keys in the user-level settings file, never a project file a
+worker could write. A command-line flag outranks the setting, which outranks the built-in
+default (30 rounds orchestrated and 12 for a single worker, 16,384 and 32,768 output
+tokens, a 128,000-token window). An output cap is lowered to the model's supported limit
+(`kgraf_core::output_limit`, from the bundled catalog) with a notice.
+
 Scheduling has two modes. A play control hands the orchestrator everything.
 Alternatively the user selects nodes and an order, and the orchestrator
 completes that partial order. **Admission control binds in both:** a
@@ -897,7 +908,9 @@ whole-suite runner kGraf recognizes (`unittest discover`, `pytest`, `node
 workspace), each attempt runs only the tests that belong to its declared
 files by the runner's naming convention, and the brief names that command.
 The whole command is added as a root gate when it is not one already, so it
-judges the merged result. Anything else runs whole, as do gate remediations.
+judges the merged result. Anything else runs whole, as do gate remediations; the brief then still names the whole
+command as what the attempt is judged by, calls the contract's Acceptance line advisory,
+and says failures in other contracts' unfinished code are not the worker's to fix.
 An attempt that changed none of its declared files is refused whatever its
 check says.
 

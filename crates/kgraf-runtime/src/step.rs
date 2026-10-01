@@ -58,6 +58,12 @@ impl StepBudget {
         self.used
     }
 
+    /// Add `rounds` to the budget: a progress checkpoint granted another block
+    /// (decision 0096).
+    pub fn extend(&mut self, rounds: u32) {
+        self.budget = self.budget.saturating_add(rounds);
+    }
+
     /// Rounds not yet spent, the final round included.
     pub fn rounds_left(&self) -> u32 {
         self.budget.saturating_sub(self.used)
@@ -198,6 +204,22 @@ mod tests {
         assert_eq!(b.rounds_left(), 4);
         let resumed = StepBudget::new(4, 3);
         assert_eq!(resumed.rounds_left(), 1);
+    }
+
+    #[test]
+    fn an_extended_budget_moves_the_warning_and_the_final_round() {
+        let mut b = StepBudget::new(5, 0);
+        b.next_round();
+        b.next_round();
+        b.extend(5);
+        let mut kinds = Vec::new();
+        while let RoundPlan::Run { notice, .. } = b.next_round() {
+            kinds.push(notice.map(|(k, _)| k));
+        }
+        assert_eq!(kinds.len(), 8);
+        assert_eq!(kinds[5], Some(NoticeKind::StepsLeft));
+        assert_eq!(kinds[7], Some(NoticeKind::FinalRound));
+        assert_eq!(b.used(), 10);
     }
 
     #[test]

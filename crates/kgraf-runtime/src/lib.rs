@@ -52,6 +52,7 @@ mod masking;
 mod paths;
 mod permission_resolver;
 mod prefix;
+mod progress;
 mod rebuild;
 mod settle;
 mod shortfall;
@@ -90,9 +91,16 @@ pub use permission_resolver::ModeResolver;
 pub use prefix::{
     McpInstructions, PrefixDigest, PrefixEncoder, PrefixError, PrefixSlice, SharedPrefix,
 };
+pub use progress::{
+    CheckKind, CheckScore, Checkpoint, CheckpointBaseline, CheckpointVerdict,
+    DEFAULT_MAX_CHECKPOINTS, FAILED_WRITE_LIMIT, ProgressMeasure, REPEATED_CALL_LIMIT,
+    REPEATED_ERROR_LIMIT, RoundBlocks, SloppyPattern, check_score, command_of,
+};
 pub use rebuild::{INTERRUPTED_RESULT, ResumeError, ResumeState, TranscriptBuilder};
 pub use settle::{TranscriptSettler, settle_for_disk};
-pub use shortfall::{RefusedCall, SHORTFALL_TOOL, capability_of, refusal_hint};
+pub use shortfall::{
+    RefusalDirectory, RefusalRecord, RefusedCall, SHORTFALL_TOOL, capability_of, refusal_hint,
+};
 pub use stall::{DEFAULT_STALL_REPEATS, Stall, StallDetector, call_digest};
 pub use step::{RoundPlan, StepBudget, WARN_AT_ROUNDS_LEFT};
 pub use thresholds::{
@@ -100,7 +108,8 @@ pub use thresholds::{
     MAX_COMPACTION_POINT_PERCENT, MIN_COMPACTION_POINT_PERCENT, PointSource, ThresholdError,
 };
 pub use worker::{
-    AskResolver, CANCEL_BEFORE_SEND_REASON, CallMode, LoopSettings, OUTPUT_LIMIT_ABANDON_REASON,
-    OUTPUT_LIMIT_NOTICE, STEER_ABANDON_BEFORE_SEND_REASON, STEER_ABANDON_REASON, STEER_INTERRUPTED,
-    STEER_NOT_RUN, SpawnOptions, WorkerEnv, WorkerError, blocking, spawn_worker,
+    AskResolver, CANCEL_BEFORE_SEND_REASON, CallMode, EMPTY_TURN_ABANDON_REASON, EMPTY_TURN_NOTICE,
+    LoopSettings, OUTPUT_LIMIT_ABANDON_REASON, OUTPUT_LIMIT_NOTICE,
+    STEER_ABANDON_BEFORE_SEND_REASON, STEER_ABANDON_REASON, STEER_INTERRUPTED, STEER_NOT_RUN,
+    SpawnOptions, WorkerEnv, WorkerError, blocking, spawn_worker,
 };

@@ -21,6 +21,8 @@ blake3 = "1"
 # FuturesUnordered: a round's independent tool calls run concurrently inside the
 # worker's task, with no spawn per call.
 futures-util = "0.3"
+# Check-run output parsing for the progress gate (decision 0096).
+regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

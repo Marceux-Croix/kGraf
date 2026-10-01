@@ -93,12 +93,14 @@ impl PermissionRuntime {
 }
 
 impl RunLoop {
-    /// The user's current mode and allow set, and whether a person attends.
+    /// The user's current mode, allow set and rules, and whether a person
+    /// attends.
     pub(super) fn authority(&self) -> Authority {
         let s = self.perms.control.settings();
         Authority {
             mode: s.mode,
             allow: s.allow,
+            rules: s.rules,
             attended: self.perms.attended,
         }
     }

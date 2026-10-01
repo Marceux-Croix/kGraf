@@ -125,6 +125,9 @@ mod plan_review;
 mod shortfall_hooks;
 // Decision 0095: runtime compaction, seen from the run loop.
 mod compaction_hooks;
+// Decision 0096: progress-gated round budgets, seen from the run loop.
+mod checkpoint_hooks;
+use checkpoint_hooks::checkpoint_note;
 mod speculate;
 
 /// Default cap on contracts in one plan (one decomposition answer).
@@ -267,6 +270,12 @@ pub trait Workspaces: Send + Sync {
     /// is never silent. A provider that removes nothing has none.
     fn take_problems(&self) -> Vec<String> {
         Vec::new()
+    }
+    /// The repository root the worktrees are made from, when there is one. A
+    /// plan's absolute write path inside it is read as the relative path
+    /// ([`crate::plan::normalize_plan`]); with `None`, an absolute path is refused.
+    fn repo_root(&self) -> Option<PathBuf> {
+        None
     }
     /// Merge the verified, selected attempt in `workspace` into the integration
     /// branch. A conflict is returned, never resolved by this call: only a
@@ -1026,6 +1035,31 @@ pub struct OrchestratorHandle {
     stop_token: kgraf_tools::CancellationToken,
 }
 
+#[cfg(test)]
+impl OrchestratorHandle {
+    /// A handle whose contract actions `answer` replies to, standing in for a
+    /// run loop, so a worker tool can be driven through its real line. Every
+    /// other message is dropped.
+    pub(crate) fn answering_contracts(
+        answer: impl Fn(crate::challenge::ContractControl) -> crate::challenge::ContractReply
+        + Send
+        + 'static,
+    ) -> Self {
+        let (tx, mut rx) = mpsc::channel(8);
+        tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                if let LoopMsg::Control(Control::Contract(control, reply)) = msg {
+                    let _ = reply.send(answer(*control));
+                }
+            }
+        });
+        Self {
+            tx,
+            stop_token: kgraf_tools::CancellationToken::new(),
+        }
+    }
+}
+
 impl OrchestratorHandle {
     /// Stop the run: cancel every worker; the record stays resumable.
     pub async fn stop(&self) {
@@ -1713,6 +1747,11 @@ pub struct Orchestrator {
     /// ([`crate::SCHEDULED_ASK_TIMEOUT`]) unless the run was started from the
     /// box.
     pub(crate) question_timeout: Duration,
+    /// Set when the run is known to be unattended
+    /// ([`crate::asks::QuestionAttendance::Unattended`], given explicitly): a
+    /// question the orchestrator cannot answer is answered at once with the
+    /// unattended text instead of waiting out [`Self::question_timeout`].
+    pub(crate) question_unattended: bool,
     /// How long one paid session call may run
     /// ([`sessions::SESSION_CALL_TIMEOUT`] unless set).
     pub(crate) session_call_timeout: Duration,
@@ -1754,6 +1793,7 @@ impl Orchestrator {
             question_desk: Arc::new(crate::asks::QuestionDesk::default()),
             question_answerer: None,
             question_timeout: crate::asks::QuestionAttendance::Unattended.timeout(),
+            question_unattended: false,
             session_call_timeout: sessions::SESSION_CALL_TIMEOUT,
             session_notices: None,
             index_extractor_changes: Vec::new(),
@@ -1785,9 +1825,12 @@ impl Orchestrator {
     }
 
     /// Who can answer a worker's question, which sets how long it waits for
-    /// the user. The default is unattended.
+    /// the user. Without a call, attendance is not known and a question waits
+    /// the unattended timeout; `Unattended` given here is a known fact, and a
+    /// question nobody can answer is then answered at once.
     pub fn with_question_attendance(mut self, attendance: crate::asks::QuestionAttendance) -> Self {
         self.question_timeout = attendance.timeout();
+        self.question_unattended = attendance == crate::asks::QuestionAttendance::Unattended;
         // Decision 0094: a person in the box can answer permission requests
         // and approve a plan; with nobody, what would ask is denied.
         self.perms.attended = attendance == crate::asks::QuestionAttendance::Box;
@@ -2225,6 +2268,7 @@ impl RunLoop {
             question_desk,
             question_answerer,
             question_timeout,
+            question_unattended,
             session_call_timeout,
             session_notices,
             index_extractor_changes,
@@ -2386,6 +2430,7 @@ impl RunLoop {
             question_answerer,
             sessions_rt: sessions::SessionRuntime::new(
                 question_timeout,
+                question_unattended,
                 session_notices,
                 session_call_timeout,
             ),
@@ -3010,6 +3055,17 @@ impl RunLoop {
                 self.settle_call(reservation, Some(&out.calls))?;
                 self.mark_delivered(note_ids);
                 let specs = sanitize_plan(out.contracts)?;
+                // Repairs the planner's intent makes certain (a task-kind word
+                // in `route`, an absolute path inside the repository), each
+                // stated as a notice.
+                let (specs, repairs) = crate::plan::normalize_plan(
+                    specs,
+                    self.s.workspaces.repo_root().as_deref(),
+                    &self.roster(),
+                );
+                for r in repairs {
+                    self.notices.insert(kgraf_secrets::scrub_persist_owned(r));
+                }
                 validate_plan_with(
                     &specs,
                     &BTreeSet::new(),
@@ -5998,6 +6054,13 @@ impl RunLoop {
             .compaction
             .as_ref()
             .is_some_and(|n| n.trigger == kgraf_runtime::CompactionTrigger::StopPoint);
+        // Decision 0096: a worker that ran past its round budget on measured
+        // progress is a sizing miss too.
+        let extended = f
+            .result
+            .round_blocks
+            .as_ref()
+            .is_some_and(kgraf_runtime::RoundBlocks::extended);
         self.trace(TraceEvent::WorkerFinished {
             at_ms: now,
             contract: f.contract.clone(),
@@ -6010,7 +6073,7 @@ impl RunLoop {
             projected_tokens: flight.projection.tokens,
             stop_tokens,
             window_tokens,
-            sizing_miss: handed_back || compacted_at_stop,
+            sizing_miss: handed_back || compacted_at_stop || extended,
             calls: f.result.calls.iter().map(|c| c.to_string()).collect(),
             spend_micros: spend.micros(),
             error: outcome_error(&f.result.outcome),
@@ -6021,6 +6084,13 @@ impl RunLoop {
         self.trace_spend().await?;
         if let Some(notice) = &f.result.compaction {
             self.record_compaction(&contract, &f.worker, notice).await?;
+        }
+        if let Some(blocks) = &f.result.round_blocks {
+            // One miss per worker: a hand-back or a stop-point compaction
+            // counted it already.
+            let counted = handed_back || compacted_at_stop;
+            self.record_checkpoints(&contract, &f.worker, blocks, counted, now)
+                .await?;
         }
 
         // Loop shapes.
@@ -6069,8 +6139,12 @@ impl RunLoop {
         self.record_write_set(&f.contract, &f.result.changed_paths, now);
         // Decision 0093: an attempt that reported a shortfall stopped on the
         // orchestrator's cancel. It is neither verified nor a failure; its
-        // contract goes on as the shortfall's resolution says.
+        // contract goes on as the shortfall's resolution says. One stopped
+        // for reporting shortfalls nothing grounded is stuck: a failure.
         if f.merged.is_none() && self.take_shortfall(&f.contract, &f.worker, &mut flight) {
+            return self.finish_attempt(contract, flight).await;
+        }
+        if f.merged.is_none() && self.take_shortfall_stuck(&f.contract, &f.worker, &mut flight) {
             return self.finish_attempt(contract, flight).await;
         }
         // Merged before the kill: verified by the merge that already happened.
@@ -6394,7 +6468,12 @@ impl RunLoop {
                         spend_known.then_some(spend),
                     );
                 }
-                let note = format!("{} ({})", outcome_name(other), f.worker);
+                let note = format!(
+                    "{} ({}){}",
+                    outcome_name(other),
+                    f.worker,
+                    checkpoint_note(f.result.round_blocks.as_ref())
+                );
                 self.submit_report(&contract, Some(&f.worker), ReportKind::Stuck, &note);
             }
         }
@@ -7492,10 +7571,11 @@ impl RunLoop {
                     scope,
                     need,
                     why,
+                    grounding,
                     skill_refusal,
                 } => {
                     let answer = self
-                        .on_shortfall(worker, kind, scope, need, why, skill_refusal)
+                        .on_shortfall(worker, kind, scope, need, why, grounding, skill_refusal)
                         .await?;
                     let _ = reply.send(answer);
                 }

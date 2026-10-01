@@ -425,6 +425,7 @@ async fn run_one(
         attendance: Attendance::Unattended,
         call_mode: CallMode::Stream,
         max_output_tokens: budget.max_output_tokens,
+        max_checkpoints: kgraf_host::limits::DEFAULT_MAX_CHECKPOINTS,
         path_case: kgraf_tools::detect_path_case(ws.root())
             .context("cannot probe the worktree's filesystem case behavior")?,
         read_denies: vec![state.clone()],
@@ -440,6 +441,7 @@ async fn run_one(
         skills: None,
         permissions: std::sync::Arc::new(kgraf_tools::PermissionControl::manual()),
         protected_writes: None,
+        refusals: None,
     };
     let worker_brief = WorkerBrief {
         task: worker_id.into(),

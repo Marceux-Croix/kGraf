@@ -43,6 +43,8 @@ pub struct WorkerArgs {
     pub slices: Vec<String>,
     pub budget: u32,
     pub max_tokens: u32,
+    /// The most progress checkpoints the worker may reach (decision 0096).
+    pub max_checkpoints: u32,
     pub mode: String,
     pub window: u64,
     pub point: Option<u8>,
@@ -67,7 +69,7 @@ pub struct WorkerArgs {
     pub tbench_bridge_socket: Option<PathBuf>,
 }
 
-pub fn run(root: &Path, args: WorkerArgs) -> Result<()> {
+pub fn run(root: &Path, mut args: WorkerArgs) -> Result<()> {
     let instruction = std::fs::read_to_string(&args.brief)
         .with_context(|| format!("cannot read the brief {}", args.brief.display()))?;
     if instruction.trim().is_empty() {
@@ -75,6 +77,16 @@ pub fn run(root: &Path, args: WorkerArgs) -> Result<()> {
     }
     if args.events.is_some() && args.resume.is_some() {
         bail!("--resume names the transcript to continue; do not also pass --events");
+    }
+    // An output cap above the model's supported limit is lowered, said on
+    // stderr, never silently.
+    let (max_tokens, clamp) = kgraf_host::limits::clamp_output(
+        args.max_tokens,
+        [(args.provider.as_str(), args.model.as_str())],
+    );
+    args.max_tokens = max_tokens;
+    if let Some(c) = clamp {
+        eprintln!("clamped    {}", c.sentence("worker"));
     }
     let entry = kgraf_fleet::entry(&args.provider)?;
     let credential = kgraf_fleet::credential_from_env(entry)?;
@@ -227,6 +239,26 @@ pub fn run(root: &Path, args: WorkerArgs) -> Result<()> {
     let result = outcome?;
 
     println!("steps      {}", result.steps);
+    // Decision 0096: the round budget is a checkpoint; each one reached, with
+    // what it measured and decided, and the ceiling.
+    if let Some(blocks) = &result.round_blocks {
+        println!(
+            "blocks     {} rounds each, at most {} checkpoints{}",
+            blocks.block_rounds,
+            blocks.ceiling,
+            if blocks.extended() {
+                "; ran past its round budget"
+            } else {
+                ""
+            }
+        );
+        for checkpoint in &blocks.checkpoints {
+            println!(
+                "checkpoint {}",
+                kgraf_secrets::scrub_persist(&checkpoint.render())
+            );
+        }
+    }
     println!("prefix     {}", result.prefix_digest);
     for failure in &result.trace_failures {
         println!("trace      NOT RECORDED: {failure}");
@@ -476,6 +508,7 @@ fn drive(d: DriveArgs<'_>) -> Result<kgraf_runtime::WorkerResult> {
             attendance: Attendance::detect(DEFAULT_PROMPT_TIMEOUT),
             call_mode: mode,
             max_output_tokens: args.max_tokens,
+            max_checkpoints: args.max_checkpoints,
             path_case: kgraf_tools::detect_path_case(ws.root())
                 .context("cannot probe the worktree's filesystem case behavior")?,
             read_denies,
@@ -499,6 +532,7 @@ fn drive(d: DriveArgs<'_>) -> Result<kgraf_runtime::WorkerResult> {
             .context("cannot read the project's skill inventory")?,
             permissions: crate::permissions_cli::control(root, &Default::default())?,
             protected_writes: None,
+            refusals: None,
         })
     })();
     let assembly = match prepared {
@@ -683,6 +717,8 @@ fn show(event: &WorkerEvent, started: std::time::Instant) {
             notice.summary_source,
             kgraf_runtime::render_notice(notice, summary)
         ),
+        // Decision 0096: the loop's own measurement at a round checkpoint.
+        WorkerEvent::Checkpoint { checkpoint, .. } => println!("\n[{}]", checkpoint.render()),
     }
     std::io::stdout().flush().ok();
 }

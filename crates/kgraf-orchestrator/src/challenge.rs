@@ -1453,8 +1453,13 @@ pub enum ContractControl {
         kind: crate::shortfall::ShortfallKind,
         /// What a permission report asks for (decision 0094).
         scope: crate::shortfall::RequestScope,
+        /// The worker's words.
         need: String,
         why: String,
+        /// For a permission report: what it was grounded in, from the
+        /// worker's recorded policy refusals (never its words). `None` for
+        /// an instructions report.
+        grounding: Option<crate::shortfall::Grounding>,
         /// The worker's active skill refusing what the report asks for, as
         /// kGraf found it (never the worker's words): a permission grant
         /// cannot lift a skill's `allowed-tools` (decision 0053).
@@ -1474,8 +1479,16 @@ pub enum ContractReply {
         recipients: usize,
     },
     Arbitrated,
-    /// How a shortfall was resolved (decision 0093), for the reporting worker.
+    /// How a shortfall was resolved (decision 0093), for the reporting
+    /// worker, which stops.
     Shortfall(String),
+    /// A shortfall answered without a decision (nothing refused it, or its
+    /// path needs no grant or belongs to another contract); the worker
+    /// continues.
+    ShortfallAnswered(String),
+    /// A shortfall whose need did not name exactly one refused subject; the
+    /// worker is told to name one, as for malformed input.
+    ShortfallInvalid(String),
     /// Refused without effect.
     Refused(String),
 }

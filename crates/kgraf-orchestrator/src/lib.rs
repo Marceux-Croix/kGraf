@@ -184,9 +184,9 @@ pub use partition::{
 pub use plan::{
     ContractSpec, CostBasis, Decomposer, GroundOutput, GroundRequest, Grounder, ModelAnswerer,
     ModelCaller, ModelDecomposer, ModelGrounder, PlanError, PlanOutput, PlanRequest, answer_prompt,
-    judge_prompt, parse_answer, parse_grounding, parse_interfaces, parse_plan, parse_verdicts,
-    sanitize_id, sanitize_interfaces, sanitize_plan, valid_write_path, validate_plan,
-    validate_plan_with,
+    judge_prompt, normalize_plan, parse_answer, parse_grounding, parse_interfaces, parse_plan,
+    parse_verdicts, sanitize_id, sanitize_interfaces, sanitize_plan, valid_write_path,
+    validate_plan, validate_plan_with,
 };
 pub use port::{InboundKind, InboundMessage, MessagePort, OutboundReply, PortError, UntrustedText};
 pub use question_route::{
@@ -216,9 +216,9 @@ pub use scheduler_loop::{
 };
 pub use session_tools::{SESSION_TOOL_NAMES, SessionLine, session_tools};
 pub use shortfall::{
-    Authority, Grant, GrantRecord, MAX_SHORTFALL_REDISPATCHES, RequestScope, SHORTFALL_TAG,
-    SHORTFALL_TOOL, ShortfallDecision, ShortfallKind, ShortfallTool, unverified_reason,
-    vacuous_check,
+    Authority, Grant, GrantRecord, Grounding, MAX_ANSWERED_SHORTFALLS, MAX_SHORTFALL_REDISPATCHES,
+    RequestScope, SHORTFALL_TAG, SHORTFALL_TOOL, ShortfallDecision, ShortfallKind, ShortfallTool,
+    unverified_reason, vacuous_check,
 };
 pub use sizing::{
     ORCHESTRATOR_AGENT_PREFIX, Projection, ProjectionSource, Sizer, dear_usage, dear_usage_on,

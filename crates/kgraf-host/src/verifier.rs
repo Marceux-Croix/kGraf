@@ -799,6 +799,11 @@ impl Verifier for CommandVerifier {
     /// work. Read from the worktree as dispatched; the verifier reads it again
     /// after the work, so a test file the worker adds is included then.
     fn acceptance_brief(&self, contract: &OpenContract, workspace: &Path) -> Option<String> {
+        // A gate remediation is judged on the merged result: sibling failures
+        // there are its work, so the "not yours to fix" text does not apply.
+        if !contract.gate_commands.is_empty() {
+            return None;
+        }
         let scope = check_scope(&self.command, contract, workspace);
         crate::scoped_check::brief(&scope, &self.command)
     }

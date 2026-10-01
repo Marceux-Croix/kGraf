@@ -6,6 +6,9 @@
 //! ```text
 //!   BetweenRounds --cancelled--------------------------------> Cancelled
 //!        | context >= stop point ----------------------------> HandedBack
+//!        | progress checkpoint due (decision 0096, `progress.rs`):
+//!        |   progressing, or grace: the budget grows a block
+//!        |   idle twice after a productive one ---------------> BudgetExhausted
 //!        | budget spent -------------------------------------> BudgetExhausted
 //!        | (budget notice, then the steering drain: every
 //!        |  queued message becomes an `Injected` event)
@@ -190,6 +193,10 @@ pub struct LoopSettings {
     /// After a cancel, how long running tool calls get to finish, so what they
     /// actually did is recorded instead of being guessed at.
     pub tool_cancel_grace: std::time::Duration,
+    /// The most progress checkpoints a worker may reach, so at most this many
+    /// blocks of the brief's round budget (decision 0096). 1 is the old wall:
+    /// the first checkpoint ends the extension whatever it measures.
+    pub max_checkpoints: u32,
 }
 
 impl Default for LoopSettings {
@@ -205,7 +212,27 @@ impl Default for LoopSettings {
             // more, never less. Detect with `kgraf_tools::detect_path_case`.
             path_case: PathCase::Insensitive,
             tool_cancel_grace: std::time::Duration::from_secs(2),
+            max_checkpoints: crate::progress::DEFAULT_MAX_CHECKPOINTS,
         }
+    }
+}
+
+/// What the progress gate needs to know of a call (decision 0096): the paths
+/// its tool declares it writes, and whether the masker hides its result.
+struct EnvFacts<'a>(&'a WorkerEnv);
+
+impl crate::progress::CallFacts for EnvFacts<'_> {
+    fn written_paths(&self, tool: &str, input: &serde_json::Value) -> Vec<PathBuf> {
+        self.0
+            .tools
+            .get(tool)
+            .and_then(|registered| registered.tool().access(input).ok())
+            .map(|access| access.writes_paths().iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    fn hides(&self, output: &str, is_error: bool) -> bool {
+        self.0.masker.hides_result(output, is_error)
     }
 }
 
@@ -239,6 +266,10 @@ pub struct WorkerEnv {
     /// check, and a failed integrity check fails the worker. `None`: every
     /// protected path is refused, in every mode.
     pub protected_writes: Option<Arc<kgraf_tools::ProtectedWrites>>,
+    /// Where each worker spawned here mirrors its policy refusals while it
+    /// runs, for the run's `report_shortfall` (decision 0093). `None`: no
+    /// tool reads them.
+    pub refusals: Option<Arc<crate::shortfall::RefusalDirectory>>,
 }
 
 impl WorkerEnv {
@@ -264,6 +295,7 @@ impl WorkerEnv {
             settings: LoopSettings::default(),
             skills: None,
             protected_writes: None,
+            refusals: None,
         }
     }
 }
@@ -463,6 +495,14 @@ async fn prepare(
         None => crate::worktree::git_entry(&brief.workspace_root),
         Some(events) => resumed_git_entry(&brief.workspace_root, events),
     };
+    // Decision 0096: the checkpoints an earlier segment reached, and what its
+    // open block did, so the rounds they granted and the next measurement
+    // carry over.
+    let mut progress =
+        crate::progress::ProgressGate::new(brief.step_budget, env.settings.max_checkpoints);
+    if let Some(events) = options.resume_from.as_deref() {
+        progress.resume(events, &EnvFacts(env));
+    }
     let (builder, rounds_used, delivered, prior) = match options.resume_from {
         Some(events) => {
             let state = ResumeState::from_events_with_base(
@@ -700,17 +740,24 @@ async fn prepare(
     }
     handle.set_spawn_duplicates(already_delivered, listed_twice);
     handle.set_skills(worker_skills);
+    let refused =
+        crate::shortfall::RefusedCalls::mirrored(env.refusals.clone(), brief.worker.as_str());
     let worker = Worker {
         git_at_start,
         env: env.clone(),
         approval,
-        budget: StepBudget::new(brief.step_budget, rounds_used),
+        budget: StepBudget::new(
+            brief.step_budget.saturating_add(progress.rounds_granted()),
+            rounds_used,
+        ),
+        progress,
         brief,
         seq: EventSequence::new(),
         builder,
         stall,
         notified_round: None,
         output_limit_retried: false,
+        empty_turn_retried: false,
         phase: CancelPhase::BetweenRounds,
         calls,
         last_call,
@@ -722,7 +769,7 @@ async fn prepare(
         changed,
         done,
         denied: 0,
-        refused: crate::shortfall::RefusedCalls::default(),
+        refused,
         capabilities: std::collections::HashMap::new(),
         fence: options.fence,
         steering,
@@ -838,6 +885,16 @@ pub(crate) const DENIED_PREFIX: &str = "ERROR: denied by ";
 /// scope or fenced).
 pub(crate) const REFUSED_PREFIX: &str = "ERROR: refused: ";
 
+/// The start of the result of a call the approval chain turned away because
+/// the tool could not read its input ([`kgraf_tools::INVALID_INPUT`]). Not
+/// "denied": no policy refused it, and a worker told "denied" reads a typo as
+/// a permission it lacks. Like a denial, the call did nothing.
+pub(crate) const INVALID_CALL_PREFIX: &str = "ERROR: invalid call: ";
+
+/// What follows an invalid call's reason.
+pub(crate) const INVALID_CALL_ADVICE: &str =
+    "; fix the call and retry. This is not a permission refusal.";
+
 /// The result a call gets when an interrupt-mode message abandons its round
 /// before the call started (decision 0067, point 3).
 pub const STEER_NOT_RUN: &str = "ERROR: not run: the worker was redirected by a new message";
@@ -910,6 +967,14 @@ pub const OUTPUT_LIMIT_NOTICE: &str = "Your last response reached the output lim
      calls, one file or a few hunks at a time, and send them in separate calls. This is your \
      only continuation: if the limit is reached again the run fails.";
 
+/// The `RoundAbandoned` reason for a turn with no tool call and no visible
+/// answer, given one continuation round.
+pub const EMPTY_TURN_ABANDON_REASON: &str = "the turn had no tool call and no answer";
+
+/// The notice that follows an empty turn: one continuation round.
+pub const EMPTY_TURN_NOTICE: &str = "You ended your turn without calling a tool or giving an \
+     answer; continue the task with a tool call, or answer.";
+
 struct Worker {
     /// `<root>/.git` as it was when this worker first started
     /// ([`crate::worktree::GitEntry`]; recorded in the transcript's
@@ -930,6 +995,9 @@ struct Worker {
     /// Whether the round just before was an output-ceiling stop that got its
     /// one continuation. Cleared by any round that ends another way.
     output_limit_retried: bool,
+    /// Whether the round just before was an empty turn that got its one
+    /// continuation. Cleared by any round that has a tool call or an answer.
+    empty_turn_retried: bool,
     phase: CancelPhase,
     calls: Vec<CallId>,
     /// The parent of the next round's ledger row (see the module docs, Trace).
@@ -973,6 +1041,9 @@ struct Worker {
     archive: Option<HistoryArchive>,
     /// The compaction notice, once compacted (at most one per worker).
     compaction: Option<CompactionNotice>,
+    /// The progress gate that turns the round budget into checkpoints
+    /// (decision 0096).
+    progress: crate::progress::ProgressGate,
 }
 
 impl Drop for Worker {
@@ -1000,15 +1071,18 @@ impl Worker {
     /// change outside the declared writes. A subagent's fence still refuses it
     /// ([`fence_violation`]): a fence guards paths inside the worktree, which
     /// the sandbox does not.
-    fn scope_violation(&self, access: &kgraf_tools::Access) -> Option<String> {
+    /// Why the call is refused before it runs, and the path that refused it
+    /// when one path did.
+    fn scope_violation(&self, access: &kgraf_tools::Access) -> Option<(String, Option<String>)> {
         if access.is_exclusive() && !access.is_sandboxed_build() && self.brief.write_scope.is_some()
         {
-            return Some(
+            return Some((
                 "the call may write anywhere (it declares no paths) and this worker has a declared \
                  write scope; with a write scope, the shell runs only the build and test \
                  allowlist named in its description, and files change only through apply_patch"
                     .into(),
-            );
+                None,
+            ));
         }
         for path in access.writes_paths() {
             if let Some(why) = kgraf_core::paths::forbidden_reason(path) {
@@ -1026,9 +1100,9 @@ impl Worker {
                     Some(Ok(kgraf_tools::protected::Area::Tracked)) => {}
                     Some(Ok(_)) => continue,
                     Some(Err(why)) => {
-                        return Some(format!(
-                            "{} is not writable by a worker: {why}",
-                            path.display()
+                        return Some((
+                            format!("{} is not writable by a worker: {why}", path.display()),
+                            Some(path.to_string_lossy().into_owned()),
                         ));
                     }
                     None => {}
@@ -1037,14 +1111,17 @@ impl Worker {
             if let Some(scope) = &self.brief.write_scope {
                 let inside = scope.iter().any(|s| crate::paths::same_path(s, path));
                 if !inside {
-                    return Some(format!(
-                        "{} is outside the declared write scope",
-                        path.display()
+                    return Some((
+                        format!("{} is outside the declared write scope", path.display()),
+                        Some(path.to_string_lossy().into_owned()),
                     ));
                 }
             }
         }
-        self.fence.as_ref().and_then(|f| fence_violation(f, access))
+        self.fence
+            .as_ref()
+            .and_then(|f| fence_violation(f, access))
+            .map(|why| (why, None))
     }
 
     async fn run(mut self, endpoint: WorkerEndpoint) {
@@ -1139,6 +1216,7 @@ impl Worker {
             rationale,
             refused: self.refused.take(),
             compaction: self.compaction.clone(),
+            round_blocks: self.progress.report(),
         };
         // `Err` means the handle is gone: nobody is waiting for the result, and the
         // ledger already holds every call it names.
@@ -1242,6 +1320,8 @@ impl Worker {
             .accept(&event)
             .map_err(|e| Halt::Failed(format!("the loop produced an out-of-order event: {e}")))?;
         self.archive_event(&event);
+        // Observed in its persisted form, as a resume reads it back.
+        self.progress.observe(&event, &EnvFacts(&self.env));
         if let Some(model_event) = model_event {
             self.builder.apply(model_event);
         }
@@ -1351,6 +1431,14 @@ impl Worker {
                 }
                 return Ok((self.hand_back(context_tokens), String::new()));
             }
+            // Decision 0096: the round budget is a checkpoint. Measured where
+            // the budget would warn that three rounds remain, after the
+            // context check, so a full context still hands back first.
+            if self.progress.due(self.budget.used())
+                && let Some(outcome) = self.checkpoint(ep).await?
+            {
+                return Ok((outcome, String::new()));
+            }
             let final_round = match self.budget.next_round() {
                 RoundPlan::Exhausted => return Ok((WorkerOutcome::BudgetExhausted, String::new())),
                 RoundPlan::Run {
@@ -1415,6 +1503,9 @@ impl Worker {
             if reason != StopReason::MaxTokens {
                 // A round that ended another way ends the run of ceiling stops.
                 self.output_limit_retried = false;
+            }
+            if !uses.is_empty() || !response.text().trim().is_empty() {
+                self.empty_turn_retried = false;
             }
             match (reason, uses.is_empty()) {
                 (StopReason::ToolUse, true) => {
@@ -1487,6 +1578,53 @@ impl Worker {
                             .into(),
                     ));
                 }
+                // No tool call and no visible text: the model's plan sits in its
+                // reasoning, or there is nothing at all. That is not an answer,
+                // so it is not a completed attempt. The turn is dropped and the
+                // model gets one counted continuation round (a notice, as the
+                // output ceiling does); a second empty turn in a row fails,
+                // naming the stop reason the provider gave. The round is
+                // already counted, so a checkpoint (decision 0096) sees these
+                // rounds as rounds without progress.
+                (StopReason::EndTurn | StopReason::StopSequence, true)
+                    if response.text().trim().is_empty() =>
+                {
+                    if !final_round && !self.empty_turn_retried && self.budget.rounds_left() >= 2 {
+                        self.empty_turn_retried = true;
+                        self.abandon(
+                            ep,
+                            CancelPhase::ModelStream,
+                            None,
+                            EMPTY_TURN_ABANDON_REASON,
+                        )
+                        .await?;
+                        self.emit(
+                            ep,
+                            WorkerEvent::Notice {
+                                kind: crate::event::NoticeKind::EmptyTurn,
+                                text: EMPTY_TURN_NOTICE.to_owned(),
+                            },
+                        )
+                        .await?;
+                        continue;
+                    }
+                    self.emit_stop(ep, reason, &response).await?;
+                    let why = if self.empty_turn_retried {
+                        "twice in a row, after being told to continue"
+                    } else {
+                        "on its last round"
+                    };
+                    return Ok((
+                        WorkerOutcome::Failed {
+                            error: format!(
+                                "the model ended its turn with no tool call and no answer {why} \
+                                 (stop reason {reason:?}, reasoning only: {})",
+                                !response.reasoning().trim().is_empty()
+                            ),
+                        },
+                        String::new(),
+                    ));
+                }
                 (StopReason::EndTurn | StopReason::StopSequence, true) => {
                     self.emit_stop(ep, reason, &response).await?;
                     return Ok((WorkerOutcome::Completed, response.text()));
@@ -1548,6 +1686,97 @@ impl Worker {
                         .await?;
                 }
                 Err(halt) => return Err(halt),
+            }
+        }
+    }
+
+    /// Measure a progress checkpoint (decision 0096), record it, and apply
+    /// its verdict: another block of rounds, the grace notice, or the end.
+    /// Returns the outcome when the verdict ends the attempt at once.
+    async fn checkpoint(&mut self, ep: &WorkerEndpoint) -> Result<Option<WorkerOutcome>, Halt> {
+        use crate::progress::CheckpointVerdict;
+        let used = self.budget.used();
+        let root = self.brief.workspace_root.clone();
+        let tracked = self.progress.tracked(&self.changed);
+        let at_start = self.git_at_start.clone();
+        // File reads and git run off the executor thread.
+        let read = tokio::task::spawn_blocking(move || {
+            let status = at_start
+                .ok()
+                .map(|entry| crate::worktree::dirty_paths(&root, &entry));
+            let mut paths = tracked;
+            let mut failure = None;
+            let dirty = match status {
+                Some(Ok(status)) => {
+                    paths.extend(status.paths.iter().cloned());
+                    Some(status.paths.into_iter().collect::<BTreeSet<PathBuf>>())
+                }
+                Some(Err(e)) => {
+                    failure = Some(e);
+                    None
+                }
+                None => None,
+            };
+            (crate::progress::digests(&root, &paths), dirty, failure)
+        })
+        .await;
+        let (now, dirty) = match read {
+            Ok((now, dirty, failure)) => {
+                if let Some(e) = failure {
+                    self.trace_failures
+                        .push(format!("worktree status at checkpoint not read: {e}"));
+                }
+                (now, dirty)
+            }
+            Err(e) => {
+                // No digests: every tracked file reads as absent, which the
+                // measurement reports as changed or unchanged honestly
+                // against its record; the failure is on the result.
+                self.trace_failures
+                    .push(format!("checkpoint measurement did not finish: {e}"));
+                (Default::default(), None)
+            }
+        };
+        let (measure, baseline) = self.progress.measure(used, &now, dirty.as_ref());
+        let (checkpoint, baseline) = self.progress.decide(used, measure, baseline);
+        let verdict = checkpoint.verdict;
+        self.budget.extend(checkpoint.rounds_granted);
+        self.emit(
+            ep,
+            WorkerEvent::Checkpoint {
+                checkpoint: Box::new(checkpoint),
+                baseline: Box::new(baseline),
+            },
+        )
+        .await?;
+        match verdict {
+            CheckpointVerdict::Grace => {
+                self.emit(
+                    ep,
+                    WorkerEvent::Notice {
+                        kind: crate::event::NoticeKind::NoProgress,
+                        text: crate::progress::grace_notice(self.progress.block()),
+                    },
+                )
+                .await?;
+                Ok(None)
+            }
+            CheckpointVerdict::EndStuck => Ok(Some(WorkerOutcome::BudgetExhausted)),
+            CheckpointVerdict::Continue
+            | CheckpointVerdict::EndNoProgress
+            | CheckpointVerdict::Ceiling => Ok(None),
+        }
+    }
+
+    /// Record, for the progress gate, the content of each path a call is
+    /// about to write that the gate has no record of (decision 0096), so a
+    /// write later put back is seen as no change.
+    fn capture_preimages(&mut self, accesses: &[kgraf_tools::Access]) {
+        let root = &self.brief.workspace_root;
+        for path in accesses.iter().flat_map(|a| a.writes_paths()) {
+            if self.progress.needs_preimage(path) {
+                let digest = blocking(|| crate::progress::file_digest(&root.join(path)));
+                self.progress.capture_preimage(path.clone(), digest);
             }
         }
     }
@@ -2245,14 +2474,14 @@ impl Worker {
             loop {
                 match verdict {
                     Verdict::Run(call) => {
-                        if let Some(why) = self.scope_violation(call.access()) {
+                        if let Some((why, path)) = self.scope_violation(call.access()) {
                             self.denied += 1;
                             let mut finished = WorkerEvent::ToolCallFinished {
                                 call_id: call_id.clone(),
                                 output: format!("{REFUSED_PREFIX}{why}"),
                                 is_error: true,
                             };
-                            self.note_refusal(&mut finished);
+                            self.note_refusal(&mut finished, path);
                             self.emit(ep, finished).await?;
                             break;
                         }
@@ -2265,12 +2494,17 @@ impl Worker {
                     }
                     Verdict::Denied { by, reason } => {
                         self.denied += 1;
+                        let output = if by == kgraf_tools::INVALID_INPUT {
+                            format!("{INVALID_CALL_PREFIX}{reason}{INVALID_CALL_ADVICE}")
+                        } else {
+                            format!("{DENIED_PREFIX}{by}: {reason}")
+                        };
                         let mut finished = WorkerEvent::ToolCallFinished {
                             call_id: call_id.clone(),
-                            output: format!("{DENIED_PREFIX}{by}: {reason}"),
+                            output,
                             is_error: true,
                         };
-                        self.note_refusal(&mut finished);
+                        self.note_refusal(&mut finished, None);
                         self.emit(ep, finished).await?;
                         break;
                     }
@@ -2341,6 +2575,8 @@ impl Worker {
         let accesses: Vec<kgraf_tools::Access> =
             approved.iter().map(|a| a.access().clone()).collect();
         let waits = dependencies(&accesses, self.env.settings.path_case);
+        // Before any call of the round runs (decision 0096).
+        self.capture_preimages(&accesses);
         let ids: Vec<String> = approved.iter().map(|a| a.call_id().to_owned()).collect();
         let tools: Vec<String> = approved.iter().map(|a| a.tool().to_owned()).collect();
         // The stall detector's key for each call, to tell it whether the call's
@@ -2446,7 +2682,7 @@ impl Worker {
             done[j] = true;
             let mut finished =
                 self.record_result(j, &accesses, call_id, &tool, &digests[j], result);
-            self.note_refusal(&mut finished);
+            self.note_refusal(&mut finished, None);
             // A sandboxed build declares no paths; ask git what it changed. Before
             // any emit: a cancel during an emit must not lose the paths.
             if accesses[j].is_sandboxed_build() {
@@ -2742,8 +2978,10 @@ impl Worker {
     /// refusal (a scope or fence refusal, or a denial a policy made) is
     /// recorded and its text gets the reporting hint; a call that ran without
     /// error marks earlier refusals of its capability as retried. A denial
-    /// for malformed input or a misplaced path is neither.
-    fn note_refusal(&mut self, event: &mut WorkerEvent) {
+    /// for malformed input or a misplaced path is neither; the newest
+    /// malformed-input error is kept for a report's answer. `path`: the path a
+    /// write-scope refusal named.
+    fn note_refusal(&mut self, event: &mut WorkerEvent, path: Option<String>) {
         let WorkerEvent::ToolCallFinished {
             call_id,
             output,
@@ -2759,16 +2997,30 @@ impl Worker {
             self.refused.ran_ok(&tool, &capability);
             return;
         }
-        let policy = if let Some(rest) = output.strip_prefix(DENIED_PREFIX) {
-            let (by, reason) = rest.split_once(": ").unwrap_or((rest, ""));
-            crate::shortfall::is_policy_denial(by, reason)
-        } else {
-            output.starts_with(REFUSED_PREFIX)
-        };
-        if !policy {
+        if output.starts_with(INVALID_CALL_PREFIX)
+            || (output.starts_with("ERROR: invalid input")
+                && tool != crate::shortfall::SHORTFALL_TOOL)
+        {
+            self.refused.input_error(&tool, output.clone());
             return;
         }
-        self.refused.refused(&tool, capability, output.clone());
+        let policy = if let Some(rest) = output.strip_prefix(DENIED_PREFIX) {
+            let (by, reason) = rest.split_once(": ").unwrap_or((rest, ""));
+            crate::shortfall::is_policy_denial(by, reason).then(|| by.to_owned())
+        } else {
+            output.starts_with(REFUSED_PREFIX).then(String::new)
+        };
+        let Some(by) = policy else {
+            return;
+        };
+        self.refused.refused(crate::shortfall::RefusedCall {
+            tool: tool.clone(),
+            capability,
+            reason: output.clone(),
+            retried_ok: false,
+            by,
+            path,
+        });
         let can_report = self
             .env
             .tools
@@ -2826,6 +3078,7 @@ impl Worker {
                 Halt::Failed(format!("the loop produced an out-of-order event: {e}"))
             })?;
             self.archive_event(&event);
+            self.progress.observe(&event, &EnvFacts(&self.env));
             if let Some(model_event) = &model_event {
                 self.builder.apply(model_event);
             }

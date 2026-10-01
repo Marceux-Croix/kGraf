@@ -248,6 +248,16 @@ pub struct OpenContract {
     /// its attempt is neither verified nor counted a failure.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub shortfall_workers: Vec<AgentId>,
+    /// One entry per shortfall answered to its worker without a decision
+    /// (nothing refused it, ambiguous, a path in scope or owned elsewhere),
+    /// bounded per worker by `MAX_ANSWERED_SHORTFALLS`; a worker's entries
+    /// go when its attempt finishes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shortfall_answers: Vec<AgentId>,
+    /// Workers stopped for reporting past that bound: when one finishes, its
+    /// attempt is stuck, counted a failure.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shortfall_stuck: Vec<AgentId>,
     /// Set when a shortfall is held for the user: the held reason, applied
     /// once the reporting attempt has finished.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -366,6 +376,8 @@ impl OpenContract {
             shortfall_notes: Vec::new(),
             shortfall_redispatches: 0,
             shortfall_workers: Vec::new(),
+            shortfall_answers: Vec::new(),
+            shortfall_stuck: Vec::new(),
             shortfall_hold: None,
             pending_permission: None,
         }
@@ -465,8 +477,15 @@ pub struct RunCounters {
     /// Readiness failures.
     pub readiness_failures: u64,
     /// Workers that reached the stop point and handed back or compacted (0057
-    /// and 0095 sizing misses), one per worker.
+    /// and 0095 sizing misses), or ran past their round budget on measured
+    /// progress (0096), one per worker.
     pub sizing_misses: u64,
+    /// Workers a round checkpoint let run past their round budget on measured
+    /// progress (decision 0096).
+    pub round_extensions: u64,
+    /// Workers a round checkpoint stopped: no progress at two checkpoints in a
+    /// row after a productive one, or the checkpoint ceiling (decision 0096).
+    pub checkpoint_stops: u64,
     /// Reservations made (worker attempts and orchestrator calls); accounting
     /// only, decision 0080 removed every spend cap, so none is ever refused.
     pub budget_admitted: u64,

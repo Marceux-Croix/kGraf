@@ -1,8 +1,9 @@
 //! The settings surface's model: configuration only, never work state (0017).
 //!
 //! It carries the compaction slider (0057 addendum 2), the background-mode switch
-//! (0052), the concurrency caps (0017) and the worker-worktree switch (0088). Anything that describes work in flight
-//! belongs on the graph, not here.
+//! (0052), the concurrency caps (0017), the worker-worktree switch (0088) and the four
+//! run-limit sliders (rounds per worker, worker and orchestrator output caps, context
+//! window). Anything that describes work in flight belongs on the graph, not here.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -236,6 +237,183 @@ impl Default for ParallelismSlider {
     }
 }
 
+/// One run-limit slider: a value inside `min..=max`, moved in `step`s, with a
+/// built-in default. Like [`CompactionSlider`], it follows its default until the
+/// user moves it, and a followed slider writes no key to the settings file, so a
+/// later change of the default reaches a user who never chose a value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LimitSlider {
+    min: u64,
+    max: u64,
+    step: u64,
+    default: u64,
+    chosen: Option<u64>,
+}
+
+impl LimitSlider {
+    /// Rounds per worker (decision 0017 addendum): 4 to 200, one at a time.
+    pub fn rounds() -> Self {
+        Self::new(
+            u64::from(kgraf_host::limits::ROUNDS_BOUNDS.0),
+            u64::from(kgraf_host::limits::ROUNDS_BOUNDS.1),
+            1,
+            u64::from(kgraf_host::limits::DEFAULT_ROUNDS_ORCHESTRATED),
+        )
+    }
+    /// Progress checkpoints per worker (decision 0096): 1 to 50, one at a time.
+    /// 1 is the old fixed round limit.
+    pub fn max_checkpoints() -> Self {
+        Self::new(
+            u64::from(kgraf_host::limits::MAX_CHECKPOINTS_BOUNDS.0),
+            u64::from(kgraf_host::limits::MAX_CHECKPOINTS_BOUNDS.1),
+            1,
+            u64::from(kgraf_host::limits::DEFAULT_MAX_CHECKPOINTS),
+        )
+    }
+    /// Worker output cap per reply: 1,024 to 131,072 in steps of 1,024.
+    pub fn worker_max_tokens() -> Self {
+        Self::new(
+            u64::from(kgraf_host::limits::WORKER_MAX_TOKENS_BOUNDS.0),
+            u64::from(kgraf_host::limits::WORKER_MAX_TOKENS_BOUNDS.1),
+            1_024,
+            u64::from(kgraf_host::limits::DEFAULT_WORKER_MAX_TOKENS),
+        )
+    }
+    /// Orchestrator output cap per call: 4,096 to 131,072 in steps of 1,024.
+    pub fn planner_max_tokens() -> Self {
+        Self::new(
+            u64::from(kgraf_host::limits::PLANNER_MAX_TOKENS_BOUNDS.0),
+            u64::from(kgraf_host::limits::PLANNER_MAX_TOKENS_BOUNDS.1),
+            1_024,
+            u64::from(kgraf_host::limits::DEFAULT_PLANNER_MAX_TOKENS),
+        )
+    }
+    /// Assumed context window: 8,192 to 1,000,000 in steps of 1,024.
+    pub fn window() -> Self {
+        Self::new(
+            kgraf_host::limits::WINDOW_BOUNDS.0,
+            kgraf_host::limits::WINDOW_BOUNDS.1,
+            1_024,
+            kgraf_host::limits::DEFAULT_WINDOW,
+        )
+    }
+
+    fn new(min: u64, max: u64, step: u64, default: u64) -> Self {
+        Self {
+            min,
+            max,
+            step,
+            default,
+            chosen: None,
+        }
+    }
+
+    pub fn min(&self) -> u64 {
+        self.min
+    }
+    pub fn max(&self) -> u64 {
+        self.max
+    }
+    pub fn step(&self) -> u64 {
+        self.step
+    }
+    pub fn default_value(&self) -> u64 {
+        self.default
+    }
+    /// What the control shows and what a run uses.
+    pub fn value(&self) -> u64 {
+        self.chosen.unwrap_or(self.default)
+    }
+    /// The user's choice, if any: what is written to the settings file.
+    pub fn chosen(&self) -> Option<u64> {
+        self.chosen
+    }
+    pub fn follows_default(&self) -> bool {
+        self.chosen.is_none()
+    }
+
+    /// `v` moved to the nearest step and inside the bounds. The ends are always
+    /// reachable even when they are not a multiple of the step.
+    pub fn snap(&self, v: u64) -> u64 {
+        let stepped = (v.saturating_add(self.step / 2) / self.step) * self.step;
+        stepped.clamp(self.min, self.max)
+    }
+
+    /// The user moved the slider to `v` (snapped). Returns the stored value.
+    pub fn set_by_user(&mut self, v: u64) -> u64 {
+        let v = self.snap(v);
+        self.chosen = Some(v);
+        v
+    }
+
+    /// A value read from the file: kept as written (already inside the bounds),
+    /// so a hand-edited 5,000 is what runs, not the nearest step.
+    fn load_exact(&mut self, v: u64) {
+        self.chosen = Some(v.clamp(self.min, self.max));
+    }
+
+    /// Back to following the default.
+    pub fn reset(&mut self) {
+        self.chosen = None;
+    }
+}
+
+/// The five run-limit sliders, saved as the user's global settings. They apply
+/// to every run the app starts, and to the command line when no flag is given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunLimitSliders {
+    pub rounds: LimitSlider,
+    pub max_checkpoints: LimitSlider,
+    pub worker_max_tokens: LimitSlider,
+    pub planner_max_tokens: LimitSlider,
+    pub window: LimitSlider,
+}
+
+impl Default for RunLimitSliders {
+    fn default() -> Self {
+        Self {
+            rounds: LimitSlider::rounds(),
+            max_checkpoints: LimitSlider::max_checkpoints(),
+            worker_max_tokens: LimitSlider::worker_max_tokens(),
+            planner_max_tokens: LimitSlider::planner_max_tokens(),
+            window: LimitSlider::window(),
+        }
+    }
+}
+
+impl RunLimitSliders {
+    /// The chosen values, as the host and the command line read them.
+    pub fn user_limits(&self) -> kgraf_host::limits::UserLimits {
+        kgraf_host::limits::UserLimits {
+            rounds: self.rounds.chosen().map(|v| v as u32),
+            max_checkpoints: self.max_checkpoints.chosen().map(|v| v as u32),
+            worker_max_tokens: self.worker_max_tokens.chosen().map(|v| v as u32),
+            planner_max_tokens: self.planner_max_tokens.chosen().map(|v| v as u32),
+            window: self.window.chosen(),
+        }
+    }
+
+    fn from_user_limits(u: kgraf_host::limits::UserLimits) -> Self {
+        let mut s = Self::default();
+        if let Some(v) = u.rounds {
+            s.rounds.load_exact(u64::from(v));
+        }
+        if let Some(v) = u.max_checkpoints {
+            s.max_checkpoints.load_exact(u64::from(v));
+        }
+        if let Some(v) = u.worker_max_tokens {
+            s.worker_max_tokens.load_exact(u64::from(v));
+        }
+        if let Some(v) = u.planner_max_tokens {
+            s.planner_max_tokens.load_exact(u64::from(v));
+        }
+        if let Some(v) = u.window {
+            s.window.load_exact(v);
+        }
+        s
+    }
+}
+
 /// Highest work-item cap the slider offers. 0017's starting band is three to five;
 /// sixteen leaves room to measure past it without inviting an unbounded fan-out.
 pub const MAX_WORK_ITEMS_CAP: usize = 16;
@@ -333,6 +511,10 @@ pub struct Settings {
     /// `sync_parallelism` wiring); its own migration and clamp behavior are
     /// complete and tested.
     pub parallelism: ParallelismSlider,
+    /// Rounds per worker, the two output caps and the context window: global
+    /// run limits in the user-level settings file (never a project file a worker
+    /// could write). The command line reads the same keys; a flag outranks them.
+    pub limits: RunLimitSliders,
     /// Set by [`Settings::from_toml_str`] when a legacy `max_work_items` or
     /// `max_live_agents` key drove [`Settings::parallelism`]'s initial pin
     /// (design: "A warning names the migration"). Never persisted (not a
@@ -386,6 +568,7 @@ impl Default for Settings {
             prefer_high_performance_gpu: false,
             caps: ConcurrencyCaps::default(),
             parallelism: ParallelismSlider::default(),
+            limits: RunLimitSliders::default(),
             migration_warning: None,
             appearance: Appearance::default(),
             color_vision: kgraf_core::palette::Vision::default(),
@@ -433,6 +616,17 @@ struct SettingsFile {
     /// genuinely legacy file from an ordinary, modern, unpinned one.
     #[serde(default)]
     parallelism_managed: bool,
+    /// The run limits (`kgraf_host::limits`); absent means the built-in default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rounds_per_worker: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_checkpoints: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    worker_max_tokens: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    planner_max_tokens: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_window: Option<i64>,
     appearance: Option<Appearance>,
     #[serde(skip_serializing_if = "Option::is_none")]
     color_vision: Option<kgraf_core::palette::Vision>,
@@ -506,6 +700,12 @@ impl Settings {
                  from the migrated value."
             ));
         }
+        // The same reader the command line uses, so an out-of-range value is
+        // refused in both places with the same words.
+        settings.limits = RunLimitSliders::from_user_limits(
+            kgraf_host::limits::UserLimits::from_toml_str(text)
+                .map_err(|e| ShellError::Config(e.to_string()))?,
+        );
         if let Some(a) = file.appearance {
             settings.appearance = a;
         }
@@ -553,6 +753,11 @@ impl Settings {
             parallelism_agents: (!self.parallelism.follows_max())
                 .then(|| i64::from(self.parallelism.value())),
             parallelism_managed: true,
+            rounds_per_worker: self.limits.rounds.chosen().map(|v| v as i64),
+            max_checkpoints: self.limits.max_checkpoints.chosen().map(|v| v as i64),
+            worker_max_tokens: self.limits.worker_max_tokens.chosen().map(|v| v as i64),
+            planner_max_tokens: self.limits.planner_max_tokens.chosen().map(|v| v as i64),
+            context_window: self.limits.window.chosen().map(|v| v as i64),
             appearance: Some(self.appearance),
             color_vision: (self.color_vision != kgraf_core::palette::Vision::default())
                 .then_some(self.color_vision),
@@ -1018,5 +1223,105 @@ mod tests {
         let err = Settings::from_toml_str("parallelism_agents = 0\nparallelism_managed = true")
             .expect_err("reject");
         assert!(matches!(err, ShellError::CapOutOfRange { .. }));
+    }
+
+    // --- Run-limit sliders ---
+
+    #[test]
+    fn limit_sliders_have_the_stated_bounds_and_defaults() {
+        let l = RunLimitSliders::default();
+        let shape = |s: &LimitSlider| (s.min(), s.max(), s.step(), s.value());
+        assert_eq!(shape(&l.rounds), (4, 200, 1, 30));
+        assert_eq!(shape(&l.max_checkpoints), (1, 50, 1, 10));
+        assert_eq!(shape(&l.worker_max_tokens), (1_024, 131_072, 1_024, 16_384));
+        assert_eq!(
+            shape(&l.planner_max_tokens),
+            (4_096, 131_072, 1_024, 32_768)
+        );
+        assert_eq!(shape(&l.window), (8_192, 1_000_000, 1_024, 128_000));
+        assert_eq!(l.user_limits(), kgraf_host::limits::UserLimits::default());
+    }
+
+    #[test]
+    fn a_slider_moves_in_steps_and_stays_inside_its_bounds() {
+        let mut s = LimitSlider::worker_max_tokens();
+        assert_eq!(s.snap(5_000), 5_120, "nearest step");
+        assert_eq!(s.snap(0), 1_024, "floor is the minimum");
+        assert_eq!(s.snap(10_000_000), 131_072, "ceiling is the maximum");
+        assert_eq!(s.set_by_user(20_000), 20_480);
+        assert_eq!(s.value(), 20_480);
+        assert!(!s.follows_default());
+        s.reset();
+        assert_eq!(s.value(), 16_384);
+        assert!(s.follows_default());
+        let w = LimitSlider::window();
+        assert_eq!(
+            w.snap(1_000_000),
+            1_000_000,
+            "the maximum is reachable off-step"
+        );
+        let r = LimitSlider::rounds();
+        assert_eq!((r.snap(3), r.snap(201), r.snap(77)), (4, 200, 77));
+    }
+
+    #[test]
+    fn run_limits_persist_and_a_followed_slider_writes_no_key() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("settings.toml");
+        let mut s = Settings::default();
+        let text = s.to_toml_string().expect("toml");
+        for key in [
+            "rounds_per_worker",
+            "max_checkpoints",
+            "worker_max_tokens",
+            "planner_max_tokens",
+            "context_window",
+        ] {
+            assert!(!text.contains(key), "{key} is not written while followed");
+        }
+        s.limits.rounds.set_by_user(60);
+        s.limits.max_checkpoints.set_by_user(3);
+        s.limits.planner_max_tokens.set_by_user(65_536);
+        s.limits.window.set_by_user(204_800);
+        s.save(&path).expect("save");
+        let back = Settings::load(&path).expect("load");
+        assert_eq!(back, s);
+        assert_eq!(back.limits.rounds.value(), 60);
+        assert!(back.limits.worker_max_tokens.follows_default());
+        // The command line reads the same file with the host's reader.
+        let user = kgraf_host::limits::UserLimits::load(&path).expect("cli read");
+        assert_eq!(user, back.limits.user_limits());
+        assert_eq!(user.rounds, Some(60));
+        assert_eq!(user.max_checkpoints, Some(3));
+        assert_eq!(user.planner_max_tokens, Some(65_536));
+        assert_eq!(user.window, Some(204_800));
+        assert_eq!(user.worker_max_tokens, None);
+    }
+
+    #[test]
+    fn a_hand_written_value_runs_as_written_and_a_bad_one_is_refused() {
+        let s = Settings::from_toml_str(
+            "worker_max_tokens = 5000
+",
+        )
+        .expect("in range");
+        assert_eq!(s.limits.worker_max_tokens.value(), 5_000, "not snapped");
+        for bad in [
+            "rounds_per_worker = 3
+",
+            "max_checkpoints = 0
+",
+            "max_checkpoints = 51
+",
+            "worker_max_tokens = 200000
+",
+            "planner_max_tokens = 10
+",
+            "context_window = 5
+",
+        ] {
+            let e = Settings::from_toml_str(bad).expect_err(bad).to_string();
+            assert!(e.contains(bad.split(' ').next().expect("key")), "{e}");
+        }
     }
 }

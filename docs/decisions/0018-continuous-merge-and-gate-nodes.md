@@ -169,3 +169,16 @@ writes outside their scope.
 Alternatives rejected: comparing failing test sets at the base and on the attempt (an output
 parser per runner, and it accepts a partial fix); a planner-written per-contract command (not
 a mechanism); a prompt-only change (the verifier would still refuse the correct attempt).
+
+## Amendment (2026-10-01): a worker is always told what it is judged by
+
+When the verify command is not one kGraf can narrow (`cargo build --workspace`, a script,
+`make`), the brief used to say nothing about the check. A worker then read the planner's
+"Acceptance: cargo test --workspace" as its test and fought sibling contracts' `todo!()`
+stubs. Now every contract's brief states: "Your attempt is accepted when `<verify command>`
+passes in your worktree. The Acceptance line of your contract is advisory. Failures in other
+contracts' unfinished code (stubs such as `todo!()`) are not yours to fix." A narrowed check
+keeps its own text. A gate remediation gets no such text: it fixes what the merged result
+failed, so sibling failures there are its work. Tests: `scoped_check`
+`a_whole_check_brief_names_the_command_and_calls_acceptance_advisory`, `kgraf-host`
+`a_remediation_is_checked_with_the_whole_command`.

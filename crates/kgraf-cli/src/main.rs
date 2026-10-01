@@ -196,19 +196,29 @@ enum Command {
         /// `kgraf index` in the worktree first.
         #[arg(long = "slice")]
         slices: Vec<String>,
-        /// Model rounds, including the final answer round.
-        #[arg(long, default_value_t = kgraf_host::worker::config::DEFAULT_STEP_BUDGET)]
-        budget: u32,
-        /// Output ceiling per round.
-        #[arg(long, default_value_t = kgraf_host::worker::config::DEFAULT_MAX_OUTPUT_TOKENS)]
-        max_tokens: u32,
+        /// Rounds in one block. A block is extended by another of the same size
+        /// while the worker makes measured progress (decision 0096), at most
+        /// --max-checkpoints blocks; a worker that stops making progress ends
+        /// at the next block boundary with a final answer round. Default: the
+        /// `rounds_per_worker` user setting, else 12.
+        #[arg(long)]
+        budget: Option<u32>,
+        /// The most blocks of rounds the worker may be granted; 1 is a fixed
+        /// round limit. Default: the `max_checkpoints` user setting, else 10.
+        #[arg(long)]
+        max_checkpoints: Option<u32>,
+        /// Output ceiling per round, lowered to the model's supported limit.
+        /// Default: the `worker_max_tokens` user setting, else 16,384.
+        #[arg(long)]
+        max_tokens: Option<u32>,
         /// `complete` or `stream`. `stream` needs an adapter with streaming.
         #[arg(long, default_value = "complete")]
         mode: String,
         /// The model's context window in tokens (the effective window is the
-        /// lesser of this and 100,000).
-        #[arg(long, default_value_t = kgraf_host::worker::config::DEFAULT_CONTEXT_WINDOW_TOKENS)]
-        window: u64,
+        /// lesser of this and 100,000). Default: the `context_window` user
+        /// setting, else 128,000.
+        #[arg(long)]
+        window: Option<u64>,
         /// Compaction point in percent (5 to 95); the worker hands back there.
         #[arg(long)]
         point: Option<u8>,
@@ -304,15 +314,25 @@ enum Command {
         /// Live workers at once, parallel attempts included.
         #[arg(long, default_value_t = 8)]
         max_agents: usize,
-        /// Model rounds per worker.
-        #[arg(long, default_value_t = 30)]
-        steps: u32,
-        /// Output ceiling per worker round.
-        #[arg(long, default_value_t = 4096)]
-        max_tokens: u32,
-        /// The models' context window in tokens.
-        #[arg(long, default_value_t = 128_000)]
-        window: u64,
+        /// Rounds in one block per worker. A block is extended by another of
+        /// the same size while the worker makes measured progress (decision
+        /// 0096), at most --max-checkpoints blocks. Default: the
+        /// `rounds_per_worker` user setting, else 30.
+        #[arg(long)]
+        steps: Option<u32>,
+        /// The most blocks of rounds a worker may be granted; 1 is a fixed
+        /// round limit. Default: the `max_checkpoints` user setting, else 10.
+        #[arg(long)]
+        max_checkpoints: Option<u32>,
+        /// Output ceiling per worker round, lowered to each model's supported
+        /// limit with a notice. Default: the `worker_max_tokens` user setting,
+        /// else 16,384.
+        #[arg(long)]
+        max_tokens: Option<u32>,
+        /// The models' context window in tokens. Default: the `context_window`
+        /// user setting, else 128,000.
+        #[arg(long)]
+        window: Option<u64>,
         /// Compaction point in percent (5 to 95).
         #[arg(long)]
         point: Option<u8>,
@@ -370,10 +390,12 @@ enum Command {
         /// configuration's `shell_timeout_secs`; without either, 600.
         #[arg(long)]
         shell_timeout: Option<u64>,
-        /// Output ceiling, in tokens, of each orchestrator call. An answer cut
-        /// off at it fails, naming this flag.
-        #[arg(long, default_value_t = 8192)]
-        planner_max_tokens: u32,
+        /// Output ceiling, in tokens, of each orchestrator call, lowered to the
+        /// planner model's supported limit with a notice. An answer cut off at
+        /// it fails, naming this flag. Default: the `planner_max_tokens` user
+        /// setting, else 32,768.
+        #[arg(long)]
+        planner_max_tokens: Option<u32>,
         /// With --resume: run this held or failed gate again, with a fresh
         /// remediation allowance. Needs --gate-note.
         #[arg(long, requires = "resume", requires = "gate_note")]
@@ -627,12 +649,20 @@ enum ScheduleAction {
         max_items: usize,
         #[arg(long, default_value_t = 8)]
         max_agents: usize,
-        #[arg(long, default_value_t = 30)]
-        steps: u32,
-        #[arg(long, default_value_t = 4096)]
-        max_tokens: u32,
-        #[arg(long, default_value_t = 128_000)]
-        window: u64,
+        /// Rounds in one block per worker. A block is extended by another of
+        /// the same size while the worker makes measured progress (decision
+        /// 0096). The block count limit is the `max_checkpoints` user setting,
+        /// else 10. Default: the `rounds_per_worker` user setting, else 30.
+        #[arg(long)]
+        steps: Option<u32>,
+        /// Output ceiling per worker round. Default: the `worker_max_tokens`
+        /// user setting, else 16,384.
+        #[arg(long)]
+        max_tokens: Option<u32>,
+        /// The models' context window in tokens. Default: the `context_window`
+        /// user setting, else 128,000.
+        #[arg(long)]
+        window: Option<u64>,
         /// The acceptance command run in each worker's worktree. Without it,
         /// the first test command the project's build files declare (Cargo,
         /// npm `test`, pyproject, a Makefile `test` target).
@@ -784,6 +814,23 @@ fn feature_name(command: &Command) -> &'static str {
 /// `--permission-mode`'s value (decision 0094).
 fn parse_mode(s: &str) -> std::result::Result<kgraf_tools::PermissionMode, String> {
     s.parse()
+}
+
+/// The four run limits of one command: its flags, the user's settings file,
+/// then the built-in defaults, with each value's source printed on stderr so
+/// a run says where its limits came from. A settings file that is broken or
+/// names a value outside the sliders' bounds stops the command.
+fn resolve_limits(
+    flags: kgraf_host::limits::UserLimits,
+    rounds_default: u32,
+    planner: bool,
+) -> Result<kgraf_host::limits::ResolvedLimits> {
+    let user = kgraf_host::limits::UserLimits::load_default()?;
+    let resolved = kgraf_host::limits::ResolvedLimits::resolve(&flags, &user, rounds_default);
+    for line in resolved.report(planner) {
+        eprintln!("{line}");
+    }
+    Ok(resolved)
 }
 
 fn fetch_choice(fetch: bool, no_fetch: bool) -> kgraf_host::deps::RunFetch {
@@ -973,6 +1020,7 @@ fn main() -> Result<()> {
             max_items,
             max_agents,
             steps,
+            max_checkpoints,
             max_tokens,
             window,
             point,
@@ -1010,59 +1058,73 @@ fn main() -> Result<()> {
             plan_review,
             approve_plan,
             container_sandbox,
-        } => orchestrate_cmd::run(
-            &root,
-            orchestrate_cmd::OrchestrateArgs {
-                routes,
-                planner,
-                model_routes,
-                instruction,
-                resume,
-                run,
-                prices,
-                max_items,
-                max_agents,
-                steps,
-                max_tokens,
-                window,
-                point,
-                verify,
-                interactive,
-                gate_commands,
-                gate_timeout: std::time::Duration::from_secs(gate_timeout),
-                contract_checks,
-                interface_review,
-                worktrees: kgraf_host::WorktreeRetention::from_delete(!keep_worktrees),
-                sessions,
-                check_timeout: std::time::Duration::from_secs(check_timeout),
-                check_compile_timeout: std::time::Duration::from_secs(check_compile_timeout),
-                shell_timeout: shell_timeout.map(std::time::Duration::from_secs),
-                planner_max_tokens,
-                retry_gate,
-                waive_gate,
-                gate_note,
-                corpus,
-                approve,
-                accept_commands,
-                corrections,
-                interpret_budget,
-                rate_limits,
-                routing,
-                tbench_bridge_socket,
-                fetch_deps: fetch_choice(fetch_deps, no_fetch_deps),
-                permissions: permissions_cli::PermissionArgs {
-                    mode: permission_mode,
-                    allow,
-                    allow_paths: allow_path,
-                    deny,
-                    ask,
-                    container_sandbox,
-                    plan_review,
-                    permissions_file,
+        } => {
+            let limits = resolve_limits(
+                kgraf_host::limits::UserLimits {
+                    rounds: steps,
+                    max_checkpoints,
+                    worker_max_tokens: max_tokens,
+                    planner_max_tokens,
+                    window,
                 },
-                approve_plan,
-            },
-        ),
+                kgraf_host::limits::DEFAULT_ROUNDS_ORCHESTRATED,
+                true,
+            )?;
+            orchestrate_cmd::run(
+                &root,
+                orchestrate_cmd::OrchestrateArgs {
+                    routes,
+                    planner,
+                    model_routes,
+                    instruction,
+                    resume,
+                    run,
+                    prices,
+                    max_items,
+                    max_agents,
+                    steps: limits.rounds.0,
+                    max_checkpoints: limits.max_checkpoints.0,
+                    max_tokens: limits.worker_max_tokens.0,
+                    window: limits.window.0,
+                    point,
+                    verify,
+                    interactive,
+                    gate_commands,
+                    gate_timeout: std::time::Duration::from_secs(gate_timeout),
+                    contract_checks,
+                    interface_review,
+                    worktrees: kgraf_host::WorktreeRetention::from_delete(!keep_worktrees),
+                    sessions,
+                    check_timeout: std::time::Duration::from_secs(check_timeout),
+                    check_compile_timeout: std::time::Duration::from_secs(check_compile_timeout),
+                    shell_timeout: shell_timeout.map(std::time::Duration::from_secs),
+                    planner_max_tokens: limits.planner_max_tokens.0,
+                    retry_gate,
+                    waive_gate,
+                    gate_note,
+                    corpus,
+                    approve,
+                    accept_commands,
+                    corrections,
+                    interpret_budget,
+                    rate_limits,
+                    routing,
+                    tbench_bridge_socket,
+                    fetch_deps: fetch_choice(fetch_deps, no_fetch_deps),
+                    permissions: permissions_cli::PermissionArgs {
+                        mode: permission_mode,
+                        allow,
+                        allow_paths: allow_path,
+                        deny,
+                        ask,
+                        container_sandbox,
+                        plan_review,
+                        permissions_file,
+                    },
+                    approve_plan,
+                },
+            )
+        }
         Command::Instructions { action } => instructions(&root, action),
         Command::Worker {
             provider,
@@ -1070,6 +1132,7 @@ fn main() -> Result<()> {
             brief,
             slices,
             budget,
+            max_checkpoints,
             max_tokens,
             mode,
             window,
@@ -1086,32 +1149,46 @@ fn main() -> Result<()> {
             task,
             shell_timeout,
             tbench_bridge_socket,
-        } => worker_cmd::run(
-            &root,
-            worker_cmd::WorkerArgs {
-                provider,
-                model,
-                brief,
-                slices,
-                budget,
-                max_tokens,
-                mode,
-                window,
-                point,
-                events,
-                resume,
-                cancel_after_ms,
-                ledger,
-                config,
-                base,
-                integration_branch,
-                warm_target,
-                worker,
-                task,
-                shell_timeout: shell_timeout.map(std::time::Duration::from_secs),
-                tbench_bridge_socket,
-            },
-        ),
+        } => {
+            let limits = resolve_limits(
+                kgraf_host::limits::UserLimits {
+                    rounds: budget,
+                    max_checkpoints,
+                    worker_max_tokens: max_tokens,
+                    planner_max_tokens: None,
+                    window,
+                },
+                kgraf_host::limits::DEFAULT_ROUNDS_SINGLE_WORKER,
+                false,
+            )?;
+            worker_cmd::run(
+                &root,
+                worker_cmd::WorkerArgs {
+                    provider,
+                    model,
+                    brief,
+                    slices,
+                    budget: limits.rounds.0,
+                    max_checkpoints: limits.max_checkpoints.0,
+                    max_tokens: limits.worker_max_tokens.0,
+                    mode,
+                    window: limits.window.0,
+                    point,
+                    events,
+                    resume,
+                    cancel_after_ms,
+                    ledger,
+                    config,
+                    base,
+                    integration_branch,
+                    warm_target,
+                    worker,
+                    task,
+                    shell_timeout: shell_timeout.map(std::time::Duration::from_secs),
+                    tbench_bridge_socket,
+                },
+            )
+        }
         Command::Schedule { action } => match action {
             ScheduleAction::Add {
                 id,
@@ -1153,26 +1230,41 @@ fn main() -> Result<()> {
                 fetch_deps,
                 no_fetch_deps,
                 keep_worktrees,
-            } => schedule_cmd::run_now(
-                &root,
-                schedule_cmd::RunNowArgs {
-                    id,
-                    routes,
-                    planner,
-                    model_routes,
-                    prices,
-                    max_items,
-                    max_agents,
-                    steps,
-                    max_tokens,
-                    window,
-                    verify,
-                    force,
-                    shell_timeout: shell_timeout.map(std::time::Duration::from_secs),
-                    fetch_deps: fetch_choice(fetch_deps, no_fetch_deps),
-                    worktrees: kgraf_host::WorktreeRetention::from_delete(!keep_worktrees),
-                },
-            ),
+            } => {
+                let limits = resolve_limits(
+                    kgraf_host::limits::UserLimits {
+                        rounds: steps,
+                        max_checkpoints: None,
+                        worker_max_tokens: max_tokens,
+                        planner_max_tokens: None,
+                        window,
+                    },
+                    kgraf_host::limits::DEFAULT_ROUNDS_ORCHESTRATED,
+                    true,
+                )?;
+                schedule_cmd::run_now(
+                    &root,
+                    schedule_cmd::RunNowArgs {
+                        id,
+                        routes,
+                        planner,
+                        model_routes,
+                        prices,
+                        max_items,
+                        max_agents,
+                        steps: limits.rounds.0,
+                        max_checkpoints: limits.max_checkpoints.0,
+                        max_tokens: limits.worker_max_tokens.0,
+                        planner_max_tokens: limits.planner_max_tokens.0,
+                        window: limits.window.0,
+                        verify,
+                        force,
+                        shell_timeout: shell_timeout.map(std::time::Duration::from_secs),
+                        fetch_deps: fetch_choice(fetch_deps, no_fetch_deps),
+                        worktrees: kgraf_host::WorktreeRetention::from_delete(!keep_worktrees),
+                    },
+                )
+            }
         },
         Command::Call {
             provider,
@@ -2381,6 +2473,7 @@ mod tests {
             max_items,
             max_agents,
             steps,
+            max_checkpoints,
             max_tokens,
             window,
             verify,
@@ -2406,7 +2499,13 @@ mod tests {
             sessions,
             "decision 0067: on since a live run showed all three together"
         );
-        assert_eq!(planner_max_tokens, d::planner_max_tokens());
+        // The four run limits are unset flags: the user setting, then these
+        // defaults, fill them (`resolve_limits`).
+        assert_eq!(planner_max_tokens, None);
+        assert_eq!(
+            kgraf_host::limits::DEFAULT_PLANNER_MAX_TOKENS,
+            d::planner_max_tokens()
+        );
         assert_eq!(
             std::time::Duration::from_secs(check_timeout),
             d::check_timeout()
@@ -2417,14 +2516,111 @@ mod tests {
         );
         assert_eq!(max_items, d::max_items());
         assert_eq!(max_agents, d::max_agents());
-        assert_eq!(steps, d::steps());
-        assert_eq!(max_tokens, d::max_tokens());
-        assert_eq!(window, d::window());
+        assert_eq!((steps, max_tokens, window), (None, None, None));
+        assert_eq!(max_checkpoints, None);
+        assert_eq!(d::max_checkpoints(), 10);
+        assert_eq!(d::steps(), 30);
+        assert_eq!(d::max_tokens(), 16_384);
+        assert_eq!(d::planner_max_tokens(), 32_768);
+        assert_eq!(d::window(), 128_000);
         assert_eq!(verify, d::verify());
         assert_eq!(
             std::time::Duration::from_secs(gate_timeout),
             d::gate_timeout()
         );
+    }
+
+    /// A limit flag given on the command line reaches the resolver as a
+    /// flag, which outranks the user setting and the default.
+    #[test]
+    fn a_limit_flag_is_a_flag_and_an_unset_one_is_not() {
+        use kgraf_host::limits::{ResolvedLimits, Source, UserLimits};
+        let cli = Cli::try_parse_from([
+            "kgraf",
+            "orchestrate",
+            "--route",
+            "ollama:llama3",
+            "--prices",
+            "p.json",
+            "--steps",
+            "77",
+            "--max-checkpoints",
+            "1",
+            "--planner-max-tokens",
+            "5000",
+        ])
+        .expect("parse");
+        let Command::Orchestrate {
+            steps,
+            max_checkpoints,
+            max_tokens,
+            window,
+            planner_max_tokens,
+            ..
+        } = cli.command
+        else {
+            panic!("not orchestrate");
+        };
+        let flags = UserLimits {
+            rounds: steps,
+            max_checkpoints,
+            worker_max_tokens: max_tokens,
+            planner_max_tokens,
+            window,
+        };
+        let user = UserLimits {
+            rounds: Some(40),
+            max_checkpoints: Some(25),
+            worker_max_tokens: Some(2_048),
+            ..UserLimits::default()
+        };
+        let r = ResolvedLimits::resolve(&flags, &user, 30);
+        assert_eq!(r.rounds, (77, Source::Flag));
+        assert_eq!(r.max_checkpoints, (1, Source::Flag), "the flag outranks 25");
+        assert_eq!(r.planner_max_tokens, (5_000, Source::Flag));
+        assert_eq!(r.worker_max_tokens, (2_048, Source::Setting));
+        assert_eq!(r.window, (128_000, Source::Default));
+    }
+
+    /// `kgraf worker --max-checkpoints` reaches the resolver as a flag, and
+    /// without it the user setting, then the default, supplies the value.
+    #[test]
+    fn the_worker_checkpoint_flag_outranks_the_setting() {
+        use kgraf_host::limits::{ResolvedLimits, Source, UserLimits};
+        let parse = |extra: &[&str]| {
+            let mut argv = vec![
+                "kgraf",
+                "worker",
+                "--provider",
+                "p",
+                "--model",
+                "m",
+                "--brief",
+                "b.txt",
+            ];
+            argv.extend_from_slice(extra);
+            let Command::Worker {
+                budget,
+                max_checkpoints,
+                ..
+            } = Cli::try_parse_from(argv).expect("parse").command
+            else {
+                panic!("not worker");
+            };
+            UserLimits {
+                rounds: budget,
+                max_checkpoints,
+                ..UserLimits::default()
+            }
+        };
+        let user = UserLimits {
+            max_checkpoints: Some(25),
+            ..UserLimits::default()
+        };
+        let with = ResolvedLimits::resolve(&parse(&["--max-checkpoints", "2"]), &user, 12);
+        assert_eq!(with.max_checkpoints, (2, Source::Flag));
+        let without = ResolvedLimits::resolve(&parse(&[]), &user, 12);
+        assert_eq!(without.max_checkpoints, (25, Source::Setting));
     }
 
     #[test]

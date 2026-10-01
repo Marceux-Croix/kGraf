@@ -142,6 +142,7 @@ pub mod deps;
 pub mod error;
 mod gates;
 pub mod host;
+pub mod limits;
 pub mod migrate;
 mod scoped_check;
 mod verifier;

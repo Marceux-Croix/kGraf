@@ -47,3 +47,22 @@ retries ran out.
   plan pin, which would then be dropped after one failed attempt.
 - **Change what attempt index 0 means inside `attempt_route`.** Rejected: other callers
   depend on index 0 returning the base route unchanged.
+
+## Amendment (2026-10-01): plan intake repairs what the planner's intent makes certain
+
+A re-ask of the planner costs minutes on a local model. Three mistakes are now repaired at
+intake, each stated as a run notice, and one refusal is reworded:
+
+- A contract's `route` that is not a configured route but is a task-kind word
+  (`implementation`, `tests`, ...) is taken as unset, and becomes the contract's `task_kind`
+  when that is absent. A route name that is configured is a pin whatever it is called; any
+  other unknown name is still refused. The decomposition prompt now says a kind goes in
+  `task_kind` only and `route` is null unless the Routes line lists it.
+- An absolute write path inside the repository root becomes the repository-relative path.
+  One outside the root, or one that leaves it with `..`, is still refused.
+- A write to protected state (`.kgraf`, `.git`, ...) or to Cargo or rustup configuration is
+  refused with a reason that names it, not as "not a relative path inside the repository".
+
+Tests: `a_task_kind_word_in_route_is_left_unset_with_a_notice`,
+`an_absolute_write_inside_the_repository_is_made_relative_with_a_notice`,
+`a_protected_write_is_refused_with_its_own_reason`.

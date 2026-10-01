@@ -127,6 +127,8 @@ pub struct Assembly {
     pub attendance: Attendance,
     pub call_mode: CallMode,
     pub max_output_tokens: u32,
+    /// The most progress checkpoints the worker may reach (decision 0096).
+    pub max_checkpoints: u32,
     pub path_case: PathCase,
     /// Paths no shell command may read: directories, or single files (see
     /// the module docs and [`state_read_denies`]).
@@ -186,6 +188,10 @@ pub struct Assembly {
     /// path stays refused in every mode (a worker run outside an
     /// orchestrated attempt).
     pub protected_writes: Option<Arc<kgraf_tools::ProtectedWrites>>,
+    /// Where the attempt's worker mirrors its policy refusals for the run's
+    /// `report_shortfall` (decision 0093). `None`: no report reads them (a
+    /// worker run outside an orchestrated attempt).
+    pub refusals: Option<Arc<kgraf_runtime::RefusalDirectory>>,
 }
 
 /// The environment variable that tells a stdio MCP server the worktree it
@@ -686,6 +692,7 @@ pub async fn assemble(a: Assembly) -> Result<Assembled> {
     env.prefixes = a.prefixes;
     env.slices = slices;
     env.skills = skills;
+    env.refusals = a.refusals.clone();
     if a.external_executor.is_none() {
         env.protected_writes = a.protected_writes.clone();
     }
@@ -714,6 +721,7 @@ pub async fn assemble(a: Assembly) -> Result<Assembled> {
     )));
     env.settings.call_mode = a.call_mode;
     env.settings.max_output_tokens = a.max_output_tokens;
+    env.settings.max_checkpoints = a.max_checkpoints;
     env.settings.path_case = a.path_case;
     Ok(Assembled {
         env: Arc::new(env),

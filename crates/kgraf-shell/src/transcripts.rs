@@ -231,6 +231,10 @@ fn event_turn(event: WorkerEvent, turns: &mut Vec<Turn>) {
         WorkerEvent::Resumed { call_id } => {
             turns.push(Turn::Event(format!("call {call_id} resumed")))
         }
+        // Decision 0096: a round checkpoint, as the loop measured it.
+        WorkerEvent::Checkpoint { checkpoint, .. } => {
+            turns.push(Turn::Event(checkpoint.render()))
+        }
     }
 }
 

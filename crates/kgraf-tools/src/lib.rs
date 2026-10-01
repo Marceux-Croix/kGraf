@@ -60,6 +60,7 @@ mod untrusted;
 pub(crate) use access::normalize_relative;
 pub use access::{Access, PathCase, detect_path_case};
 pub use apply_patch::{ApplyPatchTool, ProtectedApplyPatch};
+pub use approval::INVALID_INPUT;
 pub use dependency_refetch::{DependencyRefetch, RefetchOutcome};
 pub use error::{AccessError, ApprovalError, RegistryError, ToolError};
 pub use external::{ExternalExecutor, ExternalOutcome, SyncedWrites, remote_policy};

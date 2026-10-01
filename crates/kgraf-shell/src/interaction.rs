@@ -158,6 +158,85 @@ pub fn apply_parallelism(limits: kgraf_orchestrator::Limits, admission: &Admissi
     admission.gate().set_limits(limits);
 }
 
+/// `n` with a comma between each group of three digits (`131072` is `131,072`).
+pub fn group_thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// One run-limit slider as a setting row: a bold label, its description in the
+/// secondary color (CMP-SET-1), the slider (CMP-SET-2) with its value shown in
+/// tabular numerals, the default as a legend and a "Return to default" action
+/// once the user has moved away from it (CMP-SET-3, the default standing in for a
+/// recommendation), and, when `note` is given, a note stating the clamp
+/// (CMP-SET-6: a fixed behavior, not a warning). Returns whether the value
+/// changed this frame. Colors come only from the palette (THM-4).
+pub fn limit_slider_row(
+    ui: &mut egui::Ui,
+    p: &crate::theme::Palette,
+    label: &str,
+    description: &str,
+    slider: &mut crate::settings::LimitSlider,
+    grouped: bool,
+    notes: &[String],
+) -> bool {
+    ui.label(
+        egui::RichText::new(label)
+            .font(theme::bold(14.0))
+            .color(p.text),
+    );
+    ui.label(egui::RichText::new(description).small().color(p.text_2));
+    let mut value = slider.value();
+    let mut widget = egui::Slider::new(&mut value, slider.min()..=slider.max())
+        .step_by(slider.step() as f64)
+        .smart_aim(false);
+    if grouped {
+        widget = widget
+            .logarithmic(true)
+            .custom_formatter(|n, _| group_thousands(n as u64))
+            .custom_parser(|s| s.replace(',', "").trim().parse::<f64>().ok());
+    }
+    let mut changed = ui.add(widget).changed();
+    if changed {
+        slider.set_by_user(value);
+    }
+    ui.label(
+        egui::RichText::new(format!(
+            "Default: {}",
+            if grouped {
+                group_thousands(slider.default_value())
+            } else {
+                slider.default_value().to_string()
+            }
+        ))
+        .small()
+        .color(p.text_2),
+    );
+    if !slider.follows_default()
+        && chrome::text_button(ui, p.primary, "Return to default").clicked()
+    {
+        slider.reset();
+        changed = true;
+    }
+    for note in notes {
+        egui::Frame::new()
+            .fill(p.additive)
+            .corner_radius(theme::radius::CARD)
+            .inner_margin(egui::Margin::symmetric(16, 12))
+            .show(ui, |ui| {
+                ui.label(egui::RichText::new(note).small().color(p.text_2));
+            });
+    }
+    changed
+}
+
 /// The parallelism slider (decision 0067): one number, agent sessions
 /// live at once process-wide, with a per-machine maximum and its breakdown.
 /// Settings is configuration only (0017): the breakdown states the
@@ -1416,5 +1495,101 @@ mod tests {
         assert!(i.take_plan().is_none(), "the same nodes do not mark it");
         i.set_schedule_nodes(vec![node("nightly: held for you (disabled: y)")]);
         assert!(i.take_plan().is_some());
+    }
+
+    #[test]
+    fn thousands_are_grouped_by_three() {
+        for (n, text) in [
+            (0, "0"),
+            (999, "999"),
+            (1_024, "1,024"),
+            (131_072, "131,072"),
+            (1_000_000, "1,000,000"),
+        ] {
+            assert_eq!(group_thousands(n), text);
+        }
+    }
+
+    /// The limit slider row states its default, offers "Return to default" only
+    /// once moved, and shows a clamp note when given one (CMP-SET-3, CMP-SET-6).
+    #[test]
+    fn a_limit_slider_row_offers_a_return_only_once_moved_and_shows_the_note() {
+        use crate::settings::LimitSlider;
+        use egui_kittest::kittest::Queryable;
+        let note = "app: worker output cap 131072 lowered to 16384 tokens".to_owned();
+        let mut h = egui_kittest::Harness::new_ui_state(
+            {
+                let note = note.clone();
+                move |ui, s: &mut LimitSlider| {
+                    // The row's label uses the bold face the theme installs;
+                    // a headless first frame has none yet.
+                    if !crate::theme::ensure(ui.ctx()) {
+                        return;
+                    }
+                    limit_slider_row(
+                        ui,
+                        &crate::theme::Palette::dark(),
+                        "Worker reply cap (tokens)",
+                        "The most output tokens one worker reply may have.",
+                        s,
+                        true,
+                        std::slice::from_ref(&note),
+                    );
+                }
+            },
+            LimitSlider::worker_max_tokens(),
+        );
+        h.run();
+        h.get_by_label("Default: 16,384");
+        h.get_by_label_contains("lowered to 16384");
+        assert!(
+            h.query_by_label("Return to default").is_none(),
+            "following the default: nothing to return to"
+        );
+        h.state_mut().set_by_user(32_768);
+        h.run();
+        h.get_by_label("Return to default").click();
+        h.run();
+        assert!(h.state().follows_default(), "the button returns it");
+        assert_eq!(h.state().value(), 16_384);
+    }
+
+    /// The checkpoint-ceiling row is an ungrouped slider from 1 to 50 whose
+    /// description says that 1 is the old fixed round limit, and moving it
+    /// changes the value the settings carry.
+    #[test]
+    fn the_checkpoint_slider_row_states_the_fixed_limit_and_moves_the_value() {
+        use crate::settings::LimitSlider;
+        use egui_kittest::kittest::Queryable;
+        let mut h = egui_kittest::Harness::new_ui_state(
+            move |ui, s: &mut LimitSlider| {
+                if !crate::theme::ensure(ui.ctx()) {
+                    return;
+                }
+                limit_slider_row(
+                    ui,
+                    &crate::theme::Palette::dark(),
+                    "Most round blocks per worker",
+                    "The most blocks of rounds one worker may be given while it keeps making \
+                     progress. 1 means the old fixed round limit: no extension.",
+                    s,
+                    false,
+                    &[],
+                );
+            },
+            LimitSlider::max_checkpoints(),
+        );
+        h.run();
+        h.get_by_label("Most round blocks per worker");
+        h.get_by_label_contains("1 means the old fixed round limit");
+        h.get_by_label("Default: 10");
+        assert!(h.query_by_label("Return to default").is_none());
+        assert_eq!(h.state_mut().set_by_user(0), 1, "floor");
+        assert_eq!(h.state_mut().set_by_user(99), 50, "ceiling");
+        h.state_mut().set_by_user(1);
+        h.run();
+        h.get_by_label("Return to default").click();
+        h.run();
+        assert_eq!(h.state().value(), 10);
     }
 }

@@ -1193,6 +1193,7 @@ async fn each_attempt_gets_a_shell_bound_to_its_own_worktree() {
         ledger: ledger.clone(),
         config: WorkerConfig::with_servers(vec![echo_server()]).expect("config"),
         max_output_tokens: 1_000,
+        max_checkpoints: 3,
         read_denies: vec![state.clone()],
         workspaces: r.workspaces.clone(),
         routes,
@@ -1204,6 +1205,7 @@ async fn each_attempt_gets_a_shell_bound_to_its_own_worktree() {
         dependency_refetch: crate::deps::inert_refetch(),
         skills: None,
         skill_directory: Default::default(),
+        refusal_directory: Default::default(),
         permissions: Arc::new(kgraf_tools::PermissionControl::manual()),
     };
     let context = ContextConfig::for_model(200_000).expect("context");
@@ -1229,6 +1231,10 @@ async fn each_attempt_gets_a_shell_bound_to_its_own_worktree() {
             .build(&route, &ws, &worker.into(), &"r9/c-shell".into())
             .await
             .expect("built");
+        assert_eq!(
+            built.env.settings.max_checkpoints, 3,
+            "the run's checkpoint ceiling reaches the assembled worker's loop settings"
+        );
         assert!(built.env.tools.names().any(|n| n == "shell"));
         assert!(
             built
@@ -1364,6 +1370,7 @@ async fn a_session_tool_call_with_the_flag_on_answers_as_an_error() {
         ledger: ledger.clone(),
         config: WorkerConfig::default(),
         max_output_tokens: 1_000,
+        max_checkpoints: crate::limits::DEFAULT_MAX_CHECKPOINTS,
         read_denies: vec![state.clone()],
         workspaces: r.workspaces.clone(),
         routes,
@@ -1375,6 +1382,7 @@ async fn a_session_tool_call_with_the_flag_on_answers_as_an_error() {
         dependency_refetch: crate::deps::inert_refetch(),
         skills: None,
         skill_directory: Default::default(),
+        refusal_directory: Default::default(),
         permissions: Arc::new(kgraf_tools::PermissionControl::manual()),
     };
     let context = ContextConfig::for_model(200_000).expect("context");
@@ -1470,6 +1478,7 @@ async fn the_assembled_prefix_digest_with_the_flag_off_is_pinned() {
         ledger: ledger.clone(),
         config: WorkerConfig::default(),
         max_output_tokens: 1_000,
+        max_checkpoints: crate::limits::DEFAULT_MAX_CHECKPOINTS,
         read_denies: vec![state.clone()],
         workspaces: r.workspaces.clone(),
         routes,
@@ -1481,6 +1490,7 @@ async fn the_assembled_prefix_digest_with_the_flag_off_is_pinned() {
         dependency_refetch: crate::deps::inert_refetch(),
         skills: None,
         skill_directory: Default::default(),
+        refusal_directory: Default::default(),
         permissions: Arc::new(kgraf_tools::PermissionControl::manual()),
     };
     let context = ContextConfig::for_model(200_000).expect("context");
@@ -1522,9 +1532,11 @@ async fn the_assembled_prefix_digest_with_the_flag_off_is_pinned() {
     // again: every worker lists the `recall_history` tool. Re-pinned once
     // more when the shell tool description began naming the build commands'
     // options, so a model no longer reads the bare names as "without flags",
-    // and the system prompt said kGraf commits the worktree itself.
+    // and the system prompt said kGraf commits the worktree itself. Re-pinned
+    // again when the `apply_patch` description said a patch without its
+    // `*** Begin Patch` line is applied as if it had one.
     assert_eq!(
-        digest, "b1c27084e1e061daaf44184e3d0938d5ea911e734560388f5cb950aa7b4dc0d2",
+        digest, "3c8c8132d8d40fdb928d94fb9d02afb8e1d1a8fddf193bc0d60f41b0748d7060",
         "a change here means every worker's cache resets even with the \
          sessions flag off, which nothing in decision 0067 may cause \
          (re-pinned for the intentional `apply_patch` description \
@@ -1591,6 +1603,7 @@ async fn an_mcp_tool_allowed_with_kgraf_allow_runs_in_an_unattended_delegate() {
             ledger,
             config: WorkerConfig::with_servers(vec![echo_server()]).expect("config"),
             max_output_tokens: 1_000,
+            max_checkpoints: crate::limits::DEFAULT_MAX_CHECKPOINTS,
             read_denies: vec![state.clone()],
             workspaces: r.workspaces.clone(),
             routes,
@@ -1602,6 +1615,7 @@ async fn an_mcp_tool_allowed_with_kgraf_allow_runs_in_an_unattended_delegate() {
             dependency_refetch: crate::deps::inert_refetch(),
             skills: None,
             skill_directory: Default::default(),
+            refusal_directory: Default::default(),
             permissions: Arc::new(kgraf_tools::PermissionControl::manual()),
         }
     };
@@ -4254,6 +4268,7 @@ async fn a_host_resolver_answers_the_attempts_asks() {
             ledger: ledger.clone(),
             config: WorkerConfig::default(),
             max_output_tokens: 1_000,
+            max_checkpoints: crate::limits::DEFAULT_MAX_CHECKPOINTS,
             read_denies: vec![state.clone()],
             workspaces: r.workspaces.clone(),
             routes,
@@ -4265,6 +4280,7 @@ async fn a_host_resolver_answers_the_attempts_asks() {
             dependency_refetch: crate::deps::inert_refetch(),
             skills: None,
             skill_directory: Default::default(),
+            refusal_directory: Default::default(),
             permissions: Arc::new(kgraf_tools::PermissionControl::manual()),
         }),
         asks: allow.clone(),
@@ -6648,6 +6664,7 @@ mod skill_enforcement {
             ledger: ledger.clone(),
             config: WorkerConfig::default(),
             max_output_tokens: 1_000,
+            max_checkpoints: crate::limits::DEFAULT_MAX_CHECKPOINTS,
             read_denies: vec![state.clone()],
             workspaces: r.workspaces.clone(),
             routes,
@@ -6660,6 +6677,7 @@ mod skill_enforcement {
             // Read from the state directory as `Host::build_base` does.
             skills: crate::worker::assemble::run_skills(&state, None).expect("inventory"),
             skill_directory: Default::default(),
+            refusal_directory: Default::default(),
             permissions: Arc::new(kgraf_tools::PermissionControl::manual()),
         };
         let context = ContextConfig::for_model(200_000).expect("context");
@@ -6868,3 +6886,54 @@ mod skill_enforcement {
 
 #[path = "bypass_git_files_tests.rs"]
 mod bypass_git_files;
+
+/// An output cap above a model's supported limit is lowered, and every run
+/// says so at its start; the caps the host uses are the lowered ones.
+#[test]
+fn an_output_cap_above_the_models_limit_is_lowered_with_a_notice() {
+    let (_dir, mut config) = project();
+    config.routes = vec!["openai:gpt-4o".into()];
+    config.max_tokens = 131_072;
+    config.planner_max_tokens = 8_192;
+    let host = Host::open(config).expect("open");
+    assert_eq!(host.output_caps(), (16_384, 8_192), "gpt-4o allows 16,384");
+    let mut said = Vec::new();
+    host.startup(&mut |n| said.push(n)).expect("startup");
+    let clamps: Vec<_> = said
+        .iter()
+        .filter_map(|n| match n {
+            crate::Notice::OutputCapClamped { which, clamp } => Some((*which, clamp.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(clamps.len(), 1, "{said:?}");
+    assert_eq!(clamps[0].0, "worker");
+    assert_eq!(
+        (clamps[0].1.requested, clamps[0].1.limit),
+        (131_072, 16_384)
+    );
+    // The settings surface asks the same question before a run starts.
+    let notes = host.output_clamp_notes(131_072, 131_072);
+    assert_eq!(notes.len(), 2, "{notes:?}");
+    assert!(host.output_clamp_notes(4_096, 4_096).is_empty());
+}
+
+/// A model the catalog does not list has no known limit: the cap stands and
+/// nothing is said.
+#[test]
+fn a_model_with_no_known_limit_keeps_the_requested_cap() {
+    let (_dir, mut config) = project();
+    config.routes = vec!["ollama:zz-unlisted-model".into()];
+    config.max_tokens = 131_072;
+    config.planner_max_tokens = 131_072;
+    let host = Host::open(config).expect("open");
+    assert_eq!(host.output_caps(), (131_072, 131_072));
+    let mut said = Vec::new();
+    host.startup(&mut |n| said.push(n)).expect("startup");
+    assert!(
+        !said
+            .iter()
+            .any(|n| matches!(n, crate::Notice::OutputCapClamped { .. })),
+        "{said:?}"
+    );
+}

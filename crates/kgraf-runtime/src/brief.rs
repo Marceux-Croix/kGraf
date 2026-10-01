@@ -106,7 +106,10 @@ pub enum WorkerOutcome {
     Completed,
     /// The context reached the worker stop point; the remainder is handed back.
     HandedBack { handoff: Handoff },
-    /// The step budget ran out.
+    /// The step budget ran out: a progress checkpoint stopped granting blocks
+    /// and the final round issued tool calls, or two checkpoints in a row
+    /// measured no progress after a productive one (decision 0096;
+    /// `WorkerResult::round_blocks` says which).
     BudgetExhausted,
     /// The same tool call repeated inside the budget (0056 stall detection).
     Stalled { call_digest: String, repeats: u32 },
@@ -290,6 +293,13 @@ pub struct WorkerResult {
     /// attempt against the contract. Serde-defaulted so an older record loads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route_fault: Option<String>,
+    /// The progress checkpoints the worker reached (decision 0096): the block
+    /// size, the ceiling, and each checkpoint's measurement and verdict. Set
+    /// by the loop alone, never from model output. `None` when the worker
+    /// finished inside its first block. Serde-defaulted so an older record
+    /// still loads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub round_blocks: Option<crate::progress::RoundBlocks>,
 }
 
 impl WorkerResult {
@@ -317,6 +327,7 @@ impl WorkerResult {
             refused: Vec::new(),
             compaction: None,
             route_fault: None,
+            round_blocks: None,
         }
     }
 }

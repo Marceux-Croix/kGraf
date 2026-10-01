@@ -108,6 +108,11 @@ pub struct ProjectFactory {
     /// to every host this factory opens and pushed to the one open now.
     /// `None` (a factory with no setting given) leaves the default, `Delete`.
     worktrees: Mutex<Option<kgraf_host::WorktreeRetention>>,
+    /// The user's run limits (rounds per worker, the two output caps, the
+    /// context window), shared by every project of the process. A host opened
+    /// from `run.json` takes each one the file leaves out from here; a change
+    /// reopens the host when no run is active, like a changed `run.json`.
+    limits: kgraf_host::limits::SharedLimits,
     /// The user's live permission control (decision 0094): every host this
     /// factory opens runs under it, box and scheduled runs alike.
     permissions: Option<crate::permission_bar::PermissionUi>,
@@ -124,12 +129,17 @@ struct Hosts {
     /// The open host, with the fingerprint of the file it came from (`None` for
     /// a host given by the caller, which is never reloaded).
     current: Option<(Arc<HostFactory>, Option<Fingerprint>)>,
+    /// The user limits the current host was opened with.
+    limits_applied: kgraf_host::limits::UserLimits,
     /// Hosts replaced after a change whose ended runs still await housekeeping.
     retired: Vec<Arc<HostFactory>>,
 }
 
 /// Shown while a changed `run.json` waits for the active run.
 pub const RUN_CONFIG_PENDING: &str = "run.json changed; applies after the active run ends";
+
+/// Shown while a changed run limit (Settings) waits for the active run.
+pub const RUN_LIMITS_PENDING: &str = "run limits changed; apply after the active run ends";
 
 impl ProjectFactory {
     /// A factory that opens the project's host from `.kgraf/run.json`.
@@ -140,8 +150,16 @@ impl ProjectFactory {
             asks: None,
             box_runs: Mutex::new(std::collections::BTreeSet::new()),
             worktrees: Mutex::new(None),
+            limits: kgraf_host::limits::SharedLimits::default(),
             permissions: None,
         }
+    }
+
+    /// Every host this factory opens takes the run limits the user set from
+    /// `limits`, for each one `run.json` does not name.
+    pub fn with_run_limits(mut self, limits: kgraf_host::limits::SharedLimits) -> Self {
+        self.limits = limits;
+        self
     }
 
     /// Every host this factory opens runs under the user's permission control
@@ -268,11 +286,13 @@ impl ProjectFactory {
             project: host.root().to_path_buf(),
             hosts: Mutex::new(Hosts {
                 current: Some((Arc::new(HostFactory::new(host)), None)),
+                limits_applied: kgraf_host::limits::UserLimits::default(),
                 retired: Vec::new(),
             }),
             asks: None,
             box_runs: Mutex::new(std::collections::BTreeSet::new()),
             worktrees: Mutex::new(None),
+            limits: kgraf_host::limits::SharedLimits::default(),
             permissions: None,
         }
     }
@@ -306,15 +326,25 @@ impl ProjectFactory {
         let active = active + self.box_runs().len();
         let path = self.config_path();
         let mut hosts = self.hosts();
-        let changed = match &hosts.current {
+        let file_changed = match &hosts.current {
             Some((_, Some(fp))) => Self::fingerprint(&path).as_ref() != Some(fp),
             _ => false,
         };
-        if !changed {
+        // A host given by the caller (no file) is never reloaded, limits or not.
+        let limits_changed = matches!(&hosts.current, Some((_, Some(_))))
+            && hosts.limits_applied != self.limits.get();
+        if !file_changed && !limits_changed {
             return None;
         }
         if active > 0 {
-            return Some(RUN_CONFIG_PENDING.to_owned());
+            return Some(
+                if file_changed {
+                    RUN_CONFIG_PENDING
+                } else {
+                    RUN_LIMITS_PENDING
+                }
+                .to_owned(),
+            );
         }
         if let Some((old, _)) = hosts.current.take() {
             log::info!("{} changed; the next check opens it again", path.display());
@@ -339,7 +369,8 @@ impl ProjectFactory {
         // Taken before the load: a change during it is seen by the next refresh.
         let fingerprint = Self::fingerprint(&path);
         let user_worktrees = *self.worktrees.lock().unwrap_or_else(|p| p.into_inner());
-        let host = RunConfig::load(&self.project, &path)
+        let user_limits = self.limits.get();
+        let host = RunConfig::load_with(&self.project, &path, &user_limits)
             .and_then(|mut config| {
                 if let Some(retention) = user_worktrees {
                     config.worktrees = retention;
@@ -368,7 +399,11 @@ impl ProjectFactory {
         })?;
         log::info!("scheduled runs: {seeded} spent in the last hour counts toward the hourly cap");
         let factory = Arc::new(factory);
-        self.hosts().current = Some((factory.clone(), fingerprint));
+        {
+            let mut hosts = self.hosts();
+            hosts.current = Some((factory.clone(), fingerprint));
+            hosts.limits_applied = user_limits;
+        }
         Ok(factory)
     }
 
@@ -2170,6 +2205,54 @@ mod tests {
             matches!(&err, ReadinessFailure::MissingConfiguration(m)
                 if m.contains("worktrees") && m.contains("Delete worker worktrees after use")),
             "{err}"
+        );
+    }
+
+    /// The user's run limits reach the host the factory opens for every limit
+    /// `run.json` leaves out, and a change reopens the host once no run is active
+    /// (the mechanism: the opened host's own configuration changes).
+    #[test]
+    fn the_users_run_limits_reach_the_host_and_a_change_reopens_it() {
+        use kgraf_host::limits::{SharedLimits, UserLimits};
+        let dir = configured_project(1.0);
+        let shared = SharedLimits::new(UserLimits {
+            rounds: Some(61),
+            max_checkpoints: Some(4),
+            planner_max_tokens: Some(40_000),
+            ..UserLimits::default()
+        });
+        let factory = ProjectFactory::for_project(dir.path()).with_run_limits(shared.clone());
+        let rt = multi_thread();
+        rt.block_on(factory.configured()).expect("configured");
+        let cfg = |f: &ProjectFactory| {
+            let h = f.host().expect("open");
+            (
+                h.config().steps,
+                h.config().planner_max_tokens,
+                h.config().max_tokens,
+                h.config().max_checkpoints,
+            )
+        };
+        assert_eq!(
+            cfg(&factory),
+            (61, 40_000, 16_384, 4),
+            "run.json names none of them"
+        );
+        assert_eq!(factory.refresh(0), None, "unchanged: nothing to do");
+
+        shared.set(UserLimits {
+            rounds: Some(62),
+            max_checkpoints: Some(5),
+            ..UserLimits::default()
+        });
+        assert_eq!(factory.refresh(1).as_deref(), Some(RUN_LIMITS_PENDING));
+        assert_eq!(cfg(&factory).0, 61, "an active run keeps its host");
+        assert_eq!(factory.refresh(0), None);
+        rt.block_on(factory.configured()).expect("reopened");
+        assert_eq!(
+            cfg(&factory),
+            (62, 32_768, 16_384, 5),
+            "the new limits apply"
         );
     }
 

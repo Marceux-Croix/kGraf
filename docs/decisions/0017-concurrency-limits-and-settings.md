@@ -111,3 +111,40 @@ and none of those are knowable in advance.
 **A cap on concurrent items only.** Rejected as insufficient, because
 recursive decomposition means item count and agent count are not the same
 number.
+
+## Amendment (2026-10-01): run limits are global user settings
+
+Five run limits are settings the user changes once, for every run, with a slider each in
+Settings > General (no new panel; configuration only, so 0017's boundary holds). They are
+keys in the user-level `settings.toml`, the file a worker cannot write, and the command
+line reads the same keys.
+
+| Setting key | Slider range (step) | Built-in default |
+| --- | --- | --- |
+| `rounds_per_worker` | 4 to 200 (1) | 30 orchestrated, 12 for `kgraf worker` |
+| `max_checkpoints` | 1 to 50 (1) | 10 |
+| `worker_max_tokens` | 1,024 to 131,072 (1,024) | 16,384 (was 4,096) |
+| `planner_max_tokens` | 4,096 to 131,072 (1,024) | 32,768 (was 8,192) |
+| `context_window` | 8,192 to 1,000,000 (1,024) | 128,000 |
+
+- **Precedence:** flag, then user setting, then built-in default. A key in `.kgraf/run.json`
+  counts as a flag for its project. A slider that was never moved writes no key, so a later
+  change of a default reaches a user who never chose a value. A settings value outside the
+  bounds is an error naming the key, in the app and on the command line.
+- **The checkpoint ceiling (decision 0096).** `rounds_per_worker` is the size of one block
+  of rounds; `max_checkpoints` is the most blocks a worker may be granted while it makes
+  measured progress. 1 means the old fixed round limit. It reaches every worker the app or
+  the command line assembles, orchestrated or single, as `LoopSettings::max_checkpoints`,
+  and the command flag is `--max-checkpoints` on `orchestrate` and `worker`.
+- **One rounds setting, two defaults.** A single `kgraf worker` run is one probe and keeps
+  its smaller default of 12 until a value is set; an orchestrated worker is one share of a
+  plan and defaults to 30.
+- **Clamped to the model, with a notice.** An output cap above a model's supported output
+  limit (the bundled model catalog's `max_output_tokens`) is lowered for that run and
+  reported at the run's start. The worker cap is the lowest limit among the worker routes,
+  which rotate; a model the catalog does not list is not clamped. Settings shows the same
+  sentence under the slider before a run starts.
+- **The window slider and the ceiling.** A single worker still uses at most 100,000 tokens
+  of the window (0057), so a window above that does not raise a worker's use.
+- **When a change applies.** Runs started after it. A project's host is reopened when no
+  run is active, and a change made during a run waits for it to end.

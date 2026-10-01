@@ -189,6 +189,16 @@ pub enum WorkerEvent {
         notice: Box<crate::compaction::CompactionNotice>,
         summary: Box<crate::compaction::CompactionSummary>,
     },
+    /// A progress checkpoint (decision 0096): what the loop measured over the
+    /// block since the previous one, its verdict, and the baseline the next
+    /// one compares against. Built by the loop alone, between rounds, from the
+    /// worktree and the worker's own tool results; no model output becomes
+    /// one. Never model input: a resume reads it to restore the rounds the
+    /// checkpoints granted.
+    Checkpoint {
+        checkpoint: Box<crate::progress::Checkpoint>,
+        baseline: Box<crate::progress::CheckpointBaseline>,
+    },
 }
 
 /// Why the loop added text to a user turn.
@@ -202,6 +212,13 @@ pub enum NoticeKind {
     /// The last response reached the output ceiling and was discarded; this is
     /// the one continuation round, asking the model to split large patches.
     OutputLimit,
+    /// A checkpoint measured no progress and granted one more block (decision
+    /// 0096); the next checkpoint without progress ends the attempt.
+    NoProgress,
+    /// The last turn had no tool call and no visible answer (a model that
+    /// planned only in its reasoning); it was discarded and the model was told
+    /// to continue. A second empty turn in a row fails the attempt.
+    EmptyTurn,
 }
 
 impl WorkerEvent {
@@ -355,6 +372,23 @@ impl WorkerEvent {
                         constraints,
                         constraints_dropped: summary.constraints_dropped,
                     }),
+                }
+            }
+            // The loop's own measurement. Its one text that came from a
+            // model is a command's first two words, scrubbed when the loop
+            // recorded it; the improvement lines quote that label.
+            WorkerEvent::Checkpoint {
+                mut checkpoint,
+                baseline,
+            } => {
+                checkpoint.measure.checks_improved =
+                    std::mem::take(&mut checkpoint.measure.checks_improved)
+                        .into_iter()
+                        .map(|t| scrub(t, counts))
+                        .collect();
+                WorkerEvent::Checkpoint {
+                    checkpoint,
+                    baseline,
                 }
             }
             // Structured data only: ids, usage counts, a stop reason, a
@@ -611,6 +645,10 @@ impl EventSequence {
             // Decision 0095: compaction replaces the private remainder, so it
             // lands only between rounds, like an injection.
             WorkerEvent::Compacted { .. } if self.streaming || !self.open.is_empty() => {
+                return Err(SequenceError::NotBetweenRounds);
+            }
+            // Decision 0096: a checkpoint is measured between rounds.
+            WorkerEvent::Checkpoint { .. } if self.streaming || !self.open.is_empty() => {
                 return Err(SequenceError::NotBetweenRounds);
             }
             WorkerEvent::RoundAbandoned { .. } => {

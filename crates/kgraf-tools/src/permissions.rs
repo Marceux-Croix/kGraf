@@ -1450,6 +1450,77 @@ pub fn hard_limit(
     deletion
 }
 
+/// What a grant to a contract would allow, for [`rule_on_grant`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GrantSubject<'a> {
+    /// A shell program (`argv[0]`).
+    Program(&'a str),
+    /// A repository path a file tool would write.
+    Path(&'a str),
+    /// A tool by wire name.
+    Tool(&'a str),
+}
+
+impl GrantSubject<'_> {
+    /// Whether `rule` would apply to some call the grant allows.
+    fn reached_by(&self, rule: &Rule) -> bool {
+        match *self {
+            Self::Program(program) => {
+                if rule.tool != "shell" && rule.tool != "*" {
+                    return false;
+                }
+                let Some(p) = &rule.pattern else {
+                    return true;
+                };
+                // A one-word prefix pattern (`python*`) matches the program as
+                // a prefix; otherwise the pattern's first word is a program,
+                // and some command line of that program may match the rest.
+                match p.strip_suffix('*') {
+                    Some(prefix) if !prefix.contains(char::is_whitespace) => {
+                        program.starts_with(prefix) || prefix.starts_with(program)
+                    }
+                    _ => p.split_whitespace().next() == Some(program),
+                }
+            }
+            Self::Path(path) => {
+                if rule.tool == "shell" {
+                    return false;
+                }
+                match &rule.pattern {
+                    None => rule.tool == "*" || rule.tool == "apply_patch",
+                    Some(_) => rule.matches(&rule.tool, &[path.to_owned()]),
+                }
+            }
+            Self::Tool(tool) => rule.tool == tool || rule.tool == "*",
+        }
+    }
+}
+
+/// The user's rule a grant to a contract would meet again (decision 0094).
+/// A grant cannot lift a deny or an ask rule: the rules hook runs on every
+/// call in every mode, so a program, path or tool granted against a rule is
+/// refused or asked about again on the next attempt. Deny wins over ask.
+pub fn rule_on_grant(rules: &UserRules, subject: GrantSubject<'_>) -> Option<HardLimit> {
+    if let Some(rule) = rules.deny.iter().find(|r| subject.reached_by(r)) {
+        return Some(HardLimit::Deny(format!(
+            "your deny rule `{}` blocks it in every permission mode, and a grant cannot lift a \
+             rule",
+            rule.text()
+        )));
+    }
+    rules
+        .ask
+        .iter()
+        .find(|r| subject.reached_by(r))
+        .map(|rule| {
+            HardLimit::Ask(format!(
+                "your ask rule `{}` asks about it in every permission mode, and a grant cannot \
+                 lift a rule",
+                rule.text()
+            ))
+        })
+}
+
 /// The approval hook for the limits no mode lifts. Install it **last** in the
 /// chain: it then reviews the input every earlier hook left, so no earlier
 /// hook's rewrite or allow gets past a deny or an ask rule.
@@ -1634,6 +1705,57 @@ mod tests {
         assert!(Rule::parse("shell(").is_err());
         assert!(Rule::parse("(x)").is_err());
         assert!(Rule::parse("shell()").is_err());
+    }
+
+    /// A grant meets the rule that would refuse or ask about the calls it
+    /// allows; an unrelated rule is not met.
+    #[test]
+    fn a_grant_meets_the_rule_its_calls_would_meet() {
+        let rules = UserRules {
+            deny: vec![Rule::parse("shell(curl*)").expect("rule")],
+            ask: vec![
+                Rule::parse("shell(python3*)").expect("rule"),
+                Rule::parse("apply_patch(secrets/*)").expect("rule"),
+                Rule::parse("mcp__web__fetch").expect("rule"),
+                Rule::parse("shell(git push*)").expect("rule"),
+            ],
+        };
+        let deny = rule_on_grant(&rules, GrantSubject::Program("curl"));
+        assert!(
+            matches!(&deny, Some(HardLimit::Deny(r)) if r.contains("shell(curl*)")),
+            "{deny:?}"
+        );
+        let ask = rule_on_grant(&rules, GrantSubject::Program("python3"));
+        assert!(
+            matches!(&ask, Some(HardLimit::Ask(r)) if r.contains("shell(python3*)")),
+            "{ask:?}"
+        );
+        assert!(matches!(
+            rule_on_grant(&rules, GrantSubject::Program("git")),
+            Some(HardLimit::Ask(_))
+        ));
+        assert_eq!(rule_on_grant(&rules, GrantSubject::Program("cp")), None);
+        assert!(matches!(
+            rule_on_grant(&rules, GrantSubject::Path("secrets/key.txt")),
+            Some(HardLimit::Ask(_))
+        ));
+        assert_eq!(
+            rule_on_grant(&rules, GrantSubject::Path("src/lib.rs")),
+            None
+        );
+        assert!(matches!(
+            rule_on_grant(&rules, GrantSubject::Tool("mcp__web__fetch")),
+            Some(HardLimit::Ask(_))
+        ));
+        assert_eq!(rule_on_grant(&rules, GrantSubject::Tool("mcp__x__y")), None);
+        let every_shell = UserRules {
+            deny: vec![Rule::parse("shell").expect("rule")],
+            ask: vec![],
+        };
+        assert!(matches!(
+            rule_on_grant(&every_shell, GrantSubject::Program("ls")),
+            Some(HardLimit::Deny(_))
+        ));
     }
 
     /// A deny rule wins over everything; an ask rule asks; the critical-path

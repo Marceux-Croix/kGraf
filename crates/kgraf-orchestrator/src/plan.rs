@@ -352,6 +352,112 @@ pub fn valid_write_path(path: &str) -> bool {
         && !kgraf_runtime::is_build_config_path(p)
 }
 
+/// Why [`valid_write_path`] refuses `path`, worded to follow "declares write
+/// `<path>`, which". An absolute path or one that leaves the repository is a
+/// path problem the planner fixes by writing a relative path; protected state
+/// (`.kgraf`, `.git`, ...) and build configuration are named as what they are,
+/// since a relative path was never the problem there.
+fn write_path_refusal(path: &str) -> String {
+    use std::path::Component;
+    let p = std::path::Path::new(path);
+    let leaves = p.as_os_str().is_empty()
+        || p.components().any(|c| {
+            matches!(
+                c,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        });
+    if leaves {
+        return "is not a relative path inside the repository".to_owned();
+    }
+    if let Some(why) = p.components().find_map(|c| match c {
+        Component::Normal(n) => kgraf_core::paths::protected_name_reason(&n.to_string_lossy()),
+        _ => None,
+    }) {
+        return format!("names protected state: {why}");
+    }
+    if kgraf_runtime::is_build_config_path(p) {
+        return "is Cargo or rustup configuration, which kGraf never merges from a worker"
+            .to_owned();
+    }
+    "is not a path a worker may write".to_owned()
+}
+
+/// What [`normalize_plan`] changed, one line per kind of change, for the run's
+/// notices: a leniency is always stated, never silent.
+pub type PlanNotices = Vec<String>;
+
+/// Repairs in a plan the planner's intent makes certain, each stated in the
+/// returned notices (a notice, never a refusal, since a re-ask on a local model
+/// costs minutes):
+///
+/// - a contract's `route` that is no configured route but is a task-kind word
+///   (`implementation`, `tests`, ...) is taken as unset; the word becomes the
+///   contract's `task_kind` when that is absent;
+/// - a declared write that is an absolute path inside `repo_root` becomes the
+///   repository-relative path. An absolute path outside the root stays as
+///   written, so [`validate_plan`] refuses it.
+pub fn normalize_plan(
+    mut contracts: Vec<ContractSpec>,
+    repo_root: Option<&std::path::Path>,
+    roster: &[String],
+) -> (Vec<ContractSpec>, PlanNotices) {
+    let mut notices: BTreeSet<String> = BTreeSet::new();
+    let roots: Vec<std::path::PathBuf> = repo_root
+        .into_iter()
+        .flat_map(|r| [Some(r.to_path_buf()), r.canonicalize().ok()])
+        .flatten()
+        .collect();
+    for c in &mut contracts {
+        if let Some(r) = c.route.clone()
+            && !roster.contains(&r)
+            && let Some(kind) = kgraf_core::model_profile::TaskKind::ALL
+                .into_iter()
+                .find(|k| k.as_str().eq_ignore_ascii_case(r.trim()))
+        {
+            c.route = None;
+            let adopted = if c.task_kind.is_none() {
+                c.task_kind = Some(kind);
+                format!(" and used as its task kind `{}`", kind.as_str())
+            } else {
+                String::new()
+            };
+            notices.insert(format!(
+                "contract `{}` named route `{r}`, which is a task kind and no configured route; \
+                 its route was left unset{adopted}",
+                c.id
+            ));
+        }
+        for w in &mut c.writes {
+            let p = std::path::Path::new(&w.path);
+            if !p.is_absolute() {
+                continue;
+            }
+            let inside = roots
+                .iter()
+                .find_map(|root| p.strip_prefix(root).ok())
+                // A `..` after the root leaves it again: left as written.
+                .filter(|rel| {
+                    !rel.as_os_str().is_empty()
+                        && !rel
+                            .components()
+                            .any(|c| matches!(c, std::path::Component::ParentDir))
+                });
+            if let Some(rel) = inside
+                && let Some(rel) = rel.to_str()
+            {
+                notices.insert(format!(
+                    "contract `{}` declared the absolute write `{}`; it was taken as the \
+                     repository-relative `{rel}`",
+                    c.id, w.path
+                ));
+                w.path = rel.to_owned();
+            }
+        }
+    }
+    (contracts, notices.into_iter().collect())
+}
+
 /// Whether `path` names a directory or a glob rather than one file: a
 /// trailing `/`, or a glob metacharacter (`*`, `?`). Square brackets are not
 /// one: a write scope matches an exact path, and `[id]` is an ordinary file
@@ -506,8 +612,10 @@ pub fn validate_plan_with(
                 && kgraf_core::paths::is_bypass_git_file(std::path::Path::new(&w.path));
             if !valid_write_path(&w.path) && !git_file {
                 return Err(PlanError::Invalid(format!(
-                    "contract `{}` declares write `{}`, which is not a relative path inside the repository",
-                    c.id, w.path
+                    "contract `{}` declares write `{}`, which {}",
+                    c.id,
+                    w.path,
+                    write_path_refusal(&w.path)
                 )));
             }
             if is_glob_or_directory(&w.path) {
@@ -966,7 +1074,9 @@ acceptance never asks a worker to stage, commit or push with git. Label each con
 \"implementation\" (behavior behind a fixed interface), \"tests\", \"refactor\" \
 (structure without behavior change), \"scripting\" (shell, build and glue scripts) or \
 \"docs\" (prose). This is what decision 0075's fitness routing picks a model by; omit it \
-only when truly unclear, since it then defaults to \"implementation\". A contract's \
+only when truly unclear, since it then defaults to \"implementation\". A kind goes in \
+\"task_kind\" only. A contract's \"route\" is null unless the request's Routes line lists \
+that exact route name; a kind word is never a route. A contract's \
 \"tools\" may name only tools on the request's Tools line, spelled exactly as listed; a \
 contract that names a tool its route does not offer is refused before it starts. A \
 contract's \"depends_on\" lists the ids of other contracts in this answer that must land \
@@ -1803,6 +1913,134 @@ mod tests {
         let err = validate_plan(&[s], &BTreeSet::new(), &["kimi".to_owned()], &[], 32)
             .expect_err("unknown route");
         assert!(err.to_string().contains("not configured"));
+    }
+
+    /// A task-kind word in `route` is the planner mixing two fields up, not a
+    /// pin: it is taken as unset and said, never a re-ask. A real route name
+    /// that equals a kind word is still a route; an unknown non-kind name is
+    /// still refused.
+    #[test]
+    fn a_task_kind_word_in_route_is_left_unset_with_a_notice() {
+        let roster = vec!["kimi".to_owned(), "docs".to_owned()];
+        let mut a = spec("a", &[]);
+        a.route = Some("implementation".into());
+        let mut b = spec("b", &[]);
+        b.route = Some("Tests".into());
+        b.task_kind = Some(kgraf_core::model_profile::TaskKind::Docs);
+        let mut c = spec("c", &[]);
+        c.route = Some("docs".into());
+        let mut d = spec("d", &[]);
+        d.route = Some("openai:gpt".into());
+        let (out, notices) = normalize_plan(vec![a, b, c, d], None, &roster);
+        assert_eq!(out[0].route, None);
+        assert_eq!(
+            out[0].task_kind,
+            Some(kgraf_core::model_profile::TaskKind::Implementation)
+        );
+        assert_eq!(out[1].route, None);
+        assert_eq!(
+            out[1].task_kind,
+            Some(kgraf_core::model_profile::TaskKind::Docs),
+            "an explicit task_kind is kept"
+        );
+        assert_eq!(
+            out[2].route.as_deref(),
+            Some("docs"),
+            "a configured route stays"
+        );
+        assert_eq!(out[3].route.as_deref(), Some("openai:gpt"));
+        assert_eq!(notices.len(), 2, "{notices:?}");
+        assert!(
+            notices.iter().all(|n| n.contains("task kind")),
+            "{notices:?}"
+        );
+        // The unknown, non-kind route is still refused by validation.
+        let err = validate_plan(&out, &BTreeSet::new(), &roster, &[], 32).expect_err("refused");
+        assert!(err.to_string().contains("`openai:gpt`"), "{err}");
+    }
+
+    /// An absolute write path inside the repository becomes the relative path,
+    /// with a notice; one outside it stays and is refused.
+    #[test]
+    fn an_absolute_write_inside_the_repository_is_made_relative_with_a_notice() {
+        let dir = tempfile::tempdir().expect("dir");
+        let root = dir.path();
+        let inside = root.join("src").join("answer.txt");
+        let mut a = spec("a", &[]);
+        a.writes = vec![
+            WriteTarget {
+                path: inside.to_string_lossy().into_owned(),
+                node: None,
+            },
+            WriteTarget {
+                path: "src/b.rs".into(),
+                node: None,
+            },
+        ];
+        let mut b = spec("b", &[]);
+        b.writes = vec![WriteTarget {
+            path: "/etc/passwd".into(),
+            node: None,
+        }];
+        let mut c = spec("c", &[]);
+        c.writes = vec![WriteTarget {
+            path: root.join("..").join("x").to_string_lossy().into_owned(),
+            node: None,
+        }];
+        let (out, notices) = normalize_plan(vec![a, b, c], Some(root), &[]);
+        assert_eq!(out[0].writes[0].path, "src/answer.txt");
+        assert_eq!(out[0].writes[1].path, "src/b.rs");
+        assert_eq!(out[1].writes[0].path, "/etc/passwd");
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].contains("src/answer.txt"), "{notices:?}");
+        for spec_out in &out[1..] {
+            let err = validate_plan(
+                std::slice::from_ref(spec_out),
+                &BTreeSet::new(),
+                &[],
+                &[],
+                32,
+            )
+            .expect_err("outside the repository");
+            assert!(
+                err.to_string()
+                    .contains("not a relative path inside the repository"),
+                "{err}"
+            );
+        }
+        // Without a known root nothing is rewritten.
+        let mut d = spec("d", &[]);
+        d.writes[0].path = inside.to_string_lossy().into_owned();
+        let (out, notices) = normalize_plan(vec![d], None, &[]);
+        assert!(out[0].writes[0].path.starts_with('/'));
+        assert!(notices.is_empty());
+    }
+
+    /// Protected kGraf state and build configuration are refused under their
+    /// own names, not as a relative-path problem.
+    #[test]
+    fn a_protected_write_is_refused_with_its_own_reason() {
+        let refusal = |path: &str| {
+            let mut s = spec("a", &[]);
+            s.writes[0].path = path.into();
+            validate_plan(&[s], &BTreeSet::new(), &[], &[], 32)
+                .expect_err("refused")
+                .to_string()
+        };
+        let state = refusal(".kgraf/ledger.db");
+        assert!(state.contains("protected state"), "{state}");
+        assert!(!state.contains("not a relative path"), "{state}");
+        assert!(refusal("sub/.git/config").contains("protected state"));
+        assert!(refusal(".cargo/config.toml").contains("Cargo or rustup configuration"));
+        assert!(refusal("../x").contains("not a relative path inside the repository"));
+        assert!(refusal("/abs/x").contains("not a relative path inside the repository"));
+    }
+
+    /// The decomposition prompt keeps the route and task-kind fields apart.
+    #[test]
+    fn the_prompt_keeps_route_and_task_kind_apart() {
+        assert!(DECOMPOSE_SYSTEM.contains("never a route"));
+        assert!(DECOMPOSE_SYSTEM.contains("\"task_kind\" only"));
     }
 
     #[test]

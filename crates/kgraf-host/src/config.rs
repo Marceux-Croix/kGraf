@@ -69,6 +69,12 @@ pub struct RunConfig {
     /// Model rounds per worker (`--steps`).
     #[serde(default = "defaults::steps")]
     pub steps: u32,
+    /// The most progress checkpoints a worker may reach (`--max-checkpoints`,
+    /// decision 0096): a worker's round budget is a block that is extended
+    /// while it makes measured progress, at most this many blocks. 1 is a
+    /// fixed round limit.
+    #[serde(default = "defaults::max_checkpoints")]
+    pub max_checkpoints: u32,
     /// Output ceiling per worker round (`--max-tokens`).
     #[serde(default = "defaults::max_tokens")]
     pub max_tokens: u32,
@@ -234,13 +240,16 @@ pub mod defaults {
         8
     }
     pub fn steps() -> u32 {
-        30
+        crate::limits::DEFAULT_ROUNDS_ORCHESTRATED
+    }
+    pub fn max_checkpoints() -> u32 {
+        crate::limits::DEFAULT_MAX_CHECKPOINTS
     }
     pub fn max_tokens() -> u32 {
-        4096
+        crate::limits::DEFAULT_WORKER_MAX_TOKENS
     }
     pub fn window() -> u64 {
-        128_000
+        crate::limits::DEFAULT_WINDOW
     }
     pub fn verify() -> String {
         "cargo test --workspace".to_owned()
@@ -278,9 +287,10 @@ pub mod defaults {
     pub fn sessions() -> bool {
         true
     }
-    /// The orchestrator's output ceiling before the setting existed.
+    /// The orchestrator's output ceiling; a model with a lower supported
+    /// output limit lowers it for that run, with a notice.
     pub fn planner_max_tokens() -> u32 {
-        8_192
+        crate::limits::DEFAULT_PLANNER_MAX_TOKENS
     }
 }
 
@@ -325,6 +335,7 @@ impl RunConfig {
             max_items: defaults::max_items(),
             max_agents: defaults::max_agents(),
             steps: defaults::steps(),
+            max_checkpoints: defaults::max_checkpoints(),
             max_tokens: defaults::max_tokens(),
             window: defaults::window(),
             point: None,
@@ -357,6 +368,18 @@ impl RunConfig {
     /// notice on stderr, per file loaded, naming which were set and that they
     /// no longer apply.
     pub fn load(root: impl Into<PathBuf>, path: &Path) -> Result<Self> {
+        Self::load_with(root, path, &crate::limits::UserLimits::default())
+    }
+
+    /// [`RunConfig::load`], where a limit the file does not set takes the
+    /// user's setting before the built-in default (the file, like a flag,
+    /// outranks the setting). The five limits are `steps`, `max_checkpoints`,
+    /// `max_tokens`, `planner_max_tokens` and `window`.
+    pub fn load_with(
+        root: impl Into<PathBuf>,
+        path: &Path,
+        user: &crate::limits::UserLimits,
+    ) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_step(|| format!("cannot read {}", path.display()))?;
         // Said plainly, rather than as serde's "unknown field": the key was
@@ -393,6 +416,7 @@ impl RunConfig {
         let mut config: RunConfig = serde_json::from_str(&text)
             .with_step(|| format!("{} is not a run configuration", path.display()))?;
         config.root = root.into();
+        config.apply_user_limits(user, &text);
         if config.prices.is_relative()
             && let Some(dir) = path.parent()
         {
@@ -400,6 +424,38 @@ impl RunConfig {
         }
         config.notice_deprecated_caps(path);
         Ok(config)
+    }
+
+    /// Set each limit that the run file `text` leaves out to the user's
+    /// setting, when there is one.
+    fn apply_user_limits(&mut self, user: &crate::limits::UserLimits, text: &str) {
+        let file: serde_json::Value = serde_json::from_str(text).unwrap_or_default();
+        let unset = |key: &str| file.get(key).is_none();
+        if unset("steps")
+            && let Some(v) = user.rounds
+        {
+            self.steps = v;
+        }
+        if unset("max_checkpoints")
+            && let Some(v) = user.max_checkpoints
+        {
+            self.max_checkpoints = v;
+        }
+        if unset("max_tokens")
+            && let Some(v) = user.worker_max_tokens
+        {
+            self.max_tokens = v;
+        }
+        if unset("planner_max_tokens")
+            && let Some(v) = user.planner_max_tokens
+        {
+            self.planner_max_tokens = v;
+        }
+        if unset("window")
+            && let Some(v) = user.window
+        {
+            self.window = v;
+        }
     }
 
     /// The stderr notice `RunConfig::load` prints once per loaded file that
@@ -502,6 +558,11 @@ impl RunConfig {
                     )));
                 }
             }
+        }
+        if self.max_checkpoints == 0 {
+            return Err(Error::Invalid(
+                "--max-checkpoints must be at least 1: 1 keeps the fixed round limit".into(),
+            ));
         }
         // An empty command runs as a no-op shell and passes, so an empty
         // acceptance or gate command would accept everything.
@@ -1259,5 +1320,47 @@ mod tests {
         ));
         check_model_routes(&[spec("typed-decision=systemone:jev-latest")], Some(&none))
             .expect("a local route needs no key");
+    }
+
+    /// A limit the run file leaves out takes the user's setting, then the
+    /// default; a limit the file names stays the file's (like a flag).
+    #[test]
+    fn a_run_file_outranks_the_user_setting_which_outranks_the_default() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("run.json");
+        let user = crate::limits::UserLimits {
+            rounds: Some(55),
+            max_checkpoints: Some(4),
+            worker_max_tokens: Some(2_048),
+            planner_max_tokens: Some(65_536),
+            window: Some(200_000),
+        };
+        std::fs::write(
+            &path,
+            r#"{"routes": ["kimi:model"], "prices": "p.json", "steps": 9, "window": 64000}"#,
+        )
+        .expect("write");
+        let c = RunConfig::load_with(dir.path(), &path, &user).expect("load");
+        assert_eq!(c.steps, 9, "the file wins");
+        assert_eq!(c.window, 64_000, "the file wins");
+        assert_eq!(c.max_tokens, 2_048, "the setting fills what the file omits");
+        assert_eq!(c.planner_max_tokens, 65_536);
+        assert_eq!(
+            c.max_checkpoints, 4,
+            "the setting fills what the file omits"
+        );
+        let c = RunConfig::load(dir.path(), &path).expect("load");
+        assert_eq!(c.max_checkpoints, 10, "no setting: default");
+        std::fs::write(
+            &path,
+            r#"{"routes": ["kimi:model"], "prices": "p.json", "max_checkpoints": 2}"#,
+        )
+        .expect("write");
+        let c = RunConfig::load_with(dir.path(), &path, &user).expect("load");
+        assert_eq!(c.max_checkpoints, 2, "the file wins");
+        let c = RunConfig::load(dir.path(), &path).expect("load");
+        assert_eq!(c.max_tokens, defaults::max_tokens(), "no setting: default");
+        assert_eq!(c.planner_max_tokens, 32_768);
+        assert_eq!(c.max_tokens, 16_384);
     }
 }

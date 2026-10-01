@@ -129,6 +129,7 @@ pub fn open_project_parts(
     with_scheduler: bool,
     wake: kgraf_orchestrator::Wake,
     permissions: Option<permission_bar::PermissionUi>,
+    run_limits: kgraf_host::limits::SharedLimits,
 ) -> ProjectParts {
     if !project.is_dir() {
         return ProjectParts {
@@ -154,6 +155,7 @@ pub fn open_project_parts(
     let router = Arc::new(kgraf_orchestrator::AskRouter::new(desk.clone()));
     let factory = scheduler_bg::ProjectFactory::for_project(project.to_path_buf())
         .with_worktree_retention(worktrees)
+        .with_run_limits(run_limits)
         .with_ask_resolver(router.clone());
     // Decision 0094: one permission control for the process, from the
     // user-level file beside the settings file.
@@ -379,6 +381,8 @@ pub fn run_with_host(
             // A host given by the caller serves the `--project` folder.
             // `restore` hands the opener canonical paths, so the match is on the
             // canonical `--project` too: `./repo` and `/abs/repo` are one folder.
+            // One value for every project's factory; the sliders write it.
+            let run_limits = kgraf_host::limits::SharedLimits::new(settings.limits.user_limits());
             let mut given = host;
             let launch = project.as_deref().map(projects::canonical);
             let workspace = Workspace::restore(
@@ -400,6 +404,7 @@ pub fn run_with_host(
                         with_scheduler,
                         wake.clone(),
                         Some(permissions.clone()),
+                        run_limits.clone(),
                     ),
                 },
             );
@@ -407,6 +412,7 @@ pub fn run_with_host(
             settings.active_project = workspace.active().map(|p| p.root.clone());
             let opener_wake = wake.clone();
             let opener_permissions = permissions.clone();
+            let opener_limits = run_limits.clone();
             let opener: projects::Opener = Box::new(move |root, background, worktrees| {
                 open_project_parts(
                     root,
@@ -415,6 +421,7 @@ pub fn run_with_host(
                     with_scheduler,
                     opener_wake.clone(),
                     Some(opener_permissions.clone()),
+                    opener_limits.clone(),
                 )
             });
             let mut app = ShellApp::new(AppParts {
@@ -433,6 +440,7 @@ pub fn run_with_host(
                 update,
                 permissions: Some(permissions.clone()),
             });
+            app.use_run_limits(run_limits);
             app.enable_compaction_measurement();
             Ok(Box::new(app))
         }),

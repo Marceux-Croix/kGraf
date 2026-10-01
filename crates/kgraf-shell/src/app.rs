@@ -392,6 +392,10 @@ pub struct ShellApp {
     compaction_measure: Option<crate::compaction_measure::Measurement>,
     /// The user's live permission control (decision 0094).
     pub(crate) permissions: Option<crate::permission_bar::PermissionUi>,
+    /// The run limits the sliders set, shared with every project's run factory
+    /// (`ProjectFactory::with_run_limits`): written each frame from the settings
+    /// when they changed, read by a factory when it opens a host.
+    run_limits: kgraf_host::limits::SharedLimits,
 }
 
 /// Everything `ShellApp` needs at creation.
@@ -429,6 +433,7 @@ pub struct AppParts {
 impl ShellApp {
     pub fn new(parts: AppParts) -> Self {
         let chrome = ChromeState::default();
+        let parts_limits = parts.settings.limits.user_limits();
         Self {
             settings: parts.settings,
             store: parts.store,
@@ -459,6 +464,22 @@ impl ShellApp {
             update: parts.update,
             permissions: parts.permissions,
             compaction_measure: None,
+            run_limits: kgraf_host::limits::SharedLimits::new(parts_limits),
+        }
+    }
+
+    /// Shares `limits` with the project factories opened before this app
+    /// existed: from the next frame the sliders write to it.
+    pub fn use_run_limits(&mut self, limits: kgraf_host::limits::SharedLimits) {
+        limits.set(self.settings.limits.user_limits());
+        self.run_limits = limits;
+    }
+
+    /// Pushes the run-limit sliders to the shared value when they changed.
+    pub(crate) fn sync_run_limits(&mut self) {
+        let now = self.settings.limits.user_limits();
+        if self.run_limits.get() != now {
+            self.run_limits.set(now);
         }
     }
 
@@ -546,6 +567,7 @@ impl ShellApp {
         self.sync_capacity_sources();
         self.sync_compaction_recommendation();
         self.sync_parallelism();
+        self.sync_run_limits();
         let max_writers = self.machine_gate().limits().max_writers.max(1) as usize;
         let effective_agents = self.settings.parallelism.effective().max(1) as usize;
         let limits = kgraf_orchestrator::Limits::new(max_writers, effective_agents)
@@ -1925,6 +1947,37 @@ mod tests {
         store.persist_if_changed(&s);
         assert_eq!(Settings::load(&path).expect("load"), s);
         assert!(store.last_error.is_none());
+    }
+
+    /// Moving a run-limit slider reaches the value every project's run factory
+    /// reads, from the next frame (the mechanism, not the saved setting).
+    #[test]
+    fn a_moved_run_limit_slider_reaches_the_shared_value() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = headless_app(
+            dir.path(),
+            kgraf_capacity::Capacity {
+                max_agents: 4,
+                max_writers: 2,
+                exec_slots: 2,
+                bounds: Vec::new(),
+            },
+        );
+        let shared = kgraf_host::limits::SharedLimits::default();
+        app.use_run_limits(shared.clone());
+        assert_eq!(shared.get(), kgraf_host::limits::UserLimits::default());
+        app.settings.limits.rounds.set_by_user(77);
+        app.settings.limits.window.set_by_user(64_000);
+        app.settings.limits.max_checkpoints.set_by_user(1);
+        app.sync_run_limits();
+        let got = shared.get();
+        assert_eq!((got.rounds, got.window), (Some(77), Some(64_512)));
+        assert_eq!(got.max_checkpoints, Some(1));
+        app.settings.limits.rounds.reset();
+        app.settings.limits.max_checkpoints.reset();
+        app.sync_run_limits();
+        assert_eq!(shared.get().rounds, None, "back to following the default");
+        assert_eq!(shared.get().max_checkpoints, None);
     }
 
     #[test]
