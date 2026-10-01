@@ -233,10 +233,6 @@ fn bypass_still_refuses_the_books_and_the_rest() {
     }
 }
 
-fn argv(words: &[&str]) -> Vec<String> {
-    words.iter().map(|w| (*w).to_owned()).collect()
-}
-
 /// A second linked worktree `name` on a new branch, with its admin dir.
 fn add_worktree(r: &Repo, name: &str) -> (PathBuf, PathBuf) {
     let wt = r.state.join("worktrees").join(name);
@@ -448,17 +444,11 @@ fn a_shell_command_that_corrupts_a_ref_is_caught_after_it_runs() {
     let r = repo();
     let c = control(PermissionMode::Bypass);
     let g = guard(&r, c.clone());
-    let w = g
-        .before_shell(&argv(&["git", "status"]))
-        .expect("snapshot")
-        .expect("bypass");
+    let w = g.before_shell().expect("snapshot").expect("bypass");
     assert_eq!(w.root(), r.common);
     g.after_shell(w).expect("nothing changed");
     assert!(outcomes(&c).is_empty());
-    let w = g
-        .before_shell(&argv(&["git", "status"]))
-        .expect("snapshot")
-        .expect("bypass");
+    let w = g.before_shell().expect("snapshot").expect("bypass");
     std::fs::write(r.common.join("refs/heads/other"), "zzz\n").expect("corrupt");
     let err = g.after_shell(w).expect_err("detected");
     assert!(
@@ -474,35 +464,37 @@ fn a_shell_command_that_corrupts_a_ref_is_caught_after_it_runs() {
 fn outside_bypass_the_shell_gets_no_git_window() {
     let r = repo();
     let g = guard(&r, control(PermissionMode::Auto));
-    assert!(
-        g.before_shell(&argv(&["git", "commit"]))
-            .expect("ok")
-            .is_none()
-    );
+    assert!(g.before_shell().expect("ok").is_none());
 }
 
-/// In Bypass only a command that names git or the git directory opens a
-/// window; a build does not, so it never waits on the repository lock.
+/// In Bypass every command opens a window, and an open window holds no
+/// repository lock: another taker gets the lock exclusively while it is open.
+/// A command that changes nothing takes no lock after it either: it ends
+/// while another holder keeps the lock.
 #[test]
-fn only_a_command_that_names_git_opens_a_window() {
+fn every_bypass_command_opens_a_window_that_holds_no_lock() {
     let r = repo();
-    let g = guard(&r, control(PermissionMode::Bypass));
-    for words in [
-        vec!["git", "commit", "-m", "x"],
-        vec!["/usr/bin/git", "status"],
-        vec!["sh", "-c", "echo x > .git/info/exclude"],
-        vec!["sh", "-c", "make GIT=1"],
-    ] {
-        assert!(g.names_git(&argv(&words)), "{words:?}");
-    }
-    for words in [
-        vec!["cargo", "build"],
-        vec!["sh", "-c", "make test"],
-        vec!["ls", "-la"],
-    ] {
-        assert!(!g.names_git(&argv(&words)), "{words:?}");
-        assert!(g.before_shell(&argv(&words)).expect("ok").is_none());
-    }
+    let g = guard(&r, control(PermissionMode::Bypass)).with_lock_timeout(Duration::from_secs(5));
+    let w = g.before_shell().expect("snapshot").expect("every command");
+    assert_eq!(w.root(), r.common);
+    assert_eq!(windows::open_count(&r.common), 1);
+    let held = repo_lock::acquire(
+        &r.common,
+        repo_lock::Mode::Exclusive,
+        "another check",
+        Duration::from_millis(200),
+    )
+    .expect("the open window holds no lock");
+    let start = std::time::Instant::now();
+    g.after_shell(w).expect("nothing changed");
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "an unchanged command did not wait for the lock: {:?}",
+        start.elapsed()
+    );
+    assert_eq!(windows::open_count(&r.common), 0);
+    drop(held);
+    g.finish().expect("nothing changed");
 }
 
 #[test]
@@ -576,10 +568,7 @@ fn deleted_objects_are_restored_and_the_attempt_fails() {
     let mut victims = packs.clone();
     victims.push(loose_file.clone());
     let before = bytes(&victims);
-    let w = g
-        .before_shell(&argv(&["sh", "-c", "git gc --prune=now"]))
-        .expect("snapshot")
-        .expect("window");
+    let w = g.before_shell().expect("snapshot").expect("window");
     let (method, dir) = g.object_snapshot().expect("taken");
     assert_eq!(method, ObjectSnapshotMethod::HardLink);
     assert!(
@@ -612,10 +601,7 @@ fn a_repack_that_loses_no_object_passes() {
     let r = repo();
     let g = guard(&r, control(PermissionMode::Bypass));
     let (_packs, head) = packed_then_loose(&r, "b.txt");
-    let w = g
-        .before_shell(&argv(&["git", "repack", "-a", "-d"]))
-        .expect("snapshot")
-        .expect("window");
+    let w = g.before_shell().expect("snapshot").expect("window");
     git(&r.checkout, &["repack", "-a", "-d", "-q"]);
     git(&r.checkout, &["prune-packed"]);
     assert!(!loose(&r, &head).exists());
@@ -632,10 +618,7 @@ fn objects_written_by_others_and_new_objects_survive_a_restore() {
     let r = repo();
     let g = guard(&r, control(PermissionMode::Bypass));
     let (packs, _head) = packed_then_loose(&r, "b.txt");
-    let w = g
-        .before_shell(&argv(&["git", "status"]))
-        .expect("snapshot")
-        .expect("window");
+    let w = g.before_shell().expect("snapshot").expect("window");
     g.after_shell(w).expect("nothing changed");
     // Another worker's merge, between this attempt's windows.
     let (wt2, _admin2) = add_worktree(&r, "w2");
@@ -643,10 +626,7 @@ fn objects_written_by_others_and_new_objects_survive_a_restore() {
     git(&wt2, &["add", "c.txt"]);
     git(&wt2, &["commit", "-q", "-m", "c"]);
     let theirs = git(&wt2, &["rev-parse", "HEAD"]);
-    let w = g
-        .before_shell(&argv(&["git", "status"]))
-        .expect("snapshot")
-        .expect("window");
+    let w = g.before_shell().expect("snapshot").expect("window");
     // The command writes a new object, then deletes the pack and the other
     // worker's commit.
     let mine = git(&r.checkout, &["hash-object", "-w", "--stdin"]);
@@ -677,10 +657,7 @@ fn the_copy_fallback_restores_and_verifies_by_hash() {
     let mut victims = packs.clone();
     victims.push(loose(&r, &head));
     let before = bytes(&victims);
-    let w = g
-        .before_shell(&argv(&["git", "gc"]))
-        .expect("snapshot")
-        .expect("window");
+    let w = g.before_shell().expect("snapshot").expect("window");
     let (method, dir) = g.object_snapshot().expect("taken");
     assert_eq!(method, ObjectSnapshotMethod::Copy);
     assert!(dir.join("owner").is_file(), "{}", dir.display());
@@ -710,10 +687,7 @@ fn a_copy_that_fails_its_hash_is_not_restored() {
     let r = repo();
     let g = guard(&r, control(PermissionMode::Bypass)).with_object_copies();
     let (_packs, head) = packed_then_loose(&r, "b.txt");
-    let w = g
-        .before_shell(&argv(&["git", "gc"]))
-        .expect("snapshot")
-        .expect("window");
+    let w = g.before_shell().expect("snapshot").expect("window");
     let (_, dir) = g.object_snapshot().expect("taken");
     let file = loose(&r, &head);
     let rel = file.strip_prefix(r.common.join("objects")).expect("rel");
@@ -739,10 +713,7 @@ fn an_object_altered_in_place_is_reported_not_restorable() {
     let r = repo();
     let g = guard(&r, control(PermissionMode::Bypass));
     let (_packs, head) = packed_then_loose(&r, "b.txt");
-    let w = g
-        .before_shell(&argv(&["git", "status"]))
-        .expect("snapshot")
-        .expect("window");
+    let w = g.before_shell().expect("snapshot").expect("window");
     let file = loose(&r, &head);
     let mut perms = std::fs::metadata(&file).expect("meta").permissions();
     #[allow(clippy::permissions_set_readonly_false)]
@@ -754,8 +725,59 @@ fn an_object_altered_in_place_is_reported_not_restorable() {
         .open(&file)
         .and_then(|mut f| std::io::Write::write_all(&mut f, b"x"))
         .expect("in place");
-    let err = g.after_shell(w).expect_err("detected");
+    // Its directory is unchanged, so the per-command check sees it only
+    // while that directory is racy (just written, as here); the
+    // end-of-attempt pass compares every object file either way.
+    let early = g.after_shell(w).err().unwrap_or_default();
+    let err = g.finish().expect_err("detected at the latest at the end");
+    assert!(
+        early.contains("altered in place") || err.contains("altered in place"),
+        "{early} / {err}"
+    );
+}
+
+/// The same alteration in a directory whose record is settled (older than
+/// the racy margin): the per-command check reads no file there and passes;
+/// the end-of-attempt pass finds it.
+#[cfg(unix)]
+#[test]
+fn an_object_altered_in_place_in_a_settled_directory_is_found_at_the_end() {
+    let r = repo();
+    let g = guard(&r, control(PermissionMode::Bypass));
+    let (_packs, head) = packed_then_loose(&r, "b.txt");
+    std::thread::sleep(objects::RACY + Duration::from_millis(500));
+    let w = g.before_shell().expect("snapshot").expect("window");
+    let file = loose(&r, &head);
+    let mut perms = std::fs::metadata(&file).expect("meta").permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    perms.set_readonly(false);
+    std::fs::set_permissions(&file, perms).expect("chmod");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&file)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, b"x"))
+        .expect("in place");
+    g.after_shell(w).expect("the directory did not change");
+    let err = g.finish().expect_err("detected at the end");
     assert!(err.contains("altered in place"), "{err}");
+}
+
+/// A deletion in a settled object directory changes that directory's
+/// record, so the per-command check reads it again and finds the loss.
+#[test]
+fn a_deletion_in_a_settled_object_directory_is_found_after_the_command() {
+    let r = repo();
+    let g = guard(&r, control(PermissionMode::Bypass));
+    let (_packs, head) = packed_then_loose(&r, "b.txt");
+    std::thread::sleep(objects::RACY + Duration::from_millis(500));
+    let w = g.before_shell().expect("snapshot").expect("window");
+    let file = loose(&r, &head);
+    let before = std::fs::read(&file).expect("read");
+    std::fs::remove_file(&file).expect("delete");
+    let err = g.after_shell(w).expect_err("detected");
+    assert!(err.contains("object files restored"), "{err}");
+    assert_eq!(std::fs::read(&file).expect("restored"), before);
 }
 
 /// A real other file system, where this machine has one at hand (Linux
@@ -789,10 +811,7 @@ fn a_state_directory_on_another_file_system_falls_back_to_copies() {
             json_check(),
         );
         let (_packs, head) = packed_then_loose(&r, "b.txt");
-        let w = g
-            .before_shell(&argv(&["git", "gc"]))
-            .expect("snapshot")
-            .expect("window");
+        let w = g.before_shell().expect("snapshot").expect("window");
         assert_eq!(
             g.object_snapshot().expect("taken").0,
             ObjectSnapshotMethod::Copy
@@ -811,9 +830,7 @@ fn an_object_store_over_the_copy_bound_gets_no_window() {
     let g = guard(&r, control(PermissionMode::Bypass))
         .with_object_copies()
         .with_object_copy_limit(16);
-    let err = g
-        .before_shell(&argv(&["git", "commit"]))
-        .expect_err("over the bound");
+    let err = g.before_shell().expect_err("over the bound");
     assert!(
         matches!(&err, WindowError::Unprotected(e) if e.contains("16-byte bound")),
         "{err}"
@@ -832,113 +849,290 @@ fn an_object_store_over_the_copy_bound_gets_no_window() {
     .expect("the lock was released");
 }
 
-// ---- serialization ----
+// ---- parallel commands and attribution ----
 
-/// Two workers' Bypass shell windows that each write a ref at the same time
-/// run one after the other: their windows never overlap, each check names
-/// only its own ref, and both writes land.
-#[test]
-fn two_workers_writing_refs_at_once_are_serialized() {
-    let r = repo();
-    let (wt2, admin2) = add_worktree(&r, "w2");
-    let tree = git(&r.checkout, &["rev-parse", "HEAD^{tree}"]);
+/// Two Bypass guards on one repository, workers `w1` and `w2`, each with
+/// its own worktree, and their permission controls.
+type Pair = (
+    Arc<ProtectedWrites>,
+    Arc<ProtectedWrites>,
+    Arc<PermissionControl>,
+    Arc<PermissionControl>,
+);
+
+fn pair(r: &Repo) -> Pair {
+    let (wt2, admin2) = add_worktree(r, "w2");
     let c1 = control(PermissionMode::Bypass);
     let c2 = control(PermissionMode::Bypass);
-    let g1 = Arc::new(guard(&r, c1.clone()));
-    let g2 = Arc::new(guard_for(&r, c2.clone(), "w2", wt2, admin2));
+    let g1 = Arc::new(guard(r, c1.clone()));
+    let g2 = Arc::new(guard_for(r, c2.clone(), "w2", wt2, admin2));
+    (g1, g2, c1, c2)
+}
+
+/// Run `command` in a window of each guard on its own thread: every window
+/// opens before any command runs (so the commands overlap); `between` is
+/// waited on after each command and before its check (to line the checks
+/// up). Returns each thread's command span and its `after_shell` result, in
+/// guard order.
+#[allow(clippy::type_complexity)]
+fn run_parallel(
+    guards: Vec<(Arc<ProtectedWrites>, Box<dyn FnOnce() + Send>)>,
+    between: Arc<std::sync::Barrier>,
+) -> Vec<((std::time::Instant, std::time::Instant), Result<(), String>)> {
+    let opened = Arc::new(std::sync::Barrier::new(guards.len()));
+    let threads: Vec<_> = guards
+        .into_iter()
+        .map(|(g, command)| {
+            let opened = opened.clone();
+            let between = between.clone();
+            std::thread::spawn(move || {
+                let w = g.before_shell().expect("window").expect("bypass");
+                opened.wait();
+                let began = std::time::Instant::now();
+                command();
+                let ended = std::time::Instant::now();
+                between.wait();
+                ((began, ended), g.after_shell(w))
+            })
+        })
+        .collect();
+    threads
+        .into_iter()
+        .map(|t| t.join().expect("join"))
+        .collect()
+}
+
+fn overlap(
+    a: (std::time::Instant, std::time::Instant),
+    b: (std::time::Instant, std::time::Instant),
+) -> bool {
+    a.0 < b.1 && b.0 < a.1
+}
+
+/// Two workers' commands that do not touch git (a real process each, as a
+/// build would be) run at the same time: their spans overlap, nothing is
+/// checked and nothing is recorded.
+#[test]
+fn two_workers_commands_that_do_not_touch_git_run_in_parallel() {
+    let r = repo();
+    let (g1, g2, c1, c2) = pair(&r);
+    let sleep = |dir: PathBuf| -> Box<dyn FnOnce() + Send> {
+        Box::new(move || {
+            let ok = Command::new("sh")
+                .args(["-c", "sleep 0.4; echo built > out.txt"])
+                .current_dir(dir)
+                .status()
+                .expect("sh")
+                .success();
+            assert!(ok);
+        })
+    };
+    let w2_root = r.state.join("worktrees").join("w2");
+    let results = run_parallel(
+        vec![
+            (g1.clone(), sleep(r.worktree.clone())),
+            (g2.clone(), sleep(w2_root)),
+        ],
+        Arc::new(std::sync::Barrier::new(1)),
+    );
+    let (a, b) = (results[0].0, results[1].0);
+    assert!(
+        overlap(a, b),
+        "the commands ran one after the other: {a:?} {b:?}"
+    );
+    for (_, res) in &results {
+        res.as_ref().expect("nothing changed in git");
+    }
+    assert!(outcomes(&c1).is_empty() && outcomes(&c2).is_empty());
+    g1.finish().expect("w1 stands");
+    g2.finish().expect("w2 stands");
+}
+
+/// A command that moves a ref to a commit that exists is checked and kept,
+/// and recorded once, with no hedge when no other command ran.
+#[test]
+fn a_command_that_changes_a_ref_validly_is_checked_and_kept() {
+    let r = repo();
+    let c = control(PermissionMode::Bypass);
+    let g = guard(&r, c.clone());
+    let tree = git(&r.checkout, &["rev-parse", "HEAD^{tree}"]);
+    let oid = git(&r.checkout, &["commit-tree", &tree, "-m", "valid"]);
+    let w = g.before_shell().expect("snapshot").expect("window");
+    git(&r.checkout, &["update-ref", "refs/heads/other", &oid]);
+    g.after_shell(w).expect("a valid ref passes");
+    assert_eq!(
+        outcomes(&c),
+        vec![(".git/refs/heads/other".into(), "kept".into())]
+    );
+    assert_eq!(git(&r.checkout, &["rev-parse", "refs/heads/other"]), oid);
+    g.finish().expect("the attempt stands");
+}
+
+/// Two workers' commands that each write a valid ref at the same time
+/// overlap; both writes land. The first check covers both changes and names
+/// the other worker, whose command was still running, with the hedge; the
+/// second finds its change already checked and records nothing more.
+#[test]
+fn two_workers_writing_refs_at_once_overlap_and_the_check_says_the_cause_is_shared() {
+    let r = repo();
+    let (g1, g2, c1, c2) = pair(&r);
+    let tree = git(&r.checkout, &["rev-parse", "HEAD^{tree}"]);
     let commits: Vec<String> = ["a", "b"]
         .iter()
         .map(|m| git(&r.checkout, &["commit-tree", &tree, "-m", m]))
         .collect();
-    let barrier = Arc::new(std::sync::Barrier::new(2));
-    let spans = Arc::new(Mutex::new(Vec::new()));
-    let checkout = r.checkout.clone();
-    let threads: Vec<_> = [(g1, "refs/heads/from-w1"), (g2, "refs/heads/from-w2")]
-        .into_iter()
-        .zip(commits.clone())
-        .map(|((g, refname), oid)| {
-            let barrier = barrier.clone();
-            let spans = spans.clone();
-            let checkout = checkout.clone();
-            std::thread::spawn(move || {
-                barrier.wait();
-                let w = g
-                    .before_shell(&argv(&["git", "update-ref", refname, &oid]))
-                    .expect("window")
-                    .expect("bypass");
-                let start = std::time::Instant::now();
-                git(&checkout, &["update-ref", refname, &oid]);
-                std::thread::sleep(Duration::from_millis(200));
-                let end = std::time::Instant::now();
-                g.after_shell(w).expect("a valid ref passes");
-                spans.lock().expect("spans").push((start, end));
-            })
+    let write = |refname: &'static str, oid: String| -> Box<dyn FnOnce() + Send> {
+        let checkout = r.checkout.clone();
+        Box::new(move || {
+            git(&checkout, &["update-ref", refname, &oid]);
+            std::thread::sleep(Duration::from_millis(100));
         })
-        .collect();
-    for t in threads {
-        t.join().expect("join");
+    };
+    let results = run_parallel(
+        vec![
+            (g1.clone(), write("refs/heads/from-w1", commits[0].clone())),
+            (g2.clone(), write("refs/heads/from-w2", commits[1].clone())),
+        ],
+        Arc::new(std::sync::Barrier::new(2)),
+    );
+    assert!(overlap(results[0].0, results[1].0), "{results:?}");
+    for (_, res) in &results {
+        res.as_ref().expect("valid refs pass");
     }
-    let spans = spans.lock().expect("spans").clone();
-    let (a, b) = (spans[0], spans[1]);
-    assert!(a.1 <= b.0 || b.1 <= a.0, "windows overlapped: {spans:?}");
-    assert_eq!(
-        outcomes(&c1),
-        vec![(".git/refs/heads/from-w1".into(), "kept".into())]
+    let mut logged = outcomes(&c1);
+    logged.extend(outcomes(&c2));
+    assert_eq!(logged.len(), 1, "one check covered both: {logged:?}");
+    let (path, outcome) = &logged[0];
+    assert!(
+        path.contains("refs/heads/from-w1") && path.contains("refs/heads/from-w2"),
+        "{path}"
     );
-    assert_eq!(
-        outcomes(&c2),
-        vec![(".git/refs/heads/from-w2".into(), "kept".into())]
+    assert!(outcome.starts_with("kept; "), "{outcome}");
+    assert!(outcome.contains(NOT_EXCLUSIVE), "{outcome}");
+    assert!(
+        outcome.contains("(w1)") || outcome.contains("(w2)"),
+        "names the other worker: {outcome}"
     );
-    assert_eq!(
-        git(&r.checkout, &["rev-parse", "refs/heads/from-w1"]),
-        commits[0]
-    );
-    assert_eq!(
-        git(&r.checkout, &["rev-parse", "refs/heads/from-w2"]),
-        commits[1]
-    );
+    for (i, refname) in ["refs/heads/from-w1", "refs/heads/from-w2"]
+        .iter()
+        .enumerate()
+    {
+        assert_eq!(git(&r.checkout, &["rev-parse", refname]), commits[i]);
+    }
+    g1.finish().expect("w1 stands");
+    g2.finish().expect("w2 stands");
 }
 
-/// kGraf's own git (the runner merges and worktree changes use) waits while a
-/// window is open, and a window waits while kGraf's git runs.
+/// Two workers' commands that each corrupt a ref at the same time: the
+/// first check finds both, restores both, and names the other worker; both
+/// attempts fail, each saying the cause is shared, and the repository is
+/// whole.
 #[test]
-fn kgraf_git_and_a_window_wait_for_each_other() {
+fn overlapping_corrupting_commands_both_fail_with_a_shared_cause() {
     let r = repo();
-    let g = guard(&r, control(PermissionMode::Bypass));
-    let tree = git(&r.checkout, &["rev-parse", "HEAD^{tree}"]);
-    let oid = git(&r.checkout, &["commit-tree", &tree, "-m", "k"]);
-    let w = g
-        .before_shell(&argv(&["git", "status"]))
-        .expect("window")
-        .expect("bypass");
-    let checkout = r.checkout.clone();
-    let merge = std::thread::spawn(move || {
-        let start = std::time::Instant::now();
-        kgraf_sandbox::git::Git::discover()
-            .expect("git")
-            .run(&checkout, ["update-ref", "refs/heads/merged", oid.as_str()])
-            .expect("update-ref");
-        start.elapsed()
-    });
-    std::thread::sleep(Duration::from_millis(300));
-    assert!(
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(&r.checkout)
-            .args(["rev-parse", "--verify", "--quiet", "refs/heads/merged"])
-            .env_remove("GIT_DIR")
-            .output()
-            .expect("git")
-            .stdout
-            .is_empty(),
-        "the merge ran inside the window"
+    let (g1, g2, c1, c2) = pair(&r);
+    let main = r.common.join("refs/heads/main");
+    let other = r.common.join("refs/heads/other");
+    let before = (
+        std::fs::read(&main).expect("main"),
+        std::fs::read(&other).expect("other"),
     );
-    g.after_shell(w).expect("nothing changed");
-    let waited = merge.join().expect("join");
-    assert!(waited >= Duration::from_millis(250), "{waited:?}");
-    git(&r.checkout, &["rev-parse", "--verify", "refs/heads/merged"]);
+    let corrupt = |path: PathBuf| -> Box<dyn FnOnce() + Send> {
+        Box::new(move || std::fs::write(&path, "garbage\n").expect("corrupt"))
+    };
+    let results = run_parallel(
+        vec![
+            (g1.clone(), corrupt(main.clone())),
+            (g2.clone(), corrupt(other.clone())),
+        ],
+        Arc::new(std::sync::Barrier::new(2)),
+    );
+    for ((_, res), name) in results.iter().zip(["w1", "w2"]) {
+        let err = res.as_ref().expect_err("each attempt is failed");
+        assert!(err.contains(NOT_EXCLUSIVE), "{name}: {err}");
+    }
+    assert_eq!(std::fs::read(&main).expect("main"), before.0);
+    assert_eq!(std::fs::read(&other).expect("other"), before.1);
+    let mut logged = outcomes(&c1);
+    logged.extend(outcomes(&c2));
+    assert_eq!(logged.len(), 2, "{logged:?}");
+    assert!(
+        logged.iter().all(|(_, o)| o.contains(NOT_EXCLUSIVE)),
+        "{logged:?}"
+    );
+    let finder = logged
+        .iter()
+        .find(|(_, o)| o.starts_with("restored: "))
+        .expect("one check found and restored the damage");
+    assert!(
+        finder.0.contains("refs/heads/main") && finder.0.contains("refs/heads/other"),
+        "{finder:?}"
+    );
+    assert!(
+        logged
+            .iter()
+            .any(|(_, o)| o.starts_with("restored by another worker's check")),
+        "{logged:?}"
+    );
+    assert!(g1.finish().is_err() && g2.finish().is_err());
+    fsck_ok(&r);
+}
 
-    // A merge in flight (a shared hold) makes the window wait.
+/// A command still running when another command's check found damage it
+/// could not have made (the damage was there before it started) is not
+/// failed: its pre-state already held the damaged bytes.
+#[test]
+fn damage_older_than_a_running_command_does_not_fail_it() {
+    let r = repo();
+    let (g1, g2, c1, _c2) = pair(&r);
+    let main = r.common.join("refs/heads/main");
+    let before = std::fs::read(&main).expect("main");
+    let w1 = g1.before_shell().expect("w1").expect("bypass");
+    std::fs::write(&main, "garbage\n").expect("corrupt");
+    // w2 starts after the damage is there.
+    let w2 = g2.before_shell().expect("w2").expect("bypass");
+    let err = g1.after_shell(w1).expect_err("w1's damage");
+    assert!(!err.contains(NOT_EXCLUSIVE), "{err}");
+    assert_eq!(outcomes(&c1).len(), 1);
+    assert_eq!(std::fs::read(&main).expect("main"), before);
+    g2.after_shell(w2).expect("w2 did not cause it");
+    g2.finish().expect("w2 stands");
+}
+
+/// A command that changed git waits, before its check, for kGraf's own git
+/// work in flight (a shared hold), and a wait past the timeout fails the
+/// attempt loud: the change is not checked, and the attempt is not trusted.
+#[test]
+fn a_changed_command_waits_for_kgraf_git_and_fails_loud_past_the_timeout() {
+    let r = repo();
+    let c = control(PermissionMode::Bypass);
+    let g = guard(&r, c.clone()).with_lock_timeout(Duration::from_millis(200));
+    let held = repo_lock::acquire(
+        &r.common,
+        repo_lock::Mode::Shared,
+        "merge-back git update-ref",
+        Duration::from_secs(1),
+    )
+    .expect("shared");
+    // Nothing changed: no lock, no wait.
+    let w = g.before_shell().expect("window").expect("bypass");
+    g.after_shell(w).expect("nothing changed");
+    // A change: the check waits for the lock, and gives up loud.
+    let w = g.before_shell().expect("window").expect("bypass");
+    std::fs::write(r.common.join("info/exclude"), "/scratch/\n").expect("write");
+    let err = g.after_shell(w).expect_err("the check could not run");
+    assert!(err.contains("could not be checked"), "{err}");
+    assert!(err.contains("merge-back git update-ref"), "{err}");
+    assert!(
+        outcomes(&c)[0].1.starts_with("unchecked: "),
+        "{:?}",
+        outcomes(&c)
+    );
+    drop(held);
+    assert!(g.finish().is_err());
+
+    // A shared hold released while the check waits: the check runs after it.
+    let g = guard(&r, control(PermissionMode::Bypass));
     let held = repo_lock::acquire(
         &r.common,
         repo_lock::Mode::Shared,
@@ -946,47 +1140,67 @@ fn kgraf_git_and_a_window_wait_for_each_other() {
         Duration::from_secs(1),
     )
     .expect("shared");
+    let w = g.before_shell().expect("window").expect("bypass");
+    std::fs::write(r.common.join("info/exclude"), "/other/\n").expect("write");
     let releaser = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(300));
         drop(held);
     });
     let start = std::time::Instant::now();
-    let w = g
-        .before_shell(&argv(&["git", "status"]))
-        .expect("window")
-        .expect("bypass");
+    g.after_shell(w).expect("checked and kept");
     assert!(start.elapsed() >= Duration::from_millis(250));
-    g.after_shell(w).expect("nothing changed");
     releaser.join().expect("join");
 }
 
-/// A wait past the lock timeout fails loud, naming the holder: no write is
-/// made and no window opens.
+/// kGraf's own git does not wait for an open window: a window holds no lock
+/// while its command runs.
 #[test]
-fn a_lock_wait_past_the_timeout_fails_loud() {
+fn kgraf_git_does_not_wait_for_a_running_command() {
     let r = repo();
-    let g =
-        guard(&r, control(PermissionMode::Bypass)).with_lock_timeout(Duration::from_millis(200));
-    let _held = repo_lock::acquire(
-        &r.common,
-        repo_lock::Mode::Shared,
-        "merge-back git update-ref",
-        Duration::from_secs(1),
-    )
-    .expect("shared");
-    let err = g.before_write(&Area::Git).expect_err("timed out");
+    let g = guard(&r, control(PermissionMode::Bypass));
+    let tree = git(&r.checkout, &["rev-parse", "HEAD^{tree}"]);
+    let oid = git(&r.checkout, &["commit-tree", &tree, "-m", "k"]);
+    let w = g.before_shell().expect("window").expect("bypass");
+    let start = std::time::Instant::now();
+    kgraf_sandbox::git::Git::discover()
+        .expect("git")
+        .run(
+            &r.checkout,
+            ["update-ref", "refs/heads/merged", oid.as_str()],
+        )
+        .expect("update-ref");
     assert!(
-        matches!(&err, WindowError::Busy(e) if e.contains("merge-back git update-ref")),
-        "{err}"
+        start.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        start.elapsed()
     );
-    let err = g
-        .before_shell(&argv(&["git", "commit"]))
-        .expect_err("timed out");
-    assert!(matches!(err, WindowError::Busy(_)), "{err}");
-    // A settings write takes no repository lock.
-    let _w = g
-        .before_write(&Area::Settings("run.json".into()))
-        .expect("settings");
+    // kGraf's valid change is seen as a change during the command: checked
+    // and kept.
+    g.after_shell(w).expect("a valid ref passes");
+    git(&r.checkout, &["rev-parse", "--verify", "refs/heads/merged"]);
+}
+
+/// A window dropped without its check (an abandoned call) is checked at the
+/// attempt's next window, and its damage fails the attempt.
+#[test]
+fn an_abandoned_command_is_checked_at_the_next_window() {
+    let r = repo();
+    let g = guard(&r, control(PermissionMode::Bypass));
+    let main = r.common.join("refs/heads/main");
+    let before = std::fs::read(&main).expect("main");
+    let w = g.before_shell().expect("window").expect("bypass");
+    std::fs::write(&main, "garbage\n").expect("corrupt");
+    drop(w);
+    assert_eq!(windows::open_count(&r.common), 0);
+    let w = g.before_shell().expect("window").expect("bypass");
+    assert_eq!(
+        std::fs::read(&main).expect("main"),
+        before,
+        "restored first"
+    );
+    g.after_shell(w).expect("this command changed nothing");
+    let err = g.finish().expect_err("the abandoned command's damage");
+    assert!(err.contains("abandoned shell command"), "{err}");
 }
 
 /// A snapshot a crashed process left (its owner gone) is removed when the
@@ -1008,11 +1222,84 @@ fn a_snapshot_a_dead_process_left_is_swept() {
         std::fs::write(dir.join("owner"), format!("pid={pid}:start=-:{host}\n")).expect("owner");
     }
     let g = guard(&r, control(PermissionMode::Bypass));
-    let w = g
-        .before_shell(&argv(&["git", "status"]))
-        .expect("snapshot")
-        .expect("window");
+    let w = g.before_shell().expect("snapshot").expect("window");
     g.after_shell(w).expect("nothing changed");
     assert!(!abandoned.exists(), "the dead owner's snapshot is gone");
     assert!(live.exists(), "a live owner's snapshot is kept");
+}
+
+// ---- cost ----
+
+/// The per-command cost of a Bypass shell window around a command that does
+/// not touch git: `before_shell` plus `after_shell` with nothing changed, on
+/// the small test repository and on one with 2,000 loose refs and 6,000
+/// loose objects. Prints the numbers; run with `--ignored --nocapture`.
+#[test]
+#[ignore = "measurement; prints timings"]
+fn measure_the_cost_of_a_window_around_a_command_that_does_not_touch_git() {
+    fn per_command(g: &ProtectedWrites, n: u32) -> Duration {
+        let start = std::time::Instant::now();
+        for _ in 0..n {
+            let w = g.before_shell().expect("window").expect("bypass");
+            g.after_shell(w).expect("nothing changed");
+        }
+        start.elapsed() / n
+    }
+    let r = repo();
+    let g = guard(&r, control(PermissionMode::Bypass));
+    let first = std::time::Instant::now();
+    let w = g.before_shell().expect("window").expect("bypass");
+    g.after_shell(w).expect("nothing changed");
+    let first = first.elapsed();
+    std::thread::sleep(objects::RACY + Duration::from_millis(500));
+    let small = per_command(&g, 200);
+    g.finish().expect("stands");
+    println!("small repository: first command {first:?}, each later one {small:?}");
+
+    let r = repo();
+    let head = git(&r.checkout, &["rev-parse", "HEAD"]);
+    let mut stdin = String::new();
+    for i in 0..2000 {
+        stdin.push_str(&format!("create refs/tags/t{i} {head}\n"));
+    }
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
+        .arg(&r.checkout)
+        .args(["update-ref", "--stdin"]);
+    for var in kgraf_sandbox::git::GIT_REDIRECT_ENV {
+        cmd.env_remove(var);
+    }
+    let mut child = cmd.stdin(Stdio::piped()).spawn().expect("update-ref");
+    std::io::Write::write_all(child.stdin.as_mut().expect("stdin"), stdin.as_bytes())
+        .expect("write");
+    drop(child.stdin.take());
+    assert!(child.wait().expect("wait").success());
+    let blobs = r.checkout.join("blobs");
+    std::fs::create_dir_all(&blobs).expect("blobs");
+    let mut names = Vec::new();
+    for i in 0..6000 {
+        let p = blobs.join(format!("{i}"));
+        std::fs::write(&p, format!("blob {i}\n")).expect("blob");
+        names.push(p.to_string_lossy().into_owned());
+    }
+    for chunk in names.chunks(1000) {
+        let mut args = vec!["hash-object", "-w"];
+        args.extend(chunk.iter().map(String::as_str));
+        git(&r.checkout, &args);
+    }
+    let g = guard(&r, control(PermissionMode::Bypass));
+    let first = std::time::Instant::now();
+    let w = g.before_shell().expect("window").expect("bypass");
+    g.after_shell(w).expect("nothing changed");
+    let first = first.elapsed();
+    let racy = per_command(&g, 20);
+    std::thread::sleep(objects::RACY + Duration::from_millis(500));
+    let large = per_command(&g, 100);
+    let finish = std::time::Instant::now();
+    g.finish().expect("stands");
+    println!(
+        "2,000 loose refs, 6,000 loose objects: first command {first:?}, each later one \
+         {large:?} (within the racy margin of the writes: {racy:?}); end of attempt {:?}",
+        finish.elapsed()
+    );
 }

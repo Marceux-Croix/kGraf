@@ -351,3 +351,73 @@ merging the three files as data), `kgraf-tools` (the tool path in each mode), an
 (a hosted run with a scripted model: declared files merged in Bypass, undeclared ones held to
 the scope, another mode refusing them). Mutation checks remove the hooks override, the driver
 overrides, the verifier's allowance and the worker's scope check; each makes a test fail.
+
+## Amendment: every Bypass shell command writes the git directory; only real changes are checked
+
+This replaces the word rule and the command-long exclusive lock of the amendment above. The word
+rule missed a script that runs git, and the lock queued parallel workers' git commands behind
+each other.
+
+- **Which commands.** Every shell command in Bypass gets the shared git directory as a sandbox
+  writable root. Outside Bypass it stays read-only.
+- **No lock while a command runs.** A shell window takes no repository lock before or during its
+  command, so parallel workers' commands run at the same time. kGraf's own git processes keep the
+  shared lock per process, and a protected write through `apply_patch` keeps its exclusive
+  window. The exclusive lock is taken only for the check after a command that changed
+  something.
+- **Pre-state,** before each command, without a lock: the git files a restore needs (the shared
+  `config`, `HEAD`, `packed-refs`, `shallow`, every file under `refs/` and `info/`, each worktree
+  admin directory's `HEAD`, `gitdir` and `commondir`, this worktree's `index`) with their stamps
+  (length, modification and change times, inode) and bytes, cached and read again only when a
+  stamp differs or was not settled (both times older than the read by 3 s, the rule git applies
+  to its index, since a coarse clock may not show a second change within one tick); and the
+  object snapshot, brought up to date per directory, reading only directories whose stamp
+  changed, are new or gone, or are not settled. Git's transient names (`tmp_*`, `*.lock`) are not
+  snapshotted. The cheap repository check runs once per attempt, at its first command.
+- **Change detection,** after the command, without a lock: a git file whose bytes differ, a file
+  added or removed, or a snapshotted object file missing or replaced in a changed directory. No
+  change: nothing more, no lock, nothing recorded.
+- **Check,** on a change, under the exclusive lock: the checks and the restore of the amendments
+  above, from the window's own pre-state. A changed file exactly as a check that passed during
+  this command left it was already checked, and is neither checked nor recorded again. When the
+  attempt ends, every object file is compared with the snapshot once, which also finds a file
+  altered in place, and the fsck runs when anything changed.
+- **Attribution,** from a per-repository registry of the open windows in the kGraf process:
+  - A check that finds a change names every other window still open whose pre-state differs from
+    what the check found in the changed files (every open window when object files were lost):
+    those commands started before the change was there. A command that ended before the change
+    was found is not named: its own check ran after it ended.
+  - A passing check that names others records `kept; changed while another worker's command
+    also ran; cause not exclusive (...)`.
+  - On damage, the check marks each named window before anything is restored, then restores. Its
+    own attempt fails, and each marked window's attempt fails when its command ends, whatever its
+    own check found, recorded `restored by another worker's check: ...` with the same phrase: a
+    restore can erase the trace of the write that caused the damage. So when two commands overlap
+    and either damages the repository, both attempts fail and both records say the cause is
+    shared. A window whose pre-state already held the damaged bytes is not marked.
+  - A changed command whose check cannot take the lock in time fails its attempt, recorded
+    `unchecked: <error>`. A window dropped without its check is checked at the attempt's next
+    window or at its end.
+- **Cost,** measured on macOS (APFS), release build: per command that changes nothing, 0.26 ms on
+  a small repository and 15 ms with 2,000 loose refs and 6,000 loose objects. A whole sandboxed
+  shell call: 17.0 ms without the guard, 18.5 to 18.9 ms with it. The attempt's first command pays
+  the object snapshot: 25 ms on a small repository, 2.2 s with 6,000 loose objects.
+- **Not taken.** A per-command manifest of every object file (0.12 s per scan at 20,000 loose
+  objects, twice per command). A per-command exclusive lock. A shared lock held by each command:
+  a check would wait out every parallel build, and it would not tell who wrote what.
+- **Limits.** When commands overlap, a change is attributed to all that may have made it, not to
+  the one that did. A change kGraf's own git work makes while a command runs (a merge moving the
+  integration branch) is seen by that command's check: checked and, when valid, recorded against
+  it. The last restore step (every changed file) can put back a ref another command moved validly
+  meanwhile; it runs only when restoring the invalid files did not make the check pass. An object
+  file altered in place in a settled directory is found when the attempt ends. Commands of a
+  second kGraf process on the same repository are serialized at their checks but not named in
+  attribution. The first command of every Bypass attempt pays the object snapshot.
+
+**Correction (the two amendments above interact).** The hardening amendment says there is no gap
+between kGraf's configuration listing and the git command it prepares, because a Bypass shell
+command that can write the configuration ran only in an exclusive window. Since every Bypass shell
+command now runs without the lock, that premise no longer holds: a Bypass command can change the
+repository configuration between the listing and the command, so a filter, driver or hook it adds
+in that interval could run in kGraf's own git. The gap is open until kGraf's git stops depending on
+a listing taken in a separate process.

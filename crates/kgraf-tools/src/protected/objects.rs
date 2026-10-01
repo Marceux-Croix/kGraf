@@ -16,7 +16,22 @@
 //! device and inode at capture. A file is *lost* when it is missing or any of
 //! those differs now (removed, replaced, truncated or rewritten). New files
 //! are never lost: objects are additive, and another worker's or kGraf's new
-//! objects are never removed by a restore.
+//! objects are never removed by a restore. Git's temporary files (`tmp_*`)
+//! and lock files (`*.lock`) are not snapshotted: another worker's git may
+//! rename them away at any moment, which is not a loss.
+//!
+//! **Cost per shell command** (decision 0094): every Bypass shell command
+//! runs with the store writable and without a lock, so the snapshot is
+//! brought up to date before each command and checked after it. Both work
+//! per directory: each directory under `objects/` is recorded with its
+//! modification and change times and inode, and only a directory whose
+//! record differs (a file added, removed or renamed in it changes it) or
+//! that changed within [`RACY`] of the last sync (a coarse clock may not show
+//! a later change) is read again. An unchanged store costs one `lstat` per
+//! directory, however many objects it holds. A file altered in place leaves
+//! its directory unchanged; git writes object files read-only, so this takes
+//! a `chmod` first, and [`ObjectSnapshot::lost_full`], which reads every
+//! file, finds it when the attempt ends.
 //!
 //! **Verification before a restore.** A linked entry shares its file with the
 //! store, so it is put back only if that shared file still has the recorded
@@ -30,9 +45,68 @@
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use kgraf_sandbox::{HostId, ProcessIdentity};
+
+/// A directory or file changed within this long before a sync is read again
+/// at the next one, whatever its record says: on a file system whose clock
+/// counts whole seconds (or two, on FAT), a second change within the same
+/// tick leaves the record as it was. The rule git applies to its index
+/// ("racy git").
+pub(crate) const RACY: Duration = Duration::from_secs(3);
+
+/// A file's or directory's state for the cheap change test: an entry added,
+/// removed or renamed in a directory changes its times; a write to a file
+/// changes its change time, which no process can set back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Stamp {
+    len: u64,
+    mtime: Option<SystemTime>,
+    /// Change time (Unix), seconds and nanoseconds; `None` elsewhere.
+    ctime: Option<(i64, i64)>,
+    id: Option<(u64, u64)>,
+}
+
+pub(crate) fn stamp_of(m: &std::fs::Metadata) -> Stamp {
+    #[cfg(unix)]
+    let (ctime, id) = {
+        use std::os::unix::fs::MetadataExt;
+        (Some((m.ctime(), m.ctime_nsec())), Some((m.dev(), m.ino())))
+    };
+    #[cfg(not(unix))]
+    let (ctime, id) = (None, None);
+    Stamp {
+        len: m.len(),
+        mtime: m.modified().ok(),
+        ctime,
+        id,
+    }
+}
+
+impl Stamp {
+    /// Whether this record shows any later change: both times older than
+    /// `since` by [`RACY`]. Never without a change time (Windows), where a
+    /// caller compares contents instead.
+    pub(crate) fn settled(&self, since: SystemTime) -> bool {
+        let Some(limit) = since.checked_sub(RACY) else {
+            return false;
+        };
+        let ctime = self.ctime.and_then(|(s, ns)| {
+            let s = u64::try_from(s).ok()?;
+            let ns = u32::try_from(ns.clamp(0, 999_999_999)).ok()?;
+            SystemTime::UNIX_EPOCH.checked_add(Duration::new(s, ns))
+        });
+        self.mtime.is_some_and(|t| t < limit) && ctime.is_some_and(|t| t < limit)
+    }
+}
+
+/// Whether a store file is one of git's transient names, never snapshotted.
+fn transient(rel: &Path) -> bool {
+    rel.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with("tmp_") || n.ends_with(".lock"))
+}
 
 /// What identifies a file's state cheaply.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -87,6 +161,10 @@ pub(crate) struct ObjectSnapshot {
     /// Snapshot directories already made, so each file costs one link and
     /// not a `create_dir_all` too.
     made: std::collections::HashSet<PathBuf>,
+    /// Every directory under the store (relative; empty for the store
+    /// itself) as it was at the last sync, and when that sync started.
+    dirs: BTreeMap<PathBuf, Stamp>,
+    synced_at: Option<SystemTime>,
 }
 
 impl ObjectSnapshot {
@@ -120,8 +198,10 @@ impl ObjectSnapshot {
             copied: 0,
             copy_limit,
             made: std::collections::HashSet::new(),
+            dirs: BTreeMap::new(),
+            synced_at: None,
         };
-        if let Err(e) = snap.sync() {
+        if let Err(e) = snap.sync(true) {
             snap.remove();
             return Err(e);
         }
@@ -142,18 +222,25 @@ impl ObjectSnapshot {
     }
 
     /// Bring the snapshot to the store as it is now: capture new and changed
-    /// files, forget files that are gone. Called while no one else writes the
-    /// repository (under its exclusive lock), before a guarded command.
-    pub(crate) fn sync(&mut self) -> Result<(), String> {
-        let now = scan(&self.objects)?;
-        let gone: Vec<PathBuf> = self
-            .entries
-            .keys()
-            .filter(|k| !now.contains_key(*k))
-            .cloned()
-            .collect();
-        for rel in gone {
-            self.forget(&rel);
+    /// files and, with `forget`, drop files that are gone. Only directories
+    /// that changed since the last sync are read ([`Self::dirty`]). Without
+    /// `forget` (another command of the same attempt is still running, and
+    /// its check may need a file it deleted) gone files are kept, so that
+    /// check can still put them back.
+    pub(crate) fn sync(&mut self, forget: bool) -> Result<(), String> {
+        let started = SystemTime::now();
+        let (dirty, dirs) = self.dirty()?;
+        let now = scan_dirs(&self.objects, &dirty)?;
+        if forget {
+            let gone: Vec<PathBuf> = self
+                .entries
+                .keys()
+                .filter(|k| in_dirs(k, &dirty) && !now.contains_key(*k))
+                .cloned()
+                .collect();
+            for rel in gone {
+                self.forget(&rel);
+            }
         }
         for (rel, meta) in now {
             if self.entries.get(&rel).is_some_and(|e| e.meta == meta) {
@@ -162,7 +249,56 @@ impl ObjectSnapshot {
             self.forget(&rel);
             self.capture(&rel, meta)?;
         }
+        self.dirs = dirs;
+        self.synced_at = Some(started);
         Ok(())
+    }
+
+    /// The directories to read again (changed since the last sync, new, gone
+    /// or racy) and every directory's record now. Every recorded directory is
+    /// stamped once; only a dirty one is listed, to find new subdirectories
+    /// (adding or removing one changes its parent, so a clean directory has
+    /// exactly its recorded subdirectories).
+    fn dirty(&self) -> Result<(Vec<PathBuf>, BTreeMap<PathBuf, Stamp>), String> {
+        let mut dirty = Vec::new();
+        let mut now = BTreeMap::new();
+        let mut queue: Vec<PathBuf> = if self.dirs.is_empty() {
+            vec![PathBuf::new()]
+        } else {
+            self.dirs.keys().cloned().collect()
+        };
+        let mut seen: std::collections::HashSet<PathBuf> = queue.iter().cloned().collect();
+        while let Some(rel) = queue.pop() {
+            let path = self.objects.join(&rel);
+            let stamp = match std::fs::symlink_metadata(&path) {
+                Ok(m) if m.is_dir() => stamp_of(&m),
+                // Gone (or no longer a directory): its recorded files are
+                // judged as missing.
+                Ok(_) => {
+                    dirty.push(rel);
+                    continue;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    dirty.push(rel);
+                    continue;
+                }
+                Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+            };
+            let clean = match (self.dirs.get(&rel), self.synced_at) {
+                (Some(old), Some(at)) => *old == stamp && old.settled(at),
+                _ => false,
+            };
+            if !clean {
+                for (child, m) in read_one(&self.objects, &rel)? {
+                    if m.is_dir() && seen.insert(child.clone()) {
+                        queue.push(child);
+                    }
+                }
+                dirty.push(rel.clone());
+            }
+            now.insert(rel, stamp);
+        }
+        Ok((dirty, now))
     }
 
     fn forget(&mut self, rel: &Path) {
@@ -232,8 +368,22 @@ impl ObjectSnapshot {
     }
 
     /// The snapshotted files that are missing from the store now, or not
-    /// the file that was captured.
+    /// the file that was captured, judged in the directories that changed
+    /// since the last sync: one `lstat` per directory when nothing did.
     pub(crate) fn lost(&self) -> Result<Vec<PathBuf>, String> {
+        let (dirty, _) = self.dirty()?;
+        let now = scan_dirs(&self.objects, &dirty)?;
+        Ok(self
+            .entries
+            .iter()
+            .filter(|(rel, e)| in_dirs(rel, &dirty) && now.get(*rel) != Some(&e.meta))
+            .map(|(rel, _)| rel.clone())
+            .collect())
+    }
+
+    /// [`Self::lost`] over every file, whatever its directory's record says,
+    /// so a file altered in place is found too. For the end-of-attempt check.
+    pub(crate) fn lost_full(&self) -> Result<Vec<PathBuf>, String> {
         let now = scan(&self.objects)?;
         Ok(self
             .entries
@@ -316,6 +466,8 @@ impl ObjectSnapshot {
     pub(crate) fn remove(&mut self) {
         self.entries.clear();
         self.made.clear();
+        self.dirs.clear();
+        self.synced_at = None;
         self.copied = 0;
         let _ = std::fs::remove_dir_all(&self.dir);
     }
@@ -374,34 +526,60 @@ pub(crate) fn sweep_abandoned(base: &Path) {
     }
 }
 
-/// Every regular file under `objects`, by relative path. Links are not
-/// followed.
+/// Every regular file under `objects`, by relative path, git's transient
+/// names left out. Links are not followed.
 fn scan(objects: &Path) -> Result<BTreeMap<PathBuf, Meta>, String> {
     let mut out = BTreeMap::new();
     let mut stack = vec![PathBuf::new()];
     while let Some(rel) = stack.pop() {
-        let dir = objects.join(&rel);
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(e) => e,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(format!("cannot read {}: {e}", dir.display())),
-        };
-        for entry in entries {
-            let entry = entry.map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
-            let child = rel.join(entry.file_name());
-            let m = match std::fs::symlink_metadata(entry.path()) {
-                Ok(m) => m,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(format!("cannot read {}: {e}", entry.path().display())),
-            };
+        for (child, m) in read_one(objects, &rel)? {
             if m.is_dir() {
                 stack.push(child);
-            } else if m.is_file() {
+            } else if m.is_file() && !transient(&child) {
                 out.insert(child, meta_of(&m));
             }
         }
     }
     Ok(out)
+}
+
+/// The regular files directly in each of `dirs` (relative to `objects`).
+fn scan_dirs(objects: &Path, dirs: &[PathBuf]) -> Result<BTreeMap<PathBuf, Meta>, String> {
+    let mut out = BTreeMap::new();
+    for rel in dirs {
+        for (child, m) in read_one(objects, rel)? {
+            if m.is_file() && !transient(&child) {
+                out.insert(child, meta_of(&m));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// One directory's entries with their metadata; none when it is gone.
+fn read_one(objects: &Path, rel: &Path) -> Result<Vec<(PathBuf, std::fs::Metadata)>, String> {
+    let dir = objects.join(rel);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("cannot read {}: {e}", dir.display())),
+    };
+    let mut out = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
+        match std::fs::symlink_metadata(entry.path()) {
+            Ok(m) => out.push((rel.join(entry.file_name()), m)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("cannot read {}: {e}", entry.path().display())),
+        }
+    }
+    Ok(out)
+}
+
+/// Whether the store file `rel` lies directly in one of `dirs`.
+fn in_dirs(rel: &Path, dirs: &[PathBuf]) -> bool {
+    let parent = rel.parent().unwrap_or(Path::new(""));
+    dirs.iter().any(|d| d == parent)
 }
 
 fn clear(path: &Path) -> Result<(), String> {

@@ -606,7 +606,12 @@ pub enum PermissionEvent {
     /// ([`crate::protected`]): which worker, the path as the worker named it,
     /// the mode, and what became of it: `kept` after its integrity check
     /// passed, or `restored: <check output>` when the check failed and the
-    /// snapshot was put back.
+    /// snapshot was put back. A Bypass shell command's outcome adds
+    /// [`crate::protected::NOT_EXCLUSIVE`] and the other workers when
+    /// commands running at the same time may have made the change; it is
+    /// `restored by another worker's check: ...` when another command's
+    /// check found damage this one may have caused, and `unchecked: ...`
+    /// when the check could not run.
     ProtectedWrite {
         worker: String,
         path: String,

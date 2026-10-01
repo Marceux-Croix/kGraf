@@ -601,14 +601,17 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   - **Bypass**: everything is granted without asking: workers' shell commands run under a write
     scope, except the few the policy forbids. It offers no protection against prompt injection
     or unintended actions. Workers may also write the repository's git directory (a patch to
-    `.git/info/exclude`, `.git/config` or a ref, or a `git` command in the shell) and kGraf's
+    `.git/info/exclude`, `.git/config` or a ref, or any shell command) and kGraf's
     settings files `.kgraf/run.json` and `.kgraf/worker.json`. Before the first such write,
     kGraf copies the refs, config and index (at most 32 MiB) or the settings file; after each
     write it checks that the repository still reads (every ref resolves, the config parses,
     and `git fsck --connectivity-only` when the attempt ends) and that the settings file still
     loads. A write that fails its check is put back, and the attempt fails with the check's
     output and is not merged; every write, kept or put back, shows in the run's trace and the
-    activity card. The ledger, the trace, run records, transcripts, the graph and the rest of
+    activity card. Workers' shell commands still run in parallel: only a command that changed
+    something in `.git` is checked. When two workers' commands run at the same time and the
+    check finds damage, both attempts fail, and the trace says the cause is shared ("changed
+    while another worker's command also ran; cause not exclusive"). The ledger, the trace, run records, transcripts, the graph and the rest of
     `.kgraf` stay refused in every mode, as do `.git/objects`, the `.git` link file,
     `.gitconfig` and a nested `.git`. In Bypass only, workers may also write `.gitattributes`,
     `.gitmodules` and files under `.githooks`. These are ordinary files of your project: a

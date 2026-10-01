@@ -1011,18 +1011,17 @@ impl Tool for ShellTool {
             }
             None => None,
         };
-        // Decision 0094: in Bypass, a command that names git gets the git
-        // directory writable inside a window that holds the repository lock,
-        // snapshotted first and checked after, before the call returns, so
-        // no later git operation meets an unchecked write and no other git
-        // write runs meanwhile. Any other command keeps it read-only.
+        // Decision 0094: in Bypass, every command gets the git directory
+        // writable. Its state is recorded first, without a lock, so parallel
+        // workers' commands run at the same time; after the command, only a
+        // change found there is checked (under the repository lock), before
+        // the call returns, so no later git operation meets an unchecked
+        // write. Outside Bypass the git directory stays read-only.
         let mut window = None;
         let mut read_only_note = None;
-        let mut failure_note = None;
         if let Some(guard) = &self.protected {
             let g = guard.clone();
-            let words = cmd.clone();
-            match tokio::task::spawn_blocking(move || g.before_shell(&words))
+            match tokio::task::spawn_blocking(move || g.before_shell())
                 .await
                 .map_err(|e| internal(format!("protected-write snapshot task failed: {e}")))?
             {
@@ -1030,21 +1029,12 @@ impl Tool for ShellTool {
                     policy = policy.with_writable_root(w.root().to_path_buf());
                     window = Some((guard.clone(), w));
                 }
-                Ok(None) => {
-                    if guard.bypass() {
-                        failure_note = Some(
-                            "\n[in Bypass the git directory is writable only for a command that \
-                             names git or the git directory; this one named neither, so it was \
-                             read-only]",
-                        );
-                    }
-                }
-                // Another git window or kGraf's own git work held the
-                // repository past the bound: the command is not run.
+                Ok(None) => {}
+                // `before_shell` takes no lock, so this is not expected; if
+                // it comes, the command is not run rather than run unguarded.
                 Err(crate::protected::WindowError::Busy(e)) => {
                     return Ok(ToolOutput::error(format!(
-                        "the command was not run: it names git, and the repository stayed \
-                         locked: {e}"
+                        "the command was not run: the repository stayed locked: {e}"
                     )));
                 }
                 // Run as in every other mode, the git directory read-only,
@@ -1080,13 +1070,6 @@ impl Tool for ShellTool {
         if let Some(note) = read_only_note {
             output.parts.push(crate::OutputPart::Text {
                 text: crate::UntrustedText::new(note),
-            });
-        }
-        if let Some(note) = failure_note
-            && output.is_error
-        {
-            output.parts.push(crate::OutputPart::Text {
-                text: crate::UntrustedText::new(note.to_owned()),
             });
         }
         if !verdict.build {
@@ -4028,24 +4011,53 @@ fn main() {
             assert_eq!(std::fs::read(&exclude).unwrap_or_default(), before);
         }
 
-        /// In Bypass, a command whose words name neither git nor the git
-        /// directory runs with the git directory read-only and takes no
-        /// repository lock; its failure says why. (The target path is read
-        /// from a file, so no word of the command names it.)
+        /// A guarded shell tool for worker `worker` in workspace `ws`.
+        fn guarded_tool_in(
+            f: &Fixture,
+            ws: &Workspace,
+            worker: &str,
+        ) -> (ShellTool, std::sync::Arc<crate::ProtectedWrites>) {
+            let control = crate::protected::tests::control(crate::PermissionMode::Bypass);
+            let state = f._tmp.path().join("state");
+            std::fs::create_dir_all(&state).expect("state");
+            let guard = std::sync::Arc::new(
+                crate::ProtectedWrites::for_workspace(
+                    control.clone(),
+                    worker,
+                    ws,
+                    state,
+                    crate::protected::tests::json_check(),
+                )
+                .expect("guard"),
+            );
+            let policy = ExecPolicy::default_kgraf_policy().with_permissions(control);
+            let (tool, _hook) = ShellTool::new(policy);
+            (
+                tool.with_workspace(ws.clone())
+                    .with_protected_writes(guard.clone()),
+                guard,
+            )
+        }
+
+        /// In Bypass every command may write the git directory, not only one
+        /// whose words name git: a script that runs git (no word of the
+        /// command says `git`) moves a ref, and the change is checked and
+        /// kept.
         #[tokio::test]
-        async fn bypass_keeps_the_git_directory_read_only_for_a_command_that_does_not_name_it() {
+        async fn bypass_lets_a_script_that_runs_git_indirectly_write_the_git_directory() {
             let f = fixture(PLAIN_BUILD_RS);
             let (tool, guard) = guarded_tool(&f, crate::PermissionMode::Bypass);
-            let exclude = f.ws.git_common_dir().join("info/exclude");
-            let before = std::fs::read(&exclude).unwrap_or_default();
             std::fs::write(
-                f.ws.root().join("target.txt"),
-                exclude.display().to_string(),
+                f.ws.root().join("tool.sh"),
+                "git update-ref refs/heads/indirect HEAD\n",
             )
-            .expect("target");
-            let script = "printf x >> \"$(cat target.txt)\"";
-            let words = ["sh", "-c", script];
-            assert!(!guard.names_git(&words.map(str::to_owned)));
+            .expect("script");
+            let words = ["sh", "tool.sh"];
+            assert!(
+                words
+                    .iter()
+                    .all(|w| !w.to_ascii_lowercase().contains("git"))
+            );
             let out = tool
                 .call(
                     call_input(&words),
@@ -4056,39 +4068,99 @@ fn main() {
                 .expect("ran");
             let is_error = out.is_error;
             let text = out.render();
-            assert!(is_error, "{text}");
-            assert!(
-                text.contains("writable only for a command that names git"),
-                "{text}"
-            );
-            assert_eq!(std::fs::read(&exclude).unwrap_or_default(), before);
-            guard.finish().expect("nothing was written");
+            assert!(!is_error, "{text}");
+            let indirect = f.ws.git_common_dir().join("refs/heads/indirect");
+            assert!(indirect.is_file(), "{text}");
+            assert!(guard.wrote(Path::new(".git/refs/heads/indirect")));
+            guard.finish().expect("the repository passes fsck");
         }
 
-        /// In Bypass, a git command whose window cannot take the repository
-        /// lock within the bound is not run at all.
+        /// Through the real sandbox: two workers' commands that do not touch
+        /// git run at the same time. Each sleeps 0.8 s; run one after the
+        /// other they would take at least 1.6 s.
         #[tokio::test]
-        async fn bypass_does_not_run_a_git_command_while_the_repository_stays_locked() {
+        async fn bypass_runs_two_workers_commands_in_parallel() {
             let f = fixture(PLAIN_BUILD_RS);
-            let control = crate::protected::tests::control(crate::PermissionMode::Bypass);
-            let state = f._tmp.path().join("state");
-            std::fs::create_dir_all(&state).expect("state");
-            let guard = std::sync::Arc::new(
-                crate::ProtectedWrites::for_workspace(
-                    control.clone(),
-                    "w1",
-                    &f.ws,
-                    state,
-                    crate::protected::tests::json_check(),
-                )
-                .expect("guard")
-                .with_lock_timeout(Duration::from_millis(200)),
+            let ws2 = f
+                ._manager
+                .create(&WorkspaceSpec {
+                    name: "w2",
+                    base: "HEAD",
+                    branch: None,
+                })
+                .expect("second worktree");
+            let (t1, g1) = guarded_tool_in(&f, &f.ws, "w1");
+            let (t2, g2) = guarded_tool_in(&f, &ws2, "w2");
+            let words = ["sh", "-c", "sleep 0.8; echo built > out.txt"];
+            let (c1, c2) = (
+                ctx(f.ws.root().to_path_buf()),
+                ctx(ws2.root().to_path_buf()),
             );
-            let policy = ExecPolicy::default_kgraf_policy().with_permissions(control);
-            let (tool, _hook) = ShellTool::new(policy);
-            let tool = tool
-                .with_workspace(f.ws.clone())
-                .with_protected_writes(guard.clone());
+            let (p1, p2) = (CallPermit::new(), CallPermit::new());
+            let start = std::time::Instant::now();
+            let (o1, o2) = tokio::join!(
+                t1.call(call_input(&words), &c1, &p1),
+                t2.call(call_input(&words), &c2, &p2),
+            );
+            let elapsed = start.elapsed();
+            for out in [o1.expect("w1 ran"), o2.expect("w2 ran")] {
+                let is_error = out.is_error;
+                assert!(!is_error, "{}", out.render());
+            }
+            assert!(
+                elapsed < Duration::from_millis(1400),
+                "the commands ran one after the other: {elapsed:?}"
+            );
+            assert!(f.ws.root().join("out.txt").is_file() && ws2.root().join("out.txt").is_file());
+            g1.finish().expect("w1 stands");
+            g2.finish().expect("w2 stands");
+        }
+
+        /// The cost of the Bypass window on a whole shell call through the
+        /// real sandbox: the same command that does not touch git, with and
+        /// without the guard, median of 30 calls each. Prints the numbers;
+        /// run with `--ignored --nocapture`.
+        #[tokio::test]
+        #[ignore = "measurement; prints timings"]
+        async fn measure_the_bypass_window_on_a_shell_call() {
+            let f = fixture(PLAIN_BUILD_RS);
+            let (guarded, guard) = guarded_tool(&f, crate::PermissionMode::Bypass);
+            let control = crate::protected::tests::control(crate::PermissionMode::Bypass);
+            let (plain, _hook) =
+                ShellTool::new(ExecPolicy::default_kgraf_policy().with_permissions(control));
+            let plain = plain.with_workspace(f.ws.clone());
+            let words = ["sh", "-c", "echo built > out.txt"];
+            let c = ctx(f.ws.root().to_path_buf());
+            let mut median = Vec::new();
+            for tool in [&plain, &guarded, &plain, &guarded] {
+                let mut times = Vec::new();
+                for _ in 0..30 {
+                    let start = std::time::Instant::now();
+                    let out = tool
+                        .call(call_input(&words), &c, &CallPermit::new())
+                        .await
+                        .expect("ran");
+                    let is_error = out.is_error;
+                    assert!(!is_error, "{}", out.render());
+                    times.push(start.elapsed());
+                }
+                times.sort();
+                median.push(times[times.len() / 2]);
+            }
+            println!(
+                "shell call, median of 30: without the guard {:?} / {:?}, with it {:?} / {:?}",
+                median[0], median[2], median[1], median[3]
+            );
+            guard.finish().expect("stands");
+        }
+
+        /// In Bypass a command runs while kGraf's own git work holds the
+        /// repository (a merge in flight): no lock is taken before a command,
+        /// and one that changed nothing takes none after it.
+        #[tokio::test]
+        async fn bypass_runs_a_command_while_kgraf_git_holds_the_repository() {
+            let f = fixture(PLAIN_BUILD_RS);
+            let (tool, guard) = guarded_tool(&f, crate::PermissionMode::Bypass);
             let _held = kgraf_sandbox::repo_lock::acquire(
                 f.ws.git_common_dir(),
                 kgraf_sandbox::repo_lock::Mode::Shared,
@@ -4096,24 +4168,20 @@ fn main() {
                 Duration::from_secs(1),
             )
             .expect("held");
-            let marker = f.ws.root().join("ran.txt");
-            let script = format!("touch '{}' && git status", marker.display());
+            let start = std::time::Instant::now();
             let out = tool
                 .call(
-                    call_input(&["sh", "-c", &script]),
+                    call_input(&["sh", "-c", "touch ran.txt"]),
                     &ctx(f.ws.root().to_path_buf()),
                     &CallPermit::new(),
                 )
                 .await
                 .expect("answered");
             let is_error = out.is_error;
-            let text = out.render();
-            assert!(is_error, "{text}");
-            assert!(
-                text.contains("was not run") && text.contains("merge-back"),
-                "{text}"
-            );
-            assert!(!marker.exists(), "the command did not run");
+            assert!(!is_error, "{}", out.render());
+            assert!(f.ws.root().join("ran.txt").exists(), "the command ran");
+            assert!(start.elapsed() < Duration::from_secs(5));
+            assert!(guard.failure().is_none());
         }
     }
 

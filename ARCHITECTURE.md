@@ -1127,7 +1127,7 @@ one group in the box. The user's deny and ask rules and the refusal to delete
 system paths hold in every mode; a run nobody attends denies what would ask.
 In Bypass only, a worker may also write the repository's git directory
 (`.git/<path>`, resolved as git resolves it; through `apply_patch`, and
-through a shell command that names git) and kGraf's settings
+through any shell command) and kGraf's settings
 (`.kgraf/run.json`, `.kgraf/worker.json`), each write behind a bounded
 snapshot and an integrity check that runs before the call returns, with
 `git fsck --connectivity-only` when an object file went missing and when the
@@ -1154,6 +1154,21 @@ configured merge driver conflicts when both sides change it. The config
 listing that prepares a command runs inside the same shared hold of the
 repository lock as the command, so a Bypass git window cannot change the
 config between the two. The user's own git still honors everything.
+
+and fails the attempt, so it is never merged. A shell command runs without a
+lock, in parallel with other workers' commands: its git files and the object
+snapshot are brought up to date before it (only what changed is read again),
+and only a change found after it is checked. A protected `apply_patch` write,
+and the check and restore after a changed command, hold the repository's lock
+exclusively, and every git process kGraf runs on the repository (merges, the
+integration view, ref updates, worktree add and remove) holds it shared: an
+advisory `flock` on the shared git directory itself, so it also serializes
+two kGraf processes and a crashed holder's lock is released by the kernel;
+waits are bounded and fail loud. Commands overlap, so a check names every
+other running command that started before the change was there: a kept
+change records "changed while another worker's command also ran; cause not
+exclusive", and on damage each named command's attempt fails too. The
+ledger, trace, run records, transcripts and graph stay refused in every mode.
 An instructions report amends the contract once; at most two re-dispatches per
 contract for shortfalls. With plan review on, no worker starts until the user
 approves the plan in the box. A contract accepted on a check that always

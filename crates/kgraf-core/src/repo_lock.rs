@@ -1,34 +1,38 @@
 //! One lock per repository that serializes a worker's Bypass git writes
 //! against every other git write kGraf makes there (decision 0094).
 //!
-//! **Modes.** Exclusive: a worker's protected git write or Bypass shell
-//! command with the shared git directory writable, together with the
-//! integrity check and restore that follow it. Shared: each git process kGraf
-//! itself runs on the repository (merges into the integration branch and its
-//! view, ref and branch updates, worktree add and remove, prune, the worker's
-//! status read, the co-change history read). Each holder takes it before
+//! **Modes.** Exclusive: a worker's protected git write with the integrity
+//! check and restore that follow it, and the check (and restore) after a
+//! Bypass shell command that changed the git directory. The shell command
+//! itself runs without the lock, in parallel with other workers' commands
+//! and kGraf's git. Shared: each git process kGraf itself runs on the
+//! repository (merges into the integration branch and its view, ref and
+//! branch updates, worktree add and remove, prune, the worker's status read,
+//! the co-change history read). Each holder takes it before
 //! `crate::host_git::command` builds the invocation, so the runner's config
-//! listing and the command it prepares run in one hold. kGraf's own
+//! listing and the command it prepares run in one hold. Because a Bypass
+//! shell command holds no lock, it can still change the git configuration
+//! between that listing and the command; that gap is open. kGraf's own
 //! processes do not wait for each other (they already serialize where they
 //! must: merges by a mutex and a compare-and-swap on the branch); they wait
-//! only while a worker's exclusive window is open, and a window waits until
-//! no kGraf git process runs. A check inside a window therefore sees only the
-//! window's own change.
+//! only while an exclusive holder runs, and an exclusive taker waits until no
+//! kGraf git process runs, so a check never runs while kGraf's git is
+//! mid-write.
 //!
 //! **Granularity.** kGraf takes the shared lock per git process, never across
 //! a multi-step operation, so no lock is ever taken while another is held in
-//! the same thread (no nesting, no lock-order deadlock). A window that opens
-//! between two steps of a merge sees the first step's result in its snapshot,
-//! never as its own change.
+//! the same thread (no nesting, no lock-order deadlock). A protected write
+//! that opens between two steps of a merge sees the first step's result in
+//! its snapshot, never as its own change.
 //!
 //! **Across processes.** An advisory `flock` (`File::lock`), so two kGraf
 //! processes on one repository serialize as two threads of one do (each
 //! acquisition opens its own file description, and flock locks of separate
 //! descriptions conflict in one process too). On Unix the lock is taken on
 //! the shared git directory itself, not on a file inside it: a worker's
-//! sandbox may write inside that directory while its window is open, and
-//! could delete or replace a lock file there, after which the next taker
-//! would lock a new file while the window still runs. The directory cannot be
+//! sandbox may write inside that directory while its command runs, and
+//! could delete or replace a lock file there, after which two takers would
+//! lock different files. The directory cannot be
 //! removed or renamed from inside the sandbox (its parent is not writable),
 //! so its lock cannot be dodged. On Windows, where a directory cannot be
 //! locked, the lock is `kgraf-repo.lock` in that directory, opened without
@@ -67,9 +71,11 @@ pub const WINDOWS_LOCK_FILE: &str = "kgraf-repo.lock";
 /// How a lock is held.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
-    /// kGraf's own git process: many at once, none during a window.
+    /// kGraf's own git process: many at once, none while an exclusive
+    /// holder runs.
     Shared,
-    /// A worker's Bypass git window and its check: alone.
+    /// A worker's protected write, or the check after a Bypass shell
+    /// command that changed the git directory: alone.
     Exclusive,
 }
 
