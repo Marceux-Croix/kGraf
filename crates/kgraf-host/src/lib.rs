@@ -143,6 +143,7 @@ pub mod error;
 mod gates;
 pub mod host;
 pub mod migrate;
+mod scoped_check;
 mod verifier;
 pub mod worker;
 mod workspaces;

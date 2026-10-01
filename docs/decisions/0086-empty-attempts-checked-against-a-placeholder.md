@@ -69,3 +69,17 @@ as finished code, so error types with derived traits, platform shims and mocks w
 real items are never flagged. The standard derives (`Debug`, `Clone`, `Copy`, `Default`,
 `PartialEq`, `Eq`, `Hash`, `PartialOrd`, `Ord`) and documentation, lint and layout attributes
 do not. Tests cover the shape both ways.
+
+## Amendment: an attempt that changed none of its declared files is refused
+
+A check that already passes before the work (`cargo build --workspace` over a stub the
+placeholder check does not recognize) accepted attempts that changed nothing, and the run
+counted those contracts done.
+
+- An attempt with no commit (nothing differs from its dispatch base) on a contract that
+  declared write targets now fails verification, whatever its check returned, and says why.
+  The reason reaches the next attempt's brief; past the failure limit the contract is held.
+  This is the rule an empty remediation already follows (0018).
+- Still passed with the notice: a contract with no declared write (a check-only contract), and
+  a handoff child adopting its parent's worktree.
+- A contract whose work is already present now fails loud instead of passing silently.

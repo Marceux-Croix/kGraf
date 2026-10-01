@@ -281,6 +281,39 @@ async fn concurrent_dispatches_each_settle_into_the_runs_accounted_spend() {
     assert_eq!(report.spent, ledger_cost, "both calls are ledgered");
 }
 
+/// The verifier's own word on the check an attempt is judged by (for the
+/// command verifier, the tests of the contract's files) reaches the worker's
+/// brief, with the contract and its worktree.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_verifiers_acceptance_brief_reaches_the_workers_brief() {
+    let dir = tempfile::tempdir().expect("dir");
+    let plan = plan_json(&[c("a", "make a", "src/a.rs", &[])]);
+    let p = Parts::open(
+        dir.path(),
+        move |_| plan.clone(),
+        |_| SERVES.into(),
+        Duration::from_millis(5),
+    );
+    *p.verifier.acceptance.lock().expect("lock") = Some("runs only the tests of src/a.rs".into());
+    let report = Orchestrator::new(config(), p.services(WINDOW))
+        .expect("orchestrator")
+        .start(RunId::new("r1"), "one part".into())
+        .await
+        .expect("run");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    let first = p
+        .stats
+        .requests()
+        .into_iter()
+        .find(|r| r.2 == 0)
+        .map(|r| r.1)
+        .expect("a worker request");
+    assert!(
+        first.contains("a in a worktree: runs only the tests of src/a.rs"),
+        "{first}"
+    );
+}
+
 /// Decision 0084: the verifier's reason for refusing an attempt (a scope
 /// violation, a failing check's output) reaches the next fresh attempt's
 /// brief, as a data block, and is kept on the contract's record.

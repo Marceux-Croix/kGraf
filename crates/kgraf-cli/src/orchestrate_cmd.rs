@@ -199,6 +199,14 @@ fn notice_line(n: &Notice) -> String {
                 .to_owned()
         }
         Notice::GateCommands(commands) => format!("gates      {}", commands.join("; ")),
+        Notice::AcceptanceNarrowed {
+            command,
+            added_gate,
+        } => format!(
+            "accept     each contract runs the tests of its own files from `{command}`; the whole \
+             command runs on the merged result as a root gate{}",
+            if *added_gate { " (added)" } else { "" }
+        ),
         Notice::GraphEmpty { root, files_seen } => format!(
             "graph      empty after indexing {} ({files_seen} file(s) seen): no graph slices \
              for this run, likely no supported language in the tree",

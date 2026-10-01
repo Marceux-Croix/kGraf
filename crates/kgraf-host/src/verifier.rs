@@ -29,7 +29,9 @@ use std::time::Duration;
 ///    contract declared, compared as a case- and normalization-insensitive
 ///    volume resolves names, and none may be repository metadata or cargo's
 ///    or rustup's configuration ([`build_config_changes`]);
-/// 4. the acceptance command runs **inside the sandbox** of that worktree
+/// 4. the acceptance command, narrowed to the tests of the contract's own
+///    files when its runner allows ([`crate::scoped_check`]; a gate
+///    remediation keeps the whole command), runs **inside the sandbox** of that worktree
 ///    (writes confined to the worktree and its scratch directory, network off,
 ///    kGraf's state unreadable, the same policy as the worker's shell),
 ///    bounded by the gate timeout; when its shell exits, its process group is
@@ -113,6 +115,30 @@ fn empty_integration_notice(contract: &str) -> String {
          exactly as it was dispatched",
         clean(contract)
     )
+}
+
+/// The refusal of an attempt that changed none of its declared files.
+fn unchanged_writes_reason(command: &str, writes: &[&str]) -> String {
+    format!(
+        "the attempt changed none of its declared files ({}); `{}` passed on the tree exactly as \
+         it was dispatched, which proves nothing about the work. Make the change the contract \
+         asks for",
+        clean(&writes.join(", ")),
+        clean(command)
+    )
+}
+
+/// The check an attempt at `contract` runs in the tree at `root`: the tests of
+/// its declared files, or the whole command. A gate remediation always runs
+/// the whole command: it fixes what the merged result failed.
+fn check_scope(whole: &str, contract: &OpenContract, root: &Path) -> crate::scoped_check::Scope {
+    if !contract.gate_commands.is_empty() {
+        return crate::scoped_check::Scope::Whole {
+            why: "a gate remediation is checked with the whole command".into(),
+        };
+    }
+    let writes: Vec<&str> = contract.writes.iter().map(|w| w.path.as_str()).collect();
+    crate::scoped_check::scope(whole, root, &writes)
 }
 
 /// Whether `c` can change how a terminal or a reader shows the text around
@@ -491,7 +517,7 @@ impl Verifier for CommandVerifier {
                 workspace.display()
             ));
         };
-        let command = self.command.clone();
+        let whole = self.command.clone();
         let denies = self.read_denies.clone();
         let merge_back = self.merge_back.clone();
         let contract = contract.clone();
@@ -608,7 +634,11 @@ impl Verifier for CommandVerifier {
                 );
             }
             // 4. The acceptance command, confined, in the worker's tree; its
-            // process group is killed when its shell exits.
+            // process group is killed when its shell exits. Narrowed to the
+            // tests of the contract's files (decision 0018 amendment): the
+            // whole command runs as the root gate on the merged result.
+            let scope = check_scope(&whole, &contract, ws.root());
+            let command = scope.command(&whole);
             let (mut passed, mut output) = run_confined(
                 &ws,
                 manager.repo(),
@@ -655,6 +685,12 @@ impl Verifier for CommandVerifier {
             drop(quiet);
             if !passed {
                 let mut reason = format!("`{}` failed: {}", clean(&failing), clean_lines(&output));
+                if let crate::scoped_check::Scope::Narrowed { selected, .. } = &scope {
+                    reason.push_str(&format!(
+                        " (the tests of the contract's files: {})",
+                        clean(&selected.join(", "))
+                    ));
+                }
                 if let Err(e) = &cleared {
                     reason.push_str(&format!("; also, what it left could not be removed: {e}"));
                 }
@@ -693,12 +729,24 @@ impl Verifier for CommandVerifier {
                 // continues in (a handoff child's inherited worktree).
                 let write_paths: Vec<&str> =
                     contract.writes.iter().map(|w| w.path.as_str()).collect();
-                let left_as_stub = placeholder_writes_left_in_place(write_paths, |p| {
+                let left_as_stub = placeholder_writes_left_in_place(write_paths.clone(), |p| {
                     read_write_target(ws.root(), p)
                 });
                 if !left_as_stub.is_empty() {
                     let reason = placeholder_left_in_place_reason(&left_as_stub);
                     return Ok(Verdict::Fail { reason });
+                }
+                // A contract that declared files to write and changed none of
+                // them did not do its work, whatever its check says: a check
+                // that already passes before the work (`cargo build` over a
+                // stub that compiles) proves nothing. Refused, as an empty
+                // remediation is (decision 0018); retried, then held. A handoff
+                // child adopting its parent's worktree is the exception: the
+                // work it continues may already be all there is.
+                if !write_paths.is_empty() && contract.workspace.is_none() {
+                    return Ok(Verdict::Fail {
+                        reason: unchanged_writes_reason(&command, &write_paths),
+                    });
                 }
                 workspaces
                     .empty
@@ -744,6 +792,15 @@ impl Verifier for CommandVerifier {
         })
         .await
         .map_err(|e| e.to_string())?
+    }
+
+    /// The narrowed check, named in the brief so the worker runs what it is
+    /// judged by and knows sibling stubs failing the whole suite are not its
+    /// work. Read from the worktree as dispatched; the verifier reads it again
+    /// after the work, so a test file the worker adds is included then.
+    fn acceptance_brief(&self, contract: &OpenContract, workspace: &Path) -> Option<String> {
+        let scope = check_scope(&self.command, contract, workspace);
+        crate::scoped_check::brief(&scope, &self.command)
     }
 }
 

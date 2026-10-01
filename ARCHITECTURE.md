@@ -669,6 +669,9 @@ instant.
   unknown timezone is refused at creation.
 - **The window can be closed.** The app keeps a visible tray process so
   schedules still fire.
+- **Runs counted.** `schedule list` counts clock-started occurrences and
+  manual `run-now` runs together; a manual run with no outcome yet is counted
+  apart.
 
 `kgraf-schedule` parses recurrence rules and owns a fenced SQLite claim
 table. The scheduler loop lives in `kgraf-orchestrator`; the desktop shell
@@ -882,6 +885,16 @@ gate's commands, and its verifier runs them after the run's own check, so a
 remediation is accepted only when the gate's commands pass in its worktree.
 A remediation that integrates no change counts as failed: the gate opens the
 next one or holds, and never runs again on the unchanged commit.
+
+**A contract is accepted on its own tests.** When the acceptance command is a
+whole-suite runner kGraf recognizes (`unittest discover`, `pytest`, `node
+--test` or `npm test` over it, jest or vitest, `cargo test` over a
+workspace), each attempt runs only the tests that belong to its declared
+files by the runner's naming convention, and the brief names that command.
+The whole command is added as a root gate when it is not one already, so it
+judges the merged result. Anything else runs whole, as do gate remediations.
+An attempt that changed none of its declared files is refused whatever its
+check says.
 
 Gates are also what makes an imperfect partition survivable. The
 interference the underlying research most warns about is **semantic**:

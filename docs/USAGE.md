@@ -516,6 +516,17 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   routes, verifies each attempt with `--verify` (default `cargo test --workspace`), runs
   quality gates (discovered, or `--gate-command`), and merges verified work onto its own
   branch `kgraf/<run>`. Your checked-out branch never moves.
+- When `--verify` is a whole-suite test runner kGraf recognizes, each contract is checked on
+  the tests of its own files only, and the whole command runs as a root gate on the merged
+  result (an `accept` line says so). Recognized: `python3 -m unittest discover [-s DIR]`
+  (`test_<name>.py`), `pytest` with options only (`test_<name>.py`, `<name>_test.py`),
+  `node --test`, and `npm test` running `node --test`, jest or vitest (`<name>.test.ts`,
+  `<name>.spec.ts`, or a file in a `test` folder), and `cargo test --workspace` (the package
+  of each file). A script such as `sh check.sh`, a command that already selects tests, a
+  contract whose files have no test, and a gate remediation run the command whole.
+- An attempt that changed none of its contract's declared files is not verified, even when
+  `--verify` passes: the check passed on the tree as dispatched, which proves nothing. It is
+  retried with the reason, then held.
 - kGraf sets no spend limit (decision 0080): set one in your provider's console. Every call
   is still on the ledger, and `kgraf spend` totals it. The concurrency caps are `--max-items`
   (default 4) and `--max-agents` (default 8).
@@ -575,7 +586,7 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   `cargo check`, `cargo test`, `cargo clippy` and `cargo fmt --check`, each under argument
   rules (for example, no `--manifest-path` outside the worktree, no `--config`, no `-Z`,
   no `--target-dir`), plus the run's own `--verify` and `--gate-command` commands exactly
-  as configured. Set `build_commands` in `.kgraf/worker.json` to change the list (`[]`
+  as configured, and each narrowed form of `--verify` (one test file or package). Set `build_commands` in `.kgraf/worker.json` to change the list (`[]`
   turns it off). A worker with a declared write scope (every orchestrated attempt) runs
   these and no other shell command that can write; the verifier still refuses any commit
   that changes a file outside the declared writes. The list is on unless `build_commands`
@@ -748,6 +759,9 @@ cargo run -p kgraf-cli -- schedule run-now nightly --route kimi:<model-id> --pri
   start the same schedule beside it and a second `run-now` is refused. `--verify` defaults to
   the first test command the project's build files declare. A run that ends blocked or
   stopped makes `orchestrate` exit non-zero, and `run-now` records it as failed.
+- `schedule list` counts a schedule's runs, clock-started and `run-now` together, as
+  `runs: N done, M failed`. A `run-now` still going (or one whose process ended before it
+  recorded an outcome) is shown on its own line, never counted as done.
 
 ## The desktop app
 

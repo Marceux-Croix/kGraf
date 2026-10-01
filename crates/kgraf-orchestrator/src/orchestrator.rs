@@ -5481,6 +5481,11 @@ impl RunLoop {
             + &self.interface_brief(&contract.contract)
             + &self.producer_rationale_brief(contract)
             + &refusal_brief(contract)
+            + &self
+                .s
+                .verifier
+                .acceptance_brief(contract, &workspace)
+                .unwrap_or_default()
             + &crate::shortfall::shortfall_brief(contract);
         let Some(route) = self.route(&route_name) else {
             send_failed(format!("route `{route_name}` is not configured"));

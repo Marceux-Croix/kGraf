@@ -48,3 +48,19 @@ and their total spend are reported, not just their individual outcomes, since a 
 makes an action cheaper tends to increase how often that action is taken.
 
 Scheduling depends on the orchestrator existing first; nothing here is built before that.
+
+## Amendment: a run-now is counted among the schedule's runs
+
+`schedule list` counted runs from the claim table's occurrences only, and a manual
+`schedule run-now` claims no occurrence, so a completed run-now showed `0 done, 0 failed`
+beside its own completed last run.
+
+- The claim table's `manual_runs` gains an `outcome` column (`done`, `failed`, or empty while
+  the run goes), added on open to an older table. `run-now` sets it when the run ends; a
+  missing row or a write that fails is printed, not fatal.
+- `schedule list` counts occurrences and manual runs together. A manual run with no outcome is
+  counted apart on its own line, never as done.
+- A manual outcome does not move the consecutive-failure count: a person started that run and
+  saw its result.
+- `schedule remove` clears manual runs too, so a schedule re-added under the same id starts
+  with no runs and no spend.

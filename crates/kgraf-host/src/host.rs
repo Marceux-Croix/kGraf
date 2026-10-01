@@ -120,6 +120,11 @@ pub enum Notice {
     /// the approved plan's), or none: a run that passes its gates says which
     /// commands passed them.
     GateCommands(Vec<String>),
+    /// The acceptance command is a test runner kGraf narrows: each contract
+    /// is checked on the tests of its own files, and the whole command runs
+    /// as a root gate on the merged result (`added_gate`: it was not one of
+    /// the gate commands already, so it was added).
+    AcceptanceNarrowed { command: String, added_gate: bool },
 }
 
 /// How a prepared run begins.
@@ -1404,9 +1409,13 @@ impl Host {
         // (the acceptance command) and the run's configured gate commands,
         // exactly as configured, besides the configuration's build and test
         // allowlist; `--shell-timeout` wins over the file's timeout.
+        // A narrowed acceptance command is allowed in each form the verifier
+        // can run (one test file or package each), read from the tree now.
+        let narrowed = crate::scoped_check::variants(&self.config.verify, &self.config.root);
         let worker_config = worker_config.with_configured_commands(
             std::iter::once(self.config.verify.as_str())
-                .chain(self.config.gate_commands.iter().map(String::as_str)),
+                .chain(self.config.gate_commands.iter().map(String::as_str))
+                .chain(narrowed.iter().map(String::as_str)),
         );
         let worker_config = match self.config.shell_timeout {
             Some(timeout) => worker_config.with_shell_timeout(timeout),
@@ -1657,6 +1666,17 @@ impl Host {
                  anything",
                 blank + 1
             )));
+        }
+        // Each contract is checked on its own files' tests when the acceptance
+        // command allows it; the whole command then judges the merged result,
+        // as a root gate, so a run never completes on per-file checks alone.
+        let (gate_commands, added_gate) =
+            crate::scoped_check::with_whole_gate(gate_commands, &self.config.verify, root);
+        if crate::scoped_check::narrowable(&self.config.verify, root) {
+            notices(Notice::AcceptanceNarrowed {
+                command: self.config.verify.clone(),
+                added_gate,
+            });
         }
         notices(Notice::GateCommands(gate_commands.clone()));
         let orchestrator = orchestrator.with_gate_runner(Arc::new(CommandGateRunner {

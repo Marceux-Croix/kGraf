@@ -2730,7 +2730,9 @@ async fn an_empty_attempt_is_checked_and_what_its_check_writes_is_not_a_change()
     assert!(ws.is_dir(), "a failed check leaves the worktree");
     assert!(!ws.join("gen.txt").exists(), "without the check's output");
 
-    let c2 = named("b.txt", "w-empty2");
+    // No declared write: an empty attempt on declared writes is refused.
+    let mut c2 = named("b.txt", "w-empty2");
+    c2.writes.clear();
     let ws = prepared(&r, &c2, "w-empty2").await;
     let verdict = verifier(&r, "touch gen.txt")
         .verify(&c2, &ws, &result())
@@ -2867,12 +2869,13 @@ async fn a_committed_attempt_that_left_a_declared_placeholder_untouched_is_refus
     assert!(ok.passed(), "{ok:?}");
 }
 
-/// A contract whose declared write target never held a placeholder (a
-/// re-verify, or a check-only contract) still auto-passes when nothing
-/// changed, and now carries a notice saying so (decision 0086): an accepted
-/// no-op is reported, never only traced.
+/// An attempt that changed none of the files its contract declared is not
+/// verified, even when its check passes on the tree as dispatched: a check
+/// that already passes before the work (`cargo build` over a stub that
+/// compiles) proves nothing about the work. The refusal says why, and the
+/// contract is retried or held like any failed attempt.
 #[tokio::test]
-async fn a_legitimately_unchanged_non_stub_file_passes_with_a_notice() {
+async fn an_attempt_that_changed_none_of_its_declared_files_is_not_verified() {
     let dir = tempfile::tempdir().expect("dir");
     let root = dir.path().join("repo");
     let base = dir.path().join("ws");
@@ -2888,6 +2891,25 @@ async fn a_legitimately_unchanged_non_stub_file_passes_with_a_notice() {
         .verify(&c, &ws, &result())
         .await
         .expect("ran");
+    let Verdict::Fail { reason } = &verdict else {
+        panic!("an empty attempt on declared writes must fail, got {verdict:?}");
+    };
+    assert!(reason.contains("changed none of"), "{reason}");
+    assert!(reason.contains("src/lib.rs"), "{reason}");
+}
+
+/// A contract with no declared write (a check-only contract) that changes
+/// nothing still passes, with the notice that it integrated no change.
+#[tokio::test]
+async fn a_check_only_contract_that_changes_nothing_passes_with_a_notice() {
+    let r = repo();
+    let mut c = named("x", "w-check");
+    c.writes.clear();
+    let ws = prepared(&r, &c, "w-check").await;
+    let verdict = verifier(&r, "true")
+        .verify(&c, &ws, &result())
+        .await
+        .expect("ran");
     let Verdict::Pass {
         commit: None,
         notices,
@@ -2899,6 +2921,111 @@ async fn a_legitimately_unchanged_non_stub_file_passes_with_a_notice() {
     assert!(
         notices.iter().any(|n| n.contains("integrated no change")),
         "{notices:?}"
+    );
+}
+
+/// A two-module Python package whose suite is the run's acceptance command.
+fn python_package(dir: tempfile::TempDir) -> Repo {
+    let root = dir.path().join("repo");
+    let base = dir.path().join("ws");
+    let stub = |name: &str| format!("def {name}(s):\n    raise NotImplementedError\n");
+    let test = |module: &str, name: &str| {
+        format!(
+            "import unittest\nfrom textkit.{module} import {name}\n\n\nclass T(unittest.TestCase):\n    \
+             def test_it(self):\n        self.assertEqual({name}('Ab'), 'ab')\n"
+        )
+    };
+    let files = [
+        ("textkit/__init__.py".to_owned(), String::new()),
+        ("textkit/slug.py".to_owned(), stub("slugify")),
+        ("textkit/counts.py".to_owned(), stub("lower")),
+        ("tests/test_slug.py".to_owned(), test("slug", "slugify")),
+        ("tests/test_counts.py".to_owned(), test("counts", "lower")),
+    ];
+    let files: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(a, b)| (a.as_str(), b.as_str()))
+        .collect();
+    repo_in(dir, root, &base, &files)
+}
+
+fn python3_present() -> bool {
+    std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_ok()
+}
+
+/// The rule of `scoped_check`: a contract is accepted on the tests of its own
+/// files. With the whole suite as the acceptance command, a contract that
+/// implemented its module passed nothing while a sibling's stub still failed
+/// the suite, and its worker asked for writes outside its scope.
+#[tokio::test]
+async fn a_contract_is_accepted_on_the_tests_of_its_own_files() {
+    if !python3_present() {
+        eprintln!("python3 is absent; skipped");
+        return;
+    }
+    let r = python_package(tempfile::tempdir().expect("dir"));
+    let suite = "python3 -m unittest discover -s tests";
+    let c = named("textkit/slug.py", "w-slug");
+    let ws = prepared(&r, &c, "w-slug").await;
+    std::fs::write(
+        ws.join("textkit/slug.py"),
+        "def slugify(s):\n    return s.lower()\n",
+    )
+    .expect("write");
+    let v = verifier(&r, suite);
+    let brief = v.acceptance_brief(&c, &ws).expect("a narrowed brief");
+    assert!(
+        brief.contains("`python3 -m unittest discover -s tests -p test_slug.py`"),
+        "{brief}"
+    );
+    let verdict = v.verify(&c, &ws, &result()).await.expect("ran");
+    let Verdict::Pass { by, .. } = &verdict else {
+        panic!("its own tests pass while the sibling stub fails the suite: {verdict:?}");
+    };
+    assert_eq!(by, "python3 -m unittest discover -s tests -p test_slug.py");
+
+    // Its own tests still judge it: a wrong implementation fails.
+    let c2 = named("textkit/slug.py", "w-slug-wrong");
+    let ws2 = prepared(&r, &c2, "w-slug-wrong").await;
+    std::fs::write(
+        ws2.join("textkit/slug.py"),
+        "def slugify(s):\n    return s\n",
+    )
+    .expect("write");
+    let verdict = v.verify(&c2, &ws2, &result()).await.expect("ran");
+    let Verdict::Fail { reason } = &verdict else {
+        panic!("a wrong slugify fails its own test: {verdict:?}");
+    };
+    assert!(reason.contains("-p test_slug.py"), "{reason}");
+}
+
+/// A remediation is judged on the whole command and the failing gate's
+/// commands: it fixes what the merged result failed, not one file's tests.
+#[tokio::test]
+async fn a_remediation_is_checked_with_the_whole_command() {
+    if !python3_present() {
+        eprintln!("python3 is absent; skipped");
+        return;
+    }
+    let r = python_package(tempfile::tempdir().expect("dir"));
+    let suite = "python3 -m unittest discover -s tests";
+    let mut c = named("textkit/slug.py", "w-fix");
+    c.gate_commands = vec!["true".into()];
+    let ws = prepared(&r, &c, "w-fix").await;
+    std::fs::write(
+        ws.join("textkit/slug.py"),
+        "def slugify(s):\n    return s.lower()\n",
+    )
+    .expect("write");
+    let v = verifier(&r, suite);
+    assert!(v.acceptance_brief(&c, &ws).is_none());
+    let verdict = v.verify(&c, &ws, &result()).await.expect("ran");
+    assert!(
+        matches!(&verdict, Verdict::Fail { reason } if reason.contains(suite)),
+        "the sibling stub still fails the whole suite: {verdict:?}"
     );
 }
 
@@ -5872,8 +5999,10 @@ async fn every_kind_of_attempt_follows_the_policy() {
         (WorktreeRetention::Keep, true),
     ] {
         let r = with_retention(repo_ignoring_target(), retention);
-        // Empty, selected: nothing to merge.
-        let empty = named("b.txt", "w-empty");
+        // Empty, selected: nothing to merge (a check-only contract: one with
+        // declared writes that changed nothing is refused).
+        let mut empty = named("b.txt", "w-empty");
+        empty.writes.clear();
         let we = prepared(&r, &empty, "w-empty").await;
         let (tree_e, scratch_e) = write_build_output(&r, &we);
         let v = verifier(&r, "true")

@@ -64,6 +64,6 @@ pub use storage::{
 };
 pub use store::{
     ClaimOutcome, DeferralOutcome, ExpiredClaim, HELD_FOR_MANUAL_RUN, ManualClaim,
-    OccurrenceRecord, RunOutcome, ScheduleStatus, ScheduleStore, TickDecision,
+    OccurrenceRecord, RunCounts, RunOutcome, ScheduleStatus, ScheduleStore, TickDecision,
 };
 pub use timezone::parse_time_zone;

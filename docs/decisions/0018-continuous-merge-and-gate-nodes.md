@@ -133,3 +133,39 @@ that would have made it pass never started.
 - **A remediation that integrates no change counts as failed.** The gate opens the next
   remediation, whose brief says why the last did not count, or holds past the limit; it is
   never run again on the unchanged commit.
+
+## Amendment: a contract is accepted on its own tests; the whole command is the root gate
+
+When the acceptance command (`--verify`) is the whole suite and each contract writes one file,
+no contract can pass before its siblings merge: their stubs fail the suite, and workers ask for
+writes outside their scope.
+
+- **The rule.** A contract is accepted on the tests that belong to its declared write set. The
+  project's whole test command judges the integrated result, as the root gate, once every
+  contract has landed.
+- **How a test belongs to a file** is read from the runner the command names and the tree, by
+  the runner's naming convention:
+  - `python -m unittest discover [-s DIR]`: `test_<stem>.py`, run with `-p test_<stem>.py`;
+  - `pytest` or `python -m pytest` with options only: `test_<stem>.py` or `<stem>_test.py`,
+    appended as a path;
+  - `node --test` with options only, and `npm test` whose `test` script is `node --test`,
+    `jest` or `vitest`: `<stem>.test.<ext>`, `<stem>.spec.<ext>`, or `<stem>.<ext>` in a
+    `test`, `tests` or `__tests__` folder, after `npm test --`;
+  - `cargo test` or `cargo nextest run` over a workspace (`--workspace`, `--all`, or a virtual
+    manifest): the package of each declared file, with `-p <package>`.
+  A declared test file selects itself. One command runs per test file or package, joined with
+  `&&`.
+- **The whole command runs** when the command is not one of these (a script, `make`, shell
+  syntax or quotes), when it already selects tests, when no test belongs to the contract's
+  files, and always for a gate remediation. A failed narrowed check names the tests it ran.
+- **The root gate.** When the acceptance command is narrowable and is not already a gate
+  command, it is added to the gate commands, so the whole suite judges the merged result even
+  when discovery found nothing. The run prints an `accept` line saying so.
+- **The worker is told** the exact narrowed command and the whole one, and that tests of files
+  outside its write set may fail until their contracts merge.
+- **Known limit.** Cargo narrows to the package: two contracts in one crate still see each
+  other's stubs fail that crate's tests.
+
+Alternatives rejected: comparing failing test sets at the base and on the attempt (an output
+parser per runner, and it accepts a partial fix); a planner-written per-contract command (not
+a mechanism); a prompt-only change (the verifier would still refuse the correct attempt).

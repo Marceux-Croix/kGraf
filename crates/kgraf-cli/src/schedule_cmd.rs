@@ -19,7 +19,9 @@
 //! table: a schedule the table has disabled is refused unless `--force`, and it
 //! takes the schedule's manual lock (`ScheduleStore::claim_manual_run`) for the
 //! length of the run, so the scheduler loop does not start the same schedule
-//! beside it and a second `run-now` is refused. It records no occurrence. The
+//! beside it and a second `run-now` is refused. It records no occurrence; its run
+//! id and outcome go in the claim table's `manual_runs`, so `list` counts it among
+//! the schedule's runs and its spend. The
 //! scheduler loop that uses the claim table lives in
 //! `kgraf-orchestrator::scheduler_loop` and is driven from `kgraf-shell`'s
 //! background mode.
@@ -241,9 +243,11 @@ pub fn list(root: &Path, prices: Option<&Path>) -> Result<()> {
         } else {
             "enabled".to_owned()
         };
-        let (done, failed) = claims
-            .occurrence_counts(&def.id)
-            .context("cannot read occurrence counts")?;
+        // Clock-started and run-now runs together.
+        let counts = claims
+            .run_counts(&def.id)
+            .context("cannot read the schedule's run counts")?;
+        let (done, failed) = (counts.done, counts.failed);
         println!("{:<20} {kind:<44} {state}", def.id);
         println!("  work node: {}", entry.node_id);
         if let Some(run) = views
@@ -274,6 +278,12 @@ pub fn list(root: &Path, prices: Option<&Path>) -> Result<()> {
         match spend {
             Some(money) => println!("  runs: {done} done, {failed} failed; spend {money}"),
             None => println!("  runs: {done} done, {failed} failed; spend unavailable (no ledger)"),
+        }
+        if counts.unsettled > 0 {
+            println!(
+                "  {} run-now run(s) with no outcome: still going, or ended before recording one",
+                counts.unsettled
+            );
         }
     }
     Ok(())
@@ -709,6 +719,23 @@ fn run_now_with(
     match &result {
         Ok(()) => record(EventKind::Completed, "manual run-now", spend),
         Err(e) => record(EventKind::Failed, &format!("{e:#}"), spend),
+    }
+    // The claim table's run counts are what `schedule list` reports; a run-now
+    // claims no occurrence, so its outcome is set on its `manual_runs` row. A
+    // failure here is bookkeeping, printed, and does not change the run's result.
+    match ScheduleStore::open(&crate::state_dir(root)?.join("schedule.db"))
+        .and_then(|claims| claims.record_manual_outcome(&args.id, &run_id, result.is_ok()))
+    {
+        Ok(true) => {}
+        Ok(false) => eprintln!(
+            "warning: run {run_id} has no row in `{}`'s claim table, so `schedule list` \
+             does not count it",
+            args.id
+        ),
+        Err(e) => eprintln!(
+            "warning: could not record run {run_id}'s outcome in `{}`'s run counts: {e}",
+            args.id
+        ),
     }
     result
 }
@@ -1156,6 +1183,18 @@ mod tests {
             "{recorded:?}"
         );
         assert!(!recorded.iter().any(|e| e == "completed"), "{recorded:?}");
+        assert_eq!(
+            open_claims(root)
+                .expect("claims")
+                .run_counts("nightly")
+                .expect("counts"),
+            kgraf_schedule::RunCounts {
+                done: 0,
+                failed: 1,
+                unsettled: 0
+            },
+            "the failed run-now is counted among the schedule's runs"
+        );
     }
 
     #[test]
@@ -1165,6 +1204,43 @@ mod tests {
         scheduled(root);
         run_now_with(root, run_now_args("nightly", false), |_, _| Ok(())).expect("ok");
         assert_eq!(events(root).last().map(String::as_str), Some("completed"));
+        // `schedule list` counts runs from the claim table; a run-now claims no
+        // occurrence, so its outcome must reach the table another way or the list
+        // shows `0 done, 0 failed` beside a completed last run.
+        assert_eq!(
+            open_claims(root)
+                .expect("claims")
+                .run_counts("nightly")
+                .expect("counts"),
+            kgraf_schedule::RunCounts {
+                done: 1,
+                failed: 0,
+                unsettled: 0
+            }
+        );
+    }
+
+    /// While the run goes, it is counted unsettled: started, not yet done.
+    #[test]
+    fn a_running_run_now_is_counted_unsettled_until_it_ends() {
+        let dir = tempfile::tempdir().expect("dir");
+        let root = dir.path();
+        scheduled(root);
+        run_now_with(root, run_now_args("nightly", false), |root, _| {
+            let counts = open_claims(root)?.run_counts("nightly")?;
+            assert_eq!(counts.unsettled, 1, "{counts:?}");
+            assert_eq!(counts.done + counts.failed, 0, "{counts:?}");
+            Ok(())
+        })
+        .expect("ok");
+        assert_eq!(
+            open_claims(root)
+                .expect("claims")
+                .run_counts("nightly")
+                .expect("counts")
+                .done,
+            1
+        );
     }
 
     fn disable(root: &Path) {

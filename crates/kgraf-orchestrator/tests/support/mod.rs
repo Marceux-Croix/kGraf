@@ -575,6 +575,8 @@ pub struct FileVerifier {
     pub numbers: Mutex<Vec<u32>>,
     /// (contract, `contract.gate_commands`) as each verification saw them.
     pub gate_commands: Mutex<Vec<(String, Vec<String>)>>,
+    /// When set, what `acceptance_brief` returns, after the contract's id.
+    pub acceptance: Mutex<Option<String>>,
 }
 
 impl FileVerifier {
@@ -589,6 +591,7 @@ impl FileVerifier {
             verified: AtomicUsize::new(0),
             numbers: Mutex::new(Vec::new()),
             gate_commands: Mutex::new(Vec::new()),
+            acceptance: Mutex::new(None),
         })
     }
 }
@@ -662,6 +665,19 @@ impl Verifier for FileVerifier {
 
     async fn recheck(&self, _commit: &VerifiedCommit) -> Result<bool, String> {
         Ok(self.recheck_ok.load(Ordering::SeqCst))
+    }
+
+    fn acceptance_brief(&self, contract: &OpenContract, workspace: &Path) -> Option<String> {
+        let text = self.acceptance.lock().expect("lock").clone()?;
+        Some(format!(
+            "\n\n{} in {}: {text}",
+            contract.contract,
+            if workspace.as_os_str().is_empty() {
+                "none"
+            } else {
+                "a worktree"
+            }
+        ))
     }
 }
 

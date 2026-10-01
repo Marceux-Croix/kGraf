@@ -234,3 +234,11 @@ Rejected for the one-string form: refusing without splitting (models repeat the 
 unattended refusal often holds the contract for a call whose meaning is clear); running every
 one-string command through `sh -c` (grants shell syntax to every such call); splitting with
 quote rules (a quote is shell syntax here and is refused).
+
+## Amendment: the narrowed forms of the acceptance command are allowed too
+
+The verifier may run the acceptance command narrowed to one test file or package (0018). A
+worker may run each such form as well: at build time kGraf reads the tree and adds every
+single-part narrowed command (one per test file, or per cargo package) to the allowlist,
+exactly, beside the command as configured. A test file a worker adds later is not in that
+list; the worker can still run the whole command, and the verifier runs the new file's tests.

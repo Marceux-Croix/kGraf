@@ -72,9 +72,12 @@ CREATE TABLE IF NOT EXISTS occurrences (
 -- design, see schedule_cmd.rs's module doc), so its run id has nowhere to live
 -- without this table; without it, a run-now's spend was invisible to `schedule list`
 -- entirely, undercounting the reported figure.
+-- `outcome` is NULL while the run goes (or when it ended without reporting one),
+-- then 'done' or 'failed', so `schedule list` counts a run-now among its runs.
 CREATE TABLE IF NOT EXISTS manual_runs (
     schedule_id TEXT NOT NULL,
     run_id      TEXT NOT NULL,
+    outcome     TEXT,
     PRIMARY KEY (schedule_id, run_id)
 );
 
@@ -296,6 +299,11 @@ impl ScheduleStore {
             conn.execute_batch(
                 "ALTER TABLE occurrences ADD COLUMN deferred_count INTEGER NOT NULL DEFAULT 0",
             )?;
+        }
+        // A run-now's outcome, added after `manual_runs` first shipped: before it,
+        // a run-now was in the spend but never in the run counts.
+        if !has_column(&conn, "manual_runs", "outcome")? {
+            conn.execute_batch("ALTER TABLE manual_runs ADD COLUMN outcome TEXT")?;
         }
         Ok(Self {
             conn,
@@ -778,6 +786,12 @@ impl ScheduleStore {
             "DELETE FROM manual_locks WHERE schedule_id = ?1",
             params![schedule_id],
         )?;
+        // Manual runs too: a schedule re-added under this id must not inherit
+        // their counts or their spend.
+        self.conn.execute(
+            "DELETE FROM manual_runs WHERE schedule_id = ?1",
+            params![schedule_id],
+        )?;
         self.conn.execute(
             "DELETE FROM schedules WHERE schedule_id = ?1",
             params![schedule_id],
@@ -929,6 +943,27 @@ impl ScheduleStore {
             |row| row.get(0),
         )?;
         Ok((done as u64, failed as u64))
+    }
+
+    /// Every run of this schedule, clock-started occurrences and manual run-now
+    /// runs together: what `schedule list` reports as its runs. A manual run with
+    /// no outcome yet (still going, or its process ended before it could record
+    /// one) is counted as `unsettled`, never as done or failed.
+    pub fn run_counts(&self, schedule_id: &str) -> Result<RunCounts, ScheduleError> {
+        let (done, failed) = self.occurrence_counts(schedule_id)?;
+        let (manual_done, manual_failed, unsettled): (i64, i64, i64) = self.conn.query_row(
+            "SELECT COALESCE(SUM(outcome = 'done'), 0),
+                    COALESCE(SUM(outcome = 'failed'), 0),
+                    COALESCE(SUM(outcome IS NULL), 0)
+             FROM manual_runs WHERE schedule_id = ?1",
+            params![schedule_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        Ok(RunCounts {
+            done: done + manual_done as u64,
+            failed: failed + manual_failed as u64,
+            unsettled: unsettled as u64,
+        })
     }
 
     /// Corrects a `last_seen` that is ahead of `now` (a forward system-clock jump
@@ -1089,6 +1124,24 @@ impl ScheduleStore {
             params![schedule_id, run_id],
         )?;
         Ok(())
+    }
+
+    /// Records how a manual run ended, `done` or failed. Returns whether a row was
+    /// updated: `false` means [`ScheduleStore::record_manual_run`] never recorded
+    /// this run, and the caller must say so. A manual outcome does not move
+    /// `consecutive_failures`: a person started the run and saw its result, so it
+    /// is not evidence the schedule should stop firing by itself.
+    pub fn record_manual_outcome(
+        &self,
+        schedule_id: &str,
+        run_id: &str,
+        done: bool,
+    ) -> Result<bool, ScheduleError> {
+        let updated = self.conn.execute(
+            "UPDATE manual_runs SET outcome = ?3 WHERE schedule_id = ?1 AND run_id = ?2",
+            params![schedule_id, run_id, if done { "done" } else { "failed" }],
+        )?;
+        Ok(updated > 0)
     }
 
     /// Handles a capacity refusal ([`RunOutcome::Failed`] carrying
@@ -1307,6 +1360,15 @@ impl ScheduleStore {
             .optional()
             .map_err(ScheduleError::from)
     }
+}
+
+/// A schedule's runs, from [`ScheduleStore::run_counts`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RunCounts {
+    pub done: u64,
+    pub failed: u64,
+    /// Manual runs with no recorded outcome.
+    pub unsettled: u64,
 }
 
 /// One occurrence, from [`ScheduleStore::occurrences_since`].
@@ -2462,6 +2524,80 @@ mod tests {
                 "sched-s1-1700000000-abcd1234".to_owned(),
             ]
         );
+    }
+
+    /// A run-now claims no occurrence, so its outcome lives on its `manual_runs`
+    /// row; `run_counts` adds those to the clock-started runs, and a run that has
+    /// not settled is counted apart, never as done.
+    #[test]
+    fn run_counts_include_manual_runs_and_count_an_unsettled_one_apart() {
+        let store = ScheduleStore::open_in_memory().unwrap();
+        let due = t(9, 0, 0);
+        let generation = claim(&store, "s1", due, "a", due, Duration::from_secs(60));
+        store
+            .record_outcome("s1", due, "a", generation, &RunOutcome::Success)
+            .unwrap();
+        store.record_manual_run("s1", "m-done").unwrap();
+        store.record_manual_run("s1", "m-failed").unwrap();
+        store.record_manual_run("s1", "m-running").unwrap();
+        assert!(store.record_manual_outcome("s1", "m-done", true).unwrap());
+        assert!(
+            store
+                .record_manual_outcome("s1", "m-failed", false)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .record_manual_outcome("s1", "no-such-run", true)
+                .unwrap(),
+            "an outcome for a run never recorded matches no row and says so"
+        );
+        assert_eq!(
+            store.run_counts("s1").unwrap(),
+            RunCounts {
+                done: 2,
+                failed: 1,
+                unsettled: 1
+            }
+        );
+        // The scheduler-only tally is unchanged by manual runs.
+        assert_eq!(store.occurrence_counts("s1").unwrap(), (1, 0));
+        // A manual outcome is not a schedule failure: it does not count toward
+        // the consecutive failures that disable a schedule.
+        assert_eq!(store.schedule_status("s1").unwrap().consecutive_failures, 0);
+    }
+
+    /// `remove_schedule` clears manual runs too, so a schedule re-added under the
+    /// same id starts with no runs and no spend.
+    #[test]
+    fn remove_schedule_clears_manual_runs() {
+        let store = ScheduleStore::open_in_memory().unwrap();
+        store.record_manual_run("s1", "m1").unwrap();
+        store.record_manual_outcome("s1", "m1", true).unwrap();
+        store.remove_schedule("s1").unwrap();
+        assert_eq!(store.run_counts("s1").unwrap(), RunCounts::default());
+        assert!(store.run_ids_for_schedule("s1").unwrap().is_empty());
+    }
+
+    /// A claim table written before manual outcomes existed gains the column on
+    /// open; its old manual rows read as unsettled.
+    #[test]
+    fn an_old_manual_runs_table_gains_the_outcome_column() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("schedule.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE manual_runs (schedule_id TEXT NOT NULL, run_id TEXT NOT NULL,
+                 PRIMARY KEY (schedule_id, run_id));
+                 INSERT INTO manual_runs VALUES ('s1', 'old');",
+            )
+            .unwrap();
+        }
+        let store = ScheduleStore::open(&path).unwrap();
+        assert_eq!(store.run_counts("s1").unwrap().unsettled, 1);
+        store.record_manual_outcome("s1", "old", false).unwrap();
+        assert_eq!(store.run_counts("s1").unwrap().failed, 1);
     }
 
     /// Verifier item 9: the read-only open runs no schema batch and writes

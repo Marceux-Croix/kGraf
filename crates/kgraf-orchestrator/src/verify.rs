@@ -69,6 +69,14 @@ pub trait Verifier: Send + Sync {
     /// Re-check a recorded progress claim on resume: whether the commit the
     /// record says was verified still verifies.
     async fn recheck(&self, commit: &VerifiedCommit) -> Result<bool, String>;
+
+    /// What a fresh attempt's brief says about the check it will be judged by,
+    /// when that differs from the run's acceptance command as written (for
+    /// example, narrowed to the tests of the contract's files). `workspace` is
+    /// the attempt's worktree as dispatched. `None` adds nothing.
+    fn acceptance_brief(&self, _contract: &OpenContract, _workspace: &Path) -> Option<String> {
+        None
+    }
 }
 
 /// Beam's ray status.
