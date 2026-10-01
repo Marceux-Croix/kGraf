@@ -23,12 +23,14 @@
 //! exactly as a worker's own attempt is carried (`worker/workspace.rs` in
 //! `kgraf-host`, and `MergeBack::commit`/`merge` themselves): attributes
 //! pinned to the integration tip's own tree (never a worker-writable
-//! `.gitattributes`), hooks and fsmonitor off, the gitlink verified before
+//! `.gitattributes`), the host runner's overrides (`kgraf_core::host_git`:
+//! hooks, every configured driver, fsmonitor and transports off), the gitlink verified before
 //! any git process touches the worktree, and a change to a protected path
 //! (`.gitattributes`, `.gitmodules`, `.git*` directories, kGraf's own state)
 //! refused loudly (`RefusalReason::ProtectedPath`) rather than
-//! merged. No filter or merge driver a worker's tree could select ever runs,
-//! because merge-back's `SafeGit` never reads attributes from a worktree.
+//! merged. No filter or merge driver ever runs: merge-back's `SafeGit` never
+//! reads attributes from a worktree, and the host runner neutralizes every
+//! driver the config defines whatever the attributes select.
 //!
 //! Written new: the mechanism composes existing merge-back
 //! primitives (`MergeBack::attempt`, `finish`) rather than writing tree

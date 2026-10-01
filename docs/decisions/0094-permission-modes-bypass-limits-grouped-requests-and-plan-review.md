@@ -230,3 +230,124 @@ worker's git writes were not serialized against other workers' or kGraf's own. B
   it, including one another worker's window left in between. On a network file system without
   flock support the lock may not exclude another machine. A git write by a command that does not
   name git is refused by the sandbox, not checked.
+
+## Amendment: kGraf's own git runs nothing a repository selects, and Bypass writes `.gitattributes`, `.gitmodules` and `.githooks`
+
+This narrows the Bypass refusal list of the first amendment above (Bypass writes the git
+directory and kGraf's settings).
+
+**1. One hardened runner for every git kGraf runs on the host** (`kgraf_core::host_git`).
+kGraf runs git outside the worker sandbox to create worktrees, commit and merge attempts, read
+status and history, and check protected writes. Each call site used to carry its own partial
+overrides (hooks and fsmonitor at best), so a filter or merge driver selected by attributes and
+defined in the config, a config-defined hook, an inherited `GIT_*` variable or a repository's
+`protocol.file.allow` reached kGraf's own git.
+
+- **Fixed overrides on every call:** `core.hooksPath` at the null device (`/dev/null`; `NUL`
+  on Windows), `core.fsmonitor=false`, `core.editor` and `sequence.editor` set to `:` (git
+  never launches it), `credential.helper` and `core.askPass` emptied, `protocol.allow=never`
+  and `GIT_ALLOW_PROTOCOL=none` (the variable outranks a repository's
+  `protocol.<name>.allow`, which `protocol.allow` does not), `submodule.recurse=false`,
+  `fetch.recurseSubmodules=false`, `push.recurseSubmodules=no`,
+  `status.submoduleSummary=false`, `commit.gpgSign`, `tag.gpgSign`,
+  `merge.verifySignatures` and `log.showSignature` false (they run `gpg.program`),
+  `diff.external` emptied, `gc.auto=0` and `maintenance.auto=false`.
+- **Per-repository overrides:** git cannot disable drivers or config hooks by kind, only by
+  name, so before each command the effective config is listed (`git config --includes -z
+  --list`, same location and environment) and every name found is neutralized:
+  `filter.<name>.clean`, `.smudge` and `.process` emptied and `.required=false` (git stores
+  and checks out the bytes unchanged); `merge.<name>.driver` emptied (git cannot run it, and
+  a path changed on both sides is a conflict, never resolved); `diff.<name>.textconv` and
+  `.command` emptied; `hook.<name>.enabled=false` (config-defined hooks, which git 2.54 runs
+  even with `core.hooksPath` at the null device: measured); `tar.<name>.command` emptied. An
+  empty command is never run; git fails with "cannot run" instead.
+- **Per-subcommand flags:** `diff`, `log`, `show` and `whatchanged` get `--no-ext-diff
+  --no-textconv`; `blame` and `annotate` get `--no-textconv`.
+- **Environment:** every inherited `GIT_*` variable is removed except the commit identity
+  (`GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME`, `GIT_COMMITTER_EMAIL`) and
+  `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM`; `GIT_TERMINAL_PROMPT=0`, `GIT_NO_LAZY_FETCH=1`,
+  `GIT_MERGE_AUTOEDIT=no`, `LC_ALL=C` and `--no-pager` are set.
+- **How they travel:** as `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>`, not
+  `-c`: `-c` splits at the first `=`, so a driver named `a=b` would be misread and left
+  active. The variables also reach the git processes git starts itself (`worktree add` runs
+  a checkout). They need git 2.31; an older git is refused rather than run without them.
+- **Kept, so results stay byte-correct:** the user's global and system config and attributes,
+  so the commit identity, `core.autocrlf`, `text`, `eol`, `ident` and
+  `working-tree-encoding` behave as in the user's own git (they are built in, not programs).
+  Merge-back keeps its own `GIT_CONFIG_NOSYSTEM=1` and its attribute source pinned to the
+  integration tip. Not set by the runner: `GIT_CONFIG_NOSYSTEM` (the Windows system config
+  carries `core.autocrlf`; its drivers are neutralized like any other) and
+  `GIT_ATTR_NOSYSTEM` (attributes only select drivers, and every configured driver is
+  neutralized).
+- **Consequence:** a path whose attributes select a configured filter (git-lfs, git-crypt) is
+  stored and checked out by kGraf in its committed form, not filtered, and a path whose merge
+  driver is configured conflicts when both sides change it. The user's own git is untouched
+  and still honors every hook, filter and driver.
+- **Covered call sites:** `kgraf_sandbox::git::Git::run` (worktree add, remove, list and
+  repair, the integration view, `kgraf worker`'s attempt reads, the check runner, the state
+  directory move), merge-back's `SafeGit` (commit, merge, fsck, gc), the subagent and
+  speculation snapshot runner in `kgraf-host`'s workspaces, the worker's status read
+  (`kgraf_runtime::worktree`), the co-change history read (`kgraf_graph::cochange`), the
+  protected-write checks (`kgraf_tools::protected`, including the end-of-attempt `git fsck`),
+  and the brief benchmark's fixture helpers. Not covered, by design: the worker's own `git`
+  inside the sandbox (its subject rules and `-c` overrides are unchanged), and cargo's own
+  git for dependency fetches (decision 0087).
+- **With the repository lock** (the amendment above). Every call site above that runs git on a
+  repository also holds the repository's lock shared for that one process: the sandbox's `Git`
+  runner, merge-back's runner, the host's snapshot and view runner, the worker's status read,
+  the co-change history read and the brief benchmark's fixture helpers. The lock module lives in
+  `kgraf_core::repo_lock` (re-exported as `kgraf_sandbox::repo_lock`), so `kgraf-runtime` and
+  `kgraf-graph` take it without depending on `kgraf-sandbox`. The lock is taken before
+  `host_git::command` builds the invocation, so the config listing runs inside the same shared
+  hold as the command it prepares; still one hold per git process, never nested. The
+  protected-write checks run inside their window's exclusive hold, so their listing does too.
+- **Measured cost:** the config listing is one more git process per call, about 6 ms on the
+  development machine (200 calls each of `git config --list` and `git rev-parse HEAD`, both
+  about 5.8 ms). The version check runs once per git executable.
+- **No gap between the listing and the command.** They are two processes, but both run inside
+  one hold of the repository lock: a Bypass shell command that can write the config runs only in
+  an exclusive window, which cannot open while the shared hold lasts, so the config the listing
+  read is the config the command reads.
+- **Known limit:** Windows behavior of the null hooks path is not run.
+
+**2. Bypass writes the three tracked git files.**
+
+- **What changes.** In Bypass only, a worker may write `.gitattributes` (at any depth),
+  `.gitmodules` and anything under `.githooks` (`kgraf_core::paths::is_bypass_git_file`; an
+  NTFS short name or a stream suffix of them stays refused, as do `.gitconfig`, a nested
+  `.git` and kGraf's state). They are ordinary tracked files in the worktree, so:
+  - `apply_patch` writes them in the worktree (`kgraf_tools::protected::Area::Tracked`), with
+    ordinary files in the same patch, deletions and moves included, under the write guard
+    that still refuses a link that resolves into `.git`. Each write is recorded as a
+    protected write (`kept`).
+  - The declared write scope applies to them like any file: the worker's own scope check,
+    the orchestrator's check of the attempt's changes, and the verifier's scope check. A plan
+    may declare them while the mode is Bypass (`validate_plan_with`); a file-scope shortfall
+    for one is grantable in Bypass.
+  - Merge-back commits and merges them as plain data
+    (`kgraf_sandbox::Attempt::allow_bypass_git_files`, set by the verifier when the mode is
+    Bypass), the hook's executable bit kept; the subagent checkpoint, result and speculation
+    snapshots let them through on the same condition.
+  - In every other mode they are refused, at the tool, the scope checks and merge-back, as
+    before.
+- **No snapshot or check.** Git history keeps every earlier version of a tracked file, so a
+  faulty write is a normal diff the verifier and the user see; the `.git` snapshot exists
+  because the git directory has no history.
+- **Why this is safe for kGraf itself.** kGraf's own git runs nothing these files select
+  (the host runner above), and merge-back still reads attributes only from the integration
+  tip's tree, never a worker's. A landed `.gitattributes` becomes that tree for later
+  attempts: its builtin attributes (`text`, `eol`, `merge=union`, `binary`) then apply to
+  kGraf's merges as they do to the user's own; programs never run.
+- **What the user's own git does.** It honors them: a landed `.githooks/pre-commit` runs at
+  the user's next commit when `core.hooksPath` is `.githooks`, and a landed `.gitmodules` is
+  read by the user's `git submodule` commands. This is the same as accepting any other change
+  from a worker, and is why the mode is Bypass.
+
+Evidence: mechanism tests in `kgraf-core` (an armed repository where plain git runs every
+planted program, then kGraf's commit, checkout, merge, worktree add, diff, log, blame, status
+and fsck leave no marker, bytes unchanged, merges byte-correct, transports refused),
+`kgraf-sandbox` (the same through the real worktree manager and merge-back, and the allowance
+merging the three files as data), `kgraf-tools` (the tool path in each mode), and `kgraf-host`
+(a hosted run with a scripted model: declared files merged in Bypass, undeclared ones held to
+the scope, another mode refusing them). Mutation checks remove the hooks override, the driver
+overrides, the verifier's allowance and the worker's scope check; each makes a test fail.

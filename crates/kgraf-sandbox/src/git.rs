@@ -10,7 +10,6 @@
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use crate::error::WorkspaceError;
 
@@ -84,16 +83,41 @@ impl Git {
         let args: Vec<OsString> = args.into_iter().map(|a| a.as_ref().to_owned()).collect();
         // Shared repository lock for this one process (decision 0094): never
         // while a worker's Bypass git window is open on the same repository.
+        // Taken before the command is built, so the host runner's config
+        // listing and the command it prepares run in the same hold and a
+        // Bypass write to the config cannot fall between them.
         let _repo =
             crate::repo_lock::shared_for(cwd, &format!("kGraf git {}", display_args(&args)))?;
-        let mut cmd = Command::new(&self.exe);
-        cmd.arg("-C").arg(cwd).args(&args);
-        for var in GIT_REDIRECT_ENV {
-            cmd.env_remove(var);
-        }
-        // Never block on a credential prompt; keep messages in one language
-        // so callers can match the "is not a working tree" case if needed.
-        cmd.env("GIT_TERMINAL_PROMPT", "0").env("LC_ALL", "C");
+        // The host runner: hooks, drivers, the file system monitor and
+        // transports off, the inherited `GIT_*` environment (`GIT_REDIRECT_ENV`
+        // among it) removed, messages in one language so callers can match
+        // the "is not a working tree" case.
+        let pre = kgraf_core::host_git::dash_c(cwd);
+        let inv = kgraf_core::host_git::Invocation {
+            exe: &self.exe,
+            cwd: None,
+            pre: &pre,
+        };
+        let mut cmd = match kgraf_core::host_git::command(&inv, &args) {
+            Ok(cmd) => cmd,
+            Err(kgraf_core::host_git::HostGitError::Config { code, stderr }) => {
+                return Err(WorkspaceError::GitFailed {
+                    args: display_args(&args),
+                    cwd: cwd.to_path_buf(),
+                    code,
+                    stderr,
+                });
+            }
+            Err(kgraf_core::host_git::HostGitError::Spawn { source, .. }) => {
+                return Err(WorkspaceError::io(&self.exe, source));
+            }
+            Err(e) => {
+                return Err(WorkspaceError::GitOutput {
+                    args: display_args(&args),
+                    detail: e.to_string(),
+                });
+            }
+        };
         cmd.stdin(if input.is_empty() {
             Stdio::null()
         } else {

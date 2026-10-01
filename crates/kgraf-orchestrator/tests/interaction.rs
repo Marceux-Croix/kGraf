@@ -128,15 +128,21 @@ async fn the_box_port_carries_a_status_question_and_a_note_through_the_real_loop
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn compact_names_what_it_could_not_compact() {
+async fn compact_asks_a_running_worker_once_and_names_what_it_could_not_compact() {
     let dir = tempfile::tempdir().expect("dir");
     let plan = plan_json(&[c("a", "make a", "src/a.rs", &[])]);
     let p = Parts::open(
         dir.path(),
         move |_| plan.clone(),
         |_| SERVES.into(),
-        Duration::from_millis(300),
+        Duration::from_millis(20),
     );
+    // The worker's first round waits for the test, so the request lands while
+    // it runs; it compacts at the boundary after that round (decision 0095).
+    let permits = Arc::new(tokio::sync::Semaphore::new(0));
+    for fake in [&p.alpha, &p.beta] {
+        *fake.hold.lock().expect("lock") = Some(("make a".into(), permits.clone()));
+    }
     let o = Orchestrator::new(config(), p.services(WINDOW)).expect("orchestrator");
     let handle = o.handle();
     let run = tokio::spawn(o.start(RunId::new("r1"), "make a".into()));
@@ -154,15 +160,44 @@ async fn compact_names_what_it_could_not_compact() {
         handle.compact(None).await,
         Err(CompactError::NothingToCompact)
     );
-    assert_eq!(
-        handle.compact(Some(worker.clone())).await,
-        Err(CompactError::RuntimeCannotCompact(worker))
-    );
+    let asked = loop {
+        match handle.compact(Some(worker.clone())).await {
+            Err(CompactError::NotStarted(_)) => tokio::time::sleep(Duration::from_millis(5)).await,
+            other => break other,
+        }
+    };
+    assert_eq!(asked, Ok(()), "a running worker is asked");
     assert_eq!(
         handle.compact(Some("nobody".into())).await,
         Err(CompactError::UnknownWorker("nobody".into()))
     );
+    // Round 0, then round 0 of the compacted remainder.
+    permits.add_permits(2);
     run.await.expect("join").expect("run");
+
+    let record = RunStore::new(p.graph.clone())
+        .load(&RunId::new("r1"))
+        .expect("load")
+        .expect("record");
+    assert_eq!(record.compactions.len(), 1, "{:?}", record.compactions);
+    let entry = &record.compactions[0];
+    assert_eq!(entry.worker, worker);
+    assert_eq!(
+        entry.notice.trigger,
+        kgraf_runtime::CompactionTrigger::UserRequest
+    );
+    assert!(!entry.sizing_miss, "a user's request is not a sizing miss");
+    assert_eq!(record.counters.sizing_misses, 0);
+    let log = TraceLog::open(&p.dir.join("runs").join("r1").join("trace.jsonl"))
+        .await
+        .expect("trace");
+    assert!(
+        log.load()
+            .await
+            .expect("load")
+            .iter()
+            .any(|e| matches!(e, TraceEvent::WorkerCompacted { worker: w, .. } if *w == worker))
+    );
     assert_eq!(
         handle.compact(None).await,
         Err(CompactError::Stopped),

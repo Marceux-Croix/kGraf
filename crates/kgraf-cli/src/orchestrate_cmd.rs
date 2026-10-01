@@ -536,7 +536,12 @@ fn report_lines(report: &kgraf_orchestrator::RunReport) -> Vec<String> {
         report.counters.readiness_failures,
         report.budget_admitted,
     ));
-    out.push(format!("handbacks  {}", report.counters.sizing_misses));
+    // Decision 0095: a worker that compacted at its stop point is a sizing miss
+    // as a hand-back is, one per worker.
+    out.push(format!(
+        "misses     {} (hand-backs and stop-point compactions)",
+        report.counters.sizing_misses
+    ));
     if report.contract_checks.enabled {
         let c = &report.contracts;
         out.push(format!(

@@ -112,6 +112,14 @@ pub enum TraceEvent {
         done_items: usize,
         remaining_items: usize,
     },
+    /// The runtime compacted a worker (decision 0095): its fixed notice, as
+    /// the worker emitted it.
+    WorkerCompacted {
+        at_ms: i64,
+        contract: String,
+        worker: String,
+        notice: kgraf_runtime::CompactionNotice,
+    },
     /// Question 3.
     Regrounding {
         at_ms: i64,
@@ -614,6 +622,24 @@ fn scrub_trace_fields(event: TraceEvent) -> TraceEvent {
             crossed_cluster,
             reason: s(reason),
         },
+        // The notice is structured; only a fallback's reason can carry a
+        // provider's text.
+        TraceEvent::WorkerCompacted {
+            at_ms,
+            contract,
+            worker,
+            mut notice,
+        } => {
+            if let kgraf_runtime::SummarySource::Runtime { reason } = notice.summary_source {
+                notice.summary_source = kgraf_runtime::SummarySource::Runtime { reason: s(reason) };
+            }
+            TraceEvent::WorkerCompacted {
+                at_ms,
+                contract,
+                worker,
+                notice,
+            }
+        }
         other @ (TraceEvent::Dispatch { .. }
         | TraceEvent::WorkerFinished { .. }
         | TraceEvent::Compaction { .. }

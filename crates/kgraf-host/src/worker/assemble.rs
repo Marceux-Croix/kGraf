@@ -597,6 +597,10 @@ pub async fn assemble(a: Assembly) -> Result<Assembled> {
         }
         None => Arc::new(NoSlices),
     };
+    // Decision 0095: every worker lists `recall_history`, so the prefix stays
+    // one per vendor and model; the worker loop answers it from the worker's
+    // own pre-compaction history, and before a compaction it has none.
+    builtins.push(Arc::new(kgraf_runtime::RecallHistoryTool));
     builtins.extend(a.extra_tools.iter().cloned());
     let skills = a
         .skills

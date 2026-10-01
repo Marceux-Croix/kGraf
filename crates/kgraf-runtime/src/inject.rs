@@ -126,6 +126,34 @@ impl Injector {
     pub fn is_finished(&self) -> bool {
         self.queue.lock().closed
     }
+
+    /// Ask the worker to compact at its next round boundary (decision 0095:
+    /// a user's `/compact <worker>`). Refused when the worker has ended or
+    /// has already compacted: a worker compacts at most once.
+    pub fn request_compaction(&self) -> Result<(), CompactRequestError> {
+        let mut state = self.queue.lock();
+        if state.closed {
+            return Err(CompactRequestError::Finished {
+                worker: self.worker.to_string(),
+            });
+        }
+        if state.compacted {
+            return Err(CompactRequestError::AlreadyCompacted {
+                worker: self.worker.to_string(),
+            });
+        }
+        state.compaction_requested = true;
+        Ok(())
+    }
+}
+
+/// Why a compaction request was refused.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum CompactRequestError {
+    #[error("worker `{worker}` has already finished")]
+    Finished { worker: String },
+    #[error("worker `{worker}` has already compacted once; a worker compacts at most once")]
+    AlreadyCompacted { worker: String },
 }
 
 /// Why an injection was refused.
@@ -153,6 +181,10 @@ struct QueueState {
     known: BTreeSet<String>,
     /// Set when the worker ends; every later push is refused.
     closed: bool,
+    /// A compaction asked for and not yet taken by the loop (decision 0095).
+    compaction_requested: bool,
+    /// Set once the worker has compacted; a later request is refused.
+    compacted: bool,
 }
 
 /// One worker's steering queue (see the module docs).
@@ -177,6 +209,18 @@ impl SteerQueue {
         // A poisoned lock means a panic while holding it; the state itself is
         // a queue and a set, each left consistent by every method below.
         self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Take a pending compaction request (decision 0095).
+    pub(crate) fn take_compaction_request(&self) -> bool {
+        std::mem::take(&mut self.lock().compaction_requested)
+    }
+
+    /// Record that the worker compacted, so a later request is refused.
+    pub(crate) fn mark_compacted(&self) {
+        let mut state = self.lock();
+        state.compacted = true;
+        state.compaction_requested = false;
     }
 
     fn push(&self, worker: &AgentId, injection: Injection) -> Result<(), InjectError> {

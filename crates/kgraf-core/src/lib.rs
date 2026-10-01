@@ -7,6 +7,7 @@
 pub mod budget;
 pub mod cost;
 pub mod flock;
+pub mod host_git;
 pub mod ids;
 pub mod legacy;
 pub mod litellm;
@@ -15,6 +16,7 @@ pub mod model_profile;
 pub mod palette;
 pub mod parallel;
 pub mod paths;
+pub mod repo_lock;
 pub mod session;
 pub mod usage;
 

@@ -610,7 +610,13 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
     output and is not merged; every write, kept or put back, shows in the run's trace and the
     activity card. The ledger, the trace, run records, transcripts, the graph and the rest of
     `.kgraf` stay refused in every mode, as do `.git/objects`, the `.git` link file,
-    `.gitattributes`, `.gitmodules` and `.githooks`.
+    `.gitconfig` and a nested `.git`. In Bypass only, workers may also write `.gitattributes`,
+    `.gitmodules` and files under `.githooks`. These are ordinary files of your project: a
+    contract must declare them like any file, the verifier checks them against that list, and
+    they merge as plain data, with no copy taken first (git history keeps every version).
+    kGraf's own git never runs what they select (see "kGraf's own git" below), but your git
+    does: a merged `.githooks/pre-commit` runs at your next commit if your `core.hooksPath` is
+    `.githooks`. Review them as you would any change.
 
   In every mode, Bypass included: your deny rules block (`deny = ["shell(curl*)"]`, or
   `--deny`), your ask rules ask (`ask = [...]`, or `--ask`), deleting the filesystem root, a
@@ -904,6 +910,36 @@ To fix a refusal, remove group or other write from the named folder or file
 (`chmod g-w,o-w <path>`), or give it to your own user. Other tools that read
 configuration above their directory, such as pytest, get no such rule.
 
+## kGraf's own git
+
+kGraf runs git on your machine, outside the worker sandbox, to create worker worktrees,
+commit and merge their work, read status and history, and check a Bypass worker's writes to
+`.git`. A repository can make git run a program or reach the network by itself, and a worker
+in Bypass may write the git config and the attribute files, so kGraf's own git ignores all of
+that:
+
+- hooks, in `.git/hooks`, in a `core.hooksPath` directory such as `.githooks`, and
+  config-defined hooks (`hook.<name>.command`);
+- every filter (`clean`, `smudge`, `process`), merge driver and diff driver (`textconv`,
+  `command`) the config defines, whatever `.gitattributes` selects, and `diff.external`;
+- the file system monitor, credential helpers, `core.askPass`, editors and pagers, commit and
+  tag signing, and signature checks;
+- every network or local transport (a fetch, a submodule clone, a lazy fetch in a partial
+  clone), and submodule recursion;
+- `GIT_*` variables in kGraf's environment, except your commit identity
+  (`GIT_AUTHOR_NAME` and friends) and `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM`.
+
+What kGraf keeps: your identity and your global config, and git's built-in attributes
+(`text`, `eol`, `ident`, `core.autocrlf`), so commits and merges come out as your own git
+would make them. Two differences follow. A file your attributes route through a filter, such
+as git-lfs or git-crypt, is committed and checked out by kGraf in its stored form, not
+filtered. A file with a configured merge driver is reported as a conflict when two attempts
+change it, rather than resolved by the driver. kGraf needs git 2.31 or newer for this and
+refuses to run an older one.
+
+Your own git is unchanged: when you commit, merge or check out yourself, every hook, filter and
+driver runs as before.
+
 ## What lives where
 
 State lives in `.kgraf/` inside the repository: the index, the ledger, run records,
@@ -988,6 +1024,23 @@ Behavior that differs from earlier builds. Each item names the decision that hol
 - A background process that leaves a worker's process group keeps the worktree from being
   deleted. The worktree stays, with a warning; stop the process, then run `kgraf clean
   <worktree>` (0088).
+- A worker at the end of a chain of hand-backs (the delegation depth cap) no longer stops its
+  contract when its context fills. kGraf compacts that worker once and it goes on: one
+  summary call on the worker's own route, recorded in the ledger as `worker_compaction`; the
+  worker's instruction is shown to it again unchanged; its earlier history stays in its
+  transcript, and the worker can search it with the `recall_history` tool. The run report
+  counts the compaction with the hand-backs (`misses`), the trace has a `worker_compacted`
+  record naming the transcript file, and the run record lists it under `compactions`. A
+  worker that fills its context a second time hands back, and its contract is held with a
+  reason that names the worktree and the transcript (0095).
+- Every worker's tool list now includes `recall_history`, so a worker transcript recorded by
+  an earlier build cannot be resumed; start that work again (0095).
+- kGraf's own git runs no hook, filter, merge driver or diff driver from your repository or
+  config, and reaches no remote (see "kGraf's own git"). A file stored through git-lfs or
+  git-crypt is committed by kGraf in its stored form, and a file with a configured merge
+  driver conflicts when two attempts change it. git 2.31 or newer is required (0094).
+- In Bypass, workers may write `.gitattributes`, `.gitmodules` and `.githooks` when the
+  contract declares them; they merge as ordinary files (0094).
 
 **Scheduled runs**
 

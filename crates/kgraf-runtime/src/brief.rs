@@ -68,8 +68,9 @@ impl WorkerBrief {
     }
 }
 
-/// What a worker hands back when its context reaches the stop point (0057: workers
-/// never compact; the orchestrator re-splits the remainder).
+/// What a worker hands back when its context reaches the stop point (0057: the
+/// orchestrator re-splits the remainder). A worker that cannot hand back
+/// compacts once instead, and hands back at a second overflow (0095).
 ///
 /// Structured so the orchestrator can re-plan from it without reading the worker's
 /// transcript: what is done, what is left, which files the worktree already holds
@@ -276,6 +277,12 @@ pub struct WorkerResult {
     /// unverified. Serde-defaulted so an older record still loads.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub refused: Vec<crate::shortfall::RefusedCall>,
+    /// The runtime's compaction notice, when this worker compacted (decision
+    /// 0095). Set by the loop alone, never from model output; the orchestrator
+    /// reads it as "the contract was larger than planned". Serde-defaulted so
+    /// an older record still loads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction: Option<crate::compaction::CompactionNotice>,
 }
 
 impl WorkerResult {
@@ -301,6 +308,7 @@ impl WorkerResult {
             trace_failures: Vec::new(),
             rationale: None,
             refused: Vec::new(),
+            compaction: None,
         }
     }
 }

@@ -200,20 +200,37 @@ pub fn read_git_history(root: &std::path::Path, max_commits: u32) -> Result<Vec<
     // `-z` ends each path with NUL and prints it raw. Without it git quotes a
     // path holding non-ASCII bytes (`"\303\251.rs"`), and the quoted text would
     // be stored as if it were the file's name.
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .arg("log")
-        .arg("-z")
-        .arg(format!("--max-count={max_commits}"))
-        .arg("--no-merges")
-        .arg("--name-only")
-        .arg("--pretty=format:%x01%ct")
-        .arg("--no-renames")
-        .output()
+    // The host runner (`kgraf_core::host_git`): the user's repository may
+    // hold hooks, drivers or a file system monitor, none of which may run.
+    let pre = kgraf_core::host_git::dash_c(root);
+    // Shared repository lock for this one process (decision 0094), taken
+    // before the command is built so the host runner's config listing and
+    // the history read run in the same hold.
+    let _repo = kgraf_core::repo_lock::shared_for(root, "kGraf git log (co-change history)")
         .map_err(|e| GraphError::History {
-            reason: format!("cannot run git: {e}"),
+            reason: e.to_string(),
         })?;
+    let max_count = format!("--max-count={max_commits}");
+    let output = kgraf_core::host_git::command(
+        &kgraf_core::host_git::Invocation::in_dir(&pre),
+        &[
+            "log",
+            "-z",
+            max_count.as_str(),
+            "--no-merges",
+            "--name-only",
+            "--pretty=format:%x01%ct",
+            "--no-renames",
+        ],
+    )
+    .map_err(|e| GraphError::History {
+        reason: format!("cannot run git: {e}"),
+    })?
+    .stdin(std::process::Stdio::null())
+    .output()
+    .map_err(|e| GraphError::History {
+        reason: format!("cannot run git: {e}"),
+    })?;
     if !output.status.success() {
         return Err(GraphError::History {
             reason: format_reason(&output),

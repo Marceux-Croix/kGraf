@@ -4,8 +4,10 @@ use std::process::Command;
 fn git(dir: &Path, args: &[&str]) {
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(dir).args(args);
-    for var in crate::git::GIT_REDIRECT_ENV {
-        cmd.env_remove(var);
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("GIT_") {
+            cmd.env_remove(&key);
+        }
     }
     let out = cmd
         .env("GIT_CONFIG_NOSYSTEM", "1")

@@ -64,7 +64,7 @@ pub use crate::coordination::Integration;
 use crate::guards::{self, DelegationPolicy, DelegationRequest};
 use crate::plan::{
     ContractSpec, CostBasis, Decomposer, GroundRequest, Grounder, PlanError, PlanRequest,
-    contract_from_spec, sanitize_interfaces, sanitize_plan, validate_plan,
+    contract_from_spec, sanitize_interfaces, sanitize_plan, validate_plan_with,
 };
 use crate::port::{InboundKind, InboundMessage, MessagePort, OutboundReply};
 use crate::readiness::{ReadinessProbe, check_tools};
@@ -123,6 +123,8 @@ mod plan_review;
 /// A worker's shortfall report, and the grant, amendment or hold that
 /// answers it (decision 0093).
 mod shortfall_hooks;
+// Decision 0095: runtime compaction, seen from the run loop.
+mod compaction_hooks;
 mod speculate;
 
 /// Default cap on contracts in one plan (one decomposition answer).
@@ -718,12 +720,13 @@ pub enum CompactError {
         "the orchestrator holds no transcript to compact: its state is the run record, which compaction never rewrites (0057)"
     )]
     NothingToCompact,
-    /// The runtime cannot make a running worker stop at a clean point on request;
-    /// a worker hands back only at its own stop point.
-    #[error(
-        "worker `{0}` cannot be compacted on request: the runtime has no forced stop-point handoff yet"
-    )]
-    RuntimeCannotCompact(String),
+    /// The worker is admitted and its loop has not started yet; ask again in
+    /// a moment.
+    #[error("worker `{0}` has not started yet; ask again once it runs")]
+    NotStarted(String),
+    /// A worker compacts at most once (decision 0095).
+    #[error("worker `{0}` has already compacted once; a worker compacts at most once")]
+    AlreadyCompacted(String),
     #[error("no running worker `{0}` in this run")]
     UnknownWorker(String),
     #[error("the orchestrator has stopped")]
@@ -2162,6 +2165,13 @@ impl Drop for RunLoop {
 }
 
 impl RunLoop {
+    /// Whether the user's mode is Bypass now, so `.gitattributes`,
+    /// `.gitmodules` and `.githooks` are ordinary files for planning and the
+    /// scope check (decision 0094). Read at each use: the mode changes at will.
+    fn bypass_git_files(&self) -> bool {
+        self.perms.control.mode() == kgraf_tools::permissions::PermissionMode::Bypass
+    }
+
     async fn open(
         o: Orchestrator,
         mut record: RunStateRecord,
@@ -2964,12 +2974,13 @@ impl RunLoop {
                 self.settle_call(reservation, Some(&out.calls))?;
                 self.mark_delivered(note_ids);
                 let specs = sanitize_plan(out.contracts)?;
-                validate_plan(
+                validate_plan_with(
                     &specs,
                     &BTreeSet::new(),
                     &self.roster(),
                     &self.tools(),
                     self.config.max_contracts_per_plan,
+                    self.bypass_git_files(),
                 )?;
                 // A decomposer that returns interfaces nobody asked for would
                 // have them silently unchecked.
@@ -5340,6 +5351,13 @@ impl RunLoop {
             ),
         };
         let path = self.files.worker_transcript(worker.as_str());
+        // Decision 0095: a worker whose hand-back could not be split compacts
+        // once instead.
+        let stop_point = self.stop_point_policy(
+            contract,
+            &brief.instruction,
+            route.context.worker_stop_tokens(),
+        );
         let cancel = Arc::new(Notify::new());
         flight.cancels.insert(worker.clone(), cancel.clone());
         let (ended_tx, ended_rx) = oneshot::channel::<()>();
@@ -5444,6 +5462,7 @@ impl RunLoop {
                         },
                         graph,
                         None,
+                        stop_point,
                     )
                     .await;
                     if let Some(closer) = closer {
@@ -5651,6 +5670,12 @@ impl RunLoop {
             .map(|r| r.context.effective_window())
             .unwrap_or(0);
         let handed_back = matches!(f.result.outcome, WorkerOutcome::HandedBack { .. });
+        // Decision 0095: a compaction at the stop point is a sizing miss too.
+        let compacted_at_stop = f
+            .result
+            .compaction
+            .as_ref()
+            .is_some_and(|n| n.trigger == kgraf_runtime::CompactionTrigger::StopPoint);
         self.trace(TraceEvent::WorkerFinished {
             at_ms: now,
             contract: f.contract.clone(),
@@ -5663,13 +5688,16 @@ impl RunLoop {
             projected_tokens: flight.projection.tokens,
             stop_tokens,
             window_tokens,
-            sizing_miss: handed_back,
+            sizing_miss: handed_back || compacted_at_stop,
             calls: f.result.calls.iter().map(|c| c.to_string()).collect(),
             spend_micros: spend.micros(),
             error: outcome_error(&f.result.outcome),
         })
         .await?;
         self.trace_spend().await?;
+        if let Some(notice) = &f.result.compaction {
+            self.record_compaction(&contract, &f.worker, notice).await?;
+        }
 
         // Loop shapes.
         if let WorkerOutcome::Stalled {
@@ -5776,8 +5804,12 @@ impl RunLoop {
             WorkerOutcome::Completed => {
                 // Merge-back scope: a write outside the contract's set fails
                 // the attempt before any verifier sees it.
-                let outside =
-                    outside_declared_scope(&f.result.changed_paths, &contract.writes, &workspace);
+                let outside = outside_declared_scope(
+                    &f.result.changed_paths,
+                    &contract.writes,
+                    &workspace,
+                    self.bypass_git_files(),
+                );
                 if flight.lease_lost || !outside.is_empty() {
                     let reason = if flight.lease_lost {
                         "the attempt was withdrawn: a lease was lost, or its interface contract was superseded".to_owned()
@@ -5992,7 +6024,11 @@ impl RunLoop {
                 return Ok(());
             }
             WorkerOutcome::HandedBack { handoff } => {
-                self.record.counters.sizing_misses += 1;
+                // One miss per worker: a compaction at the stop point counted
+                // it already.
+                if !compacted_at_stop {
+                    self.record.counters.sizing_misses += 1;
+                }
                 self.trace(TraceEvent::Compaction {
                     at_ms: now,
                     contract: f.contract.clone(),
@@ -6800,6 +6836,7 @@ impl RunLoop {
                         }
                         Ok(_) => format!("re-split refused: child id `{cid}` is taken"),
                     };
+                    let reason = reason + &self.compaction_note(worker);
                     self.submit_report(
                         parent,
                         Some(worker),
@@ -7189,22 +7226,15 @@ impl RunLoop {
         Ok(())
     }
 
-    /// `/compact` (0057 addendum). The orchestrator has no transcript, and the
-    /// runtime cannot yet stop a worker at a clean point on request, so every case
-    /// is a named refusal: the user learns what did not happen and why.
+    /// `/compact` (0057 addendum, 0095). The orchestrator has no transcript, so
+    /// that case is a named refusal. A running worker is asked to compact at
+    /// its next boundary, once; `Ok` means asked, and the worker's
+    /// `worker_compacted` trace record says when it happened.
     fn compact(&self, target: Option<String>) -> Result<(), CompactError> {
         let Some(worker) = target else {
             return Err(CompactError::NothingToCompact);
         };
-        let running = self
-            .in_flight
-            .values()
-            .any(|f| f.cancels.keys().any(|w| w.as_str() == worker));
-        if running {
-            Err(CompactError::RuntimeCannotCompact(worker))
-        } else {
-            Err(CompactError::UnknownWorker(worker))
-        }
+        self.request_compaction(worker)
     }
 
     /// Record the user's order (0014). Every id must be an open contract.
@@ -7538,11 +7568,16 @@ fn outside_declared_scope(
     changed: &[PathBuf],
     writes: &[WriteTarget],
     workspace: &Path,
+    bypass_git_files: bool,
 ) -> Vec<String> {
     changed
         .iter()
         .filter(|p| {
-            if kgraf_runtime::forbidden_path(p) {
+            // In Bypass, `.gitattributes`, `.gitmodules` and `.githooks` are
+            // judged by the declared writes like any file (decision 0094).
+            if kgraf_runtime::forbidden_path(p)
+                && !(bypass_git_files && kgraf_core::paths::is_bypass_git_file(p))
+            {
                 return true;
             }
             let declared = writes
@@ -7620,7 +7655,7 @@ pub(crate) struct AttemptSkills {
 /// (resuming from the transcript when there is one), forward every event to the
 /// transcript, and return its result and peak context.
 ///
-/// Ten positional arguments (three over clippy's default): each is a
+/// Eleven positional arguments (four over clippy's default): each is a
 /// distinct piece of per-attempt state the dispatch site already holds
 /// separately (`InFlight`'s own maps keyed by worker, not a single struct);
 /// grouping them into a new type here would only move the naming, not
@@ -7637,6 +7672,7 @@ async fn run_attempt(
     skills: AttemptSkills,
     graph: SharedGraph,
     parent_call: Option<CallId>,
+    stop_point: kgraf_runtime::StopPointPolicy,
 ) -> Result<(WorkerResult, u64), String> {
     // A kill mid-append leaves a torn last line: repaired (dropped) rather
     // than refused, as the host's worker does, so a re-adopted worker
@@ -7727,6 +7763,10 @@ async fn run_attempt(
             fence: Some(fence),
             injections,
             inherited_skills: skills.inherited,
+            // Decision 0095: named in a compaction notice, so the full
+            // pre-compaction history can be found.
+            transcript_path: Some(path.clone()),
+            stop_point,
             ..SpawnOptions::default()
         },
     )
@@ -7962,7 +8002,7 @@ mod tests {
         .map(PathBuf::from)
         .collect();
         assert_eq!(
-            outside_declared_scope(&changed, &writes, ws.path()),
+            outside_declared_scope(&changed, &writes, ws.path(), false),
             Vec::<String>::new()
         );
         let stray: Vec<PathBuf> = ["src/other.rs", "docs/Cargo.lock", "web/uv.lock"]
@@ -7970,7 +8010,7 @@ mod tests {
             .map(PathBuf::from)
             .collect();
         assert_eq!(
-            outside_declared_scope(&stray, &writes, ws.path()),
+            outside_declared_scope(&stray, &writes, ws.path(), false),
             vec![
                 "src/other.rs".to_owned(),
                 "docs/Cargo.lock".to_owned(),
@@ -7984,8 +8024,25 @@ mod tests {
             node: None,
         }];
         assert_eq!(
-            outside_declared_scope(&git, &declared_git, ws.path()),
+            outside_declared_scope(&git, &declared_git, ws.path(), true),
             vec![".git/config".to_owned()]
+        );
+        // In Bypass a declared `.gitattributes` is an ordinary write; an
+        // undeclared one is out of scope like any file; outside Bypass a
+        // declared one is still refused.
+        let attrs = [PathBuf::from(".gitattributes")];
+        let declared_attrs = [WriteTarget {
+            path: ".gitattributes".into(),
+            node: None,
+        }];
+        assert!(outside_declared_scope(&attrs, &declared_attrs, ws.path(), true).is_empty());
+        assert_eq!(
+            outside_declared_scope(&attrs, &writes, ws.path(), true),
+            vec![".gitattributes".to_owned()]
+        );
+        assert_eq!(
+            outside_declared_scope(&attrs, &declared_attrs, ws.path(), false),
+            vec![".gitattributes".to_owned()]
         );
     }
 

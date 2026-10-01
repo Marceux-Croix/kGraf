@@ -67,6 +67,11 @@ pub(crate) struct CommandVerifier {
     pub(crate) read_denies: Vec<PathBuf>,
     /// The check is killed after this long (the configured gate timeout).
     pub(crate) timeout: Duration,
+    /// The user's permission control: in the Bypass mode, changes to
+    /// `.gitattributes`, `.gitmodules` and `.githooks` are judged by the
+    /// declared write scope like any file and merged as plain data (decision
+    /// 0094); in every other mode they are refused.
+    pub(crate) permissions: Arc<kgraf_tools::PermissionControl>,
 }
 
 /// Tries of the hold check, and the pause between them: a process that has
@@ -335,12 +340,21 @@ fn declared(contract: &OpenContract, p: &Path) -> bool {
         .any(|w| same_path(Path::new(&w.path), p))
 }
 
-pub(crate) fn scope_violations(changed: &[String], contract: &OpenContract) -> Vec<String> {
+/// `bypass_git_files`: the mode is Bypass, so `.gitattributes`,
+/// `.gitmodules` and `.githooks` count as ordinary files
+/// (`kgraf_core::paths::is_bypass_git_file`).
+pub(crate) fn scope_violations(
+    changed: &[String],
+    contract: &OpenContract,
+    bypass_git_files: bool,
+) -> Vec<String> {
     changed
         .iter()
         .filter(|p| {
             let p = Path::new(p.as_str());
-            forbidden_path(p) || !declared(contract, p)
+            let protected = forbidden_path(p)
+                && !(bypass_git_files && kgraf_core::paths::is_bypass_git_file(p));
+            protected || !declared(contract, p)
         })
         .cloned()
         .collect()
@@ -484,6 +498,10 @@ impl Verifier for CommandVerifier {
         let workspaces = self.workspaces.clone();
         let attempt_root = workspace.to_path_buf();
         let timeout = self.timeout;
+        // Read once, at the start: the commit and the scope check judge the
+        // attempt under one mode.
+        let bypass_git_files =
+            self.permissions.mode() == kgraf_tools::permissions::PermissionMode::Bypass;
         tokio::task::spawn_blocking(move || {
             let manager = workspaces.manager.clone();
             let root = attempt_root.clone();
@@ -515,6 +533,7 @@ impl Verifier for CommandVerifier {
                         });
                     }
                 };
+            attempt.allow_bypass_git_files(bypass_git_files);
             let message = format!("kgraf: contract {}", contract.contract);
             let in_scope = |p: &Path| declared(&contract, p);
             let commit = match merge_back.commit_retaining(&mut attempt, &message, &in_scope) {
@@ -548,7 +567,7 @@ impl Verifier for CommandVerifier {
                         return Err(format!("cannot read the attempt's changes: {e}"));
                     }
                 };
-                let outside = scope_violations(&changed, &contract);
+                let outside = scope_violations(&changed, &contract, bypass_git_files);
                 if !outside.is_empty() {
                     // The check does not run on a refused attempt.
                     return fail(

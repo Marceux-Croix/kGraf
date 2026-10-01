@@ -65,7 +65,7 @@ old one rather than editing it.
 | [0054](0054-a-native-rust-shell-that-runs-without-a-gpu.md) | A native Rust shell that runs without a GPU | Accepted; supersedes the shell half of 0002 and the renderer half of 0010 |
 | [0055](0055-reuse-existing-code-before-writing-new-code.md) | Reuse existing code before writing new code | Accepted; amends 0054; amended by 0061 |
 | [0056](0056-long-running-tasks-resume-from-a-run-state-record.md) | Long-running tasks resume from a run-state record | Accepted |
-| [0057](0057-compaction-never-rewrites-and-runs-re-ground-on-the-original-instruction.md) | Compaction never rewrites; a resumed run re-grounds on the original instruction | Accepted; refines 0056 |
+| [0057](0057-compaction-never-rewrites-and-runs-re-ground-on-the-original-instruction.md) | Compaction never rewrites; a resumed run re-grounds on the original instruction | Accepted; refines 0056; amended by 0095 |
 | [0058](0058-the-galaxy-layout-stays-solver-free.md) | The graph layout stays solver-free; clusters grow by size bucket | Accepted; amends 0010, 0015 |
 | [0059](0059-the-ledger-is-an-event-sourced-hash-chain-with-an-external-tip.md) | The ledger is an event-sourced hash chain with an external tip | Accepted |
 | [0060](0060-each-worktree-builds-into-its-own-target-directory.md) | Each worktree builds into its own target directory | Accepted |
@@ -75,7 +75,7 @@ old one rather than editing it.
 | [0064](0064-presumed-work-nodes-from-the-roadmap.md) | Presumed work nodes come from a project's own planning documents, and are adopted, never duplicated | Accepted |
 | [0065](0065-calls-stay-in-their-language-extractors-are-stamped-a-tags-tier.md) | A call resolves only within its own language family; each extractor is stamped | Accepted; refines 0038 |
 | [0066](0066-a-project-switcher-in-the-guide.md) | Several projects open in one window, switched from the navigation rail | Accepted |
-| [0067](0067-every-agent-is-an-addressable-session.md) | Every agent is an addressable session; subagents, connections and a per-machine parallelism limit | Accepted; supersedes 0017's concurrency defaults; amends 0004, 0005, 0033, 0034 |
+| [0067](0067-every-agent-is-an-addressable-session.md) | Every agent is an addressable session; subagents, connections and a per-machine parallelism limit | Accepted; supersedes 0017's concurrency defaults; amends 0004, 0005, 0033, 0034; amended by 0095 |
 | [0068](0068-large-graphs-fold-children-into-parents.md) | Large graphs fold children into their parents under a visible-node budget | Accepted |
 | [0069](0069-local-diagnostics-clarifies-no-telemetry.md) | Local-only diagnostics clarifies "no telemetry" | Accepted |
 | [0070](0070-color-vision-modes-live-only-in-kgraf.md) | Color vision modes live in kGraf's own theme code, chosen by measurement | Accepted |
@@ -97,6 +97,7 @@ old one rather than editing it.
 | [0086](0086-empty-attempts-checked-against-a-placeholder.md) | An empty attempt is refused when its declared write target is still a placeholder, and every accepted empty attempt is reported | Accepted |
 | [0087](0087-dependencies-fetched-on-the-host-with-consent.md) | Dependencies are fetched on the host, outside the sandbox, with the user's per-project consent | Accepted |
 | [0088](0088-worker-worktrees-deleted-after-use-unless-kept.md) | Worker worktrees and their builds are deleted after use unless the user chooses to keep them | Accepted |
+| [0095](0095-a-worker-that-cannot-hand-back-is-compacted-once-by-the-runtime.md) | A worker that cannot hand back is compacted once by the runtime, with a notice it cannot suppress and a recall tool over its full earlier history | Accepted |
 | [0094](0094-permission-modes-bypass-limits-grouped-requests-and-plan-review.md) | Permission modes set only by the user; the limits Bypass keeps; grouped permission requests; plan review before dispatch | Accepted |
 | [0093](0093-a-worker-reports-a-shortfall-and-the-orchestrator-grants-within-the-operator-ceiling.md) | A worker reports a permission or instruction shortfall; the orchestrator grants within the operator's ceiling, amends, or asks the user; a run inside a disposable container may lift the shell policy | Accepted |
 | [0092](0092-azure-openai-transport.md) | Azure OpenAI is a transport option of the Chat Completions and Responses adapters, with a configured deployment-to-model mapping the response is checked against | Accepted |

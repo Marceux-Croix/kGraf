@@ -18,7 +18,10 @@ mod error;
 pub mod git;
 pub mod lifecycle;
 pub mod merge;
-pub mod repo_lock;
+/// The repository lock lives in `kgraf-core` so every crate that runs git on
+/// a repository (the worker's status read, the co-change history read) takes
+/// it without depending on this crate; re-exported under its old path.
+pub use kgraf_core::repo_lock;
 mod sandbox;
 #[cfg(unix)]
 pub mod trust;

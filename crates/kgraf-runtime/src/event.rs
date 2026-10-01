@@ -179,6 +179,16 @@ pub enum WorkerEvent {
     /// and a cancelled or abandoned round's deltas are counted just before
     /// its [`WorkerEvent::Cancelled`] or [`WorkerEvent::RoundAbandoned`].
     Redacted { counts: BTreeMap<String, u32> },
+    /// The runtime compacted this worker's context (decision 0095). Built by
+    /// the loop alone, between rounds, at most once per worker; no model output
+    /// becomes one. Every event before it is the pre-compaction history, kept
+    /// as written. The rebuild replaces the private remainder with the opening
+    /// message plus the rendered notice and summary
+    /// ([`crate::compaction::render_notice`]).
+    Compacted {
+        notice: Box<crate::compaction::CompactionNotice>,
+        summary: Box<crate::compaction::CompactionSummary>,
+    },
 }
 
 /// Why the loop added text to a user turn.
@@ -324,6 +334,29 @@ impl WorkerEvent {
             // No free text: `call_id` is an id, matched against
             // `ToolCallStarted`'s own (also never scrubbed).
             other @ WorkerEvent::Resumed { .. } => other,
+            // The summary is model output: every text field is scrubbed. The
+            // notice is the loop's own structured record (ids, counts, a
+            // path the caller chose) and passes unchanged.
+            WorkerEvent::Compacted { notice, summary } => {
+                let mut list = |items: Vec<String>, counts: &mut kgraf_secrets::Redactions| {
+                    items.into_iter().map(|t| scrub(t, counts)).collect()
+                };
+                let decisions = list(summary.decisions, counts);
+                let files_touched = list(summary.files_touched, counts);
+                let open_items = list(summary.open_items, counts);
+                let constraints = list(summary.constraints, counts);
+                WorkerEvent::Compacted {
+                    notice,
+                    summary: Box::new(crate::compaction::CompactionSummary {
+                        goal: scrub(summary.goal, counts),
+                        decisions,
+                        files_touched,
+                        open_items,
+                        constraints,
+                        constraints_dropped: summary.constraints_dropped,
+                    }),
+                }
+            }
             // Structured data only: ids, usage counts, a stop reason, a
             // phase, a digest, node ids, kind names from this crate's own
             // rules and registry, and the gitlink git wrote when the host
@@ -490,10 +523,10 @@ pub enum SequenceError {
     FinishedWithoutStart { call_id: String },
     #[error("the run ended with tool calls still open: {open:?}")]
     EndedWithOpenCalls { open: Vec<String> },
-    /// An injection arrived mid-stream or mid-tool-round (decision 0067): it
-    /// must wait for the boundary, or for a `RoundAbandoned` that closes the
-    /// round first (interrupt mode).
-    #[error("an injection arrived mid-round, not at a tool-batch boundary")]
+    /// An injection or a compaction arrived mid-stream or mid-tool-round
+    /// (decisions 0067, 0095): it must wait for the boundary, or for a
+    /// `RoundAbandoned` that closes the round first (interrupt mode).
+    #[error("an injection or a compaction arrived mid-round, not at a tool-batch boundary")]
     NotBetweenRounds,
 }
 
@@ -575,6 +608,11 @@ impl EventSequence {
                 return Err(SequenceError::NotBetweenRounds);
             }
             WorkerEvent::Injected { .. } => {}
+            // Decision 0095: compaction replaces the private remainder, so it
+            // lands only between rounds, like an injection.
+            WorkerEvent::Compacted { .. } if self.streaming || !self.open.is_empty() => {
+                return Err(SequenceError::NotBetweenRounds);
+            }
             WorkerEvent::RoundAbandoned { .. } => {
                 // Closes the round in flight, the way `Cancelled` does
                 // (`open` cleared, so the calls it held are exactly what the

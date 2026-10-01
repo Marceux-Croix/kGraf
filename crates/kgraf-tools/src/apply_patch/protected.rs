@@ -1,13 +1,17 @@
 //! `apply_patch` with protected writes (decision 0094): in the Bypass mode, a
 //! hunk on `.git/<path>` or on one of kGraf's settings files is written to the
 //! place [`crate::protected::ProtectedWrites::admit`] resolves it to, behind
-//! that guard's snapshot and integrity check. Every other mode, and every
-//! other protected path, is refused as before. The tool's name, description
+//! that guard's snapshot and integrity check; a hunk on `.gitattributes`,
+//! `.gitmodules` or `.githooks/...` is applied in the worktree like an
+//! ordinary file (with any ordinary hunks of the same patch), with no
+//! snapshot. Every other mode, and every other protected path, is refused as
+//! before. The tool's name, description
 //! and schema are [`ApplyPatchTool`]'s, byte for byte, so the shared prefix
 //! does not change with the mode (decision 0043).
 
 use super::{
-    ApplyPatchTool, Hunk, apply_all, internal, lexical, parse, refuse_repeated_paths, written_paths,
+    ApplyPatchTool, Hunk, apply_all_names, internal, lexical, parse, refuse_repeated_paths,
+    written_paths,
 };
 use crate::fs_safety;
 use crate::protected::{Area, ProtectedWrites, Target};
@@ -35,6 +39,10 @@ struct ProtectedHunk {
     hunk: Hunk,
     target: Target,
     shown: String,
+    /// False for an ordinary file applied beside `.gitattributes`,
+    /// `.gitmodules` or `.githooks` ([`Area::Tracked`]): not recorded as a
+    /// protected write.
+    protected: bool,
 }
 
 fn refused(path: &std::path::Path, why: &str) -> ToolError {
@@ -53,6 +61,8 @@ impl ProtectedApplyPatch {
     /// are refused.
     fn split(&self, hunks: &[Hunk]) -> Result<Option<Vec<ProtectedHunk>>, ToolError> {
         let mut plain = 0usize;
+        let mut plain_hunks = Vec::new();
+        let mut tracked = Vec::new();
         let mut out = Vec::new();
         for hunk in hunks {
             let paths = written_paths(hunk)?;
@@ -65,6 +75,20 @@ impl ProtectedApplyPatch {
                 }
             }
             if admitted.is_empty() {
+                plain_hunks.push((paths[0].clone(), hunk.clone()));
+                continue;
+            }
+            // `.gitattributes`, `.gitmodules` and `.githooks` are ordinary
+            // tracked files: the hunk applies as written, in the worktree,
+            // deletions and moves included (git history is their snapshot).
+            if admitted.iter().all(|(_, t)| t.area == Area::Tracked) {
+                let (shown, target) = admitted.remove(0);
+                tracked.push(ProtectedHunk {
+                    hunk: hunk.clone(),
+                    target,
+                    shown: shown.display().to_string(),
+                    protected: true,
+                });
                 continue;
             }
             // Deleting inside `.git` is a critical-path deletion, which asks
@@ -103,8 +127,28 @@ impl ProtectedApplyPatch {
                 hunk,
                 target,
                 shown: shown.display().to_string(),
+                protected: true,
             });
         }
+        if !tracked.is_empty() && out.is_empty() {
+            // Ordinary files in the same patch apply with them, in one pass
+            // over the worktree.
+            let root = tracked[0].target.root.clone();
+            for (path, hunk) in plain_hunks {
+                tracked.push(ProtectedHunk {
+                    hunk,
+                    target: Target {
+                        area: Area::Tracked,
+                        root: root.clone(),
+                        rel: path.clone(),
+                    },
+                    shown: path.display().to_string(),
+                    protected: false,
+                });
+            }
+            return Ok(Some(tracked));
+        }
+        out.extend(tracked);
         match (plain, out.is_empty()) {
             (_, true) => Ok(None),
             (0, false) => Ok(Some(out)),
@@ -154,12 +198,14 @@ fn apply_protected(
     }
     let mut problems = Vec::new();
     for root in &roots {
-        let group: Vec<Hunk> = hunks
-            .iter()
-            .filter(|h| &h.target.root == root)
-            .map(|h| h.hunk.clone())
-            .collect();
-        if let Err(e) = apply_all(&group, root, cancel) {
+        let group: Vec<&ProtectedHunk> = hunks.iter().filter(|h| &h.target.root == root).collect();
+        let names = if group.iter().any(|h| h.target.area == Area::Tracked) {
+            fs_safety::Names::BypassGitFiles
+        } else {
+            fs_safety::Names::Plain
+        };
+        let group: Vec<Hunk> = group.iter().map(|h| h.hunk.clone()).collect();
+        if let Err(e) = apply_all_names(&group, root, cancel, names) {
             problems.push(e.to_string());
         }
     }
@@ -167,6 +213,10 @@ fn apply_protected(
     // failure part way must not leave an unchecked write behind.
     let mut written = Vec::new();
     for h in &hunks {
+        if !h.protected {
+            written.push(h.shown.clone());
+            continue;
+        }
         match guard.after_write(&h.target.area, &h.shown) {
             Ok(()) => written.push(h.shown.clone()),
             Err(e) => problems.push(e),
@@ -174,8 +224,13 @@ fn apply_protected(
     }
     drop(windows);
     if problems.is_empty() {
+        let checked = if hunks.iter().any(|h| h.target.area != Area::Tracked) {
+            ", each `.git` or settings write checked after the write"
+        } else {
+            ""
+        };
         Ok(ToolOutput::text(format!(
-            "Success. Wrote these protected paths (Bypass mode), each checked after the write:\n{}",
+            "Success. Wrote these paths (Bypass mode){checked}:\n{}",
             written.join("\n")
         )))
     } else {

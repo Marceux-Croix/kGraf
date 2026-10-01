@@ -28,13 +28,15 @@
 //!   `.git` found there later may have been planted, so it is not read;
 //! - submodules are not entered (`--ignore-submodules=all`): a submodule's
 //!   git directory is inside the tree, so a planted one could name a filter;
-//! - hooks and fsmonitor are off, and no lazy fetch or transport may run.
+//! - git runs through the host runner (`kgraf_core::host_git`): hooks
+//!   (file and config-defined) and fsmonitor are off, every filter, merge and
+//!   diff driver the config defines is neutralized by name, and no lazy fetch
+//!   or transport may run.
 //!
-//! An in-tree `.gitattributes` can still name a filter driver, but only a
-//! driver the user's own configuration defines runs.
+//! An in-tree `.gitattributes` can still name a filter driver, but none runs:
+//! the host runner empties every configured driver's command.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// The `.git` entry of a worker's root as it was when the worker started,
 /// before any of its calls ran: the text of the gitlink file at the root.
@@ -199,17 +201,27 @@ pub fn dirty_paths(root: &Path, at_start: &GitEntry) -> Result<TreeStatus, Strin
             root.display()
         ));
     }
+    let admin = checked_git_dir(at_start)?;
+    // Shared repository lock for this one process (decision 0094), found from
+    // the recorded admin directory rather than the `.git` on disk. Taken
+    // before the command is built, so the host runner's config listing and
+    // the status read run in the same hold and a worker's Bypass git window
+    // cannot change the config or the index between them.
+    let _repo = kgraf_core::repo_lock::shared_for(&admin, "kGraf git status (worker tree read)")
+        .map_err(|e| e.to_string())?;
     let mut git_dir = std::ffi::OsString::from("--git-dir=");
-    git_dir.push(checked_git_dir(at_start)?);
+    git_dir.push(&admin);
     let mut work_tree = std::ffi::OsString::from("--work-tree=");
     work_tree.push(root);
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor="])
-        .arg(git_dir)
-        .arg(work_tree)
-        .args([
+    // The host runner (`kgraf_core::host_git`) removes the inherited `GIT_*`
+    // environment (a stray index or object directory), turns hooks, every
+    // configured driver and the file system monitor off, and allows no
+    // transport (a missing object in a partial clone fails the read).
+    let pre: Vec<std::ffi::OsString> =
+        vec!["-C".into(), root.as_os_str().to_owned(), git_dir, work_tree];
+    let mut cmd = kgraf_core::host_git::command(
+        &kgraf_core::host_git::Invocation::in_dir(&pre),
+        &[
             "status",
             "--porcelain=v1",
             "-z",
@@ -218,21 +230,13 @@ pub fn dirty_paths(root: &Path, at_start: &GitEntry) -> Result<TreeStatus, Strin
             "--ignore-submodules=all",
             "--",
             ".",
-        ])
-        // Explicit arguments win over these, but a stray index or object
-        // directory from the host's own environment must not apply either.
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .env_remove("GIT_OBJECT_DIRECTORY")
-        .env_remove("GIT_COMMON_DIR")
+        ],
+    )
+    .map_err(|e| format!("cannot run git: {e}"))?;
+    let output = cmd
         // A status read must not take the index lock a concurrent git holds.
         .env("GIT_OPTIONAL_LOCKS", "0")
-        // No transport: a missing object in a partial clone fails the read
-        // rather than start a fetch, and no protocol is allowed if one tried.
-        .env("GIT_NO_LAZY_FETCH", "1")
-        .env("GIT_ALLOW_PROTOCOL", "")
-        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null())
         .output()
         .map_err(|e| format!("cannot run git: {e}"))?;
     if !output.status.success() {
@@ -288,6 +292,7 @@ fn path_from_git(bytes: &[u8]) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     #[test]
     fn porcelain_entries_and_renames_parse() {

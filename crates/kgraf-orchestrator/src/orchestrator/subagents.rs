@@ -1386,6 +1386,9 @@ impl RunLoop {
                         skills,
                         graph,
                         parent_call,
+                        // A subagent's hand-back returns to its parent, which
+                        // decides what to do with the rest.
+                        kgraf_runtime::StopPointPolicy::HandBack,
                     )
                     .await
                     .map(|(result, _peak)| result);

@@ -1188,7 +1188,9 @@ mod tests {
     }
 
     /// A git that runs `script` (a POSIX shell body; `"$@"` holds git's
-    /// arguments, `-C <dir>` first) with the real git as `$REAL`.
+    /// arguments, `--no-pager -C <dir>` first) with the real git as `$REAL`.
+    /// The host runner's version check and config listing always reach the
+    /// real git, so `script` sees only the commands kGraf asked for.
     #[cfg(unix)]
     fn scripted_git(dir: &Path, script: &str) -> Git {
         use std::os::unix::fs::PermissionsExt;
@@ -1196,7 +1198,10 @@ mod tests {
         let path = dir.join("fake-git");
         std::fs::write(
             &path,
-            format!("#!/bin/sh\nREAL='{}'\n{script}\n", real.exe().display()),
+            format!(
+                "#!/bin/sh\nREAL='{}'\ncase \"$*\" in version|*' config --includes -z --list') exec \"$REAL\" \"$@\";; esac\n{script}\n",
+                real.exe().display()
+            ),
         )
         .expect("script");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
@@ -1244,7 +1249,7 @@ mod tests {
         std::fs::create_dir_all(&tools).expect("mkdir");
         let dubious = scripted_git(
             &tools,
-            "echo \"fatal: detected dubious ownership in repository at '$2'\" >&2\nexit 128",
+            "echo \"fatal: detected dubious ownership in repository at '$3'\" >&2\nexit 128",
         );
         let discover = move || Ok(dubious.clone());
         let err = migrate_state_dir_with(&root, &discover).expect_err("refused");
@@ -1284,7 +1289,7 @@ mod tests {
         // claims success and does nothing.
         let lazy = scripted_git(
             &tools,
-            "if [ \"$3\" = worktree ] && [ \"$4\" = repair ]; then exit 0; fi\nexec \"$REAL\" \"$@\"",
+            "if [ \"$4\" = worktree ] && [ \"$5\" = repair ]; then exit 0; fi\nexec \"$REAL\" \"$@\"",
         );
         let discover = move || Ok(lazy.clone());
         let err = migrate_state_dir_with(&root, &discover).expect_err("caught");

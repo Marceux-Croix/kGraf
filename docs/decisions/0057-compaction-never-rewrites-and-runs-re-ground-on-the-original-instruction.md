@@ -173,3 +173,19 @@ default. A slider the user has not moved follows the result; a moved slider keep
   file they resolve from, and dispatch resolves them again. A name that no longer resolves
   is a traced `empty_graph_lookup`, as at planning; a record with ids only keeps the ids the
   graph still holds and traces the rest. Neither fails the spawn.
+
+## Amendment (2026-10-01): a worker that cannot hand back is compacted once by the runtime
+
+Decision 0095. "A worker never compacts" now has one exception. A worker whose hand-back
+the delegation guards would refuse (the depth cap, the task length bound) is spawned with
+`StopPointPolicy::Compact` and, at its stop point, compacted once by the runtime: one
+accounted summary call on its own route in a fixed schema, the instruction re-injected
+verbatim (never summarized), a `Compacted` event the model cannot forge or suppress, and a
+`recall_history` tool over the pre-compaction events, which stay in the append-only
+transcript. This is a model-written summary, which this decision rejected as the method; it
+is accepted only as the fallback where the alternative is a held contract, only once per
+worker (a second overflow hands back, so no summary is ever summarized), and with the full
+history kept searchable. Everywhere else the stop point still hands back, the orchestrator
+still compacts only by its record, and the run record is still never rewritten. A user's
+`/compact <worker>` now compacts that worker at its next boundary, once, through the same
+mechanism.

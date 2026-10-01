@@ -463,6 +463,7 @@ impl Fixture {
                 merge_back: merge_back.clone(),
                 read_denies: Vec::new(),
                 timeout: Duration::from_secs(120),
+                permissions: Arc::new(kgraf_tools::PermissionControl::manual()),
             }),
             workspaces: workspaces.clone(),
             clock: Arc::new(SystemClock),

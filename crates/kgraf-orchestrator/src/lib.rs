@@ -185,6 +185,7 @@ pub use plan::{
     ModelCaller, ModelDecomposer, ModelGrounder, PlanError, PlanOutput, PlanRequest, answer_prompt,
     judge_prompt, parse_answer, parse_grounding, parse_interfaces, parse_plan, parse_verdicts,
     sanitize_id, sanitize_interfaces, sanitize_plan, valid_write_path, validate_plan,
+    validate_plan_with,
 };
 pub use port::{InboundKind, InboundMessage, MessagePort, OutboundReply, PortError, UntrustedText};
 pub use question_route::{

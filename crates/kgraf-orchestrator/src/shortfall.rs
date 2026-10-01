@@ -203,7 +203,10 @@ pub fn program_of(need: &str) -> Option<String> {
 
 /// The repository path a file-scope report names: its first word, relative,
 /// with no `..`, and not a path no worker may write.
-pub fn path_of(need: &str) -> Result<String, String> {
+///
+/// `bypass_git_files`: the mode is Bypass, so `.gitattributes`,
+/// `.gitmodules` and `.githooks` may be granted like any file (decision 0094).
+pub fn path_of(need: &str, bypass_git_files: bool) -> Result<String, String> {
     let p = program_of(need).ok_or_else(|| "the report names no path".to_owned())?;
     let p = p.trim_start_matches("./").to_owned();
     let path = std::path::Path::new(&p);
@@ -216,7 +219,9 @@ pub fn path_of(need: &str) -> Result<String, String> {
             "`{p}` is not a repository path (it is absolute or climbs out with `..`)"
         ));
     }
-    if let Some(why) = kgraf_core::paths::forbidden_reason(path) {
+    if let Some(why) = kgraf_core::paths::forbidden_reason(path)
+        && !(bypass_git_files && kgraf_core::paths::is_bypass_git_file(path))
+    {
         return Err(format!("`{p}` is not writable by a worker: {why}"));
     }
     Ok(p)
@@ -299,7 +304,7 @@ pub fn decide(
                 ));
             }
         },
-        RequestScope::File => match path_of(need) {
+        RequestScope::File => match path_of(need, authority.mode == PermissionMode::Bypass) {
             Ok(p) => Grant::Path(p),
             Err(e) => return hold(format!("a worker asked to write outside its scope: {e}")),
         },

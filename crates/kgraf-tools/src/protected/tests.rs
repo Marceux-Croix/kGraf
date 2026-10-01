@@ -220,9 +220,10 @@ fn bypass_still_refuses_the_books_and_the_rest() {
     for p in [
         ".git",
         ".git/objects/ab/cdef",
-        ".gitattributes",
-        ".gitmodules",
-        ".githooks/pre-commit",
+        // `.gitattributes`, `.gitmodules` and `.githooks` are admitted as
+        // tracked files (`apply_patch/git_files_tests.rs`); these are not.
+        ".gitconfig",
+        "GITATT~1",
         "src/.git/config",
         ".GIT/config",
         ".haustoria/ledger.db",

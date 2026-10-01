@@ -409,6 +409,10 @@ pub(crate) struct GitWorkspaces {
     /// Whether a released worktree that nothing needs is removed with its
     /// build output (decision 0088).
     retention: WorktreeRetention,
+    /// The user's permission control: in the Bypass mode a snapshot carries
+    /// `.gitattributes`, `.gitmodules` and `.githooks` changes as plain data
+    /// (decision 0094); in every other mode it refuses them.
+    permissions: Arc<kgraf_tools::PermissionControl>,
     /// Worktrees and attempts that could not be removed, for the orchestrator
     /// to show in the run's report ([`Workspaces::take_problems`]). Shared
     /// with the removals that run on a blocking thread or on drop.
@@ -503,6 +507,7 @@ impl GitWorkspaces {
     pub(crate) fn new(manager: Arc<WorkspaceManager>, merge_back: Arc<MergeBack>) -> Self {
         Self {
             retention: WorktreeRetention::default(),
+            permissions: Arc::new(kgraf_tools::PermissionControl::manual()),
             problems: Problems::default(),
             manager,
             merge_back,
@@ -520,6 +525,16 @@ impl GitWorkspaces {
     pub(crate) fn with_retention(mut self, retention: WorktreeRetention) -> Self {
         self.retention = retention;
         self
+    }
+
+    /// The user's permission control, read at each snapshot (decision 0094).
+    pub(crate) fn with_permissions(mut self, control: Arc<kgraf_tools::PermissionControl>) -> Self {
+        self.permissions = control;
+        self
+    }
+
+    fn bypass_git_files(&self) -> bool {
+        self.permissions.mode() == kgraf_tools::permissions::PermissionMode::Bypass
     }
 
     /// The policy this provider applies (tests).
@@ -1280,11 +1295,13 @@ impl Workspaces for GitWorkspaces {
             })
             .ok_or_else(|| format!("{} is not a worktree of this run", workspace.display()))?;
         let repo = self.manager.repo().to_path_buf();
+        let git_files = self.bypass_git_files();
         tokio::task::spawn_blocking(move || {
             child::snapshot(
                 &repo,
                 &ws,
                 "kgraf: speculative snapshot (never on a branch)",
+                git_files,
             )
         })
         .await
@@ -1339,9 +1356,10 @@ impl Workspaces for GitWorkspaces {
         let parent_ws = self.get(parent);
         let manager = self.manager.clone();
         let name = child.to_string();
+        let git_files = self.bypass_git_files();
         let ws = tokio::task::spawn_blocking(move || {
             child::discard(&manager, stale, &name).map_err(PrepareFailure::Unavailable)?;
-            child::prepare_fresh(&manager, parent_ws.as_ref(), &name)
+            child::prepare_fresh(&manager, parent_ws.as_ref(), &name, git_files)
         })
         .await
         .map_err(|e| PrepareFailure::Unavailable(e.to_string()))??;
@@ -1396,12 +1414,13 @@ impl Workspaces for GitWorkspaces {
         let manager = self.manager.clone();
         let name = child.to_string();
         let writes = writes.to_vec();
+        let git_files = self.bypass_git_files();
         tokio::task::spawn_blocking(move || {
             if !child::has_result(manager.repo(), &name) {
                 return Ok(None);
             }
             // No live worktree here, so nothing for the policy to keep.
-            child::merge(&manager, &parent_ws, None, &name, &writes, false).map(Some)
+            child::merge(&manager, &parent_ws, None, &name, &writes, false, git_files).map(Some)
         })
         .await
         .map_err(|e| e.to_string())?
@@ -1434,6 +1453,7 @@ impl Workspaces for GitWorkspaces {
         // Decision 0088: under `Keep` a merged child's worktree stays with its
         // builds, like a merged attempt's.
         let keep = !self.retention.deletes();
+        let git_files = self.bypass_git_files();
         let merged = tokio::task::spawn_blocking(move || {
             child::merge(
                 &manager,
@@ -1442,6 +1462,7 @@ impl Workspaces for GitWorkspaces {
                 &name,
                 &writes,
                 keep,
+                git_files,
             )
         })
         .await
@@ -1508,7 +1529,7 @@ pub(crate) mod child {
     use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
 
     /// The ref names of one child.
     const REFS: [&str; 3] = ["checkpoint", "handle", "result"];
@@ -1519,18 +1540,6 @@ pub(crate) mod child {
     pub(crate) fn ref_of(child: &str, what: &str) -> String {
         format!("{REF_ROOT}{child}/{what}")
     }
-
-    /// Variables that would redirect git away from the directories named on
-    /// the command line (the same list `kgraf_sandbox::git` strips).
-    const REDIRECT: &[&str] = &[
-        "GIT_DIR",
-        "GIT_WORK_TREE",
-        "GIT_INDEX_FILE",
-        "GIT_COMMON_DIR",
-        "GIT_OBJECT_DIRECTORY",
-        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-        "GIT_PREFIX",
-    ];
 
     /// A worktree a git command reads: its trusted admin dir, its root, and
     /// the tree git reads attributes from. Never the worker's own
@@ -1547,7 +1556,7 @@ pub(crate) mod child {
         pub(crate) attr: &'a str,
     }
 
-    /// One git command, hooks and fsmonitor off. `tree` is set for a command
+    /// One git command through the host runner (`kgraf_core::host_git`). `tree` is set for a command
     /// that reads a worktree (with `--attr-source` pinned to its trusted
     /// tree); without it, the command runs in the shared repository. `index`
     /// replaces the worktree's own index.
@@ -1560,43 +1569,50 @@ pub(crate) mod child {
     ) -> Result<Vec<u8>, String> {
         // Shared repository lock for this one process (decision 0094): the
         // view's checkout and the child refs never move while a worker's
-        // Bypass git window is open on the repository.
+        // Bypass git window is open on the repository. Taken before the
+        // command is built, so the host runner's config listing and the
+        // command it prepares run in the same hold and a Bypass write to the
+        // config cannot fall between them.
         let _repo = kgraf_sandbox::repo_lock::shared_for(repo, &format!("kGraf git {args:?}"))
             .map_err(|e| e.to_string())?;
-        let mut cmd = Command::new("git");
-        for var in REDIRECT {
-            cmd.env_remove(var);
-        }
-        // A worktree command runs in its work tree, so pathspecs and
-        // `add -A` resolve against it rather than the shared repository.
-        cmd.current_dir(tree.map_or(repo, |t| t.work))
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("LC_ALL", "C")
-            .env("GIT_AUTHOR_NAME", "kgraf")
-            .env("GIT_AUTHOR_EMAIL", "kgraf@localhost.invalid")
-            .env("GIT_COMMITTER_NAME", "kgraf")
-            .env("GIT_COMMITTER_EMAIL", "kgraf@localhost.invalid")
-            .args(["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor="]);
+        let mut pre: Vec<OsString> = Vec::new();
         if let Some(t) = tree {
             let mut git_dir = OsString::from("--git-dir=");
             git_dir.push(t.admin);
             let mut work_tree = OsString::from("--work-tree=");
             work_tree.push(t.work);
-            cmd.arg(git_dir)
-                .arg(work_tree)
-                .arg(format!("--attr-source={}", t.attr));
+            pre.extend([
+                git_dir,
+                work_tree,
+                OsString::from(format!("--attr-source={}", t.attr)),
+            ]);
         }
+        // A worktree command runs in its work tree, so pathspecs and
+        // `add -A` resolve against it rather than the shared repository.
+        let inv = kgraf_core::host_git::Invocation {
+            exe: Path::new("git"),
+            cwd: Some(tree.map_or(repo, |t| t.work)),
+            pre: &pre,
+        };
+        // The host runner removes the inherited `GIT_*` environment (the
+        // redirecting variables among it) and turns hooks, every configured
+        // driver, the file system monitor and transports off.
+        let mut cmd =
+            kgraf_core::host_git::command(&inv, args).map_err(|e| format!("git {args:?}: {e}"))?;
+        cmd.env("GIT_AUTHOR_NAME", "kgraf")
+            .env("GIT_AUTHOR_EMAIL", "kgraf@localhost.invalid")
+            .env("GIT_COMMITTER_NAME", "kgraf")
+            .env("GIT_COMMITTER_EMAIL", "kgraf@localhost.invalid");
         if let Some(index) = index {
             cmd.env("GIT_INDEX_FILE", index);
         }
-        cmd.args(args)
-            .stdin(if stdin.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        cmd.stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
         let mut child = cmd.spawn().map_err(|e| format!("git {args:?}: {e}"))?;
         if let Some(bytes) = stdin {
             use std::io::Write as _;
@@ -1654,9 +1670,16 @@ pub(crate) mod child {
     /// the worker wrote ([`Wt`]), and a snapshot whose changes touch a path
     /// that steers git (`.gitattributes`, `.gitmodules`, `.git*`
     /// directories) or kGraf's state is refused, loudly, as merge-back
-    /// refuses the same attempt. Used for a subagent's checkpoint
+    /// refuses the same attempt; with `bypass_git_files` (the Bypass mode,
+    /// decision 0094) `.gitattributes`, `.gitmodules` and `.githooks` pass as
+    /// plain data, as merge-back lets them. Used for a subagent's checkpoint
     /// and result (0067) and for speculative merge (0074).
-    pub(crate) fn snapshot(repo: &Path, ws: &Workspace, message: &str) -> Result<String, String> {
+    pub(crate) fn snapshot(
+        repo: &Path,
+        ws: &Workspace,
+        message: &str,
+        bypass_git_files: bool,
+    ) -> Result<String, String> {
         let admin = admin_of(ws)?;
         let tree = Some(Wt {
             admin: &admin,
@@ -1701,6 +1724,9 @@ pub(crate) mod child {
                 .filter(|p| !p.is_empty())
                 .map(|p| String::from_utf8_lossy(p).into_owned())
                 .filter(|p| p.split('/').any(kgraf_core::paths::is_protected_name))
+                .filter(|p| {
+                    !(bypass_git_files && kgraf_core::paths::is_bypass_git_file(Path::new(p)))
+                })
                 .collect();
             if !protected.is_empty() {
                 return Err(format!(
@@ -1784,6 +1810,7 @@ pub(crate) mod child {
         manager: &WorkspaceManager,
         parent: Option<&Workspace>,
         child: &str,
+        bypass_git_files: bool,
     ) -> Result<Workspace, PrepareFailure> {
         let repo = manager.repo();
         let Some(parent) = parent else {
@@ -1799,6 +1826,7 @@ pub(crate) mod child {
                 "kgraf: checkpoint of {} for subagent {child}",
                 parent.name()
             ),
+            bypass_git_files,
         )
         .map_err(PrepareFailure::Unavailable)?;
         git(
@@ -2036,6 +2064,7 @@ pub(crate) mod child {
         child: &str,
         writes: &[String],
         keep_worktree: bool,
+        bypass_git_files: bool,
     ) -> Result<ChildMerge, String> {
         let repo = manager.repo();
         let checkpoint = resolve(repo, &ref_of(child, "checkpoint"))
@@ -2044,7 +2073,12 @@ pub(crate) mod child {
         let result = match (resolve(repo, &result_ref), child_ws) {
             (Some(recorded), _) => recorded,
             (None, Some(ws)) => {
-                let result = snapshot(repo, ws, &format!("kgraf: result of subagent {child}"))?;
+                let result = snapshot(
+                    repo,
+                    ws,
+                    &format!("kgraf: result of subagent {child}"),
+                    bypass_git_files,
+                )?;
                 git(
                     repo,
                     None,
@@ -2672,6 +2706,7 @@ mod child_tests {
             Some(&old_ws),
             name,
             &w(&[]),
+            false,
             false,
         );
         assert!(!refs_under(&f.root, &child::ref_of(name, "result")).is_empty());

@@ -20,8 +20,14 @@
 //!   persisted allow rules and the worktrees are kGraf's own books, refused in
 //!   every mode, Bypass included.
 //!
-//! Every other protected name (`.gitattributes`, `.gitmodules`, `.githooks`,
-//! `.gitconfig`, a nested `.git`, the former state directory) stays refused in
+//! - `.gitattributes`, `.gitmodules` and anything under `.githooks`
+//!   ([`Area::Tracked`]): ordinary tracked files in the worktree, written
+//!   there with no snapshot (git history keeps every earlier version) and
+//!   under the declared write scope like any file. kGraf's own git never
+//!   runs a hook, filter or driver they select (`kgraf_core::host_git`).
+//!
+//! Every other protected name (`.gitconfig`, a nested `.git`, the former
+//! state directory, an NTFS short name of a protected name) stays refused in
 //! every mode, as do paths that leave the worktree. In every mode other than
 //! Bypass, every protected path stays refused with the reason
 //! [`kgraf_core::paths::forbidden_reason`] gives.
@@ -98,7 +104,10 @@ use crate::permissions::{PermissionControl, PermissionMode};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
+// The tests build their fixtures with plain git.
+#[cfg(test)]
+use std::process::Command;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -183,6 +192,13 @@ pub type SettingsCheck = Arc<dyn Fn(&str, &Path) -> Result<(), String> + Send + 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Area {
     Git,
+    /// `.gitattributes`, `.gitmodules` or a path under `.githooks`
+    /// (`kgraf_core::paths::is_bypass_git_file`): an ordinary tracked file in
+    /// the worktree. No snapshot or check: git history keeps every earlier
+    /// version, and kGraf's own git never runs what these files select
+    /// (`kgraf_core::host_git`). The declared write scope applies to it like
+    /// any file.
+    Tracked,
     /// One of [`SETTINGS_FILES`].
     Settings(String),
 }
@@ -391,6 +407,13 @@ impl ProtectedWrites {
                 _ => return None,
             }
         }
+        if kgraf_core::paths::is_bypass_git_file(rel) {
+            return Some(Ok(Target {
+                area: Area::Tracked,
+                root: self.worktree.clone(),
+                rel: rel.to_path_buf(),
+            }));
+        }
         let (first, rest) = parts.split_first()?;
         let rest_path: PathBuf = rest.iter().collect();
         match first.as_str() {
@@ -490,6 +513,9 @@ impl ProtectedWrites {
                     .map_err(WindowError::Unprotected)?;
                 Ok(WriteWindow { _lock: Some(lock) })
             }
+            // An ordinary tracked file: no snapshot, no lock (git history keeps
+            // every version).
+            Area::Tracked => Ok(WriteWindow { _lock: None }),
             Area::Settings(name) => {
                 let mut st = self.state();
                 if !st.settings.contains_key(name) {
@@ -556,6 +582,15 @@ impl ProtectedWrites {
     /// Call while the write's [`WriteWindow`] is held. `Err` carries the
     /// check's output; the attempt is then failed.
     pub fn after_write(&self, area: &Area, shown: &str) -> Result<(), String> {
+        if *area == Area::Tracked {
+            // A worktree file: recorded, but kept out of `written`, so the
+            // worker's change list (which drops what [`Self::wrote`] names,
+            // as landing outside the worktree) still carries it to the scope
+            // checks.
+            self.permissions
+                .record_protected_write(&self.worker, shown, "kept");
+            return Ok(());
+        }
         let mut st = self.state();
         let result = match area {
             Area::Git => {
@@ -563,6 +598,7 @@ impl ProtectedWrites {
                 self.check_git_and_restore(&mut st, false, &[])
             }
             Area::Settings(name) => self.check_settings_and_restore(&mut st, name),
+            Area::Tracked => Ok(()),
         };
         self.settle(&mut st, shown, result)
     }
@@ -811,24 +847,34 @@ impl ProtectedWrites {
         let exe = self.git_exe.as_ref().ok_or_else(|| {
             "git is not on PATH; a protected git write cannot be checked".to_owned()
         })?;
-        let mut cmd = Command::new(exe);
-        cmd.arg("--git-dir")
-            .arg(git_dir)
-            .args(["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor="])
-            .args(args)
-            .current_dir(&self.worktree);
-        for var in kgraf_sandbox::git::GIT_REDIRECT_ENV {
-            cmd.env_remove(var);
-        }
-        cmd.env("GIT_TERMINAL_PROMPT", "0")
-            .env("LC_ALL", "C")
-            .stdin(if stdin.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        let args: Vec<std::ffi::OsString> =
+            args.into_iter().map(|a| a.as_ref().to_owned()).collect();
+        let pre = [
+            std::ffi::OsString::from("--git-dir"),
+            git_dir.as_os_str().to_owned(),
+        ];
+        let inv = kgraf_core::host_git::Invocation {
+            exe,
+            cwd: Some(&self.worktree),
+            pre: &pre,
+        };
+        // The host runner: hooks, every configured driver, the file system
+        // monitor and transports off, the inherited `GIT_*` removed. A config
+        // git cannot read is the check's failure, reported as git's.
+        let mut cmd = match kgraf_core::host_git::command(&inv, &args) {
+            Ok(cmd) => cmd,
+            Err(kgraf_core::host_git::HostGitError::Config { stderr, .. }) => {
+                return Ok((false, String::new(), stderr));
+            }
+            Err(e) => return Err(format!("cannot run git: {e}")),
+        };
+        cmd.stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
         let mut child = cmd.spawn().map_err(|e| format!("cannot run git: {e}"))?;
         let writer = child.stdin.take();
         let input = stdin.unwrap_or_default().to_vec();

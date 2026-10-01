@@ -9,7 +9,8 @@
 //! finished run, a failure, a cancel, an interrupt, an error in the harness),
 //! [`finish`] commits it with `MergeBack::commit`, which runs git through the
 //! hardened `SafeGit`: attributes read from the integration tip's tree (never
-//! the worker's `.gitattributes`), hooks and fsmonitor off, the gitlink
+//! the worker's `.gitattributes`), the host runner's overrides
+//! (`kgraf_core::host_git`: hooks, drivers, fsmonitor, transports off), the gitlink
 //! verified, protected paths (`.gitattributes`, `.gitmodules`, `.git*`
 //! directories), nested repositories, FIFOs, oversized files and an oversized
 //! total refused as a typed outcome naming each path. The commit is left under

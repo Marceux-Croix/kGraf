@@ -33,6 +33,8 @@
 //! mid-computation, only raced: the call returns, the spawned work finishes on
 //! its own thread and its result is discarded).
 
+#[cfg(test)]
+mod git_files_tests;
 pub(crate) mod parser;
 mod protected;
 mod replace;
@@ -377,6 +379,17 @@ fn apply_all(
     root: &Path,
     cancel: &CancellationToken,
 ) -> Result<ToolOutput, ToolError> {
+    apply_all_names(hunks, root, cancel, fs_safety::Names::Plain)
+}
+
+/// [`apply_all`] under the write guard's names policy `names`: the protected
+/// apply admits `.gitattributes`, `.gitmodules` and `.githooks` in Bypass.
+fn apply_all_names(
+    hunks: &[Hunk],
+    root: &Path,
+    cancel: &CancellationToken,
+    names: fs_safety::Names,
+) -> Result<ToolOutput, ToolError> {
     refuse_repeated_paths(hunks, lexical)?;
     let dir = fs_safety::open_workspace("apply_patch", root)?;
     // Again with links followed: a hunk on a link and a hunk on its target
@@ -390,7 +403,7 @@ fn apply_all(
     // at commit, after earlier hunks had written.
     for hunk in hunks {
         for path in written_paths(hunk)? {
-            fs_safety::guard_write("apply_patch", &dir, &path)?;
+            fs_safety::guard_write_names("apply_patch", &dir, &path, names)?;
         }
     }
 
@@ -413,7 +426,7 @@ fn apply_all(
                 tool: "apply_patch".into(),
             });
         }
-        commit_one(change, &dir, &mut added, &mut modified, &mut deleted)?;
+        commit_one(change, &dir, names, &mut added, &mut modified, &mut deleted)?;
     }
     Ok(ToolOutput::text(summary(&added, &modified, &deleted)))
 }
@@ -506,26 +519,27 @@ fn plan_one(hunk: &Hunk, dir: &Dir) -> Result<Planned, ToolError> {
 fn commit_one(
     change: Planned,
     dir: &Dir,
+    names: fs_safety::Names,
     added: &mut Vec<String>,
     modified: &mut Vec<String>,
     deleted: &mut Vec<String>,
 ) -> Result<(), ToolError> {
     match change {
         Planned::Add { path, contents } => {
-            fs_safety::write_confined("apply_patch", dir, &path, contents.as_bytes())?;
+            fs_safety::write_confined_names("apply_patch", dir, &path, contents.as_bytes(), names)?;
             added.push(display(&path));
         }
         Planned::Delete { path } => {
-            fs_safety::remove_file_confined("apply_patch", dir, &path)?;
+            fs_safety::remove_file_confined_names("apply_patch", dir, &path, names)?;
             deleted.push(display(&path));
         }
         Planned::Write { path, contents } => {
-            fs_safety::write_confined("apply_patch", dir, &path, contents.as_bytes())?;
+            fs_safety::write_confined_names("apply_patch", dir, &path, contents.as_bytes(), names)?;
             modified.push(display(&path));
         }
         Planned::Move { from, to, contents } => {
-            fs_safety::write_confined("apply_patch", dir, &to, contents.as_bytes())?;
-            fs_safety::remove_file_confined("apply_patch", dir, &from)?;
+            fs_safety::write_confined_names("apply_patch", dir, &to, contents.as_bytes(), names)?;
+            fs_safety::remove_file_confined_names("apply_patch", dir, &from, names)?;
             modified.push(display(&to));
         }
     }

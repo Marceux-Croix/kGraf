@@ -106,14 +106,30 @@
 //! A trace write the ledger refuses does not stop the run (a trace field is not
 //! spend) and is not swallowed: it lands in `WorkerResult::trace_failures`.
 //!
-//! **Context (0057 addendum 2).** Workers never compact. Old tool outputs are
-//! masked on every request through [`ObservationMasker`], always from the original
-//! transcript. When the context reaches the configured stop point the worker stops
-//! between rounds and returns `HandedBack` with a structured `Handoff`, built from
-//! what the loop observed rather than from a summarizing model call, which would be
-//! hidden spend.
+//! **Context (0057 addendum 2, 0095).** Old tool outputs are masked on every
+//! request through [`ObservationMasker`], always from the original transcript.
+//! When the context reaches the configured stop point the worker stops between
+//! rounds. With [`StopPointPolicy::HandBack`] (the default) it returns
+//! `HandedBack` with a structured `Handoff`, built from what the loop observed.
+//! With [`StopPointPolicy::Compact`], set by a caller that cannot split the
+//! remainder, the runtime compacts once instead (`compaction.rs`): one accounted
+//! summary call, a `Compacted` event the model cannot forge or suppress, and a
+//! fresh remainder of the verbatim opening plus the summary. A second overflow
+//! hands back. A user's request (`Injector::request_compaction`) compacts at the
+//! next boundary the same way.
+//!
+//! ```text
+//!   BetweenRounds, context >= stop point
+//!        | already compacted ------------------------------> HandedBack
+//!        | policy HandBack --------------------------------> HandedBack
+//!        | policy Compact: summary call, Compacted --------> BetweenRounds
+//! ```
 
 use crate::brief::{BriefError, Handoff, WorkerBrief, WorkerOutcome, WorkerResult};
+use crate::compaction::{
+    CompactionNotice, CompactionSummary, CompactionTrigger, HistoryArchive, NOTHING_TO_RECALL,
+    RECALL_TOOL, SUMMARY_REQUEST, StopPointPolicy, SummarySource,
+};
 use crate::context::{
     PrefixCheckError, PrefixRegistry, PrefixSnapshot, SliceError, SliceSource, opening_messages,
 };
@@ -359,6 +375,12 @@ pub struct SpawnOptions {
     /// spawned it, before any skill of its own. Applied whether or not this
     /// environment has skills. Empty for a worker nothing spawned.
     pub inherited_skills: Vec<SkillRestriction>,
+    /// What the worker does at its stop point (decision 0095): hand back (the
+    /// default) or, for a caller that cannot split the remainder, compact once.
+    pub stop_point: StopPointPolicy,
+    /// The worker's transcript file, named in a compaction notice so the
+    /// orchestrator and the user can find the full pre-compaction history.
+    pub transcript_path: Option<PathBuf>,
 }
 
 /// Check a brief against its environment and start its worker on the current
@@ -441,17 +463,39 @@ async fn prepare(
         None => crate::worktree::git_entry(&brief.workspace_root),
         Some(events) => resumed_git_entry(&brief.workspace_root, events),
     };
-    let (builder, rounds_used, delivered) = match options.resume_from {
+    let (builder, rounds_used, delivered, prior) = match options.resume_from {
         Some(events) => {
-            let state = ResumeState::from_events(opening, &events)?;
+            let state = ResumeState::from_events_with_base(
+                opening,
+                env.prefix.estimated_tokens(),
+                &events,
+            )?;
             let used = state.rounds_used();
             let delivered = state.injected_ids().clone();
-            (state.builder, used, delivered)
+            (state.builder, used, delivered, events)
         }
         None => (
             TranscriptBuilder::new(opening).with_base_tokens(env.prefix.estimated_tokens()),
             0,
             BTreeSet::new(),
+            Vec::new(),
+        ),
+    };
+    // Decision 0095: a resumed worker that compacted keeps its archive (the
+    // events before the notice) and does not compact again; one that did not
+    // keeps its history so far for a later compaction.
+    let compaction = builder.compaction().cloned();
+    let (history, archive) = match prior
+        .iter()
+        .position(|e| matches!(e, WorkerEvent::Compacted { .. }))
+    {
+        Some(at) => (Vec::new(), Some(HistoryArchive::from_events(&prior[..at]))),
+        None => (
+            prior
+                .into_iter()
+                .filter(crate::compaction::archived_kind)
+                .collect(),
+            None,
         ),
     };
     // A fresh worker that starts at the stop point can only hand back at once with the
@@ -651,6 +695,9 @@ async fn prepare(
     // Seeded after the spawn items, so a later `inject` of a transcript id is
     // refused as a duplicate too.
     steering.seed_delivered(delivered);
+    if compaction.is_some() {
+        steering.mark_compacted();
+    }
     handle.set_spawn_duplicates(already_delivered, listed_twice);
     handle.set_skills(worker_skills);
     let worker = Worker {
@@ -678,6 +725,11 @@ async fn prepare(
         capabilities: std::collections::HashMap::new(),
         fence: options.fence,
         steering,
+        stop_point: options.stop_point,
+        transcript_path: options.transcript_path,
+        history,
+        archive,
+        compaction,
     };
     Ok((worker, endpoint, handle))
 }
@@ -907,6 +959,16 @@ struct Worker {
     fence: Option<ScopeFence>,
     /// This worker's steering queue (decision 0067, point 3).
     steering: Arc<SteerQueue>,
+    /// What the worker does at its stop point (decision 0095).
+    stop_point: StopPointPolicy,
+    /// The transcript file, for the compaction notice.
+    transcript_path: Option<PathBuf>,
+    /// The persisted events a compaction archives, until it happens.
+    history: Vec<WorkerEvent>,
+    /// The pre-compaction history `recall_history` reads, once compacted.
+    archive: Option<HistoryArchive>,
+    /// The compaction notice, once compacted (at most one per worker).
+    compaction: Option<CompactionNotice>,
 }
 
 impl Drop for Worker {
@@ -949,12 +1011,16 @@ impl Worker {
                 // Decision 0094: in Bypass the guard admits `.git` and
                 // kGraf's settings. They lie outside the worktree's files, so
                 // the declared write scope (repository files) does not apply.
+                // It also admits `.gitattributes`, `.gitmodules` and
+                // `.githooks`, which are repository files: the scope check
+                // below applies to them like any file.
                 let admitted = match &self.env.protected_writes {
-                    Some(guard) => guard.admit(path).map(|r| r.map(|_| ())),
+                    Some(guard) => guard.admit(path).map(|r| r.map(|t| t.area)),
                     None => Some(Err(why)),
                 };
                 match admitted {
-                    Some(Ok(())) => continue,
+                    Some(Ok(kgraf_tools::protected::Area::Tracked)) => {}
+                    Some(Ok(_)) => continue,
                     Some(Err(why)) => {
                         return Some(format!(
                             "{} is not writable by a worker: {why}",
@@ -1067,6 +1133,7 @@ impl Worker {
             trace_failures: std::mem::take(&mut self.trace_failures),
             rationale,
             refused: self.refused.take(),
+            compaction: self.compaction.clone(),
         };
         // `Err` means the handle is gone: nobody is waiting for the result, and the
         // ledger already holds every call it names.
@@ -1157,6 +1224,7 @@ impl Worker {
         self.seq
             .accept(&event)
             .map_err(|e| Halt::Failed(format!("the loop produced an out-of-order event: {e}")))?;
+        self.archive_event(&event);
         if let Some(model_event) = model_event {
             self.builder.apply(model_event);
         }
@@ -1249,7 +1317,21 @@ impl Worker {
             // estimate, and a note is not yet anchored by any usage report.
             let context_tokens =
                 self.builder.context_tokens() + queued.saturating_mul(3).div_ceil(2);
+            // Decision 0095: a user's request compacts at this boundary.
+            if self.compaction.is_none() && self.steering.take_compaction_request() {
+                self.compact(ep, CompactionTrigger::UserRequest, context_tokens)
+                    .await?;
+                continue;
+            }
             if self.brief.context.reached_point(context_tokens) {
+                // Compaction only where the caller cannot split the
+                // remainder, and only once: a second overflow hands back with
+                // everything the loop observed, never compacts again.
+                if self.compaction.is_none() && self.stop_point == StopPointPolicy::Compact {
+                    self.compact(ep, CompactionTrigger::StopPoint, context_tokens)
+                        .await?;
+                    continue;
+                }
                 return Ok((self.hand_back(context_tokens), String::new()));
             }
             let final_round = match self.budget.next_round() {
@@ -1547,14 +1629,206 @@ impl Worker {
         WorkerOutcome::HandedBack {
             handoff: Handoff {
                 done: self.done.clone(),
-                remaining: vec![format!(
-                    "Continue the original instruction; the worker stopped at the context \
-                     stop point ({context_tokens} of {stop} tokens). Instruction: {}",
-                    self.brief.instruction
+                remaining: vec![crate::compaction::handback_remainder(
+                    &self.brief.instruction,
+                    context_tokens,
+                    stop,
                 )],
                 files_touched: self.worktree_changes(),
                 context_tokens,
             },
+        }
+    }
+
+    /// Keep `event` (persisted form) for the recall archive, until compaction.
+    fn archive_event(&mut self, event: &WorkerEvent) {
+        if self.compaction.is_none() && crate::compaction::archived_kind(event) {
+            self.history.push(event.clone());
+        }
+    }
+
+    /// Compact this worker's context, once (decision 0095): ask the worker's
+    /// own route for a summary in the fixed schema through the ledger, then
+    /// emit `Compacted`, which rebuilds the remainder from the verbatim
+    /// opening plus the notice and summary. A summary call that fails or
+    /// answers out of schema gives a summary built from what the loop
+    /// observed; the worker goes on either way. Only a cancel ends the run
+    /// here.
+    async fn compact(
+        &mut self,
+        ep: &WorkerEndpoint,
+        trigger: CompactionTrigger,
+        at_tokens: u64,
+    ) -> Result<(), Halt> {
+        // The worker's own context as the next request would carry it, with
+        // the fixed request joined to the last user turn when there is one,
+        // so the roles alternate on every wire.
+        let mut messages = self.env.masker.mask(self.builder.messages());
+        match messages.last_mut() {
+            Some(last) if last.role == kgraf_provider::Role::User => {
+                last.content.push(Content::text(SUMMARY_REQUEST))
+            }
+            _ => messages.push(kgraf_provider::Message::user(SUMMARY_REQUEST)),
+        }
+        let request = self.env.prefix.request(
+            messages,
+            self.env.settings.max_output_tokens,
+            self.env.settings.temperature,
+        );
+        let (reply, summary_call) = self.summary_call(ep, &request).await?;
+        let parsed =
+            reply.and_then(|text| crate::compaction::parse_summary(&text, &self.brief.instruction));
+        let (mut summary, summary_source) = match parsed {
+            Ok(summary) => (summary, SummarySource::Model),
+            Err(reason) => (
+                CompactionSummary {
+                    decisions: self.done.clone(),
+                    ..CompactionSummary::default()
+                },
+                SummarySource::Runtime { reason },
+            ),
+        };
+        // What the worktree shows changed outranks what the model recalls.
+        for path in self.worktree_changes() {
+            let path = path.to_string_lossy().into_owned();
+            if !summary.files_touched.contains(&path) {
+                summary.files_touched.push(path);
+            }
+        }
+        let archive = HistoryArchive::from_events(&self.history);
+        let at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+        let mut notice = CompactionNotice {
+            worker: self.brief.worker.to_string(),
+            task: self.brief.task.to_string(),
+            trigger,
+            at_ms,
+            at_tokens,
+            stop_tokens: self.brief.context.worker_stop_tokens(),
+            window_tokens: self.brief.context.effective_window(),
+            summary_tokens: 0,
+            summary_call,
+            summary_source,
+            transcript_path: self.transcript_path.clone(),
+            archived_entries: archive.len() as u64,
+            recall: self.env.tools.get(RECALL_TOOL).is_some(),
+            items_done: self.done.len() as u64,
+            items_remaining: summary.open_items.len() as u64,
+        };
+        notice.summary_tokens = kgraf_core::budget::estimate_tokens(
+            &crate::compaction::render_notice(&notice, &summary),
+        );
+        // Set before the event is sent, so the archive stops growing at the
+        // notice and a second compaction is impossible from here on.
+        self.history = Vec::new();
+        self.archive = Some(archive);
+        self.compaction = Some(notice.clone());
+        self.steering.mark_compacted();
+        self.emit(
+            ep,
+            WorkerEvent::Compacted {
+                notice: Box::new(notice),
+                summary: Box::new(summary),
+            },
+        )
+        .await
+    }
+
+    /// The summary call: one accounted, non-streamed call on the worker's own
+    /// route, raced against cancellation. `Ok((Err(why), _))` is a call that
+    /// did not give a usable reply; the caller falls back. No ledger row, no
+    /// call (every token is attributed).
+    async fn summary_call(
+        &mut self,
+        ep: &WorkerEndpoint,
+        request: &Request,
+    ) -> Result<(Result<String, String>, Option<CallId>), Halt> {
+        if let Err(e) = self.env.prefix.check(request) {
+            return Err(Halt::Failed(e.to_string()));
+        }
+        let provider = self.env.provider.clone();
+        let trace = CallTrace {
+            parent_call: self.last_call.clone(),
+            kind: Some(crate::compaction::COMPACTION_CALL_KIND.to_owned()),
+            role: Some("worker".to_owned()),
+            given_slice_ids: self
+                .brief
+                .slices
+                .iter()
+                .map(|n| n.as_str().to_owned())
+                .collect(),
+            given_prefix_hash: Some(self.env.prefix.digest().as_str().to_owned()),
+            ..CallTrace::default()
+        };
+        let ledger = self.env.ledger.clone();
+        let token = match ledger
+            .begin_traced_async(
+                provider.adapter(),
+                provider.protocol(),
+                &request.model,
+                self.brief.worker.as_str(),
+                self.brief.task.as_str(),
+                trace,
+            )
+            .await
+        {
+            Ok(token) => token,
+            Err(e) => {
+                return Ok((
+                    Err(format!(
+                        "no ledger row could be opened for the summary call: {e}"
+                    )),
+                    None,
+                ));
+            }
+        };
+        let call = token.id().clone();
+        self.calls.push(call.clone());
+        self.last_call = Some(call.clone());
+        self.phase = CancelPhase::ModelStream;
+        // The summary call is not a round: no `ModelCall` or `Usage` event
+        // names it, so a resume never counts it against the step budget. A
+        // cancel before the request leaves settles it as a known zero in the
+        // ledger, and neither `RoundAbandoned` nor a usage event is written
+        // (either would make a rebuild miscount the rounds).
+        if ep.is_cancelled() {
+            self.settle_unsent(&call, &token).await;
+            return Err(Halt::Cancelled {
+                phase: CancelPhase::ModelStream,
+                partial: None,
+            });
+        }
+        let outcome = tokio::select! {
+            biased;
+            () = ep.cancelled() => None,
+            r = provider.complete(request, &token) => Some(r),
+        };
+        self.phase = CancelPhase::BetweenRounds;
+        match outcome {
+            None => {
+                if let Some(failure) = settle_cancelled(&call, &token, &StreamSeen::default()).await
+                {
+                    self.trace_failures.push(failure);
+                }
+                Err(Halt::Cancelled {
+                    phase: CancelPhase::ModelStream,
+                    partial: None,
+                })
+            }
+            Some(Err(e)) => Ok((Err(format!("the summary call failed: {e}")), Some(call))),
+            Some(Ok(response)) => Ok((Ok(response.text()), Some(call))),
+        }
+    }
+
+    /// Answer one `recall_history` call from this worker's own archive.
+    fn recall(&self, input: &serde_json::Value) -> (String, bool) {
+        let Some(archive) = &self.archive else {
+            return (ToolOutput::error(NOTHING_TO_RECALL).render(), true);
+        };
+        match archive.recall(input) {
+            Ok(text) => (ToolOutput::text(text).render(), false),
+            Err(why) => (ToolOutput::error(why).render(), true),
         }
     }
 
@@ -1925,6 +2199,9 @@ impl Worker {
         let chain = self.approval.clone();
         let asks = self.env.asks.clone();
         let mut approved = Vec::new();
+        // Decision 0095: `recall_history` is answered here, from this
+        // worker's own archive, after approval like every call.
+        let mut recalls: Vec<ApprovedCall> = Vec::new();
         self.capabilities.clear();
         for (call_id, tool, input) in uses {
             self.capabilities.insert(
@@ -1960,6 +2237,10 @@ impl Worker {
                             };
                             self.note_refusal(&mut finished);
                             self.emit(ep, finished).await?;
+                            break;
+                        }
+                        if call.tool() == RECALL_TOOL {
+                            recalls.push(call);
                             break;
                         }
                         approved.push(call);
@@ -2003,14 +2284,29 @@ impl Worker {
             }
         }
         // Only approved calls count toward a stall: a denied call did nothing.
-        if let Some(stall) = self
-            .stall
-            .observe(approved.iter().map(|a| (a.tool(), a.input())))
-        {
-            let ids: Vec<String> = approved.iter().map(|a| a.call_id().to_owned()).collect();
+        if let Some(stall) = self.stall.observe(
+            approved
+                .iter()
+                .chain(recalls.iter())
+                .map(|a| (a.tool(), a.input())),
+        ) {
+            let ids: Vec<String> = approved
+                .iter()
+                .chain(recalls.iter())
+                .map(|a| a.call_id().to_owned())
+                .collect();
             self.refuse_all(ep, ids, "the same call repeated; stall detected")
                 .await?;
             return Ok(Some(stall));
+        }
+        for call in recalls {
+            let (output, is_error) = self.recall(call.input());
+            let finished = WorkerEvent::ToolCallFinished {
+                call_id: call.call_id().to_owned(),
+                output,
+                is_error,
+            };
+            self.emit(ep, finished).await?;
         }
         self.execute(ep, &registry, approved).await?;
         Ok(None)
@@ -2512,6 +2808,7 @@ impl Worker {
             self.seq.accept(&event).map_err(|e| {
                 Halt::Failed(format!("the loop produced an out-of-order event: {e}"))
             })?;
+            self.archive_event(&event);
             if let Some(model_event) = &model_event {
                 self.builder.apply(model_event);
             }

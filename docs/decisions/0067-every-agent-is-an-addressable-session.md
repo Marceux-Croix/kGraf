@@ -100,3 +100,15 @@ already-composed answer crosses between agents (see decision 0005).
   of sharing the parent's.
 - **A fixed slider maximum, even a generous one.** Rejected: it ignores real provider rate
   limits, and it ignores machines with little memory or disk.
+
+## Amendment (2026-10-01): a compaction replaces a worker's private remainder once
+
+Decision 0095. The cache argument of this decision (the previous request's messages are a
+byte prefix of the next request's) has one exception: when the runtime compacts a worker,
+its next request carries the opening message plus the compaction notice and summary instead
+of the earlier turns. The shared prefix is unchanged, so the prefix digest and the prefix
+check still hold; only the worker's private remainder starts over, once. The `Compacted`
+event is appended between rounds, like an injection, and refused mid-stream or
+mid-tool-round; everything before it stays in the transcript. A user's request to compact
+one session travels on the same queue as steering (`Injector::request_compaction`) and is
+taken at the next boundary; a session that has compacted refuses a second request.

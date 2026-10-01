@@ -5,7 +5,10 @@
 //! command with the shared git directory writable, together with the
 //! integrity check and restore that follow it. Shared: each git process kGraf
 //! itself runs on the repository (merges into the integration branch and its
-//! view, ref and branch updates, worktree add and remove, prune). kGraf's own
+//! view, ref and branch updates, worktree add and remove, prune, the worker's
+//! status read, the co-change history read). Each holder takes it before
+//! `crate::host_git::command` builds the invocation, so the runner's config
+//! listing and the command it prepares run in one hold. kGraf's own
 //! processes do not wait for each other (they already serialize where they
 //! must: merges by a mutex and a compare-and-swap on the branch); they wait
 //! only while a worker's exclusive window is open, and a window waits until
@@ -50,7 +53,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use kgraf_core::flock::HeldLock;
+use crate::flock::HeldLock;
 
 /// The longest a taker waits. Longer than the shell tool's command timeout
 /// (10 minutes), since a kGraf merge may wait out a worker's whole git

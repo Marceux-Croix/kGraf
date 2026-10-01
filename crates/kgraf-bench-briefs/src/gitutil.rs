@@ -13,14 +13,27 @@ use anyhow::{Context, Result, bail};
 use std::path::Path;
 use std::process::Command;
 
+/// A git command through the host runner (`kgraf_core::host_git`): hooks,
+/// every configured driver, the file system monitor and transports off. The
+/// guard is the repository's shared lock (decision 0094), taken before the
+/// command is built so the runner's config listing and the command run in
+/// one hold; keep it until the process has exited.
+fn host_git(
+    dir: &Path,
+    args: &[&str],
+) -> Result<(Option<kgraf_core::repo_lock::RepoLockGuard>, Command)> {
+    let guard = kgraf_core::repo_lock::shared_for(dir, &format!("kGraf bench git {args:?}"))
+        .with_context(|| format!("cannot lock the repository at {}", dir.display()))?;
+    let pre = kgraf_core::host_git::dash_c(dir);
+    let cmd = kgraf_core::host_git::command(&kgraf_core::host_git::Invocation::in_dir(&pre), args)
+        .with_context(|| format!("cannot run git {args:?} in {}", dir.display()))?;
+    Ok((guard, cmd))
+}
+
 fn git(dir: &Path, args: &[&str]) -> Result<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .args(args)
+    let (_repo, mut cmd) = host_git(dir, args)?;
+    let out = cmd
+        .stdin(std::process::Stdio::null())
         .output()
         .with_context(|| format!("cannot run git {args:?} in {}", dir.display()))?;
     if !out.status.success() {
@@ -82,13 +95,9 @@ pub fn files_at(root: &Path, commit: &str, pathspecs: &[&str]) -> Result<Vec<(St
     args.extend_from_slice(pathspecs);
     let mut files = Vec::new();
     for path in git(root, &args)?.lines() {
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
-            .args(["show", &format!("{commit}:{path}")])
+        let (_repo, mut cmd) = host_git(root, &["show", &format!("{commit}:{path}")])?;
+        let out = cmd
+            .stdin(std::process::Stdio::null())
             .output()
             .with_context(|| format!("cannot run git show {commit}:{path}"))?;
         if !out.status.success() {
@@ -134,13 +143,9 @@ pub(crate) fn copy_tree(from: &Path, to: &Path, skip_top: &[&str]) -> Result<()>
 /// accepts, and an empty tree would then read as a model failure.
 pub fn checkout_commit(root: &Path, commit: &str, dest: &Path) -> Result<()> {
     std::fs::create_dir_all(dest).with_context(|| format!("cannot create {}", dest.display()))?;
-    let mut archive = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .args(["archive", "--format=tar", commit])
+    let (_repo, mut cmd) = host_git(root, &["archive", "--format=tar", commit])?;
+    let mut archive = cmd
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()

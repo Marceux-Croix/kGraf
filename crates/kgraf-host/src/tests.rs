@@ -1462,9 +1462,10 @@ async fn the_assembled_prefix_digest_with_the_flag_off_is_pinned() {
     // data, and the `apply_patch` description was rewritten in the same
     // merge. One deliberate cache reset. Decision 0093 re-pinned it once more:
     // the system prompt now tells a refused worker to report the shortfall and
-    // names the `<worker_shortfall>` block as data.
+    // names the `<worker_shortfall>` block as data. Decision 0095 re-pinned it
+    // again: every worker lists the `recall_history` tool.
     assert_eq!(
-        digest, "64cf96e795c053054f5ef67fac3c744c84eab4cb81387ecd90bc5885f2dde410",
+        digest, "451c3c43c2693538d8b1638629ae880a7eff497d024ed49c6307789b5eaf8d9d",
         "a change here means every worker's cache resets even with the \
          sessions flag off, which nothing in decision 0067 may cause \
          (re-pinned for the intentional `apply_patch` description \
@@ -3110,6 +3111,7 @@ fn verifier(r: &Repo, command: &str) -> CommandVerifier {
         merge_back: r.merge_back.clone(),
         read_denies: Vec::new(),
         timeout: Duration::from_secs(300),
+        permissions: Arc::new(kgraf_tools::PermissionControl::manual()),
     }
 }
 
@@ -3333,10 +3335,32 @@ async fn an_attempt_changing_cargo_or_rustup_configuration_is_refused() {
 #[test]
 fn scope_compares_as_the_volume_resolves_names() {
     let c = contract("src/Lib.rs");
-    assert!(scope_violations(&["src/lib.rs".into()], &c).is_empty());
+    assert!(scope_violations(&["src/lib.rs".into()], &c, false).is_empty());
     assert_eq!(
-        scope_violations(&["src/other.rs".into(), ".GIT".into()], &c),
+        scope_violations(&["src/other.rs".into(), ".GIT".into()], &c, false),
         vec!["src/other.rs".to_owned(), ".GIT".to_owned()]
+    );
+}
+
+/// Decision 0094: in Bypass a declared `.gitattributes` is an ordinary
+/// in-scope change and an undeclared one is outside the scope; `.git` stays
+/// refused when declared; outside Bypass the declared one is refused.
+#[test]
+fn bypass_judges_tracked_git_files_by_the_declared_scope() {
+    let mut c = contract(".gitattributes");
+    c.writes.push(kgraf_orchestrator::WriteTarget {
+        path: ".git/config".into(),
+        node: None,
+    });
+    let changed = |p: &[&str]| p.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+    assert!(scope_violations(&changed(&[".gitattributes"]), &c, true).is_empty());
+    assert_eq!(
+        scope_violations(&changed(&[".gitmodules", ".git/config"]), &c, true),
+        changed(&[".gitmodules", ".git/config"])
+    );
+    assert_eq!(
+        scope_violations(&changed(&[".gitattributes"]), &c, false),
+        changed(&[".gitattributes"])
     );
 }
 
@@ -6599,3 +6623,6 @@ mod skill_enforcement {
         assert!(!catalog.model_catalog().is_empty());
     }
 }
+
+#[path = "bypass_git_files_tests.rs"]
+mod bypass_git_files;

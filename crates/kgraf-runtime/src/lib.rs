@@ -13,6 +13,8 @@
 //!   the result; bulk events are backpressured, control events never wait.
 //! - [`stream_bridge`]: the provider's synchronous stream sink to the async loop.
 //! - [`ContextConfig`]: the context thresholds of decision 0057 addendum 2.
+//! - [`StopPointPolicy`], [`CompactionNotice`], [`RecallHistoryTool`]: the
+//!   runtime-enforced compaction of decision 0095 and the recall tool.
 //! - [`SharedPrefix`], [`PrefixSnapshot`], [`PrefixRegistry`]: the byte-identical
 //!   prefix, checked on every request and admitted once per vendor and model.
 //! - [`ObservationMasker`]: the masking seam; [`SessionMasker`], the default, is
@@ -39,6 +41,7 @@
 
 mod bridge;
 mod brief;
+mod compaction;
 mod context;
 mod dispatch;
 mod event;
@@ -63,6 +66,12 @@ pub use brief::{
     BriefError, Handoff, MIN_STEP_BUDGET, RATIONALE_WORD_CAP, Rationale, WorkerBrief,
     WorkerOutcome, WorkerResult, parse_rationale,
 };
+pub use compaction::{
+    COMPACTION_CALL_KIND, COMPACTION_NOTICE_HEADER, CompactionNotice, CompactionSummary,
+    CompactionTrigger, DEFAULT_READ_COUNT, HistoryArchive, MAX_READ_COUNT, MAX_RECALL_CHARS,
+    MAX_RECALL_HITS, NOTHING_TO_RECALL, RECALL_TOOL, RecallHistoryTool, SUMMARY_REQUEST,
+    StopPointPolicy, SummarySource, handback_remainder, parse_summary, render_notice,
+};
 pub use context::{
     GraphSlices, NeutralPrefixEncoder, NoSlices, PrefixCheckError, PrefixInvalidation,
     PrefixRegistry, PrefixSnapshot, RenderedSlice, SliceError, SliceSource, opening_messages,
@@ -72,7 +81,7 @@ pub use dispatch::dependencies;
 pub use event::{CancelPhase, EventSequence, NoticeKind, SequenceError, WorkerEvent};
 pub use fence::{FenceGuard, ScopeFence};
 pub use handle::{RuntimeError, WorkerEndpoint, WorkerHandle, worker_channel};
-pub use inject::{InjectError, Injection, Injector};
+pub use inject::{CompactRequestError, InjectError, Injection, Injector};
 pub use masking::{DEFAULT_KEEP_RECENT, NoMasking, ObservationMasker, SessionMasker};
 pub use paths::{
     fold_name, fold_path, forbidden_path, is_build_config_path, is_protected_name, same_path,

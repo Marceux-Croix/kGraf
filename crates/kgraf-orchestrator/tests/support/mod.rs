@@ -300,7 +300,19 @@ impl Provider for WorkerFake {
             .lock()
             .expect("lock")
             .push((instruction.clone(), start, Instant::now()));
-        let big = instruction.starts_with("BIG") && round == 0;
+        // `ALWAYSBIG` stays big in every hand-back child (the remainder quotes
+        // the instruction), so a chain reaches the delegation depth cap; it
+        // stops being big once the runtime compacted the worker (decision
+        // 0095), unless the instruction also says `STUBBORN`.
+        let compacted = request.messages.first().is_some_and(|m| {
+            m.content.iter().any(|c| {
+                c.as_text()
+                    .is_some_and(|t| t.contains(kgraf_runtime::COMPACTION_NOTICE_HEADER))
+            })
+        });
+        let always =
+            instruction.contains("ALWAYSBIG") && (!compacted || instruction.contains("STUBBORN"));
+        let big = (instruction.starts_with("BIG") || always) && round == 0;
         // Far more than any estimate of a small brief, under the stop point.
         let costly = instruction.contains("COSTLY") && round == 0;
         let usage = TokenUsage {

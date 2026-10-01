@@ -22,3 +22,7 @@ unicode-normalization = "0.1.25"
 # lock-release tests, Unix only) and `session::check_session_records` (the record
 # check for session files).
 test-support = []
+
+[dev-dependencies]
+# Throwaway repositories for the host git mechanism tests. Already in Cargo.lock.
+tempfile = "3.27.0"

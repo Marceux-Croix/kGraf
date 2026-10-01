@@ -233,6 +233,50 @@ pub fn is_build_config_path(path: &Path) -> bool {
     })
 }
 
+/// The tracked files that steer git which a worker may write in the Bypass
+/// permission mode (decision 0094): `.gitattributes`, `.gitmodules` and the
+/// `.githooks` hooks directory. They live in the worktree, not in `.git`, and
+/// git history keeps every earlier version, so they merge as plain data.
+/// kGraf's own git does not run what they select (`crate::host_git`).
+pub const BYPASS_GIT_FILES: [&str; 3] = [".gitattributes", ".gitmodules", ".githooks"];
+
+/// Whether `path` is protected only by [`BYPASS_GIT_FILES`]: relative, no
+/// `..`, at least one component is one of those names, and every protected
+/// component is one of them. `.gitattributes` and `.gitmodules` must be the
+/// last component; `.githooks` may hold a subtree. A name matches as the file
+/// system resolves it (case, normalization), but an NTFS short name or a
+/// stream suffix does not: those stay refused.
+pub fn is_bypass_git_file(path: &Path) -> bool {
+    let parts: Vec<String> = match path
+        .components()
+        .filter(|c| !matches!(c, Component::CurDir))
+        .map(|c| match c {
+            Component::Normal(n) => Some(n.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()
+    {
+        Some(p) if !p.is_empty() => p,
+        _ => return false,
+    };
+    let last = parts.len() - 1;
+    let mut any = false;
+    for (i, name) in parts.iter().enumerate() {
+        if !is_protected_name(name) {
+            continue;
+        }
+        if name.contains(':') {
+            return false;
+        }
+        match fold_name(name).as_str() {
+            ".gitattributes" | ".gitmodules" if i == last => any = true,
+            ".githooks" => any = true,
+            _ => return false,
+        }
+    }
+    any
+}
+
 /// Whether a worker may never write `path`: absolute, escaping (`..`), or
 /// through a protected component.
 ///
@@ -263,6 +307,39 @@ pub fn forbidden_reason(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bypass_git_files_are_exactly_the_three_tracked_names() {
+        for ok in [
+            ".gitattributes",
+            "src/.gitattributes",
+            ".gitmodules",
+            ".githooks/pre-commit",
+            ".githooks/lib/common.sh",
+            "./.GitAttributes",
+            ".githooks",
+        ] {
+            assert!(is_bypass_git_file(Path::new(ok)), "{ok}");
+        }
+        for bad in [
+            "src/main.rs",
+            ".git/config",
+            ".githooks/.git/config",
+            ".kgraf/run.json",
+            ".gitconfig",
+            ".gitattributes/x",
+            ".gitmodules/x",
+            "GITATT~1",
+            ".gitattributes::$DATA",
+            ".gitattributes:evil",
+            "../.gitattributes",
+            "/abs/.gitattributes",
+            ".githooks/.kgraf/x",
+            "",
+        ] {
+            assert!(!is_bypass_git_file(Path::new(bad)), "{bad}");
+        }
+    }
 
     #[test]
     fn repository_metadata_is_refused_however_it_is_spelled() {

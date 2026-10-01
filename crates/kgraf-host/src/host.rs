@@ -1381,7 +1381,8 @@ impl Host {
         );
         let workspaces = Arc::new(
             GitWorkspaces::new(manager.clone(), merge_back.clone())
-                .with_retention(self.worktree_retention()),
+                .with_retention(self.worktree_retention())
+                .with_permissions(self.permissions.clone()),
         );
         let read_denies = state_read_denies(
             &self.state,
@@ -1602,6 +1603,7 @@ impl Host {
                 merge_back: merge_back.clone(),
                 read_denies: read_denies.clone(),
                 timeout: self.config.gate_timeout,
+                permissions: self.permissions.clone(),
             }),
             workspaces: workspaces.clone(),
             clock: Arc::new(SystemClock),

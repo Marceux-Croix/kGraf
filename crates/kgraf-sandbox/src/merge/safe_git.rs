@@ -42,33 +42,29 @@ pub(super) struct GitOut {
 }
 
 impl SafeGit {
-    fn command(&self, target: &Target<'_>) -> Result<Command, MergeError> {
-        let mut cmd = Command::new(self.git.exe());
-        // Strip everything git reads from the environment (GIT_DIR,
-        // GIT_CONFIG_PARAMETERS, GIT_CONFIG_COUNT, GIT_ATTR_SOURCE,
-        // GIT_EXEC_PATH, ...): an inherited value could redirect the
-        // repository or inject config.
-        for (key, _) in std::env::vars_os() {
-            if key.to_string_lossy().starts_with("GIT_") {
-                cmd.env_remove(key);
-            }
-        }
-        cmd.env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("LC_ALL", "C")
-            .args(["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor="]);
-        match target {
+    /// The hardened command for `args` at `target`, built by the host runner
+    /// (`kgraf_core::host_git`: hooks, every configured driver, the file
+    /// system monitor and transports off, inherited `GIT_*` removed). `Ok(Err)`
+    /// is git failing to read the config, returned as git's own failure.
+    fn command(
+        &self,
+        target: &Target<'_>,
+        args: &[OsString],
+    ) -> Result<Result<Command, GitOut>, MergeError> {
+        let mut pre: Vec<OsString> = Vec::new();
+        let cwd: &Path = match target {
             Target::Repo => {
-                cmd.arg(join_flag("--git-dir=", &self.common_dir));
-                cmd.current_dir(&self.common_dir);
+                pre.push(join_flag("--git-dir=", &self.common_dir));
+                &self.common_dir
             }
-            Target::Discover(dir) => {
-                cmd.current_dir(dir);
-            }
+            Target::Discover(dir) => dir,
             Target::Worktree { git_dir, work_tree } => {
                 // A worktree command without a trusted attribute source would
-                // read the worker's `.gitattributes` and could run a filter
-                // driver on the host. Refuse rather than fall back.
+                // read the worker's `.gitattributes`. The host runner already
+                // neutralizes every configured driver; the pinned source also
+                // keeps a worker's builtin attributes (`merge=union`, `eol`)
+                // from changing how its own attempt is staged or merged.
+                // Refuse rather than fall back.
                 if self.attr_tree.is_none() {
                     return Err(WorkspaceError::GitOutput {
                         args: "(worktree command)".into(),
@@ -76,15 +72,43 @@ impl SafeGit {
                     }
                     .into());
                 }
-                cmd.arg(join_flag("--git-dir=", git_dir));
-                cmd.arg(join_flag("--work-tree=", work_tree));
-                cmd.current_dir(work_tree);
+                pre.push(join_flag("--git-dir=", git_dir));
+                pre.push(join_flag("--work-tree=", work_tree));
+                work_tree
             }
-        }
+        };
         if let Some(tree) = &self.attr_tree {
-            cmd.arg(format!("--attr-source={tree}"));
+            pre.push(OsString::from(format!("--attr-source={tree}")));
         }
-        Ok(cmd)
+        let inv = kgraf_core::host_git::Invocation {
+            exe: self.git.exe(),
+            cwd: Some(cwd),
+            pre: &pre,
+        };
+        let mut cmd = match kgraf_core::host_git::command(&inv, args) {
+            Ok(cmd) => cmd,
+            Err(kgraf_core::host_git::HostGitError::Config { code, stderr }) => {
+                return Ok(Err(GitOut {
+                    code,
+                    stdout: Vec::new(),
+                    stderr,
+                }));
+            }
+            Err(kgraf_core::host_git::HostGitError::Spawn { source, .. }) => {
+                return Err(WorkspaceError::io(self.git.exe(), source).into());
+            }
+            Err(e) => {
+                return Err(WorkspaceError::GitOutput {
+                    args: display(args),
+                    detail: e.to_string(),
+                }
+                .into());
+            }
+        };
+        // Merge-back reads no system config: its results must not depend on
+        // a machine-wide file.
+        cmd.env("GIT_CONFIG_NOSYSTEM", "1");
+        Ok(Ok(cmd))
     }
 
     /// Run git, bounded by the timeout. Returns whatever exit status git gave.
@@ -102,6 +126,9 @@ impl SafeGit {
         let args: Vec<OsString> = args.into_iter().map(|a| a.as_ref().to_owned()).collect();
         // Shared repository lock for this one process (decision 0094): a
         // merge step never runs while a worker's Bypass git window is open.
+        // Taken before the command is built, so the host runner's config
+        // listing and the command it prepares run in the same hold and a
+        // Bypass write to the config cannot fall between them.
         // None while bootstrapping (no shared directory known yet), when only
         // `version` and `rev-parse` run.
         let _repo = if self.common_dir.as_os_str().is_empty() {
@@ -117,8 +144,10 @@ impl SafeGit {
                 .map_err(WorkspaceError::from)?,
             )
         };
-        let mut cmd = self.command(target)?;
-        cmd.args(&args);
+        let mut cmd = match self.command(target, &args)? {
+            Ok(cmd) => cmd,
+            Err(failed) => return Ok(failed),
+        };
         for (k, v) in env {
             cmd.env(k, v);
         }

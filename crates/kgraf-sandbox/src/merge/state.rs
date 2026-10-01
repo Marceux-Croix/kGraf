@@ -174,9 +174,25 @@ pub struct Attempt {
     /// [`super::MergeBack::merge`] refuses; `Some` of the paths otherwise, and
     /// merge refuses any but an empty list (decision 0083).
     pub(super) outside_scope: Option<Vec<String>>,
+    /// Whether `.gitattributes`, `.gitmodules` and `.githooks` changes merge
+    /// as plain data ([`Attempt::allow_bypass_git_files`]). Off by default.
+    pub(super) bypass_git_files: bool,
 }
 
 impl Attempt {
+    /// Let this attempt's changes to `.gitattributes`, `.gitmodules` and
+    /// paths under `.githooks` (`kgraf_core::paths::is_bypass_git_file`) be
+    /// committed and merged as plain data, under the declared write scope like
+    /// any file, instead of refused as protected paths. The caller sets it
+    /// when the user's permission mode is Bypass (decision 0094). Safe for
+    /// kGraf itself: its own git never runs a hook, filter or driver these
+    /// files select (`kgraf_core::host_git`), and merge-back reads attributes
+    /// only from the integration tip's tree. Every other protected path stays
+    /// refused.
+    pub fn allow_bypass_git_files(&mut self, allow: bool) {
+        self.bypass_git_files = allow;
+    }
+
     /// Files the worker's run generated that its commit left out.
     pub fn excluded(&self) -> &[super::Excluded] {
         &self.excluded

@@ -34,6 +34,10 @@
 //! - `Usage` counts rounds (one ledger call per round, by call id) and anchors the
 //!   context-size estimate. A report of zero (a local model, or a call that never
 //!   left) anchors nothing; a round no report covered counts its own output.
+//! - `Compacted` (decision 0095) replaces the private remainder with the
+//!   opening messages (instruction and slices, verbatim) followed by the
+//!   rendered notice and summary, and resets the context estimate to them. The
+//!   events before it stay in the transcript; only the messages change.
 //! - A rebuild from stored events adds a note to a tool result whose text or call
 //!   input holds a `[redacted:...]` marker: the pattern scrub that stored it may
 //!   have replaced text the live model saw whole, so the model re-reads before it
@@ -129,6 +133,13 @@ pub struct TranscriptBuilder {
     /// How many leading messages some request has already carried: set at
     /// each `ModelCall`. An injection never joins a message below this index.
     sent: usize,
+    /// The opening messages, kept for a compaction to rebuild from (0095).
+    opening: Vec<Message>,
+    /// The estimate of what precedes the messages (the shared prefix), for
+    /// the context estimate after a compaction.
+    base_tokens: u64,
+    /// The compaction this transcript records, if any (at most one).
+    compaction: Option<crate::compaction::CompactionNotice>,
 }
 
 impl TranscriptBuilder {
@@ -136,6 +147,9 @@ impl TranscriptBuilder {
     pub fn new(opening: Vec<Message>) -> Self {
         let tokens_since_usage = opening.iter().map(message_tokens).sum();
         Self {
+            opening: opening.clone(),
+            base_tokens: 0,
+            compaction: None,
             messages: opening,
             text: String::new(),
             reasoning: String::new(),
@@ -164,7 +178,13 @@ impl TranscriptBuilder {
     /// context estimate, until the first usage report replaces it.
     pub fn with_base_tokens(mut self, tokens: u64) -> Self {
         self.tokens_since_usage += tokens;
+        self.base_tokens = tokens;
         self
+    }
+
+    /// The compaction this transcript records, if any.
+    pub fn compaction(&self) -> Option<&crate::compaction::CompactionNotice> {
+        self.compaction.as_ref()
     }
 
     /// Apply one event.
@@ -438,6 +458,39 @@ impl TranscriptBuilder {
             WorkerEvent::Waiting { .. } | WorkerEvent::Resumed { .. } => {}
             // Persist-only redaction counts (decision 0071): never model input.
             WorkerEvent::Redacted { .. } => {}
+            WorkerEvent::Compacted { notice, summary } => {
+                // Results held for the next turn belong to the history the
+                // summary replaced; the loop compacts only between rounds,
+                // so none is pending there.
+                self.pending = None;
+                self.group_open = false;
+                self.text.clear();
+                self.reasoning.clear();
+                self.text_signature = None;
+                let note = crate::compaction::render_notice(notice, summary);
+                let mut messages = self.opening.clone();
+                match messages.last_mut() {
+                    Some(last) if last.role == Role::User => {
+                        last.content.push(Content::text(note.clone()))
+                    }
+                    _ => messages.push(Message::user(note.clone())),
+                }
+                // A fresh remainder: nothing of it was sent, and the last
+                // usage report described the context it replaced.
+                self.tokens_since_usage =
+                    self.base_tokens + messages.iter().map(message_tokens).sum::<u64>();
+                self.messages = messages;
+                self.sent = 0;
+                self.last_usage_tokens = None;
+                self.round_anchored = false;
+                // The summary call is a ledger call of this worker, not a round.
+                if let Some(call) = &notice.summary_call
+                    && !self.calls.contains(call)
+                {
+                    self.calls.push(call.clone());
+                }
+                self.compaction = Some((**notice).clone());
+            }
         }
     }
 
@@ -605,7 +658,19 @@ impl ResumeState {
     /// sequence (including mid-stream state) never carries into the next
     /// segment.
     pub fn from_events(opening: Vec<Message>, events: &[WorkerEvent]) -> Result<Self, ResumeError> {
+        Self::from_events_with_base(opening, 0, events)
+    }
+
+    /// [`Self::from_events`], with the shared prefix's estimated size kept for
+    /// the context estimate after a compaction (decision 0095). It is not
+    /// added to the estimate before then: the usage reports anchor that.
+    pub fn from_events_with_base(
+        opening: Vec<Message>,
+        base_tokens: u64,
+        events: &[WorkerEvent],
+    ) -> Result<Self, ResumeError> {
         let mut builder = TranscriptBuilder::new(opening);
+        builder.base_tokens = base_tokens;
         builder.from_storage = true;
         let mut seq = EventSequence::new();
         let mut interrupted = Vec::new();

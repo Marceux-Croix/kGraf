@@ -12,7 +12,8 @@
 //! - A sample is a finished worker whose outcome is `completed` (held) or `failed`,
 //!   `stalled` or `budget_exhausted` (did not hold), with a known window and a peak
 //!   above zero. A hand-back and a cancel say nothing about whether the outcome held
-//!   and are left out.
+//!   and are left out, and so is a worker the runtime compacted (decision 0095): it
+//!   finished on a summary, not on the context its peak describes.
 //! - The model with the most samples is measured, and needs [`MIN_SAMPLES`] of them.
 //! - The recommendation is the highest point `p` (a multiple of 5 in the slider's
 //!   range) such that the workers whose peak stayed at or under `p` percent of the
@@ -60,16 +61,29 @@ impl WorkerSample {
 /// The samples in one trace: one per finished worker that says whether its outcome
 /// held.
 pub fn samples_from_trace(events: &[TraceEvent]) -> Vec<WorkerSample> {
+    // A worker the runtime compacted (decision 0095) finished on a summary of
+    // its context, not on the context its peak describes.
+    let compacted: std::collections::HashSet<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            TraceEvent::WorkerCompacted { worker, .. } => Some(worker.as_str()),
+            _ => None,
+        })
+        .collect();
     events
         .iter()
         .filter_map(|e| match e {
             TraceEvent::WorkerFinished {
+                worker,
                 model,
                 outcome,
                 peak_context_tokens,
                 window_tokens,
                 ..
-            } if *window_tokens > 0 && *peak_context_tokens > 0 => {
+            } if *window_tokens > 0
+                && *peak_context_tokens > 0
+                && !compacted.contains(worker.as_str()) =>
+            {
                 let held = match outcome.as_str() {
                     "completed" => true,
                     "failed" | "stalled" | "budget_exhausted" => false,
@@ -395,5 +409,55 @@ mod tests {
             samples.iter().map(|s| s.held).collect::<Vec<_>>(),
             [true, false]
         );
+    }
+
+    #[test]
+    fn a_worker_the_runtime_compacted_is_not_a_sample() {
+        let finished = |worker: &str| TraceEvent::WorkerFinished {
+            at_ms: 0,
+            contract: "c".into(),
+            worker: worker.into(),
+            route: "r".into(),
+            model: "m".into(),
+            outcome: "completed".into(),
+            steps: 1,
+            peak_context_tokens: 80_000,
+            projected_tokens: 0,
+            stop_tokens: 80_000,
+            window_tokens: 100_000,
+            sizing_miss: worker == "compacted",
+            calls: Vec::new(),
+            spend_micros: 0,
+            error: None,
+        };
+        let notice = kgraf_runtime::CompactionNotice {
+            worker: "compacted".into(),
+            task: "t".into(),
+            trigger: kgraf_runtime::CompactionTrigger::StopPoint,
+            at_ms: 0,
+            at_tokens: 80_000,
+            stop_tokens: 80_000,
+            window_tokens: 100_000,
+            summary_tokens: 300,
+            summary_call: None,
+            summary_source: kgraf_runtime::SummarySource::Model,
+            transcript_path: None,
+            archived_entries: 10,
+            recall: true,
+            items_done: 3,
+            items_remaining: 1,
+        };
+        let events = vec![
+            TraceEvent::WorkerCompacted {
+                at_ms: 0,
+                contract: "c".into(),
+                worker: "compacted".into(),
+                notice,
+            },
+            finished("compacted"),
+            finished("plain"),
+        ];
+        let samples = samples_from_trace(&events);
+        assert_eq!(samples.len(), 1, "only the plain worker: {samples:?}");
     }
 }

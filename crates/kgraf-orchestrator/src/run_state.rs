@@ -458,7 +458,8 @@ pub struct RunCounters {
     pub cluster_cap_refusals: u64,
     /// Readiness failures.
     pub readiness_failures: u64,
-    /// Workers that reached the stop point and handed back (0057 sizing misses).
+    /// Workers that reached the stop point and handed back or compacted (0057
+    /// and 0095 sizing misses), one per worker.
     pub sizing_misses: u64,
     /// Reservations made (worker attempts and orchestrator calls); accounting
     /// only, decision 0080 removed every spend cap, so none is ever refused.
@@ -575,6 +576,24 @@ pub struct RunStateRecord {
     /// re-plan is taken so a resume in between still sends them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replan_note: Option<String>,
+    /// Workers the runtime compacted (decision 0095), in order: each is a
+    /// contract that was larger than planned when the trigger was the stop
+    /// point. The notice names the worker's transcript, which holds the full
+    /// pre-compaction history.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compactions: Vec<CompactionRecord>,
+}
+
+/// One worker compaction, as the run record keeps it (decision 0095).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactionRecord {
+    pub contract: String,
+    pub worker: String,
+    /// Whether it counts as a sizing miss: the stop point triggered it, not a
+    /// user's request.
+    pub sizing_miss: bool,
+    /// The runtime's notice, as the worker emitted it.
+    pub notice: kgraf_runtime::CompactionNotice,
 }
 
 /// A run's contract-check setting, as its record keeps it.
@@ -741,6 +760,7 @@ impl RunStateRecord {
             unverified: BTreeMap::new(),
             replans: 0,
             replan_note: None,
+            compactions: Vec::new(),
         }
     }
 

@@ -191,3 +191,15 @@ returns its output so far.
   Auto's allow set, Accept edits' file programs, a grant on a shortfall, and Bypass each run a
   command as a confined, granted one; the verifier's scope check, a fence and a `forbid` rule
   still apply, and the user's deny and ask rules apply in every mode.
+
+## Amendment: host-side git goes through one hardened runner (decision 0094)
+
+The status read after a sandboxed build, merge-back and the worktree commands no longer set
+their own hooks and fsmonitor overrides; each goes through `kgraf_core::host_git`, which also
+neutralizes every filter, merge and diff driver and every config-defined hook the config names,
+refuses every transport (`GIT_ALLOW_PROTOCOL=none` outranks a repository's
+`protocol.file.allow`), and removes the inherited `GIT_*` environment but the identity. An
+in-tree `.gitattributes` can name a filter driver, but none runs. Measured on git 2.54: a
+config-defined hook (`hook.<name>.command`) runs even with `core.hooksPath=/dev/null`, so
+`hook.<name>.enabled=false` is set per name. The full list of overrides and covered call sites
+is in decision 0094's amendment.

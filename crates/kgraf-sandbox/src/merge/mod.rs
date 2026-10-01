@@ -29,11 +29,15 @@
 //!   [`Limits::max_file_bytes`], nested repositories (git would record a
 //!   gitlink to an unreachable commit and the files would vanish), and paths
 //!   that steer git (`.gitattributes`, `.gitmodules`, `.git*` directories).
+//!   In the Bypass mode the caller lets `.gitattributes`, `.gitmodules` and
+//!   `.githooks` through as plain data ([`Attempt::allow_bypass_git_files`]).
 //! - Upstream runs git with `cmd.Dir = worktree`, so git follows the worktree's
 //!   `.git` file. Here every invocation passes an explicit `--git-dir` taken
-//!   from the gitlink recorded at creation, strips every inherited `GIT_*`
-//!   variable, sets `GIT_CONFIG_NOSYSTEM=1`, `core.hooksPath=/dev/null` and
-//!   `core.fsmonitor=` (off), and is killed after [`Limits::git_timeout`].
+//!   from the gitlink recorded at creation, goes through the host runner
+//!   (`kgraf_core::host_git`: inherited `GIT_*` removed, hooks, config
+//!   hooks, fsmonitor and transports off, every configured filter, merge and
+//!   diff driver neutralized by name), sets `GIT_CONFIG_NOSYSTEM=1`, and is
+//!   killed after [`Limits::git_timeout`].
 //!   `Workspace::verify_gitlink` runs before any git process that concerns a
 //!   worker's worktree.
 //! - Attributes are read from one tree the owner trusts, fixed at open: the
@@ -41,8 +45,9 @@
 //!   passes it as `--attr-source`, and a worktree invocation without it is
 //!   refused. So no `.gitattributes` a worker writes can name a filter driver
 //!   (which git would run on the host while hashing files) or a merge driver
-//!   (a `merge=union` would silently auto-resolve conflicts); and since an
-//!   attempt touching `.gitattributes` is refused, none reaches the branch.
+//!   (a `merge=union` would silently auto-resolve conflicts) for its own
+//!   attempt. Independently, the host runner empties every driver the config
+//!   defines, so even the trusted tree's attributes run no program.
 //! - Parallel attempts at one task ([`AttemptGroup`]) are never merged
 //!   together: the verifier's selection merges one and discards the rest with
 //!   their worktrees (disjoint writes).
@@ -318,6 +323,7 @@ impl MergeBack {
             excluded: Vec::new(),
             ignore_baseline: None,
             outside_scope: None,
+            bypass_git_files: false,
         };
         let refname = attempt.attempt_ref();
         let out = self
@@ -609,7 +615,10 @@ impl MergeBack {
             }
             let mut outside = Vec::new();
             for change in changes {
-                if is_protected(&change.path) {
+                if is_protected(&change.path)
+                    && !(attempt.bypass_git_files
+                        && kgraf_core::paths::is_bypass_git_file(Path::new(&change.path)))
+                {
                     reasons.push(RefusalReason::ProtectedPath {
                         path: change.path.clone(),
                     });

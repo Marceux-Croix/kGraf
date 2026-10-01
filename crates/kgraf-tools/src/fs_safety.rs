@@ -158,8 +158,30 @@ pub(crate) fn refuses_git_dir_or_kgraf(tool: &str, rel: &Path) -> Result<(), Too
     Ok(())
 }
 
+/// Which protected names a write may touch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Names {
+    /// None: every protected name is refused.
+    Plain,
+    /// `.gitattributes`, `.gitmodules` and `.githooks`
+    /// (`kgraf_core::paths::is_bypass_git_file`), which the Bypass mode admits
+    /// (decision 0094). Every other protected name stays refused.
+    BypassGitFiles,
+}
+
+impl Names {
+    fn refuses(self, rel: &Path) -> bool {
+        touches_git_or_kgraf(rel)
+            && !(self == Names::BypassGitFiles && kgraf_core::paths::is_bypass_git_file(rel))
+    }
+}
+
 pub(crate) fn refuses_git_or_kgraf(tool: &str, rel: &Path) -> Result<(), ToolError> {
-    if touches_git_or_kgraf(rel) {
+    refuses_protected(tool, rel, Names::Plain)
+}
+
+fn refuses_protected(tool: &str, rel: &Path, names: Names) -> Result<(), ToolError> {
+    if names.refuses(rel) {
         return Err(ToolError::Access {
             tool: tool.into(),
             source: crate::AccessError::Escapes {
@@ -285,10 +307,17 @@ fn guard_read(tool: &str, dir: &Dir, rel: &Path) -> Result<(), ToolError> {
 /// The write guard on `rel` and on `rel` with its in-workspace links
 /// followed: a link to `.gitmodules` or into `.git` is refused, not written
 /// through. Also the check a planning pass runs before anything is written.
-pub(crate) fn guard_write(tool: &str, dir: &Dir, rel: &Path) -> Result<(), ToolError> {
-    refuses_git_or_kgraf(tool, rel)?;
+/// `names` admits the protected names the Bypass mode allows; a link named
+/// `.gitattributes` that resolves into `.git` is still refused.
+pub(crate) fn guard_write_names(
+    tool: &str,
+    dir: &Dir,
+    rel: &Path,
+    names: Names,
+) -> Result<(), ToolError> {
+    refuses_protected(tool, rel, names)?;
     let resolved = resolve_links(tool, dir, rel)?;
-    refuses_git_or_kgraf(tool, &resolved).map_err(|_| through_link(tool, rel, &resolved))
+    refuses_protected(tool, &resolved, names).map_err(|_| through_link(tool, rel, &resolved))
 }
 
 /// Classify a `cap_std` open or metadata failure: an attempted escape (a
@@ -539,13 +568,25 @@ pub(crate) fn metadata_if_exists(
 
 /// Write `contents` to `rel`, creating parent directories as needed, confined
 /// to the workspace. Refuses to write where a directory already exists.
+#[cfg(test)]
 pub(crate) fn write_confined(
     tool: &str,
     dir: &Dir,
     rel: &Path,
     contents: &[u8],
 ) -> Result<(), ToolError> {
-    guard_write(tool, dir, rel)?;
+    write_confined_names(tool, dir, rel, contents, Names::Plain)
+}
+
+/// [`write_confined`] under the names policy `names`.
+pub(crate) fn write_confined_names(
+    tool: &str,
+    dir: &Dir,
+    rel: &Path,
+    contents: &[u8],
+    names: Names,
+) -> Result<(), ToolError> {
+    guard_write_names(tool, dir, rel, names)?;
     if let Some(parent) = rel.parent().filter(|p| !p.as_os_str().is_empty()) {
         dir.create_dir_all(parent)
             .map_err(|e| open_error(tool, parent, e))?;
@@ -590,8 +631,19 @@ pub(crate) fn write_confined(
 /// Remove the regular file at `rel`, confined to the workspace. Refuses a
 /// directory, a path that does not resolve to a plain file, and a hard-linked
 /// file.
+#[cfg(test)]
 pub(crate) fn remove_file_confined(tool: &str, dir: &Dir, rel: &Path) -> Result<(), ToolError> {
-    guard_write(tool, dir, rel)?;
+    remove_file_confined_names(tool, dir, rel, Names::Plain)
+}
+
+/// [`remove_file_confined`] under the names policy `names`.
+pub(crate) fn remove_file_confined_names(
+    tool: &str,
+    dir: &Dir,
+    rel: &Path,
+    names: Names,
+) -> Result<(), ToolError> {
+    guard_write_names(tool, dir, rel, names)?;
     let meta = dir.metadata(rel).map_err(|e| open_error(tool, rel, e))?;
     if !meta.is_file() {
         return Err(not_a_regular_file(tool, rel));

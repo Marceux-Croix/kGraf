@@ -398,6 +398,31 @@ and that read is charged to it alone. The Anthropic adapter also marks the
 last block of the last message as a cache breakpoint, so the growing history is
 cached and not only the system prompt.
 
+**At its stop point a worker hands back, or compacts once (decision 0095).**
+Old tool outputs are masked on every request (decision 0057). When the context
+reaches the stop point the worker hands its remainder back, and the
+orchestrator makes it a child contract through the delegation guards. Where
+the guards would refuse that child (the depth cap, the task length bound), the
+runtime, never the model, compacts the worker once instead:
+
+- one accounted summary call on the worker's own route, in a fixed JSON schema
+  (goal, decisions, files touched, open items, constraints quoted word for
+  word from the instruction); an unusable reply falls back to a summary of
+  what the loop observed;
+- a `Compacted` event built by the loop alone, carrying a fixed notice (when,
+  tokens, window, summary call, transcript path, items done and remaining); it
+  reaches the worker's result, the trace and the run record, and counts as a
+  sizing miss;
+- a fresh private remainder: the instruction and slices, verbatim, plus the
+  notice and summary; the shared prefix is unchanged;
+- the earlier events stay in the append-only transcript, and the
+  `recall_history` tool searches and reads them (the worker's own history
+  only, bounded output).
+
+A second overflow hands back; at the cap the contract is held with its
+worktree and its transcript named. `/compact <worker>` compacts a running
+worker at its next boundary, once.
+
 **Tools come from three places:**
 
 - kGraf's own graph and file tools.
@@ -479,8 +504,11 @@ is the only one that fans out to peers.
 **The orchestrator holds no transcript.** Its state is the run record, which
 compaction never rewrites (decision 0057). Each orchestrator call is built
 from that record and re-grounds on the verbatim original instruction, so
-there is nothing to compact. Worker transcripts stay append-only, because
-editing an earlier message invalidates every thinking block after it.
+there is nothing to compact. `/compact <worker>` asks that running worker to
+compact at its next boundary, once (decision 0095). Worker transcripts stay
+append-only, because editing an earlier message invalidates every thinking
+block after it; a compaction appends its notice and leaves every earlier event
+in place.
 
 **Dispatch order is readiness, then leases, then run.** Readiness means
 credentials present, MCP servers reachable, and tool discovery complete. A
@@ -1108,10 +1136,24 @@ hard-link snapshot of the object store, copies where links are impossible)
 and fails the attempt, so it is never merged. Each such write, with its check
 and restore, holds the repository's lock exclusively, and every git process
 kGraf runs on the repository (merges, the integration view, ref updates,
-worktree add and remove) holds it shared: an advisory `flock` on the shared
+worktree add and remove, status and history reads) holds it shared: an advisory `flock` on the shared
 git directory itself, so it also serializes two kGraf processes and a crashed
 holder's lock is released by the kernel; waits are bounded and fail loud. The
-ledger, trace, run records, transcripts and graph stay refused in every mode.
+ledger, trace, run records, transcripts and graph stay refused in every mode. In Bypass a
+worker may also write `.gitattributes`, `.gitmodules` and `.githooks/...`:
+ordinary tracked files under the declared write scope, merged as plain data,
+with no snapshot (git history keeps every version). kGraf's own git, on the
+host, runs nothing these files or the config select: every git command kGraf
+runs is built by `kgraf_core::host_git`, with hooks (including config-defined
+hooks), every configured filter, merge and diff driver, the file system
+monitor, credential helpers, signing and every transport off, no submodule
+recursion, and the inherited `GIT_*` environment removed but the identity.
+Builtin attributes and the identity are kept, so results stay byte-correct; a
+filtered path (git-lfs) is stored in its committed form, and a path with a
+configured merge driver conflicts when both sides change it. The config
+listing that prepares a command runs inside the same shared hold of the
+repository lock as the command, so a Bypass git window cannot change the
+config between the two. The user's own git still honors everything.
 An instructions report amends the contract once; at most two re-dispatches per
 contract for shortfalls. With plan review on, no worker starts until the user
 approves the plan in the box. A contract accepted on a check that always

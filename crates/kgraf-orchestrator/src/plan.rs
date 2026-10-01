@@ -316,6 +316,29 @@ pub fn validate_plan(
     known_tools: &[String],
     max_contracts: usize,
 ) -> Result<(), PlanError> {
+    validate_plan_with(
+        contracts,
+        external,
+        roster,
+        known_tools,
+        max_contracts,
+        false,
+    )
+}
+
+/// [`validate_plan`], with `bypass_git_files` set when the user's mode is
+/// Bypass: a contract may then declare `.gitattributes`, `.gitmodules` or a
+/// path under `.githooks` (`kgraf_core::paths::is_bypass_git_file`), which a
+/// worker may write in that mode (decision 0094). Every other protected path
+/// stays refused.
+pub fn validate_plan_with(
+    contracts: &[ContractSpec],
+    external: &BTreeSet<String>,
+    roster: &[String],
+    known_tools: &[String],
+    max_contracts: usize,
+    bypass_git_files: bool,
+) -> Result<(), PlanError> {
     if contracts.is_empty() {
         return Err(PlanError::Invalid("the plan has no contracts".into()));
     }
@@ -378,7 +401,9 @@ pub fn validate_plan(
             )));
         }
         for w in &c.writes {
-            if !valid_write_path(&w.path) {
+            let git_file = bypass_git_files
+                && kgraf_core::paths::is_bypass_git_file(std::path::Path::new(&w.path));
+            if !valid_write_path(&w.path) && !git_file {
                 return Err(PlanError::Invalid(format!(
                     "contract `{}` declares write `{}`, which is not a relative path inside the repository",
                     c.id, w.path

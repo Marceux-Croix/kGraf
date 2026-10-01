@@ -674,6 +674,15 @@ fn show(event: &WorkerEvent, started: std::time::Instant) {
         WorkerEvent::Resumed { call_id } => println!("\n[{call_id} resumed]"),
         // Kinds and counts only (decision 0071).
         WorkerEvent::Redacted { counts } => println!("\n[redacted {counts:?}]"),
+        // Decision 0095: the runtime's own notice, then the text the worker
+        // continues from.
+        WorkerEvent::Compacted { notice, summary } => println!(
+            "\n[compacted at {} of {} tokens; summary from {:?}]\n{}",
+            notice.at_tokens,
+            notice.window_tokens,
+            notice.summary_source,
+            kgraf_runtime::render_notice(notice, summary)
+        ),
     }
     std::io::stdout().flush().ok();
 }
