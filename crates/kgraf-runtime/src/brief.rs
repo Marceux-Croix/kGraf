@@ -283,6 +283,13 @@ pub struct WorkerResult {
     /// an older record still loads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction: Option<crate::compaction::CompactionNotice>,
+    /// The provider error that ended the run when it said the route itself is
+    /// unreachable (`kgraf_provider::ProviderError::is_route_fault`: the
+    /// connection could not be made, or broke). Set by the loop alone; the
+    /// orchestrator takes the route out of rotation and does not count the
+    /// attempt against the contract. Serde-defaulted so an older record loads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_fault: Option<String>,
 }
 
 impl WorkerResult {
@@ -309,6 +316,7 @@ impl WorkerResult {
             rationale: None,
             refused: Vec::new(),
             compaction: None,
+            route_fault: None,
         }
     }
 }

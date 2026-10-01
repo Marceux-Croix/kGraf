@@ -993,17 +993,22 @@ fn base_name(program: &str) -> &str {
     program.rsplit('/').next().unwrap_or(program)
 }
 
-/// A shell call's argv, or empty.
+/// A shell call's argv as the shell tool runs it (`crate::command_argv`: a
+/// one-string command line is split into its words), so a mode, a rule or the
+/// deletion check judges the argv that runs. Input the tool refuses gives its
+/// raw strings, for a rule's message; it never runs. Empty when there are none.
 fn shell_argv(input: &serde_json::Value) -> Vec<String> {
-    input
-        .get("command")
-        .and_then(|c| c.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(str::to_owned))
-                .collect()
-        })
-        .unwrap_or_default()
+    crate::command_argv(input).unwrap_or_else(|| {
+        input
+            .get("command")
+            .and_then(|c| c.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
 }
 
 /// The paths a file tool's call writes: `apply_patch`'s headers, or a
@@ -1656,6 +1661,18 @@ mod tests {
             Some(HardLimit::Deny(_))
         ));
         assert_eq!(lim(&shell(&["cargo", "test"])), None);
+        // A command line in one string is judged as the words the shell tool
+        // runs, so neither a rule nor the deletion limit is dodged by it.
+        assert!(matches!(lim(&shell(&["curl x"])), Some(HardLimit::Deny(_))));
+        assert!(matches!(
+            lim(&shell(&["rm -rf /"])),
+            Some(HardLimit::Deny(_))
+        ));
+        let in_home = format!("rm -rf {}", h.display());
+        assert!(matches!(
+            lim(&shell(&[in_home.as_str()])),
+            Some(HardLimit::Deny(_))
+        ));
     }
 
     #[tokio::test]

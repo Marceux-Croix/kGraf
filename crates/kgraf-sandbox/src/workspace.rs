@@ -404,6 +404,65 @@ impl WorkspaceManager {
         self.clean_orphans_locked(referenced)
     }
 
+    /// End-of-run tidying: remove hold files no registered worktree uses
+    /// ([`Self::remove_unused_holds`]), then the `.holds` and `.scratch`
+    /// directories themselves when no kGraf worktree is registered under this
+    /// base and they are empty. They are this manager's own bookkeeping, not
+    /// worktrees, and a run that kept nothing leaves only the marker.
+    ///
+    /// Under the exclusive lock: `create` and `reopen` take the shared one, so
+    /// no workspace is being made meanwhile. With no worktree registered, no
+    /// sandboxed command can be starting either (each holds a registered
+    /// worktree's hold), so removing an empty `.holds` races nothing. The
+    /// next `create` makes both again.
+    pub fn tidy(&self) -> Result<(), WorkspaceError> {
+        let _lock = self.exclusive()?;
+        self.remove_unused_holds()?;
+        let any_registered = self.list()?.iter().any(|e| e.path.starts_with(&self.base));
+        if !any_registered {
+            remove_dir_if_empty(&self.base.join(HOLDS))?;
+            remove_dir_if_empty(&self.base.join(SCRATCH))?;
+        }
+        Ok(())
+    }
+
+    /// Remove every hold file (and session log) under `.holds` whose
+    /// workspace is not a registered worktree under this base, unless a
+    /// process started in it still runs ([`Self::quiet`] refuses it, and it
+    /// is left for a later pass). Caller holds the exclusive lock.
+    fn remove_unused_holds(&self) -> Result<(), WorkspaceError> {
+        let holds_dir = self.base.join(HOLDS);
+        let entries = match std::fs::read_dir(&holds_dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(WorkspaceError::io(&holds_dir, e)),
+        };
+        let registered: HashSet<PathBuf> = self.list()?.into_iter().map(|e| e.path).collect();
+        let mut names = std::collections::BTreeSet::new();
+        for entry in entries {
+            let entry = entry.map_err(|e| WorkspaceError::io(&holds_dir, e))?;
+            let file_name = entry.file_name().to_string_lossy().into_owned();
+            let name = file_name
+                .strip_suffix("+sessions")
+                .unwrap_or(&file_name)
+                .to_owned();
+            names.insert(name);
+        }
+        for name in names {
+            // A name that is not a valid workspace name is not ours to judge.
+            if validate_name(&name).is_err() || registered.contains(&self.base.join(&name)) {
+                continue;
+            }
+            let hold = self.hold_path(&name);
+            match self.quiet(&self.base.join(&name), &hold, true) {
+                Ok(_held) => forget_hold(&hold)?,
+                Err(WorkspaceError::Busy { .. }) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
     /// Registered worktrees of the repository, including the main one.
     pub fn list(&self) -> Result<Vec<WorktreeEntry>, WorkspaceError> {
         self.git.worktree_list(&self.repo)
@@ -471,7 +530,7 @@ impl WorkspaceManager {
         let _held = self.quiet(&path, &hold, false)?;
         self.purge(&path)?;
         remove_dir_if_exists(&self.base.join(SCRATCH).join(name))?;
-        remove_file_if_exists(&session_log(&hold))?;
+        forget_hold(&hold)?;
         Ok(path)
     }
 
@@ -549,6 +608,9 @@ impl WorkspaceManager {
                 });
             }
         }
+        // Holds earlier runs left: kGraf's own lock files, not worktrees, so
+        // not listed among the removals.
+        self.remove_unused_holds()?;
         Ok(removed)
     }
 
@@ -958,7 +1020,8 @@ impl WorkspaceManager {
         let _guard = self.guard(&ws.root)?;
         let _held = self.quiet_retrying(&ws.root, &ws.hold)?;
         self.purge(&ws.root)?;
-        remove_dir_if_exists(&ws.scratch)
+        remove_dir_if_exists(&ws.scratch)?;
+        forget_hold(&ws.hold)
     }
 
     /// [`Self::quiet`], retried for up to about one second while it reads
@@ -2047,6 +2110,34 @@ fn read_subdirs(dir: &Path) -> Result<Vec<PathBuf>, WorkspaceError> {
         }
     }
     Ok(dirs)
+}
+
+/// Remove a workspace's hold file and its session log. Called while the
+/// caller holds the hold exclusively, after the worktree is gone: no
+/// sandboxed process of it runs, and none can start (its worktree no longer
+/// exists). Removing a locked file is allowed on Unix, and on Windows, where
+/// Rust opens files with delete sharing. Before this, every workspace left
+/// its hold file under `.holds` for good.
+fn forget_hold(hold: &Path) -> Result<(), WorkspaceError> {
+    remove_file_if_exists(&session_log(hold))?;
+    remove_file_if_exists(hold)
+}
+
+/// Remove `dir` when it is empty; a directory with entries, or none, is
+/// left as it is.
+fn remove_dir_if_empty(dir: &Path) -> Result<(), WorkspaceError> {
+    match std::fs::remove_dir(dir) {
+        Ok(()) => Ok(()),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+            ) =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(WorkspaceError::io(dir, e)),
+    }
 }
 
 fn remove_dir_if_exists(path: &Path) -> Result<(), WorkspaceError> {

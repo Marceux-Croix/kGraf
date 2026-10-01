@@ -445,12 +445,41 @@ pub fn run(root: &Path, args: OrchestrateArgs) -> Result<()> {
         Ok(_) => {}
         Err(e) => println!("sweep      failed, attempt refs left in place: {e:#}"),
     }
+    for line in kept_lines(&housekeeping.kept, &outcome.report.run) {
+        println!("{line}");
+    }
+    if let Err(e) = &housekeeping.tidied {
+        println!("tidy       failed, kGraf's worktree directories left in place: {e:#}");
+    }
     let open = housekeeping.unreconciled?;
     if open != 0 {
         println!("{open} call(s) with unaccounted spend; run `kgraf unreconciled`");
     }
     // The report and housekeeping are out; now the exit code says how it went.
     ensure_completed(&outcome.report)
+}
+
+/// One line per worker worktree the run left on disk, with how to continue or
+/// remove it; a failure to list them is said. A kept worktree is never left
+/// without a word.
+fn kept_lines(kept: &kgraf_host::Result<Vec<PathBuf>>, run: &RunId) -> Vec<String> {
+    match kept {
+        Ok(paths) => paths
+            .iter()
+            .map(|p| {
+                let name = p
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                format!(
+                    "kept       worktree {name} ({}): `kgraf orchestrate --resume {run}` \
+                     continues a held or stopped contract in it; `kgraf clean {name}` removes it",
+                    p.display()
+                )
+            })
+            .collect(),
+        Err(e) => vec![format!("kept       worktrees could not be listed: {e:#}")],
+    }
 }
 
 /// A run that did not complete is an error, so the exit code and a caller such
@@ -691,6 +720,21 @@ mod tests {
     use kgraf_orchestrator::OrchestratorConfig;
     use kgraf_provider::Ledger;
     use kgraf_runtime::ContextConfig;
+
+    /// Each worktree the run left is named with how to continue or remove it.
+    #[test]
+    fn every_kept_worktree_is_named_with_its_way_out() {
+        let run = RunId::new("r7");
+        let kept = Ok(vec![PathBuf::from("/repo/.kgraf/worktrees/r7-c2-r0-a0")]);
+        let lines = kept_lines(&kept, &run);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("worktree r7-c2-r0-a0"), "{}", lines[0]);
+        assert!(lines[0].contains("--resume r7"), "{}", lines[0]);
+        assert!(lines[0].contains("kgraf clean r7-c2-r0-a0"), "{}", lines[0]);
+        assert!(kept_lines(&Ok(Vec::new()), &run).is_empty());
+        let failed = kept_lines(&Err(kgraf_host::Error::Invalid("boom".into())), &run);
+        assert!(failed[0].contains("could not be listed"), "{failed:?}");
+    }
 
     /// The error path lists every planner refusal the trace holds.
     #[test]

@@ -102,3 +102,30 @@ it as unpriced. A price entry set by hand replaces the bundled catalog's tier fo
 so a flat override is never refused above the catalog's tier. Money totals are summed at full
 precision and rounded once at the end, so a total can differ by a few micro-dollars from a sum
 of separately rounded calls.
+
+**Amendment: a route that fails at the transport is taken out of rotation, named, and probed
+again.** A route whose server is down, or drops its connections while still answering the
+readiness probe, used to keep receiving contracts; each attempt counted against its contract,
+and neither the trace nor the run output named the route.
+
+- **What counts.** A worker's model call that failed because the route is unreachable:
+  `ProviderError::Unsent` or `ProviderError::Transport` (`ProviderError::is_route_fault`,
+  carried on `WorkerResult::route_fault`). An HTTP status, a decode failure or a refusal does
+  not count.
+- **What happens** (`route_health.rs`). The fault is traced as `route_fault`. The route is out
+  of rotation for a cooldown (`OrchestratorConfig::route_fault_cooldown`, 30 s by default)
+  that doubles with each fault in a row, up to 10 minutes, and every fresh pick passes it over
+  while another route offers the contract's tools, under Rotation and Fitness. The attempt is
+  not counted toward the contract's failures; the retry is a fresh worker on a fresh pick,
+  traced as `rerouted`. An attempt on the route without a fault brings it back
+  (`route_recovered`).
+- **No other route.** The contract waits for the cooldown, and its next dispatch is the probe.
+  After three faults in a row it is held with a reason naming the route, the count and the
+  last error.
+- **The output.** The run report's notices list every route that faulted.
+- **Ledger.** A dropped call stays unreconciled (it may have been billed, decision 0006).
+
+Rejected: counting the fault against the contract; holding at the first fault when no other
+route exists (a restart would hold the run); retrying inside the worker loop (a dropped call
+may have been billed and would be paid twice); persisting route health across a resume (the
+resume is when the user fixed the route).

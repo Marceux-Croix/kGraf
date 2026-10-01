@@ -198,15 +198,35 @@ impl BuildAllowlist {
     }
 
     /// The entries, for a message or a tool description.
+    ///
+    /// The cargo entries name their options. A bare list (`cargo build;
+    /// cargo test`) was read by models as "only without flags", so a worker
+    /// asked for `cargo test --workspace` instead of running it.
     pub fn describe(&self) -> String {
         if self.commands.is_empty() {
             return "none".into();
         }
-        self.commands
+        let cargo: Vec<String> = self
+            .commands
             .iter()
+            .filter(|c| matches!(c, BuildCommand::Cargo(_)))
             .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("; ")
+            .collect();
+        let mut parts = Vec::new();
+        if !cargo.is_empty() {
+            parts.push(format!(
+                "{}, each with its usual options ({CARGO_OPTIONS_SUMMARY}), given as one array \
+                 element per argument",
+                cargo.join(", ")
+            ));
+        }
+        parts.extend(
+            self.commands
+                .iter()
+                .filter(|c| matches!(c, BuildCommand::Exact(_)))
+                .map(ToString::to_string),
+        );
+        parts.join("; ")
     }
 
     /// Where `argv` stands. An exact entry wins over the cargo rules, so a
@@ -244,6 +264,34 @@ impl BuildAllowlist {
             },
         }
     }
+}
+
+/// What [`BuildAllowlist::describe`] says the cargo entries accept. A summary
+/// of the lists below, not the lists themselves: the rules are what decide.
+const CARGO_OPTIONS_SUMMARY: &str = "--workspace, -p/--package NAME, --exclude NAME, --lib, \
+     --bins, --tests, --test NAME, --all-targets, -F/--features, --all-features, \
+     --no-default-features, --release, --profile NAME, -q, -v, --locked, --offline, --frozen, \
+     -j N, --no-run and --no-fail-fast for tests, one test name filter, and after `--` the \
+     test harness's options such as --nocapture and --test-threads N, or clippy's lint \
+     levels such as -D warnings; not --config, -Z, +toolchain, --target-dir or a \
+     --manifest-path outside the worktree";
+
+/// The words of a whole command line a model gave as one string, when the
+/// line holds no shell syntax and more than one word: `"cargo test -p x"` is
+/// `["cargo", "test", "-p", "x"]`. `None` otherwise: a line with shell syntax
+/// means a shell, and splitting it on whitespace would run something else
+/// than what it says (`a && b` is not `a` with arguments `&&` and `b`).
+pub fn split_command_line(line: &str) -> Option<Vec<String>> {
+    if line.chars().any(is_shell_syntax) {
+        return None;
+    }
+    let words: Vec<String> = line.split_whitespace().map(str::to_owned).collect();
+    (words.len() > 1).then_some(words)
+}
+
+/// Whether `line` holds a character a shell would interpret.
+pub(crate) fn has_shell_syntax(line: &str) -> bool {
+    line.chars().any(is_shell_syntax)
 }
 
 fn is_shell_syntax(c: char) -> bool {
@@ -729,6 +777,86 @@ mod tests {
         allowed(&["cargo", "build", "--manifest-path", "crates/x/Cargo.toml"]);
         allowed(&["cargo", "build", "--target", "aarch64-apple-darwin"]);
         allowed(&["cargo", "test", "--features", "serde/derive", "--release"]);
+    }
+
+    /// The flag set a worker reaches for when it runs a scaffold's own
+    /// acceptance commands: package and target selection, features, profile,
+    /// verbosity, `--no-run`, the offline and lockfile flags, and test-binary
+    /// arguments after `--`.
+    #[test]
+    fn the_acceptance_command_flag_set_is_allowed() {
+        allowed(&["cargo", "test", "--workspace"]);
+        allowed(&["cargo", "test", "-p", "tax_us"]);
+        allowed(&["cargo", "test", "--test", "pricing", "--", "--nocapture"]);
+        allowed(&["cargo", "test", "--workspace", "--", "--test-threads=1"]);
+        allowed(&["cargo", "test", "--workspace", "--", "--test-threads", "1"]);
+        allowed(&["cargo", "test", "--no-run", "-v", "--locked"]);
+        allowed(&[
+            "cargo",
+            "test",
+            "-q",
+            "--offline",
+            "--frozen",
+            "name_filter",
+        ]);
+        allowed(&[
+            "cargo",
+            "build",
+            "--workspace",
+            "--release",
+            "--all-targets",
+        ]);
+        allowed(&[
+            "cargo",
+            "build",
+            "-p",
+            "iface",
+            "-F",
+            "serde",
+            "--profile",
+            "dev",
+        ]);
+        allowed(&["cargo", "check", "--workspace", "--all-features", "--quiet"]);
+        allowed(&["cargo", "check", "--no-default-features", "--features=a,b"]);
+        allowed(&["cargo", "clippy", "--all-targets", "--", "-D", "warnings"]);
+        allowed(&[
+            "cargo",
+            "test",
+            "--doc",
+            "--no-fail-fast",
+            "--",
+            "--exact",
+            "x",
+        ]);
+    }
+
+    /// The description names the options, so a model does not read the bare
+    /// subcommand names as "without flags".
+    #[test]
+    fn the_description_names_the_accepted_options() {
+        let text = BuildAllowlist::cargo_default().describe();
+        for needle in ["--workspace", "-p", "--test", "--release", "--no-run", "--"] {
+            assert!(text.contains(needle), "{needle}: {text}");
+        }
+        assert!(text.contains("one array element per argument"), "{text}");
+    }
+
+    /// A whole command line given as one string is split into its words when
+    /// it holds no shell syntax; with shell syntax it is not split.
+    #[test]
+    fn a_command_line_in_one_string_splits_only_without_shell_syntax() {
+        assert_eq!(
+            split_command_line("cargo test --workspace"),
+            Some(argv(&["cargo", "test", "--workspace"]))
+        );
+        assert_eq!(
+            split_command_line("  cargo\ttest  -p x "),
+            Some(argv(&["cargo", "test", "-p", "x"]))
+        );
+        assert_eq!(split_command_line("cargo"), None);
+        assert_eq!(split_command_line("cargo test && rm -rf ."), None);
+        assert_eq!(split_command_line("cargo test $(id)"), None);
+        assert_eq!(split_command_line("echo 'a b'"), None);
     }
 
     #[test]

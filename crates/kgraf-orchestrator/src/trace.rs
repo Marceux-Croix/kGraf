@@ -318,6 +318,37 @@ pub enum TraceEvent {
         crossed_cluster: bool,
         reason: String,
     },
+    /// A worker's model call failed at the transport (`route_health.rs`):
+    /// the route is out of rotation until `out_until_ms`, and the attempt is
+    /// not counted against its contract.
+    RouteFault {
+        at_ms: i64,
+        route: String,
+        contract: String,
+        worker: String,
+        /// Faults in a row on this route.
+        in_a_row: u32,
+        /// Faults on this route over the run.
+        total: u32,
+        out_until_ms: i64,
+        detail: String,
+    },
+    /// A route that had faulted answered again.
+    RouteRecovered {
+        at_ms: i64,
+        route: String,
+        /// The faults in a row it recovered from.
+        after: u32,
+    },
+    /// A contract whose last attempt ended on a route fault was dispatched
+    /// on another route.
+    Rerouted {
+        at_ms: i64,
+        contract: String,
+        from: String,
+        to: String,
+        reason: String,
+    },
 }
 
 /// Persist-scrub every string value of a [`TraceEvent`] (decision 0071), including the ones nested
@@ -640,7 +671,40 @@ fn scrub_trace_fields(event: TraceEvent) -> TraceEvent {
                 notice,
             }
         }
+        TraceEvent::RouteFault {
+            at_ms,
+            route,
+            contract,
+            worker,
+            in_a_row,
+            total,
+            out_until_ms,
+            detail,
+        } => TraceEvent::RouteFault {
+            at_ms,
+            route,
+            contract,
+            worker,
+            in_a_row,
+            total,
+            out_until_ms,
+            detail: s(detail),
+        },
+        TraceEvent::Rerouted {
+            at_ms,
+            contract,
+            from,
+            to,
+            reason,
+        } => TraceEvent::Rerouted {
+            at_ms,
+            contract,
+            from,
+            to,
+            reason: s(reason),
+        },
         other @ (TraceEvent::Dispatch { .. }
+        | TraceEvent::RouteRecovered { .. }
         | TraceEvent::WorkerFinished { .. }
         | TraceEvent::Compaction { .. }
         | TraceEvent::ExtractorChanged { .. }

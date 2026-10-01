@@ -36,6 +36,9 @@ blake3 = "1"
 chrono = { version = "0.4.45", default-features = false, features = ["std", "clock"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Located errors for model answers (`contracts[0].depends_on: ...`), MIT or Apache-2.0;
+# already in the lockfile through oauth2.
+serde_path_to_error = "0.1"
 thiserror = "2"
 # `rt` for spawn (each worker's completion forwarder is a task), `sync` for the
 # loop's channels, `time` for lease and reservation renewal ticks, `macros` for select!,

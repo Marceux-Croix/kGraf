@@ -210,6 +210,19 @@ pub enum Billing {
 }
 
 impl ProviderError {
+    /// Whether this error says the route itself is unreachable, not that the
+    /// model or the request was wrong: the connection could not be made
+    /// ([`Self::Unsent`]) or broke ([`Self::Transport`]). The orchestrator
+    /// takes such a route out of rotation for a while and moves its contracts
+    /// to another route. An HTTP status, a decode failure or a refusal is an
+    /// answer from a running server, so it is not one.
+    pub fn is_route_fault(&self) -> bool {
+        matches!(
+            self,
+            ProviderError::Unsent { .. } | ProviderError::Transport { .. }
+        )
+    }
+
     /// Whether the call that produced this error may have been billed.
     ///
     /// Conservative by construction. Only outcomes that prove no generation ran
@@ -333,5 +346,26 @@ mod tests {
             reason: String::new(),
         };
         assert_eq!(decode.billing(), Billing::MayHaveBilled);
+    }
+
+    #[test]
+    fn only_an_unreachable_route_is_a_route_fault() {
+        let unsent = ProviderError::Unsent {
+            adapter: "t",
+            reason: String::new(),
+        };
+        let transport = ProviderError::Transport {
+            adapter: "t",
+            reason: String::new(),
+        };
+        assert!(unsent.is_route_fault() && transport.is_route_fault());
+        assert!(!http(500).is_route_fault() && !http(503).is_route_fault());
+        assert!(
+            !ProviderError::Decode {
+                adapter: "t",
+                reason: String::new()
+            }
+            .is_route_fault()
+        );
     }
 }

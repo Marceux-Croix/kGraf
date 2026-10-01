@@ -716,6 +716,7 @@ async fn prepare(
         last_call,
         given_tools: resumed_tools,
         trace_failures,
+        route_fault: None,
         cancel_unsent: false,
         round_redactions: kgraf_secrets::Redactions::default(),
         changed,
@@ -938,6 +939,9 @@ struct Worker {
     given_tools: Vec<String>,
     /// Trace writes the ledger refused, reported on the result.
     trace_failures: Vec<String>,
+    /// The provider error that ended the run when it says the route is
+    /// unreachable (`ProviderError::is_route_fault`), reported on the result.
+    route_fault: Option<String>,
     /// Persist-scrub redactions in this round's streamed deltas, not yet
     /// reported (decision 0071). Dropped when the round's
     /// `AssistantMessage` reports its whole text instead; reported before a
@@ -1131,6 +1135,7 @@ impl Worker {
             prefix_digest: self.env.prefix.digest().as_str().to_owned(),
             denied: self.denied,
             trace_failures: std::mem::take(&mut self.trace_failures),
+            route_fault: self.route_fault.take(),
             rationale,
             refused: self.refused.take(),
             compaction: self.compaction.clone(),
@@ -1138,6 +1143,18 @@ impl Worker {
         // `Err` means the handle is gone: nobody is waiting for the result, and the
         // ledger already holds every call it names.
         let _ = endpoint.finish(result);
+    }
+
+    /// The halt for a model call that failed with `e`. A failure that says
+    /// the route is unreachable is also kept for the result
+    /// (`WorkerResult::route_fault`), so the orchestrator can take the route
+    /// out of rotation instead of reading it as the model's failure.
+    fn provider_failed(&mut self, e: &kgraf_provider::ProviderError) -> Halt {
+        let text = e.to_string();
+        if e.is_route_fault() {
+            self.route_fault = Some(text.clone());
+        }
+        Halt::Failed(text)
     }
 
     /// Accept, apply and send one event.
@@ -1981,7 +1998,7 @@ impl Worker {
                             },
                         });
                     }
-                    Ok(Err(e)) => return Err(Halt::Failed(e.to_string())),
+                    Ok(Err(e)) => return Err(self.provider_failed(&e)),
                     Ok(Ok(response)) => {
                         for block in &response.content {
                             let event = match block {
@@ -2093,7 +2110,7 @@ impl Worker {
                                 Err(e) => overflow = Some(e),
                             }
                         }
-                        let response = result.map_err(|e| Halt::Failed(e.to_string()))?;
+                        let response = result.map_err(|e| self.provider_failed(&e))?;
                         if let Some(e) = overflow {
                             return Err(Halt::Failed(e.to_string()));
                         }

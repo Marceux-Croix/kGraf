@@ -599,3 +599,69 @@ fn startup_waits_for_another_process_mid_create() {
         cleaner.join().unwrap();
     });
 }
+
+/// A removed workspace leaves no hold file behind (one was left per
+/// workspace, forever), and at the end of a run `tidy` removes kGraf's own
+/// `.holds` and `.scratch` directories once no worktree is registered.
+#[test]
+fn a_removed_workspace_leaves_no_hold_and_tidy_leaves_no_internal_directory() {
+    let f = fixture();
+    let mgr = WorkspaceManager::open(&f.repo, &f.base).unwrap();
+    let ws = mgr.create(&spec("w1")).unwrap();
+    let hold = ws.hold_file().to_path_buf();
+    // What a sandboxed command does before it runs.
+    std::fs::create_dir_all(hold.parent().unwrap()).unwrap();
+    std::fs::File::create(&hold).unwrap();
+    mgr.remove(ws).unwrap();
+    assert!(!hold.exists(), "the hold of a removed workspace is gone");
+
+    mgr.tidy().unwrap();
+    let left: Vec<String> = std::fs::read_dir(mgr.base())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        left,
+        [".kgraf-workspaces"],
+        "only the marker stays: {left:?}"
+    );
+    // The manager still works after a tidy: a new workspace recreates both.
+    let again = mgr.create(&spec("w2")).unwrap();
+    assert!(again.scratch().is_dir());
+    mgr.remove(again).unwrap();
+}
+
+/// While a worktree is registered its scratch and hold stay, and so do the
+/// directories that hold them; a leftover hold of a gone workspace goes.
+#[test]
+fn tidy_keeps_what_a_registered_worktree_uses() {
+    let f = fixture();
+    let mgr = WorkspaceManager::open(&f.repo, &f.base).unwrap();
+    let live = mgr.create(&spec("live")).unwrap();
+    std::fs::create_dir_all(live.hold_file().parent().unwrap()).unwrap();
+    std::fs::File::create(live.hold_file()).unwrap();
+    let holds = live.hold_file().parent().unwrap().to_path_buf();
+    let stale = holds.join("gone");
+    std::fs::File::create(&stale).unwrap();
+    std::fs::write(holds.join("gone+sessions"), "").unwrap();
+
+    mgr.tidy().unwrap();
+    assert!(live.hold_file().exists());
+    assert!(live.scratch().is_dir());
+    assert!(!stale.exists(), "a hold no worktree uses is removed");
+    assert!(!holds.join("gone+sessions").exists());
+    mgr.remove(live).unwrap();
+}
+
+/// Startup cleanup removes the holds earlier runs left (before holds were
+/// removed with their workspace).
+#[test]
+fn startup_removes_holds_no_worktree_uses() {
+    let f = fixture();
+    let mgr = WorkspaceManager::open(&f.repo, &f.base).unwrap();
+    let holds = mgr.base().join(".holds");
+    std::fs::create_dir_all(&holds).unwrap();
+    std::fs::File::create(holds.join("old-worker")).unwrap();
+    mgr.startup().unwrap();
+    assert!(!holds.join("old-worker").exists());
+}

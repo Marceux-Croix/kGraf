@@ -746,6 +746,33 @@ impl GitWorkspaces {
     /// already in it, and a child spawned after the listing is not deleted.
     ///
     /// [`RunStore::referenced_worktrees`]: kgraf_orchestrator::RunStore::referenced_worktrees
+    /// The worker worktrees this process prepared or reopened that are still
+    /// registered when the run ends: kept for a resume (a held or stopped
+    /// contract), by the retention setting (decision 0088), or after a
+    /// conflict (0073). The run's output names each, so no worktree is left
+    /// without a word.
+    pub(crate) fn kept_worktrees(&self) -> Result<Vec<PathBuf>> {
+        let touched = self
+            .touched
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let base = self.manager.base().to_path_buf();
+        Ok(self
+            .manager
+            .list()
+            .lift()?
+            .into_iter()
+            .map(|e| e.path)
+            .filter(|p| {
+                p.starts_with(&base)
+                    && p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| touched.contains(n))
+            })
+            .collect())
+    }
+
     pub(crate) fn sweep_refs(
         &self,
         record: Option<&kgraf_orchestrator::RunStateRecord>,

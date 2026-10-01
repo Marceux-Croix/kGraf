@@ -32,18 +32,18 @@ pub struct ContractSpec {
     pub id: String,
     pub instruction: String,
     pub acceptance: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub writes: Vec<WriteTarget>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub depends_on: Vec<String>,
     /// Graph symbols or node ids to slice for the worker.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub slices: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub tools: Vec<String>,
     #[serde(default)]
     pub route: Option<String>,
-    #[serde(default = "one")]
+    #[serde(default = "one", deserialize_with = "null_as_one")]
     pub attempts: u32,
     /// What kind of work this contract mainly asks for (decision 0075): what
     /// [`crate::routing::RoutingPolicy::Fitness`] routes on. `None` defaults to
@@ -55,6 +55,47 @@ pub struct ContractSpec {
 
 fn one() -> u32 {
     1
+}
+
+/// An optional field a model sent as `null` reads as absent (its default).
+/// Models write `"depends_on": null` for "none" as often as `[]`; the two say
+/// the same thing, so refusing one lost a whole plan over nothing. A value of
+/// the wrong type is still refused, with its location ([`from_answer`]).
+fn null_as_default<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+}
+
+/// [`null_as_default`] for `attempts`, whose default is one, not zero.
+fn null_as_one<'de, D>(d: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<u32>::deserialize(d)?.unwrap_or_else(one))
+}
+
+/// Deserialize a model's answer, naming where a type error is
+/// (`contracts[0].depends_on: invalid type: ...`), so the re-ask note and the
+/// held reason point at the field instead of only the type.
+pub(crate) fn from_answer<T: serde::de::DeserializeOwned>(
+    value: serde_json::Value,
+    text: &str,
+) -> Result<T, PlanError> {
+    serde_path_to_error::deserialize(value).map_err(|e| {
+        let path = e.path().to_string();
+        let located = if path.is_empty() || path == "." {
+            e.inner().to_string()
+        } else {
+            format!("{path}: {}", e.inner())
+        };
+        PlanError::BadOutput {
+            reason: located,
+            excerpt: text.chars().take(200).collect(),
+        }
+    })
 }
 
 /// What decomposition is asked.
@@ -498,10 +539,7 @@ pub fn parse_plan(text: &str) -> Result<Vec<ContractSpec>, PlanError> {
         contracts: Vec<ContractSpec>,
     }
     let value = json_object(text)?;
-    let answer: Answer = serde_json::from_value(value).map_err(|e| PlanError::BadOutput {
-        reason: e.to_string(),
-        excerpt: text.chars().take(200).collect(),
-    })?;
+    let answer: Answer = from_answer(value, text)?;
     Ok(answer.contracts)
 }
 
@@ -514,15 +552,15 @@ struct InterfaceSpec {
     parties: Vec<String>,
     symbols: Vec<String>,
     stub: Vec<FileOverlay>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     wrong: Vec<FileOverlay>,
     reference: Vec<FileOverlay>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     consumer: Vec<FileOverlay>,
     tests: Vec<FileOverlay>,
     compile: Vec<String>,
     test: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     replaces: Vec<String>,
 }
 
@@ -536,7 +574,7 @@ struct InterfaceSpec {
 pub fn parse_interfaces(text: &str) -> Result<Vec<InterfaceContract>, PlanError> {
     #[derive(Deserialize)]
     struct Answer {
-        #[serde(default)]
+        #[serde(default, deserialize_with = "null_as_default")]
         interfaces: Vec<InterfaceSpec>,
     }
     let value = json_object(text)?;
@@ -546,10 +584,7 @@ pub fn parse_interfaces(text: &str) -> Result<Vec<InterfaceContract>, PlanError>
             excerpt: text.chars().take(200).collect(),
         });
     }
-    let answer: Answer = serde_json::from_value(value).map_err(|e| PlanError::BadOutput {
-        reason: format!("interfaces: {e}"),
-        excerpt: text.chars().take(200).collect(),
-    })?;
+    let answer: Answer = from_answer(value, text)?;
     Ok(answer
         .interfaces
         .into_iter()
@@ -651,10 +686,7 @@ pub fn parse_grounding(text: &str) -> Result<(bool, String), PlanError> {
         reason: String,
     }
     let value = json_object(text)?;
-    let a: Answer = serde_json::from_value(value).map_err(|e| PlanError::BadOutput {
-        reason: e.to_string(),
-        excerpt: text.chars().take(200).collect(),
-    })?;
+    let a: Answer = from_answer(value, text)?;
     Ok((a.serves, a.reason))
 }
 
@@ -868,7 +900,8 @@ const DECOMPOSE_SYSTEM: &str = "You are kGraf's orchestrator. Split the user's i
 into independent contracts, each small enough for one worker in one git worktree. \
 Contracts that touch disjoint files can run in parallel; declare every file a contract will \
 write, as a path relative to the repository root. A contract's acceptance must be checkable \
-by running tests. Label each contract with the one kind of work it mainly asks for: \
+by running tests. kGraf commits each contract's work itself once its check passes, so an \
+acceptance never asks a worker to stage, commit or push with git. Label each contract with the one kind of work it mainly asks for: \
 \"interface\" (declaring or changing an interface other work builds against), \
 \"implementation\" (behavior behind a fixed interface), \"tests\", \"refactor\" \
 (structure without behavior change), \"scripting\" (shell, build and glue scripts) or \
@@ -1188,10 +1221,7 @@ pub fn parse_answer(text: &str) -> Result<Option<String>, PlanError> {
         answer: String,
     }
     let value = json_object(text)?;
-    let a: Answer = serde_json::from_value(value).map_err(|e| PlanError::BadOutput {
-        reason: e.to_string(),
-        excerpt: text.chars().take(200).collect(),
-    })?;
+    let a: Answer = from_answer(value, text)?;
     Ok((a.answerable && !a.answer.trim().is_empty()).then_some(a.answer))
 }
 
@@ -1214,10 +1244,7 @@ pub fn parse_verdicts(
         verdicts: Vec<Verdict>,
     }
     let value = json_object(text)?;
-    let a: Answer = serde_json::from_value(value).map_err(|e| PlanError::BadOutput {
-        reason: e.to_string(),
-        excerpt: text.chars().take(200).collect(),
-    })?;
+    let a: Answer = from_answer(value, text)?;
     let mut out: Vec<crate::ConnectionVerdict> = Vec::new();
     for v in a.verdicts {
         let Some(r) = v.request.checked_sub(1).and_then(|i| requests.get(i)) else {
@@ -1445,6 +1472,69 @@ mod tests {
         let plan = parse_plan(text).expect("plan");
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].attempts, 1);
+    }
+
+    /// An optional field sent as `null` reads as absent: an empty list, or the
+    /// default attempt count. The answer's code fence is no obstacle. Nothing
+    /// is lost: `null` and `[]` say the same thing.
+    #[test]
+    fn null_in_an_optional_field_reads_as_absent_in_a_fenced_answer() {
+        let text = "```json\n{\"contracts\":[{\"id\":\"c1\",\"instruction\":\"x\",\
+            \"acceptance\":\"y\",\"writes\":null,\"depends_on\":null,\"slices\":null,\
+            \"tools\":null,\"route\":null,\"attempts\":null,\"task_kind\":null}]}\n```";
+        let plan = parse_plan(text).expect("plan");
+        assert_eq!(plan.len(), 1);
+        let c = &plan[0];
+        assert!(c.writes.is_empty() && c.depends_on.is_empty());
+        assert!(c.slices.is_empty() && c.tools.is_empty());
+        assert_eq!(c.attempts, 1);
+        assert_eq!(c.route, None);
+    }
+
+    /// A real type error stays a refusal, and it names where it is.
+    #[test]
+    fn a_wrong_type_is_refused_with_its_location() {
+        for (field, value) in [
+            ("depends_on", "\"c0\""),
+            ("acceptance", "null"),
+            ("writes", "[3]"),
+        ] {
+            let text = format!(
+                "{{\"contracts\":[{{\"id\":\"c1\",\"instruction\":\"x\",\
+                 \"acceptance\":\"y\",\"{field}\":{value}}}]}}"
+            );
+            let Err(PlanError::BadOutput { reason, .. }) = parse_plan(&text) else {
+                panic!("{field}={value} must be refused");
+            };
+            assert!(
+                reason.contains(&format!("contracts[0].{field}")),
+                "{reason}"
+            );
+        }
+        let Err(PlanError::BadOutput { reason, .. }) = parse_plan("{\"contracts\":null}") else {
+            panic!("a null plan is refused");
+        };
+        assert!(reason.contains("contracts"), "{reason}");
+    }
+
+    #[test]
+    fn null_optional_interface_fields_read_as_absent() {
+        let none = parse_interfaces(&answer_with(",\"interfaces\":null")).expect("null is none");
+        assert!(none.is_empty());
+        let with_nulls = ONE_INTERFACE.replace(
+            "\"version\":7",
+            "\"version\":7,\"wrong\":null,\"consumer\":null,\"replaces\":null",
+        );
+        let parsed = parse_interfaces(&answer_with(&with_nulls)).expect("parses");
+        assert!(parsed[0].wrong.is_empty() && parsed[0].consumer.is_empty());
+        assert!(parsed[0].replaces.is_empty());
+        let required_null = ONE_INTERFACE.replace("\"symbols\":[\"parse\"]", "\"symbols\":null");
+        let Err(PlanError::BadOutput { reason, .. }) =
+            parse_interfaces(&answer_with(&required_null))
+        else {
+            panic!("a required list sent as null is refused");
+        };
+        assert!(reason.contains("interfaces[0].symbols"), "{reason}");
     }
 
     #[test]
@@ -1685,6 +1775,7 @@ mod tests {
     #[test]
     fn the_prompts_define_depends_on_and_file_entries() {
         assert!(DECOMPOSE_SYSTEM.contains("never holds an interface id"));
+        assert!(DECOMPOSE_SYSTEM.contains("never asks a worker to stage, commit or push"));
         assert!(INTERFACES_REQUEST.contains("needs both \"path\" and \"content\""));
     }
 

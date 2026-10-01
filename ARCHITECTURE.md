@@ -513,6 +513,16 @@ in place.
 credentials present, MCP servers reachable, and tool discovery complete. A
 worker that cannot run must never hold files another worker is waiting on.
 
+**A route that fails at the transport is left behind, named, and probed
+again** (decision 0075, `route_health.rs`). A worker call that could not
+connect or whose connection broke takes its route out of rotation for a
+cooldown that doubles with each fault in a row; fresh picks pass it over while
+another route can take the contract, the attempt does not count against its
+contract, and the trace records `route_fault`, `rerouted` and
+`route_recovered`. With no other route the contract waits for the probe and is
+held, naming the route, after three faults in a row. The run report lists
+every route that faulted.
+
 - **Spend is recorded, never limited** (decision 0080). Admission holds an estimate from
   dispatch to settlement so the ledger can compare it with the actual cost; no cap refuses a
   dispatch. A hard stop is set in the provider's console.
@@ -1112,8 +1122,11 @@ edits before its merge is accepted.
 A worker builds and tests its own work. A declared allowlist of build and
 test commands runs without approval in the sandbox with the network off
 (decision 0084); under a write scope nothing else that can write runs, unless
-the user's permission mode grants it. A worker refused by policy, or short
-of instructions, reports it with `report_shortfall` and stops (decision 0093);
+the user's permission mode grants it. A command line sent as one string is
+split into its words when it holds no shell syntax, and every check judges the
+split argv; one with shell syntax is refused with the way to write it. Workers
+are told kGraf commits their worktree after its check. A worker refused by
+policy, or short of instructions, reports it with `report_shortfall` and stops (decision 0093);
 the user's permission mode decides what happens (decision 0094). The mode is
 one live setting that only the user sets, from the box's dropdown, the
 user-level `permissions.toml` or the command line: Manual asks the user,
@@ -1175,7 +1188,7 @@ every accepted empty attempt carries a notice (decision 0086). A worker's
 worktree and its build output are deleted once nothing needs them, unless the
 user chose to keep every attempt's; a worktree a resume, a live worker, a
 pending merge or an open contract (a handoff child continuing in it, a resolver
-citing it) needs is kept either way, and each failed removal is one warning in the report (decision 0088); `kgraf clean <name>` removes a kept one from `.kgraf/worktrees` (runs) or `.kgraf/workspaces` (`kgraf worker`). A retry of an
+citing it) needs is kept either way, and each failed removal is one warning in the report (decision 0088); `kgraf clean <name>` removes a kept one from `.kgraf/worktrees` (runs) or `.kgraf/workspaces` (`kgraf worker`). The run output names each worktree a run leaves, and the worktree manager removes a hold file with its workspace and its own `.holds` and `.scratch` directories at the end of a run that kept nothing. A retry of an
 unpinned contract does not repeat the route that just failed (decision 0085). A
 model with no price entry is never refused (decision 0075): the ledger keeps
 every call, and reports show its spend as unpriced. A planner answer that is not

@@ -203,3 +203,34 @@ in-tree `.gitattributes` can name a filter driver, but none runs. Measured on gi
 config-defined hook (`hook.<name>.command`) runs even with `core.hooksPath=/dev/null`, so
 `hook.<name>.enabled=false` is set per name. The full list of overrides and covered call sites
 is in decision 0094's amendment.
+
+## Amendment: a command line in one string is read as its words; the description names the options
+
+Models often send the whole command line as one string (`["cargo test --workspace"]`, or a
+bare string). Taken literally that names a program that does not exist; the allowlist did not
+list it, and an unattended run denied the command the project's own acceptance needs. Models
+also read the bare list `cargo build; cargo check; cargo test` as "only without flags". The
+argument rules of point 2 already accepted the flag set.
+
+- **One string, split.** A `command` that is one string, or one array element holding
+  whitespace, is split on whitespace when the line holds no shell syntax
+  (`kgraf_tools::execpolicy::split_command_line`). Every reader of a shell call judges the split
+  argv through one parser (`kgraf_tools::command_argv`): the command policy and this allowlist,
+  the approval hook, the permission modes, the user's deny and ask rules, the critical-deletion
+  limit and shortfall matching. The output says the line was split.
+- **One string with shell syntax, refused** as invalid input, with the way to write it
+  (separate elements, or `["sh", "-c", "<line>"]`, which needs approval).
+- **The description names the options** each cargo entry takes and what is refused, and asks
+  for one array element per argument; the worker system prompt says the same.
+- **The refused set is unchanged** (`--config`, `-Z`, `+toolchain`, `--target-dir`,
+  `--artifact-dir`, `-C`, `--lockfile-path`, a `--manifest-path` outside the worktree, a target
+  spec file, `cargo clippy --fix`, `cargo fmt` without `--check`). Allowing `+toolchain` was
+  rejected because a linked `path` toolchain runs any directory of binaries (point 2a's reason
+  for the toolchain file); a `--config` key allowlist was rejected as the denylist problem in
+  another form.
+- **No other ecosystem**: the allowlist covers cargo and the run's own configured commands.
+
+Rejected for the one-string form: refusing without splitting (models repeat the form, and an
+unattended refusal often holds the contract for a call whose meaning is clear); running every
+one-string command through `sh -c` (grants shell syntax to every such call); splitting with
+quote rules (a quote is shell syntax here and is refused).

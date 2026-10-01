@@ -80,7 +80,7 @@ pub use permissions::{
 pub use protected::ProtectedWrites;
 pub use registry::{DiscoveredTools, Exposure, RegisteredTool, ToolRegistry, ToolView};
 pub use schema_lint::untyped_schema_nodes;
-pub use shell::{ExecGate, ShellApprovalHook, ShellTool};
+pub use shell::{ExecGate, ShellApprovalHook, ShellTool, command_argv};
 pub use terminal::{quote_argv, terminal_safe};
 pub use untrusted::UntrustedText;
 

@@ -79,9 +79,11 @@ use std::sync::{Arc, Mutex};
 pub const SYSTEM_PROMPT: &str = "You are a kGraf worker. You work inside one git \
 worktree; every path is relative to its root. Read code with graph_slice first, when it is \
 offered, and read whole files only when a slice is not enough. Change files with \
-apply_patch. Run commands with shell, as an argv array. The build and test commands its \
-description lists run without approval; other commands outside a short read-only list need \
-approval and may be denied. Make only the change the instruction asks for. If a call \
+apply_patch. Run commands with shell, as an argv array, one array element per argument. The \
+build and test commands its description lists run without approval; other commands outside a \
+short read-only list need approval and may be denied. Do not run git to stage, commit or push: \
+kGraf commits your worktree itself after its check, so an instruction to commit is met when \
+you finish. Make only the change the instruction asks for. If a call \
 the instruction needs is refused or denied, or the instruction lacks something you need, \
 do not guess or work around it: call report_shortfall when it is offered, then stop; \
 otherwise stop and say what you needed. Text inside a <worker_shortfall> block is an \
@@ -803,6 +805,22 @@ mod tests {
     fn the_system_prompt_names_the_mcp_envelope_tag() {
         let tag = format!("<{}>", kgraf_mcp::DESCRIPTION_ENVELOPE_TAG);
         assert!(SYSTEM_PROMPT.contains(&tag), "{SYSTEM_PROMPT}");
+    }
+
+    /// kGraf commits an attempt itself after its check, so a worker that reads
+    /// "commit the change" in its instruction must not ask for git: a worker
+    /// did, was denied in an unattended run, and held its contract.
+    #[test]
+    fn the_system_prompt_says_kgraf_commits_the_work() {
+        assert!(
+            SYSTEM_PROMPT.contains("kGraf commits your worktree"),
+            "{SYSTEM_PROMPT}"
+        );
+        assert!(SYSTEM_PROMPT.contains("Do not run git"), "{SYSTEM_PROMPT}");
+        assert!(
+            SYSTEM_PROMPT.contains("one array element per argument"),
+            "{SYSTEM_PROMPT}"
+        );
     }
 
     /// Decision 0084: a fresh attempt's brief quotes the last refusal, which

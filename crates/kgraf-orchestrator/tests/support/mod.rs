@@ -278,9 +278,14 @@ impl Provider for WorkerFake {
             while !self.fail_parked.load(Ordering::SeqCst) {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
-            return Err(ProviderError::Unsent {
+            // A refusal from a running server, so the attempt fails as the
+            // model's: a transport error (`Unsent`, `Transport`) is a route
+            // fault, which the orchestrator does not count against the
+            // contract (`route_health.rs`).
+            return Err(ProviderError::Http {
                 adapter: "fake-worker",
-                reason: "the test failed this parked call".into(),
+                status: 400,
+                body: "the test failed this parked call".into(),
             });
         }
         let held = self.hold.lock().expect("lock").clone();

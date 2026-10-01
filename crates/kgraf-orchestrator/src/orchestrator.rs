@@ -532,6 +532,13 @@ pub struct OrchestratorConfig {
     /// 0094, `--approve-plan`): the one way a run nobody attends may start
     /// with plan review on. The approval is recorded and traced.
     pub approve_plan: bool,
+    /// How long a route whose call failed at the transport stays out of
+    /// rotation before it is probed again, doubled for each fault in a row up
+    /// to `route_health::MAX_COOLDOWN_MS` (`route_health.rs`). Thirty seconds
+    /// by default: long enough that a down server is not handed the next
+    /// contract at once, short enough that a restarted one is back within a
+    /// minute.
+    pub route_fault_cooldown: Duration,
 }
 
 impl Default for OrchestratorConfig {
@@ -553,6 +560,7 @@ impl Default for OrchestratorConfig {
             routing: crate::routing::RoutingPolicy::default(),
             max_in_flight_per_cluster: crate::cluster_cap::DEFAULT_MAX_IN_FLIGHT_PER_CLUSTER,
             approve_plan: false,
+            route_fault_cooldown: Duration::from_secs(30),
         }
     }
 }
@@ -1371,6 +1379,11 @@ struct InFlight {
     premerged: BTreeSet<AgentId>,
     /// A worktree could not be provided: the retry gets fresh workers.
     renew_workers: bool,
+    /// With `renew_workers`: the renewed attempts' worktrees are removed too,
+    /// since nothing names them any more (an attempt that ended on a route
+    /// fault, `route_health.rs`). Without it a renewed worktree is kept, as a
+    /// worktree that could not be provided always was.
+    discard_renewed: bool,
     /// Each attempt's [`Injector`], set once its worker handle exists
     /// (decision 0067, point 3): `send_to_session` reaches a running worker
     /// through this, next to `cancels`. `OnceLock` because the loop creates the
@@ -2002,6 +2015,13 @@ struct RunLoop {
     /// over by the next pick so a contract does not keep choosing the same
     /// route. Cleared at dispatch.
     not_ready_routes: BTreeMap<String, BTreeSet<String>>,
+    /// Run-wide record of routes whose calls failed at the transport
+    /// (`route_health.rs`): a route that is out is passed over by every fresh
+    /// pick while another route can take the contract.
+    route_health: crate::route_health::RouteHealth,
+    /// Contracts whose last attempt ended on a route fault, with that route:
+    /// their next dispatch on another route is traced as a move off it.
+    rerouted_from: BTreeMap<String, String>,
     /// The last read of the run's unpriced models, and when. A status reply
     /// reuses it for `UNPRICED_READ_TTL_MS` instead of pricing every counted
     /// call in the ledger on each request; the final report always reads fresh.
@@ -2304,6 +2324,8 @@ impl RunLoop {
         };
         let sizer = Sizer::from_task_usage(&tasks);
         let keeper_task = Some(keeper.clone().spawn(tx.clone()));
+        let route_fault_cooldown_ms =
+            i64::try_from(config.route_fault_cooldown.as_millis()).unwrap_or(i64::MAX);
         let mut me = Self {
             since_reground: 0,
             reground_on_resume: resumed,
@@ -2334,6 +2356,8 @@ impl RunLoop {
             readiness_waits: BTreeMap::new(),
             readiness_since: BTreeMap::new(),
             not_ready_routes: BTreeMap::new(),
+            route_health: crate::route_health::RouteHealth::new(route_fault_cooldown_ms),
+            rerouted_from: BTreeMap::new(),
             unpriced_cache: Mutex::new(None),
             wake_at: None,
             coord: coord::CoordRuntime::new(gate_runner),
@@ -4010,6 +4034,9 @@ impl RunLoop {
             .extend(self.s.workspaces.take_problems());
         warnings.extend(self.workspace_problems.iter().cloned());
         let mut notices: Vec<String> = self.notices.iter().cloned().collect();
+        // Every route whose calls failed at the transport, named with its
+        // count and last error, so an outage is never silent in the output.
+        notices.extend(self.route_health.summary_lines());
         match self.unpriced_models(true) {
             Ok(m) if m.is_empty() => {}
             Ok(m) => notices.push(format!(
@@ -4251,10 +4278,18 @@ impl RunLoop {
                 // The first route from the cursor on that offers every tool
                 // the contract names. When none does, the cursor's own route:
                 // readiness then holds the contract with the missing tool named.
+                // A route out of rotation after transport faults is passed
+                // over while another one offers the tools (`route_health.rs`).
                 let n = names.len().max(1);
+                let offering = |b: &usize| self.route_offers(&names[b % n], &c.tools);
                 let b = (0..n)
                     .map(|k| self.route_cursor.wrapping_add(k))
-                    .find(|b| self.route_offers(&names[b % n], &c.tools))
+                    .find(|b| offering(b) && !self.route_out(&names[b % n]))
+                    .or_else(|| {
+                        (0..n)
+                            .map(|k| self.route_cursor.wrapping_add(k))
+                            .find(|b| offering(b))
+                    })
                     .unwrap_or(self.route_cursor);
                 Some(b)
             }
@@ -4276,6 +4311,59 @@ impl RunLoop {
     /// A fresh route pick was used: the next pick starts one along.
     fn commit_route_pick(&mut self) {
         self.route_cursor = self.route_cursor.wrapping_add(1);
+    }
+
+    /// Record what a finished attempt says about its route
+    /// (`route_health.rs`): a transport fault takes the route out of rotation
+    /// and is traced with the route named; an attempt that made calls without
+    /// one brings a faulted route back.
+    async fn observe_route_health(
+        &mut self,
+        contract: &str,
+        worker: &AgentId,
+        route: &str,
+        result: &WorkerResult,
+        now: i64,
+    ) -> Result<(), OrchestratorError> {
+        if route.is_empty() {
+            return Ok(());
+        }
+        match &result.route_fault {
+            Some(error) => {
+                let detail = kgraf_secrets::scrub_persist_owned(error.clone());
+                let state = self.route_health.fault(route, &detail, now);
+                self.rerouted_from
+                    .insert(contract.to_owned(), route.to_owned());
+                self.trace(TraceEvent::RouteFault {
+                    at_ms: now,
+                    route: route.to_owned(),
+                    contract: contract.to_owned(),
+                    worker: worker.to_string(),
+                    in_a_row: state.in_a_row,
+                    total: state.total,
+                    out_until_ms: state.out_until_ms,
+                    detail,
+                })
+                .await?;
+            }
+            None if !result.calls.is_empty() => {
+                if let Some(after) = self.route_health.success(route) {
+                    self.trace(TraceEvent::RouteRecovered {
+                        at_ms: now,
+                        route: route.to_owned(),
+                        after,
+                    })
+                    .await?;
+                }
+            }
+            None => {}
+        }
+        Ok(())
+    }
+
+    /// Whether route `name` is out of rotation now after transport faults.
+    fn route_out(&self, name: &str) -> bool {
+        self.route_health.is_out(name, self.now())
     }
 
     /// Whether route `name` registers every tool in `tools`.
@@ -4317,10 +4405,11 @@ impl RunLoop {
             .collect();
         // A route this contract found transiently not ready is passed over,
         // unless that leaves nothing to pick.
+        // So is a route out of rotation after transport faults.
         let skip = self.not_ready_routes.get(&c.contract);
         let ready: Vec<routing::RouteInfo> = infos
             .iter()
-            .filter(|r| skip.is_none_or(|s| !s.contains(&r.name)))
+            .filter(|r| skip.is_none_or(|s| !s.contains(&r.name)) && !self.route_out(&r.name))
             .cloned()
             .collect();
         let infos = if ready.is_empty() { infos } else { ready };
@@ -4429,7 +4518,11 @@ impl RunLoop {
         } else {
             None
         };
-        let skipped = |name: &str| skip.is_some_and(|s| s.contains(name));
+        // A route out of rotation after transport faults is passed over too,
+        // for a fresh pick only, unless nothing else offers the tools.
+        let fresh = Self::route_is_fresh(c);
+        let skipped =
+            |name: &str| skip.is_some_and(|s| s.contains(name)) || (fresh && self.route_out(name));
         let offering = |name: &&String| self.route_offers(name, &c.tools);
         let rotated = (0..n)
             .map(|k| &names[(base + attempt + k) % n])
@@ -4740,6 +4833,47 @@ impl RunLoop {
         };
         let mut queued = attempts_total.saturating_sub(workers.len() as u32);
 
+        // A route still out after transport faults is picked only when no
+        // other route can take the contract (or it is pinned): the contract
+        // waits for the route's probe, and is held with the reason once the
+        // route has failed `HOLD_AFTER` times in a row (`route_health.rs`).
+        let now = self.now();
+        if let Some(down) = routes
+            .iter()
+            .find(|r| self.route_health.is_out(r, now))
+            .cloned()
+        {
+            let state = self.route_health.state(&down).cloned().unwrap_or_default();
+            if state.in_a_row >= crate::route_health::HOLD_AFTER {
+                self.rerouted_from.remove(id);
+                self.submit_report(&contract, None, ReportKind::NeedsInput, "route down");
+                self.hold(
+                    id,
+                    format!(
+                        "route `{down}` failed at the transport {} times in a row and no other \
+                         configured route can take this contract; last error: {}; fix the \
+                         route, then run `kgraf orchestrate --resume <run>` to try again",
+                        state.in_a_row, state.last_error
+                    ),
+                );
+                return self.save();
+            }
+            let wake = state.out_until_ms;
+            self.wake_at = Some(self.wake_at.map_or(wake, |w| w.min(wake)));
+            self.defer(
+                id,
+                DeferReason::Readiness,
+                format!(
+                    "route `{down}` is out of rotation after {} transport failure(s) in a row \
+                     and no other route can take this contract; it is tried again in {} s",
+                    state.in_a_row,
+                    ((wake - now).max(0) + 999) / 1_000
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+
         // Readiness before capacity.
         for r in &routes {
             let Some(route) = self.route(r) else {
@@ -4987,6 +5121,7 @@ impl RunLoop {
             lease_lost: false,
             premerged: BTreeSet::new(),
             renew_workers: false,
+            discard_renewed: false,
             injectors: BTreeMap::new(),
             skills: BTreeMap::new(),
             fences: BTreeMap::new(),
@@ -5068,6 +5203,31 @@ impl RunLoop {
             estimate_micros: estimate.micros(),
         })
         .await?;
+        // A contract whose last attempt ended on a route fault, now on
+        // another route: the move is traced with the route it left.
+        if let Some(from) = self.rerouted_from.remove(id)
+            && !routes.contains(&from)
+        {
+            let to = routes.join(",");
+            let reason = self
+                .route_health
+                .state(&from)
+                .map(|s| {
+                    format!(
+                        "route `{from}` failed at the transport ({} in a row): {}",
+                        s.in_a_row, s.last_error
+                    )
+                })
+                .unwrap_or_default();
+            self.trace(TraceEvent::Rerouted {
+                at_ms: at,
+                contract: id.to_owned(),
+                from,
+                to,
+                reason,
+            })
+            .await?;
+        }
         self.trace_spend().await?;
 
         let contract = self.record.contract(id).cloned().unwrap_or(contract);
@@ -5619,13 +5779,21 @@ impl RunLoop {
         }
         // An environment that could not be built ran nothing: no candidate, and
         // not the model's failure (it never counts toward `failures`).
+        // A route that failed at the transport ran nothing the model can be
+        // judged by: not counted toward `failures`, and the retry is a fresh
+        // worker on a fresh route pick (`route_health.rs`).
+        let route_fault = f.merged.is_none() && f.result.route_fault.is_some();
         let status = if f.merged.is_some() {
             AttemptStatus::Success
-        } else if f.env_failure.is_some() {
+        } else if f.env_failure.is_some() || route_fault {
             AttemptStatus::Empty
         } else {
             status_of(&f.result)
         };
+        if route_fault {
+            flight.renew_workers = true;
+            flight.discard_renewed = true;
+        }
         match &f.env_failure {
             Some(e) => {
                 self.record.counters.environment_failures += 1;
@@ -5694,6 +5862,8 @@ impl RunLoop {
             error: outcome_error(&f.result.outcome),
         })
         .await?;
+        self.observe_route_health(&f.contract, &f.worker, &route_name, &f.result, now)
+            .await?;
         self.trace_spend().await?;
         if let Some(notice) = &f.result.compaction {
             self.record_compaction(&contract, &f.worker, notice).await?;
@@ -6756,7 +6926,9 @@ impl RunLoop {
         // inherited, which holds the handoff parent's work. Released after
         // the record above says who still names it.
         for a in &flight.attempts {
-            let keep = not_a_failure || worktree_in_use(&self.record, &a.workspace);
+            let renewed_away = flight.renew_workers && flight.discard_renewed;
+            let keep =
+                (not_a_failure && !renewed_away) || worktree_in_use(&self.record, &a.workspace);
             self.s.workspaces.release(&a.workspace, keep).await;
         }
         self.release_leases_if_unused(&holder)?;
@@ -8067,6 +8239,7 @@ mod tests {
             lease_lost: false,
             premerged: BTreeSet::new(),
             renew_workers: false,
+            discard_renewed: false,
             injectors: BTreeMap::new(),
             skills: BTreeMap::new(),
             fences: BTreeMap::new(),

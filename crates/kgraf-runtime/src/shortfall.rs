@@ -44,14 +44,12 @@ pub struct RefusedCall {
 /// The capability a call exercises, for matching a refusal to a later retry:
 /// a shell call's program, or the tool's name.
 pub fn capability_of(tool: &str, input: &serde_json::Value) -> String {
+    // The argv the shell tool runs (a one-string command line split into its
+    // words), so `["cargo test"]` and `["cargo", "test"]` are one capability.
     if tool == "shell"
-        && let Some(program) = input
-            .get("command")
-            .and_then(|c| c.as_array())
-            .and_then(|a| a.first())
-            .and_then(|p| p.as_str())
+        && let Some(program) = kgraf_tools::command_argv(input).and_then(|a| a.into_iter().next())
     {
-        return program.to_owned();
+        return program;
     }
     tool.to_owned()
 }

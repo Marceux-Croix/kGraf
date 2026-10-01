@@ -1017,6 +1017,27 @@ Behavior that differs from earlier builds. Each item names the decision that hol
   end (0075).
 - A contract whose route is not ready moves the rotation on once for each route it finds not
   ready, not once for each check (0075).
+- A route whose calls fail at the transport (the server refuses or drops the connection) is out
+  of rotation for 30 seconds, doubling with each failure in a row up to 10 minutes. Its
+  contracts move to another route, and that attempt does not count against the contract. With
+  no other route, the contract waits and tries the route again; after three failures in a row
+  it is held with a reason naming the route. The run output has a `notice` line for each route
+  that failed, and the trace has `route_fault`, `rerouted` and `route_recovered` records
+  (0075).
+- A worker's shell command written as one string (`["cargo test --workspace"]`) runs as its
+  words when it holds no shell syntax, and the output says so. One with shell syntax (`&&`,
+  quotes, `$`) is refused with the way to write it. The build commands run without approval
+  with their usual options: `--workspace`, `-p`, `--test`, `--release`, `--no-run` and the
+  others the shell tool's description lists (0084).
+- Workers are told that kGraf commits their worktree after its check, and the planner no
+  longer writes acceptance that asks a worker to commit.
+- A planner answer that sends an optional list as `null` (`"depends_on": null`) is read as
+  empty. A field of the wrong type is still refused, and the refusal names the field
+  (`contracts[0].depends_on: ...`).
+- Each worktree a run leaves on disk (a held contract's attempt kept for `--resume`, retention,
+  a conflict) gets a `kept` line in the run output with how to resume or remove it. kGraf's own
+  `.kgraf/worktrees/.holds` and `.kgraf/worktrees/.scratch` are removed at the end of a run that
+  kept no worktree; they are internal, not worktrees (0088).
 - A file made only of plain structs and trait impls whose bodies are all `todo!()` or
   `unimplemented!()` counts as an abandoned stub. An enum, a constant, a macro call, an
   inherent impl, anything under `cfg`, or a struct with a non-standard derive marks the file as

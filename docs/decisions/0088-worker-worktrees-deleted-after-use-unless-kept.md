@@ -115,3 +115,17 @@ Tests: `kgraf-host` `clean_finds_kept_worktrees_of_runs_and_of_kgraf_worker` (ke
 both places: an unknown name is refused listing all four, a name in both is refused naming the
 two forms, each is removed from its own place, and the prefixed form removes only that one),
 `clean_refuses_a_worktree_a_record_names_unless_forced` (unchanged).
+
+## Amendment: hold files go with their workspace; kGraf's own directories are tidied; a kept worktree is named
+
+- **`.holds` and `.scratch` under `.kgraf/worktrees` are the worktree manager's own
+  bookkeeping, not worktrees**: one hold file per workspace (every sandboxed command takes it
+  shared) and one scratch directory per workspace (`CARGO_TARGET_DIR`, decision 0060).
+- **A leak, fixed.** The hold file was never removed with its workspace. `remove` and `clean`
+  now delete it and its session log while holding it, and startup cleanup removes holds no
+  registered worktree uses.
+- **Tidied at the end of a run.** `WorkspaceManager::tidy` removes unused holds, then `.holds`
+  and `.scratch` when no kGraf worktree is registered and they are empty, under the manager's
+  exclusive lock. A run that kept nothing leaves only the marker file.
+- **A kept worktree is named** in the run output (a `kept` line with how to resume or remove
+  it).

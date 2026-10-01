@@ -437,25 +437,90 @@ impl ApprovalHook for ShellApprovalHook {
 }
 
 fn argv(input: &Value) -> Result<Vec<String>, ToolError> {
+    parse_command(input).map(|(cmd, _)| cmd)
+}
+
+/// The argv a shell call's input runs as, exactly as the shell tool reads it
+/// (a one-string command line split into its words: [`parse_command`]), or
+/// `None` for input the tool refuses. Every reader of a shell call's command
+/// (permission modes, deny rules, the critical-deletion check, shortfall
+/// matching) uses this, so none of them judges a different argv than the one
+/// that runs.
+pub fn command_argv(input: &Value) -> Option<Vec<String>> {
+    argv(input).ok()
+}
+
+/// The argv of a call, and whether it came from one string that was split.
+///
+/// Models often write the whole command line as one string, as the array's
+/// one element (`["cargo test --workspace"]`) or as the value itself. Taken
+/// literally that names a program called `cargo test --workspace`, which
+/// exists nowhere, and the build allowlist does not list it, so an unattended
+/// worker was denied the very command it meant. A line with no shell syntax
+/// is split into its words (`execpolicy::split_command_line`), and every
+/// check (policy, allowlist, approval, the run) sees the split argv; the
+/// output says it was split. A line with shell syntax is refused with the way
+/// to write it: splitting it on whitespace would run something else than it
+/// says. A one-element program path that holds a space is no longer run as
+/// one word: none of kGraf's allowlists name such a program, and the refusal
+/// or the split is said, never silent.
+fn parse_command(input: &Value) -> Result<(Vec<String>, bool), ToolError> {
     let bad = |reason: &str| ToolError::InvalidInput {
         tool: "shell".into(),
         reason: reason.into(),
     };
-    let array = input
+    let one_line = |line: &str| -> Result<(Vec<String>, bool), ToolError> {
+        if line.trim().is_empty() {
+            return Err(bad("`command` must not be empty"));
+        }
+        if let Some(words) = crate::execpolicy::split_command_line(line) {
+            return Ok((words, true));
+        }
+        if crate::execpolicy::has_shell_syntax(line) && line.trim().contains(char::is_whitespace) {
+            return Err(bad(
+                "`command` is one string holding shell syntax; give the program and each \
+                 argument as its own array element (`[\"cargo\", \"test\", \"--workspace\"]`), \
+                 or, for shell syntax, `[\"sh\", \"-c\", \"<line>\"]`, which needs approval; \
+                 write files with apply_patch",
+            ));
+        }
+        Ok((vec![line.trim().to_owned()], false))
+    };
+    let command = input
         .get("command")
-        .and_then(Value::as_array)
+        .ok_or_else(|| bad("expected a `command` array of strings"))?;
+    if let Some(line) = command.as_str() {
+        return one_line(line);
+    }
+    let array = command
+        .as_array()
         .ok_or_else(|| bad("expected a `command` array of strings"))?;
     if array.is_empty() {
         return Err(bad("`command` must not be empty"));
     }
-    array
+    let cmd: Vec<String> = array
         .iter()
         .map(|v| {
             v.as_str()
                 .map(str::to_owned)
                 .ok_or_else(|| bad("every `command` element must be a string"))
         })
-        .collect()
+        .collect::<Result<_, _>>()?;
+    match cmd.as_slice() {
+        [line] if line.trim().contains(char::is_whitespace) => one_line(line),
+        _ => Ok((cmd, false)),
+    }
+}
+
+/// What a call whose one string was split ([`parse_command`]) reads after its
+/// output, so the model learns the form.
+fn split_note(cmd: &[String]) -> String {
+    format!(
+        "\n[kgraf: the command was given as one string; it ran as {} arguments, {}. Give each \
+         argument as its own array element.]",
+        cmd.len(),
+        crate::quote_argv(cmd)
+    )
 }
 
 fn forbidden(reason: Option<&str>) -> ToolError {
@@ -936,7 +1001,10 @@ impl Tool for ShellTool {
                 tool: "shell".into(),
             });
         }
-        let cmd = argv(&input)?;
+        let (cmd, split) = parse_command(&input)?;
+        // The body runs in a block so every path, early returns included,
+        // comes back here, where a split command line gets its note.
+        let result: Result<ToolOutput, ToolError> = async {
         // Checked again: `call` must never run what `access` would have
         // refused, even if a future caller invokes it directly (fail loud).
         let verdict = self.policy.evaluate(&cmd);
@@ -1113,6 +1181,17 @@ impl Tool for ShellTool {
             _ => with_dependency_hint(output),
         };
         Ok(scrub_build_output(output))
+        }
+        .await;
+        match result {
+            Ok(mut out) if split => {
+                out.parts.push(crate::OutputPart::Text {
+                    text: crate::UntrustedText::new(split_note(&cmd)),
+                });
+                Ok(out)
+            }
+            other => other,
+        }
     }
 }
 
@@ -3194,6 +3273,61 @@ mod tests {
                     matches!(hook.review(&pending(&off)).await, HookDecision::Ask { .. }),
                     "{off:?} must still need approval"
                 );
+            }
+        }
+
+        /// A model that writes the whole command line as one string
+        /// (`["cargo test --workspace"]`, or a bare string) gets the command it
+        /// meant: the words are split when the line holds no shell syntax, and
+        /// the allowlist judges the split argv. Before, the one-string form was
+        /// off the list, asked, and denied in an unattended run.
+        #[tokio::test]
+        async fn a_command_line_in_one_string_is_judged_and_run_as_its_words() {
+            let f = fixture(PLAIN_BUILD_RS);
+            let (tool, hook) = bound_tool(&f.ws);
+            for input in [
+                json!({"command": ["cargo test --workspace"]}),
+                json!({"command": "cargo test --workspace"}),
+            ] {
+                let access = tool.access(&input).expect("access");
+                assert!(access.is_sandboxed_build(), "{input}");
+                let call = PendingCall {
+                    input: input.clone(),
+                    ..pending(&["unused"])
+                };
+                assert_eq!(hook.review(&call).await, HookDecision::Allow, "{input}");
+            }
+            let ctx = ctx(f.ws.root().to_path_buf());
+            let out = tool
+                .call(
+                    json!({"command": ["cargo test -q"]}),
+                    &ctx,
+                    &CallPermit::new(),
+                )
+                .await
+                .expect("call");
+            let text = out.render();
+            assert!(!text.starts_with("ERROR"), "{text}");
+            assert!(
+                text.contains("ran as 3 arguments"),
+                "the split is said: {text}"
+            );
+        }
+
+        /// A one-string command that holds shell syntax is refused with the
+        /// reason and the way to write it, never split or run as one program.
+        #[tokio::test]
+        async fn a_one_string_command_with_shell_syntax_is_refused_with_the_way_to_write_it() {
+            let f = fixture(PLAIN_BUILD_RS);
+            let (tool, _hook) = bound_tool(&f.ws);
+            for input in [
+                json!({"command": ["cargo test && rm -rf ."]}),
+                json!({"command": "cat > x.rs << 'EOF'\nfn main() {}\nEOF"}),
+            ] {
+                let err = tool.access(&input).expect_err("refused");
+                let text = err.to_string();
+                assert!(text.contains("shell syntax"), "{text}");
+                assert!(text.contains("[\"sh\", \"-c\""), "{text}");
             }
         }
 

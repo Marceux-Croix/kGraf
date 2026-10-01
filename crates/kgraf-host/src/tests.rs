@@ -1516,9 +1516,12 @@ async fn the_assembled_prefix_digest_with_the_flag_off_is_pinned() {
     // merge. One deliberate cache reset. Decision 0093 re-pinned it once more:
     // the system prompt now tells a refused worker to report the shortfall and
     // names the `<worker_shortfall>` block as data. Decision 0095 re-pinned it
-    // again: every worker lists the `recall_history` tool.
+    // again: every worker lists the `recall_history` tool. Re-pinned once
+    // more when the shell tool description began naming the build commands'
+    // options, so a model no longer reads the bare names as "without flags",
+    // and the system prompt said kGraf commits the worktree itself.
     assert_eq!(
-        digest, "451c3c43c2693538d8b1638629ae880a7eff497d024ed49c6307789b5eaf8d9d",
+        digest, "b1c27084e1e061daaf44184e3d0938d5ea911e734560388f5cb950aa7b4dc0d2",
         "a change here means every worker's cache resets even with the \
          sessions flag off, which nothing in decision 0067 may cause \
          (re-pinned for the intentional `apply_patch` description \

@@ -2708,6 +2708,13 @@ pub struct Housekeeping {
     pub swept: Result<Vec<String>>,
     /// Calls with unaccounted spend (`kgraf unreconciled` lists them).
     pub unreconciled: Result<usize>,
+    /// Worker worktrees of this run still on disk at its end
+    /// ([`GitWorkspaces::kept_worktrees`]), each said in the run output.
+    pub kept: Result<Vec<PathBuf>>,
+    /// The worktree manager's own directories tidied
+    /// ([`kgraf_sandbox::WorkspaceManager::tidy`]); a failure is said, never
+    /// fatal.
+    pub tidied: Result<()>,
 }
 
 /// What a run needs after its end.
@@ -2746,9 +2753,13 @@ impl RunEnd {
                 }
                 Ok(swept)
             });
+        let kept = self.workspaces.kept_worktrees();
+        let tidied = self.workspaces.manager.tidy().lift();
         Housekeeping {
             swept,
             unreconciled: self.ledger.unreconciled().map(|v| v.len()).lift(),
+            kept,
+            tidied,
         }
     }
 }
