@@ -1011,25 +1011,45 @@ impl Tool for ShellTool {
             }
             None => None,
         };
-        // Decision 0094: in Bypass, the git directory is writable for this
-        // command, snapshotted first and checked after, before the call
-        // returns, so no later git operation meets an unchecked write.
-        let mut guarded = None;
+        // Decision 0094: in Bypass, a command that names git gets the git
+        // directory writable inside a window that holds the repository lock,
+        // snapshotted first and checked after, before the call returns, so
+        // no later git operation meets an unchecked write and no other git
+        // write runs meanwhile. Any other command keeps it read-only.
+        let mut window = None;
         let mut read_only_note = None;
+        let mut failure_note = None;
         if let Some(guard) = &self.protected {
             let g = guard.clone();
-            match tokio::task::spawn_blocking(move || g.before_shell())
+            let words = cmd.clone();
+            match tokio::task::spawn_blocking(move || g.before_shell(&words))
                 .await
                 .map_err(|e| internal(format!("protected-write snapshot task failed: {e}")))?
             {
-                Ok(Some(root)) => {
-                    policy = policy.with_writable_root(root);
-                    guarded = Some(guard.clone());
+                Ok(Some(w)) => {
+                    policy = policy.with_writable_root(w.root().to_path_buf());
+                    window = Some((guard.clone(), w));
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    if guard.bypass() {
+                        failure_note = Some(
+                            "\n[in Bypass the git directory is writable only for a command that \
+                             names git or the git directory; this one named neither, so it was \
+                             read-only]",
+                        );
+                    }
+                }
+                // Another git window or kGraf's own git work held the
+                // repository past the bound: the command is not run.
+                Err(crate::protected::WindowError::Busy(e)) => {
+                    return Ok(ToolOutput::error(format!(
+                        "the command was not run: it names git, and the repository stayed \
+                         locked: {e}"
+                    )));
+                }
                 // Run as in every other mode, the git directory read-only,
                 // and say so: a write that could not be restored is not made.
-                Err(e) => {
+                Err(crate::protected::WindowError::Unprotected(e)) => {
                     read_only_note = Some(format!(
                         "\n[the repository's git directory stayed read-only for this command: {e}]"
                     ));
@@ -1037,8 +1057,8 @@ impl Tool for ShellTool {
             }
         }
         let output = run_sandboxed(&cmd, ctx, &policy, &env, self.timeout, self.output_cap).await;
-        if let Some(guard) = guarded {
-            let checked = tokio::task::spawn_blocking(move || guard.after_shell())
+        if let Some((guard, w)) = window {
+            let checked = tokio::task::spawn_blocking(move || guard.after_shell(w))
                 .await
                 .map_err(|e| internal(format!("protected-write check task failed: {e}")))?;
             if let Err(check) = checked {
@@ -1060,6 +1080,13 @@ impl Tool for ShellTool {
         if let Some(note) = read_only_note {
             output.parts.push(crate::OutputPart::Text {
                 text: crate::UntrustedText::new(note),
+            });
+        }
+        if let Some(note) = failure_note
+            && output.is_error
+        {
+            output.parts.push(crate::OutputPart::Text {
+                text: crate::UntrustedText::new(note.to_owned()),
             });
         }
         if !verdict.build {
@@ -3895,6 +3922,84 @@ fn main() {
             assert!(fsck.status.success());
         }
 
+        /// Through the real sandbox: a Bypass git command that deletes the
+        /// repository's pack and a loose object is caught when it ends; both
+        /// are restored from the object snapshot, the call is an error, the
+        /// repository passes fsck and the attempt's guard holds the failure.
+        #[tokio::test]
+        async fn bypass_restores_objects_a_shell_command_deleted() {
+            let f = fixture(PLAIN_BUILD_RS);
+            let common = f.ws.git_common_dir().to_path_buf();
+            let host_git = |dir: &Path, args: &[&str]| {
+                let out = Command::new("git")
+                    .arg("-C")
+                    .arg(dir)
+                    .args(args)
+                    .env_remove("GIT_DIR")
+                    .env_remove("GIT_INDEX_FILE")
+                    .env_remove("GIT_WORK_TREE")
+                    .env("GIT_AUTHOR_NAME", "t")
+                    .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+                    .env("GIT_COMMITTER_NAME", "t")
+                    .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+                    .output()
+                    .expect("git");
+                assert!(
+                    out.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                String::from_utf8_lossy(&out.stdout).trim().to_owned()
+            };
+            host_git(&common, &["repack", "-a", "-d", "-q"]);
+            let unique = f._tmp.path().join("unique.txt");
+            std::fs::write(&unique, "an object only this test writes\n").expect("write");
+            let blob = host_git(
+                f.ws.root(),
+                &["hash-object", "-w", unique.to_str().expect("utf8")],
+            );
+            host_git(&common, &["update-ref", "refs/keep/blob", &blob]);
+            let loose = common.join("objects").join(&blob[..2]).join(&blob[2..]);
+            let packs: Vec<std::path::PathBuf> = std::fs::read_dir(common.join("objects/pack"))
+                .expect("packs")
+                .flatten()
+                .map(|e| e.path())
+                .collect();
+            assert!(loose.exists() && !packs.is_empty());
+            let (tool, guard) = guarded_tool(&f, crate::PermissionMode::Bypass);
+            let script = format!(
+                "o=\"$(git rev-parse --git-path objects)\"; rm -f \"$o\"/pack/* \"$o/{}/{}\"",
+                &blob[..2],
+                &blob[2..]
+            );
+            let out = tool
+                .call(
+                    call_input(&["sh", "-c", &script]),
+                    &ctx(f.ws.root().to_path_buf()),
+                    &CallPermit::new(),
+                )
+                .await
+                .expect("ran");
+            let is_error = out.is_error;
+            let text = out.render();
+            assert!(is_error, "{text}");
+            assert!(text.contains("object files restored"), "{text}");
+            assert!(loose.exists() && packs.iter().all(|p| p.exists()), "{text}");
+            let fsck = Command::new("git")
+                .arg("--git-dir")
+                .arg(&common)
+                .args(["fsck", "--connectivity-only", "--no-dangling"])
+                .env_remove("GIT_DIR")
+                .output()
+                .expect("fsck");
+            assert!(
+                fsck.status.success(),
+                "{}",
+                String::from_utf8_lossy(&fsck.stderr)
+            );
+            assert!(guard.finish().is_err());
+        }
+
         /// Outside Bypass the git directory stays read-only in the sandbox.
         #[tokio::test]
         async fn other_modes_keep_the_git_directory_read_only() {
@@ -3921,6 +4026,94 @@ fn main() {
                 "the sandbox refused it: {text}"
             );
             assert_eq!(std::fs::read(&exclude).unwrap_or_default(), before);
+        }
+
+        /// In Bypass, a command whose words name neither git nor the git
+        /// directory runs with the git directory read-only and takes no
+        /// repository lock; its failure says why. (The target path is read
+        /// from a file, so no word of the command names it.)
+        #[tokio::test]
+        async fn bypass_keeps_the_git_directory_read_only_for_a_command_that_does_not_name_it() {
+            let f = fixture(PLAIN_BUILD_RS);
+            let (tool, guard) = guarded_tool(&f, crate::PermissionMode::Bypass);
+            let exclude = f.ws.git_common_dir().join("info/exclude");
+            let before = std::fs::read(&exclude).unwrap_or_default();
+            std::fs::write(
+                f.ws.root().join("target.txt"),
+                exclude.display().to_string(),
+            )
+            .expect("target");
+            let script = "printf x >> \"$(cat target.txt)\"";
+            let words = ["sh", "-c", script];
+            assert!(!guard.names_git(&words.map(str::to_owned)));
+            let out = tool
+                .call(
+                    call_input(&words),
+                    &ctx(f.ws.root().to_path_buf()),
+                    &CallPermit::new(),
+                )
+                .await
+                .expect("ran");
+            let is_error = out.is_error;
+            let text = out.render();
+            assert!(is_error, "{text}");
+            assert!(
+                text.contains("writable only for a command that names git"),
+                "{text}"
+            );
+            assert_eq!(std::fs::read(&exclude).unwrap_or_default(), before);
+            guard.finish().expect("nothing was written");
+        }
+
+        /// In Bypass, a git command whose window cannot take the repository
+        /// lock within the bound is not run at all.
+        #[tokio::test]
+        async fn bypass_does_not_run_a_git_command_while_the_repository_stays_locked() {
+            let f = fixture(PLAIN_BUILD_RS);
+            let control = crate::protected::tests::control(crate::PermissionMode::Bypass);
+            let state = f._tmp.path().join("state");
+            std::fs::create_dir_all(&state).expect("state");
+            let guard = std::sync::Arc::new(
+                crate::ProtectedWrites::for_workspace(
+                    control.clone(),
+                    "w1",
+                    &f.ws,
+                    state,
+                    crate::protected::tests::json_check(),
+                )
+                .expect("guard")
+                .with_lock_timeout(Duration::from_millis(200)),
+            );
+            let policy = ExecPolicy::default_kgraf_policy().with_permissions(control);
+            let (tool, _hook) = ShellTool::new(policy);
+            let tool = tool
+                .with_workspace(f.ws.clone())
+                .with_protected_writes(guard.clone());
+            let _held = kgraf_sandbox::repo_lock::acquire(
+                f.ws.git_common_dir(),
+                kgraf_sandbox::repo_lock::Mode::Shared,
+                "merge-back",
+                Duration::from_secs(1),
+            )
+            .expect("held");
+            let marker = f.ws.root().join("ran.txt");
+            let script = format!("touch '{}' && git status", marker.display());
+            let out = tool
+                .call(
+                    call_input(&["sh", "-c", &script]),
+                    &ctx(f.ws.root().to_path_buf()),
+                    &CallPermit::new(),
+                )
+                .await
+                .expect("answered");
+            let is_error = out.is_error;
+            let text = out.render();
+            assert!(is_error, "{text}");
+            assert!(
+                text.contains("was not run") && text.contains("merge-back"),
+                "{text}"
+            );
+            assert!(!marker.exists(), "the command did not run");
         }
     }
 

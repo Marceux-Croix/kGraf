@@ -1589,3 +1589,55 @@ fn merge_refuses_an_unscoped_or_out_of_scope_attempt() {
     assert_eq!(tip(&e.f.repo), before);
     mb.discard(&mut wide).unwrap();
 }
+
+/// A merge into the integration branch never runs while a worker's Bypass
+/// git window holds the repository lock (decision 0094): it waits, then
+/// lands once the window closes. Worktree creation waits the same way.
+#[test]
+fn a_merge_and_a_worktree_add_wait_for_an_open_git_window() {
+    use kgraf_sandbox::repo_lock::{self, Mode};
+    use std::time::{Duration, Instant};
+    let e = env();
+    let mb = Arc::new(merger(&e));
+    let mut w1 = attempt(&e, "w1");
+    write(&w1, "a.txt", "from w1\n");
+    let common = e.f.repo.join(".git");
+    let window = repo_lock::acquire(
+        &common,
+        Mode::Exclusive,
+        "worker w9 shell git command",
+        Duration::from_secs(1),
+    )
+    .unwrap();
+    let before = tip(&e.f.repo);
+    let merging = {
+        let mb = mb.clone();
+        std::thread::spawn(move || {
+            let start = Instant::now();
+            let out = mb.finish(&mut w1, "w1: add a", &["a.txt"]).map(|_| ());
+            (start.elapsed(), out.map_err(|e| e.to_string()))
+        })
+    };
+    let adding = {
+        let mgr = e.mgr.clone();
+        std::thread::spawn(move || {
+            let start = Instant::now();
+            let ws = mgr.create(&WorkspaceSpec {
+                name: "w2",
+                base: BRANCH,
+                branch: None,
+            });
+            (start.elapsed(), ws.map(|_| ()).map_err(|e| e.to_string()))
+        })
+    };
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(tip(&e.f.repo), before, "nothing merged inside the window");
+    drop(window);
+    let (waited, out) = merging.join().unwrap();
+    out.unwrap();
+    assert!(waited >= Duration::from_millis(350), "{waited:?}");
+    assert_ne!(tip(&e.f.repo), before);
+    let (waited, out) = adding.join().unwrap();
+    out.unwrap();
+    assert!(waited >= Duration::from_millis(350), "{waited:?}");
+}

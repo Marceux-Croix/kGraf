@@ -161,3 +161,72 @@ snapshot and an integrity check around every such write. kGraf's own books stay 
   and says so. Another worker's git operation that runs during this worker's shell command is
   not serialized against it. `kgraf worker run`, outside an orchestrated attempt, refuses every
   protected path.
+
+## Amendment: object restore and a repository lock for Bypass git writes
+
+The amendment above left two limits: destroyed objects were detected but not restored, and a
+worker's git writes were not serialized against other workers' or kGraf's own. Both are closed.
+
+- **Git windows.** A *window* is a protected git write through `apply_patch`, or a Bypass shell
+  command with the shared git directory writable, together with the check and the restore that
+  follow it. In Bypass, a shell command opens a window only when one of its words contains
+  `git` (any case: the program, a `.git` path, a script that runs it) or the shared git
+  directory's path. Every other command runs with the git directory read-only, as in every other
+  mode, and takes no lock; a git write it makes anyway fails with the sandbox's permission error,
+  and a failed command's output says why. Holding a repository lock for every command would
+  queue all workers' builds and tests behind each other and make every merge wait out a build.
+- **The repository lock.** Each window holds the repository's lock exclusively, from its
+  snapshot through its check and restore. Each git process kGraf runs on the repository holds it
+  shared: worktree add, remove, prune and reopen, the integration branch, merges (`merge-tree`,
+  `commit-tree`, the branch compare-and-swap, `gc --auto`, attempt refs) and the integration view.
+  Shared holders run together; they wait only while a window is open, and a window waits until
+  none runs. The lock is taken per git process, never across a multi-step operation and never
+  nested in one thread.
+  - *Where.* An advisory `flock`. On Unix it is taken on the shared git directory itself, not on
+    a file in it: a window's sandbox may write inside that directory and could delete a lock file
+    there, while the directory itself cannot be removed or renamed from inside the sandbox. On
+    Windows, which cannot lock a directory, it is `kgraf-repo.lock` in that directory, opened
+    without delete sharing. A host-side mutex alone does not reach a second kGraf process on the
+    same repository; the flock does.
+  - *Stale rule.* None to judge: the kernel releases a flock when its holder's descriptors close,
+    which a crash or a kill does. Nothing is written to disk for the lock. A holder that hangs
+    while alive is not stale; its waiters time out.
+  - *Waits.* At most 15 minutes by default (longer than the shell's 10-minute command timeout). A
+    wait past it fails loud and names the holders in this process, or says another process holds
+    it: a protected write is not made, a shell command that names git is not run, a kGraf git
+    process fails with the error, and an end-of-attempt check that cannot take the lock fails the
+    attempt.
+  - *Exact attribution.* No other writer runs inside a window, so its snapshot and baseline are
+    taken when it opens, and every change at its end is its own; a window's changed files are
+    recorded as its write. A shell window dropped without its check is checked at the next window
+    or at the end of the attempt, and that failure says the attribution is no longer exact.
+- **The object snapshot.** At the attempt's first shell window, under the lock: every regular
+  file under `objects/` (loose objects, packs with their `.idx`, `.rev`, `.bitmap` and the rest,
+  `info/*`) is hard-linked into `.kgraf/git-snapshots/` in the project's state directory, which
+  is never a sandbox writable root. Git never changes an object file once written, so a link is
+  a snapshot that copies no data. Each later shell window brings it up to date. Where a hard link
+  fails (the state directory on another file system) files are copied instead, hashed with BLAKE3
+  while copied, at most 512 MiB in all; a store over the bound gets no shell git window, and the
+  command says why. An owner record beside the files lets the next snapshot remove one a crashed
+  process left. The snapshot is deleted when the attempt ends.
+- **Check and restore.** At the end of a shell window, an object file the snapshot holds that is
+  missing, or whose length, time or inode differs, is lost; when any is, the check adds
+  `git fsck --connectivity-only`, so a `git gc` that packed loose objects passes and a deletion
+  does not. On a failed check the lost files are put back first (a linked file only if the shared
+  file still has its recorded length, time and inode; a copied one only if its hash matches), then
+  the ref, config and index files as before. Object files that appeared since the snapshot are
+  never removed: objects are additive. The attempt is failed even when the restore makes the
+  repository whole: the lock rules out any other writer, so the damage was the attempt's own, and
+  a repaired repository does not make the attempt's work trustworthy.
+- **Cost,** measured on macOS (APFS) with 20,000 loose objects: taking the snapshot 5.7 s, the
+  loss scan 0.12 s, bringing it up to date 0.10 s, removing it 1.0 s; paid once per attempt at its
+  first shell git window. Git's automatic gc packs loose objects at 6,700, and a pack is one link.
+- **Not taken.** Copy-on-write clones are independent of in-place edits but platform-specific
+  and absent on ext4. Hashing every linked file reads the whole store. fsck after every window
+  runs only when an object file was lost.
+- **Limits.** An object file altered in place under the hard-link method (git writes them
+  read-only, so this takes a `chmod`) altered the snapshot too and is reported as not restorable.
+  The end-of-attempt fsck counts a problem against the attempt when its first window did not see
+  it, including one another worker's window left in between. On a network file system without
+  flock support the lock may not exclude another machine. A git write by a command that does not
+  name git is refused by the sandbox, not checked.

@@ -18,6 +18,7 @@ mod error;
 pub mod git;
 pub mod lifecycle;
 pub mod merge;
+pub mod repo_lock;
 mod sandbox;
 #[cfg(unix)]
 pub mod trust;

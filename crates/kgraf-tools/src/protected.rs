@@ -11,9 +11,9 @@
 //!   the worktree was made, never the file on disk): `HEAD` and `index` land in
 //!   this worktree's admin directory, `config`, `info/exclude` and `refs/...`
 //!   in the shared directory. `.git` itself (the link) and `.git/objects` are
-//!   refused: rewriting the link aims later git commands at another
-//!   repository, and objects are not snapshotted, so a faulty object write
-//!   could not be put back.
+//!   refused to `apply_patch`: rewriting the link aims later git commands at
+//!   another repository, and objects are compressed binary files git writes
+//!   (a shell git command in Bypass, whose window snapshots the store).
 //! - `.kgraf/run.json` and `.kgraf/worker.json`: kGraf's settings in the
 //!   project's state directory. Nothing else under `.kgraf`: the spend ledger,
 //!   the trace, run records, worker transcripts, the graph, the schedule, the
@@ -28,42 +28,71 @@
 //!
 //! **Protection against a faulty write.**
 //!
-//! - *Snapshot.* Before the first write to an area in an attempt, and again
-//!   after each passing check (so a restore never undoes more than the faulty
-//!   write and what happened since the last good state): for git, the files a
-//!   restore needs, copied byte for byte: the shared `config`, `HEAD`,
-//!   `packed-refs`, `shallow`, every file under `refs/` and `info/`, each
-//!   worktree admin directory's `HEAD`, `gitdir` and `commondir`, and this
-//!   worktree's `index`. Bounded by [`GIT_SNAPSHOT_LIMIT`] in total; a
+//! - *Serialization.* Every git window (a protected git write, or a Bypass
+//!   shell command with the shared git directory writable) holds the
+//!   repository's lock exclusively ([`kgraf_sandbox::repo_lock`]) from its
+//!   snapshot through its check and any restore; each git process kGraf runs
+//!   on the repository holds it shared. So while a window is open no other
+//!   worker and no kGraf merge, ref update or worktree change touches the
+//!   repository, and the check sees only the window's own change. Two kGraf
+//!   processes on one repository serialize the same way (the lock is a
+//!   `flock`). A wait longer than the lock timeout fails loud: the write is
+//!   not made, the command is not run.
+//! - *Which shell commands open a window.* In Bypass, a command whose words
+//!   name git (any word containing `git`, case-insensitively: the program,
+//!   a `.git` path, a script that runs it) or the shared git directory's
+//!   path. Every other command runs with the git directory read-only, as in
+//!   every other mode, and holds no lock, so builds and tests of parallel
+//!   workers never queue behind each other; a git write such a command makes
+//!   anyway fails with a permission error, and a failed command's output
+//!   says why.
+//! - *Snapshot.* At the start of each window, under the lock: for git, the
+//!   files a restore needs, copied byte for byte: the shared `config`,
+//!   `HEAD`, `packed-refs`, `shallow`, every file under `refs/` and `info/`,
+//!   each worktree admin directory's `HEAD`, `gitdir` and `commondir`, and
+//!   this worktree's `index`. Bounded by [`GIT_SNAPSHOT_LIMIT`] in total; a
 //!   repository over the bound gets no protected git write (refused, with the
-//!   size). For a settings file, its bytes (or its absence), bounded by
-//!   [`SETTINGS_FILE_LIMIT`].
-//! - *Check,* right after each protected write and each shell command run in
-//!   Bypass that changed a snapshotted git file, before the tool call returns,
-//!   so the run's next git operation never meets an unchecked write: the
+//!   size). For a shell window, also the object store
+//!   ([`objects`]): hard links into a directory under the project's state
+//!   directory (outside every sandbox writable root), taken at the attempt's
+//!   first shell window and brought up to date at each later one; copies
+//!   bounded by [`OBJECT_COPY_LIMIT`] where hard links are impossible. For a
+//!   settings file, its bytes (or its absence), bounded by
+//!   [`SETTINGS_FILE_LIMIT`]. What the per-write check finds at the start of
+//!   a window is the repository's own state, not counted against the window.
+//! - *Check,* at the end of each window, before the tool call returns, so the
+//!   run's next git operation never meets an unchecked write: the
 //!   repository's config parses, `git for-each-ref` reports no broken ref,
 //!   every ref and `HEAD` file names an object that exists (or is symbolic),
-//!   this worktree's `HEAD` resolves to a commit and its index reads. When the
-//!   attempt ends, [`ProtectedWrites::finish`] adds `git fsck
-//!   --connectivity-only` over the shared repository. A settings file is
-//!   checked by the validator the host gives (the same parser the host loads
-//!   it with). A problem the per-write check already found before the
-//!   attempt's first git write is the repository's own, not counted against
-//!   the write.
-//! - *On a failed check:* the snapshot is restored: first only the files that
-//!   changed and are invalid on their own (so a ref another worker's merge
-//!   moved meanwhile is kept), then, if the check still fails, every changed
-//!   file. The attempt is marked failed with the check's output
-//!   ([`ProtectedWrites::failure`]), the write is recorded as
-//!   `restored: <output>`, and the worker's result is failed, so it is never
-//!   merged.
+//!   this worktree's `HEAD` resolves to a commit and its index reads; and,
+//!   when an object file the snapshot holds is missing or replaced, `git fsck
+//!   --connectivity-only` over the shared repository (so a `git gc` that
+//!   packed loose objects passes, and a deleted object does not). When the
+//!   attempt ends, [`ProtectedWrites::finish`] runs that fsck once more under
+//!   the lock, then deletes the object snapshot. A settings file is checked
+//!   by the validator the host gives (the same parser the host loads it
+//!   with).
+//! - *On a failed check:* the object files that are missing or replaced are
+//!   put back from the snapshot (each verified first) and new object files
+//!   are kept; then, if the check still fails, the snapshotted files that
+//!   changed and are invalid on their own; then every changed one. If the
+//!   check still fails after that, its output says so. Either way the attempt
+//!   is marked failed with the check's output ([`ProtectedWrites::failure`]),
+//!   the window is recorded as `restored: <output>`, and the worker's result
+//!   is failed, so it is never merged: the damage was the attempt's own
+//!   (the lock rules out anyone else), and a repository made whole again
+//!   does not make the attempt's work trustworthy.
 //! - *A passing write* is kept and recorded (`kept`) with its path, worker and
 //!   mode, as a [`PermissionEvent::ProtectedWrite`] the run loop traces and
 //!   puts on the activity card.
 //!
-//! Known limits: objects are not restored (a check that finds a corrupt
-//! object fails the attempt and says so); another worker's git operation that
-//! runs during this worker's shell command is not serialized against it.
+//! Known limits: an object file altered in place (git writes them read-only,
+//! so this takes a `chmod`) under the hard-link method altered the snapshot
+//! too, and is reported as not restorable. The end-of-attempt fsck counts a
+//! problem against the attempt when the attempt's first window did not see
+//! it, including one another worker's window left between this attempt's
+//! windows (each window's own check already runs fsck when it loses an
+//! object).
 
 use crate::permissions::{PermissionControl, PermissionMode};
 use std::collections::{BTreeMap, BTreeSet};
@@ -71,6 +100,13 @@ use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
+
+use kgraf_sandbox::repo_lock::{self, RepoLockGuard};
+
+mod objects;
+pub use objects::Method as ObjectSnapshotMethod;
+use objects::ObjectSnapshot;
 
 /// The settings files under `.kgraf` a worker may write in Bypass.
 pub const SETTINGS_FILES: [&str; 2] = ["run.json", "worker.json"];
@@ -82,6 +118,62 @@ pub const GIT_SNAPSHOT_LIMIT: u64 = 32 * 1024 * 1024;
 
 /// The largest settings file that may be snapshotted and written.
 pub const SETTINGS_FILE_LIMIT: u64 = 1024 * 1024;
+
+/// The most an object-store snapshot may copy when hard links are impossible
+/// (the state directory on another file system than the repository). A
+/// store over it gets no Bypass shell git window (the command runs with the
+/// git directory read-only, and says why) rather than an unrestorable one.
+/// Hard links have no bound: they copy no data.
+pub const OBJECT_COPY_LIMIT: u64 = 512 * 1024 * 1024;
+
+/// Where object snapshots live, under the project's state directory, which
+/// is never a sandbox writable root.
+pub const SNAPSHOT_DIR: &str = "git-snapshots";
+
+/// Why a git window was not opened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WindowError {
+    /// The repository lock was not taken in time: nothing may run that
+    /// writes the git directory. A shell command is not run.
+    Busy(String),
+    /// A snapshot cannot be taken (a bound, an unreadable file): no
+    /// protected git write is made; a shell command runs with the git
+    /// directory read-only.
+    Unprotected(String),
+}
+
+impl std::fmt::Display for WindowError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WindowError::Busy(e) | WindowError::Unprotected(e) => f.write_str(e),
+        }
+    }
+}
+
+/// An open protected write: holds the repository lock for a git write until
+/// dropped, which must come after [`ProtectedWrites::after_write`].
+#[derive(Debug)]
+#[must_use = "the window holds the repository lock until the write is checked"]
+pub struct WriteWindow {
+    _lock: Option<RepoLockGuard>,
+}
+
+/// An open Bypass shell git window: the git directory the sandbox may also
+/// write, and the repository lock, held until
+/// [`ProtectedWrites::after_shell`] has checked the command's changes.
+#[derive(Debug)]
+#[must_use = "pass the window to after_shell, which checks the command's git changes"]
+pub struct ShellWindow {
+    root: PathBuf,
+    lock: Option<RepoLockGuard>,
+}
+
+impl ShellWindow {
+    /// The shared git directory, to add as a sandbox writable root.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+}
 
 /// Validates a settings file after a write: its name (one of
 /// [`SETTINGS_FILES`]) and its path. `Err` carries what is wrong.
@@ -107,6 +199,13 @@ pub struct Target {
 struct State {
     /// The last good copy of the git files, by absolute path.
     git: Option<BTreeMap<PathBuf, Vec<u8>>>,
+    /// The object store's snapshot, from the attempt's first shell window
+    /// until [`ProtectedWrites::finish`].
+    objects: Option<ObjectSnapshot>,
+    /// A shell window was opened and not yet checked (its window was dropped
+    /// without [`ProtectedWrites::after_shell`]): the next window or the
+    /// finish checks first.
+    shell_unchecked: bool,
     /// The last good copy of each settings file (`None`: it did not exist).
     settings: BTreeMap<String, Option<Vec<u8>>>,
     /// A git write or a Bypass shell command happened since the last full
@@ -115,9 +214,12 @@ struct State {
     failure: Option<String>,
     /// Every path a protected write named, kept or restored.
     written: BTreeSet<String>,
-    /// What the cheap repository check already found before the attempt's
-    /// first git write.
+    /// What the cheap repository check found when the current window
+    /// opened (the repository's own state, not the window's).
     baseline: BTreeSet<String>,
+    /// What it found when the attempt's first window opened, for the
+    /// end-of-attempt check.
+    first_baseline: BTreeSet<String>,
 }
 
 /// One attempt's guard over protected writes. Shared by its `apply_patch`
@@ -131,6 +233,9 @@ pub struct ProtectedWrites {
     state_dir: PathBuf,
     settings_check: SettingsCheck,
     git_exe: Option<PathBuf>,
+    lock_timeout: Duration,
+    object_copy_limit: u64,
+    force_object_copy: bool,
     state: Mutex<State>,
 }
 
@@ -195,8 +300,58 @@ impl ProtectedWrites {
             git_exe: kgraf_sandbox::git::Git::discover()
                 .ok()
                 .map(|g| g.exe().to_path_buf()),
+            lock_timeout: repo_lock::DEFAULT_TIMEOUT,
+            object_copy_limit: OBJECT_COPY_LIMIT,
+            force_object_copy: false,
             state: Mutex::new(State::default()),
         }
+    }
+
+    /// The longest a window waits for the repository lock
+    /// ([`repo_lock::DEFAULT_TIMEOUT`] unless set).
+    pub fn with_lock_timeout(mut self, timeout: Duration) -> Self {
+        self.lock_timeout = timeout;
+        self
+    }
+
+    /// The object-copy bound ([`OBJECT_COPY_LIMIT`] unless set).
+    pub fn with_object_copy_limit(mut self, bytes: u64) -> Self {
+        self.object_copy_limit = bytes;
+        self
+    }
+
+    /// Copy object files as if hard links were impossible (the path taken
+    /// when the state directory is on another file system).
+    pub fn with_object_copies(mut self) -> Self {
+        self.force_object_copy = true;
+        self
+    }
+
+    /// How the attempt's object snapshot holds its files, while it has one.
+    pub fn object_snapshot(&self) -> Option<(ObjectSnapshotMethod, PathBuf)> {
+        self.state()
+            .objects
+            .as_ref()
+            .map(|o| (o.method(), o.dir().to_path_buf()))
+    }
+
+    /// Whether a shell command opens a git window in Bypass: one of its words
+    /// contains `git` (any case) or the shared git directory's path.
+    pub fn names_git(&self, argv: &[String]) -> bool {
+        let common = self.common_dir.to_string_lossy();
+        argv.iter().any(|w| {
+            w.to_ascii_lowercase().contains("git") || (!common.is_empty() && w.contains(&*common))
+        })
+    }
+
+    fn lock(&self, purpose: &str) -> Result<RepoLockGuard, WindowError> {
+        repo_lock::acquire(
+            &self.common_dir,
+            repo_lock::Mode::Exclusive,
+            &format!("worker {} {purpose}", self.worker),
+            self.lock_timeout,
+        )
+        .map_err(|e| WindowError::Busy(e.to_string()))
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -256,9 +411,8 @@ impl ProtectedWrites {
         };
         if head == OsStr::new("objects") {
             return Err(
-                "`.git/objects` holds the repository's objects, which are not \
-                        snapshotted, so a faulty write there could not be restored; let git \
-                        write objects (a shell git command in Bypass)"
+                "`.git/objects` holds the repository's objects, compressed files only git \
+                        writes; let git write them (a shell git command in Bypass)"
                     .into(),
             );
         }
@@ -323,37 +477,90 @@ impl ProtectedWrites {
         }
     }
 
-    /// Take the area's snapshot if this attempt has none yet. Call before
-    /// the write; an `Err` means the write must not be made.
-    pub fn before_write(&self, area: &Area) -> Result<(), String> {
-        let mut st = self.state();
+    /// Open a protected write to `area`: for git, take the repository lock
+    /// and the snapshot. Keep the window until [`Self::after_write`] has run
+    /// for every write it covers; an `Err` means the write must not be made.
+    pub fn before_write(&self, area: &Area) -> Result<WriteWindow, WindowError> {
         match area {
             Area::Git => {
-                if st.git.is_none() {
-                    st.baseline = self.problems(false)?.into_iter().collect();
-                    st.git = Some(self.snapshot_git()?);
-                }
+                let lock = self.lock("protected git write")?;
+                let mut st = self.state();
+                self.settle_unchecked(&mut st);
+                self.open_git(&mut st, false)
+                    .map_err(WindowError::Unprotected)?;
+                Ok(WriteWindow { _lock: Some(lock) })
             }
             Area::Settings(name) => {
+                let mut st = self.state();
                 if !st.settings.contains_key(name) {
                     let path = self.state_dir.join(name);
-                    let bytes = read_bounded(&path, SETTINGS_FILE_LIMIT)?;
+                    let bytes = read_bounded(&path, SETTINGS_FILE_LIMIT)
+                        .map_err(WindowError::Unprotected)?;
                     st.settings.insert(name.clone(), bytes);
+                }
+                Ok(WriteWindow { _lock: None })
+            }
+        }
+    }
+
+    /// The start of a git window, under the lock: the repository's state now
+    /// is the baseline and the snapshot; a shell window also brings the
+    /// object snapshot up to date (taking it at the attempt's first one).
+    fn open_git(&self, st: &mut State, shell: bool) -> Result<(), String> {
+        let baseline: BTreeSet<String> = self.problems(false)?.into_iter().collect();
+        let snapshot = self.snapshot_git()?;
+        if shell {
+            match st.objects.as_mut() {
+                Some(o) => o.sync()?,
+                None => {
+                    st.objects = Some(ObjectSnapshot::take(
+                        &self.common_dir.join("objects"),
+                        self.snapshot_dir(),
+                        self.force_object_copy,
+                        self.object_copy_limit,
+                    )?);
                 }
             }
         }
+        if st.git.is_none() {
+            st.first_baseline = baseline.clone();
+        }
+        st.baseline = baseline;
+        st.git = Some(snapshot);
         Ok(())
+    }
+
+    /// A directory of this attempt's own under the state directory.
+    fn snapshot_dir(&self) -> PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let worker: String = self
+            .worker
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        self.state_dir.join(SNAPSHOT_DIR).join(format!(
+            "{worker}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ))
     }
 
     /// Check the area after a write to `shown` (the path as the worker named
     /// it), restore the snapshot when the check fails, and record the write.
-    /// `Err` carries the check's output; the attempt is then failed.
+    /// Call while the write's [`WriteWindow`] is held. `Err` carries the
+    /// check's output; the attempt is then failed.
     pub fn after_write(&self, area: &Area, shown: &str) -> Result<(), String> {
         let mut st = self.state();
         let result = match area {
             Area::Git => {
                 st.git_touched = true;
-                self.check_git_and_restore(&mut st, false)
+                self.check_git_and_restore(&mut st, false, &[])
             }
             Area::Settings(name) => self.check_settings_and_restore(&mut st, name),
         };
@@ -382,71 +589,137 @@ impl ProtectedWrites {
                 let line = format!(
                     "a protected write to {shown} failed its integrity check and was restored: {output}"
                 );
-                st.failure = Some(match st.failure.take() {
-                    Some(prev) => format!("{prev}\n{line}"),
-                    None => line.clone(),
-                });
+                push_failure(st, line.clone());
                 Err(line)
             }
         }
     }
 
-    /// Before a shell command in Bypass: the git directory the sandbox may
-    /// also write, with its snapshot taken. `Ok(None)` outside Bypass;
-    /// `Err` when the snapshot cannot be taken (the command then runs
-    /// without the git directory writable).
-    pub fn before_shell(&self) -> Result<Option<PathBuf>, String> {
-        if !self.bypass() {
+    /// Before a shell command in Bypass that names git ([`Self::names_git`]):
+    /// take the repository lock and the snapshots, and return the window
+    /// whose root the sandbox may also write. `Ok(None)` outside Bypass and
+    /// for a command that does not name git (it runs with the git directory
+    /// read-only).
+    pub fn before_shell(&self, argv: &[String]) -> Result<Option<ShellWindow>, WindowError> {
+        if !self.bypass() || !self.names_git(argv) {
             return Ok(None);
         }
-        self.before_write(&Area::Git)?;
-        Ok(Some(self.common_dir.clone()))
+        let lock = self.lock("shell git command")?;
+        let mut st = self.state();
+        self.settle_unchecked(&mut st);
+        self.open_git(&mut st, true)
+            .map_err(WindowError::Unprotected)?;
+        st.shell_unchecked = true;
+        Ok(Some(ShellWindow {
+            root: self.common_dir.clone(),
+            lock: Some(lock),
+        }))
     }
 
-    /// After a shell command that ran with the git directory writable: if a
-    /// snapshotted file changed, check (and restore on failure), recording
-    /// each changed file as a protected write.
-    pub fn after_shell(&self) -> Result<(), String> {
+    /// After a shell command that ran with the git directory writable, still
+    /// under its lock: if a snapshotted file changed or an object file is
+    /// missing or replaced, check (and restore on failure), recording the
+    /// changed files as one protected write. The lock is released when this
+    /// returns.
+    pub fn after_shell(&self, mut window: ShellWindow) -> Result<(), String> {
+        let _lock = window.lock.take();
         let mut st = self.state();
+        st.shell_unchecked = false;
+        self.check_shell(&mut st)
+    }
+
+    fn check_shell(&self, st: &mut State) -> Result<(), String> {
         let Some(snapshot) = st.git.as_ref() else {
             return Ok(());
         };
         let changed = match self.changed_files(snapshot) {
             Ok(c) => c,
-            Err(e) => return self.settle(&mut st, ".git", Err(e)),
+            Err(e) => return self.settle(st, ".git", Err(e)),
         };
-        if changed.is_empty() {
+        let lost = match st.objects.as_ref().map(ObjectSnapshot::lost).transpose() {
+            Ok(l) => l.unwrap_or_default(),
+            Err(e) => return self.settle(st, ".git/objects", Err(e)),
+        };
+        if changed.is_empty() && lost.is_empty() {
             return Ok(());
         }
         st.git_touched = true;
-        // Worded as what changed while the command ran, not as this worker's
-        // writes: kGraf's own merges for other workers move refs in the same
-        // repository meanwhile, and the comparison cannot tell them apart.
-        let shown = format!(
-            "{} (changed while a shell command ran)",
-            changed
-                .iter()
-                .map(|p| self.shown_git_path(p))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        let result = self.check_git_and_restore(&mut st, false);
-        self.settle(&mut st, &shown, result)
+        // Exact: the window held the repository lock, so every change since
+        // its snapshot is the command's own.
+        let mut shown: Vec<String> = changed.iter().map(|p| self.shown_git_path(p)).collect();
+        if !lost.is_empty() {
+            shown.push(format!(
+                ".git/objects ({} object files removed or replaced)",
+                lost.len()
+            ));
+        }
+        let result = self.check_git_and_restore(st, !lost.is_empty(), &lost);
+        self.settle(st, &shown.join(", "), result)
     }
 
-    /// When the attempt ends: the full check (`git fsck --connectivity-only`
-    /// over the shared repository) if any git write happened, then the first
-    /// failure, if any. The worker's result is failed on `Err`.
+    /// A shell window dropped without its check (its call was abandoned): the
+    /// lock was released at the drop, so check now, before anything else,
+    /// and say the attribution is no longer exact.
+    fn settle_unchecked(&self, st: &mut State) {
+        if std::mem::take(&mut st.shell_unchecked)
+            && let Err(e) = self.check_shell(st)
+        {
+            push_failure(
+                st,
+                format!(
+                    "{e} (checked after an abandoned shell command; the repository may have \
+                     changed since)"
+                ),
+            );
+        }
+    }
+
+    /// When the attempt ends: under the repository lock, the full check
+    /// (`git fsck --connectivity-only` over the shared repository) if any git
+    /// write happened, with the restore on failure; then the object snapshot
+    /// is deleted, and the first failure, if any, is returned. The worker's
+    /// result is failed on `Err`.
     pub fn finish(&self) -> Result<(), String> {
+        let touched = {
+            let st = self.state();
+            (st.git_touched || st.shell_unchecked) && st.git.is_some()
+        };
+        let lock = if touched {
+            match self.lock("end-of-attempt check") {
+                Ok(l) => Some(l),
+                Err(e) => {
+                    push_failure(
+                        &mut self.state(),
+                        format!("the end-of-attempt repository check did not run: {e}"),
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let mut st = self.state();
-        if st.git_touched && st.git.is_some() {
+        if lock.is_some() {
+            self.settle_unchecked(&mut st);
             st.git_touched = false;
-            let result = self.check_git_and_restore(&mut st, true);
+            st.baseline = st.first_baseline.clone();
+            let lost = match st.objects.as_ref().map(ObjectSnapshot::lost).transpose() {
+                Ok(l) => l.unwrap_or_default(),
+                Err(e) => {
+                    let _ = self.settle(&mut st, ".git/objects", Err(e));
+                    Vec::new()
+                }
+            };
+            let result = self.check_git_and_restore(&mut st, true, &lost);
             if result.is_err() {
                 // The shown path is the repository: the full check covers it all.
                 let _ = self.settle(&mut st, ".git", result);
             }
         }
+        if let Some(mut o) = st.objects.take() {
+            o.remove();
+        }
+        drop(lock);
         match &st.failure {
             Some(f) => Err(f.clone()),
             None => Ok(()),
@@ -668,10 +941,28 @@ impl ProtectedWrites {
             Ok((_, _, err)) => problems.push(format!("git for-each-ref: {}", err.trim())),
             Err(e) => problems.push(e),
         }
+        // Each file's own syntax first, then every object id they name in one
+        // `cat-file --batch-check`: one git process however many refs.
+        let mut named: Vec<(PathBuf, Vec<String>)> = Vec::new();
         for path in self.git_scope()? {
-            if let Err(e) = self.valid_file(&path) {
-                problems.push(format!("{}: {e}", self.shown_git_path(&path)));
+            match self.file_ids(&path) {
+                Ok(ids) => named.push((path, ids)),
+                Err(e) => problems.push(format!("{}: {e}", self.shown_git_path(&path))),
             }
+        }
+        let all: BTreeSet<String> = named.iter().flat_map(|(_, ids)| ids.clone()).collect();
+        match self.missing_ids(&all) {
+            Ok(missing) => {
+                for (path, ids) in &named {
+                    if let Some(id) = ids.iter().find(|id| missing.contains(*id)) {
+                        problems.push(format!(
+                            "{}: names an object that does not exist ({id} missing)",
+                            self.shown_git_path(path)
+                        ));
+                    }
+                }
+            }
+            Err(e) => problems.push(e),
         }
         if let Err(e) = self.git(
             &self.admin_dir,
@@ -704,6 +995,40 @@ impl ProtectedWrites {
 
     /// Whether one snapshotted file is valid on its own.
     fn valid_file(&self, path: &Path) -> Result<(), String> {
+        let ids: BTreeSet<String> = self.file_ids(path)?.into_iter().collect();
+        match self.missing_ids(&ids)?.into_iter().next() {
+            Some(id) => Err(format!(
+                "names an object that does not exist ({id} missing)"
+            )),
+            None => Ok(()),
+        }
+    }
+
+    /// The object ids in `ids` the repository does not have.
+    fn missing_ids(&self, ids: &BTreeSet<String>) -> Result<BTreeSet<String>, String> {
+        if ids.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let mut input = ids.iter().cloned().collect::<Vec<_>>().join("\n");
+        input.push('\n');
+        let (ok, out, err) = self.git_raw(
+            &self.common_dir,
+            ["cat-file", "--batch-check"],
+            Some(input.as_bytes()),
+        )?;
+        if !ok {
+            return Err(format!("cat-file: {}", err.trim()));
+        }
+        Ok(out
+            .lines()
+            .filter_map(|l| l.strip_suffix(" missing"))
+            .map(str::to_owned)
+            .collect())
+    }
+
+    /// One snapshotted file's own syntax; `Ok` carries the object ids it
+    /// names, for the caller to look up.
+    fn file_ids(&self, path: &Path) -> Result<Vec<String>, String> {
         let meta = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
         if !meta.is_file() {
             return Err("not a regular file".into());
@@ -711,7 +1036,7 @@ impl ProtectedWrites {
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         let in_refs = path.starts_with(self.common_dir.join("refs"));
         if path.starts_with(self.common_dir.join("info")) || name == "shallow" {
-            return Ok(());
+            return Ok(Vec::new());
         }
         if name == "config" && path.parent() == Some(self.common_dir.as_path()) {
             return self
@@ -724,7 +1049,7 @@ impl ProtectedWrites {
                         OsStr::new("--list"),
                     ],
                 )
-                .map(|_| ())
+                .map(|_| Vec::new())
                 .map_err(|e| format!("does not parse: {e}"));
         }
         if name == "index" {
@@ -739,7 +1064,7 @@ impl ProtectedWrites {
                 None,
             )?;
             return if ok {
-                Ok(())
+                Ok(Vec::new())
             } else {
                 Err(format!("the index does not read: {}", err.trim()))
             };
@@ -749,7 +1074,7 @@ impl ProtectedWrites {
             return if text.trim().is_empty() || text.trim().lines().count() != 1 {
                 Err("is not one path".into())
             } else {
-                Ok(())
+                Ok(Vec::new())
             };
         }
         let text = std::fs::read(path).map_err(|e| e.to_string())?;
@@ -779,35 +1104,42 @@ impl ProtectedWrites {
                 return Err(format!("{t:?} is neither an object id nor a symbolic ref"));
             }
         }
-        if ids.is_empty() {
-            return Ok(());
-        }
-        let mut input = ids.join("\n");
-        input.push('\n');
-        let (ok, out, err) = self.git_raw(
-            &self.common_dir,
-            ["cat-file", "--batch-check"],
-            Some(input.as_bytes()),
-        )?;
-        if !ok {
-            return Err(format!("cat-file: {}", err.trim()));
-        }
-        match out.lines().find(|l| l.ends_with(" missing")) {
-            Some(l) => Err(format!("names an object that does not exist ({l})")),
-            None => Ok(()),
-        }
+        Ok(ids)
     }
 
-    /// Check; on failure restore (changed and invalid files first, then every
-    /// changed file) and check again. A passing check refreshes the snapshot.
-    fn check_git_and_restore(&self, st: &mut State, full: bool) -> Result<(), String> {
+    /// Check (with fsck when `full`); on failure restore and check again.
+    /// The restore goes from least to most: the object files in `lost` that
+    /// are missing or replaced (new object files are kept), then the
+    /// snapshotted files that changed and are invalid on their own, then every
+    /// changed one. A passing check refreshes the snapshot.
+    fn check_git_and_restore(
+        &self,
+        st: &mut State,
+        full: bool,
+        lost: &[PathBuf],
+    ) -> Result<(), String> {
         let first = match self.check_git(full, &st.baseline) {
             Ok(()) => {
                 st.git = Some(self.snapshot_git()?);
+                if let Some(o) = st.objects.as_mut() {
+                    o.sync()?;
+                }
                 return Ok(());
             }
             Err(e) => e,
         };
+        let mut notes = Vec::new();
+        if !lost.is_empty()
+            && let Some(o) = st.objects.as_mut()
+        {
+            match o.restore(lost) {
+                Ok(n) => notes.push(format!("{n} object files restored from the snapshot")),
+                Err(e) => notes.push(format!("not restored: {e}")),
+            }
+            if self.check_git(full, &st.baseline).is_ok() {
+                return Err(with_notes(first, &notes));
+            }
+        }
         let snapshot = st.git.clone().unwrap_or_default();
         let changed = self.changed_files(&snapshot)?;
         let invalid: Vec<PathBuf> = changed
@@ -821,7 +1153,7 @@ impl ProtectedWrites {
             })?;
         }
         if self.check_git(full, &st.baseline).is_ok() {
-            return Err(first);
+            return Err(with_notes(first, &notes));
         }
         for path in &changed {
             restore_file(path, snapshot.get(path).map(Vec::as_slice)).map_err(|e| {
@@ -829,13 +1161,41 @@ impl ProtectedWrites {
             })?;
         }
         match self.check_git(full, &st.baseline) {
-            Ok(()) => Err(first),
+            Ok(()) => Err(with_notes(first, &notes)),
             Err(still) => Err(format!(
-                "{first}; the snapshot was restored and the repository still fails its check \
-                 (objects are not snapshotted): {still}"
+                "{}; the snapshot was restored and the repository still fails its check: {still}",
+                with_notes(first, &notes)
             )),
         }
     }
+}
+
+impl Drop for ProtectedWrites {
+    /// The object snapshot goes with the attempt even when
+    /// [`ProtectedWrites::finish`] never ran.
+    fn drop(&mut self) {
+        let st = self.state.get_mut().unwrap_or_else(|p| p.into_inner());
+        if let Some(mut o) = st.objects.take() {
+            o.remove();
+        }
+    }
+}
+
+/// The restore's notes first: a long check output (fsck) is cut short where
+/// it is shown, and what was put back must survive the cut.
+fn with_notes(first: String, notes: &[String]) -> String {
+    if notes.is_empty() {
+        first
+    } else {
+        format!("{}; the check found: {first}", notes.join("; "))
+    }
+}
+
+fn push_failure(st: &mut State, line: String) {
+    st.failure = Some(match st.failure.take() {
+        Some(prev) => format!("{prev}\n{line}"),
+        None => line,
+    });
 }
 
 fn is_object_id(s: &str) -> bool {

@@ -133,11 +133,17 @@ fn apply_protected(
             areas.push(h.target.area.clone());
         }
     }
+    // Each window (for git: the repository lock) stays open until every
+    // write in it is checked, below.
+    let mut windows = Vec::new();
     for area in &areas {
-        if let Err(e) = guard.before_write(area) {
-            return Ok(ToolOutput::error(format!(
-                "the protected write was not made: {e}"
-            )));
+        match guard.before_write(area) {
+            Ok(w) => windows.push(w),
+            Err(e) => {
+                return Ok(ToolOutput::error(format!(
+                    "the protected write was not made: {e}"
+                )));
+            }
         }
     }
     let mut roots: Vec<PathBuf> = Vec::new();
@@ -166,6 +172,7 @@ fn apply_protected(
             Err(e) => problems.push(e),
         }
     }
+    drop(windows);
     if problems.is_empty() {
         Ok(ToolOutput::text(format!(
             "Success. Wrote these protected paths (Bypass mode), each checked after the write:\n{}",

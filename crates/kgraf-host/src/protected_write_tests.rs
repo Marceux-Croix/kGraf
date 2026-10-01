@@ -24,6 +24,9 @@ enum Worker {
     BadSettings,
     /// Tries the ledger and the trace, then writes `a.txt`.
     Books,
+    /// Deletes the object of its `HEAD` commit and every pack with a shell
+    /// git command, then writes `a.txt`.
+    DeletesObjects,
 }
 
 struct Script {
@@ -106,6 +109,16 @@ impl Provider for Script {
                     round,
                 )),
                 (Worker::CorruptsRef, 1) => Some(write_a()),
+                (Worker::DeletesObjects, 0) => Some(tool(
+                    "shell",
+                    serde_json::json!({"command": [
+                        "sh", "-c",
+                        "o=\"$(git rev-parse --git-path objects)\"; h=\"$(git rev-parse HEAD)\"; \
+                         rm -f \"$o/$(echo $h | cut -c1-2)/$(echo $h | cut -c3-)\" \"$o\"/pack/*"
+                    ]}),
+                    round,
+                )),
+                (Worker::DeletesObjects, 1) => Some(write_a()),
                 (Worker::BadSettings, 0) => Some(tool(
                     "apply_patch",
                     patch("*** Add File: .kgraf/worker.json\n+{\"shell_timeout_secs\": 0}"),
@@ -307,6 +320,64 @@ async fn bypass_restores_a_corrupted_ref_and_fails_the_attempt() {
         &["rev-parse", "--verify", "refs/heads/main"]
     ));
     assert!(!git_ok(&r.root, &["cat-file", "-e", "kgraf/pw-ref:a.txt"]));
+}
+
+/// Bypass: a shell git command that deletes its HEAD commit's object (and
+/// any pack) is caught when it ends; the object is restored from the
+/// attempt's object snapshot, every attempt fails with the check's output,
+/// nothing is merged, the repository passes fsck, and no snapshot is left
+/// in the state directory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bypass_restores_deleted_objects_and_fails_the_attempt() {
+    let r = run(
+        Worker::DeletesObjects,
+        kgraf_tools::PermissionMode::Bypass,
+        "pw-objects",
+    )
+    .await;
+    assert_ne!(
+        r.report.status,
+        kgraf_orchestrator::RunStatus::Completed,
+        "{}",
+        r.trace
+    );
+    assert!(r.report.verified.is_empty());
+    let failed: Vec<&str> = r
+        .trace
+        .lines()
+        .filter(|l| l.contains(r#""event":"worker_finished""#))
+        .collect();
+    assert!(!failed.is_empty(), "{}", r.trace);
+    assert!(
+        failed
+            .iter()
+            .all(|l| l.contains(r#""outcome":"failed""#) && l.contains("object files restored")),
+        "{failed:?}"
+    );
+    let lines = protected_lines(&r.trace);
+    assert!(
+        !lines.is_empty()
+            && lines
+                .iter()
+                .all(|l| l.contains(".git/objects") && l.contains("restored")),
+        "{lines:?}"
+    );
+    assert!(git_ok(
+        &r.root,
+        &["fsck", "--connectivity-only", "--no-dangling"]
+    ));
+    assert!(!git_ok(
+        &r.root,
+        &["cat-file", "-e", "kgraf/pw-objects:a.txt"]
+    ));
+    let left: Vec<_> = std::fs::read_dir(
+        r.root
+            .join(".kgraf")
+            .join(kgraf_tools::protected::SNAPSHOT_DIR),
+    )
+    .map(|d| d.flatten().map(|e| e.path()).collect())
+    .unwrap_or_default();
+    assert!(left.is_empty(), "{left:?}");
 }
 
 /// Bypass: a settings file the host would refuse to load is put back (here

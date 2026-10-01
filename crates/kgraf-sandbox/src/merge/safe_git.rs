@@ -100,6 +100,23 @@ impl SafeGit {
         S: AsRef<OsStr>,
     {
         let args: Vec<OsString> = args.into_iter().map(|a| a.as_ref().to_owned()).collect();
+        // Shared repository lock for this one process (decision 0094): a
+        // merge step never runs while a worker's Bypass git window is open.
+        // None while bootstrapping (no shared directory known yet), when only
+        // `version` and `rev-parse` run.
+        let _repo = if self.common_dir.as_os_str().is_empty() {
+            None
+        } else {
+            Some(
+                crate::repo_lock::acquire(
+                    &self.common_dir,
+                    crate::repo_lock::Mode::Shared,
+                    &format!("kGraf merge-back git {}", display(&args)),
+                    crate::repo_lock::DEFAULT_TIMEOUT,
+                )
+                .map_err(WorkspaceError::from)?,
+            )
+        };
         let mut cmd = self.command(target)?;
         cmd.args(&args);
         for (k, v) in env {

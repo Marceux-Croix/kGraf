@@ -1558,6 +1558,11 @@ pub(crate) mod child {
         args: &[&str],
         stdin: Option<&[u8]>,
     ) -> Result<Vec<u8>, String> {
+        // Shared repository lock for this one process (decision 0094): the
+        // view's checkout and the child refs never move while a worker's
+        // Bypass git window is open on the repository.
+        let _repo = kgraf_sandbox::repo_lock::shared_for(repo, &format!("kGraf git {args:?}"))
+            .map_err(|e| e.to_string())?;
         let mut cmd = Command::new("git");
         for var in REDIRECT {
             cmd.env_remove(var);

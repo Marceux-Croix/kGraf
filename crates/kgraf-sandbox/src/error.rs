@@ -78,6 +78,10 @@ pub enum WorkspaceError {
     /// A per-path guard was poisoned by a panic in another thread.
     #[error("workspace guard poisoned for {0}")]
     GuardPoisoned(PathBuf),
+    /// The repository lock that serializes kGraf's git processes against a
+    /// worker's Bypass git window was not taken in time (decision 0094).
+    #[error(transparent)]
+    RepoLock(#[from] crate::repo_lock::RepoLockError),
     #[error("I/O error at {path}: {source}")]
     Io {
         path: PathBuf,

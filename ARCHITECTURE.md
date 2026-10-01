@@ -1098,12 +1098,20 @@ requests at once, and requests raised within 2 s of each other are answered as
 one group in the box. The user's deny and ask rules and the refusal to delete
 system paths hold in every mode; a run nobody attends denies what would ask.
 In Bypass only, a worker may also write the repository's git directory
-(`.git/<path>`, resolved as git resolves it) and kGraf's settings
+(`.git/<path>`, resolved as git resolves it; through `apply_patch`, and
+through a shell command that names git) and kGraf's settings
 (`.kgraf/run.json`, `.kgraf/worker.json`), each write behind a bounded
 snapshot and an integrity check that runs before the call returns, with
-`git fsck --connectivity-only` when the attempt ends; a failed check restores
-the snapshot and fails the attempt, so it is never merged. The ledger, trace,
-run records, transcripts and graph stay refused in every mode.
+`git fsck --connectivity-only` when an object file went missing and when the
+attempt ends; a failed check restores the snapshot (object files from a
+hard-link snapshot of the object store, copies where links are impossible)
+and fails the attempt, so it is never merged. Each such write, with its check
+and restore, holds the repository's lock exclusively, and every git process
+kGraf runs on the repository (merges, the integration view, ref updates,
+worktree add and remove) holds it shared: an advisory `flock` on the shared
+git directory itself, so it also serializes two kGraf processes and a crashed
+holder's lock is released by the kernel; waits are bounded and fail loud. The
+ledger, trace, run records, transcripts and graph stay refused in every mode.
 An instructions report amends the contract once; at most two re-dispatches per
 contract for shortfalls. With plan review on, no worker starts until the user
 approves the plan in the box. A contract accepted on a check that always

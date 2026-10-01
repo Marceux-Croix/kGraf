@@ -82,6 +82,10 @@ impl Git {
         use std::io::Write;
         use std::process::Stdio;
         let args: Vec<OsString> = args.into_iter().map(|a| a.as_ref().to_owned()).collect();
+        // Shared repository lock for this one process (decision 0094): never
+        // while a worker's Bypass git window is open on the same repository.
+        let _repo =
+            crate::repo_lock::shared_for(cwd, &format!("kGraf git {}", display_args(&args)))?;
         let mut cmd = Command::new(&self.exe);
         cmd.arg("-C").arg(cwd).args(&args);
         for var in GIT_REDIRECT_ENV {
