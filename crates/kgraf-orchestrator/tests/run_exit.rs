@@ -57,7 +57,12 @@ async fn a_loop_error_with_a_worker_in_flight_cancels_it_and_frees_every_slot() 
         parts.stats.requests().iter().any(|r| r.1.contains("HOLDB"))
     })
     .await;
-    assert_eq!(machine.agents_live(), 2, "both workers hold a machine slot");
+    // The slot is taken at admission, before the worker's first request, so
+    // this is a bound on the real event and not a guess at its timing.
+    wait_for("both workers to hold a machine slot", || {
+        machine.agents_live() == 2
+    })
+    .await;
 
     // From now on the store refuses the run record; `b` finishing makes the
     // loop save it.
@@ -81,7 +86,16 @@ async fn a_loop_error_with_a_worker_in_flight_cancels_it_and_frees_every_slot() 
         "the original error, not a cleanup one: {error:?}"
     );
 
-    // Every slot is back: the local gate and the process-wide one.
+    // Every slot is back: the local gate and the process-wide one. A dropped
+    // flight keeps its slot and holds until its worker's task has ended, then
+    // returns them from a task of its own (`InFlight::drop`), so they come
+    // back just after the run returns, not before. Wait for that release.
+    wait_for("every slot and hold to be returned", || {
+        parts.admission.gate().in_flight() == (0, 0)
+            && machine.agents_live() == 0
+            && parts.admission.budget().held() == kgraf_core::Money::ZERO
+    })
+    .await;
     assert_eq!(
         parts.admission.gate().in_flight(),
         (0, 0),
