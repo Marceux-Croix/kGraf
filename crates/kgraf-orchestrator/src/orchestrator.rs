@@ -1460,6 +1460,11 @@ struct InFlight {
     /// Workers whose attempt was merged before the process died: already on
     /// the integration branch, never merged again.
     premerged: BTreeSet<AgentId>,
+    /// Workers whose attempt stopped on a shortfall the orchestrator held,
+    /// and whose in-scope result is being verified before the hold applies
+    /// (decision 0093, amended 2026-10-02): a pass merges it, a failure
+    /// leaves the hold as it was.
+    held_verify: BTreeSet<AgentId>,
     /// A worktree could not be provided: the retry gets fresh workers.
     renew_workers: bool,
     /// With `renew_workers`: the renewed attempts' worktrees are removed too,
@@ -5329,6 +5334,7 @@ impl RunLoop {
             handed_back: None,
             lease_lost: false,
             premerged: BTreeSet::new(),
+            held_verify: BTreeSet::new(),
             renew_workers: false,
             discard_renewed: false,
             injectors: BTreeMap::new(),
@@ -6187,8 +6193,20 @@ impl RunLoop {
         // orchestrator's cancel. It is neither verified nor a failure; its
         // contract goes on as the shortfall's resolution says. One stopped
         // for reporting shortfalls nothing grounded is stuck: a failure.
+        // Amended 2026-10-02: a shortfall the orchestrator held is a claim
+        // that the contract cannot be done in its scope. When the attempt
+        // changed files in its scope, the verifier judges that claim first:
+        // the attempt goes to verification as a completed one would.
+        let mut verify_held = false;
         if f.merged.is_none() && self.take_shortfall(&f.contract, &f.worker, &mut flight) {
-            return self.finish_attempt(contract, flight).await;
+            if !self.verify_before_hold(&f.contract, &f.result) {
+                return self.finish_attempt(contract, flight).await;
+            }
+            if let Some(i) = idx {
+                flight.attempts[i].status = AttemptStatus::Success;
+            }
+            flight.held_verify.insert(f.worker.clone());
+            verify_held = true;
         }
         if f.merged.is_none() && self.take_shortfall_stuck(&f.contract, &f.worker, &mut flight) {
             return self.finish_attempt(contract, flight).await;
@@ -6245,7 +6263,7 @@ impl RunLoop {
             return self.finish_attempt(contract, flight).await;
         }
         match &f.result.outcome {
-            WorkerOutcome::Completed => {
+            outcome if verify_held || matches!(outcome, WorkerOutcome::Completed) => {
                 // Merge-back scope: a write outside the contract's set fails
                 // the attempt before any verifier sees it.
                 let outside = outside_declared_scope(
@@ -6294,6 +6312,16 @@ impl RunLoop {
                 // Decision 0079: resolved against `self` here, off the loop in
                 // the spawn below, never a second time inside it.
                 let review_setup = self.interface_review_setup(&c, &f.worker);
+                // The plan's other open contracts: work this attempt's tree
+                // may lack, so a check of the whole instruction can fail on
+                // it (decision 0018, amended 2026-10-02).
+                let unmerged: Vec<String> = self
+                    .record
+                    .open_contracts
+                    .iter()
+                    .filter(|o| o.contract != f.contract)
+                    .map(|o| o.contract.clone())
+                    .collect();
                 // The producer's definition of done (0076 step 3, 0081
                 // requirement 3): read here, off `self`, since the spawn below
                 // does not hold it. Empty for a contract that produces no
@@ -6315,7 +6343,10 @@ impl RunLoop {
                 // contract's slot in `in_flight` never clears.
                 let verify_task = tokio::spawn(async move {
                     let mut infrastructure = false;
-                    let mut verdict = match verifier.verify(&c, &workspace, &result).await {
+                    let mut verdict = match verifier
+                        .verify_among(&c, &workspace, &result, &unmerged)
+                        .await
+                    {
                         Ok(v) => v,
                         Err(e) => {
                             infrastructure = true;
@@ -6729,6 +6760,16 @@ impl RunLoop {
         } else {
             verdict
         };
+        // Decision 0093, amended 2026-10-02: an attempt verified before its
+        // held shortfall applies. A pass is the verifier overruling the
+        // claim; a failure leaves the hold as it was.
+        let held_verify = flight.held_verify.remove(&worker);
+        let verdict = if held_verify {
+            self.settle_held_verify(&contract_id, &worker, verdict, &mut flight)
+                .await?
+        } else {
+            verdict
+        };
         let passed = verdict.passed();
         // Live recording (decision 0075): the one write path for
         // `Source::Live` tallies. Wired here, not inside `finalize`/
@@ -6744,9 +6785,11 @@ impl RunLoop {
         // verifier could not run or panicked, or a lease was lost while the
         // attempt was verified. Each would count against the route as a
         // failed attempt (and tilt Fitness away from it) for a fault that is
-        // the environment's.
+        // the environment's. Nor when an attempt stopped on a held shortfall
+        // fails its check: it was cancelled before it finished.
         if !infrastructure
             && !lease_lost
+            && (passed || !held_verify)
             && let Some(attempt) = flight.attempts.iter().find(|a| a.worker == worker)
         {
             self.record_live_outcome(
@@ -8776,6 +8819,7 @@ mod tests {
             handed_back: None,
             lease_lost: false,
             premerged: BTreeSet::new(),
+            held_verify: BTreeSet::new(),
             renew_workers: false,
             discard_renewed: false,
             injectors: BTreeMap::new(),

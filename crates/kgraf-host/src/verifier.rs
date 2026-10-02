@@ -74,6 +74,11 @@ pub(crate) struct CommandVerifier {
     /// declared write scope like any file and merged as plain data (decision
     /// 0094); in every other mode they are refused.
     pub(crate) permissions: Arc<kgraf_tools::PermissionControl>,
+    /// `command` is also one of the run's gate commands, so the root gate
+    /// runs it on the merged result. Only then may an attempt's whole check
+    /// be deferred to it ([`deferred_notice`]); without it a deferred check
+    /// would never run.
+    pub(crate) root_gate: bool,
 }
 
 /// Tries of the hold check, and the pause between them: a process that has
@@ -170,6 +175,34 @@ fn passes_at(
     let (passed, _) = ran?;
     removed.map_err(|e| format!("cannot remove the worktree at {base}: {e}"))?;
     Ok(passed)
+}
+
+/// What a worker checked by the whole command is told about deferral.
+pub(crate) const DEFERRED_BRIEF: &str = "If that command can only pass once other contracts \
+     of the plan have merged (it also fails on the tree you were given), it is checked on the \
+     merged result instead; do your own files' part and do not write files of other contracts \
+     to make it pass. A change of yours that makes it fail where it passed before is still a \
+     failure.";
+
+/// Characters of a deferred check's failing output quoted in its notice.
+const DEFERRED_OUTPUT_CHARS: usize = 300;
+
+/// The notice of an attempt whose whole check was deferred to the root gate
+/// (decision 0018, amended 2026-10-02). Named per contract: the run's notices
+/// are a set.
+fn deferred_notice(contract: &str, command: &str, unmerged: &[String], failed: &str) -> String {
+    let failed: String = failed.trim().chars().take(DEFERRED_OUTPUT_CHARS).collect();
+    format!(
+        "contract {}: `{}` is deferred to the root gate: it failed on this attempt and also at \
+         its dispatch base while contracts {} of the plan were not merged, so the failure \
+         cannot be told apart from their missing work. The attempt passed its scope and \
+         placeholder checks and merges; the whole command runs on the merged result before the \
+         run can complete. It said: {}",
+        clean(contract),
+        clean(command),
+        clean(&unmerged.join(", ")),
+        clean(&failed)
+    )
 }
 
 /// The refusal of an attempt that changed none of its declared files.
@@ -564,8 +597,25 @@ impl Verifier for CommandVerifier {
         &self,
         contract: &OpenContract,
         workspace: &Path,
-        _result: &WorkerResult,
+        result: &WorkerResult,
     ) -> Result<Verdict, String> {
+        self.verify_among(contract, workspace, result, &[]).await
+    }
+
+    async fn verify_among(
+        &self,
+        contract: &OpenContract,
+        workspace: &Path,
+        _result: &WorkerResult,
+        unmerged: &[String],
+    ) -> Result<Verdict, String> {
+        // Only with the whole command also a root gate: a deferred check
+        // must still run before the run can complete.
+        let unmerged: Vec<String> = if self.root_gate {
+            unmerged.to_vec()
+        } else {
+            Vec::new()
+        };
         let Some(ws) = self.workspaces.get(workspace) else {
             return Err(format!(
                 "{} is not a live worktree of this run",
@@ -718,6 +768,41 @@ impl Verifier for CommandVerifier {
                 if !ok {
                     (passed, output, failing) = (false, out, gate_command.clone());
                     break;
+                }
+            }
+            // Decision 0018, amended 2026-10-02: the whole command judges the
+            // whole instruction. On an attempt whose tree lacks other open
+            // contracts of the plan, it can fail on their missing work, and
+            // no attempt of a contract they depend on could ever pass. The
+            // command runs again at the dispatch base: if it passes there,
+            // this attempt's change broke it, a plain failure. If it fails
+            // there too, the failure cannot be told apart from the missing
+            // work, so the check is deferred to the root gate, which runs
+            // the same command on the merged result before the run can
+            // complete. Only a committed (non-empty) attempt, whose scope and
+            // placeholder checks above passed, is deferred.
+            let mut deferred: Option<String> = None;
+            let defers = !passed
+                && failing == command
+                && commit.is_some()
+                && contract.gate_commands.is_empty()
+                && matches!(scope, crate::scoped_check::Scope::Whole { .. })
+                && !unmerged.is_empty();
+            if defers {
+                match passes_at(&manager, ws.head(), &denies, &command, timeout) {
+                    Ok(false) => {
+                        deferred = Some(clean_lines(&output));
+                        passed = true;
+                    }
+                    Ok(true) => output.push_str(
+                        "\n(it passes at the dispatch base, so this attempt's change makes it \
+                         fail)",
+                    ),
+                    Err(e) => output.push_str(&format!(
+                        "\n(it could not be run at the dispatch base to tell whether the \
+                         contracts not merged yet ({}) cause the failure: {e})",
+                        unmerged.join(", ")
+                    )),
                 }
             }
             // 5. Quiet again, held through the cleanup. A process that escaped
@@ -873,11 +958,23 @@ impl Verifier for CommandVerifier {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0);
+            let by = match &deferred {
+                Some(failed) => {
+                    notices.push(deferred_notice(
+                        &contract.contract,
+                        &command,
+                        &unmerged,
+                        failed,
+                    ));
+                    format!("{command} (deferred to the root gate)")
+                }
+                None => command,
+            };
             Ok(Verdict::Pass {
-                by: command.clone(),
+                by: by.clone(),
                 commit: Some(VerifiedCommit {
                     sha: commit,
-                    verified_by: command,
+                    verified_by: by,
                     verified_ms: now,
                 }),
                 notices,
@@ -912,7 +1009,14 @@ impl Verifier for CommandVerifier {
             return None;
         }
         let scope = check_scope(&self.command, contract, workspace);
-        crate::scoped_check::brief(&scope, &self.command)
+        let text = crate::scoped_check::brief(&scope, &self.command)?;
+        // Decision 0018, amended 2026-10-02: the worker is told when the whole
+        // check may be deferred, so it does not chase files of other
+        // contracts that the check needs.
+        if self.root_gate && matches!(scope, crate::scoped_check::Scope::Whole { .. }) {
+            return Some(format!("{text} {DEFERRED_BRIEF}"));
+        }
+        Some(text)
     }
 
     /// The narrowed check a write set gets, read from the repository at plan

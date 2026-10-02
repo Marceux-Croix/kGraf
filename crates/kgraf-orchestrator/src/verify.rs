@@ -66,6 +66,22 @@ pub trait Verifier: Send + Sync {
         result: &WorkerResult,
     ) -> Result<Verdict, String>;
 
+    /// [`Verifier::verify`], told which other contracts of the plan are still
+    /// open (`unmerged`): their work may be missing from the attempt's tree.
+    /// A verifier whose check judges the whole instruction may defer that
+    /// check to the root gate for such an attempt, saying so in the verdict
+    /// (decision 0018, amended 2026-10-02). The default ignores the list.
+    async fn verify_among(
+        &self,
+        contract: &OpenContract,
+        workspace: &Path,
+        result: &WorkerResult,
+        unmerged: &[String],
+    ) -> Result<Verdict, String> {
+        let _ = unmerged;
+        self.verify(contract, workspace, result).await
+    }
+
     /// Re-check a recorded progress claim on resume: whether the commit the
     /// record says was verified still verifies.
     async fn recheck(&self, commit: &VerifiedCommit) -> Result<bool, String>;

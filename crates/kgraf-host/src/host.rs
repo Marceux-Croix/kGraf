@@ -125,6 +125,12 @@ pub enum Notice {
     /// as a root gate on the merged result (`added_gate`: it was not one of
     /// the gate commands already, so it was added).
     AcceptanceNarrowed { command: String, added_gate: bool },
+    /// The acceptance command is not one kGraf narrows: each contract runs it
+    /// whole, and it runs as a root gate on the merged result too
+    /// (`added_gate`: it was not one of the gate commands already). A
+    /// contract whose tree lacks other open contracts' work, and on which it
+    /// fails at the dispatch base too, has it deferred to that root gate.
+    AcceptanceWhole { command: String, added_gate: bool },
     /// An output cap was above what a model supports, so it was lowered for
     /// this run. `which` is `worker` (the cap is the smallest limit among the
     /// worker routes, which rotate) or `orchestrator`.
@@ -1679,6 +1685,32 @@ impl Host {
             model_calls,
             extractor_changed,
         } = base;
+        let gate_commands = match plan {
+            Some(plan) if self.config.gate_commands.is_empty() => plan.validation_commands(),
+            _ => discover_validation_commands(root, &self.config.gate_commands)?,
+        };
+        // A blank command runs nothing and passes: refused for a command from
+        // the plan as for one from the configuration.
+        if let Some(blank) = gate_commands.iter().position(|c| c.trim().is_empty()) {
+            return Err(Error::Invalid(format!(
+                "gate command {} is empty: an empty gate command passes without checking \
+                 anything",
+                blank + 1
+            )));
+        }
+        // The acceptance command always judges the merged result too, as a
+        // root gate: a narrowed command ran only each contract's own tests,
+        // and a whole command may be deferred to the root gate for a contract
+        // whose tree lacks other contracts' work (decision 0018, amended
+        // 2026-10-02). Either way a run never completes without it passing
+        // on the merged result. Computed before the verifier, which needs to
+        // know the root gate runs it.
+        let (gate_commands, added_gate) =
+            crate::scoped_check::with_whole_gate(gate_commands, &self.config.verify);
+        let root_gate = {
+            let verify = self.config.verify.trim();
+            !verify.is_empty() && gate_commands.iter().any(|g| g.trim() == verify)
+        };
         let routes = route_envs(
             &assembler,
             manager,
@@ -1738,6 +1770,7 @@ impl Host {
                 read_denies: read_denies.clone(),
                 timeout: self.config.gate_timeout,
                 permissions: self.permissions.clone(),
+                root_gate,
             }),
             workspaces: workspaces.clone(),
             clock: Arc::new(SystemClock),
@@ -1783,26 +1816,13 @@ impl Host {
             )),
             None => orchestrator,
         };
-        let gate_commands = match plan {
-            Some(plan) if self.config.gate_commands.is_empty() => plan.validation_commands(),
-            _ => discover_validation_commands(root, &self.config.gate_commands)?,
-        };
-        // A blank command runs nothing and passes: refused for a command from
-        // the plan as for one from the configuration.
-        if let Some(blank) = gate_commands.iter().position(|c| c.trim().is_empty()) {
-            return Err(Error::Invalid(format!(
-                "gate command {} is empty: an empty gate command passes without checking \
-                 anything",
-                blank + 1
-            )));
-        }
-        // Each contract is checked on its own files' tests when the acceptance
-        // command allows it; the whole command then judges the merged result,
-        // as a root gate, so a run never completes on per-file checks alone.
-        let (gate_commands, added_gate) =
-            crate::scoped_check::with_whole_gate(gate_commands, &self.config.verify, root);
         if crate::scoped_check::narrowable(&self.config.verify, root) {
             notices(Notice::AcceptanceNarrowed {
+                command: self.config.verify.clone(),
+                added_gate,
+            });
+        } else if root_gate {
+            notices(Notice::AcceptanceWhole {
                 command: self.config.verify.clone(),
                 added_gate,
             });

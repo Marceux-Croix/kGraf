@@ -215,6 +215,15 @@ fn notice_line(n: &Notice) -> String {
              command runs on the merged result as a root gate{}",
             if *added_gate { " (added)" } else { "" }
         ),
+        Notice::AcceptanceWhole {
+            command,
+            added_gate,
+        } => format!(
+            "accept     each contract runs `{command}` whole; it also runs on the merged result \
+             as a root gate{}, and it is deferred to that gate for a contract that cannot pass it \
+             before the plan's other contracts merge",
+            if *added_gate { " (added)" } else { "" }
+        ),
         Notice::OutputCapClamped { which, clamp } => {
             format!("clamped    {}", clamp.sentence(which))
         }

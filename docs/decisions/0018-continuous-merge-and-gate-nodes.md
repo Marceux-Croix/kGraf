@@ -234,3 +234,56 @@ detector ended it, and the next attempt knew neither. Only a verifier's refusal 
 Evidence: `kgraf-orchestrator/src/orchestrator.rs` (unit tests on the stop note and the brief)
 and `kgraf-orchestrator/tests/retry_brief_stop.rs` (a real worker loop stalls; the next
 attempt's opening message carries the repeated call).
+
+## Amendment (2026-10-02): a whole check a split cannot pass per contract is deferred to the root gate
+
+A run's check (`python3 check.py`) needed two files, and the planner split the work into two
+contracts, the second depending on the first. The verifier ran the whole command on the first
+contract alone, where it could never pass; the run ended Blocked. A cargo command has a plan
+validator for shared test scopes; a plain command had nothing.
+
+- **The rule.** The run's acceptance command (`--verify`) checks the whole instruction. A
+  contract whose attempt cannot pass it until other contracts of the plan merge has the check
+  deferred, never dropped: it runs on the merged result as the root gate before the run can
+  complete.
+- **When a check is deferred.** All of these hold: the command runs whole on the attempt (it is
+  not narrowed); the contract is not a gate remediation; the attempt committed a change, and its
+  scope and placeholder checks passed; other contracts of the plan are still open (the
+  orchestrator passes their ids to `Verifier::verify_among`); the command fails on the attempt;
+  and it also fails at the attempt's dispatch base, on a throwaway worktree. A command that
+  passes at the dispatch base and fails on the attempt was broken by the attempt: a plain
+  failure, never deferred, and the reason says "it passes at the dispatch base, so this
+  attempt's change makes it fail". A command that passes on the attempt passes as before
+  (`cargo build --workspace` over compiling stubs keeps its per-contract check).
+- **The last contract is checked whole.** With no other contract open, nothing is missing from
+  the tree, so the command must pass on the attempt itself.
+- **The command is always a root gate.** It is added to the gate commands whenever it is not
+  blank and not one already, narrowable or not (`scoped_check::with_whole_gate`), so a run with
+  no discovered gate now has one. The verifier defers only when it knows the root gate runs the
+  command (`CommandVerifier::root_gate`). The run prints an `accept` line for a whole command
+  too.
+- **Said, never silent.** A deferred attempt's verdict is `<command> (deferred to the root
+  gate)`, and a notice names the contract, the open contracts, and the first 300 characters of
+  the failing output. The brief of a contract checked whole tells the worker that a command
+  that can only pass once other contracts merge is checked on the merged result, not to write
+  other contracts' files to make it pass, and that breaking a check that passed before is still
+  a failure.
+- **Known limit.** Blame for a defect in a deferred contract lands on the contract that is
+  checked whole after it, or on the root gate's remediation; the deferred contract itself is not
+  re-opened.
+
+Rejected: refusing or re-asking the plan at intake when a dependent split makes the command
+unpassable per contract. Whether a plain command can pass on part of the work cannot be read
+from the command text, and a re-plan costs a planner call per guess. Rejected: accepting a
+deferred contract on the planner's per-contract Acceptance line (a model-written command is not
+a mechanism; this amendment's base comparison is). Rejected: deferring only by the dependency
+graph (contracts with dependents): it misses a parallel split whose siblings the check needs,
+and it would drop the per-contract `cargo build` check that passes on stubs today.
+
+Tests: `kgraf-host` `tests.rs`
+`a_whole_check_a_dependent_split_cannot_pass_is_deferred_to_the_root_gate`,
+`a_whole_check_is_not_deferred_for_the_last_contract_or_without_a_root_gate`,
+`a_whole_check_the_attempt_broke_is_never_deferred`; `scoped_check`
+`the_acceptance_command_becomes_a_root_gate_once`; `shortfall_tests.rs`
+`a_run_check_a_dependent_split_needs_is_deferred_and_judged_at_the_root_gate` and
+`a_deferred_run_check_that_never_passes_does_not_complete_the_run`.

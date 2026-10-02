@@ -32,7 +32,11 @@
 //! **When the whole command runs.** An unrecognized command (a script, `make`,
 //! anything with shell syntax or quotes), a command that already selects tests
 //! (a path, a `-p` pattern, a package), or a write set with no test of its own:
-//! the whole command runs, as before, and the reason is kept.
+//! the whole command runs, as before, and the reason is kept. A whole command
+//! may then fail only because other open contracts of the plan are not merged;
+//! the verifier defers it to the root gate when it fails at the dispatch base
+//! too (`verifier.rs`, decision 0018 amended 2026-10-02). The acceptance
+//! command is a root gate in every case ([`with_whole_gate`]).
 //!
 //! **Known limit.** Cargo narrows to the package, not further: two contracts in
 //! one crate still see each other's stubs fail that crate's tests.
@@ -105,25 +109,23 @@ enum Runner {
 }
 
 /// Whether `command`, run in `root`, is a whole-suite command this module can
-/// narrow. A run whose acceptance command is narrowable gets that command as a
-/// root gate too, so the whole suite still judges the merged result.
+/// narrow.
 pub(crate) fn narrowable(command: &str, root: &Path) -> bool {
     runner(command, root).is_ok()
 }
 
-/// `gates` with `verify` appended when `verify` is narrowable and not already
-/// one of them, and whether it was appended. The whole acceptance command then
-/// judges the merged result: per-contract checks ran only their own tests.
-pub(crate) fn with_whole_gate(
-    mut gates: Vec<String>,
-    verify: &str,
-    root: &Path,
-) -> (Vec<String>, bool) {
-    let present = gates.iter().any(|g| g.trim() == verify.trim());
-    if present || !narrowable(verify, root) {
+/// `gates` with `verify` appended when it is not blank and not already one of
+/// them, and whether it was appended. The whole acceptance command then judges
+/// the merged result: a narrowed per-contract check ran only its own tests,
+/// and a whole one may have been deferred to this gate for a contract whose
+/// tree lacked other contracts' work (decision 0018, amended 2026-10-02).
+pub(crate) fn with_whole_gate(mut gates: Vec<String>, verify: &str) -> (Vec<String>, bool) {
+    let verify = verify.trim();
+    let present = gates.iter().any(|g| g.trim() == verify);
+    if present || verify.is_empty() {
         return (gates, false);
     }
-    gates.push(verify.trim().to_owned());
+    gates.push(verify.to_owned());
     (gates, true)
 }
 
@@ -862,24 +864,29 @@ mod tests {
     }
 
     #[test]
-    fn a_narrowable_acceptance_command_becomes_a_root_gate_once() {
-        let t = tree(PY);
+    fn the_acceptance_command_becomes_a_root_gate_once() {
         let suite = "python3 -m unittest discover -s tests";
         assert_eq!(
-            with_whole_gate(Vec::new(), suite, t.path()),
+            with_whole_gate(Vec::new(), suite),
             (vec![suite.to_owned()], true)
         );
         assert_eq!(
-            with_whole_gate(vec![suite.to_owned()], suite, t.path()),
+            with_whole_gate(vec![suite.to_owned()], suite),
             (vec![suite.to_owned()], false)
         );
         assert_eq!(
-            with_whole_gate(vec!["python3 -m pytest".into()], suite, t.path()),
+            with_whole_gate(vec!["python3 -m pytest".into()], suite),
             (vec!["python3 -m pytest".to_owned(), suite.to_owned()], true)
         );
-        // Not narrowed, so each contract already ran it whole: no gate added.
+        // Not narrowed, it still judges the merged result: a contract may
+        // have had it deferred to this gate.
         assert_eq!(
-            with_whole_gate(Vec::new(), "sh check.sh", t.path()),
+            with_whole_gate(Vec::new(), "sh check.sh"),
+            (vec!["sh check.sh".to_owned()], true)
+        );
+        // A blank command checks nothing and is never a gate.
+        assert_eq!(
+            with_whole_gate(Vec::new(), "  "),
             (Vec::<String>::new(), false)
         );
     }

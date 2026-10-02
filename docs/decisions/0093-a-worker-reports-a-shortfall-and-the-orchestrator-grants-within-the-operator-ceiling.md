@@ -205,3 +205,41 @@ retried once each of them has run without error since, in any form. A refusal a 
 one program is matched on that program only, as before. Details and evidence: decision 0094,
 amendment of the same date ("a script of build commands, after one `cd` into the worktree, runs
 as a build").
+
+## Amendment (2026-10-02, second): a held shortfall is verified in scope before it blocks
+
+A contract's instruction asked for a dependency to be added to `Cargo.toml`, but its `writes`
+listed only `src/lib.rs`, and the dependency was already in `Cargo.toml`. The worker wrote the
+correct `lib.rs` body, then tried to edit `Cargo.toml`, was refused, and reported a file
+shortfall. No contract wrote that file, so the unattended run held the contract as a plan-shape
+error. The attempt was never verified, and its correct in-scope change was thrown away; the run
+ended Blocked with the stub still in place.
+
+- **The rule.** A held shortfall is a claim that the contract cannot be done inside its scope. The
+  verifier judges that claim before the hold applies. When an attempt stops on a shortfall the
+  orchestrator decided to hold, and the attempt changed files, it goes to verification as a
+  completed attempt would.
+- **A pass merges it.** The attempt is a candidate like any other: the verifier's scope check,
+  placeholder check, contract checks and merge-back all apply. The hold is dropped, and the
+  shortfall is kept as a fact: a notice and a trace `notice` event name the contract, the check
+  that passed, and the held reason in full.
+- **A failure keeps the hold.** The attempt is marked stopped again, as before: not a failure,
+  its worktree kept for `--resume`, no retry. The held reason gains "Its in-scope result was
+  checked first and failed: ...".
+- **What does not qualify.** A grant or an amendment (they re-dispatch), a question waiting for
+  the user, an attempt that changed nothing, and a pass on a check that checks nothing (`true`
+  with no gate command), which is turned into a failure.
+- **Fail loud holds.** Nothing unverified merges, and scope is never widened: the refused write
+  stays refused, and the verifier refuses any change outside the declared writes.
+- **Live tallies.** A held attempt that fails its check is not recorded against its route: it was
+  cancelled before it finished.
+
+Rejected: checking the worker's claim against the repository (it needs a semantic reading of the
+instruction and the file per file kind; the verifier already says whether the contract is met).
+Rejected: granting the path in an unattended run (it widens scope to a file the plan never
+assigned).
+
+Tests: `kgraf-host` `shortfall_tests.rs`
+`a_held_shortfall_whose_in_scope_result_verifies_is_merged_and_kept_as_a_fact`,
+`a_held_shortfall_whose_in_scope_result_fails_its_check_stays_held`,
+`a_vacuous_check_does_not_overrule_a_held_shortfall`.

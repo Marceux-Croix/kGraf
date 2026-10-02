@@ -3149,6 +3149,107 @@ async fn the_plan_scope_of_a_write_set_is_its_own_test_file() {
     );
 }
 
+/// The whole check of a dependent split (decision 0018, amended 2026-10-02):
+/// `out/greeting.txt` is contract `c1`'s file, `out/sha.txt` its dependent
+/// `c2`'s, and the run's check needs both. On `c1` alone it fails here and at
+/// the dispatch base, so with `c2` open it is deferred to the root gate: the
+/// attempt passes, and the verdict and a notice say so.
+const BOTH_FILES: &str = "test -f out/greeting.txt && test -f out/sha.txt";
+
+async fn greeting_attempt(r: &Repo, worker: &str) -> (OpenContract, PathBuf) {
+    let c = named("out/greeting.txt", worker);
+    let ws = prepared(r, &c, worker).await;
+    std::fs::create_dir_all(ws.join("out")).expect("mkdir");
+    std::fs::write(ws.join("out/greeting.txt"), "hello\n").expect("write");
+    (c, ws)
+}
+
+#[tokio::test]
+async fn a_whole_check_a_dependent_split_cannot_pass_is_deferred_to_the_root_gate() {
+    let r = repo();
+    let (c, ws) = greeting_attempt(&r, "w-defer").await;
+    let v = CommandVerifier {
+        root_gate: true,
+        ..verifier(&r, BOTH_FILES)
+    };
+    let verdict = v
+        .verify_among(&c, &ws, &result(), &["c2".to_owned()])
+        .await
+        .expect("ran");
+    let Verdict::Pass {
+        by,
+        notices,
+        commit,
+    } = &verdict
+    else {
+        panic!("deferred while c2 is open: {verdict:?}");
+    };
+    assert!(by.contains("deferred to the root gate"), "{by}");
+    assert!(commit.is_some(), "the attempt's work is committed");
+    let notice = notices
+        .iter()
+        .find(|n| n.contains("is deferred to the root gate"))
+        .unwrap_or_else(|| panic!("said in a notice: {notices:?}"));
+    assert!(notice.contains("contract w-defer"), "{notice}");
+    assert!(notice.contains("contracts c2"), "{notice}");
+    // The worker was told before it started.
+    let brief = v.acceptance_brief(&c, &ws).expect("a brief");
+    assert!(brief.contains(crate::verifier::DEFERRED_BRIEF), "{brief}");
+    let ungated = verifier(&r, BOTH_FILES)
+        .acceptance_brief(&c, &ws)
+        .expect("a brief");
+    assert!(
+        !ungated.contains(crate::verifier::DEFERRED_BRIEF),
+        "{ungated}"
+    );
+}
+
+/// No deferral without the reasons for it: with no other contract open (the
+/// last contract of the plan) or without the root gate, the same attempt
+/// fails its check, as before.
+#[tokio::test]
+async fn a_whole_check_is_not_deferred_for_the_last_contract_or_without_a_root_gate() {
+    let r = repo();
+    let gated = CommandVerifier {
+        root_gate: true,
+        ..verifier(&r, BOTH_FILES)
+    };
+    let (c, ws) = greeting_attempt(&r, "w-last").await;
+    let verdict = gated
+        .verify_among(&c, &ws, &result(), &[])
+        .await
+        .expect("ran");
+    assert!(!verdict.passed(), "nothing left to merge: {verdict:?}");
+
+    let ungated = verifier(&r, BOTH_FILES);
+    let (c, ws) = greeting_attempt(&r, "w-ungated").await;
+    let verdict = ungated
+        .verify_among(&c, &ws, &result(), &["c2".to_owned()])
+        .await
+        .expect("ran");
+    assert!(!verdict.passed(), "no root gate would run it: {verdict:?}");
+}
+
+/// A whole check that passes at the dispatch base and fails on the attempt
+/// was broken by the attempt: never deferred, and the reason says so.
+#[tokio::test]
+async fn a_whole_check_the_attempt_broke_is_never_deferred() {
+    let r = repo();
+    let v = CommandVerifier {
+        root_gate: true,
+        ..verifier(&r, "test ! -f out/greeting.txt")
+    };
+    let (c, ws) = greeting_attempt(&r, "w-broke").await;
+    let verdict = v
+        .verify_among(&c, &ws, &result(), &["c2".to_owned()])
+        .await
+        .expect("ran");
+    let Verdict::Fail { reason } = &verdict else {
+        panic!("the attempt broke a check that passed at its base: {verdict:?}");
+    };
+    assert!(reason.contains("passes at the dispatch base"), "{reason}");
+}
+
 /// A remediation is judged on the whole command and the failing gate's
 /// commands: it fixes what the merged result failed, not one file's tests.
 #[tokio::test]
@@ -3442,6 +3543,7 @@ fn verifier(r: &Repo, command: &str) -> CommandVerifier {
         read_denies: Vec::new(),
         timeout: Duration::from_secs(300),
         permissions: Arc::new(kgraf_tools::PermissionControl::manual()),
+        root_gate: false,
     }
 }
 

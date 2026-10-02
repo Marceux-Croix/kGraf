@@ -529,6 +529,16 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   `<name>.spec.ts`, or a file in a `test` folder), and `cargo test --workspace` (the package
   of each file). A script such as `sh check.sh`, a command that already selects tests, a
   contract whose files have no test, and a gate remediation run the command whole.
+- `--verify` always runs as a root gate on the merged result too, narrowable or not, unless
+  it is already a gate command (decision 0018). A whole command can fail on one contract only
+  because other contracts of the plan have not merged yet: a check that needs files from two
+  contracts of a split cannot pass on the first. When the command fails on an attempt, other
+  contracts of the plan are still open, and it also fails at the attempt's dispatch base, the
+  check for that contract is deferred to the root gate: the attempt merges after its scope and
+  placeholder checks, its verdict reads `<command> (deferred to the root gate)`, and a notice
+  names the contract and the contracts not merged. The last contract is checked whole, and the
+  run completes only when the root gate passes. A command that passes at the dispatch base and
+  fails on the attempt was broken by the attempt: that is a failure, never deferred.
 - A worker's round budget (`worker --budget`, default 12; orchestrated workers 30) is a
   checkpoint, not a wall (decision 0096). Near the end of each block of that many rounds,
   kGraf measures what the worker did since the last checkpoint: files changed on net, its
@@ -695,6 +705,15 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   you. A contract is re-dispatched at most twice for shortfalls; a grant that did not help
   holds. Every grant, hold and answer is in the run's trace (`shortfall` and `permission`
   events), and each grant is kept on the contract with who asked, why, and who granted it.
+- A shortfall that would hold the contract (a plan-shape error for a file no contract writes,
+  a denial nobody attends to answer, a deny rule, a skill) is a claim that the contract cannot
+  be done in its scope, and the verifier judges it first (decision 0093). When the worker had
+  changed files, its attempt is verified as a completed one would be. If the check passes, the
+  contract merges, nothing outside its scope is granted or written, and a notice keeps the
+  shortfall as a fact ("verified in its own scope after a shortfall that would have held
+  it"). If the check fails, or checks nothing (`true`), the contract is held as before and the
+  held reason adds what the check said. A question waiting for you is not checked first: you
+  answer it.
 - Permission modes (decision 0094). One setting decides who answers a permission request past
   the base policy, for a worker's approval ask and for a shortfall report alike:
   - **Manual**: you answer every request.
@@ -1382,7 +1401,9 @@ Behavior that differs from earlier builds. Each item names the decision that hol
   the contract's tests (`cargo build --workspace`, a script), the brief names the whole command,
   calls the contract's Acceptance line advisory, and says `todo!()` panics and failing tests in other contracts' unfinished
   code are not the worker's to fix, and says a compile error anywhere that the worker's change
-  caused (for example by changing a public type's shape) is its own (0018).
+  caused (for example by changing a public type's shape) is its own (0018). It also says that a
+  command that can only pass once other contracts merge is checked on the merged result, and
+  that the worker must not write other contracts' files to make it pass.
 - The planner is told that the repository's existing public items (type names and shapes, trait
   signatures, how callers use them) are the interface. A contract instruction that gives a type
   fields where a file the contract writes defines it as a unit struct produces a notice at plan

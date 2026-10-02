@@ -14,6 +14,9 @@
 //!    the next attempt is a fresh worker built with the grant.
 //!    `take_shortfall_stuck`: a worker stopped for reporting past the bound
 //!    of answered reports finishes as an error, counted a failure.
+//!    `verify_before_hold`: an attempt stopped on a held shortfall that
+//!    changed files in its scope is verified first (amended 2026-10-02);
+//!    `settle_held_verify` merges it on a pass and keeps the hold otherwise.
 //! 3. `finalize_ordinary` applies a held decision as the contract's held
 //!    reason, once every attempt has finished. A request waiting for the
 //!    user holds the contract until it is answered (`permission_hooks`).
@@ -24,6 +27,11 @@ use crate::shortfall::{
     Grounding, MAX_ANSWERED_SHORTFALLS, RequestScope, ShortfallDecision, ShortfallKind,
     decide_in_plan, instructions_answer, path_answer, skill_hold_reason, stored,
 };
+
+/// The longest part of a failed check quoted in a shortfall's hold, in
+/// characters: enough for the first error line, short enough for a status
+/// line.
+const MAX_HELD_CHECK_CHARS: usize = 400;
 
 impl RunLoop {
     /// Seven arguments: the six fields of the report as the control carries
@@ -344,6 +352,95 @@ impl RunLoop {
         }
         flight.renew_workers = true;
         true
+    }
+
+    /// Whether an attempt that stopped on a shortfall is verified before the
+    /// shortfall's hold applies (decision 0093, amended 2026-10-02). Only a
+    /// hold qualifies: a grant or an amendment re-dispatches, and a question
+    /// waiting for the user is the user's to answer. The attempt must have
+    /// changed files: an empty attempt has nothing to judge. Scope is not
+    /// widened: the verifier refuses any change outside the declared writes,
+    /// and the policy already refused the write the worker asked for.
+    pub(super) fn verify_before_hold(&self, contract: &str, result: &WorkerResult) -> bool {
+        self.record.contract(contract).is_some_and(|c| {
+            c.shortfall_hold.is_some()
+                && c.pending_permission.is_none()
+                && !result.changed_paths.is_empty()
+        })
+    }
+
+    /// The verdict on an attempt verified before its held shortfall applies.
+    ///
+    /// - A pass on a check that checks something: the verifier overrules the
+    ///   claim. The hold is dropped, the attempt is a candidate as any
+    ///   completed one is, and the report is kept as a fact (a notice and a
+    ///   trace event), never silently.
+    /// - A pass on a check that checks nothing (`true`, with no gate command)
+    ///   overrules nothing: it is turned into a failure.
+    /// - A failure: the attempt is stopped again (not counted a failure, its
+    ///   worktree kept for a resume), and the hold names what the check said.
+    pub(super) async fn settle_held_verify(
+        &mut self,
+        contract_id: &str,
+        worker: &AgentId,
+        verdict: Verdict,
+        flight: &mut InFlight,
+    ) -> Result<Verdict, OrchestratorError> {
+        let gate_checked = self
+            .record
+            .contract(contract_id)
+            .is_some_and(|c| !c.gate_commands.is_empty());
+        let verdict = match verdict {
+            Verdict::Pass { by, .. } if !gate_checked && crate::shortfall::vacuous_check(&by) => {
+                Verdict::Fail {
+                    reason: format!(
+                        "the check `{}` checks nothing, so it cannot overrule the shortfall",
+                        by.trim()
+                    ),
+                }
+            }
+            other => other,
+        };
+        match &verdict {
+            Verdict::Pass { by, .. } => {
+                let held = self
+                    .record
+                    .contract_mut(contract_id)
+                    .and_then(|c| c.shortfall_hold.take())
+                    .unwrap_or_default();
+                let detail = kgraf_secrets::scrub_persist_owned(format!(
+                    "contract {contract_id}: verified in its own scope after a shortfall that \
+                     would have held it: its in-scope result passed `{}`, so the shortfall did \
+                     not block the contract. Nothing outside its write scope was granted or \
+                     written. The shortfall, kept as a fact: {held}",
+                    by.trim()
+                ));
+                self.notices.insert(detail.clone());
+                let at = self.now();
+                self.trace(TraceEvent::Notice {
+                    at_ms: at,
+                    contract: contract_id.to_owned(),
+                    worker: worker.to_string(),
+                    detail,
+                })
+                .await?;
+            }
+            Verdict::Fail { reason } => {
+                if let Some(a) = flight.attempts.iter_mut().find(|a| a.worker == *worker) {
+                    a.status = AttemptStatus::Stopped;
+                }
+                let checked: String = reason.chars().take(MAX_HELD_CHECK_CHARS).collect();
+                if let Some(c) = self.record.contract_mut(contract_id)
+                    && let Some(hold) = c.shortfall_hold.as_mut()
+                {
+                    *hold = kgraf_secrets::scrub_persist_owned(format!(
+                        "{hold}. Its in-scope result was checked first and failed: {checked}"
+                    ));
+                }
+            }
+        }
+        self.save()?;
+        Ok(verdict)
     }
 
     /// Whether `worker`'s attempt ended in a shortfall report. If it did, the

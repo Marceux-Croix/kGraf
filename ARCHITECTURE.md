@@ -1020,7 +1020,7 @@ whole-suite runner kGraf recognizes (`unittest discover`, `pytest`, `node
 workspace), each attempt runs only the tests that belong to its declared
 files by the runner's naming convention, and the brief names that command.
 The whole command is added as a root gate when it is not one already, so it
-judges the merged result. Anything else runs whole, as do gate remediations; the brief then still names the whole
+judges the merged result. The acceptance command is a root gate in every case, narrowable or not (decision 0018). A whole command that fails on an attempt while other contracts of the plan are open, and also fails at the attempt's dispatch base, is deferred to that root gate for that contract: the attempt merges after its scope and placeholder checks, with a verdict and a notice that say so, and the run completes only when the root gate passes. A command the attempt broke (it passes at the dispatch base) is a failure; the last open contract is checked whole. Anything else runs whole, as do gate remediations; the brief then still names the whole
 command as what the attempt is judged by, calls the contract's Acceptance line advisory,
 and says `todo!()` panics and failing tests in other contracts' unfinished code are not the
 worker's to fix, while a compile error anywhere that the worker's change caused is its own.
@@ -1355,7 +1355,7 @@ change records "changed while another worker's command also ran; cause not
 exclusive", and on damage each named command's attempt fails too. The
 ledger, trace, run records, transcripts and graph stay refused in every mode.
 An instructions report amends the contract once; at most two re-dispatches per
-contract for shortfalls. With plan review on, no worker starts until the user
+contract for shortfalls. A shortfall the orchestrator would hold is verified first: an attempt that changed files goes to the verifier, and a pass merges it with the shortfall kept as a notice, while a failure, or a check that checks nothing, keeps the hold (decision 0093). With plan review on, no worker starts until the user
 approves the plan in the box. A contract accepted on a check that always
 passes, or after a refusal its worker never retried, is reported unverified
 (decision 0093). A dependency missing from the local cargo cache is fetched by the host, outside

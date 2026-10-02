@@ -10,7 +10,10 @@
 //! A report nothing refused is answered and the worker continues; three
 //! such reports end the attempt as stuck; a file another contract owns is
 //! answered, never granted, even in Bypass. A worker that finished after a
-//! refusal it never retried is reported unverified. The
+//! refusal it never retried is reported unverified. A shortfall that would
+//! hold the contract is verified in scope first: a pass merges it, a failure
+//! keeps the hold. A run check a dependent split cannot pass on its first
+//! contract is deferred to the root gate, which still has to pass. The
 //! model is a script; the host, the orchestrator, the worker loop, the
 //! approval chain, the shell tool and the sandbox are real. A child of
 //! `tests.rs`, for its fixtures.
@@ -47,6 +50,14 @@ pub(super) enum Worker {
     /// Runs an `sh -c` script of `mkdir` and `cp`; if refused, reports the
     /// shortfall naming `mkdir`.
     RunsScript,
+    /// Writes its own `a.txt`, then tries to write `cfg.toml`, a file no
+    /// contract of the plan writes, is refused, and reports a file
+    /// shortfall for it: the claim is that the contract needs that file.
+    WritesThenReportsUnowned,
+    /// The plan of [`DEPENDENT_PLAN`]: contract `a` writes `a.txt`, contract
+    /// `b`, which depends on `a`, writes `b.txt`. Each worker writes its own
+    /// file and answers.
+    DependentSplit,
 }
 
 pub(super) struct Script {
@@ -115,6 +126,10 @@ fn add_file(path: &str) -> serde_json::Value {
 /// scripted worker which contract's brief it reads.
 const SIBLING_PLAN: &str = r#"{"contracts":[{"id":"a","instruction":"TASK-A: write a.txt","acceptance":"a.txt exists","writes":[{"path":"a.txt"}],"tools":[]},{"id":"b","instruction":"TASK-B: write b.txt","acceptance":"b.txt exists","writes":[{"path":"b.txt"}],"tools":[]}]}"#;
 
+/// A dependent split: `b` depends on `a`. A run check that needs both files
+/// cannot pass on `a` alone.
+const DEPENDENT_PLAN: &str = r#"{"contracts":[{"id":"a","instruction":"TASK-A: write a.txt","acceptance":"a.txt exists","writes":[{"path":"a.txt"}],"tools":[]},{"id":"b","instruction":"TASK-B: write b.txt","acceptance":"b.txt exists","writes":[{"path":"b.txt"}],"tools":[],"depends_on":["a"]}]}"#;
+
 #[async_trait::async_trait]
 impl Provider for Script {
     fn adapter(&self) -> &'static str {
@@ -139,6 +154,8 @@ impl Provider for Script {
                 vec![Content::text(
                     if matches!(self.worker, Worker::EditsSibling | Worker::InstructsSibling) {
                         SIBLING_PLAN
+                    } else if self.worker == Worker::DependentSplit {
+                        DEPENDENT_PLAN
                     } else {
                         r#"{"contracts":[{"id":"a","instruction":"copy README.md to a.txt","acceptance":"a.txt exists","writes":[{"path":"a.txt"}],"tools":[]}]}"#
                     },
@@ -218,6 +235,28 @@ impl Provider for Script {
                 (Worker::RefusedThenWrites, _, 0) => Some(tool("shell", cp(), round)),
                 (Worker::RefusedThenWrites, _, 1) => Some(tool("apply_patch", patch(), round)),
                 (Worker::Writes, _, 0) => Some(tool("apply_patch", patch(), round)),
+                (Worker::WritesThenReportsUnowned, _, 0) => {
+                    Some(tool("apply_patch", patch(), round))
+                }
+                (Worker::WritesThenReportsUnowned, _, 1) => {
+                    Some(tool("apply_patch", add_file("cfg.toml"), round))
+                }
+                (Worker::WritesThenReportsUnowned, _, 2) => Some(tool(
+                    kgraf_runtime::SHORTFALL_TOOL,
+                    serde_json::json!({
+                        "kind": "permission",
+                        "scope": "file",
+                        "need": "cfg.toml",
+                        "why": "the instruction says to add a setting to cfg.toml"
+                    }),
+                    round,
+                )),
+                (Worker::DependentSplit, _, 0) if seen.contains("TASK-A") => {
+                    Some(tool("apply_patch", add_file("a.txt"), round))
+                }
+                (Worker::DependentSplit, _, 0) => {
+                    Some(tool("apply_patch", add_file("b.txt"), round))
+                }
                 (Worker::RunsScript, _, 0) => Some(tool("shell", script(), round)),
                 (Worker::RunsScript, _, 1) if !seen.contains("exit status: 0") => {
                     let mut input = report();
@@ -988,5 +1027,167 @@ async fn headless_plan_review_fails_loud_unless_approved_on_the_command_line() {
     assert_eq!(
         outcome.report.status,
         kgraf_orchestrator::RunStatus::Completed
+    );
+}
+
+/// Decision 0093, amended 2026-10-02: a worker that wrote its own file and
+/// then reported that it needs `cfg.toml`, a file no contract writes, would
+/// be held as a plan-shape error. Its in-scope result is verified first; it
+/// passes, so the contract merges, the shortfall is kept as a fact in a
+/// notice, and `cfg.toml` is never granted or written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_held_shortfall_whose_in_scope_result_verifies_is_merged_and_kept_as_a_fact() {
+    let (report, trace, script) = run(
+        Worker::WritesThenReportsUnowned,
+        control(kgraf_tools::PermissionMode::Manual),
+        "test -f a.txt",
+        "sf-held-verifies",
+    )
+    .await;
+    assert_eq!(
+        report.status,
+        kgraf_orchestrator::RunStatus::Completed,
+        "{report:?}\n{trace}"
+    );
+    assert_eq!(report.verified, vec!["a".to_owned()], "{report:?}");
+    let lines = shortfall_lines(&trace);
+    assert_eq!(lines.len(), 1, "{trace}");
+    assert!(lines[0].contains("plan-shape error"), "{}", lines[0]);
+    let fact = report
+        .notices
+        .iter()
+        .find(|n| n.contains("verified in its own scope"))
+        .unwrap_or_else(|| panic!("the shortfall is kept as a fact: {report:?}"));
+    assert!(fact.contains("`test -f a.txt`"), "{fact}");
+    assert!(fact.contains("cfg.toml"), "{fact}");
+    assert!(!script.saw_grant.load(Ordering::SeqCst), "nothing granted");
+    assert_eq!(script.attempts.load(Ordering::SeqCst), 1, "one attempt");
+    assert!(
+        !permission_lines(&trace)
+            .iter()
+            .any(|l| l.contains("granted") && l.contains("cfg.toml")),
+        "{trace}"
+    );
+}
+
+/// The same report, with a check the in-scope result fails: the hold stands,
+/// as a plan-shape error, and says what the check said. Nothing is merged,
+/// and the attempt is not retried.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_held_shortfall_whose_in_scope_result_fails_its_check_stays_held() {
+    let (report, trace, script) = run(
+        Worker::WritesThenReportsUnowned,
+        control(kgraf_tools::PermissionMode::Manual),
+        "test -f never.txt",
+        "sf-held-fails",
+    )
+    .await;
+    let kgraf_orchestrator::RunStatus::Blocked { reason } = &report.status else {
+        panic!("{report:?}\n{trace}");
+    };
+    assert!(reason.contains("plan-shape error"), "{reason}");
+    assert!(
+        reason.contains("Its in-scope result was checked first and failed"),
+        "{reason}"
+    );
+    assert!(reason.contains("test -f never.txt"), "{reason}");
+    assert!(report.verified.is_empty(), "{report:?}");
+    assert_eq!(script.attempts.load(Ordering::SeqCst), 1, "no retry");
+    assert!(
+        !report
+            .notices
+            .iter()
+            .any(|n| n.contains("verified in its own scope")),
+        "{report:?}"
+    );
+}
+
+/// A check that checks nothing cannot overrule the shortfall: the hold
+/// stands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_vacuous_check_does_not_overrule_a_held_shortfall() {
+    let (report, trace, _) = run(
+        Worker::WritesThenReportsUnowned,
+        control(kgraf_tools::PermissionMode::Manual),
+        "true",
+        "sf-held-vacuous",
+    )
+    .await;
+    let kgraf_orchestrator::RunStatus::Blocked { reason } = &report.status else {
+        panic!("{report:?}\n{trace}");
+    };
+    assert!(reason.contains("plan-shape error"), "{reason}");
+    assert!(reason.contains("checks nothing"), "{reason}");
+    assert!(report.verified.is_empty(), "{report:?}");
+}
+
+/// Decision 0018, amended 2026-10-02, through a hosted run: the run check
+/// needs both files of a dependent split, so it cannot pass on `a` alone. It
+/// is deferred for `a` (said in a notice), `b` is checked with it whole once
+/// `a` has merged, and the root gate runs it on the merged result before the
+/// run completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_check_a_dependent_split_needs_is_deferred_and_judged_at_the_root_gate() {
+    let check = "test -f a.txt && test -f b.txt";
+    let (report, trace, _) = run(
+        Worker::DependentSplit,
+        control(kgraf_tools::PermissionMode::Manual),
+        check,
+        "verify-deferred",
+    )
+    .await;
+    assert_eq!(
+        report.status,
+        kgraf_orchestrator::RunStatus::Completed,
+        "{report:?}\n{trace}"
+    );
+    assert!(
+        report
+            .notices
+            .iter()
+            .any(|n| n.contains("contract a:") && n.contains("deferred to the root gate")),
+        "{report:?}"
+    );
+    assert!(
+        !report
+            .notices
+            .iter()
+            .any(|n| n.contains("contract b:") && n.contains("deferred")),
+        "the last contract is checked whole: {report:?}"
+    );
+    let root_passed = trace.lines().any(|l| {
+        l.contains(r#""event":"gate""#)
+            && l.contains(r#""gate":"gate:root""#)
+            && l.contains(r#""state":"passed""#)
+    });
+    assert!(root_passed, "the root gate ran the check\n{trace}");
+}
+
+/// A deferred check still has to pass: a run check no merged result can pass
+/// never completes the run, though it was deferred for `a`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_deferred_run_check_that_never_passes_does_not_complete_the_run() {
+    let check = "test -f a.txt && test -f b.txt && test -f c.txt";
+    let (report, trace, _) = run(
+        Worker::DependentSplit,
+        control(kgraf_tools::PermissionMode::Manual),
+        check,
+        "verify-deferred-fails",
+    )
+    .await;
+    assert!(
+        matches!(report.status, kgraf_orchestrator::RunStatus::Blocked { .. }),
+        "{report:?}\n{trace}"
+    );
+    assert!(
+        report
+            .notices
+            .iter()
+            .any(|n| n.contains("contract a:") && n.contains("deferred to the root gate")),
+        "{report:?}"
+    );
+    assert!(
+        !report.verified.contains(&"b".to_owned()),
+        "b is checked whole and fails: {report:?}"
     );
 }
