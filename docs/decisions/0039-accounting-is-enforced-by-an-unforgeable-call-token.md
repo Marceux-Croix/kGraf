@@ -130,3 +130,11 @@ provider's cached prefix is unchanged. After the bound, or on the last round, th
 and its error names the parse failure. The kind is not a route fault: the server is up. Any other
 5xx keeps the earlier behavior: no retry, the row open, and only a transport failure moves the
 route out of rotation.
+
+**Amended 2026-10-02: a bare `EOF` is the same failure.** A planning call answered HTTP 500 with
+`{"error":{"message":"EOF","type":"api_error",...}}`, which the marker list did not match, so the
+attempt failed with no retry. The adapter now also parses the body and treats an `error.message`
+that is exactly `EOF`, or contains `unexpected EOF`, as `ModelOutputMalformed`. The field is
+read, never the text around it: `EOF` elsewhere in a body, a 4xx, or a non-JSON body stays a
+plain HTTP error. Tests: `a_bare_eof_error_message_is_malformed_output`,
+`eof_elsewhere_than_the_error_message_is_not_malformed_output`.

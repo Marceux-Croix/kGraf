@@ -1049,7 +1049,10 @@ async fn a_second_end_with_no_tool_call_fails_the_attempt_with_a_named_reason() 
     let WorkerOutcome::Failed { error } = &result.outcome else {
         panic!("expected Failed, got {:?}", result.outcome);
     };
-    assert!(error.contains("no tool call and no change"), "{error}");
+    assert!(
+        error.contains("no write and no mutating command"),
+        "{error}"
+    );
     assert!(
         error.contains("a.py, b.py"),
         "the writes are named: {error}"
@@ -1077,17 +1080,76 @@ async fn an_answer_with_no_tool_call_still_completes_a_contract_that_writes_noth
     }
 }
 
+/// Round evidence (polyglot attempt 2): two `read_file` calls, then the turn
+/// ended as done with nothing written, and the attempt was recorded completed.
+/// A read is not a change, so the contract that writes gets the notice, and a
+/// second read-only end fails the attempt.
 #[tokio::test]
-async fn a_read_only_attempt_that_used_a_tool_completes_without_a_notice() {
+async fn a_read_only_attempt_that_used_a_tool_is_not_a_completion_when_the_contract_writes() {
     let dir = tempfile::tempdir().expect("dir");
     let provider = Fake::new(|request| match rounds(request) {
         0 => tool("cfg", "read_config", json!({}), 200),
         _ => answer("the config is fine; nothing needed changing"),
     });
+    let env = env_with(provider.clone(), false);
+    let handle = spawn_worker(
+        env,
+        small_window_brief(dir.path(), Some(vec![PathBuf::from("a.py")])),
+        SpawnOptions::default(),
+    )
+    .await
+    .expect("spawn");
+    let (events, result) = drain(handle).await;
+    assert_eq!(notices(&events, kgraf_runtime::NoticeKind::NoChange), 1);
+    let WorkerOutcome::Failed { error } = &result.outcome else {
+        panic!("expected Failed, got {:?}", result.outcome);
+    };
+    assert!(
+        error.contains("no write and no mutating command"),
+        "{error}"
+    );
+    assert!(error.contains("a.py"), "{error}");
+}
+
+/// A read followed by a write is a completion for a contract that writes.
+#[tokio::test]
+async fn a_read_then_a_write_completes_without_a_notice() {
+    let dir = tempfile::tempdir().expect("dir");
+    let provider = Fake::new(|request| match rounds(request) {
+        0 => tool("cfg", "read_config", json!({}), 200),
+        1 => tool(
+            "w",
+            "write_file",
+            json!({"path": "a.py", "content": "x"}),
+            200,
+        ),
+        _ => answer("done"),
+    });
     let env = env_with(provider, false);
     let handle = spawn_worker(
         env,
         small_window_brief(dir.path(), Some(vec![PathBuf::from("a.py")])),
+        SpawnOptions::default(),
+    )
+    .await
+    .expect("spawn");
+    let (events, result) = drain(handle).await;
+    assert_eq!(result.outcome, WorkerOutcome::Completed, "{result:?}");
+    assert_eq!(notices(&events, kgraf_runtime::NoticeKind::NoChange), 0);
+}
+
+/// A read-only attempt is still a completion for a contract that writes nothing.
+#[tokio::test]
+async fn a_read_only_attempt_that_used_a_tool_completes_a_contract_that_writes_nothing() {
+    let dir = tempfile::tempdir().expect("dir");
+    let provider = Fake::new(|request| match rounds(request) {
+        0 => tool("cfg", "read_config", json!({}), 200),
+        _ => answer("the config is fine"),
+    });
+    let env = env_with(provider, false);
+    let handle = spawn_worker(
+        env,
+        small_window_brief(dir.path(), None),
         SpawnOptions::default(),
     )
     .await

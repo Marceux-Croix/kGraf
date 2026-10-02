@@ -46,6 +46,9 @@ pub struct ProjectContext {
     /// Said with the run's notices: a cut, a file read for want of signatures,
     /// a lookup that failed.
     pub notices: Vec<String>,
+    /// The graph files the instruction names, by path, by file name, or by an
+    /// item that lives in them: the files the section shows signatures of.
+    pub named_files: Vec<String>,
 }
 
 /// Build the section for `instruction` from the manifests under the graph's
@@ -103,7 +106,11 @@ pub fn project_context(
             manifest_cut + sig_cut
         );
     }
-    ProjectContext { text, notices }
+    ProjectContext {
+        text,
+        notices,
+        named_files: sigs.paths.into_iter().collect(),
+    }
 }
 
 /// The lines that fit `limit` bytes, and how many were left out.
@@ -337,6 +344,8 @@ fn named_symbols(instruction: &str) -> Vec<String> {
 struct SignatureLines {
     lines: Vec<String>,
     taken: BTreeSet<String>,
+    /// Paths of the nodes shown.
+    paths: BTreeSet<String>,
 }
 
 impl SignatureLines {
@@ -344,6 +353,7 @@ impl SignatureLines {
         if n.signature.trim().is_empty() || !self.taken.insert(n.id.clone()) {
             return;
         }
+        self.paths.insert(n.path.clone());
         // A trait, struct, enum or class is its declaration: the header alone
         // names no method and no field, which is what a plan gets wrong. Its
         // text is read through the graph, bounded per item.
@@ -407,6 +417,7 @@ impl SignatureLines {
         if !self.taken.insert(file.id.clone()) {
             return;
         }
+        self.paths.insert(path.to_owned());
         match graph.source_of(file) {
             Ok(text) => {
                 let mut cut = text.len().min(CAP_BYTES - MANIFEST_BYTES - CUT_NOTE_BYTES);
@@ -526,6 +537,25 @@ mod tests {
         );
         assert!(ctx.text.contains("pub struct Receipt"), "{}", ctx.text);
         assert!(ctx.text.len() <= CAP_BYTES, "{}", ctx.text.len());
+    }
+
+    /// The files the instruction names, by path or by an item in them, are
+    /// returned for the plan checks; a file it does not name is not.
+    #[test]
+    fn the_named_files_are_the_paths_the_section_shows() {
+        let (_dir, g, files) = fixture();
+        let by_path = project_context(&g, "Edit crates/counter/src/lib.rs.", &files);
+        assert_eq!(
+            by_path.named_files,
+            vec!["crates/counter/src/lib.rs".to_owned()]
+        );
+        let by_item = project_context(&g, "Implement `Pricing` for a counter.", &files);
+        assert_eq!(
+            by_item.named_files,
+            vec!["crates/counter/src/lib.rs".to_owned()]
+        );
+        let none = project_context(&g, "Say hello.", &files);
+        assert!(none.named_files.is_empty(), "{:?}", none.named_files);
     }
 
     /// A file the instruction names is listed by signature, not by text.

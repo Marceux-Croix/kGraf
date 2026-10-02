@@ -17,43 +17,92 @@
 // receives; it does not change whether, or where, a pattern matches.
 
 use super::parser::UpdateFileChunk;
-use super::seek_sequence;
+use super::seek_sequence::{self, Seek};
+
+/// The result note for a line group that matched only under a tolerant rule.
+fn tolerant_note(path: &str, what: &str, index: usize) -> String {
+    format!(
+        "note: in {path}, {what} matched at line {} only after ignoring whitespace or \
+         typographic punctuation differences; they are not exact copies of the file",
+        index + 1
+    )
+}
+
+/// The refusal for a tolerant match that fits in several places.
+fn ambiguous(path: &str, what: &str, at: &[usize]) -> String {
+    let lines: Vec<String> = at.iter().take(8).map(|i| (i + 1).to_string()).collect();
+    format!(
+        "{what} match more than one place in {path} (lines {}) once whitespace differences are \
+         ignored, so none was chosen. Copy the lines exactly as the file has them, or add a \
+         unique line before them.",
+        lines.join(", ")
+    )
+}
+
+/// The refusal for an update chunk that adds lines and removes or keeps none.
+fn anchorless_addition(path: &str, chunk: &UpdateFileChunk) -> String {
+    let first = chunk.new_lines.first().map_or("", String::as_str);
+    format!(
+        "An Update File chunk for {path} has only `+` lines, so it names no place in the file and \
+         was not applied. To insert lines, put an unchanged line from the file just before them, \
+         starting with a space, so they go after it. To append at the end, finish the chunk with \
+         `*** End of File`. To make a new file or replace one, use `*** Add File: {path}` (first \
+         added line: '{first}')."
+    )
+}
 
 /// `(start_index, old_len, new_lines)`: replace `old_len` lines starting at
 /// `start_index` with `new_lines`.
 type Replacement = (usize, usize, Vec<String>);
 
 /// Compute a list of replacements needed to transform `original_lines` into the
-/// new lines, given the patch `chunks`.
+/// new lines, given the patch `chunks`, plus a note for each place a line
+/// matched only under a tolerant rule (whitespace, typographic punctuation).
 pub(crate) fn compute_replacements(
     original_lines: &[String],
     path: &str,
     chunks: &[UpdateFileChunk],
-) -> Result<Vec<Replacement>, String> {
+) -> Result<(Vec<Replacement>, Vec<String>), String> {
     let mut replacements: Vec<Replacement> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
     let mut line_index: usize = 0;
 
     for chunk in chunks {
-        // If a chunk has a `change_context`, we use seek_sequence to find it, then
+        // If a chunk has a `change_context`, we use `seek` to find it, then
         // adjust our `line_index` to continue from there.
         if let Some(ctx_line) = &chunk.change_context {
-            if let Some(idx) = seek_sequence::seek_sequence(
-                original_lines,
-                std::slice::from_ref(ctx_line),
-                line_index,
-                /*eof*/ false,
-            ) {
-                line_index = idx + 1;
-            } else {
-                let pattern = std::slice::from_ref(ctx_line);
-                let hint = seek_sequence::describe_mismatch(original_lines, pattern, line_index);
-                return Err(format!(
-                    "Failed to find context '{ctx_line}' in {path}. {hint}"
-                ));
+            let pattern = std::slice::from_ref(ctx_line);
+            match seek_sequence::seek(original_lines, pattern, line_index, /*eof*/ false) {
+                Seek::Exact(idx) => line_index = idx + 1,
+                Seek::Tolerant(idx) => {
+                    notes.push(tolerant_note(path, "the `@@` context line", idx));
+                    line_index = idx + 1;
+                }
+                Seek::Ambiguous(at) => {
+                    return Err(ambiguous(
+                        path,
+                        &format!("the `@@` context '{ctx_line}'"),
+                        &at,
+                    ));
+                }
+                Seek::Missing => {
+                    let hint =
+                        seek_sequence::describe_mismatch(original_lines, pattern, line_index);
+                    return Err(format!(
+                        "Failed to find context '{ctx_line}' in {path}. {hint}"
+                    ));
+                }
             }
         }
 
         if chunk.old_lines.is_empty() {
+            // A chunk of only `+` lines names no line to go after. Placing it
+            // at the end of the file regardless was a silent append (a file
+            // that gained the same block once per retry), so it is refused
+            // unless the file is empty or the chunk says `*** End of File`.
+            if !original_lines.is_empty() && !chunk.is_end_of_file {
+                return Err(anchorless_addition(path, chunk));
+            }
             // Preserve the legacy split representation's handling of a final
             // empty line: a trailing empty element in `original_lines` marks
             // the file's final newline, so the true insertion point is just
@@ -71,11 +120,11 @@ pub(crate) fn compute_replacements(
         // from the chunk. If found, schedule that region for replacement.
         let mut pattern: &[String] = &chunk.old_lines;
         let mut found =
-            seek_sequence::seek_sequence(original_lines, pattern, line_index, chunk.is_end_of_file);
+            seek_sequence::seek(original_lines, pattern, line_index, chunk.is_end_of_file);
 
         let mut new_slice: &[String] = &chunk.new_lines;
 
-        if found.is_none() && pattern.last().is_some_and(String::is_empty) {
+        if matches!(found, Seek::Missing) && pattern.last().is_some_and(String::is_empty) {
             // Retry without the trailing empty line which represents the final
             // newline in the file.
             pattern = &pattern[..pattern.len() - 1];
@@ -83,39 +132,46 @@ pub(crate) fn compute_replacements(
                 new_slice = &new_slice[..new_slice.len() - 1];
             }
 
-            found = seek_sequence::seek_sequence(
-                original_lines,
-                pattern,
-                line_index,
-                chunk.is_end_of_file,
-            );
+            found = seek_sequence::seek(original_lines, pattern, line_index, chunk.is_end_of_file);
         }
 
-        if let Some(start_idx) = found {
-            replacements.push((start_idx, pattern.len(), new_slice.to_vec()));
-            line_index = start_idx + pattern.len();
-        } else {
-            // Mirror `seek_sequence`'s own eof branch (`replace.rs` calls it
-            // just above with the same `chunk.is_end_of_file`) so the
-            // diagnostic looks at the same window `seek_sequence` searched,
-            // not a different one.
-            let search_start = if chunk.is_end_of_file && original_lines.len() >= pattern.len() {
-                original_lines.len() - pattern.len()
-            } else {
-                line_index
-            };
-            let hint = seek_sequence::describe_mismatch(original_lines, pattern, search_start);
-            return Err(format!(
-                "Failed to find expected lines in {}:\n{}\n{hint}",
-                path,
-                chunk.old_lines.join("\n"),
-            ));
+        match found {
+            Seek::Exact(start_idx) | Seek::Tolerant(start_idx) => {
+                if matches!(found, Seek::Tolerant(_)) {
+                    notes.push(tolerant_note(
+                        path,
+                        "the patch's unchanged and `-` lines",
+                        start_idx,
+                    ));
+                }
+                replacements.push((start_idx, pattern.len(), new_slice.to_vec()));
+                line_index = start_idx + pattern.len();
+            }
+            Seek::Ambiguous(at) => {
+                return Err(ambiguous(path, "the patch's unchanged and `-` lines", &at));
+            }
+            Seek::Missing => {
+                // Mirror `seek`'s own eof branch so the diagnostic looks at the
+                // same window `seek` searched, not a different one.
+                let search_start = if chunk.is_end_of_file && original_lines.len() >= pattern.len()
+                {
+                    original_lines.len() - pattern.len()
+                } else {
+                    line_index
+                };
+                let hint = seek_sequence::describe_mismatch(original_lines, pattern, search_start);
+                return Err(format!(
+                    "Failed to find expected lines in {}:\n{}\n{hint}",
+                    path,
+                    chunk.old_lines.join("\n"),
+                ));
+            }
         }
     }
 
     replacements.sort_by_key(|(index, _, _)| *index);
 
-    Ok(replacements)
+    Ok((replacements, notes))
 }
 
 /// Apply the `(start_index, old_len, new_lines)` replacements to `original_lines`,
@@ -195,7 +251,7 @@ pub(crate) fn derive_new_contents(
     original: &str,
     path: &str,
     chunks: &[UpdateFileChunk],
-) -> Result<String, String> {
+) -> Result<(String, Vec<String>), String> {
     let dominant = if uses_crlf(original) { "\r\n" } else { "\n" };
     let final_newline = original.is_empty() || original.ends_with('\n');
     let segments: Vec<&str> = original.split('\n').collect();
@@ -224,7 +280,7 @@ pub(crate) fn derive_new_contents(
         endings.pop();
     }
 
-    let replacements = compute_replacements(&original_lines, path, chunks)?;
+    let (replacements, notes) = compute_replacements(&original_lines, path, chunks)?;
     let ending_replacements: Vec<(usize, usize, Vec<&'static str>)> = replacements
         .iter()
         .map(|(start, old_len, new)| {
@@ -237,7 +293,7 @@ pub(crate) fn derive_new_contents(
     let new_lines = apply_replacements(original_lines, &replacements);
     let new_endings = apply_replacements(endings, &ending_replacements);
     if new_lines.is_empty() {
-        return Ok(String::new());
+        return Ok((String::new(), notes));
     }
     let mut out = String::with_capacity(original.len());
     let count = new_lines.len();
@@ -247,7 +303,7 @@ pub(crate) fn derive_new_contents(
             out.push_str(ending);
         }
     }
-    Ok(out)
+    Ok((out, notes))
 }
 
 #[cfg(test)]
@@ -255,6 +311,10 @@ mod tests {
     use super::*;
     use crate::apply_patch::parse_patch;
     use crate::apply_patch::parser::Hunk;
+
+    fn derive(original: &str, path: &str, chunks: &[UpdateFileChunk]) -> Result<String, String> {
+        derive_new_contents(original, path, chunks).map(|(text, _)| text)
+    }
 
     fn update_chunks(patch_body: &str) -> Vec<UpdateFileChunk> {
         let patch = format!("*** Begin Patch\n{patch_body}\n*** End Patch");
@@ -268,7 +328,7 @@ mod tests {
     #[test]
     fn a_single_line_replacement_keeps_surrounding_lines() {
         let chunks = update_chunks("*** Update File: f\n@@\n foo\n-bar\n+baz");
-        let new = derive_new_contents("foo\nbar\nqux\n", "f", &chunks).expect("applies");
+        let new = derive("foo\nbar\nqux\n", "f", &chunks).expect("applies");
         assert_eq!(new, "foo\nbaz\nqux\n");
     }
 
@@ -276,11 +336,11 @@ mod tests {
     #[test]
     fn a_crlf_file_keeps_its_line_endings() {
         let chunks = update_chunks("*** Update File: f\n@@\n foo\n-bar\n+baz\n+extra");
-        let new = derive_new_contents("foo\r\nbar\r\nqux\r\n", "f", &chunks).expect("applies");
+        let new = derive("foo\r\nbar\r\nqux\r\n", "f", &chunks).expect("applies");
         assert_eq!(new, "foo\r\nbaz\r\nextra\r\nqux\r\n");
         // A pure addition at the end keeps them too.
-        let chunks = update_chunks("*** Update File: f\n@@\n+tail");
-        let new = derive_new_contents("a\r\nb\r\n", "f", &chunks).expect("applies");
+        let chunks = update_chunks("*** Update File: f\n@@\n+tail\n*** End of File");
+        let new = derive("a\r\nb\r\n", "f", &chunks).expect("applies");
         assert_eq!(new, "a\r\nb\r\ntail\r\n");
     }
 
@@ -291,19 +351,19 @@ mod tests {
     fn a_mixed_file_changes_only_where_it_was_edited() {
         // CRLF dominant, one LF line the patch does not touch.
         let chunks = update_chunks("*** Update File: f\n@@\n a\n-b\n+B");
-        let new = derive_new_contents("a\r\nb\r\nlf\nc\r\n", "f", &chunks).expect("applies");
+        let new = derive("a\r\nb\r\nlf\nc\r\n", "f", &chunks).expect("applies");
         assert_eq!(new, "a\r\nB\r\nlf\nc\r\n");
         // LF dominant, one CRLF line the patch does not touch.
         let chunks = update_chunks("*** Update File: f\n@@\n-a\n+A\n+added");
-        let new = derive_new_contents("a\nb\ncr\r\nc\n", "f", &chunks).expect("applies");
+        let new = derive("a\nb\ncr\r\nc\n", "f", &chunks).expect("applies");
         assert_eq!(new, "A\nadded\nb\ncr\r\nc\n");
         // A CRLF line in an LF file still matches patch context.
         let chunks = update_chunks("*** Update File: f\n@@\n cr\n-c\n+C");
-        let new = derive_new_contents("a\ncr\r\nc\nd\n", "f", &chunks).expect("applies");
+        let new = derive("a\ncr\r\nc\nd\n", "f", &chunks).expect("applies");
         assert_eq!(new, "a\ncr\r\nC\nd\n");
         // A line added after a final line with no newline gives it one.
         let chunks = update_chunks("*** Update File: f\n@@\n last\n+more");
-        let new = derive_new_contents("x\r\nlast", "f", &chunks).expect("applies");
+        let new = derive("x\r\nlast", "f", &chunks).expect("applies");
         assert_eq!(new, "x\r\nlast\r\nmore");
     }
 
@@ -313,36 +373,33 @@ mod tests {
     fn the_final_newline_state_is_kept() {
         let chunks = update_chunks("*** Update File: f\n@@\n foo\n-bar\n+baz");
         assert_eq!(
-            derive_new_contents("foo\nbar", "f", &chunks).expect("applies"),
+            derive("foo\nbar", "f", &chunks).expect("applies"),
             "foo\nbaz"
         );
         assert_eq!(
-            derive_new_contents("foo\nbar\n", "f", &chunks).expect("applies"),
+            derive("foo\nbar\n", "f", &chunks).expect("applies"),
             "foo\nbaz\n"
         );
         assert_eq!(
-            derive_new_contents("foo\r\nbar", "f", &chunks).expect("applies"),
+            derive("foo\r\nbar", "f", &chunks).expect("applies"),
             "foo\r\nbaz"
         );
         // A pure addition to a file with no final newline.
-        let chunks = update_chunks("*** Update File: f\n@@\n+tail");
-        assert_eq!(
-            derive_new_contents("only", "f", &chunks).expect("applies"),
-            "only\ntail"
-        );
+        let chunks = update_chunks("*** Update File: f\n@@\n+tail\n*** End of File");
+        assert_eq!(derive("only", "f", &chunks).expect("applies"), "only\ntail");
     }
 
     #[test]
-    fn a_pure_addition_chunk_inserts_at_end_of_file() {
-        let chunks = update_chunks("*** Update File: f\n@@\n+new-line");
-        let new = derive_new_contents("only\n", "f", &chunks).expect("applies");
+    fn a_pure_addition_chunk_marked_end_of_file_appends() {
+        let chunks = update_chunks("*** Update File: f\n@@\n+new-line\n*** End of File");
+        let new = derive("only\n", "f", &chunks).expect("applies");
         assert_eq!(new, "only\nnew-line\n");
     }
 
     #[test]
     fn a_missing_context_line_is_reported_with_the_path() {
         let chunks = update_chunks("*** Update File: f\n@@\n missing-context\n-x\n+y");
-        let err = derive_new_contents("a\nb\n", "f", &chunks).unwrap_err();
+        let err = derive("a\nb\n", "f", &chunks).unwrap_err();
         assert!(err.contains("missing-context"));
         assert!(err.contains('f'));
     }
@@ -394,7 +451,7 @@ mod tests {
         ]
         .join("\n");
         let chunks = update_chunks(&patch_body);
-        let err = derive_new_contents(&original, "src/lib.rs", &chunks).unwrap_err();
+        let err = derive(&original, "src/lib.rs", &chunks).unwrap_err();
         assert!(
             err.contains("pub fn tally_csv_ints(line: &str) -> i64 {"),
             "must quote the real full line back: {err}"
@@ -415,10 +472,71 @@ mod tests {
              @@ -5,11 +5,15 @@\n\
              +new\n",
         );
-        let err = derive_new_contents("a\nb\nc\n", "f", &chunks).unwrap_err();
+        let err = derive("a\nb\nc\n", "f", &chunks).unwrap_err();
         assert!(
             err.contains("unified-diff hunk header"),
             "must name the mistake by kind: {err}"
         );
+    }
+
+    /// A greenfield worker sent `*** Update File: Cargo.toml` with only `+`
+    /// lines three times; each applied as an append and the file held three
+    /// `[workspace]` tables.
+    #[test]
+    fn an_update_of_only_added_lines_is_refused_not_appended() {
+        let chunks = update_chunks(
+            "*** Update File: Cargo.toml\n+[workspace]\n+members = [\"wcl-core\", \"wcl\"]",
+        );
+        let original = "[package]\nname = \"wcl-workspace\"\n\n[workspace]\nmembers = [\"wcl-core\", \"wcl\"]\n";
+        let err = derive(original, "Cargo.toml", &chunks).unwrap_err();
+        assert!(err.contains("only `+` lines"), "{err}");
+        assert!(err.contains("Cargo.toml"), "{err}");
+        assert!(err.contains("*** End of File"), "{err}");
+        assert!(err.contains("*** Add File: Cargo.toml"), "{err}");
+        // An `@@` context does not anchor it either: it used to append at the end.
+        let chunks = update_chunks("*** Update File: f\n@@ b\n+new");
+        let err = derive("a\nb\nc\n", "f", &chunks).unwrap_err();
+        assert!(err.contains("only `+` lines"), "{err}");
+    }
+
+    #[test]
+    fn an_update_of_only_added_lines_to_an_empty_file_is_applied() {
+        let chunks = update_chunks("*** Update File: f\n+one\n+two");
+        assert_eq!(derive("", "f", &chunks).expect("applies"), "one\ntwo\n");
+    }
+
+    #[test]
+    fn indentation_and_trailing_whitespace_differences_match_once_with_a_note() {
+        let chunks =
+            update_chunks("*** Update File: f\n@@\n fn a() {\n-    old();\n+    new();\n }");
+        let (new, notes) =
+            derive_new_contents("fn a() {  \n\told();\n}\n", "f", &chunks).expect("applies");
+        assert_eq!(new, "fn a() {\n    new();\n}\n");
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].starts_with("note: in f"), "{notes:?}");
+        // An exact match carries no note.
+        let (_, notes) =
+            derive_new_contents("fn a() {\n    old();\n}\n", "f", &chunks).expect("applies");
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    #[test]
+    fn a_whitespace_tolerant_match_that_fits_twice_is_refused() {
+        let chunks = update_chunks("*** Update File: f\n@@\n-x = 1\n+x = 2");
+        let err = derive("  x = 1\n\tx = 1\n", "f", &chunks).unwrap_err();
+        assert!(err.contains("more than one place"), "{err}");
+        assert!(err.contains("lines 1, 2"), "{err}");
+        // The same lines matched exactly keep the first-match rule.
+        assert_eq!(
+            derive("x = 1\nx = 1\n", "f", &chunks).expect("applies"),
+            "x = 2\nx = 1\n"
+        );
+    }
+
+    #[test]
+    fn a_context_line_that_fits_twice_after_ignoring_whitespace_is_refused() {
+        let chunks = update_chunks("*** Update File: f\n@@ fn a() {\n-    old();\n+    new();");
+        let err = derive(" fn a() {\n    old();\n\tfn a() {\n", "f", &chunks).unwrap_err();
+        assert!(err.contains("`@@` context"), "{err}");
     }
 }

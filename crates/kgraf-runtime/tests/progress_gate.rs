@@ -425,7 +425,10 @@ async fn a_productive_long_task_runs_past_its_budget_in_one_worker_and_completes
     assert_eq!(blocks.checkpoints[1].at_round, 57);
     let first = &blocks.checkpoints[0];
     assert_eq!(first.at_round, 27);
-    assert_eq!(first.measure.files_changed.len(), 14);
+    // 14 files were written in the block; the first block counts those that
+    // changed after its midpoint (round 13), 7 of them.
+    assert_eq!(first.measure.files_changed.len(), 7);
+    assert!(first.measure.files_discounted.is_empty());
     assert_eq!(
         first.measure.checks_improved,
         vec!["cargo test: 1 passed, 39 failed -> 13 passed, 27 failed"]
@@ -739,4 +742,36 @@ async fn a_resumed_worker_keeps_the_rounds_its_checkpoints_granted() {
         verdicts(&resumed),
         vec![CheckpointVerdict::Continue, CheckpointVerdict::Continue]
     );
+}
+
+/// Greenfield shape (decision 0096, first block): one test passes after the
+/// first file is written in round 1, every later round either rewrites
+/// `src/lib.rs` with new content or runs the tests, and the tests stay at one
+/// passed, 39 failed. Counting each file that differs from the empty start
+/// called every such block progress and extended it; the first block now
+/// discounts the changed files and ends at the old wall.
+#[tokio::test]
+async fn a_first_block_of_early_writes_and_churn_with_a_flat_failing_check_gets_no_extension() {
+    let dir = tempfile::tempdir().expect("dir");
+    let model = Model::new(|round| match round {
+        0 => call("read_file", json!({"path": "BRIEF.md"})),
+        1 => call("write_file", json!({"path": "done/f1", "content": "ok"})),
+        r if r.is_multiple_of(2) => call(
+            "write_file",
+            json!({"path": "src/lib.rs", "content": format!("version {r}")}),
+        ),
+        _ => call("shell", json!({"command": ["cargo", "test"]})),
+    });
+    let (_, result) = run(env(model), dir.path(), 10).await;
+
+    assert_eq!(verdicts(&result), vec![CheckpointVerdict::EndNoProgress]);
+    let first = &result.round_blocks.as_ref().expect("blocks").checkpoints[0];
+    assert!(first.measure.files_changed.is_empty(), "{first:?}");
+    assert_eq!(
+        first.measure.files_discounted,
+        vec![std::path::PathBuf::from("src/lib.rs")],
+        "{first:?}"
+    );
+    assert!(first.measure.checks_improved.is_empty());
+    assert_eq!(result.outcome, WorkerOutcome::BudgetExhausted);
 }

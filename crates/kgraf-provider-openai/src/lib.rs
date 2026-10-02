@@ -73,9 +73,26 @@ const MALFORMED_OUTPUT_MARKERS: [&str; 3] = [
 ];
 
 /// Whether a 5xx body says the server failed to parse the model's own output.
+///
+/// Two shapes count. A body whose text carries one of
+/// [`MALFORMED_OUTPUT_MARKERS`], and a JSON error body whose `error.message` is
+/// exactly `EOF` or contains `unexpected EOF`: Ollama answers a bare
+/// `{"error":{"message":"EOF",...}}` when the model's output ends in the middle
+/// of a tool call. The EOF forms are read from the parsed field, never matched
+/// in arbitrary text, since `EOF` appears in unrelated messages.
 fn is_malformed_output_body(body: &str) -> bool {
     let lower = body.to_ascii_lowercase();
-    MALFORMED_OUTPUT_MARKERS.iter().any(|m| lower.contains(m))
+    if MALFORMED_OUTPUT_MARKERS.iter().any(|m| lower.contains(m)) {
+        return true;
+    }
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| {
+            v.pointer("/error/message")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .is_some_and(|m| m.trim() == "EOF" || m.to_ascii_lowercase().contains("unexpected eof"))
 }
 
 /// The error for a non-success status. A 5xx whose body names a parse failure of
@@ -137,6 +154,40 @@ mod http_error_tests {
             let e = http_error("a", 500, body.to_owned());
             assert!(e.is_malformed_model_output(), "{body}");
         }
+    }
+
+    /// Round evidence: call 14 of a planning run answered HTTP 500 with this
+    /// body, and the attempt failed with no retry.
+    #[test]
+    fn a_bare_eof_error_message_is_malformed_output() {
+        for body in [
+            r#"{"error":{"message":"EOF","type":"api_error","param":null,"code":null}}"#,
+            r#"{"error":{"message":"unexpected EOF"}}"#,
+            r#"{"error":{"message":"read tcp: unexpected EOF while decoding"}}"#,
+        ] {
+            let e = http_error("a", 500, body.to_owned());
+            assert!(e.is_malformed_model_output(), "{body}");
+        }
+    }
+
+    #[test]
+    fn eof_elsewhere_than_the_error_message_is_not_malformed_output() {
+        for body in [
+            "EOF",
+            r#"{"error":{"message":"heredoc EOF marker missing"}}"#,
+            r#"{"error":{"message":"EOFs"}}"#,
+            r#"{"detail":"EOF"}"#,
+            r#"{"error":{"message":"overloaded","code":"EOF"}}"#,
+        ] {
+            let e = http_error("a", 500, body.to_owned());
+            assert!(matches!(e, ProviderError::Http { .. }), "{body}");
+        }
+        // A 4xx with the same body stays a plain HTTP error.
+        let body = r#"{"error":{"message":"EOF"}}"#;
+        assert!(matches!(
+            http_error("a", 400, body.to_owned()),
+            ProviderError::Http { .. }
+        ));
     }
 
     #[test]

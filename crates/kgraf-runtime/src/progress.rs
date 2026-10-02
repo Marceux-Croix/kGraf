@@ -39,6 +39,17 @@
 //!
 //! A block is progressing when (a) or (b) holds and (c) finds nothing.
 //!
+//! **The first block is measured harder.** Its (a) compares with the empty
+//! start, so any early write would count, and a worker that wrote its files in
+//! round 2 and then rewrote them with its test run flat at the same failure
+//! was extended block after block. In the first block (a) counts only files
+//! that differ from their content at the block's midpoint (the worker captures
+//! it), and when the block ran a test or build command, none of its commands
+//! improved and every one of them ended failing, file changes alone do not
+//! count: the measure lists them as `files_discounted`. A command that ended
+//! passing leaves (a) as it is. With no midpoint capture (a resumed attempt, a
+//! block too short to have one) (a) falls back to the compare with the start.
+//!
 //! **Verdicts** (one per checkpoint):
 //!
 //! ```text
@@ -117,6 +128,15 @@ impl CheckScore {
             (BuildErrors, Tests) => true,
             (Tests, BuildErrors) => false,
             (ExitStatus, _) | (_, ExitStatus) => !before.exit_ok && self.exit_ok,
+        }
+    }
+
+    /// Whether the run ended failing: failed tests or compiler errors, or a
+    /// nonzero exit.
+    fn failing(&self) -> bool {
+        match self.kind {
+            CheckKind::Tests | CheckKind::BuildErrors => self.failed > 0 || !self.exit_ok,
+            CheckKind::ExitStatus => !self.exit_ok,
         }
     }
 
@@ -332,8 +352,13 @@ pub enum SloppyPattern {
 pub struct ProgressMeasure {
     /// Model rounds in the block.
     pub rounds: u32,
-    /// Files whose content differs from the previous checkpoint's.
+    /// Files whose content differs from the previous checkpoint's (in the
+    /// first block: from their content at the block's midpoint).
     pub files_changed: Vec<PathBuf>,
+    /// Files that changed but were not counted, because the first block ran
+    /// a test or build command that ended failing and none improved.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files_discounted: Vec<PathBuf>,
     /// Commands whose score improved, each as `label: before -> after`.
     pub checks_improved: Vec<String>,
     pub sloppy: Vec<SloppyPattern>,
@@ -396,6 +421,12 @@ impl Checkpoint {
             "{} file(s) changed",
             self.measure.files_changed.len()
         ));
+        if !self.measure.files_discounted.is_empty() {
+            parts.push(format!(
+                "{} changed file(s) not counted: the checks ran failing and none improved",
+                self.measure.files_discounted.len()
+            ));
+        }
         if !self.measure.checks_improved.is_empty() {
             parts.push(format!(
                 "checks improved: {}",
@@ -517,6 +548,8 @@ struct BlockLog {
     /// Content of a path just before the block's first write to it, for a
     /// path the baseline does not record.
     preimages: BTreeMap<PathBuf, Option<String>>,
+    /// Content digests of the tracked paths at the first block's midpoint.
+    midpoint: Option<BTreeMap<PathBuf, Option<String>>>,
 }
 
 impl BlockLog {
@@ -673,6 +706,24 @@ impl ProgressGate {
         self.log.observe(event, facts);
     }
 
+    /// The round at which the first block's midpoint is captured.
+    fn midpoint_round(&self) -> u32 {
+        (self.next_at / 2).max(1)
+    }
+
+    /// Whether the first block's midpoint capture is due: the first block only,
+    /// once, after its midpoint and before its checkpoint.
+    pub(crate) fn midpoint_due(&self, used: u32) -> bool {
+        self.checkpoints.is_empty()
+            && self.log.midpoint.is_none()
+            && used >= self.midpoint_round()
+            && used < self.next_at
+    }
+
+    pub(crate) fn capture_midpoint(&mut self, digests: BTreeMap<PathBuf, Option<String>>) {
+        self.log.midpoint = Some(digests);
+    }
+
     /// Paths whose content before a write must be captured: declared write
     /// paths the baseline does not record and the block has not captured.
     pub(crate) fn needs_preimage(&self, path: &Path) -> bool {
@@ -703,6 +754,8 @@ impl ProgressGate {
         dirty: Option<&BTreeSet<PathBuf>>,
     ) -> (ProgressMeasure, CheckpointBaseline) {
         let mut files_changed = Vec::new();
+        let mut since_midpoint = Vec::new();
+        let first_block = self.checkpoints.is_empty();
         let mut unchanged = BTreeSet::new();
         for (path, digest) in now {
             let changed = match self.baseline.files.get(path) {
@@ -720,10 +773,31 @@ impl ProgressGate {
             } else {
                 unchanged.insert(path.clone());
             }
+            // The first block's (a): a net change from the start that also
+            // differs from the midpoint capture or, for a path first written
+            // after it, from its content before that write.
+            if let (true, Some(mid)) = (first_block, &self.log.midpoint) {
+                let moved = match mid.get(path).or_else(|| self.log.preimages.get(path)) {
+                    Some(before) => before != digest,
+                    None => changed,
+                };
+                if moved && changed {
+                    since_midpoint.push(path.clone());
+                }
+            }
         }
+        // `files_changed` keeps the compare with the block's start for the
+        // revert check below; `counted` is what (a) counts.
+        let mut counted = if first_block && self.log.midpoint.is_some() {
+            since_midpoint
+        } else {
+            files_changed.clone()
+        };
         // (b): each command's latest score against its reference.
         let mut checks = self.baseline.checks.clone();
         let mut checks_improved = Vec::new();
+        // Latest score of each test or build command run in the block.
+        let mut latest_scores: Vec<CheckScore> = Vec::new();
         let mut seen: Vec<&str> = Vec::new();
         for (key, _, _) in &self.log.checks {
             if !seen.contains(&key.as_str()) {
@@ -754,7 +828,20 @@ impl ProgressGate {
                     latest.describe()
                 ));
             }
+            if latest.kind != CheckKind::ExitStatus {
+                latest_scores.push(*latest);
+            }
             checks.insert(key.to_owned(), *latest);
+        }
+        // The first block: file changes alone do not count while the block's
+        // test and build commands all ended failing and none improved.
+        let mut files_discounted = Vec::new();
+        if first_block
+            && checks_improved.is_empty()
+            && !latest_scores.is_empty()
+            && latest_scores.iter().all(CheckScore::failing)
+        {
+            files_discounted = std::mem::take(&mut counted);
         }
         // (c).
         let mut sloppy = Vec::new();
@@ -804,7 +891,8 @@ impl ProgressGate {
         }
         let measure = ProgressMeasure {
             rounds: used.saturating_sub(self.log.rounds_at_start),
-            files_changed,
+            files_changed: counted,
+            files_discounted,
             checks_improved,
             sloppy,
         };
@@ -1296,5 +1384,157 @@ mod tests {
         let (m, _) = resumed.measure(17, &BTreeMap::new(), None);
         assert_eq!(m.rounds, 10);
         assert_eq!(m.sloppy.len(), 1, "the open block's calls were replayed");
+    }
+
+    /// A first block of block size 10: the checkpoint falls at round 7 and the
+    /// midpoint at round 3.
+    fn first_block_gate() -> ProgressGate {
+        let mut g = ProgressGate::new(10, 10);
+        // `a.rs` and `b.rs` did not exist at the start of the block.
+        g.capture_preimage("a.rs".into(), None);
+        g.capture_preimage("b.rs".into(), None);
+        g
+    }
+
+    const FAILING: &str = "exit status: 101\ntest result: FAILED. 1 passed; 39 failed;";
+
+    #[test]
+    fn the_midpoint_is_captured_once_in_the_first_block_only() {
+        let mut g = ProgressGate::new(10, 10);
+        assert!(!g.midpoint_due(2));
+        assert!(g.midpoint_due(3));
+        assert!(g.midpoint_due(6));
+        assert!(!g.midpoint_due(7), "the checkpoint is due then");
+        g.capture_midpoint(BTreeMap::new());
+        assert!(!g.midpoint_due(4), "once");
+        let (c, b) = g.decide(7, ProgressMeasure::default(), CheckpointBaseline::default());
+        let _ = (c, b);
+        assert!(!g.midpoint_due(12), "later blocks are measured as before");
+    }
+
+    /// Greenfield shape: files written in round 2, then churn, with the test
+    /// run flat at the same failure. Counting every file that differs from the
+    /// empty start called this progress and extended it.
+    #[test]
+    fn a_first_block_with_a_flat_failing_check_does_not_count_file_changes() {
+        let mut g = first_block_gate();
+        let cmd = json!({"command": ["cargo", "test"]});
+        call(&mut g, "1", "write", json!({"path": "a.rs"}), "ok", false);
+        g.capture_midpoint(files(&[("a.rs", Some("v1"))]));
+        call(&mut g, "2", "shell", cmd.clone(), FAILING, true);
+        call(
+            &mut g,
+            "3",
+            "write",
+            json!({"path": "a.rs", "n": 2}),
+            "ok",
+            false,
+        );
+        call(&mut g, "4", "shell", cmd, FAILING, true);
+        let (m, _) = g.measure(7, &files(&[("a.rs", Some("v2"))]), None);
+        assert!(m.files_changed.is_empty(), "{m:?}");
+        assert_eq!(m.files_discounted, vec![PathBuf::from("a.rs")]);
+        assert!(m.checks_improved.is_empty());
+        assert!(!m.progressing());
+        let (c, _) = g.decide(7, m, CheckpointBaseline::default());
+        assert_eq!(c.verdict, CheckpointVerdict::EndNoProgress);
+        assert!(c.render().contains("not counted"), "{}", c.render());
+    }
+
+    #[test]
+    fn a_first_block_with_a_failing_check_that_improved_is_progress() {
+        let mut g = first_block_gate();
+        let cmd = json!({"command": ["cargo", "test"]});
+        call(&mut g, "1", "write", json!({"path": "a.rs"}), "ok", false);
+        call(&mut g, "2", "shell", cmd.clone(), FAILING, true);
+        g.capture_midpoint(files(&[("a.rs", Some("v1"))]));
+        call(
+            &mut g,
+            "3",
+            "write",
+            json!({"path": "a.rs", "n": 2}),
+            "ok",
+            false,
+        );
+        call(
+            &mut g,
+            "4",
+            "shell",
+            cmd,
+            "exit status: 101\ntest result: FAILED. 20 passed; 20 failed;",
+            true,
+        );
+        let (m, _) = g.measure(7, &files(&[("a.rs", Some("v2"))]), None);
+        assert!(m.progressing(), "{m:?}");
+        assert_eq!(m.files_changed, vec![PathBuf::from("a.rs")]);
+        assert!(m.files_discounted.is_empty());
+    }
+
+    #[test]
+    fn a_first_block_whose_check_ends_passing_keeps_its_file_changes() {
+        let mut g = first_block_gate();
+        let cmd = json!({"command": ["cargo", "test"]});
+        g.capture_midpoint(files(&[("a.rs", Some("v1"))]));
+        call(
+            &mut g,
+            "1",
+            "write",
+            json!({"path": "a.rs", "n": 2}),
+            "ok",
+            false,
+        );
+        call(
+            &mut g,
+            "2",
+            "shell",
+            cmd,
+            "exit status: 0\ntest result: ok. 40 passed; 0 failed;",
+            false,
+        );
+        let (m, _) = g.measure(7, &files(&[("a.rs", Some("v2"))]), None);
+        assert!(m.progressing(), "{m:?}");
+    }
+
+    #[test]
+    fn a_first_block_counts_only_files_that_changed_since_its_midpoint() {
+        let mut g = first_block_gate();
+        call(&mut g, "1", "write", json!({"path": "a.rs"}), "ok", false);
+        g.capture_midpoint(files(&[("a.rs", Some("v1"))]));
+        call(&mut g, "2", "write", json!({"path": "b.rs"}), "ok", false);
+        // `a.rs` is as it was at the midpoint; `b.rs` was first written after it.
+        let now = files(&[("a.rs", Some("v1")), ("b.rs", Some("w1"))]);
+        let (m, _) = g.measure(7, &now, None);
+        assert_eq!(m.files_changed, vec![PathBuf::from("b.rs")]);
+        // Nothing written after the midpoint: no progress, and no discount note
+        // (no check ran).
+        let mut g = first_block_gate();
+        call(&mut g, "1", "write", json!({"path": "a.rs"}), "ok", false);
+        g.capture_midpoint(files(&[("a.rs", Some("v1"))]));
+        let (m, _) = g.measure(7, &files(&[("a.rs", Some("v1"))]), None);
+        assert!(m.files_changed.is_empty());
+        assert!(m.files_discounted.is_empty());
+        assert!(!m.progressing());
+    }
+
+    #[test]
+    fn a_later_block_is_measured_against_the_last_checkpoint_as_before() {
+        let mut g = first_block_gate();
+        let cmd = json!({"command": ["cargo", "test"]});
+        call(&mut g, "1", "write", json!({"path": "a.rs"}), "ok", false);
+        let (m, base) = g.measure(7, &files(&[("a.rs", Some("v1"))]), None);
+        assert!(m.progressing(), "no check ran: the files count");
+        g.decide(7, m, base);
+        call(
+            &mut g,
+            "3",
+            "write",
+            json!({"path": "a.rs", "n": 2}),
+            "ok",
+            false,
+        );
+        call(&mut g, "4", "shell", cmd, FAILING, true);
+        let (m, _) = g.measure(17, &files(&[("a.rs", Some("v2"))]), None);
+        assert_eq!(m.files_changed, vec![PathBuf::from("a.rs")]);
+        assert!(m.files_discounted.is_empty());
     }
 }

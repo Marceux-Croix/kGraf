@@ -7137,6 +7137,7 @@ impl RunLoop {
         // Said in the held reason, so a contract held on workers that never
         // ran (a provider refusing every request) names the refusal.
         let worker_failure = last_worker_failure(&flight.attempts);
+        let mut pinned_too_large = pinned_too_large_hold(&flight.attempts);
         let backoff = (self.config.tick.as_millis() as i64).max(1);
         let retry_now = self.now();
         if let Some(c) = self.record.contract_mut(&id) {
@@ -7188,6 +7189,12 @@ impl RunLoop {
             } else if let Some(reason) = c.shortfall_hold.take() {
                 // Decision 0093: a shortfall beyond what the orchestrator may
                 // resolve alone waits for the user.
+                ContractStatus::Held { reason }
+            } else if let Some(reason) = pinned_too_large.take()
+                && !not_a_failure
+            {
+                // The same brief on the same routes fails the same way, so a
+                // retry only repeats it: held now, with the remedy.
                 ContractStatus::Held { reason }
             } else if failures > max_retries && !not_a_failure {
                 ContractStatus::Held {
@@ -8035,6 +8042,29 @@ fn last_stop_note(attempts: &[Attempt]) -> Option<String> {
 /// Starts the failure text of an attempt that could not run a single round
 /// because its pinned context reaches the worker's stop point.
 const PINNED_CONTEXT_PREFIX: &str = "pinned context too large: ";
+
+/// The held reason for a round whose every attempt failed because the pinned
+/// context (prefix, slices, instruction) reaches the worker's stop point. That
+/// size does not change between attempts of one brief, so a retry fails the
+/// same way; the contract is held with what to change instead. `None` when any
+/// attempt failed another way (a route with a larger window may succeed).
+fn pinned_too_large_hold(attempts: &[Attempt]) -> Option<String> {
+    let mut first: Option<String> = None;
+    for a in attempts {
+        let WorkerOutcome::Failed { error } = &a.result.as_ref()?.outcome else {
+            return None;
+        };
+        let detail = error.strip_prefix(PINNED_CONTEXT_PREFIX)?;
+        first.get_or_insert_with(|| detail.to_owned());
+    }
+    let detail = kgraf_secrets::scrub_persist(&first?).into_owned();
+    Some(format!(
+        "{}. This fails the same way on every attempt, so it was not retried. Split the \
+         contract into smaller ones, use a route with a larger context window, or raise the \
+         context stop point, then resume it",
+        detail.trim_end_matches('.')
+    ))
+}
 
 /// The tag a verifier's refusal reason is quoted in, as data, in a fresh
 /// attempt's brief (decision 0084). The worker's system prompt names it.

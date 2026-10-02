@@ -4,117 +4,109 @@
 // only to widen the end-of-file search window for `PreserveLineEndings`; kGraf
 // matches on LF lines (`apply_patch::replace` strips and restores a CRLF file's
 // carriage returns around the edit), so the `NormalizeToLf` arm is the only
-// behavior kept.
+// behavior kept. The tolerant passes (trailing whitespace, indentation,
+// typographic punctuation) now require a single place to fit; several is
+// `Seek::Ambiguous` instead of the first one.
+
+/// A rule for when two lines are the same.
+type Same = dyn Fn(&str, &str) -> bool;
+
+/// How [`seek`] located a pattern.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Seek {
+    /// Every line equal, at this index.
+    Exact(usize),
+    /// Found at this index only after ignoring whitespace or typographic
+    /// punctuation differences; the one place the pattern fits under that rule.
+    Tolerant(usize),
+    /// Under a tolerant rule the pattern fits at several places (the indices);
+    /// no one of them is chosen.
+    Ambiguous(Vec<usize>),
+    Missing,
+}
 
 /// Attempt to find the sequence of `pattern` lines within `lines` beginning at or after `start`.
-/// Returns the starting index of the match or `None` if not found. Matches are attempted with
-/// decreasing strictness: exact match, then ignoring trailing whitespace, then ignoring leading
-/// and trailing whitespace. When `eof` is true, we first try starting at the end-of-file (so that
-/// patterns intended to match file endings are applied at the end), and fall back to searching
-/// from `start` if needed.
+/// Matches are attempted with decreasing strictness: exact match (the first one wins), then
+/// ignoring trailing whitespace, then ignoring leading and trailing whitespace, then also
+/// normalizing typographic punctuation. A tolerant rule must fit in exactly one place: when it
+/// fits in several, the result is [`Seek::Ambiguous`], because picking the first would edit a
+/// line the model may not have meant. When `eof` is true, we first try starting at the end-of-file
+/// (so that patterns intended to match file endings are applied at the end).
 ///
 /// Special cases handled defensively:
-///  • Empty `pattern` → returns `Some(start)` (no-op match)
-///  • `pattern.len() > lines.len()` → returns `None` (cannot match, avoids
-///    out‑of‑bounds panic that occurred pre‑2025‑04‑12)
+///  - Empty `pattern` returns `Exact(start)` (no-op match)
+///  - `pattern.len() > lines.len()` returns `Missing` (cannot match, avoids an
+///    out-of-bounds slice)
+pub(crate) fn seek(lines: &[String], pattern: &[String], start: usize, eof: bool) -> Seek {
+    if pattern.is_empty() {
+        return Seek::Exact(start);
+    }
+    if pattern.len() > lines.len() {
+        return Seek::Missing;
+    }
+    let search_start = if eof {
+        lines.len() - pattern.len()
+    } else {
+        start
+    };
+    let last = lines.len() - pattern.len();
+    let fits = |i: usize, same: &Same| {
+        pattern
+            .iter()
+            .enumerate()
+            .all(|(p_idx, pat)| same(&lines[i + p_idx], pat))
+    };
+    if let Some(i) = (search_start..=last).find(|&i| lines[i..i + pattern.len()] == *pattern) {
+        return Seek::Exact(i);
+    }
+    let rules: [&Same; 3] = [
+        &|a, b| a.trim_end() == b.trim_end(),
+        &|a, b| a.trim() == b.trim(),
+        // Typographic dashes, quotes and spaces read as their ASCII forms, so
+        // a patch typed in ASCII applies to a file that holds the typographic
+        // ones (what `git apply` does when it ignores minor byte differences).
+        &|a, b| normalise(a) == normalise(b),
+    ];
+    for same in rules {
+        let hits: Vec<usize> = (search_start..=last).filter(|&i| fits(i, same)).collect();
+        match hits.as_slice() {
+            [] => {}
+            [only] => return Seek::Tolerant(*only),
+            _ => return Seek::Ambiguous(hits),
+        }
+    }
+    Seek::Missing
+}
+
+fn normalise(s: &str) -> String {
+    s.trim()
+        .chars()
+        .map(|c| match c {
+            '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2015}'
+            | '\u{2212}' => '-',
+            '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' => '\'',
+            '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}' => '"',
+            '\u{00A0}' | '\u{2002}' | '\u{2003}' | '\u{2004}' | '\u{2005}' | '\u{2006}'
+            | '\u{2007}' | '\u{2008}' | '\u{2009}' | '\u{200A}' | '\u{202F}' | '\u{205F}'
+            | '\u{3000}' => ' ',
+            other => other,
+        })
+        .collect()
+}
+
+/// [`seek`] as an index: the old first-match behavior, for the unit tests of
+/// the matching rules that do not care about ambiguity.
+#[cfg(test)]
 pub(crate) fn seek_sequence(
     lines: &[String],
     pattern: &[String],
     start: usize,
     eof: bool,
 ) -> Option<usize> {
-    if pattern.is_empty() {
-        return Some(start);
+    match seek(lines, pattern, start, eof) {
+        Seek::Exact(i) | Seek::Tolerant(i) => Some(i),
+        Seek::Ambiguous(_) | Seek::Missing => None,
     }
-
-    // When the pattern is longer than the available input there is no possible
-    // match. Early‑return to avoid the out‑of‑bounds slice that would occur in
-    // the search loops below (previously caused a panic when
-    // `pattern.len() > lines.len()`).
-    if pattern.len() > lines.len() {
-        return None;
-    }
-    let search_start = if eof && lines.len() >= pattern.len() {
-        lines.len() - pattern.len()
-    } else {
-        start
-    };
-    // Exact match first.
-    for i in search_start..=lines.len().saturating_sub(pattern.len()) {
-        if lines[i..i + pattern.len()] == *pattern {
-            return Some(i);
-        }
-    }
-    // Then rstrip match.
-    for i in search_start..=lines.len().saturating_sub(pattern.len()) {
-        let mut ok = true;
-        for (p_idx, pat) in pattern.iter().enumerate() {
-            if lines[i + p_idx].trim_end() != pat.trim_end() {
-                ok = false;
-                break;
-            }
-        }
-        if ok {
-            return Some(i);
-        }
-    }
-    // Finally, trim both sides to allow more lenience.
-    for i in search_start..=lines.len().saturating_sub(pattern.len()) {
-        let mut ok = true;
-        for (p_idx, pat) in pattern.iter().enumerate() {
-            if lines[i + p_idx].trim() != pat.trim() {
-                ok = false;
-                break;
-            }
-        }
-        if ok {
-            return Some(i);
-        }
-    }
-
-    // ------------------------------------------------------------------
-    // Final, most permissive pass, attempt to match after *normalising*
-    // common Unicode punctuation to their ASCII equivalents so that diffs
-    // authored with plain ASCII characters can still be applied to source
-    // files that contain typographic dashes / quotes, etc.  This mirrors the
-    // fuzzy behaviour of `git apply` which ignores minor byte-level
-    // differences when locating context lines.
-    // ------------------------------------------------------------------
-
-    fn normalise(s: &str) -> String {
-        s.trim()
-            .chars()
-            .map(|c| match c {
-                // Various dash / hyphen code-points → ASCII '-'
-                '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2015}'
-                | '\u{2212}' => '-',
-                // Fancy single quotes → '\''
-                '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' => '\'',
-                // Fancy double quotes → '"'
-                '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}' => '"',
-                // Non-breaking space and other odd spaces → normal space
-                '\u{00A0}' | '\u{2002}' | '\u{2003}' | '\u{2004}' | '\u{2005}' | '\u{2006}'
-                | '\u{2007}' | '\u{2008}' | '\u{2009}' | '\u{200A}' | '\u{202F}' | '\u{205F}'
-                | '\u{3000}' => ' ',
-                other => other,
-            })
-            .collect::<String>()
-    }
-
-    for i in search_start..=lines.len().saturating_sub(pattern.len()) {
-        let mut ok = true;
-        for (p_idx, pat) in pattern.iter().enumerate() {
-            if normalise(&lines[i + p_idx]) != normalise(pat) {
-                ok = false;
-                break;
-            }
-        }
-        if ok {
-            return Some(i);
-        }
-    }
-
-    None
 }
 
 /// The longest a file line or a pattern line is echoed back in a hint, in

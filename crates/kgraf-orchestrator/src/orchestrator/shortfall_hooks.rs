@@ -21,8 +21,8 @@
 use super::*;
 use crate::challenge::ContractReply;
 use crate::shortfall::{
-    Grounding, MAX_ANSWERED_SHORTFALLS, RequestScope, ShortfallDecision, ShortfallKind, decide,
-    instructions_answer, path_answer, skill_hold_reason, stored,
+    Grounding, MAX_ANSWERED_SHORTFALLS, RequestScope, ShortfallDecision, ShortfallKind,
+    decide_in_plan, instructions_answer, path_answer, skill_hold_reason, stored,
 };
 
 impl RunLoop {
@@ -132,7 +132,15 @@ impl RunLoop {
                 (stored(&subject), why)
             }
         };
-        let decision = decide(kind, scope, &need, &why, &contract, &self.authority());
+        let decision = decide_in_plan(
+            kind,
+            scope,
+            &need,
+            &why,
+            &contract,
+            &self.authority(),
+            Some(&self.record.open_contracts),
+        );
         let decision = match decision {
             ShortfallDecision::Grant { grant, .. } | ShortfallDecision::AskUser { grant, .. }
                 if self.grant_unappliable(&grant).is_some() =>

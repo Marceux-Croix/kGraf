@@ -220,65 +220,135 @@ fn patch_text(input: &Value) -> Result<&str, ToolError> {
     Ok(patch)
 }
 
-/// The leniency stated in the result of a call whose patch had no envelope.
-const ENVELOPE_NOTE: &str =
+const BEGIN_NOTE: &str =
     "note: the patch had no '*** Begin Patch' line; it was applied as if it had";
+const END_NOTE: &str = "note: the patch had no '*** End Patch' line (or a malformed one); it was \
+     applied as if it ended there, so check that no lines were cut off";
+const UNIFIED_NOTE: &str = "note: an `@@ -a,b +c,d @@` header is a unified-diff header, which this \
+     format does not use; its line numbers were ignored and the text after it, if any, was taken as \
+     the `@@` context line";
 
-/// `patch` with a missing `*** Begin Patch` / `*** End Patch` envelope
-/// supplied, and whether it was changed. Models often send the hunks alone.
-/// Only a patch whose first non-blank line is a file header
-/// (`*** Add File:`, `*** Update File:`, `*** Delete File:`) is repaired, so
-/// the intent is certain; a missing end marker is added with it. Anything else
-/// (a patch that starts some other way, or one that has its begin line and
-/// lacks its end line) goes to the parser unchanged and is refused there.
-fn with_envelope(patch: &str) -> (std::borrow::Cow<'_, str>, bool) {
+/// A patch repaired into the form the parser takes, and a note per repair.
+/// Models send the hunks without the envelope, drop or mangle the end line,
+/// or head a chunk with a unified-diff `@@ -a,b +c,d @@` line. Each repair is
+/// one whose intent is certain, and each is stated in the call's result.
+/// Anything else goes to the parser unchanged and is refused there.
+///
+/// - A first non-blank line that is a file header gets `*** Begin Patch`.
+/// - A patch that begins with `*** Begin Patch` (or was given one) and whose
+///   last line is not `*** End Patch` gets one; a last line that is only a
+///   mangled end marker (`***/ End Patch`) is replaced by it.
+/// - `@@ -a,b +c,d @@ text` in an Update File section becomes `@@ text`
+///   (`@@` when there is no text).
+fn repaired(patch: &str) -> (String, Vec<&'static str>) {
+    let mut notes = Vec::new();
     let first = patch.lines().map(str::trim).find(|l| !l.is_empty());
     let headed = first.is_some_and(|l| {
         ["*** Add File:", "*** Update File:", "*** Delete File:"]
             .iter()
             .any(|h| l.starts_with(h))
     });
-    if !headed {
-        return (std::borrow::Cow::Borrowed(patch), false);
+    let begun = first == Some(parser::BEGIN_PATCH_MARKER);
+    if !headed && !begun {
+        return (patch.to_string(), notes);
     }
-    let body = patch.trim();
-    let end = if body.lines().last().map(str::trim) == Some(parser::END_PATCH_MARKER) {
-        String::new()
-    } else {
-        format!("\n{}", parser::END_PATCH_MARKER)
-    };
-    (
-        std::borrow::Cow::Owned(format!("{}\n{body}{end}", parser::BEGIN_PATCH_MARKER)),
-        true,
-    )
-}
-
-/// Whether `input`'s patch is one [`with_envelope`] repairs.
-fn envelope_supplied(input: &Value) -> bool {
-    input
-        .get("patch")
-        .and_then(Value::as_str)
-        .is_some_and(|p| with_envelope(p).1)
-}
-
-/// `result` with [`ENVELOPE_NOTE`] added to a completed call, when `supplied`.
-fn noting_envelope(
-    result: Result<ToolOutput, ToolError>,
-    supplied: bool,
-) -> Result<ToolOutput, ToolError> {
-    match result {
-        Ok(mut out) if supplied => {
-            out.parts.push(crate::OutputPart::Text {
-                text: crate::UntrustedText::new(ENVELOPE_NOTE),
-            });
-            Ok(out)
+    let mut lines: Vec<String> = patch.trim().lines().map(str::to_string).collect();
+    if headed {
+        lines.insert(0, parser::BEGIN_PATCH_MARKER.to_string());
+        notes.push(BEGIN_NOTE);
+    }
+    let last = lines.last().map(|l| l.trim().to_string());
+    match last.as_deref() {
+        Some(parser::END_PATCH_MARKER) if lines.len() > 1 => {}
+        Some(l) if l.starts_with('*') && l.ends_with("End Patch") && lines.len() > 1 => {
+            if let Some(slot) = lines.last_mut() {
+                *slot = parser::END_PATCH_MARKER.to_string();
+            }
+            notes.push(END_NOTE);
         }
-        other => other,
+        _ => {
+            lines.push(parser::END_PATCH_MARKER.to_string());
+            notes.push(END_NOTE);
+        }
     }
+    let mut in_update = false;
+    for line in &mut lines {
+        let t = line.trim_end();
+        if t.starts_with("*** ") {
+            in_update = t.starts_with(parser::UPDATE_FILE_MARKER);
+        } else if in_update && let Some(context) = unified_header_context(t) {
+            *line = if context.is_empty() {
+                "@@".to_string()
+            } else {
+                format!("@@ {context}")
+            };
+            if !notes.contains(&UNIFIED_NOTE) {
+                notes.push(UNIFIED_NOTE);
+            }
+        }
+    }
+    (lines.join("\n"), notes)
 }
 
-fn parse(input: &Value) -> Result<Vec<Hunk>, ToolError> {
-    let (text, _) = with_envelope(patch_text(input)?);
+/// The text after a unified-diff hunk header `@@ -a[,b] +c[,d] @@`, trimmed
+/// (empty when the header stands alone), or `None` if `line` is not one.
+fn unified_header_context(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("@@ -")?;
+    let (old, rest) = rest.split_once(" +")?;
+    let (new, rest) = rest.split_once(" @@")?;
+    let range = |r: &str| {
+        r.split(',').count() <= 2
+            && r.split(',')
+                .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+    };
+    (range(old) && range(new) && (rest.is_empty() || rest.starts_with(' '))).then(|| rest.trim())
+}
+
+/// The patch as parsed, and the notes for everything lenient about it.
+struct Parsed {
+    hunks: Vec<Hunk>,
+    notes: Vec<String>,
+}
+
+/// A Delete File and an Add File of one path in one patch is a replace: the
+/// delete is dropped (the add overwrites the file) and a note says so. Both
+/// orders count. This is the evident intent, and the two hunks would
+/// otherwise be refused as one path named twice.
+fn merge_delete_add(hunks: Vec<Hunk>, notes: &mut Vec<String>) -> Vec<Hunk> {
+    let added: Vec<PathBuf> = hunks
+        .iter()
+        .filter_map(|h| match h {
+            Hunk::AddFile { path, .. } => normalize_hunk_path(path).ok(),
+            _ => None,
+        })
+        .collect();
+    hunks
+        .into_iter()
+        .filter(|h| {
+            let Hunk::DeleteFile { path } = h else {
+                return true;
+            };
+            let Ok(norm) = normalize_hunk_path(path) else {
+                return true;
+            };
+            let replaced = added
+                .iter()
+                .any(|a| kgraf_core::paths::fold_path(a) == kgraf_core::paths::fold_path(&norm));
+            if replaced {
+                notes.push(format!(
+                    "note: the patch deleted and added {}; it was applied as a replace of the \
+                     file (the Add File content is now the whole file)",
+                    norm.display()
+                ));
+            }
+            !replaced
+        })
+        .collect()
+}
+
+fn parse(input: &Value) -> Result<Parsed, ToolError> {
+    let (text, repairs) = repaired(patch_text(input)?);
+    let mut notes: Vec<String> = repairs.iter().map(ToString::to_string).collect();
     let hunks = parse_patch(&text).map_err(|e| ToolError::InvalidInput {
         tool: "apply_patch".into(),
         reason: e.to_string(),
@@ -292,7 +362,26 @@ fn parse(input: &Value) -> Result<Vec<Hunk>, ToolError> {
             ),
         });
     }
-    Ok(hunks)
+    let hunks = merge_delete_add(hunks, &mut notes);
+    Ok(Parsed { hunks, notes })
+}
+
+/// `result` with each of `notes` added to a completed call as a text part.
+fn with_notes(
+    result: Result<ToolOutput, ToolError>,
+    notes: Vec<String>,
+) -> Result<ToolOutput, ToolError> {
+    match result {
+        Ok(mut out) => {
+            for note in notes {
+                out.parts.push(crate::OutputPart::Text {
+                    text: crate::UntrustedText::new(note),
+                });
+            }
+            Ok(out)
+        }
+        other => other,
+    }
 }
 
 fn internal(reason: impl Into<String>) -> ToolError {
@@ -438,7 +527,7 @@ impl Tool for ApplyPatchTool {
     /// actually prevents an escape runs in [`fs_safety`] at [`Tool::call`]
     /// time, since `access()` has no filesystem to resolve a symlink against.
     fn access(&self, input: &Value) -> Result<Access, ToolError> {
-        let hunks = parse(input)?;
+        let hunks = parse(input)?.hunks;
         refuse_repeated_paths(&hunks, lexical)?;
         let mut access = Access::none();
         for hunk in &hunks {
@@ -466,11 +555,10 @@ impl Tool for ApplyPatchTool {
                 tool: "apply_patch".into(),
             });
         }
-        let hunks = parse(&input)?;
+        let Parsed { hunks, notes } = parse(&input)?;
         if hunks.is_empty() {
             return Ok(ToolOutput::error("the patch made no changes"));
         }
-        let supplied = envelope_supplied(&input);
         let root = ctx.workspace_root.clone();
         let cancel = ctx.cancel.clone();
         let task = tokio::task::spawn_blocking(move || apply_all(&hunks, &root, &cancel));
@@ -478,7 +566,7 @@ impl Tool for ApplyPatchTool {
             _ = ctx.cancel.cancelled() => Err(ToolError::Cancelled { tool: "apply_patch".into() }),
             result = task => result.map_err(|e| internal(format!("apply task failed: {e}")))?,
         };
-        noting_envelope(result, supplied)
+        with_notes(result, notes)
     }
 }
 
@@ -512,7 +600,15 @@ fn apply_all(
     root: &Path,
     cancel: &CancellationToken,
 ) -> Result<ToolOutput, ToolError> {
-    apply_all_names(hunks, root, cancel, fs_safety::Names::Plain)
+    let applied = apply_all_names(hunks, root, cancel, fs_safety::Names::Plain)?;
+    with_notes(Ok(ToolOutput::text(applied.summary)), applied.notes)
+}
+
+/// What a completed apply reports: the summary of files changed, and a note
+/// for each place a line matched only under a tolerant rule.
+struct Applied {
+    summary: String,
+    notes: Vec<String>,
 }
 
 /// [`apply_all`] under the write guard's names policy `names`: the protected
@@ -522,7 +618,7 @@ fn apply_all_names(
     root: &Path,
     cancel: &CancellationToken,
     names: fs_safety::Names,
-) -> Result<ToolOutput, ToolError> {
+) -> Result<Applied, ToolError> {
     refuse_repeated_paths(hunks, lexical)?;
     let dir = fs_safety::open_workspace("apply_patch", root)?;
     // Again with links followed: a hunk on a link and a hunk on its target
@@ -541,13 +637,14 @@ fn apply_all_names(
     }
 
     let mut planned = Vec::with_capacity(hunks.len());
+    let mut notes = Vec::new();
     for hunk in hunks {
         if cancel.is_cancelled() {
             return Err(ToolError::Cancelled {
                 tool: "apply_patch".into(),
             });
         }
-        planned.push(plan_one(hunk, &dir)?);
+        planned.push(plan_one(hunk, &dir, &mut notes)?);
     }
 
     let mut added = Vec::new();
@@ -561,10 +658,13 @@ fn apply_all_names(
         }
         commit_one(change, &dir, names, &mut added, &mut modified, &mut deleted)?;
     }
-    Ok(ToolOutput::text(summary(&added, &modified, &deleted)))
+    Ok(Applied {
+        summary: summary(&added, &modified, &deleted),
+        notes,
+    })
 }
 
-fn plan_one(hunk: &Hunk, dir: &Dir) -> Result<Planned, ToolError> {
+fn plan_one(hunk: &Hunk, dir: &Dir, notes: &mut Vec<String>) -> Result<Planned, ToolError> {
     match hunk {
         Hunk::AddFile { path, contents } => {
             let path = normalize_hunk_path(path)?;
@@ -605,9 +705,10 @@ fn plan_one(hunk: &Hunk, dir: &Dir) -> Result<Planned, ToolError> {
             let path = normalize_hunk_path(path)?;
             let original =
                 fs_safety::read_capped_to_string("apply_patch", dir, &path, MAX_READ_BYTES, false)?;
-            let new_contents =
+            let (new_contents, matched) =
                 replace::derive_new_contents(&original, &path.display().to_string(), chunks)
                     .map_err(internal)?;
+            notes.extend(matched);
             match move_path {
                 Some(dest) => {
                     let dest = normalize_hunk_path(dest)?;
@@ -855,7 +956,6 @@ mod tests {
         // Malformed beyond the missing envelope stays an error.
         for bad in [
             "just some text",
-            "*** Begin Patch\n*** Add File: a.txt\n+one",
             "--- a/x\n+++ b/x\n*** Add File: a.txt\n+one",
         ] {
             let err = tool.access(&json!({ "patch": bad })).expect_err("refused");
@@ -897,10 +997,6 @@ mod tests {
             (
                 "update twice",
                 "*** Update File: a.txt\n@@\n-one\n+ONE\n*** Update File: a.txt\n@@\n-two\n+TWO",
-            ),
-            (
-                "delete then add",
-                "*** Delete File: a.txt\n*** Add File: a.txt\n+fresh",
             ),
             (
                 "move onto an edited path",
@@ -1435,5 +1531,165 @@ mod tests {
             "old\n"
         );
         assert!(root.join("sub/m").exists(), "the link itself must survive");
+    }
+
+    /// Runs `patch` against a temp workspace seeded with `seed` files and
+    /// returns the rendered result and the directory.
+    async fn run_patch(
+        seed: &[(&str, &str)],
+        patch: &str,
+    ) -> (Result<String, String>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (name, text) in seed {
+            std::fs::write(dir.path().join(name), text).expect("seed");
+        }
+        let out = ApplyPatchTool
+            .call(
+                json!({ "patch": patch }),
+                &ctx(dir.path().to_path_buf()),
+                &crate::CallPermit::new(),
+            )
+            .await;
+        (out.map(|o| o.render()).map_err(|e| e.to_string()), dir)
+    }
+
+    /// Round evidence: a worker ended its patch with `***/ End Patch`, and a
+    /// patch with no end line at all was refused with "last line must be".
+    #[tokio::test]
+    async fn a_missing_or_mangled_end_line_is_applied_and_the_result_says_so() {
+        let body = "*** Begin Patch\n*** Update File: a.txt\n@@\n one\n-two\n+TWO\n";
+        for (label, patch) in [
+            ("no end line", body.to_string()),
+            ("mangled end line", format!("{body}***/ End Patch")),
+        ] {
+            let (out, dir) = run_patch(&[("a.txt", "one\ntwo\n")], &patch).await;
+            let text = out.unwrap_or_else(|e| panic!("{label}: {e}"));
+            assert!(text.contains("no '*** End Patch' line"), "{label}: {text}");
+            let written = std::fs::read_to_string(dir.path().join("a.txt")).expect("read");
+            assert_eq!(written, "one\nTWO\n", "{label}");
+        }
+    }
+
+    /// Round evidence (conflicts-tier2, greenfield): `*** Delete File: x`
+    /// then `*** Add File: x` was refused 24 times as one path in two hunks.
+    #[tokio::test]
+    async fn a_delete_and_an_add_of_one_path_is_a_replace_with_a_note() {
+        for order in [
+            "*** Delete File: a.txt\n*** Add File: a.txt\n+fresh",
+            "*** Add File: a.txt\n+fresh\n*** Delete File: a.txt",
+        ] {
+            let (out, dir) = run_patch(
+                &[("a.txt", "one\ntwo\n")],
+                wrap(order)["patch"].as_str().expect("patch"),
+            )
+            .await;
+            let text = out.unwrap_or_else(|e| panic!("{order}: {e}"));
+            assert!(text.contains("deleted and added a.txt"), "{text}");
+            assert!(text.contains("A a.txt"), "{text}");
+            assert!(!text.contains("D a.txt"), "{text}");
+            let written = std::fs::read_to_string(dir.path().join("a.txt")).expect("read");
+            assert_eq!(written, "fresh\n");
+        }
+        // The same path in a delete and an update is still refused.
+        let (out, _) = run_patch(
+            &[("a.txt", "one\n")],
+            wrap("*** Delete File: a.txt\n*** Update File: a.txt\n@@\n-one\n+x")["patch"]
+                .as_str()
+                .expect("patch"),
+        )
+        .await;
+        assert!(out.expect_err("refused").contains("more than one hunk"));
+    }
+
+    /// Round evidence (pricing_engine): `@@ -1,4 +1,4 @@` and
+    /// `@@ -14,28 +14,4 @@ use tax_us::TaxUs;` headed update chunks.
+    #[tokio::test]
+    async fn a_unified_diff_hunk_header_is_stripped_and_the_result_says_so() {
+        let file = "use iface::{Order, Receipt};\nuse discount_flat::FlatDiscount;\nuse tax_us::TaxUs;\n\nfn price() {\n    old();\n}\n";
+        let alone = wrap(
+            "*** Update File: p.rs\n@@ -1,4 +1,4 @@\n-use iface::{Order, Receipt};\n+use iface::{Order, Receipt, Discount};\n use discount_flat::FlatDiscount;",
+        );
+        let (out, dir) =
+            run_patch(&[("p.rs", file)], alone["patch"].as_str().expect("patch")).await;
+        let text = out.expect("applies");
+        assert!(text.contains("unified-diff header"), "{text}");
+        let written = std::fs::read_to_string(dir.path().join("p.rs")).expect("read");
+        assert!(
+            written.starts_with("use iface::{Order, Receipt, Discount};\n"),
+            "{written}"
+        );
+        // The text after the header is the context line.
+        let sectioned = wrap(
+            "*** Update File: p.rs\n@@ -14,28 +14,4 @@ use tax_us::TaxUs;\n \n fn price() {\n-    old();\n+    new();",
+        );
+        let (out, dir) = run_patch(
+            &[("p.rs", file)],
+            sectioned["patch"].as_str().expect("patch"),
+        )
+        .await;
+        let text = out.expect("applies");
+        assert!(text.contains("unified-diff header"), "{text}");
+        let written = std::fs::read_to_string(dir.path().join("p.rs")).expect("read");
+        assert!(written.contains("    new();"), "{written}");
+        // A plain `@@ text` line carries no note.
+        let plain = wrap("*** Update File: p.rs\n@@ fn price() {\n-    old();\n+    new();");
+        let (out, _) = run_patch(&[("p.rs", file)], plain["patch"].as_str().expect("patch")).await;
+        assert!(!out.expect("applies").contains("unified-diff"));
+    }
+
+    #[test]
+    fn unified_header_detection_is_exact() {
+        assert_eq!(unified_header_context("@@ -1 +1 @@"), Some(""));
+        assert_eq!(
+            unified_header_context("@@ -1,4 +1,5 @@ fn x()"),
+            Some("fn x()")
+        );
+        for not in [
+            "@@ fn x()",
+            "@@ -a,b +c,d @@",
+            "@@ -1,4 +1,4 @@fn x()",
+            "@@ -1,2,3 +1 @@",
+            "@@ - +1 @@",
+            "@@",
+        ] {
+            assert_eq!(unified_header_context(not), None, "{not}");
+        }
+    }
+
+    /// Round evidence (greenfield): an Update File of only `+` lines was
+    /// applied as an append, three times, and each said "Success".
+    #[tokio::test]
+    async fn an_anchorless_addition_through_the_tool_is_refused_and_writes_nothing() {
+        let seed = "[workspace]\nmembers = [\"a\"]\n";
+        let (out, dir) = run_patch(
+            &[("Cargo.toml", seed)],
+            wrap("*** Update File: Cargo.toml\n+[workspace]\n+members = [\"a\"]")["patch"]
+                .as_str()
+                .expect("patch"),
+        )
+        .await;
+        let err = out.expect_err("refused");
+        assert!(err.contains("only `+` lines"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("Cargo.toml")).expect("read"),
+            seed
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tolerant_match_is_stated_in_the_result() {
+        let (out, dir) = run_patch(
+            &[("a.rs", "fn a() {\n\told();\n}\n")],
+            wrap("*** Update File: a.rs\n@@\n fn a() {\n-    old();\n+    new();\n }")["patch"]
+                .as_str()
+                .expect("patch"),
+        )
+        .await;
+        let text = out.expect("applies");
+        assert!(text.contains("only after ignoring whitespace"), "{text}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.rs")).expect("read"),
+            "fn a() {\n    new();\n}\n"
+        );
     }
 }

@@ -84,6 +84,7 @@ impl RunLoop {
             ))
         })?;
         request.project_context = context.text;
+        let named_files = context.named_files;
         for notice in context.notices {
             self.intake_notice(notice);
         }
@@ -99,36 +100,45 @@ impl RunLoop {
             let refusal = match self.decompose_once(&request, note_ids).await {
                 Ok(None) => return Ok(None),
                 Ok(Some(specs)) => {
-                    let groups = self.single_test_groups(&specs);
-                    if groups.is_empty() {
-                        break specs;
-                    }
-                    let reason = crate::plan::single_test_reason(&groups);
-                    if shared_refused || last_ask {
-                        let (merged, notices) = crate::plan::merge_groups(specs, &groups);
-                        // A merge can join a dependency cycle through a contract
-                        // between the merged ones: checked like any plan.
-                        match validate_plan_with(
-                            &merged,
-                            &BTreeSet::new(),
-                            &self.roster(),
-                            &self.tools(),
-                            self.config.max_contracts_per_plan,
-                            self.bypass_git_files(),
-                        ) {
-                            Ok(()) => {
-                                for n in notices {
-                                    self.intake_notice(n);
-                                }
-                                break merged;
-                            }
-                            Err(e) => PlanError::Invalid(format!(
-                                "{reason}; merging them is not possible as the plan stands ({e})"
-                            )),
-                        }
+                    // The plan against the repository as it is now (an
+                    // unwritten scaffold file, a workspace its acceptance
+                    // builds before its members exist). A split's children
+                    // are not checked: earlier contracts' work is not in the
+                    // checkout this reads.
+                    if let Some(refusal) = self.plan_repo_refusal(&specs, &named_files, outer) {
+                        refusal
                     } else {
-                        shared_refused = true;
-                        PlanError::Invalid(reason)
+                        let groups = self.single_test_groups(&specs);
+                        if groups.is_empty() {
+                            break specs;
+                        }
+                        let reason = crate::plan::single_test_reason(&groups);
+                        if shared_refused || last_ask {
+                            let (merged, notices) = crate::plan::merge_groups(specs, &groups);
+                            // A merge can join a dependency cycle through a contract
+                            // between the merged ones: checked like any plan.
+                            match validate_plan_with(
+                                &merged,
+                                &BTreeSet::new(),
+                                &self.roster(),
+                                &self.tools(),
+                                self.config.max_contracts_per_plan,
+                                self.bypass_git_files(),
+                            ) {
+                                Ok(()) => {
+                                    for n in notices {
+                                        self.intake_notice(n);
+                                    }
+                                    break merged;
+                                }
+                                Err(e) => PlanError::Invalid(format!(
+                                    "{reason}; merging them is not possible as the plan stands ({e})"
+                                )),
+                            }
+                        } else {
+                            shared_refused = true;
+                            PlanError::Invalid(reason)
+                        }
                     }
                 }
                 Err(OrchestratorError::Plan(e)) if e.reaskable() => e,
@@ -172,6 +182,22 @@ impl RunLoop {
             Some((interfaces, unchecked)) => Ok(Some((specs, interfaces, unchecked))),
             None => Ok(None),
         }
+    }
+
+    /// The refusal of `specs` against the repository checkout, when it has
+    /// one ([`crate::plan_repo`]). Not applied to a split's children (`outer`
+    /// is not empty).
+    fn plan_repo_refusal(
+        &self,
+        specs: &[ContractSpec],
+        named_files: &[String],
+        outer: &BTreeSet<String>,
+    ) -> Option<PlanError> {
+        if !outer.is_empty() {
+            return None;
+        }
+        let root = self.s.workspaces.repo_root()?;
+        crate::plan_repo::refusal(specs, named_files, &crate::plan_repo::DiskRepo(root))
     }
 
     /// The groups of contracts that declare one write set checked by one test

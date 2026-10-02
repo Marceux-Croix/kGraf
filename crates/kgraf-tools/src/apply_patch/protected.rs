@@ -10,8 +10,8 @@
 //! does not change with the mode (decision 0043).
 
 use super::{
-    ApplyPatchTool, Hunk, apply_all_names, envelope_supplied, internal, lexical, noting_envelope,
-    parse, refuse_repeated_paths, written_paths,
+    ApplyPatchTool, Hunk, Parsed, apply_all_names, internal, lexical, parse, refuse_repeated_paths,
+    with_notes, written_paths,
 };
 use crate::fs_safety;
 use crate::protected::{Area, ProtectedWrites, Target};
@@ -197,6 +197,7 @@ fn apply_protected(
         }
     }
     let mut problems = Vec::new();
+    let mut notes = Vec::new();
     for root in &roots {
         let group: Vec<&ProtectedHunk> = hunks.iter().filter(|h| &h.target.root == root).collect();
         let names = if group.iter().any(|h| h.target.area == Area::Tracked) {
@@ -205,8 +206,9 @@ fn apply_protected(
             fs_safety::Names::Plain
         };
         let group: Vec<Hunk> = group.iter().map(|h| h.hunk.clone()).collect();
-        if let Err(e) = apply_all_names(&group, root, cancel, names) {
-            problems.push(e.to_string());
+        match apply_all_names(&group, root, cancel, names) {
+            Ok(applied) => notes.extend(applied.notes),
+            Err(e) => problems.push(e.to_string()),
         }
     }
     // Every touched area is checked, whether or not its hunks applied: a
@@ -229,10 +231,13 @@ fn apply_protected(
         } else {
             ""
         };
-        Ok(ToolOutput::text(format!(
-            "Success. Wrote these paths (Bypass mode){checked}:\n{}",
-            written.join("\n")
-        )))
+        with_notes(
+            Ok(ToolOutput::text(format!(
+                "Success. Wrote these paths (Bypass mode){checked}:\n{}",
+                written.join("\n")
+            ))),
+            notes,
+        )
     } else {
         Ok(ToolOutput::error(problems.join("\n")))
     }
@@ -255,7 +260,7 @@ impl Tool for ProtectedApplyPatch {
     /// [`ApplyPatchTool::access`], with a protected path the guard admits
     /// declared as a write instead of refused.
     fn access(&self, input: &Value) -> Result<Access, ToolError> {
-        let hunks = parse(input)?;
+        let hunks = parse(input)?.hunks;
         refuse_repeated_paths(&hunks, lexical)?;
         let mut access = Access::none();
         for hunk in &hunks {
@@ -282,11 +287,10 @@ impl Tool for ProtectedApplyPatch {
         ctx: &ToolContext,
         permit: &CallPermit,
     ) -> Result<ToolOutput, ToolError> {
-        let hunks = parse(&input)?;
+        let Parsed { hunks, notes } = parse(&input)?;
         let Some(protected) = self.split(&hunks)? else {
             return ApplyPatchTool.call(input, ctx, permit).await;
         };
-        let supplied = envelope_supplied(&input);
         let guard = self.guard.clone();
         let cancel = ctx.cancel.clone();
         // Not raced against the cancel: a write that started must reach its
@@ -295,7 +299,7 @@ impl Tool for ProtectedApplyPatch {
             tokio::task::spawn_blocking(move || apply_protected(&guard, protected, &cancel))
                 .await
                 .map_err(|e| internal(format!("apply task failed: {e}")))?;
-        noting_envelope(result, supplied)
+        with_notes(result, notes)
     }
 }
 

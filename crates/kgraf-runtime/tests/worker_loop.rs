@@ -4620,7 +4620,7 @@ async fn a_second_rejected_patch_carries_a_worked_example_for_its_file() {
         1 => Round::tool(vec![(
             "t2",
             "apply_patch",
-            json!({"patch": "*** Begin Patch\n*** Add File: notes.md\n+x"}),
+            json!({"patch": "*** Begin Patch\n*** Add File: notes.md\nx\n*** End Patch"}),
         )]),
         2 => Round::tool(vec![(
             "t3",
@@ -4644,10 +4644,7 @@ async fn a_second_rejected_patch_carries_a_worked_example_for_its_file() {
     assert!(!first.contains("A minimal valid patch"), "{first}");
     let (second, is_error) = finished_output(&events, "t2");
     assert!(is_error);
-    assert!(
-        second.contains("The last line of the patch must be exactly `*** End Patch`."),
-        "{second}"
-    );
+    assert!(second.contains("Each file section starts with"), "{second}");
     assert!(
         second.contains("A minimal valid patch for this file:"),
         "{second}"

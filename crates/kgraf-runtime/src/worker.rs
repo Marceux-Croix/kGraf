@@ -1536,6 +1536,10 @@ impl Worker {
             // Decision 0096: the round budget is a checkpoint. Measured where
             // the budget would warn that three rounds remain, after the
             // context check, so a full context still hands back first.
+            if self.progress.midpoint_due(self.budget.used()) {
+                let (digests, _) = self.read_tree_state().await;
+                self.progress.capture_midpoint(digests);
+            }
             if self.progress.due(self.budget.used())
                 && let Some(outcome) = self.checkpoint(ep).await?
             {
@@ -1767,8 +1771,9 @@ impl Worker {
                         String::new(),
                     ));
                 }
-                // The model announced work and ended the turn: no tool call in
-                // the whole attempt, and its contract writes files. That is not
+                // The model announced work and ended the turn: no successful
+                // write and no mutating command in the whole attempt (reads
+                // may have happened), and its contract writes files. That is not
                 // a completion. The text stays in the transcript; the model
                 // gets one notice (counted in the budget) and a second such
                 // end fails the attempt with a named reason. The round is
@@ -1803,8 +1808,8 @@ impl Worker {
                     return Ok((
                         WorkerOutcome::Failed {
                             error: format!(
-                                "the model ended the attempt as done {why} with no tool call and \
-                                 no change, although its contract writes {}",
+                                "the model ended the attempt as done {why} with no write and no \
+                                 mutating command, although its contract writes {}",
                                 self.write_scope_paths()
                             ),
                         },
@@ -1877,16 +1882,19 @@ impl Worker {
         }
     }
 
-    /// Measure a progress checkpoint (decision 0096), record it, and apply
-    /// its verdict: another block of rounds, the grace notice, or the end.
-    /// Returns the outcome when the verdict ends the attempt at once.
-    async fn checkpoint(&mut self, ep: &WorkerEndpoint) -> Result<Option<WorkerOutcome>, Halt> {
-        use crate::progress::CheckpointVerdict;
-        let used = self.budget.used();
+    /// Digests of every path the progress gate tracks (dirty ones included), and
+    /// what git lists as changed when that could be read. File reads and git
+    /// run off the executor thread; a failure is on the result's trace, and
+    /// never read as "unchanged".
+    async fn read_tree_state(
+        &mut self,
+    ) -> (
+        std::collections::BTreeMap<PathBuf, Option<String>>,
+        Option<BTreeSet<PathBuf>>,
+    ) {
         let root = self.brief.workspace_root.clone();
         let tracked = self.progress.tracked(&self.changed);
         let at_start = self.git_at_start.clone();
-        // File reads and git run off the executor thread.
         let read = tokio::task::spawn_blocking(move || {
             let status = at_start
                 .ok()
@@ -1907,7 +1915,7 @@ impl Worker {
             (crate::progress::digests(&root, &paths), dirty, failure)
         })
         .await;
-        let (now, dirty) = match read {
+        match read {
             Ok((now, dirty, failure)) => {
                 if let Some(e) = failure {
                     self.trace_failures
@@ -1923,7 +1931,16 @@ impl Worker {
                     .push(format!("checkpoint measurement did not finish: {e}"));
                 (Default::default(), None)
             }
-        };
+        }
+    }
+
+    /// Measure a progress checkpoint (decision 0096), record it, and apply
+    /// its verdict: another block of rounds, the grace notice, or the end.
+    /// Returns the outcome when the verdict ends the attempt at once.
+    async fn checkpoint(&mut self, ep: &WorkerEndpoint) -> Result<Option<WorkerOutcome>, Halt> {
+        use crate::progress::CheckpointVerdict;
+        let used = self.budget.used();
+        let (now, dirty) = self.read_tree_state().await;
         let (measure, baseline) = self.progress.measure(used, &now, dirty.as_ref());
         let (checkpoint, baseline) = self.progress.decide(used, measure, baseline);
         let verdict = checkpoint.verdict;
@@ -2078,15 +2095,16 @@ impl Worker {
             .unwrap_or_default()
     }
 
-    /// An end as done with no tool call anywhere in the attempt, for a
-    /// contract that declares writes.
+    /// An end as done with no successful write and no mutating command in the
+    /// attempt, for a contract that declares writes. Reads do not count: an
+    /// attempt that read two files and then said it was done changed nothing
+    /// (`made_progress` holds only successful writes and the paths a shell
+    /// command changed, so a failed write or a read leaves it empty).
     fn ended_without_change(&self) -> bool {
         self.brief
             .write_scope
             .as_ref()
             .is_some_and(|paths| !paths.is_empty())
-            && self.tool_calls == 0
-            && self.builder.tool_calls().is_empty()
             && self.compaction.is_none()
             && !self.made_progress()
     }

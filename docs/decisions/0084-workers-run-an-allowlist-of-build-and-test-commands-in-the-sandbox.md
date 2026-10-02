@@ -273,3 +273,43 @@ unchanged.
 
 Tests: `kgraf-tools` `a_rejection_help_example_is_a_valid_patch_for_the_targeted_file` (the
 example parses), `kgraf-runtime` `a_second_rejected_patch_carries_a_worked_example_for_its_file`.
+
+## Amendment (2026-10-02): `apply_patch` repairs more of what a model's intent makes certain, and refuses a silent append
+
+In one benchmark round 290 of 508 `apply_patch` calls failed (57%): "Failed to find expected
+lines", "Failed to find context", "last line must be `*** End Patch`", "Unexpected line in
+update hunk", a delete and an add of one file refused as one path in two hunks, a bad hunk
+header, a unified-diff `@@ -a,b +c,d @@` header, an empty hunk. Stalled attempts ran for a long
+time on retries. The same round showed an Update File chunk of only `+` lines applied as an
+append, three times, leaving three `[workspace]` tables in one `Cargo.toml`, each call
+reporting success. Every repair below is stated in the call's result as a `note:`; anything
+else malformed is still refused.
+
+- **A missing or mangled `*** End Patch`** is supplied, like a missing `*** Begin Patch`. The
+  note says to check that no lines were cut off, because a patch cut off by the output limit
+  now applies as far as it goes.
+- **A Delete File and an Add File of one path in one patch is a replace.** The delete is
+  dropped, the add overwrites, and the note says so. A delete with an update of one path is
+  still refused.
+- **An `@@ -a,b +c,d @@` header** is stripped to `@@` plus the text after it, which is the
+  context line. The note says the numbers were ignored.
+- **Matching.** Context and `-` lines match exactly first (the first match wins, as before),
+  then ignoring trailing whitespace, then indentation, then typographic punctuation. These
+  looser rules must fit in exactly one place. Several places is refused, naming the lines, and
+  one place is accepted with a note. Before, the first looser match was taken silently.
+- **A chunk of only `+` lines names no place** and is refused with how to anchor it (an
+  unchanged line before it, `*** End of File`, or `*** Add File`), unless the file is empty or
+  the chunk ends with `*** End of File`. This applies with an `@@` context too: the context
+  was never the insertion point, the lines went to the end of the file.
+- **Not changed:** a line in an Update File hunk that has no `+`, `-` or space prefix is still
+  refused. Taking it as context would guess the intent of a patch that already mixes forms.
+
+Tests: `kgraf-tools` `a_missing_or_mangled_end_line_is_applied_and_the_result_says_so`,
+`a_delete_and_an_add_of_one_path_is_a_replace_with_a_note`,
+`a_unified_diff_hunk_header_is_stripped_and_the_result_says_so`,
+`unified_header_detection_is_exact`,
+`an_anchorless_addition_through_the_tool_is_refused_and_writes_nothing`,
+`a_tolerant_match_is_stated_in_the_result`, `replace.rs`
+`an_update_of_only_added_lines_is_refused_not_appended`,
+`a_whitespace_tolerant_match_that_fits_twice_is_refused`,
+`a_context_line_that_fits_twice_after_ignoring_whitespace_is_refused`.

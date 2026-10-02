@@ -140,3 +140,37 @@ reason into the stop reason, which is recorded on the turn; the raw string is no
 Tests: `an_empty_turn_gets_one_notice_round_and_is_not_completed`,
 `two_empty_turns_in_a_row_fail_the_attempt`,
 `a_tool_call_between_empty_turns_resets_the_empty_turn_count`.
+
+## Amendment (2026-10-02): three gaps closed
+
+- **The first block is measured against its midpoint and its checks.** The first checkpoint
+  compared files with the empty start, so any early write counted, and a worker that wrote its
+  files in round 2, then rewrote them while its test run stayed at the same failure, was
+  extended block after block. In the first block, a changed file now counts only if it also
+  differs from its content at the block's midpoint (the worker captures the digests once, at
+  half the first checkpoint's round). And when the block ran a test or build command, none of
+  those improved, and every one ended failing, changed files alone do not count: the
+  checkpoint lists them as `files_discounted` and says so. A command that ended passing leaves
+  the files counted. Later blocks, the sloppy patterns and the verdict table are unchanged. A
+  resumed attempt, or a block too short to have a midpoint, falls back to the compare with the
+  start. Series now ending at the old wall instead of `Continue`: early writes, churn, flat
+  failing check.
+- **An end as done with only reads is not a completion.** The no-change notice required that
+  the attempt had made no tool call at all, so an attempt that read two files and ended its
+  turn was recorded completed. It now keys on no successful write and no command that changed
+  the tree, for a contract that declares writes. The failure text says "no write and no
+  mutating command".
+- **A pinned context that cannot fit is not retried.** When the prefix, slices and instruction
+  already reach the stop point, no round can run and the same brief fails the same way. The
+  contract is now held after that attempt, with the sizes and the remedy (split the contract,
+  use a route with a larger window, or raise the stop point). If any attempt of the round
+  failed another way, the normal retry rules apply, since another route may fit.
+
+Tests: `progress.rs` `a_first_block_with_a_flat_failing_check_does_not_count_file_changes`,
+`a_first_block_with_a_failing_check_that_improved_is_progress`,
+`a_first_block_whose_check_ends_passing_keeps_its_file_changes`,
+`a_first_block_counts_only_files_that_changed_since_its_midpoint`,
+`a_later_block_is_measured_against_the_last_checkpoint_as_before`;
+`progress_gate.rs` `a_first_block_of_early_writes_and_churn_with_a_flat_failing_check_gets_no_extension`;
+`compaction.rs` `a_read_only_attempt_that_used_a_tool_is_not_a_completion_when_the_contract_writes`;
+`kgraf-orchestrator` `pinned_context_hold.rs`.

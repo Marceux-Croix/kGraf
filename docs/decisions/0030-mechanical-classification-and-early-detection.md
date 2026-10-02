@@ -343,3 +343,31 @@ Renamed tests, now checking the behavior above:
 `a_dependency_on_an_interface_id_is_refused_by_name` is
 `a_dependency_outside_the_plan_is_refused_by_name` (the contracts answer holds no interface ids
 now).
+
+## Amendment (2026-10-02): the plan is checked against the repository, and a plan-shape hold says so
+
+- **A named scaffold file that no contract writes is refused.** A file the instruction names
+  (by path, or through an item in it that the planner context shows) that holds placeholder
+  bodies (`todo!()`, `unimplemented!()`, `raise NotImplementedError`, on a line that is code)
+  and is in no contract's writes is refused with the file named and the fix. The work it
+  stands for would be done by nobody, or a worker would meet it outside its scope and the
+  contract would be held.
+- **A workspace acceptance before its members exist is refused.** A contract whose acceptance
+  runs `cargo build|test|check|clippy` with `--workspace` or `--all` is refused when the
+  workspace's own `Cargo.toml`, or a member's manifest, is neither in the repository nor
+  written by that contract or one it depends on. The members come from the manifest in the
+  repository, or, for a root manifest the plan creates, from the member list in the
+  instruction. A member written only by another contract that this one does not depend on is
+  the deadlock the check exists for: the build fails on the missing manifest and the contract
+  that creates it never runs first. This is broader than "written by no contract". Both
+  refusals are re-askable and are not applied to a split's children, whose earlier work is not
+  in the checkout the check reads. The reasons name the file and suggest the fix.
+- **A hold for a file no contract writes asks for a re-plan.** When a worker needs a file that
+  no open contract writes, and nobody attends the run, the hold says that is a plan-shape
+  error and that the plan needs a contract that lists the file. It no longer suggests
+  `--allow-path`, which would let one attempt write a file the plan never assigned. Attended
+  runs still ask, and a file another contract writes, or a command, keeps the permission wording.
+
+Tests: `kgraf-orchestrator` `plan_repo.rs` unit tests, `tests/plan_repo_intake.rs`,
+`planner_context.rs` `the_named_files_are_the_paths_the_section_shows`, `shortfall.rs`
+`a_hold_for_a_file_no_contract_writes_asks_for_a_replan`.

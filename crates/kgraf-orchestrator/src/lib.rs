@@ -90,6 +90,7 @@ mod outside_error;
 pub mod pairing;
 mod partition;
 mod plan;
+mod plan_repo;
 pub mod planner_context;
 mod port;
 mod question_route;

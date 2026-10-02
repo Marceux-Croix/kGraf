@@ -22,7 +22,7 @@ use super::*;
 use crate::review_desk::{PermissionRequestView, ReviewDesk};
 use crate::run_state::PendingPermission;
 use crate::shortfall::{
-    Authority, Grant, GrantRecord, RequestScope, ShortfallDecision, ShortfallKind, decide,
+    Authority, Grant, GrantRecord, RequestScope, ShortfallDecision, ShortfallKind, decide_in_plan,
 };
 use kgraf_tools::permissions::PermissionControl;
 
@@ -407,13 +407,14 @@ impl RunLoop {
             })
             .collect();
         for (contract, p, snapshot) in waiting {
-            let decision = decide(
+            let decision = decide_in_plan(
                 ShortfallKind::Permission,
                 p.scope,
                 &p.need,
                 &p.why,
                 &snapshot,
                 &authority,
+                Some(&self.record.open_contracts),
             );
             match decision {
                 ShortfallDecision::Grant { grant, by } => {

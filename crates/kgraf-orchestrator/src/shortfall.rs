@@ -567,6 +567,7 @@ pub fn instructions_answer<'a>(
 /// permission mode. Pure: nothing the worker wrote can change `authority`.
 /// For a permission report, `need` is the subject [`ground`] found in the
 /// worker's refusals, not the worker's words.
+#[cfg(test)]
 pub fn decide(
     kind: ShortfallKind,
     scope: RequestScope,
@@ -574,6 +575,24 @@ pub fn decide(
     why: &str,
     contract: &OpenContract,
     authority: &Authority,
+) -> ShortfallDecision {
+    decide_in_plan(kind, scope, need, why, contract, authority, None)
+}
+
+/// [`decide`] with the run's open contracts, when they are known. A file a
+/// worker needs that no open contract writes is a plan-shape error: the plan
+/// has no contract for that file. An unattended hold then says so and asks
+/// for a re-plan, instead of pointing at `--allow-path`, which would let one
+/// attempt write a file the plan never assigned. With `plan` as `None` the
+/// hold keeps the permission wording.
+pub fn decide_in_plan(
+    kind: ShortfallKind,
+    scope: RequestScope,
+    need: &str,
+    why: &str,
+    contract: &OpenContract,
+    authority: &Authority,
+    plan: Option<&[OpenContract]>,
 ) -> ShortfallDecision {
     let hold = |reason: String| ShortfallDecision::Hold { reason };
     if contract.shortfall_redispatches >= MAX_SHORTFALL_REDISPATCHES {
@@ -669,8 +688,24 @@ pub fn decide(
         "a worker needs {} ({why}); grant it to this contract?",
         grant.describe()
     );
+    let unowned_file = match (&grant, plan) {
+        (Grant::Path(p), Some(plan)) => (!plan.iter().any(|c| {
+            c.writes
+                .iter()
+                .any(|w| w.path.trim_start_matches("./") == p)
+        }))
+        .then_some(p),
+        _ => None,
+    };
     if authority.attended {
         ShortfallDecision::AskUser { grant, question }
+    } else if let Some(path) = unowned_file {
+        hold(format!(
+            "a worker needs to write `{path}` ({why}), and no contract of this plan writes it. \
+             That is a plan-shape error, not a missing permission: a path grant would let one \
+             attempt write a file the plan never assigned. The plan needs a contract that lists \
+             `{path}` in its writes; re-plan, then run again"
+        ))
     } else {
         hold(format!(
             "denied: {question} Nobody attends this run (the {} permission mode would ask). \
@@ -2171,5 +2206,53 @@ mod tests {
         );
         // `path:line:col` and a trailing period still name the path.
         assert!(ask("see pricing_engine/src/lib.rs:5:18.").is_some());
+    }
+
+    /// A file no contract of the plan writes is a plan-shape error: the hold
+    /// asks for a re-plan and does not suggest `--allow-path`. A file another
+    /// contract writes, and a plan not known, keep the permission wording.
+    #[test]
+    fn a_hold_for_a_file_no_contract_writes_asks_for_a_replan() {
+        let a = authority(PermissionMode::Manual, false);
+        let mine = contract_writing("c1", &["src/lib.rs"]);
+        let plan = [mine.clone(), contract_writing("c2", &["src/other.rs"])];
+        let ask = |need: &str, plan: Option<&[OpenContract]>| {
+            decide_in_plan(
+                ShortfallKind::Permission,
+                RequestScope::File,
+                need,
+                "the build needs it",
+                &mine,
+                &a,
+                plan,
+            )
+        };
+        let ShortfallDecision::Hold { reason } = ask("docs/new.md", Some(&plan)) else {
+            panic!("expected a hold");
+        };
+        assert!(
+            reason.contains("no contract of this plan writes it"),
+            "{reason}"
+        );
+        assert!(reason.contains("re-plan"), "{reason}");
+        assert!(reason.contains("`docs/new.md` in its writes"), "{reason}");
+        assert!(!reason.contains("--allow-path"), "{reason}");
+        // The plan is not known: the permission wording stays.
+        let ShortfallDecision::Hold { reason } = ask("docs/new.md", None) else {
+            panic!("expected a hold");
+        };
+        assert!(reason.contains("--allow-path docs/new.md"), "{reason}");
+        // Attended: the user is asked, as before.
+        let attended = authority(PermissionMode::Manual, true);
+        let d = decide_in_plan(
+            ShortfallKind::Permission,
+            RequestScope::File,
+            "docs/new.md",
+            "x",
+            &mine,
+            &attended,
+            Some(&plan),
+        );
+        assert!(matches!(d, ShortfallDecision::AskUser { .. }), "{d:?}");
     }
 }

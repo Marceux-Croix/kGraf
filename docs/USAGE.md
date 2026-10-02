@@ -537,7 +537,10 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   the same result). A worker that is making progress keeps going with another block, in the
   same conversation. One block without progress after a productive one is allowed; a second
   ends the attempt as stuck, and the orchestrator retries it, then holds the contract. A
-  worker that never shows progress stops at its budget as before, and no worker runs more
+  worker that never shows progress stops at its budget as before. The first block is
+  stricter: files count only if they changed after its midpoint, and when it ran a test or
+  build command that stayed failing without improving, changed files alone do not count (the
+  checkpoint says how many were not counted), and no worker runs more
   than `max_checkpoints` blocks (default 10; 1 is the old fixed limit; see "Run limits"). What the model says about its progress is never read. `worker` prints
   each checkpoint; `orchestrate` reports workers that ran past their budget as
   `rounds` and counts each once as a sizing miss.
@@ -1210,7 +1213,14 @@ Behavior that differs from earlier builds. Each item names the decision that hol
   others the shell tool's description lists (0084).
 - A worker's `apply_patch` patch that starts with a file header (`*** Add File:`,
   `*** Update File:`, `*** Delete File:`) and lacks `*** Begin Patch` is applied as if it had
-  the envelope, and the result says so. Any other malformed patch is refused. From the second
+  the envelope, and the result says so. So is a patch with no `*** End Patch` line or a
+  mangled one, a Delete File plus an Add File of one path (applied as a replace), and an
+  `@@ -a,b +c,d @@` header (its numbers are ignored; the text after it is the context line);
+  each is a note in the result. Lines match exactly first, then ignoring trailing whitespace,
+  indentation and typographic punctuation; a looser match that fits in several places is
+  refused, and one that fits in one place is noted. An Update File chunk of only `+` lines is
+  refused (it names no place; it used to append at the end) unless the file is empty or the
+  chunk ends with `*** End of File`. Any other malformed patch is refused. From the second
   patch a worker has rejected, the rejection ends with the rule it broke and a minimal valid
   patch for the file it targeted (0084).
 - A worker turn with no tool call and no visible answer (a plan only in the model's reasoning)
@@ -1221,13 +1231,29 @@ Behavior that differs from earlier builds. Each item names the decision that hol
   again, at most twice in a row, with one added note: "Your previous reply contained a
   malformed tool call ... Send one well-formed tool call." Each try is its own ledger call; the
   failed one stays unreconciled like any 5xx. After the second retry, or on the last round, the
-  attempt fails and its error names the parse failure. Any other 5xx is not retried (0039).
-- A worker whose contract writes files and which ends an attempt as done with no tool call at
-  all (it only said what it would do) has not finished. It is told once: "You ended without
-  making any change; this contract writes <paths>. Continue with tool calls, or call
-  report_shortfall if the work cannot be done." If it ends again with no tool call, the attempt
-  fails and the failure names the contract's write paths. A contract that writes nothing, and
-  an attempt that made any tool call, end as before (0096).
+  attempt fails and its error names the parse failure. A bare `{"error":{"message":"EOF"}}`
+  500, or a message containing `unexpected EOF`, counts as the same failure (the field is
+  read, not the text around it). Any other 5xx is not retried (0039).
+- A worker whose contract writes files and which ends an attempt as done with no successful
+  write and no command that changed the tree (it only said what it would do, or only read)
+  has not finished. It is told once: "You ended without making any change; this contract
+  writes <paths>. Continue with tool calls, or call report_shortfall if the work cannot be
+  done." If it ends again the same way, the attempt fails and the failure names the contract's
+  write paths. A contract that writes nothing, and an attempt that wrote or changed
+  something, end as before (0096).
+- A contract whose pinned context (the prefix, its slices and its instruction) already reaches
+  the worker's stop point cannot run one round, and a second attempt of the same brief fails
+  the same way. It is not retried: the contract is held with the reason and the remedy (split
+  the contract, use a route with a larger window, or raise the stop point) (0096).
+- When a worker needs a file that no contract of the plan writes and nobody attends the run,
+  the hold says the plan needs a contract for that file and to re-plan. It does not suggest
+  `--allow-path`, which would let one attempt write a file the plan never assigned. A file
+  another contract writes, or a command, keeps the permission wording (0093).
+- Before a plan is accepted, two checks read your repository. A file the instruction names
+  that holds placeholder bodies (`todo!()`, `unimplemented!()`, `raise NotImplementedError`)
+  and that no contract writes is refused, naming the file. A contract whose acceptance builds
+  a whole Cargo workspace (`--workspace`) is refused when a member's manifest does not exist
+  and no contract it depends on writes it. The planner is asked again with the reason (0030).
 - A worker that reaches its context stop point before it has written anything is compacted
   once instead of handed back: a child would receive the same whole task and meet the same
   stop point. After that one compaction it goes on while its context fits the model's window;
