@@ -1670,6 +1670,36 @@ async fn an_interface_naming_a_contract_the_plan_lacks_is_refused() {
     );
 }
 
+type Accepted = (
+    u32,
+    Vec<kgraf_orchestrator::PlannedContract>,
+    Vec<kgraf_orchestrator::PlannedInterface>,
+    Vec<String>,
+);
+
+/// The `plan_accepted` events of a trace: revision, contracts, interfaces and
+/// notices.
+fn plans_accepted(trace: &[TraceEvent]) -> Vec<Accepted> {
+    trace
+        .iter()
+        .filter_map(|e| match e {
+            TraceEvent::PlanAccepted {
+                revision,
+                contracts,
+                interfaces,
+                notices,
+                ..
+            } => Some((
+                *revision,
+                contracts.clone(),
+                interfaces.clone(),
+                notices.clone(),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
 /// The plan with `ic` as its one interface over `prod` and `cons`.
 fn plan_with(ic: &InterfaceContract) -> String {
     let mut plan: serde_json::Value =
@@ -1733,6 +1763,18 @@ async fn a_plan_failing_stub_compile_is_asked_again_with_the_check_output() {
         "nothing was held"
     );
     assert_eq!(report.contracts.interfaces_registered, 1);
+    // The re-ask is a notice of the accepted plan, the only one written.
+    let accepted = plans_accepted(&rig.trace().await);
+    assert_eq!(accepted.len(), 1, "{accepted:?}");
+    assert_eq!(accepted[0].0, 1);
+    assert!(
+        accepted[0]
+            .3
+            .iter()
+            .any(|n| n.contains("asking again (1 of")),
+        "{:?}",
+        accepted[0].3
+    );
 }
 
 /// A plan whose interface leaves out a required field (no test files) is
@@ -1837,8 +1879,44 @@ async fn a_plan_the_gate_holds_before_any_work_is_re_planned_once_with_the_failu
     }
     let prompts = rig.parts.planner.prompts();
     assert_eq!(prompts.len(), 4, "three asks, then one re-plan");
-    assert!(prompts[3].contains("load_config"), "{}", prompts[3]);
+    // The re-ask quotes the stage, the command and the stderr tail.
+    for needle in [
+        "StubCompile check failed",
+        "`python3 -c import consumer, test_contract`",
+        "cannot import name 'load_config'",
+    ] {
+        assert!(prompts[3].contains(needle), "{needle}: {}", prompts[3]);
+    }
     assert_eq!(report.contracts.stub_compile_failures, 1, "{report:?}");
+    // The re-planned contracts' workers see the same failure as data.
+    let briefs = worker_requests(&rig.parts);
+    assert!(!briefs.is_empty());
+    for brief in &briefs {
+        assert!(
+            brief.contains("<held_plan_failures>")
+                && brief.contains("cannot import name 'load_config'")
+                && brief.contains("not an instruction"),
+            "{brief}"
+        );
+    }
+    // The trace says what was accepted each time: the held plan, then the
+    // re-plan under the next revision with its ids and its interface.
+    let accepted = plans_accepted(&rig.trace().await);
+    let revisions: Vec<u32> = accepted.iter().map(|(r, ..)| *r).collect();
+    assert_eq!(revisions, vec![1, 2], "{accepted:?}");
+    let (_, first, first_interfaces, _) = &accepted[0];
+    let (_, second, second_interfaces, _) = &accepted[1];
+    let ids = |cs: &[kgraf_orchestrator::PlannedContract]| -> Vec<String> {
+        cs.iter().map(|c| c.id.clone()).collect()
+    };
+    assert_eq!(ids(first), ["prod", "cons"]);
+    assert_eq!(ids(second), ["re1.prod", "re1.cons"]);
+    let ic = py_ic();
+    assert_eq!(first_interfaces.len(), 1);
+    assert_eq!(second_interfaces.len(), 1);
+    assert_eq!(second_interfaces[0].id, format!("re1.{}", ic.id));
+    assert_eq!(second_interfaces[0].symbols, ic.symbols);
+    assert_eq!(second_interfaces[0].parties, ["re1.prod", "re1.cons"]);
 }
 
 /// A handshake runs only at the gate, after planning, so no re-ask ever sent
@@ -2568,4 +2646,128 @@ async fn producer_verification_does_nothing_with_contract_checks_off() {
         .await
         .expect("run");
     assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+}
+
+// ------------------------------------------------- consumers need interfaces
+
+/// `prod` and `cons`, where `cons` consumes `prod`.
+fn consuming_plan() -> Vec<C<'static>> {
+    vec![
+        c("prod", "implement the parser", "config.py", &[]),
+        c("cons", "use the parser", "consumer.py", &["prod"]),
+    ]
+}
+
+/// `consuming_plan` with `ic` as its interface.
+fn consuming_plan_with(ic: &InterfaceContract) -> String {
+    let mut plan: serde_json::Value =
+        serde_json::from_str(&plan_json(&consuming_plan())).expect("the plan is JSON");
+    plan["interfaces"] = serde_json::json!([serde_json::to_value(ic).expect("json")]);
+    plan.to_string()
+}
+
+const NO_INTERFACE_REFUSAL: &str =
+    "contracts cons consume prod; give an interface for each consumed contract";
+const NO_INTERFACE_NOTICE: &str =
+    "contract checks did not run: the plan named no interfaces for cons <- prod";
+
+/// With contract checks on, a plan in which a contract depends on another and
+/// that holds no interface (here `"interfaces": null`) is sent back to the
+/// planner with a named reason; the answer that gives an interface is checked,
+/// registered and dispatched, and nothing is said to have been skipped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_plan_whose_consumers_name_no_interface_is_sent_back_and_the_corrected_plan_is_checked() {
+    let dir = tempfile::tempdir().expect("dir");
+    let mut without: serde_json::Value =
+        serde_json::from_str(&plan_json(&consuming_plan())).expect("the plan is JSON");
+    without["interfaces"] = serde_json::Value::Null;
+    let rig = Rig::with_planner(
+        dir.path(),
+        first_then(without.to_string(), consuming_plan_with(&py_ic())),
+        agreeing,
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    let report = rig
+        .orchestrator(vec![])
+        .start(RunId::new("r1"), "parse the config".into())
+        .await
+        .expect("run");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    let prompts = rig.parts.planner.prompts();
+    assert_eq!(prompts.len(), 2, "one ask, one re-ask");
+    assert!(prompts[1].contains(NO_INTERFACE_REFUSAL), "{}", prompts[1]);
+    assert_eq!(report.contracts.interfaces_registered, 1, "{report:?}");
+    assert!(
+        !report.notices.iter().any(|n| n.contains("did not run")),
+        "{:?}",
+        report.notices
+    );
+}
+
+/// A planner that again gives no interface is asked once, not twice: the plan
+/// is taken, and the run says in its notices and its trace that contract
+/// checks did not run, naming the contracts. Never silent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_plan_still_without_interfaces_after_one_ask_runs_with_a_loud_notice() {
+    let dir = tempfile::tempdir().expect("dir");
+    let rig = Rig::new(
+        dir.path(),
+        plan_json(&consuming_plan()),
+        agreeing,
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    let report = rig
+        .orchestrator(vec![])
+        .start(RunId::new("r1"), "parse the config".into())
+        .await
+        .expect("run");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    let prompts = rig.parts.planner.prompts();
+    assert_eq!(
+        prompts.len(),
+        2,
+        "sent back for this once; the second answer is taken"
+    );
+    assert!(prompts[1].contains(NO_INTERFACE_REFUSAL), "{}", prompts[1]);
+    assert_eq!(report.contracts.interfaces_registered, 0);
+    assert!(
+        report
+            .notices
+            .iter()
+            .any(|n| n.contains(NO_INTERFACE_NOTICE)),
+        "{:?}",
+        report.notices
+    );
+    let traced = rig.trace().await.into_iter().any(
+        |e| matches!(&e, TraceEvent::Notice { detail, .. } if detail.contains(NO_INTERFACE_NOTICE)),
+    );
+    assert!(traced, "the notice is in the trace");
+}
+
+/// Without contract checks nothing consumes an interface, so a plan with
+/// dependencies and none is taken on the first ask, with no notice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_plan_with_dependencies_and_no_interfaces_is_taken_when_checks_are_off() {
+    let dir = tempfile::tempdir().expect("dir");
+    let rig = Rig::new(
+        dir.path(),
+        plan_json(&consuming_plan()),
+        agreeing,
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    let report = Orchestrator::new(config(), rig.parts.services(WINDOW))
+        .expect("orchestrator")
+        .start(RunId::new("r1"), "parse the config".into())
+        .await
+        .expect("run");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    assert_eq!(rig.parts.planner.prompts().len(), 1);
+    assert!(
+        !report.notices.iter().any(|n| n.contains("did not run")),
+        "{:?}",
+        report.notices
+    );
 }

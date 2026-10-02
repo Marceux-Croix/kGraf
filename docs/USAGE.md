@@ -422,6 +422,11 @@ and each model route with the tool that reaches it.
   connection, or the run fails before it builds anything:
   "route `ollama` is unreachable at http://localhost:11434/v1: ...; start its server or
   remove the route". Hosted routes are not dialed at start.
+- **A local route's address can be moved.** A route that takes no credential is called at its
+  catalog address unless `KGRAF_<ROUTE>_BASE_URL` is set (`KGRAF_OLLAMA_BASE_URL`,
+  `KGRAF_LLAMA_CPP_BASE_URL`: the route id upper-cased, `-` as `_`) to an `http://` or
+  `https://` URL. A value that is not one stops the run before it builds. A route that takes
+  a credential is never moved this way, so a variable cannot send a key to another host.
 - **Accounting.** Every call is a ledger row. Embedding and rerank calls record their input
   tokens; a typed decision records what the server reports. Add the model to the price table
   to see its cost; without a row it is shown as unpriced, never as $0. A priced call too
@@ -551,6 +556,19 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   costed at the base rate.
 - `orchestrate` exits non-zero unless the run completed: a run that ends blocked or
   stopped is a failure to a script or a scheduler.
+- **Ctrl-C and SIGTERM stop the run, and say what they left.** The first SIGINT (Ctrl-C) or
+  SIGTERM during `orchestrate` or `schedule run-now` is the same stop as the app's stop
+  button. No new work starts, every worker and every model call in flight is cancelled, and a
+  call that was cancelled is settled in the ledger: it is never left `in_flight`, and one that
+  may have billed is listed by `kgraf unreconciled`. The usual report prints with status
+  `Stopped`, every worktree the run left is named on a `kept       worktree` line with how to
+  continue or remove it, and the command exits with 128 plus the signal number (130 for
+  SIGINT, 143 for SIGTERM). `--resume RUN` continues the run. Stopping may take up to 30
+  seconds; a line says if that bound was reached. A second interrupt during the stop exits at
+  once and prints one `cut short` line: calls may still be open and worktrees may be left on
+  disk, and the next run's startup removes stale worktrees. An interrupt that arrives while
+  the run is being set up starts nothing and exits the same way. On Windows, Ctrl-C does the
+  same; there is no SIGTERM.
 - A planner answer that is not the JSON asked for, or a plan that breaks a rule, is asked
   for again (at most twice, each ask on the ledger) with the refusal as a note, before the
   run stops. A plan that the interface checks hold before any work started (a handshake
@@ -754,10 +772,20 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   another's code, the planner also writes an interface contract: a stub, a reference, the
   consumer's expectations and a test. Before the first worker starts, the sandbox checks
   it: the consumer and the test compile against the stub, the test fails against the stub
-  and passes against the reference, and the two parties' handshakes agree. A contract that fails is held, with the file that failed named. Each handshake and each check names every party's route and model, and the run record keeps each hold with them, so you can see which models disagreed. A contract whose compiler or test runner
+  and passes against the reference, and the two parties' handshakes agree. A plan in which a contract depends on another but names no interface is sent back to the planner once; if the answer still names none, the run goes on and says in its notices and trace that contract checks did not run, naming the contracts. A contract that fails is held, with the file that failed named. Each handshake and each check names every party's route and model, and the run record keeps each hold with them, so you can see which models disagreed. A contract whose compiler or test runner
   is not installed is held too, with the program named. A worker can challenge a contract
   with the `challenge_contract` tool; the answer names the artifact that settled it, or
   says it is judgment.
+- Every planner prompt carries up to 8 KB about the project so the planner does not invent
+  names: the package names from the manifests (`Cargo.toml`, `package.json`,
+  `pyproject.toml`), then the signatures, from the code graph, of the files and symbols your
+  instruction names. What does not fit is cut, and a notice says how much. A named file the
+  graph has no signatures for is included as text up to the cap, with a notice. Name the
+  files and symbols you mean in the instruction (in backticks, or by path) to get their
+  signatures into the prompt. An interface file or command that still holds a template slot
+  such as `<crate_name>` is refused and the planner is asked again. When a re-plan follows a
+  hold, it quotes the failed check (stage, command, last lines of its output), and the
+  re-planned contracts' workers see the same text in their briefs, marked as data.
 - `--check-timeout` and `--check-compile-timeout` (600 seconds each) bound one check run.
   `--planner-max-tokens` (default 32,768) is the output limit of each orchestrator call. An
   answer cut off at that limit fails and names the flag; interface contracts carry whole
@@ -1101,7 +1129,9 @@ Behavior that differs from earlier builds. Each item names the decision that hol
 - A worker's shell command written as one string (`["cargo test --workspace"]`), or with the
   program and its leading words in the first element (`["cargo test", "--workspace", "-q"]`),
   runs as its words when it holds no shell syntax, and the output says so. One with shell syntax (`&&`,
-  quotes, `$`) is refused with the way to write it. The build commands run without approval
+  quotes, `$`) is refused with the way to write it. A string that holds a JSON-encoded list of
+  strings (`"[\"python\", \"-c\", \"print(1)\"]"`) runs as that list, each element one argument,
+  and the output says so. The build commands run without approval
   with their usual options: `--workspace`, `-p`, `--test`, `--release`, `--no-run` and the
   others the shell tool's description lists (0084).
 - A worker's `apply_patch` patch that starts with a file header (`*** Add File:`,
@@ -1110,10 +1140,43 @@ Behavior that differs from earlier builds. Each item names the decision that hol
 - A worker turn with no tool call and no visible answer (a plan only in the model's reasoning)
   is not a finished attempt: the worker is told to continue, once. A second empty turn in a
   row fails the attempt, and the failure names the stop reason (0096).
+- A worker whose contract writes files and which ends an attempt as done with no tool call at
+  all (it only said what it would do) has not finished. It is told once: "You ended without
+  making any change; this contract writes <paths>. Continue with tool calls, or call
+  report_shortfall if the work cannot be done." If it ends again with no tool call, the attempt
+  fails and the failure names the contract's write paths. A contract that writes nothing, and
+  an attempt that made any tool call, end as before (0096).
+- A worker that reaches its context stop point before it has written anything is compacted
+  once instead of handed back: a child would receive the same whole task and meet the same
+  stop point. After that one compaction it goes on while its context fits the model's window;
+  past the window it hands back. A worker that has written something still hands back. The
+  trace's `compaction` record for a hand-back has a `cause` field: `measured_context` (the
+  last reported usage plus the estimate of what was added since reached the stop point) or
+  `queued_messages` (the queued steering messages pushed the next round past it). A hand-back
+  is never decided from a projection (0095).
+- A retry after an attempt that stopped before any verifier saw it carries what stopped it, as
+  data, the way a verifier's refusal is carried: a stall names the repeated call, a spent step
+  budget says so, a runtime failure gives its reason, and each lists the calls a policy refused
+  that no later call got past (the rule or policy and its text). The contract record keeps it
+  as `last_stop` (0018).
+- A permission event never says `granted` for a call that a later rule refused. A mode's grant
+  is recorded when the approval chain lets the call run; when a deny rule (or another hook)
+  refuses the call after the mode allowed it, the trace has one `grant_refused` event naming
+  the subject, the mode, and the refusing hook with its reason (0094).
 - Every worker brief says what its attempt is judged by. When `--verify` cannot be narrowed to
   the contract's tests (`cargo build --workspace`, a script), the brief names the whole command,
-  calls the contract's Acceptance line advisory, and says failures in other contracts' unfinished
-  code are not the worker's to fix (0018).
+  calls the contract's Acceptance line advisory, and says `todo!()` panics and failing tests in other contracts' unfinished
+  code are not the worker's to fix, and says a compile error anywhere that the worker's change
+  caused (for example by changing a public type's shape) is its own (0018).
+- The planner is told that the repository's existing public items (type names and shapes, trait
+  signatures, how callers use them) are the interface. A contract instruction that gives a type
+  fields where a file the contract writes defines it as a unit struct produces a notice at plan
+  intake; the plan is not refused, because the instruction may ask for the change. When a worker's
+  attempt is refused for a compile error in a file its contract does not write, the retry is
+  amended once with the error, the file, and the instruction to keep the public shape that existing
+  callers use, instead of being sent again unchanged (0018). A worker that reports its
+  instructions insufficient by asking for a change to a file another contract owns is answered, not
+  re-dispatched (0093).
 - A planner answer is repaired where its intent is certain, with a notice in the run output: a
   task-kind word in a contract's `route` (`implementation`) is read as no route, and an absolute
   write path inside the repository becomes the relative path. A write to `.kgraf` or `.git` is

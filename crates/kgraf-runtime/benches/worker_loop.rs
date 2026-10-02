@@ -161,6 +161,7 @@ impl Instant0 {
             });
         }
         Response {
+            finish_reason: None,
             model: request.model.clone(),
             content,
             stop_reason: if tool_round {

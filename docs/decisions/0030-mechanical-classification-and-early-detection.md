@@ -171,3 +171,57 @@ demonstration.
 - **`/dev/null` is allowed as an output.** An absolute path into the repository stays
   refused: a check runs in a scratch copy of the repository whose own directory is the only
   one it may write, so only a relative path works.
+
+## Amendment (2026-10-01): consuming contracts need an interface, or the run says checks did not run
+
+A live run's planner answered `"interfaces": null` although one contract consumed four others. The
+run went on and no contract check ran; nothing said so.
+
+With contract checks on, a plan in which any contract depends on another contract of the answer and
+that holds no interface (null or empty) is refused back to the planner once, with "contracts c5
+consume c1, c2, c3, c4; give an interface for each consumed contract". The plan is sent back for
+this reason once, however many re-asks other refusals leave. If the answer still holds none, or the
+re-ask budget is spent, the plan is taken and a notice, shown in the run output and traced, says
+"contract checks did not run: the plan named no interfaces for c5 <- c1, c2, c3, c4". A run without
+contract checks is unchanged. A dependency is the only signal of consumption read; a plan that
+names another contract's symbols without a dependency is not detected.
+
+Tests: `kgraf-orchestrator` `tests/contract_flow.rs`
+`a_plan_whose_consumers_name_no_interface_is_sent_back_and_the_corrected_plan_is_checked`,
+`a_plan_still_without_interfaces_after_one_ask_runs_with_a_loud_notice`,
+`a_plan_with_dependencies_and_no_interfaces_is_taken_when_checks_are_off`; `plan.rs` unit tests.
+
+## Amendment (2026-10-01): the planner is told the project's names, and four planning faults are closed
+
+Paid benchmark runs showed four faults that blocked or misdirected contract checks.
+
+1. **Consumer canary.** The canary-consumer compile run layered the broken consumer files and then
+   the valid tests files. A consumer file and a tests file at one path (allowed when their content
+   is the same) was restored by the tests overlay, the compile succeeded, and the check blamed the
+   compile command. 21 runs across three benchmarks were blocked this way. The consumer canary now
+   breaks only the consumer files that no tests file shares a path with, and applies the valid
+   tests last. A shared file is broken by the test canary, which applies its canary last. When every
+   consumer path is shared, the test canary covers them and no consumer canary runs.
+2. **Names and signatures.** The planner never saw file contents, so it wrote crate names that were
+   not the package's, trait methods with another parameter count and struct fields that did not
+   exist. Every decomposition prompt now carries a section of at most 8 KB (`planner_context.rs`):
+   package names from the manifests (the first 3 KB), then signatures, read through the code graph,
+   of the files and symbols the instruction names. A trait, struct, enum or class is given as its
+   declaration, at most 1.5 KB each, because its header alone names no method and no field. What
+   does not fit is cut with a count, and a notice says so. A named file the graph holds no signature
+   for is included as text up to the cap, with a notice (the whole-file read is the fallback, and it
+   is noticed).
+3. **Re-plan.** The re-plan's note quotes each failure as the check wrote it: stage, command and the
+   stderr tail. The re-planned contracts' instructions end with the same text in a
+   `held_plan_failures` data block, so a worker sees what was wrong with the plan it replaces.
+4. **Placeholders.** A template slot (`<crate_name>`, `<package>`, `<your-name>`) in an interface
+   command, or used as a path root or import target in an interface file, is refused at intake with
+   the slot named, and the planner is asked again. Generics and markup in source are not slots. Like
+   the command rules, this judges a new plan only; a persisted interface is not invalidated.
+
+Tests: `kgraf-orchestrator` `tests/contract_checks.rs`
+`a_consumer_file_shared_with_the_tests_still_gets_a_canary_and_a_sound_contract_passes` (real
+runner); `tests/orchestrator.rs` `the_planner_prompt_carries_the_crate_name_and_the_trait_signature`;
+`tests/contract_flow.rs` `a_plan_the_gate_holds_before_any_work_is_re_planned_once_with_the_failure`;
+`plan.rs` `a_placeholder_in_a_command_or_an_interface_file_is_refused_with_a_reason`;
+`planner_context.rs` unit tests.

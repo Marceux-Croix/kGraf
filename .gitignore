@@ -39,3 +39,4 @@ __pycache__/
 # Super canary fixtures carry their own isolated home with a skills folder.
 !/canary/fixtures/**/.claude/
 /canary/cassettes/
+!/canary/tests/fixtures/**/ledger.db

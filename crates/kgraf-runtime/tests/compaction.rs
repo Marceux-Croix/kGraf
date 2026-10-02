@@ -24,10 +24,10 @@ use kgraf_provider::{
 };
 use kgraf_runtime::{
     COMPACTION_CALL_KIND, COMPACTION_NOTICE_HEADER, CallMode, CompactRequestError,
-    CompactionTrigger, ContextConfig, NOTHING_TO_RECALL, NeutralPrefixEncoder, PrefixRegistry,
-    PrefixSnapshot, RECALL_TOOL, RecallHistoryTool, SUMMARY_REQUEST, SharedPrefix, SpawnOptions,
-    StopPointPolicy, SummarySource, WorkerBrief, WorkerEnv, WorkerEvent, WorkerHandle,
-    WorkerOutcome, WorkerResult, spawn_worker,
+    CompactionTrigger, ContextConfig, NOTHING_TO_RECALL, NeutralPrefixEncoder, PointSource,
+    PrefixRegistry, PrefixSnapshot, RECALL_TOOL, RecallHistoryTool, SUMMARY_REQUEST, SharedPrefix,
+    SpawnOptions, StopPointPolicy, SummarySource, WorkerBrief, WorkerEnv, WorkerEvent,
+    WorkerHandle, WorkerOutcome, WorkerResult, spawn_worker,
 };
 use kgraf_tools::{
     Access, CallPermit, Exposure, Tool, ToolContext, ToolError, ToolOutput, ToolRegistry,
@@ -139,6 +139,7 @@ impl Provider for Fake {
             });
         }
         Ok(Response {
+            finish_reason: None,
             model: request.model.clone(),
             content,
             stop_reason: round.stop,
@@ -950,4 +951,267 @@ async fn a_cancel_during_the_summary_call_loses_nothing_and_the_resume_compacts_
         .filter(|e| matches!(e, WorkerEvent::ModelCall { .. }))
         .count();
     assert_eq!(result.steps as usize, rounds_before + rounds_after);
+}
+
+// ------------------------------------------------ no-change ends and early hand-backs
+
+/// A worker whose context window is 32,768 tokens (stop point 11,468), as the
+/// local model in the evidence that drove these tests.
+fn small_window_brief(root: &Path, writes: Option<Vec<PathBuf>>) -> WorkerBrief {
+    WorkerBrief {
+        context: ContextConfig::for_model(32_768)
+            .expect("config")
+            .with_point(35, PointSource::User)
+            .expect("point"),
+        write_scope: writes,
+        ..brief(root)
+    }
+}
+
+/// One reply that reports `input` prompt tokens and `output` generated tokens
+/// and calls `read_config`: a long first reply plus one read.
+fn long_first_reply(n: u64, input: u64, output: u64) -> Round {
+    // `n` varies the call, so repeating it is not a stall.
+    let mut round = tool(&format!("cfg{n}"), "read_config", json!({"n": n}), input);
+    round.usage.text_output = output;
+    round
+}
+
+fn notices(events: &[WorkerEvent], kind: kgraf_runtime::NoticeKind) -> usize {
+    events
+        .iter()
+        .filter(|e| matches!(e, WorkerEvent::Notice { kind: k, .. } if *k == kind))
+        .count()
+}
+
+#[tokio::test]
+async fn an_announcement_with_no_tool_call_is_not_a_completion_when_the_contract_writes() {
+    let dir = tempfile::tempdir().expect("dir");
+    // The first turn is dropped from the transcript, so the second request
+    // looks like the first: the script counts calls instead.
+    let sent = std::sync::atomic::AtomicUsize::new(0);
+    let provider =
+        Fake::new(
+            move |_| match sent.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                0 => {
+                    answer("I'll implement all 8 classes in `shapes/library.py` and run the tests.")
+                }
+                1 => tool(
+                    "w",
+                    "write_file",
+                    json!({"path": "shapes.py", "content": "x"}),
+                    200,
+                ),
+                _ => answer("done"),
+            },
+        );
+    let env = env_with(provider.clone(), false);
+    let handle = spawn_worker(
+        env,
+        small_window_brief(dir.path(), Some(vec![PathBuf::from("shapes.py")])),
+        SpawnOptions::default(),
+    )
+    .await
+    .expect("spawn");
+    let (events, result) = drain(handle).await;
+    assert_eq!(result.outcome, WorkerOutcome::Completed, "{result:?}");
+    assert_eq!(result.steps, 3, "the notice round is counted");
+    assert_eq!(notices(&events, kgraf_runtime::NoticeKind::NoChange), 1);
+    let requests = provider.requests();
+    let text = text_of(&requests[1]);
+    assert!(
+        text.contains("You ended without making any change; this contract writes shapes.py."),
+        "{text}"
+    );
+    assert!(text.contains("report_shortfall"), "{text}");
+    assert!(
+        !text.contains("I'll implement all 8 classes"),
+        "the dropped turn is not resent"
+    );
+}
+
+#[tokio::test]
+async fn a_second_end_with_no_tool_call_fails_the_attempt_with_a_named_reason() {
+    let dir = tempfile::tempdir().expect("dir");
+    let provider = Fake::new(|_| answer("I'll do it now."));
+    let env = env_with(provider.clone(), false);
+    let handle = spawn_worker(
+        env,
+        small_window_brief(
+            dir.path(),
+            Some(vec![PathBuf::from("a.py"), PathBuf::from("b.py")]),
+        ),
+        SpawnOptions::default(),
+    )
+    .await
+    .expect("spawn");
+    let (_, result) = drain(handle).await;
+    let WorkerOutcome::Failed { error } = &result.outcome else {
+        panic!("expected Failed, got {:?}", result.outcome);
+    };
+    assert!(error.contains("no tool call and no change"), "{error}");
+    assert!(
+        error.contains("a.py, b.py"),
+        "the writes are named: {error}"
+    );
+    assert_eq!(provider.requests().len(), 2, "one notice, no third round");
+}
+
+#[tokio::test]
+async fn an_answer_with_no_tool_call_still_completes_a_contract_that_writes_nothing() {
+    let dir = tempfile::tempdir().expect("dir");
+    for scope in [None, Some(Vec::new())] {
+        let provider = Fake::new(|_| answer("The answer is 4."));
+        let env = env_with(provider.clone(), false);
+        let handle = spawn_worker(
+            env,
+            small_window_brief(dir.path(), scope),
+            SpawnOptions::default(),
+        )
+        .await
+        .expect("spawn");
+        let (events, result) = drain(handle).await;
+        assert_eq!(result.outcome, WorkerOutcome::Completed);
+        assert_eq!(notices(&events, kgraf_runtime::NoticeKind::NoChange), 0);
+        assert_eq!(provider.requests().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn a_read_only_attempt_that_used_a_tool_completes_without_a_notice() {
+    let dir = tempfile::tempdir().expect("dir");
+    let provider = Fake::new(|request| match rounds(request) {
+        0 => tool("cfg", "read_config", json!({}), 200),
+        _ => answer("the config is fine; nothing needed changing"),
+    });
+    let env = env_with(provider, false);
+    let handle = spawn_worker(
+        env,
+        small_window_brief(dir.path(), Some(vec![PathBuf::from("a.py")])),
+        SpawnOptions::default(),
+    )
+    .await
+    .expect("spawn");
+    let (events, result) = drain(handle).await;
+    assert_eq!(result.outcome, WorkerOutcome::Completed);
+    assert_eq!(notices(&events, kgraf_runtime::NoticeKind::NoChange), 0);
+}
+
+/// The evidence shape: one reply of 6,319 prompt and a long generated part,
+/// one read, nothing written; the measured context passes the stop point
+/// (11,468). Handing the whole task to a child would repeat it, so the worker
+/// compacts and goes on.
+#[tokio::test]
+async fn a_stop_point_reached_with_nothing_written_compacts_instead_of_handing_back() {
+    let dir = tempfile::tempdir().expect("dir");
+    let provider = Fake::new(|request| {
+        if is_summary(request) {
+            return answer(SUMMARY);
+        }
+        if compacted(request) {
+            return match rounds(request) {
+                0 => tool(
+                    "w",
+                    "write_file",
+                    json!({"path": "shapes.py", "content": "x"}),
+                    3_000,
+                ),
+                _ => answer("done"),
+            };
+        }
+        long_first_reply(rounds(request) as u64, 6_319, 5_300)
+    });
+    let env = env_with(provider.clone(), false);
+    let handle = spawn_worker(
+        env,
+        small_window_brief(dir.path(), None),
+        SpawnOptions::default(),
+    )
+    .await
+    .expect("spawn");
+    let (events, result) = drain(handle).await;
+    assert_eq!(result.outcome, WorkerOutcome::Completed, "{result:?}");
+    assert_eq!(compactions(&events).len(), 1);
+    let notice = result.compaction.expect("compacted");
+    assert_eq!(notice.trigger, CompactionTrigger::StopPoint);
+    assert_eq!(notice.stop_tokens, 11_468);
+    assert!(notice.at_tokens >= 11_468, "{notice:?}");
+}
+
+/// After that one compaction, a second stop point with still nothing written
+/// does not hand the whole task back either, while the window holds.
+#[tokio::test]
+async fn a_second_stop_point_with_nothing_written_goes_on_while_the_window_holds() {
+    let dir = tempfile::tempdir().expect("dir");
+    let provider = Fake::new(|request| {
+        if is_summary(request) {
+            return answer(SUMMARY);
+        }
+        if compacted(request) {
+            return match rounds(request) {
+                0 => long_first_reply(1, 12_000, 100),
+                _ => answer("done"),
+            };
+        }
+        long_first_reply(rounds(request) as u64, 6_319, 5_300)
+    });
+    let env = env_with(provider, false);
+    let handle = spawn_worker(
+        env,
+        small_window_brief(dir.path(), None),
+        SpawnOptions::default(),
+    )
+    .await
+    .expect("spawn");
+    let (events, result) = drain(handle).await;
+    assert_eq!(result.outcome, WorkerOutcome::Completed, "{result:?}");
+    assert_eq!(compactions(&events).len(), 1, "compacted once, never twice");
+}
+
+/// With nothing written and the window itself passed, the hand-back stays: the
+/// next request would not fit. It names what was measured.
+#[tokio::test]
+async fn a_hand_back_with_nothing_written_past_the_window_names_the_measured_context() {
+    let dir = tempfile::tempdir().expect("dir");
+    let provider = Fake::new(|request| {
+        if is_summary(request) {
+            return answer(SUMMARY);
+        }
+        if compacted(request) {
+            return long_first_reply(1, 40_000, 100);
+        }
+        long_first_reply(rounds(request) as u64, 6_319, 5_300)
+    });
+    let env = env_with(provider, false);
+    let handle = spawn_worker(
+        env,
+        small_window_brief(dir.path(), None),
+        SpawnOptions::default(),
+    )
+    .await
+    .expect("spawn");
+    let (_, result) = drain(handle).await;
+    let WorkerOutcome::HandedBack { handoff } = &result.outcome else {
+        panic!("expected a hand-back, got {:?}", result.outcome);
+    };
+    assert_eq!(handoff.cause, kgraf_runtime::HandoffCause::MeasuredContext);
+    assert!(handoff.context_tokens >= 40_000);
+}
+
+/// Work done, then the stop point: the hand-back stands, and says it came
+/// from measured context.
+#[tokio::test]
+async fn a_hand_back_after_a_write_stands_and_names_the_measured_context() {
+    let dir = tempfile::tempdir().expect("dir");
+    let provider = Fake::new(growing_then_done(SUMMARY));
+    let env = env_with(provider, true);
+    let handle = spawn_worker(env, brief(dir.path()), SpawnOptions::default())
+        .await
+        .expect("spawn");
+    let (_, result) = drain(handle).await;
+    let WorkerOutcome::HandedBack { handoff } = &result.outcome else {
+        panic!("expected a hand-back, got {:?}", result.outcome);
+    };
+    assert!(!handoff.done.is_empty());
+    assert_eq!(handoff.cause, kgraf_runtime::HandoffCause::MeasuredContext);
 }

@@ -439,6 +439,26 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_is_not_serialized_into_the_next_request() {
+        // `Provider::resends_reasoning` is false for this adapter: the context
+        // estimate leaves reasoning output out of the next prompt because this
+        // holds.
+        let mut r = request();
+        r.messages = vec![kgraf_provider::Message {
+            role: Role::Assistant,
+            content: vec![
+                Content::Reasoning {
+                    text: "SECRET-REASONING-TEXT".into(),
+                },
+                Content::text("visible"),
+            ],
+        }];
+        let text = to_wire(&r, false).to_string();
+        assert!(text.contains("visible"), "{text}");
+        assert!(!text.contains("SECRET-REASONING-TEXT"), "{text}");
+    }
+
+    #[test]
     fn temperature_is_sent_without_float_noise() {
         let mut r = request();
         r.temperature = Some(0.3);

@@ -113,14 +113,23 @@ impl ExecPolicy {
     /// `argv`'s program (decision 0094: every grant is recorded). A verdict
     /// the mode did not decide (the allowlist, a contract's grant, a rule)
     /// records nothing.
-    pub fn record_mode_grant(&self, worker: &str, argv: &[String], verdict: &PolicyVerdict) {
+    pub fn record_mode_grant(
+        &self,
+        worker: &str,
+        call_id: &str,
+        argv: &[String],
+        verdict: &PolicyVerdict,
+    ) {
         let Some(live) = &self.live else { return };
         let Some(program) = argv.first() else { return };
         if !verdict.granted || self.unrestricted || self.granted.contains(program) {
             return;
         }
         if live.0.shell_unrestricted() || live.0.policy_grants_program(program).is_some() {
-            live.0.record_grant(worker, &format!("`{program}`"), "mode");
+            // Staged, not recorded: a later hook of the chain may refuse the
+            // call, and the chain settles it (`PermissionControl::settle_call`).
+            live.0
+                .stage_grant(worker, call_id, &format!("`{program}`"), "mode");
         }
     }
 

@@ -264,6 +264,7 @@ impl Provider for BillsPrompt {
         };
         token.settle(&usage, None)?;
         Ok(Response {
+            finish_reason: None,
             model: request.model.clone(),
             content: vec![Content::text(self.0.clone())],
             stop_reason: StopReason::EndTurn,

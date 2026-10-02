@@ -54,6 +54,33 @@ pub enum DeferReason {
     Readiness,
 }
 
+/// A contract as the plan was accepted. The instruction is written in full:
+/// trace lines have no size cap.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PlannedContract {
+    pub id: String,
+    /// The instruction as stored for dispatch (the brief's instruction part;
+    /// the worker's brief adds the acceptance, the write list and later
+    /// sections around it).
+    pub instruction: String,
+    pub acceptance: String,
+    pub writes: Vec<String>,
+    pub depends_on: Vec<String>,
+    /// The route the plan pinned, when it pinned one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_kind: Option<kgraf_core::model_profile::TaskKind>,
+}
+
+/// An interface as the plan was accepted.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PlannedInterface {
+    pub id: String,
+    pub parties: Vec<String>,
+    pub symbols: Vec<String>,
+}
+
 /// One trace record.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
@@ -68,6 +95,46 @@ pub enum TraceEvent {
         target_tokens: u64,
         projection: ProjectionSource,
         estimate_micros: i64,
+        /// blake3 hex digest of the instruction the first attempt's worker
+        /// opens with (its brief, without the slices that follow it). Empty
+        /// in a trace written before the field existed, and when no attempt
+        /// got as far as building a brief.
+        #[serde(default)]
+        brief_digest: String,
+        /// The same digest per attempt, keyed by worker id. Attempts that
+        /// built no brief (no worktree) are absent.
+        #[serde(default)]
+        brief_digests: std::collections::BTreeMap<String, String>,
+        /// The commit the attempts' worktrees start from: the integration
+        /// branch tip when the dispatch began (the commit a remediation names
+        /// instead, when the contract carries one). Absent when the workspace
+        /// provider has no integration branch, and in a trace written before
+        /// the field existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base_commit: Option<String>,
+        /// The same commit per attempt, keyed by worker id.
+        #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+        base_commits: std::collections::BTreeMap<String, String>,
+    },
+    /// A plan was accepted for dispatch: written once per accepted plan, after
+    /// intake normalization and any re-asks, with the contracts as they will
+    /// be dispatched. A re-plan that replaces a held plan writes another
+    /// event under the next `revision`. A resume that interrupts the plan
+    /// between this record and the saved record can write the same revision
+    /// twice; the contents are the same.
+    PlanAccepted {
+        at_ms: i64,
+        /// 1 for the first accepted plan; one more for each re-plan.
+        revision: u32,
+        contracts: Vec<PlannedContract>,
+        /// The interfaces the plan registered; empty when it has none.
+        #[serde(default)]
+        interfaces: Vec<PlannedInterface>,
+        /// Notices raised while the plan was taken in (repairs, the unit
+        /// struct shape notice, "contract checks did not run", re-ask
+        /// reasons), scrubbed.
+        #[serde(default)]
+        notices: Vec<String>,
     },
     Deferred {
         at_ms: i64,
@@ -101,6 +168,16 @@ pub enum TraceEvent {
         /// field existed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+        /// The stop reason of the attempt's last model round that ended on its
+        /// own, normalized (`end_turn`, `tool_use`, `max_tokens`,
+        /// `stop_sequence`, `pause_turn`, `other`). Absent when no round
+        /// ended, and in a trace written before the field existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_stop: Option<kgraf_provider::StopReason>,
+        /// Tool calls the attempt started. Zero in a trace written before the
+        /// field existed.
+        #[serde(default)]
+        tool_calls: u32,
     },
     /// Question 2.
     Compaction {
@@ -111,6 +188,11 @@ pub enum TraceEvent {
         context_tokens: u64,
         done_items: usize,
         remaining_items: usize,
+        /// What the worker measured against its stop point
+        /// (`kgraf_runtime::HandoffCause::as_str`): a hand-back is never a
+        /// projection. Empty in a trace from before the field.
+        #[serde(default)]
+        cause: String,
     },
     /// The runtime compacted a worker (decision 0095): its fixed notice, as
     /// the worker emitted it.
@@ -741,6 +823,25 @@ fn scrub_trace_fields(event: TraceEvent) -> TraceEvent {
             to,
             reason: s(reason),
         },
+        TraceEvent::PlanAccepted {
+            at_ms,
+            revision,
+            mut contracts,
+            interfaces,
+            notices,
+        } => {
+            for c in &mut contracts {
+                c.instruction = s(std::mem::take(&mut c.instruction));
+                c.acceptance = s(std::mem::take(&mut c.acceptance));
+            }
+            TraceEvent::PlanAccepted {
+                at_ms,
+                revision,
+                contracts,
+                interfaces,
+                notices: notices.into_iter().map(s).collect(),
+            }
+        }
         other @ (TraceEvent::Dispatch { .. }
         | TraceEvent::RouteRecovered { .. }
         | TraceEvent::WorkerFinished { .. }

@@ -153,8 +153,8 @@ pub use config::{ModelRouteSpec, RouteSpec, RunConfig, WorktreeRetention};
 pub use error::{Error, NotReady, Result};
 pub use gates::discover_validation_commands;
 pub use host::{
-    CorpusRequest, Host, HostFactory, Housekeeping, Notice, PreparedRun, RouteCapacityInput,
-    RouteShape, RunHandle, RunOutcome, RunShape, RunStart, RunSummary, Startup,
+    CorpusRequest, Host, HostFactory, Housekeeping, Notice, PreparedRun, Retained,
+    RouteCapacityInput, RouteShape, RunHandle, RunOutcome, RunShape, RunStart, RunSummary, Startup,
 };
 pub use migrate::{MigrationReport, migrate_state_dir};
 pub use workspaces::{clean, state_dir};

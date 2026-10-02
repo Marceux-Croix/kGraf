@@ -225,6 +225,114 @@ fn print_notice(n: Notice) {
     println!("{}", notice_line(&n));
 }
 
+/// How long a run may take to stop after the first interrupt: workers
+/// cancelled, calls settled, worktrees listed. Past it the process exits and
+/// says so; startup cleanup (decision 0056) handles what is left.
+const STOP_BOUND: Duration = Duration::from_secs(30);
+
+/// A run that ended because the process was asked to stop: SIGINT or SIGTERM
+/// on Unix, Ctrl-C on Windows. `main` turns it into the conventional exit code
+/// (128 plus the signal number), so a supervisor can tell it from a failure.
+#[derive(Debug, thiserror::Error)]
+#[error("run {run} was interrupted by {name}{detail}")]
+pub struct Interrupted {
+    run: RunId,
+    name: &'static str,
+    signal: i32,
+    detail: String,
+}
+
+impl Interrupted {
+    /// The process exit code: 128 plus the signal number.
+    pub fn exit_code(&self) -> u8 {
+        u8::try_from(128 + self.signal).unwrap_or(130)
+    }
+}
+
+/// The interrupt signals of this process. Installed before anything else a
+/// run does, so a signal that arrives during setup is kept, not lost, and so
+/// the dependency fetch's own handler (`kgraf_host::deps`) chains to this one
+/// instead of ending the process.
+struct Interrupts {
+    #[cfg(unix)]
+    int: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    term: tokio::signal::unix::Signal,
+    #[cfg(windows)]
+    ctrl_c: tokio::signal::windows::CtrlC,
+}
+
+impl Interrupts {
+    /// Must run inside the tokio runtime.
+    fn install() -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            Ok(Self {
+                int: signal(SignalKind::interrupt())?,
+                term: signal(SignalKind::terminate())?,
+            })
+        }
+        #[cfg(windows)]
+        {
+            Ok(Self {
+                ctrl_c: tokio::signal::windows::ctrl_c()?,
+            })
+        }
+    }
+
+    /// The next interrupt: its number (2 for SIGINT and Ctrl-C, 15 for SIGTERM).
+    async fn next(&mut self) -> i32 {
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                _ = self.int.recv() => 2,
+                _ = self.term.recv() => 15,
+            }
+        }
+        #[cfg(windows)]
+        {
+            self.ctrl_c.recv().await;
+            2
+        }
+    }
+
+    /// An interrupt already received, without waiting for one.
+    async fn pending(&mut self) -> Option<i32> {
+        tokio::time::timeout(Duration::ZERO, self.next()).await.ok()
+    }
+}
+
+fn signal_name(signal: i32) -> &'static str {
+    match (signal, cfg!(windows)) {
+        (15, _) => "SIGTERM",
+        (_, true) => "Ctrl-C",
+        _ => "SIGINT",
+    }
+}
+
+fn interrupted(run: &RunId, signal: i32, detail: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(Interrupted {
+        run: run.clone(),
+        name: signal_name(signal),
+        signal,
+        detail: detail.into(),
+    })
+}
+
+/// The end of a run that was asked to stop twice, or did not stop within
+/// [`STOP_BOUND`]. Exits at once: the run is still going, and a second
+/// interrupt is the user saying not to wait. What is left on disk is
+/// handled by the next run's startup cleanup.
+fn cut_short(why: &str, signal: i32) -> ! {
+    println!(
+        "cut short  {why}; worktrees and attempt refs of this run may be left on disk and calls \
+         may still be open: `kgraf unreconciled` lists calls, `kgraf clean <worktree>` removes a \
+         worktree, and the next run's startup removes stale ones"
+    );
+    std::process::exit(128 + signal)
+}
+
 pub fn run(root: &Path, args: OrchestrateArgs) -> Result<()> {
     // Decision 0094: the user-level permissions file and this command's
     // flags, the only sources of the mode. Bypass is announced on stderr.
@@ -245,6 +353,9 @@ pub fn run(root: &Path, args: OrchestrateArgs) -> Result<()> {
         .enable_all()
         .build()
         .context("cannot start the async runtime")?;
+    let mut interrupts = runtime
+        .block_on(async { Interrupts::install() })
+        .context("cannot listen for interrupts")?;
 
     // Reading a corpus (with or without corrections) creates nothing in
     // the repository: no branch, no worktree. Approval names the plan id of a
@@ -266,14 +377,33 @@ pub fn run(root: &Path, args: OrchestrateArgs) -> Result<()> {
         // presumed twice. No roadmap is said, not raised: the reading below
         // plans from the whole corpus, or from the instruction alone.
         host.with_graph(|g| crate::plan_cmd::presume_after_index(g, "the corpus is still read"))?;
-        let intake = runtime.block_on(host.read_corpus(
+        let reading_call = host.read_corpus(
             &run_id,
             CorpusRequest {
                 instruction,
                 corrections: args.corrections.clone(),
                 budget_tokens: args.interpret_budget,
             },
-        ))?;
+        );
+        let intake = runtime.block_on(async {
+            tokio::select! {
+                intake = reading_call => Ok(intake),
+                signal = interrupts.next() => Err(signal),
+            }
+        });
+        let intake = match intake {
+            Ok(intake) => intake?,
+            // The reading call is dropped: its ledger row is left
+            // unreconciled (it may have billed), never in flight.
+            Err(signal) => {
+                return Err(interrupted(
+                    &run_id,
+                    signal,
+                    ": the reading was cut off, nothing was stored, and its model call may have \
+                     billed (`kgraf unreconciled` lists it)",
+                ));
+            }
+        };
         for c in &intake.charged {
             println!("ledger call {c} (interpretation)");
         }
@@ -373,13 +503,33 @@ pub fn run(root: &Path, args: OrchestrateArgs) -> Result<()> {
             Some(q) if crate::deps_cmd::attended() => {
                 use crate::deps_cmd::Answer;
                 use kgraf_host::deps::Consent;
-                match crate::deps_cmd::ask(&q)? {
+                // The prompt blocks on the terminal, so it runs off the
+                // runtime and an interrupt ends the process at once.
+                let registry = q.registry;
+                let asked = runtime.block_on(async {
+                    let prompt = tokio::task::spawn_blocking(move || crate::deps_cmd::ask(&q));
+                    tokio::select! {
+                        answer = prompt => Ok(answer),
+                        signal = interrupts.next() => Err(signal),
+                    }
+                });
+                let answer = match asked {
+                    Ok(answer) => answer.context("the dependency question ended abnormally")??,
+                    Err(signal) => {
+                        println!(
+                            "stopped    {}: no dependency answer given",
+                            signal_name(signal)
+                        );
+                        std::process::exit(128 + signal)
+                    }
+                };
+                match answer {
                     Answer::Once => host.grant_dependency_fetch(&run_id),
-                    Answer::Always => host.set_dependency_consent(q.registry, Consent::Allowed)?,
+                    Answer::Always => host.set_dependency_consent(registry, Consent::Allowed)?,
                     Answer::NotNow => return Err(e.into()),
                     // Stored, then built again: the refusal's own error (with
                     // how to undo it) is what the user reads.
-                    Answer::Never => host.set_dependency_consent(q.registry, Consent::Refused)?,
+                    Answer::Never => host.set_dependency_consent(registry, Consent::Refused)?,
                 }
                 build(&host)?
             }
@@ -387,6 +537,16 @@ pub fn run(root: &Path, args: OrchestrateArgs) -> Result<()> {
         },
     };
 
+    // An interrupt that came during setup: nothing has started, so say so.
+    if let Some(signal) = runtime.block_on(interrupts.pending()) {
+        return Err(interrupted(
+            &run_id,
+            signal,
+            ": it arrived before the run started, so nothing was started",
+        ));
+    }
+
+    let mut signaled: Option<i32> = None;
     let outcome = runtime.block_on(async {
         if args.interactive {
             prepared.attach_port(Arc::new(StdinPort::start()));
@@ -435,7 +595,37 @@ pub fn run(root: &Path, args: OrchestrateArgs) -> Result<()> {
                 (None, None) => bail!("give --instruction FILE, --corpus or --resume RUN"),
             }
         };
-        match prepared.run(start).await {
+        let handle = prepared.handle();
+        let running = prepared.run(start);
+        tokio::pin!(running);
+        let ended = tokio::select! {
+            ended = &mut running => ended,
+            signal = interrupts.next() => {
+                signaled = Some(signal);
+                println!(
+                    "stopping   {} received: no new work starts, workers and model calls are \
+                     cancelled, and calls and worktrees are accounted for (at most {} s; \
+                     a second interrupt exits at once)",
+                    signal_name(signal),
+                    STOP_BOUND.as_secs()
+                );
+                // The same stop the desktop's stop button sends: cancels every
+                // worker and planner call, keeps worktrees and transcripts, and
+                // leaves the run record resumable.
+                handle.stop().await;
+                tokio::select! {
+                    ended = &mut running => ended,
+                    second = interrupts.next() => cut_short("a second interrupt arrived", second),
+                    () = tokio::time::sleep(STOP_BOUND) => {
+                        cut_short(
+                            &format!("the {} s stop bound was reached", STOP_BOUND.as_secs()),
+                            signal,
+                        )
+                    }
+                }
+            }
+        };
+        match ended {
             Ok(outcome) => Ok(outcome),
             Err(e) => {
                 // A run that fails has no report, so the planner refusals it
@@ -470,6 +660,20 @@ pub fn run(root: &Path, args: OrchestrateArgs) -> Result<()> {
         println!("{open} call(s) with unaccounted spend; run `kgraf unreconciled`");
     }
     // The report and housekeeping are out; now the exit code says how it went.
+    // A run that stopped because the process was interrupted exits with the
+    // signal's code; one that finished anyway is a finished run.
+    if let Some(signal) = signaled
+        && matches!(
+            outcome.report.status,
+            kgraf_orchestrator::RunStatus::Stopped
+        )
+    {
+        return Err(interrupted(
+            &outcome.report.run,
+            signal,
+            format!("; `--resume {}` continues it", outcome.report.run),
+        ));
+    }
     ensure_completed(&outcome.report)
 }
 

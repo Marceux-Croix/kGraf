@@ -36,6 +36,9 @@ enum Worker {
     /// Contract `a` writes `b.txt` (contract `b`'s file), is refused,
     /// reports it, then writes its own `a.txt`; contract `b` writes `b.txt`.
     EditsSibling,
+    /// As `EditsSibling`, but contract `a` reports an `instructions`
+    /// shortfall asking for `b.txt` to be changed, then writes its own file.
+    InstructsSibling,
     /// Runs `cp`, is refused, then writes the file with apply_patch anyway
     /// and answers: the worker that guesses.
     RefusedThenWrites,
@@ -126,11 +129,13 @@ impl Provider for Script {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner()) = format!("{system}{:?}", request.messages);
             (
-                vec![Content::text(if self.worker == Worker::EditsSibling {
-                    SIBLING_PLAN
-                } else {
-                    r#"{"contracts":[{"id":"a","instruction":"copy README.md to a.txt","acceptance":"a.txt exists","writes":[{"path":"a.txt"}],"tools":[]}]}"#
-                })],
+                vec![Content::text(
+                    if matches!(self.worker, Worker::EditsSibling | Worker::InstructsSibling) {
+                        SIBLING_PLAN
+                    } else {
+                        r#"{"contracts":[{"id":"a","instruction":"copy README.md to a.txt","acceptance":"a.txt exists","writes":[{"path":"a.txt"}],"tools":[]}]}"#
+                    },
+                )],
                 StopReason::EndTurn,
             )
         } else if system.contains("still serves") {
@@ -187,7 +192,22 @@ impl Provider for Script {
                     2 => Some(tool("apply_patch", add_file("a.txt"), round)),
                     _ => None,
                 },
-                (Worker::EditsSibling, _, 0) => Some(tool("apply_patch", add_file("b.txt"), round)),
+                (Worker::InstructsSibling, _, r) if seen.contains("TASK-A") => match r {
+                    0 => Some(tool(
+                        kgraf_runtime::SHORTFALL_TOOL,
+                        serde_json::json!({
+                            "kind": "instructions",
+                            "need": "The stub code in b.txt must be updated to use the new type",
+                            "why": "my type now has a field and b.txt builds it as a value"
+                        }),
+                        round,
+                    )),
+                    1 => Some(tool("apply_patch", add_file("a.txt"), round)),
+                    _ => None,
+                },
+                (Worker::EditsSibling | Worker::InstructsSibling, _, 0) => {
+                    Some(tool("apply_patch", add_file("b.txt"), round))
+                }
                 (Worker::RefusedThenWrites, _, 0) => Some(tool("shell", cp(), round)),
                 (Worker::RefusedThenWrites, _, 1) => Some(tool("apply_patch", patch(), round)),
                 (Worker::Writes, _, 0) => Some(tool("apply_patch", patch(), round)),
@@ -205,6 +225,7 @@ impl Provider for Script {
         };
         token.settle(&usage, None)?;
         Ok(kgraf_provider::Response {
+            finish_reason: None,
             model: request.model.clone(),
             content,
             stop_reason,
@@ -652,6 +673,44 @@ async fn bypass_answers_a_sibling_contracts_file_and_never_grants_it() {
     assert!(
         report.verified.contains(&"a".to_owned()) && report.verified.contains(&"b".to_owned()),
         "{report:?}"
+    );
+}
+
+/// An `instructions` report that asks for a change to a file another contract
+/// owns is answered, not written into the reporting contract's own
+/// instruction, where it would change nothing: nothing is amended, the
+/// contract is not re-dispatched for it, and the worker keeps working.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_instructions_report_about_a_sibling_contracts_file_is_answered_not_amended() {
+    let (report, trace, script) = run(
+        Worker::InstructsSibling,
+        control(kgraf_tools::PermissionMode::Manual),
+        "test -f a.txt -o -f b.txt",
+        "sf-instructs-sibling",
+    )
+    .await;
+    assert_eq!(
+        report.status,
+        kgraf_orchestrator::RunStatus::Completed,
+        "{report:?}\n{trace}"
+    );
+    let lines = shortfall_lines(&trace);
+    assert_eq!(lines.len(), 1, "{trace}");
+    assert!(lines[0].contains("answered:"), "{}", lines[0]);
+    assert!(
+        lines[0].contains("`b.txt` belongs to contract `b`")
+            && lines[0].contains("Keep the public shape"),
+        "{}",
+        lines[0]
+    );
+    assert!(
+        !trace.contains("the contract was amended"),
+        "no amendment of the reporting contract\n{trace}"
+    );
+    assert_eq!(
+        script.attempts.load(Ordering::SeqCst),
+        2,
+        "one attempt per contract: the report did not re-dispatch `a`"
     );
 }
 

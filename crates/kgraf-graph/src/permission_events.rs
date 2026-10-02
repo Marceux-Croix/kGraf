@@ -14,8 +14,8 @@ pub struct PermissionEventRow {
     pub run_id: Option<String>,
     /// The worker a grant went to, if any.
     pub agent: Option<String>,
-    /// `mode_changed`, `plan_review_changed`, `granted`, `denied`,
-    /// `plan_approved`, `plan_rejected`, `plan_changed`.
+    /// `mode_changed`, `plan_review_changed`, `granted`, `grant_refused`,
+    /// `denied`, `plan_approved`, `plan_rejected`, `plan_changed`.
     pub event: String,
     /// One line for the card, scrubbed by the caller.
     pub line: String,

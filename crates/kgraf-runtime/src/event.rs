@@ -106,7 +106,15 @@ pub enum WorkerEvent {
     /// Usage for one accounted provider call, with its ledger id (every token is attributed).
     Usage { call: CallId, usage: TokenUsage },
     /// The model ended a round.
-    Stop { reason: StopReason },
+    Stop {
+        reason: StopReason,
+        /// The provider's own finish string behind `reason`, where the
+        /// adapter reads one (`stop`, `tool_calls`, `length`, `end_turn`).
+        /// Absent in a transcript written before the field existed, and for
+        /// a provider that sends none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        finish_reason: Option<String>,
+    },
     /// The worker was cancelled.
     Cancelled { phase: CancelPhase },
     /// An approval decision on a tool call.
@@ -219,6 +227,10 @@ pub enum NoticeKind {
     /// planned only in its reasoning); it was discarded and the model was told
     /// to continue. A second empty turn in a row fails the attempt.
     EmptyTurn,
+    /// The model ended the attempt as done with no tool call in the whole
+    /// attempt although its contract writes files; it was told once to
+    /// continue or call `report_shortfall`. A second such end fails the attempt.
+    NoChange,
 }
 
 impl WorkerEvent {
@@ -418,7 +430,7 @@ impl WorkerEvent {
     pub fn is_terminal(&self) -> bool {
         match self {
             WorkerEvent::Cancelled { .. } => true,
-            WorkerEvent::Stop { reason } => {
+            WorkerEvent::Stop { reason, .. } => {
                 !matches!(reason, StopReason::ToolUse | StopReason::PauseTurn)
             }
             _ => false,
@@ -456,6 +468,7 @@ impl WorkerEvent {
                 usage,
             }),
             StreamEvent::Finished { stop_reason } => Some(WorkerEvent::Stop {
+                finish_reason: None,
                 reason: stop_reason,
             }),
         }
@@ -615,7 +628,7 @@ impl EventSequence {
                         call_id: call_id.clone(),
                     })?;
             }
-            WorkerEvent::Stop { reason }
+            WorkerEvent::Stop { reason, .. }
                 if !matches!(reason, StopReason::ToolUse | StopReason::PauseTurn) =>
             {
                 if !self.open.is_empty() {
@@ -700,7 +713,10 @@ mod tests {
     }
 
     fn stop(reason: StopReason) -> WorkerEvent {
-        WorkerEvent::Stop { reason }
+        WorkerEvent::Stop {
+            finish_reason: None,
+            reason,
+        }
     }
 
     #[test]

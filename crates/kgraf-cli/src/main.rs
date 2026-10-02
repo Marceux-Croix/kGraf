@@ -842,7 +842,22 @@ fn fetch_choice(fetch: bool, no_fetch: bool) -> kgraf_host::deps::RunFetch {
     }
 }
 
-fn main() -> Result<()> {
+/// Prints the report `fn main() -> Result` prints and exits 1 for a failure;
+/// an interrupted run exits with 128 plus its signal.
+fn main() -> std::process::ExitCode {
+    match run_cli() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("Error: {err:?}");
+            match err.downcast_ref::<orchestrate_cmd::Interrupted>() {
+                Some(interrupted) => std::process::ExitCode::from(interrupted.exit_code()),
+                None => std::process::ExitCode::FAILURE,
+            }
+        }
+    }
+}
+
+fn run_cli() -> Result<()> {
     // First, so every later line (including `rmcp`'s) goes through the filter.
     kgraf_cli::logging::init()?;
     // A configured credential the scrubber refuses (a placeholder, a repeat)

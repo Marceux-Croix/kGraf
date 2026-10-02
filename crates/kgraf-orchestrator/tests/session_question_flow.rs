@@ -1170,16 +1170,22 @@ async fn a_message_to_an_agent_that_retires_is_reported_to_the_sender_by_injecti
     let handle = o.handle();
     let run = tokio::spawn(o.start(RunId::new("r1"), "make x and y".into()));
     until("x parks", || p.alpha.hang_reached.load(Ordering::SeqCst)).await;
-    let record = record_of(&p);
-    let worker_of = |id: &str| {
-        record
-            .open_contracts
-            .iter()
-            .find(|c| c.contract == id)
-            .and_then(|c| c.workers.first().cloned())
-            .expect("dispatched")
+    // x parking says only that x's attempt started. y is dispatched by the
+    // same loop, possibly after that, so wait until the saved record names
+    // a worker for both before reading either.
+    let workers_of_x_and_y = || {
+        let record = try_record_of(&p)?;
+        let worker_of = |id: &str| {
+            record
+                .open_contracts
+                .iter()
+                .find(|c| c.contract == id)
+                .and_then(|c| c.workers.first().cloned())
+        };
+        Some((worker_of("x")?, worker_of("y")?))
     };
-    let (x, y) = (worker_of("x"), worker_of("y"));
+    until("x and y are dispatched", || workers_of_x_and_y().is_some()).await;
+    let (x, y) = workers_of_x_and_y().expect("both dispatched");
     handle
         .send_message(y.clone(), x.clone(), "are you using Config?".into())
         .await

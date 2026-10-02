@@ -69,3 +69,27 @@ No savings claim follows from any of this.
 
 Reactivated if measurement shows that structural retrieval from the graph misses information
 that a semantic memory system would find in long runs.
+
+
+## Amendment: SIGINT and SIGTERM stop a run honestly
+
+`kgraf orchestrate` used to end the process in the middle of a call on Ctrl-C or SIGTERM:
+the provider call stayed `in_flight` in the ledger and worker worktrees were left with no
+word to the user.
+
+The first SIGINT or SIGTERM now sends the run the same stop the app's stop button sends: no
+new dispatch, every worker cancelled, and the planner's own call in flight ended. A call
+dropped that way settles as unreconciled (it may have billed); a worker's cancelled call
+settles as cancelled. Neither stays `in_flight`. The command prints the usual report with
+status `Stopped`, one `kept       worktree` line per worktree left, and exits with 128 plus the
+signal number. `schedule run-now` shares the path and records the run as failed.
+
+- **Bounded.** The stop is given 30 seconds. At the bound, or at a second interrupt, the
+  process prints one `cut short` line and exits at once with the same code; startup cleanup
+  handles what is left.
+- **Listeners are installed first**, so an interrupt during setup is kept, and the
+  dependency fetch's handler chains to ours instead of ending the process.
+- **Windows** uses Ctrl-C; there is no SIGTERM.
+- **Rejected.** Letting the default handler end the process (the defect). Exiting at once
+  after the first signal and leaving settlement to startup cleanup: the user would not be
+  told what was left.

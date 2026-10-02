@@ -220,6 +220,18 @@ pub struct OpenContract {
     /// ([`MAX_REFUSAL_CHARS`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_refusal: Option<String>,
+    /// What stopped the last failed round's attempts before any verifier saw
+    /// them: the repeated call of a stall, a spent budget, a runtime failure,
+    /// each with the calls a policy refused. Carried in the next fresh
+    /// attempt's brief as data. Scrubbed and capped ([`MAX_REFUSAL_CHARS`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_stop: Option<String>,
+    /// The one amendment given after a refusal whose compile error lay in a
+    /// file this contract does not write (`outside_error.rs`): quoted in every
+    /// later attempt's brief. Set at most once, so a contract is amended once.
+    /// Scrubbed for storage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outside_error_note: Option<String>,
     /// Commands an attempt must pass besides the run's own check: a gate
     /// remediation carries the commands of the gate it remediates, so a fix
     /// that the run's check already passed without is not accepted until the
@@ -370,6 +382,8 @@ impl OpenContract {
             resolver_source: None,
             task_kind: None,
             last_refusal: None,
+            last_stop: None,
+            outside_error_note: None,
             gate_commands: Vec::new(),
             granted_programs: Vec::new(),
             grants: Vec::new(),
@@ -609,6 +623,10 @@ pub struct RunStateRecord {
     /// re-plan is taken so a resume in between still sends them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replan_note: Option<String>,
+    /// The same failures as data for the re-planned contracts' briefs: each
+    /// carries them, so a worker sees what was wrong with the held plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replan_failures: Option<String>,
     /// Workers the runtime compacted (decision 0095), in order: each is a
     /// contract that was larger than planned when the trigger was the stop
     /// point. The notice names the worker's transcript, which holds the full
@@ -814,6 +832,7 @@ impl RunStateRecord {
             unverified: BTreeMap::new(),
             replans: 0,
             replan_note: None,
+            replan_failures: None,
             compactions: Vec::new(),
             check_holds: Vec::new(),
         }

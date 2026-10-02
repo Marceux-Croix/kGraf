@@ -322,6 +322,12 @@ pub struct Response {
     /// The provider's own request id, where it sends one, for reconciling a call
     /// against a provider-side invoice.
     pub request_id: Option<String>,
+    /// The provider's own finish string (`stop`, `tool_calls`, `end_turn`,
+    /// `STOP`), exactly as the wire carried it, where the adapter reads one.
+    /// `stop_reason` is the normalized form; this keeps what it was mapped
+    /// from, so an `Other` is explainable. `None` where the protocol sends no
+    /// such string.
+    pub finish_reason: Option<String>,
 }
 
 impl Response {

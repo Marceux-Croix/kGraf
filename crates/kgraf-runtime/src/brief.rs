@@ -85,6 +85,35 @@ pub struct Handoff {
     pub files_touched: Vec<PathBuf>,
     /// Context tokens in use when the worker stopped.
     pub context_tokens: u64,
+    /// Why the worker stopped: what was measured against the stop point.
+    #[serde(default)]
+    pub cause: HandoffCause,
+}
+
+/// What made a worker hand back. A hand-back is never a projection: the loop
+/// compares measured context (the last reported usage plus the estimate for
+/// what was added since) with the stop point. There is no tool the model calls
+/// to hand back.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HandoffCause {
+    /// The transcript alone (reported usage plus estimated additions) reached
+    /// the stop point.
+    #[default]
+    MeasuredContext,
+    /// The transcript was below the stop point; the queued steering messages
+    /// pushed the next round past it.
+    QueuedMessages,
+}
+
+impl HandoffCause {
+    /// The name the trace records.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MeasuredContext => "measured_context",
+            Self::QueuedMessages => "queued_messages",
+        }
+    }
 }
 
 impl Handoff {
@@ -112,7 +141,14 @@ pub enum WorkerOutcome {
     /// `WorkerResult::round_blocks` says which).
     BudgetExhausted,
     /// The same tool call repeated inside the budget (0056 stall detection).
-    Stalled { call_digest: String, repeats: u32 },
+    Stalled {
+        call_digest: String,
+        repeats: u32,
+        /// The repeated call as `tool input` (cut at a fixed length), so a
+        /// retry brief can name it. Empty in a record from before the field.
+        #[serde(default)]
+        call: String,
+    },
     /// The worker was cancelled.
     Cancelled,
     /// The run failed.
@@ -252,6 +288,15 @@ pub struct WorkerResult {
     pub commit: Option<String>,
     /// Every provider call this run made, in order.
     pub calls: Vec<CallId>,
+    /// The stop reason of the last model round that ended on its own, as the
+    /// provider reported it normalized. `None` when no round ended (a run cut
+    /// short before its first response) and in a record from before the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_stop: Option<kgraf_provider::StopReason>,
+    /// Tool calls the worker started in this run segment. Zero in a record
+    /// from before the field.
+    #[serde(default)]
+    pub tool_calls: u32,
     /// Model rounds used.
     pub steps: u32,
     /// The shared prefix digest every call of this run was checked against
@@ -300,6 +345,12 @@ pub struct WorkerResult {
     /// still loads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub round_blocks: Option<crate::progress::RoundBlocks>,
+    /// The largest context measure this run segment read at a stop check
+    /// (`TranscriptBuilder::context_tokens` plus queued messages): the same
+    /// figure the stop point is compared with. Zero for a run that never
+    /// reached a check and in a record from before the field.
+    #[serde(default)]
+    pub peak_context_tokens: u64,
 }
 
 impl WorkerResult {
@@ -319,6 +370,8 @@ impl WorkerResult {
             changed_paths: Vec::new(),
             commit: None,
             calls: Vec::new(),
+            last_stop: None,
+            tool_calls: 0,
             steps: 0,
             prefix_digest: String::new(),
             denied: 0,
@@ -328,6 +381,7 @@ impl WorkerResult {
             compaction: None,
             route_fault: None,
             round_blocks: None,
+            peak_context_tokens: 0,
         }
     }
 }
@@ -381,6 +435,7 @@ mod tests {
             remaining: vec!["wire parser into CLI".into()],
             files_touched: vec![PathBuf::from("src/parser.rs")],
             context_tokens: 80_000,
+            cause: HandoffCause::default(),
         };
         handoff.validate().expect("valid");
         let outcome = WorkerOutcome::HandedBack {
@@ -413,6 +468,7 @@ mod tests {
                 WorkerOutcome::Stalled {
                     call_digest: "abc".into(),
                     repeats: 3,
+                    call: "read_file {}".into(),
                 },
             )
         };

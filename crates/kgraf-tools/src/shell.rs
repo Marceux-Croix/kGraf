@@ -429,7 +429,7 @@ impl ApprovalHook for ShellApprovalHook {
                 // Decision 0094: a command the user's permission mode let
                 // run is a grant, and every grant is recorded.
                 self.policy
-                    .record_mode_grant(call.worker.as_str(), &cmd, &verdict);
+                    .record_mode_grant(call.worker.as_str(), &call.call_id, &cmd, &verdict);
                 HookDecision::Allow
             }
         }
@@ -464,17 +464,17 @@ pub fn command_argv(input: &Value) -> Option<Vec<String>> {
 /// says. A one-element program path that holds a space is no longer run as
 /// one word: none of kGraf's allowlists name such a program, and the refusal
 /// or the split is said, never silent.
-fn parse_command(input: &Value) -> Result<(Vec<String>, bool), ToolError> {
+fn parse_command(input: &Value) -> Result<(Vec<String>, ArgvForm), ToolError> {
     let bad = |reason: &str| ToolError::InvalidInput {
         tool: "shell".into(),
         reason: reason.into(),
     };
-    let one_line = |line: &str| -> Result<(Vec<String>, bool), ToolError> {
+    let one_line = |line: &str| -> Result<(Vec<String>, ArgvForm), ToolError> {
         if line.trim().is_empty() {
             return Err(bad("`command` must not be empty"));
         }
         if let Some(words) = crate::execpolicy::split_command_line(line) {
-            return Ok((words, true));
+            return Ok((words, ArgvForm::Split));
         }
         if crate::execpolicy::has_shell_syntax(line) && line.trim().contains(char::is_whitespace) {
             return Err(bad(
@@ -484,12 +484,19 @@ fn parse_command(input: &Value) -> Result<(Vec<String>, bool), ToolError> {
                  write files with apply_patch",
             ));
         }
-        Ok((vec![line.trim().to_owned()], false))
+        Ok((vec![line.trim().to_owned()], ArgvForm::Plain))
     };
     let command = input
         .get("command")
         .ok_or_else(|| bad("expected a `command` array of strings"))?;
     if let Some(line) = command.as_str() {
+        // A JSON-encoded list inside the string (`"[\"python\", \"-c\", \"print(1)\"]"`):
+        // the model meant that list. Read as that list, each element one
+        // argument, and said in the result. Only a non-empty list of strings
+        // qualifies; any other string goes the way it always went.
+        if let Some(list) = json_string_list(line) {
+            return Ok((list, ArgvForm::JsonList));
+        }
         return one_line(line);
     }
     let array = command
@@ -524,11 +531,37 @@ fn parse_command(input: &Value) -> Result<(Vec<String>, bool), ToolError> {
                 ));
             };
             words.extend(rest.iter().cloned());
-            Ok((words, true))
+            Ok((words, ArgvForm::Split))
         }
-        _ => Ok((cmd, false)),
+        _ => Ok((cmd, ArgvForm::Plain)),
     }
 }
+
+/// How a call's argv was read from its `command` input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ArgvForm {
+    /// An array of strings, or one word: run as given.
+    Plain,
+    /// One string, or a first element holding spaces, split into words.
+    Split,
+    /// A string holding a JSON-encoded array of strings, read as that array.
+    JsonList,
+}
+
+/// The elements of `line` when its trimmed text is a non-empty JSON array of
+/// strings, else `None`.
+fn json_string_list(line: &str) -> Option<Vec<String>> {
+    let text = line.trim();
+    if !(text.starts_with('[') && text.ends_with(']')) {
+        return None;
+    }
+    let list: Vec<String> = serde_json::from_str(text).ok()?;
+    (!list.is_empty()).then_some(list)
+}
+
+/// What a call whose `command` was a JSON-encoded list reads after its
+/// output, so the model learns the form.
+const JSON_LIST_NOTE: &str = "\nnote: `command` was a JSON-encoded list; it was read as that list";
 
 /// What a call whose one string was split ([`parse_command`]) reads after its
 /// output, so the model learns the form.
@@ -1019,7 +1052,7 @@ impl Tool for ShellTool {
                 tool: "shell".into(),
             });
         }
-        let (cmd, split) = parse_command(&input)?;
+        let (cmd, form) = parse_command(&input)?;
         // The body runs in a block so every path, early returns included,
         // comes back here, where a split command line gets its note.
         let result: Result<ToolOutput, ToolError> = async {
@@ -1202,9 +1235,13 @@ impl Tool for ShellTool {
         }
         .await;
         match result {
-            Ok(mut out) if split => {
+            Ok(mut out) if form != ArgvForm::Plain => {
+                let note = match form {
+                    ArgvForm::JsonList => JSON_LIST_NOTE.to_owned(),
+                    _ => split_note(&cmd),
+                };
                 out.parts.push(crate::OutputPart::Text {
-                    text: crate::UntrustedText::new(split_note(&cmd)),
+                    text: crate::UntrustedText::new(note),
                 });
                 Ok(out)
             }
@@ -3102,31 +3139,51 @@ mod tests {
 
     /// The same three calls with no gate bound at all run concurrently (the
     /// existing, unbounded behavior is unchanged by this field's addition).
+    ///
+    /// Concurrency is proven by rendezvous, not by wall-clock time. Each
+    /// command drops a marker file, then waits until all three markers exist.
+    /// Three calls that overlap all see three markers and print `met`. Calls
+    /// that ran one after another could never see three, and each prints
+    /// `missed` when its 20 s bound runs out. Process start-up latency under
+    /// load cannot fail this test, and a serialized tool cannot pass it.
     #[tokio::test]
     async fn with_no_exec_gate_bound_three_calls_run_concurrently() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let marks = dir.path().join("marks");
+        std::fs::create_dir(&marks).expect("marks dir");
         let (tool, _hook) = ShellTool::new(policy());
         let tool = std::sync::Arc::new(tool);
 
-        let start = std::time::Instant::now();
         let mut handles = Vec::new();
-        for _ in 0..3 {
+        for i in 0..3 {
             let tool = tool.clone();
             let root = dir.path().to_path_buf();
+            let script = format!(
+                "d='{d}'; : > \"$d/{i}\"; n=0; \
+                 while [ \"$(ls \"$d\" | wc -l)\" -lt 3 ]; do \
+                   n=$((n+1)); \
+                   if [ \"$n\" -gt 1000 ]; then echo missed; exit 0; fi; \
+                   sleep 0.02; \
+                 done; echo met",
+                d = marks.display()
+            );
             handles.push(tokio::spawn(async move {
                 let permit = CallPermit::new();
-                let input = json!({"command": ["/bin/sleep", "0.15"]});
+                let input = json!({"command": ["/bin/sh", "-c", script]});
                 tool.call(input, &ctx(root), &permit).await
             }));
         }
         for h in handles {
-            h.await.expect("task did not panic").expect("call ok");
+            let out = h
+                .await
+                .expect("task did not panic")
+                .expect("call ok")
+                .render();
+            assert!(
+                out.contains("met") && !out.contains("missed"),
+                "a call never saw the other two running at once: {out}"
+            );
         }
-        let elapsed = start.elapsed();
-        assert!(
-            elapsed < std::time::Duration::from_millis(280),
-            "three 150ms calls with no gate took {elapsed:?}; expected them concurrent"
-        );
     }
 
     /// The mechanism, isolated from `ShellTool`: acquiring past the
@@ -3332,6 +3389,33 @@ mod tests {
             );
         }
 
+        /// A JSON-encoded list in a string runs as that list, is judged as that
+        /// list by the allowlist, and the output carries the note.
+        #[tokio::test]
+        async fn a_json_list_string_runs_as_the_list_and_the_note_is_said() {
+            let f = fixture(PLAIN_BUILD_RS);
+            let (tool, hook) = bound_tool(&f.ws);
+            let input = json!({"command": "[\"cargo\", \"test\", \"-q\"]"});
+            let access = tool.access(&input).expect("access");
+            assert!(access.is_sandboxed_build());
+            let call = PendingCall {
+                input: input.clone(),
+                ..pending(&["unused"])
+            };
+            assert_eq!(hook.review(&call).await, HookDecision::Allow);
+            let ctx = ctx(f.ws.root().to_path_buf());
+            let out = tool
+                .call(input, &ctx, &CallPermit::new())
+                .await
+                .expect("call");
+            let text = out.render();
+            assert!(!text.starts_with("ERROR"), "{text}");
+            assert!(
+                text.contains("note: `command` was a JSON-encoded list; it was read as that list"),
+                "{text}"
+            );
+        }
+
         /// `["cargo test", "--workspace", "-q"]`: the first element's words are
         /// split off and put before the rest, the split is said, and the policy
         /// judges the real argv. Before, the program was named `cargo test` and
@@ -3341,8 +3425,8 @@ mod tests {
             let f = fixture(PLAIN_BUILD_RS);
             let (tool, hook) = bound_tool(&f.ws);
             let input = json!({"command": ["cargo test", "--workspace", "-q"]});
-            let (argv, split) = parse_command(&input).expect("parsed");
-            assert!(split);
+            let (argv, form) = parse_command(&input).expect("parsed");
+            assert_eq!(form, ArgvForm::Split);
             assert_eq!(argv, ["cargo", "test", "--workspace", "-q"]);
             let access = tool.access(&input).expect("access");
             assert!(access.is_sandboxed_build());
@@ -3357,10 +3441,45 @@ mod tests {
                 parse_command(&json!({"command": ["cargo test && x", "-q"]})).expect_err("refused");
             assert!(err.to_string().contains("shell syntax"), "{err}");
             // A first element without spaces is untouched.
-            let (argv, split) =
+            let (argv, form) =
                 parse_command(&json!({"command": ["touch", "a b"]})).expect("parsed");
-            assert!(!split);
+            assert_eq!(form, ArgvForm::Plain);
             assert_eq!(argv, ["touch", "a b"]);
+        }
+
+        /// A string holding a JSON-encoded array of strings is that array: the
+        /// elements are the argv as given (never split again), and the form is
+        /// said. Other strings keep their old reading.
+        #[test]
+        fn a_json_encoded_list_in_a_string_is_read_as_that_list() {
+            let (argv, form) =
+                parse_command(&json!({"command": "[\"python\",\"-c\",\"print(1)\"]"}))
+                    .expect("parsed");
+            assert_eq!(form, ArgvForm::JsonList);
+            assert_eq!(argv, ["python", "-c", "print(1)"]);
+            // Whitespace around the text, and an element holding spaces kept whole.
+            let (argv, form) =
+                parse_command(&json!({"command": "  [\"sh\", \"-c\", \"echo a b\"]\n"}))
+                    .expect("parsed");
+            assert_eq!(form, ArgvForm::JsonList);
+            assert_eq!(argv, ["sh", "-c", "echo a b"]);
+            // Not a list of strings, an empty list, and malformed text: the old paths.
+            for text in ["[1, 2]", "[\"a\", 2]", "[\"a\"", "[]"] {
+                let read = parse_command(&json!({"command": text}));
+                assert!(
+                    !matches!(read, Ok((_, ArgvForm::JsonList))),
+                    "{text} must not be read as a JSON list"
+                );
+            }
+            let (argv, form) = parse_command(&json!({"command": "cargo test -q"})).expect("parsed");
+            assert_eq!(
+                (argv, form),
+                (
+                    vec!["cargo".into(), "test".into(), "-q".into()],
+                    ArgvForm::Split
+                )
+            );
+            assert!(JSON_LIST_NOTE.contains("read as that list"));
         }
 
         /// A one-string command that holds shell syntax is refused with the

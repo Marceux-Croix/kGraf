@@ -180,7 +180,7 @@ Every error kGraf's local diagnostics file records carries one of these `KG-nnnn
 
 **Likely cause:** The environment is not fully set up for the routes a run names, or the local model server is not running.
 
-**What to do:** Run `kgraf providers` (or the shell's readiness check) and fix what it names; for an unreachable local route, start its server (for Ollama, `ollama serve`) or remove the route.
+**What to do:** Run `kgraf providers` (or the shell's readiness check) and fix what it names; for an unreachable local route, start its server (for Ollama, `ollama serve`), point the route at the server's address with `KGRAF_<ROUTE>_BASE_URL` (for example `KGRAF_OLLAMA_BASE_URL`), or remove the route.
 
 ### KG-0502 Run Not Found
 

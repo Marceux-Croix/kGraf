@@ -676,7 +676,16 @@ impl OpenAiAdapter {
             stop_reason = StopReason::MaxTokens;
         }
 
+        // The wire's own account: the reason an incomplete response gives, else
+        // its status (`completed`, `incomplete`, ...).
+        let finish_reason = body
+            .get("incomplete_details")
+            .and_then(|d| d.get("reason"))
+            .and_then(|r| r.as_str())
+            .or_else(|| body.get("status").and_then(|s| s.as_str()))
+            .map(str::to_owned);
         Ok(Response {
+            finish_reason,
             model: returned_model.to_owned(),
             content,
             stop_reason,
@@ -1144,6 +1153,26 @@ mod tests {
 
     fn adapter() -> OpenAiAdapter {
         OpenAiAdapter::new(config("http://127.0.0.1:9")).expect("adapter")
+    }
+
+    #[test]
+    fn reasoning_is_not_serialized_into_the_next_request() {
+        // `Provider::resends_reasoning` is false: the context estimate leaves
+        // reasoning output out of the next prompt because this holds.
+        assert!(!adapter().resends_reasoning());
+        let mut request = Request::new("model-x", "hi", 100);
+        request.messages = vec![kgraf_provider::Message {
+            role: Role::Assistant,
+            content: vec![
+                Content::Reasoning {
+                    text: "SECRET-REASONING-TEXT".into(),
+                },
+                Content::text("visible"),
+            ],
+        }];
+        let text = adapter().to_wire(&request).to_string();
+        assert!(text.contains("visible"), "{text}");
+        assert!(!text.contains("SECRET-REASONING-TEXT"), "{text}");
     }
 
     #[test]

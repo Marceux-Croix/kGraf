@@ -131,3 +131,10 @@ a box run then sets `Box`). A question the orchestrator cannot answer from the r
 then answered at once with a recorded text that says nobody is attached and tells the worker
 to state its assumption, and a session notice says so. A run whose attendance was never
 declared keeps the timed wait. Test: `a_known_unattended_run_answers_a_question_at_once`.
+
+## Amendment (2026-10-01): a hand-back with nothing written is a compaction
+
+A hand-back from a worker that has written nothing is a compaction (decision 0095, amendment of
+the same date): the child of such a hand-back would carry the same whole task, so the one
+remainder replacement the runtime makes happens in the worker instead of one level down. The
+hand-back's `Handoff` and the trace record name the measured cause.

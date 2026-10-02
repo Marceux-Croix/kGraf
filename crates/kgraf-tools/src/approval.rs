@@ -273,6 +273,8 @@ pub struct ApprovalChain {
     ask_policy: AskPolicy,
     clock: Clock,
     seal_key: [u8; 32],
+    /// Where a mode's staged grants are settled; see [`Self::with_permissions`].
+    permissions: Option<Arc<crate::permissions::PermissionControl>>,
 }
 
 impl ApprovalChain {
@@ -285,6 +287,7 @@ impl ApprovalChain {
             ask_policy: AskPolicy::Interactive,
             clock: Arc::new(now_ms),
             seal_key: process_seal_key(),
+            permissions: None,
         }
     }
 
@@ -367,7 +370,35 @@ impl ApprovalChain {
         call: PendingCall,
         log: &mut dyn ApprovalLog,
     ) -> Result<Verdict, ApprovalError> {
-        self.run_from(view, 0, call, false, log).await
+        let (worker, call_id) = (call.worker.to_string(), call.call_id.clone());
+        let verdict = self.run_from(view, 0, call, false, log).await?;
+        self.settle_grants(&worker, &call_id, &verdict);
+        Ok(verdict)
+    }
+
+    /// The chain reached a final verdict for a call (not an ask still
+    /// waiting): grants a mode staged for it are recorded as granted when it
+    /// runs, and as refused, naming the refusing hook, when it does not.
+    fn settle_grants(&self, worker: &str, call_id: &str, verdict: &Verdict) {
+        let Some(control) = &self.permissions else {
+            return;
+        };
+        match verdict {
+            Verdict::Run(_) => {
+                control.settle_call(worker, call_id, None);
+            }
+            Verdict::Denied { by, reason } => {
+                control.settle_call(worker, call_id, Some((by, reason)));
+            }
+            Verdict::Ask(_) => {}
+        }
+    }
+
+    /// Settle staged mode grants on this chain's calls
+    /// ([`PermissionControl::settle_call`]). Not part of the chain's digest.
+    pub fn with_permissions(mut self, control: Arc<crate::permissions::PermissionControl>) -> Self {
+        self.permissions = Some(control);
+        self
     }
 
     /// Continue a paused call with the user's answer, after verifying the seal.
@@ -380,6 +411,7 @@ impl ApprovalChain {
     ) -> Result<Verdict, ApprovalError> {
         self.verify(&paused)?;
         if let Some(denied) = self.deny_if_expired(&paused, log).await? {
+            self.settle_grants(paused.call.worker.as_str(), &paused.call.call_id, &denied);
             return Ok(denied);
         }
         let decision = match &answer {
@@ -389,16 +421,19 @@ impl ApprovalChain {
             },
         };
         log.record(record(&paused.call, "user", decision)).await?;
-        match answer {
+        let (worker, call_id) = (paused.call.worker.to_string(), paused.call.call_id.clone());
+        let verdict = match answer {
             UserAnswer::Allow => {
                 self.run_from(view, paused.next_hook, paused.call, paused.rewritten, log)
-                    .await
+                    .await?
             }
-            UserAnswer::Deny { reason } => Ok(Verdict::Denied {
+            UserAnswer::Deny { reason } => Verdict::Denied {
                 by: "user".into(),
                 reason,
-            }),
-        }
+            },
+        };
+        self.settle_grants(&worker, &call_id, &verdict);
+        Ok(verdict)
     }
 
     /// For an unattended ask: deny it if its deadline has passed, otherwise hand
@@ -410,7 +445,10 @@ impl ApprovalChain {
     ) -> Result<Verdict, ApprovalError> {
         self.verify(&paused)?;
         match self.deny_if_expired(&paused, log).await? {
-            Some(denied) => Ok(denied),
+            Some(denied) => {
+                self.settle_grants(paused.call.worker.as_str(), &paused.call.call_id, &denied);
+                Ok(denied)
+            }
             None => Ok(Verdict::Ask(paused)),
         }
     }
@@ -1241,6 +1279,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_seal_made_under_a_guessable_key_is_refused() {
+        let f = Fixture::new();
+        let c = chain(vec![ask_hook()]);
+        for key in [[0u8; 32], [1u8; 32]] {
+            let forger = chain(vec![ask_hook()]).with_seal_key(key);
+            let mut log = MemoryApprovalLog::default();
+            let forged = paused(&forger, &f, json!({"cmd": "rm -rf /"}), &mut log).await;
+            assert!(matches!(
+                c.answer(f.view(), forged, UserAnswer::Allow, &mut log)
+                    .await,
+                Err(ApprovalError::PausedCallAltered { .. })
+            ));
+        }
+        assert!(f.ran().is_empty());
+    }
+
+    #[test]
+    fn the_process_seal_key_is_stable_and_varies_across_its_blocks() {
+        let key = process_seal_key();
+        assert_eq!(key, process_seal_key());
+        let blocks: Vec<&[u8]> = key.chunks(8).collect();
+        for (i, a) in blocks.iter().enumerate() {
+            for b in &blocks[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+    }
+
+    #[test]
+    fn the_default_clock_reads_the_wall_clock_in_epoch_milliseconds() {
+        let wall = || {
+            i64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("after epoch")
+                    .as_millis(),
+            )
+            .expect("fits")
+        };
+        let before = wall();
+        let read = now_ms();
+        let after = wall();
+        assert!((before..=after).contains(&read), "{before} {read} {after}");
+    }
+
+    #[tokio::test]
+    async fn the_default_clock_sets_an_unattended_deadline_from_the_present() {
+        let f = Fixture::new();
+        let c = chain(vec![ask_hook()]).with_ask_policy(AskPolicy::Unattended {
+            on_ask: UnattendedAsk::TimeoutThenDeny {
+                after: Duration::from_secs(60),
+            },
+        });
+        let before = now_ms();
+        let mut log = MemoryApprovalLog::default();
+        let p = paused(&c, &f, json!({}), &mut log).await;
+        let after = now_ms();
+        let deadline = p.deadline_ms().expect("deadline");
+        assert!((before + 60_000..=after + 60_000).contains(&deadline));
+    }
+
+    #[tokio::test]
+    async fn an_approved_call_and_a_paused_call_report_who_and_what_they_carry() {
+        let f = Fixture::new();
+        let mut log = MemoryApprovalLog::default();
+        let Verdict::Run(approved) = chain(vec![])
+            .review(f.view(), call(json!({"cmd": "ls"})), &mut log)
+            .await
+            .expect("review")
+        else {
+            panic!("expected run");
+        };
+        assert_eq!(approved.call_id(), "c1");
+        assert_eq!(approved.input(), &json!({"cmd": "ls"}));
+        assert!(!approved.was_rewritten());
+
+        let p = paused(&chain(vec![ask_hook()]), &f, json!({}), &mut log).await;
+        assert_eq!(p.asked_by(), "ask");
+    }
+
+    #[tokio::test]
     async fn a_different_chain_cannot_answer_a_paused_call() {
         let f = Fixture::new();
         let c = chain(vec![ask_hook(), Arc::new(DenyDanger)]);
@@ -1455,5 +1574,165 @@ mod tests {
             reason.starts_with("invalid input for tool `shell`"),
             "{reason}"
         );
+    }
+
+    /// A mode's grant at an early hook, as the shell policy stages it.
+    struct StagesGrant(Arc<crate::permissions::PermissionControl>);
+
+    #[async_trait::async_trait]
+    impl ApprovalHook for StagesGrant {
+        fn name(&self) -> &str {
+            "shell-command-policy"
+        }
+        async fn review(&self, call: &PendingCall) -> HookDecision {
+            self.0
+                .stage_grant(call.worker.as_str(), &call.call_id, "`python3`", "mode");
+            HookDecision::Allow
+        }
+    }
+
+    fn bypass_with_deny_rule() -> Arc<crate::permissions::PermissionControl> {
+        use crate::permissions::{
+            ModeSource, PermissionControl, PermissionMode, PermissionSettings, Rule, UserRules,
+        };
+        Arc::new(
+            PermissionControl::new(
+                PermissionSettings {
+                    mode: PermissionMode::Bypass,
+                    rules: UserRules {
+                        deny: vec![Rule::parse("shell(python3*)").expect("rule")],
+                        ask: vec![],
+                    },
+                    ..PermissionSettings::default()
+                },
+                ModeSource::CommandLine,
+                crate::permissions::ProcessFacts::default(),
+            )
+            .expect("bypass"),
+        )
+    }
+
+    /// A call the mode granted and a later deny rule refused is one event with
+    /// the final outcome. No `granted` event is ever recorded for it.
+    #[tokio::test]
+    async fn a_grant_a_later_deny_rule_refuses_is_traced_as_refused_and_never_as_granted() {
+        use crate::permissions::{PermissionEvent, PermissionRulesHook};
+        let f = Fixture::new();
+        let control = bypass_with_deny_rule();
+        let c = chain(vec![
+            Arc::new(StagesGrant(control.clone())),
+            Arc::new(PermissionRulesHook::new(control.clone(), None)),
+        ])
+        .with_permissions(control.clone());
+        let mut log = MemoryApprovalLog::default();
+        let verdict = c
+            .review(
+                f.view(),
+                call(json!({"command": ["python3", "check.py"]})),
+                &mut log,
+            )
+            .await
+            .expect("review");
+        let Verdict::Denied { by, reason } = verdict else {
+            panic!("expected a denial, got {verdict:?}");
+        };
+        assert_eq!(by, crate::permissions::PERMISSION_RULES_HOOK);
+        let events = control.events_since(0);
+        assert!(
+            !events
+                .iter()
+                .any(|(_, e)| matches!(e, PermissionEvent::Granted { .. })),
+            "{events:?}"
+        );
+        let refused: Vec<_> = events
+            .iter()
+            .filter_map(|(_, e)| match e {
+                PermissionEvent::GrantRefused {
+                    subject,
+                    by,
+                    refused_by,
+                    reason,
+                    ..
+                } => Some((
+                    subject.clone(),
+                    by.clone(),
+                    refused_by.clone(),
+                    reason.clone(),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(refused.len(), 1, "{events:?}");
+        assert_eq!(refused[0].0, "`python3`");
+        assert_eq!(refused[0].1, "mode");
+        assert_eq!(refused[0].2, by);
+        assert_eq!(refused[0].3, reason);
+        let line = events[0].1.line();
+        assert!(
+            line.starts_with("refused `python3` to w1 (Bypass"),
+            "{line}"
+        );
+        assert!(line.contains("shell(python3*)"), "{line}");
+        // The same refusal repeated is not a new event.
+        let again = c
+            .review(
+                f.view(),
+                PendingCall {
+                    call_id: "c2".into(),
+                    ..call(json!({"command": ["python3", "check.py"]}))
+                },
+                &mut log,
+            )
+            .await
+            .expect("review");
+        assert!(matches!(again, Verdict::Denied { .. }));
+        assert_eq!(control.events_since(0).len(), 1);
+    }
+
+    /// The same chain with a call no rule refuses records the grant, once the
+    /// chain lets the call run.
+    #[tokio::test]
+    async fn a_grant_the_chain_lets_run_is_recorded_as_granted() {
+        use crate::permissions::{PermissionEvent, PermissionRulesHook};
+        let f = Fixture::new();
+        let control = bypass_with_deny_rule();
+        let c = chain(vec![
+            Arc::new(StagesGrant(control.clone())),
+            Arc::new(PermissionRulesHook::new(control.clone(), None)),
+        ])
+        .with_permissions(control.clone());
+        let mut log = MemoryApprovalLog::default();
+        let verdict = c
+            .review(f.view(), call(json!({"command": ["ls"]})), &mut log)
+            .await
+            .expect("review");
+        assert!(matches!(verdict, Verdict::Run(_)), "{verdict:?}");
+        let events = control.events_since(0);
+        assert!(
+            matches!(&events[..], [(_, PermissionEvent::Granted { subject, .. })] if subject == "`python3`"),
+            "{events:?}"
+        );
+    }
+
+    /// The real shell hook only stages a mode's grant; nothing is recorded
+    /// until the chain settles the call.
+    #[tokio::test]
+    async fn the_shell_hook_stages_a_mode_grant_and_does_not_record_it() {
+        use crate::execpolicy::{Decision, ExecPolicy};
+        use crate::permissions::PermissionEvent;
+        let control = bypass_with_deny_rule();
+        let hook = crate::ShellApprovalHook::new(
+            ExecPolicy::new(Decision::Prompt).with_permissions(control.clone()),
+        );
+        let decision = hook
+            .review(&call(json!({"command": ["python3", "check.py"]})))
+            .await;
+        assert_eq!(decision, HookDecision::Allow);
+        assert!(control.events_since(0).is_empty());
+        control.settle_call("w1", "c1", None);
+        assert!(matches!(
+            &control.events_since(0)[..],
+            [(_, PermissionEvent::Granted { subject, by, .. })] if subject == "`python3`" && by == "mode"
+        ));
     }
 }

@@ -1,0 +1,33 @@
+[package]
+name = "kgraf-soak"
+version.workspace = true
+description = "Soak driver: many orchestrations on one Host in one process, with the process's memory, descriptors, threads and children sampled after each. Used by the canary's memory-soak scenario. Never published, never packaged by dist."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+# Not a product artifact: `cargo publish` must refuse this crate outright.
+publish = false
+
+# `dist` auto-detects any crate with a `[[bin]]` as a release artifact. This key tells it to
+# skip this one, so a release never ships a test driver.
+[package.metadata.dist]
+dist = false
+
+[[bin]]
+name = "kgraf-soak"
+path = "src/main.rs"
+
+[dependencies]
+kgraf-core.workspace = true
+kgraf-host.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# Process sampling through libproc (macOS) and `malloc_trim` (Linux, glibc).
+libc.workspace = true

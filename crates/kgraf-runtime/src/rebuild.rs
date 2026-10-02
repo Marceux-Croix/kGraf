@@ -99,6 +99,22 @@ struct PendingResults {
     results: HashMap<String, (String, bool)>,
 }
 
+/// Bytes per token above which a deduction of unreported reasoning would be a
+/// guess rather than a bound; see [`TranscriptBuilder::context_tokens`].
+const REASONING_BYTES_PER_TOKEN_CEILING: u64 = 5;
+
+/// A usage report reduced to what sizes the next prompt.
+#[derive(Clone, Copy, Debug)]
+struct Anchor {
+    input: u64,
+    text_output: u64,
+    /// Reasoning tokens the provider reported apart from text; zero when it
+    /// reports none or does not split them.
+    reasoning_reported: u64,
+    /// Bytes of reasoning text of the round the report covers.
+    reasoning_bytes: usize,
+}
+
 /// Builds the messages sent to the model from the events of a run.
 #[derive(Clone, Debug)]
 pub struct TranscriptBuilder {
@@ -110,8 +126,19 @@ pub struct TranscriptBuilder {
     pending: Option<PendingResults>,
     last_call: Option<CallId>,
     rounds: u32,
-    last_usage_tokens: Option<u64>,
+    /// The last usage report that anchored the estimate, as reported.
+    anchor: Option<Anchor>,
     tokens_since_usage: u64,
+    /// Estimated reasoning tokens of rounds no usage report covered, apart
+    /// from `tokens_since_usage` so the estimate counts them only when the
+    /// route resends reasoning (`reasoning_resent`).
+    since_usage_reasoning: u64,
+    /// Whether the next request carries the reasoning this transcript holds.
+    /// `true` until the loop says otherwise: counting what is not sent only
+    /// raises the estimate, never lowers it.
+    reasoning_resent: bool,
+    /// Bytes of reasoning text the latest `Stop` ended, reset at each call.
+    stop_reasoning_bytes: usize,
     tool_calls: Vec<(String, serde_json::Value)>,
     started: HashMap<String, (String, serde_json::Value)>,
     succeeded: Vec<(String, serde_json::Value)>,
@@ -157,8 +184,11 @@ impl TranscriptBuilder {
             pending: None,
             last_call: None,
             rounds: 0,
-            last_usage_tokens: None,
+            anchor: None,
             tokens_since_usage,
+            since_usage_reasoning: 0,
+            reasoning_resent: true,
+            stop_reasoning_bytes: 0,
             tool_calls: Vec::new(),
             started: HashMap::new(),
             succeeded: Vec::new(),
@@ -179,6 +209,16 @@ impl TranscriptBuilder {
     pub fn with_base_tokens(mut self, tokens: u64) -> Self {
         self.tokens_since_usage += tokens;
         self.base_tokens = tokens;
+        self
+    }
+
+    /// Say whether the route resends the model's reasoning in the next
+    /// request (`Provider::resends_reasoning`). When it does not, reasoning
+    /// output is not part of the next prompt and the estimate leaves it out.
+    /// Takes effect on the next read, so a transcript replayed from storage
+    /// can be told after the replay.
+    pub fn with_reasoning_resent(mut self, resent: bool) -> Self {
+        self.reasoning_resent = resent;
         self
     }
 
@@ -217,6 +257,7 @@ impl TranscriptBuilder {
                 self.count_round(call);
                 self.round_anchored = false;
                 self.group_open = false;
+                self.stop_reasoning_bytes = 0;
                 // The loop reads `messages()` (which flushes) before it opens
                 // the call, so flushing here changes nothing the loop sent; it
                 // makes a rebuild from stored events agree on where the sent
@@ -235,20 +276,33 @@ impl TranscriptBuilder {
                 // an oversized request past the stop point. A round no report
                 // anchored counts its own output instead (see `Stop`).
                 if total > 0 {
-                    self.last_usage_tokens = Some(total);
+                    self.anchor = Some(Anchor {
+                        input: usage.total_input(),
+                        text_output: usage.text_output,
+                        reasoning_reported: usage.reasoning_output,
+                        // The usage report may come before or after the
+                        // round's `Stop`: the reasoning is in one of the two.
+                        reasoning_bytes: self.reasoning.len().max(self.stop_reasoning_bytes),
+                    });
                     self.tokens_since_usage = 0;
+                    self.since_usage_reasoning = 0;
                     self.round_anchored = true;
                 }
             }
-            WorkerEvent::Stop { reason } => {
+            WorkerEvent::Stop { reason, .. } => {
                 self.flush_results();
                 self.group_open = false;
-                if !self.round_anchored {
+                if self.round_anchored {
+                    if let Some(anchor) = self.anchor.as_mut() {
+                        anchor.reasoning_bytes = self.reasoning.len();
+                    }
+                } else {
                     // No usage report covered this round, so its output is in
                     // no anchor: estimate it.
-                    self.tokens_since_usage +=
-                        estimate_tokens(&self.text) + estimate_tokens(&self.reasoning);
+                    self.tokens_since_usage += estimate_tokens(&self.text);
+                    self.since_usage_reasoning += estimate_tokens(&self.reasoning);
                 }
+                self.stop_reasoning_bytes = self.reasoning.len();
                 let mut content = Vec::new();
                 if !self.reasoning.is_empty() {
                     content.push(Content::Reasoning {
@@ -487,7 +541,8 @@ impl TranscriptBuilder {
                     self.base_tokens + messages.iter().map(message_tokens).sum::<u64>();
                 self.messages = messages;
                 self.sent = 0;
-                self.last_usage_tokens = None;
+                self.anchor = None;
+                self.since_usage_reasoning = 0;
                 self.round_anchored = false;
                 // The summary call is a ledger call of this worker, not a round.
                 if let Some(call) = &notice.summary_call
@@ -562,10 +617,15 @@ impl TranscriptBuilder {
     }
 
     /// Estimated context tokens for the next call: the provider's last reported
-    /// input plus output, plus an estimate of what was appended since. Before any
-    /// usage, an estimate of the whole opening.
+    /// input plus the output the next request carries, plus an estimate of what
+    /// was appended since. Before any usage, an estimate of the whole opening.
+    ///
+    /// The output the next request carries is the text and tool calls. Reasoning
+    /// is counted only when the route resends it (`with_reasoning_resent`); no
+    /// adapter does today, so a thinking model's reasoning is billed on the
+    /// round that produced it and absent from every later prompt.
     pub fn context_tokens(&self) -> u64 {
-        self.last_usage_tokens.unwrap_or(0) + self.tokens_since_usage
+        self.anchored_tokens() + self.tokens_since_usage + self.unanchored_reasoning()
     }
 
     /// [`Self::context_tokens`] with the unreported part bounded from above
@@ -575,7 +635,39 @@ impl TranscriptBuilder {
     /// punctuation or base64) can exceed it. Used where an underestimate would
     /// let spend cross a ceiling.
     pub fn conservative_context_tokens(&self) -> u64 {
-        self.last_usage_tokens.unwrap_or(0) + self.tokens_since_usage.saturating_mul(3).div_ceil(2)
+        self.anchored_tokens()
+            + self.tokens_since_usage.saturating_mul(3).div_ceil(2)
+            + self.unanchored_reasoning().saturating_mul(3).div_ceil(2)
+    }
+
+    /// What the last usage report says the next prompt holds.
+    fn anchored_tokens(&self) -> u64 {
+        let Some(anchor) = &self.anchor else {
+            return 0;
+        };
+        let output = anchor.text_output + anchor.reasoning_reported;
+        let unsent = if self.reasoning_resent {
+            0
+        } else if anchor.reasoning_reported > 0 {
+            anchor.reasoning_reported
+        } else {
+            // The route did not split reasoning from text, so the reasoning
+            // sits inside `text_output`. Take out a lower bound of it: the
+            // reasoning text kGraf holds, at an assumed five bytes per token.
+            // Real text runs three to four bytes per token, so this leaves
+            // some reasoning counted rather than risk an underestimate.
+            (anchor.reasoning_bytes as u64 / REASONING_BYTES_PER_TOKEN_CEILING)
+                .min(anchor.text_output)
+        };
+        anchor.input + output - unsent
+    }
+
+    fn unanchored_reasoning(&self) -> u64 {
+        if self.reasoning_resent {
+            self.since_usage_reasoning
+        } else {
+            0
+        }
     }
 
     /// Every tool call started, in order, for stall detection on resume.
@@ -729,7 +821,7 @@ impl ResumeState {
                 .iter()
                 .rev()
                 .find(|e| !matches!(e, WorkerEvent::Usage { .. })),
-            Some(WorkerEvent::Stop { reason })
+            Some(WorkerEvent::Stop { reason, .. })
                 if !matches!(reason, StopReason::ToolUse | StopReason::PauseTurn)
         );
         if ended_complete {
@@ -843,6 +935,7 @@ mod tests {
                 signature: signature.map(|s| kgraf_provider::Signature::new(s, "adapter:model")),
             },
             WorkerEvent::Stop {
+                finish_reason: None,
                 reason: StopReason::EndTurn,
             },
         ]
@@ -966,6 +1059,7 @@ mod tests {
             },
             usage(call, 100),
             WorkerEvent::Stop {
+                finish_reason: None,
                 reason: StopReason::ToolUse,
             },
         ];
@@ -988,6 +1082,7 @@ mod tests {
                 },
                 usage("c2", 150),
                 WorkerEvent::Stop {
+                    finish_reason: None,
                     reason: StopReason::EndTurn,
                 },
             ],
@@ -1180,6 +1275,7 @@ mod tests {
             },
             usage("c2", 150),
             WorkerEvent::Stop {
+                finish_reason: None,
                 reason: StopReason::EndTurn,
             },
         ]);
@@ -1344,6 +1440,7 @@ mod tests {
         });
         events.push(usage("c2", 50));
         events.push(WorkerEvent::Stop {
+            finish_reason: None,
             reason: StopReason::EndTurn,
         });
 
@@ -1364,6 +1461,7 @@ mod tests {
         events.extend(tool_round("c1", &["a"]));
         assert!(ResumeState::from_events(vec![Message::user("x")], &events).is_ok());
         events.push(WorkerEvent::Stop {
+            finish_reason: None,
             reason: StopReason::EndTurn,
         });
         assert_eq!(
@@ -1389,6 +1487,7 @@ mod tests {
             },
             usage("c1", 100),
             WorkerEvent::Stop {
+                finish_reason: None,
                 reason: StopReason::PauseTurn,
             },
         ];
@@ -1396,6 +1495,7 @@ mod tests {
 
         let mut completed = events;
         completed.push(WorkerEvent::Stop {
+            finish_reason: None,
             reason: StopReason::EndTurn,
         });
         assert_eq!(
@@ -1431,6 +1531,7 @@ mod tests {
         }
         assert_eq!(b.succeeded().len(), 2);
         b.apply(&WorkerEvent::Stop {
+            finish_reason: None,
             reason: StopReason::ToolUse,
         });
         b.apply(&started("c"));
@@ -1456,6 +1557,7 @@ mod tests {
             text: "fresh".into(),
         });
         state.builder.apply(&WorkerEvent::Stop {
+            finish_reason: None,
             reason: StopReason::EndTurn,
         });
         assert_eq!(state.messages()[1], Message::assistant("fresh"));
@@ -1468,6 +1570,7 @@ mod tests {
         b.apply(&usage("c1", 1_000));
         assert_eq!(b.context_tokens(), 1_010);
         b.apply(&WorkerEvent::Stop {
+            finish_reason: None,
             reason: StopReason::ToolUse,
         });
         b.apply(&started("a"));
@@ -1535,6 +1638,7 @@ mod tests {
                 signature: None,
             },
             WorkerEvent::Stop {
+                finish_reason: None,
                 reason: StopReason::EndTurn,
             },
         ]
@@ -1557,6 +1661,7 @@ mod tests {
         b.apply(&model_call("c2"));
         b.apply(&zero_usage("c2"));
         b.apply(&WorkerEvent::Stop {
+            finish_reason: None,
             reason: StopReason::ToolUse,
         });
         b.apply(&WorkerEvent::ToolCallStarted {
@@ -1586,6 +1691,7 @@ mod tests {
         let marker = "[redacted:generic-api-key; re-read the source for exact text]";
         let events = vec![
             WorkerEvent::Stop {
+                finish_reason: None,
                 reason: StopReason::ToolUse,
             },
             WorkerEvent::ToolCallStarted {
@@ -1660,6 +1766,7 @@ mod tests {
         use kgraf_tools::approval::{ApprovalRecord, RecordedDecision};
         let mut b = TranscriptBuilder::new(vec![Message::user("go")]);
         b.apply(&WorkerEvent::Stop {
+            finish_reason: None,
             reason: StopReason::ToolUse,
         });
         b.apply(&WorkerEvent::ToolCallStarted {
@@ -1733,6 +1840,7 @@ mod tests {
     fn replay_counts_only_calls_the_live_stall_check_saw() {
         let mut b = TranscriptBuilder::new(vec![Message::user("go")]);
         b.apply(&WorkerEvent::Stop {
+            finish_reason: None,
             reason: StopReason::ToolUse,
         });
         for id in ["t1", "t2", "t3", "t4"] {
@@ -1778,5 +1886,92 @@ mod tests {
         assert!(!round[2].counted);
         assert!(round[3].counted && round[3].interrupted_by_steer());
         assert!(!round[0].interrupted_by_steer());
+    }
+
+    fn thinking_round(b: &mut TranscriptBuilder, usage: TokenUsage, reasoning_bytes: usize) {
+        b.apply(&WorkerEvent::ModelCall {
+            call: CallId::new("c1"),
+        });
+        b.apply(&WorkerEvent::ReasoningDelta {
+            text: "a".repeat(reasoning_bytes),
+        });
+        b.apply(&WorkerEvent::TextDelta { text: "ok".into() });
+        b.apply(&WorkerEvent::Usage {
+            call: CallId::new("c1"),
+            usage,
+        });
+        b.apply(&WorkerEvent::Stop {
+            reason: StopReason::EndTurn,
+            finish_reason: None,
+        });
+    }
+
+    fn usage_of(input: u64, text: u64, reasoning: u64) -> TokenUsage {
+        TokenUsage {
+            uncached_input: input,
+            text_output: text,
+            reasoning_output: reasoning,
+            ..TokenUsage::default()
+        }
+    }
+
+    #[test]
+    fn reasoning_a_route_does_not_resend_leaves_the_estimate() {
+        // Reported apart: exactly the reported share comes out.
+        let mut split =
+            TranscriptBuilder::new(vec![Message::user("go")]).with_reasoning_resent(false);
+        thinking_round(&mut split, usage_of(6_000, 100, 3_000), 12_000);
+        assert_eq!(split.context_tokens(), 6_100);
+        // Not split (the reasoning sits in text output): a lower bound of it
+        // comes out, 12,000 bytes at five bytes per token.
+        let mut merged =
+            TranscriptBuilder::new(vec![Message::user("go")]).with_reasoning_resent(false);
+        thinking_round(&mut merged, usage_of(6_000, 3_100, 0), 12_000);
+        assert_eq!(merged.context_tokens(), 6_000 + 3_100 - 2_400);
+        // Never more than the output the report names.
+        let mut small =
+            TranscriptBuilder::new(vec![Message::user("go")]).with_reasoning_resent(false);
+        thinking_round(&mut small, usage_of(6_000, 50, 0), 12_000);
+        assert_eq!(small.context_tokens(), 6_000);
+    }
+
+    #[test]
+    fn reasoning_a_route_resends_stays_in_the_estimate() {
+        let mut b = TranscriptBuilder::new(vec![Message::user("go")]).with_reasoning_resent(true);
+        thinking_round(&mut b, usage_of(6_000, 100, 3_000), 12_000);
+        assert_eq!(b.context_tokens(), 9_100);
+        // The default, before the loop says otherwise, is the conservative one.
+        let mut unknown = TranscriptBuilder::new(vec![Message::user("go")]);
+        thinking_round(&mut unknown, usage_of(6_000, 3_100, 0), 12_000);
+        assert_eq!(unknown.context_tokens(), 9_100);
+    }
+
+    #[test]
+    fn the_setting_applies_to_a_transcript_already_replayed() {
+        // A resume replays stored events before the loop knows the route.
+        let mut b = TranscriptBuilder::new(vec![Message::user("go")]);
+        thinking_round(&mut b, usage_of(6_000, 3_100, 0), 12_000);
+        assert_eq!(b.context_tokens(), 9_100);
+        assert_eq!(b.with_reasoning_resent(false).context_tokens(), 6_700);
+    }
+
+    #[test]
+    fn an_unreported_round_counts_its_reasoning_only_where_it_is_resent() {
+        let run = |resent| {
+            let mut b =
+                TranscriptBuilder::new(vec![Message::user("go")]).with_reasoning_resent(resent);
+            b.apply(&WorkerEvent::ModelCall {
+                call: CallId::new("c1"),
+            });
+            b.apply(&WorkerEvent::ReasoningDelta {
+                text: "a".repeat(3_000),
+            });
+            b.apply(&WorkerEvent::Stop {
+                reason: StopReason::EndTurn,
+                finish_reason: None,
+            });
+            b.context_tokens()
+        };
+        assert_eq!(run(true) - run(false), estimate_tokens(&"a".repeat(3_000)));
     }
 }

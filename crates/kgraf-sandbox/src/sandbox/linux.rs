@@ -828,6 +828,7 @@ mod tests {
             home: home.map(|h| std::fs::canonicalize(h).unwrap()),
             ancestor_limit: None,
             cargo_homes: home.map(|h| vec![std::fs::canonicalize(h).unwrap().join(".cargo")]),
+            frozen_git: vec![],
         }
     }
 

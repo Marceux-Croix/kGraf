@@ -899,6 +899,7 @@ mod tests {
             };
             token.settle(&usage, None)?;
             Ok(kgraf_provider::Response {
+                finish_reason: None,
                 model: request.model.clone(),
                 content: vec![kgraf_provider::Content::text(format!(
                     "{{\"path\":\"consumer_test.py\",\"content\":\"from {} import double\"}}",

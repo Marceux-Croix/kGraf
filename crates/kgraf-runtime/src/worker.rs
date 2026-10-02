@@ -524,6 +524,9 @@ async fn prepare(
     // Decision 0095: a resumed worker that compacted keeps its archive (the
     // events before the notice) and does not compact again; one that did not
     // keeps its history so far for a later compaction.
+    // Decision 0057: the estimate counts what the next request carries, so it
+    // learns whether this route resends reasoning.
+    let builder = builder.with_reasoning_resent(env.provider.resends_reasoning());
     let compaction = builder.compaction().cloned();
     let (history, archive) = match prior
         .iter()
@@ -754,12 +757,16 @@ async fn prepare(
         brief,
         seq: EventSequence::new(),
         builder,
+        peak_context: 0,
         stall,
         notified_round: None,
         output_limit_retried: false,
         empty_turn_retried: false,
+        no_change_retried: false,
         phase: CancelPhase::BetweenRounds,
         calls,
+        last_stop: None,
+        tool_calls: 0,
         last_call,
         given_tools: resumed_tools,
         trace_failures,
@@ -975,6 +982,19 @@ pub const EMPTY_TURN_ABANDON_REASON: &str = "the turn had no tool call and no an
 pub const EMPTY_TURN_NOTICE: &str = "You ended your turn without calling a tool or giving an \
      answer; continue the task with a tool call, or answer.";
 
+/// The `RoundAbandoned` reason for an end as done with no tool call and no
+/// change, given one continuation round.
+const NO_CHANGE_ABANDON_REASON: &str =
+    "the turn ended with no tool call although the contract writes files";
+
+/// The notice that follows an end with no change: one continuation round.
+fn no_change_notice(paths: String) -> String {
+    format!(
+        "You ended without making any change; this contract writes {paths}. Continue with tool \
+         calls, or call report_shortfall if the work cannot be done."
+    )
+}
+
 struct Worker {
     /// `<root>/.git` as it was when this worker first started
     /// ([`crate::worktree::GitEntry`]; recorded in the transcript's
@@ -986,6 +1006,9 @@ struct Worker {
     brief: WorkerBrief,
     seq: EventSequence,
     builder: TranscriptBuilder,
+    /// The largest context measure any stop check of this segment read: the
+    /// value `reached_point` was given, so the trace reports what decided.
+    peak_context: u64,
     budget: StepBudget,
     stall: StallDetector,
     /// The round number a step notice was last emitted for. A round refunded
@@ -998,8 +1021,16 @@ struct Worker {
     /// Whether the round just before was an empty turn that got its one
     /// continuation. Cleared by any round that has a tool call or an answer.
     empty_turn_retried: bool,
+    /// Whether the attempt already got its one notice for ending as done with
+    /// no tool call although its contract writes files.
+    no_change_retried: bool,
     phase: CancelPhase,
     calls: Vec<CallId>,
+    /// The stop reason of the last round that ended naturally, this segment.
+    last_stop: Option<StopReason>,
+    /// Tool calls started this segment (counted from the events the loop
+    /// sends, as `calls` counts this segment's model calls).
+    tool_calls: u32,
     /// The parent of the next round's ledger row (see the module docs, Trace).
     last_call: Option<CallId>,
     /// The previous round's tool calls, in issue order: the tool round the next
@@ -1208,6 +1239,8 @@ impl Worker {
             changed_paths: self.worktree_changes(),
             commit: None,
             calls: std::mem::take(&mut self.calls),
+            last_stop: self.last_stop,
+            tool_calls: self.tool_calls,
             steps: self.budget.used(),
             prefix_digest: self.env.prefix.digest().as_str().to_owned(),
             denied: self.denied,
@@ -1217,6 +1250,7 @@ impl Worker {
             refused: self.refused.take(),
             compaction: self.compaction.clone(),
             round_blocks: self.progress.report(),
+            peak_context_tokens: self.peak_context.max(self.builder.context_tokens()),
         };
         // `Err` means the handle is gone: nobody is waiting for the result, and the
         // ledger already holds every call it names.
@@ -1319,6 +1353,11 @@ impl Worker {
         self.seq
             .accept(&event)
             .map_err(|e| Halt::Failed(format!("the loop produced an out-of-order event: {e}")))?;
+        match &event {
+            WorkerEvent::Stop { reason, .. } => self.last_stop = Some(*reason),
+            WorkerEvent::ToolCallStarted { .. } => self.tool_calls += 1,
+            _ => {}
+        }
         self.archive_event(&event);
         // Observed in its persisted form, as a resume reads it back.
         self.progress.observe(&event, &EnvFacts(&self.env));
@@ -1380,7 +1419,14 @@ impl Worker {
             },
         )
         .await?;
-        self.emit(ep, WorkerEvent::Stop { reason }).await
+        self.emit(
+            ep,
+            WorkerEvent::Stop {
+                reason,
+                finish_reason: response.finish_reason.clone(),
+            },
+        )
+        .await
     }
 
     async fn drive(&mut self, ep: &WorkerEndpoint) -> Result<(WorkerOutcome, String), Halt> {
@@ -1414,6 +1460,7 @@ impl Worker {
             // estimate, and a note is not yet anchored by any usage report.
             let context_tokens =
                 self.builder.context_tokens() + queued.saturating_mul(3).div_ceil(2);
+            self.peak_context = self.peak_context.max(context_tokens);
             // Decision 0095: a user's request compacts at this boundary.
             if self.compaction.is_none() && self.steering.take_compaction_request() {
                 self.compact(ep, CompactionTrigger::UserRequest, context_tokens)
@@ -1424,12 +1471,29 @@ impl Worker {
                 // Compaction only where the caller cannot split the
                 // remainder, and only once: a second overflow hands back with
                 // everything the loop observed, never compacts again.
-                if self.compaction.is_none() && self.stop_point == StopPointPolicy::Compact {
+                // Nothing written yet: a hand-back would give the child this
+                // same whole task, so it would only move the work down a level
+                // and meet the same stop point (a long first reply plus one
+                // large read does it). Compact instead, once; after that, go
+                // on while the window holds.
+                // Only the transcript's own size counts here: queued messages
+                // that cross the point alone hand back with the messages
+                // undelivered (decision 0095), whatever was written.
+                let no_progress = !self.made_progress()
+                    && self
+                        .brief
+                        .context
+                        .reached_point(self.builder.context_tokens());
+                if self.compaction.is_none()
+                    && (self.stop_point == StopPointPolicy::Compact || no_progress)
+                {
                     self.compact(ep, CompactionTrigger::StopPoint, context_tokens)
                         .await?;
                     continue;
                 }
-                return Ok((self.hand_back(context_tokens), String::new()));
+                if !(no_progress && context_tokens < self.brief.context.effective_window()) {
+                    return Ok((self.hand_back(context_tokens, queued), String::new()));
+                }
             }
             // Decision 0096: the round budget is a checkpoint. Measured where
             // the budget would warn that three rounds remain, after the
@@ -1625,6 +1689,50 @@ impl Worker {
                         String::new(),
                     ));
                 }
+                // The model announced work and ended the turn: no tool call in
+                // the whole attempt, and its contract writes files. That is not
+                // a completion. The text stays in the transcript; the model
+                // gets one notice (counted in the budget) and a second such
+                // end fails the attempt with a named reason. The round is
+                // already counted, so a checkpoint (decision 0096) sees it as a
+                // round without progress.
+                (StopReason::EndTurn | StopReason::StopSequence, true)
+                    if self.ended_without_change() =>
+                {
+                    if !final_round && !self.no_change_retried && self.budget.rounds_left() >= 2 {
+                        self.no_change_retried = true;
+                        // The turn is dropped, as an empty turn is: a `Stop`
+                        // would end the run's event sequence.
+                        self.abandon(ep, CancelPhase::ModelStream, None, NO_CHANGE_ABANDON_REASON)
+                            .await?;
+                        let text = no_change_notice(self.write_scope_paths());
+                        self.emit(
+                            ep,
+                            WorkerEvent::Notice {
+                                kind: crate::event::NoticeKind::NoChange,
+                                text,
+                            },
+                        )
+                        .await?;
+                        continue;
+                    }
+                    self.emit_stop(ep, reason, &response).await?;
+                    let why = if self.no_change_retried {
+                        "again after being told to continue"
+                    } else {
+                        "on its last round"
+                    };
+                    return Ok((
+                        WorkerOutcome::Failed {
+                            error: format!(
+                                "the model ended the attempt as done {why} with no tool call and \
+                                 no change, although its contract writes {}",
+                                self.write_scope_paths()
+                            ),
+                        },
+                        response.text(),
+                    ));
+                }
                 (StopReason::EndTurn | StopReason::StopSequence, true) => {
                     self.emit_stop(ep, reason, &response).await?;
                     return Ok((WorkerOutcome::Completed, response.text()));
@@ -1673,6 +1781,7 @@ impl Worker {
                         WorkerOutcome::Stalled {
                             call_digest: stall.call_digest,
                             repeats: stall.repeats,
+                            call: stall.call,
                         },
                         String::new(),
                     ));
@@ -1870,8 +1979,54 @@ impl Worker {
             .collect()
     }
 
-    fn hand_back(&self, context_tokens: u64) -> WorkerOutcome {
+    /// Whether the attempt changed anything or started a tool call that may have.
+    fn made_progress(&self) -> bool {
+        !self.done.is_empty() || !self.changed.is_empty()
+    }
+
+    /// The contract's declared write paths, comma separated; empty when it
+    /// declares none.
+    fn write_scope_paths(&self) -> String {
+        self.brief
+            .write_scope
+            .as_ref()
+            .map(|paths| {
+                paths
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default()
+    }
+
+    /// An end as done with no tool call anywhere in the attempt, for a
+    /// contract that declares writes.
+    fn ended_without_change(&self) -> bool {
+        self.brief
+            .write_scope
+            .as_ref()
+            .is_some_and(|paths| !paths.is_empty())
+            && self.tool_calls == 0
+            && self.builder.tool_calls().is_empty()
+            && self.compaction.is_none()
+            && !self.made_progress()
+    }
+
+    fn hand_back(&self, context_tokens: u64, queued: u64) -> WorkerOutcome {
         let stop = self.brief.context.worker_stop_tokens();
+        // The transcript alone is below the point when only the queued
+        // messages crossed it.
+        let cause = if self
+            .brief
+            .context
+            .reached_point(self.builder.context_tokens())
+            || queued == 0
+        {
+            crate::brief::HandoffCause::MeasuredContext
+        } else {
+            crate::brief::HandoffCause::QueuedMessages
+        };
         WorkerOutcome::HandedBack {
             handoff: Handoff {
                 done: self.done.clone(),
@@ -1882,6 +2037,7 @@ impl Worker {
                 )],
                 files_touched: self.worktree_changes(),
                 context_tokens,
+                cause,
             },
         }
     }

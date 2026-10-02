@@ -103,6 +103,22 @@ fn canonical(value: &serde_json::Value, h: &mut blake3::Hasher) {
 pub struct Stall {
     pub call_digest: String,
     pub repeats: u32,
+    /// The repeated call, as `tool input`, cut at [`STALL_CALL_CHARS`].
+    pub call: String,
+}
+
+/// The longest repeated-call text a stall keeps, in characters.
+pub const STALL_CALL_CHARS: usize = 300;
+
+/// `tool input` for a call, cut at [`STALL_CALL_CHARS`].
+fn describe_call(tool: &str, input: &serde_json::Value) -> String {
+    let text = format!("{tool} {input}");
+    if text.chars().count() > STALL_CALL_CHARS {
+        let head: String = text.chars().take(STALL_CALL_CHARS).collect();
+        format!("{head}...")
+    } else {
+        text
+    }
 }
 
 /// Counts identical calls over a run.
@@ -188,6 +204,7 @@ impl StallDetector {
                 stall = Some(Stall {
                     call_digest: digest,
                     repeats: entry.0,
+                    call: describe_call(tool, input),
                 });
             }
         }

@@ -22,7 +22,7 @@ use super::*;
 use crate::challenge::ContractReply;
 use crate::shortfall::{
     Grounding, MAX_ANSWERED_SHORTFALLS, RequestScope, ShortfallDecision, ShortfallKind, decide,
-    path_answer, skill_hold_reason, stored,
+    instructions_answer, path_answer, skill_hold_reason, stored,
 };
 
 impl RunLoop {
@@ -78,7 +78,20 @@ impl RunLoop {
         let asked = stored(&need);
         let why = stored(&why);
         let (need, why) = match (kind, grounding) {
-            (ShortfallKind::Instructions, _) => (asked, why),
+            (ShortfallKind::Instructions, _) => {
+                // Decision 0093, amended 2026-10-01: a report that asks for a
+                // change to a file another contract owns is answered, not
+                // written into this contract's own instruction, where it
+                // would change nothing.
+                if let Some(answer) =
+                    instructions_answer(&asked, &why, &contract, &self.record.open_contracts)
+                {
+                    return self
+                        .answer_shortfall(&contract_id, &worker, kind, &asked, &why, answer, false)
+                        .await;
+                }
+                (asked, why)
+            }
             (ShortfallKind::Permission, None) => {
                 return Ok(ContractReply::Refused(
                     "a permission report must carry the worker's refusal record".into(),

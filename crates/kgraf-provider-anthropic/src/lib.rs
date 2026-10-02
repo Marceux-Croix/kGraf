@@ -728,6 +728,10 @@ impl AnthropicAdapter {
         }
 
         let response = Response {
+            finish_reason: body
+                .get("stop_reason")
+                .and_then(|s| s.as_str())
+                .map(str::to_owned),
             model: returned_model.to_owned(),
             content,
             stop_reason: match body.get("stop_reason").and_then(|s| s.as_str()) {
@@ -944,6 +948,7 @@ impl Streaming for AnthropicAdapter {
         let mut saw_message_stop = false;
         let mut model = request.model.clone();
         let mut stop_reason = StopReason::Other;
+        let mut raw_finish: Option<String> = None;
         let mut unusable_reason: Option<String> = None;
         let mut stream_request_id = request_id.clone();
         // Anthropic streams one content block at a time, each opened by
@@ -1338,6 +1343,7 @@ impl Streaming for AnthropicAdapter {
                         .and_then(|s| s.as_str())
                     {
                         unusable_reason = unusable_stop(reason).map(str::to_owned);
+                        raw_finish = Some(reason.to_owned());
                         stop_reason = match reason {
                             "end_turn" => StopReason::EndTurn,
                             "max_tokens" => StopReason::MaxTokens,
@@ -1470,6 +1476,7 @@ impl Streaming for AnthropicAdapter {
             });
         }
         Ok(Response {
+            finish_reason: raw_finish,
             model,
             content: content.into_values().collect(),
             stop_reason,
@@ -1798,6 +1805,7 @@ mod tests {
             .await
             .expect("complete");
         assert_eq!(response.stop_reason, StopReason::PauseTurn);
+        assert_eq!(response.finish_reason.as_deref(), Some("pause_turn"));
         assert_ne!(response.stop_reason, StopReason::Other);
     }
 
@@ -2286,6 +2294,7 @@ mod tests {
         .expect("stream");
 
         assert_eq!(response.stop_reason, StopReason::PauseTurn);
+        assert_eq!(response.finish_reason.as_deref(), Some("pause_turn"));
         assert_ne!(response.stop_reason, StopReason::Other);
     }
 
@@ -4075,5 +4084,26 @@ mod tests {
         assert!(ledger.unreconciled().expect("open rows").is_empty());
         let record = ledger.call(&id).expect("read").expect("present");
         assert_eq!(record.settlement, Settlement::Counted);
+    }
+
+    #[test]
+    fn reasoning_is_not_serialized_into_the_next_request() {
+        // `Provider::resends_reasoning` is false: the context estimate leaves
+        // reasoning output out of the next prompt because this holds.
+        let adapter = AnthropicAdapter::new(config("http://127.0.0.1:9")).expect("adapter");
+        assert!(!adapter.resends_reasoning());
+        let mut request = Request::new("model-a", "hi", 10);
+        request.messages = vec![kgraf_provider::Message {
+            role: Role::Assistant,
+            content: vec![
+                Content::Reasoning {
+                    text: "SECRET-REASONING-TEXT".into(),
+                },
+                Content::text("visible"),
+            ],
+        }];
+        let text = adapter.to_wire(&request, false).to_string();
+        assert!(text.contains("visible"), "{text}");
+        assert!(!text.contains("SECRET-REASONING-TEXT"), "{text}");
     }
 }

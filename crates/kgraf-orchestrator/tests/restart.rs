@@ -268,6 +268,7 @@ fn a_worker_that_finished_before_the_kill_is_not_run_again() {
             },
         },
         WorkerEvent::Stop {
+            finish_reason: None,
             reason: StopReason::EndTurn,
         },
     ];

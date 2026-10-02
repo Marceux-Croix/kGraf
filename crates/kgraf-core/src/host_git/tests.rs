@@ -314,6 +314,42 @@ mod mechanism {
         fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("chmod");
     }
 
+    /// Whether the installed git runs hooks defined in configuration
+    /// (`hook.<name>.command`, git 2.54 and later). Probed by behavior: an
+    /// older git ignores those keys, and the control must not expect their
+    /// marker there.
+    fn config_hooks_run() -> bool {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let repo = tmp.path().join("r");
+        fs::create_dir_all(&repo).expect("repo");
+        let mark = tmp.path().join("ran");
+        plain_ok(&repo, &["init", "-q"]);
+        plain_ok(
+            &repo,
+            &[
+                "config",
+                "hook.p.command",
+                &format!("touch '{}'", mark.display()),
+            ],
+        );
+        plain_ok(&repo, &["config", "hook.p.event", "pre-commit"]);
+        plain(
+            &repo,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.invalid",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "probe",
+            ],
+        );
+        mark.exists()
+    }
+
     /// The control: under ordinary git the fixture's programs do run, so an
     /// empty marker list from kGraf's git means the overrides held, not that
     /// the fixture was inert.
@@ -326,15 +362,18 @@ mod mechanism {
         plain_ok(&h.repo, &["add", "."]);
         plain_ok(&h.repo, &["commit", "-q", "-m", "c"]);
         let marks = h.marks();
-        for expected in [
+        let mut expected = vec![
             "clean",
             "eqclean",
             "includedclean",
             "pre-commit",
             "post-commit",
-            "confighook",
             "fsmonitor",
-        ] {
+        ];
+        if config_hooks_run() {
+            expected.push("confighook");
+        }
+        for expected in expected {
             assert!(marks.iter().any(|m| m == expected), "{expected}: {marks:?}");
         }
     }

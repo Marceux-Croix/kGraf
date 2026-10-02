@@ -149,6 +149,53 @@ fn whole_command_line(program: &str) -> bool {
         .any(|arg| arg.len() > 1 && arg.starts_with('-'))
 }
 
+/// Words that, alone in angle brackets, stand for a name the author did not fill
+/// in (`<crate_name>`), whatever the language.
+const PLACEHOLDER_WORDS: [&str; 8] = [
+    "crate", "package", "project", "module", "name", "dir", "path", "version",
+];
+
+/// The first placeholder in `text`: an angle-bracketed template slot such as
+/// `<crate_name>` or `<your-package>`. With `anywhere` false only a slot used
+/// as a path root (`<crate_name>::item`) or an import target (`use <x>`,
+/// `import <x>`, `from <x>`) counts, so generics and markup in source are not
+/// taken for one. A command argument is judged with `anywhere` true.
+fn find_placeholder(text: &str, anywhere: bool) -> Option<String> {
+    let mut from = 0;
+    while let Some(i) = text[from..].find('<').map(|i| i + from) {
+        from = i + 1;
+        let len = text[i + 1..].find('>')?;
+        let word = &text[i + 1..i + 1 + len];
+        let token_like = !word.is_empty()
+            && word.len() <= 40
+            && word
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '-'));
+        if !token_like {
+            continue;
+        }
+        let norm = word.replace('-', "_");
+        let slot = PLACEHOLDER_WORDS.contains(&norm.as_str())
+            || norm.ends_with("_name")
+            || norm.ends_with("_here")
+            || norm.starts_with("your_")
+            || norm.starts_with("my_");
+        if !slot {
+            continue;
+        }
+        let end = i + 2 + len;
+        let before = text[..i].trim_end();
+        let used_as_path = text[end..].starts_with("::")
+            || ["use", "import", "from", "extern crate"]
+                .iter()
+                .any(|kw| before.ends_with(kw));
+        if anywhere || used_as_path {
+            return Some(format!("<{word}>"));
+        }
+    }
+    None
+}
+
 /// An interface contract between work contracts (0026).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InterfaceContract {
@@ -227,6 +274,42 @@ impl InterfaceContract {
                      check writes only inside its own tree, so give a path relative to the \
                      repository root, or leave the output where the build tool puts it"
                 ));
+            }
+        }
+        problems
+    }
+
+    /// Template slots the author did not fill in (`use <crate_name>::item`, a
+    /// `-p <package>` argument): the real name is in a manifest the planner
+    /// can read, and a command or file that holds the slot cannot run or build.
+    /// Judged with [`InterfaceContract::command_problems`] when a new plan is
+    /// read, so the planner is asked again naming each slot; not part of
+    /// [`InterfaceContract::validate`], for the same resume reason.
+    pub fn placeholder_problems(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+        for (what, argv) in [("compile", &self.compile), ("test", &self.test)] {
+            if let Some(slot) = argv.iter().find_map(|a| find_placeholder(a, true)) {
+                problems.push(format!(
+                    "the {what} command holds the placeholder `{slot}`; replace it with the \
+                     real name from the project's manifest"
+                ));
+            }
+        }
+        for (what, files) in [
+            ("stub", &self.stub),
+            ("wrong", &self.wrong),
+            ("reference", &self.reference),
+            ("consumer", &self.consumer),
+            ("tests", &self.tests),
+        ] {
+            for f in files {
+                if let Some(slot) = find_placeholder(&f.content, false) {
+                    problems.push(format!(
+                        "the {what} file `{}` holds the placeholder `{slot}`; replace it with \
+                         the real crate, package or module name from the project's manifest",
+                        f.path
+                    ));
+                }
             }
         }
         problems
@@ -471,6 +554,14 @@ impl CheckRun {
 /// Content that is not valid source in any language a contract uses: a canary.
 pub const CANARY: &str = "@@@ kgraf canary: deliberately not valid source ((( {{{ [[[\n";
 
+/// Whether two overlay paths name one file, as the overlays are applied.
+fn same_overlay_path(a: &str, b: &str) -> bool {
+    kgraf_core::paths::same_path(
+        Path::new(a.trim_start_matches("./")),
+        Path::new(b.trim_start_matches("./")),
+    )
+}
+
 fn canary(files: &[FileOverlay]) -> Vec<FileOverlay> {
     files
         .iter()
@@ -575,11 +666,27 @@ pub async fn check_mechanical(
 
     // 2. Canaries: the compile command must cover the test and the consumers.
     let broken_tests = canary(&ic.tests);
-    let broken_consumer = canary(&ic.consumer);
-    let mut canaries: Vec<(&str, [&[FileOverlay]; 3])> =
-        vec![("canary test", [&ic.stub, &ic.consumer, &broken_tests])];
-    if !ic.consumer.is_empty() {
-        canaries.push(("canary consumer", [&ic.stub, &broken_consumer, &ic.tests]));
+    let mut canaries: Vec<(&str, Vec<&[FileOverlay]>)> =
+        vec![("canary test", vec![&ic.stub, &ic.consumer, &broken_tests])];
+    // A consumer file that is also a tests file is one file in the tree. The
+    // tests overlay, applied last, would restore it over the canary, so the run
+    // would succeed whatever the compile command builds. The canary-test run
+    // already breaks that file (its canary is applied last), so the consumer
+    // canary breaks only the consumer files no tests file shares a path with,
+    // and the valid tests go on top of it. Every consumer path shared: nothing
+    // is left for this run, and the canary-test run covers them.
+    let consumer_only: Vec<FileOverlay> = ic
+        .consumer
+        .iter()
+        .filter(|c| !ic.tests.iter().any(|t| same_overlay_path(&t.path, &c.path)))
+        .cloned()
+        .collect();
+    let broken_consumer = canary(&consumer_only);
+    if !consumer_only.is_empty() {
+        canaries.push((
+            "canary consumer",
+            vec![&ic.stub, &ic.consumer, &broken_consumer, &ic.tests],
+        ));
     }
     for (name, layers) in canaries {
         let r = compile_once_more_on_timeout(runner, &layers, &ic.compile, name).await?;
@@ -1999,6 +2106,7 @@ mod tests {
             };
             token.settle(&usage, None)?;
             Ok(kgraf_provider::Response {
+                finish_reason: None,
                 model: request.model.clone(),
                 content: vec![kgraf_provider::Content::text(format!(
                     "{{\"provide\":[\"I will provide `parse_config` from {}\"]}}",

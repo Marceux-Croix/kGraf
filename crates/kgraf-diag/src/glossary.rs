@@ -259,7 +259,7 @@ pub const GLOSSARY: &[ErrorSpec] = &[
         "kgraf-host",
         "A configured route is missing a credential, an unknown catalog id, or has no price; or a local route's server (Ollama, llama.cpp, System One, TEI) accepts no connection at run start.",
         "The environment is not fully set up for the routes a run names, or the local model server is not running.",
-        "Run `kgraf providers` (or the shell's readiness check) and fix what it names; for an unreachable local route, start its server (for Ollama, `ollama serve`) or remove the route."
+        "Run `kgraf providers` (or the shell's readiness check) and fix what it names; for an unreachable local route, start its server (for Ollama, `ollama serve`), point the route at the server's address with `KGRAF_<ROUTE>_BASE_URL` (for example `KGRAF_OLLAMA_BASE_URL`), or remove the route."
     ),
     spec!(
         "KG-0502",

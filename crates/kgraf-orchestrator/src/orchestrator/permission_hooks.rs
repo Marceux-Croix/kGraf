@@ -131,6 +131,9 @@ impl RunLoop {
                     ("plan_review_changed", String::new())
                 }
                 kgraf_tools::PermissionEvent::Granted { worker, .. } => ("granted", worker.clone()),
+                kgraf_tools::PermissionEvent::GrantRefused { worker, .. } => {
+                    ("grant_refused", worker.clone())
+                }
                 kgraf_tools::PermissionEvent::ProtectedWrite { worker, .. } => {
                     ("protected_write", worker.clone())
                 }

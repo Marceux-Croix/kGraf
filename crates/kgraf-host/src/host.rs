@@ -296,6 +296,17 @@ pub struct Host {
     worktrees: Mutex<crate::config::WorktreeRetention>,
 }
 
+/// Entry counts of a host's per-run tables ([`Host::retained`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct Retained {
+    pub ended: usize,
+    pub refetchers: usize,
+    pub start_consents: usize,
+    pub dependency_questions: usize,
+    pub fetch_grants: usize,
+    pub notices: usize,
+}
+
 /// Most dependency questions a host keeps for [`Host::take_dependency_question`].
 const MAX_KEPT_QUESTIONS: usize = 32;
 
@@ -754,6 +765,28 @@ impl Host {
         self.ended.lock().unwrap_or_else(|p| p.into_inner()).len()
     }
 
+    /// How many entries each per-run table of this host holds. Every table is
+    /// keyed by run and emptied when its run ends, so after the last run
+    /// finished each count is zero. A soak driver reads this between runs to
+    /// show that a long-lived process does not accumulate run state.
+    pub fn retained(&self) -> Retained {
+        fn len<K, V>(m: &Mutex<BTreeMap<K, V>>) -> usize {
+            m.lock().unwrap_or_else(|p| p.into_inner()).len()
+        }
+        Retained {
+            ended: len(&self.ended),
+            refetchers: len(&self.refetchers),
+            start_consents: len(&self.start_consents),
+            dependency_questions: len(&self.dependency_questions),
+            fetch_grants: self
+                .fetch_grants
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .len(),
+            notices: self.notices.lock().unwrap_or_else(|p| p.into_inner()).len(),
+        }
+    }
+
     /// Every attempt's approval asks go to `asks` instead of the persisted-rule
     /// resolver, which denies what no rule allows (the command's delegates are
     /// unattended). The desktop shell passes its box's desk here.
@@ -968,7 +1001,12 @@ impl Host {
                     // (design: "and 1 when none is configured").
                     local_slots: Some(0),
                 },
-                base_url: Some(entry.base_url.to_owned()),
+                // An override that is not a URL fails the build before this is
+                // read; the catalog address stands in only for the display.
+                base_url: Some(
+                    kgraf_fleet::local_endpoint_from(entry, lookup)
+                        .unwrap_or_else(|_| entry.base_url.to_owned()),
+                ),
             };
         }
         let mut keys: Vec<String> = Vec::new();
@@ -2376,7 +2414,9 @@ pub(crate) fn check_reachable(
         if entry.requires_credential {
             continue;
         }
-        endpoints.push((r.route.clone(), entry.base_url.to_owned()));
+        let endpoint =
+            kgraf_fleet::local_endpoint(entry).map_err(|e| NotReady::Invalid(e.to_string()))?;
+        endpoints.push((r.route.clone(), endpoint));
     }
     probe_endpoints(&endpoints, timeout, tcp_connect)
 }
@@ -2736,6 +2776,11 @@ impl PreparedRun {
     /// finished" and "the providers and models used" (`self.shape.routes`,
     /// already public route:model pairs, never a credential) are counted once
     /// per run rather than at every internal dispatch.
+    ///
+    /// A process that outlives the run calls [`Host::finish_run`] afterwards (on
+    /// every outcome, an error included): the host's per-run tables
+    /// ([`Host::retained`]) are emptied there, and `run` does not do it. A
+    /// process that exits after one run, such as `kgraf orchestrate`, need not.
     pub async fn run(self, start: RunStart) -> Result<RunOutcome> {
         let run_id = self.run.to_string();
         kgraf_diag::record(kgraf_diag::DiagEvent::RunStarted {
@@ -3032,10 +3077,12 @@ mod reachable_tests {
     fn a_closed_local_endpoint_is_unreachable_and_a_listening_one_is_not() {
         let listening = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let open = listening.local_addr().expect("addr").port();
-        let closed = {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-            l.local_addr().expect("addr").port()
-        };
+        // Port 0 is a destination nothing can listen on (binding it asks for
+        // an ephemeral port instead), so a connect to it always fails at
+        // once. A port taken from a dropped listener is free for any other
+        // test or process to bind before the connect, which would make this
+        // test pass or fail by chance.
+        let closed = 0u16;
         let timeout = Duration::from_secs(2);
         assert_eq!(
             check_endpoint("local", &format!("http://127.0.0.1:{open}/v1"), timeout),

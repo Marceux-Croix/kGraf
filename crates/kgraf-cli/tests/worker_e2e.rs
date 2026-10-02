@@ -160,6 +160,7 @@ fn response(request: &Request, round: &Round) -> Response {
         });
     }
     Response {
+        finish_reason: None,
         model: request.model.clone(),
         content,
         stop_reason: if round.calls.is_empty() {

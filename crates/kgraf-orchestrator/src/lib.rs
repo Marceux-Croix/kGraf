@@ -83,9 +83,11 @@ mod message_tool;
 pub mod model_kinds;
 pub mod occupancy;
 mod orchestrator;
+mod outside_error;
 pub mod pairing;
 mod partition;
 mod plan;
+pub mod planner_context;
 mod port;
 mod question_route;
 mod readiness;
@@ -237,6 +239,8 @@ pub use subagent_tool::{
     ChildMerge, MAX_REPORT_ANSWER_CHARS, SPAWN_SUBAGENT_TOOL, SUBAGENT_REPORT_MARKER,
     SUBAGENT_REPORT_PREFIX, SpawnRefusal, SpawnRequest, Spawned, SubagentReport, spawned_text,
 };
-pub use trace::{DeferReason, LoopDetector, LoopKind, TraceEvent, TraceLog};
+pub use trace::{
+    DeferReason, LoopDetector, LoopKind, PlannedContract, PlannedInterface, TraceEvent, TraceLog,
+};
 pub use verify::{Attempt, AttemptStatus, Verdict, Verifier, select, status_of};
 pub use waits::{WaitKind, WaitState, one_line};

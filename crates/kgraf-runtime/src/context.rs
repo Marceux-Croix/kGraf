@@ -340,6 +340,9 @@ pub struct PrefixRegistry {
     invalidations: Mutex<Vec<PrefixInvalidation>>,
 }
 
+/// Most invalidations a [`PrefixRegistry`] keeps; the oldest are dropped first.
+pub const MAX_INVALIDATIONS_KEPT: usize = 256;
+
 /// A recorded replacement of a group's prefix.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrefixInvalidation {
@@ -412,14 +415,22 @@ impl PrefixRegistry {
             old: old.as_str().to_owned(),
             new: snapshot.digest().as_str().to_owned(),
         };
-        self.invalidations
+        let mut kept = self
+            .invalidations
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(record.clone());
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        kept.push(record.clone());
+        // The global registry lives as long as the process: keep the latest
+        // records only, so a prefix that changes every run for days does not
+        // grow the list without bound.
+        if kept.len() > MAX_INVALIDATIONS_KEPT {
+            let excess = kept.len() - MAX_INVALIDATIONS_KEPT;
+            kept.drain(..excess);
+        }
         Some(record)
     }
 
-    /// Every recorded invalidation, in order.
+    /// The recorded invalidations, in order: the latest [`MAX_INVALIDATIONS_KEPT`].
     pub fn invalidations(&self) -> Vec<PrefixInvalidation> {
         self.invalidations
             .lock()
@@ -741,6 +752,28 @@ mod tests {
         other.model = "m2".into();
         let c = PrefixSnapshot::new(other, &NeutralPrefixEncoder).expect("c");
         registry.admit(&c).expect("different group");
+    }
+
+    #[test]
+    fn the_invalidation_list_keeps_only_the_latest() {
+        let registry = PrefixRegistry::new();
+        let mut last = None;
+        // Alternate two distinct prefixes: every replace after the first is a change.
+        let snaps: Vec<PrefixSnapshot> = (0..2)
+            .map(|i| {
+                let mut p = prefix();
+                p.system.push(Content::text(format!("variant {i}")));
+                PrefixSnapshot::new(p, &NeutralPrefixEncoder).expect("snap")
+            })
+            .collect();
+        registry.admit(&snaps[0]).expect("first");
+        for n in 1..=(MAX_INVALIDATIONS_KEPT + 50) {
+            last = registry.replace(&snaps[n % 2]);
+            assert!(last.is_some(), "replace {n} changes the prefix");
+        }
+        let kept = registry.invalidations();
+        assert_eq!(kept.len(), MAX_INVALIDATIONS_KEPT);
+        assert_eq!(kept.last(), last.as_ref(), "the newest record is kept");
     }
 
     #[test]

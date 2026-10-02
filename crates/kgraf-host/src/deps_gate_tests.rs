@@ -99,13 +99,42 @@ fn project() -> (tempfile::TempDir, RunConfig) {
         r#"{"llama3": {"uncached_input": 1, "cache_read": 1, "cache_write": 1, "output": 1, "reasoning": 1}}"#,
     )
     .expect("prices");
-    let config = RunConfig::new(&root, vec!["ollama:llama3".into()], prices);
+    let config = RunConfig::new(&root, vec!["mine:llama3".into()], prices);
     (dir, config)
+}
+
+/// A model that is never called: these tests stop at or just after the
+/// dependency gate. It serves an in-process route, so the build's check that
+/// a local server accepts connections has no endpoint to dial and the result
+/// does not depend on what listens on this machine.
+struct Idle;
+
+#[async_trait::async_trait]
+impl kgraf_provider::Provider for Idle {
+    fn adapter(&self) -> &'static str {
+        "idle"
+    }
+    fn protocol(&self) -> kgraf_core::Protocol {
+        kgraf_core::Protocol::Additive
+    }
+    async fn complete(
+        &self,
+        request: &kgraf_provider::Request,
+        _token: &kgraf_provider::CallToken,
+    ) -> Result<kgraf_provider::Response, kgraf_provider::ProviderError> {
+        Err(kgraf_provider::ProviderError::ModelUnsupported {
+            adapter: "idle",
+            model: request.model.clone(),
+            available: "none".into(),
+        })
+    }
 }
 
 fn host_with(config: RunConfig, fake: &Arc<Fake>) -> Host {
     Host::open(config)
         .expect("open")
+        .with_route_provider("mine", Arc::new(Idle))
+        .expect("route")
         .with_dependency_tool(fake.clone())
 }
 

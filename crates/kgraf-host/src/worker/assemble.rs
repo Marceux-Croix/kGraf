@@ -707,7 +707,10 @@ pub async fn assemble(a: Assembly) -> Result<Assembled> {
             a.permissions.clone(),
             Some(a.workspace.root().to_path_buf()),
         )),
-    ]);
+    ])
+    // A mode's grant is recorded when the chain lets the call run, or as a
+    // refusal when a later hook (a deny rule) refuses it.
+    .with_permissions(a.permissions.clone());
     let attended = matches!(a.attendance, Attendance::Terminal { .. });
     env.asks = Some(Arc::new(kgraf_runtime::ModeResolver::new(
         Arc::new(RuleOrPromptResolver::new(

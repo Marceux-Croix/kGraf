@@ -40,6 +40,8 @@ serde_json = "1"
 # already in the lockfile through oauth2.
 serde_path_to_error = "0.1"
 thiserror = "2"
+# Package names from manifests for the planner (planner_context.rs); already in the workspace.
+toml = "1.1.6"
 # `rt` for spawn (each worker's completion forwarder is a task), `sync` for the
 # loop's channels, `time` for lease and reservation renewal ticks, `macros` for select!,
 # `process` and `io-util` for the contract checks' commands and their timeout.

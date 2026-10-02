@@ -267,6 +267,41 @@ fn worktree_creation_commit_and_merge_run_no_program() {
 
 /// The control: the same repository runs the planted programs under plain
 /// git, so an empty marker list above means the overrides held.
+/// Whether the installed git runs hooks defined in configuration
+/// (`hook.<name>.command`, git 2.54 and later). Probed by behavior: an older
+/// git ignores those keys, and the control must not expect their marker there.
+fn config_hooks_run() -> bool {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("r");
+    std::fs::create_dir_all(&repo).unwrap();
+    let mark = tmp.path().join("ran");
+    git(&repo, &["init", "-q"]);
+    git(
+        &repo,
+        &[
+            "config",
+            "hook.p.command",
+            &format!("touch '{}'", mark.display()),
+        ],
+    );
+    git(&repo, &["config", "hook.p.event", "pre-commit"]);
+    git(
+        &repo,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.invalid",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "probe",
+        ],
+    );
+    mark.exists()
+}
+
 #[test]
 fn the_armed_repository_runs_programs_under_plain_git() {
     let h = hostile();
@@ -287,7 +322,11 @@ fn the_armed_repository_runs_programs_under_plain_git() {
         ],
     );
     let marks = h.marks();
-    for expected in ["clean", "confighook", "fsmonitor", "post-commit"] {
+    let mut expected = vec!["clean", "fsmonitor", "post-commit"];
+    if config_hooks_run() {
+        expected.push("confighook");
+    }
+    for expected in expected {
         assert!(marks.iter().any(|m| m == expected), "{expected}: {marks:?}");
     }
 }

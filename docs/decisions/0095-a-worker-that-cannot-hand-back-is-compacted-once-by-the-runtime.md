@@ -121,3 +121,55 @@ that the piece was too big, and should lose nothing.
   model are recorded from the first build, so whether more work leans on it can be measured.
 - Reopen if recorded runs show summaries losing facts that recall does not recover, or if
   compacted workers complete measurably less often than handed-back chains.
+
+## Amendment (2026-10-01): no hand-back with nothing written, and a hand-back says why
+
+A local model with a 32,768-token window and a stop point at 35% (11,468 tokens) handed back
+after one step, twice in a row: one read of the file plus a long first reply (6,319 prompt and
+3,661 generated tokens, the read result on top) measured 11,561 tokens. Each child received the
+whole task again and did the same, until the depth cap. The measurement was right; the hand-back
+moved no work.
+
+- **No hand-back with nothing written.** At the stop point a worker that has written nothing
+  (no `done` item, no changed path) compacts once, under either policy. After that compaction,
+  with nothing written and a context under the model's effective window, it goes on; at or
+  past the window it hands back, because the next request would not fit. A worker that wrote
+  something hands back as before.
+- **The cause is recorded.** `Handoff::cause` is `measured_context` (the last reported usage
+  plus the estimate of what was added since reached the stop point) or `queued_messages` (the
+  transcript was below the point and the queued steering messages crossed it). The trace's
+  `compaction` record carries it as `cause`. A hand-back is never a projection of growth, and
+  no tool lets the model request one; a projection only sizes a plan at dispatch.
+
+Evidence: `kgraf-runtime/tests/compaction.rs` (`a_stop_point_reached_with_nothing_written_...`,
+`a_second_stop_point_with_nothing_written_goes_on_while_the_window_holds`,
+`a_hand_back_with_nothing_written_past_the_window_names_the_measured_context`,
+`a_hand_back_after_a_write_stands_and_names_the_measured_context`) and
+`kgraf-orchestrator/tests/orchestrator.rs` (the trace's `cause`).
+
+## Amendment (2026-10-01): the context measure counts what the next request carries
+
+The measure was the last usage report's input plus its output, plus an estimate of what was
+added since. The output included reasoning, and no adapter sends reasoning back: Chat
+Completions, Responses, Messages, Gemini and Converse each drop the reasoning part when they
+serialize a request. A thinking model's reasoning is billed on the round that produced it and
+is not in any later prompt, so the measure read high by the reasoning size and a worker reached
+the stop point too early (a 6,319-token prompt with 3,661 generated tokens measured 9,980
+before the read result, while the next prompt would hold about 6,400).
+
+- **Reasoning counts only where the route resends it.** `Provider::resends_reasoning`
+  (default `false`; the rate-limit and route wrappers forward it) tells the transcript builder.
+  An adapter that serializes reasoning must override it to `true`. Before the loop sets it, the
+  builder counts reasoning, the conservative side.
+- **Where the route reports reasoning apart** (`reasoning_output`), exactly that share leaves
+  the measure. **Where it does not** (Ollama's chat API, Converse) the reasoning is inside
+  `text_output`, and a lower bound leaves: the reasoning text kGraf holds at five bytes per
+  token, never more than the reported text output. Real text runs three to four bytes per
+  token, so some reasoning stays counted. A round no usage report covered adds its reasoning
+  estimate only where it is resent.
+- **The trace reports the measure that decided.** `WorkerResult::peak_context_tokens` is the
+  largest value any stop check read (queued messages included), and the trace's
+  `peak_context_tokens` is the larger of that and the provider's reported input. It was the
+  reported input alone, which hid the output share.
+- Each adapter has a test that a request built from a message with reasoning carries none of
+  its text, so the flag follows the code.

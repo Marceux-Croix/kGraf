@@ -4924,6 +4924,82 @@ mod tests {
         );
     }
 
+    fn batch_connection() -> Connection {
+        let conn = Connection::open_in_memory().expect("open");
+        conn.execute_batch("PRAGMA foreign_keys = ON;")
+            .expect("pragma");
+        conn.execute_batch(SCHEMA).expect("schema");
+        migrate(&conn).expect("migrate");
+        conn
+    }
+
+    #[test]
+    fn a_batch_whose_transaction_sqlite_rolled_back_fails_every_op_and_keeps_the_count() {
+        let conn = batch_connection();
+        let tip = Mutex::new(read_chain_tail(&conn).expect("tail"));
+        let first = Op::Mcp {
+            call: mcp("list_tools", None),
+        };
+        // No such row, so the op is refused.
+        let refused = Op::Ttft {
+            id: CallId::new("no-such-call"),
+            ttft_ms: 1,
+        };
+        let last = Op::Mcp {
+            call: mcp("list_tools", None),
+        };
+        let mut rolled_back = |n: usize| {
+            if n == 0 {
+                // What SQLite does on SQLITE_FULL: it drops the whole transaction.
+                conn.execute_batch("ROLLBACK").expect("rollback");
+            }
+        };
+        let out = apply_batch(
+            &conn,
+            &tip,
+            None,
+            &[&first, &refused, &last],
+            &mut rolled_back,
+        );
+        assert_eq!(out.len(), 3, "one result per op, no more");
+        assert!(matches!(out[0], Err(LedgerError::BatchFailed { .. })));
+        assert!(
+            matches!(&out[1], Err(e) if !matches!(e, LedgerError::BatchFailed { .. })),
+            "the refused op carries its own error"
+        );
+        assert!(matches!(out[2], Err(LedgerError::BatchFailed { .. })));
+        assert!(conn.is_autocommit(), "no transaction left open");
+        let on_disk = read_chain_tail(&conn).expect("tail").seq;
+        assert_eq!(tip.lock().expect("tip").seq, on_disk);
+        assert_eq!(on_disk, 0, "nothing from the batch was committed");
+    }
+
+    #[test]
+    fn a_commit_that_fails_rolls_the_transaction_back_and_fails_every_op() {
+        let conn = batch_connection();
+        let tip = Mutex::new(read_chain_tail(&conn).expect("tail"));
+        let op = Op::Mcp {
+            call: mcp("list_tools", None),
+        };
+        let mut violate_at_commit = |_: usize| {
+            conn.execute_batch(
+                "CREATE TABLE parent(id INTEGER PRIMARY KEY); \
+                 CREATE TABLE child(p INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED); \
+                 INSERT INTO child VALUES (1);",
+            )
+            .expect("deferred violation");
+        };
+        let out = apply_batch(&conn, &tip, None, &[&op], &mut violate_at_commit);
+        assert_eq!(out.len(), 1);
+        assert!(matches!(out[0], Err(LedgerError::BatchFailed { .. })));
+        assert!(
+            conn.is_autocommit(),
+            "the failed commit left no open transaction"
+        );
+        assert_eq!(read_chain_tail(&conn).expect("tail").seq, 0);
+        assert_eq!(tip.lock().expect("tip").seq, 0);
+    }
+
     fn mcp(kind: &str, tool: Option<&str>) -> McpCall {
         McpCall {
             server: "echoserver".into(),

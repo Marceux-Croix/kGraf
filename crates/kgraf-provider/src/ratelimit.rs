@@ -546,6 +546,10 @@ impl Provider for RouteRecorded {
         self.inner.protocol()
     }
 
+    fn resends_reasoning(&self) -> bool {
+        self.inner.resends_reasoning()
+    }
+
     async fn complete(
         &self,
         request: &Request,
@@ -685,6 +689,10 @@ impl Provider for RateLimited {
         self.inner.protocol()
     }
 
+    fn resends_reasoning(&self) -> bool {
+        self.inner.resends_reasoning()
+    }
+
     async fn complete(
         &self,
         request: &Request,
@@ -755,6 +763,7 @@ mod tests {
             };
             token.settle(&usage, None)?;
             Ok(Response {
+                finish_reason: None,
                 model: request.model.clone(),
                 content: vec![Content::text("ok")],
                 stop_reason: StopReason::EndTurn,

@@ -678,7 +678,7 @@ fn show(event: &WorkerEvent, started: std::time::Instant) {
             "\n[usage {call}: in {} cache r {} w {} out {}]",
             usage.uncached_input, usage.cache_read, usage.cache_write, usage.text_output
         ),
-        WorkerEvent::Stop { reason } => println!("\n[stop {reason:?}]"),
+        WorkerEvent::Stop { reason, .. } => println!("\n[stop {reason:?}]"),
         WorkerEvent::Cancelled { phase } => {
             println!(
                 "\n[cancelled during {phase:?} after {:?}]",

@@ -1730,6 +1730,7 @@ mod tests {
             };
             token.settle(&usage, None)?;
             Ok(kgraf_provider::Response {
+                finish_reason: None,
                 model: request.model.clone(),
                 content,
                 stop_reason: stop,

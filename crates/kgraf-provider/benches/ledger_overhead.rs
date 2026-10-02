@@ -128,6 +128,7 @@ impl Provider for Settles {
     ) -> Result<Response, ProviderError> {
         token.settle(&self.0, Some("req-bench"))?;
         Ok(Response {
+            finish_reason: None,
             model: request.model.clone(),
             content: vec![Content::text("ok")],
             stop_reason: StopReason::EndTurn,

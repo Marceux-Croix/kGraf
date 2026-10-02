@@ -253,6 +253,13 @@ pub enum FleetError {
     /// The route does not serve the model kind asked of it (decision 0089).
     #[error(transparent)]
     Kind(#[from] KindError),
+    /// A local route's endpoint override is not an http or https URL.
+    #[error("{variable} for `{id}` must be an http:// or https:// URL, not `{value}`")]
+    BadBaseUrl {
+        id: String,
+        variable: String,
+        value: String,
+    },
     /// The typed-decision client could not be built.
     #[error("cannot configure `{id}`")]
     Decider {
@@ -848,6 +855,61 @@ pub fn credential_env_var(entry: &Entry) -> String {
     )
 }
 
+/// The environment variable that moves a local route's endpoint
+/// (`KGRAF_OLLAMA_BASE_URL` for `ollama`): the route id upper-cased with `-` as
+/// `_`. Read only for routes that take no credential.
+pub fn base_url_env_var(entry: &Entry) -> String {
+    format!(
+        "KGRAF_{}_BASE_URL",
+        entry.id.to_ascii_uppercase().replace('-', "_")
+    )
+}
+
+/// The endpoint root a route is called at, through `lookup` (`std::env::var`
+/// in production, a map in tests).
+///
+/// A route that takes no credential and has a fixed catalog address may be moved
+/// with [`base_url_env_var`], for a server on another port or host. A route that
+/// takes a credential is never moved this way, so a variable in the environment
+/// cannot send a key to another host. A value that is not an http or https URL
+/// raises.
+pub fn local_endpoint_from(
+    entry: &Entry,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<String, FleetError> {
+    let movable = !entry.requires_credential
+        && !entry.wire.is_azure()
+        && !entry.wire.is_vertex()
+        && !entry.base_url.contains('{');
+    if !movable {
+        return Ok(entry.base_url.to_owned());
+    }
+    let variable = base_url_env_var(entry);
+    match lookup(&variable) {
+        None => Ok(entry.base_url.to_owned()),
+        Some(value) => {
+            let url = value.trim();
+            let rest = url
+                .strip_prefix("http://")
+                .or_else(|| url.strip_prefix("https://"));
+            if rest.is_some_and(|r| !r.is_empty() && !r.starts_with('/')) {
+                Ok(url.to_owned())
+            } else {
+                Err(FleetError::BadBaseUrl {
+                    id: entry.id.to_owned(),
+                    variable,
+                    value,
+                })
+            }
+        }
+    }
+}
+
+/// [`local_endpoint_from`] over the process environment.
+pub fn local_endpoint(entry: &Entry) -> Result<String, FleetError> {
+    local_endpoint_from(entry, kgraf_core::legacy::env_var)
+}
+
 /// Resolve a route's credential through `lookup`, which is `std::env::var` in
 /// production and a map in tests.
 ///
@@ -950,7 +1012,7 @@ pub fn configure(
             source,
         })?
     } else {
-        ProviderConfig::local(entry.base_url, models, entry.protocol)
+        ProviderConfig::local(&local_endpoint(entry)?, models, entry.protocol)
     };
     if entry.honors_cache_control {
         config = config.honoring_cache_control();
@@ -975,7 +1037,9 @@ pub fn limit_key(
     model: &str,
 ) -> Result<String, FleetError> {
     if !entry.base_url.contains('{') {
-        return Ok(entry.base_url.trim_end_matches('/').to_owned());
+        return Ok(local_endpoint_from(entry, &lookup)?
+            .trim_end_matches('/')
+            .to_owned());
     }
     if entry.wire == Wire::BedrockConverse {
         // The adapter records under the unresolved `{region}` URL, so the key is
@@ -1582,12 +1646,13 @@ fn build_typed_decision(
             variable: credential_env_var(entry),
         });
     }
-    let mut client = kgraf_decide::SystemOneClient::new(entry.base_url, TYPED_DECISION_STATE_LIMIT)
-        .map_err(|source| FleetError::Decider {
-            id: entry.id.to_owned(),
-            source,
-        })?
-        .with_model(model);
+    let mut client =
+        kgraf_decide::SystemOneClient::new(&local_endpoint(entry)?, TYPED_DECISION_STATE_LIMIT)
+            .map_err(|source| FleetError::Decider {
+                id: entry.id.to_owned(),
+                source,
+            })?
+            .with_model(model);
     if !credential.trim().is_empty() {
         client = client.with_api_key(credential);
     }
@@ -2859,6 +2924,61 @@ mod tests {
                 "{}: {}",
                 route.id,
                 route.base_url
+            );
+        }
+    }
+
+    /// A local route moves with its variable; a route that takes a credential
+    /// never does, so the environment cannot send a key to another host.
+    #[test]
+    fn a_local_route_moves_by_variable_and_a_credentialed_one_does_not() {
+        let ollama = entry("ollama").expect("ollama");
+        assert_eq!(base_url_env_var(ollama), "KGRAF_OLLAMA_BASE_URL");
+        assert_eq!(
+            local_endpoint_from(ollama, |_| None).expect("default"),
+            "http://localhost:11434/v1"
+        );
+        let moved = |name: &str| {
+            (name == "KGRAF_OLLAMA_BASE_URL").then(|| " http://127.0.0.1:9/v1 ".to_owned())
+        };
+        assert_eq!(
+            local_endpoint_from(ollama, moved).expect("moved"),
+            "http://127.0.0.1:9/v1"
+        );
+        // The configuration the adapter holds is at the moved address.
+        let config = ProviderConfig::local(
+            local_endpoint_from(ollama, moved).expect("moved"),
+            vec![],
+            ollama.protocol,
+        );
+        assert_eq!(config.base_url, "http://127.0.0.1:9/v1");
+        let openai = entry("openai").expect("openai");
+        let any = |_: &str| Some("http://127.0.0.1:9/v1".to_owned());
+        assert_eq!(
+            local_endpoint_from(openai, any).expect("not moved"),
+            openai.base_url
+        );
+    }
+
+    #[test]
+    fn a_base_url_override_that_is_not_a_url_raises() {
+        let ollama = entry("ollama").expect("ollama");
+        for bad in [
+            "localhost:11434",
+            "ftp://host/v1",
+            "http://",
+            "http:///v1",
+            "",
+        ] {
+            let error = local_endpoint_from(ollama, |_| Some(bad.to_owned()))
+                .expect_err("a value that is not http(s) must raise");
+            assert!(
+                matches!(error, FleetError::BadBaseUrl { .. }),
+                "{bad}: {error}"
+            );
+            assert!(
+                error.to_string().contains("KGRAF_OLLAMA_BASE_URL"),
+                "{error}"
             );
         }
     }

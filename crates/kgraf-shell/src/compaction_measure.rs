@@ -275,6 +275,8 @@ mod tests {
                 .expect("open");
             for i in 0..30u64 {
                 log.record(TraceEvent::WorkerFinished {
+                    last_stop: None,
+                    tool_calls: 0,
                     at_ms: 0,
                     contract: format!("c{i}"),
                     worker: format!("w{i}"),
@@ -329,6 +331,8 @@ mod tests {
             for i in 0..30u64 {
                 let held = i < 25;
                 log.record(TraceEvent::WorkerFinished {
+                    last_stop: None,
+                    tool_calls: 0,
                     at_ms: 0,
                     contract: format!("c{i}"),
                     worker: format!("w{i}"),
@@ -384,6 +388,8 @@ mod tests {
     #[test]
     fn a_hand_back_and_a_cancel_are_not_samples() {
         let finished = |outcome: &str| TraceEvent::WorkerFinished {
+            last_stop: None,
+            tool_calls: 0,
             at_ms: 0,
             contract: "c".into(),
             worker: "w".into(),
@@ -414,6 +420,8 @@ mod tests {
     #[test]
     fn a_worker_the_runtime_compacted_is_not_a_sample() {
         let finished = |worker: &str| TraceEvent::WorkerFinished {
+            last_stop: None,
+            tool_calls: 0,
             at_ms: 0,
             contract: "c".into(),
             worker: worker.into(),

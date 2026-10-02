@@ -522,20 +522,21 @@ impl kgraf_provider::Provider for BedrockAdapter {
                 reason: "the response has no `output.message`".to_owned(),
             })?;
         let content = wire::parse_content(message)?;
-        let stop = parsed
+        let raw_finish = parsed
             .get("stopReason")
             .and_then(Value::as_str)
             .ok_or_else(|| ProviderError::Decode {
                 adapter: ADAPTER,
                 reason: "the response has no `stopReason`".to_owned(),
-            })
-            .and_then(wire::map_stop)?;
+            })?;
+        let stop = wire::map_stop(raw_finish)?;
         match stop {
             Stop::Unusable(stop_reason) => Err(ProviderError::TurnNotUsable {
                 adapter: ADAPTER,
                 stop_reason,
             }),
             Stop::Usable(stop_reason) => Ok(Response {
+                finish_reason: Some(raw_finish.to_owned()),
                 model: request.model.clone(),
                 content,
                 stop_reason,
@@ -913,6 +914,7 @@ impl Streaming for BedrockAdapter {
         let Some(stop) = stop else {
             return Err(ProviderError::StreamTruncated { adapter: ADAPTER });
         };
+        let raw_finish = stop.clone();
         let stop = wire::map_stop(&stop);
         let max_tokens = matches!(stop, Ok(Stop::Usable(StopReason::MaxTokens)));
         if !max_tokens && let Some(error) = broken_tool_call.take() {
@@ -941,6 +943,7 @@ impl Streaming for BedrockAdapter {
                 stop_reason,
             }),
             Stop::Usable(stop_reason) => Ok(Response {
+                finish_reason: Some(raw_finish),
                 model: request.model.clone(),
                 content: content.into_values().collect(),
                 stop_reason,

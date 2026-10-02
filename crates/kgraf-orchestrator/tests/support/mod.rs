@@ -48,6 +48,13 @@ pub struct Stats {
     /// Every text of each worker's opening message (the instruction, then its
     /// slices), joined, as the first round sent it.
     pub openings: Mutex<Vec<String>>,
+    /// When above zero, each worker's first request waits, in flight, until
+    /// this many first requests are in flight at once (or ten seconds pass).
+    /// A test that needs two dispatches to overlap sets it, so the overlap is
+    /// forced by the fixture and does not depend on a sleep outlasting the gap
+    /// between two dispatches on a loaded machine.
+    pub rendezvous_parties: AtomicUsize,
+    rendezvous_arrived: AtomicUsize,
 }
 
 impl Stats {
@@ -297,6 +304,16 @@ impl Provider for WorkerFake {
         }
         let now = self.stats.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
         self.stats.max_in_flight.fetch_max(now, Ordering::SeqCst);
+        let parties = self.stats.rendezvous_parties.load(Ordering::SeqCst);
+        if parties > 0 && round == 0 {
+            self.stats.rendezvous_arrived.fetch_add(1, Ordering::SeqCst);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while self.stats.rendezvous_arrived.load(Ordering::SeqCst) < parties
+                && Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
         let start = Instant::now();
         tokio::time::sleep(self.delay).await;
         self.stats.in_flight.fetch_sub(1, Ordering::SeqCst);
@@ -405,6 +422,7 @@ impl Provider for WorkerFake {
         };
         token.settle(&usage, None)?;
         Ok(Response {
+            finish_reason: None,
             model: request.model.clone(),
             content,
             stop_reason: stop,
@@ -477,6 +495,7 @@ impl Provider for ScriptFake {
         };
         token.settle(&usage, None)?;
         Ok(Response {
+            finish_reason: None,
             model: request.model.clone(),
             content: vec![Content::text(text)],
             stop_reason: StopReason::EndTurn,
@@ -1260,6 +1279,7 @@ impl Provider for StallFake {
         };
         token.settle(&usage, None)?;
         Ok(Response {
+            finish_reason: None,
             model: request.model.clone(),
             content: vec![Content::ToolUse {
                 id: "t1".into(),

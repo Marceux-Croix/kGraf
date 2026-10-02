@@ -699,6 +699,7 @@ mod tests {
                 });
             }
             Response {
+                finish_reason: None,
                 model: request.model.clone(),
                 content,
                 stop_reason: if calls.is_empty() {

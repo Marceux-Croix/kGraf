@@ -125,6 +125,65 @@ async fn a_sound_rust_contract_passes_every_stage_in_order_and_leaves_the_base_u
     );
 }
 
+/// A consumer file at the tests file's path (the same content, which
+/// validation allows) is one file in the tree. Its canary is the canary-test
+/// run, so a correct interface passes; before, the valid tests overlay restored
+/// the file over the consumer canary and the check blamed the compile command.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_consumer_file_shared_with_the_tests_still_gets_a_canary_and_a_sound_contract_passes() {
+    let dir = tempfile::tempdir().expect("dir");
+    let repo = rust_repo(dir.path());
+    let r = runner(dir.path(), &repo);
+    let mut ic = rust_ic();
+    ic.consumer = vec![FileOverlay::new("tests/contract.rs", RUST_TEST)];
+    let runs = check_mechanical(&r, &ic)
+        .await
+        .expect("ran")
+        .expect("a correct interface with a shared path passes");
+    let canaries: Vec<(&str, bool)> = runs
+        .iter()
+        .filter(|x| x.against.starts_with("canary"))
+        .map(|x| (x.against.as_str(), x.success))
+        .collect();
+    assert_eq!(
+        canaries,
+        vec![("canary test", false)],
+        "the shared file is broken by the canary-test run; no consumer-only file is left"
+    );
+
+    // One shared file and one consumer-only file: the consumer canary breaks
+    // only the second, and a compile command that skips it is still caught.
+    ic.consumer
+        .push(FileOverlay::new("tests/consumer.rs", RUST_CONSUMER));
+    let runs = check_mechanical(&r, &ic)
+        .await
+        .expect("ran")
+        .expect("passes");
+    assert!(
+        runs.iter()
+            .any(|x| x.against == "canary consumer" && !x.success),
+        "{runs:?}"
+    );
+    ic.compile = s(&[
+        "cargo",
+        "test",
+        "--no-run",
+        "--offline",
+        "--quiet",
+        "--test",
+        "contract",
+    ]);
+    let f = check_mechanical(&r, &ic)
+        .await
+        .expect("ran")
+        .expect_err("a compile command that skips the consumer-only file fails");
+    assert!(
+        f.detail.contains("does not build every consumer file"),
+        "{}",
+        f.detail
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_consumer_expecting_another_signature_fails_stub_compile_naming_the_files() {
     let dir = tempfile::tempdir().expect("dir");

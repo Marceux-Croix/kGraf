@@ -489,6 +489,61 @@ pub fn path_answer<'a>(
     ))
 }
 
+/// The answer to an `instructions` report that asks for a change to a file
+/// another contract of the run owns, and names none of this contract's own
+/// files. Amending this contract's own instruction cannot change that file,
+/// and a worker re-dispatched on it would be told to do what it cannot, so the
+/// worker is answered instead and keeps working. `None`: the report names no
+/// such file, and goes on to [`decide`].
+pub fn instructions_answer<'a>(
+    need: &str,
+    why: &str,
+    contract: &OpenContract,
+    others: impl IntoIterator<Item = &'a OpenContract>,
+) -> Option<String> {
+    let named: Vec<String> = format!("{need} {why}")
+        .split(|c: char| {
+            c.is_whitespace() || matches!(c, '`' | '\'' | '"' | '(' | ')' | ',' | ';' | '<' | '>')
+        })
+        .map(|t| {
+            let t = t.trim_end_matches(['.', ':']);
+            // `path:line:col` names the path.
+            let t = match t.split_once(':') {
+                Some((path, rest)) if rest.starts_with(|c: char| c.is_ascii_digit()) => path,
+                _ => t,
+            };
+            t.trim_start_matches("./").to_owned()
+        })
+        .filter(|t| t.contains('/') || t.contains('.'))
+        .collect();
+    let names = |path: &str| {
+        let path = path.trim_start_matches("./");
+        named
+            .iter()
+            .any(|t| t == path || t.ends_with(&format!("/{path}")))
+    };
+    if contract.writes.iter().any(|w| names(&w.path)) {
+        return None;
+    }
+    let (holder, path) = others
+        .into_iter()
+        .filter(|o| o.contract != contract.contract)
+        .find_map(|o| {
+            o.writes
+                .iter()
+                .find(|w| names(&w.path))
+                .map(|w| (o, &w.path))
+        })?;
+    Some(format!(
+        "Nothing was amended: `{path}` belongs to contract `{}`; do not edit it and do not ask \
+         for it to change. Keep the public shape that `{path}` uses of your items as the \
+         existing code defines it, and change your own files so that it compiles as it is. \
+         Your attempt is judged by its own acceptance check ({}).",
+        holder.contract,
+        quoted_error(contract.acceptance.trim())
+    ))
+}
+
 /// Resolve one shortfall against the contract's record and the user's
 /// permission mode. Pure: nothing the worker wrote can change `authority`.
 /// For a permission report, `need` is the subject [`ground`] found in the
@@ -1704,6 +1759,85 @@ mod tests {
     }
 
     #[test]
+    fn prose_naming_none_of_several_refused_subjects_is_ambiguous_not_a_pick() {
+        let r = record(vec![
+            refused_program("python3", "access"),
+            refused_program("curl", "access"),
+        ]);
+        let Grounding::Ambiguous { answer } =
+            ground(RequestScope::Command, "let me run something please", &r)
+        else {
+            panic!("expected an ambiguous report");
+        };
+        assert!(answer.contains("need must name exactly one"), "{answer}");
+        assert!(
+            answer.contains("python3") && answer.contains("curl"),
+            "{answer}"
+        );
+    }
+
+    #[test]
+    fn a_bypass_only_git_file_is_granted_in_bypass_mode_and_held_in_every_other_mode() {
+        let in_bypass = permission(
+            RequestScope::File,
+            ".gitattributes",
+            &authority(PermissionMode::Bypass, true),
+        );
+        assert!(
+            matches!(&in_bypass, ShortfallDecision::Grant { grant: Grant::Path(p), .. } if p == ".gitattributes"),
+            "{in_bypass:?}"
+        );
+        for mode in [PermissionMode::Auto, PermissionMode::Manual] {
+            let d = permission(RequestScope::File, ".gitattributes", &authority(mode, true));
+            assert!(
+                matches!(&d, ShortfallDecision::Hold { reason } if reason.contains("not writable")),
+                "{d:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_an_earlier_grant_of_the_same_path_in_file_scope_counts_as_already_granted() {
+        let record = |program: &str, scope: RequestScope| GrantRecord {
+            program: program.into(),
+            scope,
+            worker: "w1".into(),
+            why: "x".into(),
+            at_ms: 0,
+            by: "user".into(),
+        };
+        let a = authority(PermissionMode::Manual, true);
+        let decide_file = |c: &OpenContract| {
+            decide(
+                ShortfallKind::Permission,
+                RequestScope::File,
+                "src/new.rs",
+                "needs it",
+                c,
+                &a,
+            )
+        };
+        let mut c = contract();
+        c.grants.push(record("src/new.rs", RequestScope::File));
+        assert!(
+            matches!(&decide_file(&c), ShortfallDecision::Hold { reason } if reason.contains("did not help")),
+            "the same path granted before holds"
+        );
+        let mut c = contract();
+        c.grants.push(record("src/other.rs", RequestScope::File));
+        assert!(
+            matches!(decide_file(&c), ShortfallDecision::AskUser { .. }),
+            "another path granted before does not hold this one"
+        );
+        let mut c = contract();
+        c.grants.push(record("src/new.rs", RequestScope::Command));
+        assert!(
+            matches!(decide_file(&c), ShortfallDecision::AskUser { .. }),
+            "a command grant of the same text is not a path grant"
+        );
+    }
+
+    #[test]
     fn instructions_amend_once_then_hold() {
         let a = authority(PermissionMode::Bypass, true);
         let mut c = contract();
@@ -1800,5 +1934,43 @@ mod tests {
         .expect("old record");
         assert_eq!(g.by, "operator ceiling");
         assert_eq!(g.scope, RequestScope::Command);
+    }
+
+    #[test]
+    fn an_instructions_report_about_a_file_another_contract_owns_is_answered() {
+        let own = contract_writing("c3", &["tax_us/src/lib.rs"]);
+        let owner = contract_writing("c5", &["pricing_engine/src/lib.rs"]);
+        let answer = instructions_answer(
+            "The stub code in pricing_engine/src/lib.rs must be updated to use TaxUs correctly \
+             (e.g. `TaxUs { order: default_order() }`)",
+            "my struct has a field now",
+            &own,
+            [&own, &owner],
+        )
+        .expect("answered");
+        assert!(
+            answer.contains("`pricing_engine/src/lib.rs` belongs to contract `c5`")
+                && answer.contains("Keep the public shape"),
+            "{answer}"
+        );
+    }
+
+    #[test]
+    fn an_instructions_report_is_amended_when_it_names_no_foreign_file_or_its_own() {
+        let own = contract_writing("c3", &["tax_us/src/lib.rs"]);
+        let owner = contract_writing("c5", &["pricing_engine/src/lib.rs"]);
+        let ask = |need: &str| instructions_answer(need, "", &own, [&own, &owner]);
+        assert_eq!(ask("the dataset is missing"), None);
+        assert_eq!(
+            ask("a file nobody owns, other/src/lib.rs, must change"),
+            None
+        );
+        assert_eq!(
+            ask("tax_us/src/lib.rs and pricing_engine/src/lib.rs must change"),
+            None,
+            "a report that names its own file is about its own work"
+        );
+        // `path:line:col` and a trailing period still name the path.
+        assert!(ask("see pricing_engine/src/lib.rs:5:18.").is_some());
     }
 }

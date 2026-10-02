@@ -47,8 +47,10 @@ impl ModeResolver {
     fn grant(&self, paused: &PausedCall, by: &str) -> UserAnswer {
         let call = paused.call();
         let subject = subject_of(&call.tool, &call.input);
+        // Staged: the chain goes on after this answer, and a later hook may
+        // still refuse the call.
         self.control
-            .record_grant(call.worker.as_str(), &subject, by);
+            .stage_grant(call.worker.as_str(), &call.call_id, &subject, by);
         UserAnswer::Allow
     }
 }
@@ -186,6 +188,11 @@ mod tests {
             UserAnswer::Allow
         );
         assert_eq!(asked.load(Ordering::SeqCst), 0);
+        assert!(
+            control.events_since(0).is_empty(),
+            "a grant is recorded when the chain settles the call, not before"
+        );
+        control.settle_call("w1", "c1", None);
         assert!(control.events_since(0).iter().any(|(_, e)| matches!(
             e,
             kgraf_tools::PermissionEvent::Granted { subject, .. } if subject == "`curl`"

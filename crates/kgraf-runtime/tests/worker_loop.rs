@@ -49,6 +49,10 @@ struct Round {
     signature: Option<kgraf_provider::Signature>,
     /// The provider token attached to this round's text part.
     text_signature: Option<kgraf_provider::Signature>,
+    /// The raw finish string the provider's wire carried, when it has one.
+    finish: Option<String>,
+    /// Reasoning text the round returns, ahead of its text.
+    reasoning: String,
 }
 
 impl Round {
@@ -91,6 +95,8 @@ struct Fake {
     script: Box<Script>,
     requests: Mutex<Vec<Request>>,
     streams: bool,
+    /// What `Provider::resends_reasoning` answers.
+    resends_reasoning: bool,
 }
 
 impl Fake {
@@ -99,6 +105,17 @@ impl Fake {
             script: Box::new(script),
             requests: Mutex::new(Vec::new()),
             streams,
+            resends_reasoning: false,
+        })
+    }
+
+    /// A provider that declares it sends reasoning back in the next request.
+    fn resending(script: impl Fn(&Request) -> Round + Send + Sync + 'static) -> Arc<Self> {
+        Arc::new(Self {
+            script: Box::new(script),
+            requests: Mutex::new(Vec::new()),
+            streams: false,
+            resends_reasoning: true,
         })
     }
 
@@ -113,11 +130,17 @@ impl Fake {
 }
 
 fn response(request: &Request, round: &Round) -> Response {
-    let mut content = vec![Content::Text {
+    let mut content = Vec::new();
+    if !round.reasoning.is_empty() {
+        content.push(Content::Reasoning {
+            text: round.reasoning.clone(),
+        });
+    }
+    content.push(Content::Text {
         text: round.text.clone(),
         cache_breakpoint: false,
         signature: round.text_signature.clone(),
-    }];
+    });
     for (id, name, input) in &round.calls {
         content.push(Content::ToolUse {
             id: id.clone(),
@@ -127,6 +150,7 @@ fn response(request: &Request, round: &Round) -> Response {
         });
     }
     Response {
+        finish_reason: round.finish.clone(),
         model: request.model.clone(),
         content,
         stop_reason: round.stop.unwrap_or(StopReason::EndTurn),
@@ -143,6 +167,10 @@ impl Provider for Fake {
 
     fn protocol(&self) -> Protocol {
         Protocol::Additive
+    }
+
+    fn resends_reasoning(&self) -> bool {
+        self.resends_reasoning
     }
 
     async fn complete(
@@ -526,6 +554,80 @@ async fn every_round_is_traced_in_the_ledger() {
     assert!(env.ledger.verify().expect("verify").ok);
 }
 
+/// Each round's `Stop` records the provider's normalized stop reason and,
+/// where the adapter read one, the raw finish string; the result carries the
+/// last stop and the tool-call count. A transcript line written before the
+/// field existed still parses.
+#[tokio::test]
+async fn a_stop_records_the_raw_finish_string_and_the_result_the_last_stop() {
+    let worktree = tempfile::tempdir().expect("worktree");
+    let provider = Fake::new(true, |request| match round_of(request) {
+        0 => Round {
+            finish: Some("tool_calls".into()),
+            ..Round::tool(vec![
+                ("t1", "write_file", json!({"path": "a.txt", "content": "a"})),
+                ("t2", "write_file", json!({"path": "b.txt", "content": "b"})),
+            ])
+        },
+        _ => Round {
+            finish: Some("stop".into()),
+            ..Round::answer("done")
+        },
+    });
+    let env = Arc::new(env_with(
+        provider,
+        vec![Arc::new(WriteFile)],
+        CallMode::Stream,
+    ));
+    let handle = spawn_worker(
+        env,
+        brief("w1", "write two files", worktree.path(), 6),
+        SpawnOptions::default(),
+    )
+    .await
+    .expect("spawn");
+    let (events, result) = with_timeout(drain(handle)).await.expect("in time");
+    assert_eq!(result.outcome, WorkerOutcome::Completed);
+    let stops: Vec<(StopReason, Option<String>)> = events
+        .iter()
+        .filter_map(|e| match e {
+            WorkerEvent::Stop {
+                reason,
+                finish_reason,
+            } => Some((*reason, finish_reason.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        stops,
+        vec![
+            (StopReason::ToolUse, Some("tool_calls".to_owned())),
+            (StopReason::EndTurn, Some("stop".to_owned())),
+        ]
+    );
+    assert_eq!(result.last_stop, Some(StopReason::EndTurn));
+    assert_eq!(result.tool_calls, 2);
+
+    // The written line names the field; an older line without it parses.
+    let stop_line = serde_json::to_value(WorkerEvent::Stop {
+        reason: StopReason::EndTurn,
+        finish_reason: Some("stop".into()),
+    })
+    .expect("write");
+    assert_eq!(stop_line["type"], "stop");
+    assert_eq!(stop_line["reason"], "end_turn");
+    assert_eq!(stop_line["finish_reason"], "stop");
+    let old: WorkerEvent =
+        serde_json::from_str(r#"{"type":"stop","reason":"tool_use"}"#).expect("old line");
+    assert_eq!(
+        old,
+        WorkerEvent::Stop {
+            reason: StopReason::ToolUse,
+            finish_reason: None
+        }
+    );
+}
+
 /// A provider that pauses the turn for a server-side tool (Anthropic's
 /// `pause_turn`) is a loud failure: the rebuilt transcript would drop the
 /// server tool's blocks. The paused round is still billed, and no second
@@ -573,7 +675,8 @@ async fn a_paused_turn_fails_loud_instead_of_resending_a_damaged_turn() {
         !events.iter().any(|e| matches!(
             e,
             WorkerEvent::Stop {
-                reason: StopReason::PauseTurn
+                reason: StopReason::PauseTurn,
+                ..
             }
         )),
         "no paused Stop is recorded"
@@ -1291,6 +1394,7 @@ async fn a_repeated_identical_call_ends_the_run_as_a_stall() {
         WorkerOutcome::Stalled {
             repeats,
             call_digest,
+            ..
         } => {
             assert_eq!(repeats, 3);
             assert_eq!(
@@ -1355,6 +1459,73 @@ async fn the_worker_hands_back_at_the_configured_point_and_moving_the_point_move
         assert!(!handoff.done.is_empty());
         assert!(!handoff.files_touched.is_empty());
     }
+}
+
+/// A thinking model on a route that reports no reasoning split: each round's
+/// 9,000 output tokens are almost all reasoning (36,000 bytes of it), and the
+/// prompt stays at 6,000 tokens. The stop point is 12,000 tokens.
+async fn thinking_rounds(provider: Arc<Fake>) -> WorkerResult {
+    let dir = tempfile::tempdir().expect("dir");
+    let env = Arc::new(env_with(
+        provider,
+        vec![Arc::new(WriteFile)],
+        CallMode::Complete,
+    ));
+    let mut b = brief("w1", "think", dir.path(), 50);
+    b.context = ContextConfig::for_model(100_000)
+        .and_then(|c| c.with_point(12, PointSource::User))
+        .expect("config");
+    let handle = spawn_worker(env, b, SpawnOptions::default())
+        .await
+        .expect("spawn");
+    let (_, result) = with_timeout(drain(handle)).await.expect("in time");
+    result
+}
+
+fn thinking_script(request: &Request) -> Round {
+    let n = round_of(request) as u64 + 1;
+    if n > 4 {
+        return Round::answer("done");
+    }
+    let id: &'static str = format!("t{n}").leak();
+    let mut round = Round::tool(vec![(
+        id,
+        "write_file",
+        json!({"path": format!("f{n}.txt"), "content": "x"}),
+    )]);
+    round.reasoning = "a".repeat(36_000);
+    round.usage = usage(6_000, 9_000);
+    round
+}
+
+#[tokio::test]
+async fn reasoning_a_route_does_not_resend_does_not_move_the_stop_point() {
+    // 6,000 prompt + 9,000 output is 15,000 against a 12,000 stop, but 7,200 or
+    // more of that output is reasoning no later request carries.
+    let result = thinking_rounds(Fake::new(false, thinking_script)).await;
+    assert!(
+        matches!(result.outcome, WorkerOutcome::Completed),
+        "a worker below the stop point finishes: {:?}",
+        result.outcome
+    );
+    assert_eq!(result.steps, 5);
+    // The trace's peak is the figure the stop check read: above the prompt the
+    // provider billed, below the point, and below what counting the reasoning
+    // would have read.
+    assert!(result.peak_context_tokens >= 7_800, "{result:?}");
+    assert!(result.peak_context_tokens < 12_000, "{result:?}");
+}
+
+#[tokio::test]
+async fn reasoning_a_route_resends_still_counts_toward_the_stop_point() {
+    let result = thinking_rounds(Fake::resending(thinking_script)).await;
+    let WorkerOutcome::HandedBack { handoff } = result.outcome.clone() else {
+        panic!("expected a handback, got {:?}", result.outcome);
+    };
+    assert!(handoff.context_tokens >= 15_000, "{handoff:?}");
+    assert_eq!(result.steps, 1);
+    // The peak is the measured value at the check that stopped the worker.
+    assert_eq!(result.peak_context_tokens, handoff.context_tokens);
 }
 
 #[tokio::test]

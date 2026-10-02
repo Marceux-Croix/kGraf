@@ -1917,6 +1917,8 @@ impl RunLoop {
                 calls: d.result.calls.iter().map(|c| c.to_string()).collect(),
                 spend_micros: spend.micros(),
                 error: outcome_error(&d.result.outcome),
+                last_stop: d.result.last_stop,
+                tool_calls: d.result.tool_calls,
             })
             .await;
         if let Err(e) = traced {

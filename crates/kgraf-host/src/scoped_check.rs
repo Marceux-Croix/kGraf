@@ -223,8 +223,10 @@ pub(crate) fn brief(scope: &Scope, whole: &str) -> Option<String> {
     let Scope::Narrowed { parts, selected } = scope else {
         return Some(format!(
             "\n\nYour attempt is accepted when `{whole}` passes in your worktree. The \
-             Acceptance line of your contract is advisory. Failures in other contracts' \
-             unfinished code (stubs such as `todo!()`) are not yours to fix."
+             Acceptance line of your contract is advisory. `todo!()` panics or failing tests \
+             in other contracts' unfinished code are not yours to fix; a compile error \
+             anywhere that your change caused (for example by changing a public type's \
+             shape) is yours."
         ));
     };
     Some(format!(
@@ -904,6 +906,17 @@ mod tests {
         .expect("a whole check is stated too");
         assert!(text.contains("`cargo build --workspace` passes"), "{text}");
         assert!(text.contains("advisory"), "{text}");
-        assert!(text.contains("not yours to fix"), "{text}");
+        assert!(
+            text.contains(
+                "`todo!()` panics or failing tests in other contracts' unfinished code are \
+                 not yours to fix; a compile error anywhere that your change caused (for \
+                 example by changing a public type's shape) is yours."
+            ),
+            "{text}"
+        );
+        assert!(
+            !text.contains("Failures in other contracts"),
+            "a blanket exemption for other contracts' failures must not return: {text}"
+        );
     }
 }

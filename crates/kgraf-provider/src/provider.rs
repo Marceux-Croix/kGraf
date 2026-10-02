@@ -216,6 +216,19 @@ pub trait Provider: Send + Sync {
     fn capabilities(&self) -> crate::capability::Capabilities<'_> {
         crate::capability::Capabilities::none()
     }
+
+    /// Whether this adapter sends a message's [`crate::Content::Reasoning`] back
+    /// to the model in the next request.
+    ///
+    /// The caller sizes the next prompt from this: reasoning output counts toward
+    /// it only where it is resent. The default is `false`, the shape of every
+    /// adapter here (Chat Completions, Responses, Messages, Gemini and Converse
+    /// all drop the reasoning part when they serialize a request). An adapter
+    /// that serializes it, as extended thinking with signed blocks requires in a
+    /// tool loop, must override this to `true`.
+    fn resends_reasoning(&self) -> bool {
+        false
+    }
 }
 
 /// Assert the response model is the requested model.

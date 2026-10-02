@@ -64,7 +64,7 @@ mod worktree;
 
 pub use bridge::{StreamPump, StreamSink, stream_bridge};
 pub use brief::{
-    BriefError, Handoff, MIN_STEP_BUDGET, RATIONALE_WORD_CAP, Rationale, WorkerBrief,
+    BriefError, Handoff, HandoffCause, MIN_STEP_BUDGET, RATIONALE_WORD_CAP, Rationale, WorkerBrief,
     WorkerOutcome, WorkerResult, parse_rationale,
 };
 pub use compaction::{

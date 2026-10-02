@@ -166,6 +166,7 @@ mod tests {
                 signature: Some(signature.clone()),
             },
             WorkerEvent::Stop {
+                finish_reason: None,
                 reason: StopReason::EndTurn,
             },
         ];
@@ -195,6 +196,7 @@ mod tests {
             usage(),
             message.clone(),
             WorkerEvent::Stop {
+                finish_reason: None,
                 reason: StopReason::EndTurn,
             },
         ];
@@ -205,6 +207,7 @@ mod tests {
                 usage(),
                 message,
                 WorkerEvent::Stop {
+                    finish_reason: None,
                     reason: StopReason::EndTurn
                 }
             ]

@@ -880,6 +880,7 @@ impl GeminiAdapter {
             .get("candidates")
             .and_then(|c| c.as_array())
             .and_then(|c| c.first());
+        let mut raw_finish: Option<String> = None;
         let finish = match candidate {
             Some(candidate) => {
                 if let Some(parts) = candidate
@@ -895,6 +896,7 @@ impl GeminiAdapter {
                     .get("finishReason")
                     .and_then(|r| r.as_str())
                     .ok_or_else(|| self.decode("the candidate has no `finishReason`"))?;
+                raw_finish = Some(reason.to_owned());
                 classify_finish(reason, acc.tool_calls)
             }
             None => match body
@@ -912,6 +914,7 @@ impl GeminiAdapter {
         };
         Ok(Parsed {
             response: Response {
+                finish_reason: raw_finish,
                 model: returned.to_owned(),
                 content: acc.content,
                 stop_reason,
@@ -1541,6 +1544,7 @@ impl Streaming for GeminiAdapter {
         let Some(raw) = usage_raw else {
             return Err(ProviderError::UsageMissing { adapter: self.name });
         };
+        let raw_finish = finish_reason.clone();
         let finish = match (finish_reason, prompt_block) {
             (Some(reason), _) => classify_finish(&reason, acc.tool_calls),
             (None, Some(reason)) => Finish::Unusable(format!("prompt blocked: {reason}")),
@@ -1560,6 +1564,7 @@ impl Streaming for GeminiAdapter {
         let stop_reason = self.finish_error(finish)?;
         sink(StreamEvent::Finished { stop_reason });
         Ok(Response {
+            finish_reason: raw_finish,
             model,
             content: acc.content,
             stop_reason,

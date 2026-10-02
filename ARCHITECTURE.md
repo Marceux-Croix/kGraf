@@ -423,6 +423,30 @@ A second overflow hands back; at the cap the contract is held with its
 worktree and its transcript named. `/compact <worker>` compacts a running
 worker at its next boundary, once.
 
+Two cases do not hand back. A worker that reaches the stop point with nothing written would give
+its child the same whole task, so the runtime compacts it once instead (any policy), and after
+that it goes on while its measured context is under the model's window. A hand-back is decided
+only from measured context (the last reported usage plus the estimate of what was added since,
+and the queued steering messages; reasoning output counts only where the route resends it, which
+no adapter does, so a thinking model's reasoning is not in the measure of the next prompt); `Handoff::cause` and the trace's `compaction` record say
+which (`measured_context` or `queued_messages`). There is no projection and no model-requested
+hand-back.
+
+**A turn that only announces work is not a completion.** When an attempt would end as completed
+with no tool call in the whole attempt and its contract declares writes, the runtime drops the
+turn, counts the round, sends one notice (`NoticeKind::NoChange`) and continues; a second such
+end fails the attempt with the contract's write paths named.
+
+**A retry carries what stopped the last attempt.** The stop note (`OpenContract::last_stop`)
+holds the repeated call of a stall, a spent budget or a named failure, with the calls a policy
+refused and no later call got past. The retry brief quotes it as data in the same tag as a
+verifier refusal.
+
+**A permission event states the final decision.** A mode's grant is staged at the hook that
+makes it and recorded when the approval chain settles the call (`PermissionControl::settle_call`):
+`granted` when the call runs, one `grant_refused` event (subject, mode, refusing hook, reason)
+when a later hook refused it.
+
 **Tools come from three places:**
 
 - kGraf's own graph and file tools.
@@ -451,6 +475,31 @@ round back for an answer. Every call's trace records what it was given as
 slice ids plus the prefix hash. **Not built yet:** deferring rarely used
 tools behind a search tool, and an optional intent argument on each tool call
 that labels the action on the graph at no extra model call.
+
+**Trace and transcript fields a test can read.** The `dispatch` trace event has `brief_digest`
+(the blake3 hex digest of the instruction the first attempt's worker opens with, before its
+slices) and `brief_digests` (the same digest per attempt, keyed by worker id), so a test can tell
+whether a retry carried new text: equal digests mean equal briefs. The `worker_finished` event has
+`last_stop` (the normalized stop reason of the attempt's last model round that ended on its own:
+`end_turn`, `tool_use`, `max_tokens`, `stop_sequence`, `pause_turn` or `other`; absent when no
+round ended) and `tool_calls` (tool calls the attempt started, this run segment). A worker
+transcript `stop` event is `{"type":"stop","reason":"end_turn","finish_reason":"stop"}`, where
+`finish_reason` is the provider's own finish string as its wire carried it (`Response::finish_reason`,
+set by the Chat Completions, Responses, Anthropic, Bedrock and Gemini adapters) and is absent where
+the adapter reads none. Every field is serde-defaulted, so an older trace or transcript still loads.
+
+The `plan_accepted` trace event is written once when a plan is accepted for dispatch, after intake
+normalization and any re-asks, and again for each re-plan under the next `revision` (1 for the
+first plan). It carries `contracts` (`id`, `instruction` in full as it is dispatched, `acceptance`,
+`writes` as paths, `depends_on`, `route` when the plan pinned one, `task_kind` when set),
+`interfaces` (`id`, `parties`, `symbols`; empty when the plan has none) and `notices` raised while
+the plan was taken in (repairs, the unit-struct shape notice, "contract checks did not run", re-ask
+reasons). Trace lines have no size cap, so the instruction is not shortened. A check can read the
+plan from this event without a recording of the planner's answer. The `dispatch` event also has
+`base_commit` (the integration branch tip the attempts' worktrees start from, or the commit a
+remediation names) and `base_commits` (the same, keyed by worker id); both are absent when the
+workspace provider has no integration branch. A resume that interrupts planning can write one
+revision twice with the same content. Old traces without these fields still load.
 
 **Built:** `ask_user_question`. The orchestrator first tries to answer from
 the run record in one reserved, accounted call; the user is asked only when
@@ -579,7 +628,10 @@ interface the run was given), and the run would end on that hold, the whole
 plan goes back to the planner once with the checks' failures, a handshake's
 included (decision 0031, amended). The re-plan is one ask, taken as it is,
 under ids of its own (`re1.`); a hold on it ends the run, so the top-level
-plan is asked for at most four times. A contract test may not replace a
+plan is asked for at most four times. A plan in which a contract depends on another and that
+holds no interface is also sent back, once, naming the consuming and consumed contracts; if the
+answer still holds none, the plan is taken and a notice (output and trace) says contract checks
+did not run for those contracts (decision 0030, amended). A contract test may not replace a
 file the project already tracks, and the stub, consumer and test files may
 not name one path with different content. In the handshake, a provision
 counts only from a party that writes the symbol's stub file; a shared touch
@@ -588,6 +640,8 @@ interface's own files state is not a disagreement with a silent provider; a
 negated expectation is compared with a provision only when it names the
 providing party or names no party, so an assumption about a third party is
 not read as the provider's opposite (decision 0078, amended). A sentence bound to no surface symbol is recorded as a warning and holds nothing. Each statement names its party's route and the model that stated it, each check event names every party's route and model, and the run record keeps every hold a check placed with the same parties (`check_holds`), so a hold is attributable to a model pair (0078 amendment).
+
+The planner is told the project's names and not left to invent them (decision 0030, amended). Every decomposition prompt carries a section of at most 8 KB: the package names from the manifests (`Cargo.toml` package and workspace members, `package.json`, `pyproject.toml`; the first 3 KB), then the signatures, from the code graph, of the files and symbols the instruction names (a trait, struct, enum or class as its declaration, at most 1.5 KB each). What does not fit is cut with a count and a notice. A named file the graph holds no signature for is included as text up to the cap, with a notice. A template slot such as `<crate_name>` in an interface file or command is refused at intake with the slot named, and the planner is asked again. A re-plan quotes the held plan's failures (stage, command, stderr tail), and the re-planned contracts' briefs carry them as a quoted data block. The consumer canary breaks only consumer files that no tests file shares a path with; a shared file is broken by the test canary.
 
 ### Message bus
 
@@ -910,7 +964,8 @@ files by the runner's naming convention, and the brief names that command.
 The whole command is added as a root gate when it is not one already, so it
 judges the merged result. Anything else runs whole, as do gate remediations; the brief then still names the whole
 command as what the attempt is judged by, calls the contract's Acceptance line advisory,
-and says failures in other contracts' unfinished code are not the worker's to fix.
+and says `todo!()` panics and failing tests in other contracts' unfinished code are not the
+worker's to fix, while a compile error anywhere that the worker's change caused is its own.
 An attempt that changed none of its declared files is refused whatever its
 check says.
 
@@ -1102,6 +1157,7 @@ crate and the orchestrator.
 | `kgraf-diag` | local-only usage counts and errors, and the error glossary |
 | `kgraf-bench-briefs` | a per-model brief-following bench: fixed small briefs, mechanically checked (decision 0075) |
 | `kgraf-tbench-bridge` | benchmark-only: routes a worker's shell commands into a Terminal-Bench task container; not part of the shipped app |
+| `kgraf-soak` | dev-only soak driver: many runs on one `Host` in one process, one JSON line of process resources per run; never published or packaged |
 
 ## Data flow
 
@@ -1228,7 +1284,9 @@ twice, each ask on the ledger. A run that ends blocked or stopped makes the
 command exit non-zero.
 
 **User interrupt.** The input box is always live. The user can stop the run,
-which cancels every worker mid-stream and leaves the record resumable; send
+which cancels every worker mid-stream, ends a planner call in flight, and leaves the
+record resumable (a SIGINT or SIGTERM to `kgraf orchestrate` sends the same stop, then
+prints the report, names each kept worktree and exits 128 plus the signal; decision 0056); send
 a note, which is persisted and read by the next orchestrator call; set the
 order of pending work; and answer approvals and gates. As the exception
 route, the user can also address one session directly: send it a note or

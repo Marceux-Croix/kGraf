@@ -556,3 +556,23 @@ Evidence: `kgraf-tools` (`permissions.rs`: `a_grant_meets_the_rule_its_calls_wou
 `kgraf-orchestrator` (`shortfall.rs`: `an_ask_rule_blocks_a_bypass_grant`, which also checks a
 deny rule under Bypass, Orchestrator decides and Auto with the program in the allow set), and
 `kgraf-host` (`shortfall_tests.rs`: `bypass_still_honors_a_deny_rule_through_a_hosted_run`).
+
+## Amendment (2026-10-01): a permission event states the final decision
+
+The trace said `granted python3 to <worker> (Bypass, by mode)` for a worker whose every
+`python3` call the user's deny rule `shell(python3*)` refused. The mode's grant was recorded at
+the shell policy hook, before the rules hook (last in the chain) refused the call.
+
+- The shell policy hook and the mode resolver now stage a mode's grant for the call
+  (`PermissionControl::stage_grant`, keyed by worker and call id) instead of recording it.
+- The approval chain settles the call at its final verdict (`ApprovalChain::with_permissions`,
+  `PermissionControl::settle_call`): a call that runs records the grant as before (once per
+  worker, subject and mode); a call refused by a later hook records one
+  `PermissionEvent::GrantRefused` (worker, subject, mode, who granted, refusing hook, reason),
+  once per worker, subject, hook and reason. The run trace names it `grant_refused`.
+- A call that is still waiting on an ask settles when the answer arrives.
+
+Evidence: `kgraf-tools/src/approval.rs` tests
+(`a_grant_a_later_deny_rule_refuses_is_traced_as_refused_and_never_as_granted`,
+`a_grant_the_chain_lets_run_is_recorded_as_granted`,
+`the_shell_hook_stages_a_mode_grant_and_does_not_record_it`).

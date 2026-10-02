@@ -182,3 +182,55 @@ keeps its own text. A gate remediation gets no such text: it fixes what the merg
 failed, so sibling failures there are its work. Tests: `scoped_check`
 `a_whole_check_brief_names_the_command_and_calls_acceptance_advisory`, `kgraf-host`
 `a_remediation_is_checked_with_the_whole_command`.
+
+## Amendment (2026-10-01): a compile error the worker caused is the worker's, and a retry is amended once
+
+A live local-model run on a scaffolded workspace showed two faults. The planner's instruction
+turned a unit struct (`pub struct FlatDiscount;`) into a struct with a field, and existing code
+constructed it as a value. The compile error appeared in another contract's file. The retry worker
+read the brief's sentence about other contracts' unfinished code as covering that error and left it,
+and the orchestrator sent the same instruction again with the same result.
+
+- **Brief wording.** The sentence is now: "`todo!()` panics or failing tests in other contracts'
+  unfinished code are not yours to fix; a compile error anywhere that your change caused (for
+  example by changing a public type's shape) is yours." The advisory-acceptance sentence is
+  unchanged.
+- **A retry is amended once.** When the verifier's refusal holds a compile error (the
+  `error[...]` line followed by `--> file:line` form) and every located error is in a file the
+  contract does not write, the contract gets one amendment: it quotes the error and says "The error
+  is in `<file>`, which uses `<symbol>` as the existing code defines it; keep the public shape that
+  existing callers use." The amendment is stored on the contract (`outside_error_note`), quoted as
+  data in every later attempt's brief, traced as a notice, and set at most once per contract. A
+  failing test, a panic, a warning, or any error inside the contract's own files does not
+  amend. Only the compiler's `-->` location form is read; other toolchains' errors take the
+  ordinary retry.
+- **Plan intake.** The planner is told that existing public items are the interface and that an
+  instruction must not change the shape of a public type or a trait signature unless the user
+  asked. An instruction that writes a type with fields where a declared file defines it as a unit
+  struct is noticed (a token scan of the declared files, not a parser; a notice, not a refusal).
+
+Tests: `kgraf-host` `scoped_check` `a_whole_check_brief_names_the_command_and_calls_acceptance_advisory`;
+`kgraf-orchestrator` `outside_error` unit tests and `tests/shape_guard.rs` (the retry's brief carries
+the amendment; once per contract however often it fails; the unit-struct notice).
+
+## Amendment (2026-10-01): a retry carries what stopped the last attempt
+
+A retry after a stall was dispatched with the same first prompt as the stalled attempt: a
+user deny rule had refused `python3`, the worker then re-read one file until the stall
+detector ended it, and the next attempt knew neither. Only a verifier's refusal was carried.
+
+- `OpenContract::last_stop` holds, for the last failed round's attempts that no verifier saw:
+  a stall's repeated call (`tool input`, cut at 300 characters), a spent step budget, or a
+  runtime failure's reason, each with the calls a policy refused that no later call of the same
+  capability got past (capability, tool, refusing hook, reason). It is scrubbed for storage and
+  capped like `last_refusal`.
+- The next fresh attempt's brief quotes it as data in the `verifier_refusal` tag, after a
+  sentence that says the attempt ended before verification, not to repeat the call, and to call
+  `report_shortfall` when a refusal blocks the work.
+- A worker that ends an attempt with no tool call although its contract writes files is told
+  once and then fails with a named reason (decision 0096, progress checkpoints); that reason
+  is carried the same way.
+
+Evidence: `kgraf-orchestrator/src/orchestrator.rs` (unit tests on the stop note and the brief)
+and `kgraf-orchestrator/tests/retry_brief_stop.rs` (a real worker loop stalls; the next
+attempt's opening message carries the repeated call).

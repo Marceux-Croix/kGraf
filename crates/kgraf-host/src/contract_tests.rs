@@ -229,6 +229,7 @@ impl Provider for FakeModel {
         };
         token.settle(&usage, None)?;
         Ok(Response {
+            finish_reason: None,
             model: request.model.clone(),
             content,
             stop_reason: if tool_use {
@@ -701,9 +702,12 @@ async fn runs_with_different_tool_lists_share_a_route_in_one_process() {
             .expect("run");
         (outcome.report.status, notices)
     }
-    let (first, _) = one(true, "seq-on").await;
+    // Each run's future is boxed: unboxed, the test thread (2 MiB) holds
+    // both inline, which a debug build's unoptimized state machines overflow
+    // on Linux. An optimized build needs under 512 KiB for the same path.
+    let (first, _) = Box::pin(one(true, "seq-on")).await;
     assert_eq!(first, RunStatus::Completed);
-    let (second, notices) = one(false, "seq-off").await;
+    let (second, notices) = Box::pin(one(false, "seq-off")).await;
     assert_eq!(
         second,
         RunStatus::Completed,
@@ -716,7 +720,10 @@ async fn runs_with_different_tool_lists_share_a_route_in_one_process() {
         )),
         "{notices:?}"
     );
-    let (a, b) = tokio::join!(one(true, "con-on"), one(false, "con-off"));
+    let (a, b) = tokio::join!(
+        Box::pin(one(true, "con-on")),
+        Box::pin(one(false, "con-off"))
+    );
     assert_eq!(a.0, RunStatus::Completed);
     assert_eq!(b.0, RunStatus::Completed);
 }

@@ -181,13 +181,23 @@ async fn with_no_other_route_the_contract_waits_for_probes_then_is_held_with_the
         matches!(report.status, RunStatus::Blocked { .. }),
         "{report:?}"
     );
-    assert_eq!(
-        down.calls.load(Ordering::SeqCst),
-        3,
-        "probed after each cooldown, held after the third fault in a row"
+    // The hold is decided when the contract is next considered, and only
+    // while the route is still out. The third fault's cooldown (4x the base,
+    // 80 ms here) can end first on a loaded machine, and then the next
+    // dispatch is one more probe, which faults and is held after. So the
+    // number of probes is "at least the hold threshold", not exactly it. What
+    // holds on any timing is that the hold waits for the threshold and that
+    // the reason counts exactly the probes that were made.
+    let calls = down.calls.load(Ordering::SeqCst);
+    assert!(
+        calls >= 3,
+        "held before the third fault in a row: {calls} probe(s)"
     );
     let (_, reason) = report.held.first().expect("held");
     assert!(reason.contains("route `down`"), "{reason}");
-    assert!(reason.contains("3 times in a row"), "{reason}");
+    assert!(
+        reason.contains(&format!("{calls} times in a row")),
+        "the reason counts the {calls} probes made: {reason}"
+    );
     assert!(reason.contains("transport"), "{reason}");
 }

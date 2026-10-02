@@ -101,6 +101,7 @@ impl Provider for Model {
             });
         }
         Ok(Response {
+            finish_reason: None,
             model: request.model.clone(),
             content,
             stop_reason: if turn.calls.is_empty() {

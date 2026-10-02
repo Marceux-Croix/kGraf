@@ -260,6 +260,10 @@ async fn concurrent_dispatches_each_settle_into_the_runs_accounted_spend() {
         |_| SERVES.into(),
         Duration::from_millis(40),
     );
+    // Each first request waits until both are in flight, so "both run at
+    // once" is forced by the fixture, not by a sleep outlasting the gap
+    // between the two dispatches.
+    p.stats.rendezvous_parties.store(2, Ordering::SeqCst);
     let report = Orchestrator::new(config(), p.services(WINDOW))
         .expect("o")
         .start(RunId::new("r1"), "two parts".into())
@@ -267,7 +271,7 @@ async fn concurrent_dispatches_each_settle_into_the_runs_accounted_spend() {
         .expect("run");
     assert_eq!(report.status, RunStatus::Completed, "{report:?}");
     assert!(
-        p.stats.overlapped("make a", "make b"),
+        p.stats.max_in_flight.load(Ordering::SeqCst) >= 2,
         "both dispatch at once"
     );
     let prices = prices();
@@ -440,14 +444,32 @@ async fn a_handoff_is_re_split_into_a_child_that_continues_in_the_parents_worktr
     assert!(trace.iter().any(
         |e| matches!(e, TraceEvent::Compaction { context_tokens, .. } if *context_tokens >= 9_000)
     ));
+    // The trace says why the worker handed back: measured context, never a
+    // projection.
     assert!(trace.iter().any(|e| matches!(
         e,
-        TraceEvent::WorkerFinished {
-            sizing_miss: true,
-            peak_context_tokens: 9_000,
-            ..
-        }
+        TraceEvent::Compaction { cause, .. } if cause == "measured_context"
     )));
+    // The peak is the measure the stop check read, the same figure the
+    // compaction event reports: input plus the output the next request carries.
+    let measured = trace
+        .iter()
+        .find_map(|e| match e {
+            TraceEvent::Compaction { context_tokens, .. } => Some(*context_tokens),
+            _ => None,
+        })
+        .expect("a compaction event");
+    assert!(
+        trace.iter().any(|e| matches!(
+            e,
+            TraceEvent::WorkerFinished {
+                sizing_miss: true,
+                peak_context_tokens,
+                ..
+            } if *peak_context_tokens == measured && measured >= 9_000
+        )),
+        "{trace:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -812,13 +834,17 @@ async fn empty_graph_lookups_and_spend_are_traced() {
         spends.last() > spends.first(),
         "spend grows as work settles"
     );
-    assert!(trace.iter().any(|e| matches!(
-        e,
-        TraceEvent::WorkerFinished {
-            peak_context_tokens: 100,
-            ..
-        }
-    )));
+    // At least the prompt the provider billed (100), plus the round's output.
+    assert!(
+        trace.iter().any(|e| matches!(
+            e,
+            TraceEvent::WorkerFinished {
+                peak_context_tokens: 100..=200,
+                ..
+            }
+        )),
+        "{trace:?}"
+    );
 }
 
 /// A planner that answers badly once is asked again with the refusal as a
@@ -1193,4 +1219,61 @@ async fn a_plan_naming_a_tool_no_route_offers_is_refused_at_intake_not_held_at_d
         .await
         .expect("run");
     assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+}
+
+/// The planner's prompt carries the package name from the workspace manifest
+/// and the real signature of the trait the instruction names, read from the
+/// indexed graph: the planner is not left to invent either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_planner_prompt_carries_the_crate_name_and_the_trait_signature() {
+    let dir = tempfile::tempdir().expect("dir");
+    std::fs::create_dir_all(dir.path().join("src")).expect("mkdir");
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"fx-impl-counter\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("manifest");
+    std::fs::write(
+        dir.path().join("src/lib.rs"),
+        "pub trait Pricing {\n    fn discount_cents(&self, subtotal: u64, code: &str) -> u64;\n}\n",
+    )
+    .expect("source");
+    let good = plan_json(&[c("a", "implement Pricing", "src/a.rs", &[])]);
+    let asked = Arc::new(Mutex::new(Vec::<String>::new()));
+    let seen = asked.clone();
+    let p = Parts::open(
+        dir.path(),
+        move |prompt| {
+            seen.lock().expect("lock").push(prompt.to_owned());
+            good.clone()
+        },
+        |_| SERVES.into(),
+        Duration::from_millis(5),
+    );
+    {
+        let g = p.graph.lock().expect("lock");
+        kgraf_graph::Indexer::new(&g).index().expect("index");
+    }
+    let o = Orchestrator::new(config(), p.services(WINDOW)).expect("orchestrator");
+    let report = o
+        .start(RunId::new("r1"), "implement `Pricing` for a counter".into())
+        .await
+        .expect("run");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    let asked = asked.lock().expect("lock");
+    assert!(
+        asked[0].contains("package `fx-impl-counter`"),
+        "{}",
+        asked[0]
+    );
+    assert!(
+        asked[0].contains("import name `fx_impl_counter`"),
+        "{}",
+        asked[0]
+    );
+    assert!(
+        asked[0].contains("fn discount_cents(&self, subtotal: u64, code: &str) -> u64"),
+        "{}",
+        asked[0]
+    );
 }

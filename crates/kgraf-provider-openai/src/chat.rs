@@ -1019,11 +1019,13 @@ impl ChatCompletionsAdapter {
             }
         }
 
-        let stop_reason = match choice.get("finish_reason").and_then(|f| f.as_str()) {
+        let raw_finish = choice.get("finish_reason").and_then(|f| f.as_str());
+        let stop_reason = match raw_finish {
             Some(reason) => stop_reason_for(reason, content.iter().any(is_tool_use)),
             None => StopReason::Other,
         };
         Ok(Response {
+            finish_reason: raw_finish.map(str::to_owned),
             model: returned_model.to_owned(),
             content,
             stop_reason,
@@ -1337,6 +1339,7 @@ impl Streaming for ChatCompletionsAdapter {
         let mut id_from_chunk = false;
         let expected_model = self.echo_target(&request.model)?.to_owned();
         let mut stop_reason = StopReason::Other;
+        let mut raw_finish: Option<String> = None;
         let mut stream_request_id = request_id.clone();
         let mut text = String::new();
         let mut reasoning_text = String::new();
@@ -1610,6 +1613,7 @@ impl Streaming for ChatCompletionsAdapter {
                     .filter(|r| !r.is_empty())
                 {
                     saw_finish_reason = true;
+                    raw_finish = Some(reason.to_owned());
                     stop_reason = stop_reason_for(reason, !tool_calls.is_empty());
                 }
             }
@@ -1692,6 +1696,7 @@ impl Streaming for ChatCompletionsAdapter {
             });
         }
         Ok(Response {
+            finish_reason: raw_finish,
             model,
             content,
             stop_reason,
@@ -2533,6 +2538,7 @@ mod tests {
             .await
             .expect("complete");
         assert_eq!(response.stop_reason, StopReason::ToolUse);
+        assert_eq!(response.finish_reason.as_deref(), Some("tool_calls"));
         let calls = response.tool_uses();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].1, "read_file");
@@ -2578,6 +2584,29 @@ mod tests {
             .parse_response("compatible-model", &body)
             .expect("parse");
         assert_eq!(response.tool_uses()[0].2, &json!({}));
+    }
+
+    #[test]
+    fn reasoning_is_not_serialized_into_the_next_request() {
+        // `Provider::resends_reasoning` is false: the context estimate leaves
+        // reasoning output out of the next prompt because this holds.
+        let adapter =
+            ChatCompletionsAdapter::new(config("https://example.invalid"), UsageDialect::Details)
+                .expect("adapter");
+        assert!(!adapter.resends_reasoning());
+        let mut request = Request::new("compatible-model", "x", 10);
+        request.messages = vec![kgraf_provider::Message {
+            role: Role::Assistant,
+            content: vec![
+                Content::Reasoning {
+                    text: "SECRET-REASONING-TEXT".into(),
+                },
+                Content::text("visible"),
+            ],
+        }];
+        let text = serde_json::to_string(&adapter.to_wire(&request)).expect("wire");
+        assert!(text.contains("visible"), "{text}");
+        assert!(!text.contains("SECRET-REASONING-TEXT"), "{text}");
     }
 
     #[test]
@@ -2785,6 +2814,8 @@ mod tests {
             .parse_response("compatible-model", &body)
             .expect("parse");
         assert_eq!(response.stop_reason, StopReason::Other);
+        // The normalized `Other` stays explainable: the wire string is kept.
+        assert_eq!(response.finish_reason.as_deref(), Some("content_filter"));
     }
 
     #[tokio::test]
@@ -2820,6 +2851,7 @@ mod tests {
         let response = run_stream(&adapter, &token).await.expect("stream");
         assert_eq!(response.text(), "hello");
         assert_eq!(response.stop_reason, StopReason::EndTurn);
+        assert_eq!(response.finish_reason.as_deref(), Some("stop"));
         assert_eq!(response.usage.total_input(), 10);
         assert_eq!(response.request_id.as_deref(), Some("chatcmpl-1"));
 

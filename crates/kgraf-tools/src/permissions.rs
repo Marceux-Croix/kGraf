@@ -41,7 +41,7 @@
 
 use crate::approval::{ApprovalHook, HookDecision, PendingCall};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -618,6 +618,21 @@ pub enum PermissionEvent {
         mode: PermissionMode,
         outcome: String,
     },
+    /// A request the mode (or the orchestrator under it) granted, and a later
+    /// rule of the approval chain then refused: a user deny rule, a critical
+    /// path limit, or a user's "no". The call did not run. This is the one
+    /// event for the call, so the trace never says `granted` for a call that
+    /// was refused.
+    GrantRefused {
+        worker: String,
+        subject: String,
+        mode: PermissionMode,
+        /// Who granted: `mode` or `orchestrator`.
+        by: String,
+        /// The hook that refused, as the approval log names it.
+        refused_by: String,
+        reason: String,
+    },
 }
 
 impl PermissionEvent {
@@ -641,6 +656,18 @@ impl PermissionEvent {
                 mode,
                 by,
             } => format!("granted {subject} to {worker} ({}, by {by})", mode.label()),
+            Self::GrantRefused {
+                worker,
+                subject,
+                mode,
+                by,
+                refused_by,
+                reason,
+            } => format!(
+                "refused {subject} to {worker} ({}: allowed by {by}, then refused by \
+                 {refused_by}: {reason})",
+                mode.label()
+            ),
             Self::ProtectedWrite {
                 worker,
                 path,
@@ -674,6 +701,13 @@ struct ControlState {
     /// (worker, subject, mode) already recorded as granted: a grant is the
     /// permission, not each use of it.
     granted: BTreeSet<(String, String, PermissionMode)>,
+    /// Grants a mode made for a call still in the approval chain, by
+    /// (worker, call id): (subject, by). A later hook may still refuse the
+    /// call, so a grant is recorded only when the chain settles it
+    /// ([`PermissionControl::settle_call`]).
+    staged: BTreeMap<(String, String), Vec<(String, String)>>,
+    /// (worker, subject, refusing hook, reason) already recorded as refused.
+    refused: BTreeSet<(String, String, String, String)>,
 }
 
 /// The live permission setting of this process. Shared by the orchestrator,
@@ -711,6 +745,8 @@ impl PermissionControl {
                 events: VecDeque::new(),
                 next_seq: 1,
                 granted: BTreeSet::new(),
+                staged: BTreeMap::new(),
+                refused: BTreeSet::new(),
             }),
             generation,
             facts,
@@ -843,6 +879,67 @@ impl PermissionControl {
 
     pub fn rules(&self) -> UserRules {
         self.state().settings.rules.clone()
+    }
+
+    /// Hold a grant the mode made for call `call_id` of `worker` until the
+    /// approval chain settles the call ([`Self::settle_call`]): a hook later
+    /// in the chain can still refuse it.
+    pub fn stage_grant(&self, worker: &str, call_id: &str, subject: &str, by: &str) {
+        self.state()
+            .staged
+            .entry((worker.to_owned(), call_id.to_owned()))
+            .or_default()
+            .push((subject.to_owned(), by.to_owned()));
+    }
+
+    /// The approval chain reached its end for call `call_id`: `refusal` is
+    /// `None` when the call runs, or the refusing hook and its reason. The
+    /// call's staged grants are recorded as granted when it runs, and as one
+    /// refused event each (once per worker, subject, hook and reason) when it
+    /// does not. Returns the events recorded.
+    pub fn settle_call(
+        &self,
+        worker: &str,
+        call_id: &str,
+        refusal: Option<(&str, &str)>,
+    ) -> Vec<PermissionEvent> {
+        let staged = self
+            .state()
+            .staged
+            .remove(&(worker.to_owned(), call_id.to_owned()))
+            .unwrap_or_default();
+        let mut events = Vec::new();
+        for (subject, by) in staged {
+            match refusal {
+                None => events.extend(self.record_grant(worker, &subject, &by)),
+                Some((refused_by, reason)) => {
+                    let mut s = self.state();
+                    let mode = s.settings.mode;
+                    if !s.refused.insert((
+                        worker.to_owned(),
+                        subject.clone(),
+                        refused_by.to_owned(),
+                        reason.to_owned(),
+                    )) {
+                        continue;
+                    }
+                    let event = PermissionEvent::GrantRefused {
+                        worker: worker.to_owned(),
+                        subject,
+                        mode,
+                        by,
+                        refused_by: refused_by.to_owned(),
+                        reason: reason.to_owned(),
+                    };
+                    Self::push(&mut s, event.clone());
+                    events.push(event);
+                }
+            }
+        }
+        if !events.is_empty() {
+            self.bump();
+        }
+        events
     }
 
     /// Record a grant a mode (or the orchestrator under its mode) made. The
@@ -1941,6 +2038,16 @@ mod tests {
             AskRoute::Grant { by: "mode" }
         );
         assert!(c.shell_unrestricted());
+    }
+
+    #[test]
+    fn the_user_file_allow_list_keeps_its_tools_and_paths() {
+        let s = PermissionSettings::from_toml_str(
+            "[allow]\ntools = [\"fetch\"]\npaths = [\"docs/*\", \"Cargo.toml\"]\n",
+        )
+        .expect("parse");
+        assert!(s.allow.tools.contains("fetch"));
+        assert_eq!(s.allow.paths, vec!["docs/*", "Cargo.toml"]);
     }
 
     #[test]

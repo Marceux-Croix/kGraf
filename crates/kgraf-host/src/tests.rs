@@ -47,6 +47,7 @@ impl Provider for Counts {
         };
         token.settle(&usage, None)?;
         Ok(kgraf_provider::Response {
+            finish_reason: None,
             model: request.model.clone(),
             content: vec![kgraf_provider::Content::text("ok")],
             stop_reason: kgraf_provider::StopReason::EndTurn,
@@ -1322,6 +1323,7 @@ impl Provider for CallsOneTool {
             vec![Content::text("done")]
         };
         Ok(kgraf_provider::Response {
+            finish_reason: None,
             model: request.model.clone(),
             content,
             stop_reason: if first {
@@ -1731,6 +1733,7 @@ impl Provider for McpCaller {
             vec![Content::text("done")]
         };
         Ok(kgraf_provider::Response {
+            finish_reason: None,
             model: request.model.clone(),
             content,
             stop_reason: if first {
@@ -1807,6 +1810,7 @@ impl Provider for ShellCaller {
             vec![Content::text("done")]
         };
         Ok(kgraf_provider::Response {
+            finish_reason: None,
             model: request.model.clone(),
             content,
             stop_reason: if first {
@@ -3593,6 +3597,18 @@ fn project() -> (tempfile::TempDir, RunConfig) {
     (dir, config)
 }
 
+/// A host whose generative route is in-process, for a test that builds or
+/// prepares a run but does not depend on which model answers. A build dials
+/// each local route's endpoint first, so a route named `ollama` would make the
+/// result depend on whether a server listens on this machine.
+fn open_offline(mut config: RunConfig) -> Host {
+    config.routes = vec!["mine:llama3".into()];
+    Host::open(config)
+        .expect("open")
+        .with_route_provider("mine", Arc::new(ShellCaller))
+        .expect("in-process route")
+}
+
 fn spec(s: &str) -> RouteSpec {
     RouteSpec::parse(s).expect("spec")
 }
@@ -4143,7 +4159,7 @@ fn readiness_names_the_route_or_the_credential_and_never_the_price() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_factory_builds_on_the_hosts_admission_and_finishes_once() {
     let (_dir, config) = project();
-    let host = Arc::new(Host::open(config).expect("open"));
+    let host = Arc::new(open_offline(config));
     let factory = HostFactory::new(host.clone());
     factory.configured().await.expect("configured");
     factory.ready("nightly").await.expect("ready");
@@ -4189,7 +4205,7 @@ fn a_blocking_build_off_a_multi_thread_runtime_is_refused() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_started_run_ends_through_its_handle() {
     let (_dir, config) = project();
-    let host = Host::open(config).expect("open");
+    let host = open_offline(config);
     let mut seen = Vec::new();
     let handle = host
         .start_run(RunId::new("nope"), RunStart::Resume, None, &mut |n| {
@@ -4213,7 +4229,7 @@ async fn a_started_run_ends_through_its_handle() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_prepared_run_refuses_an_empty_instruction() {
     let (_dir, config) = project();
-    let host = Host::open(config).expect("open");
+    let host = open_offline(config);
     let prepared = host
         .prepare(RunId::new("e1"), None, &mut |_| {})
         .await
@@ -4451,7 +4467,7 @@ async fn configured_owns_catalog_and_prices_and_reads_a_changed_table() {
 
 /// The build error of `config` through the factory (on a multi-thread runtime).
 fn build_error(config: RunConfig) -> OrchestratorError {
-    let host = Arc::new(Host::open(config).expect("open"));
+    let host = Arc::new(open_offline(config));
     match HostFactory::new(host).build(&RunId::new("classify")) {
         Ok(_) => panic!("the build was expected to fail"),
         Err(e) => e,
@@ -4537,11 +4553,7 @@ async fn a_timed_out_build_removes_its_probe_and_kills_its_mcp_server() {
         }
     }]});
     std::fs::write(state.join("worker.json"), worker.to_string()).expect("worker.json");
-    let host = Arc::new(
-        Host::open(config)
-            .expect("open")
-            .with_build_timeout(Duration::from_secs(3)),
-    );
+    let host = Arc::new(open_offline(config).with_build_timeout(Duration::from_secs(3)));
     let e = match HostFactory::new(host).build(&RunId::new("slow")) {
         Ok(_) => panic!("a server that never answers cannot build"),
         Err(e) => e,
@@ -4586,7 +4598,7 @@ async fn a_failed_build_step_is_transient_and_a_settings_failure_is_not() {
         r#"{"mcp_servers": [{"name": "gone", "transport": {"type": "streamable_http", "url": "http://127.0.0.1:1/mcp"}}]}"#,
     )
     .expect("worker.json");
-    let host = Arc::new(Host::open(config.clone()).expect("open"));
+    let host = Arc::new(open_offline(config.clone()));
     let built = HostFactory::new(host).build(&RunId::new("t1"));
     assert!(
         matches!(&built, Err(OrchestratorError::Build { transient: true, detail }) if detail.contains("gone")),
@@ -4594,11 +4606,7 @@ async fn a_failed_build_step_is_transient_and_a_settings_failure_is_not() {
         built.err()
     );
     std::fs::remove_file(state.join("worker.json")).expect("rm");
-    let slow = Arc::new(
-        Host::open(config)
-            .expect("open")
-            .with_build_timeout(Duration::from_millis(1)),
-    );
+    let slow = Arc::new(open_offline(config).with_build_timeout(Duration::from_millis(1)));
     let bounded = HostFactory::new(slow).build(&RunId::new("t2"));
     assert!(
         matches!(&bounded, Err(OrchestratorError::Build { transient: true, detail }) if detail.contains("did not finish")),
@@ -4626,7 +4634,7 @@ async fn an_index_made_before_open_reaches_the_first_build() {
         0,
         "the fixture starts unindexed: `kgraf index` was never run"
     );
-    let host = Host::open(config).expect("open");
+    let host = open_offline(config);
     let before = host
         .prepare(RunId::new("i1"), None, &mut |_| {})
         .await
@@ -5114,6 +5122,7 @@ async fn a_hosted_run_answers_a_workers_question_through_the_planner_first() {
             };
             token.settle(&usage, None)?;
             Ok(kgraf_provider::Response {
+                finish_reason: None,
                 model: request.model.clone(),
                 content: vec![kgraf_provider::Content::text(text)],
                 stop_reason: kgraf_provider::StopReason::EndTurn,
@@ -5214,6 +5223,7 @@ async fn a_greenfield_plan_is_approved_and_reaches_dispatch() {
             };
             token.settle(&usage, None)?;
             Ok(kgraf_provider::Response {
+                finish_reason: None,
                 model: request.model.clone(),
                 content: vec![kgraf_provider::Content::text(text)],
                 stop_reason: kgraf_provider::StopReason::EndTurn,
@@ -5385,6 +5395,7 @@ async fn a_worker_on_a_fresh_repo_gets_graph_slices() {
             };
             token.settle(&usage, None)?;
             Ok(kgraf_provider::Response {
+                finish_reason: None,
                 model: request.model.clone(),
                 content: vec![kgraf_provider::Content::text(text)],
                 stop_reason: kgraf_provider::StopReason::EndTurn,
@@ -5545,7 +5556,7 @@ mod protected_write;
 fn the_index_pass_runs_without_the_shared_graph_lock() {
     let (_dir, config) = project();
     std::fs::write(config.root.join("lib.rs"), "pub fn indexed_here() {}\n").expect("write");
-    let host = Arc::new(Host::open(config).expect("open"));
+    let host = Arc::new(open_offline(config));
     let startup = host.startup(&mut |_| {}).expect("startup");
     let (locked_tx, locked_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
@@ -6099,7 +6110,7 @@ async fn every_kind_of_attempt_follows_the_policy() {
 fn a_host_builds_each_run_with_the_worktree_policy_in_force() {
     let (_dir, mut config) = project();
     config.worktrees = WorktreeRetention::Keep;
-    let host = Host::open(config).expect("open");
+    let host = open_offline(config);
     assert_eq!(host.worktree_retention(), WorktreeRetention::Keep);
     let startup = host.startup(&mut |_| {}).expect("startup");
     let first = host
@@ -6137,8 +6148,14 @@ fn a_build_with_an_unreachable_local_route_fails_at_start() {
         return;
     }
     let (_dir, mut config) = project();
+    // The generative route is in-process: whether a server listens at the
+    // catalog's Ollama address on this machine must not decide the result.
+    config.routes = vec!["mine:llama3".into()];
     config.model_routes = vec!["typed-decision=systemone:jev-latest".into()];
-    let host = Host::open(config).expect("open");
+    let host = Host::open(config)
+        .expect("open")
+        .with_route_provider("mine", Arc::new(ShellCaller))
+        .expect("route");
     let startup = host.startup(&mut |_| {}).expect("startup");
     let err = host
         .build_base(&startup, RunId::new("unreach"), &mut |_| {})
@@ -6160,8 +6177,14 @@ fn a_build_with_an_unreachable_local_route_fails_at_start() {
 #[test]
 fn a_runs_model_routes_are_built_and_their_tools_join_every_environment() {
     let (_dir, mut config) = project();
+    // The generative route is in-process, so only the model route has an
+    // endpoint to dial.
+    config.routes = vec!["mine:llama3".into()];
     config.model_routes = vec!["typed-decision=systemone:jev-latest".into()];
-    let host = Host::open(config).expect("open");
+    let host = Host::open(config)
+        .expect("open")
+        .with_route_provider("mine", Arc::new(ShellCaller))
+        .expect("route");
     host.check_ready(&host.route_set())
         .expect("a local typed-decision route needs no key");
     // A build dials every local route's endpoint first (`check_reachable`).
@@ -6181,8 +6204,12 @@ fn a_runs_model_routes_are_built_and_their_tools_join_every_environment() {
     assert!(base.extra_tool_names().contains(&"decide".to_owned()));
     assert!(!base.extra_tool_names().contains(&"embed".to_owned()));
 
-    let (_dir, config) = project();
-    let host = Host::open(config).expect("open");
+    let (_dir, mut config) = project();
+    config.routes = vec!["mine:llama3".into()];
+    let host = Host::open(config)
+        .expect("open")
+        .with_route_provider("mine", Arc::new(ShellCaller))
+        .expect("route");
     let startup = host.startup(&mut |_| {}).expect("startup");
     let base = host
         .build_base(&startup, RunId::new("mk2"), &mut |_| {})
@@ -6217,7 +6244,7 @@ fn a_model_route_on_a_route_that_does_not_serve_its_kind_is_not_ready() {
 fn the_full_index_pass_reports_a_changed_extractor_to_the_build() {
     let (_dir, config) = project();
     std::fs::write(config.root.join("lib.rs"), "pub fn indexed_here() {}\n").expect("write");
-    let host = Host::open(config).expect("open");
+    let host = open_offline(config);
     let startup = host.startup(&mut |_| {}).expect("startup");
     let first = host
         .build_base(&startup, RunId::new("ix"), &mut |_| {})
@@ -6552,6 +6579,7 @@ mod skill_enforcement {
                 None => (vec![Content::text("done")], StopReason::EndTurn),
             };
             Ok(kgraf_provider::Response {
+                finish_reason: None,
                 model: request.model.clone(),
                 content,
                 stop_reason,
@@ -6936,4 +6964,37 @@ fn a_model_with_no_known_limit_keeps_the_requested_cap() {
             .any(|n| matches!(n, crate::Notice::OutputCapClamped { .. })),
         "{said:?}"
     );
+}
+
+/// A host that lives for days keeps no per-run state of a run that ended: each
+/// run's tables fill while it is built and empty at `finish_run`, so many runs
+/// on one host leave the same counts the first one did (none).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn finish_run_empties_every_per_run_table_of_the_host() {
+    let (_dir, config) = project();
+    let host = open_offline(config);
+    assert_eq!(host.retained(), crate::Retained::default());
+    for n in 0..4 {
+        let run = RunId::new(format!("retained-{n}"));
+        host.grant_dependency_fetch(&run);
+        let prepared = host
+            .prepare(run.clone(), None, &mut |_| {})
+            .await
+            .expect("prepare");
+        let orchestrator = prepared.into_orchestrator(&host);
+        let during = host.retained();
+        assert_eq!(during.ended, 1, "the handed-out run waits for its finish");
+        assert_eq!(during.fetch_grants, 1);
+        assert!(
+            during.start_consents == 1 && during.refetchers == 1,
+            "the build registered the run in each table: {during:?}"
+        );
+        drop(orchestrator);
+        assert!(host.finish_run(&run).is_some(), "run {n} was handed out");
+        assert_eq!(host.retained(), crate::Retained::default(), "after run {n}");
+        assert!(
+            host.finish_run(&run).is_none(),
+            "a second finish is a no-op"
+        );
+    }
 }

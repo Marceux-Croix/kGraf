@@ -175,3 +175,21 @@ test per case above, each driving `ShortfallTool` with a recorded refusal set, p
 path and skill tests); `kgraf-host` (`shortfall_tests.rs`: a report after the granted command
 ran is answered and the worker finishes; baseless reports are answered twice, then the attempt
 is stuck; Bypass answers a sibling contract's file and never grants it).
+
+## Amendment (2026-10-01, second): an instructions report about another contract's file is answered
+
+A worker filed an `instructions` shortfall asking for the stub in a file that belongs to another
+contract to be changed. The orchestrator amended the worker's own contract with the request and
+re-dispatched it, which could not change a file the contract may not write.
+
+An `instructions` report whose text names a file that another contract of the run declares, and
+none of the reporting contract's own files, is answered to its worker, as a file-scope report is:
+nothing is amended and nothing is re-dispatched; the file belongs to that contract; keep the public
+shape that file uses of the worker's items as the existing code defines it; the attempt is judged
+by its own acceptance check. The answer counts toward `MAX_ANSWERED_SHORTFALLS` like any other. A
+report that names no such file is amended as before, once, then held.
+
+Tests: `kgraf-orchestrator` `shortfall.rs`
+`an_instructions_report_about_a_file_another_contract_owns_is_answered`,
+`an_instructions_report_is_amended_when_it_names_no_foreign_file_or_its_own`; `kgraf-host`
+`shortfall_tests.rs` `an_instructions_report_about_a_sibling_contracts_file_is_answered_not_amended`.

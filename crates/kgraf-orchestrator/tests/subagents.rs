@@ -209,6 +209,7 @@ impl Provider for Scripted {
             .expect("lock")
             .push((seen.instruction.clone(), seen.round));
         Ok(Response {
+            finish_reason: None,
             model: request.model.clone(),
             content,
             stop_reason: stop,

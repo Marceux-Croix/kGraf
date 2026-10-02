@@ -105,6 +105,7 @@ impl Provider for Script {
         };
         token.settle(&usage, None)?;
         Ok(Response {
+            finish_reason: None,
             model: request.model.clone(),
             content,
             stop_reason: stop,
