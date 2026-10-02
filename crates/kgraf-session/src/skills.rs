@@ -64,7 +64,7 @@ use kgraf_tools::{
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
-use std::sync::{Arc, Mutex, PoisonError, Weak};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 
 /// Who is invoking a skill.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -200,6 +200,27 @@ impl ActiveSkill {
     /// Whether the skill restricts the tool set.
     pub fn restricts_tools(&self) -> bool {
         self.allowed.is_some()
+    }
+
+    /// The `allowed-tools` entries whose tool name matches none of `tools`, as
+    /// written. The scope in parentheses is not part of the name. The tools in
+    /// [`NEVER_RESTRICTED`] always exist for this purpose: no skill restricts
+    /// them, so an entry naming one is not a mistake.
+    fn entries_naming_no_tool(&self, tools: &[QualifiedName]) -> Vec<String> {
+        let (Some(entries), Some(patterns)) = (&self.allowed_entries, &self.allowed) else {
+            return Vec::new();
+        };
+        entries
+            .iter()
+            .zip(patterns)
+            .filter(|(_, p)| {
+                !tools.iter().any(|t| p.names(t))
+                    && !NEVER_RESTRICTED
+                        .iter()
+                        .any(|n| QualifiedName::builtin(n).is_ok_and(|q| p.names(&q)))
+            })
+            .map(|(e, _)| e.clone())
+            .collect()
     }
 
     /// The body as a tagged message for the private remainder, so nothing
@@ -480,6 +501,10 @@ pub const NEVER_RESTRICTED: &[&str] = &["report_shortfall"];
 /// goes when that chain does.
 pub struct SkillSession {
     catalog: Arc<SkillCatalog>,
+    /// The tools this environment's workers have, set once the registry is
+    /// complete ([`Self::bind_tools`]). The session is built before the MCP tools
+    /// are registered, so it cannot take them at construction.
+    tools: OnceLock<Vec<QualifiedName>>,
     workers: Mutex<HashMap<String, Weak<Mutex<ToolPolicy>>>>,
 }
 
@@ -496,8 +521,20 @@ impl SkillSession {
     pub fn new(catalog: Arc<SkillCatalog>) -> Arc<Self> {
         Arc::new(Self {
             catalog,
+            tools: OnceLock::new(),
             workers: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Tell the session which tools this environment's workers have. From then on
+    /// a skill whose `allowed-tools` names a tool outside this set is refused at
+    /// activation ([`SessionError::UnknownAllowedTools`]). The host calls this
+    /// once, after the registry is complete. A second call is ignored: the set is
+    /// the one the shared prefix was built from.
+    ///
+    /// A session never bound checks nothing; only unit tests build one.
+    pub fn bind_tools(&self, tools: impl IntoIterator<Item = QualifiedName>) {
+        let _ = self.tools.set(tools.into_iter().collect());
     }
 
     /// The entries the shared prefix lists (skills the model may invoke).
@@ -613,11 +650,51 @@ impl SkillSession {
                 worker: worker.to_owned(),
             })?;
         let active = self.catalog.activate(name, Invoker::Model)?;
+        // Refuse before narrowing the policy: a refused activation restricts
+        // nothing. Carrying on with a notice would leave a worker under a
+        // restriction that quietly lacks tools the skill's body tells it to use.
+        if let Some(tools) = self.tools.get() {
+            let unknown = active.entries_naming_no_tool(tools);
+            if !unknown.is_empty() {
+                let mut available: Vec<String> = tools.iter().map(QualifiedName::wire).collect();
+                available.sort();
+                return Err(SessionError::UnknownAllowedTools {
+                    skill: name.to_owned(),
+                    unknown: unknown
+                        .iter()
+                        .map(|entry| describe_unknown(entry, &available))
+                        .collect(),
+                    available,
+                });
+            }
+        }
         policy
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .restrict(&active);
         Ok(active)
+    }
+}
+
+/// An unknown `allowed-tools` entry as the refusal prints it: the entry, and the
+/// tool this worker has that does the same job when the name is one a coding
+/// agent commonly uses (Claude Code's `Bash`, `Read`, `Edit`, `Write`, `Grep`,
+/// `Glob`, `LS`, or `write_file`). Only a tool the worker really has is suggested.
+fn describe_unknown(entry: &str, available: &[String]) -> String {
+    let name = entry.split('(').next().unwrap_or(entry).trim();
+    let suggestion = match name {
+        "Bash" => "shell",
+        "Read" => "read_file",
+        "Write" | "Edit" | "MultiEdit" | "NotebookEdit" | "write_file" | "edit_file"
+        | "create_file" => "apply_patch",
+        "Grep" | "Glob" => "search_files",
+        "LS" => "list_directory",
+        _ => return format!("`{entry}`"),
+    };
+    if available.iter().any(|a| a == suggestion) {
+        format!("`{entry}` (use `{suggestion}`)")
+    } else {
+        format!("`{entry}`")
     }
 }
 
@@ -1146,6 +1223,59 @@ mod tests {
         ));
         assert!(ToolPattern::parse("Bash()").is_none());
         assert!(ToolPattern::parse("").is_none());
+    }
+
+    /// Round 7: a skill listed `write_file`, no worker has it, and the skill was
+    /// accepted. Under it nothing could write. Activation is refused, names the
+    /// unknown entry and the real tools, and restricts nothing.
+    #[test]
+    fn a_skill_naming_a_tool_no_worker_has_is_refused_and_restricts_nothing() {
+        let catalog = SkillCatalog::from_skills([
+            skill(
+                "writer",
+                Some(&["read_file", "write_file", "Bash(git:*)"]),
+                false,
+            ),
+            skill(
+                "fine",
+                Some(&["read_file", "report_shortfall", "mcp__gh"]),
+                false,
+            ),
+        ])
+        .expect("catalog");
+        let session = SkillSession::new(Arc::new(catalog));
+        let tool = |n: &str| QualifiedName::builtin(n).expect("name");
+        session.bind_tools([
+            tool("read_file"),
+            tool("apply_patch"),
+            tool("shell"),
+            QualifiedName::mcp("gh", "issue").expect("name"),
+        ]);
+        let worker = session.attach("w1");
+
+        let err = session.activate("w1", "writer").expect_err("refused");
+        let text = err.to_string();
+        assert!(
+            matches!(err, SessionError::UnknownAllowedTools { .. }),
+            "{text}"
+        );
+        assert!(text.contains("`write_file` (use `apply_patch`)"), "{text}");
+        assert!(text.contains("`Bash(git:*)` (use `shell`)"), "{text}");
+        assert!(
+            !text.contains("`read_file` ("),
+            "a real tool is not listed as unknown: {text}"
+        );
+        assert!(
+            text.contains("apply_patch, mcp__gh__issue, read_file, shell"),
+            "real tools listed: {text}"
+        );
+        assert!(
+            worker.restricting().is_empty(),
+            "a refused activation restricts nothing"
+        );
+
+        // Real tools, the never-restricted tool, and a connected server are known.
+        session.activate("w1", "fine").expect("activates");
     }
 
     /// `report_shortfall` runs nothing: it tells the orchestrator what the

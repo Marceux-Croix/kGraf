@@ -143,3 +143,27 @@ skills. Then a fetcher is added, verified against that vendor's real, running se
   call made in the round that activates a skill is judged by the other policies only. When one
   of them refused it, a later report of a tool the now-active skill refuses is held naming the
   skill.
+
+## Amendment (2026-10-02): a skill that lists a tool no worker has is refused
+
+- **The rule.** When the model activates a skill, every `allowed-tools` entry's tool name
+  must match a tool the worker has: a built-in, or an MCP tool of a connected server (the
+  scope in parentheses is not part of the name). An entry that matches none refuses the
+  activation. The refusal names each unknown entry, says which real tool does the same job
+  when the entry is a name coding agents commonly use (`Bash` is `shell`, `Read` is
+  `read_file`, `Edit`, `Write` and `write_file` are `apply_patch`, `Grep` and `Glob` are
+  `search_files`, `LS` is `list_directory`), and lists the tools the worker has. The worker's
+  policy is not narrowed and the skill's instructions are not injected.
+- **Why a refusal and not a notice.** An entry that names no tool cannot mean what its
+  author wrote. A worker kept under the rest of the list lacks tools the skill's own text
+  tells it to use, and in practice reads the "only these tools may be called" reply and stops.
+  A refusal reaches the worker in the same call, with the real names, so it can report the
+  shortfall or the user can fix the list. Claude Code ignores an unknown name in
+  `allowed-tools` because there the list only pre-approves tools and restricts nothing. Here
+  the list restricts (above), so an ignored name is a silently wrong restriction, and fail
+  loud wins.
+- **Where it is checked.** The tool set is known only when the worker environment is
+  complete, after MCP servers connect, so the host binds it to the skill session then
+  (`SkillSession::bind_tools`). `kgraf instructions scan` does not check names: it does not
+  know which MCP servers a worker will have. `report_shortfall` is always a known name. A
+  resumed worker re-activates its skills through the same check.

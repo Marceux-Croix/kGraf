@@ -102,6 +102,11 @@ pub struct OpenContract {
     /// plan named. Counted apart in the run report.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub slices_from_writes: bool,
+    /// The most tokens of slices this contract is given, at every dispatch.
+    /// Set on a hand-back's child, whose brief must start with room under the
+    /// stop point (`handback_fit`); `None` for a planned contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slice_cap_tokens: Option<u64>,
     /// Tools the brief needs; readiness checks the route discovered them.
     #[serde(default)]
     pub tools: Vec<String>,
@@ -362,6 +367,7 @@ impl OpenContract {
             slice_names: Vec::new(),
             slice_from: None,
             slices_from_writes: false,
+            slice_cap_tokens: None,
             tools: Vec::new(),
             route: None,
             route_pinned: false,

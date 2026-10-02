@@ -78,6 +78,7 @@ mod derive_interface;
 mod envelope;
 mod gates;
 mod guards;
+mod handback_fit;
 mod intake;
 mod interactive;
 mod interface_plan;
@@ -92,6 +93,7 @@ mod partition;
 mod placeholder;
 mod plan;
 mod plan_repo;
+mod plan_shapes;
 pub mod planner_context;
 mod port;
 mod question_route;
@@ -185,7 +187,8 @@ pub use orchestrator::{
     AttemptEnv, AttemptEnvs, CloseEnv, CompactError, DEFAULT_MAX_CONTRACTS_PER_PLAN,
     DEFAULT_MAX_SPLITS, DirWorkspaces, Orchestrator, OrchestratorConfig, OrchestratorError,
     OrchestratorHandle, OrderError, PrepareFailure, Route, RunReport, Services, SessionError,
-    StatusReport, SteerError, VERIFIER_REFUSAL_TAG, Workspaces, run_lease_holder_is_live,
+    StatusReport, SteerError, VERIFIER_REFUSAL_TAG, Workspaces, plan_review_refusal,
+    run_lease_holder_is_live,
 };
 pub use partition::{
     CONFIDENT, CauseScore, GraphPredictor, MissCause, PairScore, PartitionReport,

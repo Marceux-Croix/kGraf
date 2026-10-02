@@ -287,3 +287,32 @@ Tests: `kgraf-host` `tests.rs`
 `the_acceptance_command_becomes_a_root_gate_once`; `shortfall_tests.rs`
 `a_run_check_a_dependent_split_needs_is_deferred_and_judged_at_the_root_gate` and
 `a_deferred_run_check_that_never_passes_does_not_complete_the_run`.
+
+## Amendment (2026-10-02): plan intake compares every public shape, not only unit structs
+
+Plan intake noticed one phrasing: a unit struct that an instruction wrote with fields. An
+instruction that also changed a trait method's signature was not noticed, and the crate that
+called the method stopped building. The check was a text scan for `Name {` and `Name(` against
+`struct Name;`; a changed trait method, function, enum variant or struct field has no such text.
+
+- **Structural comparison.** `plan_shapes` reads the public declarations of the Rust files a
+  contract writes with tree-sitter (struct kind and public fields, enum variants, trait methods,
+  inherent methods, functions) and parses the code the instruction shows the same way (backtick
+  spans, fenced blocks, bare items; a bare method signature is read with or without its `;`,
+  then inside a trait body). A restated item is compared by shape: parameter names and spacing do
+  not count; types, receiver, generics, modifiers and return type do. A change is a notice naming
+  the item, the new shape and the existing one. Never a refusal: the user's instruction may ask
+  for it.
+- **What is not a change.** An item the files do not define (an addition), a private item, a
+  private field, a variant the instruction does not restate, the same shape restated.
+- **Pattern fallbacks, narrower than before.** A public unit struct given fields as text that is
+  no item (`Name { order: Order }`) keeps the older wording. A sentence that names a public item
+  in backticks with a verb of change is noticed when no code was shown, unless it says to keep,
+  not to change, or to leave it. Files with no grammar keep the unit-struct scan. The text scan
+  no longer reads `impl Name {` or `impl Trait for Name {` as a definition of `Name`.
+
+Tests: `plan_shapes` unit tests (the trait restated, bare signatures and fences, free
+functions, inherent methods, return types, struct and enum shapes, additions, private items,
+prose fallbacks, one report per change); `tests/shape_guard.rs`
+`an_instruction_that_changes_a_trait_signature_is_noticed_not_refused` and
+`an_added_item_or_a_private_change_is_not_noticed`; `plan` `defines_with_fields`.

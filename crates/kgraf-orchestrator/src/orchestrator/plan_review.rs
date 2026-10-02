@@ -17,14 +17,29 @@ use super::*;
 use crate::review_desk::{PlanAnswer, PlanItemView, PlanView};
 use crate::run_state::PlanApproval;
 
+/// Plan review is on and nobody can approve: the one rule, so a caller that
+/// knows these three facts before it creates anything (the command line, which
+/// is never attended) refuses with the same error the orchestrator would.
+pub fn plan_review_refusal(
+    plan_review: bool,
+    attended: bool,
+    approve_plan: bool,
+) -> Result<(), OrchestratorError> {
+    if plan_review && !attended && !approve_plan {
+        return Err(OrchestratorError::PlanReviewUnattended);
+    }
+    Ok(())
+}
+
 impl Orchestrator {
     /// Plan review is on and nobody can approve: refused before anything is
     /// planned or paid for.
     pub(super) fn check_plan_review(&self) -> Result<(), OrchestratorError> {
-        if self.perms.control.plan_review() && !self.perms.attended && !self.config.approve_plan {
-            return Err(OrchestratorError::PlanReviewUnattended);
-        }
-        Ok(())
+        plan_review_refusal(
+            self.perms.control.plan_review(),
+            self.perms.attended,
+            self.config.approve_plan,
+        )
     }
 }
 
@@ -243,5 +258,28 @@ impl RunLoop {
         self.record.planned = false;
         self.record.plan_progress = None;
         self.save()
+    }
+}
+
+#[cfg(test)]
+mod refusal_tests {
+    use super::plan_review_refusal;
+
+    /// Refused exactly when review is on and neither a person nor
+    /// `--approve-plan` can say yes.
+    #[test]
+    fn only_review_on_with_nobody_and_no_approval_is_refused() {
+        for plan_review in [false, true] {
+            for attended in [false, true] {
+                for approve_plan in [false, true] {
+                    let refused = plan_review_refusal(plan_review, attended, approve_plan).is_err();
+                    assert_eq!(
+                        refused,
+                        plan_review && !attended && !approve_plan,
+                        "review {plan_review}, attended {attended}, approve {approve_plan}"
+                    );
+                }
+            }
+        }
     }
 }

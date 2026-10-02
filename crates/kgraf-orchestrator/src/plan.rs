@@ -1467,46 +1467,24 @@ pub fn defines_with_fields(text: &str, name: &str) -> bool {
         if end < bytes.len() && is_ident_byte(bytes[end]) {
             continue;
         }
+        // The name after one of these words is a block's header (`impl Name {`,
+        // `impl Trait for Name {`), not a definition of the type.
+        let word_before = text[..start]
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .rfind(|w| !w.is_empty())
+            .unwrap_or("");
+        if matches!(
+            word_before,
+            "impl" | "for" | "enum" | "trait" | "mod" | "fn" | "use" | "as" | "type"
+        ) {
+            continue;
+        }
         let after = &text[end..];
         if after.starts_with('(') || after.trim_start().starts_with('{') {
             return true;
         }
     }
     false
-}
-
-/// Notices for a contract instruction that writes a type with fields where a
-/// file the contract writes defines it as a unit struct. `read` gives a file's
-/// text. A notice, never a refusal: the user's instruction may ask for the new
-/// shape.
-pub fn reshaped_unit_structs(
-    spec: &ContractSpec,
-    mut read: impl FnMut(&str) -> Option<String>,
-) -> Vec<String> {
-    let mut found: Vec<(String, String)> = Vec::new();
-    for w in &spec.writes {
-        let Some(source) = read(&w.path) else {
-            continue;
-        };
-        for name in unit_structs(&source) {
-            if defines_with_fields(&spec.instruction, &name)
-                && !found.iter().any(|(n, _)| *n == name)
-            {
-                found.push((name, w.path.clone()));
-            }
-        }
-    }
-    found
-        .into_iter()
-        .map(|(name, path)| {
-            format!(
-                "contract {} instructs `{name}` with fields, but `{path}` defines it as a unit \
-                 struct that existing code may use as a value; the shape is kept unless the \
-                 user's instruction asks to change it",
-                spec.id
-            )
-        })
-        .collect()
 }
 
 /// Re-grounding by a model through the ledger.
@@ -3324,24 +3302,10 @@ mod tests {
         assert!(defines_with_fields("Define A(Order)", "A"));
         assert!(!defines_with_fields("Keep A as it is; AB { x }", "A"));
         assert!(!defines_with_fields("construct `A;` and `BA { }`", "A"));
-    }
-
-    #[test]
-    fn a_reshaped_unit_struct_is_reported_once_with_its_file() {
-        let s = spec_full(
-            "c1",
-            "Define `A { x: u8 }` and A { y: u8 }",
-            &[],
-            &["a.rs", "b.rs"],
-        );
-        let notes = reshaped_unit_structs(&s, |_| Some("pub struct A;".into()));
-        assert_eq!(notes.len(), 1, "{notes:?}");
-        assert!(
-            notes[0].contains("`A`") && notes[0].contains("`a.rs`"),
-            "{notes:?}"
-        );
-        assert!(reshaped_unit_structs(&s, |_| None).is_empty());
-        assert!(reshaped_unit_structs(&s, |_| Some("pub struct A { x: u8 }".into())).is_empty());
+        // A block header names the type; it does not define it.
+        assert!(!defines_with_fields("Add `impl A { fn f(&self) {} }`", "A"));
+        assert!(!defines_with_fields("`impl Show for A { }`", "A"));
+        assert!(defines_with_fields("Define `struct A { x: u8 }`", "A"));
     }
 
     #[test]

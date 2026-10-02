@@ -207,6 +207,11 @@ impl ToolRegistry {
             .collect()
     }
 
+    /// Qualified names, in wire-name order.
+    pub fn qualified_names(&self) -> impl Iterator<Item = &QualifiedName> {
+        self.tools.values().map(RegisteredTool::name)
+    }
+
     /// Wire names, in order.
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.tools.keys().map(String::as_str)

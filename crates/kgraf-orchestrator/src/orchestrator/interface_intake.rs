@@ -180,7 +180,7 @@ impl RunLoop {
                 interface_plan::quote_safe(&kgraf_secrets::model_copy(&refusal.to_string()))
             ));
         };
-        self.note_reshaped_unit_structs(&specs).await?;
+        self.note_shape_changes(&specs).await?;
         // One contract binds nothing, unless it is a split's, whose interface
         // may bind the plan's other contracts.
         if !request.interfaces || (specs.len() < 2 && outer.is_empty()) {

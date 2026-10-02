@@ -79,7 +79,9 @@ async fn plan_notices(instruction: &str) -> Vec<TraceEvent> {
     std::fs::create_dir_all(root.join("src")).expect("mkdir");
     std::fs::write(
         root.join("src/discount.rs"),
-        "pub struct FlatDiscount;\npub struct Bulk { pub n: u32 }\n",
+        "pub struct FlatDiscount;\npub struct Bulk { pub n: u32 }\n\
+         pub trait Price { fn price(&self, qty: u32) -> u32; }\n\
+         fn rounding(x: u32) -> u32 { x }\n",
     )
     .expect("write");
     let plan = plan_json(&[c("c1", instruction, "src/discount.rs", &[])]);
@@ -135,6 +137,42 @@ async fn an_instruction_that_keeps_the_shape_is_not_noticed() {
         0,
         "{trace:?}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_instruction_that_changes_a_trait_signature_is_noticed_not_refused() {
+    // Round 7: only the unit-struct phrasing was caught; this one broke crate b.
+    let trace = plan_notices(
+        "Change the trait to `pub trait Price { fn price(&self, qty: u32, tier: u8) -> u32; }` \
+         and update the impl to match",
+    )
+    .await;
+    assert_eq!(
+        notices_in(
+            &trace,
+            "instructs `Price::price` as `fn price(&self,u32,u8)->u32`"
+        ),
+        1,
+        "{trace:?}"
+    );
+    assert_eq!(notices_in(&trace, "already defines the existing public"), 1);
+    assert!(
+        trace
+            .iter()
+            .any(|e| matches!(e, TraceEvent::Dispatch { .. })),
+        "a notice does not block: {trace:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_added_item_or_a_private_change_is_not_noticed() {
+    let trace = plan_notices(
+        "Add `pub fn clearance(&self) -> u32`, add `pub trait Audit { fn audit(&self, n: u8); }`, \
+         and change `fn rounding(x: u32, mode: u8) -> u32` freely",
+    )
+    .await;
+    assert_eq!(notices_in(&trace, "instructs"), 0, "{trace:?}");
+    assert_eq!(notices_in(&trace, "asks for a change"), 0, "{trace:?}");
 }
 
 // ----------------------------------------------------------------- retry amend

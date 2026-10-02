@@ -55,6 +55,22 @@ pub enum SessionError {
     #[error("skill `{skill}` has an unreadable allowed-tools entry `{entry}`")]
     BadAllowedTools { skill: String, entry: String },
 
+    /// A skill's `allowed-tools` has entries that name no tool this worker has.
+    /// The skill is refused: its restriction cannot mean what its author wrote,
+    /// and a worker under it would lack tools it was told to use. `unknown` lists
+    /// the entries as written (with a hint where a known tool does the same job)
+    /// and `available` the worker's tools.
+    #[error(
+        "skill `{skill}` lists tools in allowed-tools that this worker does not have: {}; the tools this worker has are: {}",
+        unknown.join(", "),
+        available.join(", ")
+    )]
+    UnknownAllowedTools {
+        skill: String,
+        unknown: Vec<String>,
+        available: Vec<String>,
+    },
+
     /// An active skill's `allowed-tools` does not permit this call.
     #[error("tool `{tool}` is not permitted by skill `{skill}`'s allowed-tools")]
     ToolRefused { tool: String, skill: String },

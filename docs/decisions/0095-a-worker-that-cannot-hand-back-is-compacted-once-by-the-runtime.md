@@ -173,3 +173,40 @@ before the read result, while the next prompt would hold about 6,400).
   reported input alone, which hid the output share.
 - Each adapter has a test that a request built from a message with reasoning carries none of
   its text, so the flag follows the code.
+
+## Amendment (2026-10-02): a hand-back's child is sized to fit under the stop point
+
+A local run with the stop point at 30% of a 32,768-token window (9,830 tokens) showed a child
+contract made by a hand-back starting at 6.7k to 7.5k tokens. One round of real work crossed the
+stop point, the child handed back, and so on to the depth cap of 3, where kGraf failed loud. Two
+causes. The child inherited the parent's whole pinned slice set (`child.slices =
+parent.slices.clone()`), and its instruction was the runtime's remainder of the parent's whole
+assembled brief, which for a child already quoted its parent's: the first request grew by 150 to
+490 tokens per level (4,627, 5,114, 5,272, 5,430 uncached input tokens). Nothing measured the
+child against the stop point.
+
+- **One wrapper.** `handback_fit::flatten_remainder` rebuilds the remainder as the header, the
+  chain's original instruction (the last lineage task that is not a remainder), and the
+  paragraphs the parent's brief appended at dispatch, each once. The acceptance and write lines
+  are left out, since the child's own brief states them. A last line says which hand-back the
+  child is: the delegation guards' cycle rule compares tasks, and a child that restated its
+  parent's task word for word would be refused as a cycle (the nesting had hidden that).
+- **A cap on pinned slices.** The child is sized like a planned contract (0057): the route's
+  prefix estimate at one and a half times and the brief at one token per two bytes must be at
+  most the plan target (half the stop point). What is left is the most tokens of slices it gets;
+  the parent's slices are kept in order while they fit, each counted as the route's slice source
+  renders it (a slice grows with neighbors up to the per-slice budget, so the node's source is
+  no measure). A notice says how many were kept. The cap is stored on the child
+  (`slice_cap_tokens`) and applied at every dispatch, so re-resolving the slice names cannot
+  restore the set.
+- **A child that cannot fit is not made.** When the prefix and the instruction alone pass the
+  target, `stop_point_policy` spawns the parent with `StopPointPolicy::Compact`, as it does when
+  the guards would refuse the child. `resplit` refuses the split at the first hand-back with the
+  numbers, and holds the parent with its worktree, as it does for a guard refusal.
+
+Tests: `handback_fit` unit tests (the cap, the unfit case with its numbers, slice choice, a chain
+of four remainders does not grow, an interface paragraph is carried once, a worker's own handoff
+item is untouched); `kgraf-runtime` `original_instruction_reads_through_every_hand_back_wrapper`;
+`tests/handback_fit.rs` measures the first request of every child (at most the plan target, some
+slices kept, equal size at every depth, and a contract whose child cannot fit compacts without
+handing back).

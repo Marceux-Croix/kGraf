@@ -352,6 +352,20 @@ pub fn run(root: &Path, args: OrchestrateArgs) -> Result<()> {
     // Decision 0094: the user-level permissions file and this command's
     // flags, the only sources of the mode. Bypass is announced on stderr.
     let permissions = crate::permissions_cli::control(root, &args.permissions)?;
+    // Decision 0094: a new run with plan review on has nobody to approve the plan
+    // on the command line, so it is refused here, before `Host::open` creates
+    // `.kgraf`, its databases or an integration branch, and before a trace path is
+    // printed for a trace that is never written. A reading (`--corpus` without
+    // `--approve`) starts no run, and a resume is judged against its own record by
+    // the orchestrator.
+    let starts_a_run = args.resume.is_none() && !(args.corpus && args.approve.is_none());
+    if starts_a_run {
+        kgraf_orchestrator::plan_review_refusal(
+            permissions.plan_review(),
+            false, // the command line is never attended
+            args.approve_plan,
+        )?;
+    }
     let host = Host::open(run_config(root, &args))?.with_permissions(permissions);
     let run_id = match (&args.resume, &args.run) {
         (Some(r), _) => RunId::new(r.clone()),
@@ -876,6 +890,9 @@ async fn plan_refusal_lines(trace: &Path) -> Vec<String> {
                 .collect();
             refusal_lines(&events)
         }
+        // No trace file means the run failed before it wrote its first event, so
+        // there are no refusals to show and nothing is wrong with the trace.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
         Err(e) => vec![format!("notice     the trace could not be read: {e}")],
     }
 }
@@ -1034,6 +1051,22 @@ mod tests {
             .expect("runtime");
         let from_file = rt.block_on(plan_refusal_lines(&path));
         assert_eq!(from_file.len(), 3, "{from_file:?}");
+    }
+
+    /// A run that failed before its first event wrote no trace. That is not a
+    /// fault of the trace, so it prints no notice; a trace that exists and cannot
+    /// be read (here, a directory in its place) still does.
+    #[test]
+    fn a_missing_trace_prints_no_notice_and_an_unreadable_one_does() {
+        let dir = tempfile::tempdir().expect("dir");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let missing = rt.block_on(plan_refusal_lines(&dir.path().join("trace.jsonl")));
+        assert!(missing.is_empty(), "{missing:?}");
+        let unreadable = rt.block_on(plan_refusal_lines(dir.path()));
+        assert_eq!(unreadable.len(), 1, "{unreadable:?}");
+        assert!(unreadable[0].contains("the trace could not be read"));
     }
 
     /// Graph slice use is printed: how many dispatches were given a slice,

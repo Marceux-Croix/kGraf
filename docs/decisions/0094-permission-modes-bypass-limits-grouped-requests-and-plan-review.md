@@ -955,3 +955,22 @@ Evidence: `kgraf-tools` (`execpolicy/script_build_tests.rs`:
 `a_script_refused_whole_is_retried_when_its_commands_run`); `kgraf-host`
 (`build_allowlist_tests.rs`: `a_cd_into_the_worktree_then_an_allowlisted_build_runs_unattended`).
 Each regression test fails with its part of the change reverted.
+
+## Amendment (2026-10-02): a run refused before it starts creates nothing
+
+- **The refusal comes first.** A new run on the command line with plan review on and no
+  `--approve-plan` is refused before the project is opened: no `.kgraf`, no `graph.db` or
+  `ledger.db`, no `kgraf/<run>` branch, no worktree base, and no `trace` line for a trace
+  that is never written. The output is the refusal alone. The command line is never
+  attended, so the three facts the rule needs (review on, nobody attending, no approval) are
+  known at once. The rule is one function, `plan_review_refusal`, shared with the
+  orchestrator's own check, so the early refusal is never wider than the orchestrator's.
+- **Not rolled back.** The alternative, creating the branch and state and deleting them on
+  refusal, would risk deleting a project's earlier runs' databases and worktrees, which this
+  command did not create and cannot tell apart from its own. Refusing first deletes nothing.
+- **Unchanged cases.** A reading (`--corpus` without `--approve`) starts no run. A resume is
+  judged against its own record, which exists, by the orchestrator. A run built by a host
+  that may be attended (the desktop box) is judged by the orchestrator after the build, as before.
+- **A missing trace is not a notice.** When a run fails before its first event, the command
+  no longer prints "the trace could not be read" for a file that was never written. A trace
+  that exists and cannot be read still gets the notice.

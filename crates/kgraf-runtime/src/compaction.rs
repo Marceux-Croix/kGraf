@@ -307,10 +307,27 @@ pub(crate) fn archived_kind(event: &WorkerEvent) -> bool {
 /// would-be child the same way to ask the delegation guards, at dispatch,
 /// whether a hand-back could be split at all.
 pub fn handback_remainder(instruction: &str, context_tokens: u64, stop_tokens: u64) -> String {
-    format!(
-        "Continue the original instruction; the worker stopped at the context stop point \
-         ({context_tokens} of {stop_tokens} tokens). Instruction: {instruction}"
-    )
+    format!("{REMAINDER_HEAD}{context_tokens} of {stop_tokens}{REMAINDER_TAIL}{instruction}")
+}
+
+/// Where a hand-back remainder starts, up to its token counts.
+pub const REMAINDER_HEAD: &str =
+    "Continue the original instruction; the worker stopped at the context stop point (";
+/// Where a hand-back remainder's token counts end and the instruction begins.
+const REMAINDER_TAIL: &str = " tokens). Instruction: ";
+
+/// `text` with every hand-back wrapper taken off its front: the instruction a
+/// chain of hand-backs started from. A child's instruction is a remainder
+/// that quotes its parent's, so each level of a chain wraps the one before;
+/// this reads through all of them. Text that is no remainder comes back as is.
+pub fn original_instruction(mut text: &str) -> &str {
+    while let Some(rest) = text.strip_prefix(REMAINDER_HEAD) {
+        match rest.split_once(REMAINDER_TAIL) {
+            Some((_, inner)) => text = inner,
+            None => break,
+        }
+    }
+    text
 }
 
 /// The pre-compaction history of one worker, as recall entries: one per
@@ -571,6 +588,19 @@ mod tests {
 
     const INSTRUCTION: &str = "Rename `foo` to `bar` in src/lib.rs.\nKeep the public API \
                                stable.\nDo not touch tests/.";
+
+    #[test]
+    fn original_instruction_reads_through_every_hand_back_wrapper() {
+        let once = handback_remainder(INSTRUCTION, 11_000, 9_830);
+        let thrice = handback_remainder(&handback_remainder(&once, 10_500, 9_830), 10_900, 9_830);
+        assert_eq!(original_instruction(&once), INSTRUCTION);
+        assert_eq!(original_instruction(&thrice), INSTRUCTION);
+        // Text that is no remainder, and a header with no instruction, come back as they are.
+        assert_eq!(original_instruction(INSTRUCTION), INSTRUCTION);
+        let headless = format!("{REMAINDER_HEAD}1 of 2 tokens)");
+        assert_eq!(original_instruction(&headless), headless);
+        assert_eq!(original_instruction(""), "");
+    }
 
     #[test]
     fn a_reply_in_the_schema_parses_and_keeps_only_verbatim_constraints() {

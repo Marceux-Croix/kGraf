@@ -123,6 +123,7 @@ mod permission_hooks;
 /// Show the plan and wait for the user's yes before any worker starts
 /// (decision 0094).
 mod plan_review;
+pub use plan_review::plan_review_refusal;
 /// A worker's shortfall report, and the grant, amendment or hold that
 /// answers it (decision 0093).
 mod shortfall_hooks;
@@ -3029,11 +3030,12 @@ impl RunLoop {
         self.intake_notices.push(detail);
     }
 
-    /// A contract instruction that gives a type fields where the repository
-    /// defines it as a unit struct is noticed, never refused: the user's
-    /// instruction may ask for the change. Needs the repository root and the
+    /// A contract instruction that changes a public shape the repository
+    /// defines (a type's fields, a trait method or function signature, an enum
+    /// variant) is noticed, never refused: the user's instruction may ask for
+    /// the change ([`crate::plan_shapes`]). Needs the repository root and the
     /// declared files; a contract whose files cannot be read is not checked.
-    async fn note_reshaped_unit_structs(
+    async fn note_shape_changes(
         &mut self,
         specs: &[ContractSpec],
     ) -> Result<(), OrchestratorError> {
@@ -3041,7 +3043,7 @@ impl RunLoop {
             return Ok(());
         };
         for spec in specs {
-            let notes = crate::plan::reshaped_unit_structs(spec, |path| {
+            let notes = crate::plan_shapes::shape_changes(spec, |path| {
                 std::fs::read_to_string(root.join(path)).ok()
             });
             for detail in notes {
@@ -3278,6 +3280,8 @@ impl RunLoop {
                 gone.into_iter().map(|(n, _)| n.to_string()).collect(),
             )
         };
+        // A hand-back's child holds to its cap whichever way the slices resolve.
+        let named_nodes = self.cap_slices(&contract, named_nodes)?;
         // What the named slices resolved to last time: none when the recorded
         // slices came from the declared files.
         let previous_named: &[NodeId] = if contract.slices_from_writes {
@@ -3288,6 +3292,7 @@ impl RunLoop {
         let named_changed = named_nodes != previous_named;
         let (nodes, from_writes) = if named_nodes.is_empty() {
             let (nodes, _, files) = self.write_file_slices(&contract.writes)?;
+            let nodes = self.cap_slices(&contract, nodes)?;
             if nodes.is_empty() {
                 (nodes, None)
             } else {
@@ -5492,20 +5497,81 @@ impl RunLoop {
     }
 
     fn slice_tokens(&self, nodes: &[NodeId]) -> Result<u64, OrchestratorError> {
+        Ok(self.slice_token_list(nodes)?.iter().map(|(_, t)| t).sum())
+    }
+
+    /// Each node's slice tokens, in order. A node the graph no longer holds
+    /// is left out.
+    fn slice_token_list(&self, nodes: &[NodeId]) -> Result<Vec<(NodeId, u64)>, OrchestratorError> {
         if nodes.is_empty() {
-            return Ok(0);
+            return Ok(Vec::new());
         }
         let graph = self.s.graph.clone();
         blocking(|| {
             let g = graph.lock().map_err(|_| StoreError::Poisoned)?;
-            let mut t = 0;
+            let mut out = Vec::new();
             for n in nodes {
                 if let Some(rec) = g.node(n.as_str())? {
-                    t += g.source_of(&rec).map(|s| estimate_tokens(&s)).unwrap_or(0);
+                    let t = g.source_of(&rec).map(|s| estimate_tokens(&s)).unwrap_or(0);
+                    out.push((n.clone(), t));
                 }
             }
-            Ok(t)
+            Ok(out)
         })
+    }
+
+    /// What each slice costs in a brief: the slice as the worker is given it,
+    /// rendered by the route's slice source and counted. A slice is not its
+    /// node's source (it grows with neighbors up to the per-slice budget), so
+    /// the node's source is no measure; the rendering is. A node that cannot be
+    /// rendered is left out. Without a route to render with, the node's source
+    /// bounded at [`WRITE_SLICE_EACH_TOKENS`] stands in.
+    fn rendered_slice_sizes(
+        &self,
+        route: Option<&str>,
+        nodes: &[NodeId],
+    ) -> Result<Vec<(NodeId, u64)>, OrchestratorError> {
+        let Some(source) = route
+            .and_then(|n| self.route(n))
+            .or_else(|| self.s.routes.first())
+            .map(|r| r.env.slices.clone())
+        else {
+            return Ok(self
+                .slice_token_list(nodes)?
+                .into_iter()
+                .map(|(n, t)| (n, t.min(WRITE_SLICE_EACH_TOKENS)))
+                .collect());
+        };
+        let nodes = nodes.to_vec();
+        blocking(move || {
+            Ok::<_, OrchestratorError>(
+                nodes
+                    .iter()
+                    .filter_map(|n| {
+                        let rendered = source.render(std::slice::from_ref(n)).ok()?;
+                        let slice = rendered.first()?;
+                        Some((
+                            n.clone(),
+                            estimate_tokens(&format!("// slice {}\n{}", slice.node, slice.text)),
+                        ))
+                    })
+                    .collect(),
+            )
+        })
+    }
+
+    /// `nodes` held to the contract's slice cap, when it has one (a
+    /// hand-back's child): the slices that fit, in their order.
+    fn cap_slices(
+        &self,
+        contract: &OpenContract,
+        nodes: Vec<NodeId>,
+    ) -> Result<Vec<NodeId>, OrchestratorError> {
+        let Some(cap) = contract.slice_cap_tokens else {
+            return Ok(nodes);
+        };
+        let sized = self.rendered_slice_sizes(contract.route.as_deref(), &nodes)?;
+        Ok(crate::handback_fit::fit_slices(&sized, cap))
     }
 
     /// The registry keys a contract's write set takes: whole files, and
@@ -7339,10 +7405,18 @@ impl RunLoop {
                 .as_ref()
                 .and_then(|n| parent.worktrees.get(n).cloned()),
         };
+        // What the child's brief may take, from the route it runs on.
+        let (prefix_tokens, target_tokens) = self.route(&source_route).map_or((0, u64::MAX), |r| {
+            (
+                r.env.prefix.estimated_tokens(),
+                r.context.worker_plan_target_tokens(),
+            )
+        });
         for (i, item) in handoff.remaining.iter().enumerate() {
             if item.trim().is_empty() {
                 continue;
             }
+            let item = &self.flattened_remainder(parent, item);
             let checked = guards::check(
                 &policy,
                 &roster,
@@ -7375,25 +7449,15 @@ impl RunLoop {
                         }
                         Ok(_) => format!("re-split refused: child id `{cid}` is taken"),
                     };
-                    let reason = reason + &self.compaction_note(worker);
-                    self.submit_report(
-                        parent,
-                        Some(worker),
-                        ReportKind::NeedsInput,
-                        "re-split refused",
-                    );
-                    self.hold(&parent.contract, reason);
-                    if let Some(c) = self.record.contract_mut(&parent.contract) {
-                        // The parent's worktree holds its work so far: kept,
-                        // named by the held parent, whose next attempt
-                        // continues in it rather than starting over.
-                        c.workspace = Some(workspace.clone());
-                        if let (Some(name), Some(handle)) = (&inherited_name, &inherited_handle) {
-                            c.worktrees.insert(name.clone(), handle.clone());
-                        }
-                        forget_workers(c);
-                    }
-                    return self.save();
+                    return self
+                        .hold_unsplit(
+                            parent,
+                            worker,
+                            reason,
+                            &workspace,
+                            inherited_name.as_deref().zip(inherited_handle.as_deref()),
+                        )
+                        .await;
                 }
             };
             let spec = ContractSpec {
@@ -7424,9 +7488,62 @@ impl RunLoop {
                 parent.lineage_tasks.clone(),
                 deps,
             );
-            child.slices = parent.slices.clone();
-            child.slice_names = parent.slice_names.clone();
+            // The child starts under the plan target (`handback_fit`): the
+            // parent's pinned slices are kept up to what the fixed part of the
+            // brief leaves, or the split is refused now, at the first
+            // hand-back, when nothing can fit.
+            let fit = match crate::handback_fit::child_fit(
+                prefix_tokens,
+                &brief_text(&child),
+                target_tokens,
+            ) {
+                Ok(f) => f,
+                Err(unfit) => {
+                    return self
+                        .hold_unsplit(
+                            parent,
+                            worker,
+                            format!("re-split refused: {unfit}"),
+                            &workspace,
+                            inherited_name.as_deref().zip(inherited_handle.as_deref()),
+                        )
+                        .await;
+                }
+            };
+            let sized = self.rendered_slice_sizes(Some(&source_route), &parent.slices)?;
+            let kept = crate::handback_fit::fit_slices(&sized, fit.slice_cap_tokens);
+            if kept.len() < parent.slices.len() {
+                let given: u64 = sized
+                    .iter()
+                    .filter(|(n, _)| kept.contains(n))
+                    .map(|(_, t)| t)
+                    .sum();
+                let all: u64 = sized.iter().map(|(_, t)| t).sum();
+                let detail = format!(
+                    "contract {}: the hand-back's child pins {} of {} slices ({given} of {all} \
+                     tokens) so that its brief starts under the plan target of {target_tokens} \
+                     tokens; the worker reads the rest with its tools",
+                    child.contract,
+                    kept.len(),
+                    parent.slices.len()
+                );
+                self.notices.insert(detail.clone());
+                let at = self.now();
+                self.trace(TraceEvent::Notice {
+                    at_ms: at,
+                    contract: child.contract.clone(),
+                    worker: String::new(),
+                    detail,
+                })
+                .await?;
+            }
+            child.slices = kept;
+            // The names would resolve again at dispatch to the whole set: the
+            // cap holds the trimmed set at every dispatch instead.
+            child.slice_names = Vec::new();
             child.slice_from = parent.slice_from.clone();
+            child.slices_from_writes = false;
+            child.slice_cap_tokens = Some(fit.slice_cap_tokens);
             child.workspace = Some(workspace.clone());
             if let (Some(name), Some(handle)) = (&inherited_name, &inherited_handle) {
                 child.worktrees.insert(name.clone(), handle.clone());
@@ -7481,6 +7598,35 @@ impl RunLoop {
         let ledger = self.s.ledger.clone();
         let tasks = blocking(|| ledger.usage_by_task(Some(ORCHESTRATOR_AGENT_PREFIX)))?;
         self.sizer = Sizer::from_task_usage(&tasks);
+        self.save()
+    }
+
+    /// A hand-back that cannot be split: the parent is held with `reason`, and
+    /// its worktree, which holds its work so far, is kept and named by it, so
+    /// its next attempt continues there rather than starting over.
+    async fn hold_unsplit(
+        &mut self,
+        parent: &OpenContract,
+        worker: &AgentId,
+        reason: String,
+        workspace: &Path,
+        inherited: Option<(&str, &str)>,
+    ) -> Result<(), OrchestratorError> {
+        let reason = reason + &self.compaction_note(worker);
+        self.submit_report(
+            parent,
+            Some(worker),
+            ReportKind::NeedsInput,
+            "re-split refused",
+        );
+        self.hold(&parent.contract, reason);
+        if let Some(c) = self.record.contract_mut(&parent.contract) {
+            c.workspace = Some(workspace.to_path_buf());
+            if let Some((name, handle)) = inherited {
+                c.worktrees.insert(name.to_owned(), handle.to_owned());
+            }
+            forget_workers(c);
+        }
         self.save()
     }
 

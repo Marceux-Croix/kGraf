@@ -432,6 +432,18 @@ no adapter does, so a thinking model's reasoning is not in the measure of the ne
 which (`measured_context` or `queued_messages`). There is no projection and no model-requested
 hand-back.
 
+**A hand-back's child is sized to fit.** The runtime words a remainder from the parent's whole
+assembled brief, which for a child quotes its parent's brief, so each level wrapped the one
+before and a child's first request grew with the depth. `handback_fit` brings the remainder back
+to the chain's original instruction, once, with a marker line for the hand-back's level (the
+guards' cycle rule needs the tasks of a chain to differ). The child is sized as a planned contract
+is (0057): the route's prefix estimate and the instruction's bound must leave room under the plan
+target (half the stop point), and the parent's pinned slices are cut, in order, to what is left,
+each counted as the route's slice source renders it. The cap is stored on the child
+(`slice_cap_tokens`) and applied at every dispatch, so a re-resolved slice set cannot undo it.
+A child whose fixed part alone passes the target cannot fit: `stop_point_policy` spawns its
+parent to compact (0095), and `resplit` refuses the split at the first hand-back with the numbers.
+
 **A turn that only announces work is not a completion.** When an attempt would end as completed
 with no successful write and no mutating command in the whole attempt (reads do not count) and
 its contract declares writes, the runtime drops the turn, counts the round, sends one notice
@@ -469,7 +481,9 @@ when a later hook refused it.
     skill's refusal is reported, naming the hook's verdict, and nobody is
     asked. `report_shortfall` is never restricted, and a permission report a
     worker's skill refuses holds its contract with the skill's name (decision
-    0053 amendment).
+    0053 amendment). A skill whose `allowed-tools` lists a tool the worker does
+    not have is refused at activation, naming the entry and the real tools
+    (0053, amended 2026-10-02).
 
 A pre-tool hook can allow, ask or deny a call. The loop always holds its last
 round back for an answer. Every call's trace records what it was given as
@@ -1356,7 +1370,10 @@ exclusive", and on damage each named command's attempt fails too. The
 ledger, trace, run records, transcripts and graph stay refused in every mode.
 An instructions report amends the contract once; at most two re-dispatches per
 contract for shortfalls. A shortfall the orchestrator would hold is verified first: an attempt that changed files goes to the verifier, and a pass merges it with the shortfall kept as a notice, while a failure, or a check that checks nothing, keeps the hold (decision 0093). With plan review on, no worker starts until the user
-approves the plan in the box. A contract accepted on a check that always
+approves the plan in the box. On the command line, which nobody attends, a new
+run with plan review on and no `--approve-plan` is refused before the project is
+opened, so it creates no state, branch or trace (decision 0094, amended
+2026-10-02). A contract accepted on a check that always
 passes, or after a refusal its worker never retried, is reported unverified
 (decision 0093). A dependency missing from the local cargo cache is fetched by the host, outside
 the sandbox, only with the project's consent, checked at every run start

@@ -670,6 +670,11 @@ pub async fn assemble(a: Assembly) -> Result<Assembled> {
         connections.push(caller);
     }
 
+    // The registry is complete: tell the skill session which tools a worker has,
+    // so a skill whose `allowed-tools` names one that does not exist is refused.
+    if let Some(session) = &skills {
+        session.bind_tools(registry.qualified_names().cloned());
+    }
     let registry = Arc::new(registry);
     let prefix = PrefixSnapshot::new(
         SharedPrefix {

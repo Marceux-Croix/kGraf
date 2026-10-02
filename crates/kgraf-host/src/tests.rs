@@ -6846,6 +6846,7 @@ mod skill_enforcement {
             "skills": [
                 skill_json("hidden", None, true),
                 skill_json("reader", Some(&["read_file"]), false),
+                skill_json("badwrite", Some(&["read_file", "write_file"]), false),
             ],
             "conflicts": [],
             "problems": [],
@@ -7085,6 +7086,38 @@ mod skill_enforcement {
                 .is_some_and(|r| r.contains("reader")),
             "the run's skill directory holds the worker's restriction: {:?}",
             ran.directory_refusals
+        );
+    }
+
+    /// Round 7: a skill listing `write_file`, which no worker has, was accepted and
+    /// left the worker nothing to write with. Through the real assembler, the
+    /// activation is refused, names the entry and the real tools, and restricts
+    /// nothing: the next call runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_skill_listing_a_tool_the_worker_lacks_is_refused_with_the_real_tools() {
+        let ran = run(
+            true,
+            vec![
+                vec![("skill", serde_json::json!({"name": "badwrite"}))],
+                vec![("list_directory", serde_json::json!({"path": "."}))],
+            ],
+        )
+        .await;
+        let (output, is_error) = ran.result("c0-0");
+        assert!(is_error, "{output}");
+        assert!(
+            output.contains("`write_file` (use `apply_patch`)"),
+            "{output}"
+        );
+        assert!(
+            output.contains("apply_patch") && output.contains("read_file"),
+            "{output}"
+        );
+        assert!(!output.contains("badwrite instructions"), "{output}");
+        let (listed, is_error) = ran.result("c1-0");
+        assert!(
+            !is_error,
+            "a refused activation restricts nothing: {listed}"
         );
     }
 

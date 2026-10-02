@@ -36,7 +36,10 @@ impl RunLoop {
             return StopPointPolicy::Compact;
         };
         let source_route = contract.route.clone().unwrap_or_else(|| first.clone());
-        let task = kgraf_runtime::handback_remainder(instruction, stop_tokens, stop_tokens);
+        let task = self.flattened_remainder(
+            contract,
+            &kgraf_runtime::handback_remainder(instruction, stop_tokens, stop_tokens),
+        );
         let child = format!("{}.h1", contract.contract);
         let taken = self.record.contract(&child).is_some()
             || self.record.verified_contracts.contains(&child)
@@ -54,11 +57,53 @@ impl RunLoop {
             },
         )
         .is_ok();
-        if passes && !taken {
+        // A child that could not start with room to work is no better than a
+        // refused one: the worker compacts instead (`handback_fit`).
+        let fits = {
+            let mut probe = contract.clone();
+            probe.instruction = kgraf_secrets::intake(&task);
+            self.route(&source_route).is_none_or(|r| {
+                crate::handback_fit::child_fit(
+                    r.env.prefix.estimated_tokens(),
+                    &brief_text(&probe),
+                    r.context.worker_plan_target_tokens(),
+                )
+                .is_ok()
+            })
+        };
+        if passes && !taken && fits {
             StopPointPolicy::HandBack
         } else {
             StopPointPolicy::Compact
         }
+    }
+
+    /// A hand-back remainder the runtime made from `parent`'s assembled brief,
+    /// brought back to one wrapper around the chain's original instruction, so
+    /// a child's instruction does not grow with the depth of the chain.
+    pub(super) fn flattened_remainder(&self, parent: &OpenContract, item: &str) -> String {
+        let parent_instruction = kgraf_secrets::model_copy(&parent.instruction).into_owned();
+        let root = parent
+            .lineage_tasks
+            .iter()
+            .rev()
+            .map(|t| kgraf_secrets::model_copy(t).into_owned())
+            .find(|t| !t.starts_with(kgraf_runtime::REMAINDER_HEAD))
+            .unwrap_or_else(|| parent_instruction.clone());
+        // The child's place in the chain: the remainders already in its lineage,
+        // and itself.
+        let level = 1 + parent
+            .lineage_tasks
+            .iter()
+            .filter(|t| kgraf_secrets::model_copy(t).starts_with(kgraf_runtime::REMAINDER_HEAD))
+            .count();
+        crate::handback_fit::flatten_remainder(
+            item,
+            &brief_text(parent),
+            &parent_instruction,
+            &root,
+            level,
+        )
     }
 
     /// Record a worker's compaction: trace, run record, sizing miss, report.

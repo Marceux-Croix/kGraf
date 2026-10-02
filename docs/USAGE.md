@@ -857,7 +857,9 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   dispatches it; Change plan sends your note to the planner and shows a new plan; Reject plan
   ends the run with nothing dispatched. Turning review off while a plan waits approves it. A run
   nobody can approve (the command line, a scheduled run) is refused before anything is planned,
-  unless `--approve-plan` approves the plan for you.
+  unless `--approve-plan` approves the plan for you. On the command line the refusal comes
+  before kGraf opens the project: it prints the refusal alone and creates no `.kgraf`, database,
+  branch or worktree, and leaves what earlier runs made as it was.
 - A contract whose check always passes (`--verify true`, `:`, `exit 0`), or whose worker
   finished after a policy refused a call it never ran, is printed as `unverified <id>:
   <reason>` after the `verified` line. The run still completes; the line says the check did
@@ -1141,6 +1143,11 @@ an inventory is there.
   tools. An entry naming another agent's tool (`Read`, `Bash`) matches nothing here, so
   a skill written only for another agent refuses every call; edit its list to use these
   names.
+  A skill that lists a tool the worker does not have (a name from another agent, or
+  `write_file`: the write tool is `apply_patch`) is not activated. The worker's call fails
+  with each unknown entry, the real tool that does the same job where there is one, and the
+  list of tools the worker has, and its tool set is left as it was (decision 0053, amended
+  2026-10-02).
   When the permission mode would also ask about or refuse such a call, the worker sees the
   skill's refusal, which names the mode's verdict too, and you are not asked. A worker can
   always call `report_shortfall`, whatever its skills list. A permission report for a
@@ -1405,9 +1412,18 @@ Behavior that differs from earlier builds. Each item names the decision that hol
   command that can only pass once other contracts merge is checked on the merged result, and
   that the worker must not write other contracts' files to make it pass.
 - The planner is told that the repository's existing public items (type names and shapes, trait
-  signatures, how callers use them) are the interface. A contract instruction that gives a type
-  fields where a file the contract writes defines it as a unit struct produces a notice at plan
-  intake; the plan is not refused, because the instruction may ask for the change. When a worker's
+  signatures, how callers use them) are the interface. A contract instruction that changes the
+  shape of a public item that a file the contract writes defines produces a notice at plan intake;
+  the plan is not refused, because the instruction may ask for the change. kGraf reads the code
+  the instruction shows (backtick spans, fenced blocks, bare `struct`, `enum`, `trait`, `fn` and
+  `impl` items) and compares it with the file's public declarations: a struct's kind and public
+  fields, an enum variant's fields, and the signature (parameter types, receiver, generics,
+  return type) of a trait method, a method or a function. Parameter names do not count. An
+  item the repository does not define is an addition, and a private item may change; neither is
+  noticed. For an instruction that shows no code, a sentence that names a public item in
+  backticks with a verb of change ("change `Act::act`", "add a parameter to `run`") is noticed
+  too, unless it says to keep it. Rust files are read by structure; other languages get only the
+  unit-struct check (0018). When a worker's
   attempt is refused for a compile error in a file its contract does not write, the retry is
   amended once with the error, the file, and the instruction to keep the public shape that existing
   callers use, instead of being sent again unchanged (0018). A worker that reports its
@@ -1452,6 +1468,14 @@ Behavior that differs from earlier builds. Each item names the decision that hol
   record naming the transcript file, and the run record lists it under `compactions`. A
   worker that fills its context a second time hands back, and its contract is held with a
   reason that names the worktree and the transcript (0095).
+- A hand-back's child starts with room to work. Its instruction quotes the original instruction
+  once, with a line that says which hand-back it is, instead of quoting each earlier brief
+  inside the next. Its pinned slices are cut to what is left after the prefix and the
+  instruction under the plan target (half the stop point), each slice counted as rendered; a
+  notice says how many were kept, and the worker reads the rest with its tools. When the prefix
+  and the instruction alone pass the plan target, no child can fit: the worker is spawned to
+  compact once at its stop point instead of handing back, and a re-split that is still asked
+  for is refused at the first hand-back with the numbers (0095).
 - Every worker's tool list now includes `recall_history`, so a worker transcript recorded by
   an earlier build cannot be resumed; start that work again (0095).
 - A contract whose named graph slices all find nothing, or that names none, is given the
