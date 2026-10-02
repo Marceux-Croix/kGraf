@@ -634,6 +634,30 @@ async fn a_program_this_machine_lacks_is_not_run_not_a_contract_failure() {
     );
 }
 
+/// A program that runs and cannot open a file the command names is a missing
+/// file, not a missing program: the message must not say the language cannot
+/// be checked on this machine.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_script_argument_the_tree_lacks_is_a_missing_file_not_a_missing_program() {
+    let dir = tempfile::tempdir().expect("dir");
+    let repo = py_repo(dir.path());
+    let r = runner(dir.path(), &repo);
+    let mut ic = py_ic();
+    ic.compile = s(&["bash", "-n", "serve_local.sh"]);
+    let e = check_mechanical(&r, &ic)
+        .await
+        .expect_err("a check that cannot open its file is no verdict");
+    assert!(
+        matches!(&e, CheckError::InputMissing { program, file, .. } if program == "bash" && file == "serve_local.sh"),
+        "{e}"
+    );
+    let text = e.to_string();
+    assert!(
+        text.contains("`serve_local.sh`") && !text.contains("cannot be checked on this machine"),
+        "{text}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn python_a_sound_contract_passes_and_a_missing_name_fails_stub_compile() {
     let dir = tempfile::tempdir().expect("dir");

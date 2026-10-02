@@ -475,3 +475,48 @@ Tests: `kgraf-orchestrator` `tests/contract_flow.rs`
 (`the_printed_report_states_the_interface_calls_cost_and_yield`). The recorded contracts answer is
 `tests/fixtures/planner-answers/d1-contracts-order-pricing.txt`; the recorded 5.7 KB refusal is
 `tests/fixtures/check-output/vacuity-refusal-with-xcrun-noise.txt`.
+
+## Amendment (2026-10-02, third): a check command names only files the check can see, and `not run` is two counts
+
+Two faults seen in live local-model runs.
+
+**A script nobody supplied.** A planner-written interface gave the compile command
+`["bash", "-n", "serve_local.sh"]`. No file `serve_local.sh` was in the interface (stub,
+consumer, tests) or in the repository; a contract in the plan might write it later, but the check
+runs before any contract is dispatched. `bash` exited 127 with `bash: serve_local.sh: No such file
+or directory`; the runner read exit 127 as a missing program, so the interface was taken and both
+parties were held with "the check program `serve_local.sh` is not installed ...: contracts in its
+language cannot be checked on this machine". Both halves were wrong: the program was installed,
+the language was fine, and the interface was refusable at intake.
+
+The rule: a compile or test command may read only files that exist where the check runs, which is
+the repository at the dispatch base with the interface's own files laid over it. Two mechanisms.
+- At intake, `InterfaceContract::unsupplied_command_files` lists the arguments that name a script or
+  source file (a relative path of plain path characters ending in a known script or source extension;
+  not a flag, an output after `-o`, an absolute or parent path, or quoted program text) and that the
+  interface does not supply. `missing_command_files` looks each up at the dispatch base and refuses the
+  interface when none exists, naming the file and, when a contract's writes include it, that this
+  contract writes it only after the check. The planner is asked again (one of the three asks).
+- At run time, when a program that is installed fails with exit 127 and the missing name is one of its
+  own arguments with "No such file", the error is `CheckError::InputMissing` (the file named, the
+  program said to be installed), not `ProgramMissing`. It is still a check that could not run, held
+  and counted in `checks_not_run`, so an interface persisted before this rule reads true on resume.
+
+**Not run is two counts.** `checks_not_run`, the report's `not run`, counts each `Unchecked` edge and
+each `CheckNotRun` event, both event-sourced (`challenge.rs`, `apply`). A report can say `not run 1`
+with no unchecked edge: one interface whose check could not run. The scenario canary compared the
+counter with the unchecked edges alone and read that as a disagreement; it now compares it with
+unchecked edges plus `check_not_run` events.
+
+**An edge with nothing to derive.** A producer that edits an existing file holding no scaffold has no
+stub to stand in, so no compile check can be derived for the edges that consume it. kGraf records each
+as `unchecked` with the cause ("no file P writes holds a scaffold (a placeholder body) to stand in as
+its stub") and the skipped behavior check, and counts it in `not run`. That is correct behavior. The
+scenario canary treats it as honest only when the reason says the behavior check was skipped on
+purpose and states a cause; a derived check that failed or could not run, a bare "could not be
+derived", and an edge with no record are still defects.
+
+Tests: `kgraf-orchestrator` `checks.rs` (`a_script_argument_is_a_file_the_command_reads`,
+`a_command_file_the_interface_does_not_supply_is_listed`), `tests/contract_checks.rs`
+`a_script_argument_the_tree_lacks_is_a_missing_file_not_a_missing_program`, `tests/contract_flow.rs`
+`a_check_command_naming_a_file_nobody_supplies_is_asked_again`.

@@ -3250,6 +3250,40 @@ async fn a_stub_over_an_existing_file_is_asked_to_declare_it_in_replaces() {
     assert_eq!(report.contracts.interfaces_registered, 1, "{report:?}");
 }
 
+/// A check command that names a script nobody supplies (the interface leaves it
+/// out and the repository does not hold it; a contract may write it later, but
+/// the check runs first) cannot run on any code. It is refused at intake, naming
+/// the file, and asked for again; before this rule it was taken, and the gate
+/// held both parties as "the check program is not installed".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_check_command_naming_a_file_nobody_supplies_is_asked_again() {
+    let dir = tempfile::tempdir().expect("dir");
+    let mut missing = py_ic();
+    missing.compile = s(&["bash", "-n", "serve_local.sh"]);
+    let rig = Rig::with_planner(
+        dir.path(),
+        first_then(plan_with(&missing), plan_with(&py_ic())),
+        agreeing,
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    let report = plan_then_stop(rig.orchestrator(vec![])).await;
+    let prompts = rig.parts.planner.prompts();
+    assert_eq!(
+        prompts.len(),
+        3,
+        "the contracts ask, an interface ask, one re-ask"
+    );
+    assert!(
+        prompts[2].contains("the compile command names `serve_local.sh`")
+            && prompts[2].contains("does not supply and the repository does not hold"),
+        "{}",
+        prompts[2]
+    );
+    assert_eq!(report.contracts.interfaces_registered, 1, "{report:?}");
+    assert_eq!(report.contracts.checks_not_run, 0, "{report:?}");
+}
+
 // ------------------------------------------- derive first, ask only for judgment
 
 /// The order-pricing workspace of the benchmark, as a plan finds it: a shared

@@ -746,6 +746,9 @@ impl RunLoop {
             if problems.is_empty() {
                 problems.extend(self.undeclared_replacements(&ic).await);
             }
+            if problems.is_empty() {
+                problems.extend(self.missing_command_files(&ic, specs).await);
+            }
             if problems.is_empty()
                 && let Some(runner) = self.checks_runner()
             {
@@ -974,6 +977,55 @@ impl RunLoop {
                     ic.id, f.path
                 ));
             }
+        }
+        problems
+    }
+
+    /// A file a compile or test command names that exists nowhere the check
+    /// can see: not among the interface's own files, and not in the repository
+    /// at the dispatch base. The check runs before any party is dispatched, so
+    /// a file a contract writes later is not there, and the command would fail
+    /// on the missing file, not on the code. Asked for again here, naming the
+    /// file, so the interface supplies it or uses a command over files that
+    /// exist. A read that fails says nothing about the file and is not a
+    /// problem.
+    async fn missing_command_files(
+        &self,
+        ic: &InterfaceContract,
+        specs: &[ContractSpec],
+    ) -> Vec<String> {
+        let candidates = ic.unsupplied_command_files();
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+        let Some(runner) = self.checks_runner() else {
+            return Vec::new();
+        };
+        let mut problems = Vec::new();
+        for (what, path) in candidates {
+            if !matches!(runner.read_base(&path).await, Ok(None)) {
+                continue;
+            }
+            let writers: Vec<&str> = specs
+                .iter()
+                .filter(|s| s.writes.iter().any(|w| w.path == path))
+                .map(|s| s.id.as_str())
+                .collect();
+            let later = if writers.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " ({} writes it only when it runs, after this check)",
+                    writers.join(", ")
+                )
+            };
+            problems.push(format!(
+                "interface `{}`: the {what} command names `{path}`, which the interface does \
+                 not supply and the repository does not hold{later}; the check runs before any \
+                 contract is dispatched, so give the file's content in the interface (stub, \
+                 consumer or tests), or use a command over files that exist",
+                ic.id
+            ));
         }
         problems
     }

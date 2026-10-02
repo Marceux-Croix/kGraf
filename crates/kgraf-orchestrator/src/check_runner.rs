@@ -756,6 +756,22 @@ impl SandboxRunner {
             && !timed_out
             && let Some((named, detail)) = missing_program(code, &tail)
         {
+            // The shell names what it could not open: when that is one of the
+            // command's own arguments and the program itself ran, a file is
+            // missing, not a program.
+            if let Some(file) = named.as_deref().filter(|n| {
+                *n != program
+                    && detail.contains("No such file")
+                    && args.iter().any(|a| {
+                        a.strip_prefix("./").unwrap_or(a) == n.strip_prefix("./").unwrap_or(n)
+                    })
+            }) {
+                return Err(CheckError::InputMissing {
+                    program: program.clone(),
+                    file: file.to_owned(),
+                    detail,
+                });
+            }
             return Err(CheckError::ProgramMissing {
                 program: named.unwrap_or_else(|| program.clone()),
                 detail,

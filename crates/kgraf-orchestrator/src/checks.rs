@@ -149,6 +149,44 @@ fn whole_command_line(program: &str) -> bool {
         .any(|arg| arg.len() > 1 && arg.starts_with('-'))
 }
 
+/// Extensions that mark a command argument as a script or source file the
+/// command reads (`bash -n serve_local.sh`, `python3 test_x.py`). A data or
+/// config file is left out, and so is a bare word: `unittest pkg.mod` names a
+/// module, not a file.
+const FILE_ARGUMENT_EXTENSIONS: &[&str] = &[
+    "sh", "bash", "zsh", "py", "js", "mjs", "cjs", "ts", "rs", "rb", "pl", "php", "lua", "go", "c",
+    "cc", "cpp", "h", "hpp", "java",
+];
+
+/// The arguments of `args` that name a repository file the command reads: a
+/// relative path of plain path characters that ends in a script or source
+/// extension. A flag, an absolute path, an output (the word after `-o`) and
+/// anything with a quote, space or other shell character is not one. The path
+/// is returned without a leading `./`.
+fn file_arguments(args: &[String]) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut after_output_flag = false;
+    for arg in args {
+        let was_output =
+            std::mem::replace(&mut after_output_flag, OUTPUT_FLAGS.contains(&arg.as_str()));
+        if was_output || arg.starts_with('-') || arg.starts_with('/') {
+            continue;
+        }
+        let plain = !arg.is_empty()
+            && arg
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/'));
+        let name = arg.strip_prefix("./").unwrap_or(arg);
+        let known = name
+            .rsplit_once('.')
+            .is_some_and(|(stem, ext)| !stem.is_empty() && FILE_ARGUMENT_EXTENSIONS.contains(&ext));
+        if plain && known && !name.split('/').any(|part| part == "..") {
+            out.push(name);
+        }
+    }
+    out
+}
+
 /// Words that, alone in angle brackets, stand for a name the author did not fill
 /// in (`<crate_name>`), whatever the language.
 const PLACEHOLDER_WORDS: [&str; 8] = [
@@ -307,6 +345,36 @@ impl InterfaceContract {
             }
         }
         problems
+    }
+
+    /// The files the compile and test commands name that the interface does
+    /// not supply (not among its stub, wrong, reference, consumer or tests
+    /// files), as `(compile or test, path)`. The check runs before any party
+    /// is dispatched, in a copy of the repository with only the interface's
+    /// files laid over it, so such a file exists only if the repository holds
+    /// it: a file a contract in the plan will write later is not there yet.
+    /// The caller looks each up in the repository.
+    pub fn unsupplied_command_files(&self) -> Vec<(&'static str, String)> {
+        let supplied: BTreeSet<&str> = [
+            &self.stub,
+            &self.wrong,
+            &self.reference,
+            &self.consumer,
+            &self.tests,
+        ]
+        .into_iter()
+        .flatten()
+        .map(|f| f.path.strip_prefix("./").unwrap_or(&f.path))
+        .collect();
+        let mut out = Vec::new();
+        for (what, argv) in [("compile", &self.compile), ("test", &self.test)] {
+            for file in file_arguments(argv.get(1..).unwrap_or_default()) {
+                if !supplied.contains(file) && !out.iter().any(|(w, f)| *w == what && f == file) {
+                    out.push((what, file.to_owned()));
+                }
+            }
+        }
+        out
     }
 
     /// Template slots the author did not fill in (`use <crate_name>::item`, a
@@ -552,6 +620,19 @@ pub enum CheckError {
         "the check program `{program}` is not installed ({detail}): contracts in its language cannot be checked on this machine"
     )]
     ProgramMissing { program: String, detail: String },
+    /// The program runs, and the file the command names as an argument is not
+    /// in the check's tree (`bash -n serve_local.sh`: `bash: serve_local.sh: No
+    /// such file or directory`, exit 127). The language is fine and the
+    /// program is installed; the interface leaves the file out, and no check
+    /// of the code can run until the interface supplies it.
+    #[error(
+        "the check command names the file `{file}`, which is not in the check's tree ({detail}): the interface must supply it (stub, consumer or tests) or the repository must hold it; the program `{program}` is installed"
+    )]
+    InputMissing {
+        program: String,
+        file: String,
+        detail: String,
+    },
     /// A compile run timed out twice: inconclusive about the contract (a slow or
     /// loaded machine), so it is not held against it; the check did not run.
     #[error("the {what} compile timed out twice; inconclusive, not a contract failure: {detail}")]
@@ -2547,6 +2628,50 @@ mod tests {
         assert!(e.contains("`Cargo.toml` is declared in replaces"), "{e}");
         c.replaces = vec!["src/config.rs".into()];
         c.validate().expect("a stub path may be declared");
+    }
+
+    #[test]
+    fn a_script_argument_is_a_file_the_command_reads() {
+        let argv = |a: &[&str]| a.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert_eq!(
+            file_arguments(&argv(&[
+                "-n",
+                "serve_local.sh",
+                "./t/test_a.py",
+                "-p",
+                "pkg"
+            ])),
+            vec!["serve_local.sh", "t/test_a.py"]
+        );
+        // Not files: a module, an output, an absolute path, a parent path, a
+        // quoted program text, a flag value, a data file.
+        assert!(
+            file_arguments(&argv(&[
+                "pkg.mod",
+                "-o",
+                "out.sh",
+                "/usr/bin/x.sh",
+                "../x.py",
+                "import a.py; print(1)",
+                "-cfoo.py",
+                "data.json"
+            ]))
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_command_file_the_interface_does_not_supply_is_listed() {
+        let mut c = ic();
+        c.compile = vec!["bash".into(), "-n".into(), "serve_local.sh".into()];
+        c.test = vec!["python3".into(), "test_x.py".into()];
+        c.tests = vec![FileOverlay::new("./test_x.py", "pass\n")];
+        assert_eq!(
+            c.unsupplied_command_files(),
+            vec![("compile", "serve_local.sh".to_owned())]
+        );
+        c.stub.push(FileOverlay::new("serve_local.sh", "echo hi\n"));
+        assert!(c.unsupplied_command_files().is_empty());
     }
 
     #[test]

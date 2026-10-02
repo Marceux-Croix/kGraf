@@ -651,7 +651,10 @@ command the sandbox cannot run, or that fails the stub-compile stage, is replace
 and the checks run again, with no re-ask. An accepted interface is kept across asks; a re-ask covers
 only the interfaces still refused or unbound, quoting those interfaces' previous entries and their
 refusals (cut at 12,000 characters, the cut said). An omitted interface and a malformed one are
-retried the same way. Check output reaches no
+retried the same way. A compile or test command that names a script or source file the interface
+does not supply and the repository does not hold at the dispatch base is refused with the file named
+(`missing_command_files`), because the check runs before any contract does; a program that runs and
+cannot open such a file is `CheckError::InputMissing`, not a missing program. Check output reaches no
 model, trace or notice with the host's own toolchain noise in it (`filter_host_noise`: macOS `xcrun`
 and `xcodebuild` lines, repeated identical warning blocks; error lines stay). At the end of planning
 every consumed edge no behavior interface binds (a dependency, or a pair a refused interface declared)
