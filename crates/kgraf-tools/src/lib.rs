@@ -62,7 +62,7 @@ pub use access::{Access, PathCase, detect_path_case};
 pub use apply_patch::{
     ApplyPatchTool, PatchTarget, ProtectedApplyPatch, patch_target, rejection_help,
 };
-pub use approval::INVALID_INPUT;
+pub use approval::{INVALID_INPUT, SKILLS_POLICY};
 pub use dependency_refetch::{DependencyRefetch, RefetchOutcome};
 pub use error::{AccessError, ApprovalError, RegistryError, ToolError};
 pub use external::{ExternalExecutor, ExternalOutcome, SyncedWrites, remote_policy};
@@ -78,12 +78,12 @@ pub use name::{MAX_WIRE_NAME_CHARS, MCP_PREFIX, QualifiedName};
 pub use output::{BinarySummary, OutputPart, ToolOutput};
 pub use permissions::{
     ModeSource, PermissionControl, PermissionEvent, PermissionMode, PermissionRulesHook,
-    PermissionSettings, programs_run, refused_program,
+    PermissionSettings, RefusedSubject, programs_run, refused_subject, refused_subject_of,
 };
 pub use protected::ProtectedWrites;
 pub use registry::{DiscoveredTools, Exposure, RegisteredTool, ToolRegistry, ToolView};
 pub use schema_lint::untyped_schema_nodes;
-pub use shell::{ExecGate, ShellApprovalHook, ShellTool, command_argv};
+pub use shell::{ExecGate, SHELL_POLICY_HOOK, ShellApprovalHook, ShellTool, command_argv};
 pub use terminal::{quote_argv, terminal_safe};
 pub use untrusted::UntrustedText;
 

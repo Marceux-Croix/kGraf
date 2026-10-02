@@ -3289,14 +3289,7 @@ impl Worker {
         let Some(by) = policy else {
             return;
         };
-        self.refused.refused(crate::shortfall::RefusedCall {
-            tool: tool.clone(),
-            capability: call.refused(output),
-            reason: output.clone(),
-            retried_ok: false,
-            by,
-            path,
-        });
+        self.refused.refused(call.refusal(&by, output, path));
         let can_report = self
             .env
             .tools

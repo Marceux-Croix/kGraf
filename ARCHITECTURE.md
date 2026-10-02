@@ -1256,7 +1256,14 @@ one live setting that only the user sets, from the box's dropdown, the
 user-level `permissions.toml` or the command line: Manual asks the user,
 Accept edits grants file edits, Auto grants the user's allow set, Orchestrator
 decides lets the orchestrator grant or refuse each request without asking, and
-Bypass grants everything. A mode change reaches running workers and waiting
+Bypass grants everything. Where a mode or a contract's grant covers named
+programs, an `sh -c` script of simple commands is granted when a grant covers
+every command's program, as Claude Code allows a compound command; a script
+with substitution, a subshell, backgrounding or a redirection outside the
+worktree is asked about whole, and the question names the command no grant
+covers. A refusal is recorded against what it refused: the program a
+command-level match named, or the whole tool for a skill's `allowed-tools` or
+a rule with no pattern. A mode change reaches running workers and waiting
 requests at once, and requests raised within 2 s of each other are answered as
 one group in the box. The user's deny and ask rules and the refusal to delete
 system paths hold in every mode; a run nobody attends denies what would ask.

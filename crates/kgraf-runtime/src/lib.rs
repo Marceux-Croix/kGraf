@@ -100,6 +100,7 @@ pub use rebuild::{INTERRUPTED_RESULT, ResumeError, ResumeState, TranscriptBuilde
 pub use settle::{TranscriptSettler, settle_for_disk};
 pub use shortfall::{
     RefusalDirectory, RefusalRecord, RefusedCall, SHORTFALL_TOOL, capability_of, refusal_hint,
+    refused_call,
 };
 pub use stall::{DEFAULT_STALL_REPEATS, Stall, StallDetector, call_digest};
 pub use step::{RoundPlan, StepBudget, WARN_AT_ROUNDS_LEFT};

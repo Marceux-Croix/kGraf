@@ -127,3 +127,19 @@ skills. Then a fetcher is added, verified against that vendor's real, running se
   refusal to the orchestrator, which holds the contract with the skill's name: no
   permission grant lifts a skill's `allowed-tools`, so a grant would only start an attempt
   the same skill refuses again.
+
+## Amendment (2026-10-02): a skill's refusal of a shell call is a refusal of the tool
+
+- **The tool, not the program.** `allowed-tools` restricts tools, so a skill's refusal of a
+  shell call is recorded as a refusal of the `shell` tool (`RefusedCall::whole_tool`), with the
+  program the call ran kept beside it. A report of scope `tool` naming `shell`, or of scope
+  `command` naming the program, grounds in it and is held naming the skill. The reason's text
+  after the skill's (another hook's verdict, a rule it quotes) never renames it to a program
+  (decision 0094, amended 2026-10-02).
+- **The recorded refusal names the skill.** A refusal the policy writes under
+  `skills:allowed-tools` gives the skill's name (``... not permitted by skill `NAME`'s
+  allowed-tools``), and the hold reads it from there when the worker's skill session is gone.
+- **Activation in the same round.** A round's calls are reviewed before any of them runs, so a
+  call made in the round that activates a skill is judged by the other policies only. When one
+  of them refused it, a later report of a tool the now-active skill refuses is held naming the
+  skill.

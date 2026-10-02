@@ -44,6 +44,9 @@ pub(super) enum Worker {
     RefusedThenWrites,
     /// Writes the file with apply_patch and answers.
     Writes,
+    /// Runs an `sh -c` script of `mkdir` and `cp`; if refused, reports the
+    /// shortfall naming `mkdir`.
+    RunsScript,
 }
 
 pub(super) struct Script {
@@ -84,6 +87,10 @@ fn tool(name: &str, input: serde_json::Value, round: usize) -> Content {
 
 fn cp() -> serde_json::Value {
     serde_json::json!({"command": ["cp", "README.md", "a.txt"]})
+}
+
+fn script() -> serde_json::Value {
+    serde_json::json!({"command": ["sh", "-c", "mkdir -p notes && cp README.md a.txt"]})
 }
 
 fn report() -> serde_json::Value {
@@ -211,6 +218,12 @@ impl Provider for Script {
                 (Worker::RefusedThenWrites, _, 0) => Some(tool("shell", cp(), round)),
                 (Worker::RefusedThenWrites, _, 1) => Some(tool("apply_patch", patch(), round)),
                 (Worker::Writes, _, 0) => Some(tool("apply_patch", patch(), round)),
+                (Worker::RunsScript, _, 0) => Some(tool("shell", script(), round)),
+                (Worker::RunsScript, _, 1) if !seen.contains("exit status: 0") => {
+                    let mut input = report();
+                    input["need"] = "mkdir".into();
+                    Some(tool(kgraf_runtime::SHORTFALL_TOOL, input, round))
+                }
                 _ => None,
             };
             match call {
@@ -472,6 +485,66 @@ async fn auto_accept_edits_and_bypass_run_the_command_without_a_shortfall() {
             "{name}: the mode's grant is recorded\n{trace}"
         );
     }
+}
+
+/// Decision 0094, amended 2026-10-02: in Auto with `mkdir` and `cp`
+/// allowed, an `sh -c` script of only those programs runs on the first
+/// attempt with nothing asked, and the grants recorded are of `mkdir` and
+/// `cp`. With `cp` alone allowed, the script is asked about, an unattended
+/// run denies it, and the refusal the worker reports is grounded in
+/// `mkdir`, the command the mode did not grant, not in the `sh` that ran it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn auto_runs_a_script_of_allowed_programs_and_names_the_one_it_does_not_allow() {
+    let allowing = |programs: &[&str]| {
+        control_with(
+            kgraf_tools::PermissionMode::Auto,
+            kgraf_tools::permissions::AllowSet::default()
+                .with_programs(programs.iter().copied())
+                .expect("allow"),
+            false,
+        )
+    };
+    let (report, trace, script) = run(
+        Worker::RunsScript,
+        allowing(&["mkdir", "cp"]),
+        "test -f a.txt",
+        "sf-script",
+    )
+    .await;
+    assert_eq!(
+        report.status,
+        kgraf_orchestrator::RunStatus::Completed,
+        "{report:?}\n{trace}"
+    );
+    assert!(shortfall_lines(&trace).is_empty(), "{trace}");
+    assert_eq!(script.attempts.load(Ordering::SeqCst), 1);
+    let granted: Vec<&str> = permission_lines(&trace)
+        .into_iter()
+        .filter(|l| l.contains(r#""what":"granted""#))
+        .collect();
+    for program in ["`mkdir`", "`cp`"] {
+        assert!(
+            granted.iter().any(|l| l.contains(program)),
+            "{program} granted by the mode\n{trace}"
+        );
+    }
+    assert!(!granted.iter().any(|l| l.contains("`sh`")), "{trace}");
+
+    let (report, trace, _) = run(
+        Worker::RunsScript,
+        allowing(&["cp"]),
+        "test -f a.txt",
+        "sf-script-ask",
+    )
+    .await;
+    let kgraf_orchestrator::RunStatus::Blocked { reason } = &report.status else {
+        panic!("{report:?}\n{trace}");
+    };
+    assert!(reason.contains("`mkdir`"), "{reason}");
+    assert!(reason.contains("--allow mkdir"), "{reason}");
+    let lines = shortfall_lines(&trace);
+    assert_eq!(lines.len(), 1, "{trace}");
+    assert!(lines[0].contains("held:"), "{}", lines[0]);
 }
 
 /// Bypass does not lift the user's deny rule: `cp` is refused by the rule,

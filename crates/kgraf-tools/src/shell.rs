@@ -368,6 +368,9 @@ impl ShellTool {
     }
 }
 
+/// The name [`ShellApprovalHook`] reviews and refuses calls under.
+pub const SHELL_POLICY_HOOK: &str = "shell-command-policy";
+
 /// A pre-tool hook that turns the shell command policy's `Prompt` and
 /// `Forbidden` decisions into an `Ask` or a `Deny`, so the approval chain
 /// actually gates an unclassified command instead of letting `Tool::access`
@@ -388,7 +391,7 @@ impl ShellApprovalHook {
 #[async_trait::async_trait]
 impl ApprovalHook for ShellApprovalHook {
     fn name(&self) -> &str {
-        "shell-command-policy"
+        SHELL_POLICY_HOOK
     }
 
     async fn review(&self, call: &PendingCall) -> HookDecision {
@@ -409,20 +412,30 @@ impl ApprovalHook for ShellApprovalHook {
             },
             // Decision 0084: the question names the allowlist, so an
             // unattended denial (which quotes it) says what would have run.
+            // Decision 0094 (amended 2026-10-02): a script the mode judged
+            // command by command says which command it did not grant, or
+            // why it was not judged.
             Decision::Prompt => HookDecision::Ask {
                 // Each argument quoted and every control character escaped:
                 // the model wrote this argv, and the user must read the call
                 // that will run, not one an escape sequence painted over it.
-                question: match self.policy.build_allowlist() {
-                    build if build.is_empty() => {
-                        format!("Run `{}`?", crate::quote_argv(&cmd))
+                question: {
+                    let note = verdict
+                        .script_note
+                        .as_deref()
+                        .map(|n| format!(" {n}"))
+                        .unwrap_or_default();
+                    match self.policy.build_allowlist() {
+                        build if build.is_empty() => {
+                            format!("Run `{}`?{note}", crate::quote_argv(&cmd))
+                        }
+                        build => format!(
+                            "Run `{}`?{note} It is not on the build and test allowlist, which \
+                             runs without approval: {}.",
+                            crate::quote_argv(&cmd),
+                            build.describe()
+                        ),
                     }
-                    build => format!(
-                        "Run `{}`? It is not on the build and test allowlist, which runs \
-                         without approval: {}.",
-                        crate::quote_argv(&cmd),
-                        build.describe()
-                    ),
                 },
             },
             Decision::Allow => {
@@ -4245,6 +4258,48 @@ fn main() {
                     .with_protected_writes(guard.clone()),
                 guard,
             )
+        }
+
+        /// Decision 0094, amended 2026-10-02: in Auto with `mkdir` and `cp`
+        /// allowed, the script a worker wrote runs as a confined command
+        /// through the real sandbox, which a worker with a write scope may
+        /// issue, and does what it says.
+        #[cfg(target_os = "macos")]
+        #[tokio::test]
+        async fn auto_runs_a_script_of_allowed_programs_confined() {
+            use crate::permissions::{AllowSet, ModeSource, PermissionControl, PermissionMode};
+            let f = fixture(PLAIN_BUILD_RS);
+            let control = std::sync::Arc::new(PermissionControl::manual());
+            control.set_allow(
+                AllowSet::default()
+                    .with_programs(["python3", "cp", "mkdir"])
+                    .expect("allow"),
+            );
+            control
+                .set_mode(PermissionMode::Auto, ModeSource::CommandLine)
+                .expect("auto");
+            let (tool, _hook) =
+                ShellTool::new(ExecPolicy::default_kgraf_policy().with_permissions(control));
+            let tool = tool.with_workspace(f.ws.clone());
+            std::fs::create_dir_all(f.ws.root().join("templates")).expect("dir");
+            std::fs::write(f.ws.root().join("templates/greeting.txt"), "hello\n").expect("write");
+            let input = call_input(&[
+                "sh",
+                "-c",
+                "mkdir -p out && cp templates/greeting.txt out/greeting.txt",
+            ]);
+            assert!(tool.access(&input).expect("access").is_sandboxed_build());
+            let out = tool
+                .call(input, &ctx(f.ws.root().to_path_buf()), &CallPermit::new())
+                .await
+                .expect("ran");
+            let is_error = out.is_error;
+            let text = out.render();
+            assert!(!is_error, "{text}");
+            assert_eq!(
+                std::fs::read_to_string(f.ws.root().join("out/greeting.txt")).expect("copied"),
+                "hello\n"
+            );
         }
 
         /// In Bypass, a git command in the worktree writes the shared

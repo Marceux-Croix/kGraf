@@ -283,13 +283,16 @@ pub enum Grounding {
 }
 
 /// The subject a refusal offers to a report of `scope`, if it offers one.
+/// A refusal of the whole shell tool (a skill's `allowed-tools`, a user rule
+/// with no pattern) offers the tool to scope tool and the program the call
+/// ran to scope command: both name what was refused.
 fn subject_of(scope: RequestScope, c: &RefusedCall) -> Option<String> {
     match (scope, &c.path) {
         (RequestScope::File, Some(p)) => Some(p.trim_start_matches("./").to_owned()),
         (RequestScope::Command, None) if c.tool == "shell" && c.capability != "shell" => {
             Some(c.capability.clone())
         }
-        (RequestScope::Tool, None) if c.tool != "shell" => Some(c.tool.clone()),
+        (RequestScope::Tool, None) if c.tool != "shell" || c.whole_tool => Some(c.tool.clone()),
         _ => None,
     }
 }
@@ -299,6 +302,10 @@ fn subject_of(scope: RequestScope, c: &RefusedCall) -> Option<String> {
 fn describe_refusal(c: &RefusedCall) -> String {
     match &c.path {
         Some(p) => format!("writes to `{p}` (scope file)"),
+        None if c.tool == "shell" && c.whole_tool => format!(
+            "the tool `shell` (scope tool), running `{}` (scope command)",
+            c.capability
+        ),
         None if c.tool == "shell" => format!("`{}` (scope command)", c.capability),
         None => format!("`{}` (scope tool)", c.tool),
     }
@@ -404,6 +411,18 @@ pub fn ground(scope: RequestScope, need: &str, record: &RefusalRecord) -> Ground
                     " The policy refusals on record are: {}.",
                     others.join(", ")
                 ));
+            }
+            // A worker that reports the shell tool when a policy refused one
+            // command it ran has the scope wrong, not the refusal.
+            if scope == RequestScope::Tool
+                && unretried
+                    .iter()
+                    .any(|c| c.tool == "shell" && c.path.is_none() && !c.whole_tool)
+            {
+                answer.push_str(
+                    " A refused shell command is reported with scope command, naming its \
+                     program.",
+                );
             }
             if let Some(e) = &record.last_input_error {
                 answer.push_str(&format!(
@@ -579,8 +598,8 @@ pub fn decide(
         RequestScope::Tool => {
             return hold(format!(
                 "a worker needs the tool `{}` ({why}); a tool refused by a skill's \
-                 allowed-tools or an MCP rule cannot be granted to one attempt: change the \
-                 skill or the rule and run again",
+                 allowed-tools, an MCP rule or a rule on every call of the tool cannot be \
+                 granted to one attempt: change the skill or the rule and run again",
                 program_of(need).unwrap_or_default()
             ));
         }
@@ -835,6 +854,61 @@ pub fn skill_refusal(
     })
 }
 
+/// Ground a permission report of `worker` ([`ground`]) and find what its
+/// skills refuse of the grounded subject ([`skill_refusal`]).
+///
+/// One more case grounds: a report of scope tool naming a tool the worker's
+/// live skills refuse, one of whose calls another policy refused this
+/// attempt. A skill activated in the same round as that call does not judge
+/// it (the round's calls are reviewed before any of them runs), so the
+/// record names the other policy; any grant would meet the skill on the next
+/// attempt, so the report grounds in that refusal and carries the skill's.
+pub fn ground_report(
+    skills: Option<&SkillDirectory>,
+    worker: &str,
+    scope: RequestScope,
+    need: &str,
+    record: &RefusalRecord,
+) -> (Grounding, Option<String>) {
+    let grounding = ground(scope, need, record);
+    if let Grounding::Refused { subject, .. } = &grounding {
+        let skill = skill_refusal(
+            skills,
+            worker,
+            ShortfallKind::Permission,
+            scope,
+            subject,
+            &record.refused,
+        );
+        return (grounding, skill);
+    }
+    if scope != RequestScope::Tool {
+        return (grounding, None);
+    }
+    let Some(tool) = program_of(need) else {
+        return (grounding, None);
+    };
+    let refused = record
+        .refused
+        .iter()
+        .rev()
+        .find(|c| !c.retried_ok && c.path.is_none() && c.tool == tool);
+    let live = skills.and_then(|skills| {
+        let name = QualifiedName::parse(&tool).ok()?;
+        skills.refusal_for(worker, &name, None)
+    });
+    match (refused, live) {
+        (Some(c), Some(refusal)) => (
+            Grounding::Refused {
+                subject: tool,
+                reason: c.reason.clone(),
+            },
+            Some(refusal),
+        ),
+        _ => (grounding, None),
+    }
+}
+
 /// The held reason for a permission report a skill refuses.
 pub fn skill_hold_reason(refusal: &str) -> String {
     format!(
@@ -923,18 +997,13 @@ impl Tool for ShortfallTool {
         let (grounding, skill_refusal) = match input.kind {
             ShortfallKind::Permission => {
                 let record = self.refusals.record_of(ctx.worker.as_str());
-                let grounding = ground(input.scope, &input.need, &record);
-                let skill = match &grounding {
-                    Grounding::Refused { subject, .. } => skill_refusal(
-                        self.skills.as_deref(),
-                        ctx.worker.as_str(),
-                        input.kind,
-                        input.scope,
-                        subject,
-                        &record.refused,
-                    ),
-                    _ => None,
-                };
+                let (grounding, skill) = ground_report(
+                    self.skills.as_deref(),
+                    ctx.worker.as_str(),
+                    input.scope,
+                    &input.need,
+                    &record,
+                );
                 (Some(grounding), skill)
             }
             ShortfallKind::Instructions => (None, None),
@@ -1011,6 +1080,7 @@ mod tests {
             retried_ok: false,
             by: by.into(),
             path: None,
+            whole_tool: false,
         }
     }
 
@@ -1023,6 +1093,7 @@ mod tests {
             retried_ok: false,
             by: String::new(),
             path: Some(path.into()),
+            whole_tool: false,
         }
     }
 
@@ -1410,16 +1481,15 @@ mod tests {
     #[tokio::test]
     async fn a_prose_need_a_skill_refused_is_held_naming_the_skill() {
         let (_session, skills, _w) = restricted();
-        let skill_refusal_of_patch = RefusedCall {
-            tool: "apply_patch".into(),
-            capability: "apply_patch".into(),
-            reason: "ERROR: denied by skill:read-only-audit: `apply_patch` is not in the \
-                     allowed-tools of skill `read-only-audit`"
-                .into(),
-            retried_ok: false,
-            by: "skill:read-only-audit".into(),
-            path: None,
-        };
+        // Recorded as the worker loop records the text it saw.
+        let skill_refusal_of_patch = kgraf_runtime::refused_call(
+            "apply_patch",
+            &serde_json::json!({"patch": "*** Begin Patch\n*** Add File: a.md\n+a\n*** End Patch"}),
+            kgraf_tools::SKILLS_POLICY,
+            "ERROR: denied by skills:allowed-tools: tool `apply_patch` is not permitted by skill \
+             `read-only-audit`'s allowed-tools",
+            None,
+        );
         let input = serde_json::json!({
             "kind": "permission", "scope": "tool",
             "need": "I need the apply_patch tool to write the answer file",
@@ -1453,6 +1523,126 @@ mod tests {
                 live.is_some()
             );
         }
+    }
+
+    /// The text a worker sees when the active skill refuses the shell tool,
+    /// recorded as its loop records it.
+    fn skill_refused_shell(command: serde_json::Value) -> RefusedCall {
+        kgraf_runtime::refused_call(
+            "shell",
+            &serde_json::json!({ "command": command }),
+            kgraf_tools::SKILLS_POLICY,
+            "ERROR: denied by skills:allowed-tools: tool `shell` is not permitted by skill \
+             `read-only-audit`'s allowed-tools; `shell-command-policy` would also have asked to \
+             run it",
+            None,
+        )
+    }
+
+    /// Decision 0053: a skill refused the shell tool and the worker reports
+    /// the tool, as its refusal names it. The report grounds in that refusal
+    /// of scope tool and carries the skill's refusal, so the contract is held
+    /// naming the skill; the program the call ran grounds a report of scope
+    /// command the same way. From the live skills, and, with the session
+    /// gone, from the recorded refusal.
+    #[tokio::test]
+    async fn a_skill_refusal_of_the_shell_tool_is_held_naming_the_skill() {
+        let (_session, skills, _w) = restricted();
+        let refusals = record(vec![skill_refused_shell(serde_json::json!([
+            "sh",
+            "-c",
+            "wc -l notes/beta.txt"
+        ]))]);
+        for (scope, need) in [("tool", "shell"), ("command", "sh")] {
+            for live in [Some(skills.clone()), None] {
+                let input = serde_json::json!({
+                    "kind": "permission", "scope": scope, "need": need,
+                    "why": "the instruction asks for wc -l"
+                });
+                let (control, _) = drive(refusals.clone(), live.clone(), input, loop_like).await;
+                let ContractControl::Shortfall {
+                    grounding,
+                    skill_refusal,
+                    ..
+                } = &control
+                else {
+                    panic!("{control:?}");
+                };
+                assert!(
+                    matches!(grounding, Some(Grounding::Refused { subject, .. }) if subject == need),
+                    "{scope} {need} (live {}): {control:?}",
+                    live.is_some()
+                );
+                let refusal = skill_refusal.clone().unwrap_or_else(|| {
+                    panic!("{scope} {need} (live {}): no skill named", live.is_some())
+                });
+                let held = skill_hold_reason(&refusal);
+                assert!(held.contains("read-only-audit"), "{held}");
+            }
+        }
+    }
+
+    /// The canary round where the worker activated the skill and ran a shell
+    /// call in the same round: the call was judged before the skill applied,
+    /// so the command policy's ask, denied unattended, is what the record
+    /// holds (`sh`, scope command). A report of the shell tool is still held
+    /// naming the skill, which refuses every shell call from now on. Without
+    /// an active skill the same report grounds nothing, and the answer says
+    /// how a refused command is reported.
+    #[tokio::test]
+    async fn a_shell_report_after_a_same_round_skill_activation_is_held_naming_the_skill() {
+        let (_session, skills, _w) = restricted();
+        let asked = kgraf_runtime::refused_call(
+            "shell",
+            &serde_json::json!({"command": ["sh", "-c", "wc -l notes/beta.txt"]}),
+            "user",
+            "ERROR: denied by user: Run `sh -c 'wc -l notes/beta.txt'`? It is not on the build \
+             and test allowlist, which runs without approval: cargo build. Nobody is attached \
+             to answer, and no persisted allow rule for this project covers it",
+            None,
+        );
+        assert!(!asked.whole_tool);
+        assert_eq!(asked.capability, "sh");
+        let input = serde_json::json!({
+            "kind": "permission", "scope": "tool", "need": "shell",
+            "why": "the instruction asks for wc -l via the shell tool"
+        });
+        let (control, _) = drive(
+            record(vec![asked.clone()]),
+            Some(skills.clone()),
+            input.clone(),
+            loop_like,
+        )
+        .await;
+        let ContractControl::Shortfall {
+            grounding,
+            skill_refusal,
+            ..
+        } = &control
+        else {
+            panic!("{control:?}");
+        };
+        assert!(
+            matches!(grounding, Some(Grounding::Refused { subject, .. }) if subject == "shell"),
+            "{control:?}"
+        );
+        assert!(
+            skill_refusal
+                .as_deref()
+                .is_some_and(|r| r.contains("read-only-audit")),
+            "{control:?}"
+        );
+        let (control, _) = drive(record(vec![asked]), None, input, loop_like).await;
+        let ContractControl::Shortfall {
+            grounding: Some(Grounding::NothingRefused { answer }),
+            skill_refusal: None,
+            ..
+        } = &control
+        else {
+            panic!("no skill, nothing of scope tool refused: {control:?}");
+        };
+        assert!(answer.contains("`sh` (scope command)"), "{answer}");
+        assert!(answer.contains("reported with scope command"), "{answer}");
     }
 
     // ---------------------------------------------------------- grounding
@@ -1568,8 +1758,14 @@ mod tests {
             None
         );
         // A recorded skill refusal of another subject says nothing of this one.
-        let mut other = refused_program("git", "skill:read-only-audit");
-        other.reason = "ERROR: denied by skill:read-only-audit: no".into();
+        let other = kgraf_runtime::refused_call(
+            "shell",
+            &serde_json::json!({"command": ["git", "status"]}),
+            kgraf_tools::SKILLS_POLICY,
+            "ERROR: denied by skills:allowed-tools: tool `shell` is not permitted by skill \
+             `read-only-audit`'s allowed-tools",
+            None,
+        );
         assert_eq!(
             skill_refusal(
                 None,
@@ -1577,7 +1773,7 @@ mod tests {
                 ShortfallKind::Permission,
                 RequestScope::Command,
                 "python3",
-                &[other.clone()],
+                std::slice::from_ref(&other),
             ),
             None
         );
@@ -1591,7 +1787,10 @@ mod tests {
                 &[other],
             )
             .as_deref(),
-            Some("skill:read-only-audit: no")
+            Some(
+                "skills:allowed-tools: tool `shell` is not permitted by skill \
+                 `read-only-audit`'s allowed-tools"
+            )
         );
         let held = skill_hold_reason(&command);
         assert!(

@@ -54,16 +54,46 @@ pub struct RefusedCall {
     /// refusal.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub by: String,
-    /// The repository path a write-scope refusal named.
+    /// The repository path a write-scope refusal named, or a user rule on a
+    /// file tool matched.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// The policy refused the tool itself, not one command of it: a skill's
+    /// `allowed-tools` (decision 0053) or a user rule with no pattern. A
+    /// report of scope tool grounds in it; `capability` still names the
+    /// program a refused shell call ran, so a report of scope command does
+    /// too.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub whole_tool: bool,
 }
 
 impl RefusedCall {
-    /// The skill that refused this call, if a skill's `allowed-tools` did.
+    /// The skill that refused this call, if a skill's `allowed-tools` did:
+    /// the name its refusal gives (``... is not permitted by skill `NAME`'s
+    /// allowed-tools``) under [`kgraf_tools::SKILLS_POLICY`].
     pub fn skill(&self) -> Option<&str> {
-        self.by.strip_prefix("skill:")
+        if self.by != kgraf_tools::SKILLS_POLICY {
+            return None;
+        }
+        const LEAD: &str = "by skill `";
+        let rest = &self.reason[self.reason.find(LEAD)? + LEAD.len()..];
+        rest.split_once('`').map(|(name, _)| name)
     }
+}
+
+/// The record of a call of `tool` with `input` that the policy `by` refused
+/// with `output` (the text the worker saw, without the reporting hint).
+/// `path`: the path a write-scope refusal named. What was refused is what a
+/// command-level match named, or the whole tool, or the call's own
+/// capability ([`kgraf_tools::refused_subject`]).
+pub fn refused_call(
+    tool: &str,
+    input: &serde_json::Value,
+    by: &str,
+    output: &str,
+    path: Option<String>,
+) -> RefusedCall {
+    CallCapability::of(tool, input).refusal(by, output, path)
 }
 
 /// The capability a call exercises, for matching a refusal to a later retry:
@@ -90,9 +120,10 @@ pub(crate) struct CallCapability {
     /// Every capability the call exercises: for a shell call each program of
     /// its script ([`kgraf_tools::programs_run`]), else the tool's name.
     programs: Vec<String>,
-    /// A shell call's input, to name the command a rule refused; `Null` for
-    /// any other tool, whose input can be large.
-    input: serde_json::Value,
+    /// The call's rule subjects ([`kgraf_tools::permissions::subjects`]: a
+    /// shell call's command lines, a file tool's paths), to name what a rule
+    /// refused without keeping an input that can be large.
+    subjects: Vec<String>,
     /// The file an `apply_patch` call's patch names first.
     pub(crate) patch_target: Option<kgraf_tools::PatchTarget>,
 }
@@ -112,11 +143,7 @@ impl CallCapability {
             tool: tool.to_owned(),
             capability,
             programs,
-            input: if tool == "shell" {
-                input.clone()
-            } else {
-                serde_json::Value::Null
-            },
+            subjects: kgraf_tools::permissions::subjects(tool, input),
             patch_target: (tool == "apply_patch")
                 .then(|| kgraf_tools::patch_target(input))
                 .flatten(),
@@ -127,13 +154,35 @@ impl CallCapability {
         &self.programs
     }
 
-    /// What a policy refused when it refused this call with `reason`: the
-    /// program of the command a rule matched when that is not the call's own
-    /// (`sh -c "... && python3 ..."` refused by a rule on `python3`), else
-    /// the call's capability.
-    pub(crate) fn refused(&self, reason: &str) -> String {
-        kgraf_tools::refused_program(&self.tool, &self.input, reason)
-            .unwrap_or_else(|| self.capability.clone())
+    /// The record of this call refused by `by` with `output`. Only a
+    /// command-level match (a user rule, the deletion limit, the mode's
+    /// command policy) names another program than the call's own
+    /// (`sh -c "... && python3 ..."` refused by a rule on `python3`); a
+    /// refusal of the whole tool (a skill's, a rule with no pattern) keeps
+    /// the call's capability and is marked [`RefusedCall::whole_tool`]; a
+    /// rule on a file tool's path records that path.
+    pub(crate) fn refusal(&self, by: &str, output: &str, path: Option<String>) -> RefusedCall {
+        use kgraf_tools::RefusedSubject;
+        let reason = output
+            .strip_prefix(crate::worker::DENIED_PREFIX)
+            .and_then(|rest| rest.split_once(": "))
+            .map_or(output, |(_, reason)| reason);
+        let mut call = RefusedCall {
+            tool: self.tool.clone(),
+            capability: self.capability.clone(),
+            reason: output.to_owned(),
+            retried_ok: false,
+            by: by.to_owned(),
+            path,
+            whole_tool: false,
+        };
+        match kgraf_tools::refused_subject_of(&self.tool, &self.subjects, by, reason) {
+            Some(RefusedSubject::Tool) => call.whole_tool = true,
+            Some(RefusedSubject::Program(p)) => call.capability = p,
+            Some(RefusedSubject::Path(p)) if call.path.is_none() => call.path = Some(p),
+            Some(RefusedSubject::Path(_)) | None => {}
+        }
+        call
     }
 }
 
@@ -297,6 +346,7 @@ mod tests {
             retried_ok: false,
             by: "ask-policy".into(),
             path: None,
+            whole_tool: false,
         }
     }
 
@@ -355,12 +405,20 @@ mod tests {
         let input = serde_json::json!({"command": ["sh", "-c", "mkdir x && python3 -c pass"]});
         let call = CallCapability::of("shell", &input);
         assert_eq!(call.capability, "sh");
-        assert_eq!(
-            call.refused("your deny rule `shell(python3*)` blocks this call in every mode"),
-            "python3"
+        let by_rule = call.refusal(
+            kgraf_tools::permissions::PERMISSION_RULES_HOOK,
+            "ERROR: denied by user-permission-rules: your deny rule `shell(python3*)` blocks \
+             this call in every permission mode",
+            None,
         );
+        assert_eq!(by_rule.capability, "python3");
+        assert!(!by_rule.whole_tool);
         // A reason that quotes no rule is the call's own program's.
-        assert_eq!(call.refused("denied by a hook"), "sh");
+        assert_eq!(
+            call.refusal("some-hook", "ERROR: denied by some-hook: no", None)
+                .capability,
+            "sh"
+        );
         let mut r = RefusedCalls::default();
         r.refused(refusal("python3"));
         r.refused(refusal("sh"));
@@ -399,11 +457,69 @@ mod tests {
         assert_eq!(directory.record_of("w1"), RefusalRecord::default());
     }
 
+    /// A skill's refusal, recorded from the text the worker sees, names
+    /// its skill; another policy's names none, whatever its reason says.
     #[test]
     fn a_skill_refusal_names_its_skill() {
-        let mut c = refusal("python3");
-        assert_eq!(c.skill(), None);
-        c.by = "skill:read-only-audit".into();
+        let input = serde_json::json!({"command": ["wc", "-l", "notes/beta.txt"]});
+        let c = refused_call(
+            "shell",
+            &input,
+            kgraf_tools::SKILLS_POLICY,
+            "ERROR: denied by skills:allowed-tools: tool `shell` is not permitted by skill \
+             `read-only-audit`'s allowed-tools; `shell-command-policy` would also have asked to \
+             run it",
+            None,
+        );
         assert_eq!(c.skill(), Some("read-only-audit"));
+        let mut other = c.clone();
+        other.by = "user".into();
+        assert_eq!(other.skill(), None);
+        assert_eq!(refusal("python3").skill(), None);
+    }
+
+    /// A skill's refusal of the shell tool, and a user rule on every shell
+    /// call, are refusals of the tool: recorded as such, with the program
+    /// the call ran kept for a report of scope command and for a retry. A
+    /// skill's reason that quotes a rule matching one command does not
+    /// rename it to that command's program.
+    #[test]
+    fn a_tool_level_refusal_of_a_shell_call_is_recorded_as_of_the_tool() {
+        let input = serde_json::json!({"command": ["sh", "-c", "mkdir x && python3 -c pass"]});
+        let skill = refused_call(
+            "shell",
+            &input,
+            kgraf_tools::SKILLS_POLICY,
+            "ERROR: denied by skills:allowed-tools: tool `shell` is not permitted by skill \
+             `read-only-audit`'s allowed-tools; `user-permission-rules` also refused it: your \
+             deny rule `shell(python3*)` blocks this call in every permission mode",
+            None,
+        );
+        assert!(skill.whole_tool, "{skill:?}");
+        assert_eq!(skill.capability, "sh");
+        let every_shell = refused_call(
+            "shell",
+            &input,
+            kgraf_tools::permissions::PERMISSION_RULES_HOOK,
+            "ERROR: denied by user-permission-rules: your deny rule `shell` blocks this call in \
+             every permission mode",
+            None,
+        );
+        assert!(every_shell.whole_tool, "{every_shell:?}");
+        assert_eq!(every_shell.capability, "sh");
+        // A rule on a file tool's path records the path.
+        let patch = serde_json::json!({
+            "patch": "*** Begin Patch\n*** Add File: secrets/k.txt\n+a\n*** End Patch"
+        });
+        let by_path = refused_call(
+            "apply_patch",
+            &patch,
+            kgraf_tools::permissions::PERMISSION_RULES_HOOK,
+            "ERROR: denied by user-permission-rules: your deny rule `apply_patch(secrets/*)` \
+             blocks this call in every permission mode",
+            None,
+        );
+        assert_eq!(by_path.path.as_deref(), Some("secrets/k.txt"));
+        assert!(!by_path.whole_tool);
     }
 }

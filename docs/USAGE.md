@@ -724,6 +724,24 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
     does: a merged `.githooks/pre-commit` runs at your next commit if your `core.hooksPath` is
     `.githooks`. Review them as you would any change.
 
+  A shell script is granted command by command, as Claude Code allows a compound command when
+  each subcommand is allowed. When Auto, Accept edits or a grant made to the contract after a
+  shortfall covers named programs, a worker's `["sh", "-c", SCRIPT]` (or `bash`, `zsh`, `dash`,
+  by bare name, with only `-c`) runs without asking when its script is only simple commands
+  joined by `;`, `&&`, `||`, `|` or newlines and a grant covers the program of every command:
+  `sh -c "mkdir -p out && cp templates/a.txt out/a.txt"` runs under `--allow mkdir --allow cp`
+  and is recorded as grants of `mkdir` and `cp`. It runs confined like any granted command. A
+  script with one command no grant covers is asked about whole, and the question names that
+  command (`The script runs `curl` (...), which no grant covers`); a run nobody attends denies
+  it, and a shortfall the worker reports is grounded in that program. A script is not judged
+  command by command, and so is asked about, when it expands a variable or substitutes a
+  command (`$`, a backquote), opens a subshell or a group, runs something in the background
+  (`&`), redirects input, uses a backslash, a comment, `!` or a shell keyword, starts a command
+  with a path, a quote or a `VAR=value`, or redirects output anywhere but `/dev/null` or a
+  worktree path a worker may write (an absolute path, `..`, `~`, a glob, `.git`, or any file
+  after a `cd`); the question says which. A command your policy forbids (`git push --force`)
+  refuses the whole script. Manual and Bypass are unchanged: Manual asks, Bypass runs it.
+
   In every mode, Bypass included: your deny rules block (`deny = ["shell(curl*)"]`, or
   `--deny`), your ask rules ask (`ask = [...]`, or `--ask`), deleting the filesystem root, a
   top-level directory or your home directory is refused, deleting the workspace itself or its
@@ -757,7 +775,11 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   finished after a policy refused a call it never ran, is printed as `unverified <id>:
   <reason>` after the `verified` line. The run still completes; the line says the check did
   not look at the work. A refusal names the program a rule matched: `sh -c "mkdir x && python3
-  ..."` under a deny rule on `python3` is a refusal of `python3` (0094).
+  ..."` under a deny rule on `python3` is a refusal of `python3` (0094). Only a refusal that
+  matched one command does that (your deny or ask rule, the deletion limit, or the mode naming
+  the command of a script it did not grant). A skill's `allowed-tools`, or a rule on the whole
+  tool (`deny = ["shell"]`), refuses the `shell` tool itself, and a report of that tool, or of
+  the program the call ran, is grounded in it.
 - While a worker's worktree has a `.cargo/config.toml`, `.cargo/config`, `rust-toolchain` or
   `rust-toolchain.toml` that differs from the one it started with, every allowlisted command
   is refused: those files can change what cargo runs whatever its arguments say.
@@ -1019,7 +1041,11 @@ an inventory is there.
   command or tool its skill refused holds the contract with the skill's name, however the
   report words it, since no
   permission grant lifts a skill's `allowed-tools`: edit the skill's list or the
-  instruction, then run the work again.
+  instruction, then run the work again. A skill's refusal of a shell call is a refusal of the
+  `shell` tool: a report of scope `tool` naming `shell`, or of scope `command` naming the
+  program, holds the same way. A call made in the same round as the skill's activation is
+  judged before the skill applies; if another policy refused it, a later report of a tool the
+  active skill refuses still holds the contract with the skill's name.
 - **Resuming after a skill changed.** A resumed worker re-activates its skills at the
   version it activated. If you edited, removed or disabled one of them since, the resume
   stops and names the skill: restore the skill as it was, or start the work again as a new
@@ -1219,6 +1245,14 @@ Behavior that differs from earlier builds. Each item names the decision that hol
   is recorded when the approval chain lets the call run; when a deny rule (or another hook)
   refuses the call after the mode allowed it, the trace has one `grant_refused` event naming
   the subject, the mode, and the refusing hook with its reason (0094).
+- In Auto, Accept edits, or with a program granted to the contract, a worker's `sh -c` script
+  of simple commands runs without asking when every command's program is granted; before, the
+  shell itself had to be granted, so `sh -c "mkdir -p out && cp a out/a"` was asked about (and
+  denied with nobody attending) under `--allow mkdir --allow cp`. A script with one command no
+  grant covers is asked about, naming that command (0094).
+- A skill's refusal of a shell call, or a rule on the whole `shell` tool, is recorded as a
+  refusal of the tool: a report naming the `shell` tool is held naming the skill instead of
+  being answered as nothing refused (0053, 0094).
 - Every worker brief says what its attempt is judged by. When `--verify` cannot be narrowed to
   the contract's tests (`cargo build --workspace`, a script), the brief names the whole command,
   calls the contract's Acceptance line advisory, and says `todo!()` panics and failing tests in other contracts' unfinished

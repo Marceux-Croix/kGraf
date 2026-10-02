@@ -631,3 +631,87 @@ workers; they do not bind these commands. A user who denied `shell(python3*)` an
 Evidence: `kgraf-host` `rule_conflict_tests.rs` (a denied program is said and traced and the
 run completes; off says nothing; an uncovered program says nothing; a chained command matches
 on its second part) and `rule_conflicts::tests`.
+
+## Amendment (2026-10-02): a tool refusal keeps its tool; a script is granted command by command
+
+**A refusal of the whole tool keeps the tool and its scope.** The amendment above named a
+program for any shell refusal whose reason quoted a rule anywhere, from any policy. A skill's
+`allowed-tools` refusal of a shell call composed with a rule's ("`user-permission-rules` also
+refused it: your deny rule `shell(python3*)` ...") was then recorded as a refusal of `python3`,
+and a rule with no pattern (`shell`, `*`) named the call's first program. Neither refused a
+program: both refused the `shell` tool.
+
+- `refused_program` is replaced by `refused_subject` (`kgraf-tools`, `permissions.rs`), which
+  returns the tool, a program, or a path. A skill's refusal (`SKILLS_POLICY`) is of the tool. A
+  user rule (`user-permission-rules`, or the user's denial of its ask) counts only where its text
+  begins the reason, as `hard_limit` writes it: a rule with no pattern refuses the tool; a rule on
+  `shell` names the program of the command it matched; a rule on a file tool names the path it
+  matched. The deletion limit names the deleting command, also only where its text begins the
+  reason. The mode's command policy names the command of a script it judged (below). Any other
+  refusal keeps the call's own capability.
+- `RefusedCall` gains `whole_tool`. A refusal of the whole shell tool is recorded with it set and
+  with the program the call ran as its capability, so a report of scope `tool` naming `shell`
+  and a report of scope `command` naming the program both ground in it (decision 0093).
+- `RefusedCall::skill` reads the skill's name from the refusal the policy writes under
+  `skills:allowed-tools`. It read a `skill:<name>` prefix no policy produced, so a hold from the
+  recorded refusal (the live skills gone) never named the skill.
+- A report of scope `tool` naming a tool the worker's live skills refuse, one of whose calls
+  another policy refused this attempt, grounds in that refusal and carries the skill's refusal
+  (`ground_report`, `kgraf-orchestrator`). The round's calls are reviewed before any of them
+  runs, so a call made in the same round as the skill's activation is judged by the other
+  policies only; the skill refuses every later call of the tool, so the contract is held naming
+  the skill. Without an active skill, a report of the shell tool when only commands were refused
+  is answered with the refusals on record and how a refused command is reported.
+
+**A script is granted command by command.** Claude Code's permission rules document compound
+commands this way: "A rule must match each subcommand independently", with `&&`, `||`, `;`,
+`|`, `|&`, `&` and newlines as separators, and "Deny and ask rules apply when any subcommand
+matches them". kGraf's shell tool runs an argv, so a script arrives as `sh -c SCRIPT`. In Auto
+with `mkdir` and `cp` allowed, `["sh", "-c", "mkdir -p out && cp templates/greeting.txt
+out/greeting.txt"]` was asked about ("not on the build and test allowlist") because the mode
+judged only `argv[0]`, `sh`, and a run nobody attended denied it.
+
+- `script_commands` (`kgraf-tools`, `permissions.rs`) reads `["sh" | "bash" | "zsh" | "dash",
+  "-c", SCRIPT]` (bare name, exactly `-c`, nothing after the script) as simple commands joined by
+  `;`, `&&`, `||`, `|` or newlines. It refuses to judge, naming why: `$` and backquotes,
+  parentheses and braces, `&` and `|&`, input redirection, backslashes, comments, `!`, shell
+  keywords, an operator with no command on one side, a command that does not start with a plain
+  program name (a path, a quote, a glob, `VAR=value`), and an output redirection whose target is
+  not `/dev/null` or a worktree path a worker may write (lexically inside the worktree, no `~` or
+  glob, `kgraf_core::paths::forbidden_reason` clear), or any file redirection in a script with a
+  `cd`. Its commands must agree with `simple_commands`, which the user's rules match, so a grant
+  and a rule never judge different commands. `simple_commands` no longer splits at the `&` of
+  `>&` or `<&` (`2>&1`), which separates nothing.
+- `ExecPolicy::evaluate`: when no rule names the whole call and the call is not already granted,
+  and something grants named programs (Auto with an allow set, Accept edits, or a program granted
+  to the contract after a shortfall), a judged script is granted, confined like any granted
+  command, when a grant covers the program of every command. A command a `forbid` rule or the
+  build allowlist refuses refuses the whole call, naming it ("the script runs `git` (...), which
+  is refused: ..."). A command no grant covers leaves the call to be asked, and the question names
+  the first such command ("The script runs `curl` (...), which no grant covers ..."); a script
+  that is not judged is asked about with the reason. `refused_subject` reads the program from the
+  last occurrence of that lead, after the model-written command line the question quotes, so a
+  refusal and a later report name it.
+- The mode's grants of a script are staged per program (`mkdir`, `cp`), never as `sh`.
+- Unchanged: the user's deny and ask rules, whose hook runs last on every command of the script,
+  in every mode; Bypass, which grants the call whole; Manual, which asks; persisted allow rules,
+  which still never name a shell wrapper. A program granted by its path (`./mkdir`) is not a plain
+  program name inside a script, though Accept edits grants a direct call of it by base name.
+
+Evidence: `kgraf-tools` (`permissions.rs`: `a_tool_level_refusal_keeps_the_tool_and_its_scope`,
+`a_refusal_names_the_program_of_the_command_a_rule_matched`,
+`a_plain_script_is_read_as_its_commands`, `a_script_with_any_other_construct_is_not_judged`;
+`execpolicy/policy.rs`: `auto_grants_a_script_when_it_grants_every_command`,
+`a_script_with_one_command_no_grant_covers_is_asked_naming_it`,
+`a_script_with_substitution_or_an_outside_redirect_is_not_granted`,
+`accept_edits_contract_grants_and_forbid_rules_apply_per_command`,
+`manual_and_bypass_are_unchanged_for_scripts`; `approval.rs`:
+`a_skill_refusal_of_the_shell_tool_is_not_renamed_to_a_program`,
+`auto_runs_a_script_whose_every_command_it_allows`,
+`a_deny_rule_on_one_command_refuses_a_script_the_mode_grants`; `shell.rs`:
+`auto_runs_a_script_of_allowed_programs_confined`, through the macOS sandbox); `kgraf-runtime`
+(`a_tool_level_refusal_of_a_shell_call_is_recorded_as_of_the_tool`,
+`a_skill_refusal_names_its_skill`); `kgraf-orchestrator`
+(`a_skill_refusal_of_the_shell_tool_is_held_naming_the_skill`,
+`a_shell_report_after_a_same_round_skill_activation_is_held_naming_the_skill`); `kgraf-host`
+(`auto_runs_a_script_of_allowed_programs_and_names_the_one_it_does_not_allow`, a hosted run).

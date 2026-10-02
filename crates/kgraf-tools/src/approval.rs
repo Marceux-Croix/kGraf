@@ -383,7 +383,9 @@ impl ApprovalChain {
     ///
     /// `shell` is a shell call's input, so a refusal by a rule that matched
     /// one command of a script names that command's program, not the
-    /// script's shell ([`crate::permissions::refused_program`]).
+    /// script's shell ([`crate::permissions::refused_subject`]). A refusal of
+    /// the whole tool (a skill's, a rule with no pattern) keeps the staged
+    /// subject.
     fn settle_grants(
         &self,
         worker: &str,
@@ -399,8 +401,12 @@ impl ApprovalChain {
                 control.settle_call(worker, call_id, None);
             }
             Verdict::Denied { by, reason } => {
-                let program =
-                    shell.and_then(|i| crate::permissions::refused_program("shell", i, reason));
+                let program = shell.and_then(|i| {
+                    match crate::permissions::refused_subject("shell", i, by, reason) {
+                        Some(crate::permissions::RefusedSubject::Program(p)) => Some(p),
+                        _ => None,
+                    }
+                });
                 control.settle_call_naming(worker, call_id, Some((by, reason)), program.as_deref());
             }
             Verdict::Ask(_) => {}
@@ -445,7 +451,7 @@ impl ApprovalChain {
                 reason: reason.clone(),
             },
         };
-        log.record(record(&paused.call, "user", decision)).await?;
+        log.record(record(&paused.call, USER, decision)).await?;
         let (worker, call_id) = (paused.call.worker.to_string(), paused.call.call_id.clone());
         let shell = self.shell_input_of(&paused.call);
         let verdict = match answer {
@@ -454,7 +460,7 @@ impl ApprovalChain {
                     .await?
             }
             UserAnswer::Deny { reason } => Verdict::Denied {
-                by: "user".into(),
+                by: USER.into(),
                 reason,
             },
         };
@@ -740,6 +746,15 @@ const ASK_POLICY: &str = "ask-policy";
 /// not read (its `access` returned [`ToolError::InvalidInput`]). No policy
 /// refused it; the call is malformed and the caller should fix and retry it.
 pub const INVALID_INPUT: &str = "invalid-input";
+
+/// The name a skill's `allowed-tools` policy refuses a call under (decision
+/// 0053). It restricts tools, so its refusal of a shell call is a refusal of
+/// the `shell` tool, never of the program the call ran.
+pub const SKILLS_POLICY: &str = "skills:allowed-tools";
+
+/// The `by` of a call the user denied, including an ask an unattended run
+/// answered with a denial.
+pub const USER: &str = "user";
 
 async fn deny(
     log: &mut dyn ApprovalLog,
@@ -1828,5 +1843,182 @@ mod tests {
             &control.events_since(0)[..],
             [(_, PermissionEvent::Granted { subject, by, .. })] if subject == "`python3`" && by == "mode"
         ));
+    }
+
+    /// A skill's `allowed-tools` that refuses the shell tool, under the name
+    /// the session's policy uses.
+    struct SkillRefusesShell;
+
+    impl CallPolicy for SkillRefusesShell {
+        fn name(&self) -> &str {
+            SKILLS_POLICY
+        }
+        fn fingerprint(&self) -> String {
+            "read_file".into()
+        }
+        fn check(&self, tool: &QualifiedName, _subject: Option<&str>) -> Result<(), String> {
+            Err(format!(
+                "tool `{}` is not permitted by skill `read-only-audit`'s allowed-tools",
+                tool.wire()
+            ))
+        }
+    }
+
+    /// A skill refuses the shell tool and a deny rule refuses one command of
+    /// the script too. The refusal is the skill's, of the whole tool, so the
+    /// trace keeps the staged subject; it never renames it to the program
+    /// the rule matched, whose text the composed reason quotes.
+    #[tokio::test]
+    async fn a_skill_refusal_of_the_shell_tool_is_not_renamed_to_a_program() {
+        use crate::permissions::{PermissionEvent, PermissionRulesHook};
+        let f = Fixture::new();
+        let control = bypass_with_deny_rule();
+        let c = chain(vec![
+            Arc::new(StagesProgram(control.clone())),
+            Arc::new(PermissionRulesHook::new(control.clone(), None)),
+        ])
+        .with_policy(Arc::new(SkillRefusesShell))
+        .with_permissions(control.clone());
+        let mut log = MemoryApprovalLog::default();
+        let verdict = c
+            .review(
+                f.view(),
+                call(json!({"command": ["sh", "-c", "mkdir x && python3 -c pass"]})),
+                &mut log,
+            )
+            .await
+            .expect("review");
+        let Verdict::Denied { by, reason } = &verdict else {
+            panic!("expected a denial, got {verdict:?}");
+        };
+        assert_eq!(by, SKILLS_POLICY);
+        assert!(reason.contains("deny rule `shell(python3*)`"), "{reason}");
+        let subjects: Vec<String> = control
+            .events_since(0)
+            .into_iter()
+            .filter_map(|(_, e)| match e {
+                PermissionEvent::GrantRefused { subject, .. } => Some(subject),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(subjects, ["`sh`"]);
+    }
+
+    fn auto_allowing(programs: &[&str]) -> Arc<crate::permissions::PermissionControl> {
+        use crate::permissions::{AllowSet, ModeSource, PermissionControl, PermissionMode};
+        let control = Arc::new(PermissionControl::manual());
+        control.set_allow(
+            AllowSet::default()
+                .with_programs(programs.iter().copied())
+                .expect("allow"),
+        );
+        control
+            .set_mode(PermissionMode::Auto, ModeSource::CommandLine)
+            .expect("auto");
+        control
+    }
+
+    /// Decision 0094, amended 2026-10-02: the script a worker ran in Auto
+    /// with `mkdir` and `cp` allowed runs without asking, through the real
+    /// shell hook, and the grants recorded are of `mkdir` and `cp`, never of
+    /// the `sh` that ran them.
+    #[tokio::test]
+    async fn auto_runs_a_script_whose_every_command_it_allows() {
+        use crate::execpolicy::{Decision, ExecPolicy};
+        use crate::permissions::{PermissionEvent, PermissionRulesHook};
+        let f = Fixture::new();
+        let control = auto_allowing(&["python3", "cp", "mkdir"]);
+        let c = chain(vec![
+            Arc::new(crate::ShellApprovalHook::new(
+                ExecPolicy::new(Decision::Prompt).with_permissions(control.clone()),
+            )),
+            Arc::new(PermissionRulesHook::new(control.clone(), None)),
+        ])
+        .with_permissions(control.clone());
+        let mut log = MemoryApprovalLog::default();
+        let verdict = c
+            .review(
+                f.view(),
+                call(json!({"command": [
+                    "sh", "-c",
+                    "mkdir -p out && cp templates/greeting.txt out/greeting.txt"
+                ]})),
+                &mut log,
+            )
+            .await
+            .expect("review");
+        assert!(matches!(verdict, Verdict::Run(_)), "{verdict:?}");
+        let granted: Vec<(String, String)> = control
+            .events_since(0)
+            .into_iter()
+            .filter_map(|(_, e)| match e {
+                PermissionEvent::Granted { subject, by, .. } => Some((subject, by)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            granted,
+            [
+                ("`mkdir`".to_owned(), "mode".to_owned()),
+                ("`cp`".to_owned(), "mode".to_owned())
+            ]
+        );
+    }
+
+    /// A deny rule on one command of a script the mode would grant refuses
+    /// the whole call, and the trace names that command's program.
+    #[tokio::test]
+    async fn a_deny_rule_on_one_command_refuses_a_script_the_mode_grants() {
+        use crate::execpolicy::{Decision, ExecPolicy};
+        use crate::permissions::{PermissionEvent, PermissionRulesHook, Rule, UserRules};
+        let f = Fixture::new();
+        let control = auto_allowing(&["cp", "mkdir"]);
+        let mut settings = control.settings();
+        settings.rules = UserRules {
+            deny: vec![Rule::parse("shell(cp*)").expect("rule")],
+            ask: vec![],
+        };
+        let control = Arc::new(
+            crate::permissions::PermissionControl::new(
+                settings,
+                crate::permissions::ModeSource::CommandLine,
+                crate::permissions::ProcessFacts::default(),
+            )
+            .expect("auto"),
+        );
+        let c = chain(vec![
+            Arc::new(crate::ShellApprovalHook::new(
+                ExecPolicy::new(Decision::Prompt).with_permissions(control.clone()),
+            )),
+            Arc::new(PermissionRulesHook::new(control.clone(), None)),
+        ])
+        .with_permissions(control.clone());
+        let mut log = MemoryApprovalLog::default();
+        let verdict = c
+            .review(
+                f.view(),
+                call(json!({"command": ["sh", "-c", "mkdir -p out && cp a out/a"]})),
+                &mut log,
+            )
+            .await
+            .expect("review");
+        let Verdict::Denied { by, reason } = &verdict else {
+            panic!("expected a denial, got {verdict:?}");
+        };
+        assert_eq!(by, crate::permissions::PERMISSION_RULES_HOOK);
+        assert!(reason.contains("shell(cp*)"), "{reason}");
+        let events = control.events_since(0);
+        assert!(
+            !events
+                .iter()
+                .any(|(_, e)| matches!(e, PermissionEvent::Granted { .. })),
+            "{events:?}"
+        );
+        assert!(
+            events.iter().any(
+                |(_, e)| matches!(e, PermissionEvent::GrantRefused { subject, .. } if subject == "`cp`")
+            ),
+            "{events:?}"
+        );
     }
 }

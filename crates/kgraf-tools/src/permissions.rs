@@ -907,9 +907,10 @@ impl PermissionControl {
     }
 
     /// [`Self::settle_call`], where a refused event names `refused_program`
-    /// (the program of the command a rule matched, [`refused_program`]) as its
+    /// (the program of the command a rule matched, [`refused_subject`]) as its
     /// subject instead of the grant's subject: the call's own program may be a
-    /// shell that refused nothing.
+    /// shell that refused nothing. `None` keeps the staged subject, as for a
+    /// refusal of the whole tool.
     pub fn settle_call_naming(
         &self,
         worker: &str,
@@ -1033,6 +1034,19 @@ impl PermissionControl {
                 Some("a file edit under the Accept edits permission mode")
             }
             _ => None,
+        }
+    }
+
+    /// Whether the current mode grants some named programs on its own: Auto
+    /// with programs in its allow set, or Accept edits' file programs. Only
+    /// then is a shell script judged command by command
+    /// ([`crate::execpolicy::ExecPolicy::evaluate`]).
+    pub fn grants_programs(&self) -> bool {
+        let s = self.state();
+        match s.settings.mode {
+            PermissionMode::Auto => !s.settings.allow.programs.is_empty(),
+            PermissionMode::AcceptEdits => true,
+            _ => false,
         }
     }
 
@@ -1200,6 +1214,9 @@ fn split_script(script: &str) -> Vec<String> {
         match c {
             '\'' if !double => single = !single,
             '"' if !single => double = !double,
+            // `>&` and `<&` duplicate a descriptor (`2>&1`); they separate
+            // nothing.
+            '&' if !single && !double && i > 0 && matches!(chars[i - 1], '>' | '<') => {}
             ';' | '\n' | '|' | '&' if !single && !double => {
                 parts.push(std::mem::take(&mut cur));
                 // `&&` and `||` are one separator.
@@ -1263,43 +1280,427 @@ pub fn programs_run(input: &serde_json::Value) -> Vec<String> {
     out
 }
 
-/// The text of the rule a refusal reason quotes (`your deny rule `R` ...`,
-/// `your ask rule `R` ...`).
-fn rule_quoted_in(reason: &str) -> Option<&str> {
-    ["deny rule `", "ask rule `"].iter().find_map(|lead| {
-        let rest = &reason[reason.find(lead)? + lead.len()..];
-        rest.split_once('`').map(|(rule, _)| rule)
-    })
+/// What a policy refused when it refused a call ([`refused_subject`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RefusedSubject {
+    /// The tool itself: a skill's `allowed-tools` (decision 0053), or a user
+    /// rule on every call of the tool (`shell`, `*`).
+    Tool,
+    /// The program of one command a rule, the deletion limit or the mode's
+    /// command policy matched (`sh -c "mkdir x && python3 y"` refused by
+    /// `shell(python3*)` is a refusal of `python3`, not of `sh`).
+    Program(String),
+    /// A path a user rule on a file tool matched (`apply_patch(secrets/*)`).
+    Path(String),
 }
 
-/// The program a refusal of a shell call is about, when it is not the
-/// call's own program: `sh -c "mkdir x && python3 -c pass"` refused by the
-/// rule `shell(python3*)` is a refusal of `python3`, not of `sh`, which ran
-/// no refused command. The rule the `reason` quotes is matched against the
-/// call's command lines the way [`hard_limit`] matched it (the whole call
-/// first, then each command of a script); a deletion limit's reason names the
-/// first deleting command. `None` for any other tool or reason: the call's
-/// program stands.
-pub fn refused_program(tool: &str, input: &serde_json::Value, reason: &str) -> Option<String> {
+/// How the mode's command policy names the command of a script that decided
+/// its verdict: ``the script runs `PROGRAM` (`COMMAND`)``
+/// ([`crate::execpolicy::ExecPolicy::evaluate`]).
+pub const SCRIPT_RUNS_LEAD: &str = "script runs `";
+
+/// What the policy `by` refused when it refused a call of `tool` with
+/// `input`, giving `reason`; `None` when the call's own capability stands
+/// (a shell call's program, another tool's name).
+///
+/// Only a refusal a command-level match produced names another program:
+/// a user deny or ask rule ([`PERMISSION_RULES_HOOK`], or the user's denial of
+/// that rule's ask), the deletion limit, or the mode's command policy naming
+/// the command of a script it judged ([`SCRIPT_RUNS_LEAD`]). A skill's
+/// refusal is of the tool whatever its reason quotes after it (decision 0053:
+/// `allowed-tools` restricts tools), and a rule with no pattern is a rule on
+/// the tool. A rule's or the deletion limit's text counts only where it
+/// begins the reason, which is where those policies put it; the command
+/// policy's lead is read from its last occurrence, after the model-written
+/// command line the question quotes first.
+pub fn refused_subject(
+    tool: &str,
+    input: &serde_json::Value,
+    by: &str,
+    reason: &str,
+) -> Option<RefusedSubject> {
+    refused_subject_of(tool, &subjects(tool, input), by, reason)
+}
+
+/// [`refused_subject`] for a call whose rule subjects ([`subjects`]: a
+/// shell call's command lines, the whole call first; a file tool's paths)
+/// were kept instead of its input.
+pub fn refused_subject_of(
+    tool: &str,
+    subjects: &[String],
+    by: &str,
+    reason: &str,
+) -> Option<RefusedSubject> {
+    if by == crate::approval::SKILLS_POLICY {
+        return Some(RefusedSubject::Tool);
+    }
+    let program_of_line = |line: &str| {
+        line.split_whitespace()
+            .find(|w| !is_assignment(w))
+            .map(str::to_owned)
+    };
+    let from_rules = by == PERMISSION_RULES_HOOK || by == crate::approval::USER;
+    if from_rules && let Some(text) = rule_beginning(reason) {
+        let rule = Rule::parse(text).ok()?;
+        if rule.pattern.is_none() {
+            return Some(RefusedSubject::Tool);
+        }
+        let matched = subjects
+            .iter()
+            .find(|s| rule.matches(tool, std::slice::from_ref(*s)))?;
+        return if tool == "shell" {
+            program_of_line(matched).map(RefusedSubject::Program)
+        } else {
+            Some(RefusedSubject::Path(matched.clone()))
+        };
+    }
     if tool != "shell" {
         return None;
     }
-    let commands = simple_commands(&shell_argv(input));
-    if let Some(text) = rule_quoted_in(reason) {
-        let rule = Rule::parse(text).ok()?;
-        return commands
-            .iter()
-            .find(|c| rule.matches(tool, &[c.join(" ")]))
-            .and_then(|c| program_of_command(c))
-            .map(str::to_owned);
-    }
-    if reason.contains(DELETING_LEAD) || reason.contains(DELETES_LEAD) {
-        return commands.iter().find_map(|c| {
-            let words: Vec<&str> = c.iter().map(String::as_str).collect();
-            program_index(&words).map(|at| words[at].to_owned())
+    if from_rules && (reason.starts_with(DELETING_LEAD) || reason.starts_with(DELETES_LEAD)) {
+        return subjects.iter().find_map(|line| {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            program_index(&words).map(|at| RefusedSubject::Program(words[at].to_owned()))
         });
     }
+    if by == crate::shell::SHELL_POLICY_HOOK || by == crate::approval::USER {
+        let rest = &reason[reason.rfind(SCRIPT_RUNS_LEAD)? + SCRIPT_RUNS_LEAD.len()..];
+        let (program, _) = rest.split_once('`')?;
+        return is_plain_program(program).then(|| RefusedSubject::Program(program.to_owned()));
+    }
     None
+}
+
+/// The rule text a reason begins with (`your deny rule `R` ...`, `your ask
+/// rule `R` ...`), as [`hard_limit`] words it.
+fn rule_beginning(reason: &str) -> Option<&str> {
+    ["your deny rule `", "your ask rule `"]
+        .iter()
+        .find_map(|lead| reason.strip_prefix(lead))
+        .and_then(|rest| rest.split_once('`'))
+        .map(|(rule, _)| rule)
+}
+
+/// Shells whose `-c` script a permission mode judges command by command
+/// ([`script_commands`]).
+pub const SCRIPT_SHELLS: &[&str] = &["sh", "bash", "zsh", "dash"];
+
+/// A shell call read as a script of simple commands ([`script_commands`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Script {
+    /// Not `SHELL -c SCRIPT` for a shell of [`SCRIPT_SHELLS`].
+    NotAScript,
+    /// A script holding a construct the per-command check does not judge,
+    /// and which.
+    Unjudged(String),
+    /// Simple commands only, each as its words, in order.
+    Commands(Vec<Vec<String>>),
+}
+
+/// Read a shell call's argv as a script a mode may grant command by command
+/// (decision 0094, amended 2026-10-02): `["sh", "-c", SCRIPT]` (or `bash`,
+/// `zsh`, `dash`, by bare name, with exactly the `-c` option and no
+/// arguments after the script) whose script is only simple commands joined by
+/// `;`, `&&`, `||`, `|` or newlines.
+///
+/// Each command starts with a plain program name (letters, digits, `.`,
+/// `_`, `+`, `-`; no path, quote, assignment or glob). Quoted arguments and
+/// argument globs are allowed. Refused as [`Script::Unjudged`]: command or
+/// variable expansion (`$`, backquote), subshells and groups (`(`, `{`),
+/// backgrounding (`&`, `|&`), input redirection, backslash escapes, comments,
+/// `!`, shell keywords, an operator with no command on one side, and an
+/// output redirection whose target is not `/dev/null` or a worktree path a
+/// worker may write ([`kgraf_core::paths::forbidden_reason`], lexically inside
+/// the worktree, no glob or `~`), or that follows a `cd`. The commands are
+/// checked against [`simple_commands`], which the user's rules match, so a
+/// grant and a rule never judge different commands.
+pub fn script_commands(argv: &[String]) -> Script {
+    let Some(shell) = argv.first() else {
+        return Script::NotAScript;
+    };
+    if !SCRIPT_SHELLS.contains(&base_name(shell)) {
+        return Script::NotAScript;
+    }
+    if !SCRIPT_SHELLS.contains(&shell.as_str()) {
+        return Script::Unjudged(format!(
+            "the shell is named by the path `{}`",
+            shell.escape_debug()
+        ));
+    }
+    let script = match argv {
+        [_, flag, script] if flag == "-c" => script,
+        [_, flag, _, _, ..] if flag == "-c" => {
+            return Script::Unjudged("arguments follow the script".into());
+        }
+        _ => return Script::Unjudged("the shell is given options other than `-c`".into()),
+    };
+    let commands = match ScriptReader::default().read(script) {
+        Ok(c) => c,
+        Err(why) => return Script::Unjudged(why),
+    };
+    // The user's rules match `simple_commands`; a script it splits otherwise
+    // is not judged here.
+    let theirs: Vec<Option<String>> = simple_commands(argv)
+        .iter()
+        .skip(1)
+        .map(|c| program_of_command(c).map(str::to_owned))
+        .collect();
+    let mine: Vec<Option<String>> = commands.iter().map(|c| c.first().cloned()).collect();
+    if theirs != mine {
+        return Script::Unjudged("its commands could not be told apart reliably".into());
+    }
+    Script::Commands(commands)
+}
+
+/// A program name a script command may start with: no path, quote, glob,
+/// assignment or control character.
+fn is_plain_program(word: &str) -> bool {
+    !word.is_empty()
+        && !word.starts_with('-')
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-'))
+}
+
+/// Words a script's command may not start with: shell syntax, not programs.
+const SHELL_KEYWORDS: &[&str] = &[
+    "if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done", "case", "esac",
+    "function", "select", "time", "coproc", "in",
+];
+
+/// Builtins that change the directory later redirections resolve against.
+const DIRECTORY_CHANGERS: &[&str] = &["cd", "pushd", "popd"];
+
+/// One word being read: its text, whether any of it was quoted, and whether
+/// an unquoted part holds a glob, `~` or `=`.
+#[derive(Default)]
+struct ScriptWord {
+    text: String,
+    quoted: bool,
+    special: bool,
+}
+
+/// The strict reader behind [`script_commands`]. Local mutable state, scoped
+/// to one read: a character loop is clearer here than a combinator parser.
+#[derive(Default)]
+struct ScriptReader {
+    commands: Vec<Vec<String>>,
+    words: Vec<String>,
+    word: Option<ScriptWord>,
+    /// The next word is an output redirection's target.
+    target_next: bool,
+    /// `&&`, `||` or `|` was read: a command must follow.
+    operator_pending: bool,
+    redirects_to_file: bool,
+    changes_directory: bool,
+}
+
+impl ScriptReader {
+    fn read(mut self, script: &str) -> Result<Vec<Vec<String>>, String> {
+        let chars: Vec<char> = script.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            let next = chars.get(i + 1).copied();
+            match c {
+                ' ' | '\t' => self.end_word()?,
+                '\n' => self.end_command(false)?,
+                ';' => {
+                    if next == Some(';') {
+                        return Err("it holds `;;`".into());
+                    }
+                    self.end_command(true)?;
+                }
+                '&' if next == Some('&') => {
+                    self.end_operator()?;
+                    i += 1;
+                }
+                '&' => return Err("`&` runs a command in the background".into()),
+                '|' if next == Some('|') => {
+                    self.end_operator()?;
+                    i += 1;
+                }
+                '|' if next == Some('&') => return Err("it holds `|&`".into()),
+                '|' => self.end_operator()?,
+                '>' => i = self.redirect(&chars, i)?,
+                '<' => return Err("it redirects input".into()),
+                '$' | '`' => {
+                    return Err("it expands a variable or substitutes a command".into());
+                }
+                '(' | ')' => return Err("it opens a subshell or a group".into()),
+                '{' | '}' => return Err("it holds a brace group or brace expansion".into()),
+                '\\' => return Err("it holds a backslash escape".into()),
+                '#' => return Err("it holds a comment".into()),
+                '!' => return Err("it holds `!`".into()),
+                '\'' => {
+                    let end = chars[i + 1..]
+                        .iter()
+                        .position(|&q| q == '\'')
+                        .ok_or("a quote is not closed")?;
+                    let w = self.word.get_or_insert_with(ScriptWord::default);
+                    w.text.extend(&chars[i + 1..i + 1 + end]);
+                    w.quoted = true;
+                    i += end + 1;
+                }
+                '"' => {
+                    let end = chars[i + 1..]
+                        .iter()
+                        .position(|&q| q == '"')
+                        .ok_or("a quote is not closed")?;
+                    let inner = &chars[i + 1..i + 1 + end];
+                    if inner.iter().any(|q| matches!(q, '$' | '`' | '\\')) {
+                        return Err("a double-quoted word expands, substitutes or escapes".into());
+                    }
+                    let w = self.word.get_or_insert_with(ScriptWord::default);
+                    w.text.extend(inner);
+                    w.quoted = true;
+                    i += end + 1;
+                }
+                c if c.is_control() => return Err("it holds a control character".into()),
+                c => {
+                    let w = self.word.get_or_insert_with(ScriptWord::default);
+                    w.text.push(c);
+                    if matches!(c, '*' | '?' | '[' | ']' | '~' | '=') {
+                        w.special = true;
+                    }
+                }
+            }
+            i += 1;
+        }
+        self.end_command(false)?;
+        if self.operator_pending {
+            return Err("an operator has no command after it".into());
+        }
+        if self.commands.is_empty() {
+            return Err("it runs no command".into());
+        }
+        if self.redirects_to_file && self.changes_directory {
+            return Err("it redirects to a file after changing directory".into());
+        }
+        Ok(self.commands)
+    }
+
+    /// An output redirection at `chars[at]` (`>`, `>>`, `N>`, `>&N`).
+    /// Returns the index of its last character.
+    fn redirect(&mut self, chars: &[char], at: usize) -> Result<usize, String> {
+        if self.target_next {
+            return Err("a redirection names no file".into());
+        }
+        // `2>`: the digits before `>` are the descriptor, not a word.
+        match &self.word {
+            Some(w) if !w.quoted && w.text.chars().all(|c| c.is_ascii_digit()) => {
+                self.word = None;
+            }
+            _ => self.end_word()?,
+        }
+        if self.words.is_empty() {
+            return Err("a redirection comes before its command's program".into());
+        }
+        let mut i = at;
+        if chars.get(i + 1) == Some(&'>') {
+            i += 1;
+        }
+        match chars.get(i + 1) {
+            Some('|') => Err("it holds `>|`".into()),
+            Some('&') => {
+                // `>&N` or `>&-` duplicates or closes a descriptor.
+                let digits = chars[i + 2..]
+                    .iter()
+                    .take_while(|c| c.is_ascii_digit() || **c == '-')
+                    .count();
+                if digits == 0 {
+                    return Err("it redirects with `>&` to a file".into());
+                }
+                Ok(i + 1 + digits)
+            }
+            _ => {
+                self.target_next = true;
+                Ok(i)
+            }
+        }
+    }
+
+    fn end_word(&mut self) -> Result<(), String> {
+        let Some(w) = self.word.take() else {
+            return Ok(());
+        };
+        if self.target_next {
+            self.target_next = false;
+            return self.check_target(&w);
+        }
+        if self.words.is_empty() {
+            if w.quoted || w.special || !is_plain_program(&w.text) {
+                return Err(format!(
+                    "the command `{}` does not start with a plain program name",
+                    w.text.escape_debug()
+                ));
+            }
+            if SHELL_KEYWORDS.contains(&w.text.as_str()) {
+                return Err(format!("it uses the shell keyword `{}`", w.text));
+            }
+            if DIRECTORY_CHANGERS.contains(&w.text.as_str()) {
+                self.changes_directory = true;
+            }
+        }
+        self.words.push(w.text);
+        Ok(())
+    }
+
+    fn check_target(&mut self, w: &ScriptWord) -> Result<(), String> {
+        let t = &w.text;
+        if w.special {
+            return Err(format!(
+                "a redirection target `{}` holds a glob, `~` or `=`",
+                t.escape_debug()
+            ));
+        }
+        if t == "/dev/null" {
+            return Ok(());
+        }
+        let path = crate::normalize_relative(Path::new(t)).map_err(|_| {
+            format!(
+                "a redirection writes `{}`, outside the worktree",
+                t.escape_debug()
+            )
+        })?;
+        if let Some(why) = kgraf_core::paths::forbidden_reason(&path) {
+            return Err(format!(
+                "a redirection writes `{}`, which a worker may not write: {why}",
+                t.escape_debug()
+            ));
+        }
+        self.redirects_to_file = true;
+        Ok(())
+    }
+
+    /// `;` (`explicit`) or a newline ends a command. An empty command is
+    /// allowed only at a newline or the end, never before `;` or after an
+    /// operator.
+    fn end_command(&mut self, explicit: bool) -> Result<(), String> {
+        self.end_word()?;
+        if self.target_next {
+            return Err("a redirection names no file".into());
+        }
+        if self.words.is_empty() {
+            if explicit {
+                return Err("an operator has no command on one side".into());
+            }
+            return Ok(());
+        }
+        self.commands.push(std::mem::take(&mut self.words));
+        self.operator_pending = false;
+        Ok(())
+    }
+
+    fn end_operator(&mut self) -> Result<(), String> {
+        self.end_word()?;
+        if self.target_next || self.words.is_empty() {
+            return Err("an operator has no command on one side".into());
+        }
+        self.commands.push(std::mem::take(&mut self.words));
+        self.operator_pending = true;
+        Ok(())
+    }
 }
 
 /// A call's subjects, for rule matching: a shell call's command lines (the
@@ -1322,7 +1723,7 @@ pub enum HardLimit {
     Ask(String),
 }
 
-/// How a deletion limit's reason begins, so [`refused_program`] knows the
+/// How a deletion limit's reason begins, so [`refused_subject`] knows the
 /// reason came from the deletion check and not from a rule.
 const DELETING_LEAD: &str = "deleting ";
 const DELETES_LEAD: &str = "this command deletes ";
@@ -1982,6 +2383,10 @@ mod tests {
         ));
     }
 
+    fn program(p: &str) -> Option<RefusedSubject> {
+        Some(RefusedSubject::Program(p.to_owned()))
+    }
+
     #[test]
     fn a_refusal_names_the_program_of_the_command_a_rule_matched() {
         let rules = UserRules {
@@ -1992,23 +2397,26 @@ mod tests {
             Some(HardLimit::Deny(r) | HardLimit::Ask(r)) => r,
             None => panic!("expected a limit"),
         };
+        let rules_hook = PERMISSION_RULES_HOOK;
         // A deny rule on one command of a script names that command.
         let wrapped = shell(&["sh", "-c", "mkdir x && python3 -c pass"]);
         assert_eq!(
-            refused_program("shell", &wrapped.input, &reason_of(&wrapped)).as_deref(),
-            Some("python3")
+            refused_subject("shell", &wrapped.input, rules_hook, &reason_of(&wrapped)),
+            program("python3")
         );
-        // An ask rule too, also through `-lc` and a pipe.
+        // An ask rule too, also through `-lc` and a pipe, and when the user
+        // (or an unattended run) denied the ask, whose reason begins with it.
         let ask = shell(&["bash", "-lc", "echo hi | git push origin main"]);
+        let asked = format!("{} Nobody is attached to answer.", reason_of(&ask));
         assert_eq!(
-            refused_program("shell", &ask.input, &reason_of(&ask)).as_deref(),
-            Some("git")
+            refused_subject("shell", &ask.input, crate::approval::USER, &asked),
+            program("git")
         );
         // A plain call is its own program.
         let plain = shell(&["python3", "x.py"]);
         assert_eq!(
-            refused_program("shell", &plain.input, &reason_of(&plain)).as_deref(),
-            Some("python3")
+            refused_subject("shell", &plain.input, rules_hook, &reason_of(&plain)),
+            program("python3")
         );
         // A rule on the shell itself names the shell.
         let sh_rules = UserRules {
@@ -2021,8 +2429,8 @@ mod tests {
             panic!("expected a deny");
         };
         assert_eq!(
-            refused_program("shell", &sh.input, &reason).as_deref(),
-            Some("sh")
+            refused_subject("shell", &sh.input, rules_hook, &reason),
+            program("sh")
         );
         // A deletion limit names the deleting command, not its shell.
         let rm = shell(&["sh", "-c", "mkdir x && rm -rf /usr"]);
@@ -2032,12 +2440,216 @@ mod tests {
             panic!("expected a deny");
         };
         assert_eq!(
-            refused_program("shell", &rm.input, &reason).as_deref(),
-            Some("rm")
+            refused_subject("shell", &rm.input, rules_hook, &reason),
+            program("rm")
         );
         // Another tool, or a reason that quotes no rule, leaves the call's own program.
-        assert_eq!(refused_program("apply_patch", &wrapped.input, "x"), None);
-        assert_eq!(refused_program("shell", &wrapped.input, "no rule"), None);
+        assert_eq!(
+            refused_subject("apply_patch", &wrapped.input, rules_hook, "x"),
+            None
+        );
+        assert_eq!(
+            refused_subject("shell", &wrapped.input, rules_hook, "no rule"),
+            None
+        );
+    }
+
+    /// A refusal of the whole tool keeps the tool and its scope: a skill's
+    /// `allowed-tools` (decision 0053), even when its reason goes on to quote
+    /// a rule that matched one command, and a user rule with no pattern. Only
+    /// a command-level match names a program; a reason that merely contains
+    /// a rule's text further on, or a hook that is not a rule's, names none.
+    #[test]
+    fn a_tool_level_refusal_keeps_the_tool_and_its_scope() {
+        let wrapped = shell(&["sh", "-c", "mkdir x && python3 -c pass"]);
+        let composed = "tool `shell` is not permitted by skill `read-only-audit`'s allowed-tools; \
+                        `user-permission-rules` also refused it: your deny rule \
+                        `shell(python3*)` blocks this call in every permission mode";
+        assert_eq!(
+            refused_subject(
+                "shell",
+                &wrapped.input,
+                crate::approval::SKILLS_POLICY,
+                composed
+            ),
+            Some(RefusedSubject::Tool)
+        );
+        // The same text under another hook is no rule's refusal.
+        assert_eq!(
+            refused_subject("shell", &wrapped.input, "mcp-call-review", composed),
+            None
+        );
+        assert_eq!(
+            refused_subject("shell", &wrapped.input, PERMISSION_RULES_HOOK, composed),
+            None
+        );
+        // A rule on every call of the tool refuses the tool.
+        for text in ["shell", "*"] {
+            let rules = UserRules {
+                deny: vec![Rule::parse(text).expect("rule")],
+                ask: vec![],
+            };
+            let Some(HardLimit::Deny(reason)) =
+                hard_limit(&rules, &wrapped, Some(&home()), Some(&ws()))
+            else {
+                panic!("expected a deny for {text}");
+            };
+            assert_eq!(
+                refused_subject("shell", &wrapped.input, PERMISSION_RULES_HOOK, &reason),
+                Some(RefusedSubject::Tool),
+                "{text}"
+            );
+        }
+        // A rule on a file tool's path refuses that path.
+        let rules = UserRules {
+            deny: vec![Rule::parse("apply_patch(secrets/*)").expect("rule")],
+            ask: vec![],
+        };
+        let patch = PendingCall {
+            tool: "apply_patch".into(),
+            input: json!({"patch": "*** Begin Patch\n*** Add File: notes.md\n+a\n*** Add File: secrets/key.txt\n+b\n*** End Patch"}),
+            ..shell(&["x"])
+        };
+        let Some(HardLimit::Deny(reason)) = hard_limit(&rules, &patch, Some(&home()), Some(&ws()))
+        else {
+            panic!("expected a deny");
+        };
+        assert_eq!(
+            refused_subject("apply_patch", &patch.input, PERMISSION_RULES_HOOK, &reason),
+            Some(RefusedSubject::Path("secrets/key.txt".into()))
+        );
+        // The command policy's script lead names a program only from the
+        // command policy or the user's denial of its ask, read from its last
+        // occurrence: a model-written command line quoting the lead earlier
+        // does not choose the program.
+        let tricky = shell(&["sh", "-c", "echo 'script runs `mkdir`' && curl x"]);
+        let question = "Run `sh -c 'echo ... script runs `mkdir` ...'`? The script runs `curl` \
+                        (`curl x`), which no grant covers.";
+        assert_eq!(
+            refused_subject(
+                "shell",
+                &tricky.input,
+                crate::shell::SHELL_POLICY_HOOK,
+                question
+            ),
+            program("curl")
+        );
+        assert_eq!(
+            refused_subject("shell", &tricky.input, crate::approval::USER, question),
+            program("curl")
+        );
+        assert_eq!(
+            refused_subject("shell", &tricky.input, "some-hook", question),
+            None
+        );
+    }
+
+    fn script(s: &str) -> Script {
+        script_commands(&argv(&["sh", "-c", s]))
+    }
+
+    fn programs_of(s: &str) -> Vec<String> {
+        match script(s) {
+            Script::Commands(c) => c.into_iter().map(|w| w[0].clone()).collect(),
+            other => panic!("{s:?} should be judged: {other:?}"),
+        }
+    }
+
+    /// The commands a mode may grant one by one: simple commands joined by
+    /// `;`, `&&`, `||`, `|` or newlines, with quoted arguments, argument
+    /// globs, and output redirections into the worktree or `/dev/null`.
+    #[test]
+    fn a_plain_script_is_read_as_its_commands() {
+        assert_eq!(
+            programs_of("mkdir -p out && cp templates/greeting.txt out/greeting.txt"),
+            ["mkdir", "cp"]
+        );
+        assert_eq!(
+            programs_of("mkdir a; touch a/b || echo no | wc -l\nls"),
+            ["mkdir", "touch", "echo", "wc", "ls"]
+        );
+        assert_eq!(
+            programs_of("python3 -c 'print(1); x = \"$HOME\"' && cp src/*.txt out/"),
+            ["python3", "cp"]
+        );
+        assert_eq!(
+            programs_of("python3 gen.py > out/data.json 2>/dev/null && cat out/data.json 2>&1"),
+            ["python3", "cat"]
+        );
+        assert_eq!(programs_of("mkdir x &&\n cp a x/"), ["mkdir", "cp"]);
+        assert_eq!(programs_of("echo hi>>out/log.txt;"), ["echo"]);
+        // The other shells, by bare name, with exactly `-c`.
+        for sh in ["bash", "zsh", "dash"] {
+            assert!(matches!(
+                script_commands(&argv(&[sh, "-c", "mkdir x"])),
+                Script::Commands(_)
+            ));
+        }
+        assert_eq!(script_commands(&argv(&["mkdir", "x"])), Script::NotAScript);
+        assert_eq!(
+            script_commands(&argv(&["fish", "-c", "mkdir x"])),
+            Script::NotAScript
+        );
+    }
+
+    /// Everything the per-command check does not judge is refused by name,
+    /// so the call is asked about whole.
+    #[test]
+    fn a_script_with_any_other_construct_is_not_judged() {
+        for (s, why) in [
+            ("mkdir x && $(curl x)", "expands"),
+            ("mkdir x && echo `id`", "expands"),
+            ("echo \"$HOME\"", "double-quoted"),
+            ("mkdir x & cp a b", "background"),
+            ("mkdir x |& cat", "|&"),
+            ("(mkdir x) && cp a b", "subshell"),
+            ("{ mkdir x; }", "brace"),
+            ("cp a b < in.txt", "input"),
+            ("m\\kdir x", "backslash"),
+            ("mkdir x # note", "comment"),
+            ("! mkdir x", "`!`"),
+            ("if true; then mkdir x; fi", "keyword"),
+            ("mkdir x &&", "no command after"),
+            ("&& mkdir x", "no command"),
+            ("mkdir x;; cp a b", ";;"),
+            ("mkdir x; ; cp a b", "no command"),
+            ("PATH=/tmp mkdir x", "plain program"),
+            ("./mkdir x", "plain program"),
+            ("/bin/mkdir x", "plain program"),
+            ("'mkdir' x", "plain program"),
+            ("m* x", "plain program"),
+            ("echo x > /etc/passwd", "outside the worktree"),
+            ("echo x > ../up.txt", "outside the worktree"),
+            ("echo x > ~/.profile", "glob, `~`"),
+            ("echo x > out/*.txt", "glob, `~`"),
+            ("echo x > .git/config", "may not write"),
+            ("echo x >| out.txt", ">|"),
+            ("echo x >&out.txt", ">&"),
+            ("echo x >", "names no file"),
+            ("cd sub && echo x > out.txt", "changing directory"),
+            ("echo 'open", "not closed"),
+            ("", "no command"),
+            ("mkdir x\u{1b}[2K", "control"),
+        ] {
+            match script(s) {
+                Script::Unjudged(reason) => assert!(reason.contains(why), "{s:?}: {reason}"),
+                other => panic!("{s:?} must not be judged: {other:?}"),
+            }
+        }
+        for (a, why) in [
+            (argv(&["/bin/sh", "-c", "mkdir x"]), "path"),
+            (argv(&["bash", "-lc", "mkdir x"]), "options"),
+            (argv(&["sh", "-e", "-c", "mkdir x"]), "options"),
+            (argv(&["sh", "-c", "mkdir \"$0\"", "x"]), "arguments follow"),
+        ] {
+            match script_commands(&a) {
+                Script::Unjudged(reason) => assert!(reason.contains(why), "{a:?}: {reason}"),
+                other => panic!("{a:?} must not be judged: {other:?}"),
+            }
+        }
+        // `cd` without a file redirection, and `/dev/null` after a `cd`, are
+        // still judged: nothing they write depends on the directory.
+        assert_eq!(programs_of("cd sub && ls 2>/dev/null"), ["cd", "ls"]);
     }
 
     #[test]

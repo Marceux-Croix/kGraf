@@ -448,7 +448,7 @@ impl ToolPolicy {
 
 impl CallPolicy for ToolPolicy {
     fn name(&self) -> &str {
-        "skills:allowed-tools"
+        kgraf_tools::SKILLS_POLICY
     }
 
     fn fingerprint(&self) -> String {
@@ -712,7 +712,7 @@ impl WorkerSkills {
 
 impl CallPolicy for WorkerSkills {
     fn name(&self) -> &str {
-        "skills:allowed-tools"
+        kgraf_tools::SKILLS_POLICY
     }
 
     fn fingerprint(&self) -> String {

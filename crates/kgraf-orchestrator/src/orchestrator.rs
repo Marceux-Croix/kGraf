@@ -8577,6 +8577,7 @@ mod tests {
             retried_ok,
             by: by.into(),
             path: None,
+            whole_tool: false,
         }
     }
 
