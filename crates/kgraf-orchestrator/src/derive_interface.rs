@@ -17,18 +17,11 @@
 use crate::checks::{FileOverlay, InterfaceContract, InterfaceKind};
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Text that marks a body as not written yet, per language.
-const SCAFFOLD_MARKERS: &[&str] = &[
-    "todo!(",
-    "unimplemented!(",
-    "NotImplementedError",
-    "not implemented",
-    "Not implemented",
-];
-
-/// Whether `content` is a scaffold: it holds a placeholder body.
-pub fn is_scaffold(content: &str) -> bool {
-    SCAFFOLD_MARKERS.iter().any(|m| content.contains(m))
+/// Whether `content`, the text of `path`, is a scaffold: it holds a
+/// placeholder body in code. The words in a string literal or a comment do
+/// not make a file a scaffold ([`crate::placeholder::has_placeholder_body`]).
+pub fn is_scaffold(path: &str, content: &str) -> bool {
+    crate::placeholder::has_placeholder_body(path, content)
 }
 
 /// Whether `path` names a test file by the common conventions: under a
@@ -214,7 +207,7 @@ pub fn stub_of(facts: &ProducerFacts) -> Vec<FileOverlay> {
         .iter()
         .filter_map(|(p, c)| {
             c.as_ref()
-                .filter(|c| is_scaffold(c))
+                .filter(|c| is_scaffold(p, c))
                 .map(|c| FileOverlay::new(p, c))
         })
         .collect()
@@ -489,6 +482,38 @@ mod tests {
                 .expect_err("no command")
                 .contains("build command")
         );
+    }
+
+    /// A producer file that names a placeholder only in text (a brief in a
+    /// string literal, a doc comment) is finished code, not a scaffold: it
+    /// must not stand in as the stub of a compile-only interface.
+    #[test]
+    fn a_file_that_names_a_placeholder_only_in_text_is_not_a_scaffold() {
+        let prose = "/// Doc: `todo!()` panics.\npub fn brief() -> &'static str {\n    \"`todo!()` panics; NotImplementedError; not implemented here\"\n}\n";
+        assert!(!is_scaffold("discount_flat/src/lib.rs", prose));
+        let mut f = facts();
+        f.writes[0].1 = Some(prose.into());
+        assert!(stub_of(&f).is_empty());
+        assert!(
+            derive(&f, |_| None)
+                .expect_err("no scaffold")
+                .contains("scaffold")
+        );
+        // Real scaffolds in each form still are.
+        for (path, src) in [
+            ("a/src/lib.rs", "pub fn f() -> u8 { todo!() }\n"),
+            (
+                "a/src/lib.rs",
+                "pub fn f() -> u8 { unimplemented!(\"later\") }\n",
+            ),
+            ("a/mod.py", "def f():\n    raise NotImplementedError\n"),
+            (
+                "a/index.ts",
+                "export function f(): number {\n  throw new Error(\"Not implemented\");\n}\n",
+            ),
+        ] {
+            assert!(is_scaffold(path, src), "{path}: {src}");
+        }
     }
 
     #[test]

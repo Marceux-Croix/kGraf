@@ -401,7 +401,10 @@ impl InterfaceContract {
             ("tests", &self.tests),
         ] {
             for f in files {
-                if let Some(slot) = find_placeholder(&f.content, false) {
+                // A slot in a comment or a string literal is text, and does
+                // not stop the file from building: only code is judged.
+                let code = crate::placeholder::code_only(&f.path, &f.content);
+                if let Some(slot) = find_placeholder(code.as_deref().unwrap_or(&f.content), false) {
                     problems.push(format!(
                         "the {what} file `{}` holds the placeholder `{slot}`; replace it with \
                          the real crate, package or module name from the project's manifest",

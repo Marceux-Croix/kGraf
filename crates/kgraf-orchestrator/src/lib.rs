@@ -89,6 +89,7 @@ mod orchestrator;
 mod outside_error;
 pub mod pairing;
 mod partition;
+mod placeholder;
 mod plan;
 mod plan_repo;
 pub mod planner_context;

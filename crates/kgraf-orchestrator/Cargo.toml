@@ -40,6 +40,9 @@ serde_json = "1"
 # already in the lockfile through oauth2.
 serde_path_to_error = "0.1"
 thiserror = "2"
+# The placeholder scan (placeholder.rs) lexes source with the grammars kgraf-graph already
+# compiles, so a marker inside a string literal or a comment is not code. MIT; in the workspace.
+tree-sitter.workspace = true
 # Package names from manifests for the planner (planner_context.rs); already in the workspace.
 toml = "1.1.6"
 # `rt` for spawn (each worker's completion forwarder is a task), `sync` for the

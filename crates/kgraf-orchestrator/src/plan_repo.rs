@@ -19,6 +19,7 @@
 //! Both are refused as [`PlanError::Invalid`], which the planner is asked
 //! again with; the reason names the file and the fix.
 
+use crate::placeholder::has_placeholder_body;
 use crate::plan::{ContractSpec, PlanError};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -76,20 +77,6 @@ fn writes_of(specs: &[ContractSpec]) -> BTreeMap<&str, Vec<&str>> {
     by_path
 }
 
-/// Whether `text` holds a placeholder body on a line that is code: a comment
-/// line that mentions one (a doc line, a note) does not count.
-pub(crate) fn has_placeholder_body(text: &str) -> bool {
-    text.lines().any(|line| {
-        let t = line.trim_start();
-        if t.starts_with("//") || t.starts_with('#') || t.starts_with("/*") || t.starts_with('*') {
-            return false;
-        }
-        t.contains("todo!(")
-            || t.contains("unimplemented!(")
-            || t.contains("raise NotImplementedError")
-    })
-}
-
 /// A named file that holds placeholder bodies and that no contract writes.
 fn scaffold_refusal(
     specs: &[ContractSpec],
@@ -103,7 +90,12 @@ fn scaffold_refusal(
         if written.contains_key(file) || unwritten.contains(&file) {
             continue;
         }
-        if repo.read(file).is_some_and(|t| has_placeholder_body(&t)) {
+        // Only a placeholder in code counts: the words in a string literal or a
+        // comment are text about one (`crate::placeholder`).
+        if repo
+            .read(file)
+            .is_some_and(|t| has_placeholder_body(file, &t))
+        {
             unwritten.push(file);
         }
     }
@@ -450,6 +442,47 @@ mod tests {
         // file that is absent has nothing to refuse.
         assert!(refusal(&specs, &[], &repo).is_none());
         assert!(refusal(&specs, &["gone/src/lib.rs".into()], &repo).is_none());
+    }
+
+    /// Shaped like `crates/kgraf-host/src/scoped_check.rs` as of
+    /// 2026-10-02 (self-repo): its only `todo!()` is prose in string
+    /// literals. The macro is also named in a raw string and in comments.
+    const PROSE_ONLY: &str = r###"pub fn brief() -> &'static str {
+    "Acceptance is advisory. `todo!()` panics or failing tests \
+     in other contracts' unfinished code are not yours to fix."
+}
+
+pub fn raw() -> &'static str {
+    r#"unimplemented!() in a "raw" string"#
+}
+
+// todo!() in a comment
+/* unimplemented!() /* nested */ still a comment */
+pub fn f() {}
+"###;
+
+    /// The instruction named that file, no contract wrote it, and every plan
+    /// was refused for leaving a placeholder unwritten. A placeholder in a
+    /// string, raw string or comment is text, not a body.
+    #[test]
+    fn a_placeholder_named_only_in_strings_and_comments_is_not_refused() {
+        let real = format!("{PROSE_ONLY}pub fn g() -> u8 {{\n    todo!()\n}}\n");
+        let repo = Fake::with(&[
+            ("crates/h/src/scoped_check.rs", PROSE_ONLY),
+            ("crates/h/src/real.rs", real.as_str()),
+            (
+                "py/doc.py",
+                "def f():\n    \"\"\"raise NotImplementedError until done.\"\"\"\n    return 1\n",
+            ),
+        ]);
+        let specs = [spec("c1", "x", "cargo test -p z", &["z/src/lib.rs"], &[])];
+        for text_only in ["crates/h/src/scoped_check.rs", "py/doc.py"] {
+            let got = refusal(&specs, &[text_only.into()], &repo);
+            assert!(got.is_none(), "{text_only}: {got:?}");
+        }
+        // The same text next to a real `todo!()` body is still refused.
+        let why = reason(refusal(&specs, &["crates/h/src/real.rs".into()], &repo));
+        assert!(why.contains("`crates/h/src/real.rs`"), "{why}");
     }
 
     /// Round evidence (greenfield): c1 writes `Cargo.toml` listing members

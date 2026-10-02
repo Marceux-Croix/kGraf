@@ -571,7 +571,13 @@ pub fn is_placeholder_source(path: &str, content: &str) -> bool {
     if !path.ends_with(".rs") || content.len() > MAX_SCANNED_BYTES {
         return false;
     }
-    let scan = scan_source(&mask_non_code(content));
+    // Comments and literals removed by the shared lexer (`crate::placeholder`),
+    // so a brace, quote, `fn ` or macro name in text is not code. A Rust
+    // grammar always loads; no grammar would mean no scan, so no refusal.
+    let Some(masked) = crate::placeholder::code_only(path, content) else {
+        return false;
+    };
+    let scan = scan_source(&masked);
     let placeholders = |bodies: &[String]| bodies.iter().all(|b| is_placeholder_body(b));
     if !scan.free.is_empty() {
         return placeholders(&scan.free) && placeholders(&scan.trait_impl);
@@ -583,132 +589,12 @@ pub fn is_placeholder_source(path: &str, content: &str) -> bool {
     !scan.trait_impl.is_empty() && !scan.real_items && placeholders(&scan.trait_impl)
 }
 
-/// `src` with the inside of every comment, string, raw string and character
-/// literal replaced by spaces (newlines kept), so the result has the same
-/// byte length and offsets but no brace, quote, `fn ` or macro name that came
-/// from text. A scan of the result sees only code. Lifetimes (`'a`) are not
-/// character literals and stay.
-fn mask_non_code(src: &str) -> String {
-    let b = src.as_bytes();
-    let mut out = b.to_vec();
-    let blank = |out: &mut [u8], from: usize, to: usize| {
-        for byte in &mut out[from..to] {
-            if *byte != b'\n' {
-                *byte = b' ';
-            }
-        }
-    };
-    let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
-    let mut i = 0;
-    while i < b.len() {
-        match b[i] {
-            b'/' if b.get(i + 1) == Some(&b'/') => {
-                let end = src[i..].find('\n').map_or(b.len(), |n| i + n);
-                blank(&mut out, i, end);
-                i = end;
-            }
-            b'/' if b.get(i + 1) == Some(&b'*') => {
-                // Block comments nest.
-                let mut depth = 1;
-                let mut j = i + 2;
-                while j < b.len() && depth > 0 {
-                    if b[j] == b'/' && b.get(j + 1) == Some(&b'*') {
-                        depth += 1;
-                        j += 2;
-                    } else if b[j] == b'*' && b.get(j + 1) == Some(&b'/') {
-                        depth -= 1;
-                        j += 2;
-                    } else {
-                        j += 1;
-                    }
-                }
-                blank(&mut out, i, j);
-                i = j;
-            }
-            b'r' if (i == 0
-                || !is_ident(b[i - 1])
-                || (b[i - 1] == b'b' && (i < 2 || !is_ident(b[i - 2]))))
-                && raw_string_end(b, i).is_some() =>
-            {
-                let end = raw_string_end(b, i).unwrap_or(b.len());
-                blank(&mut out, i + 1, end);
-                i = end;
-            }
-            b'"' => {
-                let mut j = i + 1;
-                while j < b.len() && b[j] != b'"' {
-                    j += if b[j] == b'\\' { 2 } else { 1 };
-                }
-                let end = (j + 1).min(b.len());
-                blank(&mut out, i + 1, j.min(b.len()));
-                i = end;
-            }
-            b'\'' => {
-                // A character literal is `'\..'` or one char then `'`;
-                // anything else is a lifetime or a label.
-                let rest = &src[i + 1..];
-                let end = match rest.chars().next() {
-                    Some('\\') => rest[1..].chars().next().and_then(|esc| {
-                        // The escaped character (maybe `'`) never closes it.
-                        let from = 1 + esc.len_utf8();
-                        rest[from..].find('\'').map(|n| i + 1 + from + n + 1)
-                    }),
-                    Some(c) if c != '\'' && rest[c.len_utf8()..].starts_with('\'') => {
-                        Some(i + 1 + c.len_utf8() + 1)
-                    }
-                    _ => None,
-                };
-                match end {
-                    Some(end) => {
-                        blank(&mut out, i + 1, end - 1);
-                        i = end;
-                    }
-                    None => i += 1,
-                }
-            }
-            _ => i += 1,
-        }
-    }
-    // Only ASCII spaces replaced bytes, and whole literals at a time, so
-    // multi-byte characters are either untouched or replaced entirely.
-    String::from_utf8(out).unwrap_or_else(|_| src.to_owned())
-}
-
-/// For a raw string that starts with the `r` at `at` (`r"..."`, `r#"..."#`),
-/// the offset just past its closing quote and hashes.
-fn raw_string_end(b: &[u8], at: usize) -> Option<usize> {
-    let mut j = at + 1;
-    let mut hashes = 0;
-    while b.get(j) == Some(&b'#') {
-        hashes += 1;
-        j += 1;
-    }
-    if b.get(j) != Some(&b'"') {
-        return None;
-    }
-    j += 1;
-    while j < b.len() {
-        if b[j] == b'"'
-            && b[j + 1..]
-                .iter()
-                .take(hashes)
-                .filter(|c| **c == b'#')
-                .count()
-                == hashes
-        {
-            return Some(j + 1 + hashes);
-        }
-        j += 1;
-    }
-    Some(b.len())
-}
-
 /// The macros a placeholder body is one call to. `unreachable!` is not one:
 /// it states an invariant, and a mock or a trait impl of a method the code
 /// under test never calls legitimately consists of nothing else.
 const PLACEHOLDER_MACROS: [&str; 2] = ["todo", "unimplemented"];
 
-/// True when the body (already masked by [`mask_non_code`]) is exactly one
+/// True when the body (already masked by [`crate::placeholder::code_only`]) is exactly one
 /// call to a [`PLACEHOLDER_MACROS`] macro, with an optional `return` before
 /// it, an optional trailing `;` and nothing else: `todo!(); real()` is real
 /// work after a placeholder call, not a placeholder. Any delimiter counts
@@ -804,7 +690,7 @@ struct Scan {
 }
 
 /// The bodies and the item kinds of a Rust source file (masked by
-/// [`mask_non_code`], so a brace in a literal or comment cannot unbalance the
+/// [`crate::placeholder::code_only`], so a brace in a literal or comment cannot unbalance the
 /// scan), found by a brace-matching scan of the items rather than a parse:
 /// this call site only asks whether the bodies found are placeholders, never
 /// compiles or lints the file. A signature with no body (a trait method

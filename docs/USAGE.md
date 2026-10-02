@@ -886,7 +886,7 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   that returns the contracts only. When the plan has two or more contracts, kGraf then derives
   an interface for each contract that another contract uses, without asking a model: where the
   repository already holds the producer's scaffold (a body of `todo!()` or `raise
-  NotImplementedError`), that scaffold is the stub, the files that use the producer's names
+  NotImplementedError` in code, not in a string or a comment), that scaffold is the stub, the files that use the producer's names
   are the consumer files, and the project's build tool compiles them (`cargo test --no-run
   -p ...`, or a Python import). A derived check that passes is registered as a compile-only
   interface: it is checked before the first worker starts, it costs no model call, and it
@@ -1335,7 +1335,10 @@ Behavior that differs from earlier builds. Each item names the decision that hol
   another contract writes, or a command, keeps the permission wording (0093).
 - Before a plan is accepted, two checks read your repository. A file the instruction names
   that holds placeholder bodies (`todo!()`, `unimplemented!()`, `raise NotImplementedError`)
-  and that no contract writes is refused, naming the file. A contract whose acceptance builds
+  and that no contract writes is refused, naming the file. Only code counts: a file that
+  mentions `todo!()` inside a string literal, a raw string or a comment holds no placeholder.
+  Files are lexed with the grammar of their language; a language kGraf has no grammar for is
+  read line by line, skipping comment lines. A contract whose acceptance builds
   a whole Cargo workspace (`--workspace`) is refused when a member's manifest does not exist
   and no contract it depends on writes it. The planner is asked again with the reason (0030).
 - A worker that reaches its context stop point before it has written anything is compacted

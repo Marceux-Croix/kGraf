@@ -1554,9 +1554,10 @@ async fn contract_facts(
         for p in &paths {
             writes.push((p.clone(), runner.read_base(p).await.ok().flatten()));
         }
-        let unimplemented = writes
-            .iter()
-            .any(|(_, c)| c.as_deref().is_none_or(derive_interface::is_scaffold));
+        let unimplemented = writes.iter().any(|(p, c)| {
+            c.as_deref()
+                .is_none_or(|c| derive_interface::is_scaffold(p, c))
+        });
         out.push(derive_interface::ContractFacts {
             id: spec.id.clone(),
             depends_on: spec.depends_on.clone(),

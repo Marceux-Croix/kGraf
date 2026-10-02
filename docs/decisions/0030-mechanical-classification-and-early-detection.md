@@ -520,3 +520,44 @@ Tests: `kgraf-orchestrator` `checks.rs` (`a_script_argument_is_a_file_the_comman
 `a_command_file_the_interface_does_not_supply_is_listed`), `tests/contract_checks.rs`
 `a_script_argument_the_tree_lacks_is_a_missing_file_not_a_missing_program`, `tests/contract_flow.rs`
 `a_check_command_naming_a_file_nobody_supplies_is_asked_again`.
+
+## Amendment (2026-10-02, fourth): a placeholder is found only in code
+
+A run on a repository whose source names `todo!()` in prose inside string literals was
+refused: the scaffold refusal read files line by line and skipped only lines that start as a
+comment, so it took the prose for a placeholder body, and every re-ask was refused the same
+way. The scaffold test of the derived interface matched plain substrings and had the same
+defect.
+
+- **One rule, in code only.** Every check that asks whether a file holds a placeholder body
+  reads `placeholder.rs`: the scaffold refusal above (`plan_repo.rs`), the scaffold that
+  stands in as a derived stub and the "code does not exist yet" fact that `behavior_plan`
+  reads (`derive_interface::is_scaffold`), and the untouched-placeholder refusal of decision
+  0086 (`stub_land::is_placeholder_source`, which now shares the lexer). The file is lexed
+  with the tree-sitter grammar of its language (Rust, Python, TypeScript, JavaScript, Go,
+  Java, C, C++, Ruby, C#, PHP; the grammars the code graph already compiles), every comment
+  and every string, raw string, byte string, character, template, heredoc and regex literal
+  is removed, and only the code left is read. A placeholder is a `todo!` or `unimplemented!`
+  call (any delimiter, a path such as `std::todo!` allowed, `my_todo!` not one), `raise` or
+  `fail` of `NotImplementedError`, or a literal that says "not implemented" as the message of
+  a `raise`, `throw`, `panic` or `fail` on the same statement line.
+- **What changes.** A file that names `todo!()` only in a string literal, raw string, doc
+  comment or comment is no longer refused and is no longer a scaffold. `except
+  NotImplementedError` is not a raise. A "not implemented" comment or a string that is not
+  raised is not a placeholder. The template-slot check (`<crate_name>`) judges an interface
+  file's code the same way, so a slot in a comment or a string is not refused. Every form a
+  real placeholder body took before is still found.
+- **Limits.** A language with no grammar is read line by line, skipping lines that start as a
+  comment; that reader cannot tell a string from code. A prose file (Markdown, text) holds no
+  placeholder. A lex costs about 6 ms for a 34 KB Rust file and about 50 ms for a 397 KB file
+  in a release build; it runs only on named files, producer writes and untouched writes.
+- **The refusal stays re-askable.** It is a `PlanError::Invalid`; the planner is asked again
+  with the reason, up to the plan ask limit.
+
+Tests: `kgraf-orchestrator` `placeholder.rs` unit tests (every grammar, Rust and Python forms,
+raised messages, the line reader, prose files),
+`plan_repo::tests::a_placeholder_named_only_in_strings_and_comments_is_not_refused`,
+`derive_interface::tests::a_file_that_names_a_placeholder_only_in_text_is_not_a_scaffold`,
+`plan::tests::a_placeholder_in_a_command_or_an_interface_file_is_refused_with_a_reason`, the
+`stub_land` masking tests, and `tests/plan_repo_intake.rs`
+`a_named_file_that_mentions_a_placeholder_only_in_text_is_not_refused`.

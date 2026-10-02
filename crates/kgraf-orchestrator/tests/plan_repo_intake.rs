@@ -171,6 +171,48 @@ async fn a_plan_that_leaves_a_named_stub_unwritten_is_refused_then_accepted_with
     assert!(prompts[1].contains("placeholder bodies"), "{}", prompts[1]);
 }
 
+/// Shaped like `crates/kgraf-host/src/scoped_check.rs` as of
+/// 2026-10-02 (self-repo): the macro is named only in string literals, a raw
+/// string and comments. No body is a placeholder.
+const PROSE_ONLY: &str = r###"//! Scoped checks. `todo!()` in a module doc.
+pub fn brief() -> &'static str {
+    "Acceptance is advisory. `todo!()` panics or failing tests \
+     in other contracts' unfinished code are not yours to fix."
+}
+
+pub fn raw() -> &'static str {
+    r#"unimplemented!() in a "raw" string"#
+}
+
+// todo!() in a comment
+pub fn f() {}
+"###;
+
+/// The self-repo run named such a file as context, the plan left it to no
+/// contract, and all three asks were refused for an unwritten placeholder.
+/// Text about a placeholder is not one: the first plan is accepted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_named_file_that_mentions_a_placeholder_only_in_text_is_not_refused() {
+    let first = plan(serde_json::json!([contract(
+        "c1",
+        "add a budget test in core/src/lib.rs",
+        "cargo test -p core",
+        &["core/src/lib.rs"]
+    )]));
+    let (prompts, refused) = planned(
+        &[
+            ("core/src/lib.rs", "pub fn budget() -> u32 { 1 }\n"),
+            ("host/src/scoped_check.rs", PROSE_ONLY),
+        ],
+        "Add a budget test in core/src/lib.rs. See host/src/scoped_check.rs for the brief.",
+        first.clone(),
+        first,
+    )
+    .await;
+    assert!(refused.is_empty(), "{refused:?}");
+    assert_eq!(prompts.len(), 1, "accepted at the first ask");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_workspace_acceptance_before_its_members_exist_is_refused_then_accepted_when_one_contract_writes_them()
  {

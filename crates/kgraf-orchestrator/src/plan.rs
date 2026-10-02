@@ -3221,6 +3221,24 @@ mod tests {
         assert!(err.to_string().contains("compile command"), "{err}");
         run(&|ic| ic.stub[0].content = "fn f(v: Vec<u8>) -> Option<name_t> { None }\n".into())
             .expect("generics are not slots");
+        // A slot in a comment or a string literal is text: the file still
+        // builds, so it is not refused. The same slot in code still is.
+        run(&|ic| ic.tests[0].content = "# from <your_module> import x\nimport a\n".into())
+            .expect("a slot in a Python comment");
+        run(&|ic| ic.tests[0].content = "HELP = 'use <crate_name>::x'\n".into())
+            .expect("a slot in a Python string");
+        run(&|ic| {
+            ic.stub[0].path = "src/lib.rs".into();
+            ic.stub[0].content =
+                "// use <crate_name>::x;\npub const H: &str = r#\"<crate_name>::y\"#;\n".into();
+        })
+        .expect("a slot in a Rust comment and raw string");
+        let err = run(&|ic| {
+            ic.stub[0].path = "src/lib.rs".into();
+            ic.stub[0].content = "// a note\nuse <crate_name>::x;\n".into();
+        })
+        .expect_err("a slot in Rust code");
+        assert!(err.to_string().contains("`<crate_name>`"), "{err}");
     }
 
     /// The command rules judge a new plan only. An interface persisted before
