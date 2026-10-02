@@ -202,7 +202,9 @@ impl ModeSource {
 /// One user rule: `tool` (every call of the tool) or `tool(pattern)`, where
 /// the pattern matches a call's subject exactly, or as a prefix when it ends
 /// in `*`. A shell call's subjects are its command line and every simple
-/// command of a `sh -c` script; a file tool's are the paths it writes.
+/// command of a `sh -c` script, each also from every place its program may
+/// stand past prefix words ([`subjects`]); a file tool's are the paths it
+/// writes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Rule {
     tool: String,
@@ -1370,35 +1372,70 @@ fn file_paths(tool: &str, input: &serde_json::Value) -> Vec<String> {
 /// Shell interpreters whose `-c` script is read as commands.
 const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "fish"];
 
+/// How deep [`simple_commands`] follows a shell started inside a script
+/// (`sh -c "bash -c 'curl x'"`). Each level's script is a strict part of the
+/// level above, so real commands stop long before this; the bound only keeps
+/// recursion finite.
+const MAX_SHELL_DEPTH: usize = 32;
+
 /// Every simple command a shell call runs, as argv lists: the call's argv
 /// itself and, for `sh -c SCRIPT` (or `-lc`, `-ec`), each command of the
-/// script split on `;`, `&&`, `||`, `|`, `&` and newlines. A script that
+/// script split on `;`, `&&`, `||`, `|`, `&` and newlines. The shell may stand
+/// after prefix words ([`command_starts`]: `env sh -c ...`, `nohup bash -c
+/// ...`), and a shell or an `eval` started by a command of the script is
+/// split the same way, its commands listed after the command that starts it.
+/// A script that
 /// cannot be split (unbalanced quotes) yields its words split on whitespace,
 /// so a rule still sees them.
 pub fn simple_commands(argv: &[String]) -> Vec<Vec<String>> {
-    let mut out = vec![argv.to_vec()];
-    let Some(program) = argv.first() else {
-        return out;
-    };
-    if !SHELLS.contains(&base_name(program)) {
-        return out;
+    nested_commands(argv).into_iter().map(|(_, c)| c).collect()
+}
+
+/// [`simple_commands`] with each command's depth: 0 for the call's argv, 1
+/// for a command of its script, 2 for a command of a script a depth-1
+/// command starts, and so on.
+fn nested_commands(argv: &[String]) -> Vec<(usize, Vec<String>)> {
+    let mut out = vec![(0, argv.to_vec())];
+    push_script_commands(argv, 1, &mut out);
+    out
+}
+
+fn push_script_commands(words: &[String], depth: usize, out: &mut Vec<(usize, Vec<String>)>) {
+    if depth > MAX_SHELL_DEPTH {
+        return;
     }
-    let mut it = argv.iter().skip(1);
-    while let Some(arg) = it.next() {
-        if arg.starts_with('-') && arg.contains('c') && !arg.starts_with("--") {
-            if let Some(script) = it.next() {
-                for segment in split_script(script) {
-                    let words = shlex::split(&segment)
-                        .unwrap_or_else(|| segment.split_whitespace().map(str::to_owned).collect());
-                    if !words.is_empty() {
-                        out.push(words);
-                    }
-                }
-            }
-            break;
+    let Some(script) = shell_script(words) else {
+        return;
+    };
+    for segment in split_script(&script) {
+        let words = shlex::split(&segment)
+            .unwrap_or_else(|| segment.split_whitespace().map(str::to_owned).collect());
+        if !words.is_empty() {
+            out.push((depth, words.clone()));
+            push_script_commands(&words, depth + 1, out);
         }
     }
-    out
+}
+
+/// The script a command runs, when its program, at any place
+/// [`command_starts`] lists, is a shell of [`SHELLS`] (the word after the
+/// first short option holding `c`) or `eval` (its arguments joined with
+/// spaces, as `eval` joins them).
+fn shell_script(words: &[String]) -> Option<String> {
+    let at = command_starts(words).into_iter().find(|&i| {
+        let b = base_name(&words[i]);
+        b == "eval" || SHELLS.contains(&b)
+    })?;
+    if base_name(&words[at]) == "eval" {
+        return Some(words[at + 1..].join(" "));
+    }
+    let mut it = words[at + 1..].iter();
+    while let Some(arg) = it.next() {
+        if arg.starts_with('-') && arg.contains('c') && !arg.starts_with("--") {
+            return it.next().cloned();
+        }
+    }
+    None
 }
 
 /// Split a script on command separators outside quotes.
@@ -1451,9 +1488,134 @@ fn split_script(script: &str) -> Vec<String> {
 }
 
 /// The program a simple command runs: its first word that is not a
-/// `VAR=value` assignment.
+/// `VAR=value` assignment or shell syntax ([`COMMAND_SYNTAX`]).
 fn program_of_command(words: &[String]) -> Option<&str> {
-    words.iter().map(String::as_str).find(|w| !is_assignment(w))
+    words
+        .iter()
+        .map(String::as_str)
+        .find(|w| !is_assignment(w) && !COMMAND_SYNTAX.contains(w))
+}
+
+/// Words of shell syntax that may stand before a command's program: a group
+/// or a subshell opened or closed, `!`, and the keywords that begin a clause
+/// (`if curl x; then curl y; fi` runs `curl` twice). Never a program.
+const COMMAND_SYNTAX: &[&str] = &[
+    "{", "}", "(", ")", "!", "if", "then", "else", "elif", "while", "until", "do", "time", "coproc",
+];
+
+/// Leading words that run the rest of the command as a command: as another
+/// process (`env`, `nohup`, `sudo`, `timeout`), in place of the shell
+/// (`exec`), or skipping functions and aliases (`command`, `builtin`).
+const WRAPPERS: &[&str] = &[
+    "sudo",
+    "doas",
+    "env",
+    "command",
+    "builtin",
+    "exec",
+    "nice",
+    "nohup",
+    "time",
+    "busybox",
+    "xargs",
+    "timeout",
+    "stdbuf",
+    "setsid",
+    "ionice",
+    "chrt",
+    "taskset",
+    "unbuffer",
+    "caffeinate",
+    "chroot",
+    "flock",
+    "noglob",
+    "nocorrect",
+    "watch",
+    "strace",
+    "ltrace",
+];
+
+/// Wrappers whose first operand comes before the command they run
+/// (`timeout 5s curl`, `chroot /srv curl`, `flock /tmp/l curl`).
+const OPERAND_WRAPPERS: &[&str] = &["timeout", "chroot", "flock", "taskset", "chrt"];
+
+/// The text after a redirection operator at the start of `word` (`2>`,
+/// `>>`, `&>`, `<`, `>&`): empty when the target is the next word, `None`
+/// when `word` is not a redirection.
+fn redirection(word: &str) -> Option<&str> {
+    let rest = word.trim_start_matches(|c: char| c.is_ascii_digit());
+    if !(rest.starts_with('>') || rest.starts_with('<') || rest.starts_with("&>")) {
+        return None;
+    }
+    Some(rest.trim_start_matches(['<', '>', '&', '|']))
+}
+
+/// Every place in a simple command where its program may stand: index 0,
+/// then each word after a leading prefix word. Prefix words are shell syntax
+/// ([`COMMAND_SYNTAX`]: `{`, `(`, `!`, `then`), wrappers ([`WRAPPERS`]:
+/// `env`, `command`, `builtin`, `exec`, `nohup`, `time`), a wrapper's
+/// operand (`timeout 5s`), options and the value an option may take, numbers,
+/// `VAR=value` assignments and redirections (`2>/dev/null curl`).
+///
+/// Where a word could be an option's value or the program (`sudo -u bob
+/// curl`, `sudo -E curl`), both places are listed, and the list goes one word
+/// past the first word that is surely not a prefix: a rule or a limit that
+/// matches any listed place applies, which errs toward refusing. One list
+/// serves the user's rules ([`subjects`]), the deletion limit
+/// ([`program_index`]), the shell a script starts ([`simple_commands`]) and
+/// the command policy's `forbid` rules, so a prefix word hides a program from
+/// none of them.
+pub(crate) fn command_starts<S: AsRef<str>>(words: &[S]) -> Vec<usize> {
+    let mut starts = Vec::new();
+    // Local mutable state, scoped to one scan: what the previous word asked
+    // of this one.
+    let (mut operand_due, mut value_due, mut target_due) = (false, false, false);
+    for (i, w) in words.iter().enumerate() {
+        let w = w.as_ref();
+        starts.push(i);
+        let b = base_name(w);
+        let prefix = if target_due {
+            target_due = false;
+            true
+        } else if COMMAND_SYNTAX.contains(&w) {
+            true
+        } else if let Some(rest) = redirection(w) {
+            target_due = rest.is_empty();
+            true
+        } else if w.contains('=') {
+            // `VAR=value`, and anything else holding `=` (`--opt=v`).
+            true
+        } else if WRAPPERS.contains(&b) {
+            operand_due = OPERAND_WRAPPERS.contains(&b);
+            value_due = false;
+            true
+        } else if w.starts_with('-') {
+            value_due = true;
+            true
+        } else if value_due {
+            value_due = false;
+            true
+        } else if w.parse::<f64>().is_ok() {
+            true
+        } else {
+            // A wrapper's operand (`timeout 5s`), once; otherwise the program.
+            std::mem::take(&mut operand_due)
+        };
+        if !prefix {
+            break;
+        }
+    }
+    starts
+}
+
+/// Whether a command names a directory changer ([`DIRECTORY_CHANGERS`]) in
+/// any word: `command cd x`, `builtin cd x` and `exec pushd x` move the
+/// shell as surely as `cd x`. Deliberately broad (`echo cd` counts): it only
+/// makes a reader refuse a redirection it would otherwise judge.
+fn names_directory_change(words: &[String]) -> bool {
+    words
+        .iter()
+        .any(|w| DIRECTORY_CHANGERS.contains(&base_name(w)))
 }
 
 fn is_assignment(word: &str) -> bool {
@@ -1535,7 +1697,7 @@ pub fn refused_subject_of(
     }
     let program_of_line = |line: &str| {
         line.split_whitespace()
-            .find(|w| !is_assignment(w))
+            .find(|w| !is_assignment(w) && !COMMAND_SYNTAX.contains(w))
             .map(str::to_owned)
     };
     let from_rules = by == PERMISSION_RULES_HOOK || by == crate::approval::USER;
@@ -1888,9 +2050,6 @@ impl ScriptReader {
             if SHELL_KEYWORDS.contains(&w.text.as_str()) {
                 return Err(format!("it uses the shell keyword `{}`", w.text));
             }
-            if DIRECTORY_CHANGERS.contains(&w.text.as_str()) {
-                self.changes_directory = true;
-            }
         }
         self.words.push(w.text);
         Ok(())
@@ -1917,7 +2076,7 @@ impl ScriptReader {
             }
             return Ok(());
         }
-        self.commands.push(std::mem::take(&mut self.words));
+        self.push_command();
         self.operator_pending = false;
         Ok(())
     }
@@ -1927,9 +2086,19 @@ impl ScriptReader {
         if self.target_next || self.words.is_empty() {
             return Err("an operator has no command on one side".into());
         }
-        self.commands.push(std::mem::take(&mut self.words));
+        self.push_command();
         self.operator_pending = true;
         Ok(())
+    }
+
+    /// Keep the command just read. Any word naming a directory changer counts
+    /// as a `cd` ([`names_directory_change`]), not only the first: `command
+    /// cd x` moves the shell as surely as `cd x`.
+    fn push_command(&mut self) {
+        if names_directory_change(&self.words) {
+            self.changes_directory = true;
+        }
+        self.commands.push(std::mem::take(&mut self.words));
     }
 }
 
@@ -2414,13 +2583,7 @@ impl<'a> RelaxedReader<'a> {
     fn finish(&mut self, cmd: &mut RelaxedCommand) {
         let done = std::mem::take(cmd);
         if done.visible {
-            // Any word naming a directory changer counts: `command cd x`
-            // moves the shell as surely as `cd x`.
-            if done
-                .words
-                .iter()
-                .any(|w| DIRECTORY_CHANGERS.contains(&base_name(w)))
-            {
+            if names_directory_change(&done.words) {
                 self.changes_directory = true;
             }
             self.commands.push(done.words);
@@ -2761,7 +2924,7 @@ fn rule_program(rule: &Rule) -> Option<(String, bool)> {
 /// The user's shell rules matched by program name against the text of a
 /// script a mode judges only because of a construct the user turned on
 /// ([`relies_on_constructs`]). Such a script may hide a command from
-/// [`simple_commands`] (`{ curl x; }` splits as `{ curl x`), so a rule whose
+/// [`simple_commands`] (`C=curl; $C u` names no program), so a rule whose
 /// program appears anywhere in the script as a word (split at every
 /// character a program name cannot hold, `/` included) refuses or asks.
 /// Deliberately broad: `shell(git push*)` here matches any script naming
@@ -2823,14 +2986,26 @@ pub fn construct_rule_limit(
 }
 
 /// A call's subjects, for rule matching: a shell call's command lines (the
-/// whole argv and each simple command, joined with single spaces), or a file
-/// tool's paths.
+/// whole argv and each simple command, joined with single spaces), each also
+/// from every place its program may stand ([`command_starts`]), so `{ curl
+/// x`, `env A=1 curl x` and `command curl x` all give `curl x` too; or a file
+/// tool's paths. The whole call comes first.
 pub fn subjects(tool: &str, input: &serde_json::Value) -> Vec<String> {
     if tool == "shell" {
-        return simple_commands(&shell_argv(input))
-            .iter()
-            .map(|c| c.join(" "))
-            .collect();
+        let mut out: Vec<String> = Vec::new();
+        for command in simple_commands(&shell_argv(input)) {
+            if command.is_empty() {
+                out.push(String::new());
+                continue;
+            }
+            for at in command_starts(&command) {
+                let line = command[at..].join(" ");
+                if !out.contains(&line) {
+                    out.push(line);
+                }
+            }
+        }
+        return out;
     }
     file_paths(tool, input)
 }
@@ -2850,12 +3025,6 @@ const DELETES_LEAD: &str = "this command deletes ";
 /// Programs that delete what they are given.
 const DELETERS: &[&str] = &["rm", "rmdir", "unlink", "shred"];
 
-/// Leading words that run the rest as a command.
-const WRAPPERS: &[&str] = &[
-    "sudo", "doas", "env", "command", "nice", "nohup", "time", "exec", "busybox", "xargs",
-    "timeout",
-];
-
 /// The limit on deleting critical paths, for one shell call. `home` is the
 /// user's home directory; `workspace` the worker's worktree (the command's
 /// working directory). A system path (the filesystem root, a top-level
@@ -2869,17 +3038,46 @@ pub fn critical_deletion(
     workspace: Option<&Path>,
 ) -> Option<HardLimit> {
     let mut ask: Option<HardLimit> = None;
-    // Where a relative operand points: the workspace, then wherever a `cd` in
-    // a script moved (unknown after `cd $X` or `cd -`).
-    let mut cwd = match workspace {
+    // Where a relative operand may point. The first entry is the workspace,
+    // moved by each plain `cd` (the first word of a script's own command), as
+    // it always was (`( cd x )` is split at the parenthesis and counts as
+    // plain, as before). A directory change kGraf is less sure of
+    // (`command cd`, `{ cd`, `pushd`, `cd -P`, a `cd` in a nested shell) adds
+    // where it may lead instead of replacing anything, and an operand is
+    // judged by the strictest result over every entry. So a directory change
+    // can only make the limit stricter.
+    let mut cwds = vec![match workspace {
         Some(ws) => Cwd::Known(ws.to_path_buf()),
         None => Cwd::NoWorkspace,
-    };
-    for command in simple_commands(argv) {
+    }];
+    for (depth, command) in nested_commands(argv) {
         let words: Vec<&str> = command.iter().map(String::as_str).collect();
-        if words.first().map(|w| base_name(w)) == Some("cd") {
-            cwd = cd(&cwd, words.get(1).copied(), home);
-            continue;
+        let starts = command_starts(&words);
+        if let Some(&at) = starts
+            .iter()
+            .find(|&&i| DIRECTORY_CHANGERS.contains(&base_name(words[i])))
+        {
+            let moved: Vec<Cwd> = cwds
+                .iter()
+                .map(|c| change_directory(c, &words[at..], home))
+                .collect();
+            let plain = depth <= 1 && at == 0 && base_name(words[0]) == "cd";
+            if plain {
+                for c in cwds.iter_mut() {
+                    *c = cd(c, words.get(1).copied(), home);
+                }
+            }
+            for m in moved {
+                if cwds.len() < MAX_CWDS && !cwds.contains(&m) {
+                    cwds.push(m);
+                }
+            }
+            // A plain `cd` deletes nothing. Any other command is still read
+            // for a deleter: `cd` may only be an option's value
+            // (`sudo -u cd rm -rf /`).
+            if plain {
+                continue;
+            }
         }
         let Some(at) = program_index(&words) else {
             continue;
@@ -2897,8 +3095,10 @@ pub fn critical_deletion(
                 .iter()
                 .take_while(|w| !w.starts_with('-') && **w != "(" && **w != "!")
             {
-                if let Target::System(p) = classify(w, home, &cwd, workspace) {
-                    return Some(system_refusal(&p));
+                for cwd in &cwds {
+                    if let Target::System(p) = classify(w, home, cwd, workspace) {
+                        return Some(system_refusal(&p));
+                    }
                 }
             }
             continue;
@@ -2919,25 +3119,55 @@ pub fn critical_deletion(
             if !operands_only && w.starts_with('-') {
                 continue;
             }
-            match classify(w, home, &cwd, workspace) {
-                Target::System(p) => return Some(system_refusal(&p)),
-                Target::Critical(p) => {
-                    ask.get_or_insert(HardLimit::Ask(format!(
-                        "{DELETES_LEAD}{p}, a critical path (the workspace itself, its \
-                         .git, or a path outside the workspace); allow it?"
-                    )));
+            for cwd in &cwds {
+                match classify(w, home, cwd, workspace) {
+                    Target::System(p) => return Some(system_refusal(&p)),
+                    Target::Critical(p) => {
+                        ask.get_or_insert(HardLimit::Ask(format!(
+                            "{DELETES_LEAD}{p}, a critical path (the workspace itself, its \
+                             .git, or a path outside the workspace); allow it?"
+                        )));
+                    }
+                    Target::Unresolved(p) if recursive => {
+                        ask.get_or_insert(HardLimit::Ask(format!(
+                            "{DELETES_LEAD}`{p}` recursively, and kGraf cannot tell what it \
+                             names; allow it?"
+                        )));
+                    }
+                    Target::Unresolved(_) | Target::Plain => {}
                 }
-                Target::Unresolved(p) if recursive => {
-                    ask.get_or_insert(HardLimit::Ask(format!(
-                        "{DELETES_LEAD}`{p}` recursively, and kGraf cannot tell what it \
-                         names; allow it?"
-                    )));
-                }
-                Target::Unresolved(_) | Target::Plain => {}
             }
         }
     }
     ask
+}
+
+/// How many places [`critical_deletion`] keeps for where relative operands
+/// may point. The first, the plain-`cd` path, is always kept.
+const MAX_CWDS: usize = 16;
+
+/// Where the directory change `words` (a changer of [`DIRECTORY_CHANGERS`]
+/// and its arguments) moves from `cwd`: `cd` and `pushd` to their first
+/// operand after options (`cd -P /` goes to `/`), `pushd` with no directory
+/// or a stack index and `popd` to a place kGraf cannot tell.
+fn change_directory(cwd: &Cwd, words: &[&str], home: Option<&Path>) -> Cwd {
+    let changer = base_name(words[0]);
+    if changer == "popd" {
+        return Cwd::Unknown;
+    }
+    let mut operands = words[1..].iter().copied();
+    let target = loop {
+        match operands.next() {
+            Some("--") => break operands.next(),
+            Some(w) if w.starts_with('-') && w != "-" => continue,
+            other => break other,
+        }
+    };
+    match target {
+        None if changer == "pushd" => Cwd::Unknown,
+        Some(t) if changer == "pushd" && t.starts_with('+') => Cwd::Unknown,
+        t => cd(cwd, t, home),
+    }
 }
 
 fn system_refusal(path: &str) -> HardLimit {
@@ -2947,27 +3177,14 @@ fn system_refusal(path: &str) -> HardLimit {
     ))
 }
 
-/// Where the deleting program stands in a simple command: after wrappers
-/// (`sudo`, `env`, `timeout`), their options and option values, and
-/// `VAR=value` words. `None` when the command runs another program first
-/// (`echo rm -rf /` deletes nothing).
+/// Where the deleting program stands in a simple command: the first place
+/// [`command_starts`] lists that names a deleter or `find`. `None` when the
+/// command runs another program first (`echo rm -rf /` deletes nothing).
 fn program_index(words: &[&str]) -> Option<usize> {
-    for (i, w) in words.iter().enumerate() {
-        let b = base_name(w);
-        if DELETERS.contains(&b) || b == "find" {
-            return Some(i);
-        }
-        let prefix = WRAPPERS.contains(&b)
-            || matches!(*w, "{" | "!" | "(")
-            || w.starts_with('-')
-            || w.contains('=')
-            || w.parse::<f64>().is_ok()
-            || (i > 0 && words[i - 1].starts_with('-') && i > 1);
-        if !prefix {
-            return None;
-        }
-    }
-    None
+    command_starts(words).into_iter().find(|&i| {
+        let b = base_name(words[i]);
+        DELETERS.contains(&b) || b == "find"
+    })
 }
 
 enum Target {
@@ -2978,6 +3195,7 @@ enum Target {
 }
 
 /// The directory a script's relative operands resolve against.
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Cwd {
     Known(PathBuf),
     /// After `cd $X`, `cd -` or another target that cannot be resolved.
@@ -3309,6 +3527,10 @@ pub fn group_requests<T: Raised + Clone>(items: &[T]) -> Vec<Vec<T>> {
     }
     groups
 }
+
+#[cfg(test)]
+#[path = "permissions_prefix_tests.rs"]
+mod prefix_tests;
 
 #[cfg(test)]
 mod tests {
@@ -4041,7 +4263,8 @@ mod tests {
         ));
         // The name match applies only to a script judged because of a
         // switch: with the switches off, or for a plain script, or in Bypass,
-        // the rules match as before.
+        // it does not apply. The rules themselves still see a command inside
+        // a group ([`command_starts`]), in Bypass too.
         let s = "mkdir x && { curl -s u; }";
         let (_, off) = hook_with(
             PermissionMode::Auto,
@@ -4067,8 +4290,17 @@ mod tests {
             rules(&["shell(curl*)"], &[]),
             only(ScriptConstruct::Subshells),
         );
+        match bypass.review(&shell(&["sh", "-c", s])).await {
+            HookDecision::Deny { reason } => assert_eq!(
+                reason,
+                "your deny rule `shell(curl*)` blocks this call in every permission mode"
+            ),
+            other => panic!("Bypass must refuse `curl` inside a group: {other:?}"),
+        }
         assert_eq!(
-            bypass.review(&shell(&["sh", "-c", s])).await,
+            bypass
+                .review(&shell(&["sh", "-c", "mkdir x && { ls; }"]))
+                .await,
             HookDecision::Allow
         );
     }

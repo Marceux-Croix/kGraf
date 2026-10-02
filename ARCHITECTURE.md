@@ -1293,6 +1293,16 @@ a rule with no pattern. A mode change reaches running workers and waiting
 requests at once, and requests raised within 2 s of each other are answered as
 one group in the box. The user's deny and ask rules and the refusal to delete
 system paths hold in every mode; a run nobody attends denies what would ask.
+Both read each command from every place its program may stand past grouping and
+prefix words (`{`, `(`, `!`, clause keywords, `env`, `command`, `builtin`,
+`exec`, `nohup`, `time`, `VAR=value`, a leading redirection), and follow a shell
+behind a wrapper or started inside a script, and `eval`; one function serves the
+rules, the deletion limit, the script split and the command policy's `forbid`
+rules. Where a word may be an option's value or the program, both are matched,
+so it errs toward refusing. A directory change kGraf is less sure of (`command
+cd`, `pushd`, a `cd` in a group or a nested shell) adds a place relative paths
+may resolve against and never replaces one; both script readers count a
+directory changer anywhere in a command (decision 0094, amended 2026-10-02, prefix words).
 In Bypass only, a worker may also write the repository's git directory
 (`.git/<path>`, resolved as git resolves it; through `apply_patch`, and on macOS through any shell command, whose sandbox keeps the git configuration files read-only; elsewhere through `apply_patch` only) and kGraf's settings
 (`.kgraf/run.json`, `.kgraf/worker.json`), each write behind a bounded

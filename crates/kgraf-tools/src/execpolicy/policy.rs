@@ -249,6 +249,14 @@ impl ExecPolicy {
             Some(v) if v.decision == Decision::Forbidden => return v,
             other => other,
         };
+        // A `forbid` rule also refuses its shape after prefix words
+        // (`env rm -rf /`, `command git push --force`), found by the same
+        // function the user's rules and the deletion limit use. Only
+        // refusals are matched there: an allow rule keeps naming the exact
+        // argv it was written for.
+        if let Some(v) = self.forbidden_after_prefix(argv) {
+            return v;
+        }
         match self.build.check(argv) {
             AllowlistMatch::Allowed => PolicyVerdict {
                 decision: Decision::Allow,
@@ -320,6 +328,31 @@ impl ExecPolicy {
                 }
             }
         }
+    }
+
+    /// The first `forbid` rule matching `argv` from a place after its prefix
+    /// words where its program may stand
+    /// ([`crate::permissions::command_starts`]).
+    fn forbidden_after_prefix(&self, argv: &[String]) -> Option<PolicyVerdict> {
+        let starts = crate::permissions::command_starts(argv);
+        self.rules
+            .iter()
+            .filter(|rule| rule.decision == Decision::Forbidden)
+            .find_map(|rule| {
+                starts.iter().skip(1).find_map(|&at| {
+                    rule.pattern
+                        .matches_prefix(&argv[at..])
+                        .map(|matched_prefix| PolicyVerdict {
+                            decision: Decision::Forbidden,
+                            read_only: false,
+                            matched_prefix: Some(matched_prefix),
+                            reason: rule.reason.clone(),
+                            build: false,
+                            granted: false,
+                            script_note: None,
+                        })
+                })
+            })
     }
 
     /// The script constructs the user turned on (decision 0094, amended

@@ -165,6 +165,26 @@ mod tests {
         );
     }
 
+    /// A program behind a group or a prefix word is the one named, as the
+    /// approval chain names it for a worker.
+    #[test]
+    fn a_program_behind_a_group_or_a_prefix_word_is_found_and_named() {
+        let r = rules(&["shell(python3*)"], &[]);
+        for line in [
+            "{ python3 check.py; }",
+            "make && env A=1 python3 check.py",
+            "command python3 check.py",
+            "if python3 check.py; then echo ok; fi",
+            "bash -c 'nohup python3 check.py'",
+        ] {
+            assert_eq!(
+                programs(&find(&r, &[("verify", line)])),
+                ["python3"],
+                "{line:?}"
+            );
+        }
+    }
+
     #[test]
     fn the_deletion_limit_is_not_a_rule_conflict() {
         // `rm -rf /` is refused by the deletion limit, not by a user rule.

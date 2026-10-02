@@ -809,3 +809,77 @@ Evidence: `kgraf-tools` (`permissions.rs`: `each_script_construct_is_judged_only
 (`the_run_file_cannot_set_the_permission_mode_or_plan_review`); `kgraf-shell`
 (`the_script_construct_switches_start_off_and_reach_the_shared_control`, kittest). Each new test
 fails with its mechanism reverted.
+
+## Amendment (2026-10-02): grouping and prefix words never hide a program from the rules
+
+**Why.** Two gaps remained after the amendment above. First, a user's deny or ask rule matched a
+command line from its first word, so `{ curl x; }` was matched as `{ curl x` and
+`deny = ["shell(curl*)"]` did not refuse it in Manual, Bypass or any mode with the switches off.
+The same held for `!`, `if`/`then`/`while`/`do`, `time`, `exec`, `command`, `builtin`,
+`nohup`, `env`, `VAR=value` before a command, a leading redirection, a shell behind a wrapper
+(`env sh -c ...`) and a shell started inside a script. The text match of the amendment above
+covered only scripts judged because of a switch. Second, the strict reader looked for a
+directory change only as a command's first word, so it judged `command cd x; echo hi > f` as a
+plain script and a grant of `command` and `echo` ran it, though the redirection then wrote
+relative to `x`.
+
+**The change.** One function, `command_starts` (`kgraf-tools`, `permissions.rs`), lists every
+place in a simple command where its program may stand: index 0, then each word after shell
+syntax (`{`, `}`, `(`, `)`, `!`, `if`, `then`, `else`, `elif`, `while`, `until`, `do`, `time`,
+`coproc`), a wrapper (`sudo`, `doas`, `env`, `command`, `builtin`, `exec`, `nice`, `nohup`,
+`time`, `busybox`, `xargs`, `timeout`, `stdbuf`, `setsid`, `ionice`, `chrt`, `taskset`,
+`unbuffer`, `caffeinate`, `chroot`, `flock`, `noglob`, `nocorrect`, `watch`, `strace`,
+`ltrace`), a wrapper's first operand where it takes one (`timeout 5s`, `chroot DIR`), an option
+and the value it may take, a number, a word holding `=`, and a redirection with its target.
+Where a word could be an option's value or the program (`sudo -u bob curl`), both places are
+listed, and the list goes one word past the first word that is surely not a prefix. It serves:
+
+- the user's rules: a shell call's subjects are now each command line from every listed place
+  (`subjects`), the whole call first, so a rule matches the program behind any prefix in every
+  mode, with no switch on, Bypass included;
+- the script split: `simple_commands` finds a shell (or `eval`) at any listed place and splits
+  its script, and splits a shell or `eval` started inside a script the same way, to a depth of
+  32;
+- the deletion limit: `program_index` is the first listed place naming a deleter, replacing its
+  own wrapper list (`if rm -rf /; then ...`, `timeout 5s rm -rf /` and `2>/dev/null rm -rf /` are
+  now refused);
+- the command policy: a `forbid` rule also refuses its shape from a listed place
+  (`env git push --force`). Allow rules still name the exact argv.
+
+Both script readers count a directory changer (`cd`, `pushd`, `popd`) in any word of a command,
+through one helper (`names_directory_change`); a redirection to a file in a script with one
+leaves it unjudged. The deletion limit follows a directory change behind a prefix word, `pushd`,
+`popd`, `cd -P DIR` and a `cd` in a nested shell by adding the place it may lead to the places a
+relative operand may resolve against (at most 16), never replacing one; only a plain `cd` as the
+first word of the call's own script moves the first place, as before. An operand is judged by
+the strictest result over every place.
+
+**No loosening.** Every change adds subjects, places or refusals; none removes one. A test keeps
+the pre-change matcher, split, deleter scan and deletion limit as a reference and checks, over a
+corpus of the commands earlier tests refuse or ask about plus every hidden shape, that each old
+subject is still a subject and that the rules hook is, in every mode, at least as strict as the
+old rules and deletion limit together. The rules hook still skips the text match in Bypass; the
+rules themselves now see the hidden command there.
+
+**Cost.** Broad by design: a rule may match a word that is an option's value (`shell(bob*)`
+matches `sudo -u bob curl`), and `echo cd > f` leaves a script unjudged. Both err toward asking.
+
+**Not read as a command.** A program named as an argument rather than a prefix: `find -exec`,
+`su -c`, `ssh HOST CMD`, `script -c`, `trap 'CMD'`, `parallel`, `source FILE`; and a command named
+by a variable. A grant still names `argv[0]`: a user who puts a wrapper (`env`, `xargs`) in the
+Auto allow set grants what it runs, though the user's rules still match the program behind it.
+
+Evidence: `kgraf-tools` (`permissions_prefix_tests.rs`:
+`a_rule_sees_the_program_behind_a_group_or_a_prefix_word_in_every_mode`,
+`a_rule_does_not_match_a_program_named_only_as_an_argument`,
+`command_starts_skips_syntax_wrappers_assignments_options_and_redirections`,
+`simple_commands_follow_a_shell_behind_a_prefix_and_a_nested_shell`,
+`the_strict_reader_sees_a_directory_change_behind_a_prefix_word`,
+`a_redirect_after_a_hidden_directory_change_is_never_granted_by_a_script_grant`,
+`the_deletion_limit_sees_a_deleter_and_a_directory_change_behind_prefix_words`,
+`a_forbid_rule_refuses_its_shape_behind_a_prefix_word`,
+`no_previously_refused_command_of_the_corpus_is_now_allowed`; `permissions.rs`:
+`a_rule_on_a_program_inside_a_construct_still_refuses_or_asks`, which now expects Bypass to
+refuse `curl` inside a group); `kgraf-host` (`rule_conflicts.rs`:
+`a_program_behind_a_group_or_a_prefix_word_is_found_and_named`). Each regression test fails with
+its part of the change reverted.

@@ -742,7 +742,8 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   (`&`), redirects input, uses a backslash, a comment, `!` or a shell keyword, starts a command
   with a path, a quote or a `VAR=value`, or redirects output anywhere but `/dev/null` or a
   worktree path a worker may write (an absolute path, `..`, `~`, a glob, `.git`, or any file
-  after a `cd`); the question says which. A command your policy forbids (`git push --force`)
+  after a directory change: `cd`, `pushd` or `popd`, also behind `command`, `builtin` or
+  `exec`); the question says which. A command your policy forbids (`git push --force`)
   refuses the whole script. Manual and Bypass are unchanged: Manual asks, Bypass runs it.
 
   You can let a mode grant those constructs too. Each has a switch, off by default, in
@@ -785,6 +786,23 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   line, a scheduled run) denies whatever would ask, and the hold says how to allow it. In the
   app, a request waits in the orchestrator box until you answer it; requests raised within 2 s
   of each other arrive as one card, with Grant and Deny on each and Grant all and Deny all.
+
+  A shell rule (`shell(curl*)`, `shell(git push*)`) matches each command a call runs, from
+  every place its program may stand. kGraf reads past grouping and prefix words before the
+  program: `{`, `(`, `!`, the keywords `if`, `then`, `else`, `elif`, `while`, `until`, `do`
+  and `time`, the wrappers `env`, `command`, `builtin`, `exec`, `nohup`, `sudo`, `timeout`,
+  `nice`, `xargs` and others like them with their options, `VAR=value` assignments, and
+  redirections before the program. So `deny = ["shell(curl*)"]` refuses `sh -c "{ curl x; }"`,
+  `sh -c "if curl x; then :; fi"`, `env A=1 curl x` and `command curl x` in every mode, with no
+  switch on. A shell behind a wrapper (`env sh -c ...`), a shell or an `eval` started inside a
+  script (`sh -c "bash -c 'curl x'"`) is read the same way. Where a word could be an option's
+  value or the program (`sudo -u bob curl`), kGraf matches both, so a rule may match a little
+  more than the command runs, never less. The refusal to delete system paths reads commands
+  the same way, and a directory change behind a prefix word (`command cd /`, `pushd /`) moves
+  where it resolves a relative path. Your policy's `forbid` rules (`git push --force`) also
+  refuse their command behind a prefix word (`env git push --force`). What kGraf does not read
+  as a command: a program named as an argument (`find . -exec curl`, `su -c`, `ssh host
+  curl`, `trap 'curl' EXIT`), and a command named by a variable.
 
   Only you set the mode: the dropdown at the top of the orchestrator box, the user-level
   `permissions.toml` (in kGraf's configuration directory, beside the app's `settings.toml`; set
