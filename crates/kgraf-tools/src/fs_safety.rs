@@ -136,7 +136,7 @@ fn touches_git_or_kgraf(rel: &Path) -> bool {
     })
 }
 
-fn reads_git_dir_or_kgraf(rel: &Path) -> bool {
+pub(crate) fn reads_git_dir_or_kgraf(rel: &Path) -> bool {
     rel.components()
         .any(|c| kgraf_core::paths::is_unreadable_name(&c.as_os_str().to_string_lossy()))
 }

@@ -1536,9 +1536,14 @@ async fn the_assembled_prefix_digest_with_the_flag_off_is_pinned() {
     // options, so a model no longer reads the bare names as "without flags",
     // and the system prompt said kGraf commits the worktree itself. Re-pinned
     // again when the `apply_patch` description said a patch without its
-    // `*** Begin Patch` line is applied as if it had one.
+    // `*** Begin Patch` line is applied as if it had one. Re-pinned again
+    // (decision 0094, amended again 2026-10-02) when the shell tool
+    // description said the allowlisted cargo commands may also be given as a
+    // `sh -c` script after one `cd` into the worktree: a worker that read only
+    // the argv form took `cd crate && cargo check` for a command needing
+    // approval.
     assert_eq!(
-        digest, "3c8c8132d8d40fdb928d94fb9d02afb8e1d1a8fddf193bc0d60f41b0748d7060",
+        digest, "8adcbb226ba4811ed44590f5ef693f8d94b6f2e18ca7136a4b29581f6d73c26a",
         "a change here means every worker's cache resets even with the \
          sessions flag off, which nothing in decision 0067 may cause \
          (re-pinned for the intentional `apply_patch` description \

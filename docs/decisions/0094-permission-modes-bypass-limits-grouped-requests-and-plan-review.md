@@ -883,3 +883,75 @@ Evidence: `kgraf-tools` (`permissions_prefix_tests.rs`:
 refuse `curl` inside a group); `kgraf-host` (`rule_conflicts.rs`:
 `a_program_behind_a_group_or_a_prefix_word_is_found_and_named`). Each regression test fails with
 its part of the change reverted.
+
+## Amendment (2026-10-02): a script of build commands, after one `cd` into the worktree, runs as a build
+
+**The gap.** A planner writes a contract's acceptance as `cd pricing_engine && cargo check`, and
+a worker runs it as `["sh", "-c", "cd pricing_engine && cargo check"]`. The command policy
+judged a script command by command only where a mode or a contract's grant covered named
+programs, and only a grant counted: the build and test allowlist (decision 0084) and `cd` did
+not. So in Manual, or in Auto with an empty allow set, the script was asked about whole, and a
+run nobody attended denied the worker the check its own contract named, though `cargo check`
+alone runs unasked. The acceptance and the worker's allowed commands disagreed by construction.
+A worker denied `sh -c "cargo test -p discount_flat"` that then ran
+`cargo test -p discount_flat` as argv was still reported unverified, because the refusal was
+recorded against `sh` and `sh` never ran again.
+
+**The rule.** A script's command is covered by a grant of its program (as before), by the
+build and test allowlist's cargo rules, or, once per script, by a `cd` into the worktree:
+
+- `cd DIR` with exactly one operand, a relative path with no `..`, no absolute path, no `~`,
+  glob or option, and not the `.git` directory or kGraf's state. A bare `cd`, `cd -`,
+  `pushd`, `popd`, a second `cd`, and a `cd` that can leave the worktree are not covered, and
+  the question says why.
+- A cargo command counts by the allowlist's cargo rules only. An exact allowlist entry (the
+  project's configured acceptance or gate command) is not counted inside a script: it is a
+  project command line, which may name a file relative to the directory it runs in.
+- A script whose commands are all allowlisted cargo commands, with or without the `cd`, is a
+  build (`PolicyVerdict::build`). One that needs a grant for any command is granted, and only
+  the mode-granted programs are recorded as grants.
+- Only the strict script reader's commands get the allowlist and `cd` coverage; a script read
+  only because a construct switch is on keeps the grant-only rule.
+
+**Checks where the script runs.** Before an allowed script runs
+(`PolicyVerdict::script_checked`), the shell tool checks the `cd` target on disk: a directory
+of the worktree, reached without a link that leaves it. For each allowlisted cargo command it
+runs decision 0084's checks in the directory the command starts in: the worktree's cargo
+configuration and toolchain file unchanged since the worker started, none of them in a
+directory between the worktree root and the `cd` target (cargo and rustup read both from the
+start directory upward, and those were never recorded), and each `--manifest-path` inside the
+worktree, resolved from that directory.
+
+**What does not change.** The user's deny and ask rules match every command of the script in
+every mode, through the rules hook, which runs after the command policy. A `forbid` rule or a
+cargo argument the allowlist refuses on one command refuses the whole script. Bypass grants a
+script whole, as before, and its hard limits stay. Nothing outside the allowlist or a grant runs
+unasked after a `cd`.
+
+**The report.** A shell script refused whole (recorded against its shell, with no
+command-level match naming another program) records the programs it held
+(`RefusedCall::held`, a directory change left out). It counts as retried once each of them
+later ran without error, in any form, so the contract is no longer reported unverified when the
+worker ran what the refused script held. A refusal a rule narrowed to one program is matched
+on that program only, as before.
+
+**Plan intake.** No intake change is needed for this shape: the acceptance form a planner
+writes now runs with the same per-command checks at the moment the worker calls it, under the
+live mode. A command outside the allowlist named in an acceptance still goes through the
+shortfall path and the mode.
+
+The tool description now says the allowlisted cargo commands may be given as a `sh -c` script
+of those commands after at most one `cd` into the worktree.
+
+Evidence: `kgraf-tools` (`execpolicy/script_build_tests.rs`:
+`a_cd_into_the_worktree_then_allowlisted_cargo_commands_is_a_build`,
+`a_cd_never_widens_what_a_script_may_run`,
+`a_cd_then_a_granted_program_is_granted_as_its_commands`,
+`deny_and_ask_rules_still_apply_inside_a_cd_script`; `shell.rs`:
+`a_cd_into_the_worktree_then_an_allowlisted_build_runs`,
+`a_cd_script_is_checked_on_disk_where_it_runs`,
+`an_allowlisted_command_is_a_sandboxed_build_and_nothing_else_is`, which now expects
+`sh -c "cargo build"` to be a build); `kgraf-runtime` (`shortfall.rs`:
+`a_script_refused_whole_is_retried_when_its_commands_run`); `kgraf-host`
+(`build_allowlist_tests.rs`: `a_cd_into_the_worktree_then_an_allowlisted_build_runs_unattended`).
+Each regression test fails with its part of the change reverted.

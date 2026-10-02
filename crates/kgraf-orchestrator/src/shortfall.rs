@@ -1116,6 +1116,7 @@ mod tests {
             by: by.into(),
             path: None,
             whole_tool: false,
+            held: Vec::new(),
         }
     }
 
@@ -1129,6 +1130,7 @@ mod tests {
             by: String::new(),
             path: Some(path.into()),
             whole_tool: false,
+            held: Vec::new(),
         }
     }
 

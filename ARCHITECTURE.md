@@ -1283,7 +1283,14 @@ programs, an `sh -c` script of simple commands is granted when a grant covers
 every command's program, as Claude Code allows a compound command; a script
 with substitution, a subshell, backgrounding or a redirection outside the
 worktree is asked about whole, and the question names the command no grant
-covers. The user may turn on each such construct group (variables, subshells,
+covers. A script's command is also covered by the build and test allowlist's
+cargo rules, and once per script by a `cd` into a directory of the worktree, so
+a script of allowlisted cargo commands, with or without that `cd`, is a build in
+every mode; the shell tool checks the `cd` target on disk and runs the
+allowlist's checks in the directory each cargo command starts in before the
+script runs. A script refused whole records the programs it held and counts as
+retried once each has run, so its contract is not reported unverified when the
+worker ran them as argv. The user may turn on each such construct group (variables, subshells,
 background jobs, input redirects, escapes, outside redirects; all off by
 default) in Settings, `permissions.toml` or `--script-constructs`, never
 `run.json`; a second reader then returns every program it can see, inside

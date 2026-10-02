@@ -193,3 +193,15 @@ Tests: `kgraf-orchestrator` `shortfall.rs`
 `an_instructions_report_about_a_file_another_contract_owns_is_answered`,
 `an_instructions_report_is_amended_when_it_names_no_foreign_file_or_its_own`; `kgraf-host`
 `shortfall_tests.rs` `an_instructions_report_about_a_sibling_contracts_file_is_answered_not_amended`.
+
+## Amendment (2026-10-02): a script refused whole is retried when the commands it held run
+
+A refusal counted as retried only when a later call of the same capability ran without error,
+and a shell script refused whole is recorded against its shell (`sh`). A worker denied
+`sh -c "cargo test -p a"` that then ran `cargo test -p a` as argv had run what the script held,
+yet its attempt was reported unverified because `sh` never ran again. Such a refusal now records
+the programs the script held (`RefusedCall::held`, a directory change left out), and counts as
+retried once each of them has run without error since, in any form. A refusal a rule narrowed to
+one program is matched on that program only, as before. Details and evidence: decision 0094,
+amendment of the same date ("a script of build commands, after one `cd` into the worktree, runs
+as a build").

@@ -65,6 +65,15 @@ pub struct RefusedCall {
     /// too.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub whole_tool: bool,
+    /// For a shell script refused whole (`capability` is its shell, no
+    /// command-level match named another program): the programs of the
+    /// commands it held, a directory change left out. The refusal counts as
+    /// retried once each of them later ran without error, in any form: a
+    /// worker refused `sh -c "cargo test -p a"` that then runs
+    /// `cargo test -p a` ran what the script held, though it never ran
+    /// `sh`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub held: Vec<String>,
 }
 
 impl RefusedCall {
@@ -175,6 +184,7 @@ impl CallCapability {
             by: by.to_owned(),
             path,
             whole_tool: false,
+            held: Vec::new(),
         };
         match kgraf_tools::refused_subject_of(&self.tool, &self.subjects, by, reason) {
             Some(RefusedSubject::Tool) => call.whole_tool = true,
@@ -182,9 +192,38 @@ impl CallCapability {
             Some(RefusedSubject::Path(p)) if call.path.is_none() => call.path = Some(p),
             Some(RefusedSubject::Path(_)) | None => {}
         }
+        call.held = self.held_by_script(&call);
         call
     }
+
+    /// The programs a script refused whole held ([`RefusedCall::held`]):
+    /// empty unless `call` is a shell call recorded against its own shell
+    /// program, refused neither as a tool nor for a path.
+    fn held_by_script(&self, call: &RefusedCall) -> Vec<String> {
+        let shell = call
+            .capability
+            .rsplit('/')
+            .next()
+            .unwrap_or(&call.capability);
+        if self.tool != "shell"
+            || call.whole_tool
+            || call.path.is_some()
+            || call.capability != self.capability
+            || !kgraf_tools::permissions::SCRIPT_SHELLS.contains(&shell)
+        {
+            return Vec::new();
+        }
+        self.programs
+            .iter()
+            .filter(|p| **p != call.capability && !DIRECTORY_CHANGERS.contains(&p.as_str()))
+            .cloned()
+            .collect()
+    }
 }
+
+/// Builtins that only change the shell's directory: nothing of them is left
+/// to run again once the script is gone.
+const DIRECTORY_CHANGERS: &[&str] = &["cd", "pushd", "popd"];
 
 /// Whether a denial names a policy, not a malformed or misplaced call. The
 /// approval chain's `access` step refuses paths outside the worktree; it is a
@@ -272,6 +311,9 @@ pub(crate) struct RefusedCalls {
     /// The tool whose malformed input `record.last_input_error` quotes.
     input_error_tool: Option<String>,
     mirror: Option<(Arc<RefusalDirectory>, String)>,
+    /// For each refusal, by index, the programs of [`RefusedCall::held`]
+    /// that have not yet run without error since it. Local to this run.
+    unrun: Vec<std::collections::BTreeSet<String>>,
 }
 
 impl RefusedCalls {
@@ -290,6 +332,7 @@ impl RefusedCalls {
     }
 
     pub(crate) fn refused(&mut self, call: RefusedCall) {
+        self.unrun.push(call.held.iter().cloned().collect());
         self.record.refused.push(call);
         self.publish();
     }
@@ -302,14 +345,29 @@ impl RefusedCalls {
     }
 
     /// A call of `tool` exercising `capabilities` ran without error: every
-    /// earlier refusal of one of them was retried successfully, and an input
-    /// error of the same tool was fixed.
+    /// earlier refusal of one of them was retried successfully, a script
+    /// refused whole was retried once every program it held has run
+    /// ([`RefusedCall::held`]), and an input error of the same tool was
+    /// fixed.
     pub(crate) fn ran_ok(&mut self, tool: &str, capabilities: &[String]) {
         let mut changed = false;
-        for c in &mut self.record.refused {
-            if c.tool == tool && capabilities.contains(&c.capability) && !c.retried_ok {
+        for (i, c) in self.record.refused.iter_mut().enumerate() {
+            if c.tool != tool || c.retried_ok {
+                continue;
+            }
+            if capabilities.contains(&c.capability) {
                 c.retried_ok = true;
                 changed = true;
+                continue;
+            }
+            if let Some(unrun) = self.unrun.get_mut(i)
+                && !c.held.is_empty()
+            {
+                unrun.retain(|p| !capabilities.contains(p));
+                if unrun.is_empty() {
+                    c.retried_ok = true;
+                    changed = true;
+                }
             }
         }
         if self.input_error_tool.as_deref() == Some(tool) {
@@ -330,6 +388,7 @@ impl RefusedCalls {
         }
         self.record.last_input_error = None;
         self.input_error_tool = None;
+        self.unrun.clear();
         std::mem::take(&mut self.record.refused)
     }
 }
@@ -347,6 +406,7 @@ mod tests {
             by: "ask-policy".into(),
             path: None,
             whole_tool: false,
+            held: Vec::new(),
         }
     }
 
@@ -431,6 +491,72 @@ mod tests {
             CallCapability::of("shell", &serde_json::json!({"command": ["sh", "-c", "ls"]}));
         r.ran_ok("shell", other.programs());
         assert!(!r.take()[0].retried_ok);
+    }
+
+    /// A shell script refused whole is retried once every program it held
+    /// has run without error, in any form. The shape seen in a real run: a worker was
+    /// denied `sh -c "cargo test -p discount_flat"`, then ran
+    /// `cargo test -p discount_flat` as argv, and its contract was still
+    /// reported unverified because it "never ran `sh`". A script of two
+    /// programs needs both; a refusal a rule narrowed to one program keeps
+    /// matching that program only; a directory change is nothing to rerun.
+    #[test]
+    fn a_script_refused_whole_is_retried_when_its_commands_run() {
+        let denied = "ERROR: denied by user: Run `sh -c 'cargo test -p discount_flat'`? It is \
+                      not on the build and test allowlist, which runs without approval: cargo \
+                      build, cargo check, cargo test.";
+        let script = CallCapability::of(
+            "shell",
+            &serde_json::json!({"command": ["sh", "-c", "cd discount_flat && cargo test -p discount_flat"]}),
+        );
+        let refused = script.refusal(kgraf_tools::approval::USER, denied, None);
+        assert_eq!(refused.capability, "sh");
+        assert_eq!(refused.held, ["cargo"]);
+        let mut r = RefusedCalls::default();
+        r.refused(refused);
+        let argv = CallCapability::of(
+            "shell",
+            &serde_json::json!({"command": ["cargo", "test", "-p", "discount_flat"]}),
+        );
+        r.ran_ok("shell", argv.programs());
+        assert!(r.take()[0].retried_ok, "the script's command ran");
+
+        // Two programs: retried only once both ran.
+        let two = CallCapability::of(
+            "shell",
+            &serde_json::json!({"command": ["sh", "-c", "cargo build && python3 check.py"]}),
+        );
+        let mut r = RefusedCalls::default();
+        r.refused(two.refusal("ask-policy", "ERROR: denied by ask-policy: no", None));
+        r.ran_ok("shell", &["cargo".to_owned()]);
+        r.ran_ok("apply_patch", &["python3".to_owned()]);
+        assert!(
+            !r.record.refused[0].retried_ok,
+            "python3 never ran as a shell call"
+        );
+        r.ran_ok("shell", &["python3".to_owned()]);
+        assert!(r.take()[0].retried_ok);
+
+        // A refusal a rule narrowed to `python3` holds nothing else.
+        let ruled = two.refusal(
+            kgraf_tools::permissions::PERMISSION_RULES_HOOK,
+            "ERROR: denied by user-permission-rules: your deny rule `shell(python3*)` blocks \
+             this call in every permission mode",
+            None,
+        );
+        assert_eq!(ruled.capability, "python3");
+        assert!(ruled.held.is_empty());
+        let mut r = RefusedCalls::default();
+        r.refused(ruled);
+        r.ran_ok("shell", &["cargo".to_owned()]);
+        assert!(!r.take()[0].retried_ok);
+
+        // Serialized only when held; an older record reads with none.
+        let old: RefusedCall = serde_json::from_value(serde_json::json!({
+            "tool": "shell", "capability": "sh", "reason": "x"
+        }))
+        .expect("old record");
+        assert!(old.held.is_empty());
     }
 
     /// The directory sees each refusal and input error while the worker

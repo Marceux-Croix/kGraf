@@ -1239,9 +1239,11 @@ impl PermissionControl {
     }
 
     /// Whether the current mode grants some named programs on its own: Auto
-    /// with programs in its allow set, or Accept edits' file programs. Only
-    /// then is a shell script judged command by command
-    /// ([`crate::execpolicy::ExecPolicy::evaluate`]).
+    /// with programs in its allow set, or Accept edits' file programs. A
+    /// shell script is judged command by command
+    /// ([`crate::execpolicy::ExecPolicy::evaluate`]) when this holds, when a
+    /// program is granted to the contract, or when the policy has a build and
+    /// test allowlist.
     pub fn grants_programs(&self) -> bool {
         let s = self.state();
         match s.settings.mode {

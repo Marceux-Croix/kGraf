@@ -214,9 +214,13 @@ impl BuildAllowlist {
             .collect();
         let mut parts = Vec::new();
         if !cargo.is_empty() {
+            // The `sh -c` form is named: a worker that read only the argv
+            // form took `cd crate && cargo check` for a command needing
+            // approval, and asked for one instead of running it.
             parts.push(format!(
                 "{}, each with its usual options ({CARGO_OPTIONS_SUMMARY}), given as one array \
-                 element per argument",
+                 element per argument, or as a `sh -c` script of these commands joined by `&&` \
+                 or `;`, after at most one `cd` into a directory of the worktree",
                 cargo.join(", ")
             ));
         }
@@ -263,6 +267,29 @@ impl BuildAllowlist {
                 ),
             },
         }
+    }
+}
+
+impl BuildAllowlist {
+    /// Whether `argv` is `cargo SUBCOMMAND ...` for a listed subcommand whose
+    /// arguments pass its rules. Exact entries are not consulted: a script
+    /// judged command by command (decision 0094) may run a command in a
+    /// directory it changed into, and an exact entry is a project command
+    /// line that may name a file relative to where it runs.
+    pub fn allows_by_cargo_rules(&self, argv: &[String]) -> bool {
+        let (Some(program), Some(word)) = (argv.first(), argv.get(1)) else {
+            return false;
+        };
+        if program != "cargo" {
+            return false;
+        }
+        self.commands
+            .iter()
+            .find_map(|c| match c {
+                BuildCommand::Cargo(sub) if sub.word() == word => Some(*sub),
+                _ => None,
+            })
+            .is_some_and(|sub| check_cargo(sub, &argv[2..]).is_ok())
     }
 }
 

@@ -19,5 +19,9 @@ pub use build::{
 };
 pub(crate) use build::{cargo_rule_subject_allowed, has_shell_syntax, manifest_paths_of};
 pub use decision::Decision;
+pub(crate) use policy::worktree_cd;
 pub use policy::{CommandRule, ExecPolicy, PolicyVerdict};
 pub use rule::{PatternToken, PrefixPattern};
+
+#[cfg(test)]
+mod script_build_tests;

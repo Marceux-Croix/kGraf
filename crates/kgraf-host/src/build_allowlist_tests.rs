@@ -179,6 +179,43 @@ async fn under_a_write_scope_only_the_allowlisted_build_runs() {
     assert!(out.contains("--config"), "{out}");
 }
 
+/// Decision 0094, amended again 2026-10-02, through the real `assemble()`
+/// path under Manual, unattended, with a declared write scope: a planner's
+/// acceptance shape `cd DIR && cargo check`, run as `sh -c`, and a lone
+/// allowlisted cargo command wrapped in `sh -c`, both run and pass. A
+/// command off the allowlist after the same `cd` is still denied. Before the
+/// fix the first two were asked about and denied, and contracts were
+/// held or reported unverified for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cd_into_the_worktree_then_an_allowlisted_build_runs_unattended() {
+    let (r, _denies) = lockless_crate();
+    for (worker, script) in [
+        ("w-cd-check", "cd src && cargo check --quiet"),
+        ("w-sh-test", "cargo test --quiet -p tiny"),
+    ] {
+        let (out, is_error) = one_shell_call(
+            &r,
+            WorkerConfig::default(),
+            worker,
+            serde_json::json!(["sh", "-c", script]),
+            scope(),
+        )
+        .await;
+        assert!(!is_error, "{script}: {out}");
+        assert!(out.contains("exit status: 0"), "{script}: {out}");
+    }
+    let (out, is_error) = one_shell_call(
+        &r,
+        WorkerConfig::default(),
+        "w-cd-touch",
+        serde_json::json!(["sh", "-c", "cd src && touch lib.rs"]),
+        scope(),
+    )
+    .await;
+    assert!(is_error, "{out}");
+    assert!(out.contains("The script runs `touch`"), "{out}");
+}
+
 fn bypass_with(rules: kgraf_tools::permissions::UserRules) -> Arc<kgraf_tools::PermissionControl> {
     Arc::new(
         kgraf_tools::PermissionControl::new(

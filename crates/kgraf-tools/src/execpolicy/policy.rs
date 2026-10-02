@@ -55,6 +55,11 @@ pub struct PolicyVerdict {
     /// 2026-10-02) that was not granted: the command the mode did not grant,
     /// or why the script was not judged. The approval question quotes it.
     pub script_note: Option<String>,
+    /// Allowed as a script judged command by command (decision 0094,
+    /// amended 2026-10-02): the shell tool checks the script's `cd` target
+    /// and its allowlisted cargo commands on disk before it runs
+    /// (decision 0084's checks, made in the directory each command runs in).
+    pub script_checked: bool,
 }
 
 /// An ordered set of [`CommandRule`]s, tried first match wins, falling back to
@@ -242,6 +247,7 @@ impl ExecPolicy {
                     build: false,
                     granted: false,
                     script_note: None,
+                    script_checked: false,
                 })
         });
         // A `forbid` rule wins over the allowlist.
@@ -266,6 +272,7 @@ impl ExecPolicy {
                 build: true,
                 granted: false,
                 script_note: None,
+                script_checked: false,
             },
             AllowlistMatch::Refused { reason } => PolicyVerdict {
                 decision: Decision::Forbidden,
@@ -275,6 +282,7 @@ impl ExecPolicy {
                 build: false,
                 granted: false,
                 script_note: None,
+                script_checked: false,
             },
             AllowlistMatch::NotListed => {
                 let from_rule = ruled.is_some();
@@ -286,6 +294,7 @@ impl ExecPolicy {
                     build: false,
                     granted: false,
                     script_note: None,
+                    script_checked: false,
                 });
                 // Decision 0093: a grant turns what would be asked about
                 // (or allowed unconfined) into a confined allow. A read-only
@@ -325,6 +334,7 @@ impl ExecPolicy {
                     build: false,
                     granted: true,
                     script_note: None,
+                    script_checked: false,
                 }
             }
         }
@@ -350,6 +360,7 @@ impl ExecPolicy {
                             build: false,
                             granted: false,
                             script_note: None,
+                            script_checked: false,
                         })
                 })
             })
@@ -377,14 +388,32 @@ impl ExecPolicy {
     }
 
     /// Decision 0094, amended 2026-10-02: a `sh -c` script of simple
-    /// commands ([`crate::permissions::script_commands`]) is granted when a
-    /// grant covers the program of every command, as Claude Code allows a
-    /// compound command when each subcommand is allowed. A command a
-    /// `forbid` rule or the build allowlist refuses refuses the whole call. A
-    /// command no grant covers, or a script with a construct that is not
-    /// judged, leaves the call to be asked, and the note says which. `None`
-    /// when this is not a script, or when nothing grants named programs (the
-    /// call is asked as before).
+    /// commands ([`crate::permissions::script_commands`]) is allowed when
+    /// every command is covered, as Claude Code allows a compound command
+    /// when each subcommand is allowed. A command is covered by a grant of
+    /// its program, by the build and test allowlist's cargo rules (decision
+    /// 0084), or, once per script, by a `cd` into the worktree
+    /// ([`worktree_cd`]). A script of allowlisted cargo commands, with or
+    /// without that `cd`, is a build; one that needs a grant is granted. A
+    /// command a `forbid` rule or the build allowlist refuses refuses the
+    /// whole call. A command nothing covers, or a script with a construct
+    /// that is not judged, leaves the call to be asked, and the note says
+    /// which. `None` when this is not a script, or when nothing grants named
+    /// programs and the allowlist is empty (the call is asked as before).
+    ///
+    /// Why the allowlist and `cd` count (decision 0094, amended again 2026-10-02):
+    /// a planner writes an acceptance as `cd crate && cargo check`, and a
+    /// worker runs it as `sh -c`. That script was asked about whole, and an
+    /// unattended run denied the worker the very check its contract named,
+    /// though `cargo check` alone runs unasked. A `cd` changes only the
+    /// directory the next commands start in; the shell tool checks that
+    /// directory on disk and runs decision 0084's checks there before the
+    /// script runs ([`PolicyVerdict::script_checked`]).
+    ///
+    /// Only the strict reader's commands get the allowlist and `cd`
+    /// coverage, and only the allowlist's cargo rules, not its exact
+    /// entries: an exact entry is a project command line, which may name a
+    /// file relative to the directory it runs in.
     ///
     /// With script constructs on, a script the strict reader refuses is read
     /// again accepting them ([`crate::permissions::script_commands_with`]),
@@ -396,8 +425,9 @@ impl ExecPolicy {
         use crate::permissions::{
             SCRIPT_RUNS_LEAD, Script, relies_on_constructs, script_commands_with,
         };
-        let grants_any =
-            !self.granted.is_empty() || self.live.as_ref().is_some_and(|l| l.0.grants_programs());
+        let grants_any = !self.granted.is_empty()
+            || self.live.as_ref().is_some_and(|l| l.0.grants_programs())
+            || !self.build.is_empty();
         if !grants_any {
             return None;
         }
@@ -409,6 +439,7 @@ impl ExecPolicy {
             build: false,
             granted: false,
             script_note: Some(note),
+            script_checked: false,
         };
         let constructs = self.script_constructs();
         let commands = match script_commands_with(argv, &constructs) {
@@ -437,16 +468,55 @@ impl ExecPolicy {
                     build: false,
                     granted: false,
                     script_note: None,
+                    script_checked: false,
                 });
             }
         }
-        if let Some(words) = commands.iter().find(|w| !self.grants_program(&w[0])) {
-            return Some(asked(format!(
-                "The {SCRIPT_RUNS_LEAD}{}` (`{}`), which no grant covers; a script runs without \
-                 asking only when every command in it is granted.",
-                words[0],
-                shown(words)
-            )));
+        // How each command is covered, in order; the first one nothing
+        // covers is named in the question.
+        let relaxed = relies_on_constructs(argv, &constructs);
+        let mut needs_grant = false;
+        let mut built = false;
+        let mut cd: Option<&str> = None;
+        for words in &commands {
+            let uncovered = |extra: &str| {
+                asked(format!(
+                    "The {SCRIPT_RUNS_LEAD}{}` (`{}`), which no grant covers{extra}; a script \
+                     runs without asking only when every command in it is granted.",
+                    words[0],
+                    shown(words)
+                ))
+            };
+            if !relaxed && let Some(change) = worktree_cd(words) {
+                match change {
+                    Ok(dir) if cd.is_none() => {
+                        cd = Some(dir);
+                        continue;
+                    }
+                    Ok(_) => {
+                        return Some(uncovered(
+                            " (a script may change directory once, into the worktree)",
+                        ));
+                    }
+                    Err(why) => return Some(uncovered(&format!(" ({why})"))),
+                }
+            }
+            if !relaxed && self.build.allows_by_cargo_rules(words) {
+                built = true;
+                continue;
+            }
+            if self.grants_program(&words[0]) {
+                needs_grant = true;
+                continue;
+            }
+            return Some(uncovered(""));
+        }
+        // A script that only changes directory runs nothing a grant or the
+        // allowlist names; it is asked about as before.
+        if !needs_grant && !built {
+            return Some(asked(
+                "Its script runs no command a grant or the build and test allowlist covers.".into(),
+            ));
         }
         let mut programs: Vec<&str> = Vec::new();
         for words in &commands {
@@ -459,13 +529,24 @@ impl ExecPolicy {
             read_only: false,
             matched_prefix: None,
             reason: Some(format!(
-                "every command of the script is granted ({}){}",
+                "every command of the script is {} ({}){}{}",
+                if built {
+                    if needs_grant {
+                        "granted or on the build and test allowlist"
+                    } else {
+                        "on the build and test allowlist"
+                    }
+                } else {
+                    "granted"
+                },
                 programs
                     .iter()
                     .map(|p| format!("`{p}`"))
                     .collect::<Vec<_>>()
                     .join(", "),
-                if relies_on_constructs(argv, &constructs) {
+                cd.map(|d| format!(", after a `cd` into `{d}` in the worktree"))
+                    .unwrap_or_default(),
+                if relaxed {
                     format!(
                         "; it uses script constructs you turned on ({}), so only the programs \
                          kGraf can see were checked",
@@ -475,9 +556,10 @@ impl ExecPolicy {
                     String::new()
                 }
             )),
-            build: false,
-            granted: true,
+            build: !needs_grant,
+            granted: needs_grant,
             script_note: None,
+            script_checked: true,
         })
     }
 
@@ -529,6 +611,50 @@ impl ExecPolicy {
             .allow_read_only(&["pwd"], "read-only")
             .allow_read_only(&["cat"], "read-only")
     }
+}
+
+/// Whether a script's command is a directory change a script judged command
+/// by command may hold (decision 0094, amended again 2026-10-02): `None` when
+/// it is not `cd`; `Some(Ok(dir))` for `cd DIR` with `DIR` one relative path
+/// that stays inside the worktree by its words alone (no `..`, no absolute
+/// path, no `~`, glob or option, not the `.git` directory or kGraf's state);
+/// `Some(Err(why))` for any other `cd`. A bare `cd` goes to the home
+/// directory, `cd -` to the previous one, and a glob names whatever matches,
+/// so none of them is judged. `pushd` and `popd` are never covered. The
+/// shell tool checks the directory on disk (a link out of the worktree is
+/// refused) before the script runs.
+pub(crate) fn worktree_cd(words: &[String]) -> Option<Result<&str, &'static str>> {
+    if words.first().map(String::as_str) != Some("cd") {
+        return None;
+    }
+    let [_, dir] = words else {
+        return Some(Err(
+            "`cd` takes exactly one directory here; a bare `cd` goes to the home directory",
+        ));
+    };
+    if dir.is_empty()
+        || dir.starts_with('-')
+        || dir.contains(['*', '?', '[', ']', '~'])
+        || dir.chars().any(char::is_control)
+    {
+        return Some(Err(
+            "`cd` names no plain directory: an option, a glob or `~`",
+        ));
+    }
+    let path = std::path::Path::new(dir);
+    let inside = path.components().all(|c| {
+        matches!(
+            c,
+            std::path::Component::Normal(_) | std::path::Component::CurDir
+        )
+    });
+    if !inside {
+        return Some(Err("`cd` leaves the worktree: an absolute path or `..`"));
+    }
+    if crate::fs_safety::reads_git_dir_or_kgraf(path) {
+        return Some(Err("`cd` enters the `.git` directory or kGraf's own state"));
+    }
+    Some(Ok(dir))
 }
 
 #[cfg(test)]

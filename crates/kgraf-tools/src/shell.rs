@@ -1095,6 +1095,14 @@ impl Tool for ShellTool {
             build_config_unchanged(self.build_config.as_ref(), &ctx.workspace_root)?;
             confine_manifest_on_disk(&cmd, ctx)?;
         }
+        if verdict.script_checked {
+            confine_script_on_disk(
+                &cmd,
+                ctx,
+                self.policy.build_allowlist(),
+                self.build_config.as_ref(),
+            )?;
+        }
         // External executor: every check above this line already
         // ran unconditionally (forbidden, prompt-without-hook, read-only
         // confinement). Only the execution step itself is routed elsewhere
@@ -1413,6 +1421,113 @@ fn confine_on_disk(cmd: &[String], ctx: &ToolContext) -> Result<(), ToolError> {
 fn confine_manifest_on_disk(cmd: &[String], ctx: &ToolContext) -> Result<(), ToolError> {
     for manifest in crate::execpolicy::manifest_paths_of(cmd) {
         confine_one_manifest(manifest, ctx)?;
+    }
+    Ok(())
+}
+
+/// Decision 0094, amended again 2026-10-02: a script the policy allowed
+/// command by command ([`crate::execpolicy::PolicyVerdict::script_checked`])
+/// is checked in the directory each command runs in. Its `cd` target must be
+/// a directory of the worktree, reached without a link out of it. Each
+/// allowlisted cargo command gets decision 0084's checks there: the
+/// worktree's cargo configuration and toolchain file unchanged since the
+/// worker started, none of them in the directories between the worktree
+/// root and the `cd` target (cargo and rustup read them from the directory a
+/// command starts in and every directory above it), and each
+/// `--manifest-path` inside the worktree, resolved from that directory.
+fn confine_script_on_disk(
+    cmd: &[String],
+    ctx: &ToolContext,
+    build: &crate::execpolicy::BuildAllowlist,
+    recorded: Option<&BuildConfig>,
+) -> Result<(), ToolError> {
+    let crate::permissions::Script::Commands(commands) = crate::permissions::script_commands(cmd)
+    else {
+        // Read with a script construct the user turned on: no `cd` or
+        // allowlist coverage was given, so there is nothing to check here.
+        return Ok(());
+    };
+    let mut dir = std::path::PathBuf::new();
+    for words in &commands {
+        if let Some(change) = crate::execpolicy::worktree_cd(words) {
+            let target = change.map_err(|why| forbidden(Some(why)))?;
+            let rel = crate::normalize_relative(std::path::Path::new(target))
+                .map_err(|e| cd_outside(target, &e.to_string()))?;
+            confine_cd_on_disk(target, &rel, ctx)?;
+            dir = rel;
+            continue;
+        }
+        if !build.allows_by_cargo_rules(words) {
+            continue;
+        }
+        build_config_unchanged(recorded, &ctx.workspace_root)?;
+        if recorded.is_some() {
+            build_config_absent_below_root(&dir, &ctx.workspace_root)?;
+        }
+        for manifest in crate::execpolicy::manifest_paths_of(words) {
+            let joined = dir.join(manifest);
+            confine_one_manifest(&joined.to_string_lossy(), ctx)?;
+        }
+    }
+    Ok(())
+}
+
+/// A `cd` target must be a directory inside the worktree, reached without a
+/// link that leaves it, and not the `.git` directory or kGraf's state.
+fn confine_cd_on_disk(
+    target: &str,
+    rel: &std::path::Path,
+    ctx: &ToolContext,
+) -> Result<(), ToolError> {
+    if rel.as_os_str().is_empty() {
+        return Ok(());
+    }
+    crate::fs_safety::refuses_git_dir_or_kgraf("shell", rel)?;
+    let dir = crate::fs_safety::open_workspace("shell", &ctx.workspace_root)?;
+    match crate::fs_safety::metadata_if_exists("shell", &dir, rel)
+        .map_err(|e| cd_outside(target, &e.to_string()))?
+    {
+        Some(meta) if meta.is_dir() => Ok(()),
+        _ => Err(cd_outside(target, "not a directory of the worktree")),
+    }
+}
+
+/// A script's `cd` target that is not a directory of the worktree.
+fn cd_outside(target: &str, why: &str) -> ToolError {
+    ToolError::Access {
+        tool: "shell".into(),
+        source: crate::AccessError::Escapes {
+            path: format!(
+                "{target} (the `cd` of a script run without approval): {why}; such a script \
+                 changes directory only into a directory of the worktree"
+            ),
+        },
+    }
+}
+
+/// Refuse an allowlisted cargo command that starts in `dir` (relative to the
+/// worktree root) while any directory between the root (exclusive) and
+/// `dir` (inclusive) holds a [`BUILD_CONFIG_FILES`] entry. The root's own
+/// entries are held to [`build_config_unchanged`]; one below it was never
+/// recorded, so it is refused rather than trusted.
+fn build_config_absent_below_root(
+    dir: &std::path::Path,
+    root: &std::path::Path,
+) -> Result<(), ToolError> {
+    let mut at = root.to_path_buf();
+    for part in dir.components() {
+        at.push(part);
+        for rel in BUILD_CONFIG_FILES {
+            if FileState::read(&at.join(rel)) != FileState::Absent {
+                return Err(forbidden(Some(&format!(
+                    "{} is in a directory the script changes into; cargo and rustup read it \
+                     from there, so an allowlisted build or test command would not run what its \
+                     arguments say. Run the command from the worktree root (`cargo check -p \
+                     NAME`) instead",
+                    at.strip_prefix(root).unwrap_or(&at).join(rel).display()
+                ))));
+            }
+        }
     }
     Ok(())
 }
@@ -3353,7 +3468,8 @@ mod tests {
                 vec!["cargo", "run"],
                 vec!["cargo", "install", "ripgrep"],
                 vec!["./cargo", "build"],
-                vec!["sh", "-c", "cargo build"],
+                vec!["sh", "-c", "cargo build && touch x"],
+                vec!["sh", "-c", "cargo build $(echo --release)"],
             ] {
                 let access = tool.access(&call_input(&off)).expect("access");
                 assert!(!access.is_sandboxed_build(), "{off:?}");
@@ -3362,6 +3478,15 @@ mod tests {
                     "{off:?} must still need approval"
                 );
             }
+            // Decision 0094, amended again 2026-10-02: a `sh -c` script of
+            // allowlisted cargo commands alone is a build, as each command is.
+            let script = ["sh", "-c", "cargo build"];
+            assert!(
+                tool.access(&call_input(&script))
+                    .expect("access")
+                    .is_sandboxed_build()
+            );
+            assert_eq!(hook.review(&pending(&script)).await, HookDecision::Allow);
         }
 
         /// A model that writes the whole command line as one string
@@ -3987,6 +4112,81 @@ fn main() {
                 matches!(err, ToolError::Access { .. }) && err.to_string().contains("worktree"),
                 "{err}"
             );
+            assert!(!ShellTool::target_dir(&f.ws).exists(), "nothing ran");
+        }
+
+        /// Decision 0094, amended again 2026-10-02: `sh -c "cd DIR && cargo
+        /// check"` with DIR a directory of the worktree is a sandboxed build
+        /// the hook allows unasked, and it runs and passes there. Before the
+        /// fix it was asked about whole, and denied unattended.
+        #[tokio::test]
+        async fn a_cd_into_the_worktree_then_an_allowlisted_build_runs() {
+            let f = fixture(PLAIN_BUILD_RS);
+            let (tool, hook) = bound_tool(&f.ws);
+            let argv = ["sh", "-c", "cd src && cargo check --quiet"];
+            let access = tool.access(&call_input(&argv)).expect("access");
+            assert!(access.is_sandboxed_build());
+            assert_eq!(hook.review(&pending(&argv)).await, HookDecision::Allow);
+            let out = tool
+                .call(
+                    call_input(&argv),
+                    &ctx(f.ws.root().to_path_buf()),
+                    &CallPermit::new(),
+                )
+                .await
+                .expect("ran");
+            let is_error = out.is_error;
+            let rendered = out.render();
+            assert!(!is_error, "{rendered}");
+            assert!(rendered.contains("exit status: 0"), "{rendered}");
+        }
+
+        /// The disk checks run in the directory the script changes into: a
+        /// `cd` through a link out of the worktree, into a path that is no
+        /// directory, or into a directory holding cargo configuration, and a
+        /// `--manifest-path` that leaves through a link from there, are each
+        /// refused before anything runs.
+        #[tokio::test]
+        async fn a_cd_script_is_checked_on_disk_where_it_runs() {
+            let f = fixture(PLAIN_BUILD_RS);
+            std::fs::create_dir_all(f.outside.join("other")).expect("other");
+            std::fs::write(
+                f.outside.join("other/Cargo.toml"),
+                "[package]\nname = \"other\"\nversion = \"0.1.0\"\n",
+            )
+            .expect("other manifest");
+            std::os::unix::fs::symlink(f.outside.join("other"), f.ws.root().join("link"))
+                .expect("symlink");
+            std::os::unix::fs::symlink(f.outside.join("other"), f.ws.root().join("src/l"))
+                .expect("symlink");
+            let (tool, _hook) = bound_tool(&f.ws);
+            let refused = |script: &'static str| {
+                let tool = &tool;
+                let root = f.ws.root().to_path_buf();
+                async move {
+                    let argv = ["sh", "-c", script];
+                    tool.access(&call_input(&argv))
+                        .expect("lexically fine; the disk check is at call time");
+                    tool.call(call_input(&argv), &ctx(root), &CallPermit::new())
+                        .await
+                        .expect_err(script)
+                        .to_string()
+                }
+            };
+            let err = refused("cd link && cargo check").await;
+            assert!(err.contains("worktree"), "{err}");
+            let err = refused("cd nothere && cargo check").await;
+            assert!(err.contains("not a directory of the worktree"), "{err}");
+            let err = refused("cd src && cargo check --manifest-path l/Cargo.toml").await;
+            assert!(err.contains("--manifest-path"), "{err}");
+            std::fs::create_dir_all(f.ws.root().join("src/.cargo")).expect(".cargo");
+            std::fs::write(
+                f.ws.root().join("src/.cargo/config.toml"),
+                "[alias]\ncheck = \"run\"\n",
+            )
+            .expect("config");
+            let err = refused("cd src && cargo check").await;
+            assert!(err.contains("src/.cargo"), "{err}");
             assert!(!ShellTool::target_dir(&f.ws).exists(), "nothing ran");
         }
 

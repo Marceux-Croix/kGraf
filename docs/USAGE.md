@@ -744,7 +744,21 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   worktree path a worker may write (an absolute path, `..`, `~`, a glob, `.git`, or any file
   after a directory change: `cd`, `pushd` or `popd`, also behind `command`, `builtin` or
   `exec`); the question says which. A command your policy forbids (`git push --force`)
-  refuses the whole script. Manual and Bypass are unchanged: Manual asks, Bypass runs it.
+  refuses the whole script. Otherwise Manual asks, and Bypass runs it.
+
+  A script of build and test commands runs without asking in every mode, as each command does
+  alone: when every command is on the build and test allowlist under its argument rules,
+  `sh -c "cargo check && cargo test --workspace"` runs as a build. A script may also change
+  directory once, with `cd DIR` where `DIR` is a relative directory of the worktree (no `..`,
+  no absolute path, no `~`, glob or option, not `.git` or `.kgraf`): `sh -c "cd pricing_engine
+  && cargo check"`, the usual shape of a planned contract's acceptance, runs as a build there,
+  and `sh -c "cd tools && python3 gen.py"` is granted when `python3` is. Before such a script
+  runs, kGraf checks that the directory is a directory of the worktree reached without a link
+  out of it, that no cargo configuration or toolchain file (`.cargo/`, `rust-toolchain`,
+  `rust-toolchain.toml`) sits in a directory between the worktree root and it, and that each
+  `--manifest-path` stays in the worktree from there. A bare `cd`, `cd -`, `pushd`, `popd`, a
+  second `cd`, and a project's exact acceptance command after a `cd` are asked about as before.
+  Your deny and ask rules still match every command of the script.
 
   You can let a mode grant those constructs too. Each has a switch, off by default, in
   Settings > Permissions under "Shell scripts a mode may grant", in `permissions.toml` as
@@ -1346,6 +1360,13 @@ Behavior that differs from earlier builds. Each item names the decision that hol
   shell itself had to be granted, so `sh -c "mkdir -p out && cp a out/a"` was asked about (and
   denied with nobody attending) under `--allow mkdir --allow cp`. A script with one command no
   grant covers is asked about, naming that command (0094).
+- A worker's `sh -c` script of allowlisted cargo commands, after at most one `cd` into a
+  directory of the worktree, runs without asking as a build in every mode. Before,
+  `sh -c "cd pricing_engine && cargo check"`, the usual shape of a planned acceptance, was asked
+  about and denied with nobody attending, though `cargo check` alone ran (0084, 0094).
+- A worker denied a `sh -c` script whole that then runs each program the script held, in any
+  form (`cargo test -p a` after `sh -c "cargo test -p a"`), no longer leaves its contract
+  reported unverified (0093, 0094).
 - A script using variables, subshells, background jobs, input redirects, escapes or outside
   redirects can be granted when you turn on that construct's switch (Settings > Permissions,
   `script_constructs` in `permissions.toml`, or `--script-constructs`); all are off by default.

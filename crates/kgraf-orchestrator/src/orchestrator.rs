@@ -8608,6 +8608,7 @@ mod tests {
             by: by.into(),
             path: None,
             whole_tool: false,
+            held: Vec::new(),
         }
     }
 
