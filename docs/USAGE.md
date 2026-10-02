@@ -745,6 +745,39 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   after a `cd`); the question says which. A command your policy forbids (`git push --force`)
   refuses the whole script. Manual and Bypass are unchanged: Manual asks, Bypass runs it.
 
+  You can let a mode grant those constructs too. Each has a switch, off by default, in
+  Settings > Permissions under "Shell scripts a mode may grant", in `permissions.toml` as
+  `script_constructs = [...]`, and on `kgraf orchestrate` as `--script-constructs LIST`
+  (comma-separated, or `none`; it replaces the file's list for the run). `.kgraf/run.json`
+  refuses the key. The switches:
+
+  | Key | Settings name | What it lets a mode grant |
+  |---|---|---|
+  | `variables` | Variables and command substitution | `$VAR`, `${VAR}`, `$(...)`, `$((...))`, backquotes, `<(...)` |
+  | `subshells` | Subshells and groups | `( ... )`, `{ ...; }`, brace expansion `{a,b}` |
+  | `background` | Background jobs | `&`, `\|&` |
+  | `input_redirects` | Input redirects and heredocs | `<`, `<<` heredocs, `<<<`, `<>` |
+  | `escapes` | Escapes, comments and other quoting | `\`, `#`, `!`, `$'...'`, a command named by a path or a quoted word, or after `VAR=value` |
+  | `outside_redirects` | Output redirects outside the worker's files | `>` or `>>` to any path, after a `cd` too |
+
+  With a switch on, a script using that construct is granted, in a mode that grants programs
+  (Auto with an allow set, Accept edits, a program granted to the contract), when a grant covers
+  every program kGraf can see in it, the programs inside `$(...)`, backquotes, subshells and
+  groups included. What you accept: kGraf cannot see what a variable or a substitution will
+  run, so a command named by a variable (`$CMD`) runs with no check, the refusal to delete
+  system paths included. What still holds: your deny and ask rules match every command kGraf
+  can see, and for a script judged only because of a switch, a deny or ask rule whose program
+  appears anywhere in the script text as a word refuses or asks (`deny = ["shell(curl*)"]`
+  refuses `sh -c "ls && C=curl; $C u"`). This match is broad on purpose: `shell(git push*)`
+  then matches any such script that names `git`. The sandbox does not change: the
+  `outside_redirects` switch only lets the mode grant the script; the sandbox still blocks
+  writes outside the worktree and its scratch folder, and the attempt's changes are still
+  checked against the contract's declared files. Some scripts are never judged whatever the
+  switches say: shell keywords (`if`, `for`, `while`), a function definition, a script with no
+  program kGraf can see, a heredoc whose text substitutes a command, and a `${...}` holding a
+  quote or a substitution. Manual still asks; Bypass already runs these scripts. A run prints
+  `permissions mode MODE; script constructs on: LIST` at its start.
+
   In every mode, Bypass included: your deny rules block (`deny = ["shell(curl*)"]`, or
   `--deny`), your ask rules ask (`ask = [...]`, or `--ask`), deleting the filesystem root, a
   top-level directory or your home directory is refused, deleting the workspace itself or its
@@ -817,24 +850,39 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   command. On macOS and Linux a gate command also runs under a CPU-time limit of twice
   that, so a process that escapes its process group cannot spin without limit.
 - Interface contracts are experimental and off by default. `--contract-checks` turns them
-  on (`contract_checks` in `.kgraf/run.json`). With them on, planning is two calls. The
-  first returns the contracts only. When the plan has two or more contracts, a second call
-  is given the accepted contracts, which contract depends on which, and the repository
-  context, and returns the interface contracts only: for each producer another contract
-  uses, a stub, a reference, the consumer's files and a test. A consumer or test file the
-  repository already has may be named by path alone; kGraf reads it from the repository.
-  Each interface is checked as it arrives, in the sandbox: the consumer and the test compile
-  against the stub, the test fails against the stub and passes against the reference. One
-  that fails, an answer that is not JSON, and a dependency no interface binds are all sent
-  back to the second call, up to three asks in all, with the planner's previous answer and
-  the reason, which quotes the answer where it went wrong and says what each entry needs;
-  accepted interfaces are kept, and the contracts are never asked for again. When the asks
-  are spent, kGraf derives a compile check from the repository where it can (the producer's
-  scaffold as the stub, the files that use it as the consumer files) and runs it; each
-  dependency still without an interface is then counted under `not run` in the report's
-  `contracts` line, with a notice and a trace record that name the contracts and the reason.
-  The run is never held for an interface the planner could not write. Before the first
-  worker starts, the handshakes of an interface's parties are compared too. A contract
+  on (`contract_checks` in `.kgraf/run.json`). With them on, planning starts with one call
+  that returns the contracts only. When the plan has two or more contracts, kGraf then derives
+  an interface for each contract that another contract uses, without asking a model: where the
+  repository already holds the producer's scaffold (a body of `todo!()` or `raise
+  NotImplementedError`), that scaffold is the stub, the files that use the producer's names
+  are the consumer files, and the project's build tool compiles them (`cargo test --no-run
+  -p ...`, or a Python import). A derived check that passes is registered as a compile-only
+  interface: it is checked before the first worker starts, it costs no model call, and it
+  catches a signature a consumer uses and the producer's scaffold does not have. The planner
+  is asked for a behavior check (a reference and a small test of the one producer) only when
+  no test in the repository already exercises that producer alone and one could: when the only
+  tests need several producers, whose code does not exist yet, no reference of one producer
+  can pass them, so none is asked for. When no producer needs a behavior check, no second
+  call is made. Each dependency whose behavior check did not run is counted under `not run`
+  in the report's `contracts` line, with a notice and a trace record that name the contracts
+  and the reason; its compile-only interface still checks it. Where a
+  behavior check is asked for, the request lists what kGraf already supplies and the answer
+  holds only the reference and the test, within 4,096 output tokens. Each interface is
+  checked as it arrives, in the sandbox: the consumer and the test compile against the stub,
+  the test fails against the stub and passes against the reference. A compile command that
+  cannot run or does not build the files is replaced by the derived one, without asking
+  again. An interface that fails any other check, an answer that is not JSON, and a
+  dependency no interface binds are sent back, up to three asks in all, with the reason,
+  which quotes the answer where it went wrong and says what each entry needs; a re-ask covers
+  only the interfaces still refused, with the planner's previous entries for them (the
+  refusals quoted are cut at 12,000 characters), and accepted interfaces are kept. The report's `interfaces` line states what the interface call
+  cost and what it yielded: `planner 2 calls 310 s 9,400 tokens; accepted 6 compile-only, 1
+  behavior`. Output from the host's own developer tools (macOS `xcrun` and `xcodebuild`
+  lines) and repeated identical warnings are removed from check output before it is shown or
+  sent to a model, with a count of the lines removed; error lines stay. The run is never held
+  for an interface the planner could not write. Before the first
+  worker starts, the handshakes of a behavior interface's parties are compared too (a
+  compile-only interface has none). A contract
   whose interface fails at that point is held, with the file that failed named. Each
   handshake and each check names every party's route and model, and the run record keeps
   each hold with them, so you can see which models disagreed. A contract whose compiler or
@@ -1276,6 +1324,11 @@ Behavior that differs from earlier builds. Each item names the decision that hol
   shell itself had to be granted, so `sh -c "mkdir -p out && cp a out/a"` was asked about (and
   denied with nobody attending) under `--allow mkdir --allow cp`. A script with one command no
   grant covers is asked about, naming that command (0094).
+- A script using variables, subshells, background jobs, input redirects, escapes or outside
+  redirects can be granted when you turn on that construct's switch (Settings > Permissions,
+  `script_constructs` in `permissions.toml`, or `--script-constructs`); all are off by default.
+  Only the programs kGraf can see are checked, and your rules also match program names in the
+  script text (0094).
 - A skill's refusal of a shell call, or a rule on the whole `shell` tool, is recorded as a
   refusal of the tool: a report naming the `shell` tool is held naming the skill instead of
   being answered as nothing refused (0053, 0094).

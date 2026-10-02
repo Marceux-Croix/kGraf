@@ -840,6 +840,7 @@ fn the_run_file_cannot_set_the_permission_mode_or_plan_review() {
         r#""allow_bypass": true"#,
         r#""plan_review": false"#,
         r#""approve_plan": true"#,
+        r#""script_constructs": ["variables"]"#,
         r#""allow": {"programs": ["python3"]}"#,
     ] {
         let path = dir.path().join("run.json");

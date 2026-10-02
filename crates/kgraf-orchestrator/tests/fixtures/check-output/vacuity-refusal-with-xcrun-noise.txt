@@ -1,0 +1,76 @@
+interface `i_discount_flat` failed its pre-dispatch check: Vacuity check failed on interface i_discount_flat@v1: test [checkout/tests/integration.rs] against stub [discount_flat/src/lib.rs] and reference [discount_flat/src/lib.rs] by `cargo test --workspace`: the test fails against the reference, so nothing may satisfy it: `cargo test --workspace` exit status: 101: error: test failed, to rerun pass `-p checkout --test integration`
+[... output cut; the compiler errors above were kept ...]
+codebuild[72961:169715580] [MT] DVTDeveloperPaths: Failed to get length of DARWIN_USER_CACHE_DIR from confstr(3), error = Error Domain=NSPOSIXErrorDomain Code=5 "Input/output error". Using NSCachesDirectory instead.
+          2026-10-02 07:57:15.014 xcodebuild[72981:169715686]  DVTFilePathFSEvents: Failed to start fs event stream.
+          2026-10-02 07:57:15.392 xcodebuild[72981:169715683] [MT] DVTDeveloperPaths: Failed to get length of DARWIN_USER_CACHE_DIR from confstr(3), error = Error Domain=NSPOSIXErrorDomain Code=5 "Input/output error". Using NSCachesDirectory instead.
+
+warning: output of `xcrun` while finding MacOSX.sdk
+  |
+  = note: 2026-10-02 07:57:13.612 xcodebuild[72940:169715529]  DVTFilePathFSEvents: Failed to start fs event stream.
+          2026-10-02 07:57:13.899 xcodebuild[72940:169715513] [MT] DVTDeveloperPaths: Failed to get length of DARWIN_USER_CACHE_DIR from confstr(3), error = Error Domain=NSPOSIXErrorDomain Code=5 "Input/output error". Using NSCachesDirectory instead.
+          2026-10-02 07:57:14.979 xcodebuild[72978:169715672]  DVTFilePathFSEvents: Failed to start fs event stream.
+          2026-10-02 07:57:15.381 xcodebuild[72978:169715665] [MT] DVTDeveloperPaths: Failed to get length of DARWIN_USER_CACHE_DIR from confstr(3), error = Error Domain=NSPOSIXErrorDomain Code=5 "Input/output error". Using NSCachesDirectory instead.
+
+warning: output of `xcrun` while finding MacOSX.sdk
+  |
+  = note: 2026-10-02 07:57:13.660 xcodebuild[72959:169715586]  DVTFilePathFSEvents: Failed to start fs event stream.
+          2026-10-02 07:57:13.945 xcodebuild[72959:169715573] [MT] DVTDeveloperPaths: Failed to get length of DARWIN_USER_CACHE_DIR from confstr(3), error = Error Domain=NSPOSIXErrorDomain Code=5 "Input/output error". Using NSCachesDirectory instead.
+          2026-10-02 07:57:15.030 xcodebuild[72983:169715689]  DVTFilePathFSEvents: Failed to start fs event stream.
+          2026-10-02 07:57:15.418 xcodebuild[72983:169715684] [MT] DVTDeveloperPaths: Failed to get length of DARWIN_USER_CACHE_DIR from confstr(3), error = Error Domain=NSPOSIXErrorDomain Code=5 "Input/output error". Using NSCachesDirectory instead.
+
+warning: output of `xcrun` while finding MacOSX.sdk
+  |
+  = note: 2026-10-02 07:57:13.749 xcodebuild[72974:169715644]  DVTFilePathFSEvents: Failed to start fs event stream.
+          2026-10-02 07:57:14.036 xcodebuild[72974:169715642] [MT] DVTDeveloperPaths: Failed to get length of DARWIN_USER_CACHE_DIR from confstr(3), error = Error Domain=NSPOSIXErrorDomain Code=5 "Input/output error". Using NSCachesDirectory instead.
+          2026-10-02 07:57:15.089 xcodebuild[72984:169715696]  DVTFilePathFSEvents: Failed to start fs event stream.
+          2026-10-02 07:57:15.476 xcodebuild[72984:169715695] [MT] DVTDeveloperPaths: Failed to get length of DARWIN_USER_CACHE_DIR from confstr(3), error = Error Domain=NSPOSIXErrorDomain Code=5 "Input/output error". Using NSCachesDirectory instead.
+
+warning: `pricing_engine` (lib test) generated 1 warning
+warning: `discount_flat` (lib test) generated 1 warning
+warning: `shipping_standard` (lib test) generated 1 warning
+warning: `discount_bulk` (lib test) generated 1 warning
+warning: `tax_us` (lib test) generated 1 warning
+warning: `iface` (lib test) generated 1 warning
+warning: `checkout` (lib test) generated 1 warning
+warning: `checkout` (test "integration") generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.78s
+     Running unittests src/lib.rs (/tmp/kgraf-checks/check/target/debug/deps/checkout-0a123b390ab49ec9)
+     Running tests/integration.rs (/tmp/kgraf-checks/check/target/debug/deps/integration-550cbfc0611a8333)
+error: test failed, to rerun pass `-p checkout --test integration`
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 3 tests
+test vip_flat_discount_default_tax_free_shipping ... FAILED
+test taxed_state_no_discount_free_shipping ... FAILED
+test untaxed_state_bulk_discount_flat_shipping ... FAILED
+
+failures:
+
+---- vip_flat_discount_default_tax_free_shipping stdout ----
+
+thread 'vip_flat_discount_default_tax_free_shipping' (169716445) panicked at checkout/src/lib.rs:10:5:
+not yet implemented: contract 6: checkout::checkout_order is not implemented yet
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- taxed_state_no_discount_free_shipping stdout ----
+
+thread 'taxed_state_no_discount_free_shipping' (169716443) panicked at checkout/src/lib.rs:10:5:
+not yet implemented: contract 6: checkout::checkout_order is not implemented yet
+
+---- untaxed_state_bulk_discount_flat_shipping stdout ----
+
+thread 'untaxed_state_bulk_discount_flat_shipping' (169716444) panicked at checkout/src/lib.rs:10:5:
+not yet implemented: contract 6: checkout::checkout_order is not implemented yet
+
+
+failures:
+    taxed_state_no_discount_free_shipping
+    untaxed_state_bulk_discount_flat_shipping
+    vip_flat_discount_default_tax_free_shipping
+
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s (the tests must fail against the stub and pass against the reference)

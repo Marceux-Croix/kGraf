@@ -1053,7 +1053,20 @@ impl ModelCaller {
         system: &str,
         user: String,
     ) -> (Result<String, PlanError>, Option<CallId>) {
-        let mut request = Request::new(self.model.clone(), user, self.max_output_tokens);
+        self.ask_keeping_call_capped(kind, system, user, None).await
+    }
+
+    /// [`Self::ask_keeping_call`] with the answer limited to `cap` output
+    /// tokens, when that is under the caller's own limit.
+    pub(crate) async fn ask_keeping_call_capped(
+        &self,
+        kind: &str,
+        system: &str,
+        user: String,
+        cap: Option<u32>,
+    ) -> (Result<String, PlanError>, Option<CallId>) {
+        let limit = cap.map_or(self.max_output_tokens, |c| c.min(self.max_output_tokens));
+        let mut request = Request::new(self.model.clone(), user, limit);
         request.system = vec![kgraf_provider::Content::text(system)];
         let (result, call) = self.complete_once(kind, &request).await;
         (result.map(|response| response.text()), call)
@@ -1200,7 +1213,7 @@ impl ModelCaller {
                     vec![call.clone()],
                     PlanError::Truncated {
                         kind: kind.to_owned(),
-                        max_output_tokens: self.max_output_tokens,
+                        max_output_tokens: request.max_output_tokens,
                     },
                 )),
                 Some(call),
@@ -1386,10 +1399,25 @@ impl Decomposer for ModelDecomposer {
         request: &crate::interface_plan::InterfaceRequest,
     ) -> Result<crate::interface_plan::InterfaceReply, PlanError> {
         let user = crate::interface_plan::interface_prompt(request);
-        let (text, call) = self
+        let (text, call) = match self
             .0
-            .ask("interfaces", crate::interface_plan::INTERFACES_SYSTEM, user)
-            .await?;
+            .ask_keeping_call_capped(
+                "interfaces",
+                crate::interface_plan::INTERFACES_SYSTEM,
+                user,
+                request.output_cap,
+            )
+            .await
+        {
+            (Ok(text), Some(call)) => (text, call),
+            (Ok(_), None) => {
+                return Err(PlanError::BadOutput {
+                    reason: "a completed call has no ledger row".into(),
+                    excerpt: String::new(),
+                });
+            }
+            (Err(e), _) => return Err(e),
+        };
         Ok(crate::interface_plan::InterfaceReply {
             text,
             calls: vec![call],
@@ -1947,13 +1975,19 @@ mod tests {
         let parsed = parse_interfaces(&answer_with(&with_nulls)).expect("parses");
         assert!(parsed[0].wrong.is_empty() && parsed[0].consumer.is_empty());
         assert!(parsed[0].replaces.is_empty());
-        let required_null = ONE_INTERFACE.replace("\"symbols\":[\"parse\"]", "\"symbols\":null");
+        // The stub, symbols and commands may be absent (kGraf fills what it
+        // derived); the producer and its consumers may not.
+        let no_symbols = ONE_INTERFACE.replace("\"symbols\":[\"parse\"]", "\"symbols\":null");
+        let parsed = parse_interfaces(&answer_with(&no_symbols)).expect("symbols may be absent");
+        assert!(parsed[0].symbols.is_empty());
+        let required_null =
+            ONE_INTERFACE.replace("\"parties\":[\"c 1\",\"c2\"]", "\"parties\":null");
         let Err(PlanError::BadOutput { reason, .. }) =
             parse_interfaces(&answer_with(&required_null))
         else {
             panic!("a required list sent as null is refused");
         };
-        assert!(reason.contains("interfaces[0].symbols"), "{reason}");
+        assert!(reason.contains("interfaces[0].parties"), "{reason}");
     }
 
     #[test]
@@ -2465,6 +2499,63 @@ mod tests {
             "{text}"
         );
         assert_eq!(err.calls().map(<[CallId]>::len), Some(1), "attributed");
+    }
+
+    /// An interface ask that states an output cap is limited to it, under the
+    /// caller's own limit: the answer cut off names the cap, not the limit of
+    /// the planner's other calls.
+    #[tokio::test]
+    async fn an_interface_ask_is_limited_to_its_stated_output_cap() {
+        let dir = tempfile::tempdir().expect("dir");
+        let ledger = Arc::new(Ledger::open(&dir.path().join("l.db")).expect("ledger"));
+        let d = ModelDecomposer(ModelCaller {
+            provider: Arc::new(CutOff),
+            ledger,
+            model: "m".into(),
+            max_output_tokens: 32_768,
+            agent: "orchestrator:r".into(),
+            task: "r".into(),
+        });
+        let request = |cap: Option<u32>| crate::interface_plan::InterfaceRequest {
+            context: PlanRequest {
+                instruction: "do it".into(),
+                split_reason: None,
+                notes: vec![],
+                known_files: vec![],
+                routes: vec![],
+                model_routes: vec![],
+                model_calls: None,
+                tools: vec![],
+                templates: vec![],
+                interfaces: true,
+                project_context: String::new(),
+            },
+            contracts: vec![],
+            outer: vec![],
+            consumers: vec![],
+            accepted: vec![],
+            supplied: vec![],
+            output_cap: cap,
+            previous: None,
+        };
+        let capped = d
+            .interfaces(&request(Some(4_096)))
+            .await
+            .expect_err("cut off")
+            .to_string();
+        assert!(
+            capped.contains("cut off at the output limit of 4096 tokens"),
+            "{capped}"
+        );
+        let uncapped = d
+            .interfaces(&request(None))
+            .await
+            .expect_err("cut off")
+            .to_string();
+        assert!(
+            uncapped.contains("cut off at the output limit of 32768 tokens"),
+            "{uncapped}"
+        );
     }
 
     /// A planner that answers with the example JSON from the system prompt it

@@ -326,6 +326,7 @@ mod tests {
             r#"{"allow_bypass": true}"#,
             r#"{"plan_review": false}"#,
             r#"{"allow": {"programs": ["python3"]}}"#,
+            r#"{"script_constructs": ["variables"]}"#,
         ] {
             assert!(
                 matches!(parse(text), Err(WorkerConfigError::Parse { .. })),

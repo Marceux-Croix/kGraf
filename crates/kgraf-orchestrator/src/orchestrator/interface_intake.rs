@@ -4,15 +4,25 @@
 //! ```text
 //!   contracts ask --refused (parse, schema, rule)--> re-ask, at most MAX_PLAN_REASKS
 //!   contracts ask --accepted--> checks off, or one contract --> done
-//!                            --> interface ask
-//!   interface ask --every interface accepted, every consumed edge bound--> done
-//!                 --a refusal, or an edge left unbound--> re-ask with the previous
-//!                   answer and the refusal; accepted interfaces are kept
-//!                 --asks spent, or the answer cut off--> derive a compile check
-//!                   from the repository for each unbound producer; every edge
-//!                   still without an interface is recorded as unchecked
+//!                            --> derive, no model call: per consumed edge the
+//!                                producer's scaffold (stub), the files that use
+//!                                it, the compile command; each derived compile
+//!                                check that passes is registered (compile-only)
+//!                            --> per producer: behavior ask, or not asked
+//!   behavior ask  --no producer needs one--> done, no call
+//!   behavior ask  --every interface accepted, every asked edge bound--> done
+//!                 --a refusal, or an edge left unbound--> re-ask the refused
+//!                   interfaces only, with their previous answer and refusal;
+//!                   accepted interfaces are kept; a compile command that does
+//!                   not build the files is replaced, not asked about
+//!                 --asks spent, or the answer cut off--> every edge no behavior
+//!                   interface binds is recorded as unchecked, with the reason
 //! ```
 //!
+//! A behavior check is asked of the planner for a producer only when no
+//! repository test already exercises it alone and one can exist
+//! ([`derive_interface::behavior_plan`]); the answer holds a reference and a
+//! small test, and kGraf fills the stub, consumer files and compile command.
 //! An omitted interface and a malformed one end the same way: both are asked
 //! for again within the interface budget, then fall back. Neither holds the
 //! run, and neither is skipped without a recorded, counted reason.
@@ -20,9 +30,9 @@
 use super::*;
 use crate::challenge::ContractEvent;
 use crate::checks::{InterfaceContract, SandboxRunner};
-use crate::derive_interface::{self, ProducerFacts};
+use crate::derive_interface::{self, BehaviorPlan, ProducerFacts};
 use crate::interface_plan::{
-    self, InterfaceDraft, InterfaceReply, InterfaceRequest, PreviousAsk, uncovered,
+    self, InterfaceDraft, InterfaceReply, InterfaceRequest, PreviousAsk, Supplied, uncovered,
 };
 use crate::run_state::UncheckedEdge;
 
@@ -300,13 +310,23 @@ impl RunLoop {
         }
     }
 
-    /// The interface call, on its own budget of [`MAX_INTERFACE_ASKS`]. Each
-    /// answer's interfaces are taken one by one ([`Self::take_interfaces`]):
-    /// an accepted one is kept across re-asks, and a re-ask asks only for what
-    /// is still refused or unbound, quoting the previous answer and every
-    /// refusal. Consumed edges still unbound after the budget get a derived
-    /// compile check where the repository allows one, and are returned as
-    /// unchecked. `None`: a stop arrived during a call.
+    /// The interface call. kGraf derives first, at no model cost: for every
+    /// consumed edge, the producer's scaffold as the stub, the repository files
+    /// that use it as the consumer files, and the project's compile command.
+    /// Each derived compile check that passes is registered as an interface of
+    /// kind compile-only. The planner is asked only for what needs judgment, a
+    /// behavior check (a reference and a small test of one producer alone) of
+    /// a producer no repository test already exercises alone and for which
+    /// such a test can exist ([`derive_interface::behavior_plan`]); when no
+    /// producer needs one, no call is made.
+    ///
+    /// The ask has its own budget of [`MAX_INTERFACE_ASKS`]. Each answer's
+    /// interfaces are taken one by one ([`Self::take_interfaces`]): an
+    /// accepted one is kept across re-asks, and a re-ask covers only what is
+    /// still refused or unbound, quoting the previous answer of the refused
+    /// interfaces alone and their refusals. Every consumed edge no behavior
+    /// interface binds is returned as unchecked, with the reason. `None`: a
+    /// stop arrived during a call.
     async fn interface_asks(
         &mut self,
         context: PlanRequest,
@@ -314,41 +334,107 @@ impl RunLoop {
         outer: &BTreeSet<String>,
     ) -> Result<Option<(Vec<InterfaceContract>, Vec<UncheckedEdge>)>, OrchestratorError> {
         let consumers = interface_plan::consumers(specs);
+        // Events of this call are applied once: a resumed run's trace is
+        // replayed into the book before the first one.
+        self.replay_contracts().await?;
+        let derived = self
+            .derive_edges(specs, &consumers, &context.known_files)
+            .await?;
+        let mut accepted: Vec<InterfaceContract> =
+            derived.iter().filter_map(|d| d.interface.clone()).collect();
+        let skipped: BTreeMap<String, String> = derived
+            .iter()
+            .filter_map(|d| match &d.behavior {
+                BehaviorPlan::Skip(why) => Some((d.producer.clone(), why.clone())),
+                BehaviorPlan::Ask => None,
+            })
+            .collect();
+        // The edges the planner is asked a behavior check of.
+        let asked: Vec<(String, Vec<String>)> = consumers
+            .iter()
+            .filter_map(|(c, producers)| {
+                let open: Vec<String> = producers
+                    .iter()
+                    .filter(|p| !skipped.contains_key(*p))
+                    .cloned()
+                    .collect();
+                (!open.is_empty()).then(|| (c.clone(), open))
+            })
+            .collect();
+        self.note_derived(&derived, &asked);
+        let supplied = supplied_for(&derived, &asked);
+        let output_cap = supplied
+            .iter()
+            .any(|s| !s.stub.is_empty())
+            .then_some(interface_plan::SUPPLIED_OUTPUT_TOKENS);
+        // The contracts the ask is about: its producers and their consumers.
+        let involved: BTreeSet<&str> = asked
+            .iter()
+            .flat_map(|(c, ps)| std::iter::once(c.as_str()).chain(ps.iter().map(String::as_str)))
+            .collect();
+        let ask_specs: Vec<ContractSpec> = if output_cap.is_some() {
+            specs
+                .iter()
+                .filter(|s| involved.contains(s.id.as_str()))
+                .cloned()
+                .collect()
+        } else {
+            specs.to_vec()
+        };
         // Edges a refused interface declared (its producer and each other
         // party): the planner said they consume, so they are counted with
         // the dependencies when nothing accepted binds them.
         let mut declared: Vec<(String, Vec<String>)> = Vec::new();
-        let mut accepted: Vec<InterfaceContract> = Vec::new();
+        let mut behavior: Vec<InterfaceContract> = Vec::new();
         let mut previous: Option<PreviousAsk> = None;
         let mut last_refusal: Option<String> = None;
         for ask in 1..=MAX_INTERFACE_ASKS {
+            // Nothing to ask: every asked edge is bound, or every consumed edge
+            // has its behavior check decided without the planner. A plan with
+            // no consumed edge is asked once, as before: the planner may bind
+            // contracts that share a surface and no dependency.
+            if uncovered(&asked, &bound(&behavior)).is_empty()
+                && previous.is_none()
+                && !(consumers.is_empty() && ask == 1)
+            {
+                break;
+            }
             let request = InterfaceRequest {
                 context: context.clone(),
-                contracts: specs.to_vec(),
+                contracts: ask_specs.clone(),
                 outer: outer.iter().cloned().collect(),
-                consumers: consumers.clone(),
-                accepted: bound(&accepted),
+                consumers: uncovered(&asked, &bound(&behavior)),
+                accepted: bound(&behavior),
+                supplied: supplied.clone(),
+                output_cap,
                 previous: previous.take(),
             };
-            let (refusal, answer) = match self.interface_ask_once(&request).await {
+            let (refusal, answer) = match self.interface_ask_once(&request, ask).await {
                 Ok(None) => return Ok(None),
                 Ok(Some(reply)) => {
-                    let (mut reasons, implied) = self
-                        .take_interfaces(&reply.text, specs, outer, &mut accepted)
+                    let taken = self
+                        .take_interfaces(&reply.text, specs, outer, &mut behavior, &derived)
                         .await?;
-                    for (consumer, producer) in implied {
+                    let mut reasons = taken.refusals;
+                    for (consumer, producer) in taken.implied {
                         add_edge(&mut declared, &consumer, &producer);
                     }
-                    let open = uncovered(&consumers, &bound(&accepted));
+                    let open = uncovered(&asked, &bound(&behavior));
                     if !open.is_empty() {
                         reasons.push(interface_plan::unbound_reason(&open));
                     }
                     if reasons.is_empty() {
-                        // An earlier refusal stays the reason for any edge a
-                        // refused interface declared and nothing bound.
                         break;
                     }
-                    (reasons.join("\n"), Some(reply.text))
+                    // Only the interfaces refused are quoted back; an answer
+                    // that was not read at all is quoted whole.
+                    let quoted = if taken.unparsed {
+                        reply.text
+                    } else {
+                        interface_plan::answer_subset(&reply.text, &taken.failed)
+                            .unwrap_or(reply.text)
+                    };
+                    (reasons.join("\n"), Some(quoted))
                 }
                 // A cut-off answer is not asked again (it would be cut off
                 // again); it falls back like a spent budget.
@@ -385,36 +471,82 @@ impl RunLoop {
                 add_edge(&mut wanted, consumer, p);
             }
         }
-        let open = uncovered(&wanted, &bound(&accepted));
+        let open = uncovered(&wanted, &bound(&behavior));
         let mut unchecked = Vec::new();
-        if !open.is_empty() {
-            let why = last_refusal.unwrap_or_else(|| "the planner wrote none".to_owned());
-            let derived = self.derive_compile_checks(specs, &open).await?;
-            for (consumer, producers) in &open {
-                for producer in producers {
-                    let found = derived
-                        .iter()
-                        .find(|(p, _)| p == producer)
-                        .map_or("no compile check was derived", |(_, r)| r.as_str());
-                    unchecked.push(UncheckedEdge {
-                        consumer: consumer.clone(),
-                        producer: producer.clone(),
-                        reason: kgraf_secrets::scrub_persist_owned(format!(
-                            "no interface the planner wrote was accepted ({}); {found}",
-                            one_line(&why, 1_500)
-                        )),
-                    });
-                }
+        for (consumer, producers) in &open {
+            for producer in producers {
+                let found = derived
+                    .iter()
+                    .find(|d| &d.producer == producer)
+                    .map_or("no compile check was derived", |d| d.compile_note.as_str());
+                let why = match skipped.get(producer) {
+                    Some(why) => format!("behavior check not run: {why}"),
+                    None => format!(
+                        "no behavior interface the planner wrote was accepted ({})",
+                        one_line(
+                            last_refusal.as_deref().unwrap_or("the planner wrote none"),
+                            1_500
+                        )
+                    ),
+                };
+                unchecked.push(UncheckedEdge {
+                    consumer: consumer.clone(),
+                    producer: producer.clone(),
+                    reason: kgraf_secrets::scrub_persist_owned(format!("{why}; {found}")),
+                });
             }
         }
+        accepted.extend(behavior);
         Ok(Some((accepted, unchecked)))
     }
 
+    /// A notice of what kGraf derived and what it asks the planner: the
+    /// compile-only interfaces registered, and per producer whether a behavior
+    /// check is asked for.
+    fn note_derived(&mut self, derived: &[Derived], asked: &[(String, Vec<String>)]) {
+        if derived.is_empty() {
+            return;
+        }
+        let compile: Vec<&str> = derived
+            .iter()
+            .filter(|d| d.interface.is_some())
+            .map(|d| d.producer.as_str())
+            .collect();
+        let asking: BTreeSet<&str> = asked
+            .iter()
+            .flat_map(|(_, ps)| ps.iter().map(String::as_str))
+            .collect();
+        let mut text = format!(
+            "kGraf derived {} compile-only interface(s) from the repository{}; a behavior \
+             check is asked of the planner for {}",
+            compile.len(),
+            if compile.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", compile.join(", "))
+            },
+            if asking.is_empty() {
+                "no producer".to_owned()
+            } else {
+                asking.into_iter().collect::<Vec<_>>().join(", ")
+            }
+        );
+        for d in derived {
+            if let BehaviorPlan::Skip(why) = &d.behavior {
+                text.push_str(&format!("; not asked for {}: {why}", d.producer));
+            }
+        }
+        self.intake_notice(kgraf_secrets::scrub_persist_owned(text));
+    }
+
     /// One ask of the interface call: reserved, ledgered and settled as the
-    /// contracts call is. `None`: a stop arrived during the call.
+    /// contracts call is, and counted ([`ContractEvent::InterfaceAsked`]) with
+    /// the time and output tokens it took. `None`: a stop arrived during the
+    /// call.
     async fn interface_ask_once(
         &mut self,
         request: &InterfaceRequest,
+        ask: u32,
     ) -> Result<Option<InterfaceReply>, OrchestratorError> {
         let input = estimate_tokens(&request.context.instruction)
             + request
@@ -434,7 +566,10 @@ impl RunLoop {
                 estimate_tokens(&p.answer) + estimate_tokens(&p.refusal)
             })
             + 2_000;
-        let basis = self.s.decomposer.cost_basis();
+        let mut basis = self.s.decomposer.cost_basis();
+        if let Some(cap) = request.output_cap {
+            basis.max_output_tokens = basis.max_output_tokens.min(cap);
+        }
         let reservation = self.reserve_rounds(&basis, input, 0);
         let stop = self.stop_token.clone();
         let out = tokio::select! {
@@ -451,35 +586,88 @@ impl RunLoop {
             );
             return Ok(None);
         };
+        let producers: Vec<String> = {
+            let mut p: Vec<String> = request
+                .consumers
+                .iter()
+                .flat_map(|(_, ps)| ps.iter().cloned())
+                .collect();
+            p.sort();
+            p.dedup();
+            p
+        };
         match out {
             Ok(reply) => {
                 self.settle_call(reservation, Some(&reply.calls))?;
+                self.count_interface_ask(ask, producers, &reply.calls)
+                    .await?;
                 Ok(Some(reply))
             }
             Err(e) => {
+                let calls = e.calls().map(<[CallId]>::to_vec).unwrap_or_default();
                 self.settle_call(reservation, e.calls())?;
+                self.count_interface_ask(ask, producers, &calls).await?;
                 Err(e.into())
             }
         }
     }
 
+    /// Record what `calls` of one interface ask cost: their number, their
+    /// wall-clock time and their output tokens, read from the ledger.
+    async fn count_interface_ask(
+        &mut self,
+        ask: u32,
+        producers: Vec<String>,
+        calls: &[CallId],
+    ) -> Result<(), OrchestratorError> {
+        let ledger = self.s.ledger.clone();
+        let ids = calls.to_vec();
+        let (ms, output_tokens) = blocking(move || {
+            let (mut ms, mut tokens) = (0u64, 0u64);
+            for id in &ids {
+                if let Some(r) = ledger.call(id)? {
+                    ms += r
+                        .finished_ms
+                        .map_or(0, |f| u64::try_from(f - r.started_ms).unwrap_or(0));
+                    tokens += r.usage.text_output + r.usage.reasoning_output;
+                }
+            }
+            Ok::<_, kgraf_provider::LedgerError>((ms, tokens))
+        })?;
+        self.contract_event(ContractEvent::InterfaceAsked {
+            ask,
+            producers,
+            calls: calls.len() as u64,
+            ms,
+            output_tokens,
+        })
+        .await
+    }
+
     /// Take an interface answer: every interface that is well formed, binds
     /// contracts of the plan, names every file it needs and passes its
     /// mechanical checks joins `accepted`; each other one is refused with
-    /// what it needs. Returns the refusals, each naming its interface, and the
-    /// `(consumer, producer)` edges the refused interfaces declared.
+    /// what it needs. What kGraf derived for a producer fills what the answer
+    /// leaves out (the stub, the consumer files, the names, the compile
+    /// command), and a compile command that does not build the files is
+    /// replaced by the derived one and the checks run again, with no re-ask.
     async fn take_interfaces(
         &mut self,
         text: &str,
         specs: &[ContractSpec],
         outer: &BTreeSet<String>,
         accepted: &mut Vec<InterfaceContract>,
-    ) -> Result<(Vec<String>, Vec<(String, String)>), OrchestratorError> {
+        derived: &[Derived],
+    ) -> Result<Taken, OrchestratorError> {
+        let mut taken = Taken::default();
         let drafts = match crate::interface_plan::parse_interfaces(text) {
             Ok(d) => d,
-            Err(e) => return Ok((vec![e.to_string()], Vec::new())),
+            Err(e) => {
+                taken.unparsed = true;
+                taken.refusals.push(e.to_string());
+                return Ok(taken);
+            }
         };
-        let mut implied: Vec<(String, String)> = Vec::new();
         let ids: BTreeSet<&str> = specs.iter().map(|s| s.id.as_str()).collect();
         let writes_of = |p: &str| -> Option<Vec<String>> {
             specs
@@ -487,12 +675,13 @@ impl RunLoop {
                 .find(|s| s.id == p)
                 .map(|s| s.writes.iter().map(|w| w.path.clone()).collect())
         };
-        let mut refusals = Vec::new();
-        for draft in drafts {
+        for (index, draft) in drafts.into_iter().enumerate() {
             let InterfaceDraft {
-                interface,
+                mut interface,
                 from_repository,
             } = draft;
+            self.fill_derived(&mut interface, &from_repository, derived)
+                .await;
             // Sanitized one at a time: one interface's command problem refuses
             // that interface, not the others.
             let mut ic = match sanitize_interfaces(vec![interface.clone()]) {
@@ -504,8 +693,9 @@ impl RunLoop {
                         .iter()
                         .map(|p| crate::plan::sanitize_id(p))
                         .collect();
-                    implied.extend(declared_edges(&raw, &writes_of, &ids));
-                    refusals.push(e.to_string());
+                    taken.implied.extend(declared_edges(&raw, &writes_of, &ids));
+                    taken.refusals.push(e.to_string());
+                    taken.failed.push(index);
                     continue;
                 }
             };
@@ -513,10 +703,16 @@ impl RunLoop {
             if accepted.iter().any(|a| same_artifact(a, &ic)) {
                 continue;
             }
-            if accepted.iter().any(|a| a.id == ic.id) {
+            let id_taken = |id: &str, accepted: &[InterfaceContract]| {
+                accepted.iter().any(|a| a.id == id)
+                    || derived
+                        .iter()
+                        .any(|d| d.interface.as_ref().is_some_and(|i| i.id == id))
+            };
+            if id_taken(&ic.id, accepted) {
                 let base = ic.id.clone();
                 let mut n = 2;
-                while accepted.iter().any(|a| a.id == format!("{base}-{n}")) {
+                while id_taken(&format!("{base}-{n}"), accepted) {
                     n += 1;
                 }
                 ic.id = format!("{base}-{n}");
@@ -552,24 +748,154 @@ impl RunLoop {
             }
             if problems.is_empty()
                 && let Some(runner) = self.checks_runner()
-                && let Ok(Err(failure)) = crate::checks::check_mechanical(&runner, &ic).await
             {
-                // A check that could not run says nothing about the interface:
-                // it is taken, and the gate records the check as not run.
-                problems.push(format!(
-                    "interface `{}` failed its pre-dispatch check: {failure}{}",
-                    ic.id,
-                    check_guidance(failure.stage)
-                ));
+                // A check that could not run (`Err`) says nothing about the
+                // interface: it is taken, and the gate records the check as not
+                // run.
+                if let Ok(Err(failure)) = self.check_with_repair(&runner, &mut ic).await {
+                    problems.push(format!(
+                        "interface `{}` failed its pre-dispatch check: {failure}{}",
+                        ic.id,
+                        check_guidance(failure.stage)
+                    ));
+                }
             }
             if problems.is_empty() {
                 accepted.push(ic);
             } else {
-                implied.extend(declared_edges(&ic, &writes_of, &ids));
-                refusals.extend(problems);
+                taken.implied.extend(declared_edges(&ic, &writes_of, &ids));
+                taken.refusals.extend(problems);
+                taken.failed.push(index);
             }
         }
-        Ok((refusals, implied))
+        Ok(taken)
+    }
+
+    /// Fill into `ic` what kGraf derived for its producer and the answer left
+    /// out: the stub (the scaffold the repository holds, declared in
+    /// `replaces`: it stands in for that file), the consumer files, the names
+    /// on the surface. A compile command the answer lacks, or that cannot run
+    /// in the check sandbox, is replaced by the one derived over the files the
+    /// interface builds ([`Self::derived_compile`]).
+    async fn fill_derived(
+        &mut self,
+        ic: &mut InterfaceContract,
+        from_repository: &[(&'static str, usize)],
+        derived: &[Derived],
+    ) {
+        // The producer is the party kGraf derived a base for whose consumers
+        // the other parties are; failing that, the first party with a base.
+        let parties: Vec<String> = ic
+            .parties
+            .iter()
+            .map(|p| crate::plan::sanitize_id(p))
+            .collect();
+        let with_base: Vec<&Derived> = parties
+            .iter()
+            .filter_map(|p| {
+                derived
+                    .iter()
+                    .find(|d| &d.producer == p && d.base.is_some())
+            })
+            .collect();
+        let producer = with_base
+            .iter()
+            .find(|d| {
+                parties
+                    .iter()
+                    .any(|p| *p != d.producer && d.consumers.contains(p))
+            })
+            .or(with_base.first())
+            .and_then(|d| d.base.as_ref());
+        if let Some(base) = producer {
+            if ic.stub.is_empty() {
+                ic.stub = base.stub.clone();
+                for f in &base.stub {
+                    if !ic.replaces.contains(&f.path) {
+                        ic.replaces.push(f.path.clone());
+                    }
+                }
+            }
+            if ic.consumer.is_empty() && !from_repository.iter().any(|(l, _)| *l == "consumer") {
+                ic.consumer = base.consumer.clone();
+            }
+            if ic.symbols.is_empty() {
+                ic.symbols = base
+                    .symbols
+                    .iter()
+                    .take(MAX_FILLED_SYMBOLS)
+                    .cloned()
+                    .collect();
+            }
+        }
+        let broken = ic
+            .command_problems()
+            .iter()
+            .any(|p| p.starts_with("the compile"));
+        if (ic.compile.is_empty() || broken)
+            && let Some(cmd) = self.derived_compile(ic).await
+        {
+            if broken {
+                self.intake_notice(format!(
+                    "interface `{}`: the compile command could not run in the check sandbox; \
+                     kGraf uses `{}`",
+                    ic.id,
+                    cmd.join(" ")
+                ));
+            }
+            ic.compile = cmd;
+        }
+    }
+
+    /// The compile command the project's build tool takes over the consumer
+    /// and test files of `ic`, or `None` when the language or a package is
+    /// not known ([`derive_interface::compile_command`]).
+    async fn derived_compile(&self, ic: &InterfaceContract) -> Option<Vec<String>> {
+        let runner = self.checks_runner()?;
+        let files: Vec<String> = ic
+            .consumer
+            .iter()
+            .chain(&ic.tests)
+            .map(|f| f.path.clone())
+            .collect();
+        let manifests = manifests_for(&runner, &files).await;
+        derive_interface::compile_command(&files, |f| package_in(&manifests, f))
+    }
+
+    /// The mechanical checks of `ic`; when the stub-compile stage fails, the
+    /// derived compile command replaces the answer's and they run again, once,
+    /// so a command that does not build every file is repaired and not asked
+    /// about. `ic` takes the repaired command when the checks then pass.
+    async fn check_with_repair(
+        &mut self,
+        runner: &SandboxRunner,
+        ic: &mut InterfaceContract,
+    ) -> Result<Result<(), crate::checks::CheckFailure>, crate::checks::CheckError> {
+        let first = crate::checks::check_mechanical(runner, ic).await?;
+        let Err(failure) = first else {
+            return Ok(Ok(()));
+        };
+        if failure.stage != crate::checks::CheckStage::StubCompile {
+            return Ok(Err(failure));
+        }
+        let Some(cmd) = self.derived_compile(ic).await.filter(|c| *c != ic.compile) else {
+            return Ok(Err(failure));
+        };
+        let mut repaired = ic.clone();
+        repaired.compile = cmd;
+        match crate::checks::check_mechanical(runner, &repaired).await? {
+            Ok(_) => {
+                self.intake_notice(format!(
+                    "interface `{}`: the answer's compile command did not build every file; \
+                     kGraf replaced it with `{}`, and the checks passed",
+                    ic.id,
+                    repaired.compile.join(" ")
+                ));
+                *ic = repaired;
+                Ok(Ok(()))
+            }
+            Err(second) => Ok(Err(second)),
+        }
     }
 
     /// Fill the consumer and tests entries an answer named by path alone from
@@ -652,19 +978,22 @@ impl RunLoop {
         problems
     }
 
-    /// For each producer in `open`, a compile check derived from the
-    /// repository ([`crate::derive_interface`]), run now: what it found, as a
-    /// sentence for the unchecked edges' reason. Never holds the run.
-    async fn derive_compile_checks(
+    /// For every producer of a consumed edge, what kGraf can derive before any
+    /// planner call, and whether a behavior check needs the planner. The
+    /// compile check of each derived interface runs now; a derived interface
+    /// whose check fails is not registered (its failure is the reason an edge
+    /// reads as unchecked). Never holds the run.
+    async fn derive_edges(
         &mut self,
         specs: &[ContractSpec],
-        open: &[(String, Vec<String>)],
-    ) -> Result<Vec<(String, String)>, OrchestratorError> {
+        consumers: &[(String, Vec<String>)],
+        known_files: &[String],
+    ) -> Result<Vec<Derived>, OrchestratorError> {
         let Some(runner) = self.checks_runner() else {
             return Ok(Vec::new());
         };
         let mut by_producer: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for (consumer, producers) in open {
+        for (consumer, producers) in consumers {
             for p in producers {
                 by_producer
                     .entry(p.clone())
@@ -672,6 +1001,8 @@ impl RunLoop {
                     .push(consumer.clone());
             }
         }
+        let tests = repo_tests(&runner, known_files).await;
+        let contract_facts = contract_facts(&runner, specs).await;
         let mut out = Vec::new();
         for (producer, consumers) in by_producer {
             let Some(spec) = specs.iter().find(|s| s.id == producer) else {
@@ -680,73 +1011,16 @@ impl RunLoop {
             let facts = self
                 .producer_facts(&runner, spec, &consumers, specs)
                 .await?;
-            let mut manifests: BTreeMap<String, Option<String>> = BTreeMap::new();
-            for (path, _) in &facts.users {
-                for dir in derive_interface::ancestors(path) {
-                    let manifest = if dir.is_empty() {
-                        "Cargo.toml".to_owned()
-                    } else {
-                        format!("{dir}/Cargo.toml")
-                    };
-                    if manifests.contains_key(&manifest) {
-                        continue;
-                    }
-                    let text = runner.read_base(&manifest).await.ok().flatten();
-                    manifests.insert(manifest, text);
-                }
-            }
-            let package = |file: &str| {
-                derive_interface::ancestors(file)
-                    .into_iter()
-                    .find_map(|dir| {
-                        let manifest = if dir.is_empty() {
-                            "Cargo.toml".to_owned()
-                        } else {
-                            format!("{dir}/Cargo.toml")
-                        };
-                        manifests
-                            .get(&manifest)
-                            .and_then(|m| m.as_deref())
-                            .and_then(derive_interface::cargo_package)
-                    })
-            };
-            let summary = match derive_interface::derive(&facts, |files| {
-                derive_interface::compile_command(files, package)
-            }) {
-                Err(why) => format!("no compile check could be derived: {why}"),
-                Ok(ic) => {
-                    let files: Vec<&str> = ic
-                        .consumer
-                        .iter()
-                        .chain(&ic.tests)
-                        .map(|f| f.path.as_str())
-                        .collect();
-                    let what = format!(
-                        "kGraf derived a compile check from the repository (stub: the scaffold \
-                         of {}; files: {}; `{}`)",
-                        ic.stub
-                            .iter()
-                            .map(|f| f.path.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", "),
-                        files.join(", "),
-                        ic.compile.join(" ")
-                    );
-                    let verdict = match crate::checks::check_derived_compile(&runner, &ic).await {
-                        Ok(Ok(runs)) => format!(
-                            "it passed ({} run(s): stub-compile and canaries)",
-                            runs.len()
-                        ),
-                        Ok(Err(failure)) => format!("it failed: {failure}"),
-                        Err(e) => format!("it could not run: {e}"),
-                    };
-                    format!(
-                        "{what}, and {verdict}; the vacuity check did not run: no reference \
-                         implementation exists to pass a test"
-                    )
-                }
-            };
-            out.push((producer, summary));
+            let (interface, base, compile_note) = derive_one(&runner, &facts).await;
+            let behavior = derive_interface::behavior_plan(&producer, &tests, &contract_facts);
+            out.push(Derived {
+                producer,
+                consumers,
+                interface,
+                compile_note,
+                base,
+                behavior,
+            });
         }
         Ok(out)
     }
@@ -865,13 +1139,20 @@ impl RunLoop {
                 add_edge(&mut consumers, &e.consumer, &e.producer);
             }
         }
-        let open = uncovered(&consumers, &bound(interfaces));
+        // A compile-only interface binds an edge for compilation only: the
+        // edge's behavior check is the one that did not run.
+        let behavior: Vec<InterfaceContract> = interfaces
+            .iter()
+            .filter(|i| !i.is_compile_only())
+            .cloned()
+            .collect();
+        let open = uncovered(&consumers, &bound(&behavior));
         if open.is_empty() {
             return Ok(());
         }
         let detail = format!(
-            "contract checks did not run for {}: no interface kGraf could accept binds them, \
-             so they are counted as not run",
+            "contract checks did not run for {}: no behavior interface kGraf could accept binds \
+             them (a compile-only interface may), so they are counted as not run",
             interface_plan::describe_consumers(&open)
         );
         self.intake_notice(detail.clone());
@@ -986,4 +1267,250 @@ fn one_line(text: &str, max: usize) -> String {
     } else {
         flat
     }
+}
+
+/// What kGraf found for one producer before any planner call.
+struct Derived {
+    producer: String,
+    /// The plan's consumers of the producer.
+    consumers: Vec<String>,
+    /// The compile-only interface, when one was derived and its check passed:
+    /// registered with the plan's interfaces.
+    interface: Option<InterfaceContract>,
+    /// What the compile check found, as a clause of an unchecked edge's reason.
+    compile_note: String,
+    /// What the producer's repository files give an answer: its stub, the
+    /// consumer files, the names.
+    base: Option<DerivedBase>,
+    /// Whether the planner is asked for a behavior check.
+    behavior: BehaviorPlan,
+}
+
+/// The stub, consumer files and names a behavior answer need not give.
+#[derive(Clone)]
+struct DerivedBase {
+    stub: Vec<crate::checks::FileOverlay>,
+    consumer: Vec<crate::checks::FileOverlay>,
+    symbols: Vec<String>,
+}
+
+/// What [`RunLoop::take_interfaces`] found in one answer.
+#[derive(Default)]
+struct Taken {
+    /// Refusals, each naming its interface.
+    refusals: Vec<String>,
+    /// The `(consumer, producer)` edges the refused interfaces declared.
+    implied: Vec<(String, String)>,
+    /// Positions in the answer's list of the interfaces refused.
+    failed: Vec<usize>,
+    /// The answer could not be read as a list of interfaces.
+    unparsed: bool,
+}
+
+/// The most names kGraf fills into an interface from a producer's files.
+const MAX_FILLED_SYMBOLS: usize = 40;
+
+/// The most repository test files read to decide where a test of one producer
+/// alone can exist.
+const MAX_TEST_FILES: usize = 60;
+
+/// What the planner is shown of each producer it is asked a behavior check of.
+fn supplied_for(derived: &[Derived], asked: &[(String, Vec<String>)]) -> Vec<Supplied> {
+    let producers: BTreeSet<&str> = asked
+        .iter()
+        .flat_map(|(_, ps)| ps.iter().map(String::as_str))
+        .collect();
+    // Only when kGraf holds something for at least one: with nothing derived
+    // the request is the plain one.
+    if !derived
+        .iter()
+        .any(|d| producers.contains(d.producer.as_str()) && d.base.is_some())
+    {
+        return Vec::new();
+    }
+    derived
+        .iter()
+        .filter(|d| producers.contains(d.producer.as_str()))
+        .map(|d| Supplied {
+            producer: d.producer.clone(),
+            consumers: d.consumers.clone(),
+            stub: d.base.as_ref().map_or_else(Vec::new, |b| {
+                b.stub.iter().map(|f| f.path.clone()).collect()
+            }),
+            consumer: d.base.as_ref().map_or_else(Vec::new, |b| {
+                b.consumer.iter().map(|f| f.path.clone()).collect()
+            }),
+            symbols: d.base.as_ref().map_or_else(Vec::new, |b| b.symbols.clone()),
+        })
+        .collect()
+}
+
+/// The `Cargo.toml` of every directory above each of `files`, read from the
+/// dispatch base (`None`: there is none).
+async fn manifests_for(
+    runner: &SandboxRunner,
+    files: &[String],
+) -> BTreeMap<String, Option<String>> {
+    let mut manifests: BTreeMap<String, Option<String>> = BTreeMap::new();
+    for file in files {
+        for dir in derive_interface::ancestors(file) {
+            let manifest = if dir.is_empty() {
+                "Cargo.toml".to_owned()
+            } else {
+                format!("{dir}/Cargo.toml")
+            };
+            if manifests.contains_key(&manifest) {
+                continue;
+            }
+            let text = runner.read_base(&manifest).await.ok().flatten();
+            manifests.insert(manifest, text);
+        }
+    }
+    manifests
+}
+
+/// The Cargo package that holds `file`: the nearest manifest above it that
+/// declares one.
+fn package_in(manifests: &BTreeMap<String, Option<String>>, file: &str) -> Option<String> {
+    derive_interface::ancestors(file)
+        .into_iter()
+        .find_map(|dir| {
+            let manifest = if dir.is_empty() {
+                "Cargo.toml".to_owned()
+            } else {
+                format!("{dir}/Cargo.toml")
+            };
+            manifests
+                .get(&manifest)
+                .and_then(|m| m.as_deref())
+                .and_then(derive_interface::cargo_package)
+        })
+}
+
+/// The compile-only interface kGraf derives for `facts`, with its compile
+/// check run, what a behavior answer can be given, and what was found as a
+/// clause for the record. An interface whose check fails is not returned.
+async fn derive_one(
+    runner: &SandboxRunner,
+    facts: &ProducerFacts,
+) -> (Option<InterfaceContract>, Option<DerivedBase>, String) {
+    let stub = derive_interface::stub_of(facts);
+    let files: Vec<String> = facts.users.iter().map(|(p, _)| p.clone()).collect();
+    let manifests = manifests_for(runner, &files).await;
+    let package = |f: &str| package_in(&manifests, f);
+    let stub_only = |stub: Vec<crate::checks::FileOverlay>| {
+        (!stub.is_empty()).then(|| DerivedBase {
+            stub,
+            consumer: Vec::new(),
+            symbols: facts.symbols.clone(),
+        })
+    };
+    let ic = match derive_interface::derive(facts, |files| {
+        derive_interface::compile_command(files, package)
+    }) {
+        Err(why) => {
+            return (
+                None,
+                stub_only(stub),
+                format!("no compile check could be derived: {why}"),
+            );
+        }
+        Ok(ic) => ic,
+    };
+    let files: Vec<&str> = ic
+        .consumer
+        .iter()
+        .chain(&ic.tests)
+        .map(|f| f.path.as_str())
+        .collect();
+    let what = format!(
+        "kGraf derived a compile check from the repository (stub: the scaffold of {}; files: {}; \
+         `{}`)",
+        ic.stub
+            .iter()
+            .map(|f| f.path.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+        files.join(", "),
+        ic.compile.join(" ")
+    );
+    match crate::checks::check_derived_compile(runner, &ic).await {
+        Ok(Ok(runs)) => {
+            let base = DerivedBase {
+                stub: ic.stub.clone(),
+                consumer: ic.consumer.clone(),
+                symbols: ic.symbols.clone(),
+            };
+            (
+                Some(ic),
+                Some(base),
+                format!(
+                    "{what}, and it passed ({} run(s): stub-compile and canaries); it is \
+                     registered as a compile-only interface",
+                    runs.len()
+                ),
+            )
+        }
+        Ok(Err(failure)) => (
+            None,
+            stub_only(stub),
+            format!("{what}, and it failed: {failure}; it is not registered"),
+        ),
+        Err(e) => (
+            None,
+            stub_only(stub),
+            format!("{what}, and it could not run: {e}; it is not registered"),
+        ),
+    }
+}
+
+/// The repository's test files, read from the dispatch base (at most
+/// [`MAX_TEST_FILES`], each under 200 KB).
+async fn repo_tests(
+    runner: &SandboxRunner,
+    known_files: &[String],
+) -> Vec<derive_interface::TestFile> {
+    let mut out = Vec::new();
+    for path in known_files
+        .iter()
+        .filter(|f| derive_interface::is_test_path(f))
+        .take(MAX_TEST_FILES)
+    {
+        if let Some(text) = runner.read_base(path).await.ok().flatten()
+            && text.len() <= 200_000
+        {
+            out.push(derive_interface::TestFile {
+                path: path.clone(),
+                text,
+            });
+        }
+    }
+    out
+}
+
+/// What a test's reach needs to know of each contract of the plan: whether
+/// its code exists yet, and the words that show a file uses it.
+async fn contract_facts(
+    runner: &SandboxRunner,
+    specs: &[ContractSpec],
+) -> Vec<derive_interface::ContractFacts> {
+    let mut out = Vec::new();
+    for spec in specs {
+        let paths: Vec<String> = spec.writes.iter().map(|w| w.path.clone()).collect();
+        let manifests = manifests_for(runner, &paths).await;
+        let mut writes = Vec::new();
+        for p in &paths {
+            writes.push((p.clone(), runner.read_base(p).await.ok().flatten()));
+        }
+        let unimplemented = writes
+            .iter()
+            .any(|(_, c)| c.as_deref().is_none_or(derive_interface::is_scaffold));
+        out.push(derive_interface::ContractFacts {
+            id: spec.id.clone(),
+            depends_on: spec.depends_on.clone(),
+            unimplemented,
+            tokens: derive_interface::use_tokens(&writes, |f| package_in(&manifests, f)),
+        });
+    }
+    out
 }

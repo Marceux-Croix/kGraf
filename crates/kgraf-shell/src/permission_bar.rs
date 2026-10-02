@@ -19,7 +19,7 @@ use std::sync::Arc;
 use kgraf_orchestrator::{AskAnswer, PendingAsk, PermissionRequestView, PlanAnswer, PlanView};
 use kgraf_tools::permissions::{
     BYPASS_WARNING, ModeError, ModeSource, PermissionControl, PermissionMode, PermissionSettings,
-    ProcessFacts, Raised, group_requests,
+    ProcessFacts, Raised, SCRIPT_CONSTRUCTS_RISK, ScriptConstruct, group_requests,
 };
 
 use crate::orchestrator_box::{BoxBackend, Line};
@@ -98,6 +98,70 @@ impl PermissionUi {
             Err(e) => Line::Error(format!("{said}, for this session only: {e}")),
         }
     }
+}
+
+/// One script-construct switch changed in the settings surface (decision
+/// 0094, amended 2026-10-02): the live control first, so the next call any
+/// worker makes is judged with it, then the user-level file.
+pub fn set_script_construct(ui: &PermissionUi, construct: ScriptConstruct, on: bool) -> Line {
+    ui.control.set_script_construct(construct, on);
+    ui.saved(format!(
+        "{}: {}. It applies to the next shell call of every worker",
+        construct.label(),
+        if on {
+            "on, so a mode that grants programs may grant a script using it"
+        } else {
+            "off, so a script using it is asked about"
+        }
+    ))
+}
+
+/// The script-construct switches, for the settings surface's Permissions
+/// section: the risk the user accepts, then one switch per construct with
+/// its plain explanation below (CMP-SET-1: label, then a 13 px `--text-2`
+/// description). Each is off until the user turns it on. Returns the lines
+/// of any change.
+pub fn draw_script_constructs(
+    ui: &mut egui::Ui,
+    perm: &PermissionUi,
+    p: &crate::theme::Palette,
+) -> Vec<Line> {
+    use egui::RichText;
+    let mut lines = Vec::new();
+    let on = perm.control.script_constructs();
+    ui.add_space(8.0);
+    ui.label(
+        RichText::new("Shell scripts a mode may grant")
+            .font(crate::theme::medium(14.0))
+            .color(p.text),
+    );
+    ui.label(
+        RichText::new(SCRIPT_CONSTRUCTS_RISK)
+            .small()
+            .color(p.text_2),
+    );
+    for construct in ScriptConstruct::ALL {
+        let mut checked = on.allows(construct);
+        ui.add_space(4.0);
+        // CMP-SET-4 names a switch; egui's checkbox is the toggle this shell
+        // uses for every on/off setting. TXT-5: the hover says what it does.
+        if ui
+            .checkbox(&mut checked, construct.label())
+            .on_hover_text(
+                "On: a mode that grants programs may grant a script using this, when it \
+                 grants every program kGraf can see in the script.",
+            )
+            .changed()
+        {
+            lines.push(set_script_construct(perm, construct, checked));
+        }
+        ui.label(
+            RichText::new(construct.explanation())
+                .small()
+                .color(p.text_2),
+        );
+    }
+    lines
 }
 
 /// One permission request in the box: a worker's approval ask, or a request
@@ -796,6 +860,77 @@ mod tests {
             "{line:?}"
         );
         assert_eq!(ui.control.mode(), PermissionMode::Manual);
+    }
+
+    /// The script-construct switches draw off by default, and clicking one
+    /// reaches the shared control the workers' shells read and the user
+    /// file; clicking it again turns it off in both.
+    #[test]
+    fn the_script_construct_switches_start_off_and_reach_the_shared_control() {
+        use egui_kittest::kittest::{NodeT, Queryable};
+        let dir = tempfile::tempdir().expect("dir");
+        let perm = ui_at(dir.path(), PermissionSettings::default());
+        let drawn = perm.clone();
+        let mut h = egui_kittest::Harness::new_ui(move |ui| {
+            if !crate::theme::ensure(ui.ctx()) {
+                return;
+            }
+            let p = crate::theme::Palette::dark();
+            let _ = draw_script_constructs(ui, &drawn, &p);
+        });
+        h.run();
+        for c in ScriptConstruct::ALL {
+            let node = h.get_by_label(c.label());
+            assert_eq!(
+                node.accesskit_node().toggled(),
+                Some(egui::accesskit::Toggled::False),
+                "{c} starts off"
+            );
+            h.get_by_label_contains(&c.explanation()[..40]);
+        }
+        h.get_by_label_contains("kGraf cannot see what a variable or a substitution");
+        assert!(perm.control.script_constructs().is_empty());
+
+        h.get_by_label(ScriptConstruct::Variables.label()).click();
+        h.run();
+        assert!(
+            perm.control
+                .script_constructs()
+                .allows(ScriptConstruct::Variables)
+        );
+        assert!(
+            reread(&perm)
+                .script_constructs
+                .allows(ScriptConstruct::Variables)
+        );
+        assert_eq!(
+            h.get_by_label(ScriptConstruct::Variables.label())
+                .accesskit_node()
+                .toggled(),
+            Some(egui::accesskit::Toggled::True)
+        );
+        // The switch reaches what a worker's shell decides.
+        perm.control
+            .set_mode(PermissionMode::Auto, ModeSource::UserInterface)
+            .expect("auto");
+        perm.control.set_allow(
+            kgraf_tools::permissions::AllowSet::default()
+                .with_programs(["mkdir", "ls"])
+                .expect("allow"),
+        );
+        let policy = kgraf_tools::execpolicy::ExecPolicy::default_kgraf_policy()
+            .with_permissions(perm.control.clone());
+        let script: Vec<String> = ["sh", "-c", "mkdir out && ls $(ls)"]
+            .iter()
+            .map(|w| (*w).to_owned())
+            .collect();
+        assert!(policy.evaluate(&script).granted);
+
+        h.get_by_label(ScriptConstruct::Variables.label()).click();
+        h.run();
+        assert!(perm.control.script_constructs().is_empty());
+        assert!(reread(&perm).script_constructs.is_empty());
+        assert!(!policy.evaluate(&script).granted);
     }
 
     #[test]

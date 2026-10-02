@@ -196,9 +196,34 @@ fn find_placeholder(text: &str, anywhere: bool) -> Option<String> {
     None
 }
 
+/// What an interface checks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InterfaceKind {
+    /// Stub-compile and two-sided vacuity: a test fails against the stub and
+    /// passes against a reference.
+    #[default]
+    Behavior,
+    /// Stub-compile only: the consumer files compile against the producer's
+    /// scaffold and the compile command builds them. kGraf derives it from the
+    /// repository at no model cost; it has no reference, no test and no
+    /// handshake.
+    CompileOnly,
+}
+
+impl InterfaceKind {
+    fn is_behavior(&self) -> bool {
+        matches!(self, Self::Behavior)
+    }
+}
+
 /// An interface contract between work contracts (0026).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InterfaceContract {
+    /// What the interface checks. A record from before the field reads as
+    /// [`InterfaceKind::Behavior`].
+    #[serde(default, skip_serializing_if = "InterfaceKind::is_behavior")]
+    pub kind: InterfaceKind,
     pub id: String,
     /// Starts at 1; each accepted revision takes the next number.
     pub version: u32,
@@ -239,6 +264,11 @@ pub struct InterfaceContract {
 }
 
 impl InterfaceContract {
+    /// Whether the interface checks compilation only ([`InterfaceKind`]).
+    pub fn is_compile_only(&self) -> bool {
+        self.kind == InterfaceKind::CompileOnly
+    }
+
     /// `id@vN`, the name every record uses.
     pub fn label(&self) -> String {
         format!("{}@v{}", self.id, self.version)
@@ -738,6 +768,11 @@ pub async fn check_mechanical(
     runner: &SandboxRunner,
     ic: &InterfaceContract,
 ) -> Result<Result<Vec<CheckRun>, CheckFailure>, CheckError> {
+    // A compile-only interface has no reference and no test: its one check is
+    // the compile half.
+    if ic.is_compile_only() {
+        return check_derived_compile(runner, ic).await;
+    }
     if let Err(detail) = ic.validate() {
         return Ok(Err(CheckFailure {
             stage: CheckStage::Artifact,
@@ -2110,6 +2145,7 @@ mod tests {
 
     fn ic() -> InterfaceContract {
         InterfaceContract {
+            kind: crate::checks::InterfaceKind::Behavior,
             id: "config".into(),
             version: 1,
             parties: vec!["producer".into(), "consumer".into()],

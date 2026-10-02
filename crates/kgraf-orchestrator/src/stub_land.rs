@@ -1213,6 +1213,7 @@ mod tests {
 
     fn ic(id: &str, version: u32, stub: Vec<FileOverlay>) -> InterfaceContract {
         InterfaceContract {
+            kind: crate::checks::InterfaceKind::Behavior,
             id: id.into(),
             version,
             parties: vec!["prod".into(), "cons".into()],

@@ -541,6 +541,7 @@ mod tests {
 
     fn ic() -> InterfaceContract {
         InterfaceContract {
+            kind: crate::checks::InterfaceKind::Behavior,
             id: "double".into(),
             version: 1,
             parties: vec!["prod".into(), "cons".into()],

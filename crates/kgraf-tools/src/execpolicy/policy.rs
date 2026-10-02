@@ -135,7 +135,7 @@ impl ExecPolicy {
             if live.0.shell_unrestricted() || live.0.policy_grants_program(program).is_some() {
                 vec![program.clone()]
             } else if let crate::permissions::Script::Commands(commands) =
-                crate::permissions::script_commands(argv)
+                crate::permissions::script_commands_with(argv, &self.script_constructs())
             {
                 let mut out: Vec<String> = Vec::new();
                 for words in commands {
@@ -322,6 +322,16 @@ impl ExecPolicy {
         }
     }
 
+    /// The script constructs the user turned on (decision 0094, amended
+    /// 2026-10-02), read from the live control on every evaluation; none
+    /// without one.
+    fn script_constructs(&self) -> crate::permissions::ScriptConstructs {
+        self.live
+            .as_ref()
+            .map(|l| l.0.script_constructs())
+            .unwrap_or_default()
+    }
+
     /// Whether a grant lets `program` run without approval: granted to this
     /// contract, or by the user's live mode (Auto's allow set, Accept edits'
     /// file programs).
@@ -343,10 +353,16 @@ impl ExecPolicy {
     /// when this is not a script, or when nothing grants named programs (the
     /// call is asked as before).
     ///
+    /// With script constructs on, a script the strict reader refuses is read
+    /// again accepting them ([`crate::permissions::script_commands_with`]),
+    /// and the grant names them.
+    ///
     /// The user's deny and ask rules are not read here: their hook runs after
     /// this one on every command of the script, in every mode.
     fn script_verdict(&self, argv: &[String]) -> Option<PolicyVerdict> {
-        use crate::permissions::{SCRIPT_RUNS_LEAD, Script, script_commands};
+        use crate::permissions::{
+            SCRIPT_RUNS_LEAD, Script, relies_on_constructs, script_commands_with,
+        };
         let grants_any =
             !self.granted.is_empty() || self.live.as_ref().is_some_and(|l| l.0.grants_programs());
         if !grants_any {
@@ -361,7 +377,8 @@ impl ExecPolicy {
             granted: false,
             script_note: Some(note),
         };
-        let commands = match script_commands(argv) {
+        let constructs = self.script_constructs();
+        let commands = match script_commands_with(argv, &constructs) {
             Script::NotAScript => return None,
             Script::Unjudged(why) => {
                 return Some(asked(format!(
@@ -409,12 +426,21 @@ impl ExecPolicy {
             read_only: false,
             matched_prefix: None,
             reason: Some(format!(
-                "every command of the script is granted ({})",
+                "every command of the script is granted ({}){}",
                 programs
                     .iter()
                     .map(|p| format!("`{p}`"))
                     .collect::<Vec<_>>()
-                    .join(", ")
+                    .join(", "),
+                if relies_on_constructs(argv, &constructs) {
+                    format!(
+                        "; it uses script constructs you turned on ({}), so only the programs \
+                         kGraf can see were checked",
+                        constructs.describe()
+                    )
+                } else {
+                    String::new()
+                }
             )),
             build: false,
             granted: true,
@@ -813,6 +839,94 @@ mod tests {
             reason.contains("the script runs `git` (`git push --force"),
             "{reason}"
         );
+    }
+
+    /// Decision 0094, amended 2026-10-02: each script-construct switch, off,
+    /// leaves a script using it asked about with the "not judged" note, as
+    /// before; on, Auto grants it when every program kGraf can see is in
+    /// the allow set, and the grant names the switches. A program granted
+    /// to one piece of work counts the same way under Manual. A switch read
+    /// live: turning it off again reaches the policy already built.
+    #[test]
+    fn each_script_construct_switch_lets_auto_grant_a_script_using_it() {
+        use crate::permissions::{PermissionMode, ScriptConstruct};
+        let allowed = ["mkdir", "cp", "ls", "cat", "echo", "/bin/mkdir"];
+        for (c, script) in [
+            (ScriptConstruct::Variables, "mkdir out && cp $(ls src) out/"),
+            (
+                ScriptConstruct::Subshells,
+                "(mkdir out && cp a out/) && { ls; }",
+            ),
+            (ScriptConstruct::Background, "mkdir out & cp a b"),
+            (ScriptConstruct::InputRedirects, "cat < in.txt > out.txt"),
+            (ScriptConstruct::Escapes, "/bin/mkdir out # make it"),
+            (ScriptConstruct::OutsideRedirects, "echo x > ../outside.txt"),
+        ] {
+            let control = control_in(PermissionMode::Auto, &allowed);
+            let policy = ExecPolicy::default_kgraf_policy().with_permissions(control.clone());
+            let argv = sh(script);
+            let off = policy.evaluate(&argv);
+            assert!(
+                off.decision == Decision::Prompt && !off.granted,
+                "{c}: {off:?}"
+            );
+            assert!(
+                off.script_note
+                    .as_deref()
+                    .is_some_and(|n| n.contains("not judged command by command")),
+                "{c}: {off:?}"
+            );
+            control.set_script_construct(c, true);
+            let on = policy.evaluate(&argv);
+            assert!(on.decision == Decision::Allow && on.granted, "{c}: {on:?}");
+            assert!(
+                on.reason
+                    .as_deref()
+                    .is_some_and(|r| r.contains(c.key()) && r.contains("kGraf can see")),
+                "{c}: {on:?}"
+            );
+            control.set_script_construct(c, false);
+            assert_eq!(policy.evaluate(&argv), off, "{c}: turned off again");
+        }
+        // A visible program outside the allow set still asks, naming it.
+        let control = control_in(PermissionMode::Auto, &["mkdir"]);
+        control.set_script_construct(ScriptConstruct::Variables, true);
+        let policy = ExecPolicy::default_kgraf_policy().with_permissions(control);
+        let q = question(&policy, &sh("mkdir out && echo $(python3 x.py)"));
+        assert!(q.contains("The script runs `python3`"), "{q}");
+        // A contract's grant under Manual.
+        let manual = control_in(PermissionMode::Manual, &[]);
+        manual.set_script_construct(ScriptConstruct::Background, true);
+        let granted = ExecPolicy::default_kgraf_policy()
+            .with_granted_programs(["python3".into()])
+            .with_permissions(manual);
+        assert!(granted.evaluate(&sh("python3 a.py & python3 b.py")).granted);
+        assert!(!granted.evaluate(&sh("python3 a.py & mkdir b")).granted);
+    }
+
+    /// A script granted because of a switch is recorded as a grant of each
+    /// program kGraf saw in it, the one inside `$(...)` included, never of
+    /// the shell.
+    #[test]
+    fn a_script_granted_by_a_switch_records_each_visible_program() {
+        use crate::permissions::{PermissionEvent, PermissionMode, ScriptConstruct};
+        let control = control_in(PermissionMode::Auto, &["mkdir", "cp", "ls"]);
+        control.set_script_construct(ScriptConstruct::Variables, true);
+        let policy = ExecPolicy::default_kgraf_policy().with_permissions(control.clone());
+        let argv = sh("mkdir out && cp $(ls src) out/");
+        let v = policy.evaluate(&argv);
+        assert!(v.granted, "{v:?}");
+        policy.record_mode_grant("w1", "c1", &argv, &v);
+        let mut subjects: Vec<String> = control
+            .settle_call("w1", "c1", None)
+            .into_iter()
+            .filter_map(|e| match e {
+                PermissionEvent::Granted { subject, .. } => Some(subject),
+                _ => None,
+            })
+            .collect();
+        subjects.sort();
+        assert_eq!(subjects, ["`cp`", "`ls`", "`mkdir`"]);
     }
 
     /// Where nothing grants named programs the script is asked about as

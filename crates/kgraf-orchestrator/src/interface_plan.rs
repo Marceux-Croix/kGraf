@@ -18,7 +18,7 @@
 //! per ask (the accepted interfaces, the previous answer, the refusal) last,
 //! so each re-ask extends the previous ask's prompt.
 
-use crate::checks::{FileOverlay, InterfaceContract};
+use crate::checks::{FileOverlay, InterfaceContract, InterfaceKind};
 use crate::plan::{ContractSpec, PlanError, PlanRequest, from_answer, hint_for_field};
 use kgraf_core::CallId;
 use serde::Deserialize;
@@ -41,8 +41,35 @@ pub struct InterfaceRequest {
     /// Interfaces accepted from earlier asks, as `(id, parties)`: the answer
     /// leaves them out.
     pub accepted: Vec<(String, Vec<String>)>,
+    /// What kGraf supplies for each producer it asks a behavior check of, so
+    /// the answer holds only the reference and the test.
+    pub supplied: Vec<Supplied>,
+    /// The most output tokens the answer may take: stated in the prompt and
+    /// enforced on the call. `None`: the planner's own limit.
+    pub output_cap: Option<u32>,
     /// The previous ask's answer and why it was refused, on a re-ask.
     pub previous: Option<PreviousAsk>,
+}
+
+/// The most output tokens an interface answer may take when kGraf supplies the
+/// stub, the consumer files and the compile command.
+pub const SUPPLIED_OUTPUT_TOKENS: u32 = 4_096;
+
+/// What kGraf already holds for one producer (derived from the repository
+/// before the call), shown to the planner so it writes only what needs
+/// judgment: a reference and a small test of the producer alone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Supplied {
+    pub producer: String,
+    /// The consumers of the producer that the answer's `parties` name.
+    pub consumers: Vec<String>,
+    /// Paths of the stub kGraf supplies: the producer's existing scaffold.
+    /// Empty: no scaffold exists, so the answer gives the stub itself.
+    pub stub: Vec<String>,
+    /// Paths of the consumer files kGraf supplies.
+    pub consumer: Vec<String>,
+    /// The names on the producer's surface.
+    pub symbols: Vec<String>,
 }
 
 /// One refused ask, shown to the planner on the next.
@@ -75,6 +102,12 @@ pub struct InterfaceDraft {
 /// The most previous-answer characters quoted on a re-ask. An answer longer
 /// than this is cut at the end, saying so; the refusal names the location.
 const MAX_PREVIOUS_CHARS: usize = 24_000;
+
+/// The most refusal characters quoted on a re-ask. Each interface's refusal
+/// opens with the artifact it failed on, so the first ones are kept and the
+/// cut is said; a refusal can quote the check output of every interface, and
+/// 28 KB of it was resent on each ask of a recorded run.
+const MAX_REFUSAL_CHARS: usize = 12_000;
 
 pub(crate) const INTERFACES_SYSTEM: &str = "You are kGraf's orchestrator. The plan's \
 contracts are decided; you now write the interface contracts that bind them, so kGraf can \
@@ -166,6 +199,9 @@ pub fn interface_prompt(request: &InterfaceRequest) -> String {
     }
     user.push_str(INTERFACES_REQUEST);
     user.push_str(INTERFACES_EXAMPLE);
+    if !request.supplied.is_empty() {
+        user.push_str(&supplied_note(&request.supplied, request.output_cap));
+    }
     if !request.accepted.is_empty() {
         user.push_str("\n\nInterfaces already accepted, left out of your answer: ");
         let list: Vec<String> = request
@@ -191,10 +227,68 @@ pub fn interface_prompt(request: &InterfaceRequest) -> String {
              with one corrected JSON object {{\"interfaces\":[...]}} holding the interfaces \
              still needed.",
             quote_safe(&quoted),
-            quote_safe(&kgraf_secrets::model_copy(&prev.refusal))
+            quote_safe(&cut_refusal(&kgraf_secrets::model_copy(&prev.refusal)))
         ));
     }
     user
+}
+
+/// The part of the request that says what kGraf supplies and what the answer
+/// still holds. Appended after the general fields, which it narrows.
+fn supplied_note(supplied: &[Supplied], cap: Option<u32>) -> String {
+    let mut out = String::from(
+        "\n\nFor the producers below kGraf has already derived part of each interface from the \
+         repository. Where the stub is supplied, leave \"stub\", \"consumer\", \"symbols\" and \
+         \"compile\" out: kGraf fills them. Give only \"id\", \"parties\" (the producer first, then the \
+         consumers named), \"reference\" (the supplied stub's paths with a correct body, each \
+         with its whole content), \"tests\" (one small new test file of that producer alone: it \
+         must call no item of any other contract, which has no code yet) and \"test\" (an argv \
+         that runs the test). Where no stub is supplied, give \"stub\" and \"compile\" as \
+         well.\n",
+    );
+    for s in supplied {
+        out.push_str(&format!(
+            "- producer {} (consumers {}): ",
+            s.producer,
+            s.consumers.join(", ")
+        ));
+        if s.stub.is_empty() {
+            out.push_str("no stub is supplied");
+        } else {
+            out.push_str(&format!("stub supplied: {}", s.stub.join(", ")));
+        }
+        if !s.consumer.is_empty() {
+            out.push_str(&format!(
+                "; consumer files supplied: {}",
+                s.consumer.join(", ")
+            ));
+        }
+        if !s.symbols.is_empty() {
+            let shown: Vec<&str> = s.symbols.iter().take(24).map(String::as_str).collect();
+            out.push_str(&format!("; its items: {}", shown.join(", ")));
+        }
+        out.push('\n');
+    }
+    if let Some(cap) = cap {
+        out.push_str(&format!(
+            "The whole answer must take at most {cap} output tokens; a longer one is cut off and \
+             discarded.\n"
+        ));
+    }
+    out
+}
+
+/// `refusal` cut to [`MAX_REFUSAL_CHARS`], saying how much was left out.
+fn cut_refusal(refusal: &str) -> String {
+    let total = refusal.chars().count();
+    if total <= MAX_REFUSAL_CHARS {
+        return refusal.to_owned();
+    }
+    let kept: String = refusal.chars().take(MAX_REFUSAL_CHARS).collect();
+    format!(
+        "{kept}\n[{} more characters of refusals left out]",
+        total - MAX_REFUSAL_CHARS
+    )
 }
 
 /// `text` safe inside a quoted block: a `<` that could open or close a tag
@@ -237,19 +331,29 @@ struct SpecFile {
     content: Option<String>,
 }
 
+/// Every field but `id` and `parties` may be absent: kGraf fills the stub, the
+/// consumer files, the symbols and the compile command it derived, and
+/// [`shape_problems`] names what is still missing in words the planner can act
+/// on (a serde "missing field" names only the first).
 #[derive(Deserialize)]
 struct InterfaceSpec {
     id: String,
     parties: Vec<String>,
+    #[serde(default, deserialize_with = "crate::plan::null_as_default")]
     symbols: Vec<String>,
+    #[serde(default, deserialize_with = "crate::plan::null_as_default")]
     stub: Vec<SpecFile>,
     #[serde(default, deserialize_with = "crate::plan::null_as_default")]
     wrong: Vec<SpecFile>,
+    #[serde(default, deserialize_with = "crate::plan::null_as_default")]
     reference: Vec<SpecFile>,
     #[serde(default, deserialize_with = "crate::plan::null_as_default")]
     consumer: Vec<SpecFile>,
+    #[serde(default, deserialize_with = "crate::plan::null_as_default")]
     tests: Vec<SpecFile>,
+    #[serde(default, deserialize_with = "crate::plan::null_as_default")]
     compile: Vec<String>,
+    #[serde(default, deserialize_with = "crate::plan::null_as_default")]
     test: Vec<String>,
     #[serde(default, deserialize_with = "crate::plan::null_as_default")]
     replaces: Vec<String>,
@@ -300,6 +404,7 @@ pub fn parse_interfaces(text: &str) -> Result<Vec<InterfaceDraft>, PlanError> {
             let tests = files("tests", i.tests);
             InterfaceDraft {
                 interface: InterfaceContract {
+                    kind: InterfaceKind::Behavior,
                     id: i.id,
                     version: 1,
                     parties: i.parties,
@@ -318,6 +423,22 @@ pub fn parse_interfaces(text: &str) -> Result<Vec<InterfaceDraft>, PlanError> {
             }
         })
         .collect())
+}
+
+/// The answer `text` cut to the interfaces at the positions `keep` (their
+/// order kept), written as `{"interfaces":[...]}`: what a re-ask quotes back,
+/// so the planner sees only the interfaces refused and not those accepted.
+/// `None`: the text holds no interface list to cut.
+pub fn answer_subset(text: &str, keep: &[usize]) -> Option<String> {
+    let value = crate::answer_json::json_object_with(text, Some("interfaces")).ok()?;
+    let all = value.get("interfaces")?.as_array()?;
+    let kept: Vec<&serde_json::Value> = all
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| keep.contains(i))
+        .map(|(_, v)| v)
+        .collect();
+    serde_json::to_string(&serde_json::json!({ "interfaces": kept })).ok()
 }
 
 /// A bare string in `consumer` or `tests` that reads as a file path (it has
@@ -689,5 +810,103 @@ mod tests {
         let open = uncovered(&found, &bound);
         assert_eq!(open, vec![("c5".to_owned(), vec!["c2".to_owned()])]);
         assert!(unbound_reason(&open).contains("no interface binds c5 <- c2"));
+    }
+
+    #[test]
+    fn a_re_ask_quotes_only_the_interfaces_at_the_positions_kept() {
+        let text = r#"preamble {"interfaces":[{"id":"a"},{"id":"b"},{"id":"c"}]}"#;
+        assert_eq!(
+            answer_subset(text, &[1]).as_deref(),
+            Some(r#"{"interfaces":[{"id":"b"}]}"#)
+        );
+        assert_eq!(
+            answer_subset(text, &[0, 2]).as_deref(),
+            Some(r#"{"interfaces":[{"id":"a"},{"id":"c"}]}"#)
+        );
+        assert_eq!(
+            answer_subset(text, &[]).as_deref(),
+            Some(r#"{"interfaces":[]}"#)
+        );
+        assert_eq!(answer_subset("not json at all", &[0]), None);
+    }
+
+    #[test]
+    fn an_answer_may_leave_out_what_kgraf_supplies() {
+        let text = r#"{"interfaces":[{"id":"i1","parties":["c1","c2"],"reference":[{"path":"a.py","content":"x"}],"tests":[{"path":"t.py","content":"t"}],"test":["python3","t.py"]}]}"#;
+        let drafts =
+            parse_interfaces(text).expect("stub, consumer, symbols and compile may be absent");
+        let ic = &drafts[0].interface;
+        assert!(ic.stub.is_empty() && ic.consumer.is_empty() && ic.symbols.is_empty());
+        assert!(ic.compile.is_empty());
+        // Without the producer and its consumers nothing is read.
+        assert!(parse_interfaces(r#"{"interfaces":[{"id":"i1"}]}"#).is_err());
+    }
+
+    #[test]
+    fn the_request_says_what_is_supplied_and_states_the_output_cap() {
+        let supplied = vec![
+            Supplied {
+                producer: "c1".into(),
+                consumers: vec!["c5".into()],
+                stub: vec!["a/src/lib.rs".into()],
+                consumer: vec!["b/src/lib.rs".into()],
+                symbols: vec!["Flat".into()],
+            },
+            Supplied {
+                producer: "c2".into(),
+                consumers: vec!["c5".into()],
+                stub: vec![],
+                consumer: vec![],
+                symbols: vec![],
+            },
+        ];
+        let note = supplied_note(&supplied, Some(4_096));
+        for needle in [
+            "producer c1 (consumers c5): stub supplied: a/src/lib.rs; consumer files supplied: \
+             b/src/lib.rs; its items: Flat",
+            "producer c2 (consumers c5): no stub is supplied",
+            "at most 4096 output tokens",
+        ] {
+            assert!(note.contains(needle), "{needle}: {note}");
+        }
+        assert!(!supplied_note(&supplied, None).contains("output tokens"));
+    }
+
+    #[test]
+    fn a_long_refusal_is_cut_and_the_cut_is_said() {
+        let long = format!("interface `i1`: {}", "x".repeat(30_000));
+        let request = InterfaceRequest {
+            context: PlanRequest {
+                instruction: "do it".into(),
+                split_reason: None,
+                notes: vec![],
+                known_files: vec![],
+                routes: vec![],
+                model_routes: vec![],
+                model_calls: None,
+                tools: vec![],
+                templates: vec![],
+                interfaces: true,
+                project_context: String::new(),
+            },
+            contracts: vec![],
+            outer: vec![],
+            consumers: vec![],
+            accepted: vec![],
+            supplied: vec![],
+            output_cap: None,
+            previous: Some(PreviousAsk {
+                answer: "{}".into(),
+                refusal: long,
+            }),
+        };
+        let prompt = interface_prompt(&request);
+        assert!(
+            prompt.contains("interface `i1`: xxx")
+                && prompt.contains("more characters of refusals left out]"),
+            "the opening is kept and the cut said"
+        );
+        assert!(prompt.len() < 16_000, "{} bytes", prompt.len());
+        assert_eq!(cut_refusal("short"), "short");
     }
 }

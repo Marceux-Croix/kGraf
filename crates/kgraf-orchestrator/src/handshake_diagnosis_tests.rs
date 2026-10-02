@@ -331,6 +331,7 @@ fn paths_and_qualified_names_are_told_apart() {
 #[test]
 fn a_python_signature_agrees_and_a_changed_return_type_disagrees() {
     let ic = InterfaceContract {
+        kind: crate::checks::InterfaceKind::Behavior,
         id: "config".into(),
         version: 1,
         parties: vec!["prod".into(), "cons".into()],
@@ -404,6 +405,7 @@ fn a_python_signature_agrees_and_a_changed_return_type_disagrees() {
 /// The `state_tax_rate` interface those runs held on.
 fn tax_ic(id: &str, parties: &[&str]) -> InterfaceContract {
     InterfaceContract {
+        kind: crate::checks::InterfaceKind::Behavior,
         id: id.into(),
         version: 1,
         parties: parties.iter().map(|p| (*p).to_owned()).collect(),

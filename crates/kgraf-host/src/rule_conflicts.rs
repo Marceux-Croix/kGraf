@@ -18,7 +18,8 @@
 use kgraf_core::{AgentId, TaskId};
 use kgraf_tools::approval::PendingCall;
 use kgraf_tools::permissions::{
-    HardLimit, UserRules, hard_limit, refused_program, simple_commands,
+    HardLimit, PERMISSION_RULES_HOOK, RefusedSubject, UserRules, hard_limit, refused_subject,
+    simple_commands,
 };
 
 /// One program of a user command that the user's rules refuse to workers.
@@ -72,9 +73,11 @@ pub fn find(rules: &UserRules, commands: &[(&'static str, &str)]) -> Vec<RuleCon
             if !(reason.starts_with("your deny rule `") || reason.starts_with("your ask rule `")) {
                 continue;
             }
-            let Some(program) =
-                refused_program("shell", &input, &reason).or_else(|| words.first().cloned())
-            else {
+            let named = match refused_subject("shell", &input, PERMISSION_RULES_HOOK, &reason) {
+                Some(RefusedSubject::Program(p)) => Some(p),
+                _ => None,
+            };
+            let Some(program) = named.or_else(|| words.first().cloned()) else {
                 continue;
             };
             let conflict = RuleConflict {

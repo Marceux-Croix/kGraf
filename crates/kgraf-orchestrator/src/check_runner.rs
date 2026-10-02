@@ -58,6 +58,7 @@
 
 use crate::checks::{CheckError, FileOverlay};
 use kgraf_sandbox::{Network, SandboxPolicy, sandboxed_command};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1043,13 +1044,114 @@ fn last_bytes(path: &Path, keep: usize) -> Vec<u8> {
 
 #[cfg(unix)]
 fn join_tail(err: &[u8], out: &[u8]) -> String {
+    // Host toolchain noise is dropped first, so it does not take room from the
+    // errors in the byte budget, and never reaches a model, the trace or a
+    // notice.
     format!(
         "{}\n{}",
-        condense(&String::from_utf8_lossy(err), DEFAULT_TAIL_BYTES),
-        condense(&String::from_utf8_lossy(out), DEFAULT_TAIL_BYTES)
+        condense(
+            &filter_host_noise(&String::from_utf8_lossy(err)),
+            DEFAULT_TAIL_BYTES
+        ),
+        condense(
+            &filter_host_noise(&String::from_utf8_lossy(out)),
+            DEFAULT_TAIL_BYTES
+        )
     )
     .trim()
     .to_owned()
+}
+
+/// Whether a line is output of the host's own developer tools and not of the
+/// project: macOS `xcrun` and `xcodebuild` lines a compiler relays while it
+/// looks for the SDK. Never an error line (`error: ...`, `file:1: error: ...`):
+/// a missing toolchain is a finding, whatever tool says it.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn is_host_noise(line: &str) -> bool {
+    !starts_error(line)
+        && (line.contains("DVTDeveloperPaths")
+            || line.contains("DVTFilePathFSEvents")
+            || line.contains("xcodebuild[")
+            || line.contains("codebuild[")
+            || line.contains("xcrun")
+            || line.contains("MacOSX.sdk"))
+}
+
+/// A line that continues a warning block: an indented line, a `|` gutter, a
+/// numbered source line or a `= note` line. A blank line ends the block.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn continues_block(line: &str) -> bool {
+    !line.trim().is_empty() && continues_error(line)
+}
+
+/// `text` without the host's toolchain noise and without repeated identical
+/// warning blocks, each kind said once at the end with its count
+/// (`[N identical lines removed]`). Error lines are never removed. A compiler
+/// that relays one `xcrun` warning for every crate of a workspace made one
+/// refusal 28 KB, nearly all of it these.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn filter_host_noise(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut kept: Vec<&str> = Vec::with_capacity(lines.len());
+    let mut noise = 0usize;
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        // A warning block about host tools: its header, then every line of it.
+        if line.starts_with("warning:") && is_host_noise(line) {
+            noise += 1;
+            i += 1;
+            while i < lines.len() && continues_block(lines[i]) {
+                noise += 1;
+                i += 1;
+            }
+            continue;
+        }
+        if is_host_noise(line) {
+            noise += 1;
+        } else {
+            kept.push(line);
+        }
+        i += 1;
+    }
+    // Identical warning blocks: the first stays.
+    let mut out: Vec<&str> = Vec::with_capacity(kept.len());
+    let mut seen: BTreeSet<Vec<&str>> = BTreeSet::new();
+    let mut repeated = 0usize;
+    let mut i = 0;
+    while i < kept.len() {
+        if kept[i].starts_with("warning:") {
+            let mut j = i + 1;
+            while j < kept.len() && continues_block(kept[j]) {
+                j += 1;
+            }
+            let block = kept[i..j].to_vec();
+            if seen.contains(&block) {
+                repeated += block.len();
+            } else {
+                out.extend(block.iter().copied());
+                seen.insert(block);
+            }
+            i = j;
+        } else {
+            out.push(kept[i]);
+            i += 1;
+        }
+    }
+    if noise == 0 && repeated == 0 {
+        return text.to_owned();
+    }
+    let mut result = out.join("\n");
+    if !result.is_empty() {
+        result.push('\n');
+    }
+    if noise > 0 {
+        result.push_str(&format!("[{noise} host toolchain lines removed]\n"));
+    }
+    if repeated > 0 {
+        result.push_str(&format!("[{repeated} identical lines removed]\n"));
+    }
+    result
 }
 
 /// Whether a line starts a compiler diagnostic that is an error: rustc's
@@ -1158,7 +1260,7 @@ fn copy_tree(from: &Path, to: &Path, top: bool) -> Result<(), CheckError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_TAIL_BYTES, RunResult, condense, missing_program};
+    use super::{DEFAULT_TAIL_BYTES, RunResult, condense, filter_host_noise, missing_program};
 
     /// A compile error in the middle of the output, then more than the cap of
     /// trailing toolchain warnings: the error and its location are kept.
@@ -1204,6 +1306,87 @@ mod tests {
         assert_eq!(condense("short", 10), "short");
         let noise = "w\n".repeat(3_000);
         assert_eq!(condense(&noise, 100), noise[noise.len() - 100..]);
+    }
+
+    /// A real 5.7 KB refusal of the distributed-efficacy benchmark (a vacuity
+    /// failure on macOS): `xcrun` and `xcodebuild` lines the compiler relayed
+    /// for every crate, the same warning for each crate, and the three failing
+    /// tests. The noise goes, with its count; the verdict, the failing tests
+    /// and their panics stay.
+    #[test]
+    fn host_toolchain_noise_is_removed_from_a_recorded_refusal_and_the_failure_stays() {
+        let recorded =
+            include_str!("../tests/fixtures/check-output/vacuity-refusal-with-xcrun-noise.txt");
+        let filtered = filter_host_noise(recorded);
+        for gone in ["xcrun", "xcodebuild", "DVTDeveloperPaths", "MacOSX.sdk"] {
+            assert!(!filtered.contains(gone), "{gone} is host noise: {filtered}");
+        }
+        for kept in [
+            "the test fails against the reference, so nothing may satisfy it",
+            "test vip_flat_discount_default_tax_free_shipping ... FAILED",
+            "not yet implemented: contract 6: checkout::checkout_order is not implemented yet",
+            "test result: FAILED. 0 passed; 3 failed",
+            "error: test failed, to rerun pass `-p checkout --test integration`",
+        ] {
+            assert!(filtered.contains(kept), "{kept} stays: {filtered}");
+        }
+        assert!(
+            filtered.contains("host toolchain lines removed"),
+            "the removal is said: {filtered}"
+        );
+        assert!(
+            filtered.len() * 10 < recorded.len() * 7,
+            "{} of {} bytes remain",
+            filtered.len(),
+            recorded.len()
+        );
+    }
+
+    /// An error line is never noise, even when a host tool says it: a missing
+    /// Command Line Tools install is the finding. Identical warning blocks
+    /// are said once, with the count of the lines removed.
+    #[test]
+    fn error_lines_stay_and_identical_warning_blocks_are_said_once() {
+        let text = "xcrun: error: invalid active developer path (/Library/Developer/CommandLineTools)\n\
+                    warning: unused variable: `x`\n --> a/src/lib.rs:1:1\n  |\n1 | let x = 1;\n\n\
+                    warning: unused variable: `x`\n --> a/src/lib.rs:1:1\n  |\n1 | let x = 1;\n\n\
+                    warning: unused variable: `y`\n --> b/src/lib.rs:1:1\n";
+        let filtered = filter_host_noise(text);
+        assert!(filtered.contains("xcrun: error: invalid active developer path"));
+        assert_eq!(
+            filtered.matches("unused variable: `x`").count(),
+            1,
+            "{filtered}"
+        );
+        assert!(filtered.contains("unused variable: `y`"), "{filtered}");
+        assert!(
+            filtered.contains("[4 identical lines removed]"),
+            "{filtered}"
+        );
+        assert!(!filtered.contains("host toolchain"), "{filtered}");
+        // Nothing to remove: the text is returned as it came.
+        assert_eq!(
+            filter_host_noise("error: boom\nwarning: once\n"),
+            "error: boom\nwarning: once\n"
+        );
+    }
+
+    /// The filter runs before the byte budget: with the noise first and the
+    /// error after it, the error is in the tail the model reads.
+    #[cfg(unix)]
+    #[test]
+    fn the_tail_a_model_reads_carries_no_host_noise() {
+        let mut err = String::new();
+        for i in 0..200 {
+            err.push_str(&format!(
+                "2026-01-01 xcodebuild[{i}] DVTDeveloperPaths: Failed to get length\n"
+            ));
+        }
+        err.push_str("error[E0425]: cannot find value `x` in this scope\n --> a/src/lib.rs:2:5\n");
+        let tail = super::join_tail(err.as_bytes(), b"");
+        assert!(tail.contains("error[E0425]"), "{tail}");
+        assert!(!tail.contains("DVTDeveloperPaths"), "{tail}");
+        assert!(tail.len() < 400, "{} bytes", tail.len());
     }
 
     #[test]

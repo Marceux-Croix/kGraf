@@ -516,6 +516,16 @@ enum Command {
         /// With plan review on, approve the plan without showing it.
         #[arg(long)]
         approve_plan: bool,
+        /// Shell constructs a mode that grants programs may also grant inside
+        /// a `sh -c` script, comma-separated: variables, subshells,
+        /// background, input-redirects, escapes, outside-redirects; or
+        /// `none`. Replaces the `script_constructs` list of the user-level
+        /// permissions file for this run; all are off by default. With one
+        /// on, a script using it is granted when every program kGraf can see
+        /// in it is granted: kGraf cannot see what a variable or a
+        /// substitution runs. Your deny and ask rules still apply.
+        #[arg(long, value_name = "LIST", value_parser = parse_constructs)]
+        script_constructs: Option<kgraf_tools::permissions::ScriptConstructs>,
         /// The Bypass permission mode for a run whose commands execute in a
         /// disposable container. Also requires `KGRAF_CONTAINER_SANDBOX=1` in
         /// the environment. Never use it on a machine you care about.
@@ -836,6 +846,13 @@ fn parse_mode(s: &str) -> std::result::Result<kgraf_tools::PermissionMode, Strin
     s.parse()
 }
 
+/// `--script-constructs`' value (decision 0094, amended 2026-10-02).
+fn parse_constructs(
+    s: &str,
+) -> std::result::Result<kgraf_tools::permissions::ScriptConstructs, String> {
+    kgraf_tools::permissions::ScriptConstructs::parse_list(s)
+}
+
 /// The four run limits of one command: its flags, the user's settings file,
 /// then the built-in defaults, with each value's source printed on stderr so
 /// a run says where its limits came from. A settings file that is broken or
@@ -1102,6 +1119,7 @@ fn run_cli() -> Result<()> {
             permissions_file,
             plan_review,
             approve_plan,
+            script_constructs,
             container_sandbox,
             warn_rule_conflicts,
             no_warn_rule_conflicts,
@@ -1168,6 +1186,7 @@ fn run_cli() -> Result<()> {
                         container_sandbox,
                         plan_review,
                         permissions_file,
+                        script_constructs,
                     },
                     approve_plan,
                     warn_rule_conflicts: limits.warn_rule_conflicts.0,
@@ -2510,6 +2529,41 @@ mod tests {
             panic!("not orchestrate");
         };
         assert!(model_routes.is_empty());
+    }
+
+    /// `--script-constructs` takes names in either spelling or `none`, and
+    /// refuses an unknown name; absent, the file decides.
+    #[test]
+    fn orchestrate_takes_a_script_constructs_list() {
+        use kgraf_tools::permissions::{ScriptConstruct, ScriptConstructs};
+        let parse = |extra: &[&str]| {
+            let mut args = vec![
+                "kgraf",
+                "orchestrate",
+                "--route",
+                "ollama:llama3",
+                "--prices",
+                "p.json",
+            ];
+            args.extend_from_slice(extra);
+            Cli::try_parse_from(args).map(|cli| match cli.command {
+                Command::Orchestrate {
+                    script_constructs, ..
+                } => script_constructs,
+                _ => panic!("not orchestrate"),
+            })
+        };
+        assert_eq!(parse(&[]).expect("parse"), None);
+        let on = parse(&["--script-constructs", "input-redirects,outside_redirects"])
+            .expect("parse")
+            .expect("given");
+        assert!(on.allows(ScriptConstruct::InputRedirects));
+        assert!(on.allows(ScriptConstruct::OutsideRedirects));
+        assert_eq!(
+            parse(&["--script-constructs", "none"]).expect("parse"),
+            Some(ScriptConstructs::default())
+        );
+        assert!(parse(&["--script-constructs", "eval"]).is_err());
     }
 
     /// `kgraf orchestrate`'s defaults are the host's (`RunConfig::new`,

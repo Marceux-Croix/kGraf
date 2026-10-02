@@ -222,6 +222,16 @@ pub struct ContractCounters {
     /// Interface contracts the decomposition wrote and the book took
     /// ([`ContractEvent::Registered`]).
     pub interfaces_registered: u64,
+    /// Of those, interfaces of kind compile-only: derived by kGraf from the
+    /// repository at no model cost ([`crate::checks::InterfaceKind`]). The
+    /// rest are behavior interfaces.
+    pub compile_only_registered: u64,
+    /// Planner calls the interface call made ([`ContractEvent::InterfaceAsked`]).
+    pub interface_asks: u64,
+    /// Wall-clock milliseconds those calls took.
+    pub interface_ask_ms: u64,
+    /// Output tokens those calls produced (text and reasoning).
+    pub interface_ask_output_tokens: u64,
     pub checks_passed: u64,
     pub artifact_failures: u64,
     pub stub_compile_failures: u64,
@@ -268,6 +278,38 @@ pub struct ContractCounters {
     /// ([`ContractEvent::Unchecked`]), one per edge. Each is also counted in
     /// `checks_not_run`: a check the run asked for did not run.
     pub unchecked_edges: u64,
+}
+
+impl ContractCounters {
+    /// What the interface call cost and what it yielded, as the run report
+    /// states it: `planner 2 calls 310 s 9,400 tokens; accepted 6 compile-only,
+    /// 1 behavior`. The seconds and tokens per accepted interface follow from
+    /// it. The accepted interfaces are those registered, by kind.
+    pub fn interface_economy(&self) -> String {
+        fn grouped(n: u64) -> String {
+            let digits = n.to_string();
+            let mut out = String::new();
+            for (i, ch) in digits.chars().enumerate() {
+                if i > 0 && (digits.len() - i).is_multiple_of(3) {
+                    out.push(',');
+                }
+                out.push(ch);
+            }
+            out
+        }
+        let behavior = self
+            .interfaces_registered
+            .saturating_sub(self.compile_only_registered);
+        format!(
+            "planner {} call{} {} s {} tokens; accepted {} compile-only, {} behavior",
+            self.interface_asks,
+            if self.interface_asks == 1 { "" } else { "s" },
+            grouped((self.interface_ask_ms + 500) / 1_000),
+            grouped(self.interface_ask_output_tokens),
+            self.compile_only_registered,
+            behavior
+        )
+    }
 }
 
 /// One contract event, as written to the run trace.
@@ -400,6 +442,20 @@ pub enum ContractEvent {
         consumer: String,
         producers: Vec<String>,
         reason: String,
+    },
+    /// One planner call of the interface call, with what it cost: how many
+    /// calls, the wall-clock time and the output tokens. Counted in
+    /// [`ContractCounters`], so the totals of a run, a resumed one included,
+    /// are the sum of these events; with the accepted interfaces by kind they
+    /// give the seconds and tokens per accepted interface.
+    InterfaceAsked {
+        /// The ask's number within the interface call, from 1.
+        ask: u32,
+        /// The producers the ask was for.
+        producers: Vec<String>,
+        calls: u64,
+        ms: u64,
+        output_tokens: u64,
     },
 }
 
@@ -583,9 +639,22 @@ impl ContractBook {
                     }
                 }
             }
+            ContractEvent::InterfaceAsked {
+                calls,
+                ms,
+                output_tokens,
+                ..
+            } => {
+                c.interface_asks += calls;
+                c.interface_ask_ms += ms;
+                c.interface_ask_output_tokens += output_tokens;
+            }
             ContractEvent::Registered { interface } => {
                 if !self.entries.contains_key(&interface.id) {
                     c.interfaces_registered += 1;
+                    if interface.is_compile_only() {
+                        c.compile_only_registered += 1;
+                    }
                     self.entries.insert(
                         interface.id.clone(),
                         Entry {
@@ -1259,7 +1328,11 @@ pub async fn resolve_by_recompute(
         _ => Recomputed {
             resolution: Resolution::Rejected {
                 basis: Basis::Artifact { artifact },
-                reason: "every run passed: the stub compiles, the test fails against the stub and passes against the reference".into(),
+                reason: if ic.is_compile_only() {
+                    "every run passed: the consumer files compile against the stub".into()
+                } else {
+                    "every run passed: the stub compiles, the test fails against the stub and passes against the reference".into()
+                },
             },
             flaky: false,
         },
@@ -1380,7 +1453,8 @@ pub async fn classify(
         )
     });
     // 2. Prior behavior holds: the prior test passes against the new reference.
-    if broken.is_none() {
+    // A compile-only interface has no test and no reference: only step 1 applies.
+    if broken.is_none() && !prior.is_compile_only() && !revised.is_compile_only() {
         let r = runner
             .run(
                 &[&revised.reference, &prior.consumer, &prior.tests],
@@ -1401,7 +1475,7 @@ pub async fn classify(
     }
     // 3. Delivered work is complete: the revised test passes against the prior
     // reference. A revision that adds a required function fails here.
-    if broken.is_none() {
+    if broken.is_none() && !prior.is_compile_only() && !revised.is_compile_only() {
         let r = runner
             .run(
                 &[&prior.reference, &revised.consumer, &revised.tests],
@@ -1424,9 +1498,13 @@ pub async fn classify(
     let Some(detail) = broken else {
         return Ok(Ok(Classification {
             class: RevisionClass::Amend,
-            detail: format!(
-                "the prior test of {label} compiles against the revised stub and passes against the revised reference, and the revised test passes against the prior reference"
-            ),
+            detail: if prior.is_compile_only() || revised.is_compile_only() {
+                format!("the prior consumers of {label} compile against the revised stub")
+            } else {
+                format!(
+                    "the prior test of {label} compiles against the revised stub and passes against the revised reference, and the revised test passes against the prior reference"
+                )
+            },
             runs,
         }));
     };
@@ -1560,6 +1638,7 @@ mod tests {
 
     fn ic() -> InterfaceContract {
         InterfaceContract {
+            kind: crate::checks::InterfaceKind::Behavior,
             id: "config".into(),
             version: 1,
             parties: vec!["p".into(), "c".into()],
@@ -2037,6 +2116,69 @@ mod tests {
         assert!(
             !book.checked("config"),
             "a failed stage unchecks the interface"
+        );
+    }
+
+    /// The interface call's cost is event-sourced: a replay of the same events
+    /// gives the same totals, and a compile-only registration is counted apart.
+    #[test]
+    fn interface_asks_and_compile_only_registrations_are_counted_from_events() {
+        let mut book = ContractBook::new(vec![], 2).expect("book");
+        let events = [
+            ContractEvent::InterfaceAsked {
+                ask: 1,
+                producers: vec!["c1".into()],
+                calls: 1,
+                ms: 120_000,
+                output_tokens: 4_000,
+            },
+            ContractEvent::InterfaceAsked {
+                ask: 2,
+                producers: vec!["c1".into()],
+                calls: 1,
+                ms: 190_400,
+                output_tokens: 5_400,
+            },
+            ContractEvent::Registered {
+                interface: Box::new(InterfaceContract {
+                    kind: crate::checks::InterfaceKind::CompileOnly,
+                    id: "derived-c1".into(),
+                    ..ic()
+                }),
+            },
+            ContractEvent::Registered {
+                interface: Box::new(InterfaceContract {
+                    id: "i2".into(),
+                    ..ic()
+                }),
+            },
+        ];
+        for e in &events {
+            book.apply(e);
+        }
+        let c = book.counters();
+        assert_eq!(
+            (
+                c.interface_asks,
+                c.interface_ask_ms,
+                c.interface_ask_output_tokens
+            ),
+            (2, 310_400, 9_400)
+        );
+        assert_eq!((c.interfaces_registered, c.compile_only_registered), (2, 1));
+        assert_eq!(
+            c.interface_economy(),
+            "planner 2 calls 310 s 9,400 tokens; accepted 1 compile-only, 1 behavior"
+        );
+        // A registration applied again changes nothing.
+        book.apply(&events[2]);
+        assert_eq!(book.counters().compile_only_registered, 1);
+        let json = serde_json::to_value(&events[2]).expect("json");
+        assert_eq!(json["interface"]["kind"], "compile_only");
+        let behavior = serde_json::to_value(&events[3]).expect("json");
+        assert!(
+            behavior["interface"].get("kind").is_none(),
+            "a behavior interface is written as before"
         );
     }
 }

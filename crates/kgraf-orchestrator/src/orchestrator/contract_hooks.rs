@@ -330,7 +330,7 @@ impl OrchestratorHandle {
 impl RunLoop {
     /// Replay the run's own contract events once, so a resume neither repeats a
     /// paid handshake nor forgets a rejection.
-    async fn replay_contracts(&mut self) -> Result<(), OrchestratorError> {
+    pub(super) async fn replay_contracts(&mut self) -> Result<(), OrchestratorError> {
         if self.contracts.as_ref().is_none_or(|d| d.replayed) {
             return Ok(());
         }
@@ -758,7 +758,9 @@ impl RunLoop {
         let Some(d) = self.contracts.as_ref() else {
             return Ok(true);
         };
-        if d.book.stub_landed(&ic.id) {
+        // A compile-only interface's stub is the scaffold the repository
+        // already holds: there is nothing to land.
+        if d.book.stub_landed(&ic.id) || ic.is_compile_only() {
             return Ok(true);
         }
         let lander = d.stub_lander.clone();
@@ -810,6 +812,11 @@ impl RunLoop {
         &mut self,
         ic: &InterfaceContract,
     ) -> Result<(), OrchestratorError> {
+        // A compile-only interface has no reference to gate a consumer's test
+        // against.
+        if ic.is_compile_only() {
+            return Ok(());
+        }
         let Some(writer) = self
             .contracts
             .as_ref()
@@ -1074,6 +1081,15 @@ impl RunLoop {
         >,
         OrchestratorError,
     > {
+        // A compile-only interface is checked by compiling: no party is asked
+        // for a statement, so it costs no model call.
+        if ic.is_compile_only() {
+            return Ok(Ok((
+                Vec::new(),
+                Vec::new(),
+                Some("compile-only interface: signatures are checked by compiling".to_owned()),
+            )));
+        }
         let open: Vec<OpenContract> = ic
             .parties
             .iter()
@@ -1499,6 +1515,33 @@ impl RunLoop {
             };
             let label = ic.label();
             let producer = ic.stub.iter().any(|f| writes.contains(&f.path.as_str()));
+            if ic.is_compile_only() {
+                // Repository files, not the planner's: named, not quoted, so
+                // a brief does not carry whole files for a compile check.
+                let paragraph = format!(
+                    "\n\nCompile-only interface `{label}` binds this contract with {}. You are \
+                     its {}. kGraf checked before you started that the consumer files compile \
+                     against the producer's scaffold: [{}]. Keep the signatures those files use. \
+                     If the contract itself is wrong, call `{}` with interface `{}`.",
+                    ic.parties
+                        .iter()
+                        .filter(|p| p.as_str() != contract)
+                        .map(|p| format!("`{p}`"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    if producer { "producer" } else { "consumer" },
+                    ic.consumer
+                        .iter()
+                        .chain(&ic.tests)
+                        .map(|f| f.path.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    crate::challenge_tool::CHALLENGE_TOOL,
+                    ic.id,
+                );
+                push(&mut out, paragraph, &format!("interface `{label}`"));
+                continue;
+            }
             // Ids are sanitized by the orchestrator; the symbols and the files
             // were written by a model, so they are data blocks.
             let paragraph = format!(

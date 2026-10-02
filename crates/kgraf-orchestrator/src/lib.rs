@@ -139,9 +139,10 @@ pub use check_runner::{
 };
 pub use checks::{
     CANARY, CheckError, CheckFailure, CheckRun, CheckStage, FileOverlay, HandshakeFinding,
-    HandshakeRequest, HandshakeStatement, Handshaker, InterfaceContract, ModelHandshaker,
-    PartyModel, RoutedHandshaker, RunResult, SandboxRunner, anchors, check_derived_compile,
-    check_mechanical, compare_handshake, compare_handshake_ordered, ordered_pairs, parse_handshake,
+    HandshakeRequest, HandshakeStatement, Handshaker, InterfaceContract, InterfaceKind,
+    ModelHandshaker, PartyModel, RoutedHandshaker, RunResult, SandboxRunner, anchors,
+    check_derived_compile, check_mechanical, compare_handshake, compare_handshake_ordered,
+    ordered_pairs, parse_handshake,
 };
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use cluster_cap::{ClusterCapHold, DEFAULT_MAX_IN_FLIGHT_PER_CLUSTER};

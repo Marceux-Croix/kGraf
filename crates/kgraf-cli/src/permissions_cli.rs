@@ -7,13 +7,18 @@
 //! `--allow` and `--allow-path` add to Auto's allow set (`--may-grant` is
 //! `--allow`'s older name), `--deny` and `--ask` add rules, `--plan-review`
 //! turns plan review on and `--approve-plan` approves the plan without
-//! showing it. `--container-sandbox` is `--permission-mode bypass` for a run
-//! inside a disposable container, and still needs `KGRAF_CONTAINER_SANDBOX=1`.
+//! showing it. `--script-constructs` replaces the file's script-construct
+//! switches for the run (flag, then file, then all off; never `run.json`).
+//! `--container-sandbox` is `--permission-mode bypass` for a run inside a
+//! disposable container, and still needs `KGRAF_CONTAINER_SANDBOX=1`.
+//!
+//! Every command that builds a control prints one `permissions` line at its
+//! start: the mode and the script constructs on.
 
 use anyhow::{Context, Result, bail};
 use kgraf_tools::permissions::{
     AllowSet, ModeSource, PERMISSIONS_FILE_NAME, PERMISSIONS_PATH_ENV, PermissionControl,
-    PermissionMode, PermissionSettings, ProcessFacts, Rule,
+    PermissionMode, PermissionSettings, ProcessFacts, Rule, ScriptConstructs,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -40,6 +45,8 @@ pub struct PermissionArgs {
     pub container_sandbox: bool,
     pub plan_review: bool,
     pub permissions_file: Option<PathBuf>,
+    /// `--script-constructs`: replaces the file's list when given.
+    pub script_constructs: Option<ScriptConstructs>,
 }
 
 /// The user-level file this command reads: the flag, the environment
@@ -103,6 +110,9 @@ pub fn settings(
         }
     }
     s.plan_review |= args.plan_review;
+    if let Some(constructs) = &args.script_constructs {
+        s.script_constructs = constructs.clone();
+    }
     let explicit = match (args.mode, container_sandbox) {
         (Some(m), true) if m != PermissionMode::Bypass => bail!(
             "--container-sandbox selects the Bypass permission mode; it cannot be combined with \
@@ -151,7 +161,18 @@ pub fn control(root: &Path, args: &PermissionArgs) -> Result<Arc<PermissionContr
     if control.mode() == PermissionMode::Bypass {
         eprintln!("{BYPASS_NOTICE}");
     }
+    println!("{}", permissions_line(&control.settings()));
     Ok(Arc::new(control))
+}
+
+/// The run-start line naming the mode and the script constructs on, so a
+/// run's log says which scripts its mode could grant.
+pub fn permissions_line(s: &PermissionSettings) -> String {
+    format!(
+        "permissions mode {}; script constructs on: {}",
+        s.mode.as_str().replace('_', "-"),
+        s.script_constructs.describe()
+    )
 }
 
 #[cfg(test)]
@@ -228,6 +249,40 @@ mod tests {
             ..PermissionArgs::default()
         };
         assert!(settings(PermissionSettings::default(), &bad, false).is_err());
+    }
+
+    /// `--script-constructs` wins over the file's list, `none` included;
+    /// without the flag the file's list holds; with neither, all are off.
+    /// The start line names what is on.
+    #[test]
+    fn the_script_constructs_flag_wins_over_the_file_and_the_default_is_none() {
+        use kgraf_tools::permissions::ScriptConstruct;
+        let (s, _) = settings(
+            PermissionSettings::default(),
+            &PermissionArgs::default(),
+            false,
+        )
+        .expect("s");
+        assert!(s.script_constructs.is_empty());
+        assert!(permissions_line(&s).ends_with("script constructs on: none"));
+        let file = PermissionSettings::from_toml_str("script_constructs = [\"background\"]")
+            .expect("file");
+        let (s, _) = settings(file.clone(), &PermissionArgs::default(), false).expect("s");
+        assert!(s.script_constructs.allows(ScriptConstruct::Background));
+        let flag = |text: &str| PermissionArgs {
+            script_constructs: Some(ScriptConstructs::parse_list(text).expect("list")),
+            ..PermissionArgs::default()
+        };
+        let (s, _) = settings(file.clone(), &flag("variables,escapes"), false).expect("s");
+        assert!(s.script_constructs.allows(ScriptConstruct::Variables));
+        assert!(s.script_constructs.allows(ScriptConstruct::Escapes));
+        assert!(!s.script_constructs.allows(ScriptConstruct::Background));
+        assert_eq!(
+            permissions_line(&s),
+            "permissions mode manual; script constructs on: variables, escapes"
+        );
+        let (s, _) = settings(file, &flag("none"), false).expect("s");
+        assert!(s.script_constructs.is_empty());
     }
 
     /// A permissions file inside the project is refused, so a worker that

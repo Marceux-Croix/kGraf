@@ -328,6 +328,186 @@ impl AllowSet {
     }
 }
 
+/// A shell construct the strict script reader ([`script_commands`]) refuses
+/// to judge, which the user may let a mode grant (decision 0094, amended
+/// 2026-10-02). Each is off by default. With one on, a `SHELL -c` script that
+/// uses it is granted, in a mode that grants programs, when a grant covers
+/// every program kGraf can see in the script ([`script_commands_with`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScriptConstruct {
+    /// `$VAR`, `${VAR}`, `$(...)`, `$((...))`, backquotes, `<(...)`.
+    Variables,
+    /// `( ... )`, `{ ...; }` and brace expansion (`{a,b}`).
+    Subshells,
+    /// `&` and `|&`.
+    Background,
+    /// `<`, `<<` heredocs, `<<<` here-strings and `<>`.
+    InputRedirects,
+    /// Backslash escapes, comments, `!`, `$'...'`, and commands named by a
+    /// path, a quoted word, or after `VAR=value`.
+    Escapes,
+    /// Output redirects to any path, after a `cd` too.
+    OutsideRedirects,
+}
+
+impl ScriptConstruct {
+    pub const ALL: [ScriptConstruct; 6] = [
+        ScriptConstruct::Variables,
+        ScriptConstruct::Subshells,
+        ScriptConstruct::Background,
+        ScriptConstruct::InputRedirects,
+        ScriptConstruct::Escapes,
+        ScriptConstruct::OutsideRedirects,
+    ];
+
+    /// The key form in `permissions.toml` (on the command line, `-` may
+    /// stand for `_`).
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Variables => "variables",
+            Self::Subshells => "subshells",
+            Self::Background => "background",
+            Self::InputRedirects => "input_redirects",
+            Self::Escapes => "escapes",
+            Self::OutsideRedirects => "outside_redirects",
+        }
+    }
+
+    /// The switch's name in the settings surface.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Variables => "Variables and command substitution: $VAR, $(...), backquotes",
+            Self::Subshells => "Subshells and groups: ( ... ), { ...; }, {a,b}",
+            Self::Background => "Background jobs: &",
+            Self::InputRedirects => "Input redirects and heredocs: <, <<, <<<",
+            Self::Escapes => {
+                "Escapes, comments and other quoting: \\, #, !, and commands named by a path \
+                 or after VAR=value"
+            }
+            Self::OutsideRedirects => "Output redirects outside the worker's files",
+        }
+    }
+
+    /// One plain line under the switch: what kGraf checks when it is on.
+    pub fn explanation(self) -> &'static str {
+        match self {
+            Self::Variables => {
+                "kGraf cannot see what a variable holds or what a substitution prints. It checks \
+                 the programs it can read, those inside $(...) and backquotes too; a command \
+                 named by a variable, such as $CMD, runs with no check at all."
+            }
+            Self::Subshells => {
+                "The commands inside the parentheses or braces are checked like every other \
+                 command."
+            }
+            Self::Background => {
+                "A command started with & keeps running while the next one starts; each is \
+                 checked like every other command."
+            }
+            Self::InputRedirects => {
+                "A command may read any file or text the script gives it. A heredoc whose text \
+                 runs a substitution is still asked about."
+            }
+            Self::Escapes => {
+                "kGraf reads the escape or the quote and checks the program it names; a program \
+                 named by a path is checked by that exact path, as your allow set lists it."
+            }
+            Self::OutsideRedirects => {
+                "This only lets the mode grant the script. The sandbox still blocks writes \
+                 outside the worktree and its scratch folder, and the work's changes are still \
+                 checked against its declared files."
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for ScriptConstruct {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.key())
+    }
+}
+
+impl std::str::FromStr for ScriptConstruct {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let key = s.trim().replace('-', "_");
+        Self::ALL
+            .into_iter()
+            .find(|c| c.key() == key)
+            .ok_or_else(|| {
+                format!(
+                    "`{}` is not a script construct: use {}, or none",
+                    s.escape_debug(),
+                    Self::ALL.map(|c| c.key().replace('_', "-")).join(", ")
+                )
+            })
+    }
+}
+
+/// The script constructs the user turned on (none by default).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ScriptConstructs(pub BTreeSet<ScriptConstruct>);
+
+impl ScriptConstructs {
+    pub fn allows(&self, c: ScriptConstruct) -> bool {
+        self.0.contains(&c)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Turn one construct on or off.
+    pub fn set(&mut self, c: ScriptConstruct, on: bool) {
+        if on {
+            self.0.insert(c);
+        } else {
+            self.0.remove(&c);
+        }
+    }
+
+    /// The keys, comma-separated, or `none`.
+    pub fn describe(&self) -> String {
+        if self.0.is_empty() {
+            return "none".to_owned();
+        }
+        self.0
+            .iter()
+            .map(|c| c.key())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// Parse a command-line list: names separated by commas, or `none`.
+    pub fn parse_list(text: &str) -> Result<Self, String> {
+        if text.trim() == "none" {
+            return Ok(Self::default());
+        }
+        let set = text
+            .split(',')
+            .filter(|s| !s.trim().is_empty())
+            .map(str::parse)
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        if set.is_empty() {
+            return Err("name at least one script construct, or none".to_owned());
+        }
+        Ok(Self(set))
+    }
+}
+
+/// What the user accepts by turning a script construct on, shown above the
+/// switches and in the documentation.
+pub const SCRIPT_CONSTRUCTS_RISK: &str = "These switches apply only where a mode grants \
+programs: Auto with your allow set, Accept edits for file programs, and programs granted to one \
+piece of work. With a switch on, a script that uses the construct is granted when every program \
+kGraf can see in it is granted. kGraf cannot see what a variable or a substitution will run, so \
+you accept that a program it cannot see runs unchecked, the refusal to delete system paths \
+included. Your deny and ask rules still apply to every command kGraf can see, and a deny or ask \
+rule whose program is named anywhere in the script text still refuses or asks. The sandbox does \
+not change. Manual still asks, and Bypass already allows these scripts.";
+
 /// Everything the user set: the mode, Auto's allow set, the rules, plan
 /// review, and the bypass switches.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -343,6 +523,9 @@ pub struct PermissionSettings {
     pub allow_bypass: bool,
     /// The user accepted the one-time Bypass warning.
     pub bypass_warning_accepted: bool,
+    /// Shell constructs a mode may grant inside a script (all off by
+    /// default).
+    pub script_constructs: ScriptConstructs,
 }
 
 /// The user-level file's form. Unknown keys are refused, so a misspelled
@@ -366,6 +549,8 @@ struct PermissionsFile {
     deny: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     ask: Vec<String>,
+    #[serde(default, skip_serializing_if = "ScriptConstructs::is_empty")]
+    script_constructs: ScriptConstructs,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -424,6 +609,7 @@ impl PermissionSettings {
             disable_bypass: f.disable_bypass,
             allow_bypass: f.allow_bypass,
             bypass_warning_accepted: f.bypass_warning_accepted,
+            script_constructs: f.script_constructs,
         })
     }
 
@@ -441,6 +627,7 @@ impl PermissionSettings {
             },
             deny: self.rules.deny.iter().map(Rule::text).collect(),
             ask: self.rules.ask.iter().map(Rule::text).collect(),
+            script_constructs: self.script_constructs.clone(),
         };
         toml::to_string(&f).map_err(|e| e.to_string())
     }
@@ -868,6 +1055,18 @@ impl PermissionControl {
     /// The user accepted the one-time Bypass warning.
     pub fn accept_bypass_warning(&self) {
         self.state().settings.bypass_warning_accepted = true;
+        self.bump();
+    }
+
+    /// The shell constructs a mode may grant inside a script.
+    pub fn script_constructs(&self) -> ScriptConstructs {
+        self.state().settings.script_constructs.clone()
+    }
+
+    /// Turn one script construct on or off (the user's switch). Applies to
+    /// the next call judged, a running worker's included.
+    pub fn set_script_construct(&self, construct: ScriptConstruct, on: bool) {
+        self.state().settings.script_constructs.set(construct, on);
         self.bump();
     }
 
@@ -1415,6 +1614,57 @@ pub enum Script {
 /// checked against [`simple_commands`], which the user's rules match, so a
 /// grant and a rule never judge different commands.
 pub fn script_commands(argv: &[String]) -> Script {
+    script_commands_with(argv, &ScriptConstructs::default())
+}
+
+/// [`script_commands`], where a script the strict reader refuses is read
+/// again by a reader that also accepts the constructs the user turned on
+/// (decision 0094, amended 2026-10-02). With none on, it is
+/// [`script_commands`] exactly.
+///
+/// The second reader returns the commands whose program it can see, the
+/// commands inside substitutions, subshells and groups included; a command
+/// named by a variable or a substitution has no program to check and is left
+/// out, which is what the user accepted by turning variables on. A script
+/// with no program it can see at all is not judged. The strict reader's
+/// cross-check against [`simple_commands`] does not apply to it: that split
+/// does not follow these constructs, so the user's rules are also matched by
+/// program name against the script text ([`construct_rule_limit`]).
+pub fn script_commands_with(argv: &[String], constructs: &ScriptConstructs) -> Script {
+    match strict_script_commands(argv) {
+        Script::Unjudged(why) if !constructs.is_empty() => match script_text(argv) {
+            Some(script) => match RelaxedReader::new(script, constructs).read() {
+                Ok(commands) => Script::Commands(commands),
+                Err(relaxed_why) => Script::Unjudged(relaxed_why),
+            },
+            None => Script::Unjudged(why),
+        },
+        other => other,
+    }
+}
+
+/// Whether the call is a script a mode judges only because of a construct
+/// the user turned on: the strict reader refuses it and the second reader
+/// accepts it ([`script_commands_with`]).
+pub fn relies_on_constructs(argv: &[String], constructs: &ScriptConstructs) -> bool {
+    !constructs.is_empty()
+        && matches!(strict_script_commands(argv), Script::Unjudged(_))
+        && matches!(script_commands_with(argv, constructs), Script::Commands(_))
+}
+
+/// The script of `[SHELL, "-c", SCRIPT]` for a shell of [`SCRIPT_SHELLS`]
+/// named bare; `None` for any other shape.
+fn script_text(argv: &[String]) -> Option<&str> {
+    match argv {
+        [shell, flag, script] if flag == "-c" && SCRIPT_SHELLS.contains(&shell.as_str()) => {
+            Some(script)
+        }
+        _ => None,
+    }
+}
+
+/// The strict reading behind [`script_commands`].
+fn strict_script_commands(argv: &[String]) -> Script {
     let Some(shell) = argv.first() else {
         return Script::NotAScript;
     };
@@ -1647,29 +1897,9 @@ impl ScriptReader {
     }
 
     fn check_target(&mut self, w: &ScriptWord) -> Result<(), String> {
-        let t = &w.text;
-        if w.special {
-            return Err(format!(
-                "a redirection target `{}` holds a glob, `~` or `=`",
-                t.escape_debug()
-            ));
+        if check_redirect_target(&w.text, w.special)? {
+            self.redirects_to_file = true;
         }
-        if t == "/dev/null" {
-            return Ok(());
-        }
-        let path = crate::normalize_relative(Path::new(t)).map_err(|_| {
-            format!(
-                "a redirection writes `{}`, outside the worktree",
-                t.escape_debug()
-            )
-        })?;
-        if let Some(why) = kgraf_core::paths::forbidden_reason(&path) {
-            return Err(format!(
-                "a redirection writes `{}`, which a worker may not write: {why}",
-                t.escape_debug()
-            ));
-        }
-        self.redirects_to_file = true;
         Ok(())
     }
 
@@ -1701,6 +1931,895 @@ impl ScriptReader {
         self.operator_pending = true;
         Ok(())
     }
+}
+
+/// Check an output redirection's target `t` (`special`: an unquoted part
+/// holds a glob, `~` or `=`): `/dev/null`, or a worktree path a worker may
+/// write ([`kgraf_core::paths::forbidden_reason`]). `Ok(true)` when it
+/// writes a file.
+fn check_redirect_target(t: &str, special: bool) -> Result<bool, String> {
+    if special {
+        return Err(format!(
+            "a redirection target `{}` holds a glob, `~` or `=`",
+            t.escape_debug()
+        ));
+    }
+    if t == "/dev/null" {
+        return Ok(false);
+    }
+    let path = crate::normalize_relative(Path::new(t)).map_err(|_| {
+        format!(
+            "a redirection writes `{}`, outside the worktree",
+            t.escape_debug()
+        )
+    })?;
+    if let Some(why) = kgraf_core::paths::forbidden_reason(&path) {
+        return Err(format!(
+            "a redirection writes `{}`, which a worker may not write: {why}",
+            t.escape_debug()
+        ));
+    }
+    Ok(true)
+}
+
+/// What closes the command list being read.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Close {
+    End,
+    /// `)` of a subshell, `$(...)` or `<(...)`.
+    Paren,
+    /// `}` of a brace group.
+    Brace,
+}
+
+/// One word read by [`RelaxedReader`]: its text with quotes and escapes
+/// removed (an expansion adds nothing), whether any of it was quoted or
+/// escaped, whether an unquoted part holds a glob, brace, `~` or `=`, and
+/// whether it holds an expansion kGraf cannot resolve.
+#[derive(Default)]
+struct RelaxedWord {
+    text: String,
+    quoted: bool,
+    special: bool,
+    opaque: bool,
+}
+
+/// What the next word of a command is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NextWord {
+    Output,
+    Input,
+    Heredoc { strip_tabs: bool },
+}
+
+/// A heredoc whose body follows the line it was opened on.
+struct PendingHeredoc {
+    delimiter: String,
+    strip_tabs: bool,
+    expands: bool,
+}
+
+/// One command being read by [`RelaxedReader`].
+#[derive(Default)]
+struct RelaxedCommand {
+    /// The program and its arguments, when the program is visible.
+    words: Vec<String>,
+    started: bool,
+    program_seen: bool,
+    visible: bool,
+    group: bool,
+    next: Option<NextWord>,
+}
+
+impl RelaxedCommand {
+    fn at_start(&self) -> bool {
+        !self.started
+    }
+}
+
+/// The second script reader of [`script_commands_with`]: the strict reader's
+/// grammar plus the constructs the user turned on, each refused with the
+/// strict reader's reason while it is off. Recursive over substitutions,
+/// subshells and groups, so the commands inside them are returned too.
+/// Local mutable state, scoped to one read, as in [`ScriptReader`].
+///
+/// Searched before writing: a full POSIX or bash parser crate
+/// (`brush-parser`, `conch-parser`, `yash-syntax`) would read more than this
+/// needs and would still have to be mapped onto "which programs can kGraf
+/// see"; this reader only has to find program names and refuse what it
+/// cannot place, so it stays a small, auditable character loop.
+struct RelaxedReader<'a> {
+    chars: Vec<char>,
+    pos: usize,
+    allow: &'a ScriptConstructs,
+    commands: Vec<Vec<String>>,
+    heredocs: Vec<PendingHeredoc>,
+    redirects_to_file: bool,
+    changes_directory: bool,
+    unseen: bool,
+}
+
+/// Characters that end an unquoted word.
+fn ends_word(c: char) -> bool {
+    matches!(
+        c,
+        ' ' | '\t' | '\n' | ';' | '&' | '|' | '<' | '>' | '(' | ')'
+    )
+}
+
+impl<'a> RelaxedReader<'a> {
+    fn new(script: &str, allow: &'a ScriptConstructs) -> Self {
+        Self {
+            chars: script.chars().collect(),
+            pos: 0,
+            allow,
+            commands: Vec::new(),
+            heredocs: Vec::new(),
+            redirects_to_file: false,
+            changes_directory: false,
+            unseen: false,
+        }
+    }
+
+    fn read(mut self) -> Result<Vec<Vec<String>>, String> {
+        self.list(Close::End)?;
+        if !self.heredocs.is_empty() {
+            return Err("a heredoc has no body".into());
+        }
+        if self.commands.is_empty() {
+            return Err(if self.unseen {
+                "kGraf can see no program it runs".into()
+            } else {
+                "it runs no command".into()
+            });
+        }
+        if !self.allow.allows(ScriptConstruct::OutsideRedirects)
+            && self.redirects_to_file
+            && self.changes_directory
+        {
+            return Err("it redirects to a file after changing directory".into());
+        }
+        Ok(self.commands)
+    }
+
+    fn peek(&self) -> Option<char> {
+        self.chars.get(self.pos).copied()
+    }
+
+    fn peek_at(&self, n: usize) -> Option<char> {
+        self.chars.get(self.pos + n).copied()
+    }
+
+    fn need(&self, c: ScriptConstruct, why: &str) -> Result<(), String> {
+        if self.allow.allows(c) {
+            Ok(())
+        } else {
+            Err(why.to_owned())
+        }
+    }
+
+    /// Read commands until `close` (consumed).
+    fn list(&mut self, close: Close) -> Result<(), String> {
+        let mut cmd = RelaxedCommand::default();
+        let mut operator_pending = false;
+        loop {
+            let Some(c) = self.peek() else {
+                if close != Close::End {
+                    return Err("a subshell, group or substitution is not closed".into());
+                }
+                self.end_command(&mut cmd, false, &mut operator_pending)?;
+                if operator_pending {
+                    return Err("an operator has no command after it".into());
+                }
+                return Ok(());
+            };
+            let next = self.peek_at(1);
+            match c {
+                ' ' | '\t' => self.pos += 1,
+                '\\' if next == Some('\n') => {
+                    self.need(ScriptConstruct::Escapes, "it holds a backslash escape")?;
+                    self.pos += 2;
+                }
+                '\n' => {
+                    self.pos += 1;
+                    self.end_command(&mut cmd, false, &mut operator_pending)?;
+                    self.heredoc_bodies()?;
+                }
+                ';' => {
+                    if next == Some(';') {
+                        return Err("it holds `;;`".into());
+                    }
+                    self.pos += 1;
+                    self.end_command(&mut cmd, true, &mut operator_pending)?;
+                }
+                '&' if next == Some('&') => {
+                    self.pos += 2;
+                    self.end_operator(&mut cmd, &mut operator_pending)?;
+                }
+                // `&>` and `&>>` write stdout and stderr to a file.
+                '&' if next == Some('>') => {
+                    self.pos += 1;
+                    self.redirect_out(&mut cmd)?;
+                }
+                '&' => {
+                    self.need(
+                        ScriptConstruct::Background,
+                        "`&` runs a command in the background",
+                    )?;
+                    self.pos += 1;
+                    self.end_command(&mut cmd, true, &mut operator_pending)?;
+                }
+                '|' if next == Some('|') => {
+                    self.pos += 2;
+                    self.end_operator(&mut cmd, &mut operator_pending)?;
+                }
+                '|' if next == Some('&') => {
+                    self.need(ScriptConstruct::Background, "it holds `|&`")?;
+                    self.pos += 2;
+                    self.end_operator(&mut cmd, &mut operator_pending)?;
+                }
+                '|' => {
+                    self.pos += 1;
+                    self.end_operator(&mut cmd, &mut operator_pending)?;
+                }
+                // Process substitution runs a command, like `$(...)`.
+                '<' | '>' if next == Some('(') => {
+                    self.need(
+                        ScriptConstruct::Variables,
+                        "it expands a variable or substitutes a command",
+                    )?;
+                    self.pos += 2;
+                    self.list(Close::Paren)?;
+                    let w = RelaxedWord {
+                        opaque: true,
+                        ..RelaxedWord::default()
+                    };
+                    self.push_word(&mut cmd, w)?;
+                }
+                '>' => self.redirect_out(&mut cmd)?,
+                '<' => self.redirect_in(&mut cmd)?,
+                '(' => {
+                    self.need(ScriptConstruct::Subshells, "it opens a subshell or a group")?;
+                    if !cmd.at_start() {
+                        return Err(
+                            "it defines a function or opens a subshell inside a command".into()
+                        );
+                    }
+                    self.pos += 1;
+                    self.list(Close::Paren)?;
+                    cmd.started = true;
+                    cmd.group = true;
+                }
+                ')' => {
+                    if close != Close::Paren {
+                        return Err("it opens a subshell or a group".into());
+                    }
+                    self.pos += 1;
+                    self.end_command(&mut cmd, false, &mut operator_pending)?;
+                    if operator_pending {
+                        return Err("an operator has no command after it".into());
+                    }
+                    return Ok(());
+                }
+                '{' if cmd.at_start()
+                    && next.is_none_or(|n| n == ' ' || n == '\t' || n == '\n') =>
+                {
+                    self.need(
+                        ScriptConstruct::Subshells,
+                        "it holds a brace group or brace expansion",
+                    )?;
+                    self.pos += 1;
+                    self.list(Close::Brace)?;
+                    cmd.started = true;
+                    cmd.group = true;
+                }
+                '}' if close == Close::Brace && cmd.at_start() && next.is_none_or(ends_word) => {
+                    self.pos += 1;
+                    self.end_command(&mut cmd, false, &mut operator_pending)?;
+                    if operator_pending {
+                        return Err("an operator has no command after it".into());
+                    }
+                    return Ok(());
+                }
+                '#' => {
+                    self.need(ScriptConstruct::Escapes, "it holds a comment")?;
+                    while self.peek().is_some_and(|c| c != '\n') {
+                        self.pos += 1;
+                    }
+                }
+                c if c.is_ascii_digit() && self.descriptor_then_redirect() => {
+                    // `2>`, `0<`: the digits are a descriptor, not a word.
+                    while self.peek().is_some_and(|c| c.is_ascii_digit()) {
+                        self.pos += 1;
+                    }
+                }
+                _ => {
+                    let w = self.word()?;
+                    self.push_word(&mut cmd, w)?;
+                }
+            }
+        }
+    }
+
+    /// Digits at the read position directly followed by `>` or `<`.
+    fn descriptor_then_redirect(&self) -> bool {
+        let digits = self.chars[self.pos..]
+            .iter()
+            .take_while(|c| c.is_ascii_digit())
+            .count();
+        matches!(self.peek_at(digits), Some('>' | '<'))
+    }
+
+    /// An output redirection at `>` (`>`, `>>`, `>|`, `>&N`, `>&-`, `>&FILE`).
+    fn redirect_out(&mut self, cmd: &mut RelaxedCommand) -> Result<(), String> {
+        if cmd.next.is_some() {
+            return Err("a redirection names no file".into());
+        }
+        cmd.started = true;
+        let mut i = self.pos + 1;
+        if self.chars.get(i) == Some(&'>') {
+            i += 1;
+        }
+        match self.chars.get(i) {
+            Some('|') => {
+                self.need(ScriptConstruct::OutsideRedirects, "it holds `>|`")?;
+                i += 1;
+            }
+            Some('&') => {
+                let n = self.chars[i + 1..]
+                    .iter()
+                    .take_while(|c| c.is_ascii_digit() || **c == '-')
+                    .count();
+                if n > 0 {
+                    self.pos = i + 1 + n;
+                    return Ok(());
+                }
+                self.need(
+                    ScriptConstruct::OutsideRedirects,
+                    "it redirects with `>&` to a file",
+                )?;
+                i += 1;
+            }
+            _ => {}
+        }
+        self.pos = i;
+        cmd.next = Some(NextWord::Output);
+        Ok(())
+    }
+
+    /// An input redirection at `<` (`<`, `<&N`, `<<`, `<<-`, `<<<`, `<>`).
+    fn redirect_in(&mut self, cmd: &mut RelaxedCommand) -> Result<(), String> {
+        self.need(ScriptConstruct::InputRedirects, "it redirects input")?;
+        if cmd.next.is_some() {
+            return Err("a redirection names no file".into());
+        }
+        cmd.started = true;
+        let mut i = self.pos + 1;
+        let next = match self.chars.get(i) {
+            Some('<') if self.chars.get(i + 1) == Some(&'<') => {
+                i += 2;
+                NextWord::Input
+            }
+            Some('<') => {
+                i += 1;
+                let strip_tabs = self.chars.get(i) == Some(&'-');
+                if strip_tabs {
+                    i += 1;
+                }
+                NextWord::Heredoc { strip_tabs }
+            }
+            Some('&') => {
+                let n = self.chars[i + 1..]
+                    .iter()
+                    .take_while(|c| c.is_ascii_digit() || **c == '-')
+                    .count();
+                if n == 0 {
+                    return Err("it redirects input with `<&` to a word".into());
+                }
+                self.pos = i + 1 + n;
+                return Ok(());
+            }
+            // `<>` opens the file for writing too.
+            Some('>') => {
+                i += 1;
+                NextWord::Output
+            }
+            _ => NextWord::Input,
+        };
+        self.pos = i;
+        cmd.next = Some(next);
+        Ok(())
+    }
+
+    fn push_word(&mut self, cmd: &mut RelaxedCommand, w: RelaxedWord) -> Result<(), String> {
+        cmd.started = true;
+        if let Some(next) = cmd.next.take() {
+            return match next {
+                NextWord::Output => self.check_target(&w),
+                NextWord::Input => Ok(()),
+                NextWord::Heredoc { strip_tabs } => {
+                    if w.opaque {
+                        return Err("a heredoc's delimiter expands".into());
+                    }
+                    self.heredocs.push(PendingHeredoc {
+                        delimiter: w.text,
+                        strip_tabs,
+                        expands: !w.quoted,
+                    });
+                    Ok(())
+                }
+            };
+        }
+        if cmd.group {
+            return Err("a word follows a subshell or group".into());
+        }
+        if cmd.program_seen {
+            if cmd.visible {
+                cmd.words.push(w.text);
+            }
+            return Ok(());
+        }
+        let not_plain = || {
+            format!(
+                "the command `{}` does not start with a plain program name",
+                w.text.escape_debug()
+            )
+        };
+        // `! cmd` negates the command's status.
+        if !w.quoted && !w.opaque && w.text == "!" {
+            return self.need(ScriptConstruct::Escapes, "it holds `!`");
+        }
+        if !w.quoted && is_assignment(&w.text) {
+            return self.need(ScriptConstruct::Escapes, &not_plain());
+        }
+        cmd.program_seen = true;
+        if w.opaque {
+            // Named by a variable or a substitution: nothing to check.
+            self.unseen = true;
+            return Ok(());
+        }
+        if w.special
+            || w.text.is_empty()
+            || w.text.chars().any(|c| c.is_control() || c.is_whitespace())
+        {
+            return Err(not_plain());
+        }
+        if w.quoted || !is_plain_program(&w.text) {
+            self.need(ScriptConstruct::Escapes, &not_plain())?;
+        }
+        if !w.quoted && SHELL_KEYWORDS.contains(&w.text.as_str()) {
+            return Err(format!("it uses the shell keyword `{}`", w.text));
+        }
+        cmd.visible = true;
+        cmd.words.push(w.text);
+        Ok(())
+    }
+
+    fn check_target(&mut self, w: &RelaxedWord) -> Result<(), String> {
+        if self.allow.allows(ScriptConstruct::OutsideRedirects) {
+            return Ok(());
+        }
+        if w.opaque {
+            return Err(format!(
+                "a redirection writes `{}`, a path kGraf cannot resolve",
+                w.text.escape_debug()
+            ));
+        }
+        if check_redirect_target(&w.text, w.special)? {
+            self.redirects_to_file = true;
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self, cmd: &mut RelaxedCommand) {
+        let done = std::mem::take(cmd);
+        if done.visible {
+            // Any word naming a directory changer counts: `command cd x`
+            // moves the shell as surely as `cd x`.
+            if done
+                .words
+                .iter()
+                .any(|w| DIRECTORY_CHANGERS.contains(&base_name(w)))
+            {
+                self.changes_directory = true;
+            }
+            self.commands.push(done.words);
+        }
+    }
+
+    fn end_command(
+        &mut self,
+        cmd: &mut RelaxedCommand,
+        explicit: bool,
+        operator_pending: &mut bool,
+    ) -> Result<(), String> {
+        if cmd.next.is_some() {
+            return Err("a redirection names no file".into());
+        }
+        if !cmd.started {
+            if explicit {
+                return Err("an operator has no command on one side".into());
+            }
+            return Ok(());
+        }
+        self.finish(cmd);
+        *operator_pending = false;
+        Ok(())
+    }
+
+    fn end_operator(
+        &mut self,
+        cmd: &mut RelaxedCommand,
+        operator_pending: &mut bool,
+    ) -> Result<(), String> {
+        if cmd.next.is_some() || !cmd.started {
+            return Err("an operator has no command on one side".into());
+        }
+        self.finish(cmd);
+        *operator_pending = true;
+        Ok(())
+    }
+
+    /// The bodies of the heredocs opened on the line just ended.
+    fn heredoc_bodies(&mut self) -> Result<(), String> {
+        for doc in std::mem::take(&mut self.heredocs) {
+            loop {
+                if self.pos >= self.chars.len() {
+                    return Err("a heredoc is not closed".into());
+                }
+                let end = self.chars[self.pos..]
+                    .iter()
+                    .position(|&c| c == '\n')
+                    .map_or(self.chars.len(), |n| self.pos + n);
+                let line: String = self.chars[self.pos..end].iter().collect();
+                self.pos = (end + 1).min(self.chars.len());
+                let compared = if doc.strip_tabs {
+                    line.trim_start_matches('\t')
+                } else {
+                    line.as_str()
+                };
+                if compared == doc.delimiter {
+                    break;
+                }
+                if doc.expands {
+                    if line.contains('`') || line.contains("$(") {
+                        return Err("a heredoc's text substitutes a command".into());
+                    }
+                    if line.contains('$') {
+                        self.need(
+                            ScriptConstruct::Variables,
+                            "it expands a variable or substitutes a command",
+                        )?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn word(&mut self) -> Result<RelaxedWord, String> {
+        let mut w = RelaxedWord::default();
+        while let Some(c) = self.peek() {
+            match c {
+                c if ends_word(c) => break,
+                '\'' => {
+                    let end = self.chars[self.pos + 1..]
+                        .iter()
+                        .position(|&q| q == '\'')
+                        .ok_or("a quote is not closed")?;
+                    w.text.extend(&self.chars[self.pos + 1..self.pos + 1 + end]);
+                    w.quoted = true;
+                    self.pos += end + 2;
+                }
+                '"' => self.double_quoted(&mut w)?,
+                '\\' => {
+                    self.need(ScriptConstruct::Escapes, "it holds a backslash escape")?;
+                    match self.peek_at(1) {
+                        None => return Err("the script ends in a backslash".into()),
+                        Some('\n') => {}
+                        Some(e) => {
+                            w.text.push(e);
+                            w.quoted = true;
+                        }
+                    }
+                    self.pos += 2;
+                }
+                '$' => self.dollar(&mut w, false)?,
+                '`' => self.backquote(&mut w)?,
+                '!' => {
+                    self.need(ScriptConstruct::Escapes, "it holds `!`")?;
+                    w.text.push('!');
+                    self.pos += 1;
+                }
+                '#' => {
+                    self.need(ScriptConstruct::Escapes, "it holds a comment")?;
+                    w.text.push('#');
+                    self.pos += 1;
+                }
+                '{' | '}' => {
+                    self.need(
+                        ScriptConstruct::Subshells,
+                        "it holds a brace group or brace expansion",
+                    )?;
+                    w.text.push(c);
+                    w.special = true;
+                    self.pos += 1;
+                }
+                c if c.is_control() => return Err("it holds a control character".into()),
+                c => {
+                    w.text.push(c);
+                    if matches!(c, '*' | '?' | '[' | ']' | '~' | '=') {
+                        w.special = true;
+                    }
+                    self.pos += 1;
+                }
+            }
+        }
+        Ok(w)
+    }
+
+    fn double_quoted(&mut self, w: &mut RelaxedWord) -> Result<(), String> {
+        const WHY: &str = "a double-quoted word expands, substitutes or escapes";
+        w.quoted = true;
+        self.pos += 1;
+        loop {
+            match self.peek() {
+                None => return Err("a quote is not closed".into()),
+                Some('"') => {
+                    self.pos += 1;
+                    return Ok(());
+                }
+                Some('\\') => {
+                    self.need(ScriptConstruct::Escapes, WHY)?;
+                    match self.peek_at(1) {
+                        Some(e @ ('$' | '`' | '"' | '\\')) => {
+                            w.text.push(e);
+                            self.pos += 2;
+                        }
+                        Some('\n') => self.pos += 2,
+                        _ => {
+                            w.text.push('\\');
+                            self.pos += 1;
+                        }
+                    }
+                }
+                Some('$') => {
+                    self.need(ScriptConstruct::Variables, WHY)?;
+                    self.dollar(w, true)?;
+                }
+                Some('`') => {
+                    self.need(ScriptConstruct::Variables, WHY)?;
+                    self.backquote(w)?;
+                }
+                Some(c) => {
+                    w.text.push(c);
+                    self.pos += 1;
+                }
+            }
+        }
+    }
+
+    /// A `$` at the read position.
+    fn dollar(&mut self, w: &mut RelaxedWord, in_quotes: bool) -> Result<(), String> {
+        let next = self.peek_at(1);
+        if next == Some('\'') && !in_quotes {
+            // `$'...'`: a quote with backslash escapes.
+            self.need(ScriptConstruct::Escapes, "it holds a `$'...'` quote")?;
+            self.pos += 2;
+            loop {
+                match self.peek() {
+                    None => return Err("a quote is not closed".into()),
+                    Some('\'') => {
+                        self.pos += 1;
+                        break;
+                    }
+                    Some('\\') => {
+                        if let Some(e) = self.peek_at(1) {
+                            w.text.push(e);
+                        }
+                        self.pos += 2;
+                    }
+                    Some(c) => {
+                        w.text.push(c);
+                        self.pos += 1;
+                    }
+                }
+            }
+            w.quoted = true;
+            return Ok(());
+        }
+        self.need(
+            ScriptConstruct::Variables,
+            "it expands a variable or substitutes a command",
+        )?;
+        match next {
+            Some('(') if self.peek_at(2) == Some('(') => {
+                // `$((...))`: arithmetic, no command in it.
+                self.pos += 3;
+                let mut depth = 2;
+                while depth > 0 {
+                    match self.peek() {
+                        None => return Err("an arithmetic expansion is not closed".into()),
+                        Some('(') => depth += 1,
+                        Some(')') => depth -= 1,
+                        Some('`') => {
+                            return Err("an arithmetic expansion substitutes a command".into());
+                        }
+                        Some('$') if self.peek_at(1) == Some('(') => {
+                            return Err("an arithmetic expansion substitutes a command".into());
+                        }
+                        _ => {}
+                    }
+                    self.pos += 1;
+                }
+                w.opaque = true;
+            }
+            Some('(') => {
+                self.pos += 2;
+                self.list(Close::Paren)?;
+                w.opaque = true;
+            }
+            Some('{') => {
+                // `${...}`: refused when it could hide a command or a quote.
+                self.pos += 2;
+                let mut depth = 1;
+                while depth > 0 {
+                    match self.peek() {
+                        None => return Err("a parameter expansion is not closed".into()),
+                        Some('{') => depth += 1,
+                        Some('}') => depth -= 1,
+                        Some('`') | Some('\'') | Some('"') | Some('\\') => {
+                            return Err("a parameter expansion holds a quote, an escape or a \
+                                 substitution"
+                                .into());
+                        }
+                        Some('$') if self.peek_at(1) == Some('(') => {
+                            return Err("a parameter expansion holds a quote, an escape or a \
+                                 substitution"
+                                .into());
+                        }
+                        _ => {}
+                    }
+                    self.pos += 1;
+                }
+                w.opaque = true;
+            }
+            Some(c) if c.is_ascii_alphabetic() || c == '_' => {
+                self.pos += 1;
+                while self
+                    .peek()
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+                {
+                    self.pos += 1;
+                }
+                w.opaque = true;
+            }
+            Some(c) if c.is_ascii_digit() || "?@*#$!-".contains(c) => {
+                self.pos += 2;
+                w.opaque = true;
+            }
+            // `$"..."`: a quote; the next round reads it.
+            Some('"') if !in_quotes => self.pos += 1,
+            _ => {
+                w.text.push('$');
+                self.pos += 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// A backquote substitution at the read position, read as its own
+    /// script.
+    fn backquote(&mut self, w: &mut RelaxedWord) -> Result<(), String> {
+        self.need(
+            ScriptConstruct::Variables,
+            "it expands a variable or substitutes a command",
+        )?;
+        let end = self.chars[self.pos + 1..]
+            .iter()
+            .position(|&q| q == '`')
+            .ok_or("a backquote is not closed")?;
+        let inner: String = self.chars[self.pos + 1..self.pos + 1 + end]
+            .iter()
+            .collect();
+        if inner.contains('\\') {
+            return Err("a backquote substitution holds a backslash".into());
+        }
+        let mut sub = RelaxedReader::new(&inner, self.allow);
+        sub.list(Close::End)?;
+        if !sub.heredocs.is_empty() {
+            return Err("a heredoc inside a backquote substitution has no body".into());
+        }
+        self.commands.append(&mut sub.commands);
+        self.redirects_to_file |= sub.redirects_to_file;
+        self.changes_directory |= sub.changes_directory;
+        self.unseen |= sub.unseen;
+        self.pos += end + 2;
+        w.opaque = true;
+        Ok(())
+    }
+}
+
+/// The program a shell rule names, for [`construct_rule_limit`]: the base
+/// name of its pattern's first word, as a prefix when the pattern is that
+/// one word ending in `*`. `None` for a rule on another tool or on every
+/// shell call (those already match every call).
+fn rule_program(rule: &Rule) -> Option<(String, bool)> {
+    if rule.tool != "shell" && rule.tool != "*" {
+        return None;
+    }
+    let pattern = rule.pattern.as_deref()?;
+    let first = pattern.split_whitespace().next()?;
+    let one_word = !pattern.trim().contains(char::is_whitespace);
+    let (word, prefix) = match first.strip_suffix('*') {
+        Some(stem) if one_word => (stem, true),
+        _ => (first.trim_end_matches('*'), false),
+    };
+    Some((base_name(word).to_owned(), prefix))
+}
+
+/// The user's shell rules matched by program name against the text of a
+/// script a mode judges only because of a construct the user turned on
+/// ([`relies_on_constructs`]). Such a script may hide a command from
+/// [`simple_commands`] (`{ curl x; }` splits as `{ curl x`), so a rule whose
+/// program appears anywhere in the script as a word (split at every
+/// character a program name cannot hold, `/` included) refuses or asks.
+/// Deliberately broad: `shell(git push*)` here matches any script naming
+/// `git`. Deny wins over ask. `None` for any other call.
+pub fn construct_rule_limit(
+    rules: &UserRules,
+    constructs: &ScriptConstructs,
+    call: &PendingCall,
+) -> Option<HardLimit> {
+    if call.tool != "shell" {
+        return None;
+    }
+    let argv = shell_argv(&call.input);
+    if !relies_on_constructs(&argv, constructs) {
+        return None;
+    }
+    let words: Vec<&str> = argv
+        .iter()
+        .flat_map(|a| {
+            a.split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-')))
+        })
+        .filter(|w| !w.is_empty())
+        .collect();
+    let named = |rule: &Rule| -> Option<String> {
+        let (program, prefix) = rule_program(rule)?;
+        words
+            .iter()
+            .find(|w| {
+                if prefix {
+                    w.starts_with(program.as_str())
+                } else {
+                    **w == program
+                }
+            })
+            .map(|w| (*w).to_owned())
+    };
+    let why = format!(
+        "the script names `{{}}`, and with {} on, kGraf cannot see every command it runs",
+        constructs.describe()
+    );
+    if let Some((rule, word)) = rules.deny.iter().find_map(|r| named(r).map(|w| (r, w))) {
+        return Some(HardLimit::Deny(format!(
+            "your deny rule `{}` blocks this call in every permission mode: {}",
+            rule.text(),
+            why.replace("{}", &word)
+        )));
+    }
+    rules
+        .ask
+        .iter()
+        .find_map(|r| named(r).map(|w| (r, w)))
+        .map(|(rule, word)| {
+            HardLimit::Ask(format!(
+                "your ask rule `{}` asks about this call in every permission mode: {}; allow it?",
+                rule.text(),
+                why.replace("{}", &word)
+            ))
+        })
 }
 
 /// A call's subjects, for rule matching: a shell call's command lines (the
@@ -1839,6 +2958,7 @@ fn program_index(words: &[&str]) -> Option<usize> {
             return Some(i);
         }
         let prefix = WRAPPERS.contains(&b)
+            || matches!(*w, "{" | "!" | "(")
             || w.starts_with('-')
             || w.contains('=')
             || w.parse::<f64>().is_ok()
@@ -2139,13 +3259,30 @@ impl ApprovalHook for PermissionRulesHook {
     }
 
     async fn review(&self, call: &PendingCall) -> HookDecision {
-        let rules = self.control.rules();
-        match hard_limit(
-            &rules,
+        let settings = self.control.settings();
+        let limit = hard_limit(
+            &settings.rules,
             call,
             self.home.as_deref(),
             self.workspace.as_deref(),
-        ) {
+        );
+        // Decision 0094, amended 2026-10-02: a script judged only because of
+        // a construct the user turned on also meets the rules by program
+        // name in its text. Bypass grants scripts whole, whatever the
+        // switches say, so its limits stay as they were.
+        let by_name = if settings.mode == PermissionMode::Bypass {
+            None
+        } else {
+            construct_rule_limit(&settings.rules, &settings.script_constructs, call)
+        };
+        let decided = match (limit, by_name) {
+            (Some(HardLimit::Deny(r)), _) | (_, Some(HardLimit::Deny(r))) => {
+                Some(HardLimit::Deny(r))
+            }
+            (Some(l), _) | (None, Some(l)) => Some(l),
+            (None, None) => None,
+        };
+        match decided {
             Some(HardLimit::Deny(reason)) => HookDecision::Deny { reason },
             Some(HardLimit::Ask(question)) => HookDecision::Ask { question },
             None => HookDecision::Allow,
@@ -2650,6 +3787,347 @@ mod tests {
         // `cd` without a file redirection, and `/dev/null` after a `cd`, are
         // still judged: nothing they write depends on the directory.
         assert_eq!(programs_of("cd sub && ls 2>/dev/null"), ["cd", "ls"]);
+    }
+
+    fn only(c: ScriptConstruct) -> ScriptConstructs {
+        ScriptConstructs([c].into_iter().collect())
+    }
+
+    fn all_but(c: ScriptConstruct) -> ScriptConstructs {
+        ScriptConstructs(
+            ScriptConstruct::ALL
+                .into_iter()
+                .filter(|x| *x != c)
+                .collect(),
+        )
+    }
+
+    fn all() -> ScriptConstructs {
+        ScriptConstructs(ScriptConstruct::ALL.into_iter().collect())
+    }
+
+    fn read_with(s: &str, constructs: &ScriptConstructs) -> Script {
+        script_commands_with(&argv(&["sh", "-c", s]), constructs)
+    }
+
+    /// Scripts each construct switch lets a mode judge, with the programs
+    /// kGraf can see in them, in the order their commands end.
+    fn construct_cases() -> Vec<(ScriptConstruct, &'static str, Vec<&'static str>)> {
+        use ScriptConstruct::*;
+        vec![
+            (
+                Variables,
+                "mkdir x && cp $(ls src) x/",
+                vec!["mkdir", "ls", "cp"],
+            ),
+            (Variables, "echo \"$HOME\" `date`", vec!["date", "echo"]),
+            (Variables, "$CMD x && mkdir y", vec!["mkdir"]),
+            (Variables, "diff <(ls a) b", vec!["ls", "diff"]),
+            (Variables, "echo $((1 + 2)) ${HOME}", vec!["echo"]),
+            (
+                Subshells,
+                "(mkdir x && touch x/a) && { cp a b; }",
+                vec!["mkdir", "touch", "cp"],
+            ),
+            (Subshells, "cp a{1,2} out/", vec!["cp"]),
+            (Background, "mkdir x & cp a b", vec!["mkdir", "cp"]),
+            (Background, "mkdir x |& cat", vec!["mkdir", "cat"]),
+            (InputRedirects, "wc -l < in.txt", vec!["wc"]),
+            (
+                InputRedirects,
+                "cat <<EOF > out/x\nhello\nEOF\nls",
+                vec!["cat", "ls"],
+            ),
+            (InputRedirects, "cat <<'EOF'\n$(id) `id`\nEOF", vec!["cat"]),
+            (InputRedirects, "grep a <<< 'a b'", vec!["grep"]),
+            (Escapes, "mkdir x # note", vec!["mkdir"]),
+            (Escapes, "! mkdir x", vec!["mkdir"]),
+            (Escapes, "PATH=/tmp mkdir x", vec!["mkdir"]),
+            (Escapes, "/bin/mkdir x", vec!["/bin/mkdir"]),
+            (Escapes, "'mkdir' x", vec!["mkdir"]),
+            (Escapes, "m\\kdir x", vec!["mkdir"]),
+            (OutsideRedirects, "echo x > /etc/passwd", vec!["echo"]),
+            (
+                OutsideRedirects,
+                "cd sub && echo x > out.txt",
+                vec!["cd", "echo"],
+            ),
+            (OutsideRedirects, "echo x > .git/config", vec!["echo"]),
+            (OutsideRedirects, "echo x >| out.txt", vec!["echo"]),
+        ]
+    }
+
+    /// Each switch is the gate for its construct: off (and with every other
+    /// switch on) the script is not judged, as before; on, it is read as the
+    /// commands whose programs kGraf can see.
+    #[test]
+    fn each_script_construct_is_judged_only_with_its_switch_on() {
+        for (c, s, programs) in construct_cases() {
+            assert!(
+                matches!(
+                    read_with(s, &ScriptConstructs::default()),
+                    Script::Unjudged(_)
+                ),
+                "{c}: {s:?} judged with every switch off"
+            );
+            assert!(
+                matches!(script(s), Script::Unjudged(_)),
+                "{c}: {s:?} judged by the strict reader"
+            );
+            match read_with(s, &all_but(c)) {
+                Script::Unjudged(_) => {}
+                other => panic!("{c}: {s:?} judged without its switch: {other:?}"),
+            }
+            match read_with(s, &only(c)) {
+                Script::Commands(cmds) => assert_eq!(
+                    cmds.iter().map(|w| w[0].as_str()).collect::<Vec<_>>(),
+                    programs,
+                    "{c}: {s:?}"
+                ),
+                other => panic!("{c}: {s:?} not judged with its switch on: {other:?}"),
+            }
+            assert!(relies_on_constructs(&argv(&["sh", "-c", s]), &only(c)));
+        }
+        // A plain script reads the same with any switch on, and does not
+        // rely on one.
+        let plain = "mkdir -p out && cp a out/a";
+        assert_eq!(read_with(plain, &all()), script(plain));
+        assert!(!relies_on_constructs(&argv(&["sh", "-c", plain]), &all()));
+    }
+
+    /// What no switch opens: shell keywords, function definitions, a script
+    /// with no program kGraf can see, a heredoc or a parameter expansion
+    /// that could hide a command, a glob as a program, and the call shapes
+    /// the strict reader refuses.
+    #[test]
+    fn some_scripts_are_never_judged_whatever_the_switches() {
+        for (s, why) in [
+            ("if true; then mkdir x; fi", "keyword"),
+            ("f() { ls; }", "function"),
+            ("$CMD x", "no program"),
+            ("cat <<EOF\n$(id)\nEOF", "substitutes a command"),
+            ("cat <<EOF\nhello", "not closed"),
+            ("cat <<EOF", "no body"),
+            ("echo ${X:-$(id)}", "parameter expansion"),
+            ("m* x", "plain program"),
+            ("(mkdir x", "not closed"),
+            ("mkdir x)", "subshell"),
+            ("{ mkdir x", "not closed"),
+            ("( ls ) x", "follows a subshell"),
+            ("echo `ls \\`", "backslash"),
+            ("mkdir x;; cp a b", ";;"),
+            ("mkdir x &&", "no command after"),
+        ] {
+            match read_with(s, &all()) {
+                Script::Unjudged(reason) => assert!(reason.contains(why), "{s:?}: {reason}"),
+                other => panic!("{s:?} must not be judged: {other:?}"),
+            }
+        }
+        // A redirection to a path kGraf cannot resolve needs the outside
+        // switch even with variables on.
+        let s = "echo x > $OUT";
+        assert!(
+            matches!(read_with(s, &only(ScriptConstruct::Variables)), Script::Unjudged(r) if r.contains("cannot resolve"))
+        );
+        assert!(matches!(read_with(s, &all()), Script::Commands(_)));
+        for a in [
+            argv(&["/bin/sh", "-c", "mkdir $x"]),
+            argv(&["sh", "-c", "mkdir \"$0\"", "x"]),
+        ] {
+            assert!(matches!(
+                script_commands_with(&a, &all()),
+                Script::Unjudged(_)
+            ));
+        }
+    }
+
+    fn rules(deny: &[&str], ask: &[&str]) -> UserRules {
+        UserRules {
+            deny: deny.iter().map(|r| Rule::parse(r).expect("rule")).collect(),
+            ask: ask.iter().map(|r| Rule::parse(r).expect("rule")).collect(),
+        }
+    }
+
+    fn hook_with(
+        mode: PermissionMode,
+        allow: &[&str],
+        user: UserRules,
+        constructs: ScriptConstructs,
+    ) -> (Arc<PermissionControl>, PermissionRulesHook) {
+        let settings = PermissionSettings {
+            mode,
+            allow: AllowSet::default()
+                .with_programs(allow.iter().copied())
+                .expect("allow"),
+            rules: user,
+            script_constructs: constructs,
+            ..PermissionSettings::default()
+        };
+        let control = Arc::new(
+            PermissionControl::new(settings, ModeSource::CommandLine, ProcessFacts::default())
+                .expect("control"),
+        );
+        let hook = PermissionRulesHook::new(control.clone(), Some(ws())).with_home(Some(home()));
+        (control, hook)
+    }
+
+    /// With a switch on, the mode grants a script whose visible programs
+    /// are allowed, but a deny rule on a program inside `$(...)`, in a
+    /// group or in a background job still refuses the call, and an ask rule
+    /// still asks: the rules hook runs after the mode, in every mode but
+    /// Bypass, and matches the program by name in the script text.
+    #[tokio::test]
+    async fn a_rule_on_a_program_inside_a_construct_still_refuses_or_asks() {
+        use crate::execpolicy::{Decision, ExecPolicy};
+        let allowed = ["mkdir", "cp", "curl", "ls", "/usr/bin/curl"];
+        for (c, s) in [
+            (ScriptConstruct::Variables, "mkdir x && cp $(curl -s u) x/"),
+            (ScriptConstruct::Variables, "mkdir x && cp `curl -s u` x/"),
+            (ScriptConstruct::Subshells, "mkdir x && { curl -s u; }"),
+            (ScriptConstruct::Background, "curl -s u & mkdir x"),
+            (ScriptConstruct::Escapes, "mkdir x && /usr/bin/curl -s u"),
+        ] {
+            let (control, hook) = hook_with(
+                PermissionMode::Auto,
+                &allowed,
+                rules(&["shell(curl*)"], &[]),
+                only(c),
+            );
+            let policy = ExecPolicy::default_kgraf_policy().with_permissions(control);
+            let a = argv(&["sh", "-c", s]);
+            // The mode alone would grant it: every visible program is allowed.
+            let v = policy.evaluate(&a);
+            assert!(
+                v.decision == Decision::Allow && v.granted,
+                "{c}: {s:?}: {v:?}"
+            );
+            match hook.review(&shell(&["sh", "-c", s])).await {
+                HookDecision::Deny { reason } => assert!(
+                    reason.starts_with("your deny rule `shell(curl*)`"),
+                    "{c}: {s:?}: {reason}"
+                ),
+                other => panic!("{c}: {s:?} must be refused: {other:?}"),
+            }
+            let (_, asking) = hook_with(
+                PermissionMode::Auto,
+                &allowed,
+                rules(&[], &["shell(curl*)"]),
+                only(c),
+            );
+            assert!(
+                matches!(
+                    asking.review(&shell(&["sh", "-c", s])).await,
+                    HookDecision::Ask { .. }
+                ),
+                "{c}: {s:?}"
+            );
+        }
+        // The text match reaches what a variable will run: a denied program
+        // named only in an assignment refuses too.
+        let (_, hook) = hook_with(
+            PermissionMode::Auto,
+            &allowed,
+            rules(&["shell(curl*)"], &[]),
+            ScriptConstructs(
+                [ScriptConstruct::Variables, ScriptConstruct::Escapes]
+                    .into_iter()
+                    .collect(),
+            ),
+        );
+        assert!(matches!(
+            hook.review(&shell(&["sh", "-c", "C=curl; ls && $C u"]))
+                .await,
+            HookDecision::Deny { .. }
+        ));
+        // The name match applies only to a script judged because of a
+        // switch: with the switches off, or for a plain script, or in Bypass,
+        // the rules match as before.
+        let s = "mkdir x && { curl -s u; }";
+        let (_, off) = hook_with(
+            PermissionMode::Auto,
+            &allowed,
+            rules(&["shell(curl*)"], &[]),
+            ScriptConstructs::default(),
+        );
+        assert_eq!(
+            construct_rule_limit(
+                &off_rules(),
+                &ScriptConstructs::default(),
+                &shell(&["sh", "-c", s])
+            ),
+            None
+        );
+        assert_eq!(
+            off.review(&shell(&["sh", "-c", "mkdir x && ls"])).await,
+            HookDecision::Allow
+        );
+        let (_, bypass) = hook_with(
+            PermissionMode::Bypass,
+            &[],
+            rules(&["shell(curl*)"], &[]),
+            only(ScriptConstruct::Subshells),
+        );
+        assert_eq!(
+            bypass.review(&shell(&["sh", "-c", s])).await,
+            HookDecision::Allow
+        );
+    }
+
+    fn off_rules() -> UserRules {
+        rules(&["shell(curl*)"], &[])
+    }
+
+    /// A deletion of a system path inside a group or after `!` is refused
+    /// as it is in a plain command.
+    #[test]
+    fn deleting_a_system_path_inside_a_group_is_refused() {
+        for s in ["{ rm -rf ~; }", "! rm -rf /", "( rm -rf / )"] {
+            assert!(
+                matches!(limit(&["sh", "-c", s]), Some(HardLimit::Deny(_))),
+                "{s:?}"
+            );
+        }
+    }
+
+    /// The switches live in the user-level file, off unless listed, and an
+    /// unknown name is refused rather than ignored; the command-line list
+    /// takes either spelling or `none`.
+    #[test]
+    fn script_constructs_round_trip_through_the_user_file() {
+        let none = PermissionSettings::from_toml_str("").expect("empty");
+        assert!(none.script_constructs.is_empty());
+        assert!(
+            !none
+                .to_toml_string()
+                .expect("toml")
+                .contains("script_constructs")
+        );
+        let s = PermissionSettings::from_toml_str(
+            "script_constructs = [\"variables\", \"input_redirects\"]",
+        )
+        .expect("file");
+        assert!(s.script_constructs.allows(ScriptConstruct::Variables));
+        assert!(s.script_constructs.allows(ScriptConstruct::InputRedirects));
+        assert!(!s.script_constructs.allows(ScriptConstruct::Background));
+        let again =
+            PermissionSettings::from_toml_str(&s.to_toml_string().expect("toml")).expect("again");
+        assert_eq!(again, s);
+        assert!(PermissionSettings::from_toml_str("script_constructs = [\"evals\"]").is_err());
+        assert_eq!(
+            ScriptConstructs::parse_list("input-redirects,escapes").expect("list"),
+            ScriptConstructs(
+                [ScriptConstruct::InputRedirects, ScriptConstruct::Escapes]
+                    .into_iter()
+                    .collect()
+            )
+        );
+        assert!(
+            ScriptConstructs::parse_list("none")
+                .expect("none")
+                .is_empty()
+        );
+        assert!(ScriptConstructs::parse_list("evals").is_err());
+        assert!(ScriptConstructs::parse_list(",").is_err());
     }
 
     #[test]

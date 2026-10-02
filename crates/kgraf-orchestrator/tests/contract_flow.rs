@@ -50,6 +50,7 @@ fn s(v: &[&str]) -> Vec<String> {
 
 fn py_ic() -> InterfaceContract {
     InterfaceContract {
+        kind: kgraf_orchestrator::InterfaceKind::Behavior,
         id: "config".into(),
         version: 1,
         parties: s(&["prod", "cons"]),
@@ -179,6 +180,26 @@ impl Rig {
         }
     }
 
+    /// Record `files` in the run's graph, as the index of a real run does: the
+    /// planner is shown the graph's file list, and the interface call reads the
+    /// repository's test files from it.
+    fn index(&self, files: &[(&str, &str)]) {
+        let graph = self.parts.graph.lock().expect("graph lock");
+        for (path, content) in files {
+            graph
+                .upsert_file(&kgraf_graph::FileRecord {
+                    id: (*path).to_owned(),
+                    path: (*path).to_owned(),
+                    content_hash: format!("{:x}", content.len()),
+                    size_bytes: content.len() as u64,
+                    mtime_ns: 0,
+                    language: None,
+                    line_count: content.lines().count() as u32,
+                })
+                .expect("index a file");
+        }
+    }
+
     fn caller(&self, p: Arc<ScriptFake>) -> ModelCaller {
         ModelCaller {
             provider: p,
@@ -297,12 +318,39 @@ impl Rig {
         }
     }
 
+    /// The contract events of the trace, the planner calls' own records
+    /// ([`ContractEvent::InterfaceAsked`]) apart: see [`Rig::interface_asked`].
     async fn contract_events(&self) -> Vec<ContractEvent> {
+        self.all_contract_events()
+            .await
+            .into_iter()
+            .filter(|e| !matches!(e, ContractEvent::InterfaceAsked { .. }))
+            .collect()
+    }
+
+    async fn all_contract_events(&self) -> Vec<ContractEvent> {
         self.trace()
             .await
             .into_iter()
             .filter_map(|e| match e {
                 TraceEvent::Contract { record, .. } => Some(*record),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `(producers, calls, output tokens)` of each interface ask recorded.
+    async fn interface_asked(&self) -> Vec<(Vec<String>, u64, u64)> {
+        self.all_contract_events()
+            .await
+            .into_iter()
+            .filter_map(|e| match e {
+                ContractEvent::InterfaceAsked {
+                    producers,
+                    calls,
+                    output_tokens,
+                    ..
+                } => Some((producers, calls, output_tokens)),
                 _ => None,
             })
             .collect()
@@ -2570,6 +2618,7 @@ fn agreeing_double(prompt: &str) -> String {
 /// meaningfully executable code.
 fn producer_check_ic() -> InterfaceContract {
     InterfaceContract {
+        kind: kgraf_orchestrator::InterfaceKind::Behavior,
         id: "double".into(),
         version: 1,
         parties: s(&["prod", "cons"]),
@@ -2623,6 +2672,24 @@ impl ConsumerTestWriter for FixedConsumerTest {
             model: PLAN_MODEL.into(),
             max_output_tokens: 100,
         }
+    }
+}
+
+/// A consumer test writer that counts its calls and writes the placeholder.
+struct CountingConsumerTest(std::sync::atomic::AtomicUsize);
+
+#[async_trait::async_trait]
+impl ConsumerTestWriter for CountingConsumerTest {
+    async fn write(
+        &self,
+        request: &ConsumerTestRequest,
+    ) -> Result<(FileOverlay, Option<kgraf_core::CallId>), PlanError> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        FixedConsumerTest.write(request).await
+    }
+
+    fn cost_basis(&self) -> CostBasis {
+        FixedConsumerTest.cost_basis()
     }
 }
 
@@ -3032,11 +3099,12 @@ async fn a_test_file_named_by_path_alone_is_read_from_the_repository() {
     );
 }
 
-/// When the planner writes no interface it can accept, kGraf derives a compile
-/// check from the repository: the producer's scaffold is the stub, the
-/// consumer's existing file uses it, and the project's build tool (here an
-/// import) compiles them. It runs, the vacuity check is recorded as not run,
-/// and the edge stays counted as not run.
+/// kGraf derives a compile check from the repository before it asks the
+/// planner anything: the producer's scaffold is the stub, the consumer's
+/// existing file uses it, and the project's build tool (here an import)
+/// compiles them. It runs and is registered as a compile-only interface. The
+/// planner is still asked for a behavior check here (no test reaches the
+/// producer) and writes none, so the edge stays counted as not run.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn with_no_interface_a_compile_check_is_derived_from_the_scaffold() {
     let dir = tempfile::tempdir().expect("dir");
@@ -3055,6 +3123,14 @@ async fn with_no_interface_a_compile_check_is_derived_from_the_scaffold() {
     );
     let report = plan_then_stop(rig.orchestrator(vec![])).await;
     assert_eq!(report.contracts.unchecked_edges, 1, "{report:?}");
+    assert_eq!(
+        (
+            report.contracts.interfaces_registered,
+            report.contracts.compile_only_registered
+        ),
+        (1, 1),
+        "the derived compile check is registered: {report:?}"
+    );
     let reason = rig
         .contract_events()
         .await
@@ -3070,7 +3146,8 @@ async fn with_no_interface_a_compile_check_is_derived_from_the_scaffold() {
         "files: consumer.py",
         "`python3 -c import consumer`",
         "it passed (2 run(s): stub-compile and canaries)",
-        "the vacuity check did not run",
+        "registered as a compile-only interface",
+        "no behavior interface the planner wrote was accepted",
     ] {
         assert!(reason.contains(needle), "{needle}: {reason}");
     }
@@ -3171,4 +3248,893 @@ async fn a_stub_over_an_existing_file_is_asked_to_declare_it_in_replaces() {
         prompts[2]
     );
     assert_eq!(report.contracts.interfaces_registered, 1, "{report:?}");
+}
+
+// ------------------------------------------- derive first, ask only for judgment
+
+/// The order-pricing workspace of the benchmark, as a plan finds it: a shared
+/// `iface` crate and six crates whose bodies are `todo!()`, and one test file,
+/// `checkout/tests/integration.rs`, which needs all six producers.
+fn order_pricing_files() -> Vec<(&'static str, &'static str)> {
+    fn manifest(name: &'static str) -> &'static str {
+        match name {
+            "iface" => "[package]\nname = \"iface\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            "discount_flat" => {
+                "[package]\nname = \"discount_flat\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+                 [dependencies]\niface = { path = \"../iface\" }\n"
+            }
+            "discount_bulk" => {
+                "[package]\nname = \"discount_bulk\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+                 [dependencies]\niface = { path = \"../iface\" }\n"
+            }
+            "tax_us" => {
+                "[package]\nname = \"tax_us\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+                 [dependencies]\niface = { path = \"../iface\" }\n"
+            }
+            "shipping_standard" => {
+                "[package]\nname = \"shipping_standard\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+                 [dependencies]\niface = { path = \"../iface\" }\ntax_us = { path = \"../tax_us\" }\n"
+            }
+            "pricing_engine" => {
+                "[package]\nname = \"pricing_engine\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+                 [dependencies]\niface = { path = \"../iface\" }\n\
+                 discount_flat = { path = \"../discount_flat\" }\n\
+                 discount_bulk = { path = \"../discount_bulk\" }\n\
+                 tax_us = { path = \"../tax_us\" }\n\
+                 shipping_standard = { path = \"../shipping_standard\" }\n"
+            }
+            _ => {
+                "[package]\nname = \"checkout\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+                 [dependencies]\niface = { path = \"../iface\" }\n\
+                 pricing_engine = { path = \"../pricing_engine\" }\n"
+            }
+        }
+    }
+    vec![
+        (
+            "Cargo.toml",
+            "[workspace]\nresolver = \"2\"\nmembers = [\"iface\", \"discount_flat\", \
+             \"discount_bulk\", \"tax_us\", \"shipping_standard\", \"pricing_engine\", \
+             \"checkout\"]\n",
+        ),
+        ("iface/Cargo.toml", manifest("iface")),
+        (
+            "iface/src/lib.rs",
+            "pub struct LineItem {\n    pub sku: String,\n    pub qty: u32,\n    pub unit_price_cents: i64,\n}\n\
+             pub struct Order {\n    pub items: Vec<LineItem>,\n    pub state: String,\n}\n\
+             impl Order {\n    pub fn subtotal_cents(&self) -> i64 {\n        \
+             self.items.iter().map(|i| i.qty as i64 * i.unit_price_cents).sum()\n    }\n}\n\
+             pub struct Receipt {\n    pub total_cents: i64,\n}\n\
+             pub trait Discount {\n    fn discount_cents(&self, order: &Order, subtotal_cents: i64) -> i64;\n}\n\
+             pub trait TaxRule {\n    fn tax_cents(&self, order: &Order, taxable_cents: i64) -> i64;\n}\n\
+             pub trait ShippingRule {\n    fn shipping_cents(&self, order: &Order) -> i64;\n}\n",
+        ),
+        ("discount_flat/Cargo.toml", manifest("discount_flat")),
+        (
+            "discount_flat/src/lib.rs",
+            "use iface::{Discount, Order};\n\npub struct FlatDiscount;\n\n\
+             impl Discount for FlatDiscount {\n    fn discount_cents(&self, _order: &Order, \
+             _subtotal_cents: i64) -> i64 {\n        todo!(\"contract 1: not implemented yet\")\n    }\n}\n",
+        ),
+        ("discount_bulk/Cargo.toml", manifest("discount_bulk")),
+        (
+            "discount_bulk/src/lib.rs",
+            "use iface::{Discount, Order};\n\npub struct BulkDiscount;\n\n\
+             impl Discount for BulkDiscount {\n    fn discount_cents(&self, _order: &Order, \
+             _subtotal_cents: i64) -> i64 {\n        todo!(\"contract 2: not implemented yet\")\n    }\n}\n",
+        ),
+        ("tax_us/Cargo.toml", manifest("tax_us")),
+        (
+            "tax_us/src/lib.rs",
+            "use iface::{Order, TaxRule};\n\npub fn state_tax_rate(_state: &str) -> f64 {\n    \
+             todo!(\"contract 3: not implemented yet\")\n}\n\npub struct TaxUs;\n\n\
+             impl TaxRule for TaxUs {\n    fn tax_cents(&self, _order: &Order, _taxable_cents: i64) -> i64 {\n        \
+             todo!(\"contract 3: not implemented yet\")\n    }\n}\n",
+        ),
+        (
+            "shipping_standard/Cargo.toml",
+            manifest("shipping_standard"),
+        ),
+        (
+            "shipping_standard/src/lib.rs",
+            "use iface::{Order, ShippingRule};\nuse tax_us::state_tax_rate;\n\n\
+             pub struct StandardShipping;\n\nimpl ShippingRule for StandardShipping {\n    \
+             fn shipping_cents(&self, _order: &Order) -> i64 {\n        \
+             let _ = state_tax_rate;\n        todo!(\"contract 4: not implemented yet\")\n    }\n}\n",
+        ),
+        ("pricing_engine/Cargo.toml", manifest("pricing_engine")),
+        (
+            "pricing_engine/src/lib.rs",
+            "use discount_bulk::BulkDiscount;\nuse discount_flat::FlatDiscount;\n\
+             use iface::{Order, Receipt};\nuse shipping_standard::StandardShipping;\n\
+             use tax_us::TaxUs;\n\npub fn price_order(_order: &Order) -> Receipt {\n    \
+             let _ = (FlatDiscount, BulkDiscount, TaxUs, StandardShipping);\n    \
+             todo!(\"contract 5: not implemented yet\")\n}\n",
+        ),
+        ("checkout/Cargo.toml", manifest("checkout")),
+        (
+            "checkout/src/lib.rs",
+            "use iface::{Order, Receipt};\nuse pricing_engine::price_order;\n\n\
+             pub fn checkout_order(order: &Order) -> Receipt {\n    let _ = price_order;\n    \
+             let _ = order;\n    todo!(\"contract 6: checkout::checkout_order is not implemented yet\")\n}\n",
+        ),
+        (
+            "checkout/tests/integration.rs",
+            "use checkout::checkout_order;\nuse iface::{LineItem, Order};\n\n\
+             fn order(state: &str, qty: u32, cents: i64) -> Order {\n    Order {\n        \
+             items: vec![LineItem { sku: \"a\".into(), qty, unit_price_cents: cents }],\n        \
+             state: state.into(),\n    }\n}\n\n\
+             #[test]\nfn taxed_state_no_discount_free_shipping() {\n    \
+             assert_eq!(checkout_order(&order(\"CA\", 1, 3500)).total_cents, 3780);\n}\n\n\
+             #[test]\nfn untaxed_state_bulk_discount_flat_shipping() {\n    \
+             assert_eq!(checkout_order(&order(\"OR\", 12, 1000)).total_cents, 7500);\n}\n",
+        ),
+    ]
+}
+
+/// The planner for the order-pricing tests: the recorded contracts answer to
+/// the contracts ask, and `interfaces` to every interface ask.
+fn d_planner(interfaces: &'static str) -> impl Fn(&str) -> String + Send + Sync + 'static {
+    let contracts = recorded("d1-contracts-order-pricing.txt");
+    move |prompt: &str| {
+        if prompt.contains("Accepted contracts (fixed;") {
+            interfaces.to_owned()
+        } else {
+            contracts.clone()
+        }
+    }
+}
+
+/// The benchmark's shape: the only test needs all six producers, so no test
+/// of one producer alone can pass against a reference of that producer. Every
+/// ask of the interface call of the recorded runs (three per attempt, 287 to
+/// 795 s of local planner time) ended refused, nearly always as vacuous. Now
+/// kGraf derives a compile-only interface for each producer from the
+/// scaffolds, the consumers' files and the manifests, registers it, and makes
+/// no interface call: the planner's calls are the contracts ask alone. Each
+/// consumed edge is still counted as not run, with the one-line reason.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_order_pricing_workspace_gets_compile_only_interfaces_and_no_interface_call() {
+    let dir = tempfile::tempdir().expect("dir");
+    let files = order_pricing_files();
+    let rig = Rig::with_files(
+        dir.path(),
+        &files,
+        d_planner(r#"{"interfaces":[]}"#),
+        agreeing,
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    rig.index(&files);
+    let started = Instant::now();
+    let report = plan_then_stop(rig.orchestrator_for_recorded_plans()).await;
+    eprintln!(
+        "planner time for the interface call on the order-pricing fixture: 0 s, 0 calls \
+         (derive and checks: {:.1} s wall clock)",
+        started.elapsed().as_secs_f64()
+    );
+    let prompts = rig.parts.planner.prompts();
+    assert_eq!(prompts.len(), 1, "the contracts ask only: {prompts:?}");
+    let c = &report.contracts;
+    assert_eq!(
+        (c.interfaces_registered, c.compile_only_registered),
+        (5, 5),
+        "one compile-only interface per producer (c1 to c5): {report:?}"
+    );
+    assert_eq!(
+        (c.interface_asks, c.interface_ask_output_tokens),
+        (0, 0),
+        "{report:?}"
+    );
+    // c4 <- c3; c5 <- c1, c2, c3, c4; c6 <- c5: the behavior check of each
+    // edge did not run.
+    assert_eq!(c.unchecked_edges, 6, "{report:?}");
+    assert!(
+        report.notices.iter().any(|n| n.contains(
+            "kGraf derived 5 compile-only interface(s) from the repository (c1, c2, c3, c4, c5)"
+        ) && n
+            .contains("a behavior check is asked of the planner for no producer")
+            && n.contains("not asked for c3: the only tests that exercise c3")),
+        "{:?}",
+        report.notices
+    );
+    let events = rig.contract_events().await;
+    let registered: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            ContractEvent::Registered { interface } => Some(interface),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(registered.len(), 5);
+    assert!(registered.iter().all(|i| i.is_compile_only()));
+    let tax = registered
+        .iter()
+        .find(|i| i.id == "derived-c3")
+        .expect("tax_us's interface");
+    assert_eq!(tax.stub[0].path, "tax_us/src/lib.rs");
+    assert_eq!(
+        tax.compile,
+        [
+            "cargo",
+            "test",
+            "--no-run",
+            "-p",
+            "pricing_engine",
+            "-p",
+            "shipping_standard"
+        ]
+    );
+    assert_eq!(tax.parties, ["c3", "c4", "c5"]);
+    let reasons: Vec<String> = events
+        .iter()
+        .filter_map(|e| match e {
+            ContractEvent::Unchecked { reason, .. } => Some(reason.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reasons.len(), 3, "one event per consumer: {reasons:?}");
+    for r in &reasons {
+        assert!(
+            r.contains("behavior check not run: the only tests that exercise")
+                && r.contains("checkout/tests/integration.rs")
+                && r.contains("registered as a compile-only interface"),
+            "{r}"
+        );
+    }
+}
+
+/// A repository with no test that reaches the producer: the planner is asked
+/// once, for a reference and a small test only. kGraf fills the stub (the
+/// scaffold, declared in `replaces`), the consumer files, the names and the
+/// compile command, checks the interface, and registers it next to the
+/// compile-only one. The ask is counted with its tokens.
+const FLAT_SCAFFOLD: &str = "def flat(x):\n    raise NotImplementedError\n";
+const PRICING_SCAFFOLD: &str =
+    "from discount.flat import flat\n\n\ndef price(x):\n    raise NotImplementedError\n";
+const FLAT_CONTRACT_TEST: &str = "import unittest\nfrom discount.flat import flat\n\n\
+    class T(unittest.TestCase):\n    def test_flat(self):\n        self.assertEqual(flat(3), 6)\n";
+
+/// The repository of [`flat_rig`] with a test that uses `c1`'s module alone.
+const FLAT_REPO_WITH_TEST: [(&str, &str); 3] = [
+    ("discount/flat.py", FLAT_SCAFFOLD),
+    ("pricing.py", PRICING_SCAFFOLD),
+    (
+        "tests/test_flat.py",
+        "from discount.flat import flat\n\n\ndef test_flat():\n    assert flat(3) == 6\n",
+    ),
+];
+
+fn flat_plan() -> String {
+    plan_json(&[
+        c("c1", "implement flat", "discount/flat.py", &[]),
+        c("c2", "price with flat", "pricing.py", &["c1"]),
+    ])
+}
+
+/// What a planner answers the supplied request with: a reference and a test,
+/// and nothing kGraf already holds. `extra` is added to the entry.
+fn flat_answer(extra: serde_json::Value) -> String {
+    let mut entry = serde_json::json!({
+        "id": "i_flat",
+        "parties": ["c1", "c2"],
+        "reference": [{"path": "discount/flat.py", "content": "def flat(x):\n    return x * 2\n"}],
+        "tests": [{"path": "test_flat_contract.py", "content": FLAT_CONTRACT_TEST}],
+        "test": ["python3", "-m", "unittest", "-q", "test_flat_contract"],
+    });
+    if let (Some(base), Some(more)) = (entry.as_object_mut(), extra.as_object()) {
+        base.extend(more.clone());
+    }
+    serde_json::json!({ "interfaces": [entry] }).to_string()
+}
+
+fn flat_rig(dir: &Path, interfaces: String) -> Rig {
+    flat_rig_with_plan(dir, interfaces, flat_plan())
+}
+
+fn flat_rig_with_plan(dir: &Path, interfaces: String, plan: String) -> Rig {
+    Rig::with_files(
+        dir,
+        &[
+            ("discount/flat.py", FLAT_SCAFFOLD),
+            ("pricing.py", PRICING_SCAFFOLD),
+        ],
+        move |prompt| {
+            if prompt.contains("Accepted contracts (fixed;") {
+                interfaces.clone()
+            } else {
+                plan.clone()
+            }
+        },
+        agreeing,
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_producer_no_test_reaches_is_asked_once_for_a_reference_and_a_test_only() {
+    let dir = tempfile::tempdir().expect("dir");
+    // A third contract nothing depends on: the ask is about `c1` and `c2`.
+    let plan = plan_json(&[
+        c("c1", "implement flat", "discount/flat.py", &[]),
+        c("c2", "price with flat", "pricing.py", &["c1"]),
+        c("c9", "write the notes", "notes.txt", &[]),
+    ]);
+    let rig = flat_rig_with_plan(dir.path(), flat_answer(serde_json::json!({})), plan);
+    let report = plan_then_stop(rig.orchestrator(vec![])).await;
+    let prompts = rig.parts.planner.prompts();
+    assert_eq!(prompts.len(), 2, "the contracts ask, one interface ask");
+    let ask = &prompts[1];
+    assert!(
+        ask.contains("- c1: writes") && ask.contains("- c2: writes") && !ask.contains("- c9:"),
+        "only the contracts the ask is about are listed: {ask}"
+    );
+    for needle in [
+        "producer c1 (consumers c2): stub supplied: discount/flat.py; consumer files supplied: \
+         pricing.py; its items: flat",
+        "leave \"stub\", \"consumer\", \"symbols\" and \"compile\" out",
+        "at most 4096 output tokens",
+    ] {
+        assert!(ask.contains(needle), "{needle}: {ask}");
+    }
+    let c = &report.contracts;
+    assert_eq!(
+        (c.interfaces_registered, c.compile_only_registered),
+        (2, 1),
+        "{report:?}"
+    );
+    assert_eq!(c.unchecked_edges, 0, "a behavior interface binds the edge");
+    assert_eq!(
+        (c.interface_asks, c.stub_land_failures),
+        (1, 0),
+        "{report:?}"
+    );
+    assert!(c.interface_ask_output_tokens > 0, "{report:?}");
+    let asked = rig.interface_asked().await;
+    assert_eq!(asked.len(), 1);
+    assert_eq!(asked[0].0, ["c1"]);
+    let events = rig.contract_events().await;
+    let behavior = events
+        .iter()
+        .find_map(|e| match e {
+            ContractEvent::Registered { interface } if !interface.is_compile_only() => {
+                Some(interface)
+            }
+            _ => None,
+        })
+        .expect("the behavior interface is registered");
+    assert_eq!(behavior.id, "i_flat");
+    assert_eq!(
+        behavior.stub[0].content, FLAT_SCAFFOLD,
+        "the scaffold is the stub"
+    );
+    assert_eq!(behavior.replaces, ["discount/flat.py"]);
+    assert_eq!(behavior.consumer[0].path, "pricing.py");
+    assert_eq!(behavior.symbols, ["flat"]);
+    assert_eq!(
+        behavior.compile,
+        ["python3", "-c", "import pricing; import test_flat_contract"]
+    );
+}
+
+/// A compile command that does not build the test file fails the canary check.
+/// kGraf replaces it with the derived command and checks again; the planner
+/// is not asked about it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_compile_command_that_does_not_build_the_files_is_repaired_without_a_re_ask() {
+    let dir = tempfile::tempdir().expect("dir");
+    let rig = flat_rig(
+        dir.path(),
+        flat_answer(serde_json::json!({"compile": ["python3", "-c", "pass"]})),
+    );
+    let report = plan_then_stop(rig.orchestrator(vec![])).await;
+    assert_eq!(
+        rig.parts.planner.prompts().len(),
+        2,
+        "no re-ask: the contracts ask and one interface ask"
+    );
+    assert_eq!(report.contracts.interfaces_registered, 2, "{report:?}");
+    assert!(
+        report.notices.iter().any(|n| n.contains(
+            "the answer's compile command did not build every file; kGraf replaced it with \
+             `python3 -c import pricing; import test_flat_contract`"
+        )),
+        "{:?}",
+        report.notices
+    );
+    let behavior = rig
+        .contract_events()
+        .await
+        .into_iter()
+        .find_map(|e| match e {
+            ContractEvent::Registered { interface } if !interface.is_compile_only() => {
+                Some(interface)
+            }
+            _ => None,
+        })
+        .expect("registered");
+    assert_eq!(
+        behavior.compile,
+        ["python3", "-c", "import pricing; import test_flat_contract"]
+    );
+}
+
+/// A whole command line in one string cannot run in the sandbox; the planner
+/// used to be asked again with the reason. kGraf replaces it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_command_that_cannot_run_in_the_sandbox_is_replaced_not_refused() {
+    let dir = tempfile::tempdir().expect("dir");
+    let rig = flat_rig(
+        dir.path(),
+        flat_answer(serde_json::json!({"compile": ["python3 -c 'import test_flat_contract'"]})),
+    );
+    let report = plan_then_stop(rig.orchestrator(vec![])).await;
+    assert_eq!(rig.parts.planner.prompts().len(), 2, "no re-ask");
+    assert_eq!(report.contracts.interfaces_registered, 2, "{report:?}");
+    assert!(
+        report
+            .notices
+            .iter()
+            .any(|n| n.contains("the compile command could not run in the check sandbox")),
+        "{:?}",
+        report.notices
+    );
+}
+
+/// A repository test that exercises the producer alone: nothing is asked (the
+/// verifier runs that test), the compile-only interface is registered, and
+/// the edge's behavior check is recorded as not run, with the test named.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_producer_a_repository_test_exercises_alone_is_not_asked_about() {
+    let dir = tempfile::tempdir().expect("dir");
+    let rig = Rig::with_files(
+        dir.path(),
+        &FLAT_REPO_WITH_TEST,
+        |_| flat_plan(),
+        agreeing,
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    rig.index(&FLAT_REPO_WITH_TEST);
+    let report = plan_then_stop(rig.orchestrator(vec![])).await;
+    assert_eq!(rig.parts.planner.prompts().len(), 1, "no interface call");
+    assert_eq!(
+        (
+            report.contracts.interfaces_registered,
+            report.contracts.compile_only_registered,
+            report.contracts.interface_asks
+        ),
+        (1, 1, 0),
+        "{report:?}"
+    );
+    let reason = rig
+        .contract_events()
+        .await
+        .into_iter()
+        .find_map(|e| match e {
+            ContractEvent::Unchecked { reason, .. } => Some(reason),
+            _ => None,
+        })
+        .expect("the edge is recorded");
+    assert!(
+        reason.contains("behavior check not run: the repository's test tests/test_flat.py already exercises c1 alone"),
+        "{reason}"
+    );
+}
+
+/// A re-ask covers only the interface still refused: the previous answer
+/// quoted is that interface's, its refusal is quoted, and the accepted one is
+/// named as left out, not repeated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_re_ask_covers_only_the_refused_interface() {
+    let dir = tempfile::tempdir().expect("dir");
+    let entry = |id: &str,
+                 producer: &str,
+                 path: &str,
+                 reference: &str,
+                 test_name: &str,
+                 body: &str| {
+        serde_json::json!({
+            "id": id,
+            "parties": [producer, "c3"],
+            "reference": [{"path": path, "content": reference}],
+            "tests": [{"path": format!("{test_name}.py"), "content": format!(
+                "import unittest\nfrom {} import f\n\nclass T(unittest.TestCase):\n    def test_f(self):\n        {body}\n",
+                path.trim_end_matches(".py").replace('/', ".")
+            )}],
+            "test": ["python3", "-m", "unittest", "-q", test_name],
+        })
+    };
+    let good = entry(
+        "i_one",
+        "c1",
+        "one.py",
+        "def f():\n    return 1\n",
+        "test_one",
+        "self.assertEqual(f(), 1)",
+    );
+    // Passes against the scaffold too: vacuous.
+    let vacuous = entry(
+        "i_two",
+        "c2",
+        "two.py",
+        "def f():\n    return 2\n",
+        "test_two",
+        "self.assertTrue(True)",
+    );
+    let fixed = entry(
+        "i_two",
+        "c2",
+        "two.py",
+        "def f():\n    return 2\n",
+        "test_two",
+        "self.assertEqual(f(), 2)",
+    );
+    let first = serde_json::json!({"interfaces": [good, vacuous]}).to_string();
+    let second = serde_json::json!({"interfaces": [fixed]}).to_string();
+    let plan = plan_json(&[
+        c("c1", "implement one", "one.py", &[]),
+        c("c2", "implement two", "two.py", &[]),
+        c("c3", "use both", "three.py", &["c1", "c2"]),
+    ]);
+    let rig = Rig::with_files(
+        dir.path(),
+        &[
+            ("one.py", "def f():\n    raise NotImplementedError\n"),
+            ("two.py", "def f():\n    raise NotImplementedError\n"),
+            (
+                "three.py",
+                "from one import f as f1\nfrom two import f as f2\n\n\ndef g():\n    raise NotImplementedError\n",
+            ),
+        ],
+        move |prompt| {
+            if prompt.contains("<previous_answer>") {
+                second.clone()
+            } else if prompt.contains("Accepted contracts (fixed;") {
+                first.clone()
+            } else {
+                plan.clone()
+            }
+        },
+        agreeing,
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    let report = plan_then_stop(rig.orchestrator(vec![])).await;
+    let prompts = rig.parts.planner.prompts();
+    assert_eq!(
+        prompts.len(),
+        3,
+        "contracts, interface ask, one re-ask: {prompts:?}"
+    );
+    let reask = &prompts[2];
+    let previous = reask
+        .split("<previous_answer>")
+        .nth(1)
+        .and_then(|t| t.split("</previous_answer>").next())
+        .expect("the previous answer is quoted");
+    assert!(previous.contains("\"i_two\""), "{previous}");
+    assert!(
+        !previous.contains("\"i_one\""),
+        "the accepted interface is not quoted back: {previous}"
+    );
+    assert!(
+        reask.contains("so it constrains nothing") && reask.contains("interface `i_two`"),
+        "{reask}"
+    );
+    assert!(
+        reask.contains("Interfaces already accepted, left out of your answer: i_one binds c1, c3"),
+        "{reask}"
+    );
+    assert_eq!(report.contracts.interface_asks, 2, "{report:?}");
+    // Two behavior interfaces and the compile-only ones for c1 and c2.
+    assert_eq!(report.contracts.interfaces_registered, 4, "{report:?}");
+    assert_eq!(report.contracts.unchecked_edges, 0, "{report:?}");
+}
+
+/// A compile-only interface passes its gate on compilation alone: no
+/// handshake is asked of any party and no stub is landed (the stub is the
+/// scaffold already in the repository), and the run completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_compile_only_interface_costs_no_handshake_and_lands_no_stub() {
+    let dir = tempfile::tempdir().expect("dir");
+    let rig = Rig::with_files(
+        dir.path(),
+        &FLAT_REPO_WITH_TEST,
+        |_| flat_plan(),
+        agreeing,
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    let writer = Arc::new(CountingConsumerTest(std::sync::atomic::AtomicUsize::new(0)));
+    let report = rig
+        .orchestrator_with_consumer_writer(vec![], writer.clone())
+        .start(RunId::new("r1"), "price with flat".into())
+        .await
+        .expect("run");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    assert_eq!(
+        writer.0.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "no consumer test is written against a stub with no reference"
+    );
+    assert_eq!(report.contracts.checks_passed, 1, "{report:?}");
+    // A worker's brief names the compile-only interface and the files it
+    // checked; it does not carry the repository's files as quoted data.
+    let briefs = worker_requests(&rig.parts);
+    assert!(
+        briefs
+            .iter()
+            .any(|b| b.contains("Compile-only interface `derived-c1@v1`")
+                && b.contains("[pricing.py]")),
+        "{briefs:?}"
+    );
+    assert!(
+        !briefs.iter().any(|b| b.contains("<interface_file")),
+        "no file of a compile-only interface is quoted: {briefs:?}"
+    );
+    assert_eq!(report.contracts.stubs_landed, 0, "{report:?}");
+    assert!(
+        rig.handshaker.prompts().is_empty(),
+        "no model call for a compile-only interface: {:?}",
+        rig.handshaker.prompts()
+    );
+    let events = rig.contract_events().await;
+    let passed = events
+        .iter()
+        .find_map(|e| match e {
+            ContractEvent::ChecksPassed {
+                runs,
+                handshake_skipped,
+                ..
+            } => Some((runs.len(), handshake_skipped.clone())),
+            _ => None,
+        })
+        .expect("the gate passed");
+    assert_eq!(passed.0, 2, "stub-compile and the consumer canary");
+    assert!(passed.1.is_some_and(|w| w.contains("compile-only")));
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, ContractEvent::StubLanded { .. }))
+    );
+}
+
+/// The counters are event-sourced: a resumed run reads the same interface
+/// calls, output tokens and compile-only count from its trace, and counts
+/// nothing twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_interface_economy_counters_are_the_same_after_a_resume() {
+    let dir = tempfile::tempdir().expect("dir");
+    let rig = flat_rig(dir.path(), flat_answer(serde_json::json!({})));
+    let first = plan_then_stop(rig.orchestrator(vec![])).await;
+    let c1 = first.contracts;
+    assert_eq!(
+        (
+            c1.interface_asks,
+            c1.compile_only_registered,
+            c1.interfaces_registered
+        ),
+        (1, 1, 2),
+        "{first:?}"
+    );
+    assert!(c1.interface_ask_output_tokens > 0);
+    let _ = rig.trace().await;
+    let o = rig.orchestrator(vec![]);
+    let h = o.handle();
+    let run = tokio::spawn(async move { o.resume(RunId::new("r1")).await });
+    let _ = h.status().await;
+    h.stop().await;
+    let again = run.await.expect("join").expect("resumed");
+    let c2 = again.contracts;
+    assert_eq!(
+        (
+            c2.interface_asks,
+            c2.interface_ask_output_tokens,
+            c2.compile_only_registered,
+            c2.interfaces_registered
+        ),
+        (
+            c1.interface_asks,
+            c1.interface_ask_output_tokens,
+            c1.compile_only_registered,
+            c1.interfaces_registered
+        ),
+        "{again:?}"
+    );
+    let recorded = rig.interface_asked().await.len();
+    assert_eq!(recorded, 1, "recorded once");
+}
+
+/// The stub kGraf fills belongs to the producer, not to whichever party the
+/// answer names first: here `c2` is a consumer of `c1` and a producer for `c3`,
+/// both with scaffolds, and the answer lists `c2` before `c1`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answer_naming_the_consumer_first_still_gets_the_producers_stub() {
+    let dir = tempfile::tempdir().expect("dir");
+    let answer = flat_answer(serde_json::json!({"parties": ["c2", "c1"]}));
+    let plan = plan_json(&[
+        c("c1", "implement flat", "discount/flat.py", &[]),
+        c("c2", "price with flat", "pricing.py", &["c1"]),
+        c("c3", "report prices", "report.py", &["c2"]),
+    ]);
+    let rig = Rig::with_files(
+        dir.path(),
+        &[
+            ("discount/flat.py", FLAT_SCAFFOLD),
+            ("pricing.py", PRICING_SCAFFOLD),
+            (
+                "report.py",
+                "from pricing import price\n\n\ndef report(x):\n    raise NotImplementedError\n",
+            ),
+        ],
+        move |prompt| {
+            if prompt.contains("<previous_answer>") {
+                r#"{"interfaces":[]}"#.to_owned()
+            } else if prompt.contains("Accepted contracts (fixed;") {
+                answer.clone()
+            } else {
+                plan.clone()
+            }
+        },
+        agreeing,
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    let _ = plan_then_stop(rig.orchestrator(vec![])).await;
+    let behavior = rig
+        .contract_events()
+        .await
+        .into_iter()
+        .find_map(|e| match e {
+            ContractEvent::Registered { interface } if !interface.is_compile_only() => {
+                Some(interface)
+            }
+            _ => None,
+        })
+        .expect("the behavior interface for c1 is registered");
+    assert_eq!(behavior.stub[0].path, "discount/flat.py");
+    assert_eq!(behavior.replaces, ["discount/flat.py"]);
+}
+
+/// A run stopped inside the interface call has already paid for its first ask,
+/// and the trace says so. The resumed run plans again: the calls it makes now
+/// are counted with that one, and the first is not counted twice (the trace is
+/// replayed into the book before the first new event is applied).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_stopped_inside_the_interface_call_counts_each_ask_once_after_a_resume() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let dir = tempfile::tempdir().expect("dir");
+    let valid = Arc::new(AtomicBool::new(false));
+    let good = flat_answer(serde_json::json!({}));
+    let flag = valid.clone();
+    let rig = Rig::with_files(
+        dir.path(),
+        &[
+            ("discount/flat.py", FLAT_SCAFFOLD),
+            ("pricing.py", PRICING_SCAFFOLD),
+        ],
+        move |prompt| {
+            if prompt.contains("Accepted contracts (fixed;") {
+                if flag.load(Ordering::SeqCst) {
+                    good.clone()
+                } else {
+                    // An answer with no interface: refused, and asked again.
+                    r#"{"interfaces":[]}"#.to_owned()
+                }
+            } else {
+                flat_plan()
+            }
+        },
+        agreeing,
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    // The re-ask never answers: the run is stopped inside it.
+    *rig.parts.planner.hang_on.lock().expect("lock") = Some("<previous_answer>".to_owned());
+    let o = rig.orchestrator(vec![]);
+    let h = o.handle();
+    let first =
+        tokio::spawn(async move { o.start(RunId::new("r1"), "price with flat".into()).await });
+    let began = Instant::now();
+    while rig.parts.planner.prompts().len() < 3 {
+        assert!(
+            began.elapsed() < Duration::from_secs(30),
+            "the re-ask was never made"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    h.stop().await;
+    let stopped = first.await.expect("join").expect("stopped");
+    assert_eq!(stopped.status, RunStatus::Stopped, "{stopped:?}");
+    assert_eq!(
+        rig.interface_asked().await.len(),
+        1,
+        "the first ask is in the trace"
+    );
+    *rig.parts.planner.hang_on.lock().expect("lock") = None;
+    valid.store(true, Ordering::SeqCst);
+    let o = rig.orchestrator(vec![]);
+    let h = o.handle();
+    let second = tokio::spawn(async move { o.resume(RunId::new("r1")).await });
+    assert!(h.status().await.is_some(), "the plan was accepted");
+    h.stop().await;
+    let report = second.await.expect("join").expect("resumed");
+    let c = report.contracts;
+    assert_eq!(
+        rig.interface_asked().await.len(),
+        2,
+        "one ask before the stop, one after it"
+    );
+    assert_eq!(c.interface_asks, 2, "each ask is counted once: {report:?}");
+    assert_eq!(c.interfaces_registered, 2, "{report:?}");
+}
+
+/// A planner whose interface answers are always cut off at the output limit,
+/// the call made and billed as it was.
+struct CutsOffInterfaces(Arc<dyn kgraf_orchestrator::Decomposer>);
+
+#[async_trait::async_trait]
+impl kgraf_orchestrator::Decomposer for CutsOffInterfaces {
+    async fn decompose(
+        &self,
+        request: &kgraf_orchestrator::PlanRequest,
+    ) -> Result<kgraf_orchestrator::PlanOutput, PlanError> {
+        self.0.decompose(request).await
+    }
+
+    async fn interfaces(
+        &self,
+        request: &kgraf_orchestrator::InterfaceRequest,
+    ) -> Result<kgraf_orchestrator::InterfaceReply, PlanError> {
+        let reply = self.0.interfaces(request).await?;
+        Err(PlanError::attributed(
+            reply.calls,
+            PlanError::Truncated {
+                kind: "interfaces".into(),
+                max_output_tokens: 4_096,
+            },
+        ))
+    }
+
+    fn cost_basis(&self) -> CostBasis {
+        self.0.cost_basis()
+    }
+}
+
+/// An ask that fails still cost its time and tokens: it is counted, and a
+/// cut-off answer is not asked again (it would be cut off again), so the edge
+/// keeps its compile-only interface and is recorded as unchecked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_ask_that_fails_is_counted_and_not_asked_again() {
+    let dir = tempfile::tempdir().expect("dir");
+    let rig = flat_rig(dir.path(), flat_answer(serde_json::json!({})));
+    let mut services = rig.parts.services(WINDOW);
+    services.decomposer = Arc::new(CutsOffInterfaces(services.decomposer.clone()));
+    let o = Orchestrator::new(config(), services)
+        .expect("orchestrator")
+        .with_contract_checks(rig.checks(vec![]))
+        .expect("contracts");
+    let report = plan_then_stop(o).await;
+    assert_eq!(
+        rig.parts.planner.prompts().len(),
+        2,
+        "no re-ask of a cut-off answer"
+    );
+    let c = &report.contracts;
+    assert_eq!(
+        (c.interface_asks, c.interface_ask_output_tokens),
+        (1, 50),
+        "the failed ask is counted: {report:?}"
+    );
+    assert_eq!(
+        (
+            c.interfaces_registered,
+            c.compile_only_registered,
+            c.unchecked_edges
+        ),
+        (1, 1, 1),
+        "{report:?}"
+    );
 }

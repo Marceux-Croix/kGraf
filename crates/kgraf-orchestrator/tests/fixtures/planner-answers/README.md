@@ -12,6 +12,7 @@ not against an answer written to fit the fix.
 | `d1-ask3-consumer-ids.txt` | order pricing, third ask | contract ids in `consumer`, commands as lists of lists, no `tests` |
 | `d6-replan-unclosed-string.txt` | order pricing, re-plan | a file's `content` string never closed, so a line break falls inside it (line 107) |
 | `d8-ask3-empty-shells.txt` | order pricing, third ask | empty `reference` and `tests`, and the producer's file in both `stub` and `consumer` |
+| `d1-contracts-order-pricing.txt` | order pricing, contracts ask | six contracts over the scaffolded workspace: c4 depends on c3, c5 on c1 to c4, c6 on c5; the shape every interface ask of the benchmark ran on |
 | `long-run-one-file.txt` | eight classes in one file | eight chained contracts that all write `shapes/library.py`, checked by one test file |
 
 The order-pricing task is a Cargo workspace with one crate per contract; the

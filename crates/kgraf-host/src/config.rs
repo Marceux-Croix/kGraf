@@ -184,9 +184,10 @@ pub struct RunConfig {
 }
 
 /// Keys a run file may not set (decision 0094): the permission mode, its
-/// allow set and rules, plan review and the bypass switches are the user's
-/// alone, set from the desktop control, the user-level permissions file or
-/// the command line. A project file a worker could write never sets them.
+/// allow set and rules, plan review, the bypass switches and the
+/// script-construct switches are the user's alone, set from the desktop
+/// control, the user-level permissions file or the command line. A project
+/// file a worker could write never sets them.
 pub const USER_ONLY_KEYS: &[&str] = &[
     "permission_mode",
     "mode",
@@ -202,6 +203,7 @@ pub const USER_ONLY_KEYS: &[&str] = &[
     "bypass_warning_accepted",
     "may_grant",
     "container_sandbox",
+    "script_constructs",
 ];
 
 /// The run-file key [`RunConfig::load`] refuses (decision 0088).

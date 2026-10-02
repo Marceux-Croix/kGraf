@@ -6,8 +6,8 @@ mod contract_support;
 
 use contract_support::*;
 use kgraf_orchestrator::{
-    CheckError, CheckStage, FileOverlay, InterfaceContract, RevisionClass, WriteTarget,
-    check_mechanical, classify, resolve_by_recompute,
+    CheckError, CheckStage, FileOverlay, InterfaceContract, InterfaceKind, RevisionClass,
+    WriteTarget, check_mechanical, classify, resolve_by_recompute,
 };
 // Only referenced by the `#[cfg(unix)]` rlimit test below (file-size/CPU rlimits are a
 // unix-specific mechanism); a plain, unconditional import left this "unused" on a
@@ -55,6 +55,7 @@ fn rust_repo(root: &Path) -> std::path::PathBuf {
 
 fn rust_ic() -> InterfaceContract {
     InterfaceContract {
+        kind: kgraf_orchestrator::InterfaceKind::Behavior,
         id: "config".into(),
         version: 1,
         parties: s(&["prod", "cons"]),
@@ -442,6 +443,7 @@ fn py_repo(root: &Path) -> std::path::PathBuf {
 
 fn py_ic() -> InterfaceContract {
     InterfaceContract {
+        kind: kgraf_orchestrator::InterfaceKind::Behavior,
         id: "config".into(),
         version: 1,
         parties: s(&["prod", "cons"]),
@@ -1086,6 +1088,7 @@ async fn p2_a_compile_command_that_builds_nothing_fails_the_canary() {
     let repo = shell_repo(dir.path());
     let r = runner(dir.path(), &repo);
     let ic = InterfaceContract {
+        kind: kgraf_orchestrator::InterfaceKind::Behavior,
         id: "i".into(),
         version: 1,
         parties: s(&["a", "b"]),
@@ -1232,4 +1235,98 @@ async fn a_recompute_that_disagrees_with_itself_is_flaky_not_an_overturn() {
         rc.resolution,
         kgraf_orchestrator::Resolution::Rejected { .. }
     ));
+}
+
+// ------------------------------------------------------- compile-only interfaces
+
+/// What kGraf derives from a repository's scaffold: a stub, the consumer files
+/// that use it, a compile command, and no reference, no test, no test command.
+fn compile_only_ic() -> InterfaceContract {
+    InterfaceContract {
+        kind: InterfaceKind::CompileOnly,
+        id: "derived-prod".into(),
+        version: 1,
+        parties: s(&["prod", "cons"]),
+        symbols: s(&["parse_config", "Config"]),
+        stub: vec![FileOverlay::new("config.py", PY_STUB)],
+        wrong: vec![],
+        reference: vec![],
+        consumer: vec![FileOverlay::new(
+            "consumer.py",
+            "from config import parse_config, Config\n",
+        )],
+        tests: vec![],
+        compile: s(&["python3", "-c", "import consumer"]),
+        test: vec![],
+        consulted: vec![],
+        replaces: vec![],
+    }
+}
+
+/// A compile-only interface has nothing to run a test against, so `validate`
+/// (reference, tests and a test command required) does not apply: its check is
+/// the compile half, stub-compile and the consumer canary, and nothing else.
+/// A consumer that uses a name the stub lacks fails it at the stub-compile stage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_compile_only_interface_is_checked_by_compiling_alone() {
+    let dir = tempfile::tempdir().expect("dir");
+    let repo = py_repo(dir.path());
+    let r = runner(dir.path(), &repo);
+    let mut ic = compile_only_ic();
+    let runs = check_mechanical(&r, &ic)
+        .await
+        .expect("ran")
+        .expect("a stub that the consumer compiles against passes");
+    assert_eq!(
+        runs.len(),
+        2,
+        "stub-compile and the consumer canary: {runs:?}"
+    );
+    assert!(
+        runs.iter()
+            .all(|x| x.stage == CheckStage::StubCompile && x.expected)
+    );
+    ic.consumer[0].content = "from config import load_config\n".into();
+    let failure = check_mechanical(&r, &ic)
+        .await
+        .expect("ran")
+        .expect_err("a name the stub lacks");
+    assert_eq!(failure.stage, CheckStage::StubCompile, "{failure}");
+    assert!(failure.detail.contains("load_config"), "{failure}");
+}
+
+/// A revision of a compile-only interface is classified on compatibility
+/// alone: the prior consumers must still compile against the revised stub.
+/// There is no prior test to pass against a reference.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_compile_only_revision_is_classified_by_compatibility_alone() {
+    let dir = tempfile::tempdir().expect("dir");
+    let repo = py_repo(dir.path());
+    let r = runner(dir.path(), &repo);
+    let prior = compile_only_ic();
+    let mut additive = compile_only_ic();
+    additive.version = 2;
+    additive.stub[0].content = format!("{PY_STUB}\n\ndef extra():\n    return 0\n");
+    let c = classify(&r, &prior, &additive, &writes(), 0, 2)
+        .await
+        .expect("ran")
+        .expect("valid");
+    assert_eq!(c.class, RevisionClass::Amend, "{}", c.detail);
+    assert!(
+        c.detail.contains("prior consumers") && !c.detail.contains("reference"),
+        "{}",
+        c.detail
+    );
+    let mut breaking = compile_only_ic();
+    breaking.version = 2;
+    breaking.stub[0].content = "class Config:\n    pass\n".into();
+    // The revised interface's own consumers do not need parse_config; the
+    // prior ones do, and fail to compile against the revised stub.
+    breaking.consumer[0].content = "from config import Config\n".into();
+    breaking.compile = s(&["python3", "-c", "import consumer"]);
+    let c = classify(&r, &prior, &breaking, &writes(), 0, 2)
+        .await
+        .expect("ran")
+        .expect("valid");
+    assert_eq!(c.class, RevisionClass::Supersede, "{}", c.detail);
 }

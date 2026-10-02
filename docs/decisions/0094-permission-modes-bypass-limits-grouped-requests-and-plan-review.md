@@ -715,3 +715,97 @@ Evidence: `kgraf-tools` (`permissions.rs`: `a_tool_level_refusal_keeps_the_tool_
 (`a_skill_refusal_of_the_shell_tool_is_held_naming_the_skill`,
 `a_shell_report_after_a_same_round_skill_activation_is_held_naming_the_skill`); `kgraf-host`
 (`auto_runs_a_script_of_allowed_programs_and_names_the_one_it_does_not_allow`, a hosted run).
+
+## Amendment (2026-10-02): the user may let a mode grant the script constructs the strict reader refuses
+
+**Why.** The amendment above grants a script command by command only when the strict reader can
+judge it. Variables, substitution, subshells, groups, background jobs, input redirects, escapes,
+comments, path or `VAR=value` command names, and output redirects outside the worker's files are
+ordinary shell; a script using one was always asked about, and denied with nobody attending.
+Each construct group is now a user setting, off by default, so the default behavior does
+not change.
+
+**The setting.** `ScriptConstruct` (`kgraf-tools`, `permissions.rs`) has six values; the
+user-level `permissions.toml` lists those on as `script_constructs = [...]`:
+
+| Key | Settings name | Lets a mode grant |
+|---|---|---|
+| `variables` | Variables and command substitution: $VAR, $(...), backquotes | `$VAR`, `${VAR}`, `$(...)`, `$((...))`, backquotes, `<(...)`, `>(...)` |
+| `subshells` | Subshells and groups: ( ... ), { ...; }, {a,b} | `( ... )`, `{ ...; }`, brace expansion |
+| `background` | Background jobs: & | `&`, `\|&` |
+| `input_redirects` | Input redirects and heredocs: <, <<, <<< | `<`, `<&N`, `<<` and `<<-` heredocs, `<<<`, `<>` |
+| `escapes` | Escapes, comments and other quoting | `\`, `#` comments, `!`, `$'...'`, a command named by a path or a quoted word, `VAR=value` before a command |
+| `outside_redirects` | Output redirects outside the worker's files | `>`, `>>`, `>|`, `>&FILE` to any path, after a `cd` too |
+
+Sources and precedence: `kgraf orchestrate --script-constructs LIST` (comma-separated, or `none`)
+replaces the file's list for the run; then the file; then all off. The desktop's Settings >
+Permissions shows one switch per construct with a one-line explanation under the risk statement
+(`SCRIPT_CONSTRUCTS_RISK`), and a change reaches the live `PermissionControl` at once and is
+written to the file. `.kgraf/run.json` refuses `script_constructs` by name, as it refuses every
+permission key: a worker can write a project file, so a project file never loosens what a
+worker may run (this departs from the run-limit pattern, flag > run.json > user setting >
+default, for that reason). `kgraf worker` and `kgraf schedule run-now` read the file. Every
+command that builds a control prints `permissions mode MODE; script constructs on: LIST`.
+
+**The reading.** `script_commands_with(argv, constructs)` runs the strict reader first; with no
+construct on it is `script_commands` exactly. When the strict reader refuses and some construct
+is on, a second reader (`RelaxedReader`) reads the script with the strict grammar plus the
+constructs on, refusing each construct that is off with the strict reader's reason. It is
+recursive over `$(...)`, backquotes, `<(...)`, subshells and groups, and returns every command
+whose program it can see, those inside them included. A command named by a variable or a
+substitution has no program to check and is left out. Never judged, whatever the switches: shell
+keywords, a function definition, a script with no program kGraf can see, a heredoc whose
+unquoted text substitutes a command (`$(` or a backquote), a `${...}` holding a quote, an escape
+or a substitution, a backquote substitution holding a backslash, an arithmetic expansion holding
+a substitution, a glob or brace as a program name, `;;`, a control character, and the call shapes
+the strict reader refuses (a shell named by a path, options other than `-c`, arguments after the
+script). A redirection target kGraf cannot resolve (`> $OUT`) needs `outside_redirects`. The
+strict reader's cross-check against `simple_commands` does not apply to the second reader: that
+split does not follow these constructs.
+
+**What a mode does with it.** `ExecPolicy::script_verdict` and `record_mode_grant` read the
+constructs from the live control on every evaluation. Where something grants named programs
+(Auto with an allow set, Accept edits, a program granted to the contract), a script the second
+reader accepts is granted, confined like any granted command, when a grant covers every program
+it returned; the grant's reason names the constructs on and says only the visible programs were
+checked, and grants are staged per program. A visible program no grant covers is asked about
+naming it, as before. Manual without a contract grant still asks; Bypass already grants the call
+whole.
+
+**What the user accepts.** kGraf cannot see what a variable or a substitution will run: a command
+named by a variable (`$CMD`) runs with no check, the refusal to delete system paths included.
+The risk statement says so in the app and in USAGE.
+
+**What still holds.** The user's deny and ask rules match every command `simple_commands` sees,
+in every mode. Because a script judged only because of a switch may hide a command from that
+split (`{ curl x; }` splits as `{ curl x`), `construct_rule_limit` also matches the user's shell
+rules by program name against the script text, for such a script (`relies_on_constructs`): the
+base name of a rule's first pattern word (a prefix when the pattern is one word ending in `*`)
+matched against every word of the argv split at each character a program name cannot hold, `/`
+included. Deliberately broad: `shell(git push*)` matches any such script naming `git`, and a
+program named only in an assignment (`C=curl; $C u`) is matched. The rules hook applies it in
+every mode but Bypass, deny before ask, after its own deny. The deletion limit's
+`program_index` now also skips `{`, `!` and `(`, so `{ rm -rf ~; }` and `! rm -rf /` are refused
+like the plain command. The sandbox does not change: `outside_redirects` only lets the mode
+grant the script; the workspace sandbox still confines a granted command's writes to the
+worktree and its scratch directory, and the verifier still checks the attempt's changes against
+the contract's declared writes.
+
+**Alternatives rejected.** A full shell parser crate (`brush-parser`, `conch-parser`,
+`yash-syntax`) would read more than "which programs can kGraf see" and would still need that
+mapping; the second reader is a small character loop that refuses what it cannot place. Applying
+the text match to every script, or with the switches off, would change the default behavior.
+Letting `run.json` set the switches would let a worker loosen its own permissions.
+
+Evidence: `kgraf-tools` (`permissions.rs`: `each_script_construct_is_judged_only_with_its_switch_on`,
+`some_scripts_are_never_judged_whatever_the_switches`,
+`a_rule_on_a_program_inside_a_construct_still_refuses_or_asks`,
+`deleting_a_system_path_inside_a_group_is_refused`,
+`script_constructs_round_trip_through_the_user_file`; `execpolicy/policy.rs`:
+`each_script_construct_switch_lets_auto_grant_a_script_using_it`,
+`a_script_granted_by_a_switch_records_each_visible_program`); `kgraf-cli`
+(`the_script_constructs_flag_wins_over_the_file_and_the_default_is_none`,
+`orchestrate_takes_a_script_constructs_list`); `kgraf-host`
+(`the_run_file_cannot_set_the_permission_mode_or_plan_review`); `kgraf-shell`
+(`the_script_construct_switches_start_off_and_reach_the_shared_control`, kittest). Each new test
+fails with its mechanism reverted.

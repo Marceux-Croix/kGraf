@@ -623,27 +623,45 @@ Every refusal of the contracts call, the last included, is a `plan_refused` trac
 refused ask of the interface call is an `interfaces_refused` event; a run that fails planning
 prints both.
 
-With contract checks on, planning is two calls (decision 0030, amended). The contracts call
-returns the contracts only. When the answer has two or more contracts (or is a split, whose
-interface may bind the plan's other contracts), the interface call is given the accepted
-contracts, the `consumer <- producers` edges their dependencies make, and the same repository
-context, and returns the interfaces only. It has its own budget of three asks. Each interface
-is taken on its own: parsed, its parties and shape checked (symbols, stub, a reference covering
-every stub path, at least one test, both commands, no path in both stub and consumer, every stub
-path a declared write of a party), the consumer and tests files named by path alone read from
-the dispatch base, a stub file the repository already has listed in `replaces`, then its
-mechanical checks run. An accepted interface is kept across asks; a
-re-ask quotes the previous answer and every refusal, names the accepted interfaces and the edges
-still unbound, and asks only for those. An omitted interface and a malformed one are retried the
-same way. When the asks are spent, or the answer was cut off at the output limit, each producer
-of an unbound edge gets a compile check derived from the repository: its declared files that
-hold a scaffold body are the stub, the files that use its names are the consumer and test
-files, and the project's build tool compiles them; stub-compile and its canaries run, and the
-vacuity check cannot (no reference exists). At the end of planning every consumed edge no
-accepted interface binds is recorded as one unchecked contract event per consumer, with the
-reason, and counted one per edge under the report's `not run`; an edge counts once however often
-the event is applied, so a replay and a resume agree. A notice says "contract checks did not run
-for ...". The run is not held for an interface the planner could not write.
+With contract checks on, planning is two calls, and the second is made only for what needs judgment
+(decision 0030, amended). The contracts call returns the contracts only. When the answer has two
+or more contracts (or is a split, whose interface may bind the plan's other contracts), kGraf first
+derives, with no model call (`derive_interface.rs`), for every producer of a consumed edge: the stub
+(its declared files that hold a scaffold body: `todo!()`, `NotImplementedError`), the consumer files
+(the files that use its names: graph edges, and the consumers' own existing files) and the compile
+command (`cargo test --no-run -p ...` over the packages that hold them, or a Python import). It runs
+stub-compile and its canaries, and a derived check that passes is registered as an interface of kind
+compile-only (`InterfaceKind::CompileOnly`, id `derived-<producer>`; no reference, no test, no
+handshake, no consumer test, no stub land: its gate is the compile half and costs no model call;
+`ContractCounters::compile_only_registered` counts it). Then `behavior_plan` decides per producer
+whether the planner is asked for a behavior check: not when a repository test already exercises the
+producer alone, and not when every test that reaches it (by crate, module or item name, and through
+the contracts it depends on) also reaches other contracts whose code does not exist yet, so that no
+reference of the producer alone can pass it. Those edges are recorded as unchecked with a one-line
+reason; when no producer needs a check the interface call makes no planner call. Where one is asked
+(its own budget of three asks), the request names what kGraf supplies per producer and asks for
+`reference`, `tests` and `test` only, within 4,096 output tokens; kGraf fills the stub (declared in
+`replaces`), the consumer files, the names and the compile command.
+Each interface of an answer is taken on its own: parsed, its parties and shape
+checked (symbols, stub, a reference covering every stub path, at least one test, both commands, no
+path in both stub and consumer, every stub path a declared write of a party), the consumer and tests
+files named by path alone read from the dispatch base, a stub file the repository already has listed
+in `replaces` (0081), then its mechanical checks run (stub-compile with canaries, vacuity); a compile
+command the sandbox cannot run, or that fails the stub-compile stage, is replaced by the derived one
+and the checks run again, with no re-ask. An accepted interface is kept across asks; a re-ask covers
+only the interfaces still refused or unbound, quoting those interfaces' previous entries and their
+refusals (cut at 12,000 characters, the cut said). An omitted interface and a malformed one are
+retried the same way. Check output reaches no
+model, trace or notice with the host's own toolchain noise in it (`filter_host_noise`: macOS `xcrun`
+and `xcodebuild` lines, repeated identical warning blocks; error lines stay). At the end of planning
+every consumed edge no behavior interface binds (a dependency, or a pair a refused interface declared)
+is recorded as one `ContractEvent::Unchecked` per consumer, with the reason (why no behavior check was
+asked or accepted, and the derived check's result), and counted one per edge in `checks_not_run` (the
+report's `not run`) and in `unchecked_edges`; the book counts an edge once however often the event is
+applied, so a replay and a resume agree. A notice says "contract checks did not run for ...". Each
+interface ask is a `ContractEvent::InterfaceAsked` (calls, milliseconds, output tokens), so the
+report states `interfaces  planner N calls S s T tokens; accepted C compile-only, B behavior`. The run
+is not held for an interface the planner could not write.
 
 When the gate holds a plan that nothing has acted on yet (no dispatch, no merge, no stub
 landed, no interface the run was given), and the run would end on that hold, the whole plan
@@ -1262,7 +1280,14 @@ programs, an `sh -c` script of simple commands is granted when a grant covers
 every command's program, as Claude Code allows a compound command; a script
 with substitution, a subshell, backgrounding or a redirection outside the
 worktree is asked about whole, and the question names the command no grant
-covers. A refusal is recorded against what it refused: the program a
+covers. The user may turn on each such construct group (variables, subshells,
+background jobs, input redirects, escapes, outside redirects; all off by
+default) in Settings, `permissions.toml` or `--script-constructs`, never
+`run.json`; a second reader then returns every program it can see, inside
+substitutions and groups too, and the script is granted when a grant covers
+each. What a variable runs is not seen and not checked; for such a script the
+user's shell rules also match by program name in the script text, in every mode
+but Bypass (decision 0094, amended 2026-10-02). A refusal is recorded against what it refused: the program a
 command-level match named, or the whole tool for a skill's `allowed-tools` or
 a rule with no pattern. A mode change reaches running workers and waiting
 requests at once, and requests raised within 2 s of each other are answered as

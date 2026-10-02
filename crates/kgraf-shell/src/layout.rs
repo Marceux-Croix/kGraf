@@ -3144,6 +3144,8 @@ impl ShellApp {
     /// The mode itself is chosen in the orchestrator box's dropdown; Bypass is
     /// offered there only with this on, and its first use shows a warning.
     /// Turning it off while in Bypass returns the mode to Manual at once.
+    /// Below it, the script-construct switches (decision 0094, amended
+    /// 2026-10-02), all off by default.
     fn settings_permissions(&mut self, ui: &mut Ui, p: &Palette) {
         ui.label(
             RichText::new("Permissions")
@@ -3176,18 +3178,23 @@ impl ShellApp {
                     .small()
                     .color(p.text_2),
             );
-            return;
+        } else {
+            let mut allow = settings.allow_bypass;
+            if ui.checkbox(&mut allow, "Allow Bypass mode").changed() {
+                perm.control.set_allow_bypass(allow);
+                if let Some(path) = &perm.file
+                    && let Err(e) = perm.control.settings().save(path)
+                {
+                    self.chrome.notice = Some((
+                        format!("The permission setting was not saved: {e}"),
+                        Instant::now(),
+                    ));
+                }
+            }
         }
-        let mut allow = settings.allow_bypass;
-        if ui.checkbox(&mut allow, "Allow Bypass mode").changed() {
-            perm.control.set_allow_bypass(allow);
-            if let Some(path) = &perm.file
-                && let Err(e) = perm.control.settings().save(path)
-            {
-                self.chrome.notice = Some((
-                    format!("The permission setting was not saved: {e}"),
-                    Instant::now(),
-                ));
+        for line in crate::permission_bar::draw_script_constructs(ui, &perm, p) {
+            if let crate::orchestrator_box::Line::Error(e) = line {
+                self.chrome.notice = Some((e, Instant::now()));
             }
         }
     }

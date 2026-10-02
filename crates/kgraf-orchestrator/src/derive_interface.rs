@@ -1,23 +1,21 @@
-//! A compile check derived from the repository when the planner wrote no
-//! interface kGraf could accept (decision 0030, amendment of 2026-10-02).
+//! A compile-only interface derived from the repository, before any planner
+//! call (decision 0030, amendment of 2026-10-02).
 //!
-//! The planner is asked for interfaces on a bounded budget. When it still has
-//! not bound a consumed contract, kGraf does not hold the run for an artifact
-//! the planner could not write, and does not skip the check without a word.
 //! Where the repository already holds the producer's scaffold (a file with a
 //! placeholder body such as `todo!()` or `raise NotImplementedError`), that
 //! scaffold is the stub, the repository files that use the producer's items
 //! are the consumer and test files, and the project's own build tool compiles
-//! them: stub-compile and its canaries run. Nothing correct exists to pass a
-//! test, so the vacuity check cannot run; the edges stay counted as not run,
-//! with the compile result in the reason.
+//! them: stub-compile and its canaries run. The result is registered as an
+//! interface of kind compile-only. Nothing correct exists to pass a test, so
+//! the behavior check is not part of it: whether the planner is asked for one
+//! is [`behavior_plan`]'s decision.
 //!
 //! The decisions here are pure (what is a scaffold, a test file, which
-//! command builds the files); the orchestrator gathers the facts from the
-//! graph and the dispatch base.
+//! command builds the files, whether a test of one producer alone can exist);
+//! the orchestrator gathers the facts from the graph and the dispatch base.
 
-use crate::checks::{FileOverlay, InterfaceContract};
-use std::collections::BTreeSet;
+use crate::checks::{FileOverlay, InterfaceContract, InterfaceKind};
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Text that marks a body as not written yet, per language.
 const SCAFFOLD_MARKERS: &[&str] = &[
@@ -208,13 +206,10 @@ pub struct ProducerFacts {
     pub users: Vec<(String, String)>,
 }
 
-/// A compile-only interface for `facts`, or why none can be derived. The
-/// command is given by `command` over the consumer and test paths.
-pub fn derive(
-    facts: &ProducerFacts,
-    command: impl Fn(&[String]) -> Option<Vec<String>>,
-) -> Result<InterfaceContract, String> {
-    let stub: Vec<FileOverlay> = facts
+/// The producer's files that hold a scaffold at the dispatch base: the stub
+/// the repository already provides.
+pub fn stub_of(facts: &ProducerFacts) -> Vec<FileOverlay> {
+    facts
         .writes
         .iter()
         .filter_map(|(p, c)| {
@@ -222,7 +217,16 @@ pub fn derive(
                 .filter(|c| is_scaffold(c))
                 .map(|c| FileOverlay::new(p, c))
         })
-        .collect();
+        .collect()
+}
+
+/// A compile-only interface for `facts`, or why none can be derived. The
+/// command is given by `command` over the consumer and test paths.
+pub fn derive(
+    facts: &ProducerFacts,
+    command: impl Fn(&[String]) -> Option<Vec<String>>,
+) -> Result<InterfaceContract, String> {
+    let stub = stub_of(facts);
     if stub.is_empty() {
         return Err(format!(
             "no file {} writes holds a scaffold (a placeholder body) to stand in as its stub",
@@ -277,6 +281,7 @@ pub fn derive(
     let mut parties = vec![facts.producer.clone()];
     parties.extend(facts.consumers.iter().cloned());
     Ok(InterfaceContract {
+        kind: InterfaceKind::CompileOnly,
         id: format!("derived-{}", facts.producer),
         version: 1,
         parties,
@@ -291,6 +296,137 @@ pub fn derive(
         consulted: Vec::new(),
         replaces: Vec::new(),
     })
+}
+
+/// The words that show a file uses a contract's code: the crate name of the
+/// package that holds each of its files (`-` read as `_`), the Python module
+/// of each `.py` file, and the distinctive item names its files declare (an
+/// identifier in camel case or with an underscore, four characters or more,
+/// so that `new` or `len` do not link every file to every contract).
+pub fn use_tokens(
+    writes: &[(String, Option<String>)],
+    package: impl Fn(&str) -> Option<String>,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut add = |t: String| {
+        if !t.is_empty() && !out.contains(&t) {
+            out.push(t);
+        }
+    };
+    for (path, content) in writes {
+        if let Some(p) = package(path) {
+            add(p.replace('-', "_"));
+        }
+        if let Some(m) = python_module(path) {
+            add(m.rsplit('.').next().unwrap_or_default().to_owned());
+        }
+        for name in content.as_deref().map(declared_names).unwrap_or_default() {
+            let camel = name.starts_with(|c: char| c.is_ascii_uppercase())
+                && name.chars().any(|c| c.is_ascii_lowercase());
+            if name.len() >= 4 && (camel || name.contains('_')) {
+                add(name);
+            }
+        }
+    }
+    out
+}
+
+/// One contract of the plan, as far as the reach of a test goes.
+#[derive(Clone, Debug, Default)]
+pub struct ContractFacts {
+    pub id: String,
+    pub depends_on: Vec<String>,
+    /// Whether a file the contract writes is missing at the dispatch base or
+    /// holds a scaffold: its code does not exist yet.
+    pub unimplemented: bool,
+    /// [`use_tokens`] of its files.
+    pub tokens: Vec<String>,
+}
+
+/// A test file of the repository.
+#[derive(Clone, Debug)]
+pub struct TestFile {
+    pub path: String,
+    pub text: String,
+}
+
+/// Whether the planner is asked for a behavior check of one producer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BehaviorPlan {
+    /// Judgment is needed: no repository test reaches the producer, so the
+    /// planner writes a reference and a small test of it alone.
+    Ask,
+    /// No ask. The reason is one line, recorded with the edge.
+    Skip(String),
+}
+
+/// Decide whether a behavior check of `producer` needs the planner.
+///
+/// A test reaches a contract when it uses one of the contract's tokens, and
+/// reaches everything that contract depends on, transitively (a test of the
+/// outermost contract runs the code below it). Over the tests that reach
+/// `producer`:
+/// - none: [`BehaviorPlan::Ask`].
+/// - one reaches no other unimplemented contract: the repository already has a
+///   test of the producer alone, which the verifier runs; no ask.
+/// - every one reaches other unimplemented contracts: a reference of the
+///   producer alone cannot pass any of them (the others' scaffolds panic), so
+///   a check asked for would be refused as vacuous; no ask.
+pub fn behavior_plan(
+    producer: &str,
+    tests: &[TestFile],
+    contracts: &[ContractFacts],
+) -> BehaviorPlan {
+    let by_id: BTreeMap<&str, &ContractFacts> =
+        contracts.iter().map(|c| (c.id.as_str(), c)).collect();
+    let mut reaching: Vec<(&TestFile, BTreeSet<&str>)> = Vec::new();
+    for t in tests {
+        let mut reach: BTreeSet<&str> = BTreeSet::new();
+        let mut open: Vec<&str> = contracts
+            .iter()
+            .filter(|c| c.tokens.iter().any(|tok| uses_word(&t.text, tok)))
+            .map(|c| c.id.as_str())
+            .collect();
+        while let Some(id) = open.pop() {
+            if !reach.insert(id) {
+                continue;
+            }
+            if let Some(c) = by_id.get(id) {
+                open.extend(c.depends_on.iter().map(String::as_str));
+            }
+        }
+        if reach.contains(producer) {
+            reaching.push((t, reach));
+        }
+    }
+    if reaching.is_empty() {
+        return BehaviorPlan::Ask;
+    }
+    let blockers = |reach: &BTreeSet<&str>| -> Vec<String> {
+        reach
+            .iter()
+            .filter(|id| **id != producer && by_id.get(**id).is_some_and(|c| c.unimplemented))
+            .map(|id| (*id).to_owned())
+            .collect()
+    };
+    if let Some((t, _)) = reaching.iter().find(|(_, r)| blockers(r).is_empty()) {
+        return BehaviorPlan::Skip(format!(
+            "the repository's test {} already exercises {producer} alone, and the verifier runs it",
+            t.path
+        ));
+    }
+    let mut paths: Vec<&str> = reaching.iter().map(|(t, _)| t.path.as_str()).collect();
+    paths.sort_unstable();
+    let mut others: BTreeSet<String> = BTreeSet::new();
+    for (_, r) in &reaching {
+        others.extend(blockers(r));
+    }
+    BehaviorPlan::Skip(format!(
+        "the only tests that exercise {producer} ({}) also need {} unimplemented, so no test of \
+         {producer} alone can pass against a reference of it",
+        paths.join(", "),
+        others.into_iter().collect::<Vec<_>>().join(", ")
+    ))
 }
 
 #[cfg(test)]
@@ -394,5 +530,142 @@ mod tests {
                 "import tests.test_library".into()
             ])
         );
+    }
+
+    fn contract(id: &str, deps: &[&str], unimplemented: bool, tokens: &[&str]) -> ContractFacts {
+        ContractFacts {
+            id: id.into(),
+            depends_on: deps.iter().map(|d| (*d).to_owned()).collect(),
+            unimplemented,
+            tokens: tokens.iter().map(|t| (*t).to_owned()).collect(),
+        }
+    }
+
+    fn test_file(path: &str, text: &str) -> TestFile {
+        TestFile {
+            path: path.into(),
+            text: text.into(),
+        }
+    }
+
+    /// The order-pricing shape: one test, which calls the outermost contract
+    /// and so runs every producer below it. No test of one producer alone can
+    /// pass against that producer's reference.
+    fn order_pricing() -> Vec<ContractFacts> {
+        vec![
+            contract("c1", &[], true, &["discount_flat", "FlatDiscount"]),
+            contract("c2", &[], true, &["discount_bulk", "BulkDiscount"]),
+            contract("c3", &[], true, &["tax_us", "state_tax_rate"]),
+            contract(
+                "c4",
+                &["c3"],
+                true,
+                &["shipping_standard", "StandardShipping"],
+            ),
+            contract(
+                "c5",
+                &["c1", "c2", "c3", "c4"],
+                true,
+                &["pricing_engine", "price_order"],
+            ),
+            contract("c6", &["c5"], true, &["checkout", "checkout_order"]),
+        ]
+    }
+
+    #[test]
+    fn a_test_that_reaches_every_producer_through_the_outermost_one_asks_nothing() {
+        let tests = [test_file(
+            "checkout/tests/integration.rs",
+            "use checkout::checkout_order;\nfn t() { checkout_order(&o); }\n",
+        )];
+        for producer in ["c1", "c2", "c3", "c4", "c5"] {
+            let BehaviorPlan::Skip(why) = behavior_plan(producer, &tests, &order_pricing()) else {
+                panic!("{producer} is not asked about");
+            };
+            assert!(
+                why.contains("the only tests that exercise")
+                    && why.contains("checkout/tests/integration.rs")
+                    && why.contains("c6")
+                    && why.contains("unimplemented"),
+                "{why}"
+            );
+        }
+        let BehaviorPlan::Skip(why) = behavior_plan("c1", &tests, &order_pricing()) else {
+            panic!("skipped");
+        };
+        assert!(
+            why.contains("also need c2, c3, c4, c5, c6 unimplemented"),
+            "the others it needs are named, the producer is not: {why}"
+        );
+    }
+
+    #[test]
+    fn no_test_reaching_the_producer_means_the_planner_is_asked() {
+        // No test at all, and a test that reaches only another producer.
+        assert_eq!(
+            behavior_plan("c1", &[], &order_pricing()),
+            BehaviorPlan::Ask
+        );
+        let tests = [test_file(
+            "tax_us/tests/t.rs",
+            "use tax_us::state_tax_rate;\n",
+        )];
+        assert_eq!(
+            behavior_plan("c1", &tests, &order_pricing()),
+            BehaviorPlan::Ask
+        );
+    }
+
+    #[test]
+    fn a_test_of_the_producer_alone_is_the_repositorys_and_nothing_is_asked() {
+        let tests = [test_file(
+            "tax_us/tests/t.rs",
+            "use tax_us::state_tax_rate;\nfn t() { state_tax_rate(\"CA\"); }\n",
+        )];
+        let BehaviorPlan::Skip(why) = behavior_plan("c3", &tests, &order_pricing()) else {
+            panic!("not asked");
+        };
+        assert!(
+            why.contains("tax_us/tests/t.rs") && why.contains("already exercises c3 alone"),
+            "{why}"
+        );
+    }
+
+    /// A contract whose code already exists does not block a test: only an
+    /// unimplemented one makes a reference of the producer alone fail.
+    #[test]
+    fn an_implemented_contract_a_test_also_reaches_does_not_block_it() {
+        let mut contracts = order_pricing();
+        for c in &mut contracts {
+            if c.id != "c1" {
+                c.unimplemented = false;
+            }
+        }
+        let tests = [test_file(
+            "checkout/tests/integration.rs",
+            "use checkout::checkout_order;\n",
+        )];
+        let BehaviorPlan::Skip(why) = behavior_plan("c1", &tests, &contracts) else {
+            panic!("a test of c1 through finished code exists");
+        };
+        assert!(why.contains("already exercises c1 alone"), "{why}");
+    }
+
+    #[test]
+    fn use_tokens_name_the_crate_the_module_and_the_distinctive_items_only() {
+        let writes = vec![(
+            "discount-flat/src/lib.rs".to_owned(),
+            Some("pub struct FlatDiscount;\nfn new() {}\nfn discount_cents() {}\n".to_owned()),
+        )];
+        let tokens = use_tokens(&writes, |_| Some("discount-flat".to_owned()));
+        assert!(tokens.contains(&"discount_flat".to_owned()), "{tokens:?}");
+        assert!(tokens.contains(&"FlatDiscount".to_owned()), "{tokens:?}");
+        assert!(tokens.contains(&"discount_cents".to_owned()), "{tokens:?}");
+        assert!(
+            !tokens.contains(&"new".to_owned()),
+            "a short plain name links every file to every contract: {tokens:?}"
+        );
+        let py = vec![("discount/flat.py".to_owned(), None)];
+        assert_eq!(use_tokens(&py, |_| None), ["flat"]);
     }
 }

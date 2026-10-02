@@ -833,6 +833,7 @@ fn report_lines(report: &kgraf_orchestrator::RunReport) -> Vec<String> {
             c.challenges,
             c.escalations
         ));
+        out.push(format!("interfaces  {}", c.interface_economy()));
     } else {
         out.push("contracts  off: no interface contract was written or checked".to_owned());
     }
@@ -1079,6 +1080,44 @@ mod tests {
             .find(|l| l.starts_with("leases"))
             .expect("a leases line");
         assert!(line.contains("not measured"), "{line}");
+    }
+
+    /// A run with contract checks reports what its interface call cost and
+    /// what that bought, beside the `contracts` line the canary reads: planner
+    /// calls, seconds and output tokens, and the interfaces accepted by kind.
+    /// The `contracts` line keeps its form.
+    #[test]
+    fn the_printed_report_states_the_interface_calls_cost_and_yield() {
+        let mut report = test_report(kgraf_orchestrator::RunStatus::Completed);
+        report.contract_checks.enabled = true;
+        report.contracts.interfaces_registered = 7;
+        report.contracts.compile_only_registered = 6;
+        report.contracts.interface_asks = 2;
+        report.contracts.interface_ask_ms = 310_400;
+        report.contracts.interface_ask_output_tokens = 9_400;
+        let lines = report_lines(&report);
+        assert!(
+            lines.iter().any(|l| l
+                == "interfaces  planner 2 calls 310 s 9,400 tokens; accepted 6 compile-only, 1 behavior"),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("(interfaces 7, passed 0, failed 0, not run 0,")),
+            "the contracts line keeps its form: {lines:?}"
+        );
+        // No call: zero, and the singular reads as one.
+        report.contracts.interface_asks = 1;
+        report.contracts.interface_ask_ms = 0;
+        report.contracts.interface_ask_output_tokens = 0;
+        report.contracts.compile_only_registered = 0;
+        let lines = report_lines(&report);
+        assert!(
+            lines.iter().any(|l| l
+                == "interfaces  planner 1 call 0 s 0 tokens; accepted 0 compile-only, 7 behavior"),
+            "{lines:?}"
+        );
     }
 
     /// The CLI report carries an analytics failure.

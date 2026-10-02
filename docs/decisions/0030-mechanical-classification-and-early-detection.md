@@ -371,3 +371,107 @@ now).
 Tests: `kgraf-orchestrator` `plan_repo.rs` unit tests, `tests/plan_repo_intake.rs`,
 `planner_context.rs` `the_named_files_are_the_paths_the_section_shows`, `shortfall.rs`
 `a_hold_for_a_file_no_contract_writes_asks_for_a_replan`.
+
+## Amendment (2026-10-02, second): derive first, ask the planner only for judgment
+
+A live local-model run (13 cases with contract checks on) spent three asks of the interface call in every case, 287 to 795 s of local planner time per attempt, and every
+ask was refused. D1, for one: asks of 144, 123 and 166 s (433 s in all, against 225 s for the
+contracts call), refused for a stub over a file that exists and was not in `replaces`, for JSON
+that did not parse (line 6, column 75), and for a compile command that does not build the test
+files. Most refusals in the other cases were the vacuity check, "the test fails against the
+reference, so nothing may satisfy it": the benchmark's only test (`checkout/tests/integration.rs`)
+calls the outermost contract and so needs all six producers, so no reference of one producer can
+pass it. No wording of the request fixes that; the check was asking for something that cannot exist.
+A refusal text reached 28 KB, mostly one `xcrun` warning block per crate and the same output once per
+interface. The mechanical fallback then derived a compile check for each producer, ran it, and all
+passed, but the result was recorded in a reason string and registered nowhere: the dispatch gate and
+the counters never saw it.
+
+**Derive first, at no model cost.** Before the interface call, for every consumed edge kGraf derives
+the stub (the producer's declared files that hold a scaffold body), the consumer files (repository
+files that use the producer's names: graph edges and the consumers' own files) and the compile
+command (`derive_interface::compile_command`, from the manifests), and runs stub-compile and its
+canaries. A derived check that passes is **registered as an interface of kind compile-only**
+(`InterfaceKind::CompileOnly`, id `derived-<producer>`): it has no reference, no test and no test
+command, its one check is the compile half, and it is event-sourced like any interface
+(`ContractEvent::Registered`), so the dispatch gate checks it and `compile_only_registered` counts it
+apart. Its gate costs no model call: no handshake (signatures are checked by compiling), no consumer
+test (no reference to gate one against), no stub land (the stub is the scaffold already in the
+repository). A derived check that fails is not registered; its failure is the reason in the edge's
+unchecked record. A revision of a compile-only interface is classified on compatibility alone
+(`classify`: the prior consumers compile against the revised stub).
+
+**Ask only for judgment.** A behavior check (a reference and a small test of one producer alone) is
+asked of the planner for a producer only when (a) no repository test already exercises that producer
+alone and (b) a single-producer test can exist (`derive_interface::behavior_plan`). A test reaches a
+contract when it uses the contract's crate or module name or a distinctive item name, and reaches
+everything that contract depends on. Over the tests that reach the producer: none means ask; one
+that reaches no other unimplemented contract means the repository has the test and the verifier runs
+it, so no ask; all of them reaching other unimplemented contracts (a scaffold body, or a file not
+written yet) means a reference of the producer alone cannot pass any of them, so no ask. In both
+no-ask cases the edge's behavior check is recorded as not run with a one-line reason
+(`ContractEvent::Unchecked`, counted in `not run` and `unchecked_edges`), and the compile-only
+interface stays. When no producer needs a behavior check the interface call makes no planner call at
+all. A plan with no consumed edge is asked once, as before.
+
+**What the ask holds.** The request names, per producer, the stub, the consumer files and the names
+kGraf supplies, and says the answer holds only `id`, `parties`, `reference`, `tests` and `test`
+(with `stub` and `compile` too where no scaffold exists). kGraf fills the stub (its paths declared in
+`replaces`), the consumer files, the names and the compile command into the interface before it
+checks it. The answer is limited to 4,096 output tokens, stated in the request and enforced on the
+call; an answer cut off falls back like a spent budget.
+
+**Narrow re-asks, mechanical repairs.** A re-ask covers only the interfaces still refused or
+unbound: the previous answer quoted is those interfaces' entries alone (`answer_subset`), with their
+refusals; an answer that did not parse is quoted whole, and the refusals quoted are cut at 12,000
+characters, saying how much was left out. A compile command the sandbox cannot run (a
+whole command line in one string, an output path outside the tree) or that fails the stub-compile
+stage is replaced by the derived command and the checks run again, with a notice, and no re-ask.
+
+**Host noise out of check output.** `filter_host_noise` drops macOS `xcrun`, `xcodebuild`,
+`DVTDeveloperPaths`, `DVTFilePathFSEvents` and `MacOSX.sdk` lines (a warning block about them whole)
+and repeated identical warning blocks, before the output is cut to its byte budget, so the noise
+takes no room from the errors and never reaches a model, the trace or a notice. It says how many
+lines it removed. An error line is never removed.
+
+**Measure.** Each interface ask is a `ContractEvent::InterfaceAsked` (calls, wall-clock
+milliseconds and output tokens, read from the ledger), counted in `ContractCounters`
+(`interface_asks`, `interface_ask_ms`, `interface_ask_output_tokens`), with `compile_only_registered`.
+The report prints `interfaces  planner N calls S s T tokens; accepted C compile-only, B behavior`.
+Seconds and tokens per accepted interface follow. The `contracts` line keeps its form, and its
+`interfaces` count includes the compile-only ones.
+
+Result on the benchmark's shape (the test `the_order_pricing_workspace_gets_compile_only_interfaces_and_no_interface_call`
+over the recorded contracts answer): five compile-only interfaces registered, zero interface calls,
+about 12 s of checks, against three refused asks and 433 s on D1.
+
+Known limits. Reach is read from names: a test that reaches a contract through a name kGraf does not
+see (reflection, a macro) is read as not reaching it, and the planner is asked, as before. The
+compile-only interface proves the consumers build against the scaffold, not that any test tells a
+wrong producer from a right one, and a compile-only interface has no handshake: the parties' prose
+assumptions about those edges are not compared. The derive step runs one producer at a time.
+
+Tests: `kgraf-orchestrator` `tests/contract_flow.rs`
+`the_order_pricing_workspace_gets_compile_only_interfaces_and_no_interface_call`,
+`a_producer_no_test_reaches_is_asked_once_for_a_reference_and_a_test_only`,
+`a_producer_a_repository_test_exercises_alone_is_not_asked_about`,
+`a_compile_command_that_does_not_build_the_files_is_repaired_without_a_re_ask`,
+`a_command_that_cannot_run_in_the_sandbox_is_replaced_not_refused`,
+`a_re_ask_covers_only_the_refused_interface`,
+`a_compile_only_interface_costs_no_handshake_and_lands_no_stub`,
+`the_interface_economy_counters_are_the_same_after_a_resume`,
+`a_run_stopped_inside_the_interface_call_counts_each_ask_once_after_a_resume`,
+`an_ask_that_fails_is_counted_and_not_asked_again`,
+`an_answer_naming_the_consumer_first_still_gets_the_producers_stub`,
+`with_no_interface_a_compile_check_is_derived_from_the_scaffold`; `tests/contract_checks.rs`
+`a_compile_only_interface_is_checked_by_compiling_alone`,
+`a_compile_only_revision_is_classified_by_compatibility_alone`; unit tests in `derive_interface.rs`
+(`behavior_plan`, `use_tokens`), `interface_plan.rs` (`answer_subset`, the supplied request, the refusal cut), `plan.rs`
+(`an_interface_ask_is_limited_to_its_stated_output_cap`),
+`challenge.rs` (`interface_asks_and_compile_only_registrations_are_counted_from_events`),
+`check_runner.rs` (`host_toolchain_noise_is_removed_from_a_recorded_refusal_and_the_failure_stays`,
+`error_lines_stay_and_identical_warning_blocks_are_said_once`,
+`the_tail_a_model_reads_carries_no_host_noise`) and `kgraf-cli`
+(`the_printed_report_states_the_interface_calls_cost_and_yield`). The recorded contracts answer is
+`tests/fixtures/planner-answers/d1-contracts-order-pricing.txt`; the recorded 5.7 KB refusal is
+`tests/fixtures/check-output/vacuity-refusal-with-xcrun-noise.txt`.
