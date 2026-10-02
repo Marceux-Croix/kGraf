@@ -915,16 +915,21 @@ async fn a_delivered_note_is_marked_delivered_from_the_forwarded_event() {
         dir.path(),
         move |_| plan.clone(),
         |_| SERVES.into(),
-        Duration::from_millis(60),
+        Duration::from_millis(5),
     );
+    // Round 0 waits on a permit, so the note is sent while no round has
+    // completed, whatever the machine's load. A fixed delay here let a loaded
+    // machine finish the worker's last round before the note went in; such a
+    // note is correctly left undelivered and reported at retirement.
+    let release = p.hold_workers("make a");
     let o = Orchestrator::new(config(), p.services(WINDOW)).expect("orchestrator");
     let handle = o.handle();
     let run = tokio::spawn(o.start(RunId::new("r1"), "make a".into()));
     let worker = AgentId::new("r1-a-r0-a0");
     // Wait for the worker's `Injector` to exist (`run_attempt` fills the slot
-    // right after `spawn_worker` returns), but well before round 0's 60 ms
-    // delay elapses: sent while no round has completed yet, so it lands in
-    // the opening user message at once (design point 3).
+    // right after `spawn_worker` returns). The request is recorded before the
+    // hold, so round 0 is parked: the note lands in the opening user message
+    // at once (design point 3).
     while p.stats.requests().is_empty() {
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
@@ -937,6 +942,7 @@ async fn a_delivered_note_is_marked_delivered_from_the_forwarded_event() {
         )
         .await
         .expect("send_to_session");
+    release.add_permits(1);
     let report = run.await.expect("join").expect("run");
     assert_eq!(report.status, RunStatus::Completed);
     let undelivered = sessions(&p).undelivered(&worker).expect("undelivered");
@@ -1167,12 +1173,17 @@ async fn a_direct_note_reaches_the_next_orchestrator_call_as_quoted_data() {
         dir.path(),
         move |_| plan.clone(),
         |_| SERVES.into(),
-        Duration::from_millis(200),
+        Duration::from_millis(5),
     );
+    // Hold `a`'s round 0 until the note is in: a fixed delay raced a loaded
+    // machine, where `a` could retire before the send and refuse it.
+    let release = p.hold_workers("make a");
     let o = Orchestrator::new(config(), p.services(WINDOW)).expect("orchestrator");
     let handle = o.handle();
     let run = tokio::spawn(o.start(RunId::new("r1"), "make a".into()));
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    while p.stats.requests().is_empty() {
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
     let worker = AgentId::new("r1-a-r0-a0");
     handle
         .send_to_session(
@@ -1183,6 +1194,7 @@ async fn a_direct_note_reaches_the_next_orchestrator_call_as_quoted_data() {
         )
         .await
         .expect("send_to_session");
+    release.add_permits(1);
     // `b` depends on `a`; once `a` verifies, `b` becomes eligible and
     // re-grounds (0057) before its own dispatch, reading the pending note.
     let report = run.await.expect("join").expect("run");
