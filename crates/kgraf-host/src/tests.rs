@@ -2920,6 +2920,107 @@ async fn an_attempt_that_changed_none_of_its_declared_files_is_not_verified() {
     assert!(reason.contains("src/lib.rs"), "{reason}");
 }
 
+/// A run whose first contract merged the work of a file, and whose second
+/// contract declares the same file. Returns the repository (its `src/lib.rs`
+/// a stub at the run's start) after contract `c1` merged the real body.
+async fn repo_where_c1_delivered_the_file() -> Repo {
+    let dir = tempfile::tempdir().expect("dir");
+    let root = dir.path().join("repo");
+    let base = dir.path().join("ws");
+    let r = repo_in(
+        dir,
+        root,
+        &base,
+        &[("src/lib.rs", "pub fn parse() -> u16 { todo!() }\n")],
+    );
+    let c1 = named("src/lib.rs", "c1");
+    let ws = prepared(&r, &c1, "w-c1").await;
+    std::fs::write(
+        ws.join("src/lib.rs"),
+        "pub fn parse() -> u16 { 42 } // real\n",
+    )
+    .expect("write");
+    let verdict = verifier(&r, "grep -q real src/lib.rs")
+        .verify(&c1, &ws, &result())
+        .await
+        .expect("ran");
+    assert!(verdict.passed(), "{verdict:?}");
+    let merged = r.workspaces.integrate(&c1, &ws).await.expect("integrate");
+    assert!(matches!(merged, Integration::Merged { .. }), "{merged:?}");
+    r.workspaces.release(&ws, true).await;
+    r
+}
+
+/// Two contracts write one file, and the first one's merge implemented all of
+/// it. The second is dispatched on a tree where its check already passes, and
+/// it changes nothing. The check failed where the run started, so the earlier
+/// merge is the evidence: the attempt is accepted as an empty integration,
+/// with a notice that names the earlier contract and says it is unverified.
+#[tokio::test]
+async fn a_contract_whose_work_an_earlier_merge_delivered_is_accepted_empty_with_a_notice() {
+    let r = repo_where_c1_delivered_the_file().await;
+    let c2 = named("src/lib.rs", "c2");
+    let ws = prepared(&r, &c2, "w-c2").await;
+    let verdict = verifier(&r, "grep -q real src/lib.rs")
+        .verify(&c2, &ws, &result())
+        .await
+        .expect("ran");
+    let Verdict::Pass {
+        commit: None,
+        notices,
+        ..
+    } = &verdict
+    else {
+        panic!("expected an empty pass, got {verdict:?}");
+    };
+    let notice = notices
+        .iter()
+        .find(|n| n.contains("unverified"))
+        .unwrap_or_else(|| panic!("no unverified notice in {notices:?}"));
+    assert!(notice.contains("contract c2"), "{notice}");
+    assert!(notice.contains("earlier merge"), "{notice}");
+    assert!(notice.contains("(contract c1)"), "{notice}");
+    // The worktree is released as an empty integration is.
+    let Integration::Empty = r.workspaces.integrate(&c2, &ws).await.expect("integrate") else {
+        panic!("an accepted empty attempt integrates as empty");
+    };
+}
+
+/// The same two contracts with a check that also passes where the run started
+/// prove nothing about the work: still refused.
+#[tokio::test]
+async fn an_empty_attempt_is_still_refused_when_its_check_passes_at_the_run_start() {
+    let r = repo_where_c1_delivered_the_file().await;
+    let c2 = named("src/lib.rs", "c2");
+    let ws = prepared(&r, &c2, "w-c2").await;
+    let verdict = verifier(&r, "true")
+        .verify(&c2, &ws, &result())
+        .await
+        .expect("ran");
+    let Verdict::Fail { reason } = &verdict else {
+        panic!("a check that passes at the run start proves nothing, got {verdict:?}");
+    };
+    assert!(reason.contains("changed none of"), "{reason}");
+}
+
+/// An earlier merge that changed other files delivered nothing of this
+/// contract's: refused, even though its check passes now and failed at the run
+/// start.
+#[tokio::test]
+async fn an_earlier_merge_of_other_files_does_not_excuse_an_empty_attempt() {
+    let r = repo_where_c1_delivered_the_file().await;
+    let c3 = named("src/other.rs", "c3");
+    let ws = prepared(&r, &c3, "w-c3").await;
+    let verdict = verifier(&r, "grep -q real src/lib.rs")
+        .verify(&c3, &ws, &result())
+        .await
+        .expect("ran");
+    let Verdict::Fail { reason } = &verdict else {
+        panic!("another file's delivery is not this contract's, got {verdict:?}");
+    };
+    assert!(reason.contains("changed none of"), "{reason}");
+}
+
 /// A contract with no declared write (a check-only contract) that changes
 /// nothing still passes, with the notice that it integrated no change.
 #[tokio::test]
@@ -3022,6 +3123,25 @@ async fn a_contract_is_accepted_on_the_tests_of_its_own_files() {
         panic!("a wrong slugify fails its own test: {verdict:?}");
     };
     assert!(reason.contains("-p test_slug.py"), "{reason}");
+}
+
+/// Plan intake reads the same narrowing: the write set's own test file, or
+/// nothing when the whole command runs. Contracts sharing one write set
+/// checked by one test file are refused at intake on this answer.
+#[tokio::test]
+async fn the_plan_scope_of_a_write_set_is_its_own_test_file() {
+    let r = python_package(tempfile::tempdir().expect("dir"));
+    let v = verifier(&r, "python3 -m unittest discover -s tests");
+    assert_eq!(
+        v.plan_check_scope(&["textkit/slug.py"], Some(&r.root)),
+        Some(vec!["tests/test_slug.py".to_owned()])
+    );
+    assert_eq!(v.plan_check_scope(&["textkit/slug.py"], None), None);
+    let whole = verifier(&r, "make check");
+    assert_eq!(
+        whole.plan_check_scope(&["textkit/slug.py"], Some(&r.root)),
+        None
+    );
 }
 
 /// A remediation is judged on the whole command and the failing gate's

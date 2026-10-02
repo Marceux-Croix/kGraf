@@ -117,3 +117,16 @@ rather than the mechanism.
 A provider protocol that cannot report usage at all, which would force a
 decision about whether to estimate or refuse. The current position is
 refuse: an explicit "usage missing" error rather than an invented number.
+
+**Amended 2026-10-02: a server failure on the model's own malformed tool call is retried within the
+attempt.** An OpenAI-compatible server that cannot parse the model's tool-call output answers
+HTTP 500 (Ollama: `XML syntax error on line N` or `error parsing tool call`). The adapter
+recognizes that body and raises `ProviderError::ModelOutputMalformed`, a typed kind; the worker
+loop reads the kind and never the body text. The round is sent again, at most twice in a row. Each
+try is its own ledger call. The failed call stays unreconciled like any other 5xx (the model ran,
+so it may have billed), and the retry settles on its own. The retry request is the earlier one with
+one notice appended at the end ("Your previous reply contained a malformed tool call ..."), so the
+provider's cached prefix is unchanged. After the bound, or on the last round, the attempt fails
+and its error names the parse failure. The kind is not a route fault: the server is up. Any other
+5xx keeps the earlier behavior: no retry, the row open, and only a transport failure moves the
+route out of rotation.

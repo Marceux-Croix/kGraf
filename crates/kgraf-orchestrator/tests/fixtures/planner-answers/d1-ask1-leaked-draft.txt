@@ -1,0 +1,231 @@
+{
+"contracts": [
+  {
+"id": "c1",
+"instruction": "Implement `discount_flat/src/lib.rs`. Write `impl iface::Discount for FlatDiscount {}` where `fn discount_cents(&self, order: &iface::Order, subtotal_cents: i64) -> i64` returns `subtotal_cents / 10i64` when `order.state == \"VIP\"`, otherwise `0`. Keep struct definition if present.\n",
+"acceptance": "`cargo test --workspace` passes (or at least the contract's own compilation + integration tests pass with correct return values per benchmarks).",
+"writes": [
+    {"path": "discount_flat/src/lib.rs", "content": "pub struct FlatDiscount;\n\nimpl iface::Discount for FlatDiscount {\n    fn discount_cents(&self, order: &iface::Order, subtotal_cents: i64) -> i64 {\n        if order.state == \"VIP\" {\n            subtotal_cents / 10i64\n        } else {\n            0i64\n        }\n    }\n}\n"}
+],
+"depends_on": [],
+"slices": [
+ "FlatDiscount",
+ "order"
+],
+"tools": ["apply_patch"],
+"route": null,
+"attempts": 1,
+"task_kind": "implementation"
+},
+{
+"id": "c2",
+"instruction": "Implement `discount_bulk/src/lib.rs`. Write `impl iface::Discount for BulkDiscount {}` where `fn discount_cents(&self, order: &ifce::Order, _subtotal_cents: i64) -> i64` returns `5000i64` when `order.total_qty() >= 10u32`, otherwise `0i64`.\n",
+"acceptance": "`cargo test --workspace` passes with bulk discount logic correctly returning expected values from `checkout/tests/integration.rs`.",
+"writes": [
+    {"path": "discount_bulk/src/lib.rs", "content": "pub struct BulkDiscount;\n\nimpl iface::Discount for BulkDiscount {\n    fn discount_cents(&self, order: &iface::Order, _subtotal_cents: i64) -> i64 {\n        if order.total_qty() >= 10u32 {\n            5000i64\n        } else {\n            0i64\n        }\n    }\n}\n"}
+],
+"depends_on": [],
+"slices": [
+ "BulkDiscount",
+ "order"
+],
+"tools": ["apply_patch"],
+"route": null,
+"attempts": 1,
+"task_kind": "implementation"
+},
+{
+"id": "c3",
+"instruction": "Implement `tax_us/src/lib.rs`. Provide the public function `pub fn state_tax_rate(state: &str) -> f64` and implement `impl iface::TaxRule for TaxUs {}`. State tax rate returns 0.08 for \"CA\", 0.0 for \"OR\", and 0.05 (default via `_ =>`) otherwise. The `tax_cents` method must calculate `(taxable_cents as f64 * state_tax_rate(&order.state)).round() as i64`.\n",
+"acceptance": "`cargo test --workspace` passes with expected CA/OR/VIP tax return values for taxable amounts per benchmarks.",
+"writes": [
+    {"path": "tax_us/src/lib.rs", "content": "pub fn state_tax_rate(state: &str) -> f64 {\n    match state {\n        \"CA\" => 0.08,\n        \"OR\" => 0.0,\n        _ => 0.05\n    }\n}\n\npub struct TaxUs;\n\nimpl iface::TaxRule for TaxUs {\n    fn tax_cents(&self, order: &iface::Order, taxable_cents: i64) -> i64 {\n        (taxable_cents as f64 * state_tax_rate(&order.state)).round() as i64\n    }\n}\n"}
+],
+"depends_on": [],
+"slices": [
+ "state_tax_rate",
+ "TaxUs",
+ "TaxRule"
+],
+"tools": ["apply_patch"],
+"route": null,
+"attempts": 1,
+"task_kind": "implementation"
+},
+{
+"id": "c4",
+"instruction": "Implement `shipping_standard/src/lib.rs`. Provide `impl iface::ShippingRule for StandardShipping {}` where `fn shipping_cents(&self, order: &iface::Order) -> i64` calls `tax_us::state_tax_rate(&order.state)` directly. It returns 0 if that rate is strictly greater than 0.0 (for \"CA\" and others returning non-zero), otherwise returns 500 when rate is zero (e.g. \"OR\").",
+"acceptance": "`cargo test --workspace` passes with shipping costs correctly reflecting tax rule logic as specified by benchmarks.",
+"writes": [
+    {"path": "shipping_standard/src/lib.rs", "content": "pub struct StandardShipping;\n\nimpl iface::ShippingRule for StandardShipping {\n    fn shipping_cents(&self, order: &iface::Order) -> i64 {\n        let rate = tax_us::state_tax_rate(&order.state);\n        if rate > 0.0 {\n            0i64\n        } else {\n            500i64\n        }\n    }\n}\n"}
+],
+"depends_on": [
+ "c3"
+],
+"slices": [
+ "StandardShipping",
+ "state_tax_rate",
+ "ShippingRule"
+],
+"tools": ["apply_patch"],
+"route": null,
+"attempts": 1,
+"task_kind": "implementation"
+},
+{
+"id": "c5",
+"instruction": "Implement `pricing_engine/src/lib.rs`. Write: `pub fn price_order(order: &iface::Order) -> iface::Receipt` that calculates and returns a correctly composed Receipt:\n1. `subtotal_cents = order.subtotal_cents()`;\n2. Create flat discount instance (via `discount_flat::FlatDiscount`) and bulk discount via `discount_bulk::BulkDiscount`, call their `discount_cents` methods, taking the **larger** of the two results as `discount_cents` (never both);\n3. `taxable_cents = subtotal_cents - discount_cents`;\n4. Create tax instance (`tax_us::TaxUs`) and calculate `tax_cents` via its `tax_cents(order, taxable_cents)`, then\n5. create shipping instance (`shipping_standard::StandardShipping`) to get `shipping_cents(order)`;\n6. `total_cents = taxable + tax + shipping`.\nUse full explicit module paths for all external crate types/functions.",
+"acceptance": "`cargo test --workspace` passes with correct Receipt values in checkout tests (subtotal / discount selected correctly, taxes & totals computed properly across scenarios: CA/3500/280 tax -> total 3780; OR/12000/bulk 5000/tax 0/shipping 500 -> total 7500; VIP/10000/flat discount 1000/tax 450/shipping 0 -> total 9450).",
+"writes": [
+    {"path": "pricing_engine/src/lib.rs", "content": "pub fn price_order(order: &iface::Order) -> iface::Receipt {\n    let subtotal_cents = order.subtotal_cents();\n\n    let flat_discount = discount_flat::FlatDiscount;\n    let bulk_discount = interface::BulkDiscount;\n    let flat_res = iface::discount_flat::FlatDiscount.discount_cents(&flat_discount, order, subtotal_cents);\n    let bulk_res = iface::interface::BulkDiscount.discount_cents(&bulk_discount, order, subtotal_cents);\n\n    let discount_cents = if flat_res > bulk_res { flat_res } else { bulk_res };\n\n    let taxable_cents = subtotal_cents - discount_cents;\n\n    let tax_us_instance = tax_us::TaxUs;\n    let tax_cents = iface::interface::TaxRule.tax_cents(&tax_us_instance, order, taxable_cents);\n\n    let shipping_standard_instance = interface::shipping_standard::StandardShipping;\n    let shipping_cents = iface::shipping_standard::ShippingRule.shipping_cents(&shipping_standard_instance, order);\n\n    let total_cents = taxable_cents + tax_cents + shipping_cents;\n\n    iface::Receipt {\n        subtotal_cents,\n        discount_cents,\n        tax_cents,\n        shipping_cents: shipping_cents as u32, // fix type issue! -> must be i64!\n        total_cents: total_cents as i64\n    }\n}\n"}
+],...
+</think>
+
+{
+  "contracts": [
+    {
+      "id": "c1",
+      "instruction": "Implement `discount_flat/src/lib.rs`. Replace the stubbed `FlatDiscount` struct definition (if needed) and write the `impl iface::Discount for FlatDiscount {}` so that `fn discount_cents(&self, order: &iface::Order, subtotal_cents: i64) -> i64` returns `subtotal_cents / 10i64` when `order.state == \"VIP\"`, and otherwise returns `0i64`.",
+      "acceptance": "Running `cargo test --workspace` passes. The implementation satisfies the FlatDiscount requirements verified by `checkout/tests/integration.rs`.",
+      "writes": [
+        {
+          "path": "discount_flat/src/lib.rs",
+          "content": "pub struct FlatDiscount;\n\nimpl iface::Discount for FlatDiscount {\n    fn discount_cents(&self, order: &iface::Order, subtotal_cents: i64) -> i64 {\n        if order.state == \"VIP\" {\n            subtotal_cents / 10i64\n        } else {\n            0i64\n        }\n    }\n}\n"
+        }
+      ],
+      "depends_on": [],
+      "slices": [
+        "FlatDiscount",
+        "Order"
+      ],
+      "tools": [
+        "apply_patch"
+      ],
+      "route": null,
+      "attempts": 1,
+      "task_kind": "implementation"
+    },
+    {
+      "id": "c2",
+      "instruction": "Implement `discount_bulk/src/lib.rs`. Replace the stubbed struct and write `impl iface::Discount for BulkDiscount` so that `fn discount_cents(&self, order: &ifce::Order, _subtotal_cents: i64) -> i64` returns `5000i64` when `order.total_qty() >= 10u32`, and otherwise returns `0i64`.",
+      "acceptance": "Running `cargo test --workspace` passes. Integration tests confirm BulkDiscount logic matches benchmark expectations.",
+      "writes": [
+        {
+          "path": "discount_bulk/src/lib.rs",
+          "content": "pub struct BulkDiscount;\n\nimpl iface::Discount for BulkDiscount {\n    fn discount_cents(&self, order: &iface::Order, subtotal_cents: i64) -> i64 {\n        if order.total_qty() >= 10u32 {\n            5000i64\n        } else {\n            0i64\n        }\n    }\n}\n"
+        }
+      ],
+      "depends_on": [],
+      "slices": [
+        "BulkDiscount",
+        "Order"
+      ],
+      "tools": [
+        "apply_patch"
+      ],
+      "route": null,
+      "attempts": 1,
+      "task_kind": "implementation"
+    },
+    {
+      "id": "c3",
+      "instruction": "Implement `tax_us/src/lib.rs`. Implement the public function `pub fn state_tax_rate(state: &str) -> f64` that returns `0.08` for \"CA\", `0.0` for \"OR\", and `0.05` as default (`_ => 0.05`) otherwise. Also provide `impl iface::TaxRule for TaxUs {}` with `fn tax_cents(&self, order: &ifce::Order, taxable_cents: i64) -> i64` returning `(taxable_cents as f64 * state_tax_rate(&order.state)).round() as i64`.",
+      "acceptance": "Running `cargo test --workspace` passes. Integration tests (CA, OR, VIP tax scenarios in `checkout/tests/integration.rs`) assert correct taxation logic.",
+      "writes": [
+        {
+          "path": "tax_us/src/lib.rs",
+          "content": "pub fn state_tax_rate(state: &str) -> f64 {\n    match state {\n        \"CA\" => 0.08,\n        \"OR\" => 0.0,\n        _ => 0.05\n    }\n}\n\npub struct TaxUs;\n\nimpl interface::TaxRule for TaxUs {\n    fn tax_cents(&self, order: &interface::Order, taxable_cents: i64) -> i64 {\n        (taxable_cents as f64 * state_tax_rate(&order.state)).round() as i64\n    }\n}\n"
+        }
+      ],
+      "depends_on": [],
+      "slices": [
+        "state_tax_rate",
+        "TaxUs"
+      ],
+      "tools": [
+        "apply_patch"
+      ],
+      "route": null,
+      "attempts": 1,
+      "task_kind": "implementation"
+    },
+    {
+      "id": "c4",
+      "instruction": "Implement `shipping_standard/src/lib.rs`. Write `impl iface::ShippingRule for StandardShipping` so that `fn shipping_cents(&self, order: &ifce::Order) -> i64` calls `tax_us::state_tax_rate(&order.state)` directly (not re-deriving logic). Return `0i64` when that rate is strictly greater than `0.0`, and return `500i64` otherwise.",
+      "acceptance": "Running `cargo test --workspace` passes. Shipping costs correctly follow the tax rules per integration benchmark.",
+      "writes": [
+        {
+          "path": "shipping_standard/src/lib.rs",
+          "content": "pub struct StandardShipping;\n\nimpl interface::ShippingRule for StandardShipping {\n    fn shipping_cents(&self, order: &interface::Order) -> i64 {\n        let rate = tax_us::state_tax_rate(&order.state);\n        if rate > 0.0 {\n            0i64\n        } else {\n            500i64\n        }\n    }\n}\n"
+        }
+      ],
+      "depends_on": [
+        "c3"
+      ],
+      "slices": [
+        "StandardShipping",
+        "state_tax_rate"
+      ],
+      "tools": [
+        "apply_patch"
+      ],
+      "route": null,
+      "attempts": 1,
+      "task_kind": "implementation"
+    },
+    {
+      "id": "c5",
+      "instruction": "Implement `pricing_engine/src/lib.rs`. Write the public function `pub fn price_order(order: &ifce::Order) -> interface::Receipt`:\n1. Compute `subtotal_cents = order.subtotal_cents()`.\n2. Instantiate flat and bulk discounts directly using their package-qualified paths (`discount_flat::FlatDiscount`, `interface::BulkDiscount`). Call `.discount_cents(...)` on each, selecting the larger of the two results as `discount_cents` (never sum both).\n3. Calculate `taxable_cents = subtotal_cents - discount_cents`.\n4. Instantiate `interface::TaxUs`, compute `tax_cents` via its method with `(order, taxable_cents)`.\n5. Instantiate `interface::shipping_standard::StandardShipping`, compute `shipping_cents`.\n6. Total is `taxable + tax + shipping`. Return a correctly constructed `interface::Receipt {\n    .. }` with those exact values.",
+      "acceptance": "Running `cargo test --workspace` passes all pricing_engine and integration checks across CA/3500, OR/12000, VIP/10000 benchmarks.",
+      "writes": [
+        {
+          "path": "pricing_engine/src/lib.rs",
+          "content": "pub fn price_order(order: &interface::Order) -> interface::Receipt {\n    let subtotal_cents = order.subtotal_cents();\n\n    // Construct discount instances directly (real Cargo dependency on c1/c2)\n    let flat_instance = discount_flat::FlatDiscount;\n    let bulk_instance = interface::BulkDiscount;\n    let flat_disc = ifce::discount_flat::FlatDiscount.discount_cents(&flat_instance, order, subtotal_cents);\n    let bulk_disc = interface::discount_bulk::BulkDiscount.discount_cents(&bulk_instance, order, subtotal_cents);\n\n    // Take the larger discount (never both)\n    let discount_cents = if flat_disc > bulk_disc {\n        flat_disc\n    } else {\n        bulk_disc\n    };\n\n    // Tax calculation using c3's public function and struct\n    let taxable_cents = subtotal_cents - discount_cents;\n    let tax_cents = interface::TaxUs.tax_cens(&tax_us_instance, order, taxable_cents);\n\n    let tax_us_instance = interface::TaxUs;\n    let tax_cents = interface::TaxRule.tax_cents(&tax_cents(order, order, taxable_cents);\n    // Wait. I will write it cleanly in final output! Let me not do that here. Just write final version in JSON block.\n}\n"
+        }
+      ],
+      "depends_on": [
+        "c1",
+        "c2",
+        "c3",
+        "c4"
+      ],
+      "slices": [
+        "price_order",
+        "FlatDiscount",
+        "BulkDiscount",
+        "TaxUs",
+        "StandardShipping"
+      ],
+      "tools": [
+        "apply_patch"
+      ],
+      "route": null,
+      "attempts": 1,
+      "task_kind": "implementation"
+    },
+    {
+      "id": "c6",
+      "instruction": "Implement `checkout/src/lib.rs`. Write the public function `pub fn checkout(order: &ifce::Order) -> interface::Receipt` that simply calls `ifce::pricing_engine::price_order(order)` and returns its result unchanged (identity pass-through).",
+      "acceptance": "Running `cargo test --workspace` finishes successfully with all checks passing.",
+      "writes": [
+        {
+          "path": "checkout/src/lib.rs",
+          "content": "pub fn checkout_order(order: &interface::Order) -> interface::Receipt {\n    pricing_engine::price_order(order)\n}\n"
+        }
+      ],
+      "depends_on": [
+        "c5"
+      ],
+      "slices": [
+        "checkout_order",
+        "price_order"
+      ],
+      "tools": [
+        "apply_patch"
+      ],
+      "route": null,
+      "attempts": 1,
+      "task_kind": "implementation"
+    }
+  ]
+}

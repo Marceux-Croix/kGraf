@@ -190,6 +190,12 @@ impl Decomposer for EmbedsThenPlans {
         assert!(!out.is_error, "{out:?}");
         self.0.decompose(request).await
     }
+    async fn interfaces(
+        &self,
+        request: &kgraf_orchestrator::InterfaceRequest,
+    ) -> Result<kgraf_orchestrator::InterfaceReply, PlanError> {
+        self.0.interfaces(request).await
+    }
 }
 
 /// Decision 0089: every token is attributed, including a model tool's. The

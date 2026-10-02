@@ -263,6 +263,11 @@ pub struct ContractCounters {
     /// `CheckStage::StubLand`, which `stub_compile_failures` etc. do not
     /// cover.
     pub stub_land_failures: u64,
+    /// Consumed edges (a contract and one contract it depends on) that the
+    /// run's plan left with no interface that can be checked in full
+    /// ([`ContractEvent::Unchecked`]), one per edge. Each is also counted in
+    /// `checks_not_run`: a check the run asked for did not run.
+    pub unchecked_edges: u64,
 }
 
 /// One contract event, as written to the run trace.
@@ -384,6 +389,18 @@ pub enum ContractEvent {
         version: u32,
         commit: String,
     },
+    /// A consuming contract the plan took with no interface that can be
+    /// checked in full against one or more of the contracts it depends on:
+    /// the planner wrote none kGraf could accept, and none could be derived
+    /// from the repository with a reference to check it against. Recorded at
+    /// plan intake, one event per consumer; each producer is one edge counted
+    /// in `checks_not_run` and `unchecked_edges`. An edge recorded twice (a
+    /// plan step run again after a crash, or a replay) counts once.
+    Unchecked {
+        consumer: String,
+        producers: Vec<String>,
+        reason: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -425,6 +442,8 @@ pub struct ContractBook {
     holds: BTreeMap<String, String>,
     /// Contracts built against a superseded version.
     blocked: BTreeMap<String, String>,
+    /// (consumer, producer) edges recorded as unchecked.
+    unchecked: BTreeSet<(String, String)>,
     counters: ContractCounters,
     max_supersessions: u32,
 }
@@ -453,6 +472,7 @@ impl ContractBook {
             reviews: BTreeMap::new(),
             holds: BTreeMap::new(),
             blocked: BTreeMap::new(),
+            unchecked: BTreeSet::new(),
             counters: ContractCounters::default(),
             max_supersessions,
         })
@@ -542,10 +562,27 @@ impl ContractBook {
         })
     }
 
+    /// The (consumer, producer) edges recorded as unchecked.
+    pub fn unchecked(&self) -> &BTreeSet<(String, String)> {
+        &self.unchecked
+    }
+
     /// Apply one event. The only mutation path, used live and on replay.
     pub fn apply(&mut self, event: &ContractEvent) {
         let c = &mut self.counters;
         match event {
+            ContractEvent::Unchecked {
+                consumer,
+                producers,
+                ..
+            } => {
+                for p in producers {
+                    if self.unchecked.insert((consumer.clone(), p.clone())) {
+                        c.unchecked_edges += 1;
+                        c.checks_not_run += 1;
+                    }
+                }
+            }
             ContractEvent::Registered { interface } => {
                 if !self.entries.contains_key(&interface.id) {
                     c.interfaces_registered += 1;
@@ -1774,6 +1811,31 @@ mod tests {
             "pub fn parse() -&gt; u16 { 8080 }"
         ));
         assert!(!excerpt_in_contract(&ic(), "pub fn parse() -> u32"));
+    }
+
+    /// An unchecked edge counts once in `not run` and in `unchecked_edges`,
+    /// however often its event is applied (a plan step run again after a
+    /// crash, or a replay of the trace).
+    #[test]
+    fn an_unchecked_edge_counts_once_per_edge_however_often_it_is_applied() {
+        let mut book = ContractBook::new(Vec::new(), DEFAULT_MAX_SUPERSESSIONS).expect("book");
+        let event = ContractEvent::Unchecked {
+            consumer: "c5".into(),
+            producers: vec!["c1".into(), "c2".into()],
+            reason: "no interface binds them".into(),
+        };
+        book.apply(&event);
+        book.apply(&event);
+        let c = book.counters();
+        assert_eq!((c.unchecked_edges, c.checks_not_run), (2, 2));
+        book.apply(&ContractEvent::Unchecked {
+            consumer: "c5".into(),
+            producers: vec!["c2".into(), "c3".into()],
+            reason: "again".into(),
+        });
+        assert_eq!(book.counters().unchecked_edges, 3, "only c5 <- c3 is new");
+        let json = serde_json::to_value(&event).expect("json");
+        assert_eq!(json["kind"], "unchecked");
     }
 
     /// Registration is the live path's way in: applied once, so a plan step

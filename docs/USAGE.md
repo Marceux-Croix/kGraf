@@ -543,7 +543,10 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   `rounds` and counts each once as a sizing miss.
 - An attempt that changed none of its contract's declared files is not verified, even when
   `--verify` passes: the check passed on the tree as dispatched, which proves nothing. It is
-  retried with the reason, then held.
+  retried with the reason, then held. The exception: an earlier merge of the same run changed
+  those files, and the check fails on the run's original base. The attempt is then accepted as
+  an empty integration, with a notice `contract <id>: unverified: ...` naming the earlier
+  contract (0086).
 - kGraf sets no spend limit (decision 0080): set one in your provider's console. Every call
   is still on the ledger, and `kgraf spend` totals it. The concurrency caps are `--max-items`
   (default 4) and `--max-agents` (default 8).
@@ -733,7 +736,8 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
 - A contract whose check always passes (`--verify true`, `:`, `exit 0`), or whose worker
   finished after a policy refused a call it never ran, is printed as `unverified <id>:
   <reason>` after the `verified` line. The run still completes; the line says the check did
-  not look at the work.
+  not look at the work. A refusal names the program a rule matched: `sh -c "mkdir x && python3
+  ..."` under a deny rule on `python3` is a refusal of `python3` (0094).
 - While a worker's worktree has a `.cargo/config.toml`, `.cargo/config`, `rust-toolchain` or
   `rust-toolchain.toml` that differs from the one it started with, every allowlisted command
   is refused: those files can change what cargo runs whatever its arguments say.
@@ -768,12 +772,28 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   command. On macOS and Linux a gate command also runs under a CPU-time limit of twice
   that, so a process that escapes its process group cannot spin without limit.
 - Interface contracts are experimental and off by default. `--contract-checks` turns them
-  on (`contract_checks` in `.kgraf/run.json`). With them on, where one contract uses
-  another's code, the planner also writes an interface contract: a stub, a reference, the
-  consumer's expectations and a test. Before the first worker starts, the sandbox checks
-  it: the consumer and the test compile against the stub, the test fails against the stub
-  and passes against the reference, and the two parties' handshakes agree. A plan in which a contract depends on another but names no interface is sent back to the planner once; if the answer still names none, the run goes on and says in its notices and trace that contract checks did not run, naming the contracts. A contract that fails is held, with the file that failed named. Each handshake and each check names every party's route and model, and the run record keeps each hold with them, so you can see which models disagreed. A contract whose compiler or test runner
-  is not installed is held too, with the program named. A worker can challenge a contract
+  on (`contract_checks` in `.kgraf/run.json`). With them on, planning is two calls. The
+  first returns the contracts only. When the plan has two or more contracts, a second call
+  is given the accepted contracts, which contract depends on which, and the repository
+  context, and returns the interface contracts only: for each producer another contract
+  uses, a stub, a reference, the consumer's files and a test. A consumer or test file the
+  repository already has may be named by path alone; kGraf reads it from the repository.
+  Each interface is checked as it arrives, in the sandbox: the consumer and the test compile
+  against the stub, the test fails against the stub and passes against the reference. One
+  that fails, an answer that is not JSON, and a dependency no interface binds are all sent
+  back to the second call, up to three asks in all, with the planner's previous answer and
+  the reason, which quotes the answer where it went wrong and says what each entry needs;
+  accepted interfaces are kept, and the contracts are never asked for again. When the asks
+  are spent, kGraf derives a compile check from the repository where it can (the producer's
+  scaffold as the stub, the files that use it as the consumer files) and runs it; each
+  dependency still without an interface is then counted under `not run` in the report's
+  `contracts` line, with a notice and a trace record that name the contracts and the reason.
+  The run is never held for an interface the planner could not write. Before the first
+  worker starts, the handshakes of an interface's parties are compared too. A contract
+  whose interface fails at that point is held, with the file that failed named. Each
+  handshake and each check names every party's route and model, and the run record keeps
+  each hold with them, so you can see which models disagreed. A contract whose compiler or
+  test runner is not installed is held too, with the program named. A worker can challenge a contract
   with the `challenge_contract` tool; the answer names the artifact that settled it, or
   says it is judgment.
 - Every planner prompt carries up to 8 KB about the project so the planner does not invent
@@ -784,8 +804,16 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   files and symbols you mean in the instruction (in backticks, or by path) to get their
   signatures into the prompt. An interface file or command that still holds a template slot
   such as `<crate_name>` is refused and the planner is asked again. When a re-plan follows a
-  hold, it quotes the failed check (stage, command, last lines of its output), and the
-  re-planned contracts' workers see the same text in their briefs, marked as data.
+  hold, it quotes the failed check (stage, command, last lines of its output), and is asked
+  again like the first plan if its answer is not JSON or breaks a plan rule. A re-planned
+  contract's worker sees, in its brief and marked as data, only the failures that concern
+  it: those of the interfaces that bound the contract it replaces, or a file it writes.
+- The planner's answer is read leniently where the intent is certain: text up to a leaked
+  `</think>` is reasoning and is skipped, the last JSON object that parses is the answer,
+  and a line break typed inside a string is read as `\n`. Contracts that all declare the
+  same files and that the acceptance check would judge by one test file cannot be verified
+  apart; such a plan is sent back once, and merged into one contract if the planner repeats
+  it, with a notice.
 - `--check-timeout` and `--check-compile-timeout` (600 seconds each) bound one check run.
   `--planner-max-tokens` (default 32,768) is the output limit of each orchestrator call. An
   answer cut off at that limit fails and names the flag; interface contracts carry whole
@@ -1136,10 +1164,18 @@ Behavior that differs from earlier builds. Each item names the decision that hol
   others the shell tool's description lists (0084).
 - A worker's `apply_patch` patch that starts with a file header (`*** Add File:`,
   `*** Update File:`, `*** Delete File:`) and lacks `*** Begin Patch` is applied as if it had
-  the envelope, and the result says so. Any other malformed patch is refused.
+  the envelope, and the result says so. Any other malformed patch is refused. From the second
+  patch a worker has rejected, the rejection ends with the rule it broke and a minimal valid
+  patch for the file it targeted (0084).
 - A worker turn with no tool call and no visible answer (a plan only in the model's reasoning)
   is not a finished attempt: the worker is told to continue, once. A second empty turn in a
   row fails the attempt, and the failure names the stop reason (0096).
+- A server that cannot parse the model's own tool call answers HTTP 500 (Ollama does:
+  `XML syntax error on line N` or `error parsing tool call`). The worker sends that round
+  again, at most twice in a row, with one added note: "Your previous reply contained a
+  malformed tool call ... Send one well-formed tool call." Each try is its own ledger call; the
+  failed one stays unreconciled like any 5xx. After the second retry, or on the last round, the
+  attempt fails and its error names the parse failure. Any other 5xx is not retried (0039).
 - A worker whose contract writes files and which ends an attempt as done with no tool call at
   all (it only said what it would do) has not finished. It is told once: "You ended without
   making any change; this contract writes <paths>. Continue with tool calls, or call

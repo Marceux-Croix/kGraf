@@ -1,0 +1,157 @@
+```json
+{
+  "contracts": [
+    {
+      "id": "c1",
+      "instruction": "Implement FlatDiscount in discount_flat/src/lib.rs. pub struct FlatDiscount; impl iface::Discount for FlatDiscount { fn discount_cents(&self, order: &Order, subtotal_cents: i64) -> i64 { if order.state == \"VIP\" { subtotal_cents / 10 } else { 0 } } }",
+      "acceptance": "cargo check -p discount_flat && cargo test -p discount_flat -- --nocapture",
+      "writes": [
+        {"path": "discount_flat/src/lib.rs"}
+      ],
+      "depends_on": [],
+      "slices": ["crate::FlatDiscount", "impl iface::Discount for FlatDiscount"],
+      "tools": ["apply_patch"],
+      "route": null,
+      "attempts": 1,
+      "task_kind": "implementation"
+    },
+    {
+      "id": "c2",
+      "instruction": "Implement BulkDiscount in discount_bulk/src/lib.rs. pub struct BulkDiscount; impl iface::Discount for BulkDiscount { fn discount_cents(&self, order: &Order, _subtotal_cents: i64) -> i64 { if order.total_qty() >= 10 { 5000 } else { 0 } } }",
+      "acceptance": "cargo check -p discount_bulk && cargo test -p discount_bulk -- --nocapture",
+      "writes": [
+        {"path": "discount_bulk/src/lib.rs"}
+      ],
+      "depends_on": [],
+      "slices": ["crate::BulkDiscount", "impl iface::Discount for BulkDiscount"],
+      "tools": ["apply_patch"],
+      "route": null,
+      "attempts": 1,
+      "task_kind": "implementation"
+    },
+    {
+      "id": "c3",
+      "instruction": "Implement state_tax_rate and TaxUs in tax_us/src/lib.rs. pub fn state_tax_rate(state: &str) -> f64 { if state == \"CA\" { 0.08 } else if state == \"OR\" { 0.0 } else { 0.05 } } pub struct TaxUs; impl iface::TaxRule for TaxUs { fn tax_cents(&self, order: &Order, taxable_cents: i64) -> i64 { (taxable_cents as f64 * state_tax_rate(&order.state)).round() as i64 } }",
+      "acceptance": "cargo check -p tax_us && cargo test -p tax_us -- --nocapture",
+      "writes": [
+        {"path": "tax_us/src/lib.rs"}
+      ],
+      "depends_on": [],
+      "slices": ["crate::state_tax_rate", "crate::TaxUs", "impl iface::TaxRule for TaxUs"],
+      "tools": ["apply_patch"],
+      "route": null,
+      "attempts": 1,
+      "task_kind": "implementation"
+    },
+    {
+      "id": "c4",
+      "instruction": "Implement StandardShipping in shipping_standard/src/lib.rs. pub struct StandardShipping; impl iface::ShippingRule for StandardShipping { fn shipping_cents(&self, order: &Order) -> i64 { let rate = tax_us::state_tax_rate(&order.state); if rate > 0.0 { 0 } else { 500 } } }",
+      "acceptance": "cargo check -p shipping_standard && cargo test -p shipping_standard -- --nocapture",
+      "writes": [
+        {"path": "shipping_standard/src/lib.rs"}
+      ],
+      "depends_on": [
+        "c3"
+      ],
+      "slices": ["crate::StandardShipping", "impl iface::ShippingRule for StandardShipping"],
+      "tools": ["apply_patch"],
+      "route": null,
+      "attempts": 1,
+      "task_kind": "implementation"
+    },
+    {
+      "id": "c5",
+      "instruction": "Implement price_order in pricing_engine/src/lib.rs. pub fn price_order(order: &Order) -> Receipt { let subtotal = order.subtotal_cents(); let d1 = discount_flat::FlatDiscount.discount_cents(order, subtotal); let d2 = discount_bulk::BulkDiscount.discount_cents(order, subtotal); let discount = if d1 > d2 { d1 } else { d2 }; let taxable = subtotal - discount; let tax = tax_us::TaxUs.tax_cents(order, taxable); let shipping = shipping_standard::StandardShipping.shipping_cents(order); Receipt { subtotal_cents: subtotal, discount_cents: discount, tax_cents: tax, shipping_cents: shipping, total_cents: taxable + tax + shipping } }",
+      "acceptance": "cargo check -p pricing_engine && cargo test -p pricing_engine -- --nocapture",
+      "writes": [
+        {"path": "pricing_engine/src/lib.rs"}
+      ],
+      "depends_on": [
+        "c1",
+        "c2",
+        "c3",
+        "c4"
+      ],
+      "slices": ["crate::price_order"],
+      "tools": ["apply_patch"],
+      "route": null,
+      "attempts": 1,
+      "task_kind": "implementation"
+    },
+    {
+      "id": "c6",
+      "instruction": "Implement checkout_order in checkout/src/lib.rs. pub fn checkout_order(order: &Order) -> Receipt { pricing_engine::price_order(order) }",
+      "acceptance": "cargo check -p checkout && cargo test -p checkout -- --nocapture",
+      "writes": [
+        {"path": "checkout/src/lib.rs"}
+      ],
+      "depends_on": [
+        "c5"
+      ],
+      "slices": ["crate::checkout_order"],
+      "tools": ["apply_patch"],
+      "route": null,
+      "attempts": 1,
+      "task_kind": "implementation"
+    }
+  ],
+  "interfaces": [
+    {
+      "id": "i_c1_c5",
+      "parties": ["c1", "c5"],
+      "symbols": ["FlatDiscount"],
+      "stub": [
+        {"path": "discount_flat/src/lib.rs", "content": "pub struct FlatDiscount;\npub trait Discount { fn discount_cents(&self, order: &Order, subtotal_cents: i64) -> i64; }\npub use iface::Order;"},
+        {"path": "pricing_engine/src/lib.rs", "content": "use iface::{Order, Receipt, Discount};\n\npub struct FlatDiscount;\nimpl Discount for FlatDiscount {\n    fn discount_cents(&self, _order: &Order, _subtotal_cents: i64) -> i64 { 0 }\n}",
+      "reference": [
+        {"path": "discount_flat/src/lib.rs", "content": "pub struct FlatDiscount;\npub use iface::Order;\n\nimpl Discount for FlatDiscount {\n    fn discount_cents(&self, order: &Order, subtotal_cents: i64) -> i64 {\n        if order.state == \"VIP\" { subtotal_cents / 10 } else { 0 }\n    }\n},
+      "consumer": [],
+      "tests": [],
+      "compile": ["cargo", "check", "-p", "pricing_engine"],
+      "test": []
+    },
+    {
+      "id": "i_c2_c5",
+      "parties": ["c2", "c5"],
+      "symbols": ["BulkDiscount"],
+      "stub": [
+        {"path": "discount_bulk/src/lib.rs", "content": "pub struct BulkDiscount;\npub trait Discount { fn discount_cents(&self, order: &Order, subtotal_cents: i64) -> i64; }\npub use iface::Order;"},
+        {"path": "pricing_engine/src/lib.rs", "content": "[EXISTING PRICING_ENGINE STUB]"},
+      "reference": [
+        {"path": "discount_bulk/src/lib.rs", "content": "pub struct BulkDiscount;\npub use iface::Order;\n\nimpl Discount for BulkDiscount {\n    fn discount_cents(&self, order: &Order, _subtotal_cents: i64) -> i64 {\n        if order.total_qty() >= 10 { 5000 } else { 0 }\n    }\n},
+      "consumer": [],
+      "tests": [],
+      "compile": ["cargo", "check", "-p", "pricing_engine"],
+      "test": []
+    },
+    {
+      "id": "i_c3_c4",
+      "parties": ["c3", "c4"],
+      "symbols": ["state_tax_rate"],
+      "stub": [
+        {"path": "tax_us/src/lib.rs", "content": "pub fn state_tax_rate(_state: &str) -> f64 { 0.0 }"},
+        {"path": "shipping_standard/src/lib.rs", "content": "[EXISTING SHIPPING_STANDARD STUB]"},
+      "reference": [
+        {"path": "tax_us/src/lib.rs", "content": "pub fn state_tax_rate(state: &str) -> f64 {\n    if state == \"CA\" { 0.08 } else if state == \"OR\" { 0.0 } else { 0.05 }\n}"},
+      "consumer": [],
+      "tests": [],
+      "compile": ["cargo", "check", "-p", "shipping_standard"],
+      "test": []
+    },
+    {
+      "id": "i_c5_c6",
+      "parties": ["c5", "c6"],
+      "symbols": ["price_order"],
+      "stub": [
+        {"path": "pricing_engine/src/lib.rs", "content": "pub fn price_order(_order: &Order) -> Receipt { Receipt { subtotal_cents: 0, discount_cents: 0, tax_cents: 0, shipping_cents: 0, total_cents: 0 } }\npub use iface::{Order, Receipt};"},
+        {"path": "checkout/src/lib.rs", "content": "[EXISTING CHECKOUT STUB]"},
+      "reference": [
+        {"path": "pricing_engine/src/lib.rs", "content": "[REFERENCE CONTENT FROM C5 WORKER]"},
+      "consumer": [],
+      "tests": [],
+      "compile": ["cargo", "check", "-p", "checkout"],
+      "test": []
+    }
+  ]
+}
+```

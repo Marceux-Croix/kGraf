@@ -576,3 +576,28 @@ Evidence: `kgraf-tools/src/approval.rs` tests
 (`a_grant_a_later_deny_rule_refuses_is_traced_as_refused_and_never_as_granted`,
 `a_grant_the_chain_lets_run_is_recorded_as_granted`,
 `the_shell_hook_stages_a_mode_grant_and_does_not_record_it`).
+
+## Amendment (2026-10-02): a refusal names the program a rule matched
+
+A call `["sh", "-c", "mkdir x && python3 -c pass"]` refused by the deny rule `shell(python3*)`
+was recorded as a refusal of `sh`: the trace said `refused sh`, and the unverified line said the
+worker "finished after a policy refused `sh` and never ran it", though `sh` ran fine. The rule
+matcher already judged each command of a script; the record named only the call's own program.
+
+- `refused_program` (`kgraf-tools`, `permissions.rs`) matches the rule a refusal quotes (or, for
+  the deletion limit, the first deleting command) against the call's command lines in the order
+  the rule matcher uses them: the whole call first, then each command of the script. The
+  program of the command that matched is what was refused. A rule on the shell itself, or a plain
+  call, still names its own program.
+- The worker records that program as the refusal's capability (`RefusedCall`, the refusal
+  directory, the stop note, the unverified line), and the permission trace's `grant_refused`
+  event names it as its subject (`PermissionControl::settle_call_naming`). This covers the deny
+  rule, the ask rule (also when nobody attends and the ask is denied), and the deletion limit.
+- A call that ran without error clears the refusals of every program its script ran
+  (`programs_run`), not only the shell's: a later `sh -c "... && python3 ..."` that succeeded
+  retried `python3`, and one that never ran `python3` did not.
+
+Evidence: `kgraf-tools` `a_refusal_names_the_program_of_the_command_a_rule_matched`,
+`programs_run_lists_every_command_of_a_script`,
+`a_refusal_of_a_wrapped_command_names_that_commands_program` (`approval.rs`);
+`kgraf-runtime` `a_wrapped_refusal_is_recorded_against_the_refused_program`.

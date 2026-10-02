@@ -855,7 +855,7 @@ async fn plan_refusal_lines(trace: &Path) -> Vec<String> {
         Ok(text) => {
             let events: Vec<kgraf_orchestrator::TraceEvent> = text
                 .lines()
-                .filter(|l| l.contains("\"plan_refused\""))
+                .filter(|l| l.contains("\"plan_refused\"") || l.contains("\"interfaces_refused\""))
                 .filter_map(|l| serde_json::from_str(l).ok())
                 .collect();
             refusal_lines(&events)
@@ -872,6 +872,12 @@ fn refusal_lines(events: &[kgraf_orchestrator::TraceEvent]) -> Vec<String> {
                 ask, of, reason, ..
             } => Some(format!(
                 "notice     plan refused (ask {ask} of {of}): {}",
+                plain(reason)
+            )),
+            kgraf_orchestrator::TraceEvent::InterfacesRefused {
+                ask, of, reason, ..
+            } => Some(format!(
+                "notice     interfaces refused (ask {ask} of {of}): {}",
                 plain(reason)
             )),
             _ => None,
@@ -990,6 +996,16 @@ mod tests {
         assert_eq!(lines.len(), 3, "{lines:?}");
         assert!(lines[2].contains("ask 3 of 3") && lines[2].contains("refusal 3"));
         assert!(!lines.iter().any(|l| l.contains('\u{1b}')), "plain text");
+        let interfaces = refusal_lines(&[TraceEvent::InterfacesRefused {
+            at_ms: 0,
+            ask: 2,
+            of: 3,
+            reason: "no interface binds c5 <- c2".into(),
+        }]);
+        assert_eq!(
+            interfaces,
+            ["notice     interfaces refused (ask 2 of 3): no interface binds c5 <- c2"]
+        );
 
         let dir = tempfile::tempdir().expect("dir");
         let path = dir.path().join("trace.jsonl");

@@ -65,6 +65,24 @@ pub enum ProviderError {
         body: String,
     },
 
+    /// The server answered 5xx because it could not parse the **model's own**
+    /// output (a malformed tool call). The request was sound; the generation
+    /// was not, and another sample of the same request usually parses.
+    ///
+    /// Raised by an adapter that recognizes its server's error body, so
+    /// callers read this kind and never the body text. It is an answer from a
+    /// running server, so it is neither a route fault nor unbilled: the model
+    /// ran, so the ledger row stays open exactly as for any other 5xx.
+    #[error(
+        "provider `{adapter}` returned HTTP {status}: {body} (the server could not parse the \
+         model's own tool-call output)"
+    )]
+    ModelOutputMalformed {
+        adapter: &'static str,
+        status: u16,
+        body: String,
+    },
+
     /// The response did not match the protocol's schema.
     #[error("cannot decode `{adapter}` response: {reason}")]
     Decode {
@@ -185,7 +203,7 @@ impl kgraf_diag::DiagCode for ProviderError {
     fn diag_code(&self) -> &'static str {
         match self {
             ProviderError::MissingCredential { .. } => "KG-0301",
-            ProviderError::Http { .. } => "KG-0302",
+            ProviderError::Http { .. } | ProviderError::ModelOutputMalformed { .. } => "KG-0302",
             ProviderError::RateLimited { .. } => "KG-0303",
             ProviderError::ModelUnsupported { .. } => "KG-0304",
             ProviderError::UsageMissing { .. } => "KG-0305",
@@ -221,6 +239,14 @@ impl ProviderError {
             self,
             ProviderError::Unsent { .. } | ProviderError::Transport { .. }
         )
+    }
+
+    /// Whether the server failed to parse the model's own output, so a fresh
+    /// sample of the same request is worth sending (see
+    /// [`Self::ModelOutputMalformed`]). No other error kind is retried on this
+    /// ground.
+    pub fn is_malformed_model_output(&self) -> bool {
+        matches!(self, ProviderError::ModelOutputMalformed { .. })
     }
 
     /// Whether the call that produced this error may have been billed.
@@ -284,6 +310,11 @@ mod tests {
         let instances: Vec<ProviderError> = vec![
             ProviderError::MissingCredential { adapter: "t" },
             http(500),
+            ProviderError::ModelOutputMalformed {
+                adapter: "t",
+                status: 500,
+                body: String::new(),
+            },
             ProviderError::RateLimited {
                 adapter: "t",
                 route: "t".into(),
@@ -367,5 +398,15 @@ mod tests {
             }
             .is_route_fault()
         );
+        let malformed = ProviderError::ModelOutputMalformed {
+            adapter: "t",
+            status: 500,
+            body: String::new(),
+        };
+        assert!(!malformed.is_route_fault());
+        assert!(malformed.is_malformed_model_output());
+        assert!(!http(500).is_malformed_model_output());
+        // The model ran, so the row stays open like any other 5xx.
+        assert_eq!(malformed.billing(), Billing::MayHaveBilled);
     }
 }

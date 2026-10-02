@@ -83,3 +83,31 @@ counted those contracts done.
 - Still passed with the notice: a contract with no declared write (a check-only contract), and
   a handoff child adopting its parent's worktree.
 - A contract whose work is already present now fails loud instead of passing silently.
+
+## Amendment (2026-10-02): work an earlier merge delivered is accepted empty, and said
+
+A handoff child implemented a whole file. The next contract on the same file was dispatched on
+a tree where its check already passed, changed nothing, and was refused twice by the rule above;
+the run ended Blocked on correct work.
+
+- When an attempt changed none of its declared files, the verifier asks the integration branch
+  whether an earlier merge of the run changed them (`earlier_delivery.rs`). Every merge is a
+  `Merge attempt ... into <branch>` commit on the branch's first-parent line, so the commit the
+  run started from is the first commit of that line that is not one, and the merges that
+  changed the declared files name the contracts that delivered them.
+- If one did, the contract's check runs once on a throwaway worktree of the run's original
+  base. A check that fails there and passes on the tree as dispatched shows the earlier merge
+  made it pass: the attempt is accepted as an empty integration (`Integration::Empty`), with a
+  notice that begins `unverified:` and names the earlier contract (decision 0093). Nothing is
+  accepted silently.
+- A check that also passes at the original base proves nothing and is refused as before. So is
+  an attempt whose declared files no earlier merge changed, and one whose original-base check
+  could not run (the reason says so).
+
+Alternatives rejected: recording the base result at plan time (a plan has no check run for it;
+a resumed run would lack it); accepting any empty attempt whose check passes (the case this
+decision's first amendment refuses).
+
+Tests: `kgraf-host` `a_contract_whose_work_an_earlier_merge_delivered_is_accepted_empty_with_a_notice`,
+`an_empty_attempt_is_still_refused_when_its_check_passes_at_the_run_start`,
+`an_earlier_merge_of_other_files_does_not_excuse_an_empty_attempt`.

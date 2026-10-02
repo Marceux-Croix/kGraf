@@ -225,3 +225,121 @@ runner); `tests/orchestrator.rs` `the_planner_prompt_carries_the_crate_name_and_
 `tests/contract_flow.rs` `a_plan_the_gate_holds_before_any_work_is_re_planned_once_with_the_failure`;
 `plan.rs` `a_placeholder_in_a_command_or_an_interface_file_is_refused_with_a_reason`;
 `planner_context.rs` unit tests.
+
+## Amendment (2026-10-02): interfaces are a second planner call, and an unwritten interface is counted, never held
+
+A live local-model run (`qwen3.6:35b`, 13 cases with contract checks on) ended with no
+registered, checked interface in any case. The planner's answers, read one by one, showed why:
+
+- One re-ask budget (two re-asks) was shared by parse errors, schema errors, a missing interface
+  and a failed check, and each ask regenerated the whole plan (three to eight minutes on the local
+  model) without the model seeing its previous answer.
+- A refusal quoted the first 200 characters of the answer, not the place it broke (one parse error
+  was at column 3,938).
+- The answer was taken from the first `{` to the last `}`: a reasoning draft leaked before a
+  literal `</think>` refused a sound plan.
+- The prompt's example interface had empty file lists, and models copied them as empty shells; they
+  put contract ids in `consumer`, gave commands as lists of lists, and named the repository's own
+  test file by path, which the prompt did not allow.
+- On the last ask an answer with no interface was taken with a notice, while a malformed one held
+  the run: seven cases dropped their interfaces on the last ask.
+- A re-plan was one ask with no re-ask, so a stray control character or an unknown id ended it.
+
+**Two calls.** With contract checks on, the contracts call returns the contracts only; the prompt
+says that interfaces follow and that `depends_on` must list every contract whose code a contract
+uses. When the answer has two or more contracts, or is a split, the interface call
+(`interface_plan.rs`, `orchestrator/interface_intake.rs`) is given the accepted contracts, the
+`consumer <- producers` edges, and the same repository context, and returns
+`{"interfaces":[...]}` only. Its system prompt is static and its varying text (the accepted
+interfaces, the previous answer, the refusal) comes last, so each re-ask extends the previous
+prompt. The contracts are never asked for again because an interface was wrong.
+
+**Its own budget, and accumulation.** The interface call has three asks
+(`MAX_INTERFACE_ASKS`). Each interface of an answer is taken on its own: sanitized, its parties
+checked, its shape checked (`shape_problems`: symbols, stub, a reference covering every stub path,
+at least one test, both commands, no path in both stub and consumer, every stub path a declared
+write of a party), its consumer and tests files named by path alone read from the dispatch base
+(`SandboxRunner::read_base`), a stub file the repository already has must be listed in `replaces`
+(the stub land refuses it before dispatch otherwise, decision 0081), then its mechanical checks
+run. An accepted interface is kept; a
+re-ask quotes the previous answer and every refusal, names the accepted interfaces and the edges
+still unbound, and asks only for those. A repeat of an accepted interface is ignored; a new one
+under an accepted id is renamed, with a notice.
+
+**One policy.** An omitted interface and a malformed one are retried the same way, within the
+same budget. When the budget is spent, or the answer was cut off at the output limit, kGraf
+derives a compile check from the repository for each producer of an unbound edge
+(`derive_interface.rs`): the producer's declared files that hold a scaffold body (`todo!()`,
+`unimplemented!()`, `NotImplementedError`) are the stub; the repository files that use its names
+(graph edges, or the consumer contracts' own existing files; names read by keyword when the graph
+has none) are the consumer and test files; `cargo test --no-run -p <package>` or a Python import
+compiles them. Stub-compile and its canaries run (`check_derived_compile`); the vacuity check
+cannot, because no reference exists. The derived check is not registered. Every consumed edge
+that no accepted interface binds (a dependency, or a pair a refused interface declared) is then
+recorded as `ContractEvent::Unchecked` (one per consumer, with the reason: the last refusal and the
+derived check's result), counted one per edge in `checks_not_run` (the report's `not run`) and in
+`unchecked_edges`, and said in a notice ("contract checks did not run for ..."). The book counts
+an edge once however often the event is applied, so a replay and a resume agree. The run is never
+held for an interface the planner could not write, and never skips one without a counted reason.
+This replaces the 2026-10-01 rule (a plan with no interface was sent back once and then taken with
+a notice) and the 2026-09-30 amendment of decision 0031 (the last ask's plan taken without its
+mechanical checks, so the gate held on the same failure).
+
+**Actionable refusals.** The answer is extracted leniently where the intent is certain
+(`answer_json.rs`): text through the last `</think>` is skipped; the last top-level object that
+parses is the answer, and a broken object before it is skipped, never mined for inner objects; a
+raw control character inside a string is escaped and the object parsed again. A parse refusal
+quotes the answer around the point the parser stopped, marked `[ERROR HERE]`, with the usual cause
+(a string left unclosed, a key without quotes). A type error names the field, the value found and
+what the field takes. Every interface file entry that is not a file is named at once
+(`interfaces[0].consumer[0] is a string "c4", not a file; "consumer" takes files ..., never
+contract ids: list the consuming contracts in "parties"`). A bare path string in `consumer` or
+`tests` is read as the path-alone entry. In the re-ask, a `<` that could open or close a tag is
+escaped; `c5 <- c1` stays as written.
+
+**Schema.** The interface request shows one populated example entry (stub, reference, a consumer
+named by path alone, a test, both commands), says that `stub` and `reference` always give content,
+that a consumer or test file the repository already has may be named by path alone, and that a
+path is never in both stub and consumer.
+
+**One file, one test.** Contracts that declare one identical write set which the verifier's
+narrowed check (`Verifier::plan_check_scope`, the `scoped_check` rule) judges by one test file
+cannot be verified apart: the second contract of the long-run case was refused because the first
+one's work already passed the test. The plan is refused once naming them and the two fixes (merge,
+or split the file); if the planner repeats it, the contracts are merged into the first (`merge_groups`:
+instructions as parts, dependencies renamed), with a notice.
+
+Known limits. A dependency is still the only signal of consumption besides the pairs a refused
+interface declares, so a dependency kept only for ordering is counted as an unchecked edge. The
+derived compile check proves the consumers build against the scaffold, not that any test tells a
+wrong producer from a right one. A crash between the two calls asks for the contracts again.
+
+The planner answers the tests replay, verbatim, are in
+`crates/kgraf-orchestrator/tests/fixtures/planner-answers/`.
+
+Tests: `kgraf-orchestrator` `tests/plan_intake.rs`
+`a_draft_leaked_before_think_end_does_not_cost_an_ask`,
+`contracts_sharing_one_file_and_one_test_are_refused_then_merged`,
+`contracts_sharing_a_file_under_a_whole_check_are_left_alone`; `tests/contract_flow.rs`
+`a_recorded_answer_with_contract_ids_in_consumer_is_refused_naming_the_fix`,
+`a_recorded_answer_of_empty_shells_is_refused_with_what_each_needs`,
+`a_test_file_named_by_path_alone_is_read_from_the_repository`,
+`with_no_interface_a_compile_check_is_derived_from_the_scaffold`,
+`unchecked_edges_count_the_same_after_a_resume`,
+`after_three_asks_a_failing_interface_is_counted_unchecked_and_the_run_goes_on`,
+`a_plan_still_without_interfaces_after_the_budget_runs_counted_and_noticed`,
+`an_interface_naming_a_contract_the_plan_lacks_is_asked_again_then_counted`,
+`a_stub_over_an_existing_file_is_asked_to_declare_it_in_replaces`; unit tests in
+`answer_json.rs`, `interface_plan.rs`, `derive_interface.rs`, `plan.rs`
+(`contracts_sharing_one_write_set_and_one_test_are_grouped`) and `challenge.rs`
+(`an_unchecked_edge_counts_once_per_edge_however_often_it_is_applied`); `kgraf-host`
+`the_plan_scope_of_a_write_set_is_its_own_test_file`.
+
+Renamed tests, now checking the behavior above:
+`a_plan_still_without_interfaces_after_one_ask_runs_with_a_loud_notice` is
+`a_plan_still_without_interfaces_after_the_budget_runs_counted_and_noticed`;
+`an_interface_naming_a_contract_the_plan_lacks_is_refused` is
+`an_interface_naming_a_contract_the_plan_lacks_is_asked_again_then_counted`;
+`a_dependency_on_an_interface_id_is_refused_by_name` is
+`a_dependency_outside_the_plan_is_refused_by_name` (the contracts answer holds no interface ids
+now).

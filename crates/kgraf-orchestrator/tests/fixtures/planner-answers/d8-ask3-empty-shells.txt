@@ -1,0 +1,111 @@
+{
+  "contracts": [
+    {
+      "id": "c1",
+      "instruction": "Implement `discount_flat/src/lib.rs` to provide `FlatDiscount` struct implementing `iface::Discount`. `discount_cents` returns `subtotal_cents / 10` when `order.state == \"VIP\"`, else `0`.",
+      "acceptance": "The implementation compiles and correctly calculates the flat discount for VIP orders, returning `subtotal_cents / 10` as an integer division result.",
+      "writes": [ { "path": "discount_flat/src/lib.rs" } ],
+      "depends_on": [],
+      "slices": [ "iface::Discount", "iface::Order" ],
+      "tools": [ "shell" ],
+      "route": null,
+      "attempts": 1,
+      "task_kind": "implementation"
+    },
+    {
+      "id": "c2",
+      "instruction": "Implement `discount_bulk/src/lib.rs` to provide `BulkDiscount` struct implementing `iface::Discount`. `discount_cents` returns `5000` when `order.total_qty() >= 10`, else `0`.",
+      "acceptance": "The implementation compiles and correctly calculates the bulk discount for orders with quantity >= 10, returning exactly 5000.",
+      "writes": [ { "path": "discount_bulk/src/lib.rs" } ],
+      "depends_on": [],
+      "slices": [ "iface::Discount", "iface::Order" ],
+      "tools": [ "shell" ],
+      "route": null,
+      "attempts": 1,
+      "task_kind": "implementation"
+    },
+    {
+      "id": "c3",
+      "instruction": "Implement `tax_us/src/lib.rs`. Provide `pub fn state_tax_rate(state: &str) -> f64` returning 0.08 for \"CA\", 0.0 for \"OR\", and 0.05 otherwise. Implement `TaxUs` struct implementing `iface::TaxRule` with `tax_cents` returning `(taxable_cents as f64 * state_tax_rate(&order.state)).round() as i64`.",
+      "acceptance": "The implementation compiles and correctly applies state-specific tax rates, rounding the final cents correctly.",
+      "writes": [ { "path": "tax_us/src/lib.rs" } ],
+      "depends_on": [],
+      "slices": [ "iface::TaxRule", "iface::Order" ],
+      "tools": [ "shell" ],
+      "route": null,
+      "attempts": 1,
+      "task_kind": "implementation"
+    },
+    {
+      "id": "c4",
+      "instruction": "Implement `shipping_standard/src/lib.rs`. Provide `StandardShipping` struct implementing `iface::ShippingRule`. `shipping_cents` calls `tax_us::state_tax_rate(&order.state)` and returns 0 when rate > 0.0, else 500.",
+      "acceptance": "The implementation compiles against the stubbed tax_us and correctly chooses shipping based on the state tax rate boundary condition (> 0.0).",
+      "writes": [ { "path": "shipping_standard/src/lib.rs" } ],
+      "depends_on": [ "c3" ],
+      "slices": [ "iface::ShippingRule", "tax_us::state_tax_rate", "iface::Order" ],
+      "tools": [ "shell" ],
+      "route": null,
+      "attempts": 1,
+      "task_kind": "implementation"
+    },
+    {
+      "id": "c5",
+      "instruction": "Implement `pricing_engine/src/lib.rs`. Provide `pub fn price_order(order: &Order) -> Receipt`. Computes subtotal, picks larger of FlatDiscount and BulkDiscount tax = TaxUs(taxable), shipping = StandardShipping(order), and total. Instantiates contracts directly as dependencies.",
+      "acceptance": "The implementation compiles against stubbed discounts/tax/shipping and correctly orchestrates the pricing logic with exact arithmetic flow described.",
+      "writes": [ { "path": "pricing_engine/src/lib.rs" } ],
+      "depends_on": [ "c1", "c2", "c3", "c4" ],
+      "slices": [ "iface::Order", "iface::Receipt" ],
+      "tools": [ "shell" ],
+      "route": null,
+      "attempts": 1,
+      "task_kind": "implementation"
+    },
+    {
+      "id": "c6",
+      "instruction": "Implement `checkout/src/lib.rs`. Provide `pub fn checkout_order(order: &Order) -> Receipt` that simply delegates to `pricing_engine::price_order(order)`.",
+      "acceptance": "The implementation compiles against stubbed pricing_engine and passes through the receipt unchanged, verifying dependency wiring.",
+      "writes": [ { "path": "checkout/src/lib.rs" } ],
+      "depends_on": [ "c5" ],
+      "slices": [ "iface::Order", "iface::Receipt" ],
+      "tools": [ "shell" ],
+      "route": null,
+      "attempts": 1,
+      "task_kind": "implementation"
+    }
+  ],
+  "interfaces": [
+    {
+      "id": "i1",
+      "parties": [ "c3", "c4" ],
+      "symbols": [ "state_tax_rate" ],
+      "stub": [ { "path": "tax_us/src/lib.rs", "content": "pub fn state_tax_rate(_s: &str) -> f64 { 0.0 } pub struct TaxUs; pub trait TaxRule { fn tax_cents(&self, order: &Order, taxable_cents: i64) -> i64; } impl TaxRule for TaxUs { fn tax_cents(&self, _order: &Order, taxable_cents: i64) -> i64 { (taxable_cents as f64 * 0.0).round() as i64 } }" } ],
+      "reference": [],
+      "consumer": [ { "path": "shipping_standard/src/lib.rs", "content": "pub struct StandardShipping; pub trait ShippingRule { fn shipping_cents(&self, order: &Order) -> i64; } impl ShippingRule for StandardShipping { fn shipping_cents(&self, order: &Order) -> i64 { use tax_us::state_tax_rate; let rate = state_tax_rate(&order.state); if rate > 0.0 { 0 } else { 500 } } }" } ],
+      "tests": [],
+      "compile": [ "cargo", "check", "-p", "shipping_standard" ],
+      "test": [ "cargo", "test", "-p", "shipping_standard" ]
+    },
+    {
+      "id": "i2",
+      "parties": [ "c1", "c2", "c3", "c4", "c5" ],
+      "symbols": [ "FlatDiscount", "BulkDiscount", "TaxUs", "StandardShipping", "price_order" ],
+      "stub": [ { "path": "pricing_engine/src/lib.rs", "content": "use iface::Order; pub fn price_order(_order: &Order) -> i64 { 0 } struct StubDiscount; struct StubTax; struct StubShip;" } ],
+      "reference": [],
+      "consumer": [ { "path": "pricing_engine/src/lib.rs", "content": "use iface::{Order, Receipt}; pub fn price_order(order: &Order) -> Receipt { let sub = order.subtotal_cents(); let disc = 0; use pricing_engine::StubTax; Receipt { subtotal_cents: sub, discount_cents: disc, tax_cents: 0, shipping_cents: 0, total_cents: sub - disc + 0 } }" } ],
+      "tests": [],
+      "compile": [ "cargo", "check", "-p", "pricing_engine" ],
+      "test": [ "cargo", "test", "-p", "pricing_engine" ]
+    },
+    {
+      "id": "i3",
+      "parties": [ "c5", "c6" ],
+      "symbols": [ "price_order", "checkout_order" ],
+      "stub": [ { "path": "checkout/src/lib.rs", "content": "pub fn checkout_order(_o: &Order) -> i64 { 0 }" } ],
+      "reference": [],
+      "consumer": [ { "path": "checkout/src/lib.rs", "content": "use iface::Order; pub fn checkout_order(order: &Order) -> i64 { pricing_engine::price_order(order) as i64 }" } ],
+      "tests": [],
+      "compile": [ "cargo", "check", "-p", "checkout" ],
+      "test": [ "cargo", "test", "-p", "checkout" ]
+    }
+  ]
+}

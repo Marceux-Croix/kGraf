@@ -1076,11 +1076,7 @@ impl kgraf_provider::Provider for ChatCompletionsAdapter {
             .map(str::to_owned);
         if !status.is_success() {
             let text = crate::bounded_error_body(self.config.timeout, http).await;
-            let error = ProviderError::Http {
-                adapter: self.adapter_name(),
-                status: status.as_u16(),
-                body: text,
-            };
+            let error = crate::http_error(self.adapter_name(), status.as_u16(), text);
             // A 4xx rejection billed nothing; a 5xx or 408 may have. `close_on`
             // keeps the second kind open for reconciliation.
             token.close_on_async(&error, request_id.as_deref()).await?;
@@ -1317,11 +1313,7 @@ impl Streaming for ChatCompletionsAdapter {
             .map(str::to_owned);
         if !status.is_success() {
             let text = crate::bounded_error_body(self.config.timeout, http).await;
-            let error = ProviderError::Http {
-                adapter: self.adapter_name(),
-                status: status.as_u16(),
-                body: text,
-            };
+            let error = crate::http_error(self.adapter_name(), status.as_u16(), text);
             token.close_on_async(&error, request_id.as_deref()).await?;
             return Err(error);
         }
@@ -2411,6 +2403,53 @@ mod tests {
         assert_eq!(settlement_after(400).await, Settlement::Failed);
         assert_eq!(settlement_after(401).await, Settlement::Failed);
         assert_eq!(settlement_after(429).await, Settlement::Failed);
+    }
+
+    const OLLAMA_XML_500: &str = r#"{"error":{"message":"XML syntax error on line 8: element <function> closed by </parameter>","type":"api_error","param":null,"code":null}}"#;
+
+    async fn error_for(status: u16, body: &str, stream: bool) -> (ProviderError, Settlement) {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(status).set_body_string(body))
+            .mount(&server)
+            .await;
+        let adapter = ChatCompletionsAdapter::new(config(&server.uri()), UsageDialect::Details)
+            .expect("adapter");
+        let ledger = Ledger::open_in_memory().expect("ledger");
+        let token = ledger
+            .begin(ADAPTER, Protocol::Inclusive, "compatible-model", "w", "t")
+            .expect("begin");
+        let err = if stream {
+            run_stream(&adapter, &token).await
+        } else {
+            adapter
+                .complete(&Request::new("compatible-model", "hi", 100), &token)
+                .await
+        }
+        .expect_err("must raise");
+        drop(token);
+        (err, ledger.calls().expect("calls")[0].settlement)
+    }
+
+    #[tokio::test]
+    async fn a_5xx_naming_a_tool_call_parse_failure_is_a_typed_malformed_output_error() {
+        for stream in [false, true] {
+            let (err, settlement) = error_for(500, OLLAMA_XML_500, stream).await;
+            assert!(err.is_malformed_model_output(), "stream={stream}: {err:?}");
+            assert!(!err.is_route_fault());
+            // The model ran: the row stays open like any other 5xx.
+            assert_eq!(settlement, Settlement::Unreconciled);
+        }
+    }
+
+    #[tokio::test]
+    async fn other_5xx_bodies_and_other_statuses_stay_plain_http_errors() {
+        for stream in [false, true] {
+            let (err, _) = error_for(500, "upstream said no", stream).await;
+            assert!(matches!(err, ProviderError::Http { .. }), "{err:?}");
+            let (err, _) = error_for(400, OLLAMA_XML_500, stream).await;
+            assert!(matches!(err, ProviderError::Http { .. }), "{err:?}");
+        }
     }
 
     #[tokio::test]

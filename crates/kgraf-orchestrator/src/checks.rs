@@ -590,6 +590,139 @@ async fn compile_once_more_on_timeout(
     Ok(r)
 }
 
+/// Steps 1 and 2 of [`check_mechanical`]: the consumers and the tests
+/// compile against the stub, and a canary of each non-empty file list makes
+/// the compile command fail. Runs are pushed onto `runs`.
+async fn stub_compile_and_canaries(
+    runner: &SandboxRunner,
+    ic: &InterfaceContract,
+    runs: &mut Vec<CheckRun>,
+) -> Result<Result<(), CheckFailure>, CheckError> {
+    let failed = |stage: CheckStage, detail: String| {
+        Ok(Err(CheckFailure {
+            stage,
+            artifact: ic.artifact(stage),
+            detail,
+        }))
+    };
+    // 1. Stub-compile. A timeout says nothing about the contract: it is retried
+    // once, then reported as inconclusive (`CheckError`, a check that could not
+    // run), never as a stub-compile failure counted against the contract.
+    let r = compile_once_more_on_timeout(
+        runner,
+        &[&ic.stub, &ic.consumer, &ic.tests],
+        &ic.compile,
+        "stub",
+    )
+    .await?;
+    runs.push(CheckRun::new(
+        CheckStage::StubCompile,
+        "stub",
+        &r,
+        r.success,
+    ));
+    if !r.success {
+        return failed(
+            CheckStage::StubCompile,
+            format!(
+                "the consumer expectations do not compile against the stub: {}",
+                r.describe(&ic.compile)
+            ),
+        );
+    }
+
+    // 2. Canaries: the compile command must cover the test and the consumers.
+    let broken_tests = canary(&ic.tests);
+    let mut canaries: Vec<(&str, Vec<&[FileOverlay]>)> = Vec::new();
+    // A full interface always has tests (`validate`); a derived compile check
+    // may have consumer files only, and a canary of nothing proves nothing.
+    if !ic.tests.is_empty() {
+        canaries.push(("canary test", vec![&ic.stub, &ic.consumer, &broken_tests]));
+    }
+    // A consumer file that is also a tests file is one file in the tree. The
+    // tests overlay, applied last, would restore it over the canary, so the run
+    // would succeed whatever the compile command builds. The canary-test run
+    // already breaks that file (its canary is applied last), so the consumer
+    // canary breaks only the consumer files no tests file shares a path with,
+    // and the valid tests go on top of it. Every consumer path shared: nothing
+    // is left for this run, and the canary-test run covers them.
+    let consumer_only: Vec<FileOverlay> = ic
+        .consumer
+        .iter()
+        .filter(|c| !ic.tests.iter().any(|t| same_overlay_path(&t.path, &c.path)))
+        .cloned()
+        .collect();
+    let broken_consumer = canary(&consumer_only);
+    if !consumer_only.is_empty() {
+        canaries.push((
+            "canary consumer",
+            vec![&ic.stub, &ic.consumer, &broken_consumer, &ic.tests],
+        ));
+    }
+    for (name, layers) in canaries {
+        let r = compile_once_more_on_timeout(runner, &layers, &ic.compile, name).await?;
+        let expected = !r.success && !r.timed_out;
+        runs.push(CheckRun::new(CheckStage::StubCompile, name, &r, expected));
+        if !expected {
+            return failed(
+                CheckStage::StubCompile,
+                format!(
+                    "the compile command `{}` does not build every {} file: with them replaced by a deliberately broken canary it {}",
+                    ic.compile.join(" "),
+                    name.trim_start_matches("canary "),
+                    if r.timed_out {
+                        "timed out"
+                    } else {
+                        "still succeeded"
+                    }
+                ),
+            );
+        }
+    }
+
+    Ok(Ok(()))
+}
+
+/// The compile half of the checks for an interface kGraf derived from the
+/// repository when the planner wrote none it could accept: the stub is the
+/// producer's existing scaffold, the consumer and test files are repository
+/// files that use it, and there is no reference. Stub-compile and its
+/// canaries run; the vacuity check cannot (nothing correct exists to pass the
+/// tests), and the caller records it as not run. `Ok(Err(_))` is a failing
+/// check, `Err(_)` one that could not run.
+pub async fn check_derived_compile(
+    runner: &SandboxRunner,
+    ic: &InterfaceContract,
+) -> Result<Result<Vec<CheckRun>, CheckFailure>, CheckError> {
+    let mut problems = Vec::new();
+    if ic.stub.is_empty() {
+        problems.push("no stub files".to_owned());
+    }
+    if ic.consumer.is_empty() && ic.tests.is_empty() {
+        problems.push("no consumer or tests files".to_owned());
+    }
+    if ic.compile.first().is_none_or(|p| p.trim().is_empty()) {
+        problems.push("no compile command".to_owned());
+    }
+    for f in ic.stub.iter().chain(&ic.consumer).chain(&ic.tests) {
+        if !valid_write_path(&f.path) {
+            problems.push(format!("`{}` is not a path inside the repository", f.path));
+        }
+    }
+    if !problems.is_empty() {
+        return Ok(Err(CheckFailure {
+            stage: CheckStage::Artifact,
+            artifact: ic.artifact(CheckStage::Artifact),
+            detail: problems.join("; "),
+        }));
+    }
+    let mut runs = Vec::new();
+    match stub_compile_and_canaries(runner, ic, &mut runs).await? {
+        Ok(()) => Ok(Ok(runs)),
+        Err(f) => Ok(Err(f)),
+    }
+}
+
 /// Run the stub-compile check, then the vacuity check that consumes its stub.
 /// `Ok(Err(_))` is a failing check; `Err(_)` is a check that could not run.
 ///
@@ -638,75 +771,8 @@ pub async fn check_mechanical(
         }
     }
 
-    // 1. Stub-compile. A timeout says nothing about the contract: it is retried
-    // once, then reported as inconclusive (`CheckError`, a check that could not
-    // run), never as a stub-compile failure counted against the contract.
-    let r = compile_once_more_on_timeout(
-        runner,
-        &[&ic.stub, &ic.consumer, &ic.tests],
-        &ic.compile,
-        "stub",
-    )
-    .await?;
-    runs.push(CheckRun::new(
-        CheckStage::StubCompile,
-        "stub",
-        &r,
-        r.success,
-    ));
-    if !r.success {
-        return fail(
-            CheckStage::StubCompile,
-            format!(
-                "the consumer expectations do not compile against the stub: {}",
-                r.describe(&ic.compile)
-            ),
-        );
-    }
-
-    // 2. Canaries: the compile command must cover the test and the consumers.
-    let broken_tests = canary(&ic.tests);
-    let mut canaries: Vec<(&str, Vec<&[FileOverlay]>)> =
-        vec![("canary test", vec![&ic.stub, &ic.consumer, &broken_tests])];
-    // A consumer file that is also a tests file is one file in the tree. The
-    // tests overlay, applied last, would restore it over the canary, so the run
-    // would succeed whatever the compile command builds. The canary-test run
-    // already breaks that file (its canary is applied last), so the consumer
-    // canary breaks only the consumer files no tests file shares a path with,
-    // and the valid tests go on top of it. Every consumer path shared: nothing
-    // is left for this run, and the canary-test run covers them.
-    let consumer_only: Vec<FileOverlay> = ic
-        .consumer
-        .iter()
-        .filter(|c| !ic.tests.iter().any(|t| same_overlay_path(&t.path, &c.path)))
-        .cloned()
-        .collect();
-    let broken_consumer = canary(&consumer_only);
-    if !consumer_only.is_empty() {
-        canaries.push((
-            "canary consumer",
-            vec![&ic.stub, &ic.consumer, &broken_consumer, &ic.tests],
-        ));
-    }
-    for (name, layers) in canaries {
-        let r = compile_once_more_on_timeout(runner, &layers, &ic.compile, name).await?;
-        let expected = !r.success && !r.timed_out;
-        runs.push(CheckRun::new(CheckStage::StubCompile, name, &r, expected));
-        if !expected {
-            return fail(
-                CheckStage::StubCompile,
-                format!(
-                    "the compile command `{}` does not build every {} file: with them replaced by a deliberately broken canary it {}",
-                    ic.compile.join(" "),
-                    name.trim_start_matches("canary "),
-                    if r.timed_out {
-                        "timed out"
-                    } else {
-                        "still succeeded"
-                    }
-                ),
-            );
-        }
+    if let Err(failure) = stub_compile_and_canaries(runner, ic, &mut runs).await? {
+        return Ok(Err(failure));
     }
 
     // 3. Vacuity, failing side. Every producer it runs against compiled, so a

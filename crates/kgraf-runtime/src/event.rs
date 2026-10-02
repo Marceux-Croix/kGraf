@@ -231,6 +231,10 @@ pub enum NoticeKind {
     /// attempt although its contract writes files; it was told once to
     /// continue or call `report_shortfall`. A second such end fails the attempt.
     NoChange,
+    /// The server could not parse the model's own tool-call output and
+    /// answered with a 5xx; the round was dropped and sent again. Sent on each
+    /// of the bounded retries.
+    MalformedOutput,
 }
 
 impl WorkerEvent {

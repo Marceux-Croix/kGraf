@@ -734,11 +734,7 @@ impl kgraf_provider::Provider for OpenAiAdapter {
             .map(str::to_owned);
         if !status.is_success() {
             let text = crate::bounded_error_body(self.config.timeout, http).await;
-            let error = ProviderError::Http {
-                adapter: self.adapter_name(),
-                status: status.as_u16(),
-                body: text,
-            };
+            let error = crate::http_error(self.adapter_name(), status.as_u16(), text);
             // A 4xx rejection billed nothing; a 5xx or 408 may have. `close_on`
             // keeps the second kind open for reconciliation.
             token.close_on_async(&error, request_id.as_deref()).await?;
@@ -888,11 +884,7 @@ impl Streaming for OpenAiAdapter {
             .map(str::to_owned);
         if !status.is_success() {
             let text = crate::bounded_error_body(self.config.timeout, http).await;
-            let error = ProviderError::Http {
-                adapter: self.adapter_name(),
-                status: status.as_u16(),
-                body: text,
-            };
+            let error = crate::http_error(self.adapter_name(), status.as_u16(), text);
             token.close_on_async(&error, request_id.as_deref()).await?;
             return Err(error);
         }

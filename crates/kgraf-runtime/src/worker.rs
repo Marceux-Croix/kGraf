@@ -762,6 +762,7 @@ async fn prepare(
         notified_round: None,
         output_limit_retried: false,
         empty_turn_retried: false,
+        malformed_retries: 0,
         no_change_retried: false,
         phase: CancelPhase::BetweenRounds,
         calls,
@@ -778,6 +779,7 @@ async fn prepare(
         denied: 0,
         refused,
         capabilities: std::collections::HashMap::new(),
+        patch_rejections: 0,
         fence: options.fence,
         steering,
         stop_point: options.stop_point,
@@ -860,6 +862,10 @@ enum Halt {
         partial: Option<(CallId, TokenUsage)>,
     },
     Failed(String),
+    /// The server could not parse the model's own output
+    /// ([`kgraf_provider::ProviderError::ModelOutputMalformed`]). `drive` sends
+    /// the round again, a bounded number of times, before it fails the attempt.
+    ModelOutputMalformed(String),
     /// An interrupt-mode message abandoned the round in flight. Not an end:
     /// `drive` appends `RoundAbandoned` and continues to the boundary.
     Abandoned {
@@ -982,6 +988,26 @@ pub const EMPTY_TURN_ABANDON_REASON: &str = "the turn had no tool call and no an
 pub const EMPTY_TURN_NOTICE: &str = "You ended your turn without calling a tool or giving an \
      answer; continue the task with a tool call, or answer.";
 
+/// How many times a round is sent again after the server failed to parse the
+/// model's own output. Beyond it the attempt fails, naming the cause.
+pub const MAX_MALFORMED_OUTPUT_RETRIES: u32 = 2;
+
+/// The `RoundAbandoned` reason for a round the server failed on because it
+/// could not parse the model's own tool call.
+pub const MALFORMED_OUTPUT_ABANDON_REASON: &str =
+    "the server could not parse the model's tool call";
+
+/// The notice that follows such a failure. It is appended at the end of the
+/// transcript, after every earlier message, so the request prefix the
+/// provider caches is unchanged and the retry still hits it.
+pub fn malformed_output_notice(retry: u32) -> String {
+    let again = if retry > 1 { " again" } else { "" };
+    format!(
+        "Your previous reply contained a malformed tool call, which the server could not \
+         parse{again}. Send one well-formed tool call."
+    )
+}
+
 /// The `RoundAbandoned` reason for an end as done with no tool call and no
 /// change, given one continuation round.
 const NO_CHANGE_ABANDON_REASON: &str =
@@ -1021,6 +1047,10 @@ struct Worker {
     /// Whether the round just before was an empty turn that got its one
     /// continuation. Cleared by any round that has a tool call or an answer.
     empty_turn_retried: bool,
+    /// Consecutive rounds the server failed on the model's own malformed
+    /// output and that were sent again. Cleared by any round that gets a
+    /// response; capped at [`MAX_MALFORMED_OUTPUT_RETRIES`].
+    malformed_retries: u32,
     /// Whether the attempt already got its one notice for ending as done with
     /// no tool call although its contract writes files.
     no_change_retried: bool,
@@ -1055,9 +1085,12 @@ struct Worker {
     denied: u32,
     /// Calls a policy refused, for the result (decision 0093).
     refused: crate::shortfall::RefusedCalls,
-    /// Each call of the current round by id: its tool and capability
-    /// ([`crate::shortfall::capability_of`]), to match a refusal to a retry.
-    capabilities: std::collections::HashMap<String, (String, String)>,
+    /// Each call of the current round by id: what it exercises, to name what
+    /// a refusal refused and to match a refusal to a retry.
+    capabilities: std::collections::HashMap<String, crate::shortfall::CallCapability>,
+    /// `apply_patch` calls this worker made that the tool rejected: once there
+    /// are two, a rejection carries a worked example for the file it targeted.
+    patch_rejections: u32,
     /// This worker's write fence, if it has one (decision 0067, point 5).
     fence: Option<ScopeFence>,
     /// This worker's steering queue (decision 0067, point 3).
@@ -1181,7 +1214,9 @@ impl Worker {
                 }
                 (WorkerOutcome::Cancelled, String::new())
             }
-            Err(Halt::Failed(error)) => (WorkerOutcome::Failed { error }, String::new()),
+            Err(Halt::Failed(error) | Halt::ModelOutputMalformed(error)) => {
+                (WorkerOutcome::Failed { error }, String::new())
+            }
             // `drive` handles every abandon itself; one reaching here is a
             // loop defect, reported rather than read as success (fail loud).
             Err(Halt::Abandoned { .. }) => (
@@ -1265,6 +1300,9 @@ impl Worker {
         let text = e.to_string();
         if e.is_route_fault() {
             self.route_fault = Some(text.clone());
+        }
+        if e.is_malformed_model_output() {
+            return Halt::ModelOutputMalformed(text);
         }
         Halt::Failed(text)
     }
@@ -1556,8 +1594,48 @@ impl Worker {
                     self.abandon(ep, phase, partial, reason).await?;
                     continue;
                 }
+                Err(Halt::ModelOutputMalformed(text)) => {
+                    // A server failure on the model's own generation, not on the
+                    // request: another sample usually parses. Each try is its own
+                    // ledger call (the failed row stays open as for any 5xx). The
+                    // retry costs a round, so a checkpoint sees it as one, and it
+                    // is never started on the last round.
+                    if final_round
+                        || self.malformed_retries >= MAX_MALFORMED_OUTPUT_RETRIES
+                        || self.budget.rounds_left() < 2
+                    {
+                        let why = if self.malformed_retries >= MAX_MALFORMED_OUTPUT_RETRIES {
+                            format!(
+                                "; the round was sent again {} times and failed the same way \
+                                 each time",
+                                self.malformed_retries
+                            )
+                        } else {
+                            "; no round is left to send it again".to_owned()
+                        };
+                        return Err(Halt::Failed(format!("{text}{why}")));
+                    }
+                    self.malformed_retries += 1;
+                    self.abandon(
+                        ep,
+                        CancelPhase::ModelStream,
+                        None,
+                        MALFORMED_OUTPUT_ABANDON_REASON,
+                    )
+                    .await?;
+                    self.emit(
+                        ep,
+                        WorkerEvent::Notice {
+                            kind: crate::event::NoticeKind::MalformedOutput,
+                            text: malformed_output_notice(self.malformed_retries),
+                        },
+                    )
+                    .await?;
+                    continue;
+                }
                 other => other?,
             };
+            self.malformed_retries = 0;
             let uses: Vec<(String, String, serde_json::Value)> = response
                 .tool_uses()
                 .into_iter()
@@ -2608,7 +2686,7 @@ impl Worker {
         for (call_id, tool, input) in uses {
             self.capabilities.insert(
                 call_id.clone(),
-                (tool.clone(), crate::shortfall::capability_of(&tool, &input)),
+                crate::shortfall::CallCapability::of(&tool, &input),
             );
             let pending = PendingCall {
                 call_id: call_id.clone(),
@@ -3138,6 +3216,15 @@ impl Worker {
     /// malformed-input error is kept for a report's answer. `path`: the path a
     /// write-scope refusal named.
     fn note_refusal(&mut self, event: &mut WorkerEvent, path: Option<String>) {
+        self.note_refusal_record(event, path);
+        self.add_patch_help(event);
+    }
+
+    /// After the second rejected `apply_patch` call of this worker, a
+    /// rejection ends with the rule it broke and a minimal valid patch for the
+    /// file the call targeted ([`kgraf_tools::rejection_help`]). A policy
+    /// refusal is not a rejected patch: the call's format was not the problem.
+    fn add_patch_help(&mut self, event: &mut WorkerEvent) {
         let WorkerEvent::ToolCallFinished {
             call_id,
             output,
@@ -3146,11 +3233,44 @@ impl Worker {
         else {
             return;
         };
-        let Some((tool, capability)) = self.capabilities.get(call_id.as_str()).cloned() else {
+        if !*is_error
+            || output.starts_with(DENIED_PREFIX)
+            || output.starts_with(REFUSED_PREFIX)
+            || self
+                .capabilities
+                .get(call_id.as_str())
+                .is_none_or(|c| c.tool != "apply_patch")
+        {
+            return;
+        }
+        self.patch_rejections += 1;
+        if self.patch_rejections < 2 {
+            return;
+        }
+        let target = self
+            .capabilities
+            .get(call_id.as_str())
+            .and_then(|c| c.patch_target.as_ref());
+        if let Some(help) = kgraf_tools::rejection_help(output, target) {
+            output.push_str(&help);
+        }
+    }
+
+    fn note_refusal_record(&mut self, event: &mut WorkerEvent, path: Option<String>) {
+        let WorkerEvent::ToolCallFinished {
+            call_id,
+            output,
+            is_error,
+        } = event
+        else {
             return;
         };
+        let Some(call) = self.capabilities.get(call_id.as_str()).cloned() else {
+            return;
+        };
+        let tool = call.tool.clone();
         if !*is_error {
-            self.refused.ran_ok(&tool, &capability);
+            self.refused.ran_ok(&tool, call.programs());
             return;
         }
         if output.starts_with(INVALID_CALL_PREFIX)
@@ -3171,7 +3291,7 @@ impl Worker {
         };
         self.refused.refused(crate::shortfall::RefusedCall {
             tool: tool.clone(),
-            capability,
+            capability: call.refused(output),
             reason: output.clone(),
             retried_ok: false,
             by,

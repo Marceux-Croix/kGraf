@@ -612,6 +612,9 @@ pub struct FileVerifier {
     pub gate_commands: Mutex<Vec<(String, Vec<String>)>>,
     /// When set, what `acceptance_brief` returns, after the contract's id.
     pub acceptance: Mutex<Option<String>>,
+    /// When set, what `plan_check_scope` returns for every write set: the
+    /// one test file a narrowed check would run.
+    pub plan_scope: Mutex<Option<Vec<String>>>,
 }
 
 impl FileVerifier {
@@ -627,6 +630,7 @@ impl FileVerifier {
             numbers: Mutex::new(Vec::new()),
             gate_commands: Mutex::new(Vec::new()),
             acceptance: Mutex::new(None),
+            plan_scope: Mutex::new(None),
         })
     }
 }
@@ -700,6 +704,10 @@ impl Verifier for FileVerifier {
 
     async fn recheck(&self, _commit: &VerifiedCommit) -> Result<bool, String> {
         Ok(self.recheck_ok.load(Ordering::SeqCst))
+    }
+
+    fn plan_check_scope(&self, _writes: &[&str], _root: Option<&Path>) -> Option<Vec<String>> {
+        self.plan_scope.lock().expect("lock").clone()
     }
 
     fn acceptance_brief(&self, contract: &OpenContract, workspace: &Path) -> Option<String> {

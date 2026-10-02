@@ -18,9 +18,9 @@
 //!   pre-dispatch checks (0030, 0031), run in the sandbox.
 //! - [`ContractBook`], [`Challenge`], [`classify`]: challenges, escalation and
 //!   mechanical revision classification (0027, 0029, 0035-0037).
-//! - Live path: with contract checks on, the decomposition also writes the
-//!   interface contracts ([`parse_interfaces`]), which are registered before
-//!   any party is dispatched; a worker challenges one through
+//! - Live path: with contract checks on, a second planner call writes the
+//!   interface contracts binding the accepted contracts ([`parse_interfaces`]),
+//!   which are checked and registered before any party is dispatched; a worker challenges one through
 //!   [`ChallengeTool`], bound to the run by a [`ContractLine`].
 //!
 //! **Reused code.** Each block carries its provenance comment; the
@@ -61,6 +61,7 @@
 //! own transcript, so a completed model round is never issued again.
 
 mod admission;
+mod answer_json;
 mod ask_tool;
 mod asks;
 mod box_port;
@@ -73,11 +74,13 @@ pub mod cluster_cap;
 mod consumer_tests;
 mod coordination;
 pub mod demand;
+mod derive_interface;
 mod envelope;
 mod gates;
 mod guards;
 mod intake;
 mod interactive;
+mod interface_plan;
 pub mod interface_review;
 mod message_tool;
 pub mod model_kinds;
@@ -136,8 +139,8 @@ pub use check_runner::{
 pub use checks::{
     CANARY, CheckError, CheckFailure, CheckRun, CheckStage, FileOverlay, HandshakeFinding,
     HandshakeRequest, HandshakeStatement, Handshaker, InterfaceContract, ModelHandshaker,
-    PartyModel, RoutedHandshaker, RunResult, SandboxRunner, anchors, check_mechanical,
-    compare_handshake, compare_handshake_ordered, ordered_pairs, parse_handshake,
+    PartyModel, RoutedHandshaker, RunResult, SandboxRunner, anchors, check_derived_compile,
+    check_mechanical, compare_handshake, compare_handshake_ordered, ordered_pairs, parse_handshake,
 };
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use cluster_cap::{ClusterCapHold, DEFAULT_MAX_IN_FLIGHT_PER_CLUSTER};
@@ -163,6 +166,9 @@ pub use guards::{
 };
 pub use intake::{Intake, IntakeParts, ModelAsker, interpret_corpus};
 pub use interactive::{HostError, InteractiveRun, RunEvent};
+pub use interface_plan::{
+    InterfaceDraft, InterfaceReply, InterfaceRequest, PreviousAsk, parse_interfaces,
+};
 pub use interface_review::{
     ConsumerRoute, Finding, InterfaceReviewer, ReviewContext, ReviewOutcome, ReviewRecord,
     RoutedInterfaceReviewer,
@@ -186,9 +192,9 @@ pub use partition::{
 pub use plan::{
     ContractSpec, CostBasis, Decomposer, GroundOutput, GroundRequest, Grounder, ModelAnswerer,
     ModelCaller, ModelDecomposer, ModelGrounder, PlanError, PlanOutput, PlanRequest, answer_prompt,
-    judge_prompt, normalize_plan, parse_answer, parse_grounding, parse_interfaces, parse_plan,
-    parse_verdicts, sanitize_id, sanitize_interfaces, sanitize_plan, valid_write_path,
-    validate_plan, validate_plan_with,
+    judge_prompt, normalize_plan, parse_answer, parse_grounding, parse_plan, parse_verdicts,
+    sanitize_id, sanitize_interfaces, sanitize_plan, valid_write_path, validate_plan,
+    validate_plan_with,
 };
 pub use port::{InboundKind, InboundMessage, MessagePort, OutboundReply, PortError, UntrustedText};
 pub use question_route::{

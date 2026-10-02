@@ -259,3 +259,17 @@ list; the worker can still run the whole command, and the verifier runs the new 
 
 Tests: `a_first_element_holding_words_is_split_before_the_other_arguments`,
 `a_patch_without_its_envelope_is_applied_and_the_result_says_so`.
+
+## Amendment (2026-10-02): a repeated patch rejection carries a worked example
+
+About 10 of 23 worker rounds in one benchmark brief were rejected patches ("invalid hunk",
+"must be '*** End Patch'", "Failed to find context"). From the second `apply_patch` call a
+worker has rejected, the rejection ends with the one rule it broke and a minimal valid patch
+for the file the call targeted (an Add File form with one `+` line, or an Update File form
+with one context line, one `-` and one `+`). The first rejection carries none; a policy
+refusal (a write outside the scope) is not a rejected patch and carries none; an error that is
+not about the patch's format or matching gets no example. The envelope leniency above is
+unchanged.
+
+Tests: `kgraf-tools` `a_rejection_help_example_is_a_valid_patch_for_the_targeted_file` (the
+example parses), `kgraf-runtime` `a_second_rejected_patch_carries_a_worked_example_for_its_file`.

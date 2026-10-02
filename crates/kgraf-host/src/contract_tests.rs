@@ -70,8 +70,10 @@ fn add_file(path: &str, content: &str) -> serde_json::Value {
 /// What the fake model saw, for the assertions.
 #[derive(Default)]
 struct Seen {
-    /// The decomposition's user message.
+    /// The decomposition's user message (the contracts call).
     decompose: Vec<String>,
+    /// The interface call's user message.
+    interfaces: Vec<String>,
     /// Each worker's first request: its brief, and its tool names.
     briefs: Vec<(String, Vec<String>)>,
     /// Tool results the producer's worker read after its challenge.
@@ -118,8 +120,15 @@ impl FakeModel {
         let (system, user) = text_of(request);
         let mut seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
         let text = |t: String| (vec![Content::text(t)], false);
-        if system.contains("Split the user's instruction") {
-            seen.decompose.push(user.clone());
+        // The interface call answers the same plan JSON: it reads only its
+        // `interfaces`, as the contracts call reads only its `contracts`.
+        let interface_call = system.contains("interface contracts that bind them");
+        if system.contains("Split the user's instruction") || interface_call {
+            if interface_call {
+                seen.interfaces.push(user.clone());
+            } else {
+                seen.decompose.push(user.clone());
+            }
             let plan = serde_json::json!({
                 "contracts": [
                     {"id": "prod", "instruction": "Implement the parser in config.py.",
@@ -372,13 +381,22 @@ async fn a_live_run_checks_its_interface_contract_and_answers_a_workers_challeng
     verified.sort();
     assert_eq!(verified, vec!["cons".to_owned(), "prod".to_owned()]);
 
-    // The decomposition was asked for interface contracts.
+    // The contracts call was told an interface call follows, and the
+    // interface call was given the accepted contracts.
     let seen = model.snapshot();
     assert!(
         seen.decompose
             .iter()
-            .all(|u| u.contains("Interface contracts.")),
-        "the decomposition request asks for interfaces"
+            .all(|u| u.contains("Contract checks are on")),
+        "the contracts call says interfaces follow"
+    );
+    assert_eq!(seen.interfaces.len(), 1, "one interface call");
+    assert!(
+        seen.interfaces[0].contains("Accepted contracts (fixed;")
+            && seen.interfaces[0].contains("prod:")
+            && seen.interfaces[0].contains("cons:"),
+        "{}",
+        seen.interfaces[0]
     );
 
     let events = contract_events(&root, "live").await;
@@ -658,9 +676,10 @@ async fn without_contract_checks_no_interface_is_asked_checked_or_offered() {
     assert!(
         seen.decompose
             .iter()
-            .all(|u| !u.contains("Interface contracts.")),
+            .all(|u| !u.contains("Contract checks are on")),
         "no interface is asked for"
     );
+    assert!(seen.interfaces.is_empty(), "no interface call is made");
     assert_eq!(seen.handshakes, 0);
     assert!(
         seen.briefs

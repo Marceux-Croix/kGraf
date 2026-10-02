@@ -114,6 +114,9 @@ mod connections;
 // Subagents (decision 0067, point 5).
 mod subagents;
 // Speculative merge across in-flight branches (decision 0074).
+/// Plan intake: the contracts call, the interface call, and what is left
+/// unchecked.
+mod interface_intake;
 /// The user's permission mode in the loop: waiting requests, grants, and
 /// their records (decision 0094).
 mod permission_hooks;
@@ -912,21 +915,21 @@ fn cluster_cap_check(
     Ok(cluster_cap::check(contract, &clusters, in_flight, cap))
 }
 
-/// How many times the planner is asked again after a refused plan, on top of
-/// the first ask.
+/// How many times the planner is asked again after a refused contracts answer,
+/// on top of the first ask. The interface call has its own budget
+/// (`interface_intake::MAX_INTERFACE_ASKS`).
 const MAX_PLAN_REASKS: u32 = 2;
 
 /// How many times the whole plan is sent back to the planner when the
 /// pre-dispatch checks of its interfaces hold it before any work started
-/// (`RunLoop::replan`). The re-plan is one more ask, taken as it is: with
-/// [`MAX_PLAN_REASKS`], the top-level plan is asked for at most four times.
+/// (`RunLoop::replan`). A re-plan's contracts answer gets the same bounded
+/// re-ask as the first plan's, and its interfaces their own budget.
 pub(crate) const MAX_REPLANS: u32 = 1;
 
-/// A re-plan's contracts and interfaces under ids of their own (`re<n>.`),
-/// with dependencies and parties renamed to match. The held plan's
-/// interfaces stay registered under their ids (the book keeps an interface
-/// once registered), so a new contract reusing an old id would be bound, and
-/// held, by the old plan's failed interface.
+/// The held plan's failures, quoted as data for one re-planned contract's
+/// worker: only the failures that concern the files it writes or the
+/// contract it replaces (same id), so a worker is not given another
+/// contract's failures.
 fn held_plan_block(failures: &str) -> String {
     format!(
         "\n\n<held_plan_failures>\nAn earlier plan for this instruction was refused before any \
@@ -936,11 +939,17 @@ fn held_plan_block(failures: &str) -> String {
     )
 }
 
+/// A re-plan's contracts and interfaces under ids of their own (`re<n>.`),
+/// with dependencies and parties renamed to match. The held plan's
+/// interfaces stay registered under their ids (the book keeps an interface
+/// once registered), so a new contract reusing an old id would be bound, and
+/// held, by the old plan's failed interface.
 fn renamed_for_replan(
     specs: Vec<ContractSpec>,
     interfaces: Vec<crate::checks::InterfaceContract>,
+    unchecked: Vec<crate::run_state::UncheckedEdge>,
     replan: u32,
-) -> (Vec<ContractSpec>, Vec<crate::checks::InterfaceContract>) {
+) -> Decomposition {
     let rename = |id: &str| format!("re{replan}.{id}");
     let local: BTreeMap<String, String> = specs
         .iter()
@@ -970,7 +979,18 @@ fn renamed_for_replan(
             ic
         })
         .collect();
-    (specs, interfaces)
+    let unchecked = unchecked
+        .into_iter()
+        .map(|mut e| {
+            for id in [&mut e.consumer, &mut e.producer] {
+                if let Some(r) = local.get(id.as_str()) {
+                    id.clone_from(r);
+                }
+            }
+            e
+        })
+        .collect();
+    (specs, interfaces, unchecked)
 }
 
 /// A contract that keeps waiting for a transiently unready route is traced
@@ -981,8 +1001,13 @@ const READINESS_REPORT_EVERY: u32 = 20;
 /// When the unpriced models were last read, and what the read returned.
 type UnpricedRead = (i64, Result<Vec<String>, String>);
 
-/// A planner answer: the contracts and the interface contracts binding them.
-type Decomposition = (Vec<ContractSpec>, Vec<crate::checks::InterfaceContract>);
+/// A planner answer: the contracts, the interface contracts binding them, and
+/// the consumed edges the interface call left without one, with why.
+type Decomposition = (
+    Vec<ContractSpec>,
+    Vec<crate::checks::InterfaceContract>,
+    Vec<crate::run_state::UncheckedEdge>,
+);
 
 /// How long a status reply may reuse the last read of the unpriced models.
 const UNPRICED_READ_TTL_MS: i64 = 5_000;
@@ -2967,269 +2992,11 @@ impl RunLoop {
         Ok(())
     }
 
-    /// One decomposition call: the contracts, and the interface contracts
-    /// binding them when the run checks interfaces (empty otherwise). An
-    /// interface party must be a contract of this answer or one of `outer`:
-    /// the plan's other contracts, which a split's interface may bind.
-    ///
-    /// A plan the planner got wrong (an answer that is not the JSON asked for,
-    /// or a plan that breaks a rule) is asked for again, at most
-    /// [`MAX_PLAN_REASKS`] times, with the refusal as a note. Every ask is a
-    /// ledgered, reserved call; a plan still wrong after the last ask fails the
-    /// run with the last refusal.
-    async fn decompose(
-        &mut self,
-        request: PlanRequest,
-        note_ids: &[String],
-        outer: &BTreeSet<String>,
-    ) -> Result<Option<Decomposition>, OrchestratorError> {
-        self.decompose_from(request, note_ids, outer, 0).await
-    }
-
-    /// [`Self::decompose`] with `reasks` re-asks already spent. A re-plan
-    /// ([`Self::replan`]) starts at [`MAX_PLAN_REASKS`]: one ask, taken as it
-    /// is, which the pre-dispatch gate then checks.
-    async fn decompose_from(
-        &mut self,
-        mut request: PlanRequest,
-        note_ids: &[String],
-        outer: &BTreeSet<String>,
-        mut reasks: u32,
-    ) -> Result<Option<Decomposition>, OrchestratorError> {
-        request.interfaces = self.contracts.is_some();
-        // The planner is told the package names and the signatures of what the
-        // instruction names, from the manifests and the graph, so it does not
-        // invent them (`planner_context`). Built once: a re-ask sees the same.
-        let graph = self.s.graph.clone();
-        let (instruction, files) = (request.instruction.clone(), request.known_files.clone());
-        let context = blocking(move || {
-            let g = graph.lock().map_err(|_| StoreError::Poisoned)?;
-            Ok::<_, OrchestratorError>(crate::planner_context::project_context(
-                &g,
-                &instruction,
-                &files,
-            ))
-        })?;
-        request.project_context = context.text;
-        for notice in context.notices {
-            self.intake_notice(notice);
-        }
-        // The plan is sent back for missing interfaces once, however many
-        // re-asks other refusals leave.
-        let mut interfaces_refused = false;
-        loop {
-            let last_ask = reasks >= MAX_PLAN_REASKS;
-            match self
-                .decompose_once(&request, note_ids, outer, last_ask, !interfaces_refused)
-                .await
-            {
-                Err(OrchestratorError::Plan(e)) if e.reaskable() => {
-                    interfaces_refused |=
-                        e.to_string().contains(crate::plan::MISSING_INTERFACES_MARK);
-                    // One record per refusal, the last included: a run that
-                    // fails planning still shows every answer it was refused on.
-                    let at = self.now();
-                    self.trace(TraceEvent::PlanRefused {
-                        at_ms: at,
-                        ask: reasks + 1,
-                        of: MAX_PLAN_REASKS + 1,
-                        reason: e.to_string(),
-                    })
-                    .await?;
-                    if reasks >= MAX_PLAN_REASKS {
-                        return Err(OrchestratorError::Plan(e));
-                    }
-                    reasks += 1;
-                    // The refusal can quote the model's own output: scrubbed
-                    // before it is shown or persisted.
-                    self.intake_notice(kgraf_secrets::scrub_persist_owned(format!(
-                        "the planner's answer was refused ({e}); asking again ({reasks} of {MAX_PLAN_REASKS})"
-                    )));
-                    request.notes.push(format!(
-                        "<plan_refused>\nYour previous answer was refused: {}\nAnswer again with \
-                         one corrected JSON object.\n</plan_refused>",
-                        kgraf_secrets::model_copy(&e.to_string()).replace('<', "&lt;")
-                    ));
-                }
-                other => return other,
-            }
-        }
-    }
-
-    /// One ask of the planner, checked. Unless it is the `last_ask`, an
-    /// interface failing its mechanical checks refuses the answer, so the
-    /// planner is asked again with the failure ([`Self::precheck_interfaces`]).
-    async fn decompose_once(
-        &mut self,
-        request: &PlanRequest,
-        note_ids: &[String],
-        outer: &BTreeSet<String>,
-        last_ask: bool,
-        may_refuse_missing_interfaces: bool,
-    ) -> Result<Option<Decomposition>, OrchestratorError> {
-        let input = estimate_tokens(&request.instruction)
-            + request
-                .notes
-                .iter()
-                .map(|n| estimate_tokens(n))
-                .sum::<u64>()
-            + request
-                .known_files
-                .iter()
-                .take(400)
-                .map(|f| estimate_tokens(f) + 1)
-                .sum::<u64>()
-            + request
-                .templates
-                .iter()
-                .map(|t| estimate_tokens(t))
-                .sum::<u64>()
-            + 1_000;
-        let basis = self.s.decomposer.cost_basis();
-        // With model tools offered, one decomposition is up to
-        // `MAX_MODEL_TOOL_ROUNDS + 1` planner calls, each resending the
-        // conversation so far; the hold covers them all, so a planner that uses
-        // its rounds does not settle over its estimate.
-        let tool_rounds = if request.model_calls.is_some() && !request.model_routes.is_empty() {
-            crate::plan::MAX_MODEL_TOOL_ROUNDS
-        } else {
-            0
-        };
-        let reservation = self.reserve_rounds(&basis, input, tool_rounds);
-        // A stop ends the ask: dropping the call leaves its ledger row
-        // unreconciled (it may have billed), the hold is settled whole, and
-        // the loop ends as stopped. Nothing of the answer is used.
-        let stop = self.stop_token.clone();
-        let out = tokio::select! {
-            out = self.s.decomposer.decompose(request) => Some(out),
-            () = stop.cancelled() => None,
-        };
-        let Some(out) = out else {
-            self.stopping = true;
-            self.settle_model_tool_calls()?;
-            self.settle_call(reservation, None)?;
-            self.notices.insert(
-                "the run was stopped during a planner call; the call may have billed and is \
-                 listed by `kgraf unreconciled`"
-                    .to_owned(),
-            );
-            return Ok(None);
-        };
-        // The planner's own model-tool calls, settled now whatever the answer.
-        self.settle_model_tool_calls()?;
-        match out {
-            Ok(out) => {
-                self.settle_call(reservation, Some(&out.calls))?;
-                self.mark_delivered(note_ids);
-                let specs = sanitize_plan(out.contracts)?;
-                // Repairs the planner's intent makes certain (a task-kind word
-                // in `route`, an absolute path inside the repository), each
-                // stated as a notice.
-                let (specs, repairs) = crate::plan::normalize_plan(
-                    specs,
-                    self.s.workspaces.repo_root().as_deref(),
-                    &self.roster(),
-                );
-                for r in repairs {
-                    self.intake_notice(kgraf_secrets::scrub_persist_owned(r));
-                }
-                validate_plan_with(
-                    &specs,
-                    &BTreeSet::new(),
-                    &self.roster(),
-                    &self.tools(),
-                    self.config.max_contracts_per_plan,
-                    self.bypass_git_files(),
-                )?;
-                // A decomposer that returns interfaces nobody asked for would
-                // have them silently unchecked.
-                if !request.interfaces && !out.interfaces.is_empty() {
-                    return Err(OrchestratorError::Contracts(format!(
-                        "the decomposition returned {} interface contract(s), but this run \
-                         has no contract checks to check them",
-                        out.interfaces.len()
-                    )));
-                }
-                let interfaces = sanitize_interfaces(out.interfaces)?;
-                // Checked against this answer's own contracts before anything
-                // is saved: an interface binding nothing, or a
-                // contract the answer does not have, would never be checked.
-                let ids: BTreeSet<&str> = specs.iter().map(|s| s.id.as_str()).collect();
-                for ic in &interfaces {
-                    if ic.parties.is_empty() {
-                        return Err(PlanError::Invalid(format!(
-                            "interface `{}` names no parties",
-                            ic.id
-                        ))
-                        .into());
-                    }
-                    if let Some(p) = ic
-                        .parties
-                        .iter()
-                        .find(|p| !ids.contains(p.as_str()) && !outer.contains(p.as_str()))
-                    {
-                        return Err(PlanError::Invalid(format!(
-                            "interface `{}` names party `{p}`, which is not a contract of this plan",
-                            ic.id
-                        ))
-                        .into());
-                    }
-                }
-                if request.interfaces && interfaces.is_empty() {
-                    let consumers = crate::plan::consumers(&specs);
-                    if !consumers.is_empty() {
-                        if !last_ask && may_refuse_missing_interfaces {
-                            return Err(PlanError::Invalid(
-                                crate::plan::missing_interfaces_reason(&consumers),
-                            )
-                            .into());
-                        }
-                        // Taken as it is, said loudly: nothing is checked.
-                        self.contract_checks_did_not_run(&consumers).await?;
-                    }
-                }
-                self.note_reshaped_unit_structs(&specs).await?;
-                if !last_ask {
-                    self.precheck_interfaces(&interfaces).await?;
-                }
-                Ok(Some((specs, interfaces)))
-            }
-            Err(e) => {
-                self.settle_call(reservation, e.calls())?;
-                Err(e.into())
-            }
-        }
-    }
-
     /// A notice raised while a plan is taken in: shown with the run's notices
     /// and kept for the `plan_accepted` record.
     fn intake_notice(&mut self, detail: String) {
         self.notices.insert(detail.clone());
         self.intake_notices.push(detail);
-    }
-
-    /// Said when the run checks contracts and a plan with consuming contracts
-    /// holds no interface: shown with the run's notices and traced.
-    async fn contract_checks_did_not_run(
-        &mut self,
-        consumers: &[(String, Vec<String>)],
-    ) -> Result<(), OrchestratorError> {
-        let detail = format!(
-            "contract checks did not run: the plan named no interfaces for {}",
-            crate::plan::describe_consumers(consumers)
-        );
-        self.intake_notice(detail.clone());
-        let at = self.now();
-        self.trace(TraceEvent::Notice {
-            at_ms: at,
-            contract: consumers
-                .first()
-                .map(|(c, _)| c.clone())
-                .unwrap_or_default(),
-            worker: String::new(),
-            detail,
-        })
-        .await
     }
 
     /// A contract instruction that gives a type fields where the repository
@@ -3258,42 +3025,6 @@ impl RunLoop {
                     detail,
                 })
                 .await?;
-            }
-        }
-        Ok(())
-    }
-
-    /// The mechanical checks (artifact, stub-compile, vacuity) of a plan's
-    /// interfaces, run on the answer before it is taken. A failure is the
-    /// planner's to correct as much as a malformed plan is, and the planner is
-    /// the only party that can: refused as [`PlanError::Invalid`] with the
-    /// check's failure (the compiler's error lines included), so
-    /// [`Self::decompose`]'s bounded re-ask returns it to the planner. On the
-    /// last ask the plan is taken, and the pre-dispatch gate holds the
-    /// interface's parties on the same failure, as it always did.
-    ///
-    /// A check that could not run (no toolchain, a compile that timed out
-    /// twice) says nothing about the plan: it is left to the gate, which
-    /// records it. The gate runs the checks again at dispatch, against the
-    /// integration tip of that moment; a plan-time pass is not reused, since
-    /// work merged in between can change what the stub compiles against.
-    /// Trade-off: one more run of the checks per interface. The checks run on
-    /// the loop, as the planner's own call does; the loop takes controls only
-    /// after planning.
-    async fn precheck_interfaces(
-        &mut self,
-        interfaces: &[crate::checks::InterfaceContract],
-    ) -> Result<(), OrchestratorError> {
-        let Some(runner) = self.checks_runner() else {
-            return Ok(());
-        };
-        for ic in interfaces {
-            if let Ok(Err(failure)) = crate::checks::check_mechanical(&runner, ic).await {
-                return Err(PlanError::Invalid(format!(
-                    "interface `{}` failed its pre-dispatch check: {failure}",
-                    ic.id
-                ))
-                .into());
             }
         }
         Ok(())
@@ -3606,17 +3337,16 @@ impl RunLoop {
                     return Ok(false);
                 }
                 let (mut notes, note_ids) = self.pending_notes();
-                // A re-plan sends the held plan's check failures back, as one
-                // more ask taken as it is (`replan`).
+                // A re-plan sends the held plan's check failures back as a
+                // note; its contracts answer is re-asked like any plan's.
                 let replan = self.record.replan_note.clone();
                 if let Some(note) = &replan {
                     notes.push(kgraf_secrets::model_copy(note).into_owned());
                 }
-                let first_reask = if replan.is_some() { MAX_PLAN_REASKS } else { 0 };
                 let templates = self.template_offers().await?;
                 self.intake_notices.clear();
-                let Some((specs, interfaces)) = self
-                    .decompose_from(
+                let Some((specs, interfaces, unchecked)) = self
+                    .decompose(
                         PlanRequest {
                             instruction: kgraf_secrets::model_copy(
                                 &self.record.original_instruction,
@@ -3635,7 +3365,6 @@ impl RunLoop {
                         },
                         &note_ids,
                         &BTreeSet::new(),
-                        first_reask,
                     )
                     .await?
                 else {
@@ -3643,22 +3372,41 @@ impl RunLoop {
                     // resume plans again.
                     return Ok(false);
                 };
-                let (mut specs, interfaces) = if self.record.replans > 0 {
-                    renamed_for_replan(specs, interfaces, self.record.replans)
+                let (mut specs, interfaces, unchecked) = if self.record.replans > 0 {
+                    renamed_for_replan(specs, interfaces, unchecked, self.record.replans)
                 } else {
-                    (specs, interfaces)
+                    (specs, interfaces, unchecked)
                 };
-                // The re-planned contracts' workers see what was wrong with
-                // the held plan, as quoted data: the text names the same
-                // interfaces and files they are about to write.
-                if let Some(failures) = &self.record.replan_failures {
-                    let block = held_plan_block(&kgraf_secrets::model_copy(failures));
+                // A re-planned contract's worker sees the held plan's failures
+                // that concern it, as quoted data: those of the interfaces
+                // that bound the contract it replaces (same id) or a file it
+                // writes. A contract no failure concerns gets none.
+                if !self.record.replan_failure_parts.is_empty() {
+                    let prefix = format!("re{}.", self.record.replans);
                     for spec in &mut specs {
-                        spec.instruction.push_str(&block);
+                        let held_id = spec.id.strip_prefix(&prefix).unwrap_or(&spec.id);
+                        let writes: BTreeSet<&str> =
+                            spec.writes.iter().map(|w| w.path.as_str()).collect();
+                        let mine: Vec<&str> = self
+                            .record
+                            .replan_failure_parts
+                            .iter()
+                            .filter(|f| {
+                                f.parties.iter().any(|p| p == held_id)
+                                    || f.paths.iter().any(|p| writes.contains(p.as_str()))
+                            })
+                            .map(|f| f.text.as_str())
+                            .collect();
+                        if !mine.is_empty() {
+                            let block =
+                                held_plan_block(&kgraf_secrets::model_copy(&mine.join("\n")));
+                            spec.instruction.push_str(&block);
+                        }
                     }
                 }
                 let p = PlanProgress {
                     interfaces,
+                    unchecked,
                     ..PlanProgress::seeded(specs)
                 };
                 self.record.plan_progress = Some(p.clone());
@@ -3718,7 +3466,7 @@ impl RunLoop {
                     "projected {} tokens exceed the plan target of {} ({:?})",
                     projection.tokens, projection.target_tokens, projection.source
                 );
-                let Some((sub, sub_interfaces)) = self
+                let Some((sub, sub_interfaces, sub_unchecked)) = self
                     .decompose(
                         PlanRequest {
                             instruction: kgraf_secrets::model_copy(&item.spec.instruction)
@@ -3783,6 +3531,14 @@ impl RunLoop {
                         .into());
                     }
                     progress.interfaces.push(ic);
+                }
+                for mut e in sub_unchecked {
+                    for id in [&mut e.consumer, &mut e.producer] {
+                        if let Some(cid) = local.get(id.as_str()) {
+                            id.clone_from(cid);
+                        }
+                    }
+                    progress.unchecked.push(e);
                 }
                 for (c, cid) in sub.iter().zip(&child_ids).rev() {
                     let mut child = c.clone();
@@ -3868,12 +3624,19 @@ impl RunLoop {
                 symbols: ic.symbols.clone(),
             })
             .collect();
+        let registered = interfaces.clone();
         if let Err(e) = self.register_interfaces(interfaces).await {
             self.record.open_contracts.clear();
             self.record.plan_progress = None;
             self.save()?;
             return Err(e);
         }
+        // Every consumed edge no interface binds is counted as not run, with
+        // the reason the interface call found; event-sourced, so a replay or a
+        // resume counts the same.
+        let contracts = self.record.open_contracts.clone();
+        self.record_unchecked(&contracts, &registered, &progress.unchecked)
+            .await?;
         self.note_plan()?;
         self.trace_plan_accepted(planned_interfaces).await?;
         self.plan_gates_hook(&progress.leaves);
@@ -4266,9 +4029,14 @@ impl RunLoop {
         if self.record.replans >= MAX_REPLANS || self.record.source_plan.is_some() {
             return Ok(false);
         }
-        let Some(failures) = self.replan_failures() else {
+        let Some(parts) = self.replan_failures() else {
             return Ok(false);
         };
+        let failures = parts
+            .iter()
+            .map(|f| f.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         let note = format!(
             "<plan_refused>\nYour plan was refused before any work started: the pre-dispatch \
              checks of its interfaces failed.\n{}\nPlan the whole instruction again, correcting \
@@ -4283,6 +4051,13 @@ impl RunLoop {
         self.record.replans += 1;
         self.record.replan_note = Some(kgraf_secrets::intake(&note));
         self.record.replan_failures = Some(kgraf_secrets::intake(&failures));
+        self.record.replan_failure_parts = parts
+            .into_iter()
+            .map(|mut f| {
+                f.text = kgraf_secrets::intake(&f.text);
+                f
+            })
+            .collect();
         self.record.coordination.waits.clear();
         self.record.planned = false;
         self.record.plan_progress = None;
@@ -4305,6 +4080,7 @@ impl RunLoop {
             Ok(planned) => {
                 self.record.replan_note = None;
                 self.record.replan_failures = None;
+                self.record.replan_failure_parts.clear();
                 if !planned {
                     self.stopping = true;
                 }
@@ -4320,6 +4096,7 @@ impl RunLoop {
                 self.record.plan_progress = None;
                 self.record.replan_note = None;
                 self.record.replan_failures = None;
+                self.record.replan_failure_parts.clear();
                 self.notices
                     .insert(kgraf_secrets::scrub_persist_owned(format!(
                         "the re-plan was refused, so the held plan stands: {e}"

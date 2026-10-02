@@ -61,6 +61,46 @@ pub(crate) async fn bounded_error_body(
     }
 }
 
+/// Substrings (lowercase) a server's 5xx body carries when the failure is that
+/// it could not parse the model's own tool-call output. Ollama answers HTTP 500
+/// `XML syntax error on line N: ...` for a Qwen-style XML call and `error
+/// parsing tool call: raw='...'` for a JSON call; llama.cpp says `Failed to
+/// parse tool call`.
+const MALFORMED_OUTPUT_MARKERS: [&str; 3] = [
+    "xml syntax error",
+    "error parsing tool call",
+    "failed to parse tool call",
+];
+
+/// Whether a 5xx body says the server failed to parse the model's own output.
+fn is_malformed_output_body(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    MALFORMED_OUTPUT_MARKERS.iter().any(|m| lower.contains(m))
+}
+
+/// The error for a non-success status. A 5xx whose body names a parse failure of
+/// the model's own output is [`ProviderError::ModelOutputMalformed`]; every
+/// other status is a plain [`ProviderError::Http`].
+pub(crate) fn http_error(
+    adapter: &'static str,
+    status: u16,
+    body: String,
+) -> kgraf_provider::ProviderError {
+    if (500..600).contains(&status) && is_malformed_output_body(&body) {
+        kgraf_provider::ProviderError::ModelOutputMalformed {
+            adapter,
+            status,
+            body,
+        }
+    } else {
+        kgraf_provider::ProviderError::Http {
+            adapter,
+            status,
+            body,
+        }
+    }
+}
+
 /// Classify a failure to send.
 ///
 /// Only a connection that never opened is known not to have reached the provider.
@@ -79,5 +119,39 @@ pub(crate) fn send_error(
             adapter,
             reason: e.to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod http_error_tests {
+    use super::http_error;
+    use kgraf_provider::ProviderError;
+
+    #[test]
+    fn recognizes_the_server_bodies_that_name_a_model_output_parse_failure() {
+        for body in [
+            r#"{"error":{"message":"XML syntax error on line 8: element <function> closed by </parameter>"}}"#,
+            r#"{"error":{"message":"error parsing tool call: raw='{\"name\":', err=unexpected end of JSON input"}}"#,
+            "Failed to parse tool call",
+        ] {
+            let e = http_error("a", 500, body.to_owned());
+            assert!(e.is_malformed_model_output(), "{body}");
+        }
+    }
+
+    #[test]
+    fn a_5xx_is_malformed_output_only_with_a_parse_body() {
+        assert!(matches!(
+            http_error("a", 503, "overloaded".to_owned()),
+            ProviderError::Http { .. }
+        ));
+        assert!(matches!(
+            http_error("a", 429, "XML syntax error".to_owned()),
+            ProviderError::Http { .. }
+        ));
+        assert!(matches!(
+            http_error("a", 500, String::new()),
+            ProviderError::Http { .. }
+        ));
     }
 }

@@ -371,15 +371,26 @@ impl ApprovalChain {
         log: &mut dyn ApprovalLog,
     ) -> Result<Verdict, ApprovalError> {
         let (worker, call_id) = (call.worker.to_string(), call.call_id.clone());
+        let shell = self.shell_input_of(&call);
         let verdict = self.run_from(view, 0, call, false, log).await?;
-        self.settle_grants(&worker, &call_id, &verdict);
+        self.settle_grants(&worker, &call_id, shell.as_ref(), &verdict);
         Ok(verdict)
     }
 
     /// The chain reached a final verdict for a call (not an ask still
     /// waiting): grants a mode staged for it are recorded as granted when it
     /// runs, and as refused, naming the refusing hook, when it does not.
-    fn settle_grants(&self, worker: &str, call_id: &str, verdict: &Verdict) {
+    ///
+    /// `shell` is a shell call's input, so a refusal by a rule that matched
+    /// one command of a script names that command's program, not the
+    /// script's shell ([`crate::permissions::refused_program`]).
+    fn settle_grants(
+        &self,
+        worker: &str,
+        call_id: &str,
+        shell: Option<&serde_json::Value>,
+        verdict: &Verdict,
+    ) {
         let Some(control) = &self.permissions else {
             return;
         };
@@ -388,10 +399,18 @@ impl ApprovalChain {
                 control.settle_call(worker, call_id, None);
             }
             Verdict::Denied { by, reason } => {
-                control.settle_call(worker, call_id, Some((by, reason)));
+                let program =
+                    shell.and_then(|i| crate::permissions::refused_program("shell", i, reason));
+                control.settle_call_naming(worker, call_id, Some((by, reason)), program.as_deref());
             }
             Verdict::Ask(_) => {}
         }
+    }
+
+    /// A shell call's input, held for [`Self::settle_grants`] when this chain
+    /// settles mode grants.
+    fn shell_input_of(&self, call: &PendingCall) -> Option<serde_json::Value> {
+        (self.permissions.is_some() && call.tool == "shell").then(|| call.input.clone())
     }
 
     /// Settle staged mode grants on this chain's calls
@@ -411,7 +430,13 @@ impl ApprovalChain {
     ) -> Result<Verdict, ApprovalError> {
         self.verify(&paused)?;
         if let Some(denied) = self.deny_if_expired(&paused, log).await? {
-            self.settle_grants(paused.call.worker.as_str(), &paused.call.call_id, &denied);
+            let shell = self.shell_input_of(&paused.call);
+            self.settle_grants(
+                paused.call.worker.as_str(),
+                &paused.call.call_id,
+                shell.as_ref(),
+                &denied,
+            );
             return Ok(denied);
         }
         let decision = match &answer {
@@ -422,6 +447,7 @@ impl ApprovalChain {
         };
         log.record(record(&paused.call, "user", decision)).await?;
         let (worker, call_id) = (paused.call.worker.to_string(), paused.call.call_id.clone());
+        let shell = self.shell_input_of(&paused.call);
         let verdict = match answer {
             UserAnswer::Allow => {
                 self.run_from(view, paused.next_hook, paused.call, paused.rewritten, log)
@@ -432,7 +458,7 @@ impl ApprovalChain {
                 reason,
             },
         };
-        self.settle_grants(&worker, &call_id, &verdict);
+        self.settle_grants(&worker, &call_id, shell.as_ref(), &verdict);
         Ok(verdict)
     }
 
@@ -446,7 +472,13 @@ impl ApprovalChain {
         self.verify(&paused)?;
         match self.deny_if_expired(&paused, log).await? {
             Some(denied) => {
-                self.settle_grants(paused.call.worker.as_str(), &paused.call.call_id, &denied);
+                let shell = self.shell_input_of(&paused.call);
+                self.settle_grants(
+                    paused.call.worker.as_str(),
+                    &paused.call.call_id,
+                    shell.as_ref(),
+                    &denied,
+                );
                 Ok(denied)
             }
             None => Ok(Verdict::Ask(paused)),
@@ -1687,6 +1719,68 @@ mod tests {
             .expect("review");
         assert!(matches!(again, Verdict::Denied { .. }));
         assert_eq!(control.events_since(0).len(), 1);
+    }
+
+    /// A mode's grant as the runtime stages it: the call's own program.
+    struct StagesProgram(Arc<crate::permissions::PermissionControl>);
+
+    #[async_trait::async_trait]
+    impl ApprovalHook for StagesProgram {
+        fn name(&self) -> &str {
+            "shell-command-policy"
+        }
+        async fn review(&self, call: &PendingCall) -> HookDecision {
+            let program = crate::command_argv(&call.input)
+                .and_then(|a| a.into_iter().next())
+                .unwrap_or_default();
+            self.0.stage_grant(
+                call.worker.as_str(),
+                &call.call_id,
+                &format!("`{program}`"),
+                "mode",
+            );
+            HookDecision::Allow
+        }
+    }
+
+    /// A rule that matches one command of an `sh -c` script refuses that
+    /// command's program: the trace names `python3`, not the `sh` that ran
+    /// no refused command. A refused call that is the program itself still
+    /// names it.
+    #[tokio::test]
+    async fn a_refusal_of_a_wrapped_command_names_that_commands_program() {
+        use crate::permissions::{PermissionEvent, PermissionRulesHook};
+        let f = Fixture::new();
+        let control = bypass_with_deny_rule();
+        let c = chain(vec![
+            Arc::new(StagesProgram(control.clone())),
+            Arc::new(PermissionRulesHook::new(control.clone(), None)),
+        ])
+        .with_permissions(control.clone());
+        let mut log = MemoryApprovalLog::default();
+        let verdict = c
+            .review(
+                f.view(),
+                call(json!({"command": ["sh", "-c", "mkdir x && python3 -c pass"]})),
+                &mut log,
+            )
+            .await
+            .expect("review");
+        assert!(matches!(verdict, Verdict::Denied { .. }), "{verdict:?}");
+        let events = control.events_since(0);
+        let subjects: Vec<&str> = events
+            .iter()
+            .filter_map(|(_, e)| match e {
+                PermissionEvent::GrantRefused { subject, .. } => Some(subject.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(subjects, ["`python3`"], "{events:?}");
+        assert!(
+            events[0].1.line().starts_with("refused `python3` to w1"),
+            "{}",
+            events[0].1.line()
+        );
     }
 
     /// The same chain with a call no rule refuses records the grant, once the

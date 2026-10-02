@@ -79,6 +79,64 @@ pub fn capability_of(tool: &str, input: &serde_json::Value) -> String {
     tool.to_owned()
 }
 
+/// What a call of the current round exercises, kept from the call to its
+/// result: a refusal is recorded against the program a policy refused, and a
+/// success clears the refusals of every program the call ran.
+#[derive(Clone, Debug)]
+pub(crate) struct CallCapability {
+    pub(crate) tool: String,
+    /// The call's own capability ([`capability_of`]).
+    pub(crate) capability: String,
+    /// Every capability the call exercises: for a shell call each program of
+    /// its script ([`kgraf_tools::programs_run`]), else the tool's name.
+    programs: Vec<String>,
+    /// A shell call's input, to name the command a rule refused; `Null` for
+    /// any other tool, whose input can be large.
+    input: serde_json::Value,
+    /// The file an `apply_patch` call's patch names first.
+    pub(crate) patch_target: Option<kgraf_tools::PatchTarget>,
+}
+
+impl CallCapability {
+    pub(crate) fn of(tool: &str, input: &serde_json::Value) -> Self {
+        let capability = capability_of(tool, input);
+        let mut programs = vec![capability.clone()];
+        if tool == "shell" {
+            for p in kgraf_tools::programs_run(input) {
+                if !programs.contains(&p) {
+                    programs.push(p);
+                }
+            }
+        }
+        Self {
+            tool: tool.to_owned(),
+            capability,
+            programs,
+            input: if tool == "shell" {
+                input.clone()
+            } else {
+                serde_json::Value::Null
+            },
+            patch_target: (tool == "apply_patch")
+                .then(|| kgraf_tools::patch_target(input))
+                .flatten(),
+        }
+    }
+
+    pub(crate) fn programs(&self) -> &[String] {
+        &self.programs
+    }
+
+    /// What a policy refused when it refused this call with `reason`: the
+    /// program of the command a rule matched when that is not the call's own
+    /// (`sh -c "... && python3 ..."` refused by a rule on `python3`), else
+    /// the call's capability.
+    pub(crate) fn refused(&self, reason: &str) -> String {
+        kgraf_tools::refused_program(&self.tool, &self.input, reason)
+            .unwrap_or_else(|| self.capability.clone())
+    }
+}
+
 /// Whether a denial names a policy, not a malformed or misplaced call. The
 /// approval chain's `access` step refuses paths outside the worktree; it is a
 /// policy only when it quotes the command policy. Input the tool could not
@@ -194,13 +252,13 @@ impl RefusedCalls {
         self.publish();
     }
 
-    /// A call of `tool` exercising `capability` ran without error: every
-    /// earlier refusal of the same capability was retried successfully, and
-    /// an input error of the same tool was fixed.
-    pub(crate) fn ran_ok(&mut self, tool: &str, capability: &str) {
+    /// A call of `tool` exercising `capabilities` ran without error: every
+    /// earlier refusal of one of them was retried successfully, and an input
+    /// error of the same tool was fixed.
+    pub(crate) fn ran_ok(&mut self, tool: &str, capabilities: &[String]) {
         let mut changed = false;
         for c in &mut self.record.refused {
-            if c.tool == tool && c.capability == capability && !c.retried_ok {
+            if c.tool == tool && capabilities.contains(&c.capability) && !c.retried_ok {
                 c.retried_ok = true;
                 changed = true;
             }
@@ -283,10 +341,38 @@ mod tests {
         let mut r = RefusedCalls::default();
         r.refused(refusal("python3"));
         r.refused(refusal("curl"));
-        r.ran_ok("shell", "python3");
+        r.ran_ok("shell", &["python3".to_owned()]);
         let calls = r.take();
         assert!(calls[0].retried_ok);
         assert!(!calls[1].retried_ok);
+    }
+
+    /// The capability a refusal is recorded against is the program a rule
+    /// refused, and a successful call clears each program it ran, not only
+    /// the shell that wrapped them.
+    #[test]
+    fn a_wrapped_refusal_is_recorded_against_the_refused_program() {
+        let input = serde_json::json!({"command": ["sh", "-c", "mkdir x && python3 -c pass"]});
+        let call = CallCapability::of("shell", &input);
+        assert_eq!(call.capability, "sh");
+        assert_eq!(
+            call.refused("your deny rule `shell(python3*)` blocks this call in every mode"),
+            "python3"
+        );
+        // A reason that quotes no rule is the call's own program's.
+        assert_eq!(call.refused("denied by a hook"), "sh");
+        let mut r = RefusedCalls::default();
+        r.refused(refusal("python3"));
+        r.refused(refusal("sh"));
+        r.ran_ok("shell", call.programs());
+        assert!(r.take().iter().all(|c| c.retried_ok));
+        // A script that never ran python3 leaves a python3 refusal open.
+        let mut r = RefusedCalls::default();
+        r.refused(refusal("python3"));
+        let other =
+            CallCapability::of("shell", &serde_json::json!({"command": ["sh", "-c", "ls"]}));
+        r.ran_ok("shell", other.programs());
+        assert!(!r.take()[0].retried_ok);
     }
 
     /// The directory sees each refusal and input error while the worker
@@ -305,9 +391,9 @@ mod tests {
             Some("ERROR: invalid call: bad patch")
         );
         assert_eq!(directory.record_of("w2"), RefusalRecord::default());
-        r.ran_ok("apply_patch", "apply_patch");
+        r.ran_ok("apply_patch", &["apply_patch".to_owned()]);
         assert_eq!(directory.record_of("w1").last_input_error, None);
-        r.ran_ok("shell", "python3");
+        r.ran_ok("shell", &["python3".to_owned()]);
         assert!(directory.record_of("w1").refused[0].retried_ok);
         assert_eq!(r.take().len(), 1);
         assert_eq!(directory.record_of("w1"), RefusalRecord::default());

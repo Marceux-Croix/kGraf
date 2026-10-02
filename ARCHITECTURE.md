@@ -493,8 +493,8 @@ normalization and any re-asks, and again for each re-plan under the next `revisi
 first plan). It carries `contracts` (`id`, `instruction` in full as it is dispatched, `acceptance`,
 `writes` as paths, `depends_on`, `route` when the plan pinned one, `task_kind` when set),
 `interfaces` (`id`, `parties`, `symbols`; empty when the plan has none) and `notices` raised while
-the plan was taken in (repairs, the unit-struct shape notice, "contract checks did not run", re-ask
-reasons). Trace lines have no size cap, so the instruction is not shortened. A check can read the
+the plan was taken in (repairs, the unit-struct shape notice, "contract checks did not run for ...",
+re-ask reasons, a merge of contracts that share one file and one test). Trace lines have no size cap, so the instruction is not shortened. A check can read the
 plan from this event without a recording of the planner's answer. The `dispatch` event also has
 `base_commit` (the integration branch tip the attempts' worktrees start from, or the commit a
 remediation names) and `base_commits` (the same, keyed by worker id); both are absent when the
@@ -522,7 +522,7 @@ observation masking, and persisted allow rules. An unattended worker is
 denied an MCP tool until an explicit allow rule is recorded. **Not built
 yet:** the deferred tool-search tool and the per-call intent argument.
 
-**Loop behavior worth knowing.** A successful write starts a new stall count, so edit and test cycles, and re-reads after a change, do not end a run as stalled. Observation masking keeps the last N rounds of tool results, every block of a round together. A resume replays only calls that succeeded. A paused turn fails loud. A stop at the output ceiling gets one counted continuation round, then fails. A turn with no tool call and no visible answer (a plan only in the model's reasoning) gets one counted notice round, and a second one in a row fails the attempt. A patch that starts with a file header and lacks `*** Begin Patch` is applied as if it had one, and the result says so. `apply_patch` refuses a patch that names one path in two hunks, and its mismatch hints name the nearest match. A shell command's output is bounded as it is read, so a chatty command cannot grow host memory, and the command's process group is killed after a normal exit so background children do not hold the worktree.
+**Loop behavior worth knowing.** A successful write starts a new stall count, so edit and test cycles, and re-reads after a change, do not end a run as stalled. Observation masking keeps the last N rounds of tool results, every block of a round together. A resume replays only calls that succeeded. A paused turn fails loud. A stop at the output ceiling gets one counted continuation round, then fails. A turn with no tool call and no visible answer (a plan only in the model's reasoning) gets one counted notice round, and a second one in a row fails the attempt. A server failure on the model's own malformed tool call (HTTP 500 with a parse-failure body, as Ollama sends) is sent again within the attempt, at most twice in a row, each try its own ledger call and the retry carrying one added notice at the end of the transcript; after that the attempt fails and names the parse failure. A patch that starts with a file header and lacks `*** Begin Patch` is applied as if it had one, and the result says so. `apply_patch` refuses a patch that names one path in two hunks, and its mismatch hints name the nearest match. A shell command's output is bounded as it is read, so a chatty command cannot grow host memory, and the command's process group is killed after a normal exit so background children do not hold the worktree.
 
 **The round budget is a progress checkpoint (decision 0096).** A brief's round budget is one block. Where the loop would warn that three rounds remain, it measures the block instead (`kgraf-runtime/src/progress.rs`): files whose content changed on net (blake3 against the last checkpoint, the content captured before the block's first write, or git's dirty list), check runs whose pass, fail or error counts improved (cargo test and nextest, pytest, unittest, `node --test`, jest, vitest, cargo and `tsc` errors, else the exit status), and sloppy patterns (one identical error 3 times, failed writes outnumbering successes, write-then-revert, an identical call and result 3 times). Model text is never read. A progressing block gives the same worker another block in the same conversation; a block without progress after a productive one gets one grace block and a notice; a second idle checkpoint ends the attempt `BudgetExhausted` with no answer round; a worker that never progressed meets the old wall (the warning, then the final answer round), and so does one at the ceiling (`LoopSettings::max_checkpoints`, 10). Each checkpoint is a `WorkerEvent::Checkpoint` the resume reads back, and the result's `round_blocks`. The context check runs first at every boundary, so a full context still hands back or compacts. The orchestrator counts an extended worker as one sizing miss, traces `worker_checkpoints`, and counts `round_extensions` and `checkpoint_stops`.
 
@@ -604,34 +604,63 @@ checked-out branch never moves. A killed run resumes from its record with no
 repeated paid call.
 
 **Contract checks and challenges (decisions 0029 to 0037)** are available
-on the live path, off by default, opt in per run. When enabled, the planner
-writes an interface contract for each place one contract uses another's
-code, and each is registered in the run trace before any party dispatches.
+on the live path, off by default, opt in per run. When enabled, a second
+planner call writes an interface contract for each place one contract uses
+another's code, and each is registered in the run trace before any party
+dispatches.
 The sandboxed runner checks it: stub-compile, vacuity against the stub and a
 reference, then a handshake, one call per party on that party's own route
 through the ledger. A worker challenges with a dedicated tool; one challenge
 per lineage and interface is open at a time, each worker has a fixed budget
 of challenges, and escalation to the user follows only a paid review.
 
-A refused planner answer is named where it can be corrected: an interface file entry with no
-`content` is refused with its location (`interfaces[0].tests[1]`) and path, and a contract
-that depends on an interface id is refused as such. Every refusal, the last included, is a
-`plan_refused` trace event, and a run that fails planning prints them.
+A refused planner answer is named where it can be corrected: an answer that is not JSON is
+quoted around the point the parser stopped, marked `[ERROR HERE]`, with what usually causes that
+error (a string left unclosed, a key without quotes); a type error names the field, the value
+found and what the field takes; every interface file entry that is not a file is named at once.
+Every refusal of the contracts call, the last included, is a `plan_refused` trace event; every
+refused ask of the interface call is an `interfaces_refused` event; a run that fails planning
+prints both.
 
-The mechanical checks also run on each planner answer: an interface that is
-incomplete, or fails stub-compile or vacuity, refuses the answer with the
-check's failure (the compiler's error lines come first in a check's kept
-output), and the planner is asked again, at most twice; the last answer is
-taken and the gate holds on the same failure. When the gate holds a plan
-that nothing has acted on yet (no dispatch, no merge, no stub landed, no
-interface the run was given), and the run would end on that hold, the whole
-plan goes back to the planner once with the checks' failures, a handshake's
-included (decision 0031, amended). The re-plan is one ask, taken as it is,
-under ids of its own (`re1.`); a hold on it ends the run, so the top-level
-plan is asked for at most four times. A plan in which a contract depends on another and that
-holds no interface is also sent back, once, naming the consuming and consumed contracts; if the
-answer still holds none, the plan is taken and a notice (output and trace) says contract checks
-did not run for those contracts (decision 0030, amended). A contract test may not replace a
+With contract checks on, planning is two calls (decision 0030, amended). The contracts call
+returns the contracts only. When the answer has two or more contracts (or is a split, whose
+interface may bind the plan's other contracts), the interface call is given the accepted
+contracts, the `consumer <- producers` edges their dependencies make, and the same repository
+context, and returns the interfaces only. It has its own budget of three asks. Each interface
+is taken on its own: parsed, its parties and shape checked (symbols, stub, a reference covering
+every stub path, at least one test, both commands, no path in both stub and consumer, every stub
+path a declared write of a party), the consumer and tests files named by path alone read from
+the dispatch base, a stub file the repository already has listed in `replaces`, then its
+mechanical checks run. An accepted interface is kept across asks; a
+re-ask quotes the previous answer and every refusal, names the accepted interfaces and the edges
+still unbound, and asks only for those. An omitted interface and a malformed one are retried the
+same way. When the asks are spent, or the answer was cut off at the output limit, each producer
+of an unbound edge gets a compile check derived from the repository: its declared files that
+hold a scaffold body are the stub, the files that use its names are the consumer and test
+files, and the project's build tool compiles them; stub-compile and its canaries run, and the
+vacuity check cannot (no reference exists). At the end of planning every consumed edge no
+accepted interface binds is recorded as one unchecked contract event per consumer, with the
+reason, and counted one per edge under the report's `not run`; an edge counts once however often
+the event is applied, so a replay and a resume agree. A notice says "contract checks did not run
+for ...". The run is not held for an interface the planner could not write.
+
+When the gate holds a plan that nothing has acted on yet (no dispatch, no merge, no stub
+landed, no interface the run was given), and the run would end on that hold, the whole plan
+goes back to the planner once with the checks' failures, a handshake's included (decision
+0031, amended). The re-plan's contracts call is re-asked like the first plan's on an answer
+that is not JSON or breaks a rule, and its interfaces get their own budget; its ids are its own
+(`re1.`), and a hold on it ends the run. A re-planned contract's brief carries, as a quoted data
+block, only the held failures that concern it: those of interfaces that bound the contract it
+replaces or name a file it writes.
+
+The planner's answer is extracted leniently where the intent is certain: text through the last
+`</think>` is skipped, the last top-level object that parses is the answer, and a raw control
+character inside a string is escaped and the object parsed again. Contracts that declare one
+identical write set which the verifier's narrowed check judges by one test file cannot be
+verified apart: the plan is refused once naming them, and merged into the first contract if the
+planner repeats it, with a notice.
+
+A contract test may not replace a
 file the project already tracks, and the stub, consumer and test files may
 not name one path with different content. In the handshake, a provision
 counts only from a party that writes the symbol's stub file; a shared touch
@@ -967,7 +996,9 @@ command as what the attempt is judged by, calls the contract's Acceptance line a
 and says `todo!()` panics and failing tests in other contracts' unfinished code are not the
 worker's to fix, while a compile error anywhere that the worker's change caused is its own.
 An attempt that changed none of its declared files is refused whatever its
-check says.
+check says, unless an earlier merge of the run delivered those files and the check fails on
+the run's original base: that attempt is accepted as an empty integration, with an
+`unverified:` notice naming the earlier contract.
 
 Gates are also what makes an imperfect partition survivable. The
 interference the underlying research most warns about is **semantic**:

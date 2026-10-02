@@ -120,6 +120,76 @@ const APPLY_PATCH_DESCRIPTION: &str = concat!(
     "```",
 );
 
+/// The file a rejected `apply_patch` call aimed at, for [`rejection_help`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PatchTarget {
+    pub path: String,
+    /// Whether the call's first file header was `*** Add File:`.
+    pub adds: bool,
+}
+
+/// The first file a call's patch names (`*** Add File:`, `*** Update File:`
+/// or `*** Delete File:`), read leniently from the text: the call may be the
+/// malformed one, so this does not parse it. `None` when it names none.
+pub fn patch_target(input: &Value) -> Option<PatchTarget> {
+    let patch = input
+        .get("patch")
+        .or_else(|| input.get("input"))
+        .and_then(Value::as_str)?;
+    patch.lines().map(str::trim).find_map(|line| {
+        [
+            ("*** Add File:", true),
+            ("*** Update File:", false),
+            ("*** Delete File:", false),
+        ]
+        .iter()
+        .find_map(|(head, adds)| {
+            let path = line.strip_prefix(head)?.trim();
+            (!path.is_empty()).then(|| PatchTarget {
+                path: path.to_owned(),
+                adds: *adds,
+            })
+        })
+    })
+}
+
+/// What to tell a model whose `apply_patch` call was rejected more than once:
+/// the one rule the `error` shows it broke, and a minimal valid patch for the
+/// file the call targeted. `None` when the error is not one of the format or
+/// matching errors (a protected path, an escaping path), where an example
+/// would only mislead.
+pub fn rejection_help(error: &str, target: Option<&PatchTarget>) -> Option<String> {
+    let rule = if error.contains("Begin Patch") {
+        "The first line of the patch must be exactly `*** Begin Patch`."
+    } else if error.contains("End Patch") {
+        "The last line of the patch must be exactly `*** End Patch`."
+    } else if error.contains("invalid hunk") {
+        "Each file section starts with `*** Add File: <path>`, `*** Update File: <path>` or \
+         `*** Delete File: <path>`. In an Add File section every line starts with `+`. In an \
+         Update File section every line starts with a space (an unchanged line), `-` (a line \
+         to remove) or `+` (a line to add)."
+    } else if error.contains("Failed to find") {
+        "A context or `-` line is not in the file as it is now. Read the file again and copy \
+         those lines exactly, including indentation."
+    } else if error.contains("invalid patch") {
+        "A patch is `*** Begin Patch`, one or more file sections, then `*** End Patch`."
+    } else {
+        return None;
+    };
+    let path = target.map_or("path/to/file", |t| t.path.as_str());
+    let example = if target.is_some_and(|t| t.adds) {
+        format!("*** Begin Patch\n*** Add File: {path}\n+first line of the new file\n*** End Patch")
+    } else {
+        format!(
+            "*** Begin Patch\n*** Update File: {path}\n@@\n an unchanged line\n-the line to \
+             remove\n+the line to add\n*** End Patch"
+        )
+    };
+    Some(format!(
+        "\n{rule} A minimal valid patch for this file:\n{example}"
+    ))
+}
+
 /// A patch longer than this is refused before it is even parsed (cap
 /// patch size). Generous for a real multi-file change; a patch this large is
 /// already an unusual model output worth refusing rather than absorbing.
@@ -673,6 +743,66 @@ mod tests {
 
     fn wrap(body: &str) -> Value {
         json!({ "patch": format!("*** Begin Patch\n{body}\n*** End Patch") })
+    }
+
+    /// The example a rejection carries is itself a valid patch, in both forms,
+    /// and each known error names the one rule it broke; an error that is not
+    /// about the patch's format gets no example.
+    #[test]
+    fn a_rejection_help_example_is_a_valid_patch_for_the_targeted_file() {
+        let add = patch_target(&json!({"patch": "*** Begin Patch\n*** Add File: src/new.rs\n+x"}))
+            .expect("target");
+        assert_eq!(
+            add,
+            PatchTarget {
+                path: "src/new.rs".into(),
+                adds: true
+            }
+        );
+        let update = patch_target(&json!({"patch": "junk\n*** Update File: src/lib.rs\n x"}))
+            .expect("target");
+        assert!(!update.adds);
+        assert_eq!(patch_target(&json!({"patch": "--- a/x\n+++ b/x"})), None);
+        for (error, target, rule, header) in [
+            (
+                "invalid patch: The last line of the patch must be '*** End Patch'",
+                Some(&add),
+                "must be exactly `*** End Patch`",
+                "*** Add File: src/new.rs",
+            ),
+            (
+                "invalid patch: The first line of the patch must be '*** Begin Patch'",
+                Some(&update),
+                "must be exactly `*** Begin Patch`",
+                "*** Update File: src/lib.rs",
+            ),
+            (
+                "invalid hunk at line 3, 'x' is not a valid hunk header",
+                None,
+                "every line starts with `+`",
+                "*** Update File: path/to/file",
+            ),
+            (
+                "Failed to find context 'fn a' in src/lib.rs",
+                Some(&update),
+                "copy those lines exactly",
+                "*** Update File: src/lib.rs",
+            ),
+        ] {
+            let help = rejection_help(error, target).expect("help");
+            assert!(help.contains(rule), "{help}");
+            assert!(help.contains(header), "{help}");
+            let example = help
+                .split_once("for this file:\n")
+                .expect("example")
+                .1
+                .to_owned();
+            let hunks = parse_patch(&example)
+                .unwrap_or_else(|e| panic!("the example must parse: {e}\n{example}"));
+            assert_eq!(hunks.len(), 1, "{example}");
+        }
+        // A protected path or an escaping path is not a format error.
+        assert_eq!(rejection_help("path is protected", Some(&add)), None);
     }
 
     /// A patch that starts with a file header and has no envelope is applied as

@@ -320,6 +320,19 @@ pub enum TraceEvent {
         of: u32,
         reason: String,
     },
+    /// The interface call's answer was refused, in part or whole: every
+    /// interface that was not accepted, and every consumed edge still
+    /// unbound, with what each needs. One per refused ask, the last one
+    /// included. Apart from `plan_refused`: the contracts were accepted, and
+    /// are never asked for again because an interface was wrong.
+    InterfacesRefused {
+        at_ms: i64,
+        /// Which ask of the interface call, counting from 1.
+        ask: u32,
+        /// How many asks the interface call allows.
+        of: u32,
+        reason: String,
+    },
     Report {
         at_ms: i64,
         kind: String,
@@ -563,6 +576,17 @@ fn scrub_trace_fields(event: TraceEvent) -> TraceEvent {
             of,
             reason,
         } => TraceEvent::PlanRefused {
+            at_ms,
+            ask,
+            of,
+            reason: s(reason),
+        },
+        TraceEvent::InterfacesRefused {
+            at_ms,
+            ask,
+            of,
+            reason,
+        } => TraceEvent::InterfacesRefused {
             at_ms,
             ask,
             of,

@@ -623,10 +623,14 @@ pub struct RunStateRecord {
     /// re-plan is taken so a resume in between still sends them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replan_note: Option<String>,
-    /// The same failures as data for the re-planned contracts' briefs: each
-    /// carries them, so a worker sees what was wrong with the held plan.
+    /// The same failures as one text, for the record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replan_failures: Option<String>,
+    /// The same failures one by one, with the held contracts and files each
+    /// concerns: a re-planned contract's brief carries only the ones that
+    /// concern it, as data.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub replan_failure_parts: Vec<HeldFailure>,
     /// Workers the runtime compacted (decision 0095), in order: each is a
     /// contract that was larger than planned when the trigger was the stop
     /// point. The notice names the worker's transcript, which holds the full
@@ -722,6 +726,31 @@ pub struct PlanProgress {
     /// Kept here so a plan resumed between model calls keeps them.
     #[serde(default)]
     pub interfaces: Vec<crate::checks::InterfaceContract>,
+    /// Consumed edges the interface call left without an interface, with
+    /// why, party ids as the plan names them; recorded as unchecked when
+    /// planning ends.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unchecked: Vec<UncheckedEdge>,
+}
+
+/// A consumed edge (a contract and one contract it depends on) that the
+/// interface call left without an interface, and why.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UncheckedEdge {
+    pub consumer: String,
+    pub producer: String,
+    pub reason: String,
+}
+
+/// One failed check of a held plan's interface, for the re-plan's briefs.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeldFailure {
+    /// `interface <label>: <failure>`, as the planner's note quotes it.
+    pub text: String,
+    /// The held plan's contracts the interface bound.
+    pub parties: Vec<String>,
+    /// The interface's stub, consumer and tests paths.
+    pub paths: Vec<String>,
 }
 
 impl PlanProgress {
@@ -833,6 +862,7 @@ impl RunStateRecord {
             replans: 0,
             replan_note: None,
             replan_failures: None,
+            replan_failure_parts: Vec::new(),
             compactions: Vec::new(),
             check_holds: Vec::new(),
         }

@@ -188,3 +188,35 @@ parties, and with nothing else to do the run ended blocked.
 - **Recorded:** `replans` and, until the re-plan is taken, `replan_note` in the run record,
   so a resume in between still sends the failures; a notice and a trace `notice` event name
   the failures.
+
+## Amendment (2026-10-02): the re-plan is re-asked, and its failures reach only the contracts they concern
+
+These bullets supersede the matching parts of the two 2026-09-30 amendments above.
+
+- **No plan is taken without its checks.** The interface checks run on every ask of the
+  interface call (decision 0030, amendment of 2026-10-02); an interface that still fails after
+  that call's budget is not registered, and its edges are counted as not run. The last ask's
+  plan is no longer taken unchecked for the gate to hold on the same failure. The gate still
+  runs the checks again at dispatch, and the handshake runs only there.
+- **The re-plan's contracts answer is re-asked** like the first plan's, at most twice, on an
+  answer that is not JSON or breaks a plan rule; its interfaces get the interface call's own
+  budget. A live re-plan ended on one answer whose file `content` string was never closed, so
+  a line break fell inside it and the parser stopped on a control character. A hold on the
+  re-plan still ends the run (`MAX_REPLANS = 1`).
+- **A re-planned contract's brief carries only the failures that concern it**, as a quoted
+  data block: those of the held plan's interfaces that bound the contract it replaces (the
+  same id before the `re1.` prefix) or that name a file it writes. A contract no failure
+  concerns gets none; before, every re-planned worker's brief carried every failure (requests
+  of 20 to 48 KB). The run record keeps the failures one by one (`replan_failure_parts`: the
+  text, the held parties and the interface's files) next to the joined text.
+
+Tests: `contract_flow.rs` `a_re_plan_answer_that_is_not_json_is_asked_again` (the recorded
+re-plan answer), `a_held_plans_failure_reaches_only_the_contracts_it_concerns`,
+`a_handshake_failure_before_any_work_is_sent_back_to_the_planner_once`,
+`a_handshake_that_keeps_failing_is_held_after_one_re_plan`.
+
+Renamed tests: `after_two_re_asks_a_failing_interface_is_held` is
+`after_three_asks_a_failing_interface_is_counted_unchecked_and_the_run_goes_on`;
+`a_plan_the_gate_holds_before_any_work_is_re_planned_once_with_the_failure` is
+`a_held_plans_failure_reaches_only_the_contracts_it_concerns` (a stub-compile failure no longer
+reaches the gate, so a handshake mismatch holds the plan there).

@@ -1,0 +1,210 @@
+{
+  "contracts": [
+    {
+      "id": "c1",
+      "instruction": "Implement the `Stack` class in `shapes/library.py` according to its docstring specification. Replace the `raise NotImplementedError` stubs with a working implementation (e.g., using a Python list). Keep other classes intact.",
+      "acceptance": "Run `python3 -m unittest discover -s tests` and confirm it completes successfully without errors.",
+      "writes": [
+        {
+          "path": "shapes/library.py"
+        }
+      ],
+      "depends_on": [],
+      "slices": [
+        "shapes/library.py"
+      ],
+      "tools": [
+        "apply_patch",
+        "graph_slice",
+        "read_file",
+        "shell",
+        "send_message"
+      ],
+      "route": "ollama:qwen3.6:35b",
+      "attempts": 1,
+      "task_kind": "implementation"
+    },
+    {
+      "id": "c2",
+      "instruction": "Implement the `Queue` class in `shapes/library.py` according to its docstring specification. Replace the `raise NotImplementedError` stubs with a working implementation (e.g., using `collections.deque`). Keep previously implemented classes intact.",
+      "acceptance": "Run `python3 -m unittest discover -s tests` and confirm it completes successfully without errors.",
+      "writes": [
+        {
+          "path": "shapes/library.py"
+        }
+      ],
+      "depends_on": [
+        "c1"
+      ],
+      "slices": [
+        "shapes/library.py"
+      ],
+      "tools": [
+        "apply_patch",
+        "graph_slice",
+        "read_file",
+        "shell",
+        "send_message"
+      ],
+      "route": "ollama:qwen3.6:35b",
+      "attempts": 1,
+      "task_kind": "implementation"
+    },
+    {
+      "id": "c3",
+      "instruction": "Implement the `Tally` class in `shapes/library.py` according to its docstring specification. Replace the `raise NotImplementedError` stubs with a working implementation (e.g., using `collections.Counter`). Keep previously implemented classes intact.",
+      "acceptance": "Run `python3 -m unittest discover -s tests` and confirm it completes successfully without errors.",
+      "writes": [
+        {
+          "path": "shapes/library.py"
+        }
+      ],
+      "depends_on": [
+        "c2"
+      ],
+      "slices": [
+        "shapes/library.py"
+      ],
+      "tools": [
+        "apply_patch",
+        "graph_slice",
+        "read_file",
+        "shell",
+        "send_message"
+      ],
+      "route": "ollama:qwen3.6:35b",
+      "attempts": 1,
+      "task_kind": "implementation"
+    },
+    {
+      "id": "c4",
+      "instruction": "Implement the `Interval` class in `shapes/library.py` according to its docstring specification. Replace the `raise NotImplementedError` stubs with a working implementation. Ensure `lo > hi` raises `ValueError`. Keep previously implemented classes intact.",
+      "acceptance": "Run `python3 -m unittest discover -s tests` and confirm it completes successfully without errors.",
+      "writes": [
+        {
+          "path": "shapes/library.py"
+        }
+      ],
+      "depends_on": [
+        "c3"
+      ],
+      "slices": [
+        "shapes/library.py"
+      ],
+      "tools": [
+        "apply_patch",
+        "graph_slice",
+        "read_file",
+        "shell",
+        "send_message"
+      ],
+      "route": "ollama:qwen3.6:35b",
+      "attempts": 1,
+      "task_kind": "implementation"
+    },
+    {
+      "id": "c5",
+      "instruction": "Implement the `Matrix2` class in `shapes/library.py` according to its docstring specification. Replace the `raise NotImplementedError` stubs with a working implementation, including the static constructor and matrix multiplication logic. Keep previously implemented classes intact.",
+      "acceptance": "Run `python3 -m unittest discover -s tests` and confirm it completes successfully without errors.",
+      "writes": [
+        {
+          "path": "shapes/library.py"
+        }
+      ],
+      "depends_on": [
+        "c4"
+      ],
+      "slices": [
+        "shapes/library.py"
+      ],
+      "tools": [
+        "apply_patch",
+        "graph_slice",
+        "read_file",
+        "shell",
+        "send_message"
+      ],
+      "route": "ollama:qwen3.6:35b",
+      "attempts": 1,
+      "task_kind": "implementation"
+    },
+    {
+      "id": "c6",
+      "instruction": "Implement the `RingBuffer` class in `shapes/library.py` according to its docstring specification. Replace the `raise NotImplementedError` stubs with a working implementation that overwrites the oldest item when full. Keep previously implemented classes intact.",
+      "acceptance": "Run `python3 -m unittest discover -s tests` and confirm it completes successfully without errors.",
+      "writes": [
+        {
+          "path": "shapes/library.py"
+        }
+      ],
+      "depends_on": [
+        "c5"
+      ],
+      "slices": [
+        "shapes/library.py"
+      ],
+      "tools": [
+        "apply_patch",
+        "graph_slice",
+        "read_file",
+        "shell",
+        "send_message"
+      ],
+      "route": "ollama:qwen3.6:35b",
+      "attempts": 1,
+      "task_kind": "implementation"
+    },
+    {
+      "id": "c7",
+      "instruction": "Implement the `Temperature` class in `shapes/library.py` according to its docstring specification. Replace the `raise NotImplementedError` stubs with a working implementation, correctly converting between celsius, fahrenheit, and kelvin scales. Keep previously implemented classes intact.",
+      "acceptance": "Run `python3 -m unittest discover -s tests` and confirm it completes successfully without errors.",
+      "writes": [
+        {
+          "path": "shapes/library.py"
+        }
+      ],
+      "depends_on": [
+        "c6"
+      ],
+      "slices": [
+        "shapes/library.py"
+      ],
+      "tools": [
+        "apply_patch",
+        "graph_slice",
+        "read_file",
+        "shell",
+        "send_message"
+      ],
+      "route": "ollama:qwen3.6:35b",
+      "attempts": 1,
+      "task_kind": "implementation"
+    },
+    {
+      "id": "c8",
+      "instruction": "Implement the `WordWrap` class in `shapes/library.py` according to its docstring specification. Replace the `raise NotImplementedError` stubs with a working implementation using greedy word wrapping logic. Keep previously implemented classes intact.",
+      "acceptance": "Run `python3 -m unittest discover -s tests` and confirm all tests pass successfully.",
+      "writes": [
+        {
+          "path": "shapes/library.py"
+        }
+      ],
+      "depends_on": [
+        "c7"
+      ],
+      "slices": [
+        "shapes/library.py"
+      ],
+      "tools": [
+        "apply_patch",
+        "graph_slice",
+        "read_file",
+        "shell",
+        "send_message"
+      ],
+      "route": "ollama:qwen3.6:35b",
+      "attempts": 1,
+      "task_kind": "implementation"
+    }
+  ]
+}

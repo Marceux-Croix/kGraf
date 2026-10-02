@@ -351,7 +351,10 @@ impl RunLoop {
     }
 
     /// Apply an event to the book, then trace it with the counts after it.
-    async fn contract_event(&mut self, record: ContractEvent) -> Result<(), OrchestratorError> {
+    pub(super) async fn contract_event(
+        &mut self,
+        record: ContractEvent,
+    ) -> Result<(), OrchestratorError> {
         let Some(desk) = self.contracts.as_mut() else {
             return Ok(());
         };
@@ -1004,7 +1007,7 @@ impl RunLoop {
     /// stage: artifact, stub-compile, vacuity, handshake) of an interface the
     /// planner wrote. An interface the run was given before planning is not
     /// the planner's: a plan bound by one is never re-planned.
-    pub(super) fn replan_failures(&self) -> Option<String> {
+    pub(super) fn replan_failures(&self) -> Option<Vec<crate::run_state::HeldFailure>> {
         let desk = self.contracts.as_ref()?;
         let untouched = self.record.counters.dispatches == 0
             && self.record.verified_contracts.is_empty()
@@ -1013,7 +1016,7 @@ impl RunLoop {
         if !untouched {
             return None;
         }
-        let mut failures: BTreeMap<String, String> = BTreeMap::new();
+        let mut failures: BTreeMap<String, crate::run_state::HeldFailure> = BTreeMap::new();
         for c in &self.record.open_contracts {
             match &c.status {
                 ContractStatus::Planned => {}
@@ -1029,20 +1032,28 @@ impl RunLoop {
                 if let (Some(ic), Some(InterfaceState::Failed { failure })) =
                     (desk.book.get(&id), desk.book.state(&id))
                 {
-                    failures.insert(ic.label(), failure.to_string());
+                    let paths = ic
+                        .stub
+                        .iter()
+                        .chain(&ic.consumer)
+                        .chain(&ic.tests)
+                        .map(|f| f.path.trim_start_matches("./").to_owned())
+                        .collect();
+                    failures.insert(
+                        ic.label(),
+                        crate::run_state::HeldFailure {
+                            text: format!("interface {}: {failure}", ic.label()),
+                            parties: ic.parties.clone(),
+                            paths,
+                        },
+                    );
                 }
             }
         }
         if failures.is_empty() {
             return None;
         }
-        Some(
-            failures
-                .into_iter()
-                .map(|(label, failure)| format!("interface {label}: {failure}"))
-                .collect::<Vec<_>>()
-                .join("\n"),
-        )
+        Some(failures.into_values().collect())
     }
 
     /// Ask each open party for its statement, independently, and compare.

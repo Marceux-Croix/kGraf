@@ -4602,3 +4602,61 @@ async fn inherited_restrictions_apply_in_an_environment_without_skills() {
     );
     assert!(!worktree.path().join("e").exists(), "the refused write ran");
 }
+
+/// Two rejected `apply_patch` calls in one attempt: from the second on, the
+/// rejection ends with the rule it broke and a minimal valid patch for the
+/// file the call targeted. The first rejection carries none, and a policy
+/// refusal (a write outside the scope) is not a rejected patch and carries
+/// none.
+#[tokio::test]
+async fn a_second_rejected_patch_carries_a_worked_example_for_its_file() {
+    let worktree = tempfile::tempdir().expect("worktree");
+    let provider = Fake::new(true, move |request| match round_of(request) {
+        0 => Round::tool(vec![(
+            "t1",
+            "apply_patch",
+            json!({"patch": "--- a/notes.md\n+++ b/notes.md"}),
+        )]),
+        1 => Round::tool(vec![(
+            "t2",
+            "apply_patch",
+            json!({"patch": "*** Begin Patch\n*** Add File: notes.md\n+x"}),
+        )]),
+        2 => Round::tool(vec![(
+            "t3",
+            "apply_patch",
+            json!({"patch": "*** Begin Patch\n*** Add File: elsewhere/x.rs\n+x\n*** End Patch"}),
+        )]),
+        _ => Round::answer("done"),
+    });
+    let env = env_with(
+        provider.clone(),
+        vec![Arc::new(kgraf_tools::ApplyPatchTool)],
+        CallMode::Stream,
+    );
+    let mut b = brief("w1", "edit it", worktree.path(), 8);
+    b.write_scope = Some(vec![std::path::PathBuf::from("notes.md")]);
+    let handle = spawn_worker(Arc::new(env), b, SpawnOptions::default())
+        .await
+        .expect("spawn");
+    let (events, _) = with_timeout(drain(handle)).await.expect("in time");
+    let (first, _) = finished_output(&events, "t1");
+    assert!(!first.contains("A minimal valid patch"), "{first}");
+    let (second, is_error) = finished_output(&events, "t2");
+    assert!(is_error);
+    assert!(
+        second.contains("The last line of the patch must be exactly `*** End Patch`."),
+        "{second}"
+    );
+    assert!(
+        second.contains("A minimal valid patch for this file:"),
+        "{second}"
+    );
+    assert!(
+        second.contains("*** Add File: notes.md\n+first line"),
+        "{second}"
+    );
+    let (third, _) = finished_output(&events, "t3");
+    assert!(third.starts_with("ERROR: refused: "), "{third}");
+    assert!(!third.contains("A minimal valid patch"), "{third}");
+}

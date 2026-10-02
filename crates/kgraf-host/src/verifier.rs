@@ -117,6 +117,61 @@ fn empty_integration_notice(contract: &str) -> String {
     )
 }
 
+/// The notice of an attempt accepted as an empty integration because an
+/// earlier merge of the run delivered its work (decision 0086). It begins
+/// `unverified:` like the run's other unverified reasons (decision 0093): the
+/// attempt itself changed nothing, and the evidence is the earlier merge.
+fn delivered_earlier_notice(
+    contract: &str,
+    command: &str,
+    writes: &[&str],
+    earlier: &crate::earlier_delivery::EarlierDelivery,
+) -> String {
+    let short: String = earlier.original_base.chars().take(12).collect();
+    format!(
+        "contract {}: unverified: this attempt integrated no change. Its declared files ({}) \
+         were already changed by an earlier merge of this run (contract {}); `{}` passes on the \
+         tree as dispatched and failed at the run's original base {short}, so that merge made it \
+         pass",
+        clean(contract),
+        clean(&writes.join(", ")),
+        clean(&earlier.contracts.join(", ")),
+        clean(command)
+    )
+}
+
+/// Whether `command` passes on a throwaway worktree of `base`. The worktree
+/// is removed on every path; an error means the check could not be run, which
+/// says nothing about whether it passes.
+fn passes_at(
+    manager: &kgraf_sandbox::WorkspaceManager,
+    base: &str,
+    denies: &[PathBuf],
+    command: &str,
+    timeout: Duration,
+) -> Result<bool, String> {
+    let name = crate::workspaces::harness_worktree_name(crate::workspaces::PROBE_PREFIX);
+    let ws = manager
+        .create(&kgraf_sandbox::WorkspaceSpec {
+            name: &name,
+            base,
+            branch: None,
+        })
+        .map_err(|e| format!("cannot create a worktree at {base}: {e}"))?;
+    let ran = run_confined(
+        &ws,
+        manager.repo(),
+        denies,
+        command,
+        timeout,
+        CHECK_OUTPUT_CAP,
+    );
+    let removed = manager.remove(ws);
+    let (passed, _) = ran?;
+    removed.map_err(|e| format!("cannot remove the worktree at {base}: {e}"))?;
+    Ok(passed)
+}
+
 /// The refusal of an attempt that changed none of its declared files.
 fn unchanged_writes_reason(command: &str, writes: &[&str]) -> String {
     format!(
@@ -743,17 +798,69 @@ impl Verifier for CommandVerifier {
                 // remediation is (decision 0018); retried, then held. A handoff
                 // child adopting its parent's worktree is the exception: the
                 // work it continues may already be all there is.
+                //
+                // Another exception: an earlier merge of this run delivered
+                // the work, so the check passes here and failed where the run
+                // started. That is the work's evidence; it is accepted as an
+                // empty integration and said, never silently.
+                let mut delivered_earlier = None;
                 if !write_paths.is_empty() && contract.workspace.is_none() {
-                    return Ok(Verdict::Fail {
-                        reason: unchanged_writes_reason(&command, &write_paths),
-                    });
+                    let refusal = |why: Option<String>| {
+                        let mut reason = unchanged_writes_reason(&command, &write_paths);
+                        if let Some(why) = why {
+                            reason.push_str(&format!(". {why}"));
+                        }
+                        Ok(Verdict::Fail { reason })
+                    };
+                    match crate::earlier_delivery::find(
+                        manager.repo(),
+                        merge_back.integration_branch(),
+                        ws.head(),
+                        &write_paths,
+                    ) {
+                        Err(e) => {
+                            return refusal(Some(format!(
+                                "Whether an earlier merge delivered the work could not be \
+                                 read: {e}"
+                            )));
+                        }
+                        Ok(None) => return refusal(None),
+                        Ok(Some(earlier)) => {
+                            match passes_at(
+                                &manager,
+                                &earlier.original_base,
+                                &denies,
+                                &command,
+                                timeout,
+                            ) {
+                                Ok(false) => delivered_earlier = Some(earlier),
+                                // The check also passes where the run started:
+                                // it proves nothing about the work.
+                                Ok(true) => return refusal(None),
+                                Err(e) => {
+                                    return refusal(Some(format!(
+                                        "The check could not be run at the run's original base \
+                                         to tell whether an earlier merge delivered the work: {e}"
+                                    )));
+                                }
+                            }
+                        }
+                    }
                 }
                 workspaces
                     .empty
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .insert(root);
-                notices.push(empty_integration_notice(&contract.contract));
+                match &delivered_earlier {
+                    Some(earlier) => notices.push(delivered_earlier_notice(
+                        &contract.contract,
+                        &command,
+                        &write_paths,
+                        earlier,
+                    )),
+                    None => notices.push(empty_integration_notice(&contract.contract)),
+                }
                 return Ok(Verdict::Pass {
                     by: command,
                     commit: None,
@@ -806,6 +913,15 @@ impl Verifier for CommandVerifier {
         }
         let scope = check_scope(&self.command, contract, workspace);
         crate::scoped_check::brief(&scope, &self.command)
+    }
+
+    /// The narrowed check a write set gets, read from the repository at plan
+    /// intake (`scoped_check::scope`, the rule attempts are checked by).
+    fn plan_check_scope(&self, writes: &[&str], root: Option<&Path>) -> Option<Vec<String>> {
+        match crate::scoped_check::scope(&self.command, root?, writes) {
+            crate::scoped_check::Scope::Narrowed { selected, .. } => Some(selected),
+            crate::scoped_check::Scope::Whole { .. } => None,
+        }
     }
 }
 

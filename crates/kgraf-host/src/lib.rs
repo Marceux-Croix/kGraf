@@ -139,6 +139,7 @@
 mod assembler;
 pub mod config;
 pub mod deps;
+mod earlier_delivery;
 pub mod error;
 mod gates;
 pub mod host;

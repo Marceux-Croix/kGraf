@@ -903,6 +903,20 @@ impl PermissionControl {
         call_id: &str,
         refusal: Option<(&str, &str)>,
     ) -> Vec<PermissionEvent> {
+        self.settle_call_naming(worker, call_id, refusal, None)
+    }
+
+    /// [`Self::settle_call`], where a refused event names `refused_program`
+    /// (the program of the command a rule matched, [`refused_program`]) as its
+    /// subject instead of the grant's subject: the call's own program may be a
+    /// shell that refused nothing.
+    pub fn settle_call_naming(
+        &self,
+        worker: &str,
+        call_id: &str,
+        refusal: Option<(&str, &str)>,
+        refused_program: Option<&str>,
+    ) -> Vec<PermissionEvent> {
         let staged = self
             .state()
             .staged
@@ -913,6 +927,7 @@ impl PermissionControl {
             match refusal {
                 None => events.extend(self.record_grant(worker, &subject, &by)),
                 Some((refused_by, reason)) => {
+                    let subject = refused_program.map_or(subject, |p| format!("`{p}`"));
                     let mut s = self.state();
                     let mode = s.settings.mode;
                     if !s.refused.insert((
@@ -1219,6 +1234,74 @@ fn split_script(script: &str) -> Vec<String> {
         .collect()
 }
 
+/// The program a simple command runs: its first word that is not a
+/// `VAR=value` assignment.
+fn program_of_command(words: &[String]) -> Option<&str> {
+    words.iter().map(String::as_str).find(|w| !is_assignment(w))
+}
+
+fn is_assignment(word: &str) -> bool {
+    word.split_once('=').is_some_and(|(name, _)| {
+        !name.is_empty()
+            && !name.starts_with(|c: char| c.is_ascii_digit())
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
+}
+
+/// Every program a shell call runs: the call's own program and, for
+/// `sh -c SCRIPT`, the program of each command of the script
+/// ([`simple_commands`]). Distinct, in order.
+pub fn programs_run(input: &serde_json::Value) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for command in simple_commands(&shell_argv(input)) {
+        if let Some(p) = program_of_command(&command)
+            && !out.iter().any(|o| o == p)
+        {
+            out.push(p.to_owned());
+        }
+    }
+    out
+}
+
+/// The text of the rule a refusal reason quotes (`your deny rule `R` ...`,
+/// `your ask rule `R` ...`).
+fn rule_quoted_in(reason: &str) -> Option<&str> {
+    ["deny rule `", "ask rule `"].iter().find_map(|lead| {
+        let rest = &reason[reason.find(lead)? + lead.len()..];
+        rest.split_once('`').map(|(rule, _)| rule)
+    })
+}
+
+/// The program a refusal of a shell call is about, when it is not the
+/// call's own program: `sh -c "mkdir x && python3 -c pass"` refused by the
+/// rule `shell(python3*)` is a refusal of `python3`, not of `sh`, which ran
+/// no refused command. The rule the `reason` quotes is matched against the
+/// call's command lines the way [`hard_limit`] matched it (the whole call
+/// first, then each command of a script); a deletion limit's reason names the
+/// first deleting command. `None` for any other tool or reason: the call's
+/// program stands.
+pub fn refused_program(tool: &str, input: &serde_json::Value, reason: &str) -> Option<String> {
+    if tool != "shell" {
+        return None;
+    }
+    let commands = simple_commands(&shell_argv(input));
+    if let Some(text) = rule_quoted_in(reason) {
+        let rule = Rule::parse(text).ok()?;
+        return commands
+            .iter()
+            .find(|c| rule.matches(tool, &[c.join(" ")]))
+            .and_then(|c| program_of_command(c))
+            .map(str::to_owned);
+    }
+    if reason.contains(DELETING_LEAD) || reason.contains(DELETES_LEAD) {
+        return commands.iter().find_map(|c| {
+            let words: Vec<&str> = c.iter().map(String::as_str).collect();
+            program_index(&words).map(|at| words[at].to_owned())
+        });
+    }
+    None
+}
+
 /// A call's subjects, for rule matching: a shell call's command lines (the
 /// whole argv and each simple command, joined with single spaces), or a file
 /// tool's paths.
@@ -1238,6 +1321,11 @@ pub enum HardLimit {
     Deny(String),
     Ask(String),
 }
+
+/// How a deletion limit's reason begins, so [`refused_program`] knows the
+/// reason came from the deletion check and not from a rule.
+const DELETING_LEAD: &str = "deleting ";
+const DELETES_LEAD: &str = "this command deletes ";
 
 /// Programs that delete what they are given.
 const DELETERS: &[&str] = &["rm", "rmdir", "unlink", "shred"];
@@ -1315,13 +1403,13 @@ pub fn critical_deletion(
                 Target::System(p) => return Some(system_refusal(&p)),
                 Target::Critical(p) => {
                     ask.get_or_insert(HardLimit::Ask(format!(
-                        "this command deletes {p}, a critical path (the workspace itself, its \
+                        "{DELETES_LEAD}{p}, a critical path (the workspace itself, its \
                          .git, or a path outside the workspace); allow it?"
                     )));
                 }
                 Target::Unresolved(p) if recursive => {
                     ask.get_or_insert(HardLimit::Ask(format!(
-                        "this command deletes `{p}` recursively, and kGraf cannot tell what it \
+                        "{DELETES_LEAD}`{p}` recursively, and kGraf cannot tell what it \
                          names; allow it?"
                     )));
                 }
@@ -1334,7 +1422,7 @@ pub fn critical_deletion(
 
 fn system_refusal(path: &str) -> HardLimit {
     HardLimit::Deny(format!(
-        "deleting {path} is refused in every permission mode: it is a system path (the \
+        "{DELETING_LEAD}{path} is refused in every permission mode: it is a system path (the \
          filesystem root, a top-level directory or the home directory)"
     ))
 }
@@ -1892,6 +1980,77 @@ mod tests {
             lim(&shell(&[in_home.as_str()])),
             Some(HardLimit::Deny(_))
         ));
+    }
+
+    #[test]
+    fn a_refusal_names_the_program_of_the_command_a_rule_matched() {
+        let rules = UserRules {
+            deny: vec![Rule::parse("shell(python3*)").expect("rule")],
+            ask: vec![Rule::parse("shell(git push*)").expect("rule")],
+        };
+        let reason_of = |c: &PendingCall| match hard_limit(&rules, c, Some(&home()), Some(&ws())) {
+            Some(HardLimit::Deny(r) | HardLimit::Ask(r)) => r,
+            None => panic!("expected a limit"),
+        };
+        // A deny rule on one command of a script names that command.
+        let wrapped = shell(&["sh", "-c", "mkdir x && python3 -c pass"]);
+        assert_eq!(
+            refused_program("shell", &wrapped.input, &reason_of(&wrapped)).as_deref(),
+            Some("python3")
+        );
+        // An ask rule too, also through `-lc` and a pipe.
+        let ask = shell(&["bash", "-lc", "echo hi | git push origin main"]);
+        assert_eq!(
+            refused_program("shell", &ask.input, &reason_of(&ask)).as_deref(),
+            Some("git")
+        );
+        // A plain call is its own program.
+        let plain = shell(&["python3", "x.py"]);
+        assert_eq!(
+            refused_program("shell", &plain.input, &reason_of(&plain)).as_deref(),
+            Some("python3")
+        );
+        // A rule on the shell itself names the shell.
+        let sh_rules = UserRules {
+            deny: vec![Rule::parse("shell(sh*)").expect("rule")],
+            ask: vec![],
+        };
+        let sh = shell(&["sh", "-c", "mkdir x"]);
+        let Some(HardLimit::Deny(reason)) = hard_limit(&sh_rules, &sh, Some(&home()), Some(&ws()))
+        else {
+            panic!("expected a deny");
+        };
+        assert_eq!(
+            refused_program("shell", &sh.input, &reason).as_deref(),
+            Some("sh")
+        );
+        // A deletion limit names the deleting command, not its shell.
+        let rm = shell(&["sh", "-c", "mkdir x && rm -rf /usr"]);
+        let Some(HardLimit::Deny(reason)) =
+            hard_limit(&UserRules::default(), &rm, Some(&home()), Some(&ws()))
+        else {
+            panic!("expected a deny");
+        };
+        assert_eq!(
+            refused_program("shell", &rm.input, &reason).as_deref(),
+            Some("rm")
+        );
+        // Another tool, or a reason that quotes no rule, leaves the call's own program.
+        assert_eq!(refused_program("apply_patch", &wrapped.input, "x"), None);
+        assert_eq!(refused_program("shell", &wrapped.input, "no rule"), None);
+    }
+
+    #[test]
+    fn programs_run_lists_every_command_of_a_script() {
+        let c = shell(&[
+            "sh",
+            "-c",
+            "A=1 mkdir x && python3 -c pass; /usr/bin/env ls",
+        ]);
+        assert_eq!(
+            programs_run(&c.input),
+            ["sh", "mkdir", "python3", "/usr/bin/env"]
+        );
     }
 
     #[tokio::test]

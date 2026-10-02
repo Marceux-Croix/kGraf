@@ -423,6 +423,52 @@ impl SandboxRunner {
         }
     }
 
+    /// The text of the file at `path` in the base: `None` when the base holds
+    /// no file there (absent, a link, a directory, over the read bound, or not
+    /// UTF-8). Read from the commit the runner was made from, as
+    /// [`SandboxRunner::base_differs`] reads, through the same hardened blob
+    /// reader, or from the base directory. An interface may name a file the
+    /// repository already has by path alone; this is where its content comes
+    /// from.
+    pub async fn read_base(&self, path: &str) -> Result<Option<String>, CheckError> {
+        let rel = path.trim().trim_start_matches("./").to_owned();
+        let max = crate::challenge::MAX_ARTIFACT_BYTES;
+        match &self.base {
+            Resolved::Commit { repo, origin, .. } => {
+                let repo = repo.clone();
+                let sha = origin.clone();
+                blocking(move || {
+                    use kgraf_sandbox::merge::blob::{BlobError, read_blob};
+                    match read_blob(&repo, &sha, &rel, max) {
+                        Ok(bytes) => Ok(String::from_utf8(bytes).ok()),
+                        Err(
+                            BlobError::Absent { .. }
+                            | BlobError::Symlink { .. }
+                            | BlobError::NotAFile { .. }
+                            | BlobError::TooLarge { .. },
+                        ) => Ok(None),
+                        Err(e) => Err(CheckError::Config(format!(
+                            "cannot read `{rel}` at the base commit: {e}"
+                        ))),
+                    }
+                })
+                .await
+            }
+            Resolved::Directory(root) => {
+                let at = root.join(&rel);
+                blocking(move || match std::fs::symlink_metadata(&at) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                    Err(source) => Err(CheckError::Io { path: at, source }),
+                    Ok(m) if !m.is_file() || m.len() > max => Ok(None),
+                    Ok(_) => std::fs::read(&at)
+                        .map(|bytes| String::from_utf8(bytes).ok())
+                        .map_err(|source| CheckError::Io { path: at, source }),
+                })
+                .await
+            }
+        }
+    }
+
     /// Make a fresh tree of the base, overlay `layers` in order, and run `argv`
     /// in the sandbox. Everything the run wrote is removed afterwards, also when
     /// the future is dropped.

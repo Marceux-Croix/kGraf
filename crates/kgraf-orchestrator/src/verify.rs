@@ -77,6 +77,15 @@ pub trait Verifier: Send + Sync {
     fn acceptance_brief(&self, _contract: &OpenContract, _workspace: &Path) -> Option<String> {
         None
     }
+
+    /// The test files (or packages) a contract that declares `writes` would
+    /// be checked by in the repository at `root` (when the run has one), when
+    /// the check narrows to them; `None` when the whole command runs or the
+    /// verifier cannot tell. Read at plan intake: contracts that share one
+    /// write set checked by one test file cannot be verified apart.
+    fn plan_check_scope(&self, _writes: &[&str], _root: Option<&Path>) -> Option<Vec<String>> {
+        None
+    }
 }
 
 /// Beam's ray status.

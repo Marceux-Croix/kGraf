@@ -59,7 +59,9 @@ mod untrusted;
 
 pub(crate) use access::normalize_relative;
 pub use access::{Access, PathCase, detect_path_case};
-pub use apply_patch::{ApplyPatchTool, ProtectedApplyPatch};
+pub use apply_patch::{
+    ApplyPatchTool, PatchTarget, ProtectedApplyPatch, patch_target, rejection_help,
+};
 pub use approval::INVALID_INPUT;
 pub use dependency_refetch::{DependencyRefetch, RefetchOutcome};
 pub use error::{AccessError, ApprovalError, RegistryError, ToolError};
@@ -76,7 +78,7 @@ pub use name::{MAX_WIRE_NAME_CHARS, MCP_PREFIX, QualifiedName};
 pub use output::{BinarySummary, OutputPart, ToolOutput};
 pub use permissions::{
     ModeSource, PermissionControl, PermissionEvent, PermissionMode, PermissionRulesHook,
-    PermissionSettings,
+    PermissionSettings, programs_run, refused_program,
 };
 pub use protected::ProtectedWrites;
 pub use registry::{DiscoveredTools, Exposure, RegisteredTool, ToolRegistry, ToolView};
