@@ -5664,6 +5664,9 @@ mod build_allowlist;
 #[path = "shortfall_tests.rs"]
 mod shortfall;
 
+#[path = "rule_conflict_tests.rs"]
+mod rule_conflict;
+
 #[path = "protected_write_tests.rs"]
 mod protected_write;
 

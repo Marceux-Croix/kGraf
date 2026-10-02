@@ -63,6 +63,8 @@ pub struct RunNowArgs {
     /// The orchestrator's output cap: the user setting or the default
     /// (`run-now` has no flag for it).
     pub planner_max_tokens: u32,
+    /// `--warn-rule-conflicts`, else the user setting, else off.
+    pub warn_rule_conflicts: bool,
     pub window: u64,
     /// `--verify`; without it, the first validation command the project's build
     /// files declare.
@@ -694,6 +696,7 @@ fn run_now_with(
             // would ask is denied.
             permissions: Default::default(),
             approve_plan: false,
+            warn_rule_conflicts: args.warn_rule_conflicts,
         },
     );
     let spend = match run_spend(root, &run_id, &prices_path) {
@@ -1141,6 +1144,7 @@ mod tests {
             max_checkpoints: kgraf_host::limits::DEFAULT_MAX_CHECKPOINTS,
             max_tokens: 16,
             planner_max_tokens: 8_192,
+            warn_rule_conflicts: false,
             window: 1000,
             verify: Some("true".to_owned()),
             force,

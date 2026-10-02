@@ -608,6 +608,26 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   them. A model the catalog does not list has no known limit, and the cap goes to the
   provider as set. Settings shows the same note under a slider when an open project's route
   would lower it.
+- **Warning about rule conflicts.** kGraf runs your own `--verify` command, and any
+  `--gate-command` you set, itself, outside your deny and ask rules, which bind workers. When
+  the setting `warn_rule_conflicts` is on, a run checks each program of those commands
+  against your rules at its start and prints one line for each program a rule blocks, for
+  example:
+
+  ```
+  notice     Your verify command runs python3 and your rules block python3 for workers. kGraf will continue to block workers from accessing python3 and will run your verify command directly, without AI.
+  ```
+
+  The same sentence is recorded in the run's trace as a notice. A chained command
+  (`a && b`, `a; b`, `a | b`, or the commands inside `sh -c`) is split the way a worker's
+  command is, and each part is checked. A gate command reads "Your gate command ..." in the
+  same sentence. The warning changes nothing: your command runs, the rule keeps binding
+  workers, and the run never stops for it. It is off by default. Turn it on in Settings >
+  General > "Warn about rule conflicts" (key `warn_rule_conflicts = true` in the user-level
+  `settings.toml`), or per run with `--warn-rule-conflicts` or `--no-warn-rule-conflicts`
+  (`orchestrate`, `schedule run-now`). A flag outranks the setting; a `warn_rule_conflicts`
+  key in `.kgraf/run.json` counts as a flag for that project. When off, nothing is printed or
+  traced.
 - `--rate-limit ROUTE=RPM[/BURST][@MAX_WAIT_MS]` limits one route's call rate; a call that
   would wait too long fails loudly.
 - Every run indexes the working tree before it starts (incremental: about 65 ms warm and

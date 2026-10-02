@@ -36,6 +36,10 @@ pub const KEY_WORKER_MAX_TOKENS: &str = "worker_max_tokens";
 pub const KEY_PLANNER_MAX_TOKENS: &str = "planner_max_tokens";
 /// `settings.toml` key: the context window assumed for models, in tokens.
 pub const KEY_WINDOW: &str = "context_window";
+/// `settings.toml` key: whether a run warns when the user's own verify or gate
+/// command runs a program the user's deny or ask rules refuse to workers.
+/// Off unless set.
+pub const KEY_WARN_RULE_CONFLICTS: &str = "warn_rule_conflicts";
 
 /// Slider bounds (inclusive).
 pub const ROUNDS_BOUNDS: (u32, u32) = (4, 200);
@@ -54,8 +58,9 @@ pub const DEFAULT_MAX_CHECKPOINTS: u32 = kgraf_runtime::DEFAULT_MAX_CHECKPOINTS;
 pub const DEFAULT_WORKER_MAX_TOKENS: u32 = 16_384;
 pub const DEFAULT_PLANNER_MAX_TOKENS: u32 = 32_768;
 pub const DEFAULT_WINDOW: u64 = 128_000;
+pub const DEFAULT_WARN_RULE_CONFLICTS: bool = false;
 
-/// The five limits, each possibly unset. Used for the user's settings and, in
+/// The five limits and the rule-conflict warning, each possibly unset. Used for the user's settings and, in
 /// the command, for the flags.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct UserLimits {
@@ -64,6 +69,21 @@ pub struct UserLimits {
     pub worker_max_tokens: Option<u32>,
     pub planner_max_tokens: Option<u32>,
     pub window: Option<u64>,
+    /// Not a limit: whether to warn at run start about a verify or gate command
+    /// that runs a program the user's own rules refuse to workers. It lives
+    /// here because it shares the settings file, the flag-then-setting-then-
+    /// default order and the desktop's shared copy with the limits.
+    pub warn_rule_conflicts: Option<bool>,
+}
+
+fn read_bool_key(table: &toml::Table, key: &str) -> Result<Option<bool>> {
+    match table.get(key) {
+        None => Ok(None),
+        Some(v) => v
+            .as_bool()
+            .map(Some)
+            .ok_or_else(|| Error::Invalid(format!("settings: `{key}` must be true or false"))),
+    }
 }
 
 fn read_key(table: &toml::Table, key: &str, lo: u64, hi: u64) -> Result<Option<u64>> {
@@ -99,6 +119,7 @@ impl UserLimits {
             worker_max_tokens: b32(KEY_WORKER_MAX_TOKENS, WORKER_MAX_TOKENS_BOUNDS)?,
             planner_max_tokens: b32(KEY_PLANNER_MAX_TOKENS, PLANNER_MAX_TOKENS_BOUNDS)?,
             window: read_key(&table, KEY_WINDOW, WINDOW_BOUNDS.0, WINDOW_BOUNDS.1)?,
+            warn_rule_conflicts: read_bool_key(&table, KEY_WARN_RULE_CONFLICTS)?,
         })
     }
 
@@ -172,6 +193,8 @@ pub struct ResolvedLimits {
     pub worker_max_tokens: (u32, Source),
     pub planner_max_tokens: (u32, Source),
     pub window: (u64, Source),
+    /// Off by default.
+    pub warn_rule_conflicts: (bool, Source),
 }
 
 impl ResolvedLimits {
@@ -196,6 +219,11 @@ impl ResolvedLimits {
                 DEFAULT_PLANNER_MAX_TOKENS,
             ),
             window: pick(flags.window, user.window, DEFAULT_WINDOW),
+            warn_rule_conflicts: pick(
+                flags.warn_rule_conflicts,
+                user.warn_rule_conflicts,
+                DEFAULT_WARN_RULE_CONFLICTS,
+            ),
         }
     }
 
@@ -446,6 +474,36 @@ mod tests {
             (32_768, None)
         );
         assert_eq!(clamp_output_with(1, std::iter::empty(), table), (1, None));
+    }
+
+    /// The warning setting: off when unset, read as a boolean from the same file,
+    /// a non-boolean refused by key, and flag then setting then default.
+    #[test]
+    fn the_rule_conflict_setting_is_off_by_default_and_follows_the_precedence() {
+        assert_eq!(
+            UserLimits::from_toml_str("")
+                .expect("empty")
+                .warn_rule_conflicts,
+            None
+        );
+        let on = UserLimits::from_toml_str("warn_rule_conflicts = true\n").expect("on");
+        assert_eq!(on.warn_rule_conflicts, Some(true));
+        let e = UserLimits::from_toml_str("warn_rule_conflicts = 1\n")
+            .expect_err("not a boolean")
+            .to_string();
+        assert!(e.contains("warn_rule_conflicts"), "{e}");
+        let none = UserLimits::default();
+        let off = UserLimits {
+            warn_rule_conflicts: Some(false),
+            ..none
+        };
+        let r = |f: &UserLimits, u: &UserLimits| ResolvedLimits::resolve(f, u, 30);
+        assert_eq!(
+            r(&none, &none).warn_rule_conflicts,
+            (false, Source::Default)
+        );
+        assert_eq!(r(&none, &on).warn_rule_conflicts, (true, Source::Setting));
+        assert_eq!(r(&off, &on).warn_rule_conflicts, (false, Source::Flag));
     }
 
     #[test]

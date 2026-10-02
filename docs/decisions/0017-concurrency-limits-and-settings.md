@@ -148,3 +148,15 @@ line reads the same keys.
   of the window (0057), so a window above that does not raise a worker's use.
 - **When a change applies.** Runs started after it. A project's host is reopened when no
   run is active, and a change made during a run waits for it to end.
+
+## Amendment (2026-10-02): one on or off setting beside the limits
+
+Settings > General gains "Warn about rule conflicts", a checkbox (configuration only, so
+0017's boundary holds), off by default. It is the key `warn_rule_conflicts` in the same
+user-level `settings.toml`, read by the same reader, shared with the project hosts in the
+same `SharedLimits` value, and resolved flag, then setting, then default (off). It limits
+nothing; decision 0094's 2026-10-02 amendment says what it does. A change reaches runs
+started after it, as the sliders do. A key in `.kgraf/run.json` counts as a flag for its
+project. The key is written only while on, so a user who never turned it on has no key. The
+control is a checkbox like the page's other toggles, until a switch widget exists
+(`STYLE_GUIDE.md` CMP-SET-4).

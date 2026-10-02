@@ -2257,6 +2257,30 @@ mod tests {
         );
     }
 
+    /// The warning setting reaches the project's host: off without it, on with
+    /// it, and a change reopens the host like a limit does.
+    #[test]
+    fn the_rule_conflict_setting_reaches_the_host() {
+        use kgraf_host::limits::{SharedLimits, UserLimits};
+        let dir = configured_project(1.0);
+        let shared = SharedLimits::new(UserLimits::default());
+        let factory = ProjectFactory::for_project(dir.path()).with_run_limits(shared.clone());
+        let rt = multi_thread();
+        rt.block_on(factory.configured()).expect("configured");
+        assert!(!factory.host().expect("open").config().warn_rule_conflicts);
+        shared.set(UserLimits {
+            warn_rule_conflicts: Some(true),
+            ..UserLimits::default()
+        });
+        assert_eq!(
+            factory.refresh(0),
+            None,
+            "no run: reopened at once or lazily"
+        );
+        rt.block_on(factory.configured()).expect("reopened");
+        assert!(factory.host().expect("open").config().warn_rule_conflicts);
+    }
+
     /// An MCP server in `worker.json` that does not answer fails the build
     /// as transient; through `ScheduledRuns` that counts toward the pause
     /// threshold and does not disable the schedule.

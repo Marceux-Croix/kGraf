@@ -103,6 +103,10 @@ pub struct OrchestrateArgs {
     pub permissions: crate::permissions_cli::PermissionArgs,
     /// `--approve-plan` (decision 0094).
     pub approve_plan: bool,
+    /// Warn at run start about a verify or gate command that runs a program
+    /// your rules block for workers (`--warn-rule-conflicts`, else the user
+    /// setting, else off).
+    pub warn_rule_conflicts: bool,
 }
 
 /// The per-project part of the flags, as the host takes it. What is per
@@ -127,6 +131,7 @@ fn run_config(root: &Path, args: &OrchestrateArgs) -> RunConfig {
         point: args.point,
         verify: args.verify.clone(),
         gate_commands: args.gate_commands.clone(),
+        warn_rule_conflicts: args.warn_rule_conflicts,
         gate_timeout: args.gate_timeout,
         rate_limits: args.rate_limits.clone(),
         contract_checks: args.contract_checks,
@@ -213,6 +218,7 @@ fn notice_line(n: &Notice) -> String {
         Notice::OutputCapClamped { which, clamp } => {
             format!("clamped    {}", clamp.sentence(which))
         }
+        Notice::RuleConflict(conflict) => format!("notice     {}", conflict.sentence()),
         Notice::GraphEmpty { root, files_seen } => format!(
             "graph      empty after indexing {} ({files_seen} file(s) seen): no graph slices \
              for this run, likely no supported language in the tree",
@@ -1224,6 +1230,7 @@ mod tests {
             fetch_deps: kgraf_host::deps::RunFetch::Stored,
             permissions: Default::default(),
             approve_plan: false,
+            warn_rule_conflicts: false,
         }
     }
 
@@ -1512,6 +1519,25 @@ mod tests {
             "gates      cargo test --workspace; python3 -m pytest"
         );
         assert!(notice_line(&Notice::GateCommands(Vec::new())).contains("no quality gate"));
+    }
+
+    /// The rule-conflict warning prints as one `notice` line with the fixed
+    /// wording.
+    #[test]
+    fn the_rule_conflict_warning_prints_as_one_notice_line() {
+        let line = notice_line(&Notice::RuleConflict(
+            kgraf_host::rule_conflicts::RuleConflict {
+                command: "verify",
+                program: "python3".into(),
+            },
+        ));
+        assert_eq!(
+            line,
+            "notice     Your verify command runs python3 and your rules block python3 for \
+             workers. kGraf will continue to block workers from accessing python3 and will run \
+             your verify command directly, without AI."
+        );
+        assert!(!line.contains('\n'));
     }
 
     /// The notices print as the command always printed them.

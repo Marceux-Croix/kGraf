@@ -90,6 +90,12 @@ pub struct RunConfig {
     /// Quality-gate commands (`--gate-command`); empty discovers them.
     #[serde(default)]
     pub gate_commands: Vec<String>,
+    /// Warn at run start when `verify` or a configured gate command runs a
+    /// program the user's deny or ask rules refuse to workers
+    /// (`--warn-rule-conflicts`, the `warn_rule_conflicts` user setting). The
+    /// warning never changes the run. Off unless set.
+    #[serde(default)]
+    pub warn_rule_conflicts: bool,
     /// Longest one gate command, or one run of the acceptance command
     /// (`verify`), may run (`--gate-timeout`, in seconds on disk).
     #[serde(default = "defaults::gate_timeout", with = "seconds")]
@@ -341,6 +347,7 @@ impl RunConfig {
             point: None,
             verify: defaults::verify(),
             gate_commands: Vec::new(),
+            warn_rule_conflicts: crate::limits::DEFAULT_WARN_RULE_CONFLICTS,
             gate_timeout: defaults::gate_timeout(),
             rate_limits: Vec::new(),
             contract_checks: defaults::contract_checks(),
@@ -455,6 +462,11 @@ impl RunConfig {
             && let Some(v) = user.window
         {
             self.window = v;
+        }
+        if unset("warn_rule_conflicts")
+            && let Some(v) = user.warn_rule_conflicts
+        {
+            self.warn_rule_conflicts = v;
         }
     }
 
@@ -1334,6 +1346,7 @@ mod tests {
             worker_max_tokens: Some(2_048),
             planner_max_tokens: Some(65_536),
             window: Some(200_000),
+            warn_rule_conflicts: Some(true),
         };
         std::fs::write(
             &path,
@@ -1349,8 +1362,20 @@ mod tests {
             c.max_checkpoints, 4,
             "the setting fills what the file omits"
         );
+        assert!(
+            c.warn_rule_conflicts,
+            "the setting fills what the file omits"
+        );
         let c = RunConfig::load(dir.path(), &path).expect("load");
         assert_eq!(c.max_checkpoints, 10, "no setting: default");
+        assert!(!c.warn_rule_conflicts, "off by default");
+        std::fs::write(
+            &path,
+            r#"{"routes": ["kimi:model"], "prices": "p.json", "warn_rule_conflicts": false}"#,
+        )
+        .expect("write");
+        let c = RunConfig::load_with(dir.path(), &path, &user).expect("load");
+        assert!(!c.warn_rule_conflicts, "the file wins");
         std::fs::write(
             &path,
             r#"{"routes": ["kimi:model"], "prices": "p.json", "max_checkpoints": 2}"#,

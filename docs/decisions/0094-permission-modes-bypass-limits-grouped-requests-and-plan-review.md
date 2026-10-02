@@ -601,3 +601,33 @@ Evidence: `kgraf-tools` `a_refusal_names_the_program_of_the_command_a_rule_match
 `programs_run_lists_every_command_of_a_script`,
 `a_refusal_of_a_wrapped_command_names_that_commands_program` (`approval.rs`);
 `kgraf-runtime` `a_wrapped_refusal_is_recorded_against_the_refused_program`.
+
+## Amendment (2026-10-02): a warning when your own command runs a program your rules block
+
+kGraf runs the user's own verify command (`--verify`) and configured gate commands itself,
+through the gate runner, outside the approval chain. The user's deny and ask rules bind
+workers; they do not bind these commands. A user who denied `shell(python3*)` and passed
+`--verify "python3 check.py"` may expect the rule to cover the command.
+
+- **A warning, off by default.** With the user setting `warn_rule_conflicts` on (Settings >
+  General, the user-level `settings.toml`, or `--warn-rule-conflicts` and
+  `--no-warn-rule-conflicts` on `orchestrate` and `schedule run-now`, or a run.json key), a
+  run's start splits each user command as a worker's command is split (`sh -c`, `&&`, `;`,
+  `|`) and matches each part with the approval chain's own rule matcher (`hard_limit`). For
+  each program a deny or ask rule matches it prints one line, `notice     ` then the
+  sentence, and records the same sentence as a trace notice. When off, nothing is printed or
+  traced.
+- **Fixed wording.** "Your verify command runs python3 and your rules block python3 for
+  workers. kGraf will continue to block workers from accessing python3 and will run your
+  verify command directly, without AI." The program is substituted; a gate command reads
+  "gate" for "verify".
+- **No change of behavior.** The command runs, the rule keeps binding workers, the run never
+  stops for the warning. The deletion limit is not a rule and is not reported.
+- **Where.** `kgraf-host/src/rule_conflicts.rs`; `Notice::RuleConflict`;
+  `Orchestrator::with_start_notices` traces the sentences when a fresh run opens (not on a
+  resume). The setting rides in `UserLimits` with the run limits (decision 0017's 2026-10-01
+  amendment): same file, same flag-then-setting-then-default order.
+
+Evidence: `kgraf-host` `rule_conflict_tests.rs` (a denied program is said and traced and the
+run completes; off says nothing; an uncovered program says nothing; a chained command matches
+on its second part) and `rule_conflicts::tests`.

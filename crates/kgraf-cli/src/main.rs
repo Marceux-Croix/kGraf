@@ -468,6 +468,16 @@ enum Command {
         /// are not in the local cache stops before it starts.
         #[arg(long)]
         no_fetch_deps: bool,
+        /// Warn at the start of the run when your verify or gate command runs
+        /// a program your deny or ask rules block for workers. The command
+        /// runs anyway. Overrides the `warn_rule_conflicts` user setting; off
+        /// by default.
+        #[arg(long, conflicts_with = "no_warn_rule_conflicts")]
+        warn_rule_conflicts: bool,
+        /// Never warn about a verify or gate command that your rules block
+        /// for workers, whatever the user setting says.
+        #[arg(long)]
+        no_warn_rule_conflicts: bool,
         /// Who answers a permission request past the base policy (decision
         /// 0094): manual (you), accept-edits (file edits granted), auto (your
         /// allow set granted), orchestrator-decides (the orchestrator grants
@@ -686,6 +696,16 @@ enum ScheduleAction {
         /// are not in the local cache stops before it starts.
         #[arg(long)]
         no_fetch_deps: bool,
+        /// Warn at the start of the run when your verify or gate command runs
+        /// a program your deny or ask rules block for workers. The command
+        /// runs anyway. Overrides the `warn_rule_conflicts` user setting; off
+        /// by default.
+        #[arg(long, conflicts_with = "no_warn_rule_conflicts")]
+        warn_rule_conflicts: bool,
+        /// Never warn about a verify or gate command that your rules block
+        /// for workers, whatever the user setting says.
+        #[arg(long)]
+        no_warn_rule_conflicts: bool,
         /// Keep every worker's worktree and its build output after use
         /// (decision 0088); see `kgraf orchestrate --keep-worktrees`.
         #[arg(long)]
@@ -831,6 +851,16 @@ fn resolve_limits(
         eprintln!("{line}");
     }
     Ok(resolved)
+}
+
+/// This run's answer about the rule-conflict warning, from its two flags
+/// (clap refuses both at once): `None` leaves it to the user setting.
+fn warn_choice(warn: bool, no_warn: bool) -> Option<bool> {
+    match (warn, no_warn) {
+        (true, _) => Some(true),
+        (false, true) => Some(false),
+        (false, false) => None,
+    }
 }
 
 fn fetch_choice(fetch: bool, no_fetch: bool) -> kgraf_host::deps::RunFetch {
@@ -1073,6 +1103,8 @@ fn run_cli() -> Result<()> {
             plan_review,
             approve_plan,
             container_sandbox,
+            warn_rule_conflicts,
+            no_warn_rule_conflicts,
         } => {
             let limits = resolve_limits(
                 kgraf_host::limits::UserLimits {
@@ -1081,6 +1113,7 @@ fn run_cli() -> Result<()> {
                     worker_max_tokens: max_tokens,
                     planner_max_tokens,
                     window,
+                    warn_rule_conflicts: warn_choice(warn_rule_conflicts, no_warn_rule_conflicts),
                 },
                 kgraf_host::limits::DEFAULT_ROUNDS_ORCHESTRATED,
                 true,
@@ -1137,6 +1170,7 @@ fn run_cli() -> Result<()> {
                         permissions_file,
                     },
                     approve_plan,
+                    warn_rule_conflicts: limits.warn_rule_conflicts.0,
                 },
             )
         }
@@ -1172,6 +1206,7 @@ fn run_cli() -> Result<()> {
                     worker_max_tokens: max_tokens,
                     planner_max_tokens: None,
                     window,
+                    warn_rule_conflicts: None,
                 },
                 kgraf_host::limits::DEFAULT_ROUNDS_SINGLE_WORKER,
                 false,
@@ -1244,6 +1279,8 @@ fn run_cli() -> Result<()> {
                 shell_timeout,
                 fetch_deps,
                 no_fetch_deps,
+                warn_rule_conflicts,
+                no_warn_rule_conflicts,
                 keep_worktrees,
             } => {
                 let limits = resolve_limits(
@@ -1253,6 +1290,10 @@ fn run_cli() -> Result<()> {
                         worker_max_tokens: max_tokens,
                         planner_max_tokens: None,
                         window,
+                        warn_rule_conflicts: warn_choice(
+                            warn_rule_conflicts,
+                            no_warn_rule_conflicts,
+                        ),
                     },
                     kgraf_host::limits::DEFAULT_ROUNDS_ORCHESTRATED,
                     true,
@@ -1271,6 +1312,7 @@ fn run_cli() -> Result<()> {
                         max_checkpoints: limits.max_checkpoints.0,
                         max_tokens: limits.worker_max_tokens.0,
                         planner_max_tokens: limits.planner_max_tokens.0,
+                        warn_rule_conflicts: limits.warn_rule_conflicts.0,
                         window: limits.window.0,
                         verify,
                         force,
@@ -2582,6 +2624,7 @@ mod tests {
             worker_max_tokens: max_tokens,
             planner_max_tokens,
             window,
+            warn_rule_conflicts: None,
         };
         let user = UserLimits {
             rounds: Some(40),
@@ -2636,6 +2679,65 @@ mod tests {
         assert_eq!(with.max_checkpoints, (2, Source::Flag));
         let without = ResolvedLimits::resolve(&parse(&[]), &user, 12);
         assert_eq!(without.max_checkpoints, (25, Source::Setting));
+    }
+
+    /// The warning flags reach the resolver: no flag leaves it to the user
+    /// setting, and that is off unless the user turned it on; either flag
+    /// outranks the setting; both together are refused.
+    #[test]
+    fn the_rule_conflict_flags_outrank_the_setting_and_default_to_off() {
+        use kgraf_host::limits::{ResolvedLimits, Source, UserLimits};
+        let base = [
+            "kgraf",
+            "orchestrate",
+            "--route",
+            "ollama:llama3",
+            "--prices",
+            "p.json",
+        ];
+        let flags = |extra: &[&str]| {
+            let Command::Orchestrate {
+                warn_rule_conflicts,
+                no_warn_rule_conflicts,
+                ..
+            } = Cli::try_parse_from(base.iter().chain(extra.iter()).copied())
+                .expect("parse")
+                .command
+            else {
+                panic!("not orchestrate");
+            };
+            UserLimits {
+                warn_rule_conflicts: warn_choice(warn_rule_conflicts, no_warn_rule_conflicts),
+                ..UserLimits::default()
+            }
+        };
+        let on = UserLimits {
+            warn_rule_conflicts: Some(true),
+            ..UserLimits::default()
+        };
+        let resolve =
+            |f: &UserLimits, u: &UserLimits| ResolvedLimits::resolve(f, u, 30).warn_rule_conflicts;
+        assert_eq!(
+            resolve(&flags(&[]), &UserLimits::default()),
+            (false, Source::Default)
+        );
+        assert_eq!(resolve(&flags(&[]), &on), (true, Source::Setting));
+        assert_eq!(
+            resolve(&flags(&["--warn-rule-conflicts"]), &UserLimits::default()),
+            (true, Source::Flag)
+        );
+        assert_eq!(
+            resolve(&flags(&["--no-warn-rule-conflicts"]), &on),
+            (false, Source::Flag)
+        );
+        assert!(
+            Cli::try_parse_from(
+                base.iter()
+                    .copied()
+                    .chain(["--warn-rule-conflicts", "--no-warn-rule-conflicts"])
+            )
+            .is_err()
+        );
     }
 
     #[test]

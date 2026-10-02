@@ -859,6 +859,12 @@ worker could write. A command-line flag outranks the setting, which outranks the
 default (30 rounds orchestrated and 12 for a single worker, 16,384 and 32,768 output
 tokens, a 128,000-token window). An output cap is lowered to the model's supported limit
 (`kgraf_core::output_limit`, from the bundled catalog) with a notice.
+A sixth key, `warn_rule_conflicts` (off by default, a checkbox in Settings > General), rides in
+the same file, shared value and precedence but limits nothing: when on, a run's start checks
+the user's verify and configured gate commands against the user's deny and ask rules
+(`kgraf-host/src/rule_conflicts.rs`, using the approval chain's own matcher) and says, as a
+`notice` line and a trace notice, which programs the rules block for workers. It never changes
+the run.
 
 Scheduling has two modes. A play control hands the orchestrator everything.
 Alternatively the user selects nodes and an order, and the orchestrator

@@ -132,6 +132,10 @@ pub enum Notice {
         which: &'static str,
         clamp: crate::limits::OutputClamp,
     },
+    /// The user's verify or gate command runs a program the user's own rules
+    /// refuse to workers, and the `warn_rule_conflicts` setting is on. The
+    /// sentence is the whole notice; the run is not changed.
+    RuleConflict(crate::rule_conflicts::RuleConflict),
 }
 
 /// The output caps of a run, lowered to the models' supported limits: the
@@ -1804,6 +1808,28 @@ impl Host {
             });
         }
         notices(Notice::GateCommands(gate_commands.clone()));
+        // Off unless the user turned it on. The user's own commands run outside
+        // the rules, so this only says so: it prints and traces, and changes
+        // nothing about the run.
+        let orchestrator = if self.config.warn_rule_conflicts {
+            let commands: Vec<(&'static str, &str)> =
+                std::iter::once(("verify", self.config.verify.as_str()))
+                    .chain(
+                        self.config
+                            .gate_commands
+                            .iter()
+                            .map(|c| ("gate", c.as_str())),
+                    )
+                    .collect();
+            let found = crate::rule_conflicts::find(&self.permissions.rules(), &commands);
+            let sentences = found.iter().map(|c| c.sentence()).collect();
+            for conflict in found {
+                notices(Notice::RuleConflict(conflict));
+            }
+            orchestrator.with_start_notices(sentences)
+        } else {
+            orchestrator
+        };
         let orchestrator = orchestrator.with_gate_runner(Arc::new(CommandGateRunner {
             commands: gate_commands.clone(),
             manager: manager.clone(),

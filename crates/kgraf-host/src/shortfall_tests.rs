@@ -25,7 +25,7 @@ const GRANT_MARK: &str = "granted them to this contract";
 
 /// What a scripted worker does.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Worker {
+pub(super) enum Worker {
     /// Runs `cp`; if refused, reports the shortfall; with a grant, runs `cp`
     /// and answers.
     ReportsThenRuns,
@@ -46,7 +46,7 @@ enum Worker {
     Writes,
 }
 
-struct Script {
+pub(super) struct Script {
     worker: Worker,
     /// Worker attempts started (round-0 worker requests).
     attempts: AtomicUsize,
@@ -61,7 +61,7 @@ struct Script {
 }
 
 impl Script {
-    fn new(worker: Worker) -> Arc<Self> {
+    pub(super) fn new(worker: Worker) -> Arc<Self> {
         Arc::new(Self {
             worker,
             attempts: AtomicUsize::new(0),

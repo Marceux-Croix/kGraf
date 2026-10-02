@@ -3078,6 +3078,16 @@ impl ShellApp {
             true,
             &[],
         );
+        crate::interaction::limit_toggle_row(
+            ui,
+            p,
+            "Warn about rule conflicts",
+            "Off by default. On: at the start of a run, kGraf says when your verify or gate \
+             command runs a program your deny or ask rules block for workers. The command \
+             still runs.",
+            "Warn about rule conflicts",
+            &mut limits.warn_rule_conflicts,
+        );
         ui.label(
             RichText::new(
                 "Applies to runs started after the change, and to kgraf commands given no \

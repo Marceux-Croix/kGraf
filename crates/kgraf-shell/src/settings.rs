@@ -367,6 +367,10 @@ pub struct RunLimitSliders {
     pub worker_max_tokens: LimitSlider,
     pub planner_max_tokens: LimitSlider,
     pub window: LimitSlider,
+    /// Warn at run start when your verify or gate command runs a program your
+    /// deny or ask rules refuse to workers. Off by default; not a slider, but it
+    /// rides in the same settings file and shared value as the limits.
+    pub warn_rule_conflicts: bool,
 }
 
 impl Default for RunLimitSliders {
@@ -377,6 +381,7 @@ impl Default for RunLimitSliders {
             worker_max_tokens: LimitSlider::worker_max_tokens(),
             planner_max_tokens: LimitSlider::planner_max_tokens(),
             window: LimitSlider::window(),
+            warn_rule_conflicts: kgraf_host::limits::DEFAULT_WARN_RULE_CONFLICTS,
         }
     }
 }
@@ -390,6 +395,7 @@ impl RunLimitSliders {
             worker_max_tokens: self.worker_max_tokens.chosen().map(|v| v as u32),
             planner_max_tokens: self.planner_max_tokens.chosen().map(|v| v as u32),
             window: self.window.chosen(),
+            warn_rule_conflicts: self.warn_rule_conflicts.then_some(true),
         }
     }
 
@@ -410,6 +416,7 @@ impl RunLimitSliders {
         if let Some(v) = u.window {
             s.window.load_exact(v);
         }
+        s.warn_rule_conflicts = u.warn_rule_conflicts.unwrap_or(s.warn_rule_conflicts);
         s
     }
 }
@@ -627,6 +634,9 @@ struct SettingsFile {
     planner_max_tokens: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     context_window: Option<i64>,
+    /// Written only when on; absent means off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warn_rule_conflicts: Option<bool>,
     appearance: Option<Appearance>,
     #[serde(skip_serializing_if = "Option::is_none")]
     color_vision: Option<kgraf_core::palette::Vision>,
@@ -758,6 +768,7 @@ impl Settings {
             worker_max_tokens: self.limits.worker_max_tokens.chosen().map(|v| v as i64),
             planner_max_tokens: self.limits.planner_max_tokens.chosen().map(|v| v as i64),
             context_window: self.limits.window.chosen().map(|v| v as i64),
+            warn_rule_conflicts: self.limits.warn_rule_conflicts.then_some(true),
             appearance: Some(self.appearance),
             color_vision: (self.color_vision != kgraf_core::palette::Vision::default())
                 .then_some(self.color_vision),
@@ -1276,6 +1287,7 @@ mod tests {
             "worker_max_tokens",
             "planner_max_tokens",
             "context_window",
+            "warn_rule_conflicts",
         ] {
             assert!(!text.contains(key), "{key} is not written while followed");
         }
@@ -1283,6 +1295,7 @@ mod tests {
         s.limits.max_checkpoints.set_by_user(3);
         s.limits.planner_max_tokens.set_by_user(65_536);
         s.limits.window.set_by_user(204_800);
+        s.limits.warn_rule_conflicts = true;
         s.save(&path).expect("save");
         let back = Settings::load(&path).expect("load");
         assert_eq!(back, s);
@@ -1296,6 +1309,8 @@ mod tests {
         assert_eq!(user.planner_max_tokens, Some(65_536));
         assert_eq!(user.window, Some(204_800));
         assert_eq!(user.worker_max_tokens, None);
+        assert_eq!(user.warn_rule_conflicts, Some(true));
+        assert!(back.limits.warn_rule_conflicts);
     }
 
     #[test]
@@ -1318,6 +1333,8 @@ mod tests {
             "planner_max_tokens = 10
 ",
             "context_window = 5
+",
+            "warn_rule_conflicts = 3
 ",
         ] {
             let e = Settings::from_toml_str(bad).expect_err(bad).to_string();

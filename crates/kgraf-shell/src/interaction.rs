@@ -171,6 +171,29 @@ pub fn group_thousands(n: u64) -> String {
     out
 }
 
+/// One on or off setting as a row: a bold label, its description in the
+/// secondary color, then the checkbox. Returns whether it changed this frame.
+pub fn limit_toggle_row(
+    ui: &mut egui::Ui,
+    p: &crate::theme::Palette,
+    label: &str,
+    description: &str,
+    checkbox_label: &str,
+    on: &mut bool,
+) -> bool {
+    // CMP-SET-1: the label, then the description below it in `--text-2`.
+    // TXT-1 and TXT-7: short sentences, and no benefit is claimed. The control
+    // is the checkbox the other toggles on this page use; CMP-SET-4's switch
+    // has no widget here yet. Colors come only from the palette (THM-4).
+    ui.label(
+        egui::RichText::new(label)
+            .font(theme::bold(14.0))
+            .color(p.text),
+    );
+    ui.label(egui::RichText::new(description).small().color(p.text_2));
+    ui.checkbox(on, checkbox_label).changed()
+}
+
 /// One run-limit slider as a setting row: a bold label, its description in the
 /// secondary color (CMP-SET-1), the slider (CMP-SET-2) with its value shown in
 /// tabular numerals, the default as a legend and a "Return to default" action
@@ -1591,5 +1614,40 @@ mod tests {
         h.get_by_label("Return to default").click();
         h.run();
         assert_eq!(h.state().value(), 10);
+    }
+
+    /// The rule-conflict toggle starts off, and a click in the real widget
+    /// (kittest) turns on the value the user's settings carry for the host and
+    /// the command line; a second click turns it off and the key is unset again.
+    #[test]
+    fn the_rule_conflict_toggle_starts_off_and_a_click_sets_the_user_limit() {
+        use crate::settings::RunLimitSliders;
+        use egui_kittest::kittest::Queryable;
+        let mut h = egui_kittest::Harness::new_ui_state(
+            |ui, s: &mut RunLimitSliders| {
+                if !crate::theme::ensure(ui.ctx()) {
+                    return;
+                }
+                limit_toggle_row(
+                    ui,
+                    &crate::theme::Palette::dark(),
+                    "Warn about rule conflicts",
+                    "Off by default.",
+                    "Warn about rule conflicts checkbox",
+                    &mut s.warn_rule_conflicts,
+                );
+            },
+            RunLimitSliders::default(),
+        );
+        h.run();
+        assert!(!h.state().warn_rule_conflicts, "off by default");
+        assert_eq!(h.state().user_limits().warn_rule_conflicts, None);
+        h.get_by_label("Warn about rule conflicts checkbox").click();
+        h.run();
+        assert!(h.state().warn_rule_conflicts);
+        assert_eq!(h.state().user_limits().warn_rule_conflicts, Some(true));
+        h.get_by_label("Warn about rule conflicts checkbox").click();
+        h.run();
+        assert_eq!(h.state().user_limits().warn_rule_conflicts, None);
     }
 }

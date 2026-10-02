@@ -1980,6 +1980,31 @@ mod tests {
         assert_eq!(shared.get().max_checkpoints, None);
     }
 
+    /// The rule-conflict toggle is off in a fresh app and, once on, reaches the
+    /// value every project's host is opened from.
+    #[test]
+    fn the_rule_conflict_toggle_reaches_the_shared_value_and_defaults_to_off() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = headless_app(
+            dir.path(),
+            kgraf_capacity::Capacity {
+                max_agents: 4,
+                max_writers: 2,
+                exec_slots: 2,
+                bounds: Vec::new(),
+            },
+        );
+        let shared = kgraf_host::limits::SharedLimits::default();
+        app.use_run_limits(shared.clone());
+        assert_eq!(shared.get().warn_rule_conflicts, None, "off by default");
+        app.settings.limits.warn_rule_conflicts = true;
+        app.sync_run_limits();
+        assert_eq!(shared.get().warn_rule_conflicts, Some(true));
+        app.settings.limits.warn_rule_conflicts = false;
+        app.sync_run_limits();
+        assert_eq!(shared.get().warn_rule_conflicts, None);
+    }
+
     #[test]
     fn indicator_marks_cpu_rendering() {
         let facts = AdapterFacts {

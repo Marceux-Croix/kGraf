@@ -1800,6 +1800,9 @@ pub struct Orchestrator {
     /// The full index pass's extractor report, traced once the run opens
     /// ([`Self::with_index_extractor_changes`]).
     index_extractor_changes: Vec<kgraf_graph::ExtractorChange>,
+    /// Plain-sentence notices the host built for this run's start, traced once
+    /// the run opens ([`Self::with_start_notices`]).
+    start_notices: Vec<String>,
     /// The user's live permission mode, the desk the box reads, and whether
     /// a person attends (decision 0094).
     pub(crate) perms: permission_hooks::PermissionParts,
@@ -1837,6 +1840,7 @@ impl Orchestrator {
             session_call_timeout: sessions::SESSION_CALL_TIMEOUT,
             session_notices: None,
             index_extractor_changes: Vec::new(),
+            start_notices: Vec::new(),
             perms: permission_hooks::PermissionParts::default(),
         })
     }
@@ -1934,6 +1938,13 @@ impl Orchestrator {
         changes: Vec<kgraf_graph::ExtractorChange>,
     ) -> Self {
         self.index_extractor_changes = changes;
+        self
+    }
+
+    /// Sentences the host wants in this run's trace as notices, recorded once
+    /// when the run opens. They change nothing about the run.
+    pub fn with_start_notices(mut self, notices: Vec<String>) -> Self {
+        self.start_notices = notices;
         self
     }
 
@@ -2321,6 +2332,7 @@ impl RunLoop {
             session_call_timeout,
             session_notices,
             index_extractor_changes,
+            start_notices,
             perms,
         } = o;
         // The check setting is the run's: kept in the record, and a resume with
@@ -2508,6 +2520,19 @@ impl RunLoop {
                 changes: index_extractor_changes,
             })
             .await?;
+        }
+        // A fresh run only: a resumed run already traced them when it began.
+        if !resumed {
+            for detail in start_notices {
+                let at_ms = me.now();
+                me.trace(TraceEvent::Notice {
+                    at_ms,
+                    contract: String::new(),
+                    worker: String::new(),
+                    detail,
+                })
+                .await?;
+            }
         }
         if resumed {
             me.on_resume().await?;

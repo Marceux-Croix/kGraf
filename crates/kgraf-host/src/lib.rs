@@ -145,6 +145,7 @@ mod gates;
 pub mod host;
 pub mod limits;
 pub mod migrate;
+pub mod rule_conflicts;
 mod scoped_check;
 mod verifier;
 pub mod worker;
