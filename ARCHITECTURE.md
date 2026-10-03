@@ -1318,6 +1318,14 @@ a rule with no pattern. A mode change reaches running workers and waiting
 requests at once, and requests raised within 2 s of each other are answered as
 one group in the box. The user's deny and ask rules and the refusal to delete
 system paths hold in every mode; a run nobody attends denies what would ask.
+A rule or allow-set tool must name a tool a worker can have: a built-in, a
+Claude Code name read as the kGraf tool that does the same job (`Bash` as
+`shell`, `Edit` and `Write` as `apply_patch`, `Read` as `read_file`), an MCP
+name, or `*`. Any other name is refused where the rule is read (command line,
+user file, desktop), and a rule that no worker tool of the run matches, once the
+MCP servers have listed theirs, is said at run start as a notice and traced.
+Patterns follow Claude Code's wildcards, each only widening what an existing
+rule matched (decision 0094, amended 2026-10-02, rule names).
 Both read each command from every place its program may stand past grouping and
 prefix words (`{`, `(`, `!`, clause keywords, `env`, `command`, `builtin`,
 `exec`, `nohup`, `time`, `VAR=value`, a leading redirection), and follow a shell

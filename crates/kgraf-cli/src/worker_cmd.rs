@@ -451,6 +451,9 @@ fn drive(d: DriveArgs<'_>) -> Result<kgraf_runtime::WorkerResult> {
     }
     println!("transcript {}", transcript_path.display());
 
+    // The control the worker runs under, kept so the rules that name none of
+    // its tools can be said once its MCP servers have listed theirs.
+    let mut permissions = None;
     let prepared = (|| -> Result<Assembly> {
         let (allow_store, rules) = PersistedAllowStore::open(allow_store_path(state), ws.root())
             .context("cannot open the project's allow rules")?;
@@ -530,7 +533,9 @@ fn drive(d: DriveArgs<'_>) -> Result<kgraf_runtime::WorkerResult> {
                 args.tbench_bridge_socket.as_deref(),
             )
             .context("cannot read the project's skill inventory")?,
-            permissions: crate::permissions_cli::control(root, &Default::default())?,
+            permissions: permissions
+                .insert(crate::permissions_cli::control(root, &Default::default())?)
+                .clone(),
             protected_writes: None,
             refusals: None,
         })
@@ -590,6 +595,16 @@ fn drive(d: DriveArgs<'_>) -> Result<kgraf_runtime::WorkerResult> {
                 );
                 for (tool, why) in &report.refused {
                     println!("mcp        {server}: tool `{tool}` NOT registered: {why}");
+                }
+            }
+            // Decision 0094, amended 2026-10-02: a rule naming an MCP tool is
+            // checked once the servers have listed their tools.
+            if let Some(control) = &permissions {
+                let tools: Vec<String> = assembled.env.tools.names().map(str::to_owned).collect();
+                for sentence in
+                    kgraf_tools::permissions::unmatched_entries(&control.settings(), &tools)
+                {
+                    println!("notice     {sentence}");
                 }
             }
             println!(

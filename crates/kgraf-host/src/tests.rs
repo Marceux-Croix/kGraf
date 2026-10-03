@@ -1554,8 +1554,22 @@ async fn the_assembled_prefix_digest_with_the_flag_off_is_pinned() {
 
 /// The real MCP server over stdio, as `kgraf worker`'s tests use it.
 fn echo_server() -> kgraf_mcp::McpServerConfig {
+    kgraf_mcp::McpServerConfig::new(
+        "echoserver",
+        kgraf_mcp::McpTransport::Stdio {
+            command: echo_binary().to_string_lossy().into_owned(),
+            args: vec![],
+            env: BTreeMap::new(),
+            cwd: None,
+        },
+    )
+    .expect("valid")
+}
+
+/// The real MCP server's binary, built once per test process.
+fn echo_binary() -> &'static PathBuf {
     static PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    let binary = PATH.get_or_init(|| {
+    PATH.get_or_init(|| {
         escargot::CargoBuild::new()
             .bin("mcp-echo-server")
             .manifest_path(concat!(
@@ -1568,17 +1582,7 @@ fn echo_server() -> kgraf_mcp::McpServerConfig {
             .expect("build mcp-echo-server")
             .path()
             .to_path_buf()
-    });
-    kgraf_mcp::McpServerConfig::new(
-        "echoserver",
-        kgraf_mcp::McpTransport::Stdio {
-            command: binary.to_string_lossy().into_owned(),
-            args: vec![],
-            env: BTreeMap::new(),
-            cwd: None,
-        },
-    )
-    .expect("valid")
+    })
 }
 
 /// An MCP tool allowed with `kgraf allow` runs in an
@@ -5773,6 +5777,9 @@ mod shortfall;
 
 #[path = "rule_conflict_tests.rs"]
 mod rule_conflict;
+
+#[path = "rule_names_tests.rs"]
+mod rule_names;
 
 #[path = "protected_write_tests.rs"]
 mod protected_write;

@@ -142,6 +142,12 @@ pub enum Notice {
     /// refuse to workers, and the `warn_rule_conflicts` setting is on. The
     /// sentence is the whole notice; the run is not changed.
     RuleConflict(crate::rule_conflicts::RuleConflict),
+    /// A deny or ask rule, or an allow-set tool, of the user's permission
+    /// settings names no tool any worker of this run has (an MCP server that
+    /// does not list it, or a built-in this run does not register), so it
+    /// does nothing in this run (decision 0094, amended 2026-10-02). The
+    /// sentence is the whole notice; it is also traced.
+    RuleMatchesNoTool(String),
 }
 
 /// The output caps of a run, lowered to the models' supported limits: the
@@ -1721,6 +1727,23 @@ impl Host {
             notices,
         )
         .await?;
+        // Decision 0094, amended 2026-10-02: a rule naming an MCP tool is
+        // accepted when it is read, since a server's tools are known only once
+        // it connects. Here every route's environment has connected its
+        // servers, so a rule or allow-set tool that names none of the workers'
+        // tools is said: printed and traced. A notice, not a refusal: the user
+        // file holds rules for every project, and a tool this run's workers
+        // lack cannot be called here.
+        let unmatched_rules = {
+            let tools: Vec<String> = routes
+                .iter()
+                .flat_map(|r| r.env.tools.names().map(str::to_owned))
+                .collect();
+            kgraf_tools::permissions::unmatched_entries(&self.permissions.settings(), &tools)
+        };
+        for sentence in &unmatched_rules {
+            notices(Notice::RuleMatchesNoTool(sentence.clone()));
+        }
         // A prefix that differs from the one the last run in this process used
         // for the same vendor and model is a cache miss: said, not hidden. The
         // process-wide registry records the last prefix in force per group
@@ -1830,8 +1853,10 @@ impl Host {
         notices(Notice::GateCommands(gate_commands.clone()));
         // Off unless the user turned it on. The user's own commands run outside
         // the rules, so this only says so: it prints and traces, and changes
-        // nothing about the run.
-        let orchestrator = if self.config.warn_rule_conflicts {
+        // nothing about the run. The rules that name no tool are traced with
+        // them, always.
+        let mut start_notices = unmatched_rules;
+        if self.config.warn_rule_conflicts {
             let commands: Vec<(&'static str, &str)> =
                 std::iter::once(("verify", self.config.verify.as_str()))
                     .chain(
@@ -1842,14 +1867,12 @@ impl Host {
                     )
                     .collect();
             let found = crate::rule_conflicts::find(&self.permissions.rules(), &commands);
-            let sentences = found.iter().map(|c| c.sentence()).collect();
+            start_notices.extend(found.iter().map(|c| c.sentence()));
             for conflict in found {
                 notices(Notice::RuleConflict(conflict));
             }
-            orchestrator.with_start_notices(sentences)
-        } else {
-            orchestrator
-        };
+        }
+        let orchestrator = orchestrator.with_start_notices(start_notices);
         let orchestrator = orchestrator.with_gate_runner(Arc::new(CommandGateRunner {
             commands: gate_commands.clone(),
             manager: manager.clone(),

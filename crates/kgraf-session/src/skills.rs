@@ -679,17 +679,13 @@ impl SkillSession {
 /// An unknown `allowed-tools` entry as the refusal prints it: the entry, and the
 /// tool this worker has that does the same job when the name is one a coding
 /// agent commonly uses (Claude Code's `Bash`, `Read`, `Edit`, `Write`, `Grep`,
-/// `Glob`, `LS`, or `write_file`). Only a tool the worker really has is suggested.
+/// `Glob`, `LS`, or `write_file`; the table the permission rules read them by,
+/// `kgraf_tools::permissions::tool_hint`). Only a tool the worker really has is
+/// suggested.
 fn describe_unknown(entry: &str, available: &[String]) -> String {
     let name = entry.split('(').next().unwrap_or(entry).trim();
-    let suggestion = match name {
-        "Bash" => "shell",
-        "Read" => "read_file",
-        "Write" | "Edit" | "MultiEdit" | "NotebookEdit" | "write_file" | "edit_file"
-        | "create_file" => "apply_patch",
-        "Grep" | "Glob" => "search_files",
-        "LS" => "list_directory",
-        _ => return format!("`{entry}`"),
+    let Some(suggestion) = kgraf_tools::permissions::tool_hint(name) else {
+        return format!("`{entry}`");
     };
     if available.iter().any(|a| a == suggestion) {
         format!("`{entry}` (use `{suggestion}`)")

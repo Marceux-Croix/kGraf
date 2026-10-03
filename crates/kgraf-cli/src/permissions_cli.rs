@@ -251,6 +251,54 @@ mod tests {
         assert!(settings(PermissionSettings::default(), &bad, false).is_err());
     }
 
+    /// `--deny` and `--ask` take Claude Code's tool names (`Bash(rm -rf*)` is
+    /// a `shell` rule) and refuse a rule naming no tool, naming the flag, the
+    /// rule and the tools a rule may name; the same holds for the user file
+    /// the command reads.
+    #[test]
+    fn a_flag_rule_naming_no_tool_is_refused_and_a_claude_code_name_is_read() {
+        let args = PermissionArgs {
+            deny: vec!["Bash(rm -rf*)".into()],
+            ask: vec!["mcp__gh__delete_repo".into()],
+            ..PermissionArgs::default()
+        };
+        let (s, _) = settings(PermissionSettings::default(), &args, false).expect("s");
+        assert!(s.rules.deny[0].names_tool("shell"));
+        assert_eq!(s.rules.deny[0].text(), "Bash(rm -rf*)");
+        for (deny, ask, flag) in [
+            (vec!["bash(rm -rf*)".to_owned()], vec![], "--deny"),
+            (vec![], vec!["WebFetch".to_owned()], "--ask"),
+        ] {
+            let bad = PermissionArgs {
+                deny,
+                ask,
+                ..PermissionArgs::default()
+            };
+            let e = format!(
+                "{:#}",
+                settings(PermissionSettings::default(), &bad, false).expect_err(flag)
+            );
+            assert!(e.starts_with(flag), "{e}");
+            assert!(e.contains("which is no kGraf tool"), "{e}");
+            assert!(e.contains("apply_patch") && e.contains("shell"), "{e}");
+        }
+        let dir = tempfile::tempdir().expect("dir");
+        let file = dir.path().join("user").join("permissions.toml");
+        std::fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&file, "deny = [\"Bah(rm*)\"]").expect("write");
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project).expect("project");
+        let e = control(
+            &project,
+            &PermissionArgs {
+                permissions_file: Some(file),
+                ..PermissionArgs::default()
+            },
+        )
+        .expect_err("refused");
+        assert!(format!("{e:#}").contains("`Bah(rm*)`"), "{e:#}");
+    }
+
     /// `--script-constructs` wins over the file's list, `none` included;
     /// without the flag the file's list holds; with neither, all are off.
     /// The start line names what is on.

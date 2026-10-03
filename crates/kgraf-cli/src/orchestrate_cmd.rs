@@ -228,6 +228,7 @@ fn notice_line(n: &Notice) -> String {
             format!("clamped    {}", clamp.sentence(which))
         }
         Notice::RuleConflict(conflict) => format!("notice     {}", conflict.sentence()),
+        Notice::RuleMatchesNoTool(sentence) => format!("notice     {sentence}"),
         Notice::GraphEmpty { root, files_seen } => format!(
             "graph      empty after indexing {} ({files_seen} file(s) seen): no graph slices \
              for this run, likely no supported language in the tree",

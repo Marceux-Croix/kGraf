@@ -45,6 +45,12 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+#[path = "permission_names.rs"]
+pub mod permission_names;
+pub use permission_names::{
+    BUILTIN_TOOLS, CLAUDE_CODE_ALIASES, claude_code_alias, tool_hint, unmatched_entries,
+};
+
 /// The name of the hook that enforces the user's rules and the critical-path
 /// limit. An ask from it is a hard ask: no persisted allow rule covers it and
 /// no mode grants it; a run nobody attends denies it.
@@ -199,16 +205,33 @@ impl ModeSource {
     }
 }
 
-/// One user rule: `tool` (every call of the tool) or `tool(pattern)`, where
-/// the pattern matches a call's subject exactly, or as a prefix when it ends
-/// in `*`. A shell call's subjects are its command line and every simple
-/// command of a `sh -c` script, each also from every place its program may
-/// stand past prefix words ([`subjects`]); a file tool's are the paths it
-/// writes.
+/// One user rule: `tool` (every call of the tool) or `tool(pattern)`. A `*`
+/// in the pattern stands for any text; a pattern with no `*` matches a
+/// subject exactly; a trailing ` *` or `:*` that is the only wildcard also
+/// matches the bare command (Claude Code's forms). A shell call's subjects
+/// are its command line and every simple command of a `sh -c` script, each
+/// also from every place its program may stand past prefix words
+/// ([`subjects`]); a file tool's are the paths it writes or reads.
+///
+/// The tool must be one a worker can have ([`permission_names`]): a kGraf
+/// tool, a Claude Code name read as one (`Bash(rm *)` is `shell(rm *)`), an
+/// MCP name, or `*`. Anything else is refused when the rule is read, since it
+/// would match nothing. [`Rule::text`] is the rule as the user wrote it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Rule {
+    /// The kGraf tool (or tool-name glob) the rule is on.
     tool: String,
+    /// The pattern as kGraf matches it.
     pattern: Option<String>,
+    /// The rule as written, for messages and the user file.
+    written: String,
+    /// The pattern as written, when reading it changed it (`git:*` read as
+    /// `git *`, `./src/*` as `src/*`). It still matches, so no rule matches
+    /// less than its text did before it was read this way.
+    legacy: Option<String>,
+    /// A Claude Code relative path rule: it matches the path at any depth
+    /// (`Edit(.env)` matches `config/.env`).
+    any_depth: bool,
 }
 
 impl Rule {
@@ -223,37 +246,66 @@ impl Rule {
                 (tool, Some(p.trim().to_owned()))
             }
         };
-        let tool = tool.trim();
-        if tool.is_empty() || tool.chars().any(|c| c.is_whitespace()) {
+        let name = tool.trim();
+        if name.is_empty() || name.chars().any(|c| c.is_whitespace()) {
             return Err(format!("rule `{t}` names no tool"));
         }
         if pattern.as_deref() == Some("") {
             return Err(format!("rule `{t}` has an empty pattern"));
         }
+        let tool = permission_names::canonical_tool(name, t, permission_names::Role::Rule)
+            .map_err(|e| format!("rule {e}"))?;
+        let (canonical, any_depth) = match &pattern {
+            None => (None, false),
+            Some(p) => {
+                let (c, deep) = permission_names::canonical_pattern(name, &tool, p, t)
+                    .map_err(|e| format!("rule {e}"))?;
+                (Some(c), deep)
+            }
+        };
+        let legacy = pattern.filter(|p| canonical.as_ref() != Some(p));
         Ok(Self {
-            tool: tool.to_owned(),
-            pattern,
+            tool,
+            pattern: canonical,
+            written: t.to_owned(),
+            legacy,
+            any_depth,
         })
     }
 
     pub fn text(&self) -> String {
-        match &self.pattern {
-            None => self.tool.clone(),
-            Some(p) => format!("{}({p})", self.tool),
-        }
+        self.written.clone()
+    }
+
+    /// Whether the rule is on the tool with wire name `tool`, whatever its
+    /// pattern.
+    pub fn names_tool(&self, tool: &str) -> bool {
+        permission_names::tool_name_matches(&self.tool, tool)
     }
 
     fn matches(&self, tool: &str, subjects: &[String]) -> bool {
-        if self.tool != tool && self.tool != "*" {
+        if !self.names_tool(tool) {
             return false;
         }
         match &self.pattern {
             None => true,
-            Some(p) => subjects.iter().any(|s| match p.strip_suffix('*') {
-                Some(prefix) => s.starts_with(prefix),
-                None => s == p,
-            }),
+            Some(p) => subjects.iter().any(|s| self.matches_subject(p, s)),
         }
+    }
+
+    fn matches_subject(&self, pattern: &str, subject: &str) -> bool {
+        let at = |s: &str| {
+            permission_names::pattern_matches(pattern, s)
+                || self
+                    .legacy
+                    .as_deref()
+                    .is_some_and(|l| permission_names::glob(l, s))
+        };
+        at(subject)
+            || (self.any_depth
+                && subject
+                    .match_indices('/')
+                    .any(|(i, _)| at(&subject[i + 1..])))
     }
 }
 
@@ -269,7 +321,8 @@ pub struct UserRules {
 pub struct AllowSet {
     /// Shell programs, each an exact `argv[0]`.
     pub programs: BTreeSet<String>,
-    /// Tools by wire name.
+    /// Tools by wire name, or an MCP server's tools (`mcp__<server>`,
+    /// `mcp__<server>__*`). Read through [`AllowSet::with_tools`].
     pub tools: BTreeSet<String>,
     /// Repository paths a contract's write scope may be widened to: exact,
     /// or a prefix when the entry ends in `*`.
@@ -301,8 +354,29 @@ impl AllowSet {
         self.programs.contains(program)
     }
 
+    /// Whether an entry covers the wire name `tool`: the tool itself, or an
+    /// MCP server's tools (`mcp__<server>`, `mcp__<server>__*`).
     pub fn allows_tool(&self, tool: &str) -> bool {
-        self.tools.contains(tool)
+        self.tools
+            .iter()
+            .any(|t| permission_names::tool_name_matches(t, tool))
+    }
+
+    /// Add tools, each a kGraf tool, a Claude Code name read as one (`Bash`
+    /// is `shell`), or an MCP name. Any other name is refused: Auto would
+    /// grant nothing by it.
+    pub fn with_tools<I, S>(mut self, tools: I) -> Result<Self, String>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        for t in tools {
+            let t = t.as_ref().trim();
+            let tool = permission_names::canonical_tool(t, t, permission_names::Role::Allow)
+                .map_err(|e| format!("allow-set tool {e}"))?;
+            self.tools.insert(tool);
+        }
+        Ok(self)
     }
 
     pub fn allows_path(&self, path: &str) -> bool {
@@ -598,10 +672,10 @@ impl PermissionSettings {
         Ok(Self {
             mode: f.mode.unwrap_or_default(),
             allow: AllowSet {
-                tools: f.allow.tools.into_iter().collect(),
                 paths: f.allow.paths,
                 ..AllowSet::default()
             }
+            .with_tools(&f.allow.tools)?
             .with_programs(f.allow.programs)?,
             rules: UserRules {
                 deny: rules(&f.deny)?,
@@ -2906,19 +2980,19 @@ impl<'a> RelaxedReader<'a> {
 }
 
 /// The program a shell rule names, for [`construct_rule_limit`]: the base
-/// name of its pattern's first word, as a prefix when the pattern is that
-/// one word ending in `*`. `None` for a rule on another tool or on every
-/// shell call (those already match every call).
+/// name of its pattern's first word, as a prefix when that word holds a `*`
+/// (the text before the first `*`; a `*` stands for any text, so
+/// `* --version` names every program). `None` for a rule on another tool or
+/// on every shell call (those already match every call).
 fn rule_program(rule: &Rule) -> Option<(String, bool)> {
-    if rule.tool != "shell" && rule.tool != "*" {
+    if !rule.names_tool("shell") {
         return None;
     }
     let pattern = rule.pattern.as_deref()?;
     let first = pattern.split_whitespace().next()?;
-    let one_word = !pattern.trim().contains(char::is_whitespace);
-    let (word, prefix) = match first.strip_suffix('*') {
-        Some(stem) if one_word => (stem, true),
-        _ => (first.trim_end_matches('*'), false),
+    let (word, prefix) = match first.split_once('*') {
+        Some((stem, _)) => (stem, true),
+        None => (first, false),
     };
     Some((base_name(word).to_owned(), prefix))
 }
@@ -3392,20 +3466,26 @@ impl GrantSubject<'_> {
     fn reached_by(&self, rule: &Rule) -> bool {
         match *self {
             Self::Program(program) => {
-                if rule.tool != "shell" && rule.tool != "*" {
+                if !rule.names_tool("shell") {
                     return false;
                 }
                 let Some(p) = &rule.pattern else {
                     return true;
                 };
                 // A one-word prefix pattern (`python*`) matches the program as
-                // a prefix; otherwise the pattern's first word is a program,
+                // a prefix; a first word holding a `*` elsewhere (`py*n x`,
+                // `* --version`) matches a program starting with the text
+                // before it; otherwise the pattern's first word is a program,
                 // and some command line of that program may match the rest.
+                let first = p.split_whitespace().next().unwrap_or_default();
                 match p.strip_suffix('*') {
                     Some(prefix) if !prefix.contains(char::is_whitespace) => {
                         program.starts_with(prefix) || prefix.starts_with(program)
                     }
-                    _ => p.split_whitespace().next() == Some(program),
+                    _ => match first.split_once('*') {
+                        Some((stem, _)) => program.starts_with(stem),
+                        None => first == program,
+                    },
                 }
             }
             Self::Path(path) => {
@@ -3413,11 +3493,11 @@ impl GrantSubject<'_> {
                     return false;
                 }
                 match &rule.pattern {
-                    None => rule.tool == "*" || rule.tool == "apply_patch",
+                    None => rule.names_tool("apply_patch"),
                     Some(_) => rule.matches(&rule.tool, &[path.to_owned()]),
                 }
             }
-            Self::Tool(tool) => rule.tool == tool || rule.tool == "*",
+            Self::Tool(tool) => rule.names_tool(tool),
         }
     }
 }
@@ -3533,6 +3613,10 @@ pub fn group_requests<T: Raised + Clone>(items: &[T]) -> Vec<Vec<T>> {
 #[cfg(test)]
 #[path = "permissions_prefix_tests.rs"]
 mod prefix_tests;
+
+#[cfg(test)]
+#[path = "permission_names_tests.rs"]
+mod name_tests;
 
 #[cfg(test)]
 mod tests {
@@ -4526,10 +4610,10 @@ mod tests {
     #[test]
     fn the_user_file_allow_list_keeps_its_tools_and_paths() {
         let s = PermissionSettings::from_toml_str(
-            "[allow]\ntools = [\"fetch\"]\npaths = [\"docs/*\", \"Cargo.toml\"]\n",
+            "[allow]\ntools = [\"mcp__web__fetch\"]\npaths = [\"docs/*\", \"Cargo.toml\"]\n",
         )
         .expect("parse");
-        assert!(s.allow.tools.contains("fetch"));
+        assert!(s.allow.tools.contains("mcp__web__fetch"));
         assert_eq!(s.allow.paths, vec!["docs/*", "Cargo.toml"]);
     }
 

@@ -3167,7 +3167,9 @@ impl ShellApp {
                  request without asking, except your deny and ask rules and deleting system \
                  paths, and offers no protection against prompt injection. Off: the box does \
                  not offer Bypass. Deny and ask rules, and disable_bypass, are set in the \
-                 user-level permissions.toml.",
+                 user-level permissions.toml. A rule may use Claude Code's tool names (Bash, \
+                 Edit, Write, Read); a rule that names no tool is refused, and the window then \
+                 runs in Manual and says why.",
             )
             .small()
             .color(p.text_2),

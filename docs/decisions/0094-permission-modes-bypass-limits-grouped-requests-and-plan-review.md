@@ -974,3 +974,71 @@ Each regression test fails with its part of the change reverted.
 - **A missing trace is not a notice.** When a run fails before its first event, the command
   no longer prints "the trace could not be read" for a file that was never written. A trace
   that exists and cannot be read still gets the notice.
+
+## Amendment (2026-10-02): a rule names a tool a worker can have
+
+A rule that names a tool no worker has matches nothing, and nothing said so. `Rule::parse` took
+any name: `deny = ["Bash(rm*)"]`, written the way Claude Code spells its shell tool, was
+accepted and compared against calls of a tool named `Bash`, which no worker has, so `rm` ran
+in every mode while the user believed it was denied. `[allow] tools` had the same gap. The
+cause, in `Rule::matches`: `if self.tool != tool && self.tool != "*" { return false; }`, with
+`self.tool` whatever the user wrote.
+
+- **Claude Code's names are read as kGraf's tools.** The matching is the same, so an alias
+  makes a Claude Code habit protect what it says: `Bash` is `shell` (command text; kGraf also
+  matches each command of an `sh -c` script and past wrappers, which Claude Code does not),
+  `Edit`, `Write`, `MultiEdit` and `NotebookEdit` are `apply_patch` (Claude Code consults path
+  rules on `Edit` only; kGraf applies them for all four, the stricter reading), `Read` is
+  `read_file`, `Grep` and `Glob` are `search_files`, `LS` is `list_directory`. Names whose
+  semantics differ: a Claude Code `Read` rule also covers its search tools and blocks an edit
+  of the same path, and an `Edit` rule covers shell redirections; kGraf's `Read` covers
+  `read_file` only, and neither covers a redirection. Claude Code tools kGraf has no
+  counterpart for (`WebFetch`, `WebSearch`, `Agent`, `Task` and the rest) are refused. The
+  rule keeps its text as written for refusals and the user file.
+- **Wildcards follow Claude Code's documentation.** A `*` anywhere stands for any text; a
+  trailing ` *` or `:*` that is the only wildcard also matches the bare command (`ls *` and
+  `ls:*` match `ls`, not `lsof`; `ls*` matches both). A Claude Code path rule names a
+  repository path: relative patterns match at any depth (Claude Code does so for a bare name
+  and `dir/**` in deny and ask rules; kGraf for every relative pattern, the stricter reading),
+  `/path` and `./path` at the repository root. `mcp__<server>` covers every tool of that
+  server, and a deny or ask rule's tool name may be a glob (`mcp__*`). Each of these only
+  widens what a rule matched before: the pattern as written still matches as it did (so
+  `git:*` still matches `git:x`), and a test checks old matching implies new over a corpus.
+- **Any other name is refused where the rule is read.** `--deny`, `--ask`, `permissions.toml`
+  and the desktop all read rules through `Rule::parse`, so each refuses `bash(rm*)`,
+  `WebFetch` or `write_file(src/*)`, naming the rule, a hint where a kGraf tool does the job
+  (`use shell`), and every name a rule may use. So are rules kGraf could never match: a pattern
+  on a tool whose calls name no command or path (`graph_slice(x)`), a Claude Code parameter
+  rule (`Bash(timeout:30)`), a path outside the repository (`Edit(//etc/x)`, `Read(~/.ssh/*)`),
+  and a carve-out (`Edit(!docs/**)`). Refusal, not a notice: the set of built-in names is known
+  when the rule is read, and a deny rule that cannot match must not let a run start. The
+  command line stops; the desktop runs in Manual, where every request asks, and says why.
+- **An MCP name is checked at run start.** A server's tools are known only once it connects,
+  so `mcp__<server>__<tool>`, `mcp__<server>` and MCP globs are accepted when read. After the
+  route probes connect every configured server, each deny or ask rule and allow-set tool that
+  matches none of the workers' tools is said once (`Notice::RuleMatchesNoTool`), printed as a
+  `notice` line and traced as a run-start notice; `kgraf worker` prints the same line once its
+  servers have listed their tools. A notice, not a refusal: the user file serves every
+  project, and a tool this run's workers lack cannot be called in it.
+- **Allow-set tools.** `[allow] tools` take the same names; a wildcard is refused unless it
+  follows one server's literal `mcp__<server>__`, since Auto would grant every tool it matched.
+- **One table.** The skill refusal's hint (`allowed-tools` naming `Bash` suggests `shell`)
+  reads the same table (`kgraf_tools::permissions::tool_hint`).
+- **The desktop has no rule editor.** Rules are set in `permissions.toml`; the Settings
+  Permissions section now says that Claude Code names are read and an unknown name is refused.
+
+Evidence: `kgraf-tools` (`permission_names_tests.rs`:
+`a_claude_code_bash_deny_rule_refuses_the_shell_command_in_every_mode`,
+`a_bash_rule_and_its_shell_rule_match_the_same_calls`,
+`wildcards_match_as_claude_code_documents_them`, `no_rule_matches_less_than_before`,
+`a_rule_or_allow_entry_naming_no_tool_is_refused_with_the_known_names`,
+`a_pattern_that_can_never_match_is_refused`, `mcp_names_are_accepted_and_cover_their_server`,
+`claude_code_path_rules_match_repository_paths`,
+`unmatched_entries_name_each_rule_that_names_no_worker_tool`); `kgraf-cli`
+(`permissions_cli.rs`: `a_flag_rule_naming_no_tool_is_refused_and_a_claude_code_name_is_read`);
+`kgraf-host` (`rule_names_tests.rs`:
+`an_mcp_rule_is_checked_against_the_tools_the_servers_list_at_run_start`, with the real MCP
+echo server over stdio, and `every_builtin_tool_name_is_one_a_rule_may_name`); `kgraf-shell`
+(`permission_bar.rs`:
+`a_rule_naming_no_tool_is_refused_in_the_window_and_a_claude_code_name_loads`). Each
+regression test fails with its part of the change reverted.

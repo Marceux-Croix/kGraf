@@ -837,6 +837,31 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   as a command: a program named as an argument (`find . -exec curl`, `su -c`, `ssh host
   curl`, `trap 'curl' EXIT`), and a command named by a variable.
 
+  A rule names a tool a worker can have, or it is refused where it is read (`--deny`, `--ask`,
+  `permissions.toml`, and the app, which then runs in Manual and says why), with the tools a
+  rule may name. The names are kGraf's tools (`shell`, `apply_patch`, `read_file`,
+  `list_directory`, `search_files`, and the others the refusal lists), `*` for every tool, an
+  MCP server's tool as `mcp__<server>__<tool>`, every tool of a server as `mcp__<server>` or
+  `mcp__<server>__*`, and Claude Code's names, read as the kGraf tool that does the same job:
+  `Bash` as `shell` (`deny = ["Bash(rm *)"]` is `shell(rm *)`), `Edit`, `Write`, `MultiEdit`
+  and `NotebookEdit` as `apply_patch`, `Read` as `read_file`, `Grep` and `Glob` as
+  `search_files`. Patterns follow Claude Code's: a `*` stands for any text, and a trailing ` *`
+  or `:*` that is the only `*` also matches the bare command, so `shell(ls *)` and
+  `shell(ls:*)` match `ls` and `ls -la` but not `lsof`, and `shell(ls*)` matches `lsof` too.
+  A Claude Code path rule names a path in the repository: `Edit(.env)` or `Edit(secrets/**)`
+  matches at any depth, `Edit(/src/**)` and `Edit(./src/*)` only at the root; a path outside
+  the repository (`//...`, `~/...`), a carve-out (`!...`) and a parameter rule
+  (`Bash(timeout:30)`) are refused, as kGraf can never match them. Differences from Claude
+  Code: a `Read` rule covers `read_file` only, so a path the searches must not see needs its
+  own `search_files(...)` rule; a `Read` rule does not stop an edit; an `Edit` rule does not
+  cover a shell redirection. Claude Code tools kGraf does not have (`WebFetch`, `WebSearch`,
+  `Agent`, `Task` and others) are refused. An MCP name is checked when the run starts, once the
+  servers have listed their tools: a deny or ask rule, or an allow-set tool, that names no tool
+  any worker of the run has is printed as a `notice` line and traced, and the run goes on (the
+  same file serves every project, and a tool the workers lack cannot be called). `[allow]
+  tools` take the same names, except a wildcard outside one server's `mcp__<server>__`, since
+  Auto would grant every tool it matched.
+
   Only you set the mode: the dropdown at the top of the orchestrator box, the user-level
   `permissions.toml` (in kGraf's configuration directory, beside the app's `settings.toml`; set
   `KGRAF_PERMISSIONS_PATH` or pass `--permissions-file` to use another), or

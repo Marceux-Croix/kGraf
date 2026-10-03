@@ -1088,4 +1088,26 @@ mod tests {
         assert_eq!(ui.control.mode(), PermissionMode::Manual);
         assert!(notice.is_some());
     }
+
+    /// The window reads the same rules the command line does: a Claude Code
+    /// name is read as the kGraf tool, and a rule naming no tool is refused
+    /// with the notice the window shows, so the window runs in Manual (every
+    /// request asks) instead of trusting a rule that protects nothing.
+    #[test]
+    fn a_rule_naming_no_tool_is_refused_in_the_window_and_a_claude_code_name_loads() {
+        let dir = tempfile::tempdir().expect("dir");
+        let good = dir.path().join("good.toml");
+        std::fs::write(&good, "mode = \"auto\"\ndeny = [\"Bash(rm -rf*)\"]").expect("write");
+        let (ui, notice) = PermissionUi::load(Some(good));
+        assert_eq!(notice, None);
+        assert_eq!(ui.control.mode(), PermissionMode::Auto);
+        assert!(ui.control.rules().deny[0].names_tool("shell"));
+        let bad = dir.path().join("bad.toml");
+        std::fs::write(&bad, "mode = \"auto\"\ndeny = [\"WebFetch\"]").expect("write");
+        let (ui, notice) = PermissionUi::load(Some(bad));
+        assert_eq!(ui.control.mode(), PermissionMode::Manual);
+        let notice = notice.expect("notice");
+        assert!(notice.contains("`WebFetch`"), "{notice}");
+        assert!(notice.contains("which is no kGraf tool"), "{notice}");
+    }
 }
