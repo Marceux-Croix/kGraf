@@ -49,6 +49,7 @@ mod graph_slice;
 pub mod model_tools;
 mod name;
 mod output;
+pub mod permission_edit;
 pub mod permissions;
 pub mod protected;
 mod registry;

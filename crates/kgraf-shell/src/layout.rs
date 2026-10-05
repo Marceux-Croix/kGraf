@@ -3166,10 +3166,9 @@ impl ShellApp {
                 "The permission mode is chosen in the orchestrator box. Bypass grants every \
                  request without asking, except your deny and ask rules and deleting system \
                  paths, and offers no protection against prompt injection. Off: the box does \
-                 not offer Bypass. Deny and ask rules, and disable_bypass, are set in the \
-                 user-level permissions.toml. A rule may use Claude Code's tool names (Bash, \
-                 Edit, Write, Read); a rule that names no tool is refused, and the window then \
-                 runs in Manual and says why.",
+                 not offer Bypass. disable_bypass is set in the user-level permissions.toml, \
+                 which also holds the rules below. A rule that names no tool is refused, and \
+                 the window then runs in Manual and says why.",
             )
             .small()
             .color(p.text_2),
@@ -3194,6 +3193,7 @@ impl ShellApp {
                 }
             }
         }
+        crate::permission_bar::draw_rule_editor(ui, &perm, p);
         for line in crate::permission_bar::draw_script_constructs(ui, &perm, p) {
             if let crate::orchestrator_box::Line::Error(e) = line {
                 self.chrome.notice = Some((e, Instant::now()));

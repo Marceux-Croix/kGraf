@@ -1156,6 +1156,13 @@ impl PermissionControl {
         self.state().settings.rules.clone()
     }
 
+    /// Replace the deny and ask rules (the user edited them). Applies to the
+    /// next call judged, a running worker's included.
+    pub fn set_rules(&self, rules: UserRules) {
+        self.state().settings.rules = rules;
+        self.bump();
+    }
+
     /// Hold a grant the mode made for call `call_id` of `worker` until the
     /// approval chain settles the call ([`Self::settle_call`]): a hook later
     /// in the chain can still refuse it.

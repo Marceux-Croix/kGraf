@@ -17,6 +17,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use kgraf_orchestrator::{AskAnswer, PendingAsk, PermissionRequestView, PlanAnswer, PlanView};
+use kgraf_tools::permission_edit::{self, RuleKind};
 use kgraf_tools::permissions::{
     BYPASS_WARNING, ModeError, ModeSource, PermissionControl, PermissionMode, PermissionSettings,
     ProcessFacts, Raised, SCRIPT_CONSTRUCTS_RISK, ScriptConstruct, group_requests,
@@ -162,6 +163,191 @@ pub fn draw_script_constructs(
         );
     }
     lines
+}
+
+/// The lists the editor shows (decision 0094): deny, ask, and Auto's allowed
+/// programs. The allow set's tools and paths stay editable in the file.
+pub const EDITOR_KINDS: [RuleKind; 3] = [RuleKind::Deny, RuleKind::Ask, RuleKind::AllowProgram];
+
+type Lists = Vec<(RuleKind, Vec<String>)>;
+
+/// What the rule editor keeps between frames: the file's lists as last read,
+/// each field's draft text, and the line the last change produced.
+#[derive(Clone, Debug, Default)]
+struct RuleEditorState {
+    /// `None` until read, and again after a change, so the next frame reads.
+    lists: Option<Result<Lists, String>>,
+    drafts: [String; 3],
+    said: Option<Line>,
+}
+
+/// Add `text` to the list of `kind` in the user file, then apply the lists
+/// to the live control, so the next call any worker makes is judged with it.
+/// The entry is checked first by the loader's own readers; an invalid one
+/// returns the loader's message and writes nothing.
+pub fn add_rule(ui: &PermissionUi, kind: RuleKind, text: &str) -> Result<Line, String> {
+    let entry = permission_edit::validate(kind, text)?;
+    let path = ui
+        .file
+        .as_ref()
+        .ok_or("no user-level permissions file is configured")?;
+    if !path.exists() {
+        // Write the current settings first so the new file also holds them.
+        ui.persist()?;
+    }
+    permission_edit::add_to_file(path, kind, &entry)?;
+    sync_from_file(ui, format!("Added {} `{entry}`", kind_noun(kind)))
+}
+
+/// Remove `entry` from the list of `kind` in the user file and apply the
+/// lists to the live control.
+pub fn remove_rule(ui: &PermissionUi, kind: RuleKind, entry: &str) -> Result<Line, String> {
+    let path = ui
+        .file
+        .as_ref()
+        .ok_or("no user-level permissions file is configured")?;
+    permission_edit::remove_from_file(path, kind, entry)?;
+    sync_from_file(ui, format!("Removed {} `{entry}`", kind_noun(kind)))
+}
+
+fn kind_noun(kind: RuleKind) -> &'static str {
+    match kind {
+        RuleKind::Deny => "deny rule",
+        RuleKind::Ask => "ask rule",
+        RuleKind::AllowProgram => "allowed program",
+        RuleKind::AllowTool => "allowed tool",
+        RuleKind::AllowPath => "allowed path",
+    }
+}
+
+/// Read the file the edit just wrote and give its rules and allow set to the
+/// live control. Mode and switches are left as they are.
+fn sync_from_file(ui: &PermissionUi, said: String) -> Result<Line, String> {
+    let path = ui.file.as_ref().ok_or("no permissions file")?;
+    match PermissionSettings::load(path, None) {
+        Ok(loaded) => {
+            ui.control.set_rules(loaded.rules);
+            ui.control.set_allow(loaded.allow);
+            Ok(Line::Notice(format!(
+                "{said}. It applies to the next call of every worker"
+            )))
+        }
+        Err(e) => Err(format!(
+            "{said}, but the file is not valid, so it is not applied: {e}"
+        )),
+    }
+}
+
+/// The rule editor, in Settings > Permissions: three short lists, each rule
+/// one line with a remove control, and one field with an Add button per list.
+/// Configuration only (CMP-DLG-6). The field checks its text as the user types
+/// and shows the loader's message under it (CMP-FLD-4, error text `--danger`);
+/// a rule that is not valid cannot be added. Each add or remove is written to
+/// the user file at once.
+pub fn draw_rule_editor(ui: &mut egui::Ui, perm: &PermissionUi, p: &crate::theme::Palette) {
+    use egui::RichText;
+    let id = ui.make_persistent_id("permission-rule-editor");
+    let mut st: RuleEditorState = ui.data_mut(|d| d.get_temp(id)).unwrap_or_default();
+    if st.lists.is_none() {
+        st.lists = Some(match &perm.file {
+            None => Err("no user-level permissions file is configured".to_owned()),
+            Some(path) => permission_edit::read_text(path).and_then(|text| {
+                EDITOR_KINDS
+                    .iter()
+                    .map(|k| permission_edit::entries(&text, *k).map(|e| (*k, e)))
+                    .collect()
+            }),
+        });
+    }
+    ui.add_space(8.0);
+    ui.label(
+        RichText::new("Rules")
+            .font(crate::theme::medium(14.0))
+            .color(p.text),
+    );
+    // One short line of shapes (TXT-1); the long form is in the usage guide.
+    ui.label(
+        RichText::new(
+            "Shapes: shell(git push*), apply_patch(docs/*). Claude Code names such as \
+             Bash(...) are read as kGraf tools.",
+        )
+        .small()
+        .color(p.text_2),
+    );
+    let mut change: Option<Result<Line, String>> = None;
+    match st.lists.clone().expect("set above") {
+        Err(e) => {
+            ui.label(RichText::new(e).size(12.0).color(p.danger));
+        }
+        Ok(lists) => {
+            for (n, (kind, entries)) in lists.iter().enumerate() {
+                ui.push_id(*kind, |ui| {
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new(kind.label())
+                            .font(crate::theme::medium(13.0))
+                            .color(p.text),
+                    );
+                    ui.label(RichText::new(kind.explanation()).small().color(p.text_2));
+                    for entry in entries {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(entry).monospace().color(p.text));
+                            // TXT-5: the hover says what the button does.
+                            if crate::chrome::text_button(ui, p.text_2, "Remove")
+                                .on_hover_text(format!("Remove {entry} from {}", kind.label()))
+                                .clicked()
+                            {
+                                change = Some(remove_rule(perm, *kind, entry));
+                            }
+                        });
+                    }
+                    let draft = &mut st.drafts[n];
+                    let field = ui.add(
+                        egui::TextEdit::singleline(draft)
+                            .hint_text(format!("for example {}", kind.example()))
+                            .desired_width(ui.available_width() - 80.0),
+                    );
+                    let checked = if draft.trim().is_empty() {
+                        None
+                    } else {
+                        Some(permission_edit::validate(*kind, draft))
+                    };
+                    let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if crate::chrome::tonal_button(ui, p, "Add").clicked() || enter {
+                        // An invalid rule is not sent: its message is already
+                        // under the field.
+                        match &checked {
+                            Some(Ok(_)) => {
+                                change = Some(add_rule(perm, *kind, draft));
+                                if matches!(change, Some(Ok(_))) {
+                                    draft.clear();
+                                }
+                            }
+                            Some(Err(_)) => {}
+                            None => change = Some(Err("Type a rule first".to_owned())),
+                        }
+                    }
+                    if let Some(Err(e)) = &checked {
+                        ui.label(RichText::new(e).size(12.0).color(p.danger));
+                    }
+                });
+            }
+        }
+    }
+    if let Some(result) = change {
+        st.said = Some(result.unwrap_or_else(Line::Error));
+        st.lists = None;
+    }
+    match &st.said {
+        Some(Line::Notice(t)) => {
+            ui.label(RichText::new(t).size(12.0).color(p.text_2));
+        }
+        Some(Line::Error(t)) => {
+            ui.label(RichText::new(t).size(12.0).color(p.danger));
+        }
+        _ => {}
+    }
+    ui.data_mut(|d| d.insert_temp(id, st));
 }
 
 /// One permission request in the box: a worker's approval ask, or a request
@@ -1109,5 +1295,142 @@ mod tests {
         let notice = notice.expect("notice");
         assert!(notice.contains("`WebFetch`"), "{notice}");
         assert!(notice.contains("which is no kGraf tool"), "{notice}");
+    }
+
+    const EDITOR_FILE: &str = "# my rules\nmode = \"auto\" # keep\nplan_review = true\ndeny = [\"shell(curl*)\"] # no network\nask = [\"shell(git push*)\"]\n\n[allow]\nprograms = [\"make\"]\n";
+
+    fn editor_harness(perm: &PermissionUi) -> egui_kittest::Harness<'static> {
+        let drawn = perm.clone();
+        egui_kittest::Harness::new_ui(move |ui| {
+            if !crate::theme::ensure(ui.ctx()) {
+                return;
+            }
+            draw_rule_editor(ui, &drawn, &crate::theme::Palette::dark());
+        })
+    }
+
+    fn editor_at(dir: &std::path::Path) -> (PermissionUi, egui_kittest::Harness<'static>) {
+        std::fs::write(dir.join("permissions.toml"), EDITOR_FILE).expect("write");
+        let (perm, notice) = PermissionUi::load(Some(dir.join("permissions.toml")));
+        assert_eq!(notice, None);
+        let mut h = editor_harness(&perm);
+        h.run();
+        (perm, h)
+    }
+
+    fn type_into(h: &mut egui_kittest::Harness<'_>, field: usize, text: &str) {
+        use egui_kittest::kittest::Queryable;
+        {
+            let fields: Vec<_> = h
+                .get_all_by_role(egui::accesskit::Role::TextInput)
+                .collect();
+            fields[field].focus();
+        }
+        h.run();
+        h.get_all_by_role(egui::accesskit::Role::TextInput)
+            .nth(field)
+            .expect("field")
+            .type_text(text);
+        h.run();
+    }
+
+    fn file_text(perm: &PermissionUi) -> String {
+        std::fs::read_to_string(perm.file.as_ref().expect("file")).expect("read")
+    }
+
+    #[test]
+    fn the_editor_lists_the_rules_of_the_file_by_kind() {
+        use egui_kittest::kittest::Queryable;
+        let dir = tempfile::tempdir().expect("dir");
+        let (_perm, h) = editor_at(dir.path());
+        for t in [
+            "Deny rules",
+            "Ask rules",
+            "Allowed programs",
+            "shell(curl*)",
+            "shell(git push*)",
+            "make",
+        ] {
+            h.get_by_label(t);
+        }
+        assert_eq!(h.get_all_by_label("Remove").count(), 3);
+        h.get_by_label_contains("Claude Code names such as Bash(...)");
+    }
+
+    #[test]
+    fn a_valid_rule_is_saved_applied_and_listed_after_a_reload() {
+        use egui_kittest::kittest::Queryable;
+        let dir = tempfile::tempdir().expect("dir");
+        let (perm, mut h) = editor_at(dir.path());
+        type_into(&mut h, 0, "Bash(rm -rf*)");
+        h.get_all_by_label("Add").next().expect("add").click();
+        h.run();
+        assert!(file_text(&perm).contains("Bash(rm -rf*)"));
+        assert_eq!(reread(&perm).rules.deny.len(), 2);
+        // The live control, which the workers' hook reads, has it too.
+        assert_eq!(perm.control.rules().deny.len(), 2);
+        h.get_by_label("Bash(rm -rf*)");
+        // A new window reads the file and shows it.
+        let mut again = editor_harness(&perm);
+        again.run();
+        again.get_by_label("Bash(rm -rf*)");
+    }
+
+    #[test]
+    fn an_invalid_rule_shows_the_loaders_message_and_is_not_saved() {
+        use egui_kittest::kittest::Queryable;
+        let dir = tempfile::tempdir().expect("dir");
+        let (perm, mut h) = editor_at(dir.path());
+        let before = file_text(&perm);
+        type_into(&mut h, 0, "WebFetch");
+        let loader = kgraf_tools::permissions::Rule::parse("WebFetch").unwrap_err();
+        h.get_by_label(&loader);
+        h.get_all_by_label("Add").next().expect("add").click();
+        h.run();
+        assert_eq!(file_text(&perm), before);
+        assert_eq!(perm.control.rules().deny.len(), 1);
+        h.get_by_label(&loader);
+    }
+
+    #[test]
+    fn removing_a_rule_saves_and_applies() {
+        use egui_kittest::kittest::Queryable;
+        let dir = tempfile::tempdir().expect("dir");
+        let (perm, mut h) = editor_at(dir.path());
+        h.get_all_by_label("Remove").next().expect("remove").click();
+        h.run();
+        assert!(reread(&perm).rules.deny.is_empty());
+        assert!(perm.control.rules().deny.is_empty());
+        assert!(!file_text(&perm).contains("shell(curl*)"));
+        assert!(h.query_by_label("shell(curl*)").is_none());
+        assert_eq!(reread(&perm).rules.ask.len(), 1);
+    }
+
+    #[test]
+    fn other_keys_and_comments_survive_a_save() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (perm, mut h) = editor_at(dir.path());
+        type_into(&mut h, 1, "shell(rm*)");
+        {
+            use egui_kittest::kittest::Queryable;
+            h.get_all_by_label("Add").nth(1).expect("add").click();
+        }
+        h.run();
+        let text = file_text(&perm);
+        for kept in [
+            "# my rules",
+            "mode = \"auto\" # keep",
+            "plan_review = true",
+            "# no network",
+            "programs = [\"make\"]",
+        ] {
+            assert!(text.contains(kept), "{kept} lost:\n{text}");
+        }
+        let saved = reread(&perm);
+        assert_eq!(saved.mode, PermissionMode::Auto);
+        assert!(saved.plan_review);
+        assert_eq!(saved.rules.ask.len(), 2);
+        // The mode the user chose is untouched in the live control.
+        assert_eq!(perm.control.mode(), PermissionMode::Auto);
     }
 }

@@ -837,6 +837,17 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   as a command: a program named as an argument (`find . -exec curl`, `su -c`, `ssh host
   curl`, `trap 'curl' EXIT`), and a command named by a variable.
 
+  You can edit the rules in Settings > Permissions under "Rules", with no file editing. Three
+  lists show the rules of `permissions.toml`: Deny rules, Ask rules and Allowed programs
+  (`[allow] programs`; the allow set's `tools` and `paths` are edited in the file). Each rule is
+  one line with a Remove button. Type a rule in the field under a list and press Add or Enter.
+  The field checks the rule as you type, with the message the file loader gives, and an invalid
+  rule cannot be added. Each add or remove is written to `permissions.toml` at once (a temporary
+  file, then a rename) and applies to the next call of every worker, running ones included. A
+  rule is not edited in place: remove it and add it again. Only the list you changed is
+  written; the other keys, the comments and the order of the file stay as they were. The window
+  never writes a project file.
+
   A rule names a tool a worker can have, or it is refused where it is read (`--deny`, `--ask`,
   `permissions.toml`, and the app, which then runs in Manual and says why), with the tools a
   rule may name. The names are kGraf's tools (`shell`, `apply_patch`, `read_file`,

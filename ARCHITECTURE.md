@@ -1308,7 +1308,12 @@ retried once each has run, so its contract is not reported unverified when the
 worker ran them as argv. The user may turn on each such construct group (variables, subshells,
 background jobs, input redirects, escapes, outside redirects; all off by
 default) in Settings, `permissions.toml` or `--script-constructs`, never
-`run.json`; a second reader then returns every program it can see, inside
+`run.json`. Settings > Permissions also holds the rule editor
+(`permission_bar::draw_rule_editor`): deny, ask and allowed-program lists, an add field per
+list checked by the loader's own readers (`kgraf_tools::permission_edit::validate`), and a
+remove button per rule. An edit changes only its list in the file's text (`toml_edit`, so
+comments and other keys stay), writes it atomically, then gives the file's rules and allow set
+to the live control (`PermissionControl::set_rules`, `set_allow`); a second reader then returns every program it can see, inside
 substitutions and groups too, and the script is granted when a grant covers
 each. What a variable runs is not seen and not checked; for such a script the
 user's shell rules also match by program name in the script text, in every mode
