@@ -20,7 +20,7 @@ kgraf-secrets = { path = "../kgraf-secrets" }
 # The galaxy renderer mounted in the central panel.
 kgraf-galaxy.workspace = true
 # The per-machine parallelism maximum's breakdown (decision 0067), shown
-# in Settings > General next to the parallelism slider.
+# in Settings > Runs next to the parallelism slider.
 kgraf-capacity.workspace = true
 # `kgraf_provider::limits::last_429`: the capacity re-measure thread's
 # learned-rate overlay reads it directly (decision 0067).
@@ -147,7 +147,9 @@ wiremock.workspace = true
 # Makes a history write fail on demand in the H4 recorder tests (a refusing trigger).
 rusqlite.workspace = true
 # Drives the real widgets through AccessKit in tests (MIT OR Apache-2.0).
-egui_kittest = "0.36.2"
+# `wgpu` renders a test window to an image, for the settings dialog's picture
+# (an ignored test, run by hand).
+egui_kittest = { version = "0.36.2", features = ["wgpu"] }
 # Headless render state for the graph interaction tests.
 pollster = "1.0.1"
 kgraf-tools.workspace = true

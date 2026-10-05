@@ -113,6 +113,16 @@ impl CompactionSlider {
     pub fn update_recommendation(&mut self, recommendation: Recommendation) {
         self.recommendation = recommendation;
     }
+
+    /// The point a run takes from this slider: `None` while it follows the
+    /// unmeasured default, which is the runtime's own default, so the run is
+    /// labeled as running on it; otherwise the value shown.
+    pub fn run_point(&self) -> Option<u8> {
+        match (self.pinned, self.recommendation) {
+            (None, Recommendation::Unmeasured(_)) => None,
+            _ => Some(self.value().percent()),
+        }
+    }
 }
 
 /// The parallelism slider (decision 0067): one number, `max_agents`,
@@ -396,6 +406,8 @@ impl RunLimitSliders {
             planner_max_tokens: self.planner_max_tokens.chosen().map(|v| v as u32),
             window: self.window.chosen(),
             warn_rule_conflicts: self.warn_rule_conflicts.then_some(true),
+            // Not one of these sliders: `Settings::run_limits` adds it.
+            compaction_point: None,
         }
     }
 
@@ -564,6 +576,15 @@ impl Settings {
     /// The switch as the host takes it.
     pub fn worktree_retention(&self) -> kgraf_host::WorktreeRetention {
         kgraf_host::WorktreeRetention::from_delete(self.delete_worker_worktrees)
+    }
+
+    /// What every run the app starts takes from Settings: the run-limit
+    /// sliders, the rule-conflict switch and the compaction point.
+    pub fn run_limits(&self) -> kgraf_host::limits::UserLimits {
+        kgraf_host::limits::UserLimits {
+            compaction_point: self.compaction.run_point(),
+            ..self.limits.user_limits()
+        }
     }
 }
 

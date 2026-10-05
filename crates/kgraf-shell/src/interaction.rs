@@ -171,31 +171,8 @@ pub fn group_thousands(n: u64) -> String {
     out
 }
 
-/// One on or off setting as a row: a bold label, its description in the
-/// secondary color, then the checkbox. Returns whether it changed this frame.
-pub fn limit_toggle_row(
-    ui: &mut egui::Ui,
-    p: &crate::theme::Palette,
-    label: &str,
-    description: &str,
-    checkbox_label: &str,
-    on: &mut bool,
-) -> bool {
-    // CMP-SET-1: the label, then the description below it in `--text-2`.
-    // TXT-1 and TXT-7: short sentences, and no benefit is claimed. The control
-    // is the checkbox the other toggles on this page use; CMP-SET-4's switch
-    // has no widget here yet. Colors come only from the palette (THM-4).
-    ui.label(
-        egui::RichText::new(label)
-            .font(theme::bold(14.0))
-            .color(p.text),
-    );
-    ui.label(egui::RichText::new(description).small().color(p.text_2));
-    ui.checkbox(on, checkbox_label).changed()
-}
-
-/// One run-limit slider as a setting row: a bold label, its description in the
-/// secondary color (CMP-SET-1), the slider (CMP-SET-2) with its value shown in
+/// One run-limit slider as a setting row: its label and description
+/// (CMP-SET-1, through [`crate::settings_rows`]), the slider (CMP-SET-2) with its value shown in
 /// tabular numerals, the default as a legend and a "Return to default" action
 /// once the user has moved away from it (CMP-SET-3, the default standing in for a
 /// recommendation), and, when `note` is given, a note stating the clamp
@@ -210,12 +187,9 @@ pub fn limit_slider_row(
     grouped: bool,
     notes: &[String],
 ) -> bool {
-    ui.label(
-        egui::RichText::new(label)
-            .font(theme::bold(14.0))
-            .color(p.text),
-    );
-    ui.label(egui::RichText::new(description).small().color(p.text_2));
+    use crate::settings_rows as row;
+    row::label(ui, p, label);
+    row::description(ui, p, description);
     let mut value = slider.value();
     let mut widget = egui::Slider::new(&mut value, slider.min()..=slider.max())
         .step_by(slider.step() as f64)
@@ -230,17 +204,17 @@ pub fn limit_slider_row(
     if changed {
         slider.set_by_user(value);
     }
-    ui.label(
-        egui::RichText::new(format!(
+    row::helper(
+        ui,
+        p,
+        &format!(
             "Default: {}",
             if grouped {
                 group_thousands(slider.default_value())
             } else {
                 slider.default_value().to_string()
             }
-        ))
-        .small()
-        .color(p.text_2),
+        ),
     );
     if !slider.follows_default()
         && chrome::text_button(ui, p.primary, "Return to default").clicked()
@@ -249,13 +223,7 @@ pub fn limit_slider_row(
         changed = true;
     }
     for note in notes {
-        egui::Frame::new()
-            .fill(p.additive)
-            .corner_radius(theme::radius::CARD)
-            .inner_margin(egui::Margin::symmetric(16, 12))
-            .show(ui, |ui| {
-                ui.label(egui::RichText::new(note).small().color(p.text_2));
-            });
+        row::note(ui, p, note);
     }
     changed
 }
@@ -281,7 +249,20 @@ pub fn parallelism_controls(
     hosting: bool,
     max_attempts: Option<usize>,
 ) {
-    ui.label("Parallelism (agent sessions live at once)");
+    use crate::settings_rows as row;
+    row::label(ui, p, "Parallelism");
+    // TXT-1: one plain sentence for what the number bounds and when.
+    row::description(
+        ui,
+        p,
+        if hosting {
+            "The most agent sessions live at once, over every run this window hosts. \
+             Applies from the next dispatch."
+        } else {
+            "The most agent sessions live at once, over every run this window hosts. \
+             With no project open it hosts none."
+        },
+    );
     let max = slider.max();
     // The widget's own range must cover a pinned value that now exceeds the
     // maximum (CMP-SET-2 does not itself say what happens above the range;
@@ -296,16 +277,12 @@ pub fn parallelism_controls(
     // CMP-SET-3: the maximum is the "recommendation" a parallelism slider
     // follows; stated as a legend, with a return action once pinned away
     // from it.
-    ui.label(
-        egui::RichText::new(format!("Machine maximum: {max}"))
-            .small()
-            .color(p.text_2),
-    );
+    row::helper(ui, p, &format!("Machine maximum: {max}"));
     if !slider.follows_max() && chrome::text_button(ui, p.primary, "Return to maximum").clicked() {
         slider.return_to_max();
     }
     if let Some(note) = slider.clamp_note() {
-        ui.colored_label(p.danger, note);
+        row::error(ui, p, &note);
     }
     // A live-agent ceiling below a contract's parallel attempts would hold
     // that contract forever. Settings is configuration only (0017): it
@@ -315,17 +292,12 @@ pub fn parallelism_controls(
     if let Some(attempts) = max_attempts
         && (slider.effective() as usize) < attempts
     {
-        ui.colored_label(
-            p.danger,
-            format!("Below the largest attempt count: {attempts}"),
+        row::error(
+            ui,
+            p,
+            &format!("Below the largest attempt count: {attempts}"),
         );
     }
-    let note = if hosting {
-        "Binds every run this window hosts, from the next dispatch."
-    } else {
-        "Binds runs this window hosts; with no project open it hosts none."
-    };
-    ui.label(egui::RichText::new(note).weak());
     if let Some(capacity) = breakdown {
         // CMP-SET-6: a note stating a fixed fact (which bound currently
         // binds, and why), `--additive` fill.
@@ -1289,6 +1261,10 @@ mod tests {
         assert_eq!(most, (3, "r1/a".to_owned()));
         let mut h = egui_kittest::Harness::new_ui_state(
             move |ui, s: &mut ParallelismSlider| {
+                // The row's label uses the medium face the theme installs.
+                if !crate::theme::ensure(ui.ctx()) {
+                    return;
+                }
                 parallelism_controls(
                     ui,
                     &crate::theme::Palette::dark(),
@@ -1628,12 +1604,11 @@ mod tests {
                 if !crate::theme::ensure(ui.ctx()) {
                     return;
                 }
-                limit_toggle_row(
+                crate::settings_rows::toggle(
                     ui,
                     &crate::theme::Palette::dark(),
                     "Warn about rule conflicts",
                     "Off by default.",
-                    "Warn about rule conflicts checkbox",
                     &mut s.warn_rule_conflicts,
                 );
             },
@@ -1642,11 +1617,11 @@ mod tests {
         h.run();
         assert!(!h.state().warn_rule_conflicts, "off by default");
         assert_eq!(h.state().user_limits().warn_rule_conflicts, None);
-        h.get_by_label("Warn about rule conflicts checkbox").click();
+        h.get_by_label("Warn about rule conflicts").click();
         h.run();
         assert!(h.state().warn_rule_conflicts);
         assert_eq!(h.state().user_limits().warn_rule_conflicts, Some(true));
-        h.get_by_label("Warn about rule conflicts checkbox").click();
+        h.get_by_label("Warn about rule conflicts").click();
         h.run();
         assert_eq!(h.state().user_limits().warn_rule_conflicts, None);
     }

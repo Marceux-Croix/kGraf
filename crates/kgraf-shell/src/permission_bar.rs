@@ -5,6 +5,11 @@
 //! a new panel: the box is where the user answers the orchestrator, and the plan
 //! lights what it touches on the graph ("no second place to look").
 //!
+//! The settings dialog's Permissions tab draws its parts from here too: what
+//! reading the file found ([`draw_load_result`]), the rule editor
+//! ([`draw_rule_editor`]) and the script-construct switches
+//! ([`draw_script_constructs`]). The mode itself stays in the box.
+//!
 //! The model ([`PermissionBar`] and the free functions) is pure over a
 //! [`BoxBackend`] and a [`PermissionUi`], so its transitions are tested without
 //! a window; the drawing functions only call it.
@@ -14,7 +19,7 @@
 //! permissions file, never to a project file.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use kgraf_orchestrator::{AskAnswer, PendingAsk, PermissionRequestView, PlanAnswer, PlanView};
 use kgraf_tools::permission_edit::{self, RuleKind};
@@ -25,6 +30,7 @@ use kgraf_tools::permissions::{
 };
 
 use crate::orchestrator_box::{BoxBackend, Line};
+use crate::settings_rows as row;
 
 /// The live control and where the user's changes are written.
 #[derive(Clone, Debug)]
@@ -35,8 +41,10 @@ pub struct PermissionUi {
     pub file: Option<PathBuf>,
     /// What reading the file found: the valid entries, each refused entry
     /// with its reason, the notices, and why Manual is forced, if it is.
-    /// Settings > Permissions shows it.
-    pub load: Arc<SettingsLoad>,
+    /// Shared by every clone (the box of each project, the settings dialog),
+    /// and replaced when the rule editor reads the file again
+    /// ([`PermissionUi::load_result`]).
+    loaded: Arc<RwLock<Arc<SettingsLoad>>>,
 }
 
 impl PermissionUi {
@@ -82,7 +90,7 @@ impl PermissionUi {
             Self {
                 control: Arc::new(control),
                 file,
-                load: Arc::new(load),
+                loaded: Arc::new(RwLock::new(Arc::new(load))),
             },
             notice,
         )
@@ -95,11 +103,23 @@ impl PermissionUi {
         Self {
             control,
             file,
-            load: Arc::new(SettingsLoad {
+            loaded: Arc::new(RwLock::new(Arc::new(SettingsLoad {
                 settings,
                 ..SettingsLoad::default()
-            }),
+            }))),
         }
+    }
+
+    /// What the last read of the file found.
+    pub fn load_result(&self) -> Arc<SettingsLoad> {
+        self.loaded
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    fn set_load_result(&self, load: SettingsLoad) {
+        *self.loaded.write().unwrap_or_else(|p| p.into_inner()) = Arc::new(load);
     }
 
     /// Write the live settings to the user-level file, keeping each refused
@@ -109,7 +129,7 @@ impl PermissionUi {
     fn persist(&self) -> Result<(), String> {
         match &self.file {
             Some(path) => {
-                let text = self.load.file_text(&self.control.settings())?;
+                let text = self.load_result().file_text(&self.control.settings())?;
                 write_settings_file(path, &text).map_err(|e| e.to_string())
             }
             None => Err("no user-level permissions file is configured".to_owned()),
@@ -148,56 +168,48 @@ pub fn set_script_construct(ui: &PermissionUi, construct: ScriptConstruct, on: b
 }
 
 /// The script-construct switches, for the settings surface's Permissions
-/// section: the risk the user accepts, then one switch per construct with
-/// its plain explanation below (CMP-SET-1: label, then a 13 px `--text-2`
-/// description). Each is off until the user turns it on. Returns the lines
-/// of any change.
+/// tab: the risk the user accepts as the section's description, then one
+/// switch per construct with its plain explanation below (CMP-SET-1, through
+/// [`crate::settings_rows`]). Each is off until the user turns it on.
+/// Returns the lines of any change.
 pub fn draw_script_constructs(
     ui: &mut egui::Ui,
     perm: &PermissionUi,
     p: &crate::theme::Palette,
 ) -> Vec<Line> {
-    use egui::RichText;
     let mut lines = Vec::new();
     let on = perm.control.script_constructs();
-    ui.add_space(8.0);
-    ui.label(
-        RichText::new("Shell scripts a mode may grant")
-            .font(crate::theme::medium(14.0))
-            .color(p.text),
-    );
-    ui.label(
-        RichText::new(SCRIPT_CONSTRUCTS_RISK)
-            .small()
-            .color(p.text_2),
-    );
+    row::heading(ui, p, "Shell scripts a mode may grant");
+    row::description(ui, p, SCRIPT_CONSTRUCTS_RISK);
     for construct in ScriptConstruct::ALL {
         let mut checked = on.allows(construct);
-        ui.add_space(4.0);
-        // CMP-SET-4 names a switch; egui's checkbox is the toggle this shell
-        // uses for every on/off setting. TXT-5: the hover says what it does.
-        if ui
-            .checkbox(&mut checked, construct.label())
-            .on_hover_text(
-                "On: a mode that grants programs may grant a script using this, when it \
-                 grants every program kGraf can see in the script.",
-            )
-            .changed()
-        {
+        ui.add_space(8.0);
+        if row::toggle(
+            ui,
+            p,
+            construct.label(),
+            construct.explanation(),
+            &mut checked,
+        ) {
             lines.push(set_script_construct(perm, construct, checked));
         }
-        ui.label(
-            RichText::new(construct.explanation())
-                .small()
-                .color(p.text_2),
-        );
     }
     lines
 }
 
-/// The lists the editor shows (decision 0094): deny, ask, and Auto's allowed
-/// programs. The allow set's tools and paths stay editable in the file.
-pub const EDITOR_KINDS: [RuleKind; 3] = [RuleKind::Deny, RuleKind::Ask, RuleKind::AllowProgram];
+/// The lists the editor shows (decision 0094): every list of the file, the
+/// rules first, then Auto's allow set.
+pub const EDITOR_KINDS: [RuleKind; 5] = RuleKind::ALL;
+
+/// The rule lists, under one heading: blocks and asks in every mode.
+pub const RULE_KINDS: [RuleKind; 2] = [RuleKind::Deny, RuleKind::Ask];
+
+/// The allow set, under one heading: what Auto grants without asking.
+pub const ALLOW_KINDS: [RuleKind; 3] = [
+    RuleKind::AllowProgram,
+    RuleKind::AllowTool,
+    RuleKind::AllowPath,
+];
 
 type Lists = Vec<(RuleKind, Vec<String>)>;
 
@@ -207,16 +219,19 @@ type Lists = Vec<(RuleKind, Vec<String>)>;
 struct RuleEditorState {
     /// `None` until read, and again after a change, so the next frame reads.
     lists: Option<Result<Lists, String>>,
-    drafts: [String; 3],
+    drafts: [String; 5],
     said: Option<Line>,
 }
 
-/// Add `text` to the list of `kind` in the user file, then apply the lists
-/// to the live control, so the next call any worker makes is judged with it.
-/// The entry is checked first by the loader's own readers; an invalid one
-/// returns the loader's message and writes nothing.
+/// Add `text` to the list of `kind` in the user file, then read the file
+/// again and apply it to the live control, so the next call any worker makes
+/// is judged with it. The entry is checked first with the loader's own check
+/// ([`permission_edit::validate`], which calls
+/// [`kgraf_tools::permissions::validate_entry`]); an invalid one returns the
+/// loader's message and writes nothing. An entry that loads with a notice is
+/// added, and the notice is said with it.
 pub fn add_rule(ui: &PermissionUi, kind: RuleKind, text: &str) -> Result<Line, String> {
-    let entry = permission_edit::validate(kind, text)?;
+    let checked = permission_edit::validate(kind, text)?;
     let path = ui
         .file
         .as_ref()
@@ -225,19 +240,23 @@ pub fn add_rule(ui: &PermissionUi, kind: RuleKind, text: &str) -> Result<Line, S
         // Write the current settings first so the new file also holds them.
         ui.persist()?;
     }
-    permission_edit::add_to_file(path, kind, &entry)?;
-    sync_from_file(ui, format!("Added {} `{entry}`", kind_noun(kind)))
+    permission_edit::add_to_file(path, kind, &checked.text)?;
+    let mut said = format!("Added {} `{}`", kind_noun(kind), checked.text);
+    if let Some(notice) = &checked.notice {
+        said = format!("{said}. {}", as_sentence(notice).trim_end_matches('.'));
+    }
+    reload_from_file(ui, said)
 }
 
-/// Remove `entry` from the list of `kind` in the user file and apply the
-/// lists to the live control.
+/// Remove `entry` from the list of `kind` in the user file, then read the
+/// file again and apply it.
 pub fn remove_rule(ui: &PermissionUi, kind: RuleKind, entry: &str) -> Result<Line, String> {
     let path = ui
         .file
         .as_ref()
         .ok_or("no user-level permissions file is configured")?;
     permission_edit::remove_from_file(path, kind, entry)?;
-    sync_from_file(ui, format!("Removed {} `{entry}`", kind_noun(kind)))
+    reload_from_file(ui, format!("Removed {} `{entry}`", kind_noun(kind)))
 }
 
 fn kind_noun(kind: RuleKind) -> &'static str {
@@ -250,32 +269,144 @@ fn kind_noun(kind: RuleKind) -> &'static str {
     }
 }
 
-/// Read the file the edit just wrote and give its rules and allow set to the
-/// live control. Mode and switches are left as they are.
-fn sync_from_file(ui: &PermissionUi, said: String) -> Result<Line, String> {
-    let path = ui.file.as_ref().ok_or("no permissions file")?;
-    match PermissionSettings::load(path, None) {
-        Ok(loaded) => {
-            ui.control.set_rules(loaded.rules);
-            ui.control.set_allow(loaded.allow);
-            Ok(Line::Notice(format!(
-                "{said}. It applies to the next call of every worker"
-            )))
+/// Read the file the edit just wrote entry by entry, as the window reads it
+/// at start ([`PermissionSettings::load_entries`]), and apply it: the valid
+/// rules and allow set go to the live control, and the load result is
+/// replaced, so the refused entries and notices Settings lists are current.
+/// The plan-review switch, Allow Bypass and the script-construct switches
+/// are left as they are: the editor changes only the lists.
+///
+/// A refused deny or ask entry forces Manual, as at start. When the file no
+/// longer has one, the forced Manual is lifted and the file's own mode
+/// applies, as it would at the next start; a mode this process cannot start
+/// in stays Manual with the reason as a notice.
+fn reload_from_file(ui: &PermissionUi, said: String) -> Result<Line, String> {
+    let path = ui
+        .file
+        .as_ref()
+        .ok_or("no user-level permissions file is configured")?;
+    let mut load = PermissionSettings::load_entries(path, None).map_err(|e| {
+        format!("{said}, but the file is not a permissions file, so it is not applied: {e}")
+    })?;
+    ui.control.set_rules(load.settings.rules.clone());
+    ui.control.set_allow(load.settings.allow.clone());
+    let was_forced = ui.load_result().forced_manual.is_some();
+    if load.forced_manual.is_some() {
+        if ui.control.mode() != PermissionMode::Manual {
+            // Manual can always be set.
+            let _ = ui
+                .control
+                .set_mode(PermissionMode::Manual, ModeSource::UserConfig);
         }
-        Err(e) => Err(format!(
-            "{said}, but the file is not valid, so it is not applied: {e}"
-        )),
+    } else if was_forced
+        && load.settings.mode != ui.control.mode()
+        && let Err(e) = ui
+            .control
+            .set_mode(load.settings.mode, ModeSource::UserConfig)
+    {
+        load.notices
+            .insert(0, format!("Permission mode set to Manual: {e}"));
     }
+    ui.set_load_result(load);
+    Ok(Line::Notice(format!(
+        "{said}. It applies to the next call of every worker"
+    )))
 }
 
-/// The rule editor, in Settings > Permissions: three short lists, each rule
-/// one line with a remove control, and one field with an Add button per list.
-/// Configuration only (CMP-DLG-6). The field checks its text as the user types
-/// and shows the loader's message under it (CMP-FLD-4, error text `--danger`);
-/// a rule that is not valid cannot be added. Each add or remove is written to
-/// the user file at once.
-pub fn draw_rule_editor(ui: &mut egui::Ui, perm: &PermissionUi, p: &crate::theme::Palette) {
+/// One list of the rule editor: its label and description, each entry with a
+/// Remove button, then a field with an Add button. A listed entry the loader
+/// refuses is drawn in `--danger`, with the reason on hover (COL-7: a broken
+/// setting). The field checks its text as the user types: a refused entry
+/// shows the loader's message in `--danger`, and an entry that loads but
+/// matches no call shows the loader's notice as helper text (CMP-FLD-4).
+fn draw_rule_list(
+    ui: &mut egui::Ui,
+    perm: &PermissionUi,
+    p: &crate::theme::Palette,
+    kind: RuleKind,
+    entries: &[String],
+    draft: &mut String,
+) -> Option<Result<Line, String>> {
     use egui::RichText;
+    let mut change = None;
+    ui.push_id(kind, |ui| {
+        row::label(ui, p, kind.label());
+        row::description(ui, p, kind.explanation());
+        ui.add_space(4.0);
+        for entry in entries {
+            ui.horizontal(|ui| {
+                // The row is the button's height, so the entry and its Remove
+                // button center on one line.
+                ui.set_min_height(crate::theme::size::BUTTON_S);
+                let refused = permission_edit::validate(kind, entry).err();
+                // TYP-6: an entry is inline code, mono on the additive fill.
+                let text = RichText::new(entry)
+                    .monospace()
+                    .background_color(p.additive)
+                    .color(if refused.is_some() { p.danger } else { p.text });
+                let shown = ui.label(text);
+                if let Some(why) = &refused {
+                    shown.on_hover_text(why);
+                }
+                // TXT-5: the hover says what the button does.
+                if crate::chrome::text_button(ui, p.text_2, "Remove")
+                    .on_hover_text(format!("Remove {entry} from {}", kind.label()))
+                    .clicked()
+                {
+                    change = Some(remove_rule(perm, kind, entry));
+                }
+            });
+        }
+        let mut submit = false;
+        ui.horizontal(|ui| {
+            let field = ui.add(
+                egui::TextEdit::singleline(draft)
+                    .hint_text(format!("for example {}", kind.example()))
+                    .desired_width(ui.available_width() - 64.0),
+            );
+            let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            submit = crate::chrome::tonal_button(ui, p, "Add")
+                .on_hover_text(format!("Add the entry to {}", kind.label()))
+                .clicked()
+                || enter;
+        });
+        let checked = (!draft.trim().is_empty()).then(|| permission_edit::validate(kind, draft));
+        match &checked {
+            Some(Err(e)) => row::error(ui, p, &as_sentence(e)),
+            Some(Ok(c)) => {
+                if let Some(notice) = &c.notice {
+                    row::helper(ui, p, &as_sentence(notice));
+                }
+            }
+            None => {}
+        }
+        if submit {
+            // An invalid entry is not sent: its message is already under
+            // the field.
+            match &checked {
+                Some(Ok(_)) => {
+                    let result = add_rule(perm, kind, draft);
+                    if result.is_ok() {
+                        draft.clear();
+                    }
+                    change = Some(result);
+                }
+                Some(Err(_)) => {}
+                // CMP-FLD-4: an empty submit says so instead of doing nothing.
+                None => change = Some(Err("Type an entry first".to_owned())),
+            }
+        }
+    });
+    change
+}
+
+/// The rule editor, in Settings > Permissions: every list of the user file in
+/// one form. "Rules" holds deny and ask; "Allowed in Auto" holds the allow
+/// set's programs, tools and paths. Each entry is one line with Remove, and
+/// each list has one field with Add. Configuration only (CMP-DLG-6). Each add
+/// or remove is written to the user file at once, keeping its comments, and
+/// the file is read again and applied.
+pub fn draw_rule_editor(ui: &mut egui::Ui, perm: &PermissionUi, p: &crate::theme::Palette) {
     let id = ui.make_persistent_id("permission-rule-editor");
     let mut st: RuleEditorState = ui.data_mut(|d| d.get_temp(id)).unwrap_or_default();
     if st.lists.is_none() {
@@ -289,78 +420,44 @@ pub fn draw_rule_editor(ui: &mut egui::Ui, perm: &PermissionUi, p: &crate::theme
             }),
         });
     }
-    ui.add_space(8.0);
-    ui.label(
-        RichText::new("Rules")
-            .font(crate::theme::medium(14.0))
-            .color(p.text),
-    );
-    // One short line of shapes (TXT-1); the long form is in the usage guide.
-    ui.label(
-        RichText::new(
-            "Shapes: shell(git push*), apply_patch(docs/*). Claude Code names such as \
-             Bash(...) are read as kGraf tools.",
-        )
-        .small()
-        .color(p.text_2),
-    );
     let mut change: Option<Result<Line, String>> = None;
     match st.lists.clone().expect("set above") {
-        Err(e) => {
-            ui.label(RichText::new(e).size(12.0).color(p.danger));
-        }
+        Err(e) => row::error(ui, p, &e),
         Ok(lists) => {
-            for (n, (kind, entries)) in lists.iter().enumerate() {
-                ui.push_id(*kind, |ui| {
-                    ui.add_space(8.0);
-                    ui.label(
-                        RichText::new(kind.label())
-                            .font(crate::theme::medium(13.0))
-                            .color(p.text),
-                    );
-                    ui.label(RichText::new(kind.explanation()).small().color(p.text_2));
-                    for entry in entries {
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(entry).monospace().color(p.text));
-                            // TXT-5: the hover says what the button does.
-                            if crate::chrome::text_button(ui, p.text_2, "Remove")
-                                .on_hover_text(format!("Remove {entry} from {}", kind.label()))
-                                .clicked()
-                            {
-                                change = Some(remove_rule(perm, *kind, entry));
-                            }
-                        });
+            for (title, about, kinds) in [
+                (
+                    "Rules",
+                    "A rule names a tool and a pattern: shell(git push*), apply_patch(docs/*). \
+                     Claude Code names such as Bash(...) are read as kGraf tools; one kGraf \
+                     does not have, such as WebFetch, loads with a notice and matches nothing. \
+                     A refused deny or ask rule keeps the mode at Manual until you correct it.",
+                    &RULE_KINDS[..],
+                ),
+                (
+                    "Allowed in Auto",
+                    "What the Auto mode grants without asking. Deny and ask rules still apply.",
+                    &ALLOW_KINDS[..],
+                ),
+            ] {
+                row::divider(ui, p);
+                row::heading(ui, p, title);
+                row::description(ui, p, about);
+                for kind in kinds {
+                    let n = EDITOR_KINDS
+                        .iter()
+                        .position(|k| k == kind)
+                        .expect("every kind is listed");
+                    let entries = lists
+                        .iter()
+                        .find(|(k, _)| k == kind)
+                        .map(|(_, e)| e.as_slice())
+                        .unwrap_or_default();
+                    ui.add_space(12.0);
+                    if let Some(c) = draw_rule_list(ui, perm, p, *kind, entries, &mut st.drafts[n])
+                    {
+                        change = Some(c);
                     }
-                    let draft = &mut st.drafts[n];
-                    let field = ui.add(
-                        egui::TextEdit::singleline(draft)
-                            .hint_text(format!("for example {}", kind.example()))
-                            .desired_width(ui.available_width() - 80.0),
-                    );
-                    let checked = if draft.trim().is_empty() {
-                        None
-                    } else {
-                        Some(permission_edit::validate(*kind, draft))
-                    };
-                    let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    if crate::chrome::tonal_button(ui, p, "Add").clicked() || enter {
-                        // An invalid rule is not sent: its message is already
-                        // under the field.
-                        match &checked {
-                            Some(Ok(_)) => {
-                                change = Some(add_rule(perm, *kind, draft));
-                                if matches!(change, Some(Ok(_))) {
-                                    draft.clear();
-                                }
-                            }
-                            Some(Err(_)) => {}
-                            None => change = Some(Err("Type a rule first".to_owned())),
-                        }
-                    }
-                    if let Some(Err(e)) = &checked {
-                        ui.label(RichText::new(e).size(12.0).color(p.danger));
-                    }
-                });
+                }
             }
         }
     }
@@ -370,52 +467,58 @@ pub fn draw_rule_editor(ui: &mut egui::Ui, perm: &PermissionUi, p: &crate::theme
     }
     match &st.said {
         Some(Line::Notice(t)) => {
-            ui.label(RichText::new(t).size(12.0).color(p.text_2));
+            ui.add_space(4.0);
+            row::helper(ui, p, t);
         }
         Some(Line::Error(t)) => {
-            ui.label(RichText::new(t).size(12.0).color(p.danger));
+            ui.add_space(4.0);
+            row::error(ui, p, t);
         }
         _ => {}
     }
     ui.data_mut(|d| d.insert_temp(id, st));
 }
 
-/// What reading `permissions.toml` found, for the settings surface's
-/// Permissions section: why Manual is forced (orange, COL-7: a broken
-/// setting), each refused entry with its reason, and
-/// each notice for an entry that loads but matches no call. Nothing when the
-/// file loaded clean.
+/// What reading `permissions.toml` found, at the top of Settings >
+/// Permissions: why Manual is forced (`--danger`, COL-7: a broken setting),
+/// each refused entry with its reason, and each notice for an entry that
+/// loads but matches no call. Drawn from [`PermissionUi::load_result`], which
+/// the rule editor replaces after each save. Nothing when the file loaded
+/// clean.
 pub fn draw_load_result(ui: &mut egui::Ui, perm: &PermissionUi, p: &crate::theme::Palette) {
-    use egui::RichText;
-    let load = &perm.load;
+    let load = perm.load_result();
     if load.forced_manual.is_none() && load.refused.is_empty() && load.notices.is_empty() {
         return;
     }
     ui.add_space(8.0);
     if let Some(why) = &load.forced_manual {
-        ui.label(RichText::new(why).small().color(p.danger));
+        row::error(ui, p, why);
     }
     if !load.refused.is_empty() {
         ui.add_space(4.0);
-        ui.label(
-            RichText::new("Refused entries in permissions.toml")
-                .font(crate::theme::medium(14.0))
-                .color(p.text),
-        );
+        row::label(ui, p, "Refused entries in permissions.toml");
         for line in &load.refused {
-            ui.label(RichText::new(line.sentence()).small().color(p.text_2));
+            row::description(ui, p, &line.sentence());
         }
     }
     if !load.notices.is_empty() {
         ui.add_space(4.0);
-        ui.label(
-            RichText::new("Notices")
-                .font(crate::theme::medium(14.0))
-                .color(p.text),
-        );
+        row::label(ui, p, "Notices");
         for notice in &load.notices {
-            ui.label(RichText::new(notice).small().color(p.text_2));
+            row::description(ui, p, &as_sentence(notice));
         }
+    }
+}
+
+/// Loader text shown as a sentence in Settings. The loader writes its notices
+/// and refusals to follow a `notice` or `error` label on the command line, so
+/// they start in lower case; a line of its own in the window starts with a
+/// capital (TXT-1).
+pub(crate) fn as_sentence(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
     }
 }
 
@@ -549,7 +652,7 @@ impl PermissionBar {
         if from == mode {
             return Line::Notice(format!("The permission mode is already {}.", mode.label()));
         }
-        if let Some(why) = &ui.load.forced_manual {
+        if let Some(why) = &ui.load_result().forced_manual {
             return Line::Error(format!("The permission mode stays Manual. {why}"));
         }
         match ui.control.set_mode(mode, ModeSource::UserInterface) {
@@ -710,7 +813,8 @@ pub fn draw_bar(
             .selected_text(current.label())
             .width(190.0)
             .show_ui(ui, |ui| {
-                let forced = perm.load.forced_manual.as_deref();
+                let load = perm.load_result();
+                let forced = load.forced_manual.as_deref();
                 for mode in PermissionMode::ALL {
                     if let Some(why) = forced.filter(|_| mode != PermissionMode::Manual) {
                         ui.add_enabled(
@@ -1355,7 +1459,7 @@ mod tests {
         assert_eq!(ui.control.mode(), PermissionMode::Manual);
         assert!(notice.is_some());
         assert!(ui.control.rules().deny.is_empty());
-        assert!(ui.load.unreadable && ui.load.forced_manual.is_some());
+        assert!(ui.load_result().unreadable && ui.load_result().forced_manual.is_some());
         // A change in the window does not write over a file it could not read.
         let line = PermissionBar::default().set_plan_review(&ui, true);
         assert!(matches!(line, Line::Error(_)), "{line:?}");
@@ -1378,12 +1482,12 @@ mod tests {
         std::fs::write(&web, "mode = \"auto\"\ndeny = [\"WebFetch\"]").expect("write");
         let (ui, notice) = PermissionUi::load(Some(web));
         assert_eq!(ui.control.mode(), PermissionMode::Auto);
-        assert!(ui.load.refused.is_empty() && ui.load.forced_manual.is_none());
-        assert_eq!(ui.load.notices.len(), 1);
+        assert!(ui.load_result().refused.is_empty() && ui.load_result().forced_manual.is_none());
+        assert_eq!(ui.load_result().notices.len(), 1);
         assert!(
-            ui.load.notices[0].contains("kGraf has no WebFetch tool"),
+            ui.load_result().notices[0].contains("kGraf has no WebFetch tool"),
             "{:?}",
-            ui.load.notices
+            ui.load_result().notices
         );
         assert!(notice.expect("logged").contains("shell(curl*)"));
     }
@@ -1409,10 +1513,14 @@ mod tests {
         assert_eq!(rules.deny[0].text(), "Bash(curl*)");
         assert_eq!(rules.ask.len(), 1);
         assert!(ui.control.settings().allow.allows_program("ls"));
-        assert_eq!(ui.load.refused.len(), 1);
-        assert_eq!(ui.load.refused[0].text, "Bah(rm*)");
-        assert!(ui.load.refused[0].reason.contains("which is no kGraf tool"));
-        let why = ui.load.forced_manual.clone().expect("forced");
+        assert_eq!(ui.load_result().refused.len(), 1);
+        assert_eq!(ui.load_result().refused[0].text, "Bah(rm*)");
+        assert!(
+            ui.load_result().refused[0]
+                .reason
+                .contains("which is no kGraf tool")
+        );
+        let why = ui.load_result().forced_manual.clone().expect("forced");
         assert!(why.contains("deny rule \"Bah(rm*)\""), "{why}");
         assert!(notice.expect("logged").contains(&why));
 
@@ -1430,7 +1538,11 @@ mod tests {
             .expect("parse");
         assert_eq!(back.settings.mode, PermissionMode::Auto, "the user's mode");
         assert!(back.settings.plan_review);
-        assert_eq!(back.refused, ui.load.refused, "the refused entry is kept");
+        assert_eq!(
+            back.refused,
+            ui.load_result().refused,
+            "the refused entry is kept"
+        );
         assert_eq!(back.settings.rules.deny.len(), 1);
     }
 
@@ -1448,8 +1560,13 @@ mod tests {
         .expect("write");
         let (ui, _) = PermissionUi::load(Some(path));
         assert_eq!(ui.control.mode(), PermissionMode::Auto);
-        assert_eq!(ui.load.forced_manual, None);
-        assert_eq!(ui.load.refused.len(), 2, "{:#?}", ui.load.refused);
+        assert_eq!(ui.load_result().forced_manual, None);
+        assert_eq!(
+            ui.load_result().refused.len(),
+            2,
+            "{:#?}",
+            ui.load_result().refused
+        );
         assert!(ui.control.settings().allow.allows_program("ls"));
         assert_eq!(ui.control.rules().deny.len(), 1);
     }
@@ -1534,6 +1651,15 @@ mod tests {
     }
 
     #[test]
+    fn loader_text_starts_with_a_capital_in_the_window() {
+        assert_eq!(
+            as_sentence("your deny rule `WebFetch` matches no call"),
+            "Your deny rule `WebFetch` matches no call"
+        );
+        assert_eq!(as_sentence(""), "");
+    }
+
+    #[test]
     fn an_invalid_rule_shows_the_loaders_message_and_is_not_saved() {
         use egui_kittest::kittest::Queryable;
         let dir = tempfile::tempdir().expect("dir");
@@ -1541,12 +1667,12 @@ mod tests {
         let before = file_text(&perm);
         type_into(&mut h, 0, "WebFech");
         let loader = kgraf_tools::permissions::Rule::parse("WebFech").unwrap_err();
-        h.get_by_label(&loader);
+        h.get_by_label(&as_sentence(&loader));
         h.get_all_by_label("Add").next().expect("add").click();
         h.run();
         assert_eq!(file_text(&perm), before);
         assert_eq!(perm.control.rules().deny.len(), 1);
-        h.get_by_label(&loader);
+        h.get_by_label(&as_sentence(&loader));
     }
 
     #[test]

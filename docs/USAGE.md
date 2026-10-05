@@ -590,7 +590,7 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   run stops. A plan that the interface checks hold before any work started (a handshake
   mismatch, or a check the last answer failed) is sent back to the planner once with the
   failures before the run ends on the hold; the re-planned contracts are named `re1.<id>`.
-- **Run limits.** Five limits are global settings, each with a slider in Settings > General
+- **Run limits.** Five limits are global settings, each with a slider in Settings > Runs
   and a key in the user-level `settings.toml`: rounds in one block per worker
   (`rounds_per_worker`, 4 to 200), the most blocks a worker may be granted while it makes
   measured progress (`max_checkpoints`, 1 to 50; 1 means the old fixed round limit), the output cap of one worker reply (`worker_max_tokens`,
@@ -636,7 +636,7 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   command is, and each part is checked. A gate command reads "Your gate command ..." in the
   same sentence. The warning changes nothing: your command runs, the rule keeps binding
   workers, and the run never stops for it. It is off by default. Turn it on in Settings >
-  General > "Warn about rule conflicts" (key `warn_rule_conflicts = true` in the user-level
+  Permissions > "Warn about rule conflicts" (key `warn_rule_conflicts = true` in the user-level
   `settings.toml`), or per run with `--warn-rule-conflicts` or `--no-warn-rule-conflicts`
   (`orchestrate`, `schedule run-now`). A flag outranks the setting; a `warn_rule_conflicts`
   key in `.kgraf/run.json` counts as a flag for that project. When off, nothing is printed or
@@ -655,7 +655,7 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   Where it is set, one place per surface:
   - `kgraf orchestrate` and `kgraf schedule run-now`: give `--keep-worktrees`. These commands
     do not read `run.json`.
-  - The desktop app: Settings > General > "Delete worker worktrees after use" (on by
+  - The desktop app: Settings > Runs > "Delete worker worktrees after use" (on by
     default) decides for every run the app starts, box and scheduled. It applies to runs
     that start after the change.
   - `run.json` does not set it: a run file with a `worktrees` key is refused, and the error
@@ -837,16 +837,23 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   as a command: a program named as an argument (`find . -exec curl`, `su -c`, `ssh host
   curl`, `trap 'curl' EXIT`), and a command named by a variable.
 
-  You can edit the rules in Settings > Permissions under "Rules", with no file editing. Three
-  lists show the rules of `permissions.toml`: Deny rules, Ask rules and Allowed programs
-  (`[allow] programs`; the allow set's `tools` and `paths` are edited in the file). Each rule is
-  one line with a Remove button. Type a rule in the field under a list and press Add or Enter.
-  The field checks the rule as you type, with the message the file loader gives, and an invalid
-  rule cannot be added. Each add or remove is written to `permissions.toml` at once (a temporary
-  file, then a rename) and applies to the next call of every worker, running ones included. A
-  rule is not edited in place: remove it and add it again. Only the list you changed is
-  written; the other keys, the comments and the order of the file stay as they were. The window
-  never writes a project file.
+  You can edit every list of `permissions.toml` in Settings > Permissions, with no file
+  editing. "Rules" holds Deny rules and Ask rules; "Allowed in Auto" holds the allow set:
+  Allowed programs (`[allow] programs`), Allowed tools (`[allow] tools`) and Allowed paths
+  (`[allow] paths`). Each entry is one line with a Remove button. Type an entry in the field
+  under a list and press Add or Enter. The field checks the entry as you type with the check
+  the file loader uses: an entry the loader refuses shows its message and cannot be added, and
+  an entry that loads but matches no call (a Claude Code tool kGraf does not have, such as
+  `WebFetch`) shows the loader's notice under the field and can be added. A listed entry the
+  loader refuses is shown in orange, with the reason on hover. Each add or remove is written
+  to `permissions.toml` at once (a temporary file, then a rename). The app then reads the file
+  again, entry by entry, as it does at start: the valid entries apply to the next call of
+  every worker, running ones included, and the refused entries and notices listed at the top
+  of the tab are brought up to date. Removing the refused deny or ask entry that kept the app
+  in Manual lifts Manual at once, with no restart, and the mode in the file applies. An entry
+  is not edited in place: remove it and add it again. Only the list you changed is written;
+  the other keys, the comments and the order of the file stay as they were. The window never
+  writes a project file.
 
   A rule names a tool a worker can have, or it is refused where it is read (`--deny`, `--ask`,
   `permissions.toml`, and the app), with the tools a rule may name. On the command line, one
@@ -1083,7 +1090,7 @@ cargo run -p kgraf-shell --bin kgraf-app -- --probe
 - `--screenshot FILE` captures the window to a PNG after the first frame and
   `--screenshot-after` seconds (default 3), then quits.
 - Closing the window can leave the app in the tray, where scheduled runs fire.
-- **Updates.** Off by default: Settings > "Check for updates on start" lets the app read
+- **Updates.** Off by default: Settings > General > "Check for updates on start" lets the app read
   the GitHub Releases of `Marceux-Croix/kGraf` at start, and "Check now" always checks.
   This is the only network request the setting causes. An offered release counts on the
   bell; its menu row says "kGraf <version> is available" and carries the button that
@@ -1098,6 +1105,23 @@ cargo run -p kgraf-shell --bin kgraf-app -- --probe
   caps do nothing (decision 0080). There is no settings screen for routes yet, so write
   this file by hand.
   Example: `{"routes": ["kimi:<model-id>"], "prices": "prices.json"}`.
+- **Settings** has five tabs. Each setting is one row: its name, one line that says what it
+  does, then its control. A change applies at once; there is no Save button.
+
+  | Tab | What it holds |
+  | --- | --- |
+  | General | Background mode; updates: check on start, include prereleases, Check now |
+  | Runs | Parallelism, the compaction point, the five run limits, deleting worker worktrees after use |
+  | Permissions | What reading `permissions.toml` found, Allow Bypass mode, the rule editor (deny, ask, and the allow set's programs, tools and paths), the shell-script switches, the rule-conflict warning |
+  | Appearance | Theme, color vision, reduced motion, the GPU preference and the current adapter |
+  | Providers | The active project's routes, read-only |
+
+  The permission mode itself is chosen in the orchestrator box, the one place it is set.
+- **The compaction point** (Settings > Runs) is the share of the effective window at which a
+  worker's context is compacted. It follows the recommendation measured from your stored runs
+  until you move it (80%, labeled unmeasured, until there are enough runs). Every run the app
+  starts takes it, from the next run; a `point` key in `.kgraf/run.json` outranks it. The
+  command line does not read it: `kgraf orchestrate` and `kgraf worker` take `--point`.
 - The settings file holds the compaction slider (5% to 95%, default 80%), the five run
   limits (see "Run limits"), the
   background-mode switch, the worker-worktree switch (`delete_worker_worktrees`, default

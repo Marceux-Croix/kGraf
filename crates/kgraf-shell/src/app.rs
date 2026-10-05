@@ -433,7 +433,7 @@ pub struct AppParts {
 impl ShellApp {
     pub fn new(parts: AppParts) -> Self {
         let chrome = ChromeState::default();
-        let parts_limits = parts.settings.limits.user_limits();
+        let parts_limits = parts.settings.run_limits();
         Self {
             settings: parts.settings,
             store: parts.store,
@@ -471,13 +471,13 @@ impl ShellApp {
     /// Shares `limits` with the project factories opened before this app
     /// existed: from the next frame the sliders write to it.
     pub fn use_run_limits(&mut self, limits: kgraf_host::limits::SharedLimits) {
-        limits.set(self.settings.limits.user_limits());
+        limits.set(self.settings.run_limits());
         self.run_limits = limits;
     }
 
     /// Pushes the run-limit sliders to the shared value when they changed.
     pub(crate) fn sync_run_limits(&mut self) {
-        let now = self.settings.limits.user_limits();
+        let now = self.settings.run_limits();
         if self.run_limits.get() != now {
             self.run_limits.set(now);
         }
@@ -1978,6 +1978,51 @@ mod tests {
         app.sync_run_limits();
         assert_eq!(shared.get().rounds, None, "back to following the default");
         assert_eq!(shared.get().max_checkpoints, None);
+    }
+
+    /// The compaction slider reaches the value every project's host is opened
+    /// from, and a host's run configuration takes it where run.json sets no
+    /// point. Following the unmeasured default sends nothing, so a run keeps
+    /// the runtime's own default; following a measured recommendation sends
+    /// it.
+    #[test]
+    fn the_compaction_slider_reaches_the_run_configuration() {
+        use crate::settings::{CompactionPoint, Recommendation};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = headless_app(
+            dir.path(),
+            kgraf_capacity::Capacity {
+                max_agents: 4,
+                max_writers: 2,
+                exec_slots: 2,
+                bounds: Vec::new(),
+            },
+        );
+        let shared = kgraf_host::limits::SharedLimits::default();
+        app.use_run_limits(shared.clone());
+        assert_eq!(
+            shared.get().compaction_point,
+            None,
+            "the unmeasured default"
+        );
+        app.settings
+            .compaction
+            .set_by_user(CompactionPoint::new(42).expect("valid"));
+        app.sync_run_limits();
+        assert_eq!(shared.get().compaction_point, Some(42));
+        let run = dir.path().join("run.json");
+        std::fs::write(&run, r#"{"routes": ["kimi:model"], "prices": "p.json"}"#).expect("write");
+        let config =
+            kgraf_host::RunConfig::load_with(dir.path(), &run, &shared.get()).expect("load");
+        assert_eq!(config.point, Some(42), "the run takes the slider's point");
+        app.settings.compaction.return_to_recommendation();
+        app.settings
+            .compaction
+            .update_recommendation(Recommendation::Measured(
+                CompactionPoint::new(65).expect("valid"),
+            ));
+        app.sync_run_limits();
+        assert_eq!(shared.get().compaction_point, Some(65), "measured: sent");
     }
 
     /// The rule-conflict toggle is off in a fresh app and, once on, reaches the

@@ -74,6 +74,11 @@ pub struct UserLimits {
     /// here because it shares the settings file, the flag-then-setting-then-
     /// default order and the desktop's shared copy with the limits.
     pub warn_rule_conflicts: Option<bool>,
+    /// The compaction point in percent of the effective window (decision 0057
+    /// addendum), as the desktop's slider sets it: the run file's `point`
+    /// outranks it. Only the desktop sets it. [`UserLimits::from_toml_str`]
+    /// does not read it, so the command line keeps `--point` and its default.
+    pub compaction_point: Option<u8>,
 }
 
 fn read_bool_key(table: &toml::Table, key: &str) -> Result<Option<bool>> {
@@ -120,6 +125,7 @@ impl UserLimits {
             planner_max_tokens: b32(KEY_PLANNER_MAX_TOKENS, PLANNER_MAX_TOKENS_BOUNDS)?,
             window: read_key(&table, KEY_WINDOW, WINDOW_BOUNDS.0, WINDOW_BOUNDS.1)?,
             warn_rule_conflicts: read_bool_key(&table, KEY_WARN_RULE_CONFLICTS)?,
+            compaction_point: None,
         })
     }
 

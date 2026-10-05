@@ -144,7 +144,7 @@ const DISK_RESERVE_FLOOR: u64 = 10 * 1024 * 1024 * 1024;
 const FD_HEADROOM: u64 = 256;
 
 /// One named bound in the breakdown: its value, where it came from, and a
-/// human-readable detail (Settings > General shows this, STYLE_GUIDE §5.2's
+/// human-readable detail (Settings > Runs shows this, STYLE_GUIDE §5.2's
 /// "state the number and its source" rule).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Bound {

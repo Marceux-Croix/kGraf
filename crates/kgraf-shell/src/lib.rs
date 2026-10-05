@@ -34,6 +34,7 @@ pub mod search;
 pub mod session_feed;
 pub mod session_panel;
 pub mod settings;
+pub mod settings_rows;
 pub mod surface;
 pub mod text_surface;
 pub mod theme;
@@ -382,7 +383,7 @@ pub fn run_with_host(
             // `restore` hands the opener canonical paths, so the match is on the
             // canonical `--project` too: `./repo` and `/abs/repo` are one folder.
             // One value for every project's factory; the sliders write it.
-            let run_limits = kgraf_host::limits::SharedLimits::new(settings.limits.user_limits());
+            let run_limits = kgraf_host::limits::SharedLimits::new(settings.run_limits());
             let mut given = host;
             let launch = project.as_deref().map(projects::canonical);
             let workspace = Workspace::restore(

@@ -34,18 +34,59 @@ use crate::session_panel;
 use crate::settings::{
     Appearance, COMPACTION_MAX_PERCENT, COMPACTION_MIN_PERCENT, CompactionPoint, Recommendation,
 };
+use crate::settings_rows;
 use crate::text_surface::{Feed, Tab};
 use crate::theme::{self, Indicator, Palette, motion, size};
 use crate::update_bg::UpdateState;
 
-/// Where the nav and the settings dialog point.
+/// Where the nav and the settings dialog point: one tab per kind of
+/// configuration (CMP-DLG-3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SettingsTab {
+    /// The window and updates.
     #[default]
     General,
-    Rendering,
+    /// Everything a run takes from Settings.
+    Runs,
+    /// The user-level permission settings and rules.
+    Permissions,
+    /// Theme, color vision, motion and the graphics adapter.
     Appearance,
+    /// The active project's routes, read-only.
     Providers,
+}
+
+impl SettingsTab {
+    /// The tabs in the order the dialog lists them.
+    pub const ALL: [SettingsTab; 5] = [
+        Self::General,
+        Self::Runs,
+        Self::Permissions,
+        Self::Appearance,
+        Self::Providers,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::General => "General",
+            Self::Runs => "Runs",
+            Self::Permissions => "Permissions",
+            Self::Appearance => "Appearance",
+            Self::Providers => "Providers",
+        }
+    }
+
+    /// The tab's 20 px icon (CMP-DLG-3). Permissions uses the shield the
+    /// orchestrator box's permission bar shows.
+    pub fn icon(self) -> char {
+        match self {
+            Self::General => icons::SETTINGS,
+            Self::Runs => icons::PLAY,
+            Self::Permissions => icons::SHIELD,
+            Self::Appearance => icons::DARK_MODE,
+            Self::Providers => icons::PROVIDERS,
+        }
+    }
 }
 
 /// The nav's current entry.
@@ -2810,6 +2851,10 @@ impl ShellApp {
         }
     }
 
+    /// The settings dialog (CMP-DLG-1 to -6): a title and one line, the tab
+    /// list on the left and the selected tab's rows on the right, Done at the
+    /// bottom. Each tab is drawn from [`crate::settings_rows`], so every
+    /// section, row and switch reads the same way.
     fn settings_dialog(&mut self, ctx: &egui::Context, p: &Palette) {
         let Some(tab) = self.chrome.settings_tab else {
             return;
@@ -2835,6 +2880,8 @@ impl ShellApp {
                 ui.set_min_height(420.0);
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
+                        // CMP-DLG-2: the title in 700 20/28, the description in
+                        // 400 14/20 `--text-2`.
                         ui.label(
                             RichText::new("Settings")
                                 .font(theme::bold(20.0))
@@ -2842,7 +2889,7 @@ impl ShellApp {
                         );
                         ui.label(
                             RichText::new("Configuration only. Work state stays on the graph.")
-                                .small()
+                                .size(14.0)
                                 .color(p.text_2),
                         );
                     });
@@ -2855,15 +2902,13 @@ impl ShellApp {
                 });
                 separator(ui, p);
                 ui.horizontal_top(|ui| {
-                    ui.allocate_ui(vec2(200.0, 360.0), |ui| {
+                    // CMP-DLG-3: a 200 px tab list.
+                    ui.allocate_ui(vec2(200.0, 440.0), |ui| {
                         ui.vertical(|ui| {
-                            for (t, icon, label) in [
-                                (SettingsTab::General, icons::SETTINGS, "General"),
-                                (SettingsTab::Rendering, icons::MEMORY, "Rendering"),
-                                (SettingsTab::Appearance, icons::DARK_MODE, "Appearance"),
-                                (SettingsTab::Providers, icons::PROVIDERS, "Providers"),
-                            ] {
-                                if chrome::guide_entry(ui, p, icon, label, tab == t).clicked() {
+                            for t in SettingsTab::ALL {
+                                if chrome::guide_entry(ui, p, t.icon(), t.label(), tab == t)
+                                    .clicked()
+                                {
                                     next_tab = t;
                                 }
                             }
@@ -2871,19 +2916,38 @@ impl ShellApp {
                     });
                     ui.add_space(16.0);
                     ui.vertical(|ui| {
-                        ui.set_width(460.0);
+                        ui.set_width(480.0);
+                        // One height for every tab, so the dialog does not
+                        // jump when the tab changes (CMP-DLG-1 fixes its size).
+                        ui.set_min_height(440.0);
                         egui::ScrollArea::vertical()
                             .id_salt("settings_body")
-                            .max_height(360.0)
-                            .show(ui, |ui| match tab {
-                                SettingsTab::General => self.settings_general(ui, p),
-                                SettingsTab::Rendering => self.settings_rendering(ui, p),
-                                SettingsTab::Appearance => self.settings_appearance(ui, p),
-                                SettingsTab::Providers => self.settings_providers(ui, p),
+                            .max_height(440.0)
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width() - 12.0);
+                                // CMP-SET-2: a slider wide enough to aim with,
+                                // leaving room for its value.
+                                ui.spacing_mut().slider_width = 300.0;
+                                match tab {
+                                    SettingsTab::General => self.settings_general(ui, p),
+                                    SettingsTab::Runs => self.settings_runs(ui, p),
+                                    SettingsTab::Permissions => self.settings_permissions(ui, p),
+                                    SettingsTab::Appearance => self.settings_appearance(ui, p),
+                                    SettingsTab::Providers => self.settings_providers(ui, p),
+                                }
+                                if let Some(err) = &self.store.last_error {
+                                    ui.add_space(8.0);
+                                    settings_rows::error(
+                                        ui,
+                                        p,
+                                        &format!("Settings not saved: {err}"),
+                                    );
+                                }
                             });
                     });
                 });
                 separator(ui, p);
+                // CMP-DLG-4: settings apply at once, so one Done and no Save.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if chrome::text_button(ui, p.primary, "Done").clicked() {
                         self.chrome.settings_tab = None;
@@ -2897,7 +2961,50 @@ impl ShellApp {
         }
     }
 
+    /// General: what the app does when its window closes, and updates.
     fn settings_general(&mut self, ui: &mut Ui, p: &Palette) {
+        settings_rows::heading(ui, p, "Window");
+        let toggled = settings_rows::toggle(
+            ui,
+            p,
+            "Background mode",
+            "On: closing the window leaves kGraf in the tray, and scheduled runs keep going. \
+             Off: closing the window quits.",
+            &mut self.settings.background_mode,
+        );
+        if toggled {
+            // Decision 0052's global switch, applied to every open project's
+            // scheduler at once, not only at the next launch.
+            for proj in self.workspace.projects() {
+                if let Some(s) = &proj.scheduler {
+                    s.set_background_mode(self.settings.background_mode);
+                }
+            }
+        }
+        if self.tray.is_none() {
+            // TXT-6: a degraded state says why.
+            settings_rows::indented(ui, |ui| {
+                settings_rows::helper(ui, p, "No tray icon in this session, so closing quits.")
+            });
+        }
+        settings_rows::divider(ui, p);
+        self.settings_updates(ui, p);
+    }
+
+    /// Runs: everything a run the app starts takes from Settings. A change
+    /// applies to runs started after it (a host reopens when no run is
+    /// active). A cap above what a model of an open project supports is
+    /// lowered for that run, and the note under the slider says so before
+    /// the run starts (the same sentence a run reports).
+    fn settings_runs(&mut self, ui: &mut Ui, p: &Palette) {
+        // CMP-SET-6: a fixed behavior, stated once for the whole tab.
+        settings_rows::note(
+            ui,
+            p,
+            "These apply to runs started after the change. The run limits also apply to \
+             kgraf commands given no flag, and a flag on the command line outranks them.",
+        );
+        ui.add_space(12.0);
         let hosting = self
             .workspace
             .projects()
@@ -2909,15 +3016,11 @@ impl ShellApp {
             .iter()
             .filter_map(|p| p.interaction.as_ref().and_then(|i| i.max_attempts()))
             .max();
-        // Decision 0067: the parallelism slider and its capacity
-        // breakdown. `ConcurrencyCaps`'s own two sliders are retired here
-        // (2026-09-28, item 5: "the work-item cap as a user
-        // control is gone"), so this is the settings surface's only
-        // concurrency control. `breakdown` is `None` only until the
-        // re-measure thread's first tick (`CapacityHandle::latest`), or when
-        // no thread was started at all (a caller of `ShellApp::new` that
-        // passed `capacity: None`); the UI degrades to "no breakdown shown
-        // yet" rather than a placeholder number invented here.
+        // Decision 0067: the parallelism slider and its capacity breakdown,
+        // the settings surface's only concurrency control. `breakdown` is
+        // `None` only until the re-measure thread's first tick, or when no
+        // thread was started; then no breakdown is shown, rather than a
+        // number invented here.
         let breakdown = self.capacity_breakdown();
         crate::interaction::parallelism_controls(
             ui,
@@ -2927,8 +3030,25 @@ impl ShellApp {
             hosting,
             attempts,
         );
-        separator(ui, p);
-        ui.label("Compaction point (% of effective window)");
+        settings_rows::divider(ui, p);
+        self.settings_compaction(ui, p);
+        settings_rows::divider(ui, p);
+        self.settings_run_limits(ui, p);
+        settings_rows::divider(ui, p);
+        self.settings_worktrees(ui, p);
+    }
+
+    /// The compaction point (decision 0057 addendum): a slider that follows
+    /// the recommendation until moved (CMP-SET-3). Every run the app starts
+    /// takes it (`Settings::run_limits`); a run file's `point` outranks it.
+    fn settings_compaction(&mut self, ui: &mut Ui, p: &Palette) {
+        settings_rows::label(ui, p, "Compaction point");
+        settings_rows::description(
+            ui,
+            p,
+            "The share of the effective window at which a worker's context is compacted. \
+             A point set in the project's run.json outranks it.",
+        );
         let slider = &mut self.settings.compaction;
         let mut percent = slider.value().percent();
         let changed = ui
@@ -2945,64 +3065,23 @@ impl ShellApp {
             // if the two drift apart; then the move is refused visibly.
             match CompactionPoint::new(i64::from(percent)) {
                 Ok(pt) => slider.set_by_user(pt),
-                Err(e) => {
-                    ui.colored_label(p.danger, e.to_string());
-                }
+                Err(e) => settings_rows::error(ui, p, &e.to_string()),
             }
         }
         let rec_text = match slider.recommendation() {
             Recommendation::Unmeasured(pt) => format!("Recommended: {}%, unmeasured", pt.percent()),
             Recommendation::Measured(pt) => format!("Recommended: {}% (measured)", pt.percent()),
         };
-        ui.label(RichText::new(rec_text).small().color(p.text_2));
+        settings_rows::helper(ui, p, &rec_text);
         if !slider.follows_recommendation()
             && chrome::text_button(ui, p.primary, "Return to recommendation").clicked()
         {
             slider.return_to_recommendation();
         }
-        separator(ui, p);
-        self.settings_run_limits(ui, p);
-        separator(ui, p);
-        let toggled = ui
-            .checkbox(
-                &mut self.settings.background_mode,
-                "Background mode: keep scheduled runs going when the window closes",
-            )
-            .changed();
-        if toggled {
-            // Decision 0052's global switch, applied to every open project's
-            // scheduler at once, not only at the next launch.
-            for proj in self.workspace.projects() {
-                if let Some(s) = &proj.scheduler {
-                    s.set_background_mode(self.settings.background_mode);
-                }
-            }
-        }
-        if self.tray.is_none() {
-            ui.label(RichText::new("No tray icon in this session; closing quits.").color(p.text_2));
-        }
-        separator(ui, p);
-        self.settings_worktrees(ui, p);
-        separator(ui, p);
-        self.settings_permissions(ui, p);
-        separator(ui, p);
-        self.settings_updates(ui, p);
-        if let Some(err) = &self.store.last_error {
-            ui.colored_label(p.danger, format!("Settings not saved: {err}"));
-        }
     }
 
-    /// The five global run limits as sliders. They apply to every run the app
-    /// starts, from the next run (a host reopens when no run is active), and to
-    /// `kgraf` commands that are given no flag. A cap above what a model of an
-    /// open project supports is lowered for that run, and the note under the
-    /// slider says so before the run starts (the same sentence a run reports).
+    /// The five global run limits as sliders, one row each.
     fn settings_run_limits(&mut self, ui: &mut Ui, p: &Palette) {
-        ui.label(
-            RichText::new("Run limits")
-                .font(theme::bold(14.0))
-                .color(p.text),
-        );
         let worker = self.settings.limits.worker_max_tokens.value() as u32;
         let planner = self.settings.limits.planner_max_tokens.value() as u32;
         let mut worker_notes = Vec::new();
@@ -3040,6 +3119,7 @@ impl ShellApp {
             false,
             &[],
         );
+        settings_rows::divider(ui, p);
         crate::interaction::limit_slider_row(
             ui,
             p,
@@ -3050,6 +3130,7 @@ impl ShellApp {
             false,
             &[],
         );
+        settings_rows::divider(ui, p);
         crate::interaction::limit_slider_row(
             ui,
             p,
@@ -3059,6 +3140,7 @@ impl ShellApp {
             true,
             &worker_notes,
         );
+        settings_rows::divider(ui, p);
         crate::interaction::limit_slider_row(
             ui,
             p,
@@ -3069,6 +3151,7 @@ impl ShellApp {
             true,
             &planner_notes,
         );
+        settings_rows::divider(ui, p);
         crate::interaction::limit_slider_row(
             ui,
             p,
@@ -3078,56 +3161,24 @@ impl ShellApp {
             true,
             &[],
         );
-        crate::interaction::limit_toggle_row(
-            ui,
-            p,
-            "Warn about rule conflicts",
-            "Off by default. On: at the start of a run, kGraf says when your verify or gate \
-             command runs a program your deny or ask rules block for workers. The command \
-             still runs.",
-            "Warn about rule conflicts",
-            &mut limits.warn_rule_conflicts,
-        );
-        ui.label(
-            RichText::new(
-                "Applies to runs started after the change, and to kgraf commands given no \
-                 flag. A flag on the command line outranks it.",
-            )
-            .small()
-            .color(p.text_2),
-        );
     }
 
-    /// The worker-worktree switch (decision 0088). A setting row: a label, then
-    /// its description below in the secondary color (CMP-SET-1), stating the
-    /// effect and the fixed exception in plain words (TXT-5, TXT-7: no saving is
-    /// claimed, only what is deleted). A change reaches every open project's
-    /// host at once and applies to the runs built after it.
+    /// The worker-worktree switch (decision 0088): the effect and the fixed
+    /// exception in plain words (TXT-5, TXT-7: no saving is claimed, only
+    /// what is deleted). A change reaches every open project's host at once
+    /// and applies to the runs built after it.
     fn settings_worktrees(&mut self, ui: &mut Ui, p: &Palette) {
-        ui.label(
-            RichText::new("Worker worktrees")
-                .font(theme::bold(14.0))
-                .color(p.text),
+        let toggled = settings_rows::toggle(
+            ui,
+            p,
+            "Delete worker worktrees after use",
+            "Each worker builds in its own worktree inside the project, with its own build \
+             folder (a Rust target folder can be several gigabytes). On: a worktree and its \
+             builds are deleted once nothing needs them. Off: every worktree stays, with its \
+             builds, until you remove it. A worktree that a live worker, a stopped run, a \
+             pending merge or a later part of the same work needs is never deleted.",
+            &mut self.settings.delete_worker_worktrees,
         );
-        ui.label(
-            RichText::new(
-                "Each worker builds in its own worktree inside the project, and a compiled \
-                 project builds its own full build folder there (a Rust target folder can be \
-                 several gigabytes). On: a worktree and its builds are deleted once nothing \
-                 needs them. Off: every worker's worktree stays, with its builds, until you \
-                 remove it. A worktree a live worker, a stopped run, a pending merge or a \
-                 later part of the same work needs is never deleted. Applies to every run \
-                 the app starts after the change.",
-            )
-            .small()
-            .color(p.text_2),
-        );
-        let toggled = ui
-            .checkbox(
-                &mut self.settings.delete_worker_worktrees,
-                "Delete worker worktrees after use",
-            )
-            .changed();
         if toggled {
             let retention = self.settings.worktree_retention();
             for proj in self.workspace.projects() {
@@ -3140,54 +3191,56 @@ impl ShellApp {
         }
     }
 
-    /// The Allow Bypass switch (decision 0094): configuration only (CMP-DLG-6).
-    /// The mode itself is chosen in the orchestrator box's dropdown; Bypass is
-    /// offered there only with this on, and its first use shows a warning.
-    /// Turning it off while in Bypass returns the mode to Manual at once.
-    /// Above it, what reading permissions.toml found: why Manual is forced,
-    /// each refused entry with its reason, and each notice. Below it, the
-    /// script-construct switches (decision 0094, amended 2026-10-02), all off
-    /// by default.
+    /// Permissions (decision 0094): what reading permissions.toml found, the
+    /// Allow Bypass switch, the rule editor, the script-construct switches and
+    /// the rule-conflict warning. Configuration only (CMP-DLG-6): the mode
+    /// itself is chosen in the orchestrator box, the one place it is set;
+    /// Bypass is offered there only with Allow Bypass on, and its first use
+    /// shows a warning. Turning Allow Bypass off while in Bypass returns the
+    /// mode to Manual at once.
     fn settings_permissions(&mut self, ui: &mut Ui, p: &Palette) {
-        ui.label(
-            RichText::new("Permissions")
-                .font(theme::bold(14.0))
-                .color(p.text),
+        settings_rows::description(
+            ui,
+            p,
+            "The permission mode is chosen in the orchestrator box. Allow Bypass, the rules \
+             and the shell-script switches are kept in the user-level permissions.toml, \
+             outside every project.",
         );
         let Some(perm) = self.permissions.clone() else {
-            ui.label(
-                RichText::new("No permission settings were loaded in this window.")
-                    .small()
-                    .color(p.text_2),
-            );
+            settings_rows::helper(ui, p, "No permission settings were loaded in this window.");
+            settings_rows::divider(ui, p);
+            self.settings_rule_conflicts(ui, p);
             return;
         };
-        let settings = perm.control.settings();
-        ui.label(
-            RichText::new(
-                "The permission mode is chosen in the orchestrator box. Bypass grants every \
-                 request without asking, except your deny and ask rules and deleting system \
-                 paths, and offers no protection against prompt injection. Off: the box does \
-                 not offer Bypass. disable_bypass and the rules below are kept in the \
-                 user-level permissions.toml. A rule may use Claude Code's tool names (Bash, \
-                 Edit, Write, Read). A rule on a Claude Code tool kGraf does not have, such as \
-                 WebFetch, loads with a notice and matches nothing. An entry that names no tool \
-                 is refused and listed below; the other entries still apply. A refused deny or \
-                 ask rule keeps the mode at Manual until you correct it.",
-            )
-            .small()
-            .color(p.text_2),
-        );
         crate::permission_bar::draw_load_result(ui, &perm, p);
+        settings_rows::divider(ui, p);
+        let settings = perm.control.settings();
+        let about = "Off: the orchestrator box does not offer Bypass. Bypass grants every \
+                     request without asking, except your deny and ask rules and deleting \
+                     system paths, and gives no protection against prompt injection.";
         if settings.disable_bypass {
-            ui.label(
-                RichText::new("Bypass is disabled in permissions.toml (disable_bypass = true).")
-                    .small()
-                    .color(p.text_2),
+            // TXT-6: a disabled control says why and what to do.
+            let mut off = false;
+            ui.add_enabled(
+                false,
+                egui::Checkbox::new(
+                    &mut off,
+                    RichText::new("Allow Bypass mode")
+                        .font(theme::medium(14.0))
+                        .color(p.text),
+                ),
             );
+            settings_rows::indented(ui, |ui| {
+                settings_rows::description(
+                    ui,
+                    p,
+                    "Bypass is disabled in permissions.toml (disable_bypass = true). Remove \
+                     that line to offer it.",
+                );
+            });
         } else {
             let mut allow = settings.allow_bypass;
-            if ui.checkbox(&mut allow, "Allow Bypass mode").changed() {
+            if settings_rows::toggle(ui, p, "Allow Bypass mode", about, &mut allow) {
                 perm.control.set_allow_bypass(allow);
                 // Through the UI's save, so refused entries stay in the file.
                 if perm.file.is_some()
@@ -3201,54 +3254,64 @@ impl ShellApp {
             }
         }
         crate::permission_bar::draw_rule_editor(ui, &perm, p);
+        settings_rows::divider(ui, p);
         for line in crate::permission_bar::draw_script_constructs(ui, &perm, p) {
             if let crate::orchestrator_box::Line::Error(e) = line {
                 self.chrome.notice = Some((e, Instant::now()));
             }
         }
+        settings_rows::divider(ui, p);
+        self.settings_rule_conflicts(ui, p);
     }
 
-    /// The update-check controls. Off by default and
-    /// said so here plainly (decision 0051's egress rule: a GitHub Releases query
-    /// is not a configured model provider or MCP server, so it is opt-in, not a
-    /// standing destination); "Check now" runs regardless of the toggle, since the
-    /// user just asked.
+    /// The rule-conflict warning: a run setting kept in settings.toml with the
+    /// run limits, shown with the rules it is about.
+    fn settings_rule_conflicts(&mut self, ui: &mut Ui, p: &Palette) {
+        settings_rows::toggle(
+            ui,
+            p,
+            "Warn about rule conflicts",
+            "Off by default. On: at the start of a run, kGraf says when your verify or gate \
+             command runs a program your deny or ask rules block for workers. The command \
+             still runs.",
+            &mut self.settings.limits.warn_rule_conflicts,
+        );
+    }
+
+    /// The update-check controls. Off by default and said so plainly (decision
+    /// 0051's egress rule: a GitHub Releases query is not a configured model
+    /// provider or MCP server, so it is opt-in, not a standing destination);
+    /// "Check now" runs regardless of the switch, since the user just asked.
     fn settings_updates(&mut self, ui: &mut Ui, p: &Palette) {
-        ui.label(
-            RichText::new("Updates")
-                .font(theme::bold(14.0))
-                .color(p.text),
-        );
-        ui.label(
-            RichText::new(
-                "Off by default. When on, checks Marceux-Croix/kGraf's GitHub Releases on \
-                 start; this is the only thing that setting does. \"Check now\" always \
-                 checks, whether or not the setting is on.",
-            )
-            .small()
-            .color(p.text_2),
-        );
-        ui.checkbox(
-            &mut self.settings.check_for_updates,
+        settings_rows::heading(ui, p, "Updates");
+        settings_rows::toggle(
+            ui,
+            p,
             "Check for updates on start",
+            "Off by default. On: kGraf reads the GitHub Releases of Marceux-Croix/kGraf when \
+             it starts. This is the only network request the setting causes.",
+            &mut self.settings.check_for_updates,
         );
-        ui.checkbox(
-            &mut self.settings.allow_prerelease_updates,
+        ui.add_space(8.0);
+        settings_rows::toggle(
+            ui,
+            p,
             "Include prereleases",
+            "Offer a prerelease too, not only a full release: at start and for Check now.",
+            &mut self.settings.allow_prerelease_updates,
         );
-        if chrome::text_button(ui, p.primary, "Check now").clicked()
+        ui.add_space(8.0);
+        if chrome::tonal_button(ui, p, "Check now")
+            .on_hover_text("Check GitHub Releases now, whether or not the setting is on.")
+            .clicked()
             && let Some(u) = &self.update
         {
             u.check_now(self.settings.allow_prerelease_updates);
         }
         match self.update_state() {
             None | Some(crate::update_bg::UpdateState::Idle) => {}
-            Some(UpdateState::Checking) => {
-                ui.label(RichText::new("Checking...").color(p.text_2));
-            }
-            Some(UpdateState::UpToDate) => {
-                ui.label(RichText::new("kGraf is up to date.").color(p.text_2));
-            }
+            Some(UpdateState::Checking) => settings_rows::helper(ui, p, "Checking..."),
+            Some(UpdateState::UpToDate) => settings_rows::helper(ui, p, "kGraf is up to date."),
             Some(UpdateState::Available(candidate)) => {
                 ui.colored_label(
                     p.primary,
@@ -3260,52 +3323,20 @@ impl ShellApp {
                     u.accept_and_install(candidate);
                 }
             }
-            Some(UpdateState::Downloading) => {
-                ui.label(RichText::new("Downloading...").color(p.text_2));
-            }
+            Some(UpdateState::Downloading) => settings_rows::helper(ui, p, "Downloading..."),
             Some(UpdateState::Ready { words, .. }) => {
                 ui.colored_label(p.text, words);
             }
             Some(UpdateState::Failed(message)) => {
-                ui.colored_label(p.danger, format!("Update check failed: {message}"));
+                settings_rows::error(ui, p, &format!("Update check failed: {message}"));
             }
         }
     }
 
-    fn settings_rendering(&mut self, ui: &mut Ui, p: &Palette) {
-        ui.checkbox(
-            &mut self.settings.prefer_high_performance_gpu,
-            "Prefer high-performance GPU",
-        )
-        .on_hover_text("Discrete GPU first. Takes effect at the next launch.");
-        separator(ui, p);
-        ui.label(
-            RichText::new("Current adapter")
-                .font(theme::medium(14.0))
-                .color(p.text),
-        );
-        let color = if self.render.path.is_software() {
-            p.danger
-        } else {
-            p.text_2
-        };
-        ui.label(RichText::new(self.render.label()).color(color));
-        ui.label(
-            RichText::new(
-                "On a CPU adapter the galaxy draws without glow, with edges only for a \
-                 selection, and the top bar says so. Start with --force-software to try it.",
-            )
-            .small()
-            .color(p.text_2),
-        );
-    }
-
+    /// Appearance: the theme and color vision as single-choice lists
+    /// (CMP-SET-5), reduced motion, and the graphics adapter.
     fn settings_appearance(&mut self, ui: &mut Ui, p: &Palette) {
-        ui.label(
-            RichText::new("Theme")
-                .font(theme::medium(14.0))
-                .color(p.text),
-        );
+        settings_rows::heading(ui, p, "Theme");
         for (a, icon, label) in [
             (Appearance::Device, icons::AUTO_THEME, "Use device theme"),
             (Appearance::Dark, icons::DARK_MODE, "Dark theme"),
@@ -3315,22 +3346,13 @@ impl ShellApp {
                 self.settings.appearance = a;
             }
         }
-        ui.label(
-            RichText::new("The graph stays on its near-black stage in every theme.")
-                .small()
-                .color(p.text_2),
+        settings_rows::description(
+            ui,
+            p,
+            "The graph stays on its near-black stage in every theme.",
         );
-        separator(ui, p);
-        ui.checkbox(
-            &mut self.settings.reduce_motion,
-            "Reduce motion: no blinking or wiggling indicators",
-        );
-        separator(ui, p);
-        ui.label(
-            RichText::new("Color vision")
-                .font(theme::medium(14.0))
-                .color(p.text),
-        );
+        settings_rows::divider(ui, p);
+        settings_rows::heading(ui, p, "Color vision");
         for v in kgraf_core::palette::Vision::ALL {
             if chrome::guide_entry(
                 ui,
@@ -3344,20 +3366,51 @@ impl ShellApp {
                 self.settings.color_vision = v;
             }
         }
-        ui.label(
-            RichText::new(
-                "Remaps the five meaning colors (progress, danger, needs input, selection, \
-                 neutral) for the chosen kind of color blindness. This is kGraf's own setting, \
-                 not part of the style guide's one palette.",
-            )
-            .small()
-            .color(p.text_2),
+        settings_rows::description(
+            ui,
+            p,
+            "Remaps the five meaning colors (progress, danger, needs input, selection, \
+             neutral) for the chosen kind of color blindness. This is kGraf's own setting, \
+             not part of the style guide's one palette.",
+        );
+        settings_rows::divider(ui, p);
+        settings_rows::toggle(
+            ui,
+            p,
+            "Reduce motion",
+            "No blinking or wiggling indicators.",
+            &mut self.settings.reduce_motion,
+        );
+        settings_rows::divider(ui, p);
+        settings_rows::heading(ui, p, "Graphics");
+        settings_rows::toggle(
+            ui,
+            p,
+            "Prefer high-performance GPU",
+            "Discrete GPU first. Takes effect at the next launch.",
+            &mut self.settings.prefer_high_performance_gpu,
+        );
+        ui.add_space(8.0);
+        settings_rows::label(ui, p, "Current adapter");
+        // TXT-6 and COL-7: CPU rendering is a degraded state, in `--danger`.
+        let color = if self.render.path.is_software() {
+            p.danger
+        } else {
+            p.text_2
+        };
+        ui.label(RichText::new(self.render.label()).size(13.0).color(color));
+        settings_rows::description(
+            ui,
+            p,
+            "On a CPU adapter the galaxy draws without glow, with edges only for a \
+             selection, and the top bar says so. Start with --force-software to try it.",
         );
     }
 
+    /// Providers: each route of the active project, read-only (CMP-SET-7).
     fn settings_providers(&mut self, ui: &mut Ui, p: &Palette) {
         let Some(proj) = self.workspace.active() else {
-            ui.label(RichText::new("Open a project to see its provider routes.").color(p.text_2));
+            settings_rows::description(ui, p, "Open a project to see its provider routes.");
             return;
         };
         let root = proj.root.clone();
@@ -3365,13 +3418,13 @@ impl ShellApp {
             .chrome
             .run_json
             .get(&run_json_path(&root), || read_run_json(&root));
-        ui.label(
-            RichText::new(format!("Routes of {} (.kgraf/run.json)", proj.name()))
-                .font(theme::medium(14.0))
-                .color(p.text),
+        settings_rows::heading(
+            ui,
+            p,
+            &format!("Routes of {} (.kgraf/run.json)", proj.name()),
         );
         if let Some(e) = &rj.error {
-            ui.label(RichText::new(e).small().color(p.danger));
+            settings_rows::error(ui, p, e);
         }
         // (route, role and kind, generative): the reasoning line applies to a
         // generative route only.
@@ -3401,18 +3454,10 @@ impl ShellApp {
                     Some(p.indicator(Indicator::Neutral)),
                 );
                 ui.vertical(|ui| {
-                    ui.label(
-                        RichText::new(&route)
-                            .font(theme::medium(14.0))
-                            .color(p.text),
-                    );
-                    ui.label(RichText::new(role).small().color(p.text_2));
+                    settings_rows::label(ui, p, &route);
+                    settings_rows::helper(ui, p, &role);
                     if generative {
-                        ui.label(
-                            RichText::new(reasoning_line(&route))
-                                .small()
-                                .color(p.text_2),
-                        );
+                        settings_rows::helper(ui, p, &reasoning_line(&route));
                     }
                 });
             })
@@ -3421,14 +3466,12 @@ impl ShellApp {
                 "Gray: reachability is not checked from this dialog. `kgraf providers` checks it.",
             );
         }
-        separator(ui, p);
-        ui.label(
-            RichText::new(
-                "Every token is attributed to a provider call. kGraf reports spend; it does not \
-                 claim savings.",
-            )
-            .small()
-            .color(p.text_2),
+        settings_rows::divider(ui, p);
+        settings_rows::description(
+            ui,
+            p,
+            "Every token is attributed to a provider call. kGraf reports spend; it does not \
+             claim savings.",
         );
     }
 }
@@ -4182,3 +4225,7 @@ mod tests {
         assert!(line.contains("unknown route"), "{line}");
     }
 }
+
+#[cfg(test)]
+#[path = "settings_dialog_tests.rs"]
+mod settings_dialog_tests;

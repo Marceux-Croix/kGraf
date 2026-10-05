@@ -400,7 +400,7 @@ impl RunConfig {
         {
             return Err(Error::Invalid(format!(
                 "{} sets `{WORKTREES_KEY}`, which a run file does not choose: in the desktop \
-                 app, Settings > General > \"Delete worker worktrees after use\" decides for \
+                 app, Settings > Runs > \"Delete worker worktrees after use\" decides for \
                  every run it starts, and `kgraf orchestrate` and `kgraf schedule run-now` \
                  take `--keep-worktrees`. Remove the key.",
                 path.display()
@@ -469,6 +469,11 @@ impl RunConfig {
             && let Some(v) = user.warn_rule_conflicts
         {
             self.warn_rule_conflicts = v;
+        }
+        if unset("point")
+            && let Some(v) = user.compaction_point
+        {
+            self.point = Some(v);
         }
     }
 
@@ -1349,6 +1354,7 @@ mod tests {
             planner_max_tokens: Some(65_536),
             window: Some(200_000),
             warn_rule_conflicts: Some(true),
+            compaction_point: Some(60),
         };
         std::fs::write(
             &path,
@@ -1385,7 +1391,19 @@ mod tests {
         .expect("write");
         let c = RunConfig::load_with(dir.path(), &path, &user).expect("load");
         assert_eq!(c.max_checkpoints, 2, "the file wins");
+        assert_eq!(c.point, Some(60), "the setting fills what the file omits");
+        std::fs::write(
+            &path,
+            r#"{"routes": ["kimi:model"], "prices": "p.json", "point": 40}"#,
+        )
+        .expect("write");
+        let c = RunConfig::load_with(dir.path(), &path, &user).expect("load");
+        assert_eq!(c.point, Some(40), "the file wins");
         let c = RunConfig::load(dir.path(), &path).expect("load");
+        assert_eq!(c.point, Some(40));
+        std::fs::write(&path, r#"{"routes": ["kimi:model"], "prices": "p.json"}"#).expect("write");
+        let c = RunConfig::load(dir.path(), &path).expect("load");
+        assert_eq!(c.point, None, "no setting: the runtime's default");
         assert_eq!(c.max_tokens, defaults::max_tokens(), "no setting: default");
         assert_eq!(c.planner_max_tokens, 32_768);
         assert_eq!(c.max_tokens, 16_384);

@@ -851,6 +851,11 @@ Its modules:
   and its overlays, the cards, the settings dialog. The galaxy renderer is
   `kgraf-galaxy`'s, used through its public API; the shell draws only
   overlays over it.
+- The settings dialog has five tabs (General, Runs, Permissions, Appearance, Providers),
+  each drawn from `settings_rows.rs`: a section heading, a row's label and one-line
+  description (CMP-SET-1), the divider between rows, a switch whose label is its
+  accessible name, and a note (CMP-SET-6). `settings_dialog_tests.rs` drives each control
+  through the accessibility tree and checks the effect it reaches.
 - `projects.rs` (decision 0066): a workspace of open projects. Each has its
   own host, scheduler, graph view and runs; the frame polls every one, so a
   background run advances. Row indicators and the menu button's tint come
@@ -896,7 +901,10 @@ worker could write. A command-line flag outranks the setting, which outranks the
 default (30 rounds orchestrated and 12 for a single worker, 16,384 and 32,768 output
 tokens, a 128,000-token window). An output cap is lowered to the model's supported limit
 (`kgraf_core::output_limit`, from the bundled catalog) with a notice.
-A sixth key, `warn_rule_conflicts` (off by default, a checkbox in Settings > General), rides in
+The desktop also sends its compaction slider through the same shared value
+(`UserLimits::compaction_point`, set only by the desktop): a run file's `point` outranks it, and
+the command line keeps `--point`.
+A sixth key, `warn_rule_conflicts` (off by default, a checkbox in Settings > Permissions), rides in
 the same file, shared value and precedence but limits nothing: when on, a run's start checks
 the user's verify and configured gate commands against the user's deny and ask rules
 (`kgraf-host/src/rule_conflicts.rs`, using the approval chain's own matcher) and says, as a
@@ -1309,11 +1317,15 @@ worker ran them as argv. The user may turn on each such construct group (variabl
 background jobs, input redirects, escapes, outside redirects; all off by
 default) in Settings, `permissions.toml` or `--script-constructs`, never
 `run.json`. Settings > Permissions also holds the rule editor
-(`permission_bar::draw_rule_editor`): deny, ask and allowed-program lists, an add field per
-list checked by the loader's own readers (`kgraf_tools::permission_edit::validate`), and a
-remove button per rule. An edit changes only its list in the file's text (`toml_edit`, so
-comments and other keys stay), writes it atomically, then gives the file's rules and allow set
-to the live control (`PermissionControl::set_rules`, `set_allow`); a second reader then returns every program it can see, inside
+(`permission_bar::draw_rule_editor`): every list of the file (deny, ask, and the allow set's
+programs, tools and paths), an add field per list checked by the loader's own per-entry check
+(`kgraf_tools::permission_edit::validate`, which calls `validate_entry`, so a notice for a
+Claude Code tool kGraf lacks shows as the entry is typed), and a remove button per entry. An
+edit changes only its list in the file's text (`toml_edit`, so comments and other keys stay),
+writes it atomically, then reads the file entry by entry again (`load_entries`), gives its valid
+rules and allow set to the live control (`PermissionControl::set_rules`, `set_allow`) and
+replaces the shared load result (`PermissionUi::load_result`), so a fixed file lifts a forced
+Manual without a restart; a second reader then returns every program it can see, inside
 substitutions and groups too, and the script is granted when a grant covers
 each. What a variable runs is not seen and not checked; for such a script the
 user's shell rules also match by program name in the script text, in every mode

@@ -6,12 +6,12 @@
 //! would erase a line the loader could not read. Only the one list an edit
 //! names changes; every other key, comment and blank line stays as written.
 //!
-//! Validation is not written here. [`validate`] calls the readers the file
-//! loader uses ([`Rule::parse`], [`AllowSet::with_programs`],
-//! [`AllowSet::with_tools`]), so a rule is refused with the loader's own
-//! message.
+//! Validation is not written here. [`validate`] calls [`validate_entry`], the
+//! one check the file loader uses for every entry, so an entry is refused with
+//! the loader's own message, and an entry that loads but matches no call
+//! carries the loader's notice.
 
-use crate::permissions::{AllowSet, Rule};
+use crate::permissions::{Entry, EntryList, validate_entry};
 use std::path::{Path, PathBuf};
 use toml_edit::{Array, DocumentMut, Item, Table, Value};
 
@@ -75,6 +75,17 @@ impl RuleKind {
         }
     }
 
+    /// The loader's name for this list.
+    pub fn list(self) -> EntryList {
+        match self {
+            Self::Deny => EntryList::Deny,
+            Self::Ask => EntryList::Ask,
+            Self::AllowProgram => EntryList::AllowPrograms,
+            Self::AllowTool => EntryList::AllowTools,
+            Self::AllowPath => EntryList::AllowPaths,
+        }
+    }
+
     /// The key in the file: a top-level key, or a key of `[allow]`.
     fn key(self) -> (Option<&'static str>, &'static str) {
         match self {
@@ -87,18 +98,35 @@ impl RuleKind {
     }
 }
 
-/// Check one entry the way the file loader does, and give the entry as it
-/// will be written (trimmed). The message is the loader's.
-pub fn validate(kind: RuleKind, text: &str) -> Result<String, String> {
+/// One entry [`validate`] accepted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Checked {
+    /// The entry as it will be written: trimmed, and a rule in the form the
+    /// loader reads back.
+    pub text: String,
+    /// The loader's notice for an entry that loads but matches no call (a
+    /// Claude Code tool kGraf has no tool for), as [`validate_entry`] gives it.
+    pub notice: Option<String>,
+}
+
+/// Check one entry the way the file loader does ([`validate_entry`]), and give
+/// the entry as it will be written (trimmed) with the loader's notice, if any.
+/// A refused entry gets the loader's message. An empty entry is refused: it
+/// would add nothing.
+pub fn validate(kind: RuleKind, text: &str) -> Result<Checked, String> {
     let t = text.trim();
-    match kind {
-        RuleKind::Deny | RuleKind::Ask => Rule::parse(t).map(|r| r.text()),
-        RuleKind::AllowProgram => AllowSet::default().with_programs([t]).map(|_| t.to_owned()),
-        RuleKind::AllowTool => AllowSet::default().with_tools([t]).map(|_| t.to_owned()),
-        // The loader reads a path as written; only an empty one is no entry.
-        RuleKind::AllowPath if t.is_empty() => Err("an allowed path is empty".to_owned()),
-        RuleKind::AllowPath => Ok(t.to_owned()),
+    if t.is_empty() {
+        return Err(format!("the {} entry is empty", kind.list().key()));
     }
+    let valid = validate_entry(kind.list(), t)?;
+    let text = match valid.entry {
+        Entry::Deny(rule) | Entry::Ask(rule) => rule.text(),
+        Entry::Tool(_) | Entry::Program(_) | Entry::Path(_) => t.to_owned(),
+    };
+    Ok(Checked {
+        text,
+        notice: valid.notice,
+    })
 }
 
 fn parse(text: &str) -> Result<DocumentMut, String> {
@@ -168,7 +196,7 @@ fn list_mut(
 /// `text` with `entry` added to the list of `kind`. The entry is checked
 /// first ([`validate`]). An entry already listed is an error, not a copy.
 pub fn with_entry_added(text: &str, kind: RuleKind, entry: &str) -> Result<String, String> {
-    let entry = validate(kind, entry)?;
+    let entry = validate(kind, entry)?.text;
     let mut doc = parse(text)?;
     let array = list_mut(&mut doc, kind, true)?.ok_or("the list could not be created")?;
     if array
@@ -245,20 +273,48 @@ mod tests {
 
     const FILE: &str = "# my rules\nmode = \"auto\" # keep\n\ndeny = [\n    \"shell(curl*)\", # no network\n]\n\n[allow]\n# programs I trust\nprograms = [\"make\"]\n";
 
+    /// The editor's check is the loader's: the same refusal message, the
+    /// same notice for a Claude Code tool kGraf lacks, and the text written
+    /// is what the loader reads back.
     #[test]
     fn an_entry_is_checked_with_the_loaders_messages() {
-        let from_loader = Rule::parse("WebFetch").unwrap_err();
-        assert_eq!(
-            validate(RuleKind::Deny, "WebFetch").unwrap_err(),
-            from_loader
+        for (kind, text) in [
+            (RuleKind::Deny, "WebFech"),
+            (RuleKind::Ask, "Bah(rm*)"),
+            (RuleKind::AllowProgram, "two words"),
+            (RuleKind::AllowTool, "fetch"),
+        ] {
+            assert_eq!(
+                validate(kind, text).unwrap_err(),
+                validate_entry(kind.list(), text).unwrap_err(),
+                "{kind:?} {text}"
+            );
+        }
+        let web = validate(RuleKind::Deny, "WebFetch").expect("loads");
+        assert_eq!(web.text, "WebFetch");
+        let from_loader = validate_entry(EntryList::Deny, "WebFetch")
+            .expect("loads")
+            .notice
+            .expect("a notice");
+        assert_eq!(web.notice.as_deref(), Some(from_loader.as_str()));
+        assert!(
+            from_loader.contains("kGraf has no WebFetch tool"),
+            "{from_loader}"
         );
+        let ask = validate(RuleKind::Ask, "  Bash(rm *) ").unwrap();
+        assert_eq!(ask.text, "Bash(rm *)");
+        assert_eq!(ask.notice, None);
         assert_eq!(
-            validate(RuleKind::Ask, "  Bash(rm *) ").unwrap(),
-            "Bash(rm *)"
+            validate(RuleKind::AllowProgram, " make ").unwrap().text,
+            "make"
         );
-        assert!(validate(RuleKind::AllowProgram, "two words").is_err());
-        assert!(validate(RuleKind::AllowTool, "WebSearch").is_err());
+        assert_eq!(validate(RuleKind::AllowTool, "Bash").unwrap().text, "Bash");
+        assert_eq!(
+            validate(RuleKind::AllowPath, " docs/* ").unwrap().text,
+            "docs/*"
+        );
         assert!(validate(RuleKind::AllowPath, " ").is_err());
+        assert!(validate(RuleKind::Deny, "").is_err());
     }
 
     #[test]

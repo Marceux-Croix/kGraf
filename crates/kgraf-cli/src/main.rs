@@ -1132,6 +1132,8 @@ fn run_cli() -> Result<()> {
                     planner_max_tokens,
                     window,
                     warn_rule_conflicts: warn_choice(warn_rule_conflicts, no_warn_rule_conflicts),
+                    // `--point` is read on its own; this field is the desktop's.
+                    compaction_point: None,
                 },
                 kgraf_host::limits::DEFAULT_ROUNDS_ORCHESTRATED,
                 true,
@@ -1226,6 +1228,7 @@ fn run_cli() -> Result<()> {
                     planner_max_tokens: None,
                     window,
                     warn_rule_conflicts: None,
+                    compaction_point: None,
                 },
                 kgraf_host::limits::DEFAULT_ROUNDS_SINGLE_WORKER,
                 false,
@@ -1313,6 +1316,7 @@ fn run_cli() -> Result<()> {
                             warn_rule_conflicts,
                             no_warn_rule_conflicts,
                         ),
+                        compaction_point: None,
                     },
                     kgraf_host::limits::DEFAULT_ROUNDS_ORCHESTRATED,
                     true,
@@ -2679,6 +2683,7 @@ mod tests {
             planner_max_tokens,
             window,
             warn_rule_conflicts: None,
+            compaction_point: None,
         };
         let user = UserLimits {
             rounds: Some(40),
