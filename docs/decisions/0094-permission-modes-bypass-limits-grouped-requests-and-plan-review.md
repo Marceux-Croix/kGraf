@@ -1042,3 +1042,67 @@ echo server over stdio, and `every_builtin_tool_name_is_one_a_rule_may_name`); `
 (`permission_bar.rs`:
 `a_rule_naming_no_tool_is_refused_in_the_window_and_a_claude_code_name_loads`). Each
 regression test fails with its part of the change reverted.
+
+## Amendment (2026-10-05): a Claude Code tool kGraf lacks is a notice; the desktop keeps the valid entries
+
+The amendment of 2026-10-02 (rule names) refused every name outside kGraf's tools, its Claude
+Code aliases and MCP names. Two effects followed. A permissions file shared with Claude Code,
+naming a tool kGraf does not have (`deny = ["WebFetch"]`), stopped every command-line run. And
+the desktop, on any refused entry, dropped every rule: `PermissionUi::load` read the file with
+`PermissionSettings::load`, whose `from_toml_str` returned the first refused entry as an error
+(`list.iter().map(|r| Rule::parse(r)).collect()`), and the window then ran
+`PermissionControl::manual()`, Manual with no rules. Safe, since every request asked, but the
+user's valid deny rules, allow set and plan review were gone, and more files now hit it.
+
+- **A Claude Code tool kGraf has no tool for loads with a notice.** A table
+  (`kgraf_tools::permissions::CLAUDE_CODE_WITHOUT_COUNTERPART`) lists the tools of Claude
+  Code's tools reference (read for Claude Code 2.1.289) that kGraf neither has nor reads as one
+  of its own, plus `Task` (the older name of `Agent`, which Claude Code still reads in
+  settings), `SlashCommand` and `TaskOutput` (in its changelog; old settings files still hold
+  them). Each entry carries a plain sentence: what kGraf uses instead, and the kGraf rule that
+  gives the intended effect (`WebFetch`: add `shell(curl*)`, `shell(wget*)` or a rule for the
+  MCP tool; `Agent` and `Task`: add `spawn_subagent`; `Skill`: add `skill`). A deny, ask or
+  allow-set entry naming one loads, from the file or a flag. It matches no call:
+  `tool_name_matches` refuses a table name before any other test, so the entry changes no
+  decision in any mode, even for a call of a tool registered under that bare name. Its notice
+  (`counterpart_notice`) is said at run start in place of the generic "names no tool" sentence,
+  printed as a `notice` line and traced, and shown in Settings. Such a name is a Claude Code
+  habit or a shared file, not a typo, so a refusal stopped a run for a tool no worker can call.
+  A name in neither table is still refused exactly as before, and the aliases do not change.
+- **One per-entry check.** `kgraf_tools::permissions::validate_entry(list, text)` checks one
+  entry of one list (`EntryList`: deny, ask, allow tools, allow programs, allow paths) and
+  returns the entry as kGraf reads it with its notice, or the reason it is refused. The file
+  readers, `AllowSet::with_tools` and `with_programs`, and the `--deny`, `--ask`, `--allow` and
+  `--allow-path` flags all use it; `kgraf worker` and `kgraf orchestrate` build their control
+  through the same command-line reader, and the desktop's scheduled runs share the desktop's
+  control. A settings editor checks an entry with the same function.
+- **The command line still refuses.** `PermissionSettings::from_toml_str` refuses a file with
+  any refused entry. The error names each one, its list and its reason, and says to correct or
+  remove it.
+- **The desktop keeps the valid entries.** `PermissionSettings::read_entries` (and
+  `load_entries`) reads the file entry by entry into a `SettingsLoad`: the settings with every
+  valid entry, each refused entry with its reason (`RefusedLine`), the notices, and
+  `forced_manual`. A refused deny or ask entry sets `forced_manual`, with a reason that names
+  the entry: an intended block or ask is missing, so the window runs in Manual and the dropdown
+  refuses another mode until the file is fixed. Refused allow entries alone keep the user's
+  mode; what they would grant asks instead. Settings > Permissions shows the reason, each
+  refused entry and each notice. A change made in the window keeps each refused entry as
+  written and, while Manual is forced, the user's mode (`SettingsLoad::file_text`), so the
+  window never deletes an entry the user must still fix. A file that is not a permissions file
+  at all (bad TOML, an unknown key, an unknown mode) keeps the earlier behavior: Manual, no
+  rules, and the reason. The window now also refuses to write over such a file.
+
+Evidence: `kgraf-tools` (`permission_names_tests.rs`:
+`a_claude_code_tool_kgraf_lacks_loads_with_a_notice_and_changes_no_decision`,
+`the_table_of_claude_code_tools_kgraf_lacks_is_consistent`,
+`a_refused_entry_is_listed_and_only_a_refused_deny_or_ask_forces_manual`,
+`a_rule_or_allow_entry_naming_no_tool_is_refused_with_the_known_names`, typos included);
+`kgraf-cli` (`permissions_cli.rs`:
+`the_command_line_refuses_a_bad_entry_by_name_and_loads_a_tool_kgraf_lacks`); `kgraf-host`
+(`rule_names_tests.rs`: `an_mcp_rule_is_checked_against_the_tools_the_servers_list_at_run_start`,
+which now also traces the `WebFetch` notice in a real run); `kgraf-shell` (`permission_bar.rs`:
+`a_claude_code_name_loads_and_a_tool_kgraf_lacks_is_a_notice_in_the_window`,
+`a_bad_deny_entry_keeps_the_other_rules_and_forces_manual_with_the_reason`,
+`a_bad_allow_entry_keeps_the_mode`,
+`a_file_whose_mode_cannot_start_falls_back_to_manual_and_says_so`). Each regression test fails
+with its part of the change reverted and passes with it restored.

@@ -48,7 +48,8 @@ use std::sync::{Arc, Mutex};
 #[path = "permission_names.rs"]
 pub mod permission_names;
 pub use permission_names::{
-    BUILTIN_TOOLS, CLAUDE_CODE_ALIASES, claude_code_alias, tool_hint, unmatched_entries,
+    BUILTIN_TOOLS, CLAUDE_CODE_ALIASES, CLAUDE_CODE_WITHOUT_COUNTERPART, claude_code_alias,
+    counterpart_notice, tool_hint, unmatched_entries, without_counterpart,
 };
 
 /// The name of the hook that enforces the user's rules and the critical-path
@@ -215,8 +216,11 @@ impl ModeSource {
 ///
 /// The tool must be one a worker can have ([`permission_names`]): a kGraf
 /// tool, a Claude Code name read as one (`Bash(rm *)` is `shell(rm *)`), an
-/// MCP name, or `*`. Anything else is refused when the rule is read, since it
-/// would match nothing. [`Rule::text`] is the rule as the user wrote it.
+/// MCP name, or `*`. A Claude Code tool kGraf has no tool for (`WebFetch`)
+/// loads but matches no call, and is said as a notice
+/// ([`counterpart_notice`]). Anything else is refused when the rule is read,
+/// since it would match nothing. [`Rule::text`] is the rule as the user wrote
+/// it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Rule {
     /// The kGraf tool (or tool-name glob) the rule is on.
@@ -330,24 +334,32 @@ pub struct AllowSet {
 }
 
 impl AllowSet {
-    /// Add programs, each a plain program name (no whitespace).
+    /// Add programs, each a plain program name (no whitespace), checked by
+    /// [`validate_entry`].
     pub fn with_programs<I, S>(mut self, programs: I) -> Result<Self, String>
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
         for p in programs {
-            let p = p.into();
-            if p.is_empty() || p.chars().any(|c| c.is_whitespace() || c.is_control()) {
-                return Err(format!(
-                    "`{}` is not a program name: an allow set lists programs, each an exact \
-                     argv[0], with no spaces",
-                    p.escape_debug()
-                ));
-            }
-            self.programs.insert(p);
+            self.add(validate_entry(EntryList::AllowPrograms, &p.into())?.entry);
         }
         Ok(self)
+    }
+
+    /// Add one entry [`validate_entry`] accepted. A rule is not an allow-set
+    /// entry and is ignored here.
+    fn add(&mut self, entry: Entry) {
+        match entry {
+            Entry::Program(p) => {
+                self.programs.insert(p);
+            }
+            Entry::Tool(t) => {
+                self.tools.insert(t);
+            }
+            Entry::Path(p) => self.paths.push(p),
+            Entry::Deny(_) | Entry::Ask(_) => {}
+        }
     }
 
     pub fn allows_program(&self, program: &str) -> bool {
@@ -363,18 +375,16 @@ impl AllowSet {
     }
 
     /// Add tools, each a kGraf tool, a Claude Code name read as one (`Bash`
-    /// is `shell`), or an MCP name. Any other name is refused: Auto would
-    /// grant nothing by it.
+    /// is `shell`), a Claude Code tool kGraf has no tool for (kept, granting
+    /// nothing), or an MCP name, checked by [`validate_entry`]. Any other name
+    /// is refused: Auto would grant nothing by it.
     pub fn with_tools<I, S>(mut self, tools: I) -> Result<Self, String>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
         for t in tools {
-            let t = t.as_ref().trim();
-            let tool = permission_names::canonical_tool(t, t, permission_names::Role::Allow)
-                .map_err(|e| format!("allow-set tool {e}"))?;
-            self.tools.insert(tool);
+            self.add(validate_entry(EntryList::AllowTools, t.as_ref())?.entry);
         }
         Ok(self)
     }
@@ -401,6 +411,237 @@ impl AllowSet {
         } else {
             parts.join(", ")
         }
+    }
+}
+
+/// A list of the user-level permissions file, and of the flags that add to
+/// it: where one entry was written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum EntryList {
+    /// `deny = [...]`, `--deny`.
+    Deny,
+    /// `ask = [...]`, `--ask`.
+    Ask,
+    /// `[allow] tools = [...]`.
+    AllowTools,
+    /// `[allow] programs = [...]`, `--allow`.
+    AllowPrograms,
+    /// `[allow] paths = [...]`, `--allow-path`.
+    AllowPaths,
+}
+
+impl EntryList {
+    /// Every list, in file order.
+    pub const ALL: [EntryList; 5] = [
+        Self::Deny,
+        Self::Ask,
+        Self::AllowTools,
+        Self::AllowPrograms,
+        Self::AllowPaths,
+    ];
+
+    /// The list's key in `permissions.toml`.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Deny => "deny",
+            Self::Ask => "ask",
+            Self::AllowTools => "allow.tools",
+            Self::AllowPrograms => "allow.programs",
+            Self::AllowPaths => "allow.paths",
+        }
+    }
+
+    /// A deny or ask list: an entry refused here is a block or an ask the
+    /// user intended and does not have.
+    pub fn is_rule(self) -> bool {
+        matches!(self, Self::Deny | Self::Ask)
+    }
+}
+
+/// One entry [`validate_entry`] accepted, as kGraf reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Entry {
+    Deny(Rule),
+    Ask(Rule),
+    /// An allow-set tool, by the name kGraf matches (`Bash` is `shell`).
+    Tool(String),
+    /// An allow-set program, an exact `argv[0]`.
+    Program(String),
+    /// An allow-set path, exact or a prefix ending in `*`.
+    Path(String),
+}
+
+/// What [`validate_entry`] returns for an entry it accepts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ValidEntry {
+    pub entry: Entry,
+    /// Set when the entry loads but matches no call: it names a Claude Code
+    /// tool kGraf has no tool for. The text says what kGraf uses instead and
+    /// which kGraf rule gives the intended effect ([`counterpart_notice`]).
+    pub notice: Option<String>,
+}
+
+/// Check one entry of the user's permission settings, as written in `list`.
+///
+/// This is the one check every reader uses: `permissions.toml` (strict on
+/// the command line, entry by entry in the desktop), the `--deny`, `--ask`,
+/// `--allow` and `--allow-path` flags, and an editor that checks an entry as
+/// the user types it. `Ok` carries the entry as kGraf reads it and, for an
+/// entry that loads but matches no call, the notice to show. `Err` is the
+/// reason the entry is refused, in a sentence that names the entry and what a
+/// valid one looks like.
+///
+/// - `Deny`, `Ask`: [`Rule::parse`]. A kGraf tool, a Claude Code name read as
+///   one, an MCP name, a tool-name glob that can match some tool, or a Claude
+///   Code tool kGraf has no tool for (loaded with a notice). Any other name,
+///   and a pattern kGraf could never match, is refused.
+/// - `AllowTools`: the same names, without wildcards except one MCP
+///   server's tools (`mcp__<server>__*`).
+/// - `AllowPrograms`: one program name with no whitespace or control
+///   characters.
+/// - `AllowPaths`: any text.
+pub fn validate_entry(list: EntryList, text: &str) -> Result<ValidEntry, String> {
+    let (entry, notice) = match list {
+        EntryList::Deny | EntryList::Ask => {
+            let rule = Rule::parse(text)?;
+            let notice = counterpart_notice(list, &rule.text(), &rule.tool);
+            let entry = if list == EntryList::Deny {
+                Entry::Deny(rule)
+            } else {
+                Entry::Ask(rule)
+            };
+            (entry, notice)
+        }
+        EntryList::AllowTools => {
+            let t = text.trim();
+            let tool = permission_names::canonical_tool(t, t, permission_names::Role::Allow)
+                .map_err(|e| format!("allow-set tool {e}"))?;
+            let notice = counterpart_notice(list, t, &tool);
+            (Entry::Tool(tool), notice)
+        }
+        EntryList::AllowPrograms => {
+            if text.is_empty() || text.chars().any(|c| c.is_whitespace() || c.is_control()) {
+                return Err(format!(
+                    "`{}` is not a program name: an allow set lists programs, each an exact \
+                     argv[0], with no spaces",
+                    text.escape_debug()
+                ));
+            }
+            (Entry::Program(text.to_owned()), None)
+        }
+        EntryList::AllowPaths => (Entry::Path(text.to_owned()), None),
+    };
+    Ok(ValidEntry { entry, notice })
+}
+
+/// An entry of `permissions.toml` that [`validate_entry`] refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RefusedLine {
+    pub list: EntryList,
+    /// The entry as written in the file.
+    pub text: String,
+    /// Why it was refused.
+    pub reason: String,
+}
+
+impl RefusedLine {
+    /// One sentence naming the entry, its list and the reason.
+    pub fn sentence(&self) -> String {
+        format!(
+            "The {} entry \"{}\" is refused: {}.",
+            self.list.key(),
+            self.text.escape_debug(),
+            self.reason.trim_end_matches('.')
+        )
+    }
+}
+
+/// What reading `permissions.toml` entry by entry found
+/// ([`PermissionSettings::read_entries`]): the settings with every valid
+/// entry, each refused entry with its reason, a notice for each entry that
+/// loads but matches no call, and, when a deny or ask entry was refused, why
+/// the mode must be Manual. The desktop runs on this and Settings shows it;
+/// the command line refuses the file if any entry was refused.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SettingsLoad {
+    /// The file's settings without the refused entries. `mode` is the
+    /// file's own; [`SettingsLoad::effective`] applies `forced_manual`.
+    pub settings: PermissionSettings,
+    pub refused: Vec<RefusedLine>,
+    pub notices: Vec<String>,
+    /// Set when a deny or ask entry was refused (a block or ask the user
+    /// intended is missing), or the file could not be read at all: the mode
+    /// is Manual, so every request asks, until the file is fixed.
+    pub forced_manual: Option<String>,
+    /// The file could not be read as settings at all
+    /// ([`SettingsLoad::unreadable`]); nothing may be written over it.
+    pub unreadable: bool,
+}
+
+impl SettingsLoad {
+    /// The settings to run under: [`SettingsLoad::settings`], in Manual when
+    /// [`SettingsLoad::forced_manual`] is set.
+    pub fn effective(&self) -> PermissionSettings {
+        let mut s = self.settings.clone();
+        if self.forced_manual.is_some() {
+            s.mode = PermissionMode::Manual;
+        }
+        s
+    }
+
+    /// The result for a file that could not be read as settings at all
+    /// (`why`): Manual, no rules, and the reason.
+    pub fn unreadable(why: &str) -> Self {
+        Self {
+            forced_manual: Some(format!(
+                "Manual applies, with no rules, because the permission settings could not be \
+                 read: {why}"
+            )),
+            unreadable: true,
+            ..Self::default()
+        }
+    }
+
+    /// The text to write to the user-level file for the live settings
+    /// `live`: the refused entries are kept as written, so a change made in
+    /// the desktop does not delete an entry the user must still fix; while
+    /// Manual is forced, the file keeps the mode the user chose. Refused for
+    /// a file that could not be read at all, so it is not written over.
+    pub fn file_text(&self, live: &PermissionSettings) -> Result<String, String> {
+        if self.unreadable {
+            return Err(
+                "permissions.toml could not be read, so kGraf does not write over it; correct \
+                 the file first"
+                    .to_owned(),
+            );
+        }
+        let mut f = PermissionsFile::from_settings(live);
+        if self.forced_manual.is_some() {
+            f.mode = Some(self.settings.mode);
+        }
+        for line in &self.refused {
+            let list = match line.list {
+                EntryList::Deny => &mut f.deny,
+                EntryList::Ask => &mut f.ask,
+                EntryList::AllowTools => &mut f.allow.tools,
+                EntryList::AllowPrograms => &mut f.allow.programs,
+                EntryList::AllowPaths => &mut f.allow.paths,
+            };
+            if !list.contains(&line.text) {
+                list.push(line.text.clone());
+            }
+        }
+        toml::to_string(&f).map_err(|e| e.to_string())
+    }
+
+    /// One line for a log: the forced-Manual reason, each refused entry and
+    /// each notice; `None` when there is nothing to say.
+    pub fn summary(&self) -> Option<String> {
+        let mut parts: Vec<String> = Vec::new();
+        parts.extend(self.forced_manual.iter().cloned());
+        parts.extend(self.refused.iter().map(RefusedLine::sentence));
+        parts.extend(self.notices.iter().cloned());
+        (!parts.is_empty()).then(|| parts.join(" "))
     }
 }
 
@@ -662,63 +903,140 @@ pub enum SettingsFileError {
     },
 }
 
-impl PermissionSettings {
-    /// Parse the user-level file's text.
-    pub fn from_toml_str(text: &str) -> Result<Self, String> {
-        let f: PermissionsFile = toml::from_str(text).map_err(|e| e.to_string())?;
-        let rules = |list: &[String]| -> Result<Vec<Rule>, String> {
-            list.iter().map(|r| Rule::parse(r)).collect()
-        };
-        Ok(Self {
-            mode: f.mode.unwrap_or_default(),
-            allow: AllowSet {
-                paths: f.allow.paths,
-                ..AllowSet::default()
-            }
-            .with_tools(&f.allow.tools)?
-            .with_programs(f.allow.programs)?,
-            rules: UserRules {
-                deny: rules(&f.deny)?,
-                ask: rules(&f.ask)?,
+impl PermissionsFile {
+    fn from_settings(s: &PermissionSettings) -> Self {
+        Self {
+            mode: Some(s.mode),
+            plan_review: s.plan_review,
+            disable_bypass: s.disable_bypass,
+            allow_bypass: s.allow_bypass,
+            bypass_warning_accepted: s.bypass_warning_accepted,
+            allow: AllowFile {
+                programs: s.allow.programs.iter().cloned().collect(),
+                tools: s.allow.tools.iter().cloned().collect(),
+                paths: s.allow.paths.clone(),
             },
+            deny: s.rules.deny.iter().map(Rule::text).collect(),
+            ask: s.rules.ask.iter().map(Rule::text).collect(),
+            script_constructs: s.script_constructs.clone(),
+        }
+    }
+}
+
+impl PermissionSettings {
+    /// Parse the user-level file's text, refusing it if any entry is refused
+    /// (the command line's reading). The error names every refused entry, its
+    /// reason, and how to fix it.
+    pub fn from_toml_str(text: &str) -> Result<Self, String> {
+        let load = Self::read_entries(text)?;
+        if load.refused.is_empty() {
+            return Ok(load.settings);
+        }
+        let lines: Vec<String> = load.refused.iter().map(RefusedLine::sentence).collect();
+        Err(format!(
+            "{} Correct or remove each refused entry in the file, then start again.",
+            lines.join(" ")
+        ))
+    }
+
+    /// Parse the user-level file's text entry by entry (the desktop's
+    /// reading): every entry goes through [`validate_entry`]; a valid entry
+    /// loads, a refused one is listed with its reason, and a refused deny or
+    /// ask entry forces Manual. `Err` only when the text is not a permissions
+    /// file at all (bad TOML, an unknown key, a value of the wrong type, an
+    /// unknown mode or script construct).
+    pub fn read_entries(text: &str) -> Result<SettingsLoad, String> {
+        let f: PermissionsFile = toml::from_str(text).map_err(|e| e.to_string())?;
+        let mut settings = Self {
+            mode: f.mode.unwrap_or_default(),
             plan_review: f.plan_review,
             disable_bypass: f.disable_bypass,
             allow_bypass: f.allow_bypass,
             bypass_warning_accepted: f.bypass_warning_accepted,
             script_constructs: f.script_constructs,
-        })
+            ..Self::default()
+        };
+        let mut load = SettingsLoad::default();
+        for (list, entries) in [
+            (EntryList::Deny, &f.deny),
+            (EntryList::Ask, &f.ask),
+            (EntryList::AllowTools, &f.allow.tools),
+            (EntryList::AllowPrograms, &f.allow.programs),
+            (EntryList::AllowPaths, &f.allow.paths),
+        ] {
+            for text in entries {
+                match validate_entry(list, text) {
+                    Ok(valid) => {
+                        load.notices.extend(valid.notice);
+                        match valid.entry {
+                            Entry::Deny(r) => settings.rules.deny.push(r),
+                            Entry::Ask(r) => settings.rules.ask.push(r),
+                            other => settings.allow.add(other),
+                        }
+                    }
+                    Err(reason) => load.refused.push(RefusedLine {
+                        list,
+                        text: text.clone(),
+                        reason,
+                    }),
+                }
+            }
+        }
+        let missing: Vec<String> = load
+            .refused
+            .iter()
+            .filter(|l| l.list.is_rule())
+            .map(|l| format!("{} rule \"{}\"", l.list.key(), l.text.escape_debug()))
+            .collect();
+        if !missing.is_empty() {
+            load.forced_manual = Some(format!(
+                "Manual applies until you correct permissions.toml, because kGraf refused your {}. \
+                 A block or an ask that you wrote is missing, so every request asks.",
+                missing.join(", ")
+            ));
+        }
+        load.settings = settings;
+        Ok(load)
     }
 
     pub fn to_toml_string(&self) -> Result<String, String> {
-        let f = PermissionsFile {
-            mode: Some(self.mode),
-            plan_review: self.plan_review,
-            disable_bypass: self.disable_bypass,
-            allow_bypass: self.allow_bypass,
-            bypass_warning_accepted: self.bypass_warning_accepted,
-            allow: AllowFile {
-                programs: self.allow.programs.iter().cloned().collect(),
-                tools: self.allow.tools.iter().cloned().collect(),
-                paths: self.allow.paths.clone(),
-            },
-            deny: self.rules.deny.iter().map(Rule::text).collect(),
-            ask: self.rules.ask.iter().map(Rule::text).collect(),
-            script_constructs: self.script_constructs.clone(),
-        };
-        toml::to_string(&f).map_err(|e| e.to_string())
+        toml::to_string(&PermissionsFile::from_settings(self)).map_err(|e| e.to_string())
     }
 
     /// Load the user-level file at `path`. A missing file is the defaults
     /// (Manual, no rules). A file inside `project_root` is refused: a worker
-    /// can write inside the project, and the mode is the user's alone.
+    /// can write inside the project, and the mode is the user's alone. Any
+    /// refused entry refuses the file ([`PermissionSettings::from_toml_str`]).
     pub fn load(path: &Path, project_root: Option<&Path>) -> Result<Self, SettingsFileError> {
+        Self::read_file(path, project_root, Self::from_toml_str).map(Option::unwrap_or_default)
+    }
+
+    /// Load the user-level file at `path` entry by entry
+    /// ([`PermissionSettings::read_entries`]). A missing file is the
+    /// defaults. `Err` when the file cannot be read, lies inside
+    /// `project_root`, or is not a permissions file at all.
+    pub fn load_entries(
+        path: &Path,
+        project_root: Option<&Path>,
+    ) -> Result<SettingsLoad, SettingsFileError> {
+        Self::read_file(path, project_root, Self::read_entries).map(Option::unwrap_or_default)
+    }
+
+    /// `parse` over the file's text; `None` for a missing file.
+    fn read_file<T>(
+        path: &Path,
+        project_root: Option<&Path>,
+        parse: impl Fn(&str) -> Result<T, String>,
+    ) -> Result<Option<T>, SettingsFileError> {
         refuse_inside_project(path, project_root)?;
         match std::fs::read_to_string(path) {
-            Ok(text) => Self::from_toml_str(&text).map_err(|reason| SettingsFileError::Invalid {
-                path: path.to_owned(),
-                reason,
-            }),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Ok(text) => parse(&text)
+                .map(Some)
+                .map_err(|reason| SettingsFileError::Invalid {
+                    path: path.to_owned(),
+                    reason,
+                }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(source) => Err(SettingsFileError::Read {
                 path: path.to_owned(),
                 source,
@@ -734,19 +1052,25 @@ impl PermissionSettings {
                 path: path.to_owned(),
                 reason,
             })?;
-        let io = |source| SettingsFileError::Write {
-            path: path.to_owned(),
-            source,
-        };
-        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-            std::fs::create_dir_all(dir).map_err(io)?;
-        }
-        let mut tmp = path.as_os_str().to_owned();
-        tmp.push(format!(".{}.tmp", std::process::id()));
-        let tmp = PathBuf::from(tmp);
-        std::fs::write(&tmp, text).map_err(io)?;
-        std::fs::rename(&tmp, path).map_err(io)
+        write_settings_file(path, &text)
     }
+}
+
+/// Write `text` to the user-level file at `path` atomically (a temporary
+/// file, then a rename).
+pub fn write_settings_file(path: &Path, text: &str) -> Result<(), SettingsFileError> {
+    let io = |source| SettingsFileError::Write {
+        path: path.to_owned(),
+        source,
+    };
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).map_err(io)?;
+    }
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".{}.tmp", std::process::id()));
+    let tmp = PathBuf::from(tmp);
+    std::fs::write(&tmp, text).map_err(io)?;
+    std::fs::rename(&tmp, path).map_err(io)
 }
 
 fn refuse_inside_project(path: &Path, root: Option<&Path>) -> Result<(), SettingsFileError> {

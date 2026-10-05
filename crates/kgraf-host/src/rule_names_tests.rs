@@ -51,7 +51,8 @@ async fn an_mcp_rule_is_checked_against_the_tools_the_servers_list_at_run_start(
     }]});
     std::fs::write(state.join("worker.json"), worker.to_string()).expect("worker.json");
     let rules = control_from(
-        "deny = [\"mcp__echoserver__echo\", \"mcp__echoserver__nosuch\", \"Bash(rm -rf*)\"]\n\
+        "deny = [\"mcp__echoserver__echo\", \"mcp__echoserver__nosuch\", \"Bash(rm -rf*)\", \
+         \"WebFetch\"]\n\
          ask = [\"mcp__other\"]\n",
     );
     let host = Host::open(config)
@@ -68,8 +69,18 @@ async fn an_mcp_rule_is_checked_against_the_tools_the_servers_list_at_run_start(
         .run(RunStart::Instruction("copy README.md to a.txt".into()))
         .await
         .expect("run");
-    let lines = unmatched(&said);
-    assert_eq!(lines.len(), 2, "{lines:#?}");
+    let mut lines = unmatched(&said);
+    assert_eq!(lines.len(), 3, "{lines:#?}");
+    // A Claude Code tool kGraf lacks is said with what to write instead.
+    let web = lines.remove(1);
+    assert!(
+        web.starts_with(
+            "your deny rule `WebFetch` matches no call, so it blocks nothing. kGraf \
+                         has no WebFetch tool."
+        ),
+        "{web}"
+    );
+    assert!(web.contains("`shell(curl*)`"), "{web}");
     assert!(
         lines[0].starts_with("your deny rule `mcp__echoserver__nosuch` names no tool"),
         "{}",
@@ -96,7 +107,7 @@ async fn an_mcp_rule_is_checked_against_the_tools_the_servers_list_at_run_start(
     }
     let trace = std::fs::read_to_string(root.join(".kgraf/runs").join(id).join("trace.jsonl"))
         .expect("trace");
-    for line in &lines {
+    for line in lines.iter().chain(std::iter::once(&web)) {
         let traced = trace
             .lines()
             .filter(|l| l.contains(r#""event":"notice""#) && l.contains(&line[..60]))

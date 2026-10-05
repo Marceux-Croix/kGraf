@@ -1326,11 +1326,19 @@ system paths hold in every mode; a run nobody attends denies what would ask.
 A rule or allow-set tool must name a tool a worker can have: a built-in, a
 Claude Code name read as the kGraf tool that does the same job (`Bash` as
 `shell`, `Edit` and `Write` as `apply_patch`, `Read` as `read_file`), an MCP
-name, or `*`. Any other name is refused where the rule is read (command line,
-user file, desktop), and a rule that no worker tool of the run matches, once the
-MCP servers have listed theirs, is said at run start as a notice and traced.
+name, or `*`. A Claude Code tool kGraf has no tool for (`WebFetch`, `Agent`
+and the rest of a table) loads, matches no call, and is said as a notice that
+names what kGraf uses instead and the kGraf rule to write. Any other name is
+refused where the rule is read, and a rule that no worker tool of the run
+matches, once the MCP servers have listed theirs, is said at run start as a
+notice and traced. One per-entry check
+(`kgraf_tools::permissions::validate_entry`) serves the flags, the user file
+and the desktop. The command line refuses a file with any refused entry,
+naming each one. The desktop reads the file entry by entry
+(`SettingsLoad`): valid entries load, Settings lists each refused entry with
+its reason, and a refused deny or ask entry forces Manual with the reason.
 Patterns follow Claude Code's wildcards, each only widening what an existing
-rule matched (decision 0094, amended 2026-10-02, rule names).
+rule matched (decision 0094, amended 2026-10-02, rule names, and 2026-10-05).
 Both read each command from every place its program may stand past grouping and
 prefix words (`{`, `(`, `!`, clause keywords, `env`, `command`, `builtin`,
 `exec`, `nohup`, `time`, `VAR=value`, a leading redirection), and follow a shell

@@ -849,8 +849,14 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   never writes a project file.
 
   A rule names a tool a worker can have, or it is refused where it is read (`--deny`, `--ask`,
-  `permissions.toml`, and the app, which then runs in Manual and says why), with the tools a
-  rule may name. The names are kGraf's tools (`shell`, `apply_patch`, `read_file`,
+  `permissions.toml`, and the app), with the tools a rule may name. On the command line, one
+  refused entry in `permissions.toml` stops the command; the error names each refused entry,
+  its list and the reason. Correct or remove it, then start again. The app keeps every valid
+  entry and lists each refused one, with its reason, in Settings > Permissions. A refused deny
+  or ask rule keeps the app in Manual (every request asks) until you correct the file, because a
+  block or ask you wrote is missing; a refused allow entry keeps your mode. A file that is not
+  valid TOML, or has an unknown key, gives Manual with no rules, and the app does not write over
+  it. The names are kGraf's tools (`shell`, `apply_patch`, `read_file`,
   `list_directory`, `search_files`, and the others the refusal lists), `*` for every tool, an
   MCP server's tool as `mcp__<server>__<tool>`, every tool of a server as `mcp__<server>` or
   `mcp__<server>__*`, and Claude Code's names, read as the kGraf tool that does the same job:
@@ -865,8 +871,14 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   (`Bash(timeout:30)`) are refused, as kGraf can never match them. Differences from Claude
   Code: a `Read` rule covers `read_file` only, so a path the searches must not see needs its
   own `search_files(...)` rule; a `Read` rule does not stop an edit; an `Edit` rule does not
-  cover a shell redirection. Claude Code tools kGraf does not have (`WebFetch`, `WebSearch`,
-  `Agent`, `Task` and others) are refused. An MCP name is checked when the run starts, once the
+  cover a shell redirection. A rule on a Claude Code tool kGraf does not have (`WebFetch`,
+  `WebSearch`, `Agent`, `Task`, `TodoWrite`, `Skill` and the others in
+  `kgraf_tools::permissions::CLAUDE_CODE_WITHOUT_COUNTERPART`) loads, matches no call, and is
+  said as a notice at run start (a `notice` line and the trace) and in Settings. The notice
+  says what kGraf uses instead and which kGraf rule gives the effect you intended, for example:
+  "kGraf has no WebFetch tool. Workers reach the web through the shell (curl, wget) or MCP
+  tools. To block that, add `shell(curl*)`, `shell(wget*)` or a rule for the MCP tool." A name
+  in neither list, such as a typo, is refused. An MCP name is checked when the run starts, once the
   servers have listed their tools: a deny or ask rule, or an allow-set tool, that names no tool
   any worker of the run has is printed as a `notice` line and traced, and the run goes on (the
   same file serves every project, and a tool the workers lack cannot be called). `[allow]

@@ -145,7 +145,9 @@ pub enum Notice {
     /// A deny or ask rule, or an allow-set tool, of the user's permission
     /// settings names no tool any worker of this run has (an MCP server that
     /// does not list it, or a built-in this run does not register), so it
-    /// does nothing in this run (decision 0094, amended 2026-10-02). The
+    /// does nothing in this run (decision 0094, amended 2026-10-02). For a
+    /// Claude Code tool kGraf has no tool for, the sentence says what kGraf
+    /// uses instead and which rule to write (amended 2026-10-05). The
     /// sentence is the whole notice; it is also traced.
     RuleMatchesNoTool(String),
 }

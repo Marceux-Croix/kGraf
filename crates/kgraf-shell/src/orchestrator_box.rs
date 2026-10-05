@@ -1726,10 +1726,10 @@ pub(crate) mod tests {
     }
 
     fn perm_ui(dir: &std::path::Path) -> crate::permission_bar::PermissionUi {
-        crate::permission_bar::PermissionUi {
-            control: std::sync::Arc::new(kgraf_tools::PermissionControl::manual()),
-            file: Some(dir.join("permissions.toml")),
-        }
+        crate::permission_bar::PermissionUi::with_control(
+            std::sync::Arc::new(kgraf_tools::PermissionControl::manual()),
+            Some(dir.join("permissions.toml")),
+        )
     }
 
     /// Decision 0094, through the real widgets: the plan waits in the box, and

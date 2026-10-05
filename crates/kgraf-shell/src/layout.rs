@@ -3144,8 +3144,10 @@ impl ShellApp {
     /// The mode itself is chosen in the orchestrator box's dropdown; Bypass is
     /// offered there only with this on, and its first use shows a warning.
     /// Turning it off while in Bypass returns the mode to Manual at once.
-    /// Below it, the script-construct switches (decision 0094, amended
-    /// 2026-10-02), all off by default.
+    /// Above it, what reading permissions.toml found: why Manual is forced,
+    /// each refused entry with its reason, and each notice. Below it, the
+    /// script-construct switches (decision 0094, amended 2026-10-02), all off
+    /// by default.
     fn settings_permissions(&mut self, ui: &mut Ui, p: &Palette) {
         ui.label(
             RichText::new("Permissions")
@@ -3166,13 +3168,17 @@ impl ShellApp {
                 "The permission mode is chosen in the orchestrator box. Bypass grants every \
                  request without asking, except your deny and ask rules and deleting system \
                  paths, and offers no protection against prompt injection. Off: the box does \
-                 not offer Bypass. disable_bypass is set in the user-level permissions.toml, \
-                 which also holds the rules below. A rule that names no tool is refused, and \
-                 the window then runs in Manual and says why.",
+                 not offer Bypass. disable_bypass and the rules below are kept in the \
+                 user-level permissions.toml. A rule may use Claude Code's tool names (Bash, \
+                 Edit, Write, Read). A rule on a Claude Code tool kGraf does not have, such as \
+                 WebFetch, loads with a notice and matches nothing. An entry that names no tool \
+                 is refused and listed below; the other entries still apply. A refused deny or \
+                 ask rule keeps the mode at Manual until you correct it.",
             )
             .small()
             .color(p.text_2),
         );
+        crate::permission_bar::draw_load_result(ui, &perm, p);
         if settings.disable_bypass {
             ui.label(
                 RichText::new("Bypass is disabled in permissions.toml (disable_bypass = true).")
@@ -3183,8 +3189,9 @@ impl ShellApp {
             let mut allow = settings.allow_bypass;
             if ui.checkbox(&mut allow, "Allow Bypass mode").changed() {
                 perm.control.set_allow_bypass(allow);
-                if let Some(path) = &perm.file
-                    && let Err(e) = perm.control.settings().save(path)
+                // Through the UI's save, so refused entries stay in the file.
+                if perm.file.is_some()
+                    && let Err(e) = perm.save()
                 {
                     self.chrome.notice = Some((
                         format!("The permission setting was not saved: {e}"),

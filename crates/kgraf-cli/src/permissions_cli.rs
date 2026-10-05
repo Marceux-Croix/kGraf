@@ -17,8 +17,8 @@
 
 use anyhow::{Context, Result, bail};
 use kgraf_tools::permissions::{
-    AllowSet, ModeSource, PERMISSIONS_FILE_NAME, PERMISSIONS_PATH_ENV, PermissionControl,
-    PermissionMode, PermissionSettings, ProcessFacts, Rule, ScriptConstructs,
+    Entry, EntryList, ModeSource, PERMISSIONS_FILE_NAME, PERMISSIONS_PATH_ENV, PermissionControl,
+    PermissionMode, PermissionSettings, ProcessFacts, ScriptConstructs, validate_entry,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -83,30 +83,31 @@ pub fn settings(
     args: &PermissionArgs,
     container_sandbox: bool,
 ) -> Result<(PermissionSettings, ModeSource)> {
+    // Every flag entry goes through the same per-entry check as a line of
+    // the file (`validate_entry`), so a flag accepts and refuses exactly what
+    // `permissions.toml` would.
     let mut s = file;
-    s.allow = AllowSet {
-        paths: s
-            .allow
-            .paths
-            .iter()
-            .cloned()
-            .chain(args.allow_paths.iter().cloned())
-            .collect(),
-        ..s.allow
-    }
-    .with_programs(args.allow.iter().cloned())
-    .map_err(anyhow::Error::msg)
-    .context("--allow")?;
-    for (list, flag, out) in [
-        (&args.deny, "--deny", &mut s.rules.deny),
-        (&args.ask, "--ask", &mut s.rules.ask),
+    for (list, flag, values) in [
+        (EntryList::AllowPaths, "--allow-path", &args.allow_paths),
+        (EntryList::AllowPrograms, "--allow", &args.allow),
+        (EntryList::Deny, "--deny", &args.deny),
+        (EntryList::Ask, "--ask", &args.ask),
     ] {
-        for r in list {
-            out.push(
-                Rule::parse(r)
-                    .map_err(anyhow::Error::msg)
-                    .with_context(|| flag.to_owned())?,
-            );
+        for v in values {
+            let valid = validate_entry(list, v)
+                .map_err(anyhow::Error::msg)
+                .with_context(|| format!("{flag} (correct or remove this flag)"))?;
+            match valid.entry {
+                Entry::Deny(r) => s.rules.deny.push(r),
+                Entry::Ask(r) => s.rules.ask.push(r),
+                Entry::Program(p) => {
+                    s.allow.programs.insert(p);
+                }
+                Entry::Path(p) => s.allow.paths.push(p),
+                Entry::Tool(t) => {
+                    s.allow.tools.insert(t);
+                }
+            }
         }
     }
     s.plan_review |= args.plan_review;
@@ -267,7 +268,7 @@ mod tests {
         assert_eq!(s.rules.deny[0].text(), "Bash(rm -rf*)");
         for (deny, ask, flag) in [
             (vec!["bash(rm -rf*)".to_owned()], vec![], "--deny"),
-            (vec![], vec!["WebFetch".to_owned()], "--ask"),
+            (vec![], vec!["WebFech".to_owned()], "--ask"),
         ] {
             let bad = PermissionArgs {
                 deny,
@@ -297,6 +298,50 @@ mod tests {
         )
         .expect_err("refused");
         assert!(format!("{e:#}").contains("`Bah(rm*)`"), "{e:#}");
+    }
+
+    /// The command line refuses a file with one bad entry, though its other
+    /// entries are valid: the error names the entry, its list, the reason and
+    /// how to fix it. A Claude Code tool kGraf lacks, in the file or a flag,
+    /// loads (its notice is said at run start) and is not a refusal.
+    #[test]
+    fn the_command_line_refuses_a_bad_entry_by_name_and_loads_a_tool_kgraf_lacks() {
+        let dir = tempfile::tempdir().expect("dir");
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project).expect("project");
+        let file = dir.path().join("permissions.toml");
+        std::fs::write(
+            &file,
+            "mode = \"auto\"\ndeny = [\"Bash(curl*)\", \"Bah(rm*)\"]\n[allow]\nprograms = [\"ls\"]",
+        )
+        .expect("write");
+        let args = PermissionArgs {
+            permissions_file: Some(file.clone()),
+            ..PermissionArgs::default()
+        };
+        let e = format!("{:#}", control(&project, &args).expect_err("refused"));
+        assert!(e.contains("The deny entry \"Bah(rm*)\" is refused"), "{e}");
+        assert!(e.contains("which is no kGraf tool"), "{e}");
+        assert!(e.contains("Correct or remove each refused entry"), "{e}");
+        assert!(
+            !e.contains("Bash(curl*)"),
+            "only the bad entry is named: {e}"
+        );
+
+        std::fs::write(&file, "deny = [\"WebFetch\"]\nask = [\"TodoWrite\"]").expect("write");
+        let c = control(
+            &project,
+            &PermissionArgs {
+                ask: vec!["WebSearch".into()],
+                permissions_file: Some(file),
+                ..PermissionArgs::default()
+            },
+        )
+        .expect("a tool kGraf lacks loads");
+        let s = c.settings();
+        assert_eq!((s.rules.deny.len(), s.rules.ask.len()), (1, 2));
+        let said = kgraf_tools::permissions::unmatched_entries(&s, &["shell".to_owned()]);
+        assert!(said[0].contains("kGraf has no WebFetch tool"), "{said:#?}");
     }
 
     /// `--script-constructs` wins over the file's list, `none` included;

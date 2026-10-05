@@ -1,7 +1,9 @@
 //! A permission rule or allow-set entry that names no tool is refused where it
 //! is read; Claude Code's tool names are read as the kGraf tools that do the
-//! same job; an MCP name is accepted and checked at run start; and no rule
-//! matches less than it did before.
+//! same job; a Claude Code tool kGraf lacks loads with a notice and changes no
+//! decision; an MCP name is accepted and checked at run start; the desktop's
+//! entry-by-entry reading keeps the valid entries; and no rule matches less
+//! than it did before.
 //!
 //! How to run: `cargo test -p kgraf-tools permissions::name_tests`. No
 //! network, no files written; paths are fixed strings under a fictional home
@@ -245,9 +247,10 @@ fn a_rule_or_allow_entry_naming_no_tool_is_refused_with_the_known_names() {
         ("bash(rm*)", Some("shell")),
         ("write_file(src/*)", Some("apply_patch")),
         ("Shell", Some("shell")),
-        ("WebFetch", None),
+        ("WebFech", None),
+        ("webfetch", None),
         ("Bah(rm*)", None),
-        ("Task", None),
+        ("Tasks", None),
     ] {
         let e = Rule::parse(rule).expect_err(rule);
         assert!(e.contains(&format!("`{rule}`")), "{e}");
@@ -267,8 +270,8 @@ fn a_rule_or_allow_entry_naming_no_tool_is_refused_with_the_known_names() {
     }
     let e = PermissionSettings::from_toml_str("deny = [\"Bah(rm*)\"]").expect_err("file deny");
     assert!(e.contains("Bah"), "{e}");
-    let e = PermissionSettings::from_toml_str("ask = [\"WebSearch\"]").expect_err("file ask");
-    assert!(e.contains("WebSearch"), "{e}");
+    let e = PermissionSettings::from_toml_str("ask = [\"WebSerch\"]").expect_err("file ask");
+    assert!(e.contains("WebSerch"), "{e}");
     let e = PermissionSettings::from_toml_str("[allow]\ntools = [\"fetch\"]").expect_err("allow");
     assert!(e.contains("allow-set tool `fetch`"), "{e}");
     for wide in ["*", "mcp__*", "sh*"] {
@@ -418,4 +421,183 @@ fn glob_matches_any_text_at_a_star_and_bytes_elsewhere() {
     assert!(!glob("a*b*c", "a_c"));
     assert!(glob("é*", "éa"));
     assert!(!glob("", "x"));
+}
+
+const WEB_FILE: &str = "mode = \"auto\"\ndeny = [\"WebFetch\", \"Bash(rm *)\"]\n\
+                        ask = [\"WebSearch\", \"WebFetch(domain:example.com)\"]\n\
+                        [allow]\ntools = [\"WebFetch\"]\nprograms = [\"ls\"]";
+
+/// A Claude Code tool kGraf lacks: `deny = ["WebFetch"]` (and an ask rule, an
+/// allow-set tool, a pattern) loads from the file, strict or entry by entry,
+/// with a notice that says what to write instead, and changes no decision:
+/// every call gets the same answer, in every mode, as with no such entry, a
+/// call of a tool registered under the bare name `WebFetch` included.
+#[tokio::test]
+async fn a_claude_code_tool_kgraf_lacks_loads_with_a_notice_and_changes_no_decision() {
+    let load = PermissionSettings::read_entries(WEB_FILE).expect("a permissions file");
+    assert!(load.refused.is_empty(), "{:#?}", load.refused);
+    assert_eq!(load.forced_manual, None);
+    assert_eq!(load.settings.mode, PermissionMode::Auto);
+    assert_eq!(load.notices.len(), 4, "{:#?}", load.notices);
+    assert_eq!(
+        load.notices[0],
+        "your deny rule `WebFetch` matches no call, so it blocks nothing. kGraf has no \
+         WebFetch tool. Workers reach the web through the shell (curl, wget) or MCP tools. To \
+         block that, add `shell(curl*)`, `shell(wget*)` or a rule for the MCP tool."
+    );
+    assert!(
+        load.notices[1].starts_with("your ask rule `WebSearch` matches no call, so it asks"),
+        "{}",
+        load.notices[1]
+    );
+    assert!(
+        load.notices[3].starts_with("your allow-set tool `WebFetch` matches no call"),
+        "{}",
+        load.notices[3]
+    );
+    // The strict reading (the command line) loads it too.
+    let with = PermissionSettings::from_toml_str(WEB_FILE).expect("strict");
+    assert_eq!(with, load.settings);
+    let without = PermissionSettings::from_toml_str(
+        "mode = \"auto\"\ndeny = [\"Bash(rm *)\"]\n[allow]\nprograms = [\"ls\"]",
+    )
+    .expect("strict");
+    let calls = [
+        call("WebFetch", json!({"url": "https://example.com"})),
+        call("WebSearch", json!({"query": "x"})),
+        shell(&["curl", "https://example.com"]),
+        shell(&["rm", "x"]),
+        shell(&["ls"]),
+        call("read_file", json!({"path": "a.txt"})),
+        patch("a.txt"),
+        call("mcp__web__fetch", json!({})),
+    ];
+    for mode in PermissionMode::ALL {
+        let a = hook(mode, with.rules.clone());
+        let b = hook(mode, without.rules.clone());
+        for c in &calls {
+            assert_eq!(
+                a.review(c).await,
+                b.review(c).await,
+                "{mode}: {} {}",
+                c.tool,
+                c.input
+            );
+        }
+    }
+    let control = |s: PermissionSettings| {
+        PermissionControl::new(s, ModeSource::CommandLine, ProcessFacts::default())
+            .expect("control")
+    };
+    let (a, b) = (control(with.clone()), control(without));
+    for c in &calls {
+        assert_eq!(
+            a.route_ask(&c.tool, &c.input),
+            b.route_ask(&c.tool, &c.input),
+            "{}",
+            c.tool
+        );
+    }
+    assert!(!with.allow.allows_tool("WebFetch"));
+    // At run start the notice is the same text, not "names no tool".
+    let said = unmatched_entries(&with, &["shell".to_owned(), "WebFetch".to_owned()]);
+    assert_eq!(said.len(), 4, "{said:#?}");
+    assert_eq!(said[0], load.notices[0]);
+}
+
+/// The table of Claude Code tools kGraf lacks: no name is also a kGraf tool
+/// or an alias, no name repeats, each text is plain (no em-dash, ends with a
+/// full stop), and every kGraf rule a text tells the user to add is one
+/// [`validate_entry`] accepts as a real rule, not another notice.
+#[test]
+fn the_table_of_claude_code_tools_kgraf_lacks_is_consistent() {
+    let mut seen = std::collections::BTreeSet::new();
+    for (name, text) in CLAUDE_CODE_WITHOUT_COUNTERPART {
+        assert!(seen.insert(*name), "{name} repeats");
+        assert!(!BUILTIN_TOOLS.contains(name), "{name}");
+        assert!(claude_code_alias(name).is_none(), "{name}");
+        assert!(
+            !text.contains('\u{2014}') && !text.contains("--"),
+            "{name}: {text}"
+        );
+        assert!(text.ends_with('.'), "{name}: {text}");
+        for (i, quoted) in text.split('`').enumerate() {
+            if i % 2 == 0 || quoted.contains('<') || quoted.contains(" = ") {
+                continue;
+            }
+            let valid = validate_entry(EntryList::Deny, quoted)
+                .unwrap_or_else(|e| panic!("{name}: `{quoted}` is no rule: {e}"));
+            assert_eq!(valid.notice, None, "{name}: `{quoted}`");
+        }
+    }
+    for name in [
+        "WebFetch",
+        "WebSearch",
+        "Agent",
+        "Task",
+        "TodoWrite",
+        "ExitPlanMode",
+    ] {
+        assert!(without_counterpart(name).is_some(), "{name}");
+    }
+}
+
+/// The desktop's reading: one refused deny entry is listed with its reason,
+/// every other entry still loads, and Manual is forced with a reason that
+/// names the entry; a refused allow entry alone keeps the user's mode. The
+/// text written back keeps each refused entry and, while Manual is forced,
+/// the user's mode. The strict reading refuses the same file, naming the
+/// entry and how to fix it.
+#[test]
+fn a_refused_entry_is_listed_and_only_a_refused_deny_or_ask_forces_manual() {
+    let text = "mode = \"auto\"\ndeny = [\"Bah(rm*)\", \"Bash(curl*)\"]\n\
+                ask = [\"shell(git push*)\"]\n[allow]\nprograms = [\"ls\"]";
+    let load = PermissionSettings::read_entries(text).expect("a permissions file");
+    assert_eq!(load.refused.len(), 1);
+    assert_eq!(load.refused[0].list, EntryList::Deny);
+    assert_eq!(load.refused[0].text, "Bah(rm*)");
+    assert!(load.refused[0].reason.contains("which is no kGraf tool"));
+    assert_eq!(load.settings.rules.deny.len(), 1);
+    assert_eq!(load.settings.rules.deny[0].text(), "Bash(curl*)");
+    assert_eq!(load.settings.rules.ask.len(), 1);
+    assert!(load.settings.allow.allows_program("ls"));
+    assert_eq!(
+        load.settings.mode,
+        PermissionMode::Auto,
+        "the file's own mode"
+    );
+    let why = load.forced_manual.clone().expect("Manual is forced");
+    assert!(why.contains("deny rule \"Bah(rm*)\""), "{why}");
+    assert!(why.contains("every request asks"), "{why}");
+    assert_eq!(load.effective().mode, PermissionMode::Manual);
+    let mut live = load.effective();
+    live.plan_review = true;
+    let back =
+        PermissionSettings::read_entries(&load.file_text(&live).expect("text")).expect("again");
+    assert_eq!(back.settings.mode, PermissionMode::Auto);
+    assert!(back.settings.plan_review);
+    assert_eq!(back.refused, load.refused);
+
+    let e = PermissionSettings::from_toml_str(text).expect_err("strict");
+    assert!(e.contains("The deny entry \"Bah(rm*)\" is refused"), "{e}");
+    assert!(e.contains("Correct or remove each refused entry"), "{e}");
+
+    let allow_only = "mode = \"auto\"\ndeny = [\"Bash(curl*)\"]\n[allow]\n\
+                      programs = [\"python3 -c\", \"ls\"]\ntools = [\"fetch\"]";
+    let load = PermissionSettings::read_entries(allow_only).expect("a permissions file");
+    assert_eq!(load.refused.len(), 2, "{:#?}", load.refused);
+    assert_eq!(load.forced_manual, None);
+    assert_eq!(load.effective().mode, PermissionMode::Auto);
+    assert!(load.settings.allow.allows_program("ls"));
+    assert_eq!(load.settings.rules.deny.len(), 1);
+    // A file that is not a permissions file at all is still an error here.
+    assert!(PermissionSettings::read_entries("mdoe = 1").is_err());
+    assert!(PermissionSettings::read_entries("deny = [").is_err());
+    let unreadable = SettingsLoad::unreadable("bad");
+    assert_eq!(unreadable.effective(), PermissionSettings::default());
+    assert!(
+        unreadable
+            .file_text(&PermissionSettings::default())
+            .is_err()
+    );
 }

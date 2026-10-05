@@ -20,7 +20,8 @@ use kgraf_orchestrator::{AskAnswer, PendingAsk, PermissionRequestView, PlanAnswe
 use kgraf_tools::permission_edit::{self, RuleKind};
 use kgraf_tools::permissions::{
     BYPASS_WARNING, ModeError, ModeSource, PermissionControl, PermissionMode, PermissionSettings,
-    ProcessFacts, Raised, SCRIPT_CONSTRUCTS_RISK, ScriptConstruct, group_requests,
+    ProcessFacts, Raised, SCRIPT_CONSTRUCTS_RISK, ScriptConstruct, SettingsLoad, group_requests,
+    write_settings_file,
 };
 
 use crate::orchestrator_box::{BoxBackend, Line};
@@ -32,64 +33,93 @@ pub struct PermissionUi {
     /// The user-level permissions file. `None`: changes hold for this process
     /// only, and the bar says so.
     pub file: Option<PathBuf>,
+    /// What reading the file found: the valid entries, each refused entry
+    /// with its reason, the notices, and why Manual is forced, if it is.
+    /// Settings > Permissions shows it.
+    pub load: Arc<SettingsLoad>,
 }
 
 impl PermissionUi {
-    /// The user-level file at `file` as a live control. A file that cannot be
-    /// read, or whose mode this process may not start in (Bypass as root, or
-    /// disabled), is not used: the control is Manual, and the notice says why.
+    /// The user-level file at `file` as a live control, read entry by entry
+    /// ([`PermissionSettings::load_entries`]): every valid entry loads, and
+    /// each refused entry is listed with its reason. A refused deny or ask
+    /// entry forces Manual, since a block or ask the user wrote is missing; a
+    /// refused allow entry keeps the user's mode. A file that is not a
+    /// permissions file at all (bad TOML, an unknown key), or whose mode this
+    /// process may not start in (Bypass as root, or disabled), gives Manual.
+    /// The returned line, if any, is for the log; Settings shows the same.
     pub fn load(file: Option<PathBuf>) -> (Self, Option<String>) {
-        let loaded = match &file {
-            Some(path) => PermissionSettings::load(path, None).map_err(|e| e.to_string()),
-            None => Ok(PermissionSettings::default()),
+        let mut load = match &file {
+            Some(path) => PermissionSettings::load_entries(path, None)
+                .unwrap_or_else(|e| SettingsLoad::unreadable(&e.to_string())),
+            None => SettingsLoad::default(),
         };
-        let (control, notice) = match loaded {
-            Ok(settings) => {
-                match PermissionControl::new(
-                    settings.clone(),
+        let settings = load.effective();
+        let control = match PermissionControl::new(
+            settings.clone(),
+            ModeSource::UserConfig,
+            ProcessFacts::detect(),
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                // Not `forced_manual`: the user may still choose another
+                // mode this process can start in.
+                load.notices
+                    .insert(0, format!("Permission mode set to Manual: {e}"));
+                PermissionControl::new(
+                    PermissionSettings {
+                        mode: PermissionMode::Manual,
+                        ..settings
+                    },
                     ModeSource::UserConfig,
                     ProcessFacts::detect(),
-                ) {
-                    Ok(c) => (c, None),
-                    Err(e) => (
-                        PermissionControl::new(
-                            PermissionSettings {
-                                mode: PermissionMode::Manual,
-                                ..settings
-                            },
-                            ModeSource::UserConfig,
-                            ProcessFacts::detect(),
-                        )
-                        .unwrap_or_else(|_| PermissionControl::manual()),
-                        Some(format!("Permission mode set to Manual: {e}")),
-                    ),
-                }
+                )
+                .unwrap_or_else(|_| PermissionControl::manual())
             }
-            Err(e) => (
-                PermissionControl::manual(),
-                Some(format!(
-                    "Permission settings could not be read, so Manual applies: {e}"
-                )),
-            ),
         };
+        let notice = load.summary();
         (
             Self {
                 control: Arc::new(control),
                 file,
+                load: Arc::new(load),
             },
             notice,
         )
     }
 
+    /// A live control with no file read: `settings` as they are, nothing
+    /// refused.
+    pub fn with_control(control: Arc<PermissionControl>, file: Option<PathBuf>) -> Self {
+        let settings = control.settings();
+        Self {
+            control,
+            file,
+            load: Arc::new(SettingsLoad {
+                settings,
+                ..SettingsLoad::default()
+            }),
+        }
+    }
+
+    /// Write the live settings to the user-level file, keeping each refused
+    /// entry as written (the user must still fix it, and a change made here
+    /// must not delete it) and, while Manual is forced, the mode the user
+    /// chose ([`SettingsLoad::file_text`]).
     fn persist(&self) -> Result<(), String> {
         match &self.file {
-            Some(path) => self
-                .control
-                .settings()
-                .save(path)
-                .map_err(|e| e.to_string()),
+            Some(path) => {
+                let text = self.load.file_text(&self.control.settings())?;
+                write_settings_file(path, &text).map_err(|e| e.to_string())
+            }
             None => Err("no user-level permissions file is configured".to_owned()),
         }
+    }
+
+    /// Persist after a change made outside this module (the Allow Bypass
+    /// switch in Settings): the same rules as every other change.
+    pub fn save(&self) -> Result<(), String> {
+        self.persist()
     }
 
     /// A change, then the line that says it, or what kept it from the file.
@@ -350,6 +380,45 @@ pub fn draw_rule_editor(ui: &mut egui::Ui, perm: &PermissionUi, p: &crate::theme
     ui.data_mut(|d| d.insert_temp(id, st));
 }
 
+/// What reading `permissions.toml` found, for the settings surface's
+/// Permissions section: why Manual is forced (orange, COL-7: a broken
+/// setting), each refused entry with its reason, and
+/// each notice for an entry that loads but matches no call. Nothing when the
+/// file loaded clean.
+pub fn draw_load_result(ui: &mut egui::Ui, perm: &PermissionUi, p: &crate::theme::Palette) {
+    use egui::RichText;
+    let load = &perm.load;
+    if load.forced_manual.is_none() && load.refused.is_empty() && load.notices.is_empty() {
+        return;
+    }
+    ui.add_space(8.0);
+    if let Some(why) = &load.forced_manual {
+        ui.label(RichText::new(why).small().color(p.danger));
+    }
+    if !load.refused.is_empty() {
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new("Refused entries in permissions.toml")
+                .font(crate::theme::medium(14.0))
+                .color(p.text),
+        );
+        for line in &load.refused {
+            ui.label(RichText::new(line.sentence()).small().color(p.text_2));
+        }
+    }
+    if !load.notices.is_empty() {
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new("Notices")
+                .font(crate::theme::medium(14.0))
+                .color(p.text),
+        );
+        for notice in &load.notices {
+            ui.label(RichText::new(notice).small().color(p.text_2));
+        }
+    }
+}
+
 /// One permission request in the box: a worker's approval ask, or a request
 /// raised by a worker's shortfall.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -479,6 +548,9 @@ impl PermissionBar {
         let from = ui.control.mode();
         if from == mode {
             return Line::Notice(format!("The permission mode is already {}.", mode.label()));
+        }
+        if let Some(why) = &ui.load.forced_manual {
+            return Line::Error(format!("The permission mode stays Manual. {why}"));
         }
         match ui.control.set_mode(mode, ModeSource::UserInterface) {
             Ok(_) => {
@@ -638,7 +710,16 @@ pub fn draw_bar(
             .selected_text(current.label())
             .width(190.0)
             .show_ui(ui, |ui| {
+                let forced = perm.load.forced_manual.as_deref();
                 for mode in PermissionMode::ALL {
+                    if let Some(why) = forced.filter(|_| mode != PermissionMode::Manual) {
+                        ui.add_enabled(
+                            false,
+                            egui::Button::selectable(false, format!("   {}", mode.label())),
+                        )
+                        .on_disabled_hover_text(why);
+                        continue;
+                    }
                     let blocked = mode == PermissionMode::Bypass
                         && (settings.disable_bypass || !settings.allow_bypass);
                     let check = if mode == current {
@@ -960,13 +1041,13 @@ mod tests {
     use kgraf_orchestrator::{PlanItemView, RequestScope};
 
     fn ui_at(dir: &std::path::Path, settings: PermissionSettings) -> PermissionUi {
-        PermissionUi {
-            control: Arc::new(
+        PermissionUi::with_control(
+            Arc::new(
                 PermissionControl::new(settings, ModeSource::UserConfig, ProcessFacts::default())
                     .expect("control"),
             ),
-            file: Some(dir.join("permissions.toml")),
-        }
+            Some(dir.join("permissions.toml")),
+        )
     }
 
     fn reread(ui: &PermissionUi) -> PermissionSettings {
@@ -1270,17 +1351,22 @@ mod tests {
         assert!(notice.expect("notice").contains("Manual"));
         let bad = dir.path().join("bad.toml");
         std::fs::write(&bad, "mdoe = 1").expect("write");
-        let (ui, notice) = PermissionUi::load(Some(bad));
+        let (ui, notice) = PermissionUi::load(Some(bad.clone()));
         assert_eq!(ui.control.mode(), PermissionMode::Manual);
         assert!(notice.is_some());
+        assert!(ui.control.rules().deny.is_empty());
+        assert!(ui.load.unreadable && ui.load.forced_manual.is_some());
+        // A change in the window does not write over a file it could not read.
+        let line = PermissionBar::default().set_plan_review(&ui, true);
+        assert!(matches!(line, Line::Error(_)), "{line:?}");
+        assert_eq!(std::fs::read_to_string(&bad).expect("read"), "mdoe = 1");
     }
 
     /// The window reads the same rules the command line does: a Claude Code
-    /// name is read as the kGraf tool, and a rule naming no tool is refused
-    /// with the notice the window shows, so the window runs in Manual (every
-    /// request asks) instead of trusting a rule that protects nothing.
+    /// name is read as the kGraf tool, and a rule on a Claude Code tool kGraf
+    /// lacks loads with its notice, refusing nothing and keeping the mode.
     #[test]
-    fn a_rule_naming_no_tool_is_refused_in_the_window_and_a_claude_code_name_loads() {
+    fn a_claude_code_name_loads_and_a_tool_kgraf_lacks_is_a_notice_in_the_window() {
         let dir = tempfile::tempdir().expect("dir");
         let good = dir.path().join("good.toml");
         std::fs::write(&good, "mode = \"auto\"\ndeny = [\"Bash(rm -rf*)\"]").expect("write");
@@ -1288,13 +1374,84 @@ mod tests {
         assert_eq!(notice, None);
         assert_eq!(ui.control.mode(), PermissionMode::Auto);
         assert!(ui.control.rules().deny[0].names_tool("shell"));
-        let bad = dir.path().join("bad.toml");
-        std::fs::write(&bad, "mode = \"auto\"\ndeny = [\"WebFetch\"]").expect("write");
-        let (ui, notice) = PermissionUi::load(Some(bad));
+        let web = dir.path().join("web.toml");
+        std::fs::write(&web, "mode = \"auto\"\ndeny = [\"WebFetch\"]").expect("write");
+        let (ui, notice) = PermissionUi::load(Some(web));
+        assert_eq!(ui.control.mode(), PermissionMode::Auto);
+        assert!(ui.load.refused.is_empty() && ui.load.forced_manual.is_none());
+        assert_eq!(ui.load.notices.len(), 1);
+        assert!(
+            ui.load.notices[0].contains("kGraf has no WebFetch tool"),
+            "{:?}",
+            ui.load.notices
+        );
+        assert!(notice.expect("logged").contains("shell(curl*)"));
+    }
+
+    /// One refused deny entry: the window keeps every other entry, names the
+    /// refused one with its reason, and runs in Manual with the reason until
+    /// the file is fixed; the dropdown refuses another mode. A change made in
+    /// the window keeps the refused entry and the user's mode in the file.
+    #[test]
+    fn a_bad_deny_entry_keeps_the_other_rules_and_forces_manual_with_the_reason() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("permissions.toml");
+        std::fs::write(
+            &path,
+            "mode = \"auto\"\ndeny = [\"Bah(rm*)\", \"Bash(curl*)\"]\n\
+             ask = [\"shell(git push*)\"]\n[allow]\nprograms = [\"ls\"]",
+        )
+        .expect("write");
+        let (ui, notice) = PermissionUi::load(Some(path.clone()));
         assert_eq!(ui.control.mode(), PermissionMode::Manual);
-        let notice = notice.expect("notice");
-        assert!(notice.contains("`WebFetch`"), "{notice}");
-        assert!(notice.contains("which is no kGraf tool"), "{notice}");
+        let rules = ui.control.rules();
+        assert_eq!(rules.deny.len(), 1, "the valid deny rule is kept");
+        assert_eq!(rules.deny[0].text(), "Bash(curl*)");
+        assert_eq!(rules.ask.len(), 1);
+        assert!(ui.control.settings().allow.allows_program("ls"));
+        assert_eq!(ui.load.refused.len(), 1);
+        assert_eq!(ui.load.refused[0].text, "Bah(rm*)");
+        assert!(ui.load.refused[0].reason.contains("which is no kGraf tool"));
+        let why = ui.load.forced_manual.clone().expect("forced");
+        assert!(why.contains("deny rule \"Bah(rm*)\""), "{why}");
+        assert!(notice.expect("logged").contains(&why));
+
+        let mut bar = PermissionBar::default();
+        let line = bar.choose_mode(&ui, PermissionMode::Auto);
+        assert!(
+            matches!(&line, Line::Error(e) if e.contains(&why)),
+            "{line:?}"
+        );
+        assert_eq!(ui.control.mode(), PermissionMode::Manual);
+
+        let line = bar.set_plan_review(&ui, true);
+        assert!(matches!(line, Line::Notice(_)), "{line:?}");
+        let back = PermissionSettings::read_entries(&std::fs::read_to_string(&path).expect("read"))
+            .expect("parse");
+        assert_eq!(back.settings.mode, PermissionMode::Auto, "the user's mode");
+        assert!(back.settings.plan_review);
+        assert_eq!(back.refused, ui.load.refused, "the refused entry is kept");
+        assert_eq!(back.settings.rules.deny.len(), 1);
+    }
+
+    /// Refused allow entries alone keep the user's mode: what they would
+    /// have granted asks instead, which is safe.
+    #[test]
+    fn a_bad_allow_entry_keeps_the_mode() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("permissions.toml");
+        std::fs::write(
+            &path,
+            "mode = \"auto\"\ndeny = [\"Bash(curl*)\"]\n[allow]\n\
+             programs = [\"python3 -c\", \"ls\"]\ntools = [\"fetch\"]",
+        )
+        .expect("write");
+        let (ui, _) = PermissionUi::load(Some(path));
+        assert_eq!(ui.control.mode(), PermissionMode::Auto);
+        assert_eq!(ui.load.forced_manual, None);
+        assert_eq!(ui.load.refused.len(), 2, "{:#?}", ui.load.refused);
+        assert!(ui.control.settings().allow.allows_program("ls"));
+        assert_eq!(ui.control.rules().deny.len(), 1);
     }
 
     const EDITOR_FILE: &str = "# my rules\nmode = \"auto\" # keep\nplan_review = true\ndeny = [\"shell(curl*)\"] # no network\nask = [\"shell(git push*)\"]\n\n[allow]\nprograms = [\"make\"]\n";
@@ -1382,8 +1539,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("dir");
         let (perm, mut h) = editor_at(dir.path());
         let before = file_text(&perm);
-        type_into(&mut h, 0, "WebFetch");
-        let loader = kgraf_tools::permissions::Rule::parse("WebFetch").unwrap_err();
+        type_into(&mut h, 0, "WebFech");
+        let loader = kgraf_tools::permissions::Rule::parse("WebFech").unwrap_err();
         h.get_by_label(&loader);
         h.get_all_by_label("Add").next().expect("add").click();
         h.run();
