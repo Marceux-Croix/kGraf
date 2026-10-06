@@ -441,6 +441,12 @@ impl RunLoop {
                 Err(OrchestratorError::Plan(e)) if !e.reaskable() && is_cut_off(&e) => {
                     (e.to_string(), None)
                 }
+                // The server could not parse the model's own output: asked
+                // again on the same budget as a refused answer, with no
+                // answer to quote (the shared malformed-output handling).
+                Err(OrchestratorError::Plan(e)) if is_server_malformed(&e) => {
+                    (e.to_string(), Some(String::new()))
+                }
                 Err(OrchestratorError::Plan(e)) if e.reaskable() => (e.to_string(), None),
                 Err(e) => return Err(e),
             };
@@ -1303,6 +1309,16 @@ fn bound(interfaces: &[InterfaceContract]) -> Vec<(String, Vec<String>)> {
 }
 
 /// Whether `e` is an answer cut off at the output limit.
+/// Whether the server could not parse the model's own output
+/// ([`kgraf_provider::ProviderError::ModelOutputMalformed`]).
+fn is_server_malformed(e: &PlanError) -> bool {
+    match e {
+        PlanError::Attributed { error, .. } => is_server_malformed(error),
+        PlanError::Provider(p) => p.is_malformed_model_output(),
+        _ => false,
+    }
+}
+
 fn is_cut_off(e: &PlanError) -> bool {
     match e {
         PlanError::Attributed { error, .. } => is_cut_off(error),

@@ -298,6 +298,7 @@ impl QuestionAnswerer for FakeAnswerer {
         Ok(AnswerOutput {
             answer: self.answer.map(str::to_owned),
             call: None,
+            retried_calls: Vec::new(),
         })
     }
 
@@ -312,6 +313,7 @@ impl QuestionAnswerer for FakeAnswerer {
         Ok(JudgeOutput {
             verdicts: Vec::new(),
             call: None,
+            retried_calls: Vec::new(),
         })
     }
 }
@@ -544,6 +546,7 @@ async fn a_requested_connection_a_judge_approves_opens_and_then_carries_messages
             Ok(AnswerOutput {
                 answer: None,
                 call: None,
+                retried_calls: Vec::new(),
             })
         }
         fn cost_basis(&self) -> CostBasis {
@@ -564,6 +567,7 @@ async fn a_requested_connection_a_judge_approves_opens_and_then_carries_messages
                     })
                     .collect(),
                 call: None,
+                retried_calls: Vec::new(),
             })
         }
     }
@@ -1285,6 +1289,7 @@ impl QuestionAnswerer for OpenAllJudge {
         Ok(AnswerOutput {
             answer: None,
             call: None,
+            retried_calls: Vec::new(),
         })
     }
     fn cost_basis(&self) -> CostBasis {
@@ -1305,6 +1310,7 @@ impl QuestionAnswerer for OpenAllJudge {
                 })
                 .collect(),
             call: None,
+            retried_calls: Vec::new(),
         })
     }
 }
@@ -1323,6 +1329,7 @@ async fn every_posted_message_ends_delivered_or_refused_never_lost() {
             Ok(AnswerOutput {
                 answer: None,
                 call: None,
+                retried_calls: Vec::new(),
             })
         }
         fn cost_basis(&self) -> CostBasis {
@@ -1354,6 +1361,7 @@ async fn every_posted_message_ends_delivered_or_refused_never_lost() {
                     })
                     .collect(),
                 call: None,
+                retried_calls: Vec::new(),
             })
         }
     }

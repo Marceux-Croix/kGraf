@@ -80,10 +80,12 @@ pub struct ConsumerTestRequest {
 /// Obtains one consumer's test of what it expects from a producer.
 #[async_trait::async_trait]
 pub trait ConsumerTestWriter: Send + Sync {
+    /// The test and every ledger call it took, the answering one last (a
+    /// malformed answer is asked again within the shared bound).
     async fn write(
         &self,
         request: &ConsumerTestRequest,
-    ) -> Result<(FileOverlay, Option<CallId>), PlanError>;
+    ) -> Result<(FileOverlay, Vec<CallId>), PlanError>;
     fn cost_basis(&self) -> CostBasis;
     /// What one test on `route` costs at most, for its reservation.
     fn cost_basis_for(&self, _route: &str) -> CostBasis {
@@ -112,7 +114,7 @@ impl ConsumerTestWriter for ModelConsumerTestWriter {
     async fn write(
         &self,
         request: &ConsumerTestRequest,
-    ) -> Result<(FileOverlay, Option<CallId>), PlanError> {
+    ) -> Result<(FileOverlay, Vec<CallId>), PlanError> {
         ask_test(&self.0, request).await
     }
 }
@@ -148,7 +150,7 @@ impl ConsumerTestWriter for RoutedConsumerTestWriter {
     async fn write(
         &self,
         request: &ConsumerTestRequest,
-    ) -> Result<(FileOverlay, Option<CallId>), PlanError> {
+    ) -> Result<(FileOverlay, Vec<CallId>), PlanError> {
         let caller = self.routes.get(&request.route).ok_or_else(|| {
             PlanError::attributed(
                 Vec::new(),
@@ -165,7 +167,7 @@ impl ConsumerTestWriter for RoutedConsumerTestWriter {
 async fn ask_test(
     caller: &ModelCaller,
     request: &ConsumerTestRequest,
-) -> Result<(FileOverlay, Option<CallId>), PlanError> {
+) -> Result<(FileOverlay, Vec<CallId>), PlanError> {
     // Ids are sanitized by the orchestrator; symbols and the brief were
     // written by a model, so they reach this one as data blocks.
     let data =
@@ -187,12 +189,14 @@ async fn ask_test(
         ),
         data("consumer_brief", request.brief.clone()),
     );
-    let (text, call) = caller
-        .ask("consumer_test", CONSUMER_TEST_SYSTEM, user)
-        .await?;
-    let test =
-        parse_consumer_test(&text).map_err(|e| PlanError::attributed(vec![call.clone()], e))?;
-    Ok((test, Some(call)))
+    caller
+        .ask_json(
+            "consumer_test",
+            CONSUMER_TEST_SYSTEM,
+            user,
+            parse_consumer_test,
+        )
+        .await
 }
 
 /// Parse a consumer test answer.
@@ -950,7 +954,7 @@ mod tests {
         assert_eq!(writer.cost_basis_for("b:mb").model, "mb");
         let calls = ledger.calls().expect("calls");
         assert_eq!(calls.len(), 1);
-        assert_eq!(Some(&calls[0].id), call.as_ref());
+        assert_eq!(vec![calls[0].id.clone()], call);
         assert_eq!(
             calls[0].model, "mb",
             "the consumer's own route's model was called"

@@ -37,7 +37,7 @@ pub use accounting::{
 };
 pub use capability::{CacheControl, Capabilities, Reasoning, StreamEvent, Streaming};
 pub use crosslimit::{CrossLimitError, SharedLimiterStore, default_store_path, key_id};
-pub use error::{Billing, ProviderError};
+pub use error::{Billing, MAX_MALFORMED_OUTPUT_RETRIES, ProviderError};
 pub use kinds::{
     DEFAULT_RERANK_MAX_DOCUMENTS, EmbedLimits, Embedder, Embeddings, ModelRoute, ModelRoutes,
     Ranked, Ranking, Reranker, cosine_similarity, rank_by_similarity,

@@ -302,6 +302,9 @@ pub struct GroundOutput {
     pub serves: bool,
     pub reason: String,
     pub call: Option<CallId>,
+    /// Earlier calls of this answer whose output was malformed and asked
+    /// again (`ModelCaller::ask_json`); settled with `call`.
+    pub retried_calls: Vec<CallId>,
 }
 
 /// A decomposition or re-grounding that failed.
@@ -329,6 +332,12 @@ pub enum PlanError {
         kind: String,
         max_output_tokens: u32,
     },
+    /// A JSON-asked call whose every answer was malformed
+    /// ([`PlanError::is_malformed_answer`]): made once and again
+    /// [`kgraf_provider::MAX_MALFORMED_OUTPUT_RETRIES`] times. `error` is the
+    /// last answer's failure. Not asked again by any caller.
+    #[error("{error}; the call was made {asks} times and every answer was malformed")]
+    MalformedAfterRetries { asks: u32, error: Box<PlanError> },
     /// A failure of a ledgered model call, with the ledger calls it made (none
     /// when it failed before the request left). The orchestrator settles its hold
     /// at those calls' ledger cost rather than the whole hold.
@@ -362,14 +371,51 @@ impl PlanError {
     }
 
     /// Whether the planner can be asked again with this error as a note: its
-    /// answer was not the JSON asked for, or the plan it gave breaks a rule.
-    /// A cut-off answer, a provider failure and a ledger failure are not: asking
-    /// again would repeat them or hide them.
+    /// answer was not the JSON asked for, the server could not parse the
+    /// model's output ([`Self::is_malformed_answer`]), or the plan it gave
+    /// breaks a rule. A cut-off answer at the output limit, any other provider
+    /// failure and a ledger failure are not: asking again would repeat them or
+    /// hide them.
     pub fn reaskable(&self) -> bool {
         match self {
             PlanError::Attributed { error, .. } => error.reaskable(),
-            PlanError::BadOutput { .. } | PlanError::Invalid(_) => true,
+            PlanError::Invalid(_) => true,
+            e => e.is_malformed_answer(),
+        }
+    }
+
+    /// Whether the model's output was malformed, so another sample of the same
+    /// call is worth asking for: the answer is not the complete JSON object
+    /// asked for (cut off mid-string with a normal stop, no object, the wrong
+    /// shape), or the server could not parse the model's own output
+    /// ([`kgraf_provider::ProviderError::ModelOutputMalformed`], which an
+    /// in-band stream `error` naming such a failure also is). An answer cut at
+    /// the output limit ([`Self::Truncated`]) is not: it would be cut again.
+    /// A plan that parses but breaks a rule ([`Self::Invalid`]) is not either.
+    pub fn is_malformed_answer(&self) -> bool {
+        match self {
+            PlanError::Attributed { error, .. } => error.is_malformed_answer(),
+            PlanError::BadOutput { .. } => true,
+            PlanError::Provider(e) => e.is_malformed_model_output(),
             _ => false,
+        }
+    }
+
+    /// Whether this is [`Self::MalformedAfterRetries`]: every answer of a
+    /// JSON-asked call was malformed, up to the bound.
+    pub fn is_malformed_after_retries(&self) -> bool {
+        match self {
+            PlanError::Attributed { error, .. } => error.is_malformed_after_retries(),
+            PlanError::MalformedAfterRetries { .. } => true,
+            _ => false,
+        }
+    }
+
+    /// The failure without its ledger calls.
+    fn into_unattributed(self) -> PlanError {
+        match self {
+            PlanError::Attributed { error, .. } => error.into_unattributed(),
+            e => e,
         }
     }
 
@@ -1045,6 +1091,80 @@ impl ModelCaller {
         }
     }
 
+    /// Ask for one JSON answer, read by `parse`. Every orchestrator call that
+    /// asks a model for JSON and has no re-ask loop of its own goes through
+    /// here, so a malformed answer ([`PlanError::is_malformed_answer`]) is
+    /// handled one way: the call is made again, at most
+    /// [`kgraf_provider::MAX_MALFORMED_OUTPUT_RETRIES`] times, the bound the
+    /// worker loop uses. An answer that is not the JSON asked for is asked
+    /// again with the refusal quoted after the request, so the model sees
+    /// where its answer broke; a server that could not parse the model's
+    /// output gets the same request again. After the bound the call fails
+    /// with [`PlanError::MalformedAfterRetries`] naming the last failure.
+    /// Any other failure (a provider error, a cut at the output limit, a
+    /// ledger error, a rule `parse` refuses with [`PlanError::Invalid`]) is
+    /// returned at once.
+    ///
+    /// Returns every ledger call made, the answering one last, on success and
+    /// on failure, so the caller settles its hold at all of them.
+    pub(crate) async fn ask_json<T>(
+        &self,
+        kind: &str,
+        system: &str,
+        user: String,
+        parse: impl Fn(&str) -> Result<T, PlanError>,
+    ) -> Result<(T, Vec<CallId>), PlanError> {
+        let mut calls: Vec<CallId> = Vec::new();
+        let mut prompt = user.clone();
+        let mut retries = 0u32;
+        loop {
+            let (result, call) = self.ask_keeping_call(kind, system, prompt).await;
+            let answered = call.is_some();
+            calls.extend(call);
+            let failure = match result {
+                Ok(text) if answered => match parse(&text) {
+                    Ok(value) => return Ok((value, calls)),
+                    Err(e) => e.into_unattributed(),
+                },
+                // Never asked again: a call with no ledger row is an
+                // accounting fault, not the model's output.
+                Ok(_) => {
+                    return Err(PlanError::attributed(
+                        calls,
+                        PlanError::BadOutput {
+                            reason: "a completed call has no ledger row".into(),
+                            excerpt: String::new(),
+                        },
+                    ));
+                }
+                Err(e) => e.into_unattributed(),
+            };
+            if !failure.is_malformed_answer() {
+                return Err(PlanError::attributed(calls, failure));
+            }
+            if retries >= kgraf_provider::MAX_MALFORMED_OUTPUT_RETRIES {
+                return Err(PlanError::attributed(
+                    calls,
+                    PlanError::MalformedAfterRetries {
+                        asks: retries + 1,
+                        error: Box::new(failure),
+                    },
+                ));
+            }
+            retries += 1;
+            prompt = match failure {
+                // The server's parse failure says nothing the model can act
+                // on: the same request is another sample.
+                PlanError::Provider(_) => user.clone(),
+                refused => format!(
+                    "{user}\n\n<answer_refused>\nYour previous answer was refused: {}\nAnswer \
+                     again with one complete JSON object and nothing else.\n</answer_refused>",
+                    crate::interface_plan::quote_safe(&refused.to_string())
+                ),
+            };
+        }
+    }
+
     /// The call and its ledger row id, which is kept on failure too, so a caller
     /// can settle a failed call at its ledger cost rather than lose track of it.
     pub(crate) async fn ask_keeping_call(
@@ -1513,13 +1633,18 @@ impl Grounder for ModelGrounder {
             user.push_str(n);
         }
         user.push_str("\nDoes the next step still serve the original instruction?");
-        let (text, call) = self.0.ask("reground", GROUND_SYSTEM, user).await?;
-        let (serves, reason) =
-            parse_grounding(&text).map_err(|e| PlanError::attributed(vec![call.clone()], e))?;
+        // A cut-off or otherwise malformed verdict is asked again within the
+        // shared bound, never taken as a hold on its first failure.
+        let ((serves, reason), mut calls) = self
+            .0
+            .ask_json("reground", GROUND_SYSTEM, user, parse_grounding)
+            .await?;
+        let call = calls.pop();
         Ok(GroundOutput {
             serves,
             reason,
-            call: Some(call),
+            call,
+            retried_calls: calls,
         })
     }
 }
@@ -1659,15 +1784,20 @@ impl crate::QuestionAnswerer for ModelAnswerer {
         &self,
         request: &crate::AnswerRequest,
     ) -> Result<crate::AnswerOutput, PlanError> {
-        let (text, call) = self
+        let (answer, mut calls) = self
             .0
-            .ask("answer_question", ANSWER_SYSTEM, answer_prompt(request))
+            .ask_json(
+                "answer_question",
+                ANSWER_SYSTEM,
+                answer_prompt(request),
+                parse_answer,
+            )
             .await?;
-        let answer =
-            parse_answer(&text).map_err(|e| PlanError::attributed(vec![call.clone()], e))?;
+        let call = calls.pop();
         Ok(crate::AnswerOutput {
             answer,
-            call: Some(call),
+            call,
+            retried_calls: calls,
         })
     }
 
@@ -1675,15 +1805,20 @@ impl crate::QuestionAnswerer for ModelAnswerer {
         &self,
         request: &crate::JudgeRequest,
     ) -> Result<crate::JudgeOutput, PlanError> {
-        let (text, call) = self
+        let (verdicts, mut calls) = self
             .0
-            .ask("judge_connections", JUDGE_SYSTEM, judge_prompt(request))
+            .ask_json(
+                "judge_connections",
+                JUDGE_SYSTEM,
+                judge_prompt(request),
+                |text| parse_verdicts(text, &request.requests),
+            )
             .await?;
-        let verdicts = parse_verdicts(&text, &request.requests)
-            .map_err(|e| PlanError::attributed(vec![call.clone()], e))?;
+        let call = calls.pop();
         Ok(crate::JudgeOutput {
             verdicts,
-            call: Some(call),
+            call,
+            retried_calls: calls,
         })
     }
 }
@@ -2477,6 +2612,226 @@ mod tests {
             "{text}"
         );
         assert_eq!(err.calls().map(<[CallId]>::len), Some(1), "attributed");
+    }
+
+    /// One scripted reply of [`Scripted`].
+    enum Scripted1 {
+        /// A text answer with a normal stop.
+        Text(&'static str),
+        /// The server could not parse the model's output (Ollama's `EOF`).
+        ServerMalformed,
+    }
+
+    /// Answers each call with the next scripted reply and records each
+    /// request's user text.
+    struct Scripted {
+        replies: std::sync::Mutex<std::collections::VecDeque<Scripted1>>,
+        prompts: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl Scripted {
+        fn new(replies: Vec<Scripted1>) -> Arc<Self> {
+            Arc::new(Self {
+                replies: std::sync::Mutex::new(replies.into()),
+                prompts: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+        fn prompts(&self) -> Vec<String> {
+            self.prompts.lock().expect("lock").clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for Scripted {
+        fn adapter(&self) -> &'static str {
+            "scripted"
+        }
+        fn protocol(&self) -> kgraf_core::Protocol {
+            kgraf_core::Protocol::Additive
+        }
+        async fn complete(
+            &self,
+            request: &Request,
+            token: &kgraf_provider::CallToken,
+        ) -> Result<kgraf_provider::Response, kgraf_provider::ProviderError> {
+            let prompt = request
+                .messages
+                .iter()
+                .flat_map(|m| m.content.iter())
+                .filter_map(kgraf_provider::Content::as_text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.prompts.lock().expect("lock").push(prompt);
+            let reply = self
+                .replies
+                .lock()
+                .expect("lock")
+                .pop_front()
+                .expect("a call past the script");
+            match reply {
+                Scripted1::ServerMalformed => {
+                    token.leave_unreconciled(None)?;
+                    Err(kgraf_provider::ProviderError::ModelOutputMalformed {
+                        adapter: "scripted",
+                        status: 500,
+                        body: r#"{"error":{"message":"EOF"}}"#.into(),
+                    })
+                }
+                Scripted1::Text(text) => {
+                    let usage = kgraf_core::TokenUsage {
+                        uncached_input: 10,
+                        text_output: 10,
+                        ..Default::default()
+                    };
+                    token.settle(&usage, None)?;
+                    Ok(kgraf_provider::Response {
+                        finish_reason: None,
+                        model: request.model.clone(),
+                        content: vec![kgraf_provider::Content::text(text)],
+                        stop_reason: kgraf_provider::StopReason::EndTurn,
+                        usage,
+                        request_id: None,
+                    })
+                }
+            }
+        }
+    }
+
+    fn scripted_caller(provider: Arc<dyn Provider>) -> ModelCaller {
+        ModelCaller {
+            provider,
+            ledger: Arc::new(Ledger::open_in_memory().expect("ledger")),
+            model: "m".into(),
+            max_output_tokens: 100,
+            agent: "orchestrator:r".into(),
+            task: "r".into(),
+        }
+    }
+
+    fn ground_request() -> GroundRequest {
+        GroundRequest {
+            original_instruction: "make a then b".into(),
+            next_contract: "b".into(),
+            next_instruction: "make b".into(),
+            verified: vec!["a".into()],
+            notes: vec![],
+        }
+    }
+
+    /// A server that could not parse the model's output gets the same
+    /// request again, with no refusal note, and the second answer counts.
+    #[tokio::test]
+    async fn a_server_parse_failure_on_a_json_asked_call_is_asked_again_unchanged() {
+        let provider = Scripted::new(vec![
+            Scripted1::ServerMalformed,
+            Scripted1::Text(r#"{"serves":true,"reason":"on track"}"#),
+        ]);
+        let out = ModelGrounder(scripted_caller(provider.clone()))
+            .ground(&ground_request())
+            .await
+            .expect("answered on the retry");
+        assert!(out.serves);
+        assert!(out.call.is_some());
+        assert_eq!(out.retried_calls.len(), 1, "the failed call is kept");
+        let prompts = provider.prompts();
+        assert_eq!(prompts.len(), 2);
+        assert_eq!(prompts[0], prompts[1], "the same request again");
+    }
+
+    /// An answer cut at the output limit is not asked again: it would be cut
+    /// again, and the error names the setting.
+    #[tokio::test]
+    async fn an_answer_cut_at_the_output_limit_is_not_asked_again() {
+        let err = ModelGrounder(scripted_caller(Arc::new(CutOff)))
+            .ground(&ground_request())
+            .await
+            .expect_err("cut off");
+        assert!(
+            matches!(&err, PlanError::Attributed { error, .. } if matches!(**error, PlanError::Truncated { .. })),
+            "{err}"
+        );
+        assert_eq!(err.calls().map(<[CallId]>::len), Some(1));
+    }
+
+    /// A rule the parser refuses on a well-formed answer is not a malformed
+    /// answer: returned at once.
+    #[tokio::test]
+    async fn a_well_formed_answer_refused_by_rule_is_not_asked_again() {
+        let provider = Scripted::new(vec![Scripted1::Text(r#"{"serves":true,"reason":"x"}"#)]);
+        let caller = scripted_caller(provider.clone());
+        let err = caller
+            .ask_json("t", "s", "u".into(), |_| {
+                Err::<(), _>(PlanError::Invalid("a rule".into()))
+            })
+            .await
+            .expect_err("refused");
+        assert!(!err.is_malformed_after_retries(), "{err}");
+        assert_eq!(provider.prompts().len(), 1);
+    }
+
+    /// The server's parse failure is asked again by the planner's own re-ask
+    /// loop; any other provider error is not.
+    #[test]
+    fn a_server_parse_failure_is_reaskable_and_another_provider_error_is_not() {
+        let malformed = PlanError::attributed(
+            vec![],
+            PlanError::Provider(kgraf_provider::ProviderError::ModelOutputMalformed {
+                adapter: "a",
+                status: 500,
+                body: "EOF".into(),
+            }),
+        );
+        assert!(malformed.reaskable() && malformed.is_malformed_answer());
+        let http = PlanError::Provider(kgraf_provider::ProviderError::Http {
+            adapter: "a",
+            status: 500,
+            body: "boom".into(),
+        });
+        assert!(!http.reaskable() && !http.is_malformed_answer());
+        let spent = PlanError::MalformedAfterRetries {
+            asks: 3,
+            error: Box::new(PlanError::Invalid("x".into())),
+        };
+        assert!(!spent.reaskable(), "a spent retry is not asked again");
+    }
+
+    /// An interface review whose every answer is malformed stays
+    /// unparseable after the bound, never an approval.
+    #[tokio::test]
+    async fn an_interface_review_malformed_every_time_is_unparseable_after_the_bound() {
+        use crate::interface_review::{InterfaceReviewer, ReviewOutcome, ReviewRequest};
+        let provider = Scripted::new(vec![
+            Scripted1::Text("{\"approve\":true,\"findings\":[{\"symbol\":\"a"),
+            Scripted1::Text("{\"approve\":true,\"findings\":[{\"symbol\":\"a"),
+            Scripted1::Text("{\"approve\":true,\"findings\":[{\"symbol\":\"a"),
+        ]);
+        let reviewer = crate::interface_review::RoutedInterfaceReviewer {
+            ledger: Arc::new(Ledger::open_in_memory().expect("ledger")),
+            routes: [(
+                "r".to_owned(),
+                (provider.clone() as Arc<dyn Provider>, "m".to_owned(), 100),
+            )]
+            .into(),
+            run: "run".into(),
+        };
+        let request = ReviewRequest {
+            producer_contract: "p".into(),
+            consumer_contract: "c".into(),
+            instruction: "i".into(),
+            acceptance: "a".into(),
+            symbols: vec![],
+            files: vec![],
+        };
+        let (outcome, _call) = reviewer
+            .review("r", "c", &request)
+            .await
+            .expect("a caller")
+            .expect("a recorded outcome");
+        assert!(
+            matches!(&outcome, ReviewOutcome::Unparseable(why) if why.contains("made 3 times")),
+            "{outcome:?}"
+        );
+        assert_eq!(provider.prompts().len(), 3);
     }
 
     /// An interface ask that states an output cap is limited to it, under the

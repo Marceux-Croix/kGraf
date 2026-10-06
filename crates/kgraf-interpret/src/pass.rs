@@ -64,6 +64,10 @@ pub struct AskAnswer {
 pub struct AskFailure {
     pub message: String,
     pub call: Option<String>,
+    /// The model's output was malformed (the server could not parse it), so
+    /// another sample of the same ask is worth making. The caller decides
+    /// whether to ask again; this crate never does.
+    pub malformed: bool,
 }
 
 /// The model, through whatever accounting path the caller owns. The orchestrator's
@@ -404,6 +408,7 @@ impl Prepared {
             .map_err(|f| InterpretError::Model {
                 message: f.message,
                 call: f.call,
+                malformed: f.malformed,
             })?;
         self.timings.model_ms = ms(t);
         Ok(Answered {

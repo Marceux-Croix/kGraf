@@ -4856,6 +4856,19 @@ impl RunLoop {
         }
     }
 
+    /// A notice when a JSON-asked orchestrator call (`what`) answered only
+    /// after `retries` malformed answers were asked again
+    /// ([`crate::plan::ModelCaller::ask_json`]): the retries cost calls, so
+    /// they are said, never silent.
+    pub(crate) fn note_malformed_retries(&mut self, what: &str, retries: usize) {
+        if retries > 0 {
+            self.notices.insert(format!(
+                "the {what} answer was malformed and was asked again {retries} time(s) before \
+                 it parsed; every call is in the ledger"
+            ));
+        }
+    }
+
     /// Re-grounding before a dispatch (0057). Returns whether the dispatch may
     /// proceed.
     async fn reground(&mut self, contract: &OpenContract) -> Result<bool, OrchestratorError> {
@@ -4896,16 +4909,20 @@ impl RunLoop {
         let reservation = self.reserve_call(&basis, input);
         let (serves, reason, call) = match self.s.grounder.ground(&request).await {
             Ok(v) => {
-                let calls: Vec<CallId> = v.call.iter().cloned().collect();
+                let calls: Vec<CallId> = v.retried_calls.iter().chain(&v.call).cloned().collect();
                 self.settle_call(reservation, Some(&calls))?;
+                self.note_malformed_retries("re-grounding", v.retried_calls.len());
                 // Only an answered call has received the notes.
                 self.mark_delivered(&note_ids);
                 (v.serves, v.reason, v.call)
             }
             Err(e) => {
                 self.settle_call(reservation, e.calls())?;
-                // A re-grounding that cannot answer is not a pass.
-                (false, format!("re-grounding failed: {e}"), None)
+                // A re-grounding that cannot answer is not a pass. The record
+                // names the last call made, so the failed answer can be found
+                // in the ledger.
+                let last = e.calls().and_then(|c| c.last()).cloned();
+                (false, format!("re-grounding failed: {e}"), last)
             }
         };
         self.reground_on_resume = false;

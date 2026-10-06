@@ -53,6 +53,10 @@ pub enum InterpretError {
     Model {
         message: String,
         call: Option<String>,
+        /// The model's output was malformed ([`AskFailure::malformed`]).
+        ///
+        /// [`AskFailure::malformed`]: crate::AskFailure::malformed
+        malformed: bool,
     },
 
     /// The answer is not the JSON asked for.
@@ -123,6 +127,23 @@ pub enum InterpretError {
         "`{command}` is not a command this plan proposes; accept only proposed commands, by name"
     )]
     UnknownCommand { command: String },
+}
+
+impl InterpretError {
+    /// Whether the model's output was malformed, so another sample of the
+    /// same ask is worth making: the answer is not the JSON asked for (cut off
+    /// mid-string, no object), or the server could not parse the model's
+    /// output. A plan that parses but is not usable is not.
+    pub fn is_malformed_answer(&self) -> bool {
+        matches!(
+            self,
+            InterpretError::BadAnswer { .. }
+                | InterpretError::Model {
+                    malformed: true,
+                    ..
+                }
+        )
+    }
 }
 
 impl kgraf_diag::DiagCode for InterpretError {

@@ -466,9 +466,14 @@ impl QuestionClassifier for ModelQuestionClassifier {
             question.quote_as_data("question", &[]),
             candidates_block(candidates)
         );
-        let (text, _call) = self
+        // Only the JSON is checked inside the retry: a malformed answer is
+        // asked again within the shared bound; a well-formed answer naming a
+        // route or node that does not exist is refused as before.
+        let (text, _calls) = self
             .0
-            .ask("question_route", CLASSIFY_SYSTEM, user)
+            .ask_json("question_route", CLASSIFY_SYSTEM, user, |text| {
+                json_object(text).map(|_| text.to_owned())
+            })
             .await
             .map_err(|e| RouteError::Call(e.to_string()))?;
         parse_classification(&text, candidates)

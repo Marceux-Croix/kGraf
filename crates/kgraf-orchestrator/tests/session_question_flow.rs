@@ -130,6 +130,7 @@ impl QuestionAnswerer for Fake {
         Ok(AnswerOutput {
             answer: self.answer.clone(),
             call: None,
+            retried_calls: Vec::new(),
         })
     }
 
@@ -156,6 +157,7 @@ impl QuestionAnswerer for Fake {
             return Ok(JudgeOutput {
                 verdicts: Vec::new(),
                 call: None,
+                retried_calls: Vec::new(),
             });
         }
         Ok(JudgeOutput {
@@ -176,6 +178,7 @@ impl QuestionAnswerer for Fake {
                 })
                 .collect(),
             call: None,
+            retried_calls: Vec::new(),
         })
     }
 }

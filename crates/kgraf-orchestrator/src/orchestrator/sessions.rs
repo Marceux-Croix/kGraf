@@ -107,6 +107,9 @@ pub struct ConnectionVerdict {
 pub struct JudgeOutput {
     pub verdicts: Vec<ConnectionVerdict>,
     pub call: Option<CallId>,
+    /// Earlier calls of this answer whose output was malformed and asked
+    /// again (`ModelCaller::ask_json`); settled with `call`.
+    pub retried_calls: Vec<CallId>,
 }
 
 /// A [`QuestionAnswerer`]'s answer.
@@ -114,6 +117,9 @@ pub struct AnswerOutput {
     /// `None`: the record does not cover the question.
     pub answer: Option<String>,
     pub call: Option<CallId>,
+    /// Earlier calls of this answer whose output was malformed and asked
+    /// again (`ModelCaller::ask_json`); settled with `call`.
+    pub retried_calls: Vec<CallId>,
 }
 
 /// A paid session call's result, back on the loop.
@@ -699,7 +705,8 @@ impl RunLoop {
         let contract = self.contract_of(&a.session).unwrap_or_default();
         match result {
             Ok(out) => {
-                let calls: Vec<CallId> = out.call.into_iter().collect();
+                self.note_malformed_retries("question", out.retried_calls.len());
+                let calls: Vec<CallId> = out.retried_calls.into_iter().chain(out.call).collect();
                 self.settle_call(a.reservation, Some(&calls))?;
                 match out.answer.filter(|t| !t.trim().is_empty()) {
                     Some(answer) => {

@@ -269,12 +269,35 @@ impl InterfaceReviewer for RoutedInterfaceReviewer {
             task: consumer_contract.to_owned(),
         };
         let user = build_prompt(request);
-        Some(
-            caller
-                .ask("interface_review", REVIEW_SYSTEM, user)
-                .await
-                .map(|(text, call)| (parse_review(&text), call)),
-        )
+        // An unparseable review is asked again within the shared bound
+        // (`ModelCaller::ask_json`); after it, the outcome is still
+        // `Unparseable`, never an approval. The earlier calls stay in the
+        // ledger under this run's review attribution; the record names the
+        // answering one.
+        let parse = |text: &str| match parse_review(text) {
+            ReviewOutcome::Unparseable(reason) => Err(PlanError::BadOutput {
+                reason,
+                excerpt: String::new(),
+            }),
+            outcome => Ok(outcome),
+        };
+        let answer = caller
+            .ask_json("interface_review", REVIEW_SYSTEM, user, parse)
+            .await;
+        Some(match answer {
+            Ok((outcome, mut calls)) => match calls.pop() {
+                Some(call) => Ok((outcome, call)),
+                None => Err(PlanError::BadOutput {
+                    reason: "a completed call has no ledger row".into(),
+                    excerpt: String::new(),
+                }),
+            },
+            Err(e) if e.is_malformed_after_retries() => match e.calls().and_then(|c| c.last()) {
+                Some(call) => Ok((ReviewOutcome::Unparseable(e.to_string()), call.clone())),
+                None => Err(e),
+            },
+            Err(e) => Err(e),
+        })
     }
 }
 

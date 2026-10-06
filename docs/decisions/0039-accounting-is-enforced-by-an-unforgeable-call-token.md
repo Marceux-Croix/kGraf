@@ -138,3 +138,27 @@ that is exactly `EOF`, or contains `unexpected EOF`, as `ModelOutputMalformed`. 
 read, never the text around it: `EOF` elsewhere in a body, a 4xx, or a non-JSON body stays a
 plain HTTP error. Tests: `a_bare_eof_error_message_is_malformed_output`,
 `eof_elsewhere_than_the_error_message_is_not_malformed_output`.
+
+**Amended 2026-10-05: every JSON-asked orchestrator call handles a malformed answer the same
+way, within the same bound.** Re-grounding had no retry, so one answer that a model ended with a normal stop and an unclosed string became a hold on the step. The `[ERROR HERE]` in such a reason is kGraf's own mark of where the parser stopped, not text from the provider. The bound is one constant,
+`kgraf_provider::MAX_MALFORMED_OUTPUT_RETRIES` (2), read by the worker loop and by
+`ModelCaller::ask_json`, which every single-shot JSON-asked orchestrator call now uses
+(re-grounding, question answer, connection judgment, handshake, consumer test, challenge
+review, interface review, question routing); the corpus interpretation loops with the same
+bound. A malformed answer is one that is not the complete JSON object asked for, or a
+`ModelOutputMalformed` from the server. A refused answer is asked again with the refusal
+quoted after the request; a server parse failure gets the same request again. Each try is
+its own ledger call, and every call is returned to the caller so the hold settles at all of
+them. After the bound the error is `PlanError::MalformedAfterRetries`, which says how many
+times the call was made. An answer cut at the output limit, a rule broken by a well-formed
+answer, and every other provider error are not retried. The planner's contracts and
+interfaces calls keep their own re-ask budgets, and a server parse failure is re-askable in
+both. The OpenAI-compatible adapters now classify an `error` object sent after HTTP 200 (a
+non-streamed body, a stream chunk, a Responses `error` or `response.failed` event) as the
+5xx body is classified: one that names a model-output parse failure is `ModelOutputMalformed`
+with status 200, any other is a `Decode` error; neither is ever answer text. Tests:
+`a_re_grounding_answer_cut_mid_string_is_asked_again_and_the_step_runs`,
+`a_re_grounding_malformed_every_time_holds_after_the_bound_and_says_so`,
+`a_server_parse_failure_on_a_json_asked_call_is_asked_again_unchanged`,
+`an_interpretation_answer_cut_mid_string_is_asked_again`,
+`a_mid_stream_eof_error_chunk_is_malformed_output_not_answer_text`.

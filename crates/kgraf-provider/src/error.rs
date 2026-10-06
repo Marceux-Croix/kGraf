@@ -4,6 +4,14 @@
 //! HTTP 200 from a real provider. The point of naming them is the fail-loud rule: silent
 //! degradation is a defect, so each one raises.
 
+/// How many times one model call is made again when the model's output was
+/// malformed: the server could not parse it ([`ProviderError::ModelOutputMalformed`]),
+/// or a structured answer was not the complete JSON object asked for (cut off
+/// mid-string, or no object at all). One bound for every caller: a worker round
+/// and each orchestrator call that asks for JSON. After it, the caller fails and
+/// names the last failure.
+pub const MAX_MALFORMED_OUTPUT_RETRIES: u32 = 2;
+
 /// What can go wrong reaching a provider.
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
@@ -65,9 +73,11 @@ pub enum ProviderError {
         body: String,
     },
 
-    /// The server answered 5xx because it could not parse the **model's own**
-    /// output (a malformed tool call). The request was sound; the generation
-    /// was not, and another sample of the same request usually parses.
+    /// The server could not parse the **model's own** output (a malformed tool
+    /// call). The request was sound; the generation was not, and another sample
+    /// of the same request usually parses. The server says so with a 5xx, or,
+    /// when it had already answered 200, with an `error` object in the body or
+    /// in the stream; `status` is the HTTP status it sent.
     ///
     /// Raised by an adapter that recognizes its server's error body, so
     /// callers read this kind and never the body text. It is an answer from a

@@ -118,6 +118,34 @@ pub(crate) fn http_error(
     }
 }
 
+/// The error for an `error` object a server sent after it had already
+/// answered HTTP 200: in the body of a non-streamed response, or as a stream
+/// chunk or event. Classified as [`http_error`] classifies a 5xx body, so a
+/// parse failure of the model's own output is
+/// [`ProviderError::ModelOutputMalformed`] (with status 200) however the server
+/// delivered it, and every other in-band error is a [`ProviderError::Decode`]
+/// carrying `reason`. Never answer text: the caller returns this error and
+/// drops what streamed before it.
+///
+/// [`ProviderError::ModelOutputMalformed`]: kgraf_provider::ProviderError::ModelOutputMalformed
+/// [`ProviderError::Decode`]: kgraf_provider::ProviderError::Decode
+pub(crate) fn in_band_error(
+    adapter: &'static str,
+    error: &serde_json::Value,
+    reason: String,
+) -> kgraf_provider::ProviderError {
+    let body = serde_json::json!({ "error": error }).to_string();
+    if is_malformed_output_body(&body) {
+        kgraf_provider::ProviderError::ModelOutputMalformed {
+            adapter,
+            status: 200,
+            body,
+        }
+    } else {
+        kgraf_provider::ProviderError::Decode { adapter, reason }
+    }
+}
+
 /// Classify a failure to send.
 ///
 /// Only a connection that never opened is known not to have reached the provider.

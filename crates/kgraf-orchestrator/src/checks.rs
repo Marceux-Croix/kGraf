@@ -2083,10 +2083,12 @@ pub struct HandshakeRequest {
 /// Obtains one party's handshake statement.
 #[async_trait::async_trait]
 pub trait Handshaker: Send + Sync {
+    /// The statement and every ledger call it took, the answering one last (a
+    /// malformed answer is asked again within the shared bound).
     async fn state(
         &self,
         request: &HandshakeRequest,
-    ) -> Result<(HandshakeStatement, Option<CallId>), PlanError>;
+    ) -> Result<(HandshakeStatement, Vec<CallId>), PlanError>;
     fn cost_basis(&self) -> CostBasis;
     /// What one statement on `route` costs at most, for its reservation.
     fn cost_basis_for(&self, _route: &str) -> CostBasis {
@@ -2114,7 +2116,7 @@ impl Handshaker for ModelHandshaker {
     async fn state(
         &self,
         request: &HandshakeRequest,
-    ) -> Result<(HandshakeStatement, Option<CallId>), PlanError> {
+    ) -> Result<(HandshakeStatement, Vec<CallId>), PlanError> {
         ask_statement(&self.0, request).await
     }
 }
@@ -2153,7 +2155,7 @@ impl Handshaker for RoutedHandshaker {
     async fn state(
         &self,
         request: &HandshakeRequest,
-    ) -> Result<(HandshakeStatement, Option<CallId>), PlanError> {
+    ) -> Result<(HandshakeStatement, Vec<CallId>), PlanError> {
         let caller = self.routes.get(&request.route).ok_or_else(|| {
             PlanError::attributed(
                 Vec::new(),
@@ -2170,7 +2172,7 @@ impl Handshaker for RoutedHandshaker {
 async fn ask_statement(
     caller: &ModelCaller,
     request: &HandshakeRequest,
-) -> Result<(HandshakeStatement, Option<CallId>), PlanError> {
+) -> Result<(HandshakeStatement, Vec<CallId>), PlanError> {
     {
         // Ids are sanitized by the orchestrator; symbols, paths and the brief
         // were written by a model, so they reach this one as data blocks.
@@ -2199,13 +2201,13 @@ async fn ask_statement(
             data("declared_writes", request.declared_writes.join("\n")),
             data("party_brief", request.brief.clone())
         );
-        let (text, call) = caller.ask("handshake", HANDSHAKE_SYSTEM, user).await?;
-        let mut statement =
-            parse_handshake(&text).map_err(|e| PlanError::attributed(vec![call.clone()], e))?;
+        let (mut statement, calls) = caller
+            .ask_json("handshake", HANDSHAKE_SYSTEM, user, parse_handshake)
+            .await?;
         statement.party = request.party.clone();
         statement.route = request.route.clone();
         statement.model = caller.model.clone();
-        Ok((statement, Some(call)))
+        Ok((statement, calls))
     }
 }
 
@@ -2343,7 +2345,7 @@ mod tests {
         assert_eq!(h.cost_basis_for("b:mb").model, "mb");
         let calls = ledger.calls().expect("calls");
         assert_eq!(calls.len(), 1);
-        assert_eq!(Some(&calls[0].id), call.as_ref());
+        assert_eq!(vec![calls[0].id.clone()], call);
         assert_eq!(calls[0].model, "mb", "the party's own model was called");
         // The statement names its route and the model that stated it (0078),
         // and a model's answer cannot set either.

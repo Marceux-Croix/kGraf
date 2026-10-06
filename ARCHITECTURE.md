@@ -618,6 +618,23 @@ directory. Verified work merges onto the run's own branch; the user's
 checked-out branch never moves. A killed run resumes from its record with no
 repeated paid call.
 
+**A malformed structured answer is asked again within one bound (0039).** Every orchestrator
+call that asks a model for JSON handles a malformed answer the same way: an answer that is not
+the complete object asked for (cut off mid-string with a normal stop, no object, the wrong
+shape), and a server that could not parse the model's output, are asked again at most twice
+(`MAX_MALFORMED_OUTPUT_RETRIES` in `kgraf-provider`, the bound the worker loop uses). The
+single-shot calls (re-grounding, the question answer, the connection judgment, the handshake,
+the consumer test, the challenge review, the interface review, question routing and the corpus
+interpretation) go through `ModelCaller::ask_json` or, for the interpretation, a loop of the
+same bound; a refused answer is asked again with the refusal quoted after the request, and a
+server parse failure gets the same request again. The planner's contracts call and interfaces
+call keep their own re-ask budgets, and a server parse failure is re-askable in both. Each try
+is its own ledger call, settled against the call's hold, and a retry that then parses is a run
+notice. After the bound the call fails and its error says how many times it was made. An
+answer cut at the output limit is not asked again. An `error` object a server sends after it
+answered 200 (in the body or mid-stream) is a typed error, never answer text, and one that
+names a parse failure of the model's output is the same malformed-output kind as the 5xx.
+
 **Contract checks and challenges (decisions 0029 to 0037)** are available
 on the live path, off by default, opt in per run. When enabled, a second
 planner call writes an interface contract for each place one contract uses

@@ -317,6 +317,50 @@ async fn a_failed_interpretation_call_is_settled_and_reported_as_charged() {
     );
 }
 
+/// An interpretation answer cut mid-string (a normal stop, the object never
+/// closed) is asked again within the shared bound; each try is its own
+/// charged call, and the answer that parses is the reading.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_interpretation_answer_cut_mid_string_is_asked_again() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let dir = tempfile::tempdir().expect("dir");
+    corpus(dir.path());
+    let asked = Arc::new(AtomicUsize::new(0));
+    let counter = asked.clone();
+    let p = Parts::open(
+        dir.path(),
+        move |prompt| {
+            if !prompt.contains("# Corpus") {
+                return "{\"contracts\":[]}".into();
+            }
+            let answer = interpretation_answer();
+            if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                // The first answer stops mid-string.
+                answer[..answer.len() / 2].to_owned()
+            } else {
+                answer
+            }
+        },
+        |_| SERVES.into(),
+        Duration::from_millis(5),
+    );
+    let prices = prices();
+    let clock = SystemClock;
+    let intake = interpret_corpus(
+        intake_parts(&p, &prices, &clock),
+        &RunId::new("r1"),
+        request(),
+        &asker(&p),
+        &NoTestRuns,
+    )
+    .await;
+    let reading = intake.result.expect("read on the retry");
+    assert_eq!(reading.answer().work_items.len(), 3);
+    assert_eq!(asked.load(Ordering::SeqCst), 2);
+    assert_eq!(intake.charged.len(), 2, "both calls are charged");
+    assert_eq!(p.admission.budget().held(), Money::ZERO);
+}
+
 /// An interpretation dropped mid-call releases its hold.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cancelled_interpretation_releases_its_hold() {

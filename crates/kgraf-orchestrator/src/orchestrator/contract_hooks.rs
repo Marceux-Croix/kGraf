@@ -869,9 +869,9 @@ impl RunLoop {
             let input = estimate_tokens(&request.brief) + 600;
             let reservation = self.reserve_call(&basis, input);
             let (test, calls) = match writer.write(&request).await {
-                Ok((test, call)) => {
-                    let calls: Vec<CallId> = call.into_iter().collect();
+                Ok((test, calls)) => {
                     self.settle_call(reservation, Some(&calls))?;
+                    self.note_malformed_retries("consumer test", calls.len().saturating_sub(1));
                     (test, calls)
                 }
                 Err(e) => {
@@ -1138,9 +1138,9 @@ impl RunLoop {
             let input = estimate_tokens(&request.brief) + 600;
             let reservation = self.reserve_call(&basis, input);
             match handshaker.state(&request).await {
-                Ok((mut statement, call)) => {
-                    let calls: Vec<CallId> = call.into_iter().collect();
+                Ok((mut statement, calls)) => {
                     self.settle_call(reservation, Some(&calls))?;
+                    self.note_malformed_retries("handshake", calls.len().saturating_sub(1));
                     // Set here, whatever the handshaker did: the route the
                     // party runs on, and the model that stated it (the
                     // route's model when the handshaker does not say), so a
@@ -1791,8 +1791,14 @@ impl RunLoop {
                 return Ok(Err(format!("the review failed: {e}")));
             }
         };
-        let calls: Vec<CallId> = verdict.call.iter().cloned().collect();
+        let calls: Vec<CallId> = verdict
+            .retried_calls
+            .iter()
+            .chain(&verdict.call)
+            .cloned()
+            .collect();
         self.settle_call(reservation, Some(&calls))?;
+        self.note_malformed_retries("challenge review", verdict.retried_calls.len());
         Ok(Ok(
             if verdict.contradicts && excerpt_in_contract(ic, &verdict.contract_excerpt) {
                 Resolution::SelfOverturn {

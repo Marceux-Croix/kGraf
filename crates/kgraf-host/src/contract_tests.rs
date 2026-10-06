@@ -144,9 +144,10 @@ impl FakeModel {
         }
         if system.starts_with("You are a kGraf worker about to consume an interface") {
             seen.consumer_tests += 1;
-            // Not a test that compiles: the writer's gate rejects it, and the
-            // rejection is recorded (0076). This test is about the checks and
-            // the challenge, not the consumer test's content.
+            // Not JSON: a malformed answer, asked again within the shared
+            // bound, after which the writer fails and the failure is recorded
+            // (0076). This test is about the checks and the challenge, not
+            // the consumer test's content.
             return text("no test".to_owned());
         }
         if system.contains("state your assumptions") {
@@ -448,9 +449,12 @@ async fn a_live_run_checks_its_interface_contract_and_answers_a_workers_challeng
     parties.sort();
     assert_eq!(parties, vec!["cons", "prod"]);
     assert_eq!(seen.handshakes, 2);
+    // The fake's answer is not JSON, so it is malformed: asked once and again
+    // up to the shared bound, then the writer fails and the run goes on.
     assert_eq!(
-        seen.consumer_tests, 1,
-        "the consumer writes one test of the producer"
+        seen.consumer_tests,
+        1 + kgraf_provider::MAX_MALFORMED_OUTPUT_RETRIES as usize,
+        "the consumer's one test is asked for within the malformed-answer bound"
     );
 
     // 3. Each worker's brief carried the interface and its test, and the tool.

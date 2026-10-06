@@ -214,6 +214,14 @@ otherwise.
   `qwen2.5-coder:7b` writes its tool call as JSON inside the reply text, and the server
   returns no structured call. kGraf reads that as a finished reply, so a worker on that model
   has nothing to run. Other model packages behave differently.
+- **An error a server sends after HTTP 200 is checked against written replies only**
+  (`openai-chat-completions` and `openai-responses` wires). An `error` object in a 200
+  body, a stream `error` chunk, or a Responses `error` or `response.failed` event is an
+  error, never answer text. One that names a parse failure of the model's own output
+  (Ollama's bare `EOF`, `error parsing tool call`) is retried as the same 500 body is
+  (decision [0039](decisions/0039-accounting-is-enforced-by-an-unforgeable-call-token.md)).
+  No live server has been seen sending such an error mid-stream; the tests use written
+  replies, so no route status changes.
 - **A model name is not a verified model.** A VERIFIED row covers the models named in its
   record. A different model on the same route can behave differently. DeepSeek is known to
   replace an unsupported model name with a cheaper one and return HTTP 200. The model echo

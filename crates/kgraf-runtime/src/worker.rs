@@ -989,8 +989,9 @@ pub const EMPTY_TURN_NOTICE: &str = "You ended your turn without calling a tool 
      answer; continue the task with a tool call, or answer.";
 
 /// How many times a round is sent again after the server failed to parse the
-/// model's own output. Beyond it the attempt fails, naming the cause.
-pub const MAX_MALFORMED_OUTPUT_RETRIES: u32 = 2;
+/// model's own output. Beyond it the attempt fails, naming the cause. The
+/// provider crate's bound, shared with the orchestrator's JSON-asked calls.
+pub const MAX_MALFORMED_OUTPUT_RETRIES: u32 = kgraf_provider::MAX_MALFORMED_OUTPUT_RETRIES;
 
 /// The `RoundAbandoned` reason for a round the server failed on because it
 /// could not parse the model's own tool call.

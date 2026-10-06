@@ -2245,7 +2245,7 @@ impl kgraf_orchestrator::Handshaker for RouteRecorder {
     ) -> Result<
         (
             kgraf_orchestrator::HandshakeStatement,
-            Option<kgraf_core::CallId>,
+            Vec<kgraf_core::CallId>,
         ),
         kgraf_orchestrator::PlanError,
     > {
@@ -2260,7 +2260,7 @@ impl kgraf_orchestrator::Handshaker for RouteRecorder {
         };
         let mut s = kgraf_orchestrator::parse_handshake(&text)?;
         s.party = request.party.clone();
-        Ok((s, None))
+        Ok((s, Vec::new()))
     }
     fn cost_basis(&self) -> kgraf_orchestrator::CostBasis {
         kgraf_orchestrator::CostBasis {
@@ -2657,10 +2657,10 @@ impl ConsumerTestWriter for FixedConsumerTest {
     async fn write(
         &self,
         _request: &ConsumerTestRequest,
-    ) -> Result<(FileOverlay, Option<kgraf_core::CallId>), PlanError> {
+    ) -> Result<(FileOverlay, Vec<kgraf_core::CallId>), PlanError> {
         Ok((
             FileOverlay::new("contract_check.py", "# consumer check placeholder\n"),
-            None,
+            Vec::new(),
         ))
     }
 
@@ -2683,7 +2683,7 @@ impl ConsumerTestWriter for CountingConsumerTest {
     async fn write(
         &self,
         request: &ConsumerTestRequest,
-    ) -> Result<(FileOverlay, Option<kgraf_core::CallId>), PlanError> {
+    ) -> Result<(FileOverlay, Vec<kgraf_core::CallId>), PlanError> {
         self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         FixedConsumerTest.write(request).await
     }

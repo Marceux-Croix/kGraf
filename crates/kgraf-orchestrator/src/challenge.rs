@@ -939,6 +939,9 @@ pub struct ReviewVerdict {
     /// The passage of the contract that contradicts the quote.
     pub contract_excerpt: String,
     pub call: Option<CallId>,
+    /// Earlier calls of this answer whose output was malformed and asked
+    /// again (`ModelCaller::ask_json`); settled with `call`.
+    pub retried_calls: Vec<CallId>,
 }
 
 /// Decides whether a verified quote shows the contract is wrong.
@@ -995,7 +998,6 @@ impl Reviewer for ModelReviewer {
             request.artifact,
             data_block("quoted_passage", &request.quote)
         ));
-        let (text, call) = self.0.ask("challenge_review", REVIEW_SYSTEM, user).await?;
         #[derive(Deserialize)]
         struct Answer {
             contradicts: bool,
@@ -1003,19 +1005,24 @@ impl Reviewer for ModelReviewer {
             #[serde(default)]
             contract_excerpt: String,
         }
-        let attribute = |e| PlanError::attributed(vec![call.clone()], e);
-        let value = crate::plan::json_object(&text).map_err(attribute)?;
-        let a: Answer = serde_json::from_value(value)
-            .map_err(|e| PlanError::BadOutput {
+        let parse = |text: &str| {
+            let value = crate::plan::json_object(text)?;
+            serde_json::from_value::<Answer>(value).map_err(|e| PlanError::BadOutput {
                 reason: e.to_string(),
                 excerpt: text.chars().take(200).collect(),
             })
-            .map_err(attribute)?;
+        };
+        let (a, mut calls) = self
+            .0
+            .ask_json("challenge_review", REVIEW_SYSTEM, user, parse)
+            .await?;
+        let call = calls.pop();
         Ok(ReviewVerdict {
             contradicts: a.contradicts,
             reason: a.reason,
             contract_excerpt: a.contract_excerpt,
-            call: Some(call),
+            call,
+            retried_calls: calls,
         })
     }
 }

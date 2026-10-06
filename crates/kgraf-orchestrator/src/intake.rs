@@ -63,6 +63,7 @@ impl Asker for ModelAsker {
             Err(e) => Err(AskFailure {
                 message: e.to_string(),
                 call,
+                malformed: e.is_malformed_answer(),
             }),
         }
     }
@@ -147,6 +148,59 @@ pub async fn interpret_corpus(
 }
 
 async fn interpret_inner(
+    parts: &IntakeParts<'_>,
+    run: &RunId,
+    request: InterpretRequest,
+    asker: &ModelAsker,
+    tests: &dyn TestResults,
+    charged: &mut Vec<CallId>,
+) -> Result<Interpretation, OrchestratorError> {
+    // A malformed answer (cut off mid-string, no object, or a server that
+    // could not parse the model's output) is asked again within the bound
+    // every JSON-asked call shares; each try is its own call, held and
+    // settled on its own. The brief is prepared again per try because an ask
+    // consumes it; the corpus read is the same.
+    let mut retries = 0u32;
+    loop {
+        let result = interpret_once(parts, run, request.clone(), asker, tests, charged).await;
+        match result {
+            Err(OrchestratorError::Interpret(e))
+                if e.is_malformed_answer()
+                    && retries < kgraf_provider::MAX_MALFORMED_OUTPUT_RETRIES =>
+            {
+                retries += 1;
+            }
+            Err(OrchestratorError::Interpret(e)) if e.is_malformed_answer() => {
+                return Err(OrchestratorError::Interpret(exhausted(e, retries + 1)));
+            }
+            other => return other,
+        }
+    }
+}
+
+/// `e`, the last of `asks` malformed answers, saying that it was the last.
+fn exhausted(e: InterpretError, asks: u32) -> InterpretError {
+    let said = format!("; the call was made {asks} times and every answer was malformed");
+    match e {
+        InterpretError::BadAnswer { reason, excerpt } => InterpretError::BadAnswer {
+            reason: format!("{reason}{said}"),
+            excerpt,
+        },
+        InterpretError::Model {
+            message,
+            call,
+            malformed,
+        } => InterpretError::Model {
+            message: format!("{message}{said}"),
+            call,
+            malformed,
+        },
+        other => other,
+    }
+}
+
+/// One interpretation ask: prepare, hold, ask, settle, finish.
+async fn interpret_once(
     parts: &IntakeParts<'_>,
     run: &RunId,
     request: InterpretRequest,

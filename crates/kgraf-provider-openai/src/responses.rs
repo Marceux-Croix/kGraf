@@ -785,12 +785,11 @@ impl kgraf_provider::Provider for OpenAiAdapter {
             token
                 .leave_unreconciled_async(request_id.as_deref())
                 .await?;
-            return Err(ProviderError::Decode {
-                adapter: self.adapter_name(),
-                reason: format!(
-                    "provider returned HTTP 200 with an `error` object in the body: {error}"
-                ),
-            });
+            return Err(crate::in_band_error(
+                self.adapter_name(),
+                error,
+                format!("provider returned HTTP 200 with an `error` object in the body: {error}"),
+            ));
         }
         match self.parse_response(&request.model, &parsed) {
             Ok(mut response) => {
@@ -1060,16 +1059,18 @@ impl Streaming for OpenAiAdapter {
                         .or_else(|| event.get("error"))
                         .cloned()
                         .unwrap_or_default();
-                    return Err(ProviderError::Decode {
-                        adapter: self.adapter_name(),
-                        reason: format!("provider sent a `response.failed` event: {error}"),
-                    });
+                    return Err(crate::in_band_error(
+                        self.adapter_name(),
+                        &error,
+                        format!("provider sent a `response.failed` event: {error}"),
+                    ));
                 }
                 Some("error") => {
-                    return Err(ProviderError::Decode {
-                        adapter: self.adapter_name(),
-                        reason: format!("provider sent a stream `error` event: {event}"),
-                    });
+                    return Err(crate::in_band_error(
+                        self.adapter_name(),
+                        &event,
+                        format!("provider sent a stream `error` event: {event}"),
+                    ));
                 }
                 _ => {}
             }
@@ -1862,6 +1863,29 @@ mod tests {
             }
             other => panic!("wrong error: {other:?}"),
         }
+        assert_eq!(ledger.unreconciled().expect("query").len(), 1);
+    }
+
+    /// A stream `error` event that names a parse failure of the model's own
+    /// output is the typed malformed-output kind, as the same body on a 5xx is.
+    #[tokio::test]
+    async fn a_stream_error_event_naming_a_tool_call_parse_failure_is_malformed_output() {
+        let server = MockServer::start().await;
+        let sse = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_cut\",\"model\":\"model-x\"}}\n\n",
+            "data: {\"type\":\"error\",\"message\":\"error parsing tool call: raw='{', err=unexpected end of JSON input\"}\n\n",
+        );
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(sse))
+            .mount(&server)
+            .await;
+        let adapter = OpenAiAdapter::new(config(&server.uri())).expect("adapter");
+        let ledger = Ledger::open_in_memory().expect("ledger");
+        let token = ledger
+            .begin(ADAPTER, Protocol::Inclusive, "model-x", "a", "t")
+            .expect("begin");
+        let err = run_stream(&adapter, &token).await.expect_err("must raise");
+        assert!(err.is_malformed_model_output(), "{err:?}");
         assert_eq!(ledger.unreconciled().expect("query").len(), 1);
     }
 

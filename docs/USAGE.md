@@ -1422,6 +1422,20 @@ Behavior that differs from earlier builds. Each item names the decision that hol
   attempt fails and its error names the parse failure. A bare `{"error":{"message":"EOF"}}`
   500, or a message containing `unexpected EOF`, counts as the same failure (the field is
   read, not the text around it). Any other 5xx is not retried (0039).
+- Every orchestrator call that asks a model for JSON (re-grounding, the planner's calls, the
+  question answer, the connection judgment, handshakes, consumer tests, challenge and
+  interface reviews, question routing, the corpus interpretation) asks again when the answer
+  is malformed: not the complete JSON object asked for (for example cut off mid-string with a
+  normal stop), or a server that could not parse the model's output. The bound is the
+  worker's: at most two more tries, each its own ledger call. A refused answer is asked again
+  with the refusal quoted, so the model sees where it broke. A retry that then parses is a
+  run notice ("the re-grounding answer was malformed and was asked again 1 time(s) ...").
+  After the bound the call fails, and its error ends "the call was made 3 times and every
+  answer was malformed"; for re-grounding the step is held with that reason. An answer cut
+  at the output limit is not asked again. An `error` object a server sends after it already
+  answered 200, in the body or mid-stream, is an error and never part of the answer; one
+  that names a model-output parse failure (`EOF`, `error parsing tool call`) is retried as
+  the 500 is (0039).
 - A worker whose contract writes files and which ends an attempt as done with no successful
   write and no command that changed the tree (it only said what it would do, or only read)
   has not finished. It is told once: "You ended without making any change; this contract

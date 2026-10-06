@@ -520,8 +520,10 @@ impl RunLoop {
         };
         let verdicts = match result {
             Ok(out) => {
+                self.note_malformed_retries("connection judgment", out.retried_calls.len());
                 if let Some(r) = j.reservation {
-                    let calls: Vec<CallId> = out.call.into_iter().collect();
+                    let calls: Vec<CallId> =
+                        out.retried_calls.into_iter().chain(out.call).collect();
                     self.settle_call(r, Some(&calls))?;
                 }
                 out.verdicts

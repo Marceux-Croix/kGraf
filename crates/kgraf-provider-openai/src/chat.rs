@@ -1127,12 +1127,11 @@ impl kgraf_provider::Provider for ChatCompletionsAdapter {
             token
                 .leave_unreconciled_async(request_id.as_deref())
                 .await?;
-            return Err(ProviderError::Decode {
-                adapter: self.adapter_name(),
-                reason: format!(
-                    "provider returned HTTP 200 with an `error` object in the body: {error}"
-                ),
-            });
+            return Err(crate::in_band_error(
+                self.adapter_name(),
+                error,
+                format!("provider returned HTTP 200 with an `error` object in the body: {error}"),
+            ));
         }
         match self.parse_response(&request.model, &parsed) {
             Ok(mut response) => {
@@ -1396,10 +1395,11 @@ impl Streaming for ChatCompletionsAdapter {
             // and was silently skipped, a failed generation would return
             // `Ok` with whatever partial content had streamed so far.
             if let Some(error) = event.get("error").filter(|e| !e.is_null()) {
-                return Err(ProviderError::Decode {
-                    adapter: self.adapter_name(),
-                    reason: format!("provider sent a stream `error` chunk: {error}"),
-                });
+                return Err(crate::in_band_error(
+                    self.adapter_name(),
+                    error,
+                    format!("provider sent a stream `error` chunk: {error}"),
+                ));
             }
 
             // Azure opens a stream with a chunk that carries the prompt filter
@@ -3000,6 +3000,65 @@ mod tests {
             1,
             "a call that streamed content billed, so it must stay visible"
         );
+    }
+
+    /// A stream cut mid-answer by an in-band error that names a parse failure
+    /// of the model's own output (Ollama's bare `EOF`) is the typed
+    /// malformed-output kind, which callers retry, never the text that
+    /// streamed before it and never a plain decode failure.
+    #[tokio::test]
+    async fn a_mid_stream_eof_error_chunk_is_malformed_output_not_answer_text() {
+        let server = MockServer::start().await;
+        let sse = concat!(
+            "data: {\"id\":\"chatcmpl-4\",\"model\":\"compatible-model\",",
+            "\"choices\":[{\"index\":0,\"delta\":{\"content\":\"{\\\"serves\\\":true,\\\"reason\\\":\\\"The step\"}}]}\n\n",
+            "data: {\"error\":{\"message\":\"EOF\",\"type\":\"api_error\"}}\n\n",
+        );
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(sse))
+            .mount(&server)
+            .await;
+        let adapter = ChatCompletionsAdapter::new(config(&server.uri()), UsageDialect::Details)
+            .expect("adapter");
+        let ledger = Ledger::open_in_memory().expect("ledger");
+        let token = ledger
+            .begin(ADAPTER, Protocol::Inclusive, "compatible-model", "w", "t")
+            .expect("begin");
+        let err = run_stream(&adapter, &token).await.expect_err("must raise");
+        assert!(err.is_malformed_model_output(), "{err:?}");
+        match &err {
+            ProviderError::ModelOutputMalformed { status, body, .. } => {
+                assert_eq!(*status, 200);
+                assert!(body.contains("EOF"), "{body}");
+                assert!(!body.contains("The step"), "streamed text leaked: {body}");
+            }
+            other => panic!("wrong error: {other:?}"),
+        }
+        assert_eq!(ledger.unreconciled().expect("query").len(), 1);
+    }
+
+    /// The non-streamed twin: HTTP 200 whose body is an `EOF` error object.
+    #[tokio::test]
+    async fn an_eof_error_object_in_a_200_body_is_malformed_output() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "error": {"message": "EOF", "type": "api_error", "param": null, "code": null}
+            })))
+            .mount(&server)
+            .await;
+        let adapter = ChatCompletionsAdapter::new(config(&server.uri()), UsageDialect::Details)
+            .expect("adapter");
+        let ledger = Ledger::open_in_memory().expect("ledger");
+        let token = ledger
+            .begin(ADAPTER, Protocol::Inclusive, "compatible-model", "w", "t")
+            .expect("begin");
+        let err = adapter
+            .complete(&Request::new("compatible-model", "hi", 100), &token)
+            .await
+            .expect_err("must raise");
+        assert!(err.is_malformed_model_output(), "{err:?}");
+        assert_eq!(ledger.unreconciled().expect("query").len(), 1);
     }
 
     #[tokio::test]
