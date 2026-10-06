@@ -388,3 +388,72 @@ contract was held after its retry.
 Tests: `kgraf-sandbox` `a_python_package_build_is_generated_only_beside_its_project`,
 `tests/merge.rs` `commit_retaining_leaves_a_python_package_build_out`; `kgraf-orchestrator`
 `a_python_package_build_the_worker_ran_is_not_an_out_of_scope_write`.
+
+## Amendment (2026-10-06, second): every language's build output is generated, Go builds in the sandbox, and a tab-indented file takes a spaces patch
+
+A worker's cargo builds into its scratch directory (`CARGO_TARGET_DIR`), so a Rust project's
+build output never reached the tree, whatever its `.gitignore` said. No other language had
+that: an npm install, a Maven or Gradle build, `dotnet build`, a CMake build, a virtual
+environment, a coverage run or a test runner's cache landed in the tree, and in a project whose
+`.gitignore` did not name it the scope check failed a correct attempt as a write outside its
+scope. The fix of the amendment above covered Python's package build only. An audit of every
+check that can hold or fail an attempt for assumptions that hold only for Rust found the rest.
+
+- **Build and install output beside its project.** A new file outside the declared writes is
+  generated when it is under one of these folders and the folder's project manifest is beside
+  it: `node_modules/`, `dist/`, `.next/` and `coverage/` (by `package.json`; `coverage/` also by
+  `Gemfile` or `composer.json`), `build/` (by `package.json`, a Gradle build file or
+  `CMakeLists.txt`), `target/` (by `pom.xml` or `Cargo.toml`), `CMakeFiles/` (by
+  `CMakeLists.txt`), `bin/` and `obj/` (by a `*.csproj`, `*.fsproj` or `*.vbproj` in the
+  folder), `.venv/`, `venv/` and `htmlcov/` (by a Python project file), `.bundle/` (by
+  `Gemfile`) and `vendor/` (by `composer.json`). A file `tsc` emitted beside its source
+  (`x.js`, `x.d.ts` and their maps beside `x.ts`) is generated too.
+- **Tool caches and compiled files by name.** At any depth, whatever project holds them:
+  `__pycache__/`, `.pytest_cache/`, `.mypy_cache/`, `.ruff_cache/`, `.hypothesis/`, `.tox/`,
+  `.nox/`, `.nyc_output/`, `.gradle/`, `.parcel-cache/`, `.turbo/`, `.dart_tool/`,
+  `.phpunit.cache/`, `.sass-cache/`, the files `.coverage` (and `.coverage.<id>`),
+  `.eslintcache` and `.phpunit.result.cache`, and compiled output by extension: `.class`, `.o`,
+  `.tsbuildinfo`.
+- **A compiled program by its first bytes.** `go build` writes the module's program into its
+  folder and `cc` writes `a.out`; no name tells them. A new file whose first bytes are an ELF,
+  Mach-O, universal-binary (and Java class) or PE header is generated. It is read without
+  following a link, as every host read of the worker's tree is (decision 0083).
+- **The same rule in both places, as before.** `kgraf_sandbox::generated_kind` decides for the
+  orchestrator's scope check and for the merge-back commit, which leaves every such new file out,
+  records it, and removes it before the acceptance check. A file of a tool's tree passes the
+  scope check even under a protected name (an npm package's own `.gitattributes` under
+  `node_modules/`): none of it is committed. A nested repository is never generated; it stays a
+  refusal. The verifier gives one notice for the build output and one for the caches, each
+  saying to add the folders to `.gitignore`.
+- **Not covered.** A tracked file a build changed, a declared path, and a folder named like an
+  output folder with no project manifest beside it (`docs/node_modules/`, a `dist/` with no
+  `package.json`): those are the worker's writes, judged as before. A project that commits its
+  `dist/` still fails a build that changes a tracked bundle, as before. The size bound of the
+  commit still counts these files before they are left out, so an install larger than 512 MiB
+  is refused (`TooMuchData`), and the worker's change list carries every file of an install.
+- **Go builds in the sandbox.** The go command writes its build cache on every build and test,
+  and stops when it cannot ("failed to initialize build cache"); its default, under
+  `~/Library/Caches` or `~/.cache`, is outside the writable roots, so every Go build, test and
+  check failed. The sandbox now sets `GOCACHE` to `<tmp>/go-build`, beside the npm cache it
+  already set: a cold cache per workspace, as cargo's build directory is. On Linux the module
+  cache under the default `GOPATH` (`~/go/pkg/mod`) is readable, as the cargo registry is; Go
+  takes private-module logins from `~/.netrc` or a helper, never from there.
+- **A tab-indented file takes a patch written with spaces.** gofmt indents Go with tabs, a
+  Makefile recipe must start with one, and a model writes four spaces per level. The offset
+  then grows with the depth, so the one-offset rule of the amendment above refused every nested
+  Go edit. When every matched non-blank line is the file's tabs written as the same number of
+  spaces per tab (2 to 8), each added line's leading spaces become one tab per that number, and
+  the result says so; an added line between two tab widths is refused, naming the file. The
+  `replace.rs` test `spaces_against_tabs_with_a_pinned_line_are_refused` named above became
+  `spaces_against_tabs_are_written_as_the_file_s_tabs`, which asserts the new behavior and
+  keeps the refusals for uneven and mixed widths.
+
+Tests: `kgraf-sandbox`
+`every_language_s_build_and_test_output_is_generated_beside_its_project`,
+`an_output_name_without_its_project_is_a_write`,
+`a_compiled_program_is_told_by_its_first_bytes`, `tests/merge.rs`
+`commit_retaining_leaves_other_languages_build_output_out`, `tests/escape_macos.rs` and
+`tests/escape_linux.rs` `the_go_build_cache_is_in_scratch_and_writable`;
+`kgraf-orchestrator` `other_languages_build_output_is_not_an_out_of_scope_write`;
+`kgraf-tools` `a_go_or_makefile_patch_written_with_spaces_gets_the_file_s_tabs`, `replace.rs`
+`spaces_against_tabs_are_written_as_the_file_s_tabs`.

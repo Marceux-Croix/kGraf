@@ -519,6 +519,100 @@ fn commit_retaining_leaves_a_python_package_build_out() {
     );
 }
 
+/// Other languages' tools leave their output in the tree, where cargo's goes
+/// to the scratch directory: an npm install (with a package's own
+/// `.gitattributes`, a protected name), a .NET build beside its project file,
+/// a pytest cache with no `.gitignore` of its own, and a program `go build`
+/// wrote, told by its first bytes. Each is left out of the commit beside its
+/// project and removed before the check; the source the worker wrote is
+/// committed, and the attempt is not refused for a protected path.
+#[test]
+fn commit_retaining_leaves_other_languages_build_output_out() {
+    let e = env();
+    let mb = merger(&e);
+    let declared = |p: &Path| {
+        [
+            "web/index.js",
+            "dotnet/Program.cs",
+            "py/test_x.py",
+            "go/main.go",
+        ]
+        .iter()
+        .any(|d| p == Path::new(d))
+    };
+    let mut w = attempt(&e, "langs");
+    write(&w, "web/package.json", "{\"name\": \"web\"}\n");
+    write(&w, "web/index.js", "module.exports = 1;\n");
+    write(&w, "web/node_modules/left-pad/index.js", "x");
+    write(
+        &w,
+        "web/node_modules/left-pad/.gitattributes",
+        "* text=auto\n",
+    );
+    write(&w, "dotnet/App.csproj", "<Project/>\n");
+    write(&w, "dotnet/Program.cs", "class P {}\n");
+    write(&w, "dotnet/obj/project.assets.json", "{}");
+    write(&w, "py/pyproject.toml", "[project]\n");
+    write(&w, "py/test_x.py", "def test_x(): pass\n");
+    write(&w, "py/.pytest_cache/v/cache/nodeids", "[]");
+    write(&w, "go/go.mod", "module example.com/vectorops\n");
+    write(&w, "go/main.go", "package main\n");
+    std::fs::write(
+        w.workspace().root().join("go/vectorops"),
+        b"\xcf\xfa\xed\xfe\x07\x00\x00\x01",
+    )
+    .unwrap();
+    let CommitOutcome::Committed { commit } =
+        mb.commit_retaining(&mut w, "langs", &declared).unwrap()
+    else {
+        panic!("committed");
+    };
+    let tree = git(&e.f.repo, &["ls-tree", "-r", "--name-only", &commit]);
+    for kept in [
+        "web/index.js",
+        "dotnet/Program.cs",
+        "py/test_x.py",
+        "go/main.go",
+    ] {
+        assert!(tree.lines().any(|p| p == kept), "{kept}: {tree}");
+    }
+    for left in ["node_modules", "obj/", ".pytest_cache", "go/vectorops"] {
+        assert!(!tree.contains(left), "{left}: {tree}");
+    }
+    // Sorted by path.
+    let kinds: Vec<_> = w
+        .excluded()
+        .iter()
+        .map(|x| (x.path.to_string_lossy().into_owned(), x.kind))
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            (
+                "dotnet/obj/project.assets.json".to_owned(),
+                GeneratedKind::BuildOutput
+            ),
+            ("go/vectorops".to_owned(), GeneratedKind::BuildOutput),
+            (
+                "py/.pytest_cache/v/cache/nodeids".to_owned(),
+                GeneratedKind::ToolCache
+            ),
+            (
+                "web/node_modules/left-pad/.gitattributes".to_owned(),
+                GeneratedKind::BuildOutput
+            ),
+            (
+                "web/node_modules/left-pad/index.js".to_owned(),
+                GeneratedKind::BuildOutput
+            ),
+        ]
+    );
+    mb.remove_excluded(&w).unwrap();
+    assert!(!w.workspace().root().join("web/node_modules").exists());
+    assert!(!w.workspace().root().join("go/vectorops").exists());
+    assert!(w.workspace().root().join("go/main.go").is_file());
+}
+
 #[test]
 fn merging_before_commit_is_an_illegal_transition() {
     let e = env();

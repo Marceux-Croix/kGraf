@@ -554,7 +554,11 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   worker that never shows progress stops at its budget as before. The first block is
   stricter: files count only if they changed after its midpoint, and when it ran a test or
   build command that stayed failing without improving, changed files alone do not count (the
-  checkpoint says how many were not counted), and no worker runs more
+  checkpoint says how many were not counted). Test runs are scored by their pass and fail
+  counts for cargo, nextest, pytest, unittest, `node --test`, Jest, Vitest, `go test`, Maven,
+  Gradle, `dotnet test`, RSpec, Minitest and PHPUnit, and builds by their error counts for
+  cargo, `tsc`, the go command, gcc, clang, javac and MSBuild; any other command by its exit
+  status. No worker runs more
   than `max_checkpoints` blocks (default 10; 1 is the old fixed limit; see "Run limits"). What the model says about its progress is never read. `worker` prints
   each checkpoint; `orchestrate` reports workers that ran past their budget as
   `rounds` and counts each once as a sizing miss.
@@ -1534,8 +1538,9 @@ Behavior that differs from earlier builds. Each item names the decision that hol
   `--allow-path`, which would let one attempt write a file the plan never assigned. A file
   another contract writes, or a command, keeps the permission wording (0093).
 - Before a plan is accepted, two checks read your repository. A file the instruction names
-  that holds placeholder bodies (`todo!()`, `unimplemented!()`, `raise NotImplementedError`)
-  and that no contract writes is refused, naming the file. Only code counts: a file that
+  that holds placeholder bodies (`todo!()`, `unimplemented!()`, `raise NotImplementedError`
+  outside an abstract method, `throw new NotImplementedException()`) and that no contract
+  writes is refused, naming the file. Only code counts: a file that
   mentions `todo!()` inside a string literal, a raw string or a comment holds no placeholder.
   Files are lexed with the grammar of their language; a language kGraf has no grammar for is
   read line by line, skipping comment lines. A contract whose acceptance runs cargo in a
@@ -1560,6 +1565,32 @@ Behavior that differs from earlier builds. Each item names the decision that hol
   writes: they are left out of the attempt and removed before the check, with a notice to
   add them to `.gitignore`, as a worker-made lockfile and `__pycache__` are (0084). Before, the
   attempt failed with "wrote outside the declared scope" for them.
+- The same holds for every language's own install, build and test output, which a worker's
+  run leaves in the tree when your `.gitignore` does not name it (cargo's goes to the
+  worker's scratch directory and never reaches the tree): `node_modules/`, `dist/`,
+  `coverage/` and `.next/` beside `package.json`; `build/` beside `package.json`, a Gradle
+  build file or `CMakeLists.txt`; Maven's `target/` beside `pom.xml`; `bin/` and `obj/`
+  beside a `.csproj`; `.venv/`, `venv/` and `htmlcov/` beside a Python project file;
+  `.bundle/` beside a `Gemfile`; `vendor/` beside `composer.json`; files `tsc` emits beside
+  their `.ts` source; tool caches anywhere (`.pytest_cache/`, `.mypy_cache/`, `.tox/`,
+  `.gradle/`, `.coverage`, `.eslintcache`, ...); `.class`, `.o` and `.tsbuildinfo` files; and
+  a program a compiler wrote (`go build`, `make`, `cc`), told by its first bytes. One notice
+  lists the build output and one the caches. The same folder names with no project manifest
+  beside them, a tracked file a build changed, and an undeclared source file are still writes
+  outside the scope (0084).
+- Go builds run in the sandbox: the go command's build cache is `GOCACHE=<scratch>/go-build`,
+  a cold cache per worker, because the default location is outside what a sandboxed command
+  may write. On Linux the module cache under `~/go/pkg/mod` is readable (0084).
+- `apply_patch` writes a patch indented with spaces into a tab-indented file (Go, a Makefile)
+  with the file's tabs, when every matched line shows the same number of spaces per tab; the
+  result says so (0084).
+- A Python or Ruby module whose base class raises `NotImplementedError` for subclasses (an
+  `@abstractmethod`, a class based on `ABC` or `Protocol`, a class another class in the file
+  derives from, or a message that says a subclass supplies it) is not a placeholder. A plan
+  may name it without writing it. C#'s `throw new NotImplementedException()` is a placeholder
+  (0030).
+- A `package.json` whose `test` script is the one `npm init` writes (`echo "Error: no test
+  specified" && exit 1`) adds no `npm test` gate; the run says the gate does not apply (0018).
 - A worker that reaches its context stop point before it has written anything is compacted
   once instead of handed back: a child would receive the same whole task and meet the same
   stop point. After that one compaction it goes on while its context fits the model's window;

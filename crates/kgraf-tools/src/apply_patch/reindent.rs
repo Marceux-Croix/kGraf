@@ -160,18 +160,25 @@ pub(crate) fn fit_to_file(
             })
         })
         .collect();
+    let context_at: std::collections::HashMap<usize, usize> =
+        context.iter().map(|&(o, n)| (n, o)).collect();
     let (patch_base, file_base) = match measured.first() {
         None => (String::new(), String::new()),
         Some(first) => {
             if let Some(other) = measured.iter().find(|m| m.offset != first.offset) {
-                return Err(inconsistent(path, file_start, old, &measured, first, other));
+                // A tab-indented file (Go, a Makefile) and a patch written
+                // with spaces: one offset per level, not one per block.
+                return match spaces_per_tab(old, matched) {
+                    Some(width) => {
+                        tabs_for_spaces(path, file_start, matched, new, &context_at, width)
+                    }
+                    None => Err(inconsistent(path, file_start, old, &measured, first, other)),
+                };
             }
             first.offset.clone()
         }
     };
 
-    let context_at: std::collections::HashMap<usize, usize> =
-        context.iter().map(|&(o, n)| (n, o)).collect();
     let mut shifted = 0usize;
     let mut lines = Vec::with_capacity(new.len());
     for (n, line) in new.iter().enumerate() {
@@ -208,6 +215,93 @@ pub(crate) fn fit_to_file(
              as the file has them",
             file_start + 1,
             describe_offset(&patch_base, &file_base),
+            if shifted == 1 { " was" } else { "s were" },
+        )
+    });
+    Ok(Fitted { lines, shift_note })
+}
+
+/// The number of spaces the patch wrote for each tab of the file, when every
+/// matched non-blank pair is the file's tabs written as that many spaces per
+/// tab (2 to 8), and at least one line is indented. A model asked to edit a
+/// tab-indented file (gofmt's Go, a Makefile's recipes) writes spaces, so
+/// the offset grows with the depth and no single offset fits.
+fn spaces_per_tab(old: &[String], matched: &[String]) -> Option<usize> {
+    let mut width = None;
+    for (p, f) in old.iter().zip(matched) {
+        if p.trim().is_empty() || f.trim().is_empty() {
+            continue;
+        }
+        let (lp, lf) = (leading(p), leading(f));
+        if !lp.chars().all(|c| c == ' ') || !lf.chars().all(|c| c == '\t') {
+            return None;
+        }
+        let (spaces, tabs) = (lp.len(), lf.len());
+        if tabs == 0 {
+            if spaces != 0 {
+                return None;
+            }
+            continue;
+        }
+        if !spaces.is_multiple_of(tabs) {
+            return None;
+        }
+        let w = spaces / tabs;
+        if !(2..=8).contains(&w) || width.is_some_and(|known| known != w) {
+            return None;
+        }
+        width = Some(w);
+    }
+    width
+}
+
+/// `new` fitted to a tab-indented file whose matched lines the patch wrote
+/// with `width` spaces per tab: context lines are the file's own, and each
+/// added line's leading spaces become one tab per `width`. An added line
+/// whose leading whitespace is not a whole number of tab widths is refused.
+fn tabs_for_spaces(
+    path: &str,
+    file_start: usize,
+    matched: &[String],
+    new: &[String],
+    context_at: &std::collections::HashMap<usize, usize>,
+    width: usize,
+) -> Result<Fitted, String> {
+    let mut lines = Vec::with_capacity(new.len());
+    let mut shifted = 0usize;
+    for (n, line) in new.iter().enumerate() {
+        if let Some(&o) = context_at.get(&n) {
+            lines.push(matched[o].clone());
+            continue;
+        }
+        let lead = leading(line);
+        if line.trim().is_empty() || lead.is_empty() {
+            lines.push(line.clone());
+            continue;
+        }
+        if !lead.chars().all(|c| c == ' ') || !lead.len().is_multiple_of(width) {
+            return Err(format!(
+                "In {path}, the patch's lines matched at line {} with {width} spaces for each tab \
+                 of the file. The added line '{}' is not indented by a whole number of {width} \
+                 spaces, so it cannot be written with tabs; the patch was not applied. Indent the \
+                 lines with tabs, as the file is.",
+                file_start + 1,
+                quote(line)
+            ));
+        }
+        lines.push(format!(
+            "{}{}",
+            "\t".repeat(lead.len() / width),
+            &line[lead.len()..]
+        ));
+        shifted += 1;
+    }
+    let shift_note = (shifted > 0).then(|| {
+        format!(
+            "note: in {path}, the patch's lines at line {} were indented with {width} spaces for \
+             each tab of the file; its {shifted} added line{} written with tabs to match the \
+             file, and its unchanged lines were kept as the file has them",
+            file_start + 1,
             if shifted == 1 { " was" } else { "s were" },
         )
     });

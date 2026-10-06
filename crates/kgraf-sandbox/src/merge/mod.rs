@@ -60,7 +60,7 @@ mod parse;
 mod safe_git;
 mod state;
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -70,8 +70,8 @@ use crate::git::{Git, parse_porcelain_z};
 use crate::workspace::{Workspace, WorkspaceManager};
 
 pub use generated::{
-    Excluded, GeneratedKind, LOCKFILES, generated_kind, is_python_bytecode, lockfile_manifests,
-    manifests_beside,
+    Excluded, GeneratedKind, LOCKFILES, file_head, generated_kind, is_compiled_binary,
+    is_python_bytecode, lockfile_manifests, manifest_matches, manifests_beside,
 };
 use parse::{
     GITLINK_MODE, MIN_GIT, SYMLINK_MODE, is_protected, new_collisions, parse_merge_tree_z,
@@ -408,10 +408,17 @@ impl MergeBack {
     ///   the same folder of the snapshot, `**/__pycache__/*.pyc|*.pyo`, or a
     ///   Python package build's output (`dist/*.whl|*.tar.gz`,
     ///   `*.egg-info/`, `build/lib*/`, `build/bdist.*/`) with a Python
-    ///   project manifest in the folder it was built in ([`generated_kind`]). A
-    ///   tracked lockfile, an in-scope path, or a lockfile name with no manifest
-    ///   beside it is never left out: those are the worker's writes, judged by
-    ///   the scope check like any other.
+    ///   project manifest in the folder it was built in, or another build
+    ///   tool's output: a file under an output folder with its project's
+    ///   manifest beside it (`node_modules/` by `package.json`, `.venv/` by a
+    ///   Python project file, Maven's `target/`, Gradle's `build/`, a .NET
+    ///   project's `bin/` and `obj/`, ...), a tool cache (`.pytest_cache/`,
+    ///   `.tox/`, `.gradle/`, `.coverage`, ...), compiled output by extension
+    ///   (`.class`, `.o`, `.tsbuildinfo`), a file `tsc` emitted beside its
+    ///   source, or a compiled program told by its first bytes
+    ///   ([`generated_kind`]). A tracked lockfile, an in-scope path, or a
+    ///   lockfile name with no manifest beside it is never left out: those are
+    ///   the worker's writes, judged by the scope check like any other.
     /// - Any other change outside the declared scope is committed (the caller
     ///   reports it and keeps the attempt for discard) and recorded, and
     ///   [`MergeBack::merge`] refuses the attempt for it
@@ -438,12 +445,17 @@ impl MergeBack {
         let new_outside: Vec<&str> = changes
             .iter()
             .filter(|c| c.old_mode.bytes().all(|b| b == b'0'))
+            // A nested repository is never a build's output: it stays a
+            // refusal (`RefusalReason::NestedRepository`) wherever it is.
+            .filter(|c| c.new_mode != GITLINK_MODE)
             .map(|c| c.path.as_str())
             .filter(|p| !in_scope(Path::new(p)))
             .collect();
-        // The manifests beside every lockfile-named path, looked up in the
-        // index with one `ls-files`; the rule itself is `generated_kind`.
-        let beside: Vec<String> = new_outside
+        // The manifests beside every candidate path, looked up in the index
+        // with one `ls-files`; the rule itself is `generated_kind`. A
+        // manifest named `*.ext` (a .NET project file) is a glob over its
+        // folder; every other one is a literal path.
+        let beside: BTreeSet<String> = new_outside
             .iter()
             .flat_map(|p| manifests_beside(Path::new(p)))
             .map(|m| m.to_string_lossy().into_owned())
@@ -455,19 +467,38 @@ impl MergeBack {
                 .iter()
                 .map(|a| (*a).to_owned())
                 .collect();
-            args.extend(beside.iter().map(|m| format!(":(literal){m}")));
+            args.extend(beside.iter().map(|m| {
+                let glob = Path::new(m)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("*."));
+                if glob {
+                    format!(":(glob){m}")
+                } else {
+                    format!(":(literal){m}")
+                }
+            }));
             self.git.ok_bytes(wt, &[], &args, None)?
         };
-        let present: HashSet<&[u8]> = listed
+        let present: Vec<PathBuf> = listed
             .split(|b| *b == 0)
             .filter(|p| !p.is_empty())
+            .map(|p| PathBuf::from(String::from_utf8_lossy(p).into_owned()))
             .collect();
+        let root = match wt {
+            Target::Worktree { work_tree, .. } => Some(*work_tree),
+            _ => None,
+        };
         let mut excluded: Vec<Excluded> = new_outside
             .into_iter()
             .filter_map(|path| {
-                generated_kind(Path::new(path), |m| {
-                    present.contains(m.to_string_lossy().as_bytes())
-                })
+                generated_kind(
+                    Path::new(path),
+                    |m| present.iter().any(|p| manifest_matches(m, p)),
+                    // A program a compiler wrote is told by its first bytes,
+                    // read without following a link.
+                    |p| root.and_then(|r| file_head(r, p)),
+                )
                 .map(|kind| Excluded {
                     path: PathBuf::from(path),
                     kind,

@@ -211,3 +211,54 @@ Still not read: a symbol named only as contained ("`vectorops` containing `dotpr
 signature with types before or after names without a colon (Go, C). Tests:
 `handshake_forms_tests.rs`, with the recorded statements as
 `tests/fixtures/handshake/two-symbols-in-one-provision.json`.
+
+## Amendment (2026-10-06, third): a bare file name in any language is a path
+
+A path in a sentence is set aside, not read as a claim about a symbol. An anchor with no `/`
+was a path only when its extension was on a short list (`rs`, `py`, `toml`, `json`, `md`,
+`txt`, `js`, `ts`, `go`, `c`, `h`, `cpp`, `yaml`, `yml`, `lock`). Every other file name
+(`serve_local.sh`, `config.rb`, `Config.java`, `Config.cs`, `config.php`, `App.tsx`,
+`pom.xml`, `build.gradle`, `setup.cfg`) was read as a claim about the subject. An expecter
+that wrote "I assume you provide `parse_config` in `config.rb`" then needed the provider to
+repeat `config.rb`, and two parties that agreed on everything were held for a disagreement.
+The same sentence with `config.py` passed.
+
+- **The rule.** An anchor is a path when it holds a `/`, or its extension is that of any
+  language kGraf reads (`kgraf_graph::Language::from_path`: Rust, Python, TypeScript and TSX,
+  JavaScript, Go, Java, C, C++, Ruby, C#, PHP, Markdown) or of a script, build or
+  configuration file (`sh`, `bash`, `zsh`, `ps1`, `bat`, `kt`, `kts`, `swift`, `scala`,
+  `xml`, `gradle`, `csproj`, `sln`, `cfg`, `ini`, `env`, `mod`, `sum`, `cmake`, `mk`, `sql`,
+  `html`, `css`, and the like).
+- **A dotted name that names a surface symbol is still that symbol.** `np.sum` read as a file
+  by its extension resolves to the surface symbol `sum` when the surface holds one, as an
+  identifier path does; otherwise it is set aside.
+
+Test: `kgraf-orchestrator` `checks.rs`
+`a_bare_file_name_in_any_language_is_a_path_not_a_claim` (nineteen file names; seventeen
+held before).
+
+## Amendment (2026-10-06, fourth): a Go or C-family signature is compared by its types
+
+A signature anchor was read only in the Rust, Python and TypeScript forms (`fn f(x: T) -> R`,
+`def f(x: T) -> R:`, `f(x: T): R`), where the types follow the names after a colon. A Go
+signature (`func ParseConfig(text string) Config`) and a Java, C# or C one (`Config
+parseConfig(String text)`) were not read as signatures and named no symbol. Two parties that
+stated their sides as such signatures were each held for stating no claim, and the symbol as
+unprovided, however well they agreed; a party that named the symbol bare and gave the
+signature beside it had the signature compared as raw text, so other parameter names or Go's
+grouped names (`a, b string` for `a string, b string`) disagreed.
+
+- **Go.** `func Name(params) results`, with or without a method receiver: the parameters are
+  all named (a name with no type takes the type of the next named one) or all unnamed, and the
+  results are the text after the parameters.
+- **C family.** `[modifiers] type name(params)`: access and storage modifiers (`public`,
+  `static`, `final`, `virtual`, ...) are dropped, the words before the name are the return
+  type, and each parameter's type is its words but the last (`const char *s` is `const char*`,
+  `int a[]` is `int[]`). A word that starts a statement (`return`, `await`, `new`, ...) makes
+  the anchor a call, not a signature; a C++ `const` or a Java `throws` clause after the
+  parameters is allowed.
+- Both reduce to the canonical `fn(types) -> result` the other forms use, so names do not
+  matter and a changed type still disagrees. Not read: a C++ return type whose template
+  arguments hold spaces.
+
+Test: `kgraf-orchestrator` `checks.rs` `a_signature_in_every_language_is_compared_by_its_types`.

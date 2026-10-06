@@ -43,6 +43,10 @@ const RAISE_WORDS: [&str; 4] = ["raise", "throw", "panic", "fail"];
 /// The exception whose raise is a placeholder body (Python, Ruby).
 const NOT_IMPLEMENTED_ERROR: &str = "NotImplementedError";
 
+/// The exception whose throw is a placeholder body (C#; Visual Studio writes
+/// it into every generated member).
+const NOT_IMPLEMENTED_EXCEPTION: &str = "NotImplementedException";
+
 /// Extensions of prose files: no code body, so no placeholder.
 const PROSE_EXTENSIONS: [&str; 5] = ["md", "markdown", "txt", "rst", "adoc"];
 
@@ -74,21 +78,170 @@ pub fn code_only(path: &str, text: &str) -> Option<String> {
 ///   of a `raise`, `throw`, `panic` or `fail` on the same line, or on the line
 ///   before when the literal opens its own line.
 ///
+/// - `throw new NotImplementedException(...)` (C#).
+///
 /// None of these counts inside a comment or a literal. A file with no
 /// grammar is read line by line ([`line_has_placeholder`]).
+///
+/// **An abstract method is not a placeholder.** In Python and Ruby, raising
+/// `NotImplementedError` is also how a correct base class makes a subclass
+/// supply a method. Such a raise does not count when its method is declared
+/// abstract (an `@abstractmethod` decorator, a class based on `ABC`,
+/// `ABCMeta` or `Protocol`), when another class in the same file derives from
+/// its class, or when its message says a subclass is to supply it
+/// ([`is_abstract_site`]). Without this, a plan whose instruction named a
+/// correct module with an abstract base class was refused for not writing it,
+/// and the run failed after its re-asks.
 pub fn has_placeholder_body(path: &str, text: &str) -> bool {
     if is_prose(path) {
         return false;
     }
     match lex(path, text) {
         Some(l) => {
-            code_has_placeholder(&l.code)
+            let abstract_lang = has_abstract_idiom(path);
+            let counts = |at: usize| !(abstract_lang && is_abstract_site(text, &l.code, at));
+            placeholder_sites(&l.code).into_iter().any(counts)
                 || l.literals
                     .iter()
-                    .any(|r| is_raised_not_implemented(text, &l.code, r))
+                    .filter(|r| is_raised_not_implemented(text, &l.code, r))
+                    .any(|r| counts(r.start))
         }
         None => text.lines().any(line_has_placeholder),
     }
+}
+
+/// Whether `path` is in a language whose base classes raise
+/// `NotImplementedError` for a subclass to override: Python and Ruby.
+fn has_abstract_idiom(path: &str) -> bool {
+    matches!(
+        Language::from_path(path),
+        Some(Language::Python | Language::Ruby)
+    )
+}
+
+/// Words in a method's raise message that say a subclass supplies the
+/// method. "Must be implemented" alone is not one: a scaffold says it too.
+const ABSTRACT_MESSAGE_WORDS: &[&str] = &[
+    "subclass",
+    "sub-class",
+    "abstract",
+    "override",
+    "overridden",
+];
+
+/// Bases that make a Python class abstract or a protocol.
+const ABSTRACT_BASES: &[&str] = &["ABC", "ABCMeta", "Protocol"];
+
+/// The indentation of a line, in columns (a tab counts as one column: only
+/// comparisons within one file are made).
+fn indent_of(line: &str) -> usize {
+    line.len() - line.trim_start().len()
+}
+
+/// The text of the line holding byte `at`, and its index.
+fn line_at(code: &str, at: usize) -> (usize, &str) {
+    let index = code[..at].matches('\n').count();
+    (index, code.lines().nth(index).unwrap_or_default())
+}
+
+/// The name a `class` line declares (Python `class Name(...)`, Ruby
+/// `class Name < Base`), and the text after the name.
+fn class_header(line: &str) -> Option<(&str, &str)> {
+    let rest = line.trim_start().strip_prefix("class ")?.trim_start();
+    let end = rest
+        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .unwrap_or(rest.len());
+    let name = &rest[..end];
+    (!name.is_empty()).then(|| (name, &rest[end..]))
+}
+
+/// Whether the placeholder at byte `at` of `code` (the source with its text
+/// blanked) is an abstract method's body in a Python or Ruby file: see
+/// [`has_placeholder_body`]. Read from the indentation of the lines around
+/// it, not from a parse: the enclosing `def` is the nearest line above with
+/// less indentation that starts one, its decorators are the `@` lines right
+/// above it, and its class is the nearest `class` line above it with less
+/// indentation still.
+fn is_abstract_site(text: &str, code: &str, at: usize) -> bool {
+    let lines: Vec<&str> = code.lines().collect();
+    let (index, site) = line_at(code, at);
+    let is_def = |l: &str| {
+        let t = l.trim_start();
+        t.starts_with("def ") || t.starts_with("async def ")
+    };
+    let mut bound = indent_of(site);
+    let mut def_at = None;
+    for i in (0..index.min(lines.len())).rev() {
+        let line = lines[i];
+        // A line that closes a signature split over lines (`) -> float:`)
+        // belongs to the `def` above it.
+        if line.trim().is_empty() || indent_of(line) >= bound || line.trim_start().starts_with(')')
+        {
+            continue;
+        }
+        if is_def(line) {
+            def_at = Some(i);
+            break;
+        }
+        if class_header(line).is_some() {
+            return false;
+        }
+        bound = indent_of(line);
+    }
+    let Some(def_at) = def_at else {
+        return false;
+    };
+    let def_indent = indent_of(lines[def_at]);
+    // Decorators directly above the `def`.
+    let decorated = lines[..def_at]
+        .iter()
+        .rev()
+        .take_while(|l| l.trim_start().starts_with('@') && indent_of(l) == def_indent)
+        .any(|l| l.contains("abstract"));
+    if decorated {
+        return true;
+    }
+    let class = lines[..def_at]
+        .iter()
+        .rev()
+        .filter(|l| !l.trim().is_empty())
+        .find(|l| indent_of(l) < def_indent)
+        .and_then(|l| class_header(l));
+    let Some((name, bases)) = class else {
+        return false;
+    };
+    // The message of a method's raise: the source text from the site to the
+    // end of its line (the literal is blanked in `code`, so read from
+    // `text`). Only in a class: "must be implemented" in a module-level
+    // function is a scaffold's own words.
+    let line_end = text[at..].find('\n').map_or(text.len(), |n| at + n);
+    let message = text[at..line_end].to_ascii_lowercase();
+    if ABSTRACT_MESSAGE_WORDS.iter().any(|w| message.contains(w)) {
+        return true;
+    }
+    let words = |s: &str| -> Vec<String> {
+        s.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .filter(|w| !w.is_empty())
+            .map(str::to_owned)
+            .collect()
+    };
+    if words(bases)
+        .iter()
+        .any(|w| ABSTRACT_BASES.contains(&w.as_str()))
+    {
+        return true;
+    }
+    // Another class in the file derives from this one: `class Circle(Shape)`
+    // in Python, `class Circle < Shape` in Ruby.
+    lines
+        .iter()
+        .filter_map(|l| class_header(l))
+        .any(|(other, b)| {
+            other != name && {
+                let b = b.trim_start();
+                (b.starts_with('(') || b.starts_with('<')) && words(b).iter().any(|w| w == name)
+            }
+        })
 }
 
 fn is_prose(path: &str) -> bool {
@@ -185,25 +338,48 @@ fn word_at(code: &str, word: &str) -> impl Iterator<Item = usize> {
 }
 
 /// Whether `code` (text already removed) holds a placeholder macro call or a
-/// raise of `NotImplementedError`.
+/// raise of `NotImplementedError` or `NotImplementedException`.
 fn code_has_placeholder(code: &str) -> bool {
-    let macro_call = PLACEHOLDER_MACROS.iter().any(|name| {
-        word_at(code, name).any(|at| {
-            let rest = code[at + name.len()..].trim_start();
-            rest.strip_prefix('!')
-                .map(str::trim_start)
-                .is_some_and(|rest| rest.starts_with(['(', '[', '{']))
-        })
-    });
-    macro_call
-        || word_at(code, NOT_IMPLEMENTED_ERROR).any(|at| {
-            let before = code[..at].trim_end();
-            ["raise", "fail"].iter().any(|kw| {
-                before
-                    .strip_suffix(kw)
-                    .is_some_and(|head| head.as_bytes().last().is_none_or(|b| !is_ident_byte(*b)))
+    !placeholder_sites(code).is_empty()
+}
+
+/// Whether the word before byte `at` of `code` is one of `words`.
+fn preceded_by(code: &str, at: usize, words: &[&str]) -> bool {
+    let before = code[..at].trim_end();
+    words.iter().any(|kw| {
+        before
+            .strip_suffix(kw)
+            .is_some_and(|head| head.as_bytes().last().is_none_or(|b| !is_ident_byte(*b)))
+    })
+}
+
+/// The offsets in `code` (text already removed) of each placeholder macro
+/// call, each raise of `NotImplementedError` (Python, Ruby) and each `throw
+/// new NotImplementedException` (C#).
+fn placeholder_sites(code: &str) -> Vec<usize> {
+    let mut sites: Vec<usize> = PLACEHOLDER_MACROS
+        .iter()
+        .flat_map(|name| {
+            word_at(code, name).filter(|&at| {
+                let rest = code[at + name.len()..].trim_start();
+                rest.strip_prefix('!')
+                    .map(str::trim_start)
+                    .is_some_and(|rest| rest.starts_with(['(', '[', '{']))
             })
         })
+        .collect();
+    sites.extend(
+        word_at(code, NOT_IMPLEMENTED_ERROR)
+            .filter(|&at| preceded_by(code, at, &["raise", "fail"])),
+    );
+    sites.extend(word_at(code, NOT_IMPLEMENTED_EXCEPTION).filter(|&at| {
+        let before = code[..at].trim_end();
+        let before = before.strip_suffix("System.").map_or(before, str::trim_end);
+        before
+            .strip_suffix("new")
+            .is_some_and(|head| preceded_by(head, head.len(), &["throw"]))
+    }));
+    sites
 }
 
 /// Whether the literal at `range` says "not implemented" and is the message
@@ -360,6 +536,94 @@ pub fn message() -> String {
         ] {
             assert!(!has_placeholder_body("pkg/mod.py", src), "{src}");
         }
+    }
+
+    /// An abstract method raises `NotImplementedError` in a correct base
+    /// class: it is not a placeholder. The same raise in a method of a class
+    /// nothing marks abstract, or in a module-level function, still is.
+    #[test]
+    fn an_abstract_method_is_not_a_placeholder() {
+        for (path, src) in [
+            (
+                "pkg/base.py",
+                "import abc\n\nclass Base:\n    @abc.abstractmethod\n    def run(self):\n        raise NotImplementedError\n",
+            ),
+            (
+                "pkg/base.py",
+                "from abc import ABC\n\nclass Base(ABC):\n    def run(self):\n        if True:\n            raise NotImplementedError()\n",
+            ),
+            (
+                "pkg/base.py",
+                "class Base(metaclass=ABCMeta):\n    def run(self):\n        raise NotImplementedError\n",
+            ),
+            (
+                "pkg/proto.py",
+                "class Reader(Protocol):\n    def read(self) -> bytes:\n        raise NotImplementedError\n",
+            ),
+            (
+                "pkg/base.py",
+                "class Base(ABC):\n    def run(\n        self,\n        n: int,\n    ) -> int:\n        raise NotImplementedError\n",
+            ),
+            (
+                "pkg/base.py",
+                "class Base:\n    def run(self):\n        raise NotImplementedError(\"subclasses must override run\")\n",
+            ),
+            (
+                "pkg/shapes.py",
+                "class Shape:\n    async def area(self):\n        raise NotImplementedError\n\nclass Circle(Shape):\n    async def area(self):\n        return 3.0\n",
+            ),
+            (
+                "lib/shape.rb",
+                "class Shape\n  def area\n    raise NotImplementedError\n  end\nend\n\nclass Circle < Shape\n  def area\n    3\n  end\nend\n",
+            ),
+        ] {
+            assert!(!has_placeholder_body(path, src), "{path}: {src}");
+        }
+        for (path, src) in [
+            (
+                "pkg/mod.py",
+                "class Base:\n    def run(self):\n        raise NotImplementedError\n",
+            ),
+            (
+                "pkg/mod.py",
+                "class Base(ABC):\n    pass\n\ndef run():\n    raise NotImplementedError(\"must be overridden\")\n",
+            ),
+            (
+                "pkg/mod.py",
+                "class Base(Shape):\n    def run(self):\n        raise NotImplementedError\n",
+            ),
+            (
+                "lib/a.rb",
+                "class A\n  def f\n    raise NotImplementedError, \"later\"\n  end\nend\n",
+            ),
+            // The abstract idiom is Python's and Ruby's; Rust has none.
+            (
+                "src/lib.rs",
+                "trait T { fn f(&self) { todo!(\"subclass\") } }\n",
+            ),
+        ] {
+            assert!(has_placeholder_body(path, src), "{path}: {src}");
+        }
+    }
+
+    #[test]
+    fn a_csharp_not_implemented_exception_is_a_placeholder() {
+        assert!(has_placeholder_body(
+            "src/Discount.cs",
+            "class D { public int Cents() { throw new NotImplementedException(); } }\n"
+        ));
+        assert!(has_placeholder_body(
+            "src/Discount.cs",
+            "class D { public int Cents() => throw new System.NotImplementedException(); }\n"
+        ));
+        assert!(!has_placeholder_body(
+            "src/Discount.cs",
+            "class D { // throw new NotImplementedException();\n public int Cents() { return 1; } }\n"
+        ));
+        assert!(!has_placeholder_body(
+            "src/Discount.cs",
+            "class D { void F() { try { G(); } catch (NotImplementedException) { } } }\n"
+        ));
     }
 
     #[test]

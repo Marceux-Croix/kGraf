@@ -22,7 +22,9 @@ use std::time::Duration;
 ///
 /// A gate that does not apply is said on stderr, never dropped silently: the
 /// pytest gate is left out, with the reason, when the project has Python
-/// tests but neither declares pytest nor has it importable.
+/// tests but neither declares pytest nor has it importable; the `npm test`
+/// gate is left out when the test script is the one `npm init` writes, which
+/// only fails.
 pub fn discover_validation_commands(root: &Path, configured: &[String]) -> Result<Vec<String>> {
     let (found, notes) = discover_with(root, configured, &pytest_importable)?;
     for note in notes {
@@ -69,8 +71,17 @@ pub(crate) fn discover_with(
             .with_step(|| format!("cannot read {}", package.display()))?;
         let json: serde_json::Value = serde_json::from_str(&text)
             .with_settings(|| format!("{} is not valid JSON", package.display()))?;
-        if json["scripts"]["test"].is_string() {
-            found.push("npm test".to_owned());
+        match json["scripts"]["test"].as_str() {
+            // `npm init` writes a test script that only fails: a gate made of
+            // it fails every correct project that has not replaced it.
+            Some(script) if is_npm_init_test(script) => notes.push(format!(
+                "npm test gate not applicable: {} has the test script `npm init` writes, which \
+                 only fails (\"no test specified\"); set gate commands, or give the project a \
+                 test script",
+                package.display()
+            )),
+            Some(_) => found.push("npm test".to_owned()),
+            None => {}
         }
     }
     // A pyproject.toml alone is also what a Rust or Node project keeps its
@@ -100,6 +111,12 @@ pub(crate) fn discover_with(
         }
     }
     Ok((found, notes))
+}
+
+/// Whether `script` is the test script `npm init` writes,
+/// `echo "Error: no test specified" && exit 1`, in any quoting.
+fn is_npm_init_test(script: &str) -> bool {
+    script.contains("no test specified") && script.contains("exit 1")
 }
 
 /// Whether the project's Python build files name pytest (a dependency, a

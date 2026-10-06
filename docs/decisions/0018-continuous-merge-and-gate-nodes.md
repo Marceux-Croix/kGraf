@@ -316,3 +316,16 @@ functions, inherent methods, return types, struct and enum shapes, additions, pr
 prose fallbacks, one report per change); `tests/shape_guard.rs`
 `an_instruction_that_changes_a_trait_signature_is_noticed_not_refused` and
 `an_added_item_or_a_private_change_is_not_noticed`; `plan` `defines_with_fields`.
+
+## Amendment (2026-10-06): the test script `npm init` writes is not a gate
+
+Gate discovery takes `npm test` whenever `package.json` has a `test` script. The script
+`npm init` writes, `echo "Error: no test specified" && exit 1`, only fails. A correct
+JavaScript project that had not replaced it got a root gate that failed every time, opened a
+remediation contract that no worker could satisfy, and held the run.
+
+- **The rule.** A `test` script that says "no test specified" and exits 1 adds no gate. The
+  discovery note says so ("npm test gate not applicable"), as it does for a pytest gate with no
+  pytest, and the run's own `--gate-command` or a real test script brings the gate back.
+
+Test: `kgraf-host` `the_npm_init_test_script_is_not_a_gate`.

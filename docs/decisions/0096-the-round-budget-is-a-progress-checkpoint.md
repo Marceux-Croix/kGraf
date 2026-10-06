@@ -205,3 +205,29 @@ use (`kgraf-runtime/src/progress.rs`, `measure_log`).
 Tests: `progress.rs` `failed_writes_followed_by_a_successful_write_are_not_sloppy`,
 `a_recovery_does_not_hide_read_errors_other_files_or_a_later_failed_write`; `compaction.rs`
 `failed_writes_before_a_write_that_works_do_not_stop_a_recompaction`.
+
+## Amendment (2026-10-06, second): the other languages' runners are scored by their counts
+
+Signal (b) read pass and fail counts only from Rust, Python and JavaScript runners, and error
+counts only from cargo and `tsc`. A Go, Java, .NET, Ruby, PHP, C or C++ worker's commands were
+scored by exit status alone, so a run that went from three failing tests to one read as flat,
+and a flat failing run did not count toward the first block's discount. Those workers were
+measured by a different rule than a Rust worker.
+
+- **Test counts.** `go test` (the `--- PASS` and `--- FAIL` lines, or, without them, the `ok`
+  and `FAIL` lines of packages that ran), Maven Surefire (`Tests run: N, Failures: F, Errors:
+  E, Skipped: S`, the last line), Gradle (`N tests completed, F failed`), `dotnet test` (both
+  summary forms), RSpec (`N examples, F failures, P pending`), Minitest (`N runs, ...
+  failures, ... errors, ... skips`) and PHPUnit (`OK (N tests, ...)`, or `Tests: N, ...,
+  Failures: F, Errors: E, Skipped: S.`).
+- **Compiler error counts.** Distinct `file:line[:col]: error:` lines (gcc, clang, javac), Go's
+  `file.go:line:col:` lines, and MSBuild's `: error CS0103:` lines (MSBuild says each twice).
+  A Go package that failed to build is scored by its errors, not as a failed test.
+- **Effect.** A Go or Java worker whose tests improve is progressing, as a Rust worker is; one
+  whose tests stay flat and failing in the first block has its file changes discounted, as a
+  Rust worker has. A command whose output none of these read is scored by exit status, as
+  before.
+
+Tests: `kgraf-runtime` `progress.rs` `scores_each_other_language_runner`,
+`a_first_block_is_measured_by_go_test_counts_as_by_cargo_s`,
+`a_first_block_whose_go_tests_improved_is_progress`.

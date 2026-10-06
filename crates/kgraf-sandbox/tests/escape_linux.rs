@@ -606,6 +606,25 @@ fn tmpdir_is_the_scratch_directory_and_is_writable() {
     assert!(e.ws.scratch().join("t").is_file());
 }
 
+/// The go command writes its build cache on every build and test and stops
+/// when it cannot; its default under `~/.cache` is readable only, so the
+/// sandbox points `GOCACHE` into the scratch directory.
+#[test]
+fn the_go_build_cache_is_in_scratch_and_writable() {
+    let e = env();
+    let out = sh(
+        &e.ws,
+        Network::Deny,
+        "mkdir -p \"$GOCACHE\" && echo t > \"$GOCACHE/t\" && printf %s \"$GOCACHE\"",
+    );
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        Path::new(&*String::from_utf8_lossy(&out.stdout)),
+        e.ws.scratch().join("go-build")
+    );
+    assert!(e.ws.scratch().join("go-build/t").is_file());
+}
+
 #[test]
 fn git_status_and_a_real_cc_compile_run_inside_the_sandbox() {
     let e = env();

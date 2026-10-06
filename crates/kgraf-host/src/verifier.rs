@@ -519,11 +519,14 @@ fn some_paths(paths: &[&Path]) -> String {
 
 /// The owner's notices for what the worker's own run generated and the commit
 /// left out: one per lockfile, one for all bytecode, one for all of a Python
-/// package build's output.
+/// package build's output, one for all other build or install output, one for
+/// all tool caches.
 pub(crate) fn worker_notices(excluded: &[Excluded]) -> Vec<String> {
     let mut notices = Vec::new();
     let mut bytecode = Vec::new();
     let mut package = Vec::new();
+    let mut output = Vec::new();
+    let mut cache = Vec::new();
     for e in excluded {
         match e.kind {
             GeneratedKind::Lockfile => notices.push(format!(
@@ -534,7 +537,26 @@ pub(crate) fn worker_notices(excluded: &[Excluded]) -> Vec<String> {
             )),
             GeneratedKind::PythonBytecode => bytecode.push(e.path.as_path()),
             GeneratedKind::PackageBuild => package.push(e.path.as_path()),
+            GeneratedKind::BuildOutput => output.push(e.path.as_path()),
+            GeneratedKind::ToolCache => cache.push(e.path.as_path()),
         }
+    }
+    if !output.is_empty() {
+        notices.push(format!(
+            "the worker's run left {} build or install output file(s) (made by the worker): {}; \
+             they were left out of the attempt and removed before the check. Add their folders \
+             to .gitignore",
+            output.len(),
+            some_paths(&output)
+        ));
+    }
+    if !cache.is_empty() {
+        notices.push(format!(
+            "the worker's run left {} tool cache file(s) (made by the worker): {}; they were left \
+             out of the attempt and removed before the check. Add them to .gitignore",
+            cache.len(),
+            some_paths(&cache)
+        ));
     }
     if !package.is_empty() {
         notices.push(format!(

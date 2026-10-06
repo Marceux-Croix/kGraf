@@ -8570,7 +8570,9 @@ fn kind_default() -> kgraf_core::model_profile::TaskKind {
 /// in the order given. A forbidden path is refused even when declared.
 ///
 /// A file the worker's own build or test run generated (decision 0084: a
-/// lockfile beside its manifest in `workspace`, Python bytecode) is not the
+/// lockfile beside its manifest in `workspace`, Python bytecode, and any
+/// other language's build, install or test output beside its project, a tool
+/// cache or a compiled program; `kgraf_sandbox::generated_kind`) is not the
 /// worker's write. It passes on to the verifier, whose merge-back commit
 /// applies the same rule (`kgraf_sandbox::generated_kind`) with the one test
 /// this check cannot make, that the file is new against the base: the commit
@@ -8583,9 +8585,36 @@ fn outside_declared_scope(
     workspace: &Path,
     bypass_git_files: bool,
 ) -> Vec<String> {
+    // No workspace known: no manifest is looked up and no file is read
+    // relative to the process's own directory, so nothing is passed on as
+    // generated.
+    let known = !workspace.as_os_str().is_empty();
+    let present = |m: &Path| known && manifest_in(workspace, m);
+    let head = |p: &Path| {
+        known
+            .then(|| kgraf_sandbox::file_head(workspace, p))
+            .flatten()
+    };
     changed
         .iter()
         .filter(|p| {
+            let declared = writes
+                .iter()
+                .any(|w| kgraf_runtime::same_path(Path::new(&w.path), p));
+            // A path git lists with a trailing `/` is a folder holding its own
+            // repository, never a build's output.
+            let nested = p.to_string_lossy().ends_with('/');
+            let generated = if declared || nested {
+                None
+            } else {
+                kgraf_sandbox::generated_kind(p, present, head)
+            };
+            // A tool's own tree (an npm package's `.gitattributes` under
+            // `node_modules/`) is passed on even under a protected name: the
+            // commit leaves every new file of it out, so nothing of it lands.
+            if generated.is_some_and(|k| k.is_tool_tree()) {
+                return false;
+            }
             // In Bypass, `.gitattributes`, `.gitmodules` and `.githooks` are
             // judged by the declared writes like any file (decision 0094).
             if kgraf_runtime::forbidden_path(p)
@@ -8593,17 +8622,31 @@ fn outside_declared_scope(
             {
                 return true;
             }
-            let declared = writes
-                .iter()
-                .any(|w| kgraf_runtime::same_path(Path::new(&w.path), p));
-            // No workspace known: no manifest is looked up relative to the
-            // process's own directory, so nothing is passed on as generated.
-            let present =
-                |m: &Path| !workspace.as_os_str().is_empty() && workspace.join(m).is_file();
-            !declared && kgraf_sandbox::generated_kind(p, present).is_none()
+            !declared && generated.is_none()
         })
         .map(|p| p.to_string_lossy().into_owned())
         .collect()
+}
+
+/// Whether the manifest `m` (a repository path from
+/// `kgraf_sandbox::manifests_beside`) is a file in `workspace`. A manifest
+/// whose file name is `*.ext` is any file of that extension in its folder (a
+/// .NET project file is named after its project).
+fn manifest_in(workspace: &Path, m: &Path) -> bool {
+    let pattern = m
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with("*."));
+    if !pattern {
+        return workspace.join(m).is_file();
+    }
+    let dir = m.parent().unwrap_or(Path::new(""));
+    std::fs::read_dir(workspace.join(dir)).is_ok_and(|entries| {
+        entries.flatten().any(|e| {
+            e.file_type().is_ok_and(|t| t.is_file())
+                && kgraf_sandbox::manifest_matches(m, &dir.join(e.file_name()))
+        })
+    })
 }
 
 /// The longest failure text kept from one worker, in characters.
@@ -9125,6 +9168,78 @@ mod tests {
         assert_eq!(
             outside_declared_scope(&elsewhere, &writes, ws.path(), false),
             vec!["web/dist/app-1.0.tar.gz".to_owned()]
+        );
+    }
+
+    /// A correct project in each language runs its own install, build and
+    /// tests, and the tools leave their output in the tree (cargo's alone goes
+    /// to the scratch directory). None of it is an out-of-scope write when the
+    /// project's `.gitignore` does not name it; the same names with no project
+    /// beside them, and an undeclared source file, still are.
+    #[test]
+    fn other_languages_build_output_is_not_an_out_of_scope_write() {
+        let ws = tempfile::tempdir().expect("dir");
+        for manifest in [
+            "web/package.json",
+            "web/src/app.ts",
+            "jvm/pom.xml",
+            "dotnet/App.csproj",
+            "py/requirements.txt",
+            "go/go.mod",
+        ] {
+            let p = ws.path().join(manifest);
+            std::fs::create_dir_all(p.parent().expect("parent")).expect("mkdir");
+            std::fs::write(p, "").expect("write");
+        }
+        // The program `go build` wrote into the module's folder.
+        std::fs::write(ws.path().join("go/vectorops"), b"\x7fELF\x02\x01\x01").expect("write");
+        let writes = [WriteTarget {
+            path: "web/src/app.ts".into(),
+            node: None,
+        }];
+        let changed: Vec<PathBuf> = [
+            "web/src/app.ts",
+            "web/src/app.js",
+            "web/node_modules/left-pad/index.js",
+            "web/node_modules/left-pad/.gitattributes",
+            "web/coverage/lcov.info",
+            "jvm/target/classes/App.class",
+            "dotnet/obj/project.assets.json",
+            "dotnet/bin/Debug/App.dll",
+            "py/.venv/bin/python3",
+            "py/.tox/log.txt",
+            "go/vectorops",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+        assert_eq!(
+            outside_declared_scope(&changed, &writes, ws.path(), false),
+            Vec::<String>::new()
+        );
+        let stray: Vec<PathBuf> = [
+            "docs/node_modules/x.js",
+            "web/src/other.js",
+            "go/main.go",
+            "go/.gitattributes",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+        assert_eq!(
+            outside_declared_scope(&stray, &writes, ws.path(), false),
+            vec![
+                "docs/node_modules/x.js".to_owned(),
+                "web/src/other.js".to_owned(),
+                "go/main.go".to_owned(),
+                "go/.gitattributes".to_owned()
+            ]
+        );
+        // No workspace: nothing is looked up, so nothing is passed on.
+        let program = [PathBuf::from("go/vectorops")];
+        assert_eq!(
+            outside_declared_scope(&program, &writes, Path::new(""), false),
+            vec!["go/vectorops".to_owned()]
         );
     }
 

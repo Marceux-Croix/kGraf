@@ -3618,6 +3618,34 @@ fn discover_py(root: &std::path::Path, importable: bool) -> (Vec<String>, Vec<St
     crate::gates::discover_with(root, &[], &|| importable).expect("discover")
 }
 
+/// `npm init` writes a test script that only fails. A JavaScript project that
+/// kept it (a correct project with no tests yet) gets no `npm test` gate, and
+/// the note says why; a real test script is a gate.
+#[test]
+fn the_npm_init_test_script_is_not_a_gate() {
+    let dir = tempfile::tempdir().expect("dir");
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{"name": "web", "scripts": {"test": "echo \"Error: no test specified\" && exit 1"}}"#,
+    )
+    .expect("w");
+    let (found, notes) = discover_py(dir.path(), false);
+    assert!(found.is_empty(), "{found:?}");
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(
+        notes[0].contains("npm test gate not applicable"),
+        "{notes:?}"
+    );
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{"name": "web", "scripts": {"test": "node --test"}}"#,
+    )
+    .expect("w");
+    let (found, notes) = discover_py(dir.path(), false);
+    assert_eq!(found, vec!["npm test"]);
+    assert!(notes.is_empty(), "{notes:?}");
+}
+
 /// A `setup.py`, `setup.cfg` or `requirements.txt` project with Python tests
 /// that declares pytest gets the pytest gate as a `pyproject.toml` one does.
 #[test]

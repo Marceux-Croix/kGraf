@@ -1432,6 +1432,7 @@ mod tests {
             "OLDPWD",
             "NPM_CONFIG_USERCONFIG",
             "NPM_CONFIG_CACHE",
+            "GOCACHE",
         ];
         for n in &names {
             assert!(allowed.contains(n), "unexpected variable {n} in {names:?}");

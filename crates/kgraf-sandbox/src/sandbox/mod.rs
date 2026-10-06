@@ -1036,6 +1036,12 @@ pub fn sandboxed_command(
             // ~/.npm is outside the writable roots; without this npm fails on
             // its first cache write. A per-workspace cache is a cold cache.
             cmd.env("NPM_CONFIG_CACHE", tmp.join("npm-cache"));
+            // The go command writes its build cache on every build and test,
+            // and stops when it cannot ("failed to initialize build cache"):
+            // its default, under ~/Library/Caches or ~/.cache, is outside the
+            // writable roots. Cargo's build output already goes to scratch
+            // (`CARGO_TARGET_DIR`); a per-workspace cache is a cold cache.
+            cmd.env("GOCACHE", tmp.join("go-build"));
         }
         // Windows cannot deny reads of the Credential Manager, so at least stop
         // git from asking it by default: an empty credential.helper resets the

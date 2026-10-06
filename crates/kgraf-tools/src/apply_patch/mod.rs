@@ -1784,6 +1784,31 @@ mod tests {
         assert_eq!(syntax::python_indentation_error(&written), None);
     }
 
+    /// gofmt indents Go with tabs, and a model writes the patch with four
+    /// spaces per level. Before, the offset grew with each level and the
+    /// patch was refused, so every nested Go edit needed exact tabs; a
+    /// Makefile recipe must start with a tab or make refuses it.
+    #[tokio::test]
+    async fn a_go_or_makefile_patch_written_with_spaces_gets_the_file_s_tabs() {
+        let go = "package v\n\nfunc Dot(a, b []int) int {\n\tsum := 0\n\tfor i := range a {\n\t\tsum += a[i]\n\t}\n\treturn sum\n}\n";
+        let patch = "*** Begin Patch\n*** Update File: v.go\n@@\n func Dot(a, b []int) int {\n     sum := 0\n     for i := range a {\n-        sum += a[i]\n+        sum += a[i] * b[i]\n     }\n     return sum\n*** End Patch";
+        let (out, dir) = run_patch(&[("v.go", go)], patch).await;
+        let text = out.expect("applies");
+        assert!(text.contains("4 spaces for each tab"), "{text}");
+        assert_eq!(
+            read(&dir, "v.go"),
+            "package v\n\nfunc Dot(a, b []int) int {\n\tsum := 0\n\tfor i := range a {\n\t\tsum += a[i] * b[i]\n\t}\n\treturn sum\n}\n"
+        );
+        let make = "test:\n\tgo vet ./...\n\tgo test ./...\n";
+        let patch = "*** Begin Patch\n*** Update File: Makefile\n@@\n test:\n     go vet ./...\n+    gofmt -l .\n     go test ./...\n*** End Patch";
+        let (out, dir) = run_patch(&[("Makefile", make)], patch).await;
+        out.expect("applies");
+        assert_eq!(
+            read(&dir, "Makefile"),
+            "test:\n\tgo vet ./...\n\tgofmt -l .\n\tgo test ./...\n"
+        );
+    }
+
     /// YAML: a nested mapping edited with the patch's lines 2 spaces
     /// shallower than the file's; the new key lands at the file's depth.
     #[tokio::test]

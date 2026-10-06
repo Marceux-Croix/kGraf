@@ -26,8 +26,10 @@
 //! - **(b) Checks improving.** A command a worker ran (the `shell` tool, or any
 //!   tool whose input names a `command` or `cmd`) is scored from its output:
 //!   pass and fail counts for `cargo test` and `cargo nextest`, pytest,
-//!   unittest, `node --test`, jest and vitest; error counts for cargo builds and
-//!   `tsc`; otherwise its exit status. The command's latest score in the block
+//!   unittest, `node --test`, jest, vitest, `go test`, Maven, Gradle,
+//!   `dotnet test`, RSpec, Minitest and PHPUnit; error counts for cargo
+//!   builds, `tsc`, the go command, gcc and clang, javac and MSBuild;
+//!   otherwise its exit status. The command's latest score in the block
 //!   is compared with its score at the previous checkpoint, or with its first
 //!   score in the block when it had none.
 //! - **(c) No sloppy pattern.** In the block: one identical error (digits
@@ -217,9 +219,115 @@ static JS_TESTS: LazyLock<regex::Regex> = LazyLock::new(|| re(r"(?m)^\s*Tests:?\
 static RUST_ERROR: LazyLock<regex::Regex> = LazyLock::new(|| re(r"(?m)^error(?:\[E\d+\])?: (.*)$"));
 static CARGO_FINISHED: LazyLock<regex::Regex> = LazyLock::new(|| re(r"(?m)^\s*Finished `?[a-z]"));
 static TSC_FOUND: LazyLock<regex::Regex> = LazyLock::new(|| re(r"Found (\d+) errors?"));
+// `go test`: one line per test with `-v` (and per failing test without it),
+// and one line per package that ran (a package whose build failed says
+// `[build failed]` and is scored by its compiler errors).
+static GO_TEST: LazyLock<regex::Regex> = LazyLock::new(|| re(r"(?m)^\s*--- (PASS|FAIL): "));
+static GO_PACKAGE: LazyLock<regex::Regex> =
+    LazyLock::new(|| re(r"(?m)^(ok|FAIL)\s+\S+\s+(?:[\d.]+s|\(cached\))"));
+// Maven Surefire and Failsafe; the last such line is the run's total.
+static SUREFIRE: LazyLock<regex::Regex> =
+    LazyLock::new(|| re(r"Tests run: (\d+), Failures: (\d+), Errors: (\d+), Skipped: (\d+)"));
+// Gradle, on a failing run.
+static GRADLE: LazyLock<regex::Regex> =
+    LazyLock::new(|| re(r"(\d+) tests? completed, (\d+) failed"));
+// `dotnet test`: the classic summary, and the newer one.
+static DOTNET: LazyLock<regex::Regex> = LazyLock::new(|| re(r"Failed:\s+(\d+), Passed:\s+(\d+)"));
+static DOTNET_SUMMARY: LazyLock<regex::Regex> =
+    LazyLock::new(|| re(r"(?i)total:\s*\d+, failed:\s*(\d+), succeeded:\s*(\d+)"));
+// RSpec.
+static RSPEC: LazyLock<regex::Regex> =
+    LazyLock::new(|| re(r"(\d+) examples?, (\d+) failures?(?:, (\d+) pending)?"));
+// Minitest.
+static MINITEST: LazyLock<regex::Regex> = LazyLock::new(|| {
+    re(r"(\d+) runs, \d+ assertions, (\d+) failures, (\d+) errors(?:, (\d+) skips)?")
+});
+// PHPUnit: `OK (5 tests, 9 assertions)`, or `Tests: 5, Assertions: 9,
+// Failures: 1, Errors: 1.`
+static PHPUNIT_OK: LazyLock<regex::Regex> =
+    LazyLock::new(|| re(r"(?m)^OK \((\d+) tests?, \d+ assertions?\)"));
+static PHPUNIT_TESTS: LazyLock<regex::Regex> =
+    LazyLock::new(|| re(r"(?m)^Tests: (\d+), Assertions: \d+(.*)$"));
+// Compiler errors with a location: gcc and clang (`f.c:3:5: error: ...`),
+// javac (`F.java:3: error: ...`), and the go command (`./f.go:3:5: ...`);
+// MSBuild's `error CS0103:` (each said twice, so distinct lines count).
+static LOCATED_ERROR: LazyLock<regex::Regex> =
+    LazyLock::new(|| re(r"(?m)^\S+:\d+:(?:\d+:)? (?:fatal )?error: .*$"));
+static GO_ERROR: LazyLock<regex::Regex> = LazyLock::new(|| re(r"(?m)^\S+\.go:\d+:\d+: .*$"));
+static MSBUILD_ERROR: LazyLock<regex::Regex> =
+    LazyLock::new(|| re(r"(?m)^.*: error [A-Z]+\d+: .*$"));
 
 fn number(m: Option<regex::Match<'_>>) -> u64 {
     m.and_then(|m| m.as_str().parse().ok()).unwrap_or(0)
+}
+
+/// Pass and fail counts from the test runners of the other languages kGraf
+/// reads: `go test`, Maven, Gradle, `dotnet test`, RSpec, Minitest and
+/// PHPUnit. Without them a run in those languages scored only its exit
+/// status, so going from five failing tests to one read as no improvement,
+/// and the first block's file changes were discounted as flat.
+fn other_runner_counts(output: &str) -> Option<(u64, u64)> {
+    let count = |re: &regex::Regex, word: &str| {
+        re.captures_iter(output)
+            .filter(|c| c.get(1).is_some_and(|m| m.as_str() == word))
+            .count() as u64
+    };
+    if GO_TEST.is_match(output) {
+        return Some((count(&GO_TEST, "PASS"), count(&GO_TEST, "FAIL")));
+    }
+    if GO_PACKAGE.is_match(output) {
+        return Some((count(&GO_PACKAGE, "ok"), count(&GO_PACKAGE, "FAIL")));
+    }
+    if let Some(c) = SUREFIRE.captures_iter(output).last() {
+        let (run, failures, errors, skipped) = (
+            number(c.get(1)),
+            number(c.get(2)),
+            number(c.get(3)),
+            number(c.get(4)),
+        );
+        let failed = failures + errors;
+        return Some((run.saturating_sub(failed + skipped), failed));
+    }
+    if let Some(c) = GRADLE.captures_iter(output).last() {
+        let (run, failed) = (number(c.get(1)), number(c.get(2)));
+        return Some((run.saturating_sub(failed), failed));
+    }
+    if let Some(c) = DOTNET.captures_iter(output).last() {
+        return Some((number(c.get(2)), number(c.get(1))));
+    }
+    if let Some(c) = DOTNET_SUMMARY.captures_iter(output).last() {
+        return Some((number(c.get(2)), number(c.get(1))));
+    }
+    if let Some(c) = RSPEC.captures_iter(output).last() {
+        let (run, failed, pending) = (number(c.get(1)), number(c.get(2)), number(c.get(3)));
+        return Some((run.saturating_sub(failed + pending), failed));
+    }
+    if let Some(c) = MINITEST.captures_iter(output).last() {
+        let failed = number(c.get(2)) + number(c.get(3));
+        let skipped = number(c.get(4));
+        return Some((number(c.get(1)).saturating_sub(failed + skipped), failed));
+    }
+    if let Some(c) = PHPUNIT_OK.captures_iter(output).last() {
+        return Some((number(c.get(1)), 0));
+    }
+    if let Some(c) = PHPUNIT_TESTS.captures_iter(output).last() {
+        let rest = c.get(2).map_or("", |m| m.as_str());
+        let mut failed = 0;
+        let mut skipped = 0;
+        for part in rest.split(',') {
+            let Some((name, n)) = part.trim().trim_end_matches('.').split_once(':') else {
+                continue;
+            };
+            let n: u64 = n.trim().parse().unwrap_or(0);
+            match name.trim() {
+                "Failures" | "Errors" => failed += n,
+                "Skipped" | "Incomplete" => skipped += n,
+                _ => {}
+            }
+        }
+        return Some((number(c.get(1)).saturating_sub(failed + skipped), failed));
+    }
+    None
 }
 
 /// Score a command's output. Test counts first (a test run's output can hold
@@ -305,6 +413,10 @@ pub fn check_score(output: &str, is_error: bool) -> CheckScore {
             return tests(passed, failed);
         }
     }
+    if let Some(score) = other_runner_counts(output) {
+        let (passed, failed) = score;
+        return tests(passed, failed);
+    }
     let errors = RUST_ERROR
         .captures_iter(output)
         .filter(|c| {
@@ -325,6 +437,20 @@ pub fn check_score(output: &str, is_error: bool) -> CheckScore {
             kind: CheckKind::BuildErrors,
             passed: 0,
             failed: number(c.get(1)),
+            exit_ok,
+        };
+    }
+    let located: BTreeSet<&str> = LOCATED_ERROR
+        .find_iter(output)
+        .chain(GO_ERROR.find_iter(output))
+        .chain(MSBUILD_ERROR.find_iter(output))
+        .map(|m| m.as_str().trim_end())
+        .collect();
+    if !located.is_empty() {
+        return CheckScore {
+            kind: CheckKind::BuildErrors,
+            passed: 0,
+            failed: located.len() as u64,
             exit_ok,
         };
     }
@@ -1204,6 +1330,112 @@ mod tests {
         assert!(!s.exit_ok, "the status line outranks the error flag");
     }
 
+    /// The other languages' runners and compilers are scored by their counts,
+    /// not only by their exit status: a Go worker that went from three
+    /// failing tests to one, still failing, has improved, as a Rust worker
+    /// whose `cargo test` did the same has.
+    #[test]
+    fn scores_each_other_language_runner() {
+        let cases: &[(&str, CheckKind, u64, u64)] = &[
+            (
+                "=== RUN   TestA\n--- PASS: TestA (0.00s)\n=== RUN   TestB\n--- FAIL: TestB (0.00s)\n    \
+                 --- FAIL: TestB/sub (0.00s)\nFAIL\nFAIL\texample.com/v\t0.004s\n",
+                CheckKind::Tests,
+                1,
+                2,
+            ),
+            (
+                "ok  \texample.com/v\t0.003s\nok  \texample.com/v/x\t(cached)\n?   \texample.com/v/cmd\t[no test files]\n",
+                CheckKind::Tests,
+                2,
+                0,
+            ),
+            (
+                "[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.1 s\n\
+                 [ERROR] Tests run: 9, Failures: 2, Errors: 1, Skipped: 1\n",
+                CheckKind::Tests,
+                5,
+                3,
+            ),
+            ("12 tests completed, 4 failed\n", CheckKind::Tests, 8, 4),
+            (
+                "Failed!  - Failed:     1, Passed:     4, Skipped:     0, Total:     5, Duration: 9 ms\n",
+                CheckKind::Tests,
+                4,
+                1,
+            ),
+            (
+                "Test summary: total: 6, failed: 2, succeeded: 4, skipped: 0, duration: 1.2s\n",
+                CheckKind::Tests,
+                4,
+                2,
+            ),
+            (
+                "Finished in 0.01 seconds\n7 examples, 2 failures, 1 pending\n",
+                CheckKind::Tests,
+                4,
+                2,
+            ),
+            (
+                "5 runs, 9 assertions, 1 failures, 1 errors, 1 skips\n",
+                CheckKind::Tests,
+                2,
+                2,
+            ),
+            ("OK (5 tests, 9 assertions)\n", CheckKind::Tests, 5, 0),
+            (
+                "FAILURES!\nTests: 6, Assertions: 9, Failures: 1, Errors: 1, Skipped: 1.\n",
+                CheckKind::Tests,
+                3,
+                2,
+            ),
+            (
+                "# example.com/v\n./v.go:3:2: undefined: dot\n./v.go:9:1: missing return\n\
+                 FAIL\texample.com/v [build failed]\n",
+                CheckKind::BuildErrors,
+                0,
+                2,
+            ),
+            (
+                "main.c:3:5: error: use of undeclared identifier 'x'\nmain.c:4:1: warning: unused\n\
+                 1 error generated.\n",
+                CheckKind::BuildErrors,
+                0,
+                1,
+            ),
+            (
+                "App.java:3: error: cannot find symbol\nApp.java:5: error: ';' expected\n2 errors\n",
+                CheckKind::BuildErrors,
+                0,
+                2,
+            ),
+            (
+                "Program.cs(3,5): error CS0103: The name 'x' does not exist [/w/App.csproj]\n\
+                 Build FAILED.\nProgram.cs(3,5): error CS0103: The name 'x' does not exist [/w/App.csproj]\n",
+                CheckKind::BuildErrors,
+                0,
+                1,
+            ),
+        ];
+        for (output, kind, passed, failed) in cases {
+            let s = check_score(output, true);
+            assert_eq!(
+                (s.kind, s.passed, s.failed),
+                (*kind, *passed, *failed),
+                "{output}"
+            );
+        }
+        let before = check_score(
+            "--- FAIL: TestA (0.00s)\n--- FAIL: TestB (0.00s)\n--- FAIL: TestC (0.00s)\nFAIL\n",
+            true,
+        );
+        let after = check_score(
+            "--- PASS: TestA (0.00s)\n--- PASS: TestB (0.00s)\n--- FAIL: TestC (0.00s)\nFAIL\n",
+            true,
+        );
+        assert!(after.improves_on(&before), "{before:?} -> {after:?}");
+    }
+
     #[test]
     fn improvement_compares_like_with_like() {
         let t = |p, f| CheckScore {
@@ -1738,6 +1970,68 @@ mod tests {
         assert!(m.progressing(), "{m:?}");
         assert_eq!(m.files_changed, vec![PathBuf::from("a.rs")]);
         assert!(m.files_discounted.is_empty());
+    }
+
+    /// Go is measured as Rust is. `go test` going from three failing tests to
+    /// one, still failing, is an improving check; the same count flat is a
+    /// failing check, so the first block's file changes alone do not count.
+    /// Scored by exit status alone, the improvement was invisible and the
+    /// flat run did not discount anything.
+    #[test]
+    fn a_first_block_is_measured_by_go_test_counts_as_by_cargo_s() {
+        let mut g = first_block_gate();
+        let cmd = json!({"command": ["go", "test", "./..."]});
+        let flat = "exit status: 1\n--- PASS: TestA (0.00s)\n--- FAIL: TestB (0.00s)\nFAIL\n";
+        call(&mut g, "1", "write", json!({"path": "a.rs"}), "ok", false);
+        g.capture_midpoint(files(&[("a.rs", Some("v1"))]));
+        call(&mut g, "2", "shell", cmd.clone(), flat, true);
+        call(
+            &mut g,
+            "3",
+            "write",
+            json!({"path": "a.rs", "n": 2}),
+            "ok",
+            false,
+        );
+        call(&mut g, "4", "shell", cmd, flat, true);
+        let (m, _) = g.measure(7, &files(&[("a.rs", Some("v2"))]), None);
+        assert_eq!(m.files_discounted, vec![PathBuf::from("a.rs")], "{m:?}");
+        assert!(!m.progressing(), "{m:?}");
+    }
+
+    #[test]
+    fn a_first_block_whose_go_tests_improved_is_progress() {
+        let mut g = first_block_gate();
+        let cmd = json!({"command": ["go", "test", "./..."]});
+        call(&mut g, "1", "write", json!({"path": "a.rs"}), "ok", false);
+        call(
+            &mut g,
+            "2",
+            "shell",
+            cmd.clone(),
+            "exit status: 1\n--- FAIL: TestA (0.00s)\n--- FAIL: TestB (0.00s)\n--- FAIL: TestC (0.00s)\nFAIL\n",
+            true,
+        );
+        g.capture_midpoint(files(&[("a.rs", Some("v1"))]));
+        call(
+            &mut g,
+            "3",
+            "write",
+            json!({"path": "a.rs", "n": 2}),
+            "ok",
+            false,
+        );
+        call(
+            &mut g,
+            "4",
+            "shell",
+            cmd,
+            "exit status: 1\n--- PASS: TestA (0.00s)\n--- PASS: TestB (0.00s)\n--- FAIL: TestC (0.00s)\nFAIL\n",
+            true,
+        );
+        let (m, _) = g.measure(7, &files(&[("a.rs", Some("v2"))]), None);
+        assert!(m.progressing(), "{m:?}");
+        assert!(m.files_discounted.is_empty(), "{m:?}");
     }
 
     #[test]

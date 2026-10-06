@@ -1082,6 +1082,48 @@ mod tests {
         assert!(refusal(&specs, &["gone/src/lib.rs".into()], &repo).is_none());
     }
 
+    /// A correct Python or Ruby project's abstract base class raises
+    /// `NotImplementedError` for its subclasses to override. The instruction
+    /// names the module so the worker can read the base, and the contract
+    /// writes only the new subclass: the plan is accepted. A module-level
+    /// scaffold beside it is still refused.
+    #[test]
+    fn a_named_abstract_base_class_is_not_an_unwritten_scaffold() {
+        let repo = Fake::with(&[
+            (
+                "shapes/base.py",
+                "from abc import ABC, abstractmethod\n\n\nclass Shape(ABC):\n    @abstractmethod\n    def area(self) -> float:\n        raise NotImplementedError\n",
+            ),
+            (
+                "shapes/plain.py",
+                "class Shape:\n    def area(self):\n        raise NotImplementedError\n\n\nclass Square(Shape):\n    def area(self):\n        return 4.0\n",
+            ),
+            (
+                "lib/shape.rb",
+                "class Shape\n  def area\n    raise NotImplementedError, \"subclasses override area\"\n  end\nend\n",
+            ),
+            (
+                "shapes/todo.py",
+                "class Shape(ABC):\n    pass\n\n\ndef circle_area(r):\n    raise NotImplementedError\n",
+            ),
+        ]);
+        let specs = [spec(
+            "c1",
+            "add a Circle subclass of Shape",
+            "python3 -m pytest",
+            &["shapes/circle.py"],
+            &[],
+        )];
+        for named in ["shapes/base.py", "shapes/plain.py", "lib/shape.rb"] {
+            assert!(
+                refusal(&specs, &[named.into()], &repo).is_none(),
+                "{named} was refused"
+            );
+        }
+        let why = reason(refusal(&specs, &["shapes/todo.py".into()], &repo));
+        assert!(why.contains("shapes/todo.py"), "{why}");
+    }
+
     /// Shaped like `crates/kgraf-host/src/scoped_check.rs` as of
     /// 2026-10-02 (self-repo): its only `todo!()` is prose in string
     /// literals. The macro is also named in a raw string and in comments.

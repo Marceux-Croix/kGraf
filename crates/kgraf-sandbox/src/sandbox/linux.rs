@@ -224,6 +224,10 @@ const HOME_READS: &[&str] = &[
     ".cache/pip",
     ".cache/uv",
     ".cache/go-build",
+    // Go's module cache under the default `GOPATH`: the downloaded module
+    // sources a build reads. Go takes private-module logins from `~/.netrc`
+    // or a credential helper, never from here.
+    "go/pkg/mod",
     ".cache/pnpm",
     ".cache/yarn",
     // The compiler cache, node-gyp's downloaded headers, and pre-commit's

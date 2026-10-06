@@ -581,18 +581,29 @@ mod tests {
     }
 
     /// Spaces in the patch against a tab in the file, with an unindented
-    /// line pinning the offset at zero, is two offsets: refused, file named.
+    /// line pinning the offset at zero, is two offsets but one tab width:
+    /// the added line is written with the file's tab (gofmt's Go, a
+    /// Makefile). Mixed widths, or an added line between widths, are refused,
+    /// file named.
     #[test]
-    fn spaces_against_tabs_with_a_pinned_line_are_refused() {
+    fn spaces_against_tabs_are_written_as_the_file_s_tabs() {
         let chunks =
             update_chunks("*** Update File: f\n@@\n fn a() {\n-    old();\n+    new();\n }");
-        let err = derive("fn a() {\n\told();\n}\n", "f", &chunks).unwrap_err();
+        assert_eq!(
+            derive("fn a() {\n\told();\n}\n", "f", &chunks).expect("applies"),
+            "fn a() {\n\tnew();\n}\n"
+        );
+        let uneven =
+            update_chunks("*** Update File: f\n@@\n fn a() {\n-    old();\n+      new();\n }");
+        let err = derive("fn a() {\n\told();\n}\n", "f", &uneven).unwrap_err();
+        assert!(err.contains("whole number of 4 spaces"), "{err}");
+        // Two widths (4 spaces for one tab, 2 for the next): not tabs at one width.
+        let mixed = update_chunks(
+            "*** Update File: f\n@@\n fn a() {\n-    if x {\n-      old();\n+    if x {\n+      new();\n }",
+        );
+        let err = derive("fn a() {\n\tif x {\n\t\told();\n}\n", "f", &mixed).unwrap_err();
         assert!(
             err.contains("not shifted from the file by one amount"),
-            "{err}"
-        );
-        assert!(
-            err.contains("4 spaces of indentation where the file has 1 tab"),
             "{err}"
         );
     }

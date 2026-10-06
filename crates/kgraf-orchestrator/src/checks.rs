@@ -154,8 +154,9 @@ fn whole_command_line(program: &str) -> bool {
 /// config file is left out, and so is a bare word: `unittest pkg.mod` names a
 /// module, not a file.
 const FILE_ARGUMENT_EXTENSIONS: &[&str] = &[
-    "sh", "bash", "zsh", "py", "js", "mjs", "cjs", "ts", "rs", "rb", "pl", "php", "lua", "go", "c",
-    "cc", "cpp", "h", "hpp", "java",
+    "sh", "bash", "zsh", "py", "js", "mjs", "cjs", "jsx", "ts", "mts", "cts", "tsx", "rs", "rb",
+    "pl", "php", "lua", "go", "c", "cc", "cpp", "cxx", "h", "hpp", "java", "kt", "kts", "cs",
+    "swift", "scala",
 ];
 
 /// The arguments of `args` that name a repository file the command reads: a
@@ -1320,10 +1321,20 @@ pub fn anchors(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// File extensions that mark an anchor as a path, not a symbol or a type.
+/// File extensions that mark an anchor as a path, not a symbol or a type,
+/// beside the source extensions of every language kGraf reads
+/// (`kgraf_graph::Language::from_path`): scripts, other languages' sources,
+/// and build and configuration files. A bare file name a party writes
+/// (`serve_local.sh`, `Config.cs`) is then set aside as `config.py` is, not
+/// read as a claim the provider must repeat.
+///
+/// A dotted name that also names a surface symbol (`np.sum` where the
+/// surface holds `sum`) is still that symbol ([`read_sentence`]).
 const PATH_EXTENSIONS: &[&str] = &[
-    "rs", "py", "toml", "json", "md", "txt", "js", "ts", "go", "c", "h", "cpp", "yaml", "yml",
-    "lock",
+    "toml", "json", "md", "txt", "yaml", "yml", "lock", "sh", "bash", "zsh", "fish", "ps1", "bat",
+    "kt", "kts", "scala", "swift", "pl", "lua", "ex", "exs", "erl", "hs", "dart", "sql", "html",
+    "css", "scss", "vue", "svelte", "xml", "gradle", "csproj", "fsproj", "vbproj", "sln", "cfg",
+    "ini", "env", "gemspec", "mod", "sum", "cmake", "mk", "proto", "graphql", "ipynb",
 ];
 
 /// Whether an anchor is a path. A path is compared through `touch`, not as a
@@ -1335,7 +1346,9 @@ fn is_path(a: &str) -> bool {
     }
     a.contains('/')
         || a.rsplit_once('.').is_some_and(|(stem, ext)| {
-            !stem.is_empty() && PATH_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str())
+            !stem.is_empty()
+                && (PATH_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str())
+                    || kgraf_graph::Language::from_path(a).is_some())
         })
 }
 
@@ -1528,6 +1541,170 @@ struct Signature {
     types: Vec<String>,
 }
 
+/// Words that may stand before a C-family return type and say nothing about
+/// it: access and storage modifiers.
+const C_MODIFIERS: &[&str] = &[
+    "public",
+    "private",
+    "protected",
+    "internal",
+    "static",
+    "final",
+    "abstract",
+    "virtual",
+    "override",
+    "sealed",
+    "inline",
+    "extern",
+    "synchronized",
+    "native",
+    "readonly",
+    "unsafe",
+    "async",
+    "default",
+    "constexpr",
+];
+
+/// Words that start a statement or an expression, never a return type:
+/// `return double(x)` is a call.
+const NOT_A_TYPE: &[&str] = &[
+    "return", "await", "assert", "new", "yield", "throw", "raise", "if", "while", "for", "print",
+    "echo", "not", "and", "or", "del", "delete", "typeof", "sizeof", "go", "defer", "call",
+    "calls", "use", "uses", "invoke", "invokes", "then", "else", "case", "when", "let", "var",
+    "val",
+];
+
+/// Whitespace outside angle and square brackets splits `s`:
+/// `Map<String, Integer> lookup` is two words.
+fn top_level_words(s: &str) -> Vec<&str> {
+    let (mut depth, mut start, mut out) = (0i32, None, Vec::new());
+    for (i, c) in s.char_indices() {
+        match c {
+            '<' | '[' => depth += 1,
+            '>' | ']' => depth -= 1,
+            _ => {}
+        }
+        if c.is_whitespace() && depth <= 0 {
+            if let Some(st) = start.take() {
+                out.push(&s[st..i]);
+            }
+        } else if start.is_none() {
+            start = Some(i);
+        }
+    }
+    if let Some(st) = start {
+        out.push(&s[st..]);
+    }
+    out
+}
+
+/// A type written as C, Java and C# write it, with the space before a `*`
+/// or `&` dropped and runs of spaces made one: `const char *` and
+/// `const char*` are one type.
+fn c_type(words: &[&str]) -> String {
+    words
+        .join(" ")
+        .replace(" *", "*")
+        .replace(" &", "&")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// For the text before a C-family signature's `(`, its name and return type:
+/// `public static int dot` is `dot` returning `int`, `char *name` is `name`
+/// returning `char*`. `None` when the text is one word, or a word before
+/// the name starts a statement (`return dot`).
+fn c_head(head: &str) -> Option<(&str, String)> {
+    let words = top_level_words(head);
+    let (word, before) = words.split_last()?;
+    let name = word.trim_start_matches(['*', '&']);
+    let stars = &word[..word.len() - name.len()];
+    let before: Vec<&str> = before
+        .iter()
+        .copied()
+        .filter(|w| !C_MODIFIERS.contains(w))
+        .collect();
+    // A type is made of identifier characters, a path (`java.util.List`,
+    // `std::string`), generics, arrays and pointers; a lone `:` (`lambda x:`)
+    // or any other sign is not one.
+    let type_like = |w: &str| {
+        w.replace("::", "").chars().all(|c| {
+            // A space only inside brackets: `top_level_words` splits at the
+            // others.
+            c.is_alphanumeric()
+                || matches!(
+                    c,
+                    '_' | '.' | '<' | '>' | '[' | ']' | '*' | '&' | ',' | '?' | ' '
+                )
+        })
+    };
+    if before.is_empty()
+        || before
+            .iter()
+            .any(|w| NOT_A_TYPE.contains(&w.to_ascii_lowercase().as_str()) || !type_like(w))
+    {
+        return None;
+    }
+    let mut ret = c_type(&before);
+    ret.push_str(stars);
+    Some((name, c_type(&[ret.as_str()])))
+}
+
+/// One C-family parameter (`int[] a`, `const char *s`, `String... args`,
+/// `int`): its type, the name dropped. A default (`int n = 0`) is dropped.
+fn c_param(p: &str) -> Param {
+    let p = default_at(p).map_or(p, |i| &p[..i]).trim();
+    let words = top_level_words(p);
+    match words.as_slice() {
+        [] => Param::Untyped,
+        [only] => Param::Type(c_type(&[only])),
+        [ty @ .., name] => {
+            let stars = name.len() - name.trim_start_matches(['*', '&']).len();
+            let mut t = c_type(ty);
+            t.push_str(&name[..stars]);
+            // `int a[]` is an `int[]`.
+            if let Some(i) = name.find('[') {
+                t.push_str(&name[i..]);
+            }
+            Param::Type(c_type(&[t.as_str()]))
+        }
+    }
+}
+
+/// Go's parameters: either every one is named (`a, b []int, s string`: a
+/// name with no type takes the type of the next named one) or none is
+/// (`int, string`).
+fn go_params(params: &[&str]) -> Vec<Param> {
+    let named = params
+        .iter()
+        .any(|p| p.trim().contains(char::is_whitespace));
+    if !named {
+        return params
+            .iter()
+            .map(|p| match p.trim() {
+                "" => Param::Untyped,
+                t => Param::Type(t.to_owned()),
+            })
+            .collect();
+    }
+    let mut out = Vec::with_capacity(params.len());
+    let mut next_type: Option<String> = None;
+    for p in params.iter().rev() {
+        let p = p.trim();
+        match p.split_once(char::is_whitespace) {
+            Some((_, ty)) => {
+                let ty = ty.trim().to_owned();
+                next_type = Some(ty.clone());
+                out.push(Param::Type(ty));
+            }
+            None => out.push(next_type.clone().map_or(Param::Untyped, Param::Type)),
+        }
+    }
+    out.reverse();
+    out
+}
+
 /// Leading keywords a signature anchor may carry.
 const SIGNATURE_KEYWORDS: &[&str] = &[
     "pub(crate) ",
@@ -1548,13 +1725,36 @@ fn signature(a: &str) -> Option<Signature> {
     while let Some(rest) = SIGNATURE_KEYWORDS.iter().find_map(|kw| s.strip_prefix(kw)) {
         s = rest.trim_start();
     }
+    // Go: `func Name(a, b []int) int`, `func (r *T) Name(...) (T, error)`.
+    let go = match s.strip_prefix("func") {
+        Some(rest) if rest.starts_with([' ', '(']) => {
+            let rest = rest.trim_start();
+            // A method's receiver comes first; a bare `func(int) int` is a
+            // function type.
+            let after_receiver = rest
+                .starts_with('(')
+                .then(|| closing_paren(rest, 0))
+                .flatten()
+                .map(|close| rest[close + 1..].trim_start())
+                .filter(|r| r.starts_with(|c: char| c.is_alphabetic() || c == '_'));
+            s = after_receiver.unwrap_or(rest);
+            true
+        }
+        _ => false,
+    };
     // `fn(i64) -> i64`: a function type, no name.
     if s.starts_with("fn(") {
         s = &s[2..];
     }
     let open = s.find('(')?;
-    let head = s[..open].trim();
-    let head = head.split('<').next().unwrap_or(head).trim();
+    let raw_head = s[..open].trim();
+    // Java, C#, C and C++: the return type stands before the name
+    // (`public static int dot(int[] a, int[] b)`).
+    let c_like = (!go).then(|| c_head(raw_head)).flatten();
+    let head = match &c_like {
+        Some((name, _)) => *name,
+        None => raw_head.split('<').next().unwrap_or(raw_head).trim(),
+    };
     if !(head.is_empty() || is_ident_path(head)) {
         return None;
     }
@@ -1563,18 +1763,38 @@ fn signature(a: &str) -> Option<Signature> {
         .trim()
         .trim_end_matches([';', ':', '{'])
         .trim();
-    // `-> T` (Rust, Python), or `: T` (TypeScript).
-    let ret = match rest.strip_prefix("->").or_else(|| rest.strip_prefix(':')) {
-        Some(r) => Some(r.trim().to_owned()).filter(|r| !r.is_empty()),
-        None if rest.is_empty() => None,
-        // `double(21) == 42` is an expression, not a signature.
-        None => return None,
+    let ret = if go {
+        // Go writes the result after the parameters, with no arrow.
+        Some(rest.to_owned()).filter(|r| !r.is_empty())
+    } else if let Some((_, ret)) = &c_like {
+        // A C++ `const` qualifier or a Java `throws` clause says nothing
+        // about the types compared here.
+        let tail_ok = rest.is_empty()
+            || ["const", "noexcept", "throws ", "override"]
+                .iter()
+                .any(|t| rest.starts_with(t));
+        if !tail_ok {
+            return None;
+        }
+        Some(ret.clone())
+    } else {
+        // `-> T` (Rust, Python), or `: T` (TypeScript).
+        match rest.strip_prefix("->").or_else(|| rest.strip_prefix(':')) {
+            Some(r) => Some(r.trim().to_owned()).filter(|r| !r.is_empty()),
+            None if rest.is_empty() => None,
+            // `double(21) == 42` is an expression, not a signature.
+            None => return None,
+        }
     };
     let named = !head.is_empty();
-    let read: Vec<Param> = split_top_level(&s[open + 1..close])
-        .into_iter()
-        .map(|p| param(p, named))
-        .collect();
+    let params = split_top_level(&s[open + 1..close]);
+    let read: Vec<Param> = if go {
+        go_params(&params)
+    } else if c_like.is_some() {
+        params.into_iter().map(c_param).collect()
+    } else {
+        params.into_iter().map(|p| param(p, named)).collect()
+    };
     let untyped = read.contains(&Param::Untyped);
     let params: Vec<String> = read
         .into_iter()
@@ -1923,7 +2143,9 @@ fn read_sentence<'s>(
         // module file) with no claim any party could anchor, so each party
         // was `NoClaims` and each file `SymbolUnprovided`.
         let (named, sig) = if is_path(&a) {
-            match resolve_path(&a, surface) {
+            // A dotted name read as a file (`np.sum`, `config.mod`) that
+            // names a surface symbol is that symbol.
+            match resolve_path(&a, surface).or_else(|| resolve(&a, surface)) {
                 Some(sym) => (Some(sym), None),
                 None => continue,
             }
@@ -2350,9 +2572,11 @@ fn stub_writers<'p>(
 /// matches `fn(i64) -> i32`), a module path that differs where the name matches
 /// (stub-compile builds the consumer against the stub, which pins the path), a
 /// symbol a provision names only as contained ("`vectorops` containing
-/// `dotproduct`", read as a claim, so `dotproduct` is still unprovided), a
-/// signature whose types stand before or after the names without a colon (Go,
-/// C), and any behavior neither party states. Those are the semantic class 0033 leaves to
+/// `dotproduct`", read as a claim, so `dotproduct` is still unprovided), a C++
+/// return type with a template whose arguments hold spaces before the name,
+/// and any behavior neither party states. Go signatures (`func F(a, b []int)
+/// int`) and C-family ones (`public static int f(int[] a)`) are compared by
+/// their types, as Rust, Python and TypeScript ones are. Those are the semantic class 0033 leaves to
 /// the gates.
 ///
 /// Every party is taken to run at the same time as every other, so any path
@@ -2966,6 +3190,153 @@ mod tests {
         );
     }
 
+    /// A file a party names by its bare name is a path, set aside like
+    /// `config.py`, in every language kGraf reads: read as a symbol, the name
+    /// of a shell script, a Ruby or C# file was a claim the provider had to
+    /// repeat, and the parties were held for a disagreement neither had.
+    #[test]
+    fn a_bare_file_name_in_any_language_is_a_path_not_a_claim() {
+        let a = st(
+            "producer",
+            &[
+                "I will provide `parse_config` returning `Config`",
+                "I will provide `Config` with a `port` field",
+            ],
+            &[],
+            &["src/config.rs"],
+        );
+        let mut held = Vec::new();
+        for file in [
+            "config.py",
+            "serve_local.sh",
+            "setup.bash",
+            "config.rb",
+            "Config.java",
+            "Config.kt",
+            "Config.cs",
+            "config.php",
+            "Config.tsx",
+            "config.jsx",
+            "config.mjs",
+            "config.hpp",
+            "config.cc",
+            "config.pyi",
+            "App.csproj",
+            "build.gradle",
+            "pom.xml",
+            "setup.cfg",
+            "CMakeLists.txt",
+        ] {
+            let b = st(
+                "consumer",
+                &[],
+                &[&format!(
+                    "I assume you provide `parse_config` in `{file}` returning `Config`"
+                )],
+                &["src/main.rs"],
+            );
+            let f = compare_handshake(&ic(), &[a.clone(), b], &writes());
+            if !f.is_empty() {
+                held.push(format!("{file}: {f:?}"));
+            }
+        }
+        assert!(held.is_empty(), "{held:#?}");
+    }
+
+    /// A Go, Java, C# or C signature names its symbol and is compared by its
+    /// types, as a Rust, Python or TypeScript one is: parameter names and Go's
+    /// grouped names (`a, b []int`) do not matter, and a changed type still
+    /// disagrees. Not read as a signature, the anchor named no symbol, so two
+    /// parties that wrote only signatures were each held for stating no
+    /// claim.
+    #[test]
+    fn a_signature_in_every_language_is_compared_by_its_types() {
+        let mut held = Vec::new();
+        for (symbol, provided, expected, agree) in [
+            (
+                "ParseConfig",
+                "func ParseConfig(text string) Config",
+                "func ParseConfig(s string) Config",
+                true,
+            ),
+            (
+                "ParseConfig",
+                "func ParseConfig(a, b string) Config",
+                "func ParseConfig(a string, b string) Config",
+                true,
+            ),
+            (
+                "ParseConfig",
+                "func (p *Parser) ParseConfig(text string) (Config, error)",
+                "func ParseConfig(s string) (Config, error)",
+                true,
+            ),
+            (
+                "ParseConfig",
+                "func ParseConfig(text string) Config",
+                "func ParseConfig(n int) Config",
+                false,
+            ),
+            (
+                "parseConfig",
+                "public static Config parseConfig(String text)",
+                "Config parseConfig(String s)",
+                true,
+            ),
+            (
+                "parseConfig",
+                "Config parseConfig(String text)",
+                "Config parseConfig(int n)",
+                false,
+            ),
+            (
+                "parse_config",
+                "struct Config parse_config(const char *text)",
+                "struct Config parse_config(const char *s)",
+                true,
+            ),
+            (
+                "ParseConfig",
+                "public Config ParseConfig(string text)",
+                "Config ParseConfig(string input)",
+                true,
+            ),
+            (
+                "Lookup",
+                "public static Dictionary<string, int> Lookup(string key)",
+                "Dictionary<string, int> Lookup(string k)",
+                true,
+            ),
+        ] {
+            let ic = InterfaceContract {
+                symbols: vec![symbol.into()],
+                ..ic()
+            };
+            let a = st(
+                "producer",
+                &[&format!("I will provide `{provided}`")],
+                &[],
+                &["src/config.rs"],
+            );
+            let b = st(
+                "consumer",
+                &[],
+                &[&format!("I assume you provide `{expected}`")],
+                &["src/main.rs"],
+            );
+            let f = compare_handshake(&ic, &[a, b], &writes());
+            let right = if agree {
+                !f.iter().any(HandshakeFinding::holds)
+            } else {
+                matches!(&f[..], [HandshakeFinding::Disagree { symbol: s, .. }] if s == symbol)
+            };
+            if !right {
+                held.push(format!("{provided} / {expected}: {f:?}"));
+            }
+        }
+        assert!(held.is_empty(), "{held:#?}");
+    }
+
     #[test]
     fn unprovided_unanchored_outside_surface_and_scope_findings() {
         let a = st(
@@ -3210,6 +3581,11 @@ mod tests {
                 "pkg"
             ])),
             vec!["serve_local.sh", "t/test_a.py"]
+        );
+        // Every language kGraf reads names its source files the same way.
+        assert_eq!(
+            file_arguments(&argv(&["App.tsx", "Calc.cs", "Calc.kt", "calc_test.go"])),
+            vec!["App.tsx", "Calc.cs", "Calc.kt", "calc_test.go"]
         );
         // Not files: a module, an output, an absolute path, a parent path, a
         // quoted program text, a flag value, a data file.

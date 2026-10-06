@@ -749,3 +749,38 @@ Tests: `kgraf-orchestrator` `derive_interface.rs`
 `a_shell_producer_is_recorded_unchecked_with_its_reason_and_never_blocked`,
 `a_producer_that_breaks_a_shape_of_its_current_code_fails_verification`,
 `a_producer_that_keeps_the_used_shapes_of_its_current_code_passes`.
+
+## Amendment (2026-10-06, fourth): an abstract method is not a scaffold, and a check that cannot apply to a language never blocks
+
+An audit of every check that can hold, refuse or fail a plan, a contract or an attempt, for
+assumptions that hold only for Rust, found the placeholder rule of the fourth amendment above
+too wide for Python and Ruby. In both, raising `NotImplementedError` is also how a correct base
+class makes a subclass supply a method. A plan whose instruction named such a module (so the
+worker could read the base) and wrote only the new subclass was refused as leaving an
+unwritten scaffold, and the run failed when its re-asks were spent. The same rule decides what
+a derived interface takes as the producer's stub.
+
+- **The rule.** A raise of `NotImplementedError` does not count as a placeholder when its
+  method has an `abstractmethod` decorator (any spelling: `@abstractmethod`,
+  `@abc.abstractmethod`, `@abstractproperty`), when its class is based on `ABC`, `ABCMeta` or
+  `Protocol`, when another class in the same file derives from its class (`class
+  Circle(Shape)`, `class Circle < Shape`), or when its message says a subclass is to supply it
+  (`subclass`, `abstract`, `override`, `overridden`). Read from the indentation of the lines
+  around the raise, after comments and strings are blanked. Only Python and Ruby files are
+  read this way.
+- **Still a placeholder.** The same raise in a module-level function, in a method of a class
+  nothing marks abstract, or with a message such as "must be implemented" alone, which a
+  scaffold says too; every `todo!()` and `unimplemented!()`.
+- **A missed form found.** C#'s `throw new NotImplementedException()` (and
+  `System.NotImplementedException`), which Visual Studio writes into every generated member,
+  is now a placeholder; a `catch` of it or a comment is not.
+- **The standing rule for language reach.** A derived check that kGraf cannot make for a
+  language (no compile command for the files, no test runner it can narrow, no member check for
+  a non-cargo workspace) records why and leaves the edge unchecked or the command whole. It
+  never holds the run. The audit found every derive, narrowing and member check already did;
+  the false blocks it found are fixed here and in decisions 0018,
+  0078, 0084 and 0096 (amendments of 2026-10-06).
+
+Tests: `kgraf-orchestrator` `placeholder.rs` `an_abstract_method_is_not_a_placeholder`,
+`a_csharp_not_implemented_exception_is_a_placeholder`; `plan_repo.rs`
+`a_named_abstract_base_class_is_not_an_unwritten_scaffold`.

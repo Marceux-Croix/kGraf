@@ -1179,7 +1179,11 @@ process that swaps a folder for a symbolic link cannot steer the removal
 outside the worktree; on Windows that removal refuses rather than risk it. A
 lockfile the worker generated, cache directories, and a Python package
 build's output beside its project manifest (`dist/*.whl`, `dist/*.tar.gz`,
-`*.egg-info/`, `build/lib*/`, `build/bdist.*/`; decision 0084, amended) are
+`*.egg-info/`, `build/lib*/`, `build/bdist.*/`; decision 0084, amended), and
+any other language's install, build or test output beside its project
+manifest (`node_modules/`, Maven's `target/`, Gradle's `build/`, `bin/` and
+`obj/` of a .NET project, `.venv/`, ...), tool caches, `.class`, `.o` and
+`.tsbuildinfo` files, and a compiled program told by its first bytes, are
 left out of the commit, with a notice, and removed before the check, so the
 check runs against the committed tree only; the scope check does not count
 them as writes. A check that changes committed files fails
