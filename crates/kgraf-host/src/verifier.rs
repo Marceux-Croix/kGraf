@@ -518,10 +518,12 @@ fn some_paths(paths: &[&Path]) -> String {
 }
 
 /// The owner's notices for what the worker's own run generated and the commit
-/// left out: one per lockfile, one for all bytecode.
+/// left out: one per lockfile, one for all bytecode, one for all of a Python
+/// package build's output.
 pub(crate) fn worker_notices(excluded: &[Excluded]) -> Vec<String> {
     let mut notices = Vec::new();
     let mut bytecode = Vec::new();
+    let mut package = Vec::new();
     for e in excluded {
         match e.kind {
             GeneratedKind::Lockfile => notices.push(format!(
@@ -531,7 +533,17 @@ pub(crate) fn worker_notices(excluded: &[Excluded]) -> Vec<String> {
                 clean(&e.path.display().to_string())
             )),
             GeneratedKind::PythonBytecode => bytecode.push(e.path.as_path()),
+            GeneratedKind::PackageBuild => package.push(e.path.as_path()),
         }
+    }
+    if !package.is_empty() {
+        notices.push(format!(
+            "the worker's run left {} Python package build file(s) (made by the worker): {}; \
+             they were left out of the attempt and removed before the check. Add dist/, build/ \
+             and *.egg-info/ to .gitignore",
+            package.len(),
+            some_paths(&package)
+        ));
     }
     if !bytecode.is_empty() {
         notices.push(format!(

@@ -405,7 +405,10 @@ impl MergeBack {
     ///   recorded in [`Attempt::excluded`]. A path is left out only when it is
     ///   new against the base, outside the declared scope (`in_scope` false),
     ///   and either a lockfile name ([`LOCKFILES`]) with one of its manifests in
-    ///   the same folder of the snapshot, or `**/__pycache__/*.pyc|*.pyo`. A
+    ///   the same folder of the snapshot, `**/__pycache__/*.pyc|*.pyo`, or a
+    ///   Python package build's output (`dist/*.whl|*.tar.gz`,
+    ///   `*.egg-info/`, `build/lib*/`, `build/bdist.*/`) with a Python
+    ///   project manifest in the folder it was built in ([`generated_kind`]). A
     ///   tracked lockfile, an in-scope path, or a lockfile name with no manifest
     ///   beside it is never left out: those are the worker's writes, judged by
     ///   the scope check like any other.

@@ -536,15 +536,109 @@ fn repo_members(manifest: &str, repo: &dyn RepoView) -> Option<Members> {
     Some(Members::from_list(strings("members"), strings("exclude")))
 }
 
+/// Words that end a prose member list: what follows them is not a member
+/// the manifest lists now ("members wcl-core, not wcl", "members wcl-core
+/// until c2 adds wcl").
+const PROSE_LIST_ENDS: &[&str] = &[
+    "not",
+    "except",
+    "excluding",
+    "until",
+    "without",
+    "but",
+    "later",
+    "after",
+    "then",
+    "once",
+    "when",
+    "unless",
+];
+
+/// The member directories an instruction names in prose after the word
+/// `member` or `members`, as planners write it: "the workspace root
+/// Cargo.toml with members wcl-core and wcl", "member crates `a`, `b`". The
+/// list is read to the end of its sentence (a period before a space, a
+/// semicolon, a parenthesis or a line break) or to a word of
+/// [`PROSE_LIST_ENDS`], and only a word that `is_member_dir` accepts counts.
+/// `is_member_dir` is the guard against prose: a word is a member only when
+/// the plan writes, or the repository holds, a `Cargo.toml` in that
+/// directory, so "members listed below" names none.
+fn prose_members(text: &str, is_member_dir: &dyn Fn(&str) -> bool) -> Vec<String> {
+    let lower = text.to_ascii_lowercase();
+    let mut found: Vec<String> = Vec::new();
+    let mut from = 0;
+    while let Some(at) = lower[from..].find("member") {
+        let start = from + at;
+        from = start + "member".len();
+        // A whole word: `member` or `members`, not `remember` or `membership`.
+        let before_ok = lower[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric());
+        // `lower` is the ASCII lowercase of `text`, so byte offsets agree.
+        if lower[from..].starts_with('s') {
+            from += 1;
+        }
+        let rest = &text[from..];
+        if !before_ok || rest.chars().next().is_some_and(char::is_alphanumeric) {
+            continue;
+        }
+        let mut end = rest.len();
+        for (i, c) in rest.char_indices() {
+            let next = rest[i + c.len_utf8()..].chars().next();
+            let sentence_end = c == '.' && next.is_none_or(char::is_whitespace);
+            if sentence_end || matches!(c, ';' | '(' | '\n' | '\r') {
+                end = i;
+                break;
+            }
+        }
+        for word in rest[..end].split(|c: char| c.is_whitespace() || c == ',') {
+            let word = word
+                .trim_matches(|c: char| matches!(c, '`' | '"' | '\'' | ':' | '[' | ']' | '.'))
+                .trim_start_matches("./")
+                .trim_end_matches('/');
+            if PROSE_LIST_ENDS.contains(&word.to_ascii_lowercase().as_str()) {
+                break;
+            }
+            if !word.is_empty() && is_member_dir(word) && !found.iter().any(|f| f == word) {
+                found.push(word.to_owned());
+            }
+        }
+    }
+    found
+}
+
 /// The members `writer`'s instruction lists for `manifest`. Only for the root
 /// manifest: a nested one the plan writes is a member's, and the
 /// instruction's member list is not about it.
-fn instruction_members<C: PlanContract>(writer: &C, manifest: &str) -> Members {
-    if manifest == "Cargo.toml" {
-        Members::from_list(members_in(writer.instruction()), Vec::new())
-    } else {
-        Members::default()
+///
+/// A `members = [...]` list is read first. A list stated in prose ("with
+/// members wcl-core and wcl") is read too, but only for words that are
+/// member directories of this plan or repository: a plan that wrote its list
+/// in prose was read as listing no member, and its root contract then failed
+/// on a later contract's missing member manifest.
+fn instruction_members<C: PlanContract>(
+    specs: &[C],
+    writer: &C,
+    manifest: &str,
+    repo: &dyn RepoView,
+) -> Members {
+    if manifest != "Cargo.toml" {
+        return Members::default();
     }
+    let listed = members_in(writer.instruction());
+    if !listed.is_empty() {
+        return Members::from_list(listed, Vec::new());
+    }
+    let written = writes_of(specs);
+    let is_member_dir = |dir: &str| {
+        let m = format!("{dir}/Cargo.toml");
+        written.contains_key(m.as_str()) || repo.exists(&m)
+    };
+    Members::from_list(
+        prose_members(writer.instruction(), &is_member_dir),
+        Vec::new(),
+    )
 }
 
 /// The members of `manifest` as a contract that can count on `supplied` sees
@@ -581,7 +675,7 @@ fn seen_members<C: PlanContract>(
         })
         .copied()
         .unwrap_or(first);
-    let listed = instruction_members(last, manifest);
+    let listed = instruction_members(specs, last, manifest, repo);
     Some(if listed.is_empty() {
         from_repo().unwrap_or_default()
     } else {
@@ -1233,6 +1327,97 @@ pub fn f() {}
         assert!(why.contains("written by no contract"), "{why}");
         assert!(why.contains("`wcl/Cargo.toml`"), "{why}");
         assert!(!why.contains("depend on `"), "{why}");
+    }
+
+    /// Round 10 greenfield, the accepted plan verbatim: the root contract's
+    /// instruction states the member list in prose. The check read no
+    /// member, accepted the plan, and `c1` failed its first attempt on
+    /// "failed to load manifest for workspace member `wcl`"; its retry
+    /// dropped `wcl` from the members, which `c2` could not add back (the
+    /// root manifest is not in its writes).
+    fn round10_plan() -> [ContractSpec; 2] {
+        [
+            spec(
+                "c1",
+                "Create the workspace root Cargo.toml with members wcl-core and wcl. Create the \
+                 wcl-core library crate directory structure and files (wcl-core/Cargo.toml with \
+                 no dependencies, wcl-core/src/lib.rs). In wcl-core/src/lib.rs, define pub struct \
+                 Counts { pub lines: usize, pub words: usize, pub bytes: usize } and pub fn \
+                 count(text: &str) -> Counts.",
+                "Run cargo test -p wcl-core from the repository root and confirm it exits with \
+                 status 0 and reports all tests passed.",
+                &["Cargo.toml", "wcl-core/Cargo.toml", "wcl-core/src/lib.rs"],
+                &[],
+            ),
+            spec(
+                "c2",
+                "Create the wcl binary crate directory structure and files (wcl/Cargo.toml \
+                 depending on wcl-core = { path = \"../wcl-core\" }, wcl/src/main.rs). Verify \
+                 the full workspace builds and tests pass.",
+                "Run cargo test --workspace from the repository root and confirm it exits with \
+                 status 0.",
+                &["wcl/Cargo.toml", "wcl/src/main.rs"],
+                &["c1"],
+            ),
+        ]
+    }
+
+    #[test]
+    fn a_member_list_in_prose_is_read_and_refused_like_a_toml_list() {
+        let why = reason(refusal(&round10_plan(), &[], &Fake::default()));
+        assert!(why.contains("contract `c1`"), "{why}");
+        assert!(why.contains("lists member `wcl`"), "{why}");
+        assert!(why.contains("`wcl/Cargo.toml`"), "{why}");
+        assert!(why.contains("only by contract `c2`"), "{why}");
+        // The remedy that makes `c1` write the member's stub is accepted.
+        let [mut c1, c2] = round10_plan();
+        c1.writes.extend(
+            ["wcl/Cargo.toml", "wcl/src/main.rs"]
+                .iter()
+                .map(|p| WriteTarget {
+                    path: (*p).into(),
+                    node: None,
+                }),
+        );
+        let ok = [c1, c2];
+        assert!(refusal(&ok, &[], &Fake::default()).is_none());
+    }
+
+    #[test]
+    fn prose_members_count_only_member_directories_and_stop_at_the_sentence() {
+        let dirs = ["wcl-core", "wcl", "crates/a"];
+        let is = |d: &str| dirs.contains(&d);
+        let read = |t: &str| prose_members(t, &is);
+        assert_eq!(read("with members wcl-core and wcl."), ["wcl-core", "wcl"]);
+        assert_eq!(
+            read("two member crates: `wcl-core`, `wcl`"),
+            ["wcl-core", "wcl"]
+        );
+        assert_eq!(read("Members: crates/a/ and wcl"), ["crates/a", "wcl"]);
+        assert_eq!(read("MEMBERS wcl-core, wcl"), ["wcl-core", "wcl"]);
+        // A word that is no member directory is prose, not a member.
+        assert!(read("the members listed below").is_empty());
+        // The list ends at its sentence, a semicolon or a parenthesis.
+        assert_eq!(read("members wcl-core. Then write wcl."), ["wcl-core"]);
+        assert_eq!(read("members wcl-core; c2 adds wcl"), ["wcl-core"]);
+        assert_eq!(read("members wcl-core (wcl comes later)"), ["wcl-core"]);
+        // A word that ends the list: what follows is not listed now.
+        assert_eq!(read("members wcl-core, not wcl"), ["wcl-core"]);
+        assert_eq!(read("members wcl-core until c2 adds wcl"), ["wcl-core"]);
+        // Only whole words: `remember`, `membership` name no list.
+        assert!(read("remember wcl; membership wcl").is_empty());
+        // Names before the word are not read.
+        assert!(read("list only wcl-core in the members").is_empty());
+    }
+
+    /// A list in prose is a fallback: a `members = [...]` list wins.
+    #[test]
+    fn a_toml_member_list_wins_over_prose() {
+        let [mut c1, c2] = round10_plan();
+        c1.instruction = "Write Cargo.toml with members = [\"wcl-core\"] (members wcl-core and \
+                          wcl come later)."
+            .into();
+        assert!(refusal(&[c1, c2], &[], &Fake::default()).is_none());
     }
 
     #[test]

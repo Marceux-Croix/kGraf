@@ -486,6 +486,39 @@ fn only_commit_retaining_leaves_generated_files_out() {
     assert!(tree.lines().any(|p| p == "Cargo.lock"), "{tree}");
 }
 
+/// The wheel and source distribution a worker's run of its own build script
+/// left in `dist/` are left out of the commit beside the project's
+/// `pyproject.toml`, recorded as a package build, and removed before the
+/// check; the script it wrote is committed.
+#[test]
+fn commit_retaining_leaves_a_python_package_build_out() {
+    let e = env();
+    let mb = merger(&e);
+    let script_only = |p: &Path| p == Path::new("dev/setup_pypi.sh");
+    let mut w = attempt(&e, "pkg");
+    write(&w, "pyproject.toml", "[project]\nname = \"vectorops\"\n");
+    write(&w, "dev/setup_pypi.sh", "python -m build\n");
+    write(&w, "dist/vectorops-0.1.0-py2.py3-none-any.whl", "wheel");
+    write(&w, "dist/vectorops-0.1.0.tar.gz", "sdist");
+    let CommitOutcome::Committed { commit } =
+        mb.commit_retaining(&mut w, "pkg", &script_only).unwrap()
+    else {
+        panic!("committed");
+    };
+    let tree = git(&e.f.repo, &["ls-tree", "-r", "--name-only", &commit]);
+    assert!(tree.lines().any(|p| p == "dev/setup_pypi.sh"), "{tree}");
+    assert!(!tree.contains("dist/"), "{tree}");
+    let kinds: Vec<_> = w.excluded().iter().map(|x| x.kind).collect();
+    assert_eq!(kinds, vec![GeneratedKind::PackageBuild; 2]);
+    mb.remove_excluded(&w).unwrap();
+    assert!(
+        !w.workspace()
+            .root()
+            .join("dist/vectorops-0.1.0.tar.gz")
+            .exists()
+    );
+}
+
 #[test]
 fn merging_before_commit_is_an_illegal_transition() {
     let e = env();

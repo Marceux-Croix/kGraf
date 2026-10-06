@@ -225,6 +225,13 @@ impl Tool for WriteFile {
         ctx: &ToolContext,
         _permit: &CallPermit,
     ) -> Result<ToolOutput, ToolError> {
+        // A patch that does not match: the file is left as it was.
+        if input["fail"].as_bool() == Some(true) {
+            return Err(ToolError::Internal {
+                tool: "write_file".into(),
+                reason: "expected lines not found".into(),
+            });
+        }
         let path = ctx
             .workspace_root
             .join(input["path"].as_str().unwrap_or_default());
@@ -892,6 +899,85 @@ async fn a_later_stop_point_with_no_progress_since_the_compaction_hands_back_and
     assert!(
         handoff.done.iter().any(|d| d.contains("f2.txt")),
         "{handoff:?}"
+    );
+}
+
+/// After a compaction the worker fails three writes of one file with one
+/// identical error, then writes that file whole, then only reads. Its later stop point is a
+/// progressing segment: the failed writes came before a write that works, so
+/// they are not a sloppy pattern, and it is compacted again (here up to a
+/// ceiling of 2). Before this rule the segment read "no measured progress"
+/// with the changed file in the same sentence (a worker that replaced its
+/// stub module whole after three refused patches).
+#[tokio::test]
+async fn failed_writes_before_a_write_that_works_do_not_stop_a_recompaction() {
+    let dir = tempfile::tempdir().expect("dir");
+    // Each segment's whole-module write differs from the last one's.
+    let segment = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let provider = Fake::new(move |request| {
+        if is_summary(request) {
+            return answer(if compacted(request) {
+                LATER_SUMMARY
+            } else {
+                SUMMARY
+            });
+        }
+        let n = rounds(request) as u64 + 1;
+        let tag = if compacted(request) { "c" } else { "t" };
+        let id: &'static str = format!("{tag}{n}").leak();
+        if !compacted(request) {
+            return tool(
+                id,
+                "write_file",
+                json!({"path": format!("f{n}.txt"), "content": "x"}),
+                10_000 * n,
+            );
+        }
+        match n {
+            // Three patches of the module that do not match: the same error
+            // each time.
+            1..=3 => tool(
+                id,
+                "write_file",
+                json!({"path": "module.txt", "content": format!("hunk {n}"), "fail": true}),
+                10_000 * n,
+            ),
+            4 => tool(
+                id,
+                "write_file",
+                json!({
+                    "path": "module.txt",
+                    "content": format!(
+                        "whole module {}",
+                        segment.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    )
+                }),
+                10_000 * n,
+            ),
+            _ => tool(id, "read_config", json!({"section": n}), 10_000 * n),
+        }
+    });
+    let env = env_with_ceiling(provider.clone(), 2);
+    let handle = spawn_worker(env, brief(dir.path()), compact_options())
+        .await
+        .expect("spawn");
+    let (events, result) = drain(handle).await;
+    assert_eq!(
+        compactions(&events).len(),
+        2,
+        "the segment with the recovered write compacted again"
+    );
+    let WorkerOutcome::HandedBack { handoff } = &result.outcome else {
+        panic!("expected a hand-back, got {:?}", result.outcome);
+    };
+    assert_eq!(
+        handoff.compaction_stop,
+        Some(kgraf_runtime::CompactionStop::Ceiling {
+            compactions: 2,
+            ceiling: 2
+        }),
+        "{:?}",
+        handoff.compaction_stop
     );
 }
 

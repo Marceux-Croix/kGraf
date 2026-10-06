@@ -776,6 +776,7 @@ pub(crate) fn test_report(status: kgraf_orchestrator::RunStatus) -> kgraf_orches
         warnings: Vec::new(),
         notices: Vec::new(),
         unverified: Vec::new(),
+        unfinished: Vec::new(),
     }
 }
 
@@ -794,6 +795,11 @@ fn report_lines(report: &kgraf_orchestrator::RunReport) -> Vec<String> {
     }
     for (c, reason) in &report.held {
         out.push(format!("held       {c}: {reason}"));
+    }
+    // A run that did not complete names what it left unfinished, so a stop
+    // with work left is never read as one with none (decision 0056).
+    for (c, state) in &report.unfinished {
+        out.push(format!("unfinished {c}: {}", plain(state)));
     }
     out.push(format!(
         "dispatched {} (serialized {}, fraction {:.3})",
@@ -1192,6 +1198,7 @@ mod tests {
             warnings: vec!["workflow template t1 quarantined".into()],
             notices: vec!["the check generated Cargo.lock".into()],
             unverified: Vec::new(),
+            unfinished: Vec::new(),
         };
         assert!(
             !report_lines(&report)
@@ -1240,6 +1247,35 @@ mod tests {
 
     fn report_with(status: kgraf_orchestrator::RunStatus) -> kgraf_orchestrator::RunReport {
         test_report(status)
+    }
+
+    /// A stopped run prints one `unfinished` line per item it left, after the
+    /// held lines, so a reader sees what the stop cut off.
+    #[test]
+    fn a_stopped_run_prints_what_it_left_unfinished() {
+        let mut report = report_with(kgraf_orchestrator::RunStatus::Stopped);
+        report.verified = vec!["c1".into()];
+        report.unfinished = vec![
+            ("c2".into(), "not verified: cut off by the stop".into()),
+            (
+                "gate:root".into(),
+                "not run: it covers open contract(s) c2".into(),
+            ),
+        ];
+        let lines = report_lines(&report);
+        assert!(lines.iter().any(|l| l == "status     Stopped"), "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l == "unfinished c2: not verified: cut off by the stop"),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l == "unfinished gate:root: not run: it covers open contract(s) c2"),
+            "{lines:?}"
+        );
     }
 
     /// Only a completed run exits zero; blocked and stopped runs are errors that

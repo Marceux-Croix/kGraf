@@ -995,6 +995,72 @@ impl RunStateRecord {
             crate::waits::one_line(&self.coordination.waits)
         )
     }
+
+    /// What a run that did not complete left unfinished, one line per item
+    /// that the `held` lines do not already name: each open contract that is
+    /// not held, with how far it got, and each gate that neither passed, was
+    /// waived nor is held. Empty for a completed run.
+    ///
+    /// A stopped run said only `verified c1` before, and a contract whose
+    /// worker the stop cancelled was named nowhere, so a reader could not
+    /// tell a stop with work left from one with none.
+    pub fn unfinished(&self) -> Vec<(String, String)> {
+        use crate::gates::GateStatus;
+        if matches!(self.status, RunStatus::Completed) {
+            return Vec::new();
+        }
+        let stopped = matches!(self.status, RunStatus::Stopped);
+        let mut out = Vec::new();
+        for c in &self.open_contracts {
+            let waits: Vec<&str> = c
+                .depends_on
+                .iter()
+                .filter(|d| !self.is_verified(d))
+                .map(String::as_str)
+                .collect();
+            let line = match &c.status {
+                ContractStatus::Held { .. } => continue,
+                ContractStatus::Planned if waits.is_empty() => "not started".to_owned(),
+                ContractStatus::Planned => {
+                    format!("not started: it waits on {}", waits.join(", "))
+                }
+                ContractStatus::Dispatched if stopped => format!(
+                    "not verified: {} attempt(s) dispatched, the last was cut off by the stop; \
+                     nothing of it was merged",
+                    c.workers.len()
+                ),
+                ContractStatus::Dispatched => format!(
+                    "not verified: {} attempt(s) dispatched; nothing of it was merged",
+                    c.workers.len()
+                ),
+            };
+            out.push((c.contract.clone(), line));
+        }
+        for g in &self.coordination.gates {
+            let open: Vec<&str> = g
+                .covers
+                .iter()
+                .filter(|c| !self.is_verified(c))
+                .map(String::as_str)
+                .collect();
+            let line = match &g.status {
+                GateStatus::Passed { .. } | GateStatus::Waived { .. } | GateStatus::Held { .. } => {
+                    continue;
+                }
+                GateStatus::Pending if open.is_empty() => "not run".to_owned(),
+                GateStatus::Pending => {
+                    format!("not run: it covers open contract(s) {}", open.join(", "))
+                }
+                GateStatus::Running { .. } => "not passed: its run did not finish".to_owned(),
+                GateStatus::Failed { remediation, .. } => {
+                    format!("failed; its remediation `{remediation}` did not finish")
+                }
+                GateStatus::Inconclusive { reason, .. } => format!("inconclusive: {reason}"),
+            };
+            out.push((g.id.clone(), line));
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -1031,6 +1097,59 @@ mod tests {
             delivered: false,
         });
         r
+    }
+
+    /// Round 10 greenfield: SIGTERM stopped the run after `c1` merged, while
+    /// the worker of `c2` ran; the report said `status Stopped` and
+    /// `verified c1`, and named neither `c2` nor the root gate.
+    #[test]
+    fn a_stopped_run_names_every_contract_and_gate_it_left_unfinished() {
+        let mut r = RunStateRecord::new(RunId::new("g"), "build wcl", 0);
+        let mut c1 = OpenContract::planned("c1", "t1".into(), "core", "cargo test");
+        c1.writes.push(WriteTarget {
+            path: "wcl-core/src/lib.rs".into(),
+            node: None,
+        });
+        let mut c2 = OpenContract::planned("c2", "t2".into(), "bin", "cargo test");
+        c2.depends_on = vec!["c1".into()];
+        let mut c3 = OpenContract::planned("c3", "t3".into(), "docs", "true");
+        c3.depends_on = vec!["c2".into()];
+        let mut c4 = OpenContract::planned("c4", "t4".into(), "x", "true");
+        c4.status = ContractStatus::Held {
+            reason: "named by the held line".into(),
+        };
+        r.coordination.gates =
+            crate::gates::plan_gates(&[c1.clone(), c2.clone(), c3.clone()], &BTreeMap::new());
+        assert_eq!(r.coordination.gates.len(), 1, "the root gate");
+        // c1 verified and closed; c2 dispatched once and cut off.
+        r.verified_contracts.push("c1".into());
+        c2.status = ContractStatus::Dispatched;
+        c2.workers.push("g-c2-r0-a0".into());
+        r.open_contracts = vec![c2, c3, c4];
+        r.status = RunStatus::Stopped;
+        let lines = r.unfinished();
+        let line = |id: &str| {
+            lines
+                .iter()
+                .find(|(c, _)| c == id)
+                .map(|(_, l)| l.clone())
+                .unwrap_or_else(|| panic!("no line for {id}: {lines:?}"))
+        };
+        assert!(line("c2").contains("cut off by the stop"), "{lines:?}");
+        assert!(line("c2").contains("nothing of it was merged"), "{lines:?}");
+        assert_eq!(line("c3"), "not started: it waits on c2");
+        assert!(
+            line("gate:root").contains("open contract(s) c2, c3"),
+            "{lines:?}"
+        );
+        // A held contract is the held line's; a verified one is not open.
+        assert!(
+            lines.iter().all(|(c, _)| c != "c4" && c != "c1"),
+            "{lines:?}"
+        );
+        // A completed run has nothing unfinished.
+        r.status = RunStatus::Completed;
+        assert!(r.unfinished().is_empty());
     }
 
     #[test]

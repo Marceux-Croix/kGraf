@@ -661,3 +661,29 @@ requires the check's verdict on every contract to match cargo's),
 `tests/plan_repo_intake.rs`
 `the_package_form_before_its_members_exist_is_refused_then_the_named_remedy_is_accepted`, and
 `kgraf-host` `a_member_manifest_a_later_contract_writes_holds_for_a_replan`.
+
+## Amendment (2026-10-06, second): a member list in prose is read
+
+The workspace check above read a member list only in the form `members = [...]`. A planner
+that stated the list in prose ("the workspace root Cargo.toml with members wcl-core and wcl")
+was read as listing no member, so the plan was accepted and its root contract failed on a
+later contract's missing member manifest ("failed to load manifest for workspace member
+`wcl`"). Its retry dropped the member from the list, which the later contract could not add
+back, as the root manifest was not in its writes.
+
+- **A member list in prose is read.** When the root contract's instruction has no
+  `members = [...]` list, the words after `member` or `members` are read to the end of their
+  sentence (a period before a space, a semicolon, a parenthesis or a line break), or to a word
+  that ends the list (`not`, `except`, `until`, `later`, `but` and the like). A word counts
+  only when the plan writes, or the repository holds, `<word>/Cargo.toml`, so prose such as
+  "the members listed below" names none. A `members = [...]` list wins over prose.
+- **Why that guard.** A word that is no member directory cannot make cargo fail, so reading
+  it would only refuse a plan for nothing. A member the instruction names in prose but that no
+  contract writes and the repository lacks is not read; that plan fails at its acceptance
+  check, as before.
+- **The re-plan hold reads it too**, since it uses the same findings.
+
+Tests: `kgraf-orchestrator` `plan_repo.rs`
+`a_member_list_in_prose_is_read_and_refused_like_a_toml_list`,
+`prose_members_count_only_member_directories_and_stop_at_the_sentence`,
+`a_toml_member_list_wins_over_prose`.

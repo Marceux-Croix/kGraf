@@ -546,7 +546,9 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   kGraf measures what the worker did since the last checkpoint: files changed on net, its
   own test, build or check runs getting better, and no sloppy pattern (the same error over
   and over, failed patches piling up, writing a file and putting it back, the same call with
-  the same result). A worker that is making progress keeps going with another block, in the
+  the same result). A failed patch of a file that a later write of the same file made good is
+  not held against the worker; a write to another file makes nothing good. A worker that is
+  making progress keeps going with another block, in the
   same conversation. One block without progress after a productive one is allowed; a second
   ends the attempt as stuck, and the orchestrator retries it, then holds the contract. A
   worker that never shows progress stops at its budget as before. The first block is
@@ -937,6 +939,12 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   `unverified <id>: <reason>` after the `verified` line. The run still completes; the line says
   the check did not look at the work. If the worker also finished after a policy refused a call
   it never ran, the reason says so too.
+- A run that did not complete (stopped, for example by Ctrl-C or SIGTERM, or blocked) prints
+  `unfinished <id>: <state>` after the `held` lines, for each open contract that is not held
+  and each gate that did not pass: "not started: it waits on c1", "not verified: 1 attempt(s)
+  dispatched, the last was cut off by the stop; nothing of it was merged", "not run: it covers
+  open contract(s) c2". Before, a stopped run printed only its `verified` line, and a contract
+  the stop cut off was named nowhere (0056).
 - A contract whose real check passed, but whose worker finished after a policy refused a call
   it never ran, is verified, and the refusal is printed as a `notice` line, for example
   "notice contract c1: verified by `cargo test`; the worker finished after a policy refused
@@ -1496,6 +1504,17 @@ Behavior that differs from earlier builds. Each item names the decision that hol
   each member it lists, or the root lists only the members that exist and each later member's
   contract adds itself. A worker that still asks for such a file, written only by a contract
   that runs later, holds its contract as a plan-shape error that asks for a re-plan (0030).
+  The member list is read from a `members = [...]` list in the root contract's instruction,
+  and also from prose such as "the workspace root Cargo.toml with members wcl-core and wcl":
+  after the word `member` or `members` to the end of the sentence, a word counts when the plan
+  writes or the repository holds `<word>/Cargo.toml`. Before, a list in prose was not read,
+  the plan was accepted, and the root contract failed on the later member's missing manifest.
+- A worker that runs its contract's build script (`python -m build`, `pip wheel`, setuptools
+  or Poetry) leaves `dist/*.whl`, `dist/*.tar.gz`, `*.egg-info/` or `build/lib*/` beside the
+  project's `pyproject.toml`, `setup.py` or `setup.cfg`. These new files are not the worker's
+  writes: they are left out of the attempt and removed before the check, with a notice to
+  add them to `.gitignore`, as a worker-made lockfile and `__pycache__` are (0084). Before, the
+  attempt failed with "wrote outside the declared scope" for them.
 - A worker that reaches its context stop point before it has written anything is compacted
   once instead of handed back: a child would receive the same whole task and meet the same
   stop point. After that one compaction it goes on while its context fits the model's window;
@@ -1607,7 +1626,8 @@ Behavior that differs from earlier builds. Each item names the decision that hol
   record naming the transcript file, and the run record lists it under `compactions`. A
   worker that fills its context again is compacted again while it is making progress: since
   its last compaction a file it works on changed or a test or build result improved, with no
-  run of failed writes or repeated errors. A worker with no such progress, one whose context
+  run of failed writes or repeated errors (a failed write of a file that a later write of the
+  same file made good does not count). A worker with no such progress, one whose context
   cannot get under the stop point even after a compaction, or one that reached the
   compaction ceiling (the progress checkpoint ceiling, `--max-checkpoints`, default 10; 1
   allows one compaction) hands back, and its contract is held with a reason that says which,

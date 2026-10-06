@@ -174,3 +174,34 @@ Tests: `progress.rs` `a_first_block_with_a_flat_failing_check_does_not_count_fil
 `progress_gate.rs` `a_first_block_of_early_writes_and_churn_with_a_flat_failing_check_gets_no_extension`;
 `compaction.rs` `a_read_only_attempt_that_used_a_tool_is_not_a_completion_when_the_contract_writes`;
 `kgraf-orchestrator` `pinned_context_hold.rs`.
+
+## Amendment (2026-10-06): a failed write made good later is not a sloppy pattern
+
+A worker that cannot hand back compacted once, then failed three patches in a row (two context
+mismatches and an update chunk with only added lines), then replaced the module whole with
+`*** Add File` (nine of its ten tests passed on that file). At its next stop point the segment
+since the compaction measured 1 file changed and "3 failed write(s) against 1 that succeeded",
+so the failed-writes pattern vetoed the change and the worker was stopped with "no measured
+progress", its changed file named in the same sentence. Its work was kept in the worktree and
+never checked.
+
+The sloppy patterns exist to stop a worker that cannot write or that goes round in circles.
+A failed write that the worker later made good is neither. Now a failed write call whose
+every path a later successful write call of the same block (or of the segment since a
+compaction) wrote is recovered:
+
+- it is not counted as a failed write (`FailedWrites` counts the failures not made good);
+- its error does not count toward a repeated identical error.
+
+A failure on a file that no later write reached still counts, so successful writes to other
+files recover nothing: a worker that writes scratch files beside a patch that keeps failing
+is vetoed as before (`progress_gate.rs`
+`new_files_beside_a_repeating_failed_patch_are_not_progress`, unchanged). A change still
+needs net file change or an improving check; a repeated error of a tool that writes nothing
+still counts; failures after the last good write still count; write-then-revert still
+counts. The rule lives in the one measure both the checkpoint and the recompaction decision
+use (`kgraf-runtime/src/progress.rs`, `measure_log`).
+
+Tests: `progress.rs` `failed_writes_followed_by_a_successful_write_are_not_sloppy`,
+`a_recovery_does_not_hide_read_errors_other_files_or_a_later_failed_write`; `compaction.rs`
+`failed_writes_before_a_write_that_works_do_not_stop_a_recompaction`.

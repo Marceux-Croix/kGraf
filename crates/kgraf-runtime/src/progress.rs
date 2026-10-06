@@ -37,6 +37,18 @@
 //!   identical, unmasked result [`REPEATED_CALL_LIMIT`] times (the stall
 //!   detector's call digest).
 //!
+//!   **A failed write that a later write made good is not sloppy.** A failed
+//!   write call whose every path a later successful write call of the block
+//!   wrote is recovered: it is not counted as a failed write, and its error
+//!   does not count toward a repeated error. The worker found a write that
+//!   works for that file and used it. A failure on a file no later write
+//!   reached still counts, so successful writes to other files (scratch files
+//!   beside a patch that keeps failing) recover nothing. Without this, a
+//!   worker that failed three patches on its stub module after a compaction
+//!   and then replaced the module whole (nine of its ten tests passing) was
+//!   stopped for "no measured progress" with its one changed file in the same
+//!   sentence.
+//!
 //! A block is progressing when (a) or (b) holds and (c) finds nothing.
 //!
 //! **The first block is measured harder.** Its (a) compares with the empty
@@ -542,6 +554,14 @@ struct BlockLog {
     calls: HashMap<String, (String, u32)>,
     failed_writes: u32,
     ok_writes: u32,
+    /// Failed write calls no later successful write has covered yet: the
+    /// paths still uncovered, and the call's error shape digest (a key of
+    /// `errors`). An entry whose paths are all written later is removed and
+    /// counted in `recovered_writes` and `recovered_errors`.
+    unrecovered: Vec<(BTreeSet<PathBuf>, Option<String>)>,
+    recovered_writes: u32,
+    /// Error shape digest -> failed write calls of that error later recovered.
+    recovered_errors: HashMap<String, u32>,
     written: BTreeSet<PathBuf>,
     /// (key, label, score), in run order.
     checks: Vec<(String, String, CheckScore)>,
@@ -553,6 +573,24 @@ struct BlockLog {
 }
 
 impl BlockLog {
+    /// A successful write of `paths`: each earlier failed write whose paths
+    /// are now all written is recovered.
+    fn recover(&mut self, paths: &[PathBuf]) {
+        let mut still = Vec::with_capacity(self.unrecovered.len());
+        for (mut left, digest) in std::mem::take(&mut self.unrecovered) {
+            left.retain(|p| !paths.contains(p));
+            if left.is_empty() {
+                self.recovered_writes += 1;
+                if let Some(d) = digest {
+                    *self.recovered_errors.entry(d).or_insert(0) += 1;
+                }
+            } else {
+                still.push((left, digest));
+            }
+        }
+        self.unrecovered = still;
+    }
+
     fn observe(&mut self, event: &WorkerEvent, facts: &dyn CallFacts) {
         match event {
             WorkerEvent::ToolCallStarted {
@@ -575,23 +613,32 @@ impl BlockLog {
                 if did_not_run(output) {
                     return;
                 }
-                if let Some(command) = command_of(&tool, &input) {
-                    let (key, label) = command_key(&command);
+                let command = command_of(&tool, &input);
+                if let Some(command) = &command {
+                    let (key, label) = command_key(command);
                     self.checks
                         .push((key, label, check_score(output, *is_error)));
-                } else if *is_error {
-                    let digest =
-                        blake3::hash(format!("{tool}\u{0}{}", error_shape(output)).as_bytes())
-                            .to_hex()
-                            .to_string();
-                    self.errors.entry(digest).or_insert((tool.clone(), 0)).1 += 1;
                 }
                 let paths = facts.written_paths(&tool, &input);
+                let error_digest = (command.is_none() && *is_error).then(|| {
+                    blake3::hash(format!("{tool}\u{0}{}", error_shape(output)).as_bytes())
+                        .to_hex()
+                        .to_string()
+                });
+                if let Some(digest) = &error_digest {
+                    self.errors
+                        .entry(digest.clone())
+                        .or_insert((tool.clone(), 0))
+                        .1 += 1;
+                }
                 if !paths.is_empty() {
                     if *is_error {
                         self.failed_writes += 1;
+                        self.unrecovered
+                            .push((paths.iter().cloned().collect(), error_digest));
                     } else {
                         self.ok_writes += 1;
+                        self.recover(&paths);
                         self.written.extend(paths);
                     }
                 }
@@ -997,23 +1044,27 @@ fn measure_log(
     {
         files_discounted = std::mem::take(&mut counted);
     }
-    // (c).
+    // (c). A failed write a later write made good (every path of it written
+    // later in the block) counts neither as a failed write nor toward a
+    // repeated error.
     let mut sloppy = Vec::new();
-    let mut repeated: Vec<&(String, u32)> = log
+    let mut repeated: Vec<(String, u32)> = log
         .errors
-        .values()
+        .iter()
+        .map(|(digest, (tool, n))| {
+            let made_good = log.recovered_errors.get(digest).copied().unwrap_or(0);
+            (tool.clone(), n.saturating_sub(made_good))
+        })
         .filter(|(_, n)| *n >= REPEATED_ERROR_LIMIT)
         .collect();
     repeated.sort();
     for (tool, times) in repeated {
-        sloppy.push(SloppyPattern::RepeatedError {
-            tool: tool.clone(),
-            times: *times,
-        });
+        sloppy.push(SloppyPattern::RepeatedError { tool, times });
     }
-    if log.failed_writes >= FAILED_WRITE_LIMIT && log.failed_writes > log.ok_writes {
+    let failed = log.failed_writes - log.recovered_writes;
+    if failed >= FAILED_WRITE_LIMIT && failed > log.ok_writes {
         sloppy.push(SloppyPattern::FailedWrites {
-            failed: log.failed_writes,
+            failed,
             succeeded: log.ok_writes,
         });
     }
@@ -1344,6 +1395,131 @@ mod tests {
             failed: 3,
             succeeded: 1
         }));
+        assert!(!m.progressing());
+    }
+
+    /// Three failed writes with one identical error, then a write that
+    /// succeeds and changes the file: the worker recovered its write path, so
+    /// neither the failed writes nor their repeated error veto the change.
+    /// (Without the rule, a worker that failed three patches after a compaction
+    /// and then replaced its stub module whole was stopped for "no measured
+    /// progress".)
+    #[test]
+    fn failed_writes_followed_by_a_successful_write_are_not_sloppy() {
+        let mut g = gate();
+        g.capture_preimage("a.py".into(), Some("stub".into()));
+        for n in 0..3 {
+            call(
+                &mut g,
+                &format!("p{n}"),
+                "write",
+                json!({"path": "a.py", "hunk": n}),
+                "ERROR: context not found",
+                true,
+            );
+        }
+        call(&mut g, "ok", "write", json!({"path": "a.py"}), "ok", false);
+        let (m, _) = g.measure(7, &files(&[("a.py", Some("done"))]), None);
+        assert_eq!(m.files_changed, vec![PathBuf::from("a.py")]);
+        assert!(m.sloppy.is_empty(), "{:?}", m.sloppy);
+        assert!(m.progressing());
+    }
+
+    /// Only a failure whose file a later write reached is made good: a
+    /// repeated read error still counts, a successful write to another file
+    /// recovers nothing, and a failed write after the success still counts.
+    #[test]
+    fn a_recovery_does_not_hide_read_errors_other_files_or_a_later_failed_write() {
+        let mut g = gate();
+        g.capture_preimage("a.py".into(), Some("stub".into()));
+        for n in 0..3 {
+            call(
+                &mut g,
+                &format!("r{n}"),
+                "read",
+                json!({"path": "missing.py", "n": n}),
+                "ERROR: no such file",
+                true,
+            );
+        }
+        call(&mut g, "ok", "write", json!({"path": "a.py"}), "ok", false);
+        let (m, _) = g.measure(7, &files(&[("a.py", Some("done"))]), None);
+        assert_eq!(
+            m.sloppy,
+            vec![SloppyPattern::RepeatedError {
+                tool: "read".into(),
+                times: 3
+            }]
+        );
+        // Scratch files beside a patch that keeps failing recover nothing.
+        let mut g = gate();
+        g.capture_preimage("a.py".into(), Some("stub".into()));
+        for n in 0..3 {
+            call(
+                &mut g,
+                &format!("p{n}"),
+                "write",
+                json!({"path": "a.py", "hunk": n}),
+                "ERROR: context not found",
+                true,
+            );
+            call(
+                &mut g,
+                &format!("s{n}"),
+                "write",
+                json!({"path": format!("scratch{n}.txt")}),
+                "ok",
+                false,
+            );
+        }
+        let (m, _) = g.measure(7, &files(&[("scratch0.txt", Some("x"))]), None);
+        assert_eq!(
+            m.sloppy,
+            vec![SloppyPattern::RepeatedError {
+                tool: "write".into(),
+                times: 3
+            }]
+        );
+        assert!(!m.progressing());
+        let mut g = gate();
+        g.capture_preimage("a.py".into(), Some("stub".into()));
+        call(
+            &mut g,
+            "p0",
+            "write",
+            json!({"path": "a.py", "n": 0}),
+            "ERROR: a",
+            true,
+        );
+        call(
+            &mut g,
+            "p1",
+            "write",
+            json!({"path": "a.py", "n": 1}),
+            "ERROR: b",
+            true,
+        );
+        call(&mut g, "ok", "write", json!({"path": "a.py"}), "ok", false);
+        // Made good: the two failures before the success. Not made good: the
+        // three after it.
+        for (n, e) in [(2, "ERROR: c"), (3, "ERROR: d"), (4, "ERROR: e")] {
+            call(
+                &mut g,
+                &format!("p{n}"),
+                "write",
+                json!({"path": "a.py", "n": n}),
+                e,
+                true,
+            );
+        }
+        let (m, _) = g.measure(7, &files(&[("a.py", Some("done"))]), None);
+        assert_eq!(
+            m.sloppy,
+            vec![SloppyPattern::FailedWrites {
+                failed: 3,
+                succeeded: 1
+            }]
+        );
         assert!(!m.progressing());
     }
 

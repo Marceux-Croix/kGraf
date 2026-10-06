@@ -361,3 +361,30 @@ and stub module as fixtures),
 `indentation_and_trailing_whitespace_differences_match_once_with_a_note`,
 `spaces_against_tabs_with_a_pinned_line_are_refused`; the unit tests in `reindent.rs` and
 `syntax.rs`.
+
+## Amendment (2026-10-06): a Python package build's output is generated, not written
+
+A contract whose work is a build script runs it, as its instruction and acceptance say, and
+the build leaves a wheel and a source distribution in `dist/`. The scope check counted them
+as the worker's writes outside its scope and failed the attempt ("wrote outside the declared
+scope: [dist/<name>-0.1.0-py2.py3-none-any.whl, dist/<name>-0.1.0.tar.gz]"), and the
+contract was held after its retry.
+
+- **The rule.** A new file outside the declared writes is a Python package build's output
+  when it is `<dir>/dist/<name>.whl` or `<dir>/dist/<name>.tar.gz`, a file under
+  `<dir>/<name>.egg-info/` (`<dir>/src/<name>.egg-info/` for a `src` layout, whose project is
+  `<dir>`), or a file under `<dir>/build/lib/`, `<dir>/build/lib.<platform>/` or
+  `<dir>/build/bdist.<platform>/`, and `<dir>` holds `pyproject.toml`, `setup.py` or
+  `setup.cfg` in the snapshot. The scope check passes it on, the merge-back commit leaves it
+  out and records it, and it is removed before the acceptance check, as a worker-made
+  lockfile is. One notice names them all and says to add `dist/`, `build/` and `*.egg-info/`
+  to `.gitignore`.
+- **Not covered.** A `dist/` with no Python project manifest where it was built (a web
+  bundle, which projects often commit), a tracked file the build changed, and any declared
+  path: those are the worker's writes, judged as before.
+- **No missing dependency.** No contract wrote `dist/`; the build that made it was the
+  contract's own, and the acceptance check builds it again.
+
+Tests: `kgraf-sandbox` `a_python_package_build_is_generated_only_beside_its_project`,
+`tests/merge.rs` `commit_retaining_leaves_a_python_package_build_out`; `kgraf-orchestrator`
+`a_python_package_build_the_worker_ran_is_not_an_out_of_scope_write`.

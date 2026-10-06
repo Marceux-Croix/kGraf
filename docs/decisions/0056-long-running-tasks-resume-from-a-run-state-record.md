@@ -93,3 +93,23 @@ signal number. `schedule run-now` shares the path and records the run as failed.
 - **Rejected.** Letting the default handler end the process (the defect). Exiting at once
   after the first signal and leaving settlement to startup cleanup: the user would not be
   told what was left.
+
+## Amendment (2026-10-06): a run that did not complete names what it left
+
+A stopped run printed `status Stopped` and its `verified` line. A contract whose worker the
+stop cancelled, and the root gate that never ran, were named nowhere, so the report could
+not be told from a stop with nothing left.
+
+- **What is printed.** After the `held` lines, one `unfinished <id>: <state>` line per open
+  contract that is not held and per gate that neither passed, was waived nor is held. A
+  contract reads "not started" or "not started: it waits on <ids>", or, once dispatched,
+  "not verified: <n> attempt(s) dispatched, the last was cut off by the stop; nothing of it
+  was merged" (for a blocked run, without the stop). A gate reads "not run: it covers open
+  contract(s) <ids>", "not passed: its run did not finish", "failed; its remediation
+  `<id>` did not finish" or "inconclusive: <reason>". A completed run prints none.
+- **Where it comes from.** `RunStateRecord::unfinished` reads the run record, so the
+  report and a resumed run agree; `RunReport::unfinished` carries it to the command.
+
+Tests: `kgraf-orchestrator` `run_state.rs`
+`a_stopped_run_names_every_contract_and_gate_it_left_unfinished`; `kgraf-cli`
+`a_stopped_run_prints_what_it_left_unfinished`.

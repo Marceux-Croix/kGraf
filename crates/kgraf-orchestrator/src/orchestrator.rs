@@ -1364,6 +1364,11 @@ pub struct RunReport {
     /// why (decision 0093): the check always passes and no gate command ran.
     /// A run with any is completed but unverified.
     pub unverified: Vec<(String, String)>,
+    /// What a run that did not complete left unfinished, beyond its held
+    /// items: each open contract with how far it got, and each gate that did
+    /// not pass ([`crate::run_state::RunStateRecord::unfinished`]). Empty for
+    /// a completed run.
+    pub unfinished: Vec<(String, String)>,
 }
 
 /// How long a release waits for a worker that ignores its cancel before it
@@ -4323,6 +4328,7 @@ impl RunLoop {
                 .iter()
                 .map(|(c, r)| (c.clone(), r.clone()))
                 .collect(),
+            unfinished: self.record.unfinished(),
         }
     }
 
@@ -8975,6 +8981,39 @@ mod tests {
                 None
             );
         }
+    }
+
+    /// Round 10 Terminal-Bench (pypi-server): `c2` owned only
+    /// `dev/setup_pypi.sh`, ran it as its instruction and acceptance said, and
+    /// the build left `dist/`; the attempt failed "wrote outside the declared
+    /// scope" for the two files no contract writes, and the contract was held
+    /// after its retry.
+    #[test]
+    fn a_python_package_build_the_worker_ran_is_not_an_out_of_scope_write() {
+        let ws = tempfile::tempdir().expect("dir");
+        std::fs::write(ws.path().join("pyproject.toml"), "[tool.poetry]\n").expect("write");
+        let writes = [WriteTarget {
+            path: "dev/setup_pypi.sh".into(),
+            node: None,
+        }];
+        let changed: Vec<PathBuf> = [
+            "dev/setup_pypi.sh",
+            "dist/vectorops-0.1.0-py2.py3-none-any.whl",
+            "dist/vectorops-0.1.0.tar.gz",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+        assert_eq!(
+            outside_declared_scope(&changed, &writes, ws.path(), false),
+            Vec::<String>::new()
+        );
+        // Without a Python project where it was built, `dist/` is a write.
+        let elsewhere = [PathBuf::from("web/dist/app-1.0.tar.gz")];
+        assert_eq!(
+            outside_declared_scope(&elsewhere, &writes, ws.path(), false),
+            vec!["web/dist/app-1.0.tar.gz".to_owned()]
+        );
     }
 
     /// Decision 0084: a lockfile the worker's own build created beside a
