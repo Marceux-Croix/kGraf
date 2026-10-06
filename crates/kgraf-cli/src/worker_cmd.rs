@@ -725,7 +725,9 @@ fn show(event: &WorkerEvent, started: std::time::Instant) {
         WorkerEvent::Redacted { counts } => println!("\n[redacted {counts:?}]"),
         // Decision 0095: the runtime's own notice, then the text the worker
         // continues from.
-        WorkerEvent::Compacted { notice, summary } => println!(
+        WorkerEvent::Compacted {
+            notice, summary, ..
+        } => println!(
             "\n[compacted at {} of {} tokens; summary from {:?}]\n{}",
             notice.at_tokens,
             notice.window_tokens,

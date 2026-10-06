@@ -682,6 +682,25 @@ impl ProgressGate {
         self.checkpoints.push(checkpoint);
     }
 
+    /// The most checkpoints this worker may reach (`LoopSettings::max_checkpoints`,
+    /// at least 1). The same figure bounds repeated compactions (decision 0095,
+    /// amendment of 2026-10-06).
+    pub(crate) fn ceiling(&self) -> u32 {
+        self.ceiling
+    }
+
+    /// Each command's latest score as of now: the last checkpoint's baseline,
+    /// with the scores of the open block laid over it. A compaction segment
+    /// starts from these, so a check that improves after the compaction is
+    /// compared with where it stood at the compaction.
+    pub(crate) fn latest_checks(&self) -> BTreeMap<String, CheckScore> {
+        let mut checks = self.baseline.checks.clone();
+        for (key, _, score) in &self.log.checks {
+            checks.insert(key.clone(), *score);
+        }
+        checks
+    }
+
     /// Rounds per block.
     pub(crate) fn block(&self) -> u32 {
         self.block
@@ -753,154 +772,14 @@ impl ProgressGate {
         now: &BTreeMap<PathBuf, Option<String>>,
         dirty: Option<&BTreeSet<PathBuf>>,
     ) -> (ProgressMeasure, CheckpointBaseline) {
-        let mut files_changed = Vec::new();
-        let mut since_midpoint = Vec::new();
-        let first_block = self.checkpoints.is_empty();
-        let mut unchanged = BTreeSet::new();
-        for (path, digest) in now {
-            let changed = match self.baseline.files.get(path) {
-                Some(before) => before != digest,
-                None => match self.log.preimages.get(path) {
-                    Some(before) => before != digest,
-                    // Not recorded at the last checkpoint, so not dirty then:
-                    // changed only if git lists it now. With no git status,
-                    // counted as changed rather than guessed unchanged.
-                    None => dirty.is_none_or(|d| d.contains(path)),
-                },
-            };
-            if changed {
-                files_changed.push(path.clone());
-            } else {
-                unchanged.insert(path.clone());
-            }
-            // The first block's (a): a net change from the start that also
-            // differs from the midpoint capture or, for a path first written
-            // after it, from its content before that write.
-            if let (true, Some(mid)) = (first_block, &self.log.midpoint) {
-                let moved = match mid.get(path).or_else(|| self.log.preimages.get(path)) {
-                    Some(before) => before != digest,
-                    None => changed,
-                };
-                if moved && changed {
-                    since_midpoint.push(path.clone());
-                }
-            }
-        }
-        // `files_changed` keeps the compare with the block's start for the
-        // revert check below; `counted` is what (a) counts.
-        let mut counted = if first_block && self.log.midpoint.is_some() {
-            since_midpoint
-        } else {
-            files_changed.clone()
-        };
-        // (b): each command's latest score against its reference.
-        let mut checks = self.baseline.checks.clone();
-        let mut checks_improved = Vec::new();
-        // Latest score of each test or build command run in the block.
-        let mut latest_scores: Vec<CheckScore> = Vec::new();
-        let mut seen: Vec<&str> = Vec::new();
-        for (key, _, _) in &self.log.checks {
-            if !seen.contains(&key.as_str()) {
-                seen.push(key);
-            }
-        }
-        for key in seen {
-            let runs: Vec<&(String, String, CheckScore)> = self
-                .log
-                .checks
-                .iter()
-                .filter(|(k, _, _)| k == key)
-                .collect();
-            let Some((_, label, latest)) = runs.last().copied() else {
-                continue;
-            };
-            let reference = match self.baseline.checks.get(key) {
-                Some(score) => Some(score),
-                None if runs.len() > 1 => runs.first().map(|(_, _, s)| s),
-                None => None,
-            };
-            if let Some(reference) = reference
-                && latest.improves_on(reference)
-            {
-                checks_improved.push(format!(
-                    "{label}: {} -> {}",
-                    reference.describe(),
-                    latest.describe()
-                ));
-            }
-            if latest.kind != CheckKind::ExitStatus {
-                latest_scores.push(*latest);
-            }
-            checks.insert(key.to_owned(), *latest);
-        }
-        // The first block: file changes alone do not count while the block's
-        // test and build commands all ended failing and none improved.
-        let mut files_discounted = Vec::new();
-        if first_block
-            && checks_improved.is_empty()
-            && !latest_scores.is_empty()
-            && latest_scores.iter().all(CheckScore::failing)
-        {
-            files_discounted = std::mem::take(&mut counted);
-        }
-        // (c).
-        let mut sloppy = Vec::new();
-        let mut repeated: Vec<&(String, u32)> = self
-            .log
-            .errors
-            .values()
-            .filter(|(_, n)| *n >= REPEATED_ERROR_LIMIT)
-            .collect();
-        repeated.sort();
-        for (tool, times) in repeated {
-            sloppy.push(SloppyPattern::RepeatedError {
-                tool: tool.clone(),
-                times: *times,
-            });
-        }
-        if self.log.failed_writes >= FAILED_WRITE_LIMIT
-            && self.log.failed_writes > self.log.ok_writes
-        {
-            sloppy.push(SloppyPattern::FailedWrites {
-                failed: self.log.failed_writes,
-                succeeded: self.log.ok_writes,
-            });
-        }
-        let reverted: Vec<PathBuf> = self
-            .log
-            .written
-            .iter()
-            .filter(|p| unchanged.contains(*p))
-            .cloned()
-            .collect();
-        if !reverted.is_empty() && files_changed.is_empty() {
-            sloppy.push(SloppyPattern::WriteThenRevert { paths: reverted });
-        }
-        let mut calls: Vec<&(String, u32)> = self
-            .log
-            .calls
-            .values()
-            .filter(|(_, n)| *n >= REPEATED_CALL_LIMIT)
-            .collect();
-        calls.sort();
-        for (tool, times) in calls {
-            sloppy.push(SloppyPattern::RepeatedCalls {
-                tool: tool.clone(),
-                times: *times,
-            });
-        }
-        let measure = ProgressMeasure {
-            rounds: used.saturating_sub(self.log.rounds_at_start),
-            files_changed: counted,
-            files_discounted,
-            checks_improved,
-            sloppy,
-        };
-        let baseline = CheckpointBaseline {
-            files: now.clone(),
-            checks,
-        };
-        (measure, baseline)
+        measure_log(
+            &self.log,
+            &self.baseline,
+            self.checkpoints.is_empty(),
+            used,
+            now,
+            dirty,
+        )
     }
 
     /// Decide on a measured block, record the checkpoint and start the next
@@ -956,6 +835,221 @@ impl ProgressGate {
             checkpoints: self.checkpoints.clone(),
         })
     }
+}
+
+/// The progress of one worker since its last compaction (decision 0095,
+/// amendment of 2026-10-06): the same measure as a checkpoint's (decision
+/// 0096: net file change or an improving check, and no sloppy pattern), taken
+/// over the rounds since the compaction instead of a round block. A worker that
+/// cannot hand back reaches its stop point again; it is compacted again only
+/// when this segment was progressing.
+///
+/// The segment's baseline is the tree and the check scores at the compaction.
+/// It is stored on the `Compacted` event, so a resume measures the open segment
+/// against the same baseline. The first block's harder rules do not apply: the
+/// baseline is a real earlier state, not the empty start.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SegmentGate {
+    log: BlockLog,
+    baseline: CheckpointBaseline,
+}
+
+impl SegmentGate {
+    /// A segment that starts at round `used` from `baseline`.
+    pub(crate) fn start(baseline: CheckpointBaseline, used: u32) -> Self {
+        Self {
+            log: BlockLog {
+                rounds_at_start: used,
+                ..BlockLog::default()
+            },
+            baseline,
+        }
+    }
+
+    pub(crate) fn observe(&mut self, event: &WorkerEvent, facts: &dyn CallFacts) {
+        self.log.observe(event, facts);
+    }
+
+    /// Whether `path`'s content before a write must be captured: the baseline
+    /// does not record it and the segment has not captured it.
+    pub(crate) fn needs_preimage(&self, path: &Path) -> bool {
+        !self.baseline.files.contains_key(path) && !self.log.preimages.contains_key(path)
+    }
+
+    pub(crate) fn capture_preimage(&mut self, path: PathBuf, digest: Option<String>) {
+        self.log.preimages.entry(path).or_insert(digest);
+    }
+
+    /// Every path the measurement digests: the baseline's, the segment's
+    /// captures and writes, and `changed`.
+    pub(crate) fn tracked(&self, changed: &BTreeSet<PathBuf>) -> BTreeSet<PathBuf> {
+        let mut paths: BTreeSet<PathBuf> = self.baseline.files.keys().cloned().collect();
+        paths.extend(self.log.preimages.keys().cloned());
+        paths.extend(self.log.written.iter().cloned());
+        paths.extend(changed.iter().cloned());
+        paths
+    }
+
+    /// Measure the segment. Pure: the caller reads the files.
+    pub(crate) fn measure(
+        &self,
+        used: u32,
+        now: &BTreeMap<PathBuf, Option<String>>,
+        dirty: Option<&BTreeSet<PathBuf>>,
+    ) -> ProgressMeasure {
+        measure_log(&self.log, &self.baseline, false, used, now, dirty).0
+    }
+}
+
+/// Measure one block's log against `baseline` (see [`ProgressGate::measure`]).
+/// `first_block` turns on the first block's harder rules (the midpoint and the
+/// discount of file changes under a flat failing check). Pure.
+fn measure_log(
+    log: &BlockLog,
+    baseline: &CheckpointBaseline,
+    first_block: bool,
+    used: u32,
+    now: &BTreeMap<PathBuf, Option<String>>,
+    dirty: Option<&BTreeSet<PathBuf>>,
+) -> (ProgressMeasure, CheckpointBaseline) {
+    let mut files_changed = Vec::new();
+    let mut since_midpoint = Vec::new();
+    let mut unchanged = BTreeSet::new();
+    for (path, digest) in now {
+        let changed = match baseline.files.get(path) {
+            Some(before) => before != digest,
+            None => match log.preimages.get(path) {
+                Some(before) => before != digest,
+                // Not recorded at the last checkpoint, so not dirty then:
+                // changed only if git lists it now. With no git status,
+                // counted as changed rather than guessed unchanged.
+                None => dirty.is_none_or(|d| d.contains(path)),
+            },
+        };
+        if changed {
+            files_changed.push(path.clone());
+        } else {
+            unchanged.insert(path.clone());
+        }
+        // The first block's (a): a net change from the start that also
+        // differs from the midpoint capture or, for a path first written
+        // after it, from its content before that write.
+        if let (true, Some(mid)) = (first_block, &log.midpoint) {
+            let moved = match mid.get(path).or_else(|| log.preimages.get(path)) {
+                Some(before) => before != digest,
+                None => changed,
+            };
+            if moved && changed {
+                since_midpoint.push(path.clone());
+            }
+        }
+    }
+    // `files_changed` keeps the compare with the block's start for the
+    // revert check below; `counted` is what (a) counts.
+    let mut counted = if first_block && log.midpoint.is_some() {
+        since_midpoint
+    } else {
+        files_changed.clone()
+    };
+    // (b): each command's latest score against its reference.
+    let mut checks = baseline.checks.clone();
+    let mut checks_improved = Vec::new();
+    // Latest score of each test or build command run in the block.
+    let mut latest_scores: Vec<CheckScore> = Vec::new();
+    let mut seen: Vec<&str> = Vec::new();
+    for (key, _, _) in &log.checks {
+        if !seen.contains(&key.as_str()) {
+            seen.push(key);
+        }
+    }
+    for key in seen {
+        let runs: Vec<&(String, String, CheckScore)> =
+            log.checks.iter().filter(|(k, _, _)| k == key).collect();
+        let Some((_, label, latest)) = runs.last().copied() else {
+            continue;
+        };
+        let reference = match baseline.checks.get(key) {
+            Some(score) => Some(score),
+            None if runs.len() > 1 => runs.first().map(|(_, _, s)| s),
+            None => None,
+        };
+        if let Some(reference) = reference
+            && latest.improves_on(reference)
+        {
+            checks_improved.push(format!(
+                "{label}: {} -> {}",
+                reference.describe(),
+                latest.describe()
+            ));
+        }
+        if latest.kind != CheckKind::ExitStatus {
+            latest_scores.push(*latest);
+        }
+        checks.insert(key.to_owned(), *latest);
+    }
+    // The first block: file changes alone do not count while the block's
+    // test and build commands all ended failing and none improved.
+    let mut files_discounted = Vec::new();
+    if first_block
+        && checks_improved.is_empty()
+        && !latest_scores.is_empty()
+        && latest_scores.iter().all(CheckScore::failing)
+    {
+        files_discounted = std::mem::take(&mut counted);
+    }
+    // (c).
+    let mut sloppy = Vec::new();
+    let mut repeated: Vec<&(String, u32)> = log
+        .errors
+        .values()
+        .filter(|(_, n)| *n >= REPEATED_ERROR_LIMIT)
+        .collect();
+    repeated.sort();
+    for (tool, times) in repeated {
+        sloppy.push(SloppyPattern::RepeatedError {
+            tool: tool.clone(),
+            times: *times,
+        });
+    }
+    if log.failed_writes >= FAILED_WRITE_LIMIT && log.failed_writes > log.ok_writes {
+        sloppy.push(SloppyPattern::FailedWrites {
+            failed: log.failed_writes,
+            succeeded: log.ok_writes,
+        });
+    }
+    let reverted: Vec<PathBuf> = log
+        .written
+        .iter()
+        .filter(|p| unchanged.contains(*p))
+        .cloned()
+        .collect();
+    if !reverted.is_empty() && files_changed.is_empty() {
+        sloppy.push(SloppyPattern::WriteThenRevert { paths: reverted });
+    }
+    let mut calls: Vec<&(String, u32)> = log
+        .calls
+        .values()
+        .filter(|(_, n)| *n >= REPEATED_CALL_LIMIT)
+        .collect();
+    calls.sort();
+    for (tool, times) in calls {
+        sloppy.push(SloppyPattern::RepeatedCalls {
+            tool: tool.clone(),
+            times: *times,
+        });
+    }
+    let measure = ProgressMeasure {
+        rounds: used.saturating_sub(log.rounds_at_start),
+        files_changed: counted,
+        files_discounted,
+        checks_improved,
+        sloppy,
+    };
+    let baseline = CheckpointBaseline {
+        files: now.clone(),
+        checks,
+    };
+    (measure, baseline)
 }
 
 /// The notice a worker gets at a grace checkpoint.

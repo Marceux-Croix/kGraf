@@ -3,7 +3,7 @@
 //! each test asserts on those requests, the event stream, the ledger rows and
 //! the result, never on a setting.
 //!
-//! 1. A worker that cannot hand back compacts exactly once at its stop point,
+//! 1. A worker that cannot hand back compacts at its stop point,
 //!    through one ledgered summary call, and goes on from the verbatim
 //!    instruction plus the summary.
 //! 2. The model can neither forge the notice (text that claims a compaction
@@ -13,7 +13,9 @@
 //!    again.
 //! 4. `recall_history` finds a detail the summary dropped, and only after a
 //!    compaction.
-//! 5. A second overflow hands back with full information.
+//! 5. A later overflow compacts again only on measured progress, with room
+//!    under the stop point, up to the checkpoint ceiling; otherwise it hands
+//!    back with full information and the reason.
 //! 6. A user's request compacts at the next boundary, once.
 
 use kgraf_core::{Protocol, TokenUsage};
@@ -404,7 +406,10 @@ async fn a_worker_that_cannot_hand_back_compacts_once_and_goes_on_from_the_verba
     assert_eq!(result.outcome, WorkerOutcome::Completed, "{result:?}");
     let at = compactions(&events);
     assert_eq!(at.len(), 1, "exactly one compaction");
-    let WorkerEvent::Compacted { notice, summary } = &events[at[0]] else {
+    let WorkerEvent::Compacted {
+        notice, summary, ..
+    } = &events[at[0]]
+    else {
         unreachable!()
     };
     assert_eq!(
@@ -530,7 +535,10 @@ async fn a_failed_summary_call_still_compacts_from_what_the_loop_observed() {
         .expect("spawn");
     let (events, result) = drain(handle).await;
     assert_eq!(result.outcome, WorkerOutcome::Completed, "{result:?}");
-    let WorkerEvent::Compacted { notice, summary } = &events[compactions(&events)[0]] else {
+    let WorkerEvent::Compacted {
+        notice, summary, ..
+    } = &events[compactions(&events)[0]]
+    else {
         unreachable!()
     };
     let SummarySource::Runtime { reason } = &notice.summary_source else {
@@ -697,50 +705,308 @@ async fn recall_finds_a_detail_the_summary_dropped_and_only_after_compaction() {
     );
 }
 
-#[tokio::test]
-async fn a_second_overflow_hands_back_with_full_information_and_never_compacts_again() {
-    let dir = tempfile::tempdir().expect("dir");
-    let provider = Fake::new(|request| {
+// ------------------------------------------- a later stop point (0095, 2026-10-06)
+
+/// A later summary in other words than the first: the first summary's decision
+/// must survive it word for word.
+const LATER_SUMMARY: &str = "{\"goal\": \"write the server files\", \"decisions\": [\"later \
+     decision\"], \"files_touched\": [], \"open_items\": [\"write the rest\"], \
+     \"constraints\": []}";
+
+/// `env_with`, with the progress checkpoint ceiling set to `ceiling`.
+fn env_with_ceiling(provider: Arc<Fake>, ceiling: u32) -> Arc<WorkerEnv> {
+    let mut env = Arc::try_unwrap(env_with(provider, true))
+        .ok()
+        .expect("one owner");
+    env.settings.max_checkpoints = ceiling;
+    Arc::new(env)
+}
+
+/// Writes a new file every round and grows 10,000 input tokens per round of
+/// its current context, so it reaches the 80,000-token stop point in round 8
+/// of every segment. The first summary differs from the later ones. File
+/// names count up from `first + 1`.
+fn writes_every_round(first: u64) -> impl Fn(&Request) -> Round + Send + Sync {
+    let counter = Arc::new(std::sync::atomic::AtomicU64::new(first));
+    move |request| {
         if is_summary(request) {
-            return answer(SUMMARY);
+            return answer(if compacted(request) {
+                LATER_SUMMARY
+            } else {
+                SUMMARY
+            });
         }
+        let k = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
         let n = rounds(request) as u64 + 1;
-        let id: &'static str = format!("{}t{n}", if compacted(request) { "c" } else { "" }).leak();
+        let id: &'static str = format!("w{k}").leak();
         tool(
             id,
             "write_file",
             json!({"path": format!("{id}.txt"), "content": "x"}),
             10_000 * n,
         )
-    });
-    let env = env_with(provider, true);
+    }
+}
+
+fn notices_of(events: &[WorkerEvent]) -> Vec<(kgraf_runtime::CompactionNotice, Vec<String>)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            WorkerEvent::Compacted {
+                notice, summary, ..
+            } => Some(((**notice).clone(), summary.decisions.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A worker that cannot hand back and keeps writing reaches its stop point
+/// again after each compaction. It compacts again each time, because the
+/// rounds since made measured progress, until the checkpoint ceiling; then it
+/// hands back with everything it did and the reason. Every later summary keeps
+/// the first one's decision word for word.
+#[tokio::test]
+async fn a_later_stop_point_with_measured_progress_compacts_again_up_to_the_ceiling() {
+    let dir = tempfile::tempdir().expect("dir");
+    let provider = Fake::new(writes_every_round(0));
+    let env = env_with_ceiling(provider.clone(), 3);
     let handle = spawn_worker(env, brief(dir.path()), compact_options())
         .await
         .expect("spawn");
     let (events, result) = drain(handle).await;
-    assert_eq!(compactions(&events).len(), 1, "once, never twice");
+    let notices = notices_of(&events);
+    assert_eq!(
+        notices.len(),
+        3,
+        "compacted at each stop point up to the ceiling"
+    );
+    assert_eq!(
+        notices.iter().map(|(n, _)| n.number).collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+    assert_eq!(
+        notices
+            .iter()
+            .map(|(n, _)| n.may_compact_again)
+            .collect::<Vec<_>>(),
+        vec![true, true, false],
+        "the last one below the ceiling says it is the last"
+    );
+    // Each archive holds everything before its notice, so it only grows.
+    assert!(
+        notices
+            .windows(2)
+            .all(|w| w[0].0.archived_entries < w[1].0.archived_entries),
+        "{notices:?}"
+    );
+    // The first summary's decision survives the later summaries.
+    for (_, decisions) in &notices[1..] {
+        assert!(
+            decisions.iter().any(|d| d == "one file per round"),
+            "{decisions:?}"
+        );
+        assert!(decisions.iter().any(|d| d == "later decision"));
+    }
+    // The model is told which rule applies at its next limit.
+    let after: Vec<String> = provider
+        .requests()
+        .iter()
+        .filter(|r| compacted(r) && !is_summary(r) && rounds(r) == 0)
+        .map(text_of)
+        .collect();
+    assert_eq!(after.len(), 3);
+    assert!(after[0].contains("compacted again only if your files or checks show progress"));
+    assert!(!after[2].contains("compacted again only if"));
     let WorkerOutcome::HandedBack { handoff } = &result.outcome else {
-        panic!("expected a handback, got {:?}", result.outcome);
+        panic!("expected a hand-back, got {:?}", result.outcome);
     };
+    assert_eq!(
+        handoff.compaction_stop,
+        Some(kgraf_runtime::CompactionStop::Ceiling {
+            compactions: 3,
+            ceiling: 3
+        })
+    );
     handoff.validate().expect("something remains");
     assert!(handoff.context_tokens >= 80_000);
     assert!(handoff.remaining[0].contains(INSTRUCTION));
-    // Everything done, before and after the compaction, is in the handoff.
+    // Everything done, in every segment, is in the handoff.
     assert!(
-        handoff.done.iter().any(|d| d.contains("t2.txt")),
+        handoff.done.iter().any(|d| d.contains("w1.txt")),
         "{handoff:?}"
     );
+    assert!(handoff.done.len() >= 30, "{}", handoff.done.len());
+    assert_eq!(result.compaction.as_ref().map(|n| n.number), Some(1));
+    assert_eq!(result.later_compactions.len(), 2);
+}
+
+/// After a compaction the worker only reads. At its next stop point the rounds
+/// since the compaction show no measured progress, so it is not compacted
+/// again: it hands back, with what was measured.
+#[tokio::test]
+async fn a_later_stop_point_with_no_progress_since_the_compaction_hands_back_and_says_so() {
+    let dir = tempfile::tempdir().expect("dir");
+    let provider = Fake::new(|request| {
+        if is_summary(request) {
+            return answer(SUMMARY);
+        }
+        let n = rounds(request) as u64 + 1;
+        if compacted(request) {
+            let id: &'static str = format!("r{n}").leak();
+            return tool(id, "read_config", json!({"section": n}), 10_000 * n);
+        }
+        let id: &'static str = format!("t{n}").leak();
+        tool(
+            id,
+            "write_file",
+            json!({"path": format!("f{n}.txt"), "content": "x"}),
+            10_000 * n,
+        )
+    });
+    let env = env_with(provider.clone(), true);
+    let handle = spawn_worker(env, brief(dir.path()), compact_options())
+        .await
+        .expect("spawn");
+    let (events, result) = drain(handle).await;
+    assert_eq!(compactions(&events).len(), 1, "no second compaction");
+    let WorkerOutcome::HandedBack { handoff } = &result.outcome else {
+        panic!("expected a hand-back, got {:?}", result.outcome);
+    };
+    let Some(kgraf_runtime::CompactionStop::NoProgress {
+        compactions,
+        measure,
+    }) = &handoff.compaction_stop
+    else {
+        panic!("expected no progress, got {:?}", handoff.compaction_stop);
+    };
+    assert_eq!(*compactions, 1);
+    assert!(measure.files_changed.is_empty(), "{measure:?}");
+    assert!(measure.checks_improved.is_empty());
+    assert!(measure.rounds >= 7, "{measure:?}");
+    let said = handoff.compaction_stop.as_ref().expect("stop").describe();
     assert!(
-        handoff.done.iter().any(|d| d.contains("ct1.txt")),
+        said.contains("no measured progress since compaction 1"),
+        "{said}"
+    );
+    // The work before the compaction is in the handoff.
+    assert!(
+        handoff.done.iter().any(|d| d.contains("f2.txt")),
         "{handoff:?}"
     );
+}
+
+/// The opening message and the summary alone reach the stop point after the
+/// compaction: no compaction can make room, so the worker hands back at once,
+/// before another round, and says so with the numbers.
+#[tokio::test]
+async fn a_compaction_that_cannot_get_under_the_stop_point_hands_back_at_once() {
+    let dir = tempfile::tempdir().expect("dir");
+    // About 60,000 tokens of instruction (3 bytes a token) under a stop point
+    // of 80,000, and a summary of about 25,000 more.
+    let filler = "keep the files short. ".repeat(8_200);
+    let big_summary: &'static str = format!(
+        "{{\"goal\": \"write the server files\", \"decisions\": [\"{}\"], \"files_touched\": [], \
+         \"open_items\": [\"write the rest\"], \"constraints\": []}}",
+        "one file per round, ".repeat(3_700)
+    )
+    .leak();
+    let provider = Fake::new(move |request| {
+        if is_summary(request) {
+            return answer(big_summary);
+        }
+        if compacted(request) {
+            return answer("a round after a compaction that left no room");
+        }
+        tool(
+            "t1",
+            "write_file",
+            json!({"path": "f1.txt", "content": "x"}),
+            85_000,
+        )
+    });
+    let env = env_with(provider.clone(), true);
+    let mut b = brief(dir.path());
+    b.instruction = format!("{INSTRUCTION}\n{filler}");
+    let handle = spawn_worker(env, b, compact_options())
+        .await
+        .expect("spawn");
+    let (events, result) = drain(handle).await;
+    assert_eq!(compactions(&events).len(), 1);
+    let WorkerOutcome::HandedBack { handoff } = &result.outcome else {
+        panic!("expected a hand-back, got {:?}", result.outcome);
+    };
+    let Some(kgraf_runtime::CompactionStop::NoRoom {
+        compactions,
+        floor_tokens,
+        stop_tokens,
+    }) = &handoff.compaction_stop
+    else {
+        panic!("expected no room, got {:?}", handoff.compaction_stop);
+    };
+    assert_eq!((*compactions, *stop_tokens), (1, 80_000));
+    assert!(*floor_tokens >= 80_000, "{floor_tokens}");
     assert!(
-        handoff
-            .files_touched
+        !provider
+            .requests()
             .iter()
-            .any(|f| f == Path::new("ct2.txt"))
+            .any(|r| compacted(r) && !is_summary(r)),
+        "no round ran after the compaction"
     );
-    assert!(result.compaction.is_some(), "the notice travels with it");
+    let said = handoff.compaction_stop.as_ref().expect("stop").describe();
+    assert!(said.contains("compaction cannot make room"), "{said}");
+}
+
+/// A resume right after a compaction measures the progress since it from the
+/// baseline the `Compacted` event stored, so the resumed worker that keeps
+/// writing compacts again at its next stop point.
+#[tokio::test]
+async fn a_resume_after_a_compaction_measures_progress_from_the_stored_baseline() {
+    let dir = tempfile::tempdir().expect("dir");
+    let provider = Fake::new(writes_every_round(0));
+    let env = env_with_ceiling(provider, 3);
+    let handle = spawn_worker(env, brief(dir.path()), compact_options())
+        .await
+        .expect("spawn");
+    let (events, _) = drain(handle).await;
+    let at = compactions(&events)[0];
+    let WorkerEvent::Compacted { baseline, .. } = &events[at] else {
+        unreachable!()
+    };
+    assert!(baseline.is_some(), "the baseline is stored on the event");
+    let stored: Vec<WorkerEvent> = events[..=at].to_vec();
+    // New files after the resume: rewriting the same files with the same
+    // content would be no net change.
+    let provider = Fake::new(writes_every_round(100));
+    let env = env_with_ceiling(provider, 2);
+    let handle = spawn_worker(
+        env,
+        brief(dir.path()),
+        SpawnOptions {
+            resume_from: Some(stored),
+            ..compact_options()
+        },
+    )
+    .await
+    .expect("resume");
+    let (events, result) = drain(handle).await;
+    let notices = notices_of(&events);
+    assert_eq!(
+        notices.len(),
+        1,
+        "one more compaction after the resume: {:?}",
+        result.outcome
+    );
+    assert_eq!(notices[0].0.number, 2);
+    let WorkerOutcome::HandedBack { handoff } = &result.outcome else {
+        panic!("expected a hand-back, got {:?}", result.outcome);
+    };
+    assert_eq!(
+        handoff.compaction_stop,
+        Some(kgraf_runtime::CompactionStop::Ceiling {
+            compactions: 2,
+            ceiling: 2
+        })
+    );
 }
 
 #[tokio::test]
@@ -1528,7 +1794,10 @@ async fn a_runtime_summary_carries_the_goal_and_the_unwritten_paths() {
     .expect("spawn");
     let (events, result) = drain(handle).await;
     assert_eq!(result.outcome, WorkerOutcome::Completed, "{result:?}");
-    let WorkerEvent::Compacted { notice, summary } = &events[compactions(&events)[0]] else {
+    let WorkerEvent::Compacted {
+        notice, summary, ..
+    } = &events[compactions(&events)[0]]
+    else {
         unreachable!()
     };
     assert!(

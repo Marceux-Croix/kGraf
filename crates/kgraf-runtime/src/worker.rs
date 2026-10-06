@@ -115,19 +115,27 @@
 //! rounds. With [`StopPointPolicy::HandBack`] (the default) it returns
 //! `HandedBack` with a structured `Handoff`, built from what the loop observed.
 //! With [`StopPointPolicy::Compact`], set by a caller that cannot split the
-//! remainder, the runtime compacts once instead (`compaction.rs`): one accounted
+//! remainder, the runtime compacts instead (`compaction.rs`): one accounted
 //! summary call, a `Compacted` event the model cannot forge or suppress, and a
-//! fresh remainder of the verbatim opening plus the summary. A second overflow
-//! hands back. A user's request (`Injector::request_compaction`) compacts at the
-//! next boundary the same way. A compaction clears the state that describes the
-//! replaced context and carries the state that describes the work
+//! fresh remainder of the verbatim opening plus the summary. At a later stop
+//! point it compacts again while `compaction::recompaction` allows it (room
+//! under the stop point, measured progress since the last compaction, below
+//! the checkpoint ceiling) and hands back with the reason otherwise. A user's
+//! request (`Injector::request_compaction`) compacts at the next boundary the
+//! same way, once. A compaction clears the state that describes the replaced
+//! context and carries the state that describes the work
 //! (`Worker::reset_context_state`).
 //!
 //! ```text
 //!   BetweenRounds, context >= stop point
-//!        | already compacted ------------------------------> HandedBack
-//!        | policy HandBack --------------------------------> HandedBack
-//!        | policy Compact: summary call, Compacted --------> BetweenRounds
+//!        | never compacted, policy HandBack, wrote something -> HandedBack
+//!        | never compacted, policy Compact or nothing written -> compact
+//!        | compacted, nothing written, under the window ------> next round
+//!        | compacted, policy Compact:
+//!        |     room, progress since, below the ceiling -------> compact
+//!        |     otherwise ---------------------------> HandedBack (CompactionStop)
+//!        | compacted, policy HandBack --------------------------> HandedBack
+//!   compact: summary call, Compacted -------------------------> BetweenRounds
 //! ```
 
 use crate::brief::{BriefError, Handoff, WorkerBrief, WorkerOutcome, WorkerResult};
@@ -411,7 +419,8 @@ pub struct SpawnOptions {
     /// environment has skills. Empty for a worker nothing spawned.
     pub inherited_skills: Vec<SkillRestriction>,
     /// What the worker does at its stop point (decision 0095): hand back (the
-    /// default) or, for a caller that cannot split the remainder, compact once.
+    /// default) or, for a caller that cannot split the remainder, compact, and
+    /// compact again at a later stop point on measured progress.
     pub stop_point: StopPointPolicy,
     /// The worker's transcript file, named in a compaction notice so the
     /// orchestrator and the user can find the full pre-compaction history.
@@ -528,26 +537,34 @@ async fn prepare(
             Vec::new(),
         ),
     };
-    // Decision 0095: a resumed worker that compacted keeps its archive (the
-    // events before the notice) and does not compact again; one that did not
-    // keeps its history so far for a later compaction.
+    // Decision 0095: a resumed worker keeps its history so far for a later
+    // compaction; one that compacted also keeps its archive (the events before
+    // its last notice) and the progress measured since that notice, against
+    // the baseline the notice's event stored.
     // Decision 0057: the estimate counts what the next request carries, so it
     // learns whether this route resends reasoning.
     let builder = builder.with_reasoning_resent(env.provider.resends_reasoning());
-    let compaction = builder.compaction().cloned();
-    let (history, archive) = match prior
+    let compactions = builder.compactions().to_vec();
+    let last_compacted = prior
         .iter()
-        .position(|e| matches!(e, WorkerEvent::Compacted { .. }))
-    {
-        Some(at) => (Vec::new(), Some(HistoryArchive::from_events(&prior[..at]))),
-        None => (
-            prior
-                .into_iter()
-                .filter(crate::compaction::archived_kind)
-                .collect(),
-            None,
-        ),
-    };
+        .rposition(|e| matches!(e, WorkerEvent::Compacted { .. }));
+    let archive = last_compacted.map(|at| HistoryArchive::from_events(&prior[..at]));
+    let segment = last_compacted.and_then(|at| {
+        let baseline = builder.compaction_baseline()?.clone();
+        let rounds = prior[..at]
+            .iter()
+            .filter(|e| matches!(e, WorkerEvent::ModelCall { .. }))
+            .count() as u32;
+        let mut segment = crate::progress::SegmentGate::start(baseline, rounds);
+        for event in &prior[at + 1..] {
+            segment.observe(event, &EnvFacts(env));
+        }
+        Some(segment)
+    });
+    let history: Vec<WorkerEvent> = prior
+        .into_iter()
+        .filter(crate::compaction::archived_kind)
+        .collect();
     // A fresh worker that starts at the stop point can only hand back at once with the
     // same remainder: refuse it, rather than let the caller split it forever.
     if fresh && brief.context.reached_point(builder.context_tokens()) {
@@ -751,7 +768,7 @@ async fn prepare(
     // Seeded after the spawn items, so a later `inject` of a transcript id is
     // refused as a duplicate too.
     steering.seed_delivered(delivered);
-    if compaction.is_some() {
+    if !compactions.is_empty() {
         steering.mark_compacted();
     }
     handle.set_spawn_duplicates(already_delivered, listed_twice);
@@ -799,7 +816,8 @@ async fn prepare(
         transcript_path: options.transcript_path,
         history,
         archive,
-        compaction,
+        compactions,
+        segment,
         slices_left_out,
     };
     Ok((worker, endpoint, handle))
@@ -1117,12 +1135,18 @@ struct Worker {
     stop_point: StopPointPolicy,
     /// The transcript file, for the compaction notice.
     transcript_path: Option<PathBuf>,
-    /// The persisted events a compaction archives, until it happens.
+    /// The persisted events a compaction archives: every archived kind of
+    /// the attempt so far, so a later compaction's archive holds all of it.
     history: Vec<WorkerEvent>,
-    /// The pre-compaction history `recall_history` reads, once compacted.
+    /// The pre-compaction history `recall_history` reads, once compacted:
+    /// everything before the last compaction.
     archive: Option<HistoryArchive>,
-    /// The compaction notice, once compacted (at most one per worker).
-    compaction: Option<CompactionNotice>,
+    /// The compaction notices, in order. More than one only for a worker that
+    /// cannot hand back and made measured progress between them.
+    compactions: Vec<CompactionNotice>,
+    /// The progress since the last compaction, for a worker that may compact
+    /// again (decision 0095, amendment of 2026-10-06).
+    segment: Option<crate::progress::SegmentGate>,
     /// The progress gate that turns the round budget into checkpoints
     /// (decision 0096).
     progress: crate::progress::ProgressGate,
@@ -1302,7 +1326,8 @@ impl Worker {
             route_fault: self.route_fault.take(),
             rationale,
             refused: self.refused.take(),
-            compaction: self.compaction.clone(),
+            compaction: self.compactions.first().cloned(),
+            later_compactions: self.compactions.iter().skip(1).cloned().collect(),
             round_blocks: self.progress.report(),
             peak_context_tokens: self.peak_context.max(self.builder.context_tokens()),
         };
@@ -1418,6 +1443,9 @@ impl Worker {
         self.archive_event(&event);
         // Observed in its persisted form, as a resume reads it back.
         self.progress.observe(&event, &EnvFacts(&self.env));
+        if let Some(segment) = self.segment.as_mut() {
+            segment.observe(&event, &EnvFacts(&self.env));
+        }
         if let Some(model_event) = model_event {
             self.builder.apply(model_event);
         }
@@ -1520,15 +1548,16 @@ impl Worker {
                 self.builder.context_tokens() + queued.saturating_mul(3).div_ceil(2);
             self.peak_context = self.peak_context.max(context_tokens);
             // Decision 0095: a user's request compacts at this boundary.
-            if self.compaction.is_none() && self.steering.take_compaction_request() {
+            if self.compactions.is_empty() && self.steering.take_compaction_request() {
                 self.compact(ep, CompactionTrigger::UserRequest, context_tokens)
                     .await?;
                 continue;
             }
             if self.brief.context.reached_point(context_tokens) {
                 // Compaction only where the caller cannot split the
-                // remainder, and only once: a second overflow hands back with
-                // everything the loop observed, never compacts again.
+                // remainder. A later overflow compacts again only on measured
+                // progress (below); otherwise it hands back with everything
+                // the loop observed and the reason.
                 // Nothing written yet: a hand-back would give the child this
                 // same whole task, so it would only move the work down a level
                 // and meet the same stop point (a long first reply plus one
@@ -1542,7 +1571,7 @@ impl Worker {
                         .brief
                         .context
                         .reached_point(self.builder.context_tokens());
-                if self.compaction.is_none()
+                if self.compactions.is_empty()
                     && (self.stop_point == StopPointPolicy::Compact || no_progress)
                 {
                     self.compact(ep, CompactionTrigger::StopPoint, context_tokens)
@@ -1550,7 +1579,29 @@ impl Worker {
                     continue;
                 }
                 if !(no_progress && context_tokens < self.brief.context.effective_window()) {
-                    return Ok((self.hand_back(context_tokens, queued), String::new()));
+                    // Decision 0095, amendment of 2026-10-06: a worker that
+                    // cannot hand back compacts again while there is room
+                    // under the stop point and it made measured progress
+                    // since its last compaction, up to the checkpoint
+                    // ceiling. Holding it would stop work that is moving;
+                    // compacting a worker that is not moving would only
+                    // spend summary calls, so that one hands back and says
+                    // why.
+                    let stop = if !self.compactions.is_empty()
+                        && self.stop_point == StopPointPolicy::Compact
+                    {
+                        match self.may_compact_again().await {
+                            Ok(()) => {
+                                self.compact(ep, CompactionTrigger::StopPoint, context_tokens)
+                                    .await?;
+                                continue;
+                            }
+                            Err(stop) => Some(stop),
+                        }
+                    } else {
+                        None
+                    };
+                    return Ok((self.hand_back(context_tokens, queued, stop), String::new()));
                 }
             }
             // Decision 0096: the round budget is a checkpoint. Measured where
@@ -1912,8 +1963,20 @@ impl Worker {
         std::collections::BTreeMap<PathBuf, Option<String>>,
         Option<BTreeSet<PathBuf>>,
     ) {
-        let root = self.brief.workspace_root.clone();
         let tracked = self.progress.tracked(&self.changed);
+        self.read_tree_paths(tracked).await
+    }
+
+    /// The digests of `tracked` plus every path git lists as dirty, and the
+    /// dirty set when git could be read.
+    async fn read_tree_paths(
+        &mut self,
+        tracked: BTreeSet<PathBuf>,
+    ) -> (
+        std::collections::BTreeMap<PathBuf, Option<String>>,
+        Option<BTreeSet<PathBuf>>,
+    ) {
+        let root = self.brief.workspace_root.clone();
         let at_start = self.git_at_start.clone();
         let read = tokio::task::spawn_blocking(move || {
             let status = at_start
@@ -1998,9 +2061,19 @@ impl Worker {
     fn capture_preimages(&mut self, accesses: &[kgraf_tools::Access]) {
         let root = &self.brief.workspace_root;
         for path in accesses.iter().flat_map(|a| a.writes_paths()) {
-            if self.progress.needs_preimage(path) {
+            let gate = self.progress.needs_preimage(path);
+            let segment = self
+                .segment
+                .as_ref()
+                .is_some_and(|s| s.needs_preimage(path));
+            if gate || segment {
                 let digest = blocking(|| crate::progress::file_digest(&root.join(path)));
-                self.progress.capture_preimage(path.clone(), digest);
+                if gate {
+                    self.progress.capture_preimage(path.clone(), digest.clone());
+                }
+                if let Some(s) = self.segment.as_mut().filter(|_| segment) {
+                    s.capture_preimage(path.clone(), digest);
+                }
             }
         }
     }
@@ -2135,7 +2208,12 @@ impl Worker {
             && !self.made_progress()
     }
 
-    fn hand_back(&self, context_tokens: u64, queued: u64) -> WorkerOutcome {
+    fn hand_back(
+        &self,
+        context_tokens: u64,
+        queued: u64,
+        compaction_stop: Option<crate::compaction::CompactionStop>,
+    ) -> WorkerOutcome {
         let stop = self.brief.context.worker_stop_tokens();
         // The transcript alone is below the point when only the queued
         // messages crossed it.
@@ -2160,8 +2238,35 @@ impl Worker {
                 files_touched: self.worktree_changes(),
                 context_tokens,
                 cause,
+                compaction_stop,
             },
         }
+    }
+
+    /// Whether this worker, which cannot hand back and has compacted, may
+    /// compact again now (`compaction::recompaction`): the floor its last
+    /// compaction left, the progress since it, and the checkpoint ceiling.
+    async fn may_compact_again(&mut self) -> Result<(), crate::compaction::CompactionStop> {
+        let compactions = self.compactions.len() as u32;
+        let floor = self.builder.compaction_floor().unwrap_or(0);
+        let stop = self.brief.context.worker_stop_tokens();
+        let measure = match self.segment.as_ref() {
+            Some(segment) => {
+                let paths = segment.tracked(&self.changed);
+                let (now, dirty) = self.read_tree_paths(paths).await;
+                self.segment
+                    .as_ref()
+                    .map(|s| s.measure(self.budget.used(), &now, dirty.as_ref()))
+            }
+            None => None,
+        };
+        crate::compaction::recompaction(
+            compactions,
+            self.progress.ceiling(),
+            floor,
+            stop,
+            measure.as_ref(),
+        )
     }
 
     /// Clear the state that describes the context a compaction replaced.
@@ -2187,14 +2292,15 @@ impl Worker {
         self.output_limit_retried = false;
     }
 
-    /// Keep `event` (persisted form) for the recall archive, until compaction.
+    /// Keep `event` (persisted form) for the recall archive of a later
+    /// compaction.
     fn archive_event(&mut self, event: &WorkerEvent) {
-        if self.compaction.is_none() && crate::compaction::archived_kind(event) {
+        if crate::compaction::archived_kind(event) {
             self.history.push(event.clone());
         }
     }
 
-    /// Compact this worker's context, once (decision 0095): ask the worker's
+    /// Compact this worker's context (decision 0095): ask the worker's
     /// own route for a summary in the fixed schema through the ledger, then
     /// emit `Compacted`, which rebuilds the remainder from the verbatim
     /// opening plus the notice and summary. A summary call that fails or
@@ -2239,6 +2345,12 @@ impl Worker {
         // yet changed as an open item. A fallback summary is all of this; a
         // model summary keeps its own wording and gains only what it left
         // out, so a summary that drops the goal never loses the task.
+        // A later compaction keeps the earlier summary's decisions and quoted
+        // constraints word for word: this summary was written from a context
+        // that held them, and a restatement of a restatement drifts.
+        if let Some(earlier) = self.builder.last_summary() {
+            crate::compaction::carry_forward(&mut summary, earlier);
+        }
         crate::compaction::complete_from_state(
             &mut summary,
             &self.brief.instruction,
@@ -2266,15 +2378,38 @@ impl Worker {
             recall: self.env.tools.get(RECALL_TOOL).is_some(),
             items_done: self.done.len() as u64,
             items_remaining: summary.open_items.len() as u64,
+            number: self.compactions.len() as u32 + 1,
+            may_compact_again: self.stop_point == StopPointPolicy::Compact
+                && (self.compactions.len() as u32 + 1) < self.progress.ceiling(),
         };
         notice.summary_tokens = kgraf_core::budget::estimate_tokens(
             &crate::compaction::render_notice(&notice, &summary),
         );
-        // Set before the event is sent, so the archive stops growing at the
-        // notice and a second compaction is impossible from here on.
-        self.history = Vec::new();
+        // The baseline the progress since this compaction is measured
+        // against, for a worker that cannot hand back: the tree and the
+        // check scores now. Stored on the event, so a resume measures the
+        // same segment. Taken at the ceiling too, so the hand-back there says
+        // whether the worker was still moving.
+        let baseline = if self.stop_point == StopPointPolicy::Compact {
+            let paths = self.progress.tracked(&self.changed);
+            let (files, _) = self.read_tree_paths(paths).await;
+            let baseline = crate::progress::CheckpointBaseline {
+                files,
+                checks: self.progress.latest_checks(),
+            };
+            self.segment = Some(crate::progress::SegmentGate::start(
+                baseline.clone(),
+                self.budget.used(),
+            ));
+            Some(Box::new(baseline))
+        } else {
+            self.segment = None;
+            None
+        };
+        // Set before the event is sent: recall reads everything before this
+        // notice, and a user's request is refused from here on.
         self.archive = Some(archive);
-        self.compaction = Some(notice.clone());
+        self.compactions.push(notice.clone());
         self.steering.mark_compacted();
         self.reset_context_state();
         self.emit(
@@ -2282,6 +2417,7 @@ impl Worker {
             WorkerEvent::Compacted {
                 notice: Box::new(notice),
                 summary: Box::new(summary),
+                baseline,
             },
         )
         .await
@@ -3420,6 +3556,9 @@ impl Worker {
             })?;
             self.archive_event(&event);
             self.progress.observe(&event, &EnvFacts(&self.env));
+            if let Some(segment) = self.segment.as_mut() {
+                segment.observe(&event, &EnvFacts(&self.env));
+            }
             if let Some(model_event) = &model_event {
                 self.builder.apply(model_event);
             }

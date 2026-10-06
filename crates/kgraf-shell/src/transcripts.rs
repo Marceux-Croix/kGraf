@@ -225,7 +225,9 @@ fn event_turn(event: WorkerEvent, turns: &mut Vec<Turn>) {
         }
         // Decision 0095: the runtime compacted this worker; the turns above
         // are the full earlier history, kept as written.
-        WorkerEvent::Compacted { notice, summary } => turns.push(Turn::Event(
+        WorkerEvent::Compacted {
+            notice, summary, ..
+        } => turns.push(Turn::Event(
             kgraf_runtime::render_notice(&notice, &summary),
         )),
         WorkerEvent::Resumed { call_id } => {

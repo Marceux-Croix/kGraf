@@ -129,7 +129,8 @@ impl Injector {
 
     /// Ask the worker to compact at its next round boundary (decision 0095:
     /// a user's `/compact <worker>`). Refused when the worker has ended or
-    /// has already compacted: a worker compacts at most once.
+    /// has already compacted: a request is taken only before a worker's first
+    /// compaction (later ones are the runtime's, on measured progress).
     pub fn request_compaction(&self) -> Result<(), CompactRequestError> {
         let mut state = self.queue.lock();
         if state.closed {
@@ -152,7 +153,10 @@ impl Injector {
 pub enum CompactRequestError {
     #[error("worker `{worker}` has already finished")]
     Finished { worker: String },
-    #[error("worker `{worker}` has already compacted once; a worker compacts at most once")]
+    #[error(
+        "worker `{worker}` has already compacted; a request to compact is taken only before a \
+         worker's first compaction"
+    )]
     AlreadyCompacted { worker: String },
 }
 

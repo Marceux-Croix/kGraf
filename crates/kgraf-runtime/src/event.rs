@@ -195,14 +195,21 @@ pub enum WorkerEvent {
     /// its [`WorkerEvent::Cancelled`] or [`WorkerEvent::RoundAbandoned`].
     Redacted { counts: BTreeMap<String, u32> },
     /// The runtime compacted this worker's context (decision 0095). Built by
-    /// the loop alone, between rounds, at most once per worker; no model output
-    /// becomes one. Every event before it is the pre-compaction history, kept
-    /// as written. The rebuild replaces the private remainder with the opening
-    /// message plus the rendered notice and summary
-    /// ([`crate::compaction::render_notice`]).
+    /// the loop alone, between rounds; no model output becomes one. A worker
+    /// that cannot hand back may compact more than once, each time on measured
+    /// progress (`crate::compaction::recompaction`). Every event before it is
+    /// the pre-compaction history, kept as written. The rebuild replaces the
+    /// private remainder with the opening message plus the rendered notice and
+    /// summary ([`crate::compaction::render_notice`]).
     Compacted {
         notice: Box<crate::compaction::CompactionNotice>,
         summary: Box<crate::compaction::CompactionSummary>,
+        /// The tree and check scores at the compaction, which the progress
+        /// since it is measured against (`crate::progress::SegmentGate`), so
+        /// a resume measures the same segment. Never model input. Absent in a
+        /// record from before it; such a worker is not compacted again.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        baseline: Option<Box<crate::progress::CheckpointBaseline>>,
     },
     /// A progress checkpoint (decision 0096): what the loop measured over the
     /// block since the previous one, its verdict, and the baseline the next
@@ -377,7 +384,11 @@ impl WorkerEvent {
             // The summary is model output: every text field is scrubbed. The
             // notice is the loop's own structured record (ids, counts, a
             // path the caller chose) and passes unchanged.
-            WorkerEvent::Compacted { notice, summary } => {
+            WorkerEvent::Compacted {
+                notice,
+                summary,
+                baseline,
+            } => {
                 let mut list = |items: Vec<String>, counts: &mut kgraf_secrets::Redactions| {
                     items.into_iter().map(|t| scrub(t, counts)).collect()
                 };
@@ -395,6 +406,7 @@ impl WorkerEvent {
                         constraints,
                         constraints_dropped: summary.constraints_dropped,
                     }),
+                    baseline,
                 }
             }
             // The loop's own measurement. Its one text that came from a

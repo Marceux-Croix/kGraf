@@ -4,8 +4,10 @@
 //! the remainder becomes a child contract (`<parent>.hN`) through the
 //! delegation guards. A chain of hand-backs ends at the depth cap, where the
 //! re-split is refused and the contract was held. Now the worker at the cap is
-//! spawned to compact once instead, and goes on; one that overflows again is
-//! held with its work and its full transcript named.
+//! spawned to compact instead, and goes on. At a later stop point it compacts
+//! again while it makes measured progress (amendment of 2026-10-06); one that
+//! overflows again with no progress is held with the reason, its work and its
+//! full transcript named.
 
 mod support;
 
@@ -138,6 +140,19 @@ async fn a_compacted_worker_that_overflows_again_is_held_with_its_work_and_trans
     };
     assert!(reason.contains("re-split refused"), "{reason}");
     assert!(reason.contains("already compacted once"), "{reason}");
+    // It wrote the same content again after its compaction: no net change,
+    // so it was not compacted again, and the reason says so.
+    assert!(
+        reason.contains("no measured progress since compaction 1"),
+        "{reason}"
+    );
+    assert!(trace(&p).await.iter().any(|e| matches!(
+        e,
+        TraceEvent::Compaction {
+            compaction_stop: Some(kgraf_runtime::CompactionStop::NoProgress { .. }),
+            ..
+        }
+    )));
     assert!(
         reason.contains(".jsonl"),
         "the transcript is named: {reason}"
@@ -146,4 +161,58 @@ async fn a_compacted_worker_that_overflows_again_is_held_with_its_work_and_trans
         held.workspace.is_some(),
         "the worktree with its work is kept"
     );
+}
+
+/// A worker at the depth cap that keeps writing new content passes its stop
+/// point again after its compaction. It made measured progress since, so it
+/// is compacted again instead of held, and finishes: two compactions, one
+/// sizing miss for the worker, and the contract verified.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_compacted_worker_that_keeps_making_progress_compacts_again_and_finishes() {
+    let dir = tempfile::tempdir().expect("dir");
+    let plan = plan("ALWAYSBIG PERSISTENT part WRITE src/big.rs");
+    let p = Parts::open(
+        dir.path(),
+        move |_| plan.clone(),
+        |_| SERVES.into(),
+        Duration::from_millis(5),
+    );
+    let mut cfg = config();
+    cfg.max_split_depth = 0;
+    let o = Orchestrator::new(cfg, p.services(WINDOW)).expect("orchestrator");
+    let report = o
+        .start(RunId::new("r1"), "a big part".into())
+        .await
+        .expect("run");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    let record = RunStore::new(p.graph.clone())
+        .load(&RunId::new("r1"))
+        .expect("load")
+        .expect("record");
+    let deepest: Vec<_> = record
+        .compactions
+        .iter()
+        .filter(|c| c.contract == record.compactions[0].contract)
+        .collect();
+    assert_eq!(deepest.len(), 2, "{:?}", record.compactions);
+    assert_eq!(
+        deepest.iter().map(|c| c.notice.number).collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    assert!(deepest.iter().all(|c| c.worker == deepest[0].worker));
+    assert_eq!(report.verified, vec![deepest[0].contract.clone()]);
+    let events = trace(&p).await;
+    let compacted = events
+        .iter()
+        .filter(|e| matches!(e, TraceEvent::WorkerCompacted { contract, .. } if *contract == deepest[0].contract))
+        .count();
+    assert_eq!(compacted, 2, "each compaction is traced");
+    // One sizing miss per worker, however often it compacted.
+    let handbacks = events
+        .iter()
+        .filter(
+            |e| matches!(e, TraceEvent::WorkerFinished { outcome, .. } if outcome == "handed_back"),
+        )
+        .count() as u64;
+    assert_eq!(record.counters.sizing_misses, handbacks + 1);
 }

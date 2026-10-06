@@ -70,7 +70,8 @@ impl WorkerBrief {
 
 /// What a worker hands back when its context reaches the stop point (0057: the
 /// orchestrator re-splits the remainder). A worker that cannot hand back
-/// compacts once instead, and hands back at a second overflow (0095).
+/// compacts instead, again at each later stop point while it makes measured
+/// progress, and hands back with the reason when it may not (0095).
 ///
 /// Structured so the orchestrator can re-plan from it without reading the worker's
 /// transcript: what is done, what is left, which files the worktree already holds
@@ -88,6 +89,11 @@ pub struct Handoff {
     /// Why the worker stopped: what was measured against the stop point.
     #[serde(default)]
     pub cause: HandoffCause,
+    /// For a worker that could not hand back and had compacted: why it was
+    /// not compacted again (no room, no progress, the ceiling). `None` for
+    /// every other hand-back. Serde-defaulted so an older record loads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_stop: Option<crate::compaction::CompactionStop>,
 }
 
 /// What made a worker hand back. A hand-back is never a projection: the loop
@@ -331,12 +337,17 @@ pub struct WorkerResult {
     /// Serde-defaulted so an older record still loads.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub refused: Vec<crate::shortfall::RefusedCall>,
-    /// The runtime's compaction notice, when this worker compacted (decision
-    /// 0095). Set by the loop alone, never from model output; the orchestrator
-    /// reads it as "the contract was larger than planned". Serde-defaulted so
-    /// an older record still loads.
+    /// The runtime's notice of this worker's first compaction, when it
+    /// compacted (decision 0095). Set by the loop alone, never from model
+    /// output; the orchestrator reads it as "the contract was larger than
+    /// planned". Serde-defaulted so an older record still loads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction: Option<crate::compaction::CompactionNotice>,
+    /// The notices of every later compaction, in order (a worker that cannot
+    /// hand back compacts again on measured progress). Empty for a worker that
+    /// compacted at most once. Serde-defaulted so an older record still loads.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub later_compactions: Vec<crate::compaction::CompactionNotice>,
     /// The provider error that ended the run when it said the route itself is
     /// unreachable (`kgraf_provider::ProviderError::is_route_fault`: the
     /// connection could not be made, or broke). Set by the loop alone; the
@@ -386,6 +397,7 @@ impl WorkerResult {
             rationale: None,
             refused: Vec::new(),
             compaction: None,
+            later_compactions: Vec::new(),
             route_fault: None,
             round_blocks: None,
             peak_context_tokens: 0,
@@ -443,6 +455,7 @@ mod tests {
             files_touched: vec![PathBuf::from("src/parser.rs")],
             context_tokens: 80_000,
             cause: HandoffCause::default(),
+            compaction_stop: None,
         };
         handoff.validate().expect("valid");
         let outcome = WorkerOutcome::HandedBack {

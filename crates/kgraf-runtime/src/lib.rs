@@ -68,11 +68,11 @@ pub use brief::{
     WorkerOutcome, WorkerResult, parse_rationale,
 };
 pub use compaction::{
-    COMPACTION_CALL_KIND, COMPACTION_NOTICE_HEADER, CompactionNotice, CompactionSummary,
-    CompactionTrigger, DEFAULT_READ_COUNT, HistoryArchive, MAX_READ_COUNT, MAX_RECALL_CHARS,
-    MAX_RECALL_HITS, NOTHING_TO_RECALL, RECALL_TOOL, REMAINDER_HEAD, RecallHistoryTool,
-    SUMMARY_REQUEST, StopPointPolicy, SummarySource, handback_remainder, original_instruction,
-    parse_summary, render_notice,
+    COMPACTION_CALL_KIND, COMPACTION_NOTICE_HEADER, CompactionNotice, CompactionStop,
+    CompactionSummary, CompactionTrigger, DEFAULT_READ_COUNT, HistoryArchive, MAX_READ_COUNT,
+    MAX_RECALL_CHARS, MAX_RECALL_HITS, NOTHING_TO_RECALL, RECALL_TOOL, REMAINDER_HEAD,
+    RecallHistoryTool, SUMMARY_REQUEST, StopPointPolicy, SummarySource, carry_forward,
+    handback_remainder, original_instruction, parse_summary, recompaction, render_notice,
 };
 pub use context::{
     GraphSlices, NeutralPrefixEncoder, NoSlices, PrefixCheckError, PrefixInvalidation,

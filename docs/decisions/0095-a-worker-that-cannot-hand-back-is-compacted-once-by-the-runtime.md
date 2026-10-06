@@ -258,3 +258,62 @@ guard must not catch, fails with its fix reverted:
 `an_output_ceiling_stop_after_a_compaction_gets_its_own_continuation`,
 `a_runtime_summary_carries_the_goal_and_the_unwritten_paths`; unit test
 `state_fills_an_empty_summary_and_only_the_gaps_of_a_model_summary`.
+
+## Amendment (2026-10-06): a worker that cannot hand back compacts again on measured progress
+
+A local run with a 32,768-token window and a stop point of 10,485 tokens ended blocked. A worker
+whose hand-back child could not start under the plan target (its prefix and instruction took
+about 6,527 tokens against a target of 5,242) was spawned to compact, compacted once at 11,167
+tokens, reached its stop point again, and handed back; the re-split was refused for the same size
+reason, and the contract was held. Point 1 limited compaction to once per worker, and the
+options rejected a second summary because a summary of a summary compounds error (decision 0057).
+Nothing measured whether the worker was still moving. In that run it was not: after its
+compaction it made four write calls and none succeeded. The hold was right, but kGraf could not
+say why.
+
+Rulings:
+
+- **A later stop point compacts again on measured progress.** A worker spawned with
+  `StopPointPolicy::Compact` that reaches its stop point again is compacted again when
+  `kgraf_runtime::recompaction` allows it, checked in this order:
+  1. **Room:** the context right after its last compaction (the opening message, notice and
+     summary) is under the stop point. Otherwise no compaction can make room and the contract
+     can never fit at this stop point: `no_room`, at once, before another round.
+  2. **Progress:** the rounds since the last compaction made measured progress: decision 0096's
+     measure (net file change or an improving check, and no sloppy pattern), against the tree
+     and the check scores at the compaction. They are stored on the `Compacted` event, so a
+     resume measures the same segment; a record from before them is not compacted again.
+     Otherwise `no_progress`, with the measure.
+  3. **Ceiling:** it has compacted fewer times than the progress checkpoint ceiling
+     (`max_checkpoints`, default 10). Otherwise `ceiling`. A ceiling of 1 keeps the single
+     compaction of before.
+  The order is the order of certainty: no room can never fit, whatever the model does; no
+  progress stops whatever the ceiling; the ceiling bounds the rest, so there is no unbounded
+  loop. A worker spawned with `StopPointPolicy::HandBack` still compacts at most once (when it
+  has written nothing), and a user's `/compact` is taken only before a worker's first compaction.
+- **No summary of a summary.** A later summary keeps every decision and quoted constraint of the
+  earlier one word for word, in front, in the earlier order (`compaction::carry_forward`); the
+  goal, the changed files and the unwritten paths already come from kGraf's state; the
+  instruction is verbatim in the remainder; `recall_history` reads everything before the last
+  compaction. No field the model sees is a restatement of a restatement.
+- **The hand-back says which.** `Handoff::compaction_stop` carries the reason; the trace's
+  `compaction` record has it as `compaction_stop`; the held reason states it, for example "no
+  measured progress since compaction 1 (0 file(s) changed, no check improved, 4 failed write(s)
+  against 0 that succeeded over 5 round(s)), so it was not compacted again".
+- **The notice tells the model the rule.** `CompactionNotice::number` counts compactions from 1;
+  `may_compact_again` makes the notice say that the limit compacts again only on progress.
+- **The orchestrator records every compaction** (`WorkerResult::later_compactions`, one
+  `worker_compacted` trace event and run-record entry each), counts one sizing miss per worker,
+  and reports how often it compacted.
+
+Tests, each failing with its part reverted and passing with it restored:
+`kgraf-runtime/tests/compaction.rs`
+`a_later_stop_point_with_measured_progress_compacts_again_up_to_the_ceiling`,
+`a_later_stop_point_with_no_progress_since_the_compaction_hands_back_and_says_so`,
+`a_compaction_that_cannot_get_under_the_stop_point_hands_back_at_once`,
+`a_resume_after_a_compaction_measures_progress_from_the_stored_baseline`; unit tests
+`recompaction_needs_room_then_progress_then_a_count_under_the_ceiling` and
+`a_later_summary_keeps_every_earlier_decision_and_constraint_word_for_word`;
+`kgraf-orchestrator/tests/compaction_depth.rs`
+`a_compacted_worker_that_keeps_making_progress_compacts_again_and_finishes` and
+`a_compacted_worker_that_overflows_again_is_held_with_its_work_and_transcript_named`.

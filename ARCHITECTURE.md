@@ -398,12 +398,13 @@ and that read is charged to it alone. The Anthropic adapter also marks the
 last block of the last message as a cache breakpoint, so the growing history is
 cached and not only the system prompt.
 
-**At its stop point a worker hands back, or compacts once (decision 0095).**
+**At its stop point a worker hands back, or compacts (decision 0095).**
 Old tool outputs are masked on every request (decision 0057). When the context
 reaches the stop point the worker hands its remainder back, and the
 orchestrator makes it a child contract through the delegation guards. Where
-the guards would refuse that child (the depth cap, the task length bound), the
-runtime, never the model, compacts the worker once instead:
+the guards would refuse that child (the depth cap, the task length bound), or
+the child could not start under the plan target, the runtime, never the model,
+compacts the worker instead:
 
 - one accounted summary call on the worker's own route, in a fixed JSON schema
   (goal, decisions, files touched, open items, constraints quoted word for
@@ -422,9 +423,21 @@ runtime, never the model, compacts the worker once instead:
   `recall_history` tool searches and reads them (the worker's own history
   only, bounded output).
 
-A second overflow hands back; at the cap the contract is held with its
-worktree and its transcript named. `/compact <worker>` compacts a running
-worker at its next boundary, once.
+At a later stop point the worker compacts again only when all of these hold,
+checked in this order: the context right after its last compaction was under
+the stop point (else no compaction can make room, and the contract can never
+fit at this stop point); the rounds since that compaction made measured
+progress (the progress gate's measure of decision 0096: net file change or an
+improving check, and no sloppy pattern, against the tree and check scores
+stored with the compaction, so a resume measures the same segment); and it has
+compacted fewer times than the progress checkpoint ceiling (a ceiling of 1
+keeps a single compaction). Otherwise it hands back with the reason (no room,
+no progress, or the ceiling), which the trace records and the held reason
+states, with the worktree and the transcript named. A later summary keeps
+every earlier decision and quoted constraint word for word, so no summary is a
+restatement of a restatement. Each compaction is traced and recorded; the
+worker counts as one sizing miss. `/compact <worker>` compacts a running
+worker at its next boundary, and only before its first compaction.
 
 What describes the replaced context is cleared at the compaction: the stall
 counts, since the earlier results are gone and a re-read is legitimate (a call

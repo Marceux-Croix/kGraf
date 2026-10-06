@@ -332,8 +332,16 @@ impl Provider for WorkerFake {
                     .is_some_and(|t| t.contains(kgraf_runtime::COMPACTION_NOTICE_HEADER))
             })
         });
-        let always =
-            instruction.contains("ALWAYSBIG") && (!compacted || instruction.contains("STUBBORN"));
+        // `PERSISTENT` stays big at the first round after its first compaction
+        // and writes new content each time, so the runtime measures progress
+        // and compacts it again; after the second compaction it is small and
+        // finishes (decision 0095, amendment of 2026-10-06).
+        let persistent = instruction.contains("PERSISTENT")
+            && compacted
+            && round == 0
+            && persistent_round(&instruction) <= 1;
+        let always = instruction.contains("ALWAYSBIG")
+            && (!compacted || instruction.contains("STUBBORN") || persistent);
         let big = (instruction.starts_with("BIG") || always) && round == 0;
         // Far more than any estimate of a small brief, under the stop point.
         let costly = instruction.contains("COSTLY") && round == 0;
@@ -372,6 +380,15 @@ impl Provider for WorkerFake {
                     .expect("lock")
                     .clone()
                     .unwrap_or_else(|| self.vendor.to_owned());
+                // New content at every write, so each counts as progress.
+                let written = if instruction.contains("PERSISTENT") {
+                    format!(
+                        "{written} {}",
+                        PERSISTENT_WRITES.fetch_add(1, Ordering::SeqCst)
+                    )
+                } else {
+                    written
+                };
                 let mut content = vec![
                     Content::text("writing"),
                     Content::ToolUse {
@@ -430,6 +447,20 @@ impl Provider for WorkerFake {
             request_id: None,
         })
     }
+}
+
+/// A distinct suffix for every `PERSISTENT` write.
+static PERSISTENT_WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many compacted first rounds a `PERSISTENT` instruction has had before
+/// this one, counted per instruction.
+fn persistent_round(instruction: &str) -> u32 {
+    static SEEN: std::sync::LazyLock<Mutex<std::collections::HashMap<String, u32>>> =
+        std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+    let mut seen = SEEN.lock().expect("lock");
+    let n = seen.entry(instruction.to_owned()).or_insert(0);
+    *n += 1;
+    *n
 }
 
 type Reply = dyn Fn(&str) -> String + Send + Sync;

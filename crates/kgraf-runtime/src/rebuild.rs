@@ -165,8 +165,16 @@ pub struct TranscriptBuilder {
     /// The estimate of what precedes the messages (the shared prefix), for
     /// the context estimate after a compaction.
     base_tokens: u64,
-    /// The compaction this transcript records, if any (at most one).
-    compaction: Option<crate::compaction::CompactionNotice>,
+    /// The compactions this transcript records, in order.
+    compactions: Vec<crate::compaction::CompactionNotice>,
+    /// The last compaction's summary, which a later one carries forward.
+    last_summary: Option<crate::compaction::CompactionSummary>,
+    /// The context estimate right after the last compaction: the floor no
+    /// compaction can get under (the opening message, notice and summary).
+    compaction_floor: Option<u64>,
+    /// The tree and check scores at the last compaction, when its event
+    /// stored them: the baseline of the progress since it.
+    compaction_baseline: Option<crate::progress::CheckpointBaseline>,
     /// The index in `replay` of the first round after the compaction, so a
     /// resume restarts the stall counts where the live loop did.
     replay_compacted_at: Option<usize>,
@@ -179,7 +187,10 @@ impl TranscriptBuilder {
         Self {
             opening: opening.clone(),
             base_tokens: 0,
-            compaction: None,
+            compactions: Vec::new(),
+            last_summary: None,
+            compaction_floor: None,
+            compaction_baseline: None,
             replay_compacted_at: None,
             messages: opening,
             text: String::new(),
@@ -226,9 +237,24 @@ impl TranscriptBuilder {
         self
     }
 
-    /// The compaction this transcript records, if any.
-    pub fn compaction(&self) -> Option<&crate::compaction::CompactionNotice> {
-        self.compaction.as_ref()
+    /// The compactions this transcript records, in order.
+    pub fn compactions(&self) -> &[crate::compaction::CompactionNotice] {
+        &self.compactions
+    }
+
+    /// The last compaction's summary, if any.
+    pub fn last_summary(&self) -> Option<&crate::compaction::CompactionSummary> {
+        self.last_summary.as_ref()
+    }
+
+    /// The context estimate right after the last compaction, if any.
+    pub fn compaction_floor(&self) -> Option<u64> {
+        self.compaction_floor
+    }
+
+    /// The baseline the last compaction stored, if any.
+    pub fn compaction_baseline(&self) -> Option<&crate::progress::CheckpointBaseline> {
+        self.compaction_baseline.as_ref()
     }
 
     /// Apply one event.
@@ -522,7 +548,11 @@ impl TranscriptBuilder {
             // (`ProgressGate::resume`); the grace notice, when there is one,
             // is its own `Notice` event.
             WorkerEvent::Checkpoint { .. } => {}
-            WorkerEvent::Compacted { notice, summary } => {
+            WorkerEvent::Compacted {
+                notice,
+                summary,
+                baseline,
+            } => {
                 // Results held for the next turn belong to the history the
                 // summary replaced; the loop compacts only between rounds,
                 // so none is pending there.
@@ -554,7 +584,10 @@ impl TranscriptBuilder {
                 {
                     self.calls.push(call.clone());
                 }
-                self.compaction = Some((**notice).clone());
+                self.compactions.push((**notice).clone());
+                self.last_summary = Some((**summary).clone());
+                self.compaction_floor = Some(self.tokens_since_usage);
+                self.compaction_baseline = baseline.as_deref().cloned();
                 self.replay_compacted_at = Some(self.replay.len());
             }
         }

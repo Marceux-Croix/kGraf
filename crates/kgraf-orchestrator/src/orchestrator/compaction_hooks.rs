@@ -4,18 +4,23 @@
 //! 1. `stop_point_policy`, at dispatch: the remainder the worker would hand
 //!    back is put to the delegation guards as a would-be child. When they
 //!    would refuse it (the depth cap, the task length bound, a taken child
-//!    id), a hand-back would only hold the contract, so the worker is spawned
-//!    with `StopPointPolicy::Compact`: it compacts once and goes on. Where the
-//!    guards would pass it, the worker hands back as before.
-//! 2. `record_compaction`, when the worker finishes: the runtime's notice is
-//!    the orchestrator's evidence that the contract was larger than planned.
-//!    It is written to the trace (`worker_compacted`) and the run record
-//!    (`compactions`), counted as a sizing miss, and reported. The ledger
-//!    already holds the worker's peak context and the summary call, which is
-//!    what the sizer projects later plans from.
-//! 3. `compaction_note`: a compacted worker that overflowed again hands back;
-//!    when the re-split is refused, the held reason says where the work and
-//!    the full transcript are, so nothing is lost.
+//!    id), or the child could not start with room to work (`handback_fit`), a
+//!    hand-back would only hold the contract, so the worker is spawned with
+//!    `StopPointPolicy::Compact`: it compacts and goes on, and compacts again
+//!    at a later stop point while it makes measured progress
+//!    (`kgraf_runtime::recompaction`). Where the guards would pass the child
+//!    and it fits, the worker hands back as before.
+//! 2. `record_compactions`, when the worker finishes: the runtime's notices
+//!    are the orchestrator's evidence that the contract was larger than
+//!    planned. Each is written to the trace (`worker_compacted`) and the run
+//!    record (`compactions`); the worker counts as one sizing miss and gets
+//!    one report. The ledger already holds the worker's peak context and the
+//!    summary calls, which is what the sizer projects later plans from.
+//! 3. `compaction_note`: a compacted worker that was not compacted again hands
+//!    back with the runtime's reason (`kgraf_runtime::CompactionStop`: no room
+//!    under the stop point, no measured progress, or the ceiling); when the
+//!    re-split is refused, the held reason names that reason and says where
+//!    the work and the full transcript are, so nothing is lost.
 //! 4. `request_compaction`: `/compact <worker>` reaches the running worker's
 //!    queue; the worker compacts at its next boundary.
 
@@ -106,45 +111,59 @@ impl RunLoop {
         )
     }
 
-    /// Record a worker's compaction: trace, run record, sizing miss, report.
-    pub(super) async fn record_compaction(
+    /// Record a worker's compactions, in order: each to the trace and the
+    /// run record; one sizing miss for the worker when any came from the stop
+    /// point (a worker is one miss however often it compacted), and one
+    /// report.
+    pub(super) async fn record_compactions(
         &mut self,
         contract: &OpenContract,
         worker: &AgentId,
-        notice: &CompactionNotice,
+        notices: &[&CompactionNotice],
     ) -> Result<(), OrchestratorError> {
-        self.trace(TraceEvent::WorkerCompacted {
-            at_ms: notice.at_ms,
-            contract: contract.contract.clone(),
-            worker: worker.to_string(),
-            notice: notice.clone(),
-        })
-        .await?;
-        // A user's request says nothing about the plan; the stop point does.
-        let sizing_miss = notice.trigger == CompactionTrigger::StopPoint;
+        let Some(last) = notices.last() else {
+            return Ok(());
+        };
+        for notice in notices {
+            self.trace(TraceEvent::WorkerCompacted {
+                at_ms: notice.at_ms,
+                contract: contract.contract.clone(),
+                worker: worker.to_string(),
+                notice: (*notice).clone(),
+            })
+            .await?;
+            // A user's request says nothing about the plan; the stop point does.
+            let sizing_miss = notice.trigger == CompactionTrigger::StopPoint;
+            self.record
+                .compactions
+                .push(crate::run_state::CompactionRecord {
+                    contract: contract.contract.clone(),
+                    worker: worker.to_string(),
+                    sizing_miss,
+                    notice: (*notice).clone(),
+                });
+        }
+        let sizing_miss = notices
+            .iter()
+            .any(|n| n.trigger == CompactionTrigger::StopPoint);
         if sizing_miss {
             self.record.counters.sizing_misses += 1;
         }
-        self.record
-            .compactions
-            .push(crate::run_state::CompactionRecord {
-                contract: contract.contract.clone(),
-                worker: worker.to_string(),
-                sizing_miss,
-                notice: notice.clone(),
-            });
+        let at: Vec<String> = notices.iter().map(|n| n.at_tokens.to_string()).collect();
         let text = if sizing_miss {
             format!(
-                "compacted once at {} of {} tokens: the contract was larger than planned; {}",
-                notice.at_tokens,
-                notice.window_tokens,
-                transcript_words(notice)
+                "compacted {} at {} of {} tokens: the contract was larger than planned; {}",
+                times(notices.len()),
+                at.join(", "),
+                last.window_tokens,
+                transcript_words(last)
             )
         } else {
             format!(
-                "compacted once on request at {} tokens; {}",
-                notice.at_tokens,
-                transcript_words(notice)
+                "compacted {} on request at {} tokens; {}",
+                times(notices.len()),
+                at.join(", "),
+                transcript_words(last)
             )
         };
         self.submit_report(contract, Some(worker), ReportKind::Informational, &text);
@@ -152,23 +171,30 @@ impl RunLoop {
     }
 
     /// What a held reason adds when the hand-back came from a worker that had
-    /// already compacted: where its work and its full history are.
-    pub(super) fn compaction_note(&self, worker: &AgentId) -> String {
-        match self
+    /// already compacted: how often, why it was not compacted again (`stop`,
+    /// from the runtime), and where its work and its full history are.
+    pub(super) fn compaction_note(
+        &self,
+        worker: &AgentId,
+        stop: Option<&kgraf_runtime::CompactionStop>,
+    ) -> String {
+        let mine: Vec<&crate::run_state::CompactionRecord> = self
             .record
             .compactions
             .iter()
-            .rev()
-            .find(|c| c.worker == worker.as_str())
-        {
-            Some(c) => format!(
-                "; the worker had already compacted once at {} tokens and reached its stop point \
-                 again; its work so far is kept in the worktree, and {}",
-                c.notice.at_tokens,
-                transcript_words(&c.notice)
-            ),
-            None => String::new(),
-        }
+            .filter(|c| c.worker == worker.as_str())
+            .collect();
+        let Some(last) = mine.last() else {
+            return String::new();
+        };
+        let why = stop.map_or_else(String::new, |s| format!(": {}", s.describe()));
+        format!(
+            "; the worker had already compacted {} (last at {} tokens) and reached its stop \
+             point again{why}; its work so far is kept in the worktree, and {}",
+            times(mine.len()),
+            last.notice.at_tokens,
+            transcript_words(&last.notice)
+        )
     }
 
     /// `/compact <worker>`: ask the running worker to compact at its next
@@ -190,6 +216,15 @@ impl RunLoop {
             CompactRequestError::Finished { .. } => CompactError::UnknownWorker(worker),
             CompactRequestError::AlreadyCompacted { .. } => CompactError::AlreadyCompacted(worker),
         })
+    }
+}
+
+/// A count of compactions in words.
+fn times(n: usize) -> String {
+    match n {
+        1 => "once".to_owned(),
+        2 => "twice".to_owned(),
+        n => format!("{n} times"),
     }
 }
 

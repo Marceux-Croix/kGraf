@@ -193,6 +193,11 @@ pub enum TraceEvent {
         /// projection. Empty in a trace from before the field.
         #[serde(default)]
         cause: String,
+        /// For a worker that could not hand back and had compacted: why it
+        /// was not compacted again (`kgraf_runtime::CompactionStop`). Absent
+        /// for every other hand-back and in a trace from before the field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        compaction_stop: Option<kgraf_runtime::CompactionStop>,
     },
     /// The runtime compacted a worker (decision 0095): its fixed notice, as
     /// the worker emitted it.

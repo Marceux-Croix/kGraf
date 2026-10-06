@@ -1577,18 +1577,27 @@ Behavior that differs from earlier builds. Each item names the decision that hol
   transcript, and the worker can search it with the `recall_history` tool. The run report
   counts the compaction with the hand-backs (`misses`), the trace has a `worker_compacted`
   record naming the transcript file, and the run record lists it under `compactions`. A
-  worker that fills its context a second time hands back, and its contract is held with a
-  reason that names the worktree and the transcript (0095).
+  worker that fills its context again is compacted again while it is making progress: since
+  its last compaction a file it works on changed or a test or build result improved, with no
+  run of failed writes or repeated errors. A worker with no such progress, one whose context
+  cannot get under the stop point even after a compaction, or one that reached the
+  compaction ceiling (the progress checkpoint ceiling, `--max-checkpoints`, default 10; 1
+  allows one compaction) hands back, and its contract is held with a reason that says which,
+  and names the worktree and the transcript. The run report counts each compaction, and a
+  worker as one miss however often it compacted (0095).
 - A hand-back's child starts with room to work. Its instruction quotes the original instruction
   once, with a line that says which hand-back it is, instead of quoting each earlier brief
   inside the next. Its pinned slices are cut to what is left after the prefix and the
   instruction under the plan target (half the stop point), each slice counted as rendered; a
   notice says how many were kept, and the worker reads the rest with its tools. When the prefix
   and the instruction alone pass the plan target, no child can fit: the worker is spawned to
-  compact once at its stop point instead of handing back, and a re-split that is still asked
-  for is refused at the first hand-back with the numbers (0095).
+  compact at its stop point instead of handing back (again at a later stop point while it makes
+  progress), and a re-split that is still asked for is refused with the numbers and the reason
+  the worker was not compacted again (0095).
 - Every worker's tool list now includes `recall_history`, so a worker transcript recorded by
   an earlier build cannot be resumed; start that work again (0095).
+- `/compact <worker>` is refused once that worker has compacted, whether you asked for the
+  compaction or kGraf made it at the stop point (0095).
 - A contract whose named graph slices all find nothing, or that names none, is given the
   top-level symbols of the files it declares it writes (at most 8, about 4,000 tokens
   together). The trace has a `notice` naming the files, and each name that found nothing is

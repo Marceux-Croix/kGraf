@@ -757,8 +757,12 @@ pub enum CompactError {
     /// a moment.
     #[error("worker `{0}` has not started yet; ask again once it runs")]
     NotStarted(String),
-    /// A worker compacts at most once (decision 0095).
-    #[error("worker `{0}` has already compacted once; a worker compacts at most once")]
+    /// A user's request is taken only before a worker's first compaction
+    /// (decision 0095).
+    #[error(
+        "worker `{0}` has already compacted; a request to compact is taken only before a \
+         worker's first compaction"
+    )]
     AlreadyCompacted(String),
     #[error("no running worker `{0}` in this run")]
     UnknownWorker(String),
@@ -6217,8 +6221,9 @@ impl RunLoop {
         let compacted_at_stop = f
             .result
             .compaction
-            .as_ref()
-            .is_some_and(|n| n.trigger == kgraf_runtime::CompactionTrigger::StopPoint);
+            .iter()
+            .chain(&f.result.later_compactions)
+            .any(|n| n.trigger == kgraf_runtime::CompactionTrigger::StopPoint);
         // Decision 0096: a worker that ran past its round budget on measured
         // progress is a sizing miss too.
         let extended = f
@@ -6256,8 +6261,15 @@ impl RunLoop {
         self.observe_route_health(&f.contract, &f.worker, &route_name, &f.result, now)
             .await?;
         self.trace_spend().await?;
-        if let Some(notice) = &f.result.compaction {
-            self.record_compaction(&contract, &f.worker, notice).await?;
+        let notices: Vec<&kgraf_runtime::CompactionNotice> = f
+            .result
+            .compaction
+            .iter()
+            .chain(&f.result.later_compactions)
+            .collect();
+        if !notices.is_empty() {
+            self.record_compactions(&contract, &f.worker, &notices)
+                .await?;
         }
         if let Some(blocks) = &f.result.round_blocks {
             // One miss per worker: a hand-back or a stop-point compaction
@@ -6636,6 +6648,7 @@ impl RunLoop {
                     done_items: handoff.done.len(),
                     remaining_items: handoff.remaining.len(),
                     cause: handoff.cause.as_str().to_owned(),
+                    compaction_stop: handoff.compaction_stop.clone(),
                 })
                 .await?;
                 self.submit_report(
@@ -7528,6 +7541,7 @@ impl RunLoop {
                             parent,
                             worker,
                             reason,
+                            handoff.compaction_stop.as_ref(),
                             &workspace,
                             inherited_name.as_deref().zip(inherited_handle.as_deref()),
                         )
@@ -7578,6 +7592,7 @@ impl RunLoop {
                             parent,
                             worker,
                             format!("re-split refused: {unfit}"),
+                            handoff.compaction_stop.as_ref(),
                             &workspace,
                             inherited_name.as_deref().zip(inherited_handle.as_deref()),
                         )
@@ -7683,10 +7698,11 @@ impl RunLoop {
         parent: &OpenContract,
         worker: &AgentId,
         reason: String,
+        stop: Option<&kgraf_runtime::CompactionStop>,
         workspace: &Path,
         inherited: Option<(&str, &str)>,
     ) -> Result<(), OrchestratorError> {
-        let reason = reason + &self.compaction_note(worker);
+        let reason = reason + &self.compaction_note(worker, stop);
         self.submit_report(
             parent,
             Some(worker),

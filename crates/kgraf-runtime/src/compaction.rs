@@ -8,7 +8,7 @@
 //! on one running worker. The model never triggers it, never performs it and
 //! cannot suppress it.
 //!
-//! **What the runtime does, once per worker:**
+//! **What the runtime does at each compaction:**
 //!
 //! 1. Asks the worker's own route for a summary in a fixed JSON schema
 //!    ([`CompactionSummary`]): goal, decisions, files touched, open items, and
@@ -30,9 +30,19 @@
 //!    `compacted` line; the loop keeps the same events in memory as the
 //!    [`HistoryArchive`] that [`RECALL_TOOL`] searches.
 //!
-//! A second overflow after compaction hands back with full information (what is
-//! done, the files, the compaction notice); it never compacts again and never
-//! truncates.
+//! **Again, only on measured progress.** A worker spawned with
+//! [`StopPointPolicy::Compact`] that reaches its stop point again is compacted
+//! again only when [`recompaction`] allows it: the context right after its last
+//! compaction was below the stop point (else no compaction can make room), the
+//! rounds since that compaction made measured progress (the progress gate's
+//! measure, decision 0096, over [`crate::progress::SegmentGate`]), and it has
+//! compacted fewer times than the checkpoint ceiling. Otherwise it hands back
+//! with full information and the reason ([`CompactionStop`] on the handoff);
+//! it never truncates. A later summary keeps every earlier decision and quoted
+//! constraint word for word ([`carry_forward`]), so a summary is never a
+//! paraphrase of a paraphrase. A worker spawned with
+//! [`StopPointPolicy::HandBack`] compacts at most once (when it has written
+//! nothing), and a user's request compacts at most once.
 //!
 //! **Recall.** `recall_history` is registered in every worker's prefix, so the
 //! tool list stays one per vendor and model; before a compaction it answers that
@@ -93,9 +103,10 @@ pub enum StopPointPolicy {
     /// default: a caller that can split the remainder wants it back.
     #[default]
     HandBack,
-    /// Compact once and go on: the caller cannot split the remainder (a
-    /// re-split child would pass the delegation depth cap, for example). A
-    /// second overflow hands back.
+    /// Compact and go on: the caller cannot split the remainder (a re-split
+    /// child would pass the delegation depth cap, or could not start with room
+    /// to work). At a later stop point the worker compacts again while
+    /// [`recompaction`] allows it, and hands back with the reason otherwise.
     Compact,
 }
 
@@ -174,6 +185,164 @@ pub struct CompactionNotice {
     pub items_done: u64,
     /// Open items the summary lists.
     pub items_remaining: u64,
+    /// Which compaction of this worker this is, from 1. Serde-defaulted so an
+    /// older record (one compaction at most) still loads.
+    #[serde(default = "first_compaction")]
+    pub number: u32,
+    /// Whether the worker may be compacted again at its next stop point, on
+    /// measured progress ([`StopPointPolicy::Compact`]). The notice tells the
+    /// model what happens at the limit. Serde-defaulted to the earlier rule.
+    #[serde(default)]
+    pub may_compact_again: bool,
+}
+
+fn first_compaction() -> u32 {
+    1
+}
+
+/// Why a worker that cannot hand back was not compacted again at its stop
+/// point and handed back instead (decision 0095, amendment of 2026-10-06).
+/// Carried on the handoff, so the orchestrator's held reason says which.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "stop", rename_all = "snake_case")]
+pub enum CompactionStop {
+    /// The context right after the last compaction (the opening message, the
+    /// notice and the summary) already reached the stop point: no compaction
+    /// can make room. The contract can never fit at this stop point.
+    NoRoom {
+        compactions: u32,
+        floor_tokens: u64,
+        stop_tokens: u64,
+    },
+    /// The rounds since the last compaction made no measured progress.
+    NoProgress {
+        compactions: u32,
+        measure: crate::progress::ProgressMeasure,
+    },
+    /// The worker made progress but has compacted as many times as the
+    /// checkpoint ceiling allows.
+    Ceiling { compactions: u32, ceiling: u32 },
+}
+
+impl CompactionStop {
+    /// One clause for a held reason.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::NoRoom {
+                compactions,
+                floor_tokens,
+                stop_tokens,
+            } => format!(
+                "compaction cannot make room: after compaction {compactions} the context still \
+                 took {floor_tokens} tokens, at or over the {stop_tokens}-token stop point, so \
+                 no round could run; raise the context window or the stop point, or shorten the \
+                 instruction"
+            ),
+            Self::NoProgress {
+                compactions,
+                measure,
+            } => {
+                let mut why = Vec::new();
+                why.push(format!("{} file(s) changed", measure.files_changed.len()));
+                if measure.checks_improved.is_empty() {
+                    why.push("no check improved".to_owned());
+                }
+                for pattern in &measure.sloppy {
+                    why.push(match pattern {
+                        crate::progress::SloppyPattern::FailedWrites { failed, succeeded } => {
+                            format!("{failed} failed write(s) against {succeeded} that succeeded")
+                        }
+                        crate::progress::SloppyPattern::RepeatedError { tool, times } => {
+                            format!("one `{tool}` error {times} times")
+                        }
+                        crate::progress::SloppyPattern::RepeatedCalls { tool, times } => {
+                            format!("one `{tool}` call with one result {times} times")
+                        }
+                        crate::progress::SloppyPattern::WriteThenRevert { paths } => {
+                            format!("{} file(s) written and put back", paths.len())
+                        }
+                    });
+                }
+                format!(
+                    "no measured progress since compaction {compactions} ({} over {} round(s)), \
+                     so it was not compacted again",
+                    why.join(", "),
+                    measure.rounds
+                )
+            }
+            Self::Ceiling {
+                compactions,
+                ceiling,
+            } => format!(
+                "it made progress but reached the ceiling of {ceiling} compaction(s) (the \
+                 progress checkpoint ceiling) after {compactions}"
+            ),
+        }
+    }
+}
+
+/// Whether a worker that cannot hand back may be compacted again at its stop
+/// point. `compactions` is how many times it has compacted (at least 1),
+/// `ceiling` the progress checkpoint ceiling, `floor_tokens` the context right
+/// after its last compaction, and `progress` what the rounds since then
+/// measured (`None`: not measurable, as for a transcript from before the
+/// segment baseline was stored, which keeps the earlier rule: no second
+/// compaction).
+///
+/// The order is the order of certainty: a context that cannot get under the
+/// stop point can never fit, whatever the model does; a worker with no
+/// progress stops whatever the ceiling; the ceiling bounds the rest.
+pub fn recompaction(
+    compactions: u32,
+    ceiling: u32,
+    floor_tokens: u64,
+    stop_tokens: u64,
+    progress: Option<&crate::progress::ProgressMeasure>,
+) -> Result<(), CompactionStop> {
+    if floor_tokens >= stop_tokens {
+        return Err(CompactionStop::NoRoom {
+            compactions,
+            floor_tokens,
+            stop_tokens,
+        });
+    }
+    match progress {
+        Some(measure) if measure.progressing() => {}
+        other => {
+            return Err(CompactionStop::NoProgress {
+                compactions,
+                measure: other.cloned().unwrap_or_default(),
+            });
+        }
+    }
+    if compactions >= ceiling.max(1) {
+        return Err(CompactionStop::Ceiling {
+            compactions,
+            ceiling: ceiling.max(1),
+        });
+    }
+    Ok(())
+}
+
+/// Keep what an earlier summary of this worker recorded: each of its decisions
+/// and quoted constraints that `summary` does not hold word for word is put
+/// back, in front and in the earlier order. A later summary is written from a
+/// context that holds the earlier one, so without this its decisions would be
+/// a restatement of a restatement (the compounding error decision 0057 warns
+/// of); with it, every decision is the model's own first wording.
+pub fn carry_forward(summary: &mut CompactionSummary, earlier: &CompactionSummary) {
+    fn keep(now: &mut Vec<String>, before: &[String]) {
+        let squashed: Vec<String> = now.iter().map(|d| squash(d)).collect();
+        let mut kept: Vec<String> = before
+            .iter()
+            .filter(|d| !squashed.contains(&squash(d)))
+            .cloned()
+            .collect();
+        kept.append(now);
+        *now = kept;
+    }
+    keep(&mut summary.decisions, &earlier.decisions);
+    keep(&mut summary.constraints, &earlier.constraints);
 }
 
 /// Parse a summary reply: the first `{` to the last `}`, in the fixed schema.
@@ -313,10 +482,19 @@ pub fn render_notice(notice: &CompactionNotice, summary: &CompactionSummary) -> 
              it, so re-read files before you edit them. ",
         );
     }
-    out.push_str(
-        "The orchestrator was told that this task was larger than planned. If you reach the \
-         limit again you stop and what is left is handed back.\n",
-    );
+    if notice.may_compact_again {
+        out.push_str(
+            "The orchestrator was told that this task was larger than planned. If you reach the \
+             limit again, your context is compacted again only if your files or checks show \
+             progress since this compaction; otherwise you stop and what is left is handed \
+             back.\n",
+        );
+    } else {
+        out.push_str(
+            "The orchestrator was told that this task was larger than planned. If you reach the \
+             limit again you stop and what is left is handed back.\n",
+        );
+    }
     if let SummarySource::Runtime { reason } = &notice.summary_source {
         out.push_str(&format!(
             "The summary was built by the runtime from your recorded actions ({reason}).\n"
@@ -656,6 +834,100 @@ mod tests {
 
     const INSTRUCTION: &str = "Rename `foo` to `bar` in src/lib.rs.\nKeep the public API \
                                stable.\nDo not touch tests/.";
+
+    fn moving() -> crate::progress::ProgressMeasure {
+        crate::progress::ProgressMeasure {
+            rounds: 6,
+            files_changed: vec![PathBuf::from("src/lib.rs")],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn recompaction_needs_room_then_progress_then_a_count_under_the_ceiling() {
+        // Room, progress, under the ceiling: compact again.
+        assert_eq!(recompaction(1, 10, 7_000, 10_485, Some(&moving())), Ok(()));
+        assert_eq!(recompaction(9, 10, 7_000, 10_485, Some(&moving())), Ok(()));
+        // No room is reported first, whatever the progress: it can never fit.
+        assert!(matches!(
+            recompaction(1, 10, 10_485, 10_485, Some(&moving())),
+            Err(CompactionStop::NoRoom {
+                floor_tokens: 10_485,
+                ..
+            })
+        ));
+        // No progress next, whatever the ceiling.
+        let stalled = crate::progress::ProgressMeasure {
+            rounds: 5,
+            sloppy: vec![crate::progress::SloppyPattern::FailedWrites {
+                failed: 4,
+                succeeded: 0,
+            }],
+            ..moving()
+        };
+        let stop = recompaction(10, 10, 7_000, 10_485, Some(&stalled)).expect_err("stalled");
+        assert!(matches!(
+            stop,
+            CompactionStop::NoProgress {
+                compactions: 10,
+                ..
+            }
+        ));
+        assert!(
+            stop.describe().contains("4 failed write(s) against 0"),
+            "{}",
+            stop.describe()
+        );
+        // Not measurable (a record from before the baseline was stored): the
+        // earlier rule, no second compaction.
+        assert!(matches!(
+            recompaction(1, 10, 7_000, 10_485, None),
+            Err(CompactionStop::NoProgress { .. })
+        ));
+        // Progress at the ceiling: the ceiling. A ceiling of 1 (or 0, read as
+        // 1) keeps the single compaction of before.
+        assert_eq!(
+            recompaction(10, 10, 7_000, 10_485, Some(&moving())),
+            Err(CompactionStop::Ceiling {
+                compactions: 10,
+                ceiling: 10
+            })
+        );
+        assert!(matches!(
+            recompaction(1, 0, 7_000, 10_485, Some(&moving())),
+            Err(CompactionStop::Ceiling { ceiling: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn a_later_summary_keeps_every_earlier_decision_and_constraint_word_for_word() {
+        let earlier = CompactionSummary {
+            decisions: vec!["Stack uses a list".into(), "Queue uses a deque".into()],
+            constraints: vec!["Do not touch tests/.".into()],
+            ..Default::default()
+        };
+        let mut later = CompactionSummary {
+            // A restatement of the first decision, the second kept as is
+            // (whitespace aside), and one new decision.
+            decisions: vec![
+                "the stack is list-based".into(),
+                "Queue  uses a deque".into(),
+                "RingBuffer wraps at capacity".into(),
+            ],
+            ..Default::default()
+        };
+        carry_forward(&mut later, &earlier);
+        assert_eq!(
+            later.decisions,
+            vec![
+                "Stack uses a list",
+                "the stack is list-based",
+                "Queue  uses a deque",
+                "RingBuffer wraps at capacity"
+            ]
+        );
+        assert_eq!(later.constraints, vec!["Do not touch tests/."]);
+    }
 
     #[test]
     fn original_instruction_reads_through_every_hand_back_wrapper() {

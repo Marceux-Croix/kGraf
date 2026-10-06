@@ -454,6 +454,8 @@ mod tests {
             recall: true,
             items_done: 3,
             items_remaining: 1,
+            number: 1,
+            may_compact_again: false,
         };
         let events = vec![
             TraceEvent::WorkerCompacted {
