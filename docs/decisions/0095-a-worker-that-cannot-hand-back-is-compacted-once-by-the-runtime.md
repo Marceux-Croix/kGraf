@@ -210,3 +210,51 @@ item is untouched); `kgraf-runtime` `original_instruction_reads_through_every_ha
 `tests/handback_fit.rs` measures the first request of every child (at most the plan target, some
 slices kept, equal size at every depth, and a contract whose child cannot fit compacts without
 handing back).
+
+## Amendment (2026-10-06): what a compaction clears, what it carries, and a summary that keeps the task
+
+A local run with a 32,768-token window compacted both attempts of one contract. Three defects:
+
+- The second attempt had written nothing when it compacted. After the compaction it read two
+  files and ended its turn with an announcement of the work. It was recorded completed, and
+  verification failed on the untouched stubs: the no-change guard was off for every compacted
+  worker. The guard's only plausible reason to skip a compacted worker, not to catch one whose
+  work was done before its compaction, is already met: the writes and changed paths carry across
+  the compaction and are rebuilt from every replayed round on resume.
+- The first attempt read one file twice before its compaction and once after. The third read
+  was refused as a stall: the stall detector kept its counts across the compaction, although the
+  earlier results were no longer in the model's context.
+- The second attempt's summary reply was not valid JSON. The fallback summary held only the
+  observed writes, which were none: an empty goal and no open item.
+
+Rulings:
+
+- **The no-change guard holds after a compaction.** A compacted worker with nothing written that
+  ends as done gets the one notice, and a second such end fails; a worker that wrote before its
+  compaction completes as before. The notice is one per attempt and is not reset by the
+  compaction.
+- **A compaction clears what describes the replaced context** (`Worker::reset_context_state`):
+  the stall counts, and the one-continuation flags of an empty turn and an output-ceiling stop,
+  whose notice or cut-off turn is not in the remainder. A call repeated to the threshold after
+  the compaction still stalls. A resume resets the replayed stall counts at the first round after
+  the compaction (`TranscriptBuilder::replay_compaction_round`).
+- **A compaction carries what describes the work:** writes and changed paths, the no-change
+  notice, the patch-rejection count, the step budget, the progress checkpoints, the refusal and
+  denial counts and the malformed-output bound.
+- **The summary is completed from kGraf's state** (`compaction::complete_from_state`): an empty
+  goal becomes the instruction's first non-blank line (through every hand-back wrapper, at most
+  300 characters), the observed writes fill an empty decision list, the changed files are added,
+  and each declared write path with no recorded change and no open item naming it becomes the
+  open item "write <path>: no change to it is recorded yet". A fallback summary is exactly this; a model summary keeps its
+  own entries and gains only what it left out.
+
+Tests (`kgraf-runtime/tests/compaction.rs`); each except the second, which guards the case the
+guard must not catch, fails with its fix reverted:
+`the_no_change_guard_holds_after_a_compaction_with_nothing_written`,
+`a_write_before_the_compaction_still_counts_after_it`,
+`a_re_read_after_a_compaction_is_not_a_stall`, `a_real_repeat_after_a_compaction_still_stalls`,
+`a_resume_after_a_compaction_counts_repeats_from_the_compaction`,
+`an_empty_turn_after_a_compaction_gets_its_own_continuation`,
+`an_output_ceiling_stop_after_a_compaction_gets_its_own_continuation`,
+`a_runtime_summary_carries_the_goal_and_the_unwritten_paths`; unit test
+`state_fills_an_empty_summary_and_only_the_gaps_of_a_model_summary`.

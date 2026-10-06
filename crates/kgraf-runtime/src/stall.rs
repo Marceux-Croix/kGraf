@@ -25,6 +25,10 @@
 //! was. A write that fails does not reset, so a worker repeating a failing edit
 //! still stalls. Repeating one successful write is bounded by the step budget.
 //!
+//! **A compaction starts a new count.** After a worker's context is compacted
+//! (decision 0095) none of the earlier results is in it, so the worker calls
+//! [`StallDetector::reset`] there too, and a resume resets at the same round.
+//!
 //! **A masked result starts a new count.** The worker's observation masker
 //! replaces a tool result with a placeholder once it leaves the last few
 //! rounds. A worker that then repeats the call is re-reading what it can no

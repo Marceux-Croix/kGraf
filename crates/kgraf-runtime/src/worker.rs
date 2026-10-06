@@ -26,7 +26,7 @@
 //!             then conflict-ordered execution, raced against cancel and
 //!             against an interrupt-mode message)
 //!        | a call repeated to the stall threshold, counted
-//!        |   since the last successful write ----------------> Stalled
+//!        |   since the last successful write or compaction --> Stalled
 //!        | cancelled: record calls that finish within the
 //!        |   grace, mark the rest ----------------------------> Cancelled
 //!        | interrupt: record calls that finish within the
@@ -119,7 +119,9 @@
 //! summary call, a `Compacted` event the model cannot forge or suppress, and a
 //! fresh remainder of the verbatim opening plus the summary. A second overflow
 //! hands back. A user's request (`Injector::request_compaction`) compacts at the
-//! next boundary the same way.
+//! next boundary the same way. A compaction clears the state that describes the
+//! replaced context and carries the state that describes the work
+//! (`Worker::reset_context_state`).
 //!
 //! ```text
 //!   BetweenRounds, context >= stop point
@@ -627,7 +629,13 @@ async fn prepare(
     // The live loop counts a round's approved calls once, before they run, and
     // resets after a write that succeeded. The replay does the same per round,
     // on the input each call ran with (after any approval rewrite).
-    for round in builder.replay_rounds() {
+    let compacted_at = builder.replay_compaction_round();
+    for (index, round) in builder.replay_rounds().iter().enumerate() {
+        // The live loop forgot every count at the compaction
+        // (`Worker::reset_context_state`).
+        if compacted_at == Some(index) {
+            stall.reset();
+        }
         // Denied and refused calls did nothing and are not counted. A replay
         // that reaches the threshold would have ended the earlier run, so the
         // result is not acted on.
@@ -2101,12 +2109,18 @@ impl Worker {
     /// attempt that read two files and then said it was done changed nothing
     /// (`made_progress` holds only successful writes and the paths a shell
     /// command changed, so a failed write or a read leaves it empty).
+    ///
+    /// A compaction does not lift the guard. `done` and `changed` carry across
+    /// it (and across a resume, from the replay of every round), so a worker
+    /// that wrote before its compaction and then ends as done is not caught,
+    /// while one that has written nothing at all still is: a compaction with
+    /// nothing written is exactly the case where the model has lost sight of
+    /// its earlier reads and may announce work it never does.
     fn ended_without_change(&self) -> bool {
         self.brief
             .write_scope
             .as_ref()
             .is_some_and(|paths| !paths.is_empty())
-            && self.compaction.is_none()
             && !self.made_progress()
     }
 
@@ -2137,6 +2151,29 @@ impl Worker {
                 cause,
             },
         }
+    }
+
+    /// Clear the state that describes the context a compaction replaced.
+    ///
+    /// - The stall counts: the earlier results are no longer in the model's
+    ///   context, so a re-read after the compaction is legitimate. Counting
+    ///   starts again at the compaction, so a call repeated after it still
+    ///   stalls at the threshold. A resume does the same from the replay
+    ///   (`TranscriptBuilder::replay_compaction_round`).
+    /// - The one-continuation flags for an empty turn and an output-ceiling
+    ///   stop: the notice or the partial output they pair with is not in the
+    ///   remainder. A resume starts them clear as well.
+    ///
+    /// Carried across on purpose: `done` and `changed` (what the worktree
+    /// holds), the no-change notice (one per attempt; a second end with
+    /// nothing written fails whether or not a compaction came between),
+    /// `patch_rejections` (a later rejection gets the worked example sooner),
+    /// the step budget, the progress gate, the refusal and denial counts, and
+    /// the malformed-output bound (it counts server faults, not context).
+    fn reset_context_state(&mut self) {
+        self.stall.reset();
+        self.empty_turn_retried = false;
+        self.output_limit_retried = false;
     }
 
     /// Keep `event` (persisted form) for the recall archive, until compaction.
@@ -2177,23 +2214,27 @@ impl Worker {
         let (reply, summary_call) = self.summary_call(ep, &request).await?;
         let parsed =
             reply.and_then(|text| crate::compaction::parse_summary(&text, &self.brief.instruction));
+        let changes = self.worktree_changes();
         let (mut summary, summary_source) = match parsed {
             Ok(summary) => (summary, SummarySource::Model),
             Err(reason) => (
-                CompactionSummary {
-                    decisions: self.done.clone(),
-                    ..CompactionSummary::default()
-                },
+                CompactionSummary::default(),
                 SummarySource::Runtime { reason },
             ),
         };
-        // What the worktree shows changed outranks what the model recalls.
-        for path in self.worktree_changes() {
-            let path = path.to_string_lossy().into_owned();
-            if !summary.files_touched.contains(&path) {
-                summary.files_touched.push(path);
-            }
-        }
+        // kGraf's own state fills what the summary lacks: the goal from the
+        // instruction, the writes that succeeded (when the summary lists no
+        // decisions), the changed files, and every declared write path not
+        // yet changed as an open item. A fallback summary is all of this; a
+        // model summary keeps its own wording and gains only what it left
+        // out, so a summary that drops the goal never loses the task.
+        crate::compaction::complete_from_state(
+            &mut summary,
+            &self.brief.instruction,
+            self.brief.write_scope.as_deref(),
+            &self.done,
+            &changes,
+        );
         let archive = HistoryArchive::from_events(&self.history);
         let at_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2224,6 +2265,7 @@ impl Worker {
         self.archive = Some(archive);
         self.compaction = Some(notice.clone());
         self.steering.mark_compacted();
+        self.reset_context_state();
         self.emit(
             ep,
             WorkerEvent::Compacted {

@@ -1277,3 +1277,352 @@ async fn a_hand_back_after_a_write_stands_and_names_the_measured_context() {
     assert!(!handoff.done.is_empty());
     assert_eq!(handoff.cause, kgraf_runtime::HandoffCause::MeasuredContext);
 }
+
+// ------------------------------------------------ state across a compaction
+
+/// Nothing written, the stop point reached, a compaction, two reads, then an
+/// end as done with no write. The no-change guard holds after the
+/// compaction, so the worker is told once and then writes.
+#[tokio::test]
+async fn the_no_change_guard_holds_after_a_compaction_with_nothing_written() {
+    let dir = tempfile::tempdir().expect("dir");
+    let provider = Fake::new(|request| {
+        if is_summary(request) {
+            return answer(SUMMARY);
+        }
+        if compacted(request) {
+            let told = text_of(request).contains("You ended without making any change");
+            return match (rounds(request), told) {
+                (0, _) => tool("after-a", "read_config", json!({"n": "a"}), 3_000),
+                (1, _) => tool("after-b", "read_config", json!({"n": "b"}), 3_200),
+                (2, false) => answer("I'll implement all three containers now."),
+                (2, true) => tool(
+                    "w",
+                    "write_file",
+                    json!({"path": "shapes.py", "content": "x"}),
+                    3_400,
+                ),
+                _ => answer("done"),
+            };
+        }
+        long_first_reply(rounds(request) as u64, 6_319, 5_300)
+    });
+    let env = env_with(provider, false);
+    let handle = spawn_worker(
+        env,
+        small_window_brief(dir.path(), Some(vec![PathBuf::from("shapes.py")])),
+        SpawnOptions::default(),
+    )
+    .await
+    .expect("spawn");
+    let (events, result) = drain(handle).await;
+    assert_eq!(compactions(&events).len(), 1);
+    assert_eq!(
+        notices(&events, kgraf_runtime::NoticeKind::NoChange),
+        1,
+        "the end with nothing written after the compaction is not a completion"
+    );
+    assert_eq!(result.outcome, WorkerOutcome::Completed, "{result:?}");
+    assert!(dir.path().join("shapes.py").exists());
+}
+
+/// The guard does not catch a worker that wrote before its compaction: what
+/// it wrote carries across, so an end as done after the compaction completes.
+#[tokio::test]
+async fn a_write_before_the_compaction_still_counts_after_it() {
+    let dir = tempfile::tempdir().expect("dir");
+    let provider = Fake::new(|request| {
+        if is_summary(request) {
+            return answer(SUMMARY);
+        }
+        if compacted(request) {
+            return answer("done: shapes.py is written");
+        }
+        tool(
+            "w",
+            "write_file",
+            json!({"path": "shapes.py", "content": "x"}),
+            12_000,
+        )
+    });
+    let env = env_with(provider, false);
+    let handle = spawn_worker(
+        env,
+        small_window_brief(dir.path(), Some(vec![PathBuf::from("shapes.py")])),
+        compact_options(),
+    )
+    .await
+    .expect("spawn");
+    let (events, result) = drain(handle).await;
+    assert_eq!(compactions(&events).len(), 1);
+    assert_eq!(notices(&events, kgraf_runtime::NoticeKind::NoChange), 0);
+    assert_eq!(result.outcome, WorkerOutcome::Completed, "{result:?}");
+}
+
+/// Two identical reads before the compaction, then `after` identical reads
+/// after it, a write and an answer. The second read crosses the stop point
+/// (11,468) with nothing written, so the worker compacts there.
+fn reads_around_a_compaction(after: usize) -> impl Fn(&Request) -> Round + Send + Sync {
+    move |request| {
+        if is_summary(request) {
+            return answer(SUMMARY);
+        }
+        let n = rounds(request);
+        if compacted(request) {
+            if n < after {
+                let id: &'static str = format!("again{n}").leak();
+                return tool(id, "read_config", json!({}), 3_000 + n as u64 * 100);
+            }
+            return if n == after {
+                tool(
+                    "w",
+                    "write_file",
+                    json!({"path": "shapes.py", "content": "x"}),
+                    3_500,
+                )
+            } else {
+                answer("done")
+            };
+        }
+        let id: &'static str = format!("before{n}").leak();
+        tool(id, "read_config", json!({}), 6_000 * (n as u64 + 1))
+    }
+}
+
+/// Two identical reads before the compaction and one after it. The earlier
+/// results are gone from the model's context, so the re-read is not a stall;
+/// the count starts again at the compaction.
+#[tokio::test]
+async fn a_re_read_after_a_compaction_is_not_a_stall() {
+    let dir = tempfile::tempdir().expect("dir");
+    let provider = Fake::new(reads_around_a_compaction(1));
+    let env = env_with(provider, false);
+    let handle = spawn_worker(
+        env,
+        small_window_brief(dir.path(), Some(vec![PathBuf::from("shapes.py")])),
+        SpawnOptions::default(),
+    )
+    .await
+    .expect("spawn");
+    let (events, result) = drain(handle).await;
+    assert_eq!(compactions(&events).len(), 1);
+    assert_eq!(result.outcome, WorkerOutcome::Completed, "{result:?}");
+}
+
+/// A call repeated to the threshold after the compaction still stalls, at its
+/// third issue since the compaction.
+#[tokio::test]
+async fn a_real_repeat_after_a_compaction_still_stalls() {
+    let dir = tempfile::tempdir().expect("dir");
+    let provider = Fake::new(reads_around_a_compaction(10));
+    let env = env_with(provider, false);
+    let handle = spawn_worker(
+        env,
+        small_window_brief(dir.path(), Some(vec![PathBuf::from("shapes.py")])),
+        SpawnOptions::default(),
+    )
+    .await
+    .expect("spawn");
+    let (events, result) = drain(handle).await;
+    assert_eq!(compactions(&events).len(), 1);
+    assert!(
+        matches!(result.outcome, WorkerOutcome::Stalled { repeats: 3, .. }),
+        "{result:?}"
+    );
+    let after = compactions(&events)[0];
+    let issued_after = events[after..]
+        .iter()
+        .filter(|e| matches!(e, WorkerEvent::ToolCallStarted { tool, .. } if tool == "read_config"))
+        .count();
+    assert_eq!(issued_after, 3, "{events:?}");
+}
+
+/// A resume after the compaction counts from the compaction too: the replay
+/// resets where the live loop did.
+#[tokio::test]
+async fn a_resume_after_a_compaction_counts_repeats_from_the_compaction() {
+    let dir = tempfile::tempdir().expect("dir");
+    let provider = Fake::new(reads_around_a_compaction(1));
+    let env = env_with(provider, false);
+    let handle = spawn_worker(
+        env,
+        small_window_brief(dir.path(), Some(vec![PathBuf::from("shapes.py")])),
+        SpawnOptions::default(),
+    )
+    .await
+    .expect("spawn");
+    let (events, _) = drain(handle).await;
+    // Stored up to the first read after the compaction, its result included.
+    let cut = events
+        .iter()
+        .position(
+            |e| matches!(e, WorkerEvent::ToolCallFinished { call_id, .. } if call_id == "again0"),
+        )
+        .expect("the read after the compaction ran");
+    let stored: Vec<WorkerEvent> = events[..=cut].to_vec();
+    // The resumed worker reads once more (the second issue since the
+    // compaction, the fourth in all), then writes.
+    let provider = Fake::new(|request| match rounds(request) {
+        1 => tool("again1", "read_config", json!({}), 3_200),
+        2 => tool(
+            "w",
+            "write_file",
+            json!({"path": "shapes.py", "content": "x"}),
+            3_500,
+        ),
+        _ => answer("done"),
+    });
+    let env = env_with(provider, false);
+    let handle = spawn_worker(
+        env,
+        small_window_brief(dir.path(), Some(vec![PathBuf::from("shapes.py")])),
+        SpawnOptions {
+            resume_from: Some(stored),
+            ..SpawnOptions::default()
+        },
+    )
+    .await
+    .expect("resume");
+    let (_, result) = drain(handle).await;
+    assert_eq!(result.outcome, WorkerOutcome::Completed, "{result:?}");
+}
+
+/// A summary reply out of schema still carries the goal and the unwritten
+/// write paths, from kGraf's own state.
+#[tokio::test]
+async fn a_runtime_summary_carries_the_goal_and_the_unwritten_paths() {
+    let dir = tempfile::tempdir().expect("dir");
+    let provider = Fake::new(|request| {
+        if is_summary(request) {
+            return answer("{\"goal\": \"implement\", \"decisions\": [\"a\" \"b\"]}");
+        }
+        if compacted(request) {
+            return match rounds(request) {
+                0 => tool(
+                    "w",
+                    "write_file",
+                    json!({"path": "a.py", "content": "x"}),
+                    3_000,
+                ),
+                1 => tool(
+                    "w2",
+                    "write_file",
+                    json!({"path": "b.py", "content": "x"}),
+                    3_100,
+                ),
+                _ => answer("done"),
+            };
+        }
+        long_first_reply(rounds(request) as u64, 6_319, 5_300)
+    });
+    let env = env_with(provider.clone(), false);
+    let handle = spawn_worker(
+        env,
+        small_window_brief(
+            dir.path(),
+            Some(vec![PathBuf::from("a.py"), PathBuf::from("b.py")]),
+        ),
+        SpawnOptions::default(),
+    )
+    .await
+    .expect("spawn");
+    let (events, result) = drain(handle).await;
+    assert_eq!(result.outcome, WorkerOutcome::Completed, "{result:?}");
+    let WorkerEvent::Compacted { notice, summary } = &events[compactions(&events)[0]] else {
+        unreachable!()
+    };
+    assert!(
+        matches!(notice.summary_source, SummarySource::Runtime { .. }),
+        "{notice:?}"
+    );
+    assert_eq!(summary.goal, INSTRUCTION);
+    assert_eq!(
+        summary.open_items,
+        vec![
+            "write a.py: no change to it is recorded yet".to_owned(),
+            "write b.py: no change to it is recorded yet".to_owned(),
+        ]
+    );
+    assert_eq!(notice.items_remaining, 2);
+    // The model continues from it.
+    let after = provider
+        .requests()
+        .into_iter()
+        .find(|r| compacted(r) && !is_summary(r))
+        .expect("a request after the compaction");
+    let text = text_of(&after);
+    assert!(text.contains("write a.py: no change"), "{text}");
+}
+
+/// `bad`, then a user's compaction, then `bad` again, then an answer. Returns
+/// how many notices of `kind` the worker sent and how it ended.
+async fn twice_around_a_compaction(
+    bad: fn() -> Round,
+    kind: kgraf_runtime::NoticeKind,
+) -> (usize, WorkerResult) {
+    let dir = tempfile::tempdir().expect("dir");
+    let injector: Arc<std::sync::OnceLock<kgraf_runtime::Injector>> =
+        Arc::new(std::sync::OnceLock::new());
+    let after = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (inj, count) = (injector.clone(), after.clone());
+    let provider = Fake::new(move |request| {
+        if is_summary(request) {
+            return answer(SUMMARY);
+        }
+        if compacted(request) {
+            return match count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                0 => bad(),
+                _ => answer("done"),
+            };
+        }
+        match rounds(request) {
+            0 => tool(
+                "a",
+                "write_file",
+                json!({"path": "a.txt", "content": "x"}),
+                1_000,
+            ),
+            _ => {
+                // The user asks for a compaction while this turn comes back.
+                inj.get()
+                    .expect("set")
+                    .request_compaction()
+                    .expect("accepted");
+                bad()
+            }
+        }
+    });
+    let env = env_with(provider, false);
+    let handle = spawn_worker(env, brief(dir.path()), SpawnOptions::default())
+        .await
+        .expect("spawn");
+    assert!(injector.set(handle.injector()).is_ok());
+    let (events, result) = drain(handle).await;
+    assert_eq!(compactions(&events).len(), 1);
+    (notices(&events, kind), result)
+}
+
+/// An empty turn, then a compaction, then an empty turn: the continuation
+/// notice of the first is not in the remainder, so the second gets its own
+/// notice instead of failing as "twice in a row".
+#[tokio::test]
+async fn an_empty_turn_after_a_compaction_gets_its_own_continuation() {
+    let (sent, result) =
+        twice_around_a_compaction(|| answer(""), kgraf_runtime::NoticeKind::EmptyTurn).await;
+    assert_eq!(sent, 2);
+    assert_eq!(result.outcome, WorkerOutcome::Completed, "{result:?}");
+}
+
+/// The same for an output-ceiling stop: the cut-off turn it continues from is
+/// not in the remainder.
+#[tokio::test]
+async fn an_output_ceiling_stop_after_a_compaction_gets_its_own_continuation() {
+    let ceiling = || Round {
+        stop: StopReason::MaxTokens,
+        ..answer("*** Begin Patch\n*** Update File: a.txt")
+    };
+    let (sent, result) =
+        twice_around_a_compaction(ceiling, kgraf_runtime::NoticeKind::OutputLimit).await;
+    assert_eq!(sent, 2);
+    assert_eq!(result.outcome, WorkerOutcome::Completed, "{result:?}");
+}

@@ -407,8 +407,11 @@ runtime, never the model, compacts the worker once instead:
 
 - one accounted summary call on the worker's own route, in a fixed JSON schema
   (goal, decisions, files touched, open items, constraints quoted word for
-  word from the instruction); an unusable reply falls back to a summary of
-  what the loop observed;
+  word from the instruction); kGraf's own state fills what the summary lacks:
+  the goal from the instruction's first line when the summary has none, the
+  writes that succeeded when it lists no decisions, the changed files, and each
+  declared write path not yet changed as an open item; an unusable reply gives
+  a summary of that state alone;
 - a `Compacted` event built by the loop alone, carrying a fixed notice (when,
   tokens, window, summary call, transcript path, items done and remaining); it
   reaches the worker's result, the trace and the run record, and counts as a
@@ -422,6 +425,16 @@ runtime, never the model, compacts the worker once instead:
 A second overflow hands back; at the cap the contract is held with its
 worktree and its transcript named. `/compact <worker>` compacts a running
 worker at its next boundary, once.
+
+What describes the replaced context is cleared at the compaction: the stall
+counts, since the earlier results are gone and a re-read is legitimate (a call
+repeated three times after the compaction still stalls, and a resume resets at
+the same round), and the one-continuation flags of an empty turn and an
+output-ceiling stop. What describes the work carries across: the writes and
+changed paths (so the no-change guard below holds for a compacted worker that
+has written nothing, and not for one that wrote before its compaction), the one
+no-change notice per attempt, the patch-rejection count, the step budget and
+the progress checkpoints.
 
 Two cases do not hand back. A worker that reaches the stop point with nothing written would give
 its child the same whole task, so the runtime compacts it once instead (any policy), and after
@@ -448,7 +461,7 @@ parent to compact (0095), and `resplit` refuses the split at the first hand-back
 with no successful write and no mutating command in the whole attempt (reads do not count) and
 its contract declares writes, the runtime drops the turn, counts the round, sends one notice
 (`NoticeKind::NoChange`) and continues; a second such end fails the attempt with the contract's
-write paths named.
+write paths named. A compaction does not lift this guard (0095).
 
 **A retry carries what stopped the last attempt.** The stop note (`OpenContract::last_stop`)
 holds the repeated call of a stall, a spent budget or a named failure, with the calls a policy

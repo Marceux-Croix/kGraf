@@ -167,6 +167,9 @@ pub struct TranscriptBuilder {
     base_tokens: u64,
     /// The compaction this transcript records, if any (at most one).
     compaction: Option<crate::compaction::CompactionNotice>,
+    /// The index in `replay` of the first round after the compaction, so a
+    /// resume restarts the stall counts where the live loop did.
+    replay_compacted_at: Option<usize>,
 }
 
 impl TranscriptBuilder {
@@ -177,6 +180,7 @@ impl TranscriptBuilder {
             opening: opening.clone(),
             base_tokens: 0,
             compaction: None,
+            replay_compacted_at: None,
             messages: opening,
             text: String::new(),
             reasoning: String::new(),
@@ -551,6 +555,7 @@ impl TranscriptBuilder {
                     self.calls.push(call.clone());
                 }
                 self.compaction = Some((**notice).clone());
+                self.replay_compacted_at = Some(self.replay.len());
             }
         }
     }
@@ -694,6 +699,14 @@ impl TranscriptBuilder {
     /// earlier segments did.
     pub fn replay_rounds(&self) -> &[Vec<ReplayCall>] {
         &self.replay
+    }
+
+    /// The index in [`Self::replay_rounds`] of the first round after the
+    /// compaction, when the transcript records one. The live loop resets its
+    /// stall counts at the compaction (the earlier results left the context),
+    /// and a replay resets at this round.
+    pub fn replay_compaction_round(&self) -> Option<usize> {
+        self.replay_compacted_at
     }
 
     /// Tool calls that finished without error, (tool, input), in finish order.

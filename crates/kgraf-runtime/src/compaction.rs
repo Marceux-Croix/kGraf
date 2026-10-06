@@ -210,6 +210,74 @@ pub fn parse_summary(reply: &str, instruction: &str) -> Result<CompactionSummary
     Ok(summary)
 }
 
+/// The longest goal, in characters, that [`complete_from_state`] takes from
+/// the instruction. The instruction itself is in the remainder whole; the goal
+/// only names the task.
+pub const RUNTIME_GOAL_CHARS: usize = 300;
+
+/// Fill what `summary` lacks from kGraf's own state, never from the model:
+///
+/// - `goal`, when empty: the first non-blank line of the original instruction
+///   (through every hand-back wrapper), cut at [`RUNTIME_GOAL_CHARS`].
+/// - `decisions`, when empty: the observed writes (`done`).
+/// - `files_touched`: each path the worktree shows changed (`changed`) not
+///   already listed; the worktree outranks the model's recall.
+/// - `open_items`: each declared write path (`write_scope`) with no recorded
+///   change and no open item naming it.
+///
+/// A runtime fallback summary starts empty and is exactly this; a model summary
+/// keeps its own entries and gains the rest.
+pub fn complete_from_state(
+    summary: &mut CompactionSummary,
+    instruction: &str,
+    write_scope: Option<&[PathBuf]>,
+    done: &[String],
+    changed: &[PathBuf],
+) {
+    if summary.goal.trim().is_empty() {
+        summary.goal = runtime_goal(instruction);
+    }
+    // A model's decisions usually name its writes in its own words; the
+    // observed writes stand in only where it listed none.
+    if summary.decisions.is_empty() {
+        summary.decisions = done.to_vec();
+    }
+    for path in changed {
+        let path = path.to_string_lossy().into_owned();
+        if !summary.files_touched.contains(&path) {
+            summary.files_touched.push(path);
+        }
+    }
+    for path in write_scope.unwrap_or_default() {
+        if changed.contains(path) {
+            continue;
+        }
+        let path = path.to_string_lossy().into_owned();
+        if summary.open_items.iter().any(|item| item.contains(&path)) {
+            continue;
+        }
+        summary
+            .open_items
+            .push(format!("write {path}: no change to it is recorded yet"));
+    }
+}
+
+/// The first non-blank line of the original instruction, cut at
+/// [`RUNTIME_GOAL_CHARS`].
+fn runtime_goal(instruction: &str) -> String {
+    let line = original_instruction(instruction)
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    if line.chars().count() > RUNTIME_GOAL_CHARS {
+        let head: String = line.chars().take(RUNTIME_GOAL_CHARS).collect();
+        format!("{head}...")
+    } else {
+        line.to_owned()
+    }
+}
+
 /// Whitespace collapsed to single spaces, so a quote that reflowed lines still
 /// matches.
 fn squash(text: &str) -> String {
@@ -600,6 +668,48 @@ mod tests {
         let headless = format!("{REMAINDER_HEAD}1 of 2 tokens)");
         assert_eq!(original_instruction(&headless), headless);
         assert_eq!(original_instruction(""), "");
+    }
+
+    #[test]
+    fn state_fills_an_empty_summary_and_only_the_gaps_of_a_model_summary() {
+        let scope = [PathBuf::from("src/lib.rs"), PathBuf::from("src/api.rs")];
+        let done = vec!["write_file wrote src/lib.rs".to_owned()];
+        let changed = [PathBuf::from("src/lib.rs")];
+        // A fallback: everything from state, the goal through a hand-back wrapper.
+        let mut fallback = CompactionSummary::default();
+        let wrapped = handback_remainder(INSTRUCTION, 11_000, 9_830);
+        complete_from_state(&mut fallback, &wrapped, Some(&scope), &done, &changed);
+        assert_eq!(fallback.goal, "Rename `foo` to `bar` in src/lib.rs.");
+        assert_eq!(fallback.decisions, done);
+        assert_eq!(fallback.files_touched, vec!["src/lib.rs".to_owned()]);
+        assert_eq!(
+            fallback.open_items,
+            vec!["write src/api.rs: no change to it is recorded yet".to_owned()]
+        );
+        // A model summary keeps its own entries; an open item that names the
+        // path already stands for it, and its own decisions are not padded.
+        let mut model = CompactionSummary {
+            goal: "rename foo".into(),
+            decisions: vec!["use sed".into()],
+            open_items: vec!["update callers in src/api.rs".into()],
+            ..CompactionSummary::default()
+        };
+        complete_from_state(&mut model, INSTRUCTION, Some(&scope), &done, &changed);
+        assert_eq!(model.goal, "rename foo");
+        assert_eq!(model.decisions, vec!["use sed".to_owned()]);
+        assert_eq!(
+            model.open_items,
+            vec!["update callers in src/api.rs".to_owned()]
+        );
+        // No write scope: no open item is made up.
+        let mut none = CompactionSummary::default();
+        complete_from_state(&mut none, INSTRUCTION, None, &[], &[]);
+        assert!(none.open_items.is_empty());
+        // A long first line is cut.
+        let long = "x".repeat(RUNTIME_GOAL_CHARS + 10);
+        let mut cut = CompactionSummary::default();
+        complete_from_state(&mut cut, &long, None, &[], &[]);
+        assert_eq!(cut.goal.chars().count(), RUNTIME_GOAL_CHARS + 3);
     }
 
     #[test]

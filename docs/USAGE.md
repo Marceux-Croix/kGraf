@@ -1470,6 +1470,12 @@ Behavior that differs from earlier builds. Each item names the decision that hol
   last reported usage plus the estimate of what was added since reached the stop point) or
   `queued_messages` (the queued steering messages pushed the next round past it). A hand-back
   is never decided from a projection (0095).
+- A compacted worker that has written nothing and ends as done is told once to continue, and
+  fails on a second such end, as any worker is; one that wrote before its compaction completes
+  normally. A file the worker read before its compaction may be read again after it without a
+  stall; three identical calls after the compaction still stall. When the model's summary is
+  unusable, the summary kGraf writes in its place still names the goal (the instruction's first
+  line) and lists each declared file not yet changed as an open item (0095).
 - A retry after an attempt that stopped before any verifier saw it carries what stopped it, as
   data, the way a verifier's refusal is carried: a stall names the repeated call, a spent step
   budget says so, a runtime failure gives its reason, and each lists the calls a policy refused
