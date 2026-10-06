@@ -23,12 +23,17 @@
 //!   branch never meets an untracked copy; the user's checkout gets the files
 //!   when the owner merges the branch. The body is fenced
 //!   ([`UntrustedText::to_markdown_fence`]) so it cannot forge headings (nodes).
-//! - **Delivery.** A message reaches a recipient in the brief of its next
-//!   fresh attempt, as data blocks. A resumed attempt continues its recorded
-//!   transcript unchanged; its messages wait for the next fresh one. Every
-//!   delivery is recorded per recipient. (A worker's own `send_message` to a
-//!   running agent is delivered mid-run by injection over a connection:
-//!   `orchestrator/connections.rs`, decision 0067.)
+//! - **Delivery.** A message reaches a recipient that is not running in the
+//!   brief of its next fresh attempt, as data blocks. A recipient whose attempt
+//!   runs (or resumes) gets the same data block injected at its next round
+//!   boundary through the runtime's injector (decision 0067), never mid-stream
+//!   or inside an open tool round; the copy is a session inbox row
+//!   ([`queued_row_id`]), so the runtime's `Injected` event marks it. A copy
+//!   the attempt never reached a boundary for falls back to the next fresh
+//!   brief. A message still undelivered when its recipient closes is traced as
+//!   `undelivered` and reported to its sender. Every delivery is recorded per
+//!   recipient. (A worker's own `send_message` uses the same injector over a
+//!   connection: `orchestrator/connections.rs`.)
 //! - **Untrusted.** A body is another model's text: it enters a prompt only
 //!   through [`UntrustedText::quote_as_data`].
 //!
@@ -127,10 +132,49 @@ pub struct Envelope {
     /// Its heading node in each file, once indexed.
     #[serde(default)]
     pub nodes: Vec<String>,
-    /// Recipients whose brief has carried it.
+    /// Recipients it reached: in a fresh brief, or injected into a running
+    /// attempt at a round boundary.
     #[serde(default)]
     pub delivered_to: BTreeSet<String>,
+    /// One entry per running attempt it was queued to for injection at a
+    /// round boundary (decision 0067's injector). Persisted so a delivery
+    /// mark the runtime writes to the session inbox is traced once, also
+    /// after a process restart.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queued: Vec<QueuedCopy>,
 }
+
+/// A copy of a message queued for one running attempt of a recipient.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueuedCopy {
+    pub contract: String,
+    pub worker: AgentId,
+    pub state: CopyState,
+}
+
+/// Where a queued copy stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum CopyState {
+    /// In the attempt's inbox and steering queue; not yet at a boundary.
+    Queued,
+    /// The runtime recorded `Injected` at transcript sequence `seq`.
+    Injected { seq: u64, at_ms: i64 },
+    /// The attempt ended before a boundary. A resume of the same attempt
+    /// queues it again; otherwise a fresh brief carries the message, or it
+    /// is reported undelivered when the recipient closes.
+    NotReached,
+}
+
+/// The inbox row id of `message`'s copy queued for `worker`. Deterministic, so
+/// a resume finds the row it already pushed instead of pushing a second one.
+pub fn queued_row_id(message: &str, worker: &AgentId) -> String {
+    format!("{QUEUED_ROW_PREFIX}{message}-{worker}")
+}
+
+/// The prefix of every [`queued_row_id`]: such a row's undelivered report is the
+/// mailbox's (`undelivered` when the recipient closes), not the session's.
+pub const QUEUED_ROW_PREFIX: &str = "mail-";
 
 /// A message to be posted.
 #[derive(Clone, Debug)]
@@ -214,6 +258,7 @@ impl Mailbox {
             files: Vec::new(),
             nodes: Vec::new(),
             delivered_to: BTreeSet::new(),
+            queued: Vec::new(),
         };
         self.messages.push(env.clone());
         Ok(env)
@@ -233,7 +278,8 @@ impl Mailbox {
             .collect()
     }
 
-    /// Messages addressed to `contract` that no brief of it has carried yet.
+    /// Messages addressed to `contract` that no brief or injection has
+    /// carried to it yet.
     pub fn undelivered(&self, contract: &str) -> Vec<&Envelope> {
         self.messages
             .iter()

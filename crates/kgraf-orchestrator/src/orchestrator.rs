@@ -6102,6 +6102,9 @@ impl RunLoop {
         let Some(contract) = self.record.contract(&f.contract).cloned() else {
             return Ok(());
         };
+        // The runtime marked every injection before this result was sent:
+        // copies it never reached a boundary for are known now (`coord.rs`).
+        self.mail_attempt_ended(&f.worker);
         let now = self.now();
         let run = self.run_id();
         let idx = flight.attempts.iter().position(|a| a.worker == f.worker);
@@ -7236,6 +7239,7 @@ impl RunLoop {
             }
             self.announce_verified(&contract, result.as_ref()).await?;
             self.clear_wait(&id);
+            self.report_undelivered_mail(&id, "verified");
             if let Some(open) = self.record.contract(&id) {
                 // The winning attempt's rationale, if it gave one, travels with
                 // the closed contract so a later dependent's brief can quote it.
@@ -7667,6 +7671,7 @@ impl RunLoop {
             .iter()
             .position(|c| c.contract == parent.contract)
             .unwrap_or(self.record.open_contracts.len());
+        self.report_undelivered_mail(&parent.contract, "superseded by its hand-back's children");
         if let Some(open) = self.record.contract(&parent.contract) {
             let closed = crate::coordination::ClosedContract::of(
                 open,

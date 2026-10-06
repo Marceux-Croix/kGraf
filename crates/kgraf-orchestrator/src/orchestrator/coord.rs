@@ -5,11 +5,13 @@
 //! file in parallel). The policies are in `gates.rs`, `envelope.rs` and
 //! `waits.rs`; this file applies them to the run.
 
+use super::sessions::{InjectOutcome, sessions_of};
 use super::*;
-use crate::envelope::{self, Draft, Envelope};
+use crate::envelope::{self, CopyState, Draft, Envelope, QueuedCopy};
 use crate::gates::{self, GateRequest, GateRunner, GateStatus, GateVerdict};
 use crate::run_state::VerifiedCommit;
 use crate::waits::{self, WaitState};
+use kgraf_core::session::InboxItem;
 use kgraf_session::transcript::TranscriptEntry;
 
 /// Loop-only coordination state: nothing here needs to survive a restart.
@@ -154,7 +156,7 @@ impl RunLoop {
     /// The one-line status over every open contract.
     /// The one-line status: every open contract (one with no noted state yet is
     /// shown as not yet checked, never left out), running gates, and messages
-    /// still waiting for a recipient's next fresh brief.
+    /// still waiting for a recipient's round boundary or next fresh brief.
     pub(super) fn wait_line(&self) -> String {
         let mut all = self.record.coordination.waits.clone();
         for c in &self.record.open_contracts {
@@ -183,7 +185,8 @@ impl RunLoop {
         line
     }
 
-    /// (message, recipient) for each open recipient no brief has carried it to.
+    /// (message, recipient) for each open recipient no brief or injection has
+    /// carried it to.
     fn pending_deliveries(&self, open: &BTreeSet<&str>) -> Vec<(String, String)> {
         let mut out = Vec::new();
         for m in &self.record.coordination.mailbox.messages {
@@ -701,6 +704,7 @@ impl RunLoop {
                         .integration
                         .insert(original.clone(), outcome);
                 }
+                self.report_undelivered_mail(&original, "verified through its resolver");
                 if let Some(open) = self.record.contract(&original) {
                     let closed = crate::coordination::ClosedContract::of(
                         open,
@@ -1498,24 +1502,36 @@ impl RunLoop {
             Some(comms_root) => self.write_comms(&env, at, comms_root).await?,
             None => (Vec::new(), Vec::new()),
         };
-        // Recipients running now cannot receive it until their next fresh brief.
+        if let Some(m) = self.record.coordination.mailbox.get_mut(&env.id) {
+            m.files = files.clone();
+            m.nodes = nodes.clone();
+        }
+        // A recipient with an attempt running now gets the message injected at
+        // that attempt's next round boundary (decision 0067's injector); one
+        // that is not running gets it in its next fresh brief.
         for r in &to {
-            if self.in_flight.contains_key(r) {
+            let Some(flight) = self.in_flight.get(r) else {
+                continue;
+            };
+            let running: Vec<AgentId> = flight.cancels.keys().cloned().collect();
+            if running.is_empty() {
+                // Its attempts have ended and are being verified or merged.
                 self.queue(TraceEvent::Message {
                     at_ms: at,
                     id: env.id.clone(),
                     action: "pending".into(),
                     from: from.clone(),
                     to: vec![r.clone()],
-                    detail: "the recipient is running; the runtime cannot inject a turn, \
-                             so it is delivered in the recipient's next fresh brief"
+                    detail: "the recipient's attempts have ended and are being settled: its \
+                             next fresh brief carries it, or it is reported undelivered if \
+                             the recipient closes first"
                         .into(),
                 });
+                continue;
             }
-        }
-        if let Some(m) = self.record.coordination.mailbox.get_mut(&env.id) {
-            m.files = files.clone();
-            m.nodes = nodes.clone();
+            for worker in running {
+                self.queue_copy(&env, r, &worker, at);
+            }
         }
         self.queue(TraceEvent::Message {
             at_ms: at,
@@ -1646,7 +1662,8 @@ impl RunLoop {
 
     /// The brief for a fresh attempt: the contract, then every message addressed
     /// to it, as data. A resumed attempt's brief is its recorded one (the
-    /// transcript is continued unchanged). Delivery is recorded when the brief is
+    /// transcript is continued unchanged); a message it has not carried is
+    /// queued for injection instead. Delivery is recorded when the brief is
     /// built and saved with the record's next write; a kill in between leaves the
     /// message marked undelivered, and the next fresh brief carries it again.
     pub(super) fn brief_with_inbox(&mut self, contract: &OpenContract, worker: &AgentId) -> String {
@@ -1654,6 +1671,21 @@ impl RunLoop {
         let transcript = self.files.worker_transcript(worker.as_str());
         let resumed = std::fs::metadata(&transcript).is_ok_and(|m| m.len() > 0);
         if resumed {
+            // The recorded brief is continued unchanged, so a message it has
+            // not carried is injected at the resumed attempt's first round
+            // boundary instead (the spawn reads the inbox row).
+            let waiting: Vec<Envelope> = self
+                .record
+                .coordination
+                .mailbox
+                .undelivered(&contract.contract)
+                .into_iter()
+                .cloned()
+                .collect();
+            let at = self.now();
+            for env in &waiting {
+                self.queue_copy(env, &contract.contract, worker, at);
+            }
             return base;
         }
         let (blocks, ids) = {
@@ -1686,5 +1718,237 @@ impl RunLoop {
             });
         }
         base + &blocks
+    }
+
+    /// Queue `env`'s copy for `worker`, a running (or resuming) attempt of
+    /// `contract`, as a session inbox row injected at its next round boundary,
+    /// and trace it as `pending` with what happens next. Never mid-stream and
+    /// never inside an open tool round: the runtime drains the queue only
+    /// between rounds (`AtBoundary`). The body is the same quoted data block a
+    /// brief carries. A row this attempt already has (a resume) is not pushed
+    /// again.
+    pub(super) fn queue_copy(&mut self, env: &Envelope, contract: &str, worker: &AgentId, at: i64) {
+        let row = envelope::queued_row_id(&env.id, worker);
+        let store = sessions_of(&self.s);
+        let pushed: Result<Option<InboxItem>, String> = match store.inbox_item(&row) {
+            // Delivered already: the settle pass traces it.
+            Ok(Some(item)) if item.delivered.is_some() => Ok(None),
+            Ok(Some(item)) => Ok(Some(item)),
+            Ok(None) => {
+                self.ensure_session_row(worker);
+                let item = InboxItem {
+                    id: row.clone(),
+                    session: worker.clone(),
+                    source: InboxSource::Agent {
+                        id: env.from_worker.clone(),
+                    },
+                    kind: InboxKind::Message,
+                    mode: InjectMode::AtBoundary,
+                    // Quoted as data, as a brief quotes it: another model's
+                    // text never enters a prompt as instructions.
+                    text: envelope::data_blocks(&[env]).trim_start().to_owned(),
+                    received_ms: at,
+                    not_before_ms: at,
+                    delivered: None,
+                };
+                store
+                    .push_inbox(&item)
+                    .map(|()| Some(item))
+                    .map_err(|e| e.to_string())
+            }
+            Err(e) => Err(e.to_string()),
+        };
+        let fallback = "if the attempt ends first, the recipient's next fresh brief carries \
+                        it, or it is reported undelivered when the recipient closes";
+        let detail = match pushed {
+            Ok(None) => {
+                // The runtime marked it before this process traced it (a
+                // restart): the settle pass traces it once.
+                let traced = self
+                    .record
+                    .coordination
+                    .mailbox
+                    .messages
+                    .iter()
+                    .filter(|m| m.id == env.id)
+                    .flat_map(|m| &m.queued)
+                    .any(|q| &q.worker == worker && matches!(q.state, CopyState::Injected { .. }));
+                if !traced {
+                    self.mark_copy(&env.id, contract, worker, CopyState::Queued);
+                }
+                return;
+            }
+            Ok(Some(item)) => {
+                self.mark_copy(&env.id, contract, worker, CopyState::Queued);
+                match self.try_inject(worker, &item) {
+                    InjectOutcome::Queued => format!(
+                        "the recipient is running: queued for {worker} at its next round \
+                         boundary; {fallback}"
+                    ),
+                    InjectOutcome::Later | InjectOutcome::NotInjectable => format!(
+                        "the recipient is starting: queued for {worker} at its first round \
+                         boundary; {fallback}"
+                    ),
+                    InjectOutcome::Ended => {
+                        self.mark_copy(&env.id, contract, worker, CopyState::NotReached);
+                        format!(
+                            "{worker} ended before the message could be queued: the \
+                             recipient's next fresh brief carries it, or it is reported \
+                             undelivered when the recipient closes"
+                        )
+                    }
+                }
+            }
+            Err(e) => format!(
+                "the message could not be queued for {worker} ({e}): the recipient's next \
+                 fresh brief carries it, or it is reported undelivered when the recipient \
+                 closes"
+            ),
+        };
+        self.queue(TraceEvent::Message {
+            at_ms: at,
+            id: env.id.clone(),
+            action: "pending".into(),
+            from: env.from_contract.clone(),
+            to: vec![contract.to_owned()],
+            detail,
+        });
+    }
+
+    /// Set the state of `message`'s copy for `worker`, adding the copy if it is
+    /// new.
+    fn mark_copy(&mut self, message: &str, contract: &str, worker: &AgentId, state: CopyState) {
+        let Some(m) = self.record.coordination.mailbox.get_mut(message) else {
+            return;
+        };
+        match m.queued.iter_mut().find(|q| &q.worker == worker) {
+            Some(q) => q.state = state,
+            None => m.queued.push(QueuedCopy {
+                contract: contract.to_owned(),
+                worker: worker.clone(),
+                state,
+            }),
+        }
+    }
+
+    /// Trace every queued copy the runtime has injected since the last pass:
+    /// `delivered`, at the time and transcript sequence the inbox row was
+    /// marked with. Called once per loop pass; a store query is made only for
+    /// copies still queued, so a run with none costs none.
+    pub(super) fn settle_mail_copies(&mut self) -> bool {
+        self.settle_copies(false)
+    }
+
+    /// [`Self::settle_mail_copies`]; with `all`, copies marked not reached are
+    /// checked too (a resumed attempt's spawn may have injected a row this
+    /// loop had given up on). `all` is for the rare points: an attempt's end
+    /// and a recipient's close.
+    fn settle_copies(&mut self, all: bool) -> bool {
+        let waiting: Vec<(String, String, AgentId)> = self
+            .record
+            .coordination
+            .mailbox
+            .messages
+            .iter()
+            .flat_map(|m| {
+                m.queued
+                    .iter()
+                    .filter(|q| {
+                        q.state == CopyState::Queued || (all && q.state == CopyState::NotReached)
+                    })
+                    .map(|q| (m.id.clone(), q.contract.clone(), q.worker.clone()))
+            })
+            .collect();
+        if waiting.is_empty() {
+            return false;
+        }
+        let mut settled = false;
+        let store = sessions_of(&self.s);
+        for (id, contract, worker) in waiting {
+            let row = envelope::queued_row_id(&id, &worker);
+            let Ok(Some(InboxItem {
+                delivered: Some((seq, at_ms)),
+                ..
+            })) = store.inbox_item(&row)
+            else {
+                continue;
+            };
+            settled = true;
+            self.mark_copy(&id, &contract, &worker, CopyState::Injected { seq, at_ms });
+            self.record
+                .coordination
+                .mailbox
+                .mark_delivered(&contract, std::slice::from_ref(&id));
+            let from = self
+                .record
+                .coordination
+                .mailbox
+                .messages
+                .iter()
+                .find(|m| m.id == id)
+                .map(|m| m.from_contract.clone())
+                .unwrap_or_default();
+            self.queue(TraceEvent::Message {
+                at_ms,
+                id,
+                action: "delivered".into(),
+                from,
+                to: vec![contract],
+                detail: format!(
+                    "injected into {worker} at a round boundary (transcript seq {seq})"
+                ),
+            });
+        }
+        settled
+    }
+
+    /// `worker`'s attempt ended: every copy it never reached a boundary for is
+    /// marked so, after one last settle pass. The message is not lost: the
+    /// contract's next fresh brief carries it, a resume of this attempt
+    /// queues it again, or it is reported when the contract closes.
+    pub(super) fn mail_attempt_ended(&mut self, worker: &AgentId) {
+        let _ = self.settle_copies(true);
+        for m in &mut self.record.coordination.mailbox.messages {
+            for q in m.queued.iter_mut().filter(|q| &q.worker == worker) {
+                if q.state == CopyState::Queued {
+                    q.state = CopyState::NotReached;
+                }
+            }
+        }
+    }
+
+    /// `contract` closes (`closure` says how) with no brief or attempt left to
+    /// carry what it was sent: each message still undelivered to it is traced
+    /// `undelivered` and reported to its sender, never lost silently.
+    pub(super) fn report_undelivered_mail(&mut self, contract: &str, closure: &str) {
+        let _ = self.settle_copies(true);
+        let lost: Vec<(String, String, AgentId)> = self
+            .record
+            .coordination
+            .mailbox
+            .undelivered(contract)
+            .into_iter()
+            .map(|m| (m.id.clone(), m.from_contract.clone(), m.from_worker.clone()))
+            .collect();
+        let at = self.now();
+        for (id, from, from_worker) in lost {
+            let why = format!(
+                "{contract} closed ({closure}) before a round boundary or a fresh brief \
+                 carried it"
+            );
+            self.queue(TraceEvent::Message {
+                at_ms: at,
+                id: id.clone(),
+                action: "undelivered".into(),
+                from: from.clone(),
+                to: vec![contract.to_owned()],
+                detail: why.clone(),
+            });
+            self.session_notice(
+                &from,
+                from_worker.as_str(),
+                format!("your message {id} to {contract} was not delivered: {why}"),
+            );
+        }
     }
 }

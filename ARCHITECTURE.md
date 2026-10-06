@@ -769,11 +769,16 @@ checkout the run works on, with its body fenced as data. That file is
 committed to the integration branch and indexed, so a message is a node on
 the change log. A verified contract's report goes to its dependents and to
 contracts whose transcripts show they read a changed path, with no bound on
-the number of recipients. Such a report reaches its recipient in the next
-fresh brief. A worker's own outbound message goes over a connection: open by
-rule (sibling, dependency, shared read, parent and child) or by one batched,
-reserved orchestrator judgment, and delivered mid-run by injection. Volume is
-never refused, only paced, and kept in order.
+the number of recipients. Such a report reaches a recipient that is not
+running in its next fresh brief. A recipient whose attempt runs, or resumes,
+gets the same quoted data block injected at its next round boundary through
+the runtime's injector, as a session inbox row, so the `Injected` event marks
+it delivered; if the attempt ends first, the next fresh brief carries it, and a
+report still undelivered when its recipient closes is traced `undelivered` and
+reported to its sender (decision 0067). A worker's own outbound message goes
+over a connection: open by rule (sibling, dependency, shared read, parent and
+child) or by one batched, reserved orchestrator judgment, and delivered mid-run
+by injection. Volume is never refused, only paced, and kept in order.
 
 ### Persistence and event spine
 

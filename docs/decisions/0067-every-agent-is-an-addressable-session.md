@@ -138,3 +138,31 @@ A hand-back from a worker that has written nothing is a compaction (decision 009
 the same date): the child of such a hand-back would carry the same whole task, so the one
 remainder replacement the runtime makes happens in the worker instead of one level down. The
 hand-back's `Handoff` and the trace record name the measured cause.
+
+## Amendment (2026-10-06): a mailbox report to a running recipient is injected at its next boundary
+
+This decision amends 0033 so that a change notice arrives mid-run, and point 3 built the
+injector, but the mailbox (`envelope.rs`, `post_message`) still delivered only in the
+recipient's next fresh brief, with a `pending` trace that said the runtime cannot inject a
+turn. A recipient whose attempt finished without a later brief never got the report, and no
+event said so. In measured canary and benchmark traces this was about 1% of mailbox notes.
+
+Now:
+- A report to a contract with a running attempt is pushed to that attempt's session inbox as a
+  `message` row (id `mail-<message>-<attempt>`, mode `at_boundary`) holding the same quoted
+  data block a brief carries, and handed to the attempt's `Injector`. The runtime drains it
+  only between rounds, never mid-stream or inside an open tool round. The `Injected` event
+  marks the row; the orchestrator then traces `message` `delivered` with the time and
+  transcript sequence of the mark, and records the copy on the envelope (`Envelope.queued`).
+- An attempt that ends before a boundary leaves the copy `not_reached`. The contract's next
+  fresh brief carries the report, as before. A resumed attempt continues its recorded brief,
+  so the report is queued for it and injected at its first boundary.
+- A report still undelivered when its recipient closes (verified, verified through its
+  resolver, or superseded by a hand-back's children) is traced `message` `undelivered` and
+  reported to its sender as a session notice. A mailbox row is not reported again when its
+  attempt's session retires, because the contract's next brief may still carry it.
+- A run that ends with the recipient held or never started does not close it, so no
+  `undelivered` event is written for it.
+
+Tests: `mailbox_injection.rs` (injected at the next boundary; falls back to the next fresh
+brief; never delivered is traced and reported).

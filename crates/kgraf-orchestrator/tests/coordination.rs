@@ -1059,11 +1059,17 @@ async fn a_report_reaches_dependents_as_data_and_readers_by_subscription_and_is_
     assert_eq!(from_a.from_worker.as_str(), "r1-a-r0-a0", "attributed");
     assert_eq!(from_a.concerns, vec!["src/a.rs".to_owned()]);
 
-    // b received it in its brief, as escaped data; c was running and the runtime
-    // cannot inject a turn, so its copy is recorded undelivered, not assumed.
+    // b received it in its brief, as escaped data. c was running, so its copy
+    // was queued for injection at c's next round boundary. Whether c reached
+    // one before it answered depends on these timed rounds, so either outcome
+    // is accepted here, but never a silent loss: delivered, or traced
+    // undelivered (`mailbox_injection.rs` drives each case on events).
     assert_eq!(from_a.id, "r1-m1", "unique per run");
     assert!(from_a.delivered_to.contains("b"));
-    assert!(!from_a.delivered_to.contains("c"));
+    assert!(
+        from_a.queued.iter().any(|q| q.contract == "c"),
+        "a copy was queued for c's running attempt: {from_a:?}"
+    );
     let b_brief = p
         .stats
         .requests()
@@ -1115,11 +1121,23 @@ async fn a_report_reaches_dependents_as_data_and_readers_by_subscription_and_is_
     assert!(trace.iter().any(
         |e| matches!(e, TraceEvent::Message { action, id, .. } if action == "posted" && id == "r1-m1")
     ));
-    // c was running when it was posted: the pending delivery is traced.
+    // c was running when it was posted: the pending delivery is traced, and
+    // it ends delivered or reported undelivered.
     assert!(trace.iter().any(|e| matches!(
         e,
         TraceEvent::Message { action, to, .. } if action == "pending" && to == &vec!["c".to_owned()]
     )));
+    let to_c_reported = trace.iter().any(|e| {
+        matches!(
+            e,
+            TraceEvent::Message { action, to, id, .. }
+                if action == "undelivered" && id == "r1-m1" && to == &vec!["c".to_owned()]
+        )
+    });
+    assert!(
+        from_a.delivered_to.contains("c") != to_c_reported,
+        "c's copy is either delivered or reported undelivered, exactly one"
+    );
     assert!(trace.iter().any(|e| matches!(
         e,
         TraceEvent::Message { action, to, .. } if action == "delivered" && to == &vec!["b".to_owned()]

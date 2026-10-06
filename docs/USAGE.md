@@ -1627,6 +1627,16 @@ Behavior that differs from earlier builds. Each item names the decision that hol
   view, and after each merge it points any indexed file whose recorded tree is gone at the
   view when the view holds the same content, so those nodes stay readable for the rest of
   the run.
+- A verified contract's report to a contract whose attempt is running is injected into that
+  attempt at its next round boundary, quoted as data, never mid-stream or inside an open
+  tool round. Before, it waited for the recipient's next fresh brief, and a recipient that
+  finished without one never got it. The trace shows `message` `pending` (`queued for
+  <attempt> at its next round boundary`), then `delivered` (`injected into <attempt> at a
+  round boundary (transcript seq N)`, at the time of delivery). If the attempt ends before a
+  boundary, the next fresh brief carries the report, and a resumed attempt gets it at its
+  first boundary. A report still undelivered when its recipient closes is traced as
+  `undelivered`, and the sender's contract gets a notice (`your message <id> to <contract>
+  was not delivered: ...`).
 - kGraf's own git runs no hook, filter, merge driver or diff driver from your repository or
   config, and reaches no remote (see "kGraf's own git"). A file stored through git-lfs or
   git-crypt is committed by kGraf in its stored form, and a file with a configured merge

@@ -192,6 +192,15 @@ pub struct WorkerFake {
     /// as it needs and releases it on an event, not a clock. Unset: no call
     /// waits.
     pub hold: Mutex<Option<(String, Arc<tokio::sync::Semaphore>)>>,
+    /// [`Self::hold`] for the round-1 call: a call whose instruction contains
+    /// `.0` records `late_parked` and waits for a permit of `.1`. A held
+    /// instruction that also says `TOOLROUND` answers round 1 with one more
+    /// tool call, so its worker reaches a further round boundary before it
+    /// answers in round 2; without it, round 1 is the answer and no boundary
+    /// follows.
+    pub late_hold: Mutex<Option<(String, Arc<tokio::sync::Semaphore>)>>,
+    /// Set when a [`Self::late_hold`] call is parked.
+    pub late_parked: AtomicBool,
 }
 
 impl WorkerFake {
@@ -207,6 +216,8 @@ impl WorkerFake {
             question: Mutex::new("which config file do I read?".into()),
             content: Mutex::new(None),
             hold: Mutex::new(None),
+            late_hold: Mutex::new(None),
+            late_parked: AtomicBool::new(false),
         })
     }
 
@@ -302,6 +313,16 @@ impl Provider for WorkerFake {
         {
             permits.acquire().await.map(|p| p.forget()).ok();
         }
+        let late = self.late_hold.lock().expect("lock").clone();
+        let mut tool_round = false;
+        if let Some((marker, permits)) = late
+            && round == 1
+            && instruction.contains(&marker)
+        {
+            self.late_parked.store(true, Ordering::SeqCst);
+            permits.acquire().await.map(|p| p.forget()).ok();
+            tool_round = instruction.contains("TOOLROUND");
+        }
         let now = self.stats.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
         self.stats.max_in_flight.fetch_max(now, Ordering::SeqCst);
         let parties = self.stats.rendezvous_parties.load(Ordering::SeqCst);
@@ -357,6 +378,20 @@ impl Provider for WorkerFake {
             ..TokenUsage::default()
         };
         let (content, stop) = match (round, write_path(&instruction)) {
+            // A released `late_hold` call with `TOOLROUND`: one more tool
+            // round (a read of the file it wrote), so a boundary follows.
+            (1, Some(path)) if tool_round => (
+                vec![
+                    Content::text("checking"),
+                    Content::ToolUse {
+                        id: "t5".into(),
+                        name: "read_file".into(),
+                        input: json!({"path": path}),
+                        signature: None,
+                    },
+                ],
+                StopReason::ToolUse,
+            ),
             // `LONGRUN`: ten rounds, each writing new content to the path,
             // then the answer: longer than `config()`'s six-round budget, and
             // progress the runtime measures at every checkpoint (decision
@@ -947,6 +982,22 @@ impl Parts {
             *fake.hold.lock().expect("lock") = Some((marker.to_owned(), permits.clone()));
         }
         permits
+    }
+
+    /// Holds every worker whose instruction contains `marker` at its round-1
+    /// call ([`WorkerFake::late_hold`]) until a permit is added.
+    pub fn hold_workers_late(&self, marker: &str) -> Arc<tokio::sync::Semaphore> {
+        let permits = Arc::new(tokio::sync::Semaphore::new(0));
+        for fake in [&self.alpha, &self.beta] {
+            *fake.late_hold.lock().expect("lock") = Some((marker.to_owned(), permits.clone()));
+        }
+        permits
+    }
+
+    /// Whether a [`Parts::hold_workers_late`] call is parked on either vendor.
+    pub fn late_parked(&self) -> bool {
+        self.alpha.late_parked.load(Ordering::SeqCst)
+            || self.beta.late_parked.load(Ordering::SeqCst)
     }
 
     pub fn services(&self, window: u64) -> Services {

@@ -157,9 +157,10 @@ pub use consumer_tests::{
 };
 pub use coordination::{BaseCheck, ClosedContract, Closure, Coordination, Integration};
 pub use envelope::{
-    Addressee, COMMS_DIR, COMMS_FILE_MAX_BYTES, COMMS_LOCK, Draft, Envelope, EnvelopeError,
-    FeedEntry, MAX_CONCERNS, MAX_LABEL_CHARS, Mailbox, append_to_comms, heading_name, label,
-    observed_reads, pair_file, pair_file_for,
+    Addressee, COMMS_DIR, COMMS_FILE_MAX_BYTES, COMMS_LOCK, CopyState, Draft, Envelope,
+    EnvelopeError, FeedEntry, MAX_CONCERNS, MAX_LABEL_CHARS, Mailbox, QUEUED_ROW_PREFIX,
+    QueuedCopy, append_to_comms, heading_name, label, observed_reads, pair_file, pair_file_for,
+    queued_row_id,
 };
 pub use gates::{
     BASE_GATE_PROBE, DEFAULT_MAX_REMEDIATIONS, GateDecision, GateDecisionError, GateDecisionRecord,

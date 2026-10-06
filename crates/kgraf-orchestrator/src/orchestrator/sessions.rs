@@ -281,6 +281,21 @@ fn store_error(e: impl std::fmt::Display) -> OrchestratorError {
     OrchestratorError::Store(StoreError::Decision(format!("session store: {e}")))
 }
 
+/// What [`RunLoop::try_inject`] did with one inbox row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum InjectOutcome {
+    /// In the worker's steering queue: it reaches the transcript at the next
+    /// round boundary, or stays listed undelivered if the worker ends first.
+    Queued,
+    /// The worker is not spawned yet: the loop's re-check, or the spawn's own
+    /// read of the inbox, queues it.
+    Later,
+    /// The worker has ended: nothing was queued.
+    Ended,
+    /// An `Answer` row: never injected.
+    NotInjectable,
+}
+
 /// Whether a session can take a message, and why not.
 pub(super) enum Liveness {
     /// Its worker runs in this process now.
@@ -426,6 +441,12 @@ impl RunLoop {
                 item.kind,
                 InboxKind::Note | InboxKind::Redirect | InboxKind::Message
             ) {
+                continue;
+            }
+            // A mailbox copy: the contract's next fresh brief may still carry
+            // it, so it is reported only if the contract closes without
+            // delivery (`report_undelivered_mail`, `coord.rs`).
+            if item.id.starts_with(crate::envelope::QUEUED_ROW_PREFIX) {
                 continue;
             }
             let what = match item.kind {
@@ -953,12 +974,18 @@ impl RunLoop {
     /// session that is not running gets it at its resume
     /// (`SpawnOptions::injections`).
     pub(super) fn inject_now_or_later(&mut self, session: &AgentId, item: &InboxItem) {
+        let _ = self.try_inject(session, item);
+    }
+
+    /// [`Self::inject_now_or_later`], saying what happened, for a caller that
+    /// traces it (the mailbox, `coord.rs`).
+    pub(super) fn try_inject(&mut self, session: &AgentId, item: &InboxItem) -> InjectOutcome {
         if !injectable(item.kind) {
-            return;
+            return InjectOutcome::NotInjectable;
         }
         let Some(injector) = self.injector_of(session) else {
             self.sessions_rt.recheck.mark(session);
-            return;
+            return InjectOutcome::Later;
         };
         match injector.inject(Injection {
             id: item.id.clone(),
@@ -968,11 +995,12 @@ impl RunLoop {
             // `item` holds the raw text (the store scrubs its own copy).
             text: kgraf_secrets::scrub_model_facing(&item.text).into_owned(),
         }) {
-            Ok(()) | Err(InjectError::Duplicate { .. }) => {}
+            Ok(()) | Err(InjectError::Duplicate { .. }) => InjectOutcome::Queued,
             // The worker ended between the liveness check and here: the row
             // stays in the inbox, delivered at its resume or reported to the
             // sender when the session retires. Never lost.
-            Err(InjectError::Finished { .. }) | Err(InjectError::NotBuilt) => {}
+            Err(InjectError::Finished { .. }) => InjectOutcome::Ended,
+            Err(InjectError::NotBuilt) => InjectOutcome::Later,
         }
     }
 
@@ -1079,12 +1107,18 @@ impl RunLoop {
     // ------------------------------------------------------------- the loop
 
     /// Once per loop pass: expire questions, start the next connection
-    /// judgment batch, and deliver inbox rows that came due (no
-    /// store query unless a session was marked or a paced row came due).
+    /// judgment batch, deliver inbox rows that came due (no
+    /// store query unless a session was marked or a paced row came due), and
+    /// trace mailbox copies the runtime injected (no store query unless a
+    /// copy is queued; `coord.rs`).
     pub(super) fn pump_sessions(&mut self) -> Result<(), OrchestratorError> {
         self.expire_questions()?;
         self.start_judging();
-        self.recheck_inbox()
+        self.recheck_inbox()?;
+        if self.settle_mail_copies() {
+            self.save()?;
+        }
+        Ok(())
     }
 
     /// The run is ending: every paid session call still in flight is aborted
