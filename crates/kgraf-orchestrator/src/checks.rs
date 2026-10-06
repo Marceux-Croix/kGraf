@@ -243,9 +243,11 @@ pub enum InterfaceKind {
     #[default]
     Behavior,
     /// Stub-compile only: the consumer files compile against the producer's
-    /// scaffold and the compile command builds them. kGraf derives it from the
-    /// repository at no model cost; it has no reference, no test and no
-    /// handshake.
+    /// scaffold, or against its current code when it edits existing code, and
+    /// the compile command builds them; after the producer's attempt passes
+    /// its own verification they must still compile against its delivery
+    /// ([`check_delivery`]). kGraf derives it from the repository at no model
+    /// cost; it has no reference, no test and no handshake.
     CompileOnly,
 }
 
@@ -305,6 +307,19 @@ impl InterfaceContract {
     /// Whether the interface checks compilation only ([`InterfaceKind`]).
     pub fn is_compile_only(&self) -> bool {
         self.kind == InterfaceKind::CompileOnly
+    }
+
+    /// Whether the interface is compile-only and its stub is the producer's
+    /// current code, not a scaffold: no stub file holds a placeholder body.
+    /// Told from the content, so a record from before the distinction reads
+    /// the same.
+    pub fn stub_is_current_code(&self) -> bool {
+        self.is_compile_only()
+            && !self.stub.is_empty()
+            && !self
+                .stub
+                .iter()
+                .any(|f| crate::placeholder::has_placeholder_body(&f.path, &f.content))
     }
 
     /// `id@vN`, the name every record uses.
@@ -799,8 +814,9 @@ async fn stub_compile_and_canaries(
 
 /// The compile half of the checks for an interface kGraf derived from the
 /// repository when the planner wrote none it could accept: the stub is the
-/// producer's existing scaffold, the consumer and test files are repository
-/// files that use it, and there is no reference. Stub-compile and its
+/// producer's existing scaffold, or its current code when it holds none, the
+/// consumer and test files are repository files that use it, and there is no
+/// reference. Stub-compile and its
 /// canaries run; the vacuity check cannot (nothing correct exists to pass the
 /// tests), and the caller records it as not run. `Ok(Err(_))` is a failing
 /// check, `Err(_)` one that could not run.
@@ -834,6 +850,118 @@ pub async fn check_derived_compile(
     match stub_compile_and_canaries(runner, ic, &mut runs).await? {
         Ok(()) => Ok(Ok(runs)),
         Err(f) => Ok(Err(f)),
+    }
+}
+
+/// Every file of `writes` (a contract's declared write targets) that exists
+/// in `workspace`, with its content: what a delivery lays over the check
+/// base. Every declared file, not only the interface's stub paths: a new
+/// module the producer added beside an edited one is part of what the
+/// consumer files compile against. A file that is not there or is not UTF-8
+/// text is left out.
+pub async fn delivered_files(workspace: &Path, writes: &[WriteTarget]) -> Vec<FileOverlay> {
+    let mut out: Vec<FileOverlay> = Vec::new();
+    for w in writes {
+        if out.iter().any(|f| f.path == w.path) || !valid_write_path(&w.path) {
+            continue;
+        }
+        if let Ok(content) = tokio::fs::read_to_string(workspace.join(&w.path)).await {
+            out.push(FileOverlay::new(w.path.clone(), content));
+        }
+    }
+    out
+}
+
+/// What the compile check of a compile-only interface found against its
+/// producer's delivery ([`check_delivery`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeliveryCheck {
+    /// The consumer files compile against the delivery.
+    Passed,
+    /// The consumer files compile at the check base without the delivery and
+    /// do not compile with it: the delivery breaks a shape they use.
+    Broken { detail: String },
+    /// No verdict on the delivery: the check could not run, timed out twice,
+    /// or the consumer files do not compile at the check base either. Never
+    /// held against the producer; the reason is reported.
+    NotJudged { reason: String },
+}
+
+/// The compile check of compile-only interface `ic` against its producer's
+/// delivery: `delivered` (the producer's files as its attempt left them) laid
+/// over the check base, which is the integration tip once merge-back has
+/// advanced it, and the interface's compile command run. The consumer files
+/// are not laid over it: the base holds their current text, which a merged
+/// contract may have changed since the interface was derived.
+///
+/// When the delivery does not compile, a control run builds the base without
+/// it. Only a control that compiles makes the failure the delivery's
+/// ([`DeliveryCheck::Broken`]); a control that fails too says the base is
+/// broken for another reason, and the check gives no verdict. Every outcome
+/// that is not a verdict is [`DeliveryCheck::NotJudged`] with its reason, so a
+/// check that cannot apply never blocks the producer and never passes silently.
+///
+/// A file the producer deleted is not removed from the check tree: an overlay
+/// can only add or replace files. The check then builds the base's copy.
+pub async fn check_delivery(
+    runner: &SandboxRunner,
+    ic: &InterfaceContract,
+    delivered: &[FileOverlay],
+) -> DeliveryCheck {
+    let label = ic.label();
+    // One wording for every outcome that is not a verdict, so a reader (the
+    // run report, the canary judge) finds each the same way.
+    let no_verdict = |cause: String| DeliveryCheck::NotJudged {
+        reason: format!(
+            "interface {label}: the compile check against the producer's delivery did not run \
+             to a verdict, and the delivery is not held for it: {cause}"
+        ),
+    };
+    if !ic.is_compile_only() {
+        return no_verdict("the interface is not compile-only".to_owned());
+    }
+    if ic.compile.first().is_none_or(|p| p.trim().is_empty()) {
+        return no_verdict("the interface has no compile command".to_owned());
+    }
+    let cmd = ic.compile.join(" ");
+    let with =
+        match compile_once_more_on_timeout(runner, &[delivered], &ic.compile, "delivery").await {
+            Ok(r) => r,
+            Err(e) => return no_verdict(format!("the check could not run: {e}")),
+        };
+    if with.success {
+        return DeliveryCheck::Passed;
+    }
+    let without = match compile_once_more_on_timeout(runner, &[], &ic.compile, "control").await {
+        Ok(r) => r,
+        Err(e) => {
+            return no_verdict(format!(
+                "`{cmd}` failed against the delivery, and the control build without it could \
+                 not run ({e}): {}",
+                with.describe(&ic.compile)
+            ));
+        }
+    };
+    if !without.success {
+        return no_verdict(format!(
+            "the consumer files do not compile at the check base without the delivery either, \
+             so the failure is not the producer's: {}",
+            without.describe(&ic.compile)
+        ));
+    }
+    let files: Vec<&str> = ic
+        .consumer
+        .iter()
+        .chain(&ic.tests)
+        .map(|f| f.path.as_str())
+        .collect();
+    DeliveryCheck::Broken {
+        detail: format!(
+            "interface {label}: the delivery breaks a shape the consumer files [{}] use. They \
+             compile at the check base without it, and with it {}",
+            files.join(", "),
+            with.describe(&ic.compile)
+        ),
     }
 }
 

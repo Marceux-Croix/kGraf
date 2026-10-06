@@ -21,6 +21,8 @@ pub(super) struct CoordRuntime {
     pub(super) gate_flights: BTreeMap<String, Admitted>,
     /// Trace records queued by synchronous code, written at the next flush.
     pub(super) pending: Vec<TraceEvent>,
+    /// The run loop ended with an error: the run-end reports say so.
+    pub(super) run_failed: bool,
 }
 
 impl CoordRuntime {
@@ -29,6 +31,7 @@ impl CoordRuntime {
             gate_runner,
             gate_flights: BTreeMap::new(),
             pending: Vec::new(),
+            run_failed: false,
         }
     }
 }
@@ -1290,6 +1293,20 @@ impl RunLoop {
 
     // ------------------------------------------------------------- messages
 
+    /// Whether a worker's transcript holds a `ModelCall`: a request left with
+    /// its brief. Read without the transcript's lock, as
+    /// [`Self::transcript_reads`] is; only a resumed attempt with a brief
+    /// copy reads it, once.
+    fn transcript_has_model_call(path: &Path) -> bool {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return false;
+        };
+        text.lines()
+            .filter(|l| l.contains("model_call"))
+            .filter_map(|l| serde_json::from_str::<TranscriptEntry<WorkerEvent>>(l).ok())
+            .any(|e| matches!(e.event, WorkerEvent::ModelCall { .. }))
+    }
+
     /// Paths a worker's transcript shows it touched. Read without the transcript's
     /// lock, which the running worker holds: a line still being written is
     /// skipped, and read on the next refresh.
@@ -1661,32 +1678,65 @@ impl RunLoop {
     }
 
     /// The brief for a fresh attempt: the contract, then every message addressed
-    /// to it, as data. A resumed attempt's brief is its recorded one (the
-    /// transcript is continued unchanged); a message it has not carried is
-    /// queued for injection instead. Delivery is recorded when the brief is
-    /// built and saved with the record's next write; a kill in between leaves the
-    /// message marked undelivered, and the next fresh brief carries it again.
+    /// to it, as data. Each is recorded as a copy in this attempt's brief
+    /// ([`CopyState::InBrief`]), not as delivered: a brief is delivered only
+    /// when the attempt's first model request carries it
+    /// ([`Self::settle_brief_copies`]). An attempt that fails before that (a
+    /// pinned context too large, a missing route) leaves the message
+    /// undelivered, so the next fresh brief carries it again, or it is
+    /// reported undelivered.
+    ///
+    /// A resumed attempt continues its transcript, whose opening is rebuilt
+    /// from this brief: it carries again exactly the messages its first
+    /// segment's brief carried, in the same order, so the conversation the
+    /// model continues is the one it had. A message that brief did not carry
+    /// is queued for injection at the resumed attempt's first round boundary.
     pub(super) fn brief_with_inbox(&mut self, contract: &OpenContract, worker: &AgentId) -> String {
         let base = brief_text(contract);
         let transcript = self.files.worker_transcript(worker.as_str());
         let resumed = std::fs::metadata(&transcript).is_ok_and(|m| m.len() > 0);
         if resumed {
-            // The recorded brief is continued unchanged, so a message it has
-            // not carried is injected at the resumed attempt's first round
-            // boundary instead (the spawn reads the inbox row).
+            let (blocks, in_brief) = {
+                let msgs: Vec<&Envelope> = self
+                    .record
+                    .coordination
+                    .mailbox
+                    .messages
+                    .iter()
+                    .filter(|m| {
+                        m.queued.iter().any(|q| {
+                            &q.worker == worker
+                                && matches!(
+                                    q.state,
+                                    CopyState::InBrief | CopyState::BriefSent { .. }
+                                )
+                        })
+                    })
+                    .collect();
+                (
+                    envelope::data_blocks(&msgs),
+                    msgs.iter().map(|m| m.id.clone()).collect::<BTreeSet<_>>(),
+                )
+            };
+            // A first segment that sent a request delivered its brief; the
+            // record may not say so yet (a kill before the next save).
+            if !in_brief.is_empty() && Self::transcript_has_model_call(&transcript) {
+                self.brief_reached_model(worker, system_now_ms());
+            }
             let waiting: Vec<Envelope> = self
                 .record
                 .coordination
                 .mailbox
                 .undelivered(&contract.contract)
                 .into_iter()
+                .filter(|m| !in_brief.contains(&m.id))
                 .cloned()
                 .collect();
             let at = self.now();
             for env in &waiting {
                 self.queue_copy(env, &contract.contract, worker, at);
             }
-            return base;
+            return base + &blocks;
         }
         let (blocks, ids) = {
             let msgs = self
@@ -1702,22 +1752,81 @@ impl RunLoop {
         if ids.is_empty() {
             return base;
         }
-        self.record
-            .coordination
-            .mailbox
-            .mark_delivered(&contract.contract, &ids);
         let at = self.now();
         for id in &ids {
+            self.mark_copy(id, &contract.contract, worker, CopyState::InBrief);
             self.queue(TraceEvent::Message {
                 at_ms: at,
                 id: id.clone(),
-                action: "delivered".into(),
+                action: "pending".into(),
                 from: String::new(),
                 to: vec![contract.contract.clone()],
-                detail: format!("in the brief of {worker}"),
+                detail: format!(
+                    "in the brief of {worker}: delivered when its first model request carries \
+                     the brief; if the attempt ends before one, the recipient's next fresh \
+                     brief carries it, or it is reported undelivered"
+                ),
             });
         }
         base + &blocks
+    }
+
+    /// `worker`'s first model request left with its brief at `at_ms`: every
+    /// message its brief carries ([`CopyState::InBrief`]) is delivered to its
+    /// contract, and traced `delivered` once.
+    pub(super) fn brief_reached_model(&mut self, worker: &AgentId, at_ms: i64) {
+        let mut sent: Vec<(String, String, String)> = Vec::new();
+        for m in &mut self.record.coordination.mailbox.messages {
+            for q in m.queued.iter_mut().filter(|q| &q.worker == worker) {
+                if q.state == CopyState::InBrief {
+                    q.state = CopyState::BriefSent { at_ms };
+                    m.delivered_to.insert(q.contract.clone());
+                    sent.push((m.id.clone(), m.from_contract.clone(), q.contract.clone()));
+                }
+            }
+        }
+        for (id, from, contract) in sent {
+            self.queue(TraceEvent::Message {
+                at_ms,
+                id,
+                action: "delivered".into(),
+                from,
+                to: vec![contract],
+                detail: format!("in the brief of {worker}"),
+            });
+        }
+    }
+
+    /// Settle each brief copy whose attempt has sent its first model request
+    /// since the last pass (the attempt's `first_calls` slot). No store query
+    /// and no file read: the slot is in memory. Returns whether any settled.
+    fn settle_brief_copies(&mut self) -> bool {
+        let sent: Vec<(AgentId, i64)> = self
+            .record
+            .coordination
+            .mailbox
+            .messages
+            .iter()
+            .flat_map(|m| &m.queued)
+            .filter(|q| q.state == CopyState::InBrief)
+            .filter_map(|q| {
+                let at = self
+                    .in_flight
+                    .get(&q.contract)?
+                    .first_calls
+                    .get(&q.worker)?
+                    .get()
+                    .copied()?;
+                Some((q.worker.clone(), at))
+            })
+            .collect::<BTreeMap<_, _>>()
+            .into_iter()
+            .collect();
+        let settled = !sent.is_empty();
+        for (worker, at) in sent {
+            self.brief_reached_model(&worker, at);
+        }
+        settled
     }
 
     /// Queue `env`'s copy for `worker`, a running (or resuming) attempt of
@@ -1844,6 +1953,7 @@ impl RunLoop {
     /// loop had given up on). `all` is for the rare points: an attempt's end
     /// and a recipient's close.
     fn settle_copies(&mut self, all: bool) -> bool {
+        let briefs = self.settle_brief_copies();
         let waiting: Vec<(String, String, AgentId)> = self
             .record
             .coordination
@@ -1860,9 +1970,9 @@ impl RunLoop {
             })
             .collect();
         if waiting.is_empty() {
-            return false;
+            return briefs;
         }
-        let mut settled = false;
+        let mut settled = briefs;
         let store = sessions_of(&self.s);
         for (id, contract, worker) in waiting {
             let row = envelope::queued_row_id(&id, &worker);
@@ -1906,14 +2016,43 @@ impl RunLoop {
     /// marked so, after one last settle pass. The message is not lost: the
     /// contract's next fresh brief carries it, a resume of this attempt
     /// queues it again, or it is reported when the contract closes.
-    pub(super) fn mail_attempt_ended(&mut self, worker: &AgentId) {
+    ///
+    /// `first_call` is when the attempt's first model request left, if one
+    /// did. Its brief copies are delivered then; without one, no model saw
+    /// the brief, so they are traced `pending` with the reason and stay
+    /// undelivered for the next fresh brief or the undelivered report.
+    pub(super) fn mail_attempt_ended(&mut self, worker: &AgentId, first_call: Option<i64>) {
         let _ = self.settle_copies(true);
+        if let Some(at) = first_call {
+            self.brief_reached_model(worker, at);
+        }
+        let mut unsent: Vec<(String, String, String)> = Vec::new();
         for m in &mut self.record.coordination.mailbox.messages {
             for q in m.queued.iter_mut().filter(|q| &q.worker == worker) {
-                if q.state == CopyState::Queued {
-                    q.state = CopyState::NotReached;
+                match q.state {
+                    CopyState::Queued => q.state = CopyState::NotReached,
+                    CopyState::InBrief => {
+                        q.state = CopyState::NotReached;
+                        unsent.push((m.id.clone(), m.from_contract.clone(), q.contract.clone()));
+                    }
+                    _ => {}
                 }
             }
+        }
+        let at = self.now();
+        for (id, from, contract) in unsent {
+            self.queue(TraceEvent::Message {
+                at_ms: at,
+                id,
+                action: "pending".into(),
+                from,
+                to: vec![contract],
+                detail: format!(
+                    "{worker} ended before its first model request, so no model read its \
+                     brief: the recipient's next fresh brief carries it, or it is reported \
+                     undelivered"
+                ),
+            });
         }
     }
 
@@ -1954,8 +2093,18 @@ impl RunLoop {
         }
     }
 
+    /// The run ends, however it ends (a status, or an error): every mailbox
+    /// note and session inbox row nothing carried is reported, once.
+    pub(super) fn report_undelivered_at_run_end(&mut self) {
+        self.report_undelivered_mail_at_run_end();
+        self.report_undelivered_inbox_at_run_end();
+    }
+
     /// How the run ended, for an `undelivered` reason.
     pub(super) fn run_end_phrase(&self) -> &'static str {
+        if self.coord.run_failed {
+            return "the run ended with an error";
+        }
         match &self.record.status {
             RunStatus::Stopped => "the run stopped",
             RunStatus::Blocked { .. } => "the run ended blocked",

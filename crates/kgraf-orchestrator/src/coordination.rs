@@ -106,6 +106,13 @@ pub struct Coordination {
     pub speculative_conflicts: Vec<crate::speculation::SpeculativeConflict>,
     /// What speculative merge has cost this run.
     pub speculation: crate::speculation::SpeculationCost,
+    /// Session inbox rows (by id) traced `undelivered` and reported to their
+    /// sender when a run ended with them still waiting (decision 0067).
+    /// Persisted, so a resumed run that ends again, or a session that retires
+    /// later, does not report the same row twice. A mailbox note keeps the
+    /// same record on itself (`Envelope::reported_undelivered`).
+    #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+    pub reported_undelivered_rows: BTreeSet<String>,
     /// Contracts that left `open_contracts`, verified or superseded by a split,
     /// with their brief kept: search reaches them (0032: "contract: ... including
     /// superseded ones"), and the text surface shows their brief.

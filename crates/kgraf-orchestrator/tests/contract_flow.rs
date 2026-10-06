@@ -2855,6 +2855,107 @@ async fn producer_verification_does_nothing_with_contract_checks_off() {
     assert_eq!(report.status, RunStatus::Completed, "{report:?}");
 }
 
+// Producer verification of a compile-only interface whose stub is the
+// producer's current code (decision 0030, amendment of 2026-10-06): the
+// consumer file must still import against the delivery.
+
+const DOUBLE_CURRENT: &str = "def double(x):\n    return x * 2\n";
+
+/// A repository where `producer.py` already holds finished code and
+/// `consumer.py` imports from it.
+fn current_code_rig(dir: &Path) -> Rig {
+    let plan = plan_json(&double_parties_plan());
+    Rig::with_files(
+        dir,
+        &[
+            ("producer.py", DOUBLE_CURRENT),
+            ("consumer.py", "from producer import double\n"),
+        ],
+        move |_| plan.clone(),
+        agreeing_double,
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    )
+}
+
+/// What kGraf derives for `prod` editing existing code.
+fn current_code_ic() -> InterfaceContract {
+    InterfaceContract {
+        kind: kgraf_orchestrator::InterfaceKind::CompileOnly,
+        id: "derived-prod".into(),
+        version: 1,
+        parties: s(&["prod", "cons"]),
+        symbols: s(&["double"]),
+        stub: vec![FileOverlay::new("producer.py", DOUBLE_CURRENT)],
+        wrong: vec![],
+        reference: vec![],
+        consumer: vec![FileOverlay::new(
+            "consumer.py",
+            "from producer import double\n",
+        )],
+        replaces: vec![],
+        tests: vec![],
+        compile: s(&["python3", "-c", "import consumer"]),
+        test: vec![],
+        consulted: vec![],
+    }
+}
+
+/// A delivery that removes a name the consumer imports fails the producer's
+/// attempt, naming the interface and the consumer file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_producer_that_breaks_a_shape_of_its_current_code_fails_verification() {
+    let dir = tempfile::tempdir().expect("dir");
+    let rig = current_code_rig(dir.path());
+    rig.parts
+        .alpha
+        .set_content("def triple(x):\n    return x * 3\n");
+    let report = rig
+        .orchestrator(vec![current_code_ic()])
+        .start(RunId::new("r1"), "implement double".into())
+        .await
+        .expect("run");
+    assert!(
+        matches!(report.status, RunStatus::Blocked { .. }),
+        "{report:?}"
+    );
+    let (passed, detail) = verdict_of(&rig, "prod")
+        .await
+        .unwrap_or_else(|| panic!("no verdict traced for `prod`"));
+    assert!(!passed, "{detail}");
+    assert!(
+        detail.contains("derived-prod@v1")
+            && detail.contains("breaks a shape")
+            && detail.contains("consumer.py")
+            && detail.contains("challenge_contract"),
+        "{detail}"
+    );
+}
+
+/// A delivery that changes only what the consumer does not use passes, and so
+/// does one that leaves the file as it was: current code left in place is not
+/// a stub left in place.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_producer_that_keeps_the_used_shapes_of_its_current_code_passes() {
+    for content in [
+        "def double(x, factor=2):\n    return x * factor\n\n\ndef helper():\n    return 0\n",
+        DOUBLE_CURRENT,
+    ] {
+        let dir = tempfile::tempdir().expect("dir");
+        let rig = current_code_rig(dir.path());
+        rig.parts.alpha.set_content(content);
+        let report = rig
+            .orchestrator(vec![current_code_ic()])
+            .start(RunId::new("r1"), "implement double".into())
+            .await
+            .expect("run");
+        assert_eq!(report.status, RunStatus::Completed, "{content}: {report:?}");
+        if let Some((passed, detail)) = verdict_of(&rig, "prod").await {
+            assert!(passed, "{content}: {detail}");
+        }
+    }
+}
+
 // ------------------------------------------------- consumers need interfaces
 
 /// `prod` and `cons`, where `cons` consumes `prod`.
@@ -3518,6 +3619,131 @@ async fn the_order_pricing_workspace_gets_compile_only_interfaces_and_no_interfa
     }
 }
 
+/// A producer that edits existing code (its file holds no scaffold): kGraf
+/// derives a compile-only interface with the current code as the stub, checks
+/// it and registers it, where before the edge read "no file holds a
+/// scaffold" and had no compile check at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_producer_that_edits_existing_code_gets_a_compile_check_of_its_current_code() {
+    let dir = tempfile::tempdir().expect("dir");
+    let files = [
+        ("discount/flat.py", "def flat(x):\n    return x * 2\n"),
+        (
+            "pricing.py",
+            "from discount.flat import flat\n\n\ndef price(x):\n    return flat(x)\n",
+        ),
+        (
+            "tests/test_flat.py",
+            "from discount.flat import flat\n\n\ndef test_flat():\n    assert flat(3) == 6\n",
+        ),
+    ];
+    let plan = flat_plan();
+    let rig = Rig::with_files(
+        dir.path(),
+        &files,
+        move |prompt| {
+            if prompt.contains("Accepted contracts (fixed;") {
+                r#"{"interfaces":[]}"#.to_owned()
+            } else {
+                plan.clone()
+            }
+        },
+        agreeing,
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    rig.index(&files);
+    let report = plan_then_stop(rig.orchestrator(vec![])).await;
+    let c = &report.contracts;
+    assert_eq!(
+        (c.interfaces_registered, c.compile_only_registered),
+        (1, 1),
+        "{report:?}"
+    );
+    let events = rig.contract_events().await;
+    let derived = events
+        .iter()
+        .find_map(|e| match e {
+            ContractEvent::Registered { interface } => Some(interface),
+            _ => None,
+        })
+        .expect("the derived interface");
+    assert!(derived.stub_is_current_code(), "{derived:?}");
+    assert_eq!(derived.stub[0].path, "discount/flat.py");
+    assert!(
+        derived.compile.first().is_some_and(|p| p == "python3"),
+        "{derived:?}"
+    );
+    let reason = events
+        .iter()
+        .find_map(|e| match e {
+            ContractEvent::Unchecked { reason, .. } => Some(reason.clone()),
+            _ => None,
+        })
+        .expect("the behavior check of the edge did not run");
+    assert!(
+        reason.contains("stub: the current code of discount/flat.py")
+            && reason.contains("registered as a compile-only interface")
+            && reason.contains("call shapes and attribute uses are not checked")
+            && !reason.contains("no compile check could be derived"),
+        "{reason}"
+    );
+}
+
+/// A shell producer: no compile check applies, so none is derived and the
+/// edge is recorded unchecked with the language named. Nothing holds the run:
+/// both contracts run and the run completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shell_producer_is_recorded_unchecked_with_its_reason_and_never_blocked() {
+    let dir = tempfile::tempdir().expect("dir");
+    let files = [
+        ("lib/common.sh", "greet_user() {\n  echo hi\n}\n"),
+        ("bin/run.sh", ". lib/common.sh\ngreet_user\n"),
+    ];
+    let plan = plan_json(&[
+        c("c1", "change greet_user", "lib/common.sh", &[]),
+        c("c2", "call greet_user", "bin/run.sh", &["c1"]),
+    ]);
+    let rig = Rig::with_files(
+        dir.path(),
+        &files,
+        move |prompt| {
+            if prompt.contains("Accepted contracts (fixed;") {
+                r#"{"interfaces":[]}"#.to_owned()
+            } else {
+                plan.clone()
+            }
+        },
+        agreeing,
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    rig.index(&files);
+    let report = rig
+        .orchestrator(vec![])
+        .start(RunId::new("r1"), "greet".into())
+        .await
+        .expect("run");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    assert_eq!(report.contracts.compile_only_registered, 0, "{report:?}");
+    assert_eq!(report.contracts.unchecked_edges, 1, "{report:?}");
+    let reason = rig
+        .contract_events()
+        .await
+        .into_iter()
+        .find_map(|e| match e {
+            ContractEvent::Unchecked { reason, .. } => Some(reason),
+            _ => None,
+        })
+        .expect("the edge is recorded unchecked");
+    assert!(
+        reason.contains("no compile check could be derived")
+            && reason.contains("shell scripts")
+            && reason.contains("no compile check applies"),
+        "{reason}"
+    );
+}
+
 /// A repository with no test that reaches the producer: the planner is asked
 /// once, for a reference and a small test only. kGraf fills the stub (the
 /// scaffold, declared in `replaces`), the consumer files, the names and the
@@ -3869,7 +4095,9 @@ async fn a_re_ask_covers_only_the_refused_interface() {
 
 /// A compile-only interface passes its gate on compilation alone: no
 /// handshake is asked of any party and no stub is landed (the stub is the
-/// scaffold already in the repository), and the run completes.
+/// scaffold already in the repository), and the run completes. The worker
+/// delivers code the consumer file imports against: the compile check runs
+/// again against the delivery before it is accepted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_compile_only_interface_costs_no_handshake_and_lands_no_stub() {
     let dir = tempfile::tempdir().expect("dir");
@@ -3881,6 +4109,9 @@ async fn a_compile_only_interface_costs_no_handshake_and_lands_no_stub() {
         |_| "{}".into(),
         Duration::from_millis(20),
     );
+    rig.parts
+        .alpha
+        .set_content("def flat(x):\n    return x * 2\n");
     let writer = Arc::new(CountingConsumerTest(std::sync::atomic::AtomicUsize::new(0)));
     let report = rig
         .orchestrator_with_consumer_writer(vec![], writer.clone())

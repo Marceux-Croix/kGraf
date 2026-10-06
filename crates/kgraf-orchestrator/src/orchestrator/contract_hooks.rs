@@ -1521,8 +1521,9 @@ impl RunLoop {
                 let paragraph = format!(
                     "\n\nCompile-only interface `{label}` binds this contract with {}. You are \
                      its {}. kGraf checked before you started that the consumer files compile \
-                     against the producer's scaffold: [{}]. Keep the signatures those files use. \
-                     If the contract itself is wrong, call `{}` with interface `{}`.",
+                     against the producer's {}: [{}]. Keep the signatures those files use: \
+                     kGraf compiles them against the producer's delivery before it is \
+                     accepted. If the contract itself is wrong, call `{}` with interface `{}`.",
                     ic.parties
                         .iter()
                         .filter(|p| p.as_str() != contract)
@@ -1530,6 +1531,11 @@ impl RunLoop {
                         .collect::<Vec<_>>()
                         .join(", "),
                     if producer { "producer" } else { "consumer" },
+                    if ic.stub_is_current_code() {
+                        "current code"
+                    } else {
+                        "scaffold"
+                    },
                     ic.consumer
                         .iter()
                         .chain(&ic.tests)

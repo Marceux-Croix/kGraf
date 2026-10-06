@@ -492,12 +492,21 @@ impl StubLander for GitStubLander {
 /// needs no injected syntax and never touches what was checked: a producer
 /// that delivers anything else, even a one-character change, clears every
 /// path it touched.
+///
+/// A compile-only interface's stub is the repository's own text, not one a
+/// planner wrote: a scaffold file left as it was is work not done, and a file
+/// of current code left as it was is a file the producer did not need to
+/// change (decision 0030, amendment of 2026-10-06). Only its scaffold files
+/// count here.
 pub fn stub_left_in_place<'a>(
     ic: &'a InterfaceContract,
     delivered: &BTreeMap<String, String>,
 ) -> Vec<&'a str> {
     ic.stub
         .iter()
+        .filter(|f| {
+            !ic.is_compile_only() || crate::placeholder::has_placeholder_body(&f.path, &f.content)
+        })
         .filter(|f| delivered.get(&f.path).is_some_and(|d| *d == f.content))
         .map(|f| f.path.as_str())
         .collect()

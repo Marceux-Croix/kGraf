@@ -352,4 +352,41 @@ async fn a_message_to_a_session_stopped_with_the_run_is_reported_at_the_runs_end
     );
     let seen = seen.lock().expect("lock").clone();
     assert!(seen.iter().any(reported), "{seen:?}");
+    let row = id.to_owned();
+    assert!(
+        try_record(&p)
+            .expect("record")
+            .coordination
+            .reported_undelivered_rows
+            .contains(&row),
+        "the report is saved with the record"
+    );
+
+    // The run is resumed and stopped again, with the message still waiting
+    // in the stopped session's inbox: its end does not report it again.
+    let o = Orchestrator::new(config(), p.services(WINDOW)).expect("orchestrator");
+    let handle = o.handle();
+    let run = tokio::spawn(o.resume(RunId::new("r1")));
+    // The resume saves the record as running before its loop starts.
+    wait_for("the run is running again", || {
+        try_record(&p).is_some_and(|r| r.status == RunStatus::Running)
+    })
+    .await;
+    handle.stop().await;
+    let report = run.await.expect("join").expect("resume");
+    assert_eq!(report.status, RunStatus::Stopped, "{report:?}");
+    let trace = trace_of(&p).await;
+    let undelivered: Vec<_> = undelivered_to(&trace, a1.as_str())
+        .into_iter()
+        .filter(|(i, _, _)| *i == row)
+        .collect();
+    assert_eq!(undelivered.len(), 1, "reported once: {undelivered:?}");
+    let notices = trace
+        .iter()
+        .filter(|e| {
+            matches!(e, TraceEvent::Notice { detail, .. }
+                if detail.contains(&row) && detail.contains("was not delivered"))
+        })
+        .count();
+    assert_eq!(notices, 1, "one notice to the sender over both runs");
 }

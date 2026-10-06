@@ -652,7 +652,9 @@ merge-back and the gate runner. A run's record is one row in the graph
 store; its worker transcripts and its trace are files under a per-run
 directory. Verified work merges onto the run's own branch; the user's
 checked-out branch never moves. A killed run resumes from its record with no
-repeated paid call.
+repeated paid call: a worker's request leaves only once its earlier rounds are
+in its transcript, so a kill repeats at most the request in flight (decision
+0056, amended).
 
 **A malformed structured answer is asked again within one bound (0039).** Every orchestrator
 call that asks a model for JSON handles a malformed answer the same way: an answer that is not
@@ -695,13 +697,19 @@ With contract checks on, planning is two calls, and the second is made only for 
 or more contracts (or is a split, whose interface may bind the plan's other contracts), kGraf first
 derives, with no model call (`derive_interface.rs`), for every producer of a consumed edge: the stub
 (its declared files that hold a scaffold body in code, not in a string or comment: `todo!()`,
-`NotImplementedError`), the consumer files
+`NotImplementedError`; when none does, every declared file that exists, so a producer that edits
+existing code has its current code as the stub), the consumer files
 (the files that use its names: graph edges, and the consumers' own existing files) and the compile
-command (`cargo test --no-run -p ...` over the packages that hold them, or a Python import). It runs
+command (`cargo test --no-run -p ...` over the packages that hold them, or a Python import; any other
+language gets none, and the edge's reason names the language, `no_command_reason`). It runs
 stub-compile and its canaries, and a derived check that passes is registered as an interface of kind
 compile-only (`InterfaceKind::CompileOnly`, id `derived-<producer>`; no reference, no test, no
 handshake, no consumer test, no stub land: its gate is the compile half and costs no model call;
-`ContractCounters::compile_only_registered` counts it). Then `behavior_plan` decides per producer
+`ContractCounters::compile_only_registered` counts it). When the producer's attempt passes its own
+verification, `check_delivery` lays its delivered files over the check base and runs the compile
+command again: a failure the base without the delivery does not have fails the attempt; a base that
+fails too, or a check that cannot run, is a notice with the pass (`DeliveryCheck::NotJudged`), never a
+hold. Then `behavior_plan` decides per producer
 whether the planner is asked for a behavior check: not when a repository test already exercises the
 producer alone, and not when every test that reaches it (by crate, module or item name, and through
 the contracts it depends on) also reaches other contracts whose code does not exist yet, so that no
@@ -780,7 +788,9 @@ committed to the integration branch and indexed, so a message is a node on
 the change log. A verified contract's report goes to its dependents and to
 contracts whose transcripts show they read a changed path, with no bound on
 the number of recipients. Such a report reaches a recipient that is not
-running in its next fresh brief. A recipient whose attempt runs, or resumes,
+running in its next fresh brief, and is delivered when that attempt's first
+model request carries the brief: an attempt that fails before one leaves it
+undelivered. A recipient whose attempt runs, or resumes,
 gets the same quoted data block injected at its next round boundary through
 the runtime's injector, as a session inbox row, so the `Injected` event marks
 it delivered; if the attempt ends first, the next fresh brief carries it, and a
@@ -801,10 +811,12 @@ and the orchestrator's notices pass as they are. A subagent's report is traced
 `report_delivered`, with the transcript sequence, when the runtime's `Injected`
 mark is on its inbox row; a parent that ends before a boundary leaves it
 `report_held` (the parent resumes) or `report_undelivered`, with a notice on
-the parent's contract. When a run ends, whatever its status, every note still
-not delivered (its recipient held, never started, or stopped with the run) is
-traced `undelivered` and reported to its sender with the reason, once per note
-and recipient (decision 0067).
+the parent's contract. After a restart, a report the parent's transcript
+already holds is traced `report_delivered` once, from its inbox row's mark.
+When a run ends, whatever its status, and also when it ends on an error, every
+note still not delivered (its recipient held, never started, or stopped with
+the run) is traced `undelivered` and reported to its sender with the reason,
+once per note and recipient over every run of the record (decision 0067).
 
 ### Persistence and event spine
 

@@ -23,6 +23,16 @@
 //! loop blocked on a stalled reader is still cancellable. The provider stream itself
 //! is reached through [`crate::stream_bridge`].
 //!
+//! **A paid round is stored before the next one leaves.** Before each model
+//! request the loop waits on [`WorkerEndpoint::stored`]: a marker on the same
+//! channel, answered when the reader asks for the event after it. A reader
+//! asks for the next event only once it has handled (stored) the one before, so
+//! the answer means every earlier event is in the transcript. Without it the
+//! reader could lag the loop by whole rounds, and a process killed while a
+//! later request was in flight would lose rounds that were already paid and
+//! answered; the resume would then ask them again. With it, a kill repeats at
+//! most the one request in flight.
+//!
 //! **A vanished worker is an error.** If the endpoint is dropped without
 //! [`WorkerEndpoint::finish`], [`WorkerHandle::result`] returns
 //! [`RuntimeError::WorkerVanished`], never a default result (fail loud).
@@ -66,6 +76,15 @@ struct Envelope {
     _permit: Option<OwnedSemaphorePermit>,
 }
 
+/// One item on the worker's channel.
+enum Queued {
+    Event(Envelope),
+    /// [`WorkerEndpoint::stored`]'s marker: answered when the reader asks
+    /// for the item after it, which it does only after it has handled every
+    /// event before it.
+    Stored(oneshot::Sender<()>),
+}
+
 /// Make a connected handle and endpoint. `bulk_capacity` bounds queued bulk events;
 /// zero is raised to one.
 pub fn worker_channel(worker: AgentId, bulk_capacity: usize) -> (WorkerHandle, WorkerEndpoint) {
@@ -98,7 +117,7 @@ pub fn worker_channel(worker: AgentId, bulk_capacity: usize) -> (WorkerHandle, W
 /// The orchestrator's end.
 pub struct WorkerHandle {
     worker: AgentId,
-    events: mpsc::UnboundedReceiver<Envelope>,
+    events: mpsc::UnboundedReceiver<Queued>,
     result: oneshot::Receiver<WorkerResult>,
     cancel: CancellationToken,
     /// The worker's steering queue (decision 0067), shared with the loop.
@@ -183,8 +202,25 @@ impl WorkerHandle {
     }
 
     /// The next event, or `None` once the worker has finished emitting.
+    ///
+    /// **Call it only after the previous event is handled.** A reader that
+    /// stores events (the transcript writers) must have stored the previous
+    /// event before it asks for the next one: asking is what tells the loop
+    /// that everything before is stored ([`WorkerEndpoint::stored`]), and the
+    /// loop then sends its next model request.
     pub async fn next_event(&mut self) -> Option<WorkerEvent> {
-        self.events.recv().await.map(|envelope| envelope.event)
+        loop {
+            match self.events.recv().await? {
+                Queued::Event(envelope) => return Some(envelope.event),
+                // Every event before the marker was returned by an earlier
+                // call, and this call means the reader is done with it. No
+                // await between the receive and the answer, so a dropped
+                // call cannot take the marker without answering it.
+                Queued::Stored(ack) => {
+                    let _ = ack.send(());
+                }
+            }
+        }
     }
 
     /// Wait for the result. Events not yet read are discarded; read them first when
@@ -203,7 +239,7 @@ impl WorkerHandle {
 /// The loop's end.
 pub struct WorkerEndpoint {
     worker: AgentId,
-    events: mpsc::UnboundedSender<Envelope>,
+    events: mpsc::UnboundedSender<Queued>,
     bulk: Arc<Semaphore>,
     result: Option<oneshot::Sender<WorkerResult>>,
     cancel: CancellationToken,
@@ -247,11 +283,34 @@ impl WorkerEndpoint {
             None
         };
         self.events
-            .send(Envelope {
+            .send(Queued::Event(Envelope {
                 event,
                 _permit: permit,
-            })
+            }))
             .map_err(|_| self.dropped())
+    }
+
+    /// Resolves once the reader has handled every event emitted before this
+    /// call (see [`WorkerHandle::next_event`]). The loop calls it before each
+    /// model request, so a process killed while that request is in flight
+    /// loses no earlier round: the resume repeats at most that one request.
+    ///
+    /// `Cancelled` if the worker is cancelled first; `HandleDropped` if the
+    /// reader goes away (it then stores nothing more, so there is nothing to
+    /// wait for). Waits as long as the reader takes: a reader that stops
+    /// reading holds the loop here, as a full bulk channel does.
+    pub async fn stored(&self) -> Result<(), RuntimeError> {
+        let (ack, acked) = oneshot::channel();
+        self.events
+            .send(Queued::Stored(ack))
+            .map_err(|_| self.dropped())?;
+        tokio::select! {
+            biased;
+            () = self.cancel.cancelled() => {
+                Err(RuntimeError::Cancelled { worker: self.worker.to_string() })
+            }
+            r = acked => r.map_err(|_| self.dropped()),
+        }
     }
 
     /// Send an event without waiting for a bulk slot, even after a cancel.
@@ -261,10 +320,10 @@ impl WorkerEndpoint {
     /// emit is refused. Bounded by the number of calls in one round.
     pub(crate) fn emit_unbounded(&self, event: WorkerEvent) -> Result<(), RuntimeError> {
         self.events
-            .send(Envelope {
+            .send(Queued::Event(Envelope {
                 event,
                 _permit: None,
-            })
+            }))
             .map_err(|_| self.dropped())
     }
 
@@ -349,6 +408,45 @@ mod tests {
     async fn the_handle_gives_an_injector_reaching_the_same_worker() {
         let (handle, _endpoint) = worker_channel("w".into(), 8);
         assert_eq!(handle.injector().worker(), handle.worker());
+    }
+
+    /// `stored` resolves only once the reader asks for the event after the
+    /// last one emitted before it: taking an event is not storing it.
+    #[tokio::test]
+    async fn stored_resolves_only_when_the_reader_asks_past_every_earlier_event() {
+        let (mut handle, endpoint) = worker_channel("w".into(), 8);
+        endpoint.emit(delta("a")).await.expect("emit");
+        endpoint.emit(usage()).await.expect("emit");
+        let mut stored = Box::pin(endpoint.stored());
+        let not_yet = Duration::from_millis(20);
+        assert!(tokio::time::timeout(not_yet, &mut stored).await.is_err());
+        assert_eq!(handle.next_event().await, Some(delta("a")));
+        assert!(tokio::time::timeout(not_yet, &mut stored).await.is_err());
+        assert_eq!(handle.next_event().await, Some(usage()));
+        // The second event is taken but not yet handled.
+        assert!(tokio::time::timeout(not_yet, &mut stored).await.is_err());
+        // Asking again answers the marker, then waits for a real event.
+        let next = tokio::time::timeout(not_yet, handle.next_event()).await;
+        assert!(next.is_err(), "the marker is not an event");
+        stored.await.expect("stored");
+        // A marker sent with no reader left: nothing more is stored.
+        drop(handle);
+        assert!(matches!(
+            endpoint.stored().await,
+            Err(RuntimeError::HandleDropped { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn stored_gives_way_to_a_cancel() {
+        let (handle, endpoint) = worker_channel("w".into(), 8);
+        endpoint.emit(usage()).await.expect("emit");
+        handle.cancel();
+        assert!(matches!(
+            endpoint.stored().await,
+            Err(RuntimeError::Cancelled { .. })
+        ));
+        drop(handle);
     }
 
     #[tokio::test]

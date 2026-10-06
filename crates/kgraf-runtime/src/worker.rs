@@ -2480,6 +2480,9 @@ impl Worker {
         // cancel before the request leaves settles it as a known zero in the
         // ledger, and neither `RoundAbandoned` nor a usage event is written
         // (either would make a rebuild miscount the rounds).
+        // The rounds it summarizes are stored before it leaves, as before a
+        // round's request (`call_model`).
+        Self::await_stored(ep).await;
         if ep.is_cancelled() {
             self.settle_unsent(&call, &token).await;
             return Err(Halt::Cancelled {
@@ -2518,6 +2521,15 @@ impl Worker {
             Ok(text) => (ToolOutput::text(text).render(), false),
             Err(why) => (ToolOutput::error(why).render(), true),
         }
+    }
+
+    /// Wait until the reader has handled every event emitted so far
+    /// ([`WorkerEndpoint::stored`]), before a paid request leaves. Its two
+    /// errors need nothing here: a cancel is read by the caller's own cancel
+    /// check right after, and a reader that left stores nothing more, which
+    /// `send` already treats as delivered.
+    async fn await_stored(ep: &WorkerEndpoint) {
+        let _ = ep.stored().await;
     }
 
     /// One accounted model call, raced against cancellation.
@@ -2590,6 +2602,11 @@ impl Worker {
             }
             return Err(halt);
         }
+        // Every earlier round, and this round's `ModelCall`, is in the
+        // transcript before the request leaves: a process killed while it is
+        // in flight repeats this request on resume, never a round already
+        // paid and answered.
+        Self::await_stored(ep).await;
 
         // Decision 0067: an interrupt that arrived after the drain and before
         // this point (the ledger write above is an await) finds a request that

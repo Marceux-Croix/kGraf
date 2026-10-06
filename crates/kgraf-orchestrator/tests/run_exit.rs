@@ -11,8 +11,11 @@ mod support;
 
 use kgraf_core::RunId;
 use kgraf_core::parallel::ParallelismLimits;
-use kgraf_orchestrator::{Admission, Limits, MachineGate, Orchestrator};
+use kgraf_orchestrator::{
+    Admission, Limits, MachineGate, Orchestrator, RunStore, TraceEvent, TraceLog,
+};
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use support::*;
 
@@ -122,4 +125,128 @@ async fn a_loop_error_with_a_worker_in_flight_cancels_it_and_frees_every_slot() 
             "{key} is still leased"
         );
     }
+}
+
+/// A run that ends on an error still reports the notes nothing carried
+/// (decision 0067): `a`'s report is addressed to `b`, which waits on `x`
+/// (parked) and never starts. The loop then fails on a refused record save.
+/// The note is traced `undelivered` with the error as the reason, and the
+/// sender gets a notice, while the loop's own error is what the run returns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_loop_error_still_reports_the_notes_nothing_carried() {
+    let dir = tempfile::tempdir().expect("dir");
+    let plan = plan_json(&[
+        c("a", "make a HOLDA", "src/a.rs", &[]),
+        c("x", "make x HANG", "src/x.rs", &[]),
+        c("y", "make y LATEY", "src/y.rs", &[]),
+        c("b", "make b", "src/b.rs", &["a", "x"]),
+    ]);
+    let parts = Parts::open(
+        dir.path(),
+        move |_| plan.clone(),
+        |_| SERVES.into(),
+        Duration::from_millis(1),
+    );
+    parts.alpha.hang.store(true, Ordering::SeqCst);
+    parts.beta.hang.store(true, Ordering::SeqCst);
+    let hold_a = parts.hold_workers("HOLDA");
+    let hold_y = parts.hold_workers_late("LATEY");
+    let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+    let sink = seen.clone();
+    let orchestrator = Orchestrator::new(config(), parts.services(WINDOW))
+        .expect("orchestrator")
+        .with_session_notices(Arc::new(move |t: String| {
+            sink.lock().expect("lock").push(t);
+        }));
+    let run = tokio::spawn(orchestrator.start(RunId::new("r1"), "make a, x, y and b".into()));
+
+    wait_for("x parks", || {
+        parts.alpha.hang_reached.load(Ordering::SeqCst)
+            || parts.beta.hang_reached.load(Ordering::SeqCst)
+    })
+    .await;
+    wait_for("y parks in round 1", || parts.late_parked()).await;
+    hold_a.add_permits(1);
+    let record = || {
+        RunStore::new(parts.graph.clone())
+            .load(&RunId::new("r1"))
+            .ok()
+            .flatten()
+    };
+    wait_for("a's report to b is saved", || {
+        record().is_some_and(|r| {
+            r.coordination
+                .mailbox
+                .messages
+                .iter()
+                .any(|m| m.from_contract == "a" && m.to.iter().any(|t| t.contract == "b"))
+        })
+    })
+    .await;
+    let msg = record()
+        .expect("record")
+        .coordination
+        .mailbox
+        .messages
+        .into_iter()
+        .find(|m| m.from_contract == "a")
+        .expect("a's report");
+
+    // From now on the store refuses the run record; `y` finishing makes the
+    // loop save it.
+    let db = rusqlite::Connection::open(dir.path().join("graph.db")).expect("db");
+    db.execute_batch(
+        "CREATE TRIGGER refuse_run_record BEFORE UPDATE ON meta \
+         WHEN NEW.key LIKE 'orchestrator/run/%' \
+         BEGIN SELECT RAISE(ABORT, 'the store refuses the run record'); END;",
+    )
+    .expect("trigger");
+    hold_y.add_permits(1);
+
+    let ended = tokio::time::timeout(Duration::from_secs(20), run)
+        .await
+        .expect("the run ended in time")
+        .expect("no panic");
+    let error = ended.expect_err("the loop's error is returned");
+    assert!(
+        format!("{error:?}").contains("refuses the run record"),
+        "the original error, not a report one: {error:?}"
+    );
+
+    let trace = TraceLog::open(&parts.dir.join("runs").join("r1").join("trace.jsonl"))
+        .await
+        .expect("trace")
+        .load()
+        .await
+        .expect("load");
+    let undelivered: Vec<&str> = trace
+        .iter()
+        .filter_map(|e| match e {
+            TraceEvent::Message {
+                id,
+                action,
+                to,
+                detail,
+                ..
+            } if action == "undelivered" && *id == msg.id && to.iter().any(|t| t == "b") => {
+                Some(detail.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(undelivered.len(), 1, "{undelivered:?}");
+    assert!(
+        undelivered[0].contains("the recipient b never started before the run ended with an error"),
+        "{undelivered:?}"
+    );
+    let reported = |t: &String| t.contains(&msg.id) && t.contains("to b was not delivered");
+    assert!(
+        trace.iter().any(|e| matches!(
+            e,
+            TraceEvent::Notice { contract, detail, .. } if contract == "a" && reported(detail)
+        )),
+        "a notice on the sender's record"
+    );
+    let seen = seen.lock().expect("lock").clone();
+    assert!(seen.iter().any(reported), "{seen:?}");
 }

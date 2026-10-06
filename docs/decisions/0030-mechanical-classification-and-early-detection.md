@@ -687,3 +687,65 @@ Tests: `kgraf-orchestrator` `plan_repo.rs`
 `a_member_list_in_prose_is_read_and_refused_like_a_toml_list`,
 `prose_members_count_only_member_directories_and_stop_at_the_sentence`,
 `a_toml_member_list_wins_over_prose`.
+
+## Amendment (2026-10-06, third): a producer that edits existing code is checked against its current code
+
+The derive step took the stub from the producer's scaffold only. A producer contract that
+edits existing code (its files hold no placeholder body) got no derived check: its consumed
+edge was recorded unchecked with "no compile check could be derived: no file `<producer>`
+writes holds a scaffold". The shapes a consumer uses still exist in that case; they are the
+code as it is. A multi-crate plan whose producers edit finished crates had no compile check on
+any edge.
+
+- **The current code is the stub.** `derive_interface::derived_stub`: the scaffold files when
+  any file the producer writes holds one, else every file it writes that exists at the dispatch
+  base. The consumer files, the compile command, stub-compile and its canaries are as before. The
+  interface is registered compile-only (`derived-<producer>`). Before dispatch the check proves
+  the compile command builds the consumer files (the canaries) and that they build now. Only a
+  scaffold is given to a behavior ask as its stub; current code is not a stub a test fails
+  against.
+- **The check that matters runs after the producer.** When the producer's attempt passes its own
+  verification, `checks::check_delivery` lays the producer's delivered files (every declared write
+  its workspace holds, so a new module beside an edited file is included) over the check base and
+  runs the interface's compile command. The consumer files are not laid over it: the base, which
+  follows the integration tip, holds their current text. A failure fails the attempt with the
+  interface, the consumer files and the compiler output named, and tells the worker to call
+  `challenge_contract` if its contract must change the shape. A change the consumer files do not
+  use compiles, so it passes. This check runs for every compile-only interface, scaffold ones
+  included: the worker brief already told the producer to keep the signatures the consumer files
+  use, and now that is checked.
+- **Never a false block.** When the delivery fails, a control build without it runs. A control
+  that fails too means the base is broken for another reason: no verdict. A check that cannot run
+  or times out twice gives no verdict either. Each case is a notice with the pass
+  (`DeliveryCheck::NotJudged`), never a failure of the producer.
+- **Current code left in place is not a stub left in place.** `stub_land::stub_left_in_place`
+  counts only scaffold files of a compile-only interface: a producer need not change every file
+  it may write.
+- **Per language.** Rust: `cargo test --no-run -p <consumer packages>` type-checks every item,
+  signature and type the consumer files use. Python: `python3 -c "import <modules>"` resolves the
+  names the consumer modules import when they load; a changed call shape or an attribute use is
+  not checked, so it never blocks. Every other language (shell, TypeScript, JavaScript, files of
+  more than one language, a file with no extension) gets no derived check, and the edge is
+  recorded unchecked with the language named (`derive_interface::no_command_reason`), decided
+  from the producer's own files before any search for their users. The derived-check sentence of
+  an edge's reason names the stub's source (`stub: the scaffold of ...` or `stub: the current
+  code of ...`) and what the command checks (`derive_interface::coverage`).
+
+Known limits. An overlay cannot delete: a file the producer removed stays in the check tree. A
+planned shape change that the consumer contract is to adopt fails the producer until the worker
+challenges the interface. The post-producer compile builds the consumer packages in a fresh target
+directory, as every check does, so it adds one cold build of them to each producer's verification.
+
+Tests: `kgraf-orchestrator` `derive_interface.rs`
+`a_producer_that_edits_existing_code_gets_its_current_code_as_the_stub`,
+`no_file_yet_or_no_user_or_no_command_derives_nothing_and_says_why`,
+`a_shell_or_typescript_user_gets_no_compile_check_and_the_reason_names_the_language`;
+`tests/contract_checks.rs`
+`rust_a_delivery_that_breaks_a_used_signature_fails_and_an_unused_change_passes`,
+`python_a_changed_call_shape_does_not_block_and_a_removed_imported_name_does`,
+`a_base_that_does_not_build_or_a_check_that_cannot_run_gives_no_verdict`,
+`the_delivery_is_every_declared_file_the_workspace_holds`; `tests/contract_flow.rs`
+`a_producer_that_edits_existing_code_gets_a_compile_check_of_its_current_code`,
+`a_shell_producer_is_recorded_unchecked_with_its_reason_and_never_blocked`,
+`a_producer_that_breaks_a_shape_of_its_current_code_fails_verification`,
+`a_producer_that_keeps_the_used_shapes_of_its_current_code_passes`.

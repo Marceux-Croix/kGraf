@@ -56,7 +56,7 @@
 
 use crate::admission::{Admission, Admitted, Reservation};
 use crate::challenge::{Challenge, Challenger, Evidence};
-use crate::checks::FileOverlay;
+use crate::checks::{DeliveryCheck, FileOverlay, check_delivery, delivered_files};
 use crate::clock::Clock;
 use crate::cluster_cap;
 use crate::consumer_tests::verify_producer_against_consumer_tests;
@@ -1504,6 +1504,11 @@ struct InFlight {
     /// Per attempt, the digest of the brief it was started with. Read once, to
     /// fill the dispatch trace event.
     brief_digests: BTreeMap<AgentId, String>,
+    /// Per attempt, when its first model request left (decision 0067): set
+    /// once by the attempt's task on its first `ModelCall` event. A mailbox
+    /// note in the attempt's fresh brief is delivered from that moment, never
+    /// from the moment the brief was built (`coord.rs`, `CopyState::InBrief`).
+    first_calls: BTreeMap<AgentId, Arc<OnceLock<i64>>>,
     run: String,
     task: String,
     clock: Arc<dyn Clock>,
@@ -2560,6 +2565,7 @@ impl RunLoop {
             }
         }
         if resumed {
+            me.load_report_fates();
             me.on_resume().await?;
         }
         Ok(me)
@@ -3869,6 +3875,9 @@ impl RunLoop {
         match planned {
             Ok(_) => self.run().await,
             Err(e) => {
+                // A resumed run can hold notes an earlier process left
+                // waiting: reported as at any run's end (decision 0067).
+                self.report_undelivered_on_error().await;
                 // The planning error is the one the caller needs: a failure to
                 // release is printed, never returned in its place.
                 if let Err(release) = self.shutdown() {
@@ -3907,6 +3916,7 @@ impl RunLoop {
     async fn run(mut self) -> Result<RunReport, OrchestratorError> {
         if let Err(e) = self.run_loop().await {
             self.release_on_error();
+            self.report_undelivered_on_error().await;
             // A run that failed after planning is still measured.
             if let Err(analytics) = self.close_frugality(false).await {
                 return Err(OrchestratorError::WithAnalyticsFailure {
@@ -3918,8 +3928,7 @@ impl RunLoop {
         }
         // Every attempt has ended: a note nothing carried is reported now,
         // whatever the status (decision 0067, amendment of 2026-10-06).
-        self.report_undelivered_mail_at_run_end();
-        self.report_undelivered_inbox_at_run_end();
+        self.report_undelivered_at_run_end();
         self.shutdown()?;
         self.flush_coord().await?;
         self.save()?;
@@ -3954,14 +3963,47 @@ impl RunLoop {
     /// still winding down after the cancel.
     fn release_on_error(&mut self) {
         // Each flight's `Drop` cancels its workers, then returns its
-        // admission and budget holds.
+        // admission and budget holds. A brief whose first model request
+        // already left is delivered: its slot is read after the cancel, so
+        // a request that left on the way is counted too.
+        let first_calls: Vec<(AgentId, Arc<OnceLock<i64>>)> = self
+            .in_flight
+            .values()
+            .flat_map(|f| f.first_calls.iter().map(|(w, s)| (w.clone(), s.clone())))
+            .collect();
         drop(std::mem::take(&mut self.in_flight));
+        for (worker, slot) in first_calls {
+            match slot.get() {
+                Some(at) => self.brief_reached_model(&worker, *at),
+                None => self.mail_attempt_ended(&worker, None),
+            }
+        }
         self.release_subagents_on_error();
         if let Err(e) = self.shutdown() {
             eprintln!("kgraf-orchestrator: a failed run could not release all it held: {e}");
         }
         if let Err(e) = self.save() {
             eprintln!("kgraf-orchestrator: a failed run's record could not be saved: {e}");
+        }
+    }
+
+    /// The run ended with an error (planning, or the loop): the run-end
+    /// reports run as on any other end, after the error path released what
+    /// the run held, and the record is saved so each report is made once.
+    /// Their own failures are printed, never returned: the run's error is
+    /// the one the caller needs.
+    async fn report_undelivered_on_error(&mut self) {
+        self.coord.run_failed = true;
+        self.report_undelivered_at_run_end();
+        if let Err(e) = self.save() {
+            eprintln!(
+                "kgraf-orchestrator: a failed run's undelivered reports could not be saved: {e}"
+            );
+        }
+        if let Err(e) = self.flush_coord().await {
+            eprintln!(
+                "kgraf-orchestrator: a failed run's undelivered reports could not be traced: {e}"
+            );
         }
     }
 
@@ -5388,6 +5430,7 @@ impl RunLoop {
             fences: BTreeMap::new(),
             ended: BTreeMap::new(),
             brief_digests: BTreeMap::new(),
+            first_calls: BTreeMap::new(),
             run: self.run_id().to_string(),
             task: contract.task.as_str().to_owned(),
             clock: self.s.clock.clone(),
@@ -5918,6 +5961,10 @@ impl RunLoop {
         );
         let cancel = Arc::new(Notify::new());
         flight.cancels.insert(worker.clone(), cancel.clone());
+        let first_call: Arc<OnceLock<i64>> = Arc::new(OnceLock::new());
+        flight
+            .first_calls
+            .insert(worker.clone(), first_call.clone());
         let (ended_tx, ended_rx) = oneshot::channel::<()>();
         flight.ended.insert(worker.clone(), ended_rx);
         // Decision 0067: created here, at dispatch, on the loop, so
@@ -6021,6 +6068,7 @@ impl RunLoop {
                         graph,
                         None,
                         stop_point,
+                        first_call,
                     )
                     .await;
                     if let Some(closer) = closer {
@@ -6126,7 +6174,15 @@ impl RunLoop {
         };
         // The runtime marked every injection before this result was sent:
         // copies it never reached a boundary for are known now (`coord.rs`).
-        self.mail_attempt_ended(&f.worker);
+        // A brief reached a model only if a request left with it: this
+        // segment's first `ModelCall`, or, for an attempt rebuilt from a
+        // finished transcript without a spawn, the calls it recorded.
+        let first_call = flight
+            .first_calls
+            .remove(&f.worker)
+            .and_then(|slot| slot.get().copied())
+            .or_else(|| (!f.result.calls.is_empty()).then(system_now_ms));
+        self.mail_attempt_ended(&f.worker, first_call);
         let now = self.now();
         let run = self.run_id();
         let idx = flight.attempts.iter().position(|a| a.worker == f.worker);
@@ -6491,7 +6547,7 @@ impl RunLoop {
                 let producer_checks = self.producer_checks_for(&f.contract);
                 let checks_runner = if producer_checks
                     .iter()
-                    .any(|(_, accepted)| !accepted.is_empty())
+                    .any(|(ic, accepted)| !accepted.is_empty() || ic.is_compile_only())
                 {
                     self.checks_runner()
                 } else {
@@ -6549,6 +6605,50 @@ impl RunLoop {
                                     reason: failure.detail,
                                 };
                                 break 'producer_checks;
+                            }
+                            // Decision 0030, amendment of 2026-10-06: the
+                            // consumer files of a compile-only interface must
+                            // still compile against the delivery. A broken
+                            // shape fails the attempt; a check that gives no
+                            // verdict is reported with the pass, never held
+                            // against the producer.
+                            if ic.is_compile_only() {
+                                let judged = match checks_runner.as_ref() {
+                                    Some(runner) => {
+                                        let delivered =
+                                            delivered_files(&workspace, &c.writes).await;
+                                        check_delivery(runner, ic, &delivered).await
+                                    }
+                                    None => DeliveryCheck::NotJudged {
+                                        reason: format!(
+                                            "interface {}: the compile check against the \
+                                             producer's delivery did not run to a verdict, and \
+                                             the delivery is not held for it: no sandbox runner \
+                                             is configured",
+                                            ic.label()
+                                        ),
+                                    },
+                                };
+                                match judged {
+                                    DeliveryCheck::Passed => {}
+                                    DeliveryCheck::Broken { detail } => {
+                                        verdict = Verdict::Fail {
+                                            reason: format!(
+                                                "{detail}. Keep the shapes those files use; if \
+                                                 this contract must change them, call `{}` with \
+                                                 interface `{}`",
+                                                crate::challenge_tool::CHALLENGE_TOOL,
+                                                ic.id
+                                            ),
+                                        };
+                                        break 'producer_checks;
+                                    }
+                                    DeliveryCheck::NotJudged { reason } => {
+                                        if let Verdict::Pass { notices, .. } = &mut verdict {
+                                            notices.push(reason);
+                                        }
+                                    }
+                                }
                             }
                             if accepted.is_empty() {
                                 continue;
@@ -8568,7 +8668,7 @@ pub(crate) struct AttemptSkills {
 /// (resuming from the transcript when there is one), forward every event to the
 /// transcript, and return its result and peak context.
 ///
-/// Eleven positional arguments (four over clippy's default): each is a
+/// Twelve positional arguments (five over clippy's default): each is a
 /// distinct piece of per-attempt state the dispatch site already holds
 /// separately (`InFlight`'s own maps keyed by worker, not a single struct);
 /// grouping them into a new type here would only move the naming, not
@@ -8586,6 +8686,7 @@ async fn run_attempt(
     graph: SharedGraph,
     parent_call: Option<CallId>,
     stop_point: kgraf_runtime::StopPointPolicy,
+    first_call: Arc<OnceLock<i64>>,
 ) -> Result<(WorkerResult, u64), String> {
     // A kill mid-append leaves a torn last line: repaired (dropped) rather
     // than refused, as the host's worker does, so a re-adopted worker
@@ -8746,6 +8847,12 @@ async fn run_attempt(
                                 WorkerEvent::Injected { id, .. } => Some(id.clone()),
                                 _ => None,
                             };
+                            // The first request of this segment left with
+                            // the brief: what the brief carries is
+                            // delivered from now (`CopyState::InBrief`).
+                            if matches!(settled, WorkerEvent::ModelCall { .. }) {
+                                let _ = first_call.set(system_now_ms());
+                            }
                             match transcript.append(settled).await {
                                 Ok(seq) => {
                                     if let Some(id) = injected_id {
@@ -8795,6 +8902,14 @@ async fn run_attempt(
     Ok((result, peak))
 }
 
+/// The system clock in milliseconds: the time base of the runtime's delivery
+/// marks, which are written off the loop, where its own clock is not.
+fn system_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
 /// Marks one injected id delivered at transcript sequence `seq`, from the
 /// graph store directly (`run_attempt` is a detached task, off the
 /// orchestrator loop, so it reaches `SessionRecords` the same way the loop's
@@ -8802,10 +8917,7 @@ async fn run_attempt(
 /// store failure is reported, never silently treated as "delivery did not
 /// happen"; the worker's own run is not affected either way.
 fn mark_delivered(graph: &SharedGraph, id: &str, seq: u64) {
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
+    let now_ms = system_now_ms();
     if let Err(e) =
         kgraf_graph::sessions::SharedSessions(graph.clone()).mark_delivered(id, seq, now_ms)
     {
@@ -9118,6 +9230,7 @@ mod tests {
             fences: BTreeMap::new(),
             ended: BTreeMap::new(),
             brief_digests: BTreeMap::new(),
+            first_calls: BTreeMap::new(),
             run: "r".into(),
             task: "r/a".into(),
             clock: Arc::new(crate::clock::SystemClock),

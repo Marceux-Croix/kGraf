@@ -840,6 +840,96 @@ async fn a_worker_makes_a_small_change_in_its_own_worktree_and_returns_a_structu
     );
 }
 
+/// A paid round is stored before the next request leaves. The reader here is a
+/// slow transcript writer: it holds the first round's tool result back from
+/// its store until the next request arrives, or for `HOLD` if none does. Each
+/// request records what the store held when it left. A loop that sent its next
+/// request while the reader still held the result would let a process kill at
+/// that moment lose a round that was paid and answered, and the resume would
+/// pay for it again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_request_leaves_before_the_reader_has_stored_every_earlier_event() {
+    const HOLD: Duration = Duration::from_millis(800);
+    let worktree = tempfile::tempdir().expect("worktree");
+    let stored: Arc<Mutex<Vec<WorkerEvent>>> = Arc::default();
+    // Per request: (its round, the events stored when it left).
+    type AtRequest = Vec<(usize, Vec<WorkerEvent>)>;
+    let at_request: Arc<Mutex<AtRequest>> = Arc::default();
+    let request_seen = Arc::new(tokio::sync::Notify::new());
+    let provider = {
+        let stored = stored.clone();
+        let at_request = at_request.clone();
+        let request_seen = request_seen.clone();
+        Fake::new(false, move |request| {
+            let round = round_of(request);
+            let snapshot = stored.lock().expect("lock").clone();
+            at_request.lock().expect("lock").push((round, snapshot));
+            // Only a request after the held result releases the hold; a
+            // stored permit from the first request would release it early.
+            if round > 0 {
+                request_seen.notify_one();
+            }
+            match round {
+                0 => Round::tool(vec![(
+                    "t1",
+                    "write_file",
+                    json!({"path": "src/a.txt", "content": "a"}),
+                )]),
+                1 => Round::tool(vec![(
+                    "t2",
+                    "write_file",
+                    json!({"path": "src/b.txt", "content": "b"}),
+                )]),
+                _ => Round::answer("done"),
+            }
+        })
+    };
+    let env = Arc::new(env_with(
+        provider.clone(),
+        vec![Arc::new(WriteFile)],
+        CallMode::Complete,
+    ));
+    let mut handle = spawn_worker(
+        env,
+        brief("w1", "Write a and b", worktree.path(), 6),
+        SpawnOptions::default(),
+    )
+    .await
+    .expect("spawn");
+    let reader = async {
+        let mut held_once = false;
+        while let Some(event) = handle.next_event().await {
+            if !held_once && matches!(event, WorkerEvent::ToolCallFinished { .. }) {
+                held_once = true;
+                let _ = tokio::time::timeout(HOLD, request_seen.notified()).await;
+            }
+            stored.lock().expect("lock").push(event);
+        }
+        handle.result().await.expect("result")
+    };
+    let result = with_timeout(reader).await.expect("in time");
+    assert_eq!(result.outcome, WorkerOutcome::Completed, "{result:?}");
+
+    let at_request = at_request.lock().expect("lock").clone();
+    assert_eq!(at_request.len(), 3, "three requests");
+    for (round, snapshot) in &at_request {
+        let calls = snapshot
+            .iter()
+            .filter(|e| matches!(e, WorkerEvent::ModelCall { .. }))
+            .count();
+        let finished = snapshot
+            .iter()
+            .filter(|e| matches!(e, WorkerEvent::ToolCallFinished { .. }))
+            .count();
+        assert_eq!(
+            (calls, finished),
+            (round + 1, *round),
+            "request {round} left before every earlier round, and its own \
+             `ModelCall`, was stored: {snapshot:#?}"
+        );
+    }
+}
+
 /// A provider's opaque token on a tool call reaches the event log and the next
 /// request, so a resumed run sends it back.
 #[tokio::test]
@@ -2203,16 +2293,25 @@ async fn a_cancel_before_any_usage_leaves_the_call_unreconciled_in_both_modes() 
             ..Round::answer("never")
         });
         let env = Arc::new(env_with(provider.clone(), vec![], mode));
-        let handle = spawn_worker(
+        let mut handle = spawn_worker(
             env.clone(),
             brief("w1", "x", dir.path(), 3),
             SpawnOptions::default(),
         )
         .await
         .expect("spawn");
-        while provider.requests().is_empty() {
-            tokio::task::yield_now().await;
-        }
+        // Read while waiting: a request leaves only once the reader has
+        // asked past every event before it (`WorkerEndpoint::stored`).
+        with_timeout(async {
+            while provider.requests().is_empty() {
+                tokio::select! {
+                    _ = handle.next_event() => {}
+                    () = tokio::task::yield_now() => {}
+                }
+            }
+        })
+        .await
+        .expect("the request left");
         handle.cancel();
         let result = with_timeout(handle.result())
             .await

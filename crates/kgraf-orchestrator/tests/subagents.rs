@@ -1584,7 +1584,9 @@ fn a_kill_while_a_child_runs_then_resume_wakes_the_parent_once_and_repeats_no_ro
     let o = first.block_on(async { rig1.orchestrator() });
     first.spawn(o.start(RunId::new(RUN), "do the work".into()));
     // Wait for both hangs (the events, not a delay): every earlier round of
-    // both agents is then complete and written down.
+    // both agents is then complete and written down: the runtime sends a
+    // request only once the transcript holds every event before it
+    // (`WorkerEndpoint::stored`), so a hang is reached only after that.
     let deadline = Instant::now() + Duration::from_secs(60);
     while !(reached.load(Ordering::SeqCst) && parent_reached.load(Ordering::SeqCst)) {
         assert!(
@@ -3448,4 +3450,171 @@ async fn a_subagent_report_its_parent_never_reached_is_traced_undelivered_and_re
     );
     let parent = provider.last("PARENT-RU").expect("parent");
     assert!(parent.report().is_none(), "the parent never saw it");
+}
+
+/// The process is killed after a child's report reached its parent's
+/// transcript. With `drop_fate`, the kill came before the loop traced
+/// `report_delivered`; with `clear_mark`, also before the inbox row was
+/// marked. Whatever the window, the trace over both processes holds
+/// `report_delivered` for it exactly once, at the transcript sequence that
+/// carried it, and the parent's transcript holds the report once.
+fn a_report_delivered_before_a_kill_is_traced_once_after_resume(clear_mark: bool, drop_fate: bool) {
+    let dir = tempfile::tempdir().expect("dir");
+    let plan = plan(&[("a", "PARENT-K3 make a", &["src/a.rs", "src/c.rs"])]);
+    let script = |hang: Option<Arc<AtomicBool>>| {
+        move |s: &Seen| {
+            if s.is("CHILD-K3") {
+                return match s.round {
+                    0 => Step::Reply(vec![write("c", "src/c.rs", "child c")]),
+                    _ => Step::Reply(answer("wrote c")),
+                };
+            }
+            if !s.used.contains("spawn") {
+                return Step::Reply(vec![spawn_writer("CHILD-K3 write c", &["src/c.rs"])]);
+            }
+            if s.report().is_none() {
+                return Step::Reply(vec![nap(s.round)]);
+            }
+            if let Some(reached) = &hang {
+                return Step::Hang(reached.clone());
+            }
+            if !s.used.contains("a") {
+                return Step::Reply(vec![write("a", "src/a.rs", "parent")]);
+            }
+            Step::Reply(answer("done"))
+        }
+    };
+    let runtime = || {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .expect("runtime")
+    };
+    let id = "subagent-report:r1-a-r0-a0.s1";
+    let reached = Arc::new(AtomicBool::new(false));
+    let first = runtime();
+    let rig1 = Rig::open(
+        dir.path(),
+        plan.clone(),
+        Limits::default(),
+        Scripted::new(script(Some(reached.clone()))),
+        true,
+    );
+    let o = first.block_on(async { rig1.orchestrator() });
+    first.spawn(o.start(RunId::new(RUN), "do the work".into()));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !reached.load(Ordering::SeqCst) {
+        assert!(Instant::now() < deadline, "the parent never saw the report");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // The parent's request that carries the report is parked; the runtime
+    // wrote the `Injected` event and the mark before sending it.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while rig1
+        .sessions()
+        .inbox_item(id)
+        .ok()
+        .flatten()
+        .and_then(|i| i.delivered)
+        .is_none()
+    {
+        assert!(Instant::now() < deadline, "the report row was never marked");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let trace_path = dir.path().join("runs").join(RUN).join("trace.jsonl");
+    let fate = |l: &str| l.contains(id) && l.contains("\"report_delivered\"");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !read(&trace_path).lines().any(fate) {
+        assert!(
+            Instant::now() < deadline,
+            "report_delivered was never traced"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    first.shutdown_background();
+    drop(rig1);
+    std::thread::sleep(Duration::from_millis(450));
+
+    // Recreate the kill's window: the trace holds no fate for the report
+    // (the loop's pass after the mark never ran), and with `clear_mark` the
+    // row is not marked either (the kill fell between the transcript append
+    // and the mark).
+    if drop_fate {
+        let kept: String = read(&trace_path)
+            .lines()
+            .filter(|l| !fate(l))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        std::fs::write(&trace_path, kept).expect("rewrite the trace");
+    }
+    if clear_mark {
+        let db = rusqlite::Connection::open(dir.path().join("graph.db")).expect("db");
+        db.execute(
+            "UPDATE session_inbox SET delivered_seq = NULL, delivered_ms = NULL WHERE id = ?1",
+            [id],
+        )
+        .expect("clear the mark");
+    }
+
+    let second = runtime();
+    let rig2 = Rig::open(
+        dir.path(),
+        plan,
+        Limits::default(),
+        Scripted::new(script(None)),
+        true,
+    );
+    let report = second
+        .block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(60),
+                rig2.orchestrator().resume(RunId::new(RUN)),
+            )
+            .await
+        })
+        .expect("the resume ended in time")
+        .expect("resume");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+
+    let (seq, _) = rig2
+        .sessions()
+        .inbox_item(id)
+        .expect("store")
+        .expect("the report's inbox row")
+        .delivered
+        .expect("marked delivered");
+    let transcript = read(&rig2.transcript("r1-a-r0-a0"));
+    let wakes = transcript
+        .lines()
+        .filter(|l| l.contains(r#""type":"injected""#) && l.contains(id))
+        .count();
+    assert_eq!(wakes, 1, "the report is in the parent's transcript once");
+    let events = second.block_on(report_events(&rig2, id));
+    let delivered: Vec<&(String, String, i64)> = events
+        .iter()
+        .filter(|(a, _, _)| a == "report_delivered")
+        .collect();
+    assert_eq!(delivered.len(), 1, "traced once: {events:?}");
+    assert!(
+        delivered[0].1.contains(&format!("(transcript seq {seq})")),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn a_report_marked_delivered_before_a_kill_is_traced_once_after_resume() {
+    a_report_delivered_before_a_kill_is_traced_once_after_resume(false, true);
+}
+
+#[test]
+fn a_report_in_the_transcript_but_unmarked_at_a_kill_is_traced_once_after_resume() {
+    a_report_delivered_before_a_kill_is_traced_once_after_resume(true, true);
+}
+
+/// The same window as above, but the first process had traced the report's
+/// fate: the resume does not trace it again.
+#[test]
+fn a_report_whose_fate_was_traced_before_a_kill_is_not_traced_again() {
+    a_report_delivered_before_a_kill_is_traced_once_after_resume(true, false);
 }

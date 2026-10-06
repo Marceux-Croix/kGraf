@@ -6,8 +6,9 @@ mod contract_support;
 
 use contract_support::*;
 use kgraf_orchestrator::{
-    CheckError, CheckStage, FileOverlay, InterfaceContract, InterfaceKind, RevisionClass,
-    WriteTarget, check_mechanical, classify, resolve_by_recompute,
+    CheckError, CheckStage, DeliveryCheck, FileOverlay, InterfaceContract, InterfaceKind,
+    RevisionClass, WriteTarget, check_delivery, check_mechanical, classify, delivered_files,
+    resolve_by_recompute,
 };
 // Only referenced by the `#[cfg(unix)]` rlimit test below (file-size/CPU rlimits are a
 // unix-specific mechanism); a plain, unconditional import left this "unused" on a
@@ -1353,4 +1354,257 @@ async fn a_compile_only_revision_is_classified_by_compatibility_alone() {
         .expect("ran")
         .expect("valid");
     assert_eq!(c.class, RevisionClass::Supersede, "{}", c.detail);
+}
+
+// ------------------------------------- compile-only interfaces of current code
+
+/// The producer's current code in a two-crate Rust workspace: `app` uses
+/// `price` and `Rate`; no consumer file uses `unused_helper`.
+const PROD_CURRENT: &str = "pub struct Rate { pub cents: i64 }\n\
+pub fn price(qty: u32) -> Rate { Rate { cents: qty as i64 * 100 } }\n\
+pub fn unused_helper() -> u8 { 1 }\n";
+
+const APP_CURRENT: &str = "use prod::{price, Rate};\n\
+pub fn total(qty: u32) -> i64 { let r: Rate = price(qty); r.cents }\n";
+
+fn two_crate_repo(root: &Path) -> std::path::PathBuf {
+    let repo = root.join("ws");
+    for (path, content) in [
+        (
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"prod\", \"app\"]\nresolver = \"2\"\n",
+        ),
+        (
+            "prod/Cargo.toml",
+            "[package]\nname = \"prod\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        ),
+        ("prod/src/lib.rs", PROD_CURRENT),
+        (
+            "app/Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+             [dependencies]\nprod = { path = \"../prod\" }\n",
+        ),
+        ("app/src/lib.rs", APP_CURRENT),
+    ] {
+        let at = repo.join(path);
+        std::fs::create_dir_all(at.parent().expect("parent")).expect("mkdir");
+        std::fs::write(at, content).expect("write");
+    }
+    commit_all(&repo);
+    repo
+}
+
+/// What kGraf derives for a producer that edits existing code: the stub is
+/// the file as it is, the consumer the file that uses it, the command the one
+/// kGraf's derive step gives for a Rust consumer.
+fn current_code_rust_ic() -> InterfaceContract {
+    InterfaceContract {
+        kind: InterfaceKind::CompileOnly,
+        id: "derived-prod".into(),
+        version: 1,
+        parties: s(&["prod", "app"]),
+        symbols: s(&["price", "Rate"]),
+        stub: vec![FileOverlay::new("prod/src/lib.rs", PROD_CURRENT)],
+        wrong: vec![],
+        reference: vec![],
+        consumer: vec![FileOverlay::new("app/src/lib.rs", APP_CURRENT)],
+        tests: vec![],
+        compile: s(&["cargo", "test", "--no-run", "-p", "app"]),
+        test: vec![],
+        consulted: vec![],
+        replaces: vec![],
+    }
+}
+
+/// Rust, current code as the stub: the check before dispatch passes (the
+/// consumer builds against the code as it is, and its canary does not), a
+/// delivery that changes a signature the consumer uses fails, and a delivery
+/// that changes only what the consumer does not use passes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rust_a_delivery_that_breaks_a_used_signature_fails_and_an_unused_change_passes() {
+    let dir = tempfile::tempdir().expect("dir");
+    let repo = two_crate_repo(dir.path());
+    let r = runner(dir.path(), &repo);
+    let ic = current_code_rust_ic();
+    assert!(ic.stub_is_current_code());
+    let runs = check_mechanical(&r, &ic)
+        .await
+        .expect("ran")
+        .expect("the consumer builds against the current code");
+    assert_eq!(
+        runs.len(),
+        2,
+        "stub-compile and the consumer canary: {runs:?}"
+    );
+
+    let broken = [FileOverlay::new(
+        "prod/src/lib.rs",
+        "pub struct Rate { pub cents: i64 }\n\
+         pub fn price(qty: u32, region: &str) -> Rate { let _ = region; Rate { cents: qty as i64 } }\n\
+         pub fn unused_helper() -> u8 { 1 }\n",
+    )];
+    match check_delivery(&r, &ic, &broken).await {
+        DeliveryCheck::Broken { detail } => {
+            assert!(
+                detail.contains("derived-prod@v1")
+                    && detail.contains("app/src/lib.rs")
+                    && detail.contains("breaks a shape"),
+                "{detail}"
+            );
+            assert!(
+                detail.contains("E0061") || detail.contains("argument"),
+                "{detail}"
+            );
+        }
+        other => panic!("a used signature changed: {other:?}"),
+    }
+
+    let unused = [
+        FileOverlay::new(
+            "prod/src/lib.rs",
+            "mod extra;\npub use extra::bonus;\n\
+             pub struct Rate { pub cents: i64 }\n\
+             pub fn price(qty: u32) -> Rate { Rate { cents: qty as i64 * 90 + bonus() } }\n\
+             pub fn unused_helper(scale: u16) -> u16 { scale * 2 }\n",
+        ),
+        FileOverlay::new("prod/src/extra.rs", "pub fn bonus() -> i64 { 5 }\n"),
+    ];
+    assert_eq!(
+        check_delivery(&r, &ic, &unused).await,
+        DeliveryCheck::Passed,
+        "only a body, an unused signature and a new module changed"
+    );
+}
+
+/// The delivery is every declared file the producer's workspace holds, not
+/// only the stub's paths: a new module beside the edited file is part of what
+/// the consumer compiles against. A declared file the workspace lacks is left
+/// out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_delivery_is_every_declared_file_the_workspace_holds() {
+    let dir = tempfile::tempdir().expect("dir");
+    let ws = dir.path().join("worktree");
+    std::fs::create_dir_all(ws.join("prod/src")).expect("mkdir");
+    std::fs::write(ws.join("prod/src/lib.rs"), "mod extra;\n").expect("write");
+    std::fs::write(ws.join("prod/src/extra.rs"), "pub fn bonus() {}\n").expect("write");
+    let w = |p: &str| WriteTarget {
+        path: p.into(),
+        node: None,
+    };
+    let got = delivered_files(
+        &ws,
+        &[
+            w("prod/src/lib.rs"),
+            w("prod/src/extra.rs"),
+            w("prod/src/gone.rs"),
+        ],
+    )
+    .await;
+    let paths: Vec<&str> = got.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(paths, ["prod/src/lib.rs", "prod/src/extra.rs"]);
+    assert_eq!(got[1].content, "pub fn bonus() {}\n");
+}
+
+const SHOP_PROD: &str = "def price(qty):\n    return qty * 100\n";
+const SHOP_APP: &str = "from shop.prod import price\n\n\ndef total(q):\n    return price(q)\n";
+
+fn shop_repo(root: &Path, app: &str) -> std::path::PathBuf {
+    let repo = root.join("shop-repo");
+    std::fs::create_dir_all(repo.join("shop")).expect("mkdir");
+    std::fs::write(repo.join("shop/__init__.py"), "").expect("write");
+    std::fs::write(repo.join("shop/prod.py"), SHOP_PROD).expect("write");
+    std::fs::write(repo.join("shop/app.py"), app).expect("write");
+    commit_all(&repo);
+    repo
+}
+
+fn current_code_py_ic(app: &str) -> InterfaceContract {
+    InterfaceContract {
+        kind: InterfaceKind::CompileOnly,
+        id: "derived-prod".into(),
+        version: 1,
+        parties: s(&["prod", "app"]),
+        symbols: s(&["price"]),
+        stub: vec![FileOverlay::new("shop/prod.py", SHOP_PROD)],
+        wrong: vec![],
+        reference: vec![],
+        consumer: vec![FileOverlay::new("shop/app.py", app)],
+        tests: vec![],
+        compile: s(&["python3", "-c", "import shop.app"]),
+        test: vec![],
+        consulted: vec![],
+        replaces: vec![],
+    }
+}
+
+/// Python, current code as the stub. The import check resolves the names the
+/// consumer imports when it loads, and no more: a changed call shape is not a
+/// failure (Python does not check one at import, so the check does not block
+/// the producer for it), and a name the consumer imports that the delivery
+/// removed is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn python_a_changed_call_shape_does_not_block_and_a_removed_imported_name_does() {
+    let dir = tempfile::tempdir().expect("dir");
+    let repo = shop_repo(dir.path(), SHOP_APP);
+    let r = runner(dir.path(), &repo);
+    let ic = current_code_py_ic(SHOP_APP);
+    check_mechanical(&r, &ic)
+        .await
+        .expect("ran")
+        .expect("the consumer imports against the current code");
+    let reshaped = [FileOverlay::new(
+        "shop/prod.py",
+        "def price(qty, region):\n    return qty * 90\n",
+    )];
+    assert_eq!(
+        check_delivery(&r, &ic, &reshaped).await,
+        DeliveryCheck::Passed
+    );
+    let renamed = [FileOverlay::new(
+        "shop/prod.py",
+        "def cost(qty):\n    return qty * 100\n",
+    )];
+    match check_delivery(&r, &ic, &renamed).await {
+        DeliveryCheck::Broken { detail } => {
+            assert!(
+                detail.contains("price") && detail.contains("shop/app.py"),
+                "{detail}"
+            );
+        }
+        other => panic!("an imported name was removed: {other:?}"),
+    }
+}
+
+/// A consumer that does not build at the check base without the delivery
+/// either is not the producer's to fix: no verdict, the reason given, never a
+/// failure of the delivery. A check that cannot run gives no verdict either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_base_that_does_not_build_or_a_check_that_cannot_run_gives_no_verdict() {
+    let dir = tempfile::tempdir().expect("dir");
+    let broken_app = "from shop.prod import price, missing_at_base\n";
+    let repo = shop_repo(dir.path(), broken_app);
+    let r = runner(dir.path(), &repo);
+    let ic = current_code_py_ic(broken_app);
+    let delivery = [FileOverlay::new(
+        "shop/prod.py",
+        "def price(qty):\n    return 1\n",
+    )];
+    match check_delivery(&r, &ic, &delivery).await {
+        DeliveryCheck::NotJudged { reason } => {
+            assert!(
+                reason.contains("without the delivery either")
+                    && reason.contains("not the producer's"),
+                "{reason}"
+            );
+        }
+        other => panic!("the base itself does not build: {other:?}"),
+    }
+    let mut missing = current_code_py_ic(SHOP_APP);
+    missing.compile = s(&["kgraf-no-such-compiler", "x"]);
+    match check_delivery(&r, &missing, &delivery).await {
+        DeliveryCheck::NotJudged { reason } => {
+            assert!(reason.contains("could not run"), "{reason}");
+        }
+        other => panic!("the program is missing: {other:?}"),
+    }
 }

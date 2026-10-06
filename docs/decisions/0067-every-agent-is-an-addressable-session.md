@@ -242,3 +242,50 @@ the `model_text` unit tests in `sessions.rs`, and `mailbox_injection.rs`.
 Not changed: a hand-back child's instruction is the runtime's remainder of the worker's own
 brief, and a subagent's task is its parent's delegation; both are instructions by design and
 pass the delegation guards.
+
+## Amendment (2026-10-06, fourth): delivery is what a model read; run-end reports run on every exit, once
+
+Four gaps were left in the delivery record of the amendment above.
+
+1. **A note in a fresh brief was recorded as delivered when the brief was built.**
+   `brief_with_inbox` (`coord.rs`) marked every message the brief carried as delivered and
+   traced `delivered` before the attempt's task started. A spawn that failed before its first
+   model request (a pinned context too large, a missing route) left the record saying
+   delivered with no model having read it. Now the brief records one copy per attempt in the
+   state `in_brief`; the attempt's task sets a slot on its first `ModelCall` event (the ledger
+   row the runtime opens before the request leaves), and the loop then marks the copy
+   `brief_sent` with that time, marks the message delivered and traces `delivered` (`in the
+   brief of <attempt>`). An attempt that ends with no request marks the copy `not_reached`
+   and traces `pending` with the reason; the message stays undelivered, so the next fresh
+   brief carries it, or it is reported undelivered at the recipient's close or the run's end.
+   A resumed attempt's opening is rebuilt with the same messages its first brief carried, in
+   the same order, so the continued conversation is the one the model had; a first segment
+   whose transcript holds a `ModelCall` settles its copies on resume.
+2. **The run-end report did not run when the run loop ended with an error.** It ran only on
+   the loop's normal return. Now it also runs after the error path has cancelled every worker
+   and released what the run held, and after a planning error, with the reason `the run ended
+   with an error`. The record is saved and the trace written after it, best effort: a failure
+   there is printed, and the loop's own error is the one returned.
+3. **A run-end report of a session inbox row was not persisted.** A resumed run that ended
+   again reported the same row again. Now each reported row id is kept in the run record
+   (`Coordination.reported_undelivered_rows`), and both the run-end report and the report at
+   a session's end skip a row already in it, as a mailbox note does with
+   `Envelope.reported_undelivered`.
+4. **A subagent report in the parent's transcript was not traced `report_delivered` after a
+   restart.** The queued-report set is loop-only. A kill after the runtime marked the inbox
+   row and before the loop traced it, or after the transcript append and before the mark,
+   left the report with no fate in the trace: adoption offered only unmarked rows, a
+   duplicate injection was skipped silently, and a resumed parent that finished before the
+   wake was called `report_after_parent_finished` with a false notice. Now adoption settles a
+   marked report row of the parent whose fate the trace does not hold, a duplicate injection
+   is settled from the row's mark, and a parent that is gone or finished is first checked for
+   the mark. A resumed run reads the fates the trace already holds (`report_delivered`,
+   `report_undelivered`) once, so none is traced twice.
+
+Tests (each fails with its part of the fix reverted): `mailbox_injection.rs`
+(`a_message_in_a_brief_no_model_request_carried_is_not_delivered`); `run_exit.rs`
+(`a_loop_error_still_reports_the_notes_nothing_carried`); `peer_messages.rs`
+(`a_message_to_a_session_stopped_with_the_run_is_reported_at_the_runs_end`, resumed and
+stopped again); `subagents.rs` (`a_report_marked_delivered_before_a_kill_is_traced_once_after_resume`,
+`a_report_in_the_transcript_but_unmarked_at_a_kill_is_traced_once_after_resume`,
+`a_report_whose_fate_was_traced_before_a_kill_is_not_traced_again`).

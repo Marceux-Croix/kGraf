@@ -983,6 +983,8 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   project; without either it is 600. A command killed at the timeout returns its output so
   far, marked `[killed after N s]`.
 - `--resume <run-id>` continues a killed run from its record without repeating a paid call.
+  Each worker's rounds are in its transcript before its next request leaves, so only a
+  request that was in flight at the kill is sent again.
   With it, `--retry-gate <gate>` or `--waive-gate <gate>`, plus `--gate-note`, decides a
   held gate.
 - `--interactive` reads notes and `?` status questions from stdin while the run goes.
@@ -994,11 +996,20 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   that returns the contracts only. When the plan has two or more contracts, kGraf then derives
   an interface for each contract that another contract uses, without asking a model: where the
   repository already holds the producer's scaffold (a body of `todo!()` or `raise
-  NotImplementedError` in code, not in a string or a comment), that scaffold is the stub, the files that use the producer's names
+  NotImplementedError` in code, not in a string or a comment), that scaffold is the stub; where
+  the producer edits existing code, its current files are the stub. The files that use the producer's names
   are the consumer files, and the project's build tool compiles them (`cargo test --no-run
   -p ...`, or a Python import). A derived check that passes is registered as a compile-only
   interface: it is checked before the first worker starts, it costs no model call, and it
-  catches a signature a consumer uses and the producer's scaffold does not have. The planner
+  catches a signature a consumer uses and the producer's scaffold does not have. When the
+  producer's attempt passes its own check, the consumer files are compiled again against what
+  it delivered: a change to a signature or type they use fails the attempt, naming the
+  interface and the files, and a change they do not use does not. If the base does not build
+  without the delivery either, or the compile cannot run, that is a notice, not a failure. In
+  Rust the compile checks every item, signature and type the consumer files use; in Python the
+  import checks only the names they import when they load, not call shapes. Shell, TypeScript,
+  JavaScript and other languages get no derived compile check: the dependency is counted under
+  `not run` with the language named, and the producer is never held by it. The planner
   is asked for a behavior check (a reference and a small test of the one producer) only when
   no test in the repository already exercises that producer alone and one could: when the only
   tests need several producers, whose code does not exist yet, no reference of one producer
@@ -1699,6 +1710,20 @@ Behavior that differs from earlier builds. Each item names the decision that hol
   ended (`<session> was held when the run stopped`). Before, such notes were reported only
   when the recipient closed, so a run that ended first lost them unseen. Each note is
   reported once per recipient; a resumed run can still deliver it (0067).
+- A report carried in a contract's fresh brief is traced `delivered` (`in the brief of
+  <attempt>`) when that attempt's first model request leaves, not when the brief is built.
+  An attempt that fails before any request (for example, its pinned context is too large)
+  leaves `message` `pending` (`<attempt> ended before its first model request, so no model
+  read its brief: ...`), and the report stays undelivered for the next fresh brief or the
+  undelivered report (0067).
+- A run that ends on an error also reports its undelivered notes, with the reason `the run
+  ended with an error`; the error the run returns is unchanged. A note waiting in a session's
+  inbox is reported once over every run of the record: a resumed run that ends again does not
+  report it again (0067).
+- After a restart, a subagent report the parent's transcript already holds is traced
+  `report_delivered` once, from its inbox row's mark. Before, it could stay with no fate in
+  the trace, or be called `report_after_parent_finished` although the parent had read it
+  (0067).
 - kGraf's own git runs no hook, filter, merge driver or diff driver from your repository or
   config, and reaches no remote (see "kGraf's own git"). A file stored through git-lfs or
   git-crypt is committed by kGraf in its stored form, and a file with a configured merge

@@ -24,7 +24,11 @@
 //!   when the owner merges the branch. The body is fenced
 //!   ([`UntrustedText::to_markdown_fence`]) so it cannot forge headings (nodes).
 //! - **Delivery.** A message reaches a recipient that is not running in the
-//!   brief of its next fresh attempt, as data blocks. A recipient whose attempt
+//!   brief of its next fresh attempt, as data blocks. It is delivered when
+//!   that attempt's first model request carries the brief
+//!   ([`CopyState::BriefSent`]), not when the brief is built: an attempt that
+//!   fails before its first request leaves it undelivered, for the next fresh
+//!   brief or the undelivered report. A recipient whose attempt
 //!   runs (or resumes) gets the same data block injected at its next round
 //!   boundary through the runtime's injector (decision 0067), never mid-stream
 //!   or inside an open tool round; the copy is a session inbox row
@@ -136,8 +140,9 @@ pub struct Envelope {
     /// Its heading node in each file, once indexed.
     #[serde(default)]
     pub nodes: Vec<String>,
-    /// Recipients it reached: in a fresh brief, or injected into a running
-    /// attempt at a round boundary.
+    /// Recipients it reached: in a fresh brief that a model request carried
+    /// ([`CopyState::BriefSent`]), or injected into a running attempt at a
+    /// round boundary.
     #[serde(default)]
     pub delivered_to: BTreeSet<String>,
     /// One entry per running attempt it was queued to for injection at a
@@ -174,6 +179,15 @@ pub enum CopyState {
     /// queues it again; otherwise a fresh brief carries the message, or it
     /// is reported undelivered when the recipient closes.
     NotReached,
+    /// In the fresh brief of the attempt, which has not yet sent a model
+    /// request. A brief is only text until a request carries it: a spawn
+    /// that fails first (a pinned context too large, a missing route) never
+    /// shows it to a model. A resume of the attempt rebuilds the same
+    /// opening, so the copy stays with it.
+    InBrief,
+    /// The attempt's first model request carried its brief, at `at_ms`: the
+    /// message is delivered.
+    BriefSent { at_ms: i64 },
 }
 
 /// The inbox row id of `message`'s copy queued for `worker`. Deterministic, so

@@ -1,14 +1,33 @@
 //! A compile-only interface derived from the repository, before any planner
-//! call (decision 0030, amendment of 2026-10-02).
+//! call (decision 0030, amendments of 2026-10-02 and 2026-10-06).
 //!
-//! Where the repository already holds the producer's scaffold (a file with a
-//! placeholder body such as `todo!()` or `raise NotImplementedError`), that
-//! scaffold is the stub, the repository files that use the producer's items
-//! are the consumer and test files, and the project's own build tool compiles
-//! them: stub-compile and its canaries run. The result is registered as an
-//! interface of kind compile-only. Nothing correct exists to pass a test, so
-//! the behavior check is not part of it: whether the planner is asked for one
-//! is [`behavior_plan`]'s decision.
+//! The stub is what the producer's files hold at the dispatch base
+//! ([`derived_stub`]):
+//!
+//! - **A scaffold** (a file with a placeholder body such as `todo!()` or
+//!   `raise NotImplementedError`): the scaffold is the stub.
+//! - **Current code** (no file the producer writes holds a scaffold, and at
+//!   least one exists): the current files are the stub. Their shapes (the
+//!   signatures and types the consumer files use) are the interface.
+//!
+//! The repository files that use the producer's items are the consumer and
+//! test files, and the project's own build tool compiles them: stub-compile
+//! and its canaries run. The result is registered as an interface of kind
+//! compile-only. When the producer's attempt passes its own verification, the
+//! same compile command runs again over the producer's delivered files
+//! ([`crate::checks::check_delivery`]): a delivery that breaks a shape the
+//! consumer files use fails the attempt, and a change they do not use does
+//! not. Nothing correct exists to pass a test, so the behavior check is not
+//! part of it: whether the planner is asked for one is [`behavior_plan`]'s
+//! decision.
+//!
+//! What the compile command checks depends on the language ([`coverage`]):
+//!
+//! | Language | Command | What it checks |
+//! | --- | --- | --- |
+//! | Rust | `cargo test --no-run -p <consumer packages>` | every item, signature and type the consumer files use |
+//! | Python | `python3 -c "import <consumer modules>"` | the names the consumer modules import when they load; call shapes and attribute uses are not checked |
+//! | any other | none | no compile check is derived; the edge is recorded unchecked with the reason ([`no_command_reason`]) |
 //!
 //! The decisions here are pure (what is a scaffold, a test file, which
 //! command builds the files, whether a test of one producer alone can exist);
@@ -183,6 +202,73 @@ pub fn compile_command(
     None
 }
 
+/// The lower-case extension of `path`'s file name; empty when it has none.
+fn extension(path: &str) -> String {
+    let name = path.rsplit_once('/').map_or(path, |(_, n)| n);
+    name.rsplit_once('.')
+        .map(|(_, e)| e.to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
+/// Whether `path` is in a language [`compile_command`] builds (Rust, Python).
+pub fn has_compile_language(path: &str) -> bool {
+    matches!(extension(path).as_str(), "rs" | "py")
+}
+
+/// Extensions of prose files, which no compile command builds and no
+/// language reason names.
+const PROSE: [&str; 5] = ["md", "markdown", "txt", "rst", "adoc"];
+
+/// Why [`compile_command`] gives no command for `files`, per language: the
+/// reason an edge with no derived compile check is recorded unchecked.
+/// `package` gives a Rust file's Cargo package.
+pub fn no_command_reason(files: &[String], package: impl Fn(&str) -> Option<String>) -> String {
+    let exts: BTreeSet<String> = files.iter().map(|f| extension(f)).collect();
+    let list = files.join(", ");
+    if exts.len() > 1 {
+        return format!(
+            "{list} are in more than one language, and kGraf derives a compile command for one \
+             language at a time"
+        );
+    }
+    match exts.iter().next().map(String::as_str).unwrap_or_default() {
+        "rs" => match files.iter().find(|f| package(f).is_none()) {
+            Some(f) => format!("no Cargo package holds `{f}`, so no cargo command builds it"),
+            None => format!("kGraf knows no build command for {list} in this project"),
+        },
+        "py" => match files.iter().find(|f| python_module(f).is_none()) {
+            Some(f) => format!(
+                "`{f}` is not importable as a Python module (each part of its path must be an \
+                 identifier), so no import resolves the names it uses"
+            ),
+            None => format!("kGraf knows no build command for {list} in this project"),
+        },
+        "sh" | "bash" | "zsh" | "ksh" => format!(
+            "{list}: shell scripts; shell has no compile step that resolves the commands or \
+             functions a script takes from another file, so no compile check applies"
+        ),
+        "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" => format!(
+            "kGraf derives no TypeScript or JavaScript compile check ({list}): a type check needs \
+             the project's own compiler setup and installed packages"
+        ),
+        "" => format!("{list}: no file extension that names a language"),
+        other => format!("kGraf derives no compile check for `.{other}` files ({list})"),
+    }
+}
+
+/// What the compile command `compile` checks, in one clause, for the record
+/// of a derived interface.
+pub fn coverage(compile: &[String]) -> &'static str {
+    match compile.first().map(String::as_str) {
+        Some("cargo") => "Rust: every item, signature and type the files use is type-checked",
+        Some("python3") => {
+            "Python: the import resolves the names the files import when they load; call shapes \
+             and attribute uses are not checked"
+        }
+        _ => "the files are built by the command",
+    }
+}
+
 /// What the orchestrator found for one producer.
 #[derive(Clone, Debug, Default)]
 pub struct ProducerFacts {
@@ -213,18 +299,66 @@ pub fn stub_of(facts: &ProducerFacts) -> Vec<FileOverlay> {
         .collect()
 }
 
+/// Where a derived interface's stub comes from ([`derived_stub`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StubSource {
+    /// The producer's scaffold files.
+    Scaffold,
+    /// The producer's existing files as they are: no file it writes holds a
+    /// scaffold, so the shapes they have now are the interface.
+    CurrentCode,
+}
+
+/// The stub of a derived interface and where it comes from: the scaffold
+/// files when any file the producer writes holds one, else every file it
+/// writes that exists at the dispatch base. A producer that edits existing
+/// code still has an interface: the shapes its files have now. Empty when no
+/// file it writes exists yet.
+pub fn derived_stub(facts: &ProducerFacts) -> (Vec<FileOverlay>, StubSource) {
+    let scaffold = stub_of(facts);
+    if !scaffold.is_empty() {
+        return (scaffold, StubSource::Scaffold);
+    }
+    let current = facts
+        .writes
+        .iter()
+        .filter_map(|(p, c)| c.as_ref().map(|c| FileOverlay::new(p, c)))
+        .collect();
+    (current, StubSource::CurrentCode)
+}
+
 /// A compile-only interface for `facts`, or why none can be derived. The
-/// command is given by `command` over the consumer and test paths.
+/// command is given by `command` over the consumer and test paths; when it
+/// gives none, `no_command` says why for those paths.
 pub fn derive(
     facts: &ProducerFacts,
     command: impl Fn(&[String]) -> Option<Vec<String>>,
+    no_command: impl Fn(&[String]) -> String,
 ) -> Result<InterfaceContract, String> {
-    let stub = stub_of(facts);
+    let (stub, _) = derived_stub(facts);
     if stub.is_empty() {
         return Err(format!(
-            "no file {} writes holds a scaffold (a placeholder body) to stand in as its stub",
+            "no file {} writes exists in the repository yet, so neither a scaffold nor current \
+             code stands in as its stub",
             facts.producer
         ));
+    }
+    // A producer in a language kGraf has no compile command for (shell,
+    // TypeScript, ...) gets no check that cannot apply: the reason names its
+    // language, before any search for the files that use it, which in such a
+    // language often finds none and would name the wrong cause.
+    if !stub.iter().any(|f| has_compile_language(&f.path)) {
+        let code: Vec<String> = stub
+            .iter()
+            .map(|f| f.path.clone())
+            .filter(|p| !PROSE.contains(&extension(p).as_str()))
+            .collect();
+        let named = if code.is_empty() {
+            stub.iter().map(|f| f.path.clone()).collect()
+        } else {
+            code
+        };
+        return Err(no_command(&named));
     }
     let stub_paths: BTreeSet<&str> = stub.iter().map(|f| f.path.as_str()).collect();
     let mut symbols: Vec<String> = Vec::new();
@@ -266,10 +400,7 @@ pub fn derive(
         .map(|f| f.path.clone())
         .collect();
     let Some(compile) = command(&built) else {
-        return Err(format!(
-            "kGraf knows no build command for {} in this project",
-            built.join(", ")
-        ));
+        return Err(no_command(&built));
     };
     let mut parties = vec![facts.producer.clone()];
     parties.extend(facts.consumers.iter().cloned());
@@ -445,15 +576,23 @@ mod tests {
         }
     }
 
+    fn cargo_pkg(files: &[String]) -> Option<Vec<String>> {
+        compile_command(files, |f| {
+            Some(f.split('/').next().unwrap_or("").to_owned())
+        })
+    }
+
+    fn reason(files: &[String]) -> String {
+        no_command_reason(files, |f| {
+            Some(f.split('/').next().unwrap_or("").to_owned())
+        })
+    }
+
     #[test]
     fn a_scaffold_becomes_the_stub_and_its_users_the_consumers() {
-        let ic = derive(&facts(), |files| {
-            compile_command(files, |f| {
-                Some(f.split('/').next().unwrap_or("").to_owned())
-            })
-        })
-        .expect("derived");
+        let ic = derive(&facts(), cargo_pkg, reason).expect("derived");
         assert_eq!(ic.stub[0].path, "discount_flat/src/lib.rs");
+        assert_eq!(derived_stub(&facts()).1, StubSource::Scaffold);
         assert_eq!(ic.consumer.len(), 1, "the integration test uses no symbol");
         assert!(ic.tests.is_empty());
         assert_eq!(ic.symbols, vec!["FlatDiscount".to_owned()]);
@@ -465,28 +604,85 @@ mod tests {
         assert!(ic.reference.is_empty(), "no reference: vacuity cannot run");
     }
 
+    /// A producer that edits existing code holds no scaffold: its current
+    /// files are the stub, and the files that use them are the consumers.
+    /// Before, no check was derived and the edge read "no file holds a
+    /// scaffold".
     #[test]
-    fn no_scaffold_or_no_user_or_no_command_derives_nothing_and_says_why() {
+    fn a_producer_that_edits_existing_code_gets_its_current_code_as_the_stub() {
         let mut f = facts();
-        f.writes[0].1 = Some("pub struct FlatDiscount;\n".into());
-        assert!(
-            derive(&f, |_| None)
-                .expect_err("no scaffold")
-                .contains("scaffold")
+        let current = "pub struct FlatDiscount;\npub fn d() -> i64 { 3 }\n";
+        f.writes[0].1 = Some(current.into());
+        f.writes.push(("discount_flat/src/new.rs".into(), None));
+        let (stub, source) = derived_stub(&f);
+        assert_eq!(source, StubSource::CurrentCode);
+        assert_eq!(stub.len(), 1, "a file that does not exist yet is no stub");
+        let ic = derive(&f, cargo_pkg, reason).expect("derived from current code");
+        assert_eq!(ic.stub[0].path, "discount_flat/src/lib.rs");
+        assert_eq!(ic.stub[0].content, current);
+        assert_eq!(
+            ic.compile,
+            ["cargo", "test", "--no-run", "-p", "pricing_engine"]
         );
+        assert_eq!(ic.symbols, vec!["FlatDiscount".to_owned()]);
+    }
+
+    #[test]
+    fn no_file_yet_or_no_user_or_no_command_derives_nothing_and_says_why() {
+        let mut f = facts();
+        f.writes[0].1 = None;
+        let why = derive(&f, cargo_pkg, reason).expect_err("no file yet");
+        assert!(why.contains("exists in the repository yet"), "{why}");
         let mut f = facts();
         f.users.clear();
-        assert!(derive(&f, |_| None).expect_err("no user").contains("uses"));
         assert!(
-            derive(&facts(), |_| None)
-                .expect_err("no command")
-                .contains("build command")
+            derive(&f, cargo_pkg, reason)
+                .expect_err("no user")
+                .contains("uses")
         );
+        let why = derive(
+            &facts(),
+            |_| None,
+            |files| no_command_reason(files, |_| None),
+        )
+        .expect_err("no command");
+        assert!(
+            why.contains("no Cargo package holds `pricing_engine/src/lib.rs`"),
+            "{why}"
+        );
+    }
+
+    /// A producer whose users are shell scripts is never given a compile
+    /// check that cannot apply: no interface is derived, and the reason names
+    /// the language. The same holds for every language kGraf has no compile
+    /// command for.
+    #[test]
+    fn a_shell_or_typescript_user_gets_no_compile_check_and_the_reason_names_the_language() {
+        let f = ProducerFacts {
+            producer: "c1".into(),
+            consumers: vec!["c2".into()],
+            writes: vec![(
+                "lib/common.sh".into(),
+                Some("greet() {\n  echo hi\n}\n".into()),
+            )],
+            symbols: vec!["greet".into()],
+            users: vec![("bin/run.sh".into(), ". lib/common.sh\ngreet\n".into())],
+        };
+        let why = derive(&f, cargo_pkg, reason).expect_err("no shell compile check");
+        assert!(
+            why.contains("shell scripts") && why.contains("no compile check applies"),
+            "{why}"
+        );
+        assert!(reason(&["web/a.ts".into()]).contains("TypeScript"));
+        assert!(reason(&["a/x.rs".into(), "b/y.py".into()]).contains("more than one language"));
+        assert!(reason(&["my-pkg/x.py".into()]).contains("not importable"));
+        assert!(coverage(&["python3".into()]).contains("call shapes"));
+        assert!(coverage(&["cargo".into()]).contains("signature"));
     }
 
     /// A producer file that names a placeholder only in text (a brief in a
     /// string literal, a doc comment) is finished code, not a scaffold: it
-    /// must not stand in as the stub of a compile-only interface.
+    /// stands in as the stub as current code, never as a scaffold.
     #[test]
     fn a_file_that_names_a_placeholder_only_in_text_is_not_a_scaffold() {
         let prose = "/// Doc: `todo!()` panics.\npub fn brief() -> &'static str {\n    \"`todo!()` panics; NotImplementedError; not implemented here\"\n}\n";
@@ -494,11 +690,7 @@ mod tests {
         let mut f = facts();
         f.writes[0].1 = Some(prose.into());
         assert!(stub_of(&f).is_empty());
-        assert!(
-            derive(&f, |_| None)
-                .expect_err("no scaffold")
-                .contains("scaffold")
-        );
+        assert_eq!(derived_stub(&f).1, StubSource::CurrentCode);
         // Real scaffolds in each form still are.
         for (path, src) in [
             ("a/src/lib.rs", "pub fn f() -> u8 { todo!() }\n"),

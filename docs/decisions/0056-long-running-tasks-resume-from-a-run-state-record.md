@@ -113,3 +113,36 @@ not be told from a stop with nothing left.
 Tests: `kgraf-orchestrator` `run_state.rs`
 `a_stopped_run_names_every_contract_and_gate_it_left_unfinished`; `kgraf-cli`
 `a_stopped_run_prints_what_it_left_unfinished`.
+
+## Amendment (2026-10-06): a paid round is stored before the next request leaves
+
+A worker's events reach its transcript through a reader: the worker loop sends each event on
+a channel, and the reader writes it. The loop did not wait for the reader, so under load the
+transcript could trail the loop by whole rounds. A process killed while a later request was
+in flight lost rounds that were already paid and answered (their tool calls had run), and
+the resume asked them again. Measured on a loaded machine: the kill-and-resume subagent test
+asked a parent's second round again in 13 of 40 runs. The transcript read at the kill ended
+at the second round's `assistant_message`, while the provider had already received the
+fourth request.
+
+- **The barrier.** Before each model request, and before a compaction summary request, the
+  loop waits on `WorkerEndpoint::stored`: a marker on the event channel that the reader
+  answers when it asks for the next event. Both transcript writers (the orchestrator's
+  attempt and `kgraf-host`'s single-worker transcript) ask for the next event only after
+  they have written the previous one, so the answer means every earlier event, and the
+  request's own `model_call`, is in the transcript.
+- **What a kill repeats.** At most the one request in flight at the kill. A cancel while the
+  loop waits settles the call as a known zero, as a cancel before the request leaves already
+  did. A reader that went away stores nothing more, so the loop does not wait for it.
+- **Cost.** One channel round trip per request, plus the time the reader takes to write what
+  it holds. A reader that stops reading holds the loop at the next request, as a full bulk
+  channel already did.
+- **Rejected.** Writing the transcript on the worker's own task (it would put file I/O on
+  the loop's path for every delta). Waiting in the test for the transcript to catch up (it
+  would hide a real repeat of a paid round).
+
+Tests: `kgraf-runtime` `worker_loop.rs`
+`no_request_leaves_before_the_reader_has_stored_every_earlier_event` (fails with the barrier
+removed); `handle.rs` `stored_resolves_only_when_the_reader_asks_past_every_earlier_event`
+and `stored_gives_way_to_a_cancel`; `kgraf-orchestrator` `subagents.rs`
+`a_kill_while_a_child_runs_then_resume_wakes_the_parent_once_and_repeats_no_round`.

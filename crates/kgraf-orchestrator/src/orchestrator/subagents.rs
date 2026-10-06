@@ -205,8 +205,15 @@ pub(super) struct Subagents {
     /// mark on the inbox row makes it `report_delivered`; the parent's end
     /// before a boundary makes it `report_held` or `report_undelivered`
     /// ([`RunLoop::settle_reports`]). Loop-only: after a restart, adoption
-    /// offers an undelivered row again and it is queued anew.
+    /// offers an undelivered row again and it is queued anew, and a row the
+    /// runtime marked delivered whose fate no trace record states yet is
+    /// settled here too (`adopt_children_of`).
     queued_reports: BTreeMap<String, AgentId>,
+    /// Report rows whose fate (`report_delivered` or `report_undelivered`)
+    /// the trace already holds: read from the trace when a run is resumed
+    /// ([`RunLoop::load_report_fates`]), then kept by this process. A fate is
+    /// traced once per row over every process of the run.
+    traced_fates: BTreeSet<String>,
     /// Adopted children waiting for a slot.
     restart: BTreeSet<AgentId>,
     /// Parents already given the soft-children notice.
@@ -700,9 +707,34 @@ impl RunLoop {
             );
             self.subagents.restart.insert(child);
         }
+        // Reports the runtime marked delivered to this parent before a
+        // restart, with no `report_delivered` in the trace (the process died
+        // between the mark and the loop's next pass): settled from the mark,
+        // so the trace states every report's fate once.
+        let store = self.sessions();
+        for (child, facts) in self.spawn_records(contract) {
+            if facts.parent != parent.as_str() || facts.preparing {
+                continue;
+            }
+            let id = format!("{SUBAGENT_REPORT_PREFIX}{child}");
+            if self.subagents.traced_fates.contains(&id)
+                || self.subagents.queued_reports.contains_key(&id)
+            {
+                continue;
+            }
+            match blocking(|| store.inbox_item(&id)) {
+                Ok(Some(item)) if item.delivered.is_some() => {
+                    self.subagents.queued_reports.insert(id, parent.clone());
+                }
+                Ok(_) => {}
+                Err(e) => self
+                    .subagents
+                    .errors
+                    .push(format!("the inbox row `{id}` could not be read: {e}")),
+            }
+        }
         // Reports that reached the inbox and maybe not the transcript: offered
         // again; the runtime refuses an id the transcript already holds.
-        let store = self.sessions();
         match blocking(|| store.undelivered(parent)) {
             Ok(items) => {
                 for item in items {
@@ -1397,6 +1429,9 @@ impl RunLoop {
                         // A subagent's hand-back returns to its parent, which
                         // decides what to do with the rest.
                         kgraf_runtime::StopPointPolicy::HandBack,
+                        // A subagent's brief carries no mailbox note, so
+                        // nothing reads when its first request left.
+                        Arc::new(OnceLock::new()),
                     )
                     .await
                     .map(|(result, _peak)| result);
@@ -2303,6 +2338,9 @@ impl RunLoop {
                 Slot::NotYet => continue,
                 Slot::Gone => {
                     self.subagents.wakes.remove(&id);
+                    if self.report_marked(&id, &parent) {
+                        continue;
+                    }
                     (
                         "report_held",
                         "its parent is not running here; the report stays in its inbox".to_owned(),
@@ -2325,9 +2363,23 @@ impl RunLoop {
                                 ),
                             )
                         }
-                        // Already in the parent's transcript: delivered once.
-                        Err(InjectError::Duplicate { .. }) => continue,
+                        // Already queued by the spawn, or already in the
+                        // parent's transcript (a resume): never sent twice.
+                        // Its fate is still traced, once, from the inbox
+                        // row's mark (`settle_reports`).
+                        Err(InjectError::Duplicate { .. }) => {
+                            self.subagents
+                                .queued_reports
+                                .insert(id.clone(), parent.clone());
+                            continue;
+                        }
                         Err(InjectError::Finished { .. }) => {
+                            // A resumed parent can finish before this pass
+                            // with the report already in its transcript
+                            // (the spawn marked it): that is a delivery.
+                            if self.report_marked(&id, &parent) {
+                                continue;
+                            }
                             let why = format!(
                                 "{parent} answered before the report reached it; the report \
                                  stays in its inbox and the run record"
@@ -2351,6 +2403,50 @@ impl RunLoop {
             .await?;
         }
         Ok(())
+    }
+
+    /// Whether report row `id` is already marked delivered (the runtime saw
+    /// it in `parent`'s transcript). If so it is settled from that mark, once
+    /// (`settle_reports`), instead of being called held or lost.
+    fn report_marked(&mut self, id: &str, parent: &AgentId) -> bool {
+        match self.sessions().inbox_item(id) {
+            Ok(Some(item)) if item.delivered.is_some() => {
+                self.subagents
+                    .queued_reports
+                    .insert(id.to_owned(), parent.clone());
+                true
+            }
+            Ok(_) => false,
+            Err(e) => {
+                self.subagents
+                    .errors
+                    .push(format!("the inbox row `{id}` could not be read: {e}"));
+                false
+            }
+        }
+    }
+
+    /// A resumed run: the report fates an earlier process traced, so none is
+    /// traced twice ([`Subagents::traced_fates`]). One pass over the trace
+    /// file; only lines naming a fate are parsed. An unreadable file is
+    /// read as holding none: a fate is then traced again, never lost.
+    pub(super) fn load_report_fates(&mut self) {
+        let Ok(text) = std::fs::read_to_string(self.files.trace()) else {
+            return;
+        };
+        for line in text
+            .lines()
+            .filter(|l| l.contains("\"report_delivered\"") || l.contains("\"report_undelivered\""))
+        {
+            if let Ok(kgraf_session::transcript::TranscriptEntry {
+                event: TraceEvent::Message { id, action, .. },
+                ..
+            }) = serde_json::from_str(line)
+                && (action == "report_delivered" || action == "report_undelivered")
+            {
+                self.subagents.traced_fates.insert(id);
+            }
+        }
     }
 
     /// Trace each queued report the runtime has injected since the last
@@ -2383,6 +2479,16 @@ impl RunLoop {
                     None
                 }
             };
+            let final_fate = match (&delivered, ended) {
+                (Some(_), _) => true,
+                (None, Some((who, resumable))) => *who == parent && !resumable,
+                (None, None) => false,
+            };
+            if final_fate && self.subagents.traced_fates.contains(&id) {
+                // An earlier process traced it before its record knew.
+                self.subagents.queued_reports.remove(&id);
+                continue;
+            }
             let (action, detail, at) = match (delivered, ended) {
                 (Some((seq, at_ms)), _) => (
                     "report_delivered",
@@ -2412,6 +2518,9 @@ impl RunLoop {
                 _ => continue,
             };
             self.subagents.queued_reports.remove(&id);
+            if final_fate {
+                self.subagents.traced_fates.insert(id.clone());
+            }
             self.queue(TraceEvent::Message {
                 at_ms: at,
                 id: id.clone(),

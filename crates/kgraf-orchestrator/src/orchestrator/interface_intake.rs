@@ -5,7 +5,8 @@
 //!   contracts ask --refused (parse, schema, rule)--> re-ask, at most MAX_PLAN_REASKS
 //!   contracts ask --accepted--> checks off, or one contract --> done
 //!                            --> derive, no model call: per consumed edge the
-//!                                producer's scaffold (stub), the files that use
+//!                                producer's scaffold, or its current code when
+//!                                it holds none (stub), the files that use
 //!                                it, the compile command; each derived compile
 //!                                check that passes is registered (compile-only)
 //!                            --> per producer: behavior ask, or not asked
@@ -1462,7 +1463,15 @@ async fn derive_one(
     runner: &SandboxRunner,
     facts: &ProducerFacts,
 ) -> (Option<InterfaceContract>, Option<DerivedBase>, String) {
-    let stub = derive_interface::stub_of(facts);
+    // Only a scaffold is given to a behavior answer as its stub: a test must
+    // fail against the stub, and current code is not a stub any test fails
+    // against.
+    let (derived, source) = derive_interface::derived_stub(facts);
+    let scaffold = |stub: Vec<crate::checks::FileOverlay>| match source {
+        derive_interface::StubSource::Scaffold => stub,
+        derive_interface::StubSource::CurrentCode => Vec::new(),
+    };
+    let stub = scaffold(derived);
     let files: Vec<String> = facts.users.iter().map(|(p, _)| p.clone()).collect();
     let manifests = manifests_for(runner, &files).await;
     let package = |f: &str| package_in(&manifests, f);
@@ -1473,9 +1482,11 @@ async fn derive_one(
             symbols: facts.symbols.clone(),
         })
     };
-    let ic = match derive_interface::derive(facts, |files| {
-        derive_interface::compile_command(files, package)
-    }) {
+    let ic = match derive_interface::derive(
+        facts,
+        |files| derive_interface::compile_command(files, package),
+        |files| derive_interface::no_command_reason(files, package),
+    ) {
         Err(why) => {
             return (
                 None,
@@ -1492,20 +1503,25 @@ async fn derive_one(
         .map(|f| f.path.as_str())
         .collect();
     let what = format!(
-        "kGraf derived a compile check from the repository (stub: the scaffold of {}; files: {}; \
-         `{}`)",
+        "kGraf derived a compile check from the repository (stub: the {} of {}; files: {}; \
+         `{}`; {})",
+        match source {
+            derive_interface::StubSource::Scaffold => "scaffold",
+            derive_interface::StubSource::CurrentCode => "current code",
+        },
         ic.stub
             .iter()
             .map(|f| f.path.as_str())
             .collect::<Vec<_>>()
             .join(", "),
         files.join(", "),
-        ic.compile.join(" ")
+        ic.compile.join(" "),
+        derive_interface::coverage(&ic.compile)
     );
     match crate::checks::check_derived_compile(runner, &ic).await {
         Ok(Ok(runs)) => {
             let base = DerivedBase {
-                stub: ic.stub.clone(),
+                stub: scaffold(ic.stub.clone()),
                 consumer: ic.consumer.clone(),
                 symbols: ic.symbols.clone(),
             };
@@ -1514,7 +1530,8 @@ async fn derive_one(
                 Some(base),
                 format!(
                     "{what}, and it passed ({} run(s): stub-compile and canaries); it is \
-                     registered as a compile-only interface",
+                     registered as a compile-only interface, and runs again against the \
+                     producer's delivery before the delivery is accepted",
                     runs.len()
                 ),
             )

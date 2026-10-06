@@ -398,3 +398,107 @@ async fn a_message_never_delivered_is_traced_and_reported_to_its_sender() {
     assert!(seen.iter().any(reported), "{seen:?}");
     assert!(report.notices.iter().any(reported), "{:?}", report.notices);
 }
+
+/// `b` depends on `a`, so `a`'s report is addressed to `b` and carried by
+/// `b`'s fresh brief. That brief is too large for `b`'s context: the spawn
+/// fails before any model request, and `b` is held. No model read the brief,
+/// so the message is not delivered: the record keeps it undelivered (the copy
+/// in the brief is `NotReached`), the trace says why, never `delivered`, and
+/// the run's end reports it to its sender.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_message_in_a_brief_no_model_request_carried_is_not_delivered() {
+    let dir = tempfile::tempdir().expect("dir");
+    // About 15,000 tokens of instruction against a 6,000-token window.
+    let padding = format!(
+        "make b {}",
+        "the quick brown fox jumps over the lazy dog ".repeat(1_500)
+    );
+    let plan = plan_json(&[
+        c("a", "make a", "src/a.rs", &[]),
+        c("b", &padding, "src/b.rs", &["a"]),
+    ]);
+    let p = Parts::open(
+        dir.path(),
+        move |_| plan.clone(),
+        |_| SERVES.into(),
+        Duration::from_millis(5),
+    );
+    let o = Orchestrator::new(config(), p.services(6_000)).expect("orchestrator");
+    let report = o
+        .start(RunId::new("r1"), "make a and b".into())
+        .await
+        .expect("run");
+    assert!(
+        matches!(report.status, RunStatus::Blocked { .. }),
+        "{report:?}"
+    );
+    assert!(
+        report
+            .held
+            .iter()
+            .any(|(id, r)| id == "b" && r.contains("pinned context")),
+        "{:?}",
+        report.held
+    );
+    assert!(
+        p.stats
+            .requests()
+            .iter()
+            .all(|r| !r.1.contains("make b the quick")),
+        "b sent no model request"
+    );
+
+    let record = try_record(&p).expect("record");
+    let msg = record
+        .coordination
+        .mailbox
+        .messages
+        .iter()
+        .find(|m| m.from_contract == "a")
+        .expect("a's report");
+    assert!(msg.to.iter().any(|t| t.contract == "b"), "{msg:?}");
+    assert!(
+        !msg.delivered_to.contains("b"),
+        "no model request carried b's brief: {msg:?}"
+    );
+    let copy = msg
+        .queued
+        .iter()
+        .find(|q| q.contract == "b")
+        .expect("the copy in b's brief");
+    assert_eq!(copy.state, CopyState::NotReached, "{copy:?}");
+
+    let trace = trace_of(&p).await;
+    let to_b = |action: &str| -> Vec<String> {
+        trace
+            .iter()
+            .filter_map(|e| match e {
+                TraceEvent::Message {
+                    id,
+                    action: a,
+                    to,
+                    detail,
+                    ..
+                } if a == action && *id == msg.id && to.iter().any(|t| t == "b") => {
+                    Some(detail.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    assert!(to_b("delivered").is_empty(), "{:?}", to_b("delivered"));
+    let pending = to_b("pending");
+    assert!(
+        pending
+            .iter()
+            .any(|d| d.contains("ended before its first model request")),
+        "{pending:?}"
+    );
+    let undelivered = to_b("undelivered");
+    assert_eq!(undelivered.len(), 1, "{undelivered:?}");
+    assert!(
+        undelivered[0].contains("the recipient b was held"),
+        "{undelivered:?}"
+    );
+    assert!(msg.reported_undelivered.contains("b"), "{msg:?}");
+}

@@ -371,6 +371,30 @@ async fn read_until(
     }
 }
 
+/// Read events until the provider holds `n` requests. A request leaves only
+/// once the reader has asked past every event before it
+/// (`WorkerEndpoint::stored`), so the reader keeps reading while it waits; a
+/// `ModelCall` event alone does not mean the request has left.
+async fn read_until_requests(
+    handle: &mut WorkerHandle,
+    events: &mut Vec<WorkerEvent>,
+    provider: &Scripted,
+    n: usize,
+) {
+    with_timeout(async {
+        while provider.requests().len() < n {
+            tokio::select! {
+                event = handle.next_event() => {
+                    events.push(event.expect("an event before the end"));
+                }
+                () = tokio::time::sleep(Duration::from_millis(2)) => {}
+            }
+        }
+    })
+    .await
+    .expect("in time");
+}
+
 async fn finish(
     mut handle: WorkerHandle,
     mut events: Vec<WorkerEvent>,
@@ -697,11 +721,8 @@ async fn an_interrupt_during_a_complete_call_abandons_it_and_leaves_the_spend_un
     .await
     .expect("spawn");
     let mut events = Vec::new();
-    read_until(&mut handle, &mut events, |e| {
-        matches!(e, WorkerEvent::ModelCall { .. })
-    })
-    .await;
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    // The call is in flight at the provider, which never answers it.
+    read_until_requests(&mut handle, &mut events, &provider, 1).await;
     handle
         .injector()
         .inject(note("m1", "Change of plan.", InjectMode::Interrupt))
@@ -1606,20 +1627,12 @@ mod review {
         let mut n = 0;
         let mut events = Vec::new();
         while n < 3 {
-            let event = with_timeout(handle.next_event())
-                .await
-                .expect("in time")
-                .expect("the worker is still live");
-            let call = matches!(event, WorkerEvent::ModelCall { .. });
-            events.push(event);
-            if call {
-                // Let the call reach the provider, then interrupt it.
-                tokio::time::sleep(Duration::from_millis(20)).await;
-                n += 1;
-                injector
-                    .inject(note(&format!("m{n}"), "again", InjectMode::Interrupt))
-                    .expect("queued");
-            }
+            // The call has reached the provider; interrupt it.
+            read_until_requests(&mut handle, &mut events, &provider, n + 1).await;
+            n += 1;
+            injector
+                .inject(note(&format!("m{n}"), "again", InjectMode::Interrupt))
+                .expect("queued");
         }
         handle.cancel();
         let (_events, result) = finish(handle, events).await;

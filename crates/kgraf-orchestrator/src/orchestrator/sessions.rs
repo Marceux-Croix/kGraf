@@ -604,8 +604,15 @@ impl RunLoop {
             }
             // A mailbox copy: the contract's next fresh brief may still carry
             // it, so it is reported only if the contract closes without
-            // delivery (`report_undelivered_mail`, `coord.rs`).
-            if item.id.starts_with(crate::envelope::QUEUED_ROW_PREFIX) {
+            // delivery (`report_undelivered_mail`, `coord.rs`). A row an
+            // earlier run's end already reported is not reported again.
+            if item.id.starts_with(crate::envelope::QUEUED_ROW_PREFIX)
+                || self
+                    .record
+                    .coordination
+                    .reported_undelivered_rows
+                    .contains(&item.id)
+            {
                 continue;
             }
             let what = match item.kind {
@@ -665,6 +672,8 @@ impl RunLoop {
     /// [`Self::retire_session`] does for a session that ends. A mailbox copy
     /// is the mailbox's to report (`report_undelivered_mail_at_run_end`), so
     /// it is skipped here. A resume of the run still delivers what waits.
+    /// Each row is reported once over every run of the record
+    /// (`Coordination::reported_undelivered_rows`, saved with the record).
     pub(super) fn report_undelivered_inbox_at_run_end(&mut self) {
         let store = sessions_of(&self.s);
         let run = kgraf_core::RunId::new(self.record.run.to_string());
@@ -717,6 +726,11 @@ impl RunLoop {
                     item.kind,
                     InboxKind::Note | InboxKind::Redirect | InboxKind::Message
                 ) || item.id.starts_with(crate::envelope::QUEUED_ROW_PREFIX)
+                    || !self
+                        .record
+                        .coordination
+                        .reported_undelivered_rows
+                        .insert(item.id.clone())
                 {
                     continue;
                 }
