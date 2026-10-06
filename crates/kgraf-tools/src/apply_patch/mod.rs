@@ -37,9 +37,11 @@
 mod git_files_tests;
 pub(crate) mod parser;
 mod protected;
+mod reindent;
 mod replace;
 mod seek_sequence;
 mod streaming_parser;
+mod syntax;
 
 pub use parser::parse_patch;
 pub use parser::{Hunk, ParseError, UpdateFileChunk};
@@ -252,7 +254,23 @@ fn repaired(patch: &str) -> (String, Vec<&'static str>) {
     if !headed && !begun {
         return (patch.to_string(), notes);
     }
-    let mut lines: Vec<String> = patch.trim().lines().map(str::to_string).collect();
+    // Blank lines are dropped from both ends, but no line is trimmed: with no
+    // end marker the last line is a body line, and trimming the whole patch
+    // cut the trailing whitespace off that line's text.
+    let mut lines: Vec<String> = patch.lines().map(str::to_string).collect();
+    let keep_from = lines
+        .iter()
+        .position(|l| !l.trim().is_empty())
+        .unwrap_or(lines.len());
+    lines.drain(..keep_from);
+    while lines.last().is_some_and(|l| l.trim().is_empty()) {
+        lines.pop();
+    }
+    // The first line is a marker or a file header (checked above), so its
+    // leading whitespace is not content.
+    if let Some(head) = lines.first_mut() {
+        *head = head.trim_start().to_string();
+    }
     if headed {
         lines.insert(0, parser::BEGIN_PATCH_MARKER.to_string());
         notes.push(BEGIN_NOTE);
@@ -1541,7 +1559,11 @@ mod tests {
     ) -> (Result<String, String>, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         for (name, text) in seed {
-            std::fs::write(dir.path().join(name), text).expect("seed");
+            let path = dir.path().join(name);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("seed dir");
+            }
+            std::fs::write(path, text).expect("seed");
         }
         let out = ApplyPatchTool
             .call(
@@ -1568,6 +1590,18 @@ mod tests {
             let written = std::fs::read_to_string(dir.path().join("a.txt")).expect("read");
             assert_eq!(written, "one\nTWO\n", "{label}");
         }
+    }
+
+    /// With no end line, the patch's last line is a body line: the repair
+    /// that supplies the end line keeps that line's trailing whitespace (a
+    /// Markdown hard line break here) instead of trimming it away.
+    #[tokio::test]
+    async fn a_supplied_end_line_keeps_the_last_line_s_trailing_whitespace() {
+        let patch = "\n*** Begin Patch\n*** Update File: a.md\n@@\n one\n-two\n+two  \n+three  ";
+        let (out, dir) = run_patch(&[("a.md", "one\ntwo\n")], patch).await;
+        let text = out.expect("applies");
+        assert!(text.contains("no '*** End Patch' line"), "{text}");
+        assert_eq!(read(&dir, "a.md"), "one\ntwo  \nthree  \n");
     }
 
     /// Round evidence (conflicts-tier2, greenfield): `*** Delete File: x`
@@ -1679,17 +1713,121 @@ mod tests {
     #[tokio::test]
     async fn a_tolerant_match_is_stated_in_the_result() {
         let (out, dir) = run_patch(
-            &[("a.rs", "fn a() {\n\told();\n}\n")],
-            wrap("*** Update File: a.rs\n@@\n fn a() {\n-    old();\n+    new();\n }")["patch"]
+            &[("a.rs", "\tfn a() {\n\t\told();\n\t}\n")],
+            wrap("*** Update File: a.rs\n@@\n fn a() {\n-\told();\n+\tnew();\n }")["patch"]
                 .as_str()
                 .expect("patch"),
         )
         .await;
         let text = out.expect("applies");
         assert!(text.contains("only after ignoring whitespace"), "{text}");
+        assert!(
+            text.contains("1 tab less indentation than the file"),
+            "{text}"
+        );
         assert_eq!(
             std::fs::read_to_string(dir.path().join("a.rs")).expect("read"),
-            "fn a() {\n    new();\n}\n"
+            "\tfn a() {\n\t\tnew();\n\t}\n"
         );
+    }
+
+    fn read(dir: &tempfile::TempDir, name: &str) -> String {
+        std::fs::read_to_string(dir.path().join(name)).expect("read")
+    }
+
+    /// Recorded evidence: a worker's patch to a Python stub module wrote
+    /// every unchanged line with one extra space after its ` ` prefix, while
+    /// its `-` and `+` lines were exact. It matched only after ignoring
+    /// whitespace and was written back as the patch's text, so line 1 of the
+    /// module gained a leading space (`IndentationError: unexpected indent`)
+    /// and the call reported success. The matched lines show two offsets
+    /// (one extra space on the context lines, none on the `-` lines), so the
+    /// patch is now refused, the file is unchanged, and the refusal names the
+    /// slip.
+    #[tokio::test]
+    async fn the_recorded_extra_space_patch_is_refused_and_the_module_is_unchanged() {
+        let module = include_str!("testdata/containers.py");
+        let patch = include_str!("testdata/containers_extra_space.patch");
+        let (out, dir) = run_patch(&[("shapes/containers.py", module)], patch).await;
+        let err = out.expect_err("refused");
+        assert!(
+            err.contains("not shifted from the file by one amount"),
+            "{err}"
+        );
+        assert!(err.contains("not applied"), "{err}");
+        assert!(
+            err.contains("Every unchanged line has 1 space more indentation"),
+            "{err}"
+        );
+        assert_eq!(read(&dir, "shapes/containers.py"), module);
+    }
+
+    /// A Python method body sent at the wrong depth (the patch has the method
+    /// at column 0, the file at column 4): context lines stay as the file has
+    /// them, added lines move 4 spaces right, and the module still parses.
+    #[tokio::test]
+    async fn a_python_patch_at_a_different_indentation_is_written_at_the_file_s() {
+        let module = "class Stack:\n    def __init__(self):\n        raise NotImplementedError\n\n    def size(self):\n        return 0\n";
+        let patch = "*** Begin Patch\n*** Update File: m.py\n@@\n def __init__(self):\n-    raise NotImplementedError\n+    self._items = []\n+\n+def push(self, item):\n+    self._items.append(item)\n \n def size(self):\n*** End Patch";
+        let (out, dir) = run_patch(&[("m.py", module)], patch).await;
+        let text = out.expect("applies");
+        assert!(
+            text.contains("4 spaces less indentation than the file"),
+            "{text}"
+        );
+        assert!(text.contains("3 added lines were re-indented"), "{text}");
+        let written = read(&dir, "m.py");
+        assert_eq!(
+            written,
+            "class Stack:\n    def __init__(self):\n        self._items = []\n\n    def push(self, item):\n        self._items.append(item)\n\n    def size(self):\n        return 0\n"
+        );
+        assert_eq!(syntax::python_indentation_error(&written), None);
+    }
+
+    /// YAML: a nested mapping edited with the patch's lines 2 spaces
+    /// shallower than the file's; the new key lands at the file's depth.
+    #[tokio::test]
+    async fn a_yaml_patch_at_a_different_indentation_is_written_at_the_file_s() {
+        let seed = "jobs:\n  build:\n    steps:\n      - run: make\n    env:\n      A: 1\n";
+        let patch = "*** Begin Patch\n*** Update File: ci.yml\n@@\n   env:\n     A: 1\n+    B: 2\n*** End Patch";
+        let (out, dir) = run_patch(&[("ci.yml", seed)], patch).await;
+        let text = out.expect("applies");
+        assert!(text.contains("re-indented"), "{text}");
+        assert_eq!(
+            read(&dir, "ci.yml"),
+            "jobs:\n  build:\n    steps:\n      - run: make\n    env:\n      A: 1\n      B: 2\n"
+        );
+    }
+
+    /// One context line at the file's indentation and another shifted: no
+    /// one offset, so the `+` lines' indentation cannot be known. Refused,
+    /// nothing written.
+    #[tokio::test]
+    async fn an_inconsistent_indentation_offset_is_refused_and_writes_nothing() {
+        let seed = "a:\n  b: 1\n  c: 2\n";
+        let patch = "*** Begin Patch\n*** Update File: x.yaml\n@@\n a:\n-    b: 1\n+    b: 3\n*** End Patch";
+        let (out, dir) = run_patch(&[("x.yaml", seed)], patch).await;
+        let err = out.expect_err("refused");
+        assert!(
+            err.contains("not shifted from the file by one amount"),
+            "{err}"
+        );
+        assert_eq!(read(&dir, "x.yaml"), seed);
+    }
+
+    /// The parse check behind the re-indent: one offset is measured, but an
+    /// added line is itself at a depth the file has no level for, so the
+    /// moved result is not valid Python. Refused before it is written.
+    #[tokio::test]
+    async fn a_tolerant_python_edit_that_no_longer_parses_is_refused() {
+        let seed = "def f():\n    return 1\n";
+        // Patch is 2 spaces deeper than the file throughout; the added line
+        // has 3 spaces, so 1 space after the move: an unmatched unindent.
+        let patch = "*** Begin Patch\n*** Update File: f.py\n@@\n   def f():\n-      return 1\n+      x = 1\n+   y = 2\n*** End Patch";
+        let (out, dir) = run_patch(&[("f.py", seed)], patch).await;
+        let err = out.expect_err("refused");
+        assert!(err.contains("no longer valid Python"), "{err}");
+        assert!(err.contains("line 3"), "{err}");
+        assert_eq!(read(&dir, "f.py"), seed);
     }
 }

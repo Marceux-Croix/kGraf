@@ -15,15 +15,24 @@
 // `seek_sequence::describe_mismatch`'s diagnostic -- see that function's doc
 // comment for why. It only adds text to an error message a caller already
 // receives; it does not change whether, or where, a pattern matches.
+// Also changed: a chunk placed by a tolerant rule (`Seek::Tolerant`) is no
+// longer written back as the patch's text. Its context lines are the file's
+// own lines (upstream's `PreserveLineEndings` branch keeps context lines the
+// same way; dropping that branch had dropped this too), and its added lines
+// are moved to the file's indentation, or the chunk is refused
+// (`apply_patch::reindent`). A Python or YAML file that parsed before such an
+// edit and does not after it is refused (`apply_patch::syntax`).
 
 use super::parser::UpdateFileChunk;
 use super::seek_sequence::{self, Seek};
+use super::{reindent, syntax};
 
 /// The result note for a line group that matched only under a tolerant rule.
 fn tolerant_note(path: &str, what: &str, index: usize) -> String {
     format!(
         "note: in {path}, {what} matched at line {} only after ignoring whitespace or \
-         typographic punctuation differences; they are not exact copies of the file",
+         typographic punctuation differences; they are not exact copies of the file, so the \
+         file's own copies of the unchanged lines were kept",
         index + 1
     )
 }
@@ -55,16 +64,27 @@ fn anchorless_addition(path: &str, chunk: &UpdateFileChunk) -> String {
 /// `start_index` with `new_lines`.
 type Replacement = (usize, usize, Vec<String>);
 
+/// The replacements for one file, the notes for the result, and whether any
+/// chunk was placed by a tolerant rule.
+struct Computed {
+    replacements: Vec<Replacement>,
+    notes: Vec<String>,
+    tolerant: bool,
+}
+
 /// Compute a list of replacements needed to transform `original_lines` into the
 /// new lines, given the patch `chunks`, plus a note for each place a line
 /// matched only under a tolerant rule (whitespace, typographic punctuation).
-pub(crate) fn compute_replacements(
+/// A chunk placed by a tolerant rule is written in the file's own whitespace
+/// ([`reindent::fit_to_file`]), or refused when that cannot be measured.
+fn compute_replacements(
     original_lines: &[String],
     path: &str,
     chunks: &[UpdateFileChunk],
-) -> Result<(Vec<Replacement>, Vec<String>), String> {
+) -> Result<Computed, String> {
     let mut replacements: Vec<Replacement> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
+    let mut tolerant = false;
     let mut line_index: usize = 0;
 
     for chunk in chunks {
@@ -136,15 +156,31 @@ pub(crate) fn compute_replacements(
         }
 
         match found {
-            Seek::Exact(start_idx) | Seek::Tolerant(start_idx) => {
-                if matches!(found, Seek::Tolerant(_)) {
-                    notes.push(tolerant_note(
-                        path,
-                        "the patch's unchanged and `-` lines",
-                        start_idx,
-                    ));
-                }
+            Seek::Exact(start_idx) => {
                 replacements.push((start_idx, pattern.len(), new_slice.to_vec()));
+                line_index = start_idx + pattern.len();
+            }
+            Seek::Tolerant(start_idx) => {
+                // The patch's lines are not exact copies of the file's, so
+                // writing them back as they are would put the patch's
+                // whitespace and punctuation into the file: context lines are
+                // taken from the file and added lines moved to its indentation.
+                let fitted = reindent::fit_to_file(
+                    path,
+                    original_lines,
+                    start_idx,
+                    pattern,
+                    new_slice,
+                    &chunk.context_line_indices,
+                )?;
+                notes.push(tolerant_note(
+                    path,
+                    "the patch's unchanged and `-` lines",
+                    start_idx,
+                ));
+                notes.extend(fitted.shift_note);
+                tolerant = true;
+                replacements.push((start_idx, pattern.len(), fitted.lines));
                 line_index = start_idx + pattern.len();
             }
             Seek::Ambiguous(at) => {
@@ -171,7 +207,11 @@ pub(crate) fn compute_replacements(
 
     replacements.sort_by_key(|(index, _, _)| *index);
 
-    Ok((replacements, notes))
+    Ok(Computed {
+        replacements,
+        notes,
+        tolerant,
+    })
 }
 
 /// Apply the `(start_index, old_len, new_lines)` replacements to `original_lines`,
@@ -280,7 +320,11 @@ pub(crate) fn derive_new_contents(
         endings.pop();
     }
 
-    let (replacements, notes) = compute_replacements(&original_lines, path, chunks)?;
+    let Computed {
+        replacements,
+        notes,
+        tolerant,
+    } = compute_replacements(&original_lines, path, chunks)?;
     let ending_replacements: Vec<(usize, usize, Vec<&'static str>)> = replacements
         .iter()
         .map(|(start, old_len, new)| {
@@ -292,9 +336,6 @@ pub(crate) fn derive_new_contents(
         .collect();
     let new_lines = apply_replacements(original_lines, &replacements);
     let new_endings = apply_replacements(endings, &ending_replacements);
-    if new_lines.is_empty() {
-        return Ok((String::new(), notes));
-    }
     let mut out = String::with_capacity(original.len());
     let count = new_lines.len();
     for (i, (line, ending)) in new_lines.iter().zip(&new_endings).enumerate() {
@@ -302,6 +343,9 @@ pub(crate) fn derive_new_contents(
         if i + 1 < count || final_newline {
             out.push_str(ending);
         }
+    }
+    if tolerant {
+        syntax::refuse_if_newly_broken(path, original, &out)?;
     }
     Ok((out, notes))
 }
@@ -505,19 +549,52 @@ mod tests {
         assert_eq!(derive("", "f", &chunks).expect("applies"), "one\ntwo\n");
     }
 
+    /// A tolerant match keeps the file's own copy of each context line
+    /// (trailing whitespace included) and moves the added lines by the
+    /// measured indentation offset.
     #[test]
     fn indentation_and_trailing_whitespace_differences_match_once_with_a_note() {
         let chunks =
             update_chunks("*** Update File: f\n@@\n fn a() {\n-    old();\n+    new();\n }");
+        // The file has the whole block 4 spaces deeper, and trailing spaces.
         let (new, notes) =
-            derive_new_contents("fn a() {  \n\told();\n}\n", "f", &chunks).expect("applies");
-        assert_eq!(new, "fn a() {\n    new();\n}\n");
-        assert_eq!(notes.len(), 1, "{notes:?}");
+            derive_new_contents("    fn a() {  \n        old();\n    }\n", "f", &chunks)
+                .expect("applies");
+        assert_eq!(new, "    fn a() {  \n        new();\n    }\n");
+        assert_eq!(notes.len(), 2, "{notes:?}");
         assert!(notes[0].starts_with("note: in f"), "{notes:?}");
+        assert!(
+            notes[1].contains("4 spaces less indentation than the file")
+                && notes[1].contains("1 added line was re-indented"),
+            "{notes:?}"
+        );
+        // Only trailing whitespace differs: the context line keeps the
+        // file's, the added line needs no move.
+        let (new, notes) =
+            derive_new_contents("fn a() {  \n    old();\n}\n", "f", &chunks).expect("applies");
+        assert_eq!(new, "fn a() {  \n    new();\n}\n");
+        assert_eq!(notes.len(), 1, "{notes:?}");
         // An exact match carries no note.
         let (_, notes) =
             derive_new_contents("fn a() {\n    old();\n}\n", "f", &chunks).expect("applies");
         assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    /// Spaces in the patch against a tab in the file, with an unindented
+    /// line pinning the offset at zero, is two offsets: refused, file named.
+    #[test]
+    fn spaces_against_tabs_with_a_pinned_line_are_refused() {
+        let chunks =
+            update_chunks("*** Update File: f\n@@\n fn a() {\n-    old();\n+    new();\n }");
+        let err = derive("fn a() {\n\told();\n}\n", "f", &chunks).unwrap_err();
+        assert!(
+            err.contains("not shifted from the file by one amount"),
+            "{err}"
+        );
+        assert!(
+            err.contains("4 spaces of indentation where the file has 1 tab"),
+            "{err}"
+        );
     }
 
     #[test]

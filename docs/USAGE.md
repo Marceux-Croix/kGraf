@@ -1411,7 +1411,12 @@ Behavior that differs from earlier builds. Each item names the decision that hol
   `@@ -a,b +c,d @@` header (its numbers are ignored; the text after it is the context line);
   each is a note in the result. Lines match exactly first, then ignoring trailing whitespace,
   indentation and typographic punctuation; a looser match that fits in several places is
-  refused, and one that fits in one place is noted. An Update File chunk of only `+` lines is
+  refused, and one that fits in one place is noted. A looser match keeps the file's own copy
+  of each unchanged line, and moves the `+` lines by the one indentation shift the matched
+  lines show between the patch and the file (the note says by how much); when the matched
+  lines are not shifted by one amount, the patch is refused, because the indentation of the
+  `+` lines cannot be known. A Python or YAML file that a looser match would leave
+  unparseable is refused before it is written. An Update File chunk of only `+` lines is
   refused (it names no place; it used to append at the end) unless the file is empty or the
   chunk ends with `*** End of File`. Any other malformed patch is refused. From the second
   patch a worker has rejected, the rejection ends with the rule it broke and a minimal valid

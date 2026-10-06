@@ -313,3 +313,51 @@ Tests: `kgraf-tools` `a_missing_or_mangled_end_line_is_applied_and_the_result_sa
 `an_update_of_only_added_lines_is_refused_not_appended`,
 `a_whitespace_tolerant_match_that_fits_twice_is_refused`,
 `a_context_line_that_fits_twice_after_ignoring_whitespace_is_refused`.
+
+## Amendment (2026-10-06): a looser `apply_patch` match is written in the file's own whitespace
+
+A worker's patch to a Python stub module had one extra space after the ` ` prefix of every
+unchanged line, while its `-` and `+` lines were exact. It matched only after ignoring
+indentation and was accepted with a note, but the matched region was replaced by the patch's
+own lines, context included. Line 1 of the module gained a leading space
+(`IndentationError: unexpected indent`), and the call reported success. The same write-back
+put the patch's trailing whitespace and ASCII punctuation into the file after the other two
+looser rules. Upstream codex keeps context lines from the file in its line-ending-preserving
+path; the port had dropped that path and with it this behavior.
+
+- **Unchanged lines are the file's.** After any looser rule, each context line is written as
+  the file has it, not as the patch has it.
+- **`+` lines move by the measured shift.** For each non-blank matched line pair, the common
+  tail of the two indentations is the line's own nesting, and what is left is the pair's
+  shift (patch base, file base). When every pair shows the same shift, each `+` line's patch
+  base is replaced by the file base, and the note says how much and how many lines moved.
+- **Two shifts refuse the patch.** The `+` lines' indentation cannot be known, so the patch is
+  refused with two lines that disagree; when every unchanged line has extra indentation and
+  every `-` line is exact, the refusal names that slip. A `+` line with less indentation than
+  the patch base is refused too. Spaces in the patch against tabs in the file, with an
+  unindented line in the same chunk, is two shifts and is refused; before, it was written in
+  the patch's spaces.
+- **A parse check backs this up.** After a looser match, a `.py`, `.pyi`, `.pyw`, `.yaml` or
+  `.yml` file that parsed before the edit and does not after it is refused before it is
+  written, with the line of the first error. Python is checked with an indentation pass that
+  follows CPython's tokenizer (needed because the tree-sitter grammar accepts an indented
+  first line) and then the tree-sitter grammar; YAML with `serde_yaml_ng`. The check is
+  comparative, so a file that already failed is not blocked, and it does not run for an exact
+  match, which is the model's own edit. A Makefile has no cheap parser here and relies on the
+  shift rule alone.
+- **A supplied `*** End Patch` keeps the last line whole.** The repair trimmed the whole patch,
+  which cut the trailing whitespace off the last body line when the end line was missing; now
+  only blank lines at the ends are dropped.
+
+Tests: `kgraf-tools`
+`the_recorded_extra_space_patch_is_refused_and_the_module_is_unchanged` (the recorded patch
+and stub module as fixtures),
+`a_python_patch_at_a_different_indentation_is_written_at_the_file_s`,
+`a_yaml_patch_at_a_different_indentation_is_written_at_the_file_s`,
+`an_inconsistent_indentation_offset_is_refused_and_writes_nothing`,
+`a_tolerant_python_edit_that_no_longer_parses_is_refused`,
+`a_supplied_end_line_keeps_the_last_line_s_trailing_whitespace`,
+`a_tolerant_match_is_stated_in_the_result`; `replace.rs`
+`indentation_and_trailing_whitespace_differences_match_once_with_a_note`,
+`spaces_against_tabs_with_a_pinned_line_are_refused`; the unit tests in `reindent.rs` and
+`syntax.rs`.
