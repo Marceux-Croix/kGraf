@@ -900,11 +900,12 @@ fn check_has_its_own_pid_namespace() -> bool {
     false
 }
 
-/// With a PID namespace: the check's escaped descendant (it would sleep 8 s)
-/// died with PID 1, so the run ends at once as a normal result. `Ok` is
-/// itself the proof that no process held the run's hold file when the check
-/// ended (`hold_free`, which the escapee's inherited lock would fail); ending
-/// before the escapee's 8-second sleep says the runner did not wait it out.
+/// With a PID namespace: the check's escaped descendant (it would live until
+/// released, which the test does not do before the run ends) died with PID 1,
+/// so the run ends at once as a normal result. `Ok` is itself the proof that
+/// no process held the run's hold file when the check ended (`hold_free`,
+/// which the escapee's inherited lock would fail); ending within the bound
+/// says the runner did not wait it out.
 /// The bound leaves room for a loaded machine (the 5-second kill grace plus
 /// start-up); on an idle one the run takes well under a second.
 #[cfg(unix)]
@@ -923,16 +924,87 @@ async fn assert_the_namespace_ended_the_escapee(
     out
 }
 
+/// The longest an escaped descendant of the tests below lives while its
+/// `alive` file exists, so a stuck test does not leave it running for long.
+#[cfg(unix)]
+const ESCAPEE_CAP_SECS: u32 = 60;
+
+/// A Python program whose forked child leaves the process group with its own
+/// `setsid` and then lives while the file named by its first argument exists
+/// (at most [`ESCAPEE_CAP_SECS`]). The test removes the file after the
+/// verdict, and the file's temporary directory goes with the test even when
+/// it fails. The child waits `delay_secs` before the `setsid`. The parent goes
+/// on only after the child has called `setsid`: it reads one byte the child
+/// writes after the call. So the child has left the group when the group kill
+/// comes, however slowly it is scheduled, and it is alive until the test
+/// removes the file. With a fixed sleep in either process the premise
+/// depended on the clock: under load, a child that had not yet called
+/// `setsid` when the parent ended was killed with the group, the tree was
+/// quiet and the check ended normally. `parent` runs in the parent after the
+/// wait.
+#[cfg(unix)]
+fn escapee(delay_secs: f64, parent: &[&str]) -> String {
+    let mut lines = vec![
+        "import os, sys, time".to_owned(),
+        "alive = sys.argv[1]".to_owned(),
+        "r, w = os.pipe()".to_owned(),
+        "if os.fork() == 0:".to_owned(),
+        "    os.close(r)".to_owned(),
+        format!("    time.sleep({delay_secs})"),
+        "    os.setsid()".to_owned(),
+        "    os.write(w, b'x')".to_owned(),
+        "    os.close(w)".to_owned(),
+        format!("    end = time.time() + {ESCAPEE_CAP_SECS}"),
+        "    while time.time() < end and os.path.exists(alive):".to_owned(),
+        "        time.sleep(0.05)".to_owned(),
+        "    os._exit(0)".to_owned(),
+        "os.close(w)".to_owned(),
+        // No byte: the child died before its `setsid`, so nothing escaped.
+        "if os.read(r, 1) != b'x':".to_owned(),
+        "    sys.exit(3)".to_owned(),
+    ];
+    lines.extend(parent.iter().map(|l| (*l).to_owned()));
+    lines.join("\n")
+}
+
+/// The argv that runs [`escapee`] with `alive` as the file that keeps its
+/// child alive. The file is made here.
+#[cfg(unix)]
+fn escapee_argv(program: &str, alive: &Path) -> Vec<String> {
+    std::fs::write(alive, "").expect("alive file");
+    vec![
+        "python3".to_owned(),
+        "-c".to_owned(),
+        program.to_owned(),
+        alive.display().to_string(),
+    ]
+}
+
 /// A descendant that leaves the process group with its own `setsid` is
 /// not reached by the group kill, but it still holds the run's hold file, so
 /// the check ends as one that could not run, never as a quiet tree. The
-/// descendant sleeps past the kill grace (5 s) and then exits by itself.
+/// descendant lives until the test removes its `alive` file, after the verdict.
 ///
 /// Linux with a PID namespace: the kernel kills the descendant when the check
 /// (PID 1) exits, so the tree is quiet and the check ends normally.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_descendant_that_leaves_the_group_is_seen_through_the_hold() {
+    assert_an_escaped_descendant_is_seen(0.0).await;
+}
+
+/// The same with a child that is slow to call `setsid` (one second), as a
+/// child on a loaded machine is: the parent waits for the call, so the child
+/// still escapes and is still seen. Before the parent waited, the parent
+/// ended first, the group kill took the child and the tree read quiet.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_descendant_slow_to_leave_the_group_is_still_seen() {
+    assert_an_escaped_descendant_is_seen(1.0).await;
+}
+
+#[cfg(unix)]
+async fn assert_an_escaped_descendant_is_seen(delay_secs: f64) {
     let dir = tempfile::tempdir().expect("dir");
     let repo = shell_repo(dir.path());
     let r = runner_with(
@@ -941,22 +1013,25 @@ async fn a_descendant_that_leaves_the_group_is_seen_through_the_hold() {
         vec![state_dir(dir.path())],
         Duration::from_secs(30),
     );
-    let escape = "import os, time\nif os.fork() == 0:\n    os.setsid()\n    time.sleep(8)\n";
+    let alive = dir.path().join("alive");
+    let argv = escapee_argv(&escapee(delay_secs, &[]), &alive);
     if check_has_its_own_pid_namespace() {
-        let _ = assert_the_namespace_ended_the_escapee(&r, &s(&["python3", "-c", escape])).await;
+        let _ = assert_the_namespace_ended_the_escapee(&r, &argv).await;
         return;
     }
     let e = r
-        .run(&[], &s(&["python3", "-c", escape]))
+        .run(&[], &argv)
         .await
         .expect_err("a tree that is not quiet is no result");
+    std::fs::remove_file(&alive).expect("release the escapee");
     assert!(e.to_string().contains("left its process group"), "{e}");
 }
 
 /// The check's forked child calls `setsid` and
-/// sleeps, and the parent deletes and recreates the hold file where it can
-/// reach (`../hold`, and any `*.hold` above that). The hold file lives outside
-/// the check's writable root, so the escaped child's lock stays visible.
+/// stays alive ([`escapee`]), and the parent deletes and recreates the hold
+/// file where it can reach (`../hold`, and any `*.hold` above that). The hold
+/// file lives outside the check's writable root, so the escaped child's lock
+/// stays visible.
 ///
 /// Linux with a PID namespace: the escaped child dies with the check (PID 1),
 /// and the hold the parent tried to recreate is outside its writable root, so
@@ -972,13 +1047,9 @@ async fn a_check_cannot_hide_an_escaped_child_by_recreating_the_hold() {
         vec![state_dir(dir.path())],
         Duration::from_secs(30),
     );
-    let probe = [
-        "import os, time, glob",
-        "if os.fork() == 0:",
-        "    os.setsid()",
-        "    time.sleep(8)",
-        "    os._exit(0)",
-        "time.sleep(0.3)",
+    let alive = dir.path().join("alive");
+    let parent = [
+        "import glob",
         "def ino(p):",
         "    try:",
         "        return os.stat(p).st_ino",
@@ -999,10 +1070,10 @@ async fn a_check_cannot_hide_an_escaped_child_by_recreating_the_hold() {
         "        pass",
         "    if p.endswith('.hold'):",
         "        print('HOLD', before, ino(p), flush=True)",
-    ]
-    .join("\n");
+    ];
+    let argv = escapee_argv(&escapee(0.0, &parent), &alive);
     if check_has_its_own_pid_namespace() {
-        let out = assert_the_namespace_ended_the_escapee(&r, &s(&["python3", "-c", &probe])).await;
+        let out = assert_the_namespace_ended_the_escapee(&r, &argv).await;
         // The check found its own hold (a `stat`, which Landlock allows) and
         // could neither remove nor replace it: the same inode after the try.
         let holds: Vec<&str> = out
@@ -1021,9 +1092,10 @@ async fn a_check_cannot_hide_an_escaped_child_by_recreating_the_hold() {
         return;
     }
     let e = r
-        .run(&[], &s(&["python3", "-c", &probe]))
+        .run(&[], &argv)
         .await
         .expect_err("the escaped child is seen");
+    std::fs::remove_file(&alive).expect("release the escapee");
     assert!(e.to_string().contains("left its process group"), "{e}");
 }
 

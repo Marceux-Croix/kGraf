@@ -4960,11 +4960,39 @@ fn alive(pid: &str) -> bool {
 }
 
 /// A build past its bound leaves nothing behind: its route probe worktree
-/// is removed, and the stdio MCP server it was starting (which never answers)
-/// is killed with its process group.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_timed_out_build_removes_its_probe_and_kills_its_mcp_server() {
+/// is removed and unregistered, and the stdio MCP server it was starting
+/// (which never answers) is killed with its process group. The probe's
+/// removal runs on the runtime's blocking pool, and git deletes a worktree's
+/// directory before its registration, so the runtime is dropped (which waits
+/// for its running blocking tasks) before the end state is checked; no
+/// removal step then runs after the test's repository is gone.
+#[test]
+fn a_timed_out_build_removes_its_probe_and_kills_its_mcp_server() {
     let (dir, config) = project();
+    let root = config.root.clone();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let (pid, probes) = rt.block_on(timed_out_build_waits(&dir, config));
+    drop(rt);
+    assert!(
+        !alive(&pid),
+        "the MCP server {pid} outlived its aborted build"
+    );
+    assert_eq!(probes(), 0, "the probe worktree outlived its aborted build");
+    let listed = git_out(&root, &["worktree", "list"]);
+    assert!(!listed.contains("probe-"), "and its registration: {listed}");
+}
+
+/// The build of [`a_timed_out_build_removes_its_probe_and_kills_its_mcp_server`]
+/// and the wait for its leftovers to go: the MCP server's pid, and a count of
+/// probe worktree directories.
+async fn timed_out_build_waits(
+    dir: &tempfile::TempDir,
+    config: RunConfig,
+) -> (String, impl Fn() -> usize + use<>) {
     let state = config.root.join(".kgraf");
     std::fs::create_dir_all(&state).expect("state");
     let pidfile = dir.path().join("server.pid");
@@ -4992,8 +5020,9 @@ async fn a_timed_out_build_removes_its_probe_and_kills_its_mcp_server() {
         .expect("the server started")
         .trim()
         .to_owned();
-    let probes = || {
-        std::fs::read_dir(state.join("worktrees"))
+    let worktrees = state.join("worktrees");
+    let probes = move || {
+        std::fs::read_dir(&worktrees)
             .map(|d| {
                 d.filter_map(|e| e.ok())
                     .filter(|e| e.file_name().to_string_lossy().starts_with("probe-"))
@@ -5005,11 +5034,7 @@ async fn a_timed_out_build_removes_its_probe_and_kills_its_mcp_server() {
     while (alive(&pid) || probes() > 0) && std::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(
-        !alive(&pid),
-        "the MCP server {pid} outlived its aborted build"
-    );
-    assert_eq!(probes(), 0, "the probe worktree outlived its aborted build");
+    (pid, probes)
 }
 
 /// A build failure the same configuration can get past (an MCP server
@@ -5091,26 +5116,78 @@ async fn an_index_made_before_open_reaches_the_first_build() {
 /// (the task's output is discarded) is removed: the guard is made with the
 /// worktree, on the blocking thread, and dropped with the output. That
 /// removal runs on a blocking thread.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_probe_created_after_an_abort_is_removed() {
+#[test]
+fn a_probe_created_after_an_abort_is_removed() {
     let r = repo();
-    let manager = r.workspaces.manager.clone();
-    let base = manager.base().to_path_buf();
-    // Nobody awaits the creation, as after an abort.
-    drop(ProbeGuard::create(manager, "probe-orphan".into()));
-    let path = base.join("probe-orphan");
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
-    let mut seen = false;
-    while std::time::Instant::now() < deadline {
-        seen |= path.exists();
-        if seen && !path.exists() {
-            break;
+    assert_an_orphaned_probe_is_removed(r.workspaces.manager.clone(), &r.root);
+}
+
+/// The same with a git whose `worktree remove` deletes the directory, waits
+/// one second, then runs: the directory is gone for that second while the
+/// worktree is still registered. Git's own `worktree remove` has the same
+/// order (directory first, registration second), with a window too short to
+/// see on an idle machine; under load, a check that stopped waiting when the
+/// directory went away could read the registration from inside it.
+#[cfg(unix)]
+#[test]
+fn a_probe_is_unregistered_after_its_directory_is_gone() {
+    use std::os::unix::fs::PermissionsExt;
+    let r = repo();
+    let real = kgraf_sandbox::git::Git::discover().expect("git");
+    let wrapper = r.outside.join("slow-remove-git");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\n\
+             case \" $* \" in *' worktree remove '*)\n  \
+             for last; do :; done\n  \
+             rm -rf \"$last\"\n  \
+             sleep 1\n;;\nesac\n\
+             exec '{}' \"$@\"\n",
+            real.exe().display()
+        ),
+    )
+    .expect("wrapper");
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let manager = WorkspaceManager::open_with_git(
+        &r.root,
+        &r.outside.join("slow-ws"),
+        kgraf_sandbox::git::Git::at(wrapper),
+    )
+    .expect("manager");
+    assert_an_orphaned_probe_is_removed(Arc::new(manager), &r.root);
+}
+
+/// Create a probe worktree whose guard nobody awaits, as after an abort, and
+/// check that it is removed and unregistered. The removal runs on the
+/// runtime's blocking pool, so the runtime is dropped before the check:
+/// dropping a tokio runtime waits for its running blocking tasks, so the
+/// removal has ended and none of its git steps runs after the test's
+/// repository is gone. The directory going away shows only that the removal
+/// started: git unregisters a worktree after it deletes the directory.
+fn assert_an_orphaned_probe_is_removed(manager: Arc<WorkspaceManager>, root: &Path) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let path = manager.base().join("probe-orphan");
+    rt.block_on(async {
+        drop(ProbeGuard::create(manager.clone(), "probe-orphan".into()));
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut seen = false;
+        while std::time::Instant::now() < deadline {
+            seen |= path.exists();
+            if seen && !path.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    });
+    drop(rt);
     assert!(!path.exists(), "the orphaned probe worktree was left");
     assert!(
-        !git_out(&r.root, &["worktree", "list"]).contains("probe-orphan"),
+        !git_out(root, &["worktree", "list"]).contains("probe-orphan"),
         "and unregistered"
     );
 }

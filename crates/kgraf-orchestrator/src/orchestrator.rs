@@ -1048,9 +1048,13 @@ enum LoopMsg {
         /// already `Fail` in this case).
         producer_challenge: Option<Box<crate::challenge::Challenge>>,
     },
+    /// The keeper found a lease lost. `generation` is the generation of the
+    /// lost token: the loop acts on the loss only while it is still current
+    /// ([`LeaseKeeper::take_loss`]).
     LeaseLost {
         holder: String,
         path: String,
+        generation: i64,
     },
     Control(Control),
     Inbound(InboundMessage, Arc<dyn MessagePort>),
@@ -1595,10 +1599,31 @@ enum HeldLease {
 }
 
 impl HeldLease {
+    /// The generation of the held token.
+    fn generation(&self) -> i64 {
+        match self {
+            HeldLease::Path(l) => l.generation(),
+            HeldLease::Node { lease, .. } => lease.generation(),
+        }
+    }
+
     fn key(&self) -> String {
         match self {
             HeldLease::Path(l) => l.path().to_owned(),
             HeldLease::Node { path, lease } => format!("{path}#{}", lease.node_id()),
+        }
+    }
+}
+
+/// Mark the flights of `contracts` as having lost a lease and cancel their
+/// workers: nothing they produce may be accepted.
+fn cancel_for_lost_lease(in_flight: &mut BTreeMap<String, InFlight>, contracts: &[String]) {
+    for id in contracts {
+        if let Some(f) = in_flight.get_mut(id) {
+            f.lease_lost = true;
+            for n in f.cancels.values() {
+                n.notify_one();
+            }
         }
     }
 }
@@ -1632,34 +1657,99 @@ struct LeaseKeeper {
     ttl_ms: i64,
     clock: Arc<dyn Clock>,
     held: Arc<Mutex<BTreeMap<String, Vec<HeldLease>>>>,
+    /// Losses found by a renewal and not yet handled by the loop:
+    /// `(holder, key)` to the generation of the lost token. A grant to the
+    /// same holder for the same key removes the entry, so a loss the loop
+    /// reads after that grant is stale ([`Self::take_loss`]). Lock order:
+    /// `held` before `lost`.
+    lost: Arc<Mutex<BTreeMap<(String, String), i64>>>,
+}
+
+/// A lease a renewal found lost: the holder, the lease's key
+/// ([`HeldLease::key`]) and the generation of the lost token.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LostLease {
+    holder: String,
+    key: String,
+    generation: i64,
 }
 
 impl LeaseKeeper {
+    fn new(graph: SharedGraph, ttl_ms: i64, clock: Arc<dyn Clock>) -> Self {
+        Self {
+            graph,
+            ttl_ms,
+            clock,
+            held: Arc::new(Mutex::new(BTreeMap::new())),
+            lost: Arc::new(Mutex::new(BTreeMap::new())),
+        }
+    }
+
     fn map(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Vec<HeldLease>>> {
         self.held.lock().unwrap_or_else(|p| p.into_inner())
     }
 
+    fn losses(&self) -> std::sync::MutexGuard<'_, BTreeMap<(String, String), i64>> {
+        self.lost.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Put `holder`'s new tokens in the map. Each new token makes a pending
+    /// loss of the same holder and key stale: the loss was of an older
+    /// generation, and the workers started under the new grant hold the new
+    /// one.
     fn insert(&self, holder: &str, leases: Vec<HeldLease>) {
-        self.map().insert(holder.to_owned(), leases);
+        let mut map = self.map();
+        {
+            let mut lost = self.losses();
+            for l in &leases {
+                lost.remove(&(holder.to_owned(), l.key()));
+            }
+        }
+        map.insert(holder.to_owned(), leases);
+    }
+
+    /// Drop every held token and every pending loss (the run releases all its
+    /// leases).
+    fn clear(&self) {
+        let mut map = self.map();
+        self.losses().clear();
+        map.clear();
+    }
+
+    /// Consume a reported loss. `true` when the loss is still current: the
+    /// keeper recorded this loss, at this generation, and no grant of the same
+    /// key to the same holder came after it. `false` for a stale loss: a grant
+    /// after the loss gave the holder a newer generation, and the workers that
+    /// hold it must not be cancelled for the old token's loss.
+    fn take_loss(&self, holder: &str, key: &str, generation: i64) -> bool {
+        let mut lost = self.losses();
+        let k = (holder.to_owned(), key.to_owned());
+        if lost.get(&k) == Some(&generation) {
+            lost.remove(&k);
+            true
+        } else {
+            false
+        }
     }
 
     fn remove(&self, holder: &str) {
         self.map().remove(holder);
     }
 
-    /// Renew every held lease; return (holder, path) of each one lost, dropped
-    /// from the map.
+    /// Renew every held lease; return each one lost. A lost lease's holder is
+    /// dropped from the map, and the loss is recorded for [`Self::take_loss`].
     ///
     /// A lease that lapsed (the registry refuses to renew a lapsed row, 0048) is
     /// taken again through ordinary admission when nobody else has taken it in
     /// the meantime: a run whose laptop slept past its TTLs does not block on
     /// itself. When another holder took it, it is lost, and the loop cancels the
     /// workers that were writing under it.
-    fn renew_all(&self) -> Result<Vec<(String, String)>, OrchestratorError> {
+    fn renew_all(&self) -> Result<Vec<LostLease>, OrchestratorError> {
         let now = self.clock.now_ms();
         let graph = self.graph.clone();
         let ttl = self.ttl_ms;
         let held = self.held.clone();
+        let pending = self.lost.clone();
         blocking(move || {
             let g = graph.lock().map_err(|_| StoreError::Poisoned)?;
             let reg = LeaseRegistry::new(&g).with_ttl_ms(ttl);
@@ -1725,12 +1815,20 @@ impl LeaseKeeper {
                             }
                         };
                     if !retaken {
-                        lost.push((holder.clone(), l.key()));
+                        lost.push(LostLease {
+                            holder: holder.clone(),
+                            key: l.key(),
+                            generation: l.generation(),
+                        });
                     }
                 }
             }
-            for (holder, _) in &lost {
-                map.remove(holder);
+            // Recorded under the map lock: a grant that follows sees the
+            // loss and makes it stale.
+            let mut losses = pending.lock().unwrap_or_else(|p| p.into_inner());
+            for l in &lost {
+                map.remove(&l.holder);
+                losses.insert((l.holder.clone(), l.key.clone()), l.generation);
             }
             Ok(lost)
         })
@@ -1787,17 +1885,6 @@ impl LeaseKeeper {
         })
     }
 
-    /// Renew all held leases of one holder now, synchronously. Returns the paths
-    /// lost (the holder is then dropped from the map).
-    fn renew_holder_now(&self, holder: &str) -> Result<Vec<String>, OrchestratorError> {
-        let lost = self.renew_all()?;
-        Ok(lost
-            .into_iter()
-            .filter(|(h, _)| h == holder)
-            .map(|(_, p)| p)
-            .collect())
-    }
-
     /// Renew on the wall clock. The timer only polls; renewal happens when a
     /// quarter of the TTL has passed on the clock the registry's expiries are
     /// written in. After a laptop sleeps, a monotonic timer has barely moved
@@ -1818,8 +1905,13 @@ impl LeaseKeeper {
                 last = now;
                 match self.renew_all() {
                     Ok(lost) => {
-                        for (holder, path) in lost {
-                            if tx.send(LoopMsg::LeaseLost { holder, path }).await.is_err() {
+                        for l in lost {
+                            let msg = LoopMsg::LeaseLost {
+                                holder: l.holder,
+                                path: l.key,
+                                generation: l.generation,
+                            };
+                            if tx.send(msg).await.is_err() {
                                 return;
                             }
                         }
@@ -2456,12 +2548,11 @@ impl RunLoop {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let run_holder = run_lease_holder(&record.run, ProcessIdentity::current(), nonce);
-        let keeper = LeaseKeeper {
-            graph: services.graph.clone(),
-            ttl_ms: config.lease_ttl_ms,
-            clock: services.clock.clone(),
-            held: Arc::new(Mutex::new(BTreeMap::new())),
-        };
+        let keeper = LeaseKeeper::new(
+            services.graph.clone(),
+            config.lease_ttl_ms,
+            services.clock.clone(),
+        );
         {
             let graph = services.graph.clone();
             let key = run_lease_key(&record.run);
@@ -4138,9 +4229,11 @@ impl RunLoop {
                     )
                     .await?
                 }
-                Some(LoopMsg::LeaseLost { holder, path }) => {
-                    self.on_lease_lost(holder, path).await?
-                }
+                Some(LoopMsg::LeaseLost {
+                    holder,
+                    path,
+                    generation,
+                }) => self.on_lease_lost(holder, path, generation).await?,
                 Some(LoopMsg::Control(c)) => self.on_control(c).await?,
                 Some(LoopMsg::ContractWork(w)) => self.on_contract_work(*w).await?,
                 Some(LoopMsg::Inbound(m, port)) => self.on_inbound(m, port).await?,
@@ -7239,10 +7332,10 @@ impl RunLoop {
         // The leases must still be ours at the moment a result is accepted, not
         // just at the last renewal tick.
         if select(&flight.attempts, &flight.premerged).is_some() && !flight.lease_lost {
-            let lost = self.keeper.renew_holder_now(&holder)?;
+            let lost = self.renew_leases_now(&holder).await?;
             if !lost.is_empty() {
+                // `renew_leases_now` counted each loss.
                 flight.lease_lost = true;
-                self.record.counters.leases_lost += 1;
                 self.defer(
                     &id,
                     DeferReason::Lease,
@@ -7929,7 +8022,7 @@ impl RunLoop {
             .collect();
         holders.extend(self.keeper.map().keys().cloned());
         holders.insert(self.run_holder.clone());
-        self.keeper.map().clear();
+        self.keeper.clear();
         self.record.admitted_leases.clear();
         let graph = self.s.graph.clone();
         blocking(|| {
@@ -7942,14 +8035,54 @@ impl RunLoop {
         })
     }
 
+    /// Renew every held lease now, synchronously, and handle every loss the
+    /// renewal finds, of any holder, through [`Self::on_lease_lost`]. A
+    /// renewal drops a lost holder from the keeper, so the renewal task never
+    /// reports that loss again: a loss of another holder found here and not
+    /// handled here would never cancel that holder's workers. Returns the keys
+    /// `holder` lost.
+    async fn renew_leases_now(&mut self, holder: &str) -> Result<Vec<String>, OrchestratorError> {
+        let lost = self.keeper.renew_all()?;
+        let mut own = Vec::new();
+        for l in lost {
+            if l.holder == holder {
+                own.push(l.key.clone());
+            }
+            self.on_lease_lost(l.holder, l.key, l.generation).await?;
+        }
+        Ok(own)
+    }
+
     /// A lease was lost (taken after it lapsed). Its workers are cancelled: their
     /// writes are no longer protected, so nothing they produced may be accepted.
     /// Losing the run lease stops the run: another orchestrator owns it now.
+    ///
+    /// A loss is reported by message, so a grant can come between the loss and
+    /// this handler: the loop takes the same key for the same holder again (a
+    /// retry or a resolver under the same lineage root) and starts workers
+    /// under the new generation. That loss is stale. It is traced and ignored,
+    /// because the new workers hold a lease that is not lost.
     async fn on_lease_lost(
         &mut self,
         holder: String,
         path: String,
+        generation: i64,
     ) -> Result<(), OrchestratorError> {
+        if !self.keeper.take_loss(&holder, &path, generation) {
+            let at = self.now();
+            return self
+                .trace(TraceEvent::Notice {
+                    at_ms: at,
+                    contract: String::new(),
+                    worker: holder.clone(),
+                    detail: format!(
+                        "a loss of the lease on {path} held by {holder} at generation \
+                         {generation} was ignored: the holder took that lease again after the \
+                         loss"
+                    ),
+                })
+                .await;
+        }
         self.record.counters.leases_lost += 1;
         let at = self.now();
         self.trace(TraceEvent::Deferred {
@@ -7979,14 +8112,7 @@ impl RunLoop {
             .filter(|c| self.holder(c) == holder)
             .map(|c| c.contract.clone())
             .collect();
-        for id in affected {
-            if let Some(f) = self.in_flight.get_mut(&id) {
-                f.lease_lost = true;
-                for n in f.cancels.values() {
-                    n.notify_one();
-                }
-            }
-        }
+        cancel_for_lost_lease(&mut self.in_flight, &affected);
         self.record
             .admitted_leases
             .retain(|l| l.agent.as_str() != holder);
@@ -9788,12 +9914,7 @@ mod tests {
                 Acquisition::Blocked(_) => panic!("blocked"),
             }
         };
-        let keeper = LeaseKeeper {
-            graph: graph.clone(),
-            ttl_ms: ttl,
-            clock: clock.clone(),
-            held: Arc::new(Mutex::new(BTreeMap::new())),
-        };
+        let keeper = LeaseKeeper::new(graph.clone(), ttl, clock.clone());
         keeper.insert("run/a@n", vec![HeldLease::Path(lease)]);
         let (tx, _rx) = mpsc::channel(8);
         let task = keeper.spawn(tx);
@@ -9838,12 +9959,11 @@ mod tests {
         ));
         let ttl = 100_000;
         let now = 1_000_000;
-        let keeper = LeaseKeeper {
-            graph: graph.clone(),
-            ttl_ms: ttl,
-            clock: Arc::new(crate::clock::ManualClock::new(now)),
-            held: Arc::new(Mutex::new(BTreeMap::new())),
-        };
+        let keeper = LeaseKeeper::new(
+            graph.clone(),
+            ttl,
+            Arc::new(crate::clock::ManualClock::new(now)),
+        );
         let holder = "r1/a@n";
         let paths = vec!["src/a.rs".to_owned()];
         let generation_of = |grant: KeptAcquisition| match grant {
@@ -9893,6 +10013,116 @@ mod tests {
             row.generation, second,
             "the renewal kept the granted token; it did not take the row again"
         );
+    }
+
+    /// A loss reaches the loop by message. When the same holder takes the
+    /// same lease again before the loop reads the message, the loss is stale:
+    /// the loop does not cancel the workers that hold the new generation. A
+    /// loss with no grant after it still cancels.
+    ///
+    /// The test runs the keeper and the loop's handling in the order the race
+    /// gives: the renewal finds generation N lost (the message is queued), the
+    /// loop grants N+1 to the same holder, then the loop handles the queued
+    /// loss with the same check and cancel [`Orchestrator::on_lease_lost`]
+    /// uses. Before the fix the message carried no generation and the loop
+    /// cancelled on every loss.
+    #[tokio::test]
+    async fn a_queued_loss_of_a_lease_taken_again_does_not_cancel_its_new_workers() {
+        let dir = tempfile::tempdir().expect("dir");
+        let graph: SharedGraph = Arc::new(Mutex::new(
+            kgraf_graph::GraphStore::open_in_memory(dir.path()).expect("graph"),
+        ));
+        let ttl = 100_000;
+        let now = 1_000_000;
+        let keeper = LeaseKeeper::new(
+            graph.clone(),
+            ttl,
+            Arc::new(crate::clock::ManualClock::new(now)),
+        );
+        let holder = "r1/a@n";
+        let key = "src/a.rs";
+        let paths = vec![key.to_owned()];
+        // Another holder takes the row between two renewals, then lets it go:
+        // the row this holder's token names is gone, and the path is free.
+        let steal = |at: i64| {
+            let g = graph.lock().expect("lock");
+            let reg = LeaseRegistry::new(&g).with_ttl_ms(ttl);
+            reg.release_all(holder).expect("release");
+            assert!(matches!(
+                reg.acquire_all("thief", "t", &paths, &[], at)
+                    .expect("acquire"),
+                Acquisition::Granted(_)
+            ));
+            reg.release_all("thief").expect("release");
+        };
+        let grant = |at: i64| match keeper
+            .acquire_held(holder, "t", &paths, &[], &BTreeMap::new(), at)
+            .expect("acquire")
+        {
+            KeptAcquisition::Granted(g) => g[0].2,
+            _ => panic!("not granted"),
+        };
+        // The loop's handling of a queued loss: the check, then the cancel.
+        let handle = |in_flight: &mut BTreeMap<String, InFlight>, lost: &LostLease| {
+            if keeper.take_loss(&lost.holder, &lost.key, lost.generation) {
+                cancel_for_lost_lease(in_flight, &["a".to_owned()]);
+            }
+        };
+        let cancelled = |in_flight: &BTreeMap<String, InFlight>| {
+            let f = &in_flight["a"];
+            let notified = f.cancels.values().all(|n| {
+                let mut wait = std::pin::pin!(n.notified());
+                wait.as_mut().enable()
+            });
+            assert_eq!(
+                f.lease_lost, notified,
+                "a flight marked lost cancels its workers"
+            );
+            f.lease_lost
+        };
+        let flight_with_worker = || {
+            let admission = Admission::new(crate::admission::Limits::new(4, 4).unwrap());
+            let mut f = bare_flight(admission);
+            f.cancels
+                .insert(AgentId::new("w1"), Arc::new(tokio::sync::Notify::new()));
+            f
+        };
+
+        let first = grant(now);
+        steal(now + 1);
+        let lost = keeper.renew_all().expect("renew");
+        assert_eq!(
+            lost,
+            vec![LostLease {
+                holder: holder.into(),
+                key: key.into(),
+                generation: first,
+            }]
+        );
+        // Before the loop reads the loss, it takes the lease again and starts
+        // new workers under the new generation.
+        let second = grant(now + 2);
+        assert!(second > first, "a grant writes a new generation");
+        let mut in_flight = BTreeMap::from([("a".to_owned(), flight_with_worker())]);
+        handle(&mut in_flight, &lost[0]);
+        assert!(
+            !cancelled(&in_flight),
+            "a stale loss of generation {first} cancelled the workers holding generation {second}"
+        );
+        assert!(
+            keeper.renew_all().expect("renew").is_empty(),
+            "the new generation is held"
+        );
+
+        // A current loss, with no grant after it, still cancels.
+        steal(now + 3);
+        let lost = keeper.renew_all().expect("renew");
+        assert_eq!(lost.len(), 1);
+        assert_eq!(lost[0].generation, second);
+        handle(&mut in_flight, &lost[0]);
+        assert!(cancelled(&in_flight), "a current loss did not cancel");
+        // A loss is handled once.
+        assert!(!keeper.take_loss(holder, key, second));
     }
 
     /// Decision 0088 with 0067: a worktree a handoff child inherited is in use

@@ -332,7 +332,13 @@ impl WorkspaceManager {
     /// deletes unregistered directories inside it. `base` must not contain
     /// the repository.
     pub fn open(repo: &Path, base: &Path) -> Result<Self, WorkspaceError> {
-        let git = Git::discover()?;
+        Self::open_with_git(repo, base, Git::discover()?)
+    }
+
+    /// [`Self::open`] with a given git executable instead of the one on
+    /// `PATH`, for example a wrapper that slows one git step down so a test
+    /// can observe the state between two steps.
+    pub fn open_with_git(repo: &Path, base: &Path, git: Git) -> Result<Self, WorkspaceError> {
         let top = git
             .run_str(repo, ["rev-parse", "--show-toplevel"])
             .map_err(|_| WorkspaceError::NotARepository(repo.to_path_buf()))?;

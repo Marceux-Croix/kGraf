@@ -658,7 +658,7 @@ impl RunLoop {
         if let Some(w) = winner
             && !flight.lease_lost
         {
-            let lost = self.keeper.renew_holder_now(&holder)?;
+            let lost = self.renew_leases_now(&holder).await?;
             if lost.is_empty() {
                 let ws = flight.attempts[w].workspace.clone();
                 accepted = matches!(
