@@ -178,3 +178,36 @@ surface symbol names is still set aside; a file symbol is provided by the party 
 stub file; a path anchor or touch is one file whatever its leading `./` or `/`; and the prompt says
 `touch` lists only the paths the party will write. The details and tests are in decision 0030's
 amendment of 2026-10-06.
+
+## Amendment (2026-10-06, second): a provision provides every symbol it lists, and an anchor is a code span
+
+A coherent handshake held on `symbol_unprovided` for a symbol its provider did state:
+
+> I will provide `` `vectorops` `` (a Python package) and `` `dotproduct` ``. The symbol
+> `` `dotproduct` `` refers to a function with signature
+> `` dotproduct(numbers_a: list[float], numbers_b: list[float]) -> float ``.
+
+The reader took the first surface anchor as the only subject and read every later anchor as a
+claim about it, so `dotproduct` was never a provision. It also split at every backtick, so a
+CommonMark double-backtick span was read as an empty anchor with its content as prose, and the
+signature's types were lost.
+
+- **An anchor is a CommonMark code span**: a run of N backticks opens a span that the next run of
+  exactly N closes, a run with no closer is prose, and backticks nested inside a span are trimmed
+  ("`` `x` ``" anchors `x`).
+- **A provision provides every symbol it lists**: a later surface symbol listed with a provided
+  one (a comma or a joiner, a parenthetical dropped, kind words allowed), or one that leads a
+  later clause, is provided too, with the claims written after it. The writer rule and
+  `double_provided` apply to each. A symbol named as a claim ("which returns a `Config`") or under
+  a use word ("and tests for `b`") is not provided. Expectations read one subject, as before.
+- **Other languages' names**: an import line names its symbols (`from vectorops import
+  dotproduct`, `use a::{b, c};`, `import { b } from "a"`); `#` separates segments; a call form or
+  an untyped `def` names the symbol and claims no arity; a default value, Python's `*` and `/`
+  markers and `cls` are not types; a JavaScript or TypeScript `function` line with a `: T` return
+  reads as a signature. Names are compared with case kept.
+
+A provider that never names a symbol is still `symbol_unprovided` and holds; no re-ask is added.
+Still not read: a symbol named only as contained ("`vectorops` containing `dotproduct`") and a
+signature with types before or after names without a colon (Go, C). Tests:
+`handshake_forms_tests.rs`, with the recorded statements as
+`tests/fixtures/handshake/two-symbols-in-one-provision.json`.

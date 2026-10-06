@@ -1001,7 +1001,10 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   compile-only interface has none). An interface whose symbols are files (packaging metadata
   such as `pyproject.toml`, a module file) is compared the same way: a party that names such a
   file in backticks makes a claim about it, and the party that writes the file provides it. A
-  party's `touch` list holds only the files it will write. A contract
+  party that lists several symbols in one sentence ("I will provide `vectorops` and
+  `dotproduct`") provides each of them, and a symbol may be named by its qualified name
+  (`vectorops.dotproduct`), its call form (`dotproduct(a, b)`) or an import line (`from
+  vectorops import dotproduct`). A party's `touch` list holds only the files it will write. A contract
   whose interface fails at that point is held, with the file that failed named. Each
   handshake and each check names every party's route and model, and the run record keeps
   each hold with them, so you can see which models disagreed. A contract whose compiler or

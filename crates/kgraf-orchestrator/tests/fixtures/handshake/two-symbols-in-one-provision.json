@@ -1,0 +1,116 @@
+{
+  "interface": {
+    "id": "re1.i_c1_to_c2",
+    "version": 1,
+    "parties": [
+      "re1.c1",
+      "re1.c2"
+    ],
+    "symbols": [
+      "vectorops",
+      "dotproduct"
+    ],
+    "stub": [
+      {
+        "path": "vectorops/__init__.py",
+        "content": "import operator\n\ndef dotproduct(numbers_a: list[float], numbers_b: list[float]) -> float:\n    return 0\n"
+      },
+      {
+        "path": "setup.py",
+        "content": "from setuptools import setup\nsetup(name='vectorops', version='0.1.0')\n"
+      }
+    ],
+    "wrong": [],
+    "reference": [
+      {
+        "path": "vectorops/__init__.py",
+        "content": "import operator\n\ndef dotproduct(numbers_a: list[float], numbers_b: list[float]) -> float:\n    '''Compute and return the dot product of two lists of numbers.'''\n    return sum(map(operator.mul, numbers_a, numbers_b))\n"
+      },
+      {
+        "path": "setup.py",
+        "content": "from setuptools import setup\n\nsetup(\n    name='vectorops',\n    version='0.1.0',\n    packages=['vectorops'],\n)\n"
+      }
+    ],
+    "consumer": [],
+    "tests": [
+      {
+        "path": "test_contract.py",
+        "content": "def test_dotproduct():\n    import vectorops\n    res = vectorops.dotproduct([1, 2], [3, 4])\n    assert res == 11, f\"Expected 11 for dot product of [1,2] and [3,4], got {res}\"\n\nif __name__ == \"__main__\":\n    test_dotproduct()\n"
+      }
+    ],
+    "compile": [
+      "python",
+      "-m",
+      "py_compile",
+      "vectorops/__init__.py",
+      "setup.py",
+      "test_contract.py"
+    ],
+    "test": [
+      "python",
+      "test_contract.py"
+    ],
+    "consulted": []
+  },
+  "handshake": [
+    {
+      "party": "re1.c1",
+      "provide": [
+        "I will provide `` `vectorops` `` (a Python package) and `` `dotproduct` ``. The symbol `` `dotproduct` `` refers to a function with signature `` dotproduct(numbers_a: list[float], numbers_b: list[float]) -> float ``."
+      ],
+      "expect": [
+        "I assume you consume the symbols `` `vectorops` `` and `` `dotproduct` `` within the package."
+      ],
+      "consume": [],
+      "touch": [
+        "vectorops/__init__.py",
+        "setup.py"
+      ],
+      "route": "ollama:qwen3.6:35b",
+      "model": "qwen3.6:35b"
+    },
+    {
+      "party": "re1.c2",
+      "provide": [],
+      "expect": [
+        "I assume you provide `vectorops` as a set of package files located in the local `dist/` directory.",
+        "I assume you ensure that `pypiserver` is available and can be executed."
+      ],
+      "consume": [
+        "I assume `vectorops` contains the `dotproduct` symbol defined as a `function` suitable for import."
+      ],
+      "touch": [],
+      "route": "ollama:qwen3.6:35b",
+      "model": "qwen3.6:35b"
+    }
+  ],
+  "recorded_findings": [
+    {
+      "finding": "symbol_unprovided",
+      "symbol": "dotproduct"
+    },
+    {
+      "finding": "outside_surface",
+      "party": "re1.c2",
+      "symbol": "pypiserver",
+      "text": "I assume you ensure that `pypiserver` is available and can be executed."
+    }
+  ],
+  "writes": {
+    "re1.c1": [
+      {
+        "path": "vectorops/__init__.py"
+      },
+      {
+        "path": "setup.py"
+      }
+    ],
+    "re1.c2": []
+  },
+  "depends_on": {
+    "re1.c1": [],
+    "re1.c2": [
+      "re1.c1"
+    ]
+  }
+}

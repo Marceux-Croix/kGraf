@@ -276,7 +276,7 @@ fn an_expectation_the_provider_does_not_state_still_fails() {
 
 #[test]
 fn signatures_reduce_to_their_types() {
-    let canon = |a: &str| signature(a).map(|s| (s.name, s.canonical));
+    let canon = |a: &str| signature(a).map(|s| (s.name, s.canonical.unwrap_or_default()));
     assert_eq!(
         canon("pub fn double(x: i64) -> i64"),
         Some(("double".into(), "fn(i64) -> i64".into()))

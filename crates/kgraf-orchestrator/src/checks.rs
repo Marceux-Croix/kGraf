@@ -1112,12 +1112,82 @@ pub fn ordered_pairs(depends_on: &BTreeMap<String, Vec<String>>) -> BTreeSet<(St
     pairs
 }
 
+/// One piece of a sentence: prose, or the content of a code span.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Piece<'t> {
+    Prose(&'t str),
+    Code(&'t str),
+}
+
+/// A sentence cut into prose and code spans by the CommonMark rule: a run of
+/// N backticks opens a span that the next run of exactly N backticks closes,
+/// and a run with no closer is prose. A span's content is trimmed, and so are
+/// the backticks a model nests inside a double-backtick span: in
+/// "`` `dotproduct` ``" the anchor is `dotproduct`.
+///
+/// Splitting at every backtick instead read a double-backtick span as an
+/// empty anchor with its content as prose, and found a nested anchor only
+/// when the backtick count before it happened to be odd.
+fn pieces(text: &str) -> Vec<Piece<'_>> {
+    let bytes = text.as_bytes();
+    let run_at = |i: usize| bytes[i..].iter().take_while(|&&b| b == b'`').count();
+    let mut out = Vec::new();
+    let (mut prose_from, mut i) = (0usize, 0usize);
+    while i < bytes.len() {
+        if bytes[i] != b'`' {
+            i += 1;
+            continue;
+        }
+        let n = run_at(i);
+        let open_end = i + n;
+        let mut k = open_end;
+        let mut close = None;
+        while let Some(off) = bytes[k..].iter().position(|&b| b == b'`') {
+            let at = k + off;
+            let m = run_at(at);
+            if m == n {
+                close = Some(at);
+                break;
+            }
+            k = at + m;
+        }
+        match close {
+            Some(at) => {
+                if prose_from < i {
+                    out.push(Piece::Prose(&text[prose_from..i]));
+                }
+                out.push(Piece::Code(
+                    text[open_end..at].trim().trim_matches('`').trim(),
+                ));
+                i = at + n;
+                prose_from = i;
+            }
+            // No closer: the run is literal prose.
+            None => i = open_end,
+        }
+    }
+    if prose_from < bytes.len() {
+        out.push(Piece::Prose(&text[prose_from..]));
+    }
+    out
+}
+
+/// The prose of a sentence, outside its code spans.
+fn prose_chunks(text: &str) -> impl Iterator<Item = &str> {
+    pieces(text).into_iter().filter_map(|p| match p {
+        Piece::Prose(s) => Some(s),
+        Piece::Code(_) => None,
+    })
+}
+
 /// The backticked anchors of a sentence, whitespace-normalized.
 pub fn anchors(text: &str) -> Vec<String> {
-    text.split('`')
-        .skip(1)
-        .step_by(2)
-        .map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "))
+    pieces(text)
+        .into_iter()
+        .filter_map(|p| match p {
+            Piece::Code(s) => Some(s.split_whitespace().collect::<Vec<_>>().join(" ")),
+            Piece::Prose(_) => None,
+        })
         .filter(|s| !s.is_empty())
         .collect()
 }
@@ -1164,9 +1234,11 @@ fn resolve_path<'s>(a: &str, surface: &BTreeSet<&'s str>) -> Option<&'s str> {
         .copied()
 }
 
-/// The segments of an identifier path, `::` and `.` both separating.
+/// The segments of an identifier path: `::` (Rust, C++, Ruby, PHP), `.`
+/// (Python, JavaScript, Java, Go) and `#` (Ruby and Javadoc `Class#method`)
+/// all separate.
 fn segments(a: &str) -> Vec<&str> {
-    a.split("::").flat_map(|s| s.split('.')).collect()
+    a.split("::").flat_map(|s| s.split(['.', '#'])).collect()
 }
 
 /// Whether an anchor is a plain identifier path: `double`,
@@ -1238,18 +1310,79 @@ fn split_top_level(s: &str) -> Vec<&str> {
         .collect()
 }
 
-/// The type of one parameter: after a single `:` (not `::`), else the whole
-/// parameter (`fn(i64)` names types only). A receiver carries no type claim.
-fn param_type(p: &str) -> Option<String> {
-    if matches!(p, "self" | "&self" | "&mut self" | "mut self") {
-        return None;
+/// What one parameter of a signature claims.
+#[derive(Debug, PartialEq, Eq)]
+enum Param {
+    /// `self`, `&mut self`, Python's `cls`: no claim.
+    Receiver,
+    /// A stated type.
+    Type(String),
+    /// A name or a value with no type: Python's `def f(a, b)`, a call
+    /// `f(a, b)` or `f([1, 2], [3, 4])`. It claims no type, and the signature
+    /// it is in claims no arity.
+    Untyped,
+}
+
+/// The index of a parameter's default `=`, outside brackets: not `==`,
+/// `=>`, `<=`, `>=` or `!=`.
+fn default_at(p: &str) -> Option<usize> {
+    let b = p.as_bytes();
+    let mut depth = 0i32;
+    for i in 0..b.len() {
+        match b[i] {
+            b'(' | b'<' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            // `=>` and `->` close nothing.
+            b'>' if i == 0 || !matches!(b[i - 1], b'=' | b'-') => depth -= 1,
+            b'=' if depth == 0
+                && !matches!(b.get(i + 1), Some(b'=' | b'>'))
+                && (i == 0 || !matches!(b[i - 1], b'=' | b'<' | b'>' | b'!')) =>
+            {
+                return Some(i);
+            }
+            _ => {}
+        }
     }
+    None
+}
+
+/// Whether an untyped parameter is a name or a value rather than a type: a
+/// plain identifier that is not a type word ([`is_type_word`]), `*args`,
+/// `**kwargs`, Python's `/` and `*` markers, or a literal.
+fn names_a_value(p: &str) -> bool {
+    let bare = p.trim_start_matches('*');
+    matches!(p, "/" | "*" | "..." | "_")
+        || p.starts_with(|c: char| {
+            c.is_ascii_digit() || matches!(c, '-' | '"' | '\'' | '[' | '{' | '(')
+        })
+        || (!bare.is_empty()
+            && is_ident_path(bare)
+            && !bare.contains(['.', ':', '#'])
+            && !is_type_word(bare))
+}
+
+/// What one parameter claims: its type after a single `:` (not `::`), a
+/// default value dropped (`b: int = 0` claims `int`). With no `:`, a
+/// parameter of an unnamed function type is a type (`fn(i64)`); one of a
+/// named signature is a type only when it reads as one (`double(i64)`), and
+/// otherwise a name or a value ([`Param::Untyped`]).
+fn param(p: &str, named: bool) -> Param {
+    if matches!(p, "self" | "&self" | "&mut self" | "mut self" | "cls") {
+        return Param::Receiver;
+    }
+    let p = default_at(p).map_or(p, |i| &p[..i]).trim();
     let bytes = p.as_bytes();
     let colon = (0..bytes.len()).find(|&i| {
         bytes[i] == b':' && bytes.get(i + 1) != Some(&b':') && (i == 0 || bytes[i - 1] != b':')
     });
-    let t = colon.map_or(p, |i| &p[i + 1..]).trim();
-    (!t.is_empty()).then(|| t.to_owned())
+    match colon {
+        Some(i) => match p[i + 1..].trim() {
+            "" => Param::Untyped,
+            t => Param::Type(t.to_owned()),
+        },
+        None if p.is_empty() || (named && names_a_value(p)) => Param::Untyped,
+        None => Param::Type(p.to_owned()),
+    }
 }
 
 /// A signature anchor: `pub fn double(x: i64) -> i64`,
@@ -1259,7 +1392,10 @@ struct Signature {
     /// The named function, empty for a bare function type.
     name: String,
     /// `fn(i64) -> i64`: parameter types and the return type, names dropped.
-    canonical: String,
+    /// `None` when a parameter has no type ([`Param::Untyped`]): a call
+    /// `dotproduct(a, b)` or an untyped `def dotproduct(a, b)` states no
+    /// parameter types to compare.
+    canonical: Option<String>,
     /// The parameter and return types, each a claim of its own.
     types: Vec<String>,
 }
@@ -1274,6 +1410,9 @@ const SIGNATURE_KEYWORDS: &[&str] = &[
     "extern ",
     "def ",
     "fn ",
+    "export ",
+    "default ",
+    "function ",
 ];
 
 fn signature(a: &str) -> Option<Signature> {
@@ -1296,20 +1435,30 @@ fn signature(a: &str) -> Option<Signature> {
         .trim()
         .trim_end_matches([';', ':', '{'])
         .trim();
-    let ret = match rest.strip_prefix("->") {
+    // `-> T` (Rust, Python), or `: T` (TypeScript).
+    let ret = match rest.strip_prefix("->").or_else(|| rest.strip_prefix(':')) {
         Some(r) => Some(r.trim().to_owned()).filter(|r| !r.is_empty()),
         None if rest.is_empty() => None,
         // `double(21) == 42` is an expression, not a signature.
         None => return None,
     };
-    let params: Vec<String> = split_top_level(&s[open + 1..close])
+    let named = !head.is_empty();
+    let read: Vec<Param> = split_top_level(&s[open + 1..close])
         .into_iter()
-        .filter_map(param_type)
+        .map(|p| param(p, named))
         .collect();
-    let canonical = match &ret {
+    let untyped = read.contains(&Param::Untyped);
+    let params: Vec<String> = read
+        .into_iter()
+        .filter_map(|p| match p {
+            Param::Type(t) => Some(t),
+            Param::Receiver | Param::Untyped => None,
+        })
+        .collect();
+    let canonical = (!untyped).then(|| match &ret {
         Some(r) => format!("fn({}) -> {r}", params.join(", ")),
         None => format!("fn({})", params.join(", ")),
-    };
+    });
     let mut types = params;
     types.extend(ret);
     Some(Signature {
@@ -1336,6 +1485,178 @@ struct Reading<'s> {
     /// it ("tests for `x`", "the call sites that invoke `x`"): in a provision,
     /// the party provides something about the symbol, not the symbol.
     subject_used: bool,
+    /// Further surface symbols the sentence names as subjects of their own,
+    /// each with the claims written after it: one listed with a provided
+    /// symbol ("`vectorops` (a Python package) and `dotproduct`"), or one that
+    /// leads a later clause ("The symbol `dotproduct` refers to ...")
+    /// ([`LEAD_WORDS`]). Only a provision reads them: a party that writes "I
+    /// will provide `a` and `b`" provides both.
+    also: Vec<(&'s str, BTreeSet<String>)>,
+}
+
+/// Words that may stand before a symbol that leads its clause: a subject
+/// ("The symbol `x` ...", "`x` returns ...") or the object of a provision
+/// verb ("I will also provide `x`"). Any other word ("It returns a `Config`")
+/// makes the symbol a claim about something else.
+const LEAD_WORDS: &[&str] = &[
+    "i",
+    "we",
+    "will",
+    "shall",
+    "also",
+    "the",
+    "a",
+    "an",
+    "my",
+    "public",
+    "contract",
+    "symbol",
+    "function",
+    "method",
+    "class",
+    "type",
+    "struct",
+    "enum",
+    "trait",
+    "module",
+    "package",
+    "constant",
+    "field",
+    "file",
+    "provide",
+    "provides",
+    "export",
+    "exports",
+    "expose",
+    "exposes",
+    "define",
+    "defines",
+    "implement",
+    "implements",
+    "supply",
+    "supplies",
+];
+
+/// Phrases that list one symbol after another (`a` and `b`, `a`, `b`).
+const LIST_JOINERS: &[&str] = &[
+    "as well as",
+    "along with",
+    "and also",
+    "and",
+    "or",
+    "plus",
+    "&",
+];
+
+/// Lowercased words of some prose, `&` kept as a word.
+fn lower_words(prose: &str) -> Vec<String> {
+    prose
+        .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '&'))
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+        .collect()
+}
+
+/// Whether the prose of a clause before a symbol leaves the symbol leading
+/// the clause ([`LEAD_WORDS`]).
+fn leads_clause(clause_prose: &str) -> bool {
+    lower_words(clause_prose)
+        .iter()
+        .all(|w| LEAD_WORDS.contains(&w.as_str()))
+}
+
+/// Whether the prose between two anchors lists the second after the first: a
+/// comma or a joiner ([`LIST_JOINERS`]), then only [`LEAD_WORDS`] ("and the
+/// function"). A parenthetical is dropped first: "`vectorops` (a Python
+/// package) and `dotproduct`" lists `dotproduct`.
+fn lists(between: &str) -> bool {
+    let mut depth = 0usize;
+    let mut flat = String::new();
+    for c in between.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => flat.push(c),
+            _ => {}
+        }
+    }
+    let words = lower_words(&flat);
+    if words.is_empty() {
+        return flat.contains(',');
+    }
+    let joined = words.join(" ");
+    LIST_JOINERS.iter().any(|j| {
+        joined
+            .strip_prefix(j)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+            && words[j.split(' ').count()..]
+                .iter()
+                .all(|w| LEAD_WORDS.contains(&w.as_str()))
+    })
+}
+
+/// The names an import statement brings in, each qualified by its module, so
+/// that [`resolve`] reads them like any qualified name:
+/// `from vectorops import dotproduct` names `vectorops.dotproduct`,
+/// `import vectorops` names `vectorops`, `use crate::a::{b, c};` names
+/// `crate::a::b` and `crate::a::c`, and `import { a, b as c } from "m"`
+/// names `a` and `b`. Anything else names nothing.
+fn imported(a: &str) -> Vec<String> {
+    let a = a.trim().trim_end_matches(';').trim();
+    // The name an item binds before any `as` alias.
+    let item = |s: &str| -> Option<String> {
+        let s = s.trim().trim_matches(|c| c == '(' || c == ')').trim();
+        s.split_whitespace().next().map(str::to_owned)
+    };
+    let items = |list: &str| -> Vec<String> {
+        list.trim()
+            .trim_matches(|c| matches!(c, '(' | ')' | '{' | '}'))
+            .split(',')
+            .filter_map(item)
+            .collect()
+    };
+    if let Some(rest) = a.strip_prefix("from ")
+        && let Some((module, names)) = rest.split_once(" import ")
+    {
+        let module = module.trim().trim_start_matches('.');
+        return items(names)
+            .into_iter()
+            .map(|n| match (module.is_empty(), n.as_str()) {
+                (true, _) => n,
+                (false, "*") => module.to_owned(),
+                (false, _) => format!("{module}.{n}"),
+            })
+            .collect();
+    }
+    if let Some(rest) = a.strip_prefix("import ") {
+        // JavaScript and TypeScript: `import { a } from "m"`, `import a from "m"`.
+        if let Some((names, _)) = rest.split_once(" from ") {
+            let names = names.trim();
+            return if names.starts_with('{') {
+                items(names)
+            } else {
+                item(names).into_iter().collect()
+            };
+        }
+        // Python: `import a.b`, `import a as b, c`.
+        return items(rest)
+            .into_iter()
+            .filter(|n| !n.starts_with(['"', '\'']))
+            .collect();
+    }
+    let rust = a
+        .strip_prefix("pub use ")
+        .or_else(|| a.strip_prefix("use "));
+    if let Some(path) = rust {
+        return match path.split_once("::{") {
+            Some((prefix, list)) => items(list)
+                .into_iter()
+                .map(|n| format!("{}::{n}", prefix.trim()))
+                .collect(),
+            None => item(path).into_iter().collect(),
+        };
+    }
+    Vec::new()
 }
 
 /// Words that join clauses when written right after a comma (", and can call
@@ -1425,31 +1746,46 @@ const USE_WORDS: &[&str] = &[
 /// written before it in an earlier clause ([`after_last_boundary`]): "`f`
 /// receives an `order`, and can call `x`" says nothing about `x`'s `order`.
 /// Anchors before the subject still name an unbound sentence's `first_other`.
+///
+/// A later surface symbol listed with a provided one, or leading a later
+/// clause, is a subject of its own ([`Reading::also`]); it stays a claim about
+/// the first subject too, as before.
 fn read_sentence<'s>(
     text: &str,
     surface: &BTreeSet<&'s str>,
     set_aside: &BTreeSet<&str>,
 ) -> Reading<'s> {
     let mut r = Reading::default();
-    // Before the subject: the claims and the prose of the current clause,
-    // both dropped at a clause boundary.
+    // Before the subject: the claims of the current clause, dropped at a
+    // clause boundary.
     let mut pending: BTreeSet<String> = BTreeSet::new();
+    // The prose of the current clause up to here.
     let mut clause_prose = String::new();
-    for (i, chunk) in text.split('`').enumerate() {
-        if i % 2 == 0 {
-            if r.subject.is_none() {
+    // Whether the current clause has named a surface symbol yet.
+    let mut clause_named = false;
+    // The prose since the last anchor read, and whether that anchor named a
+    // symbol the sentence provides (its subject, or one of `also`).
+    let mut since_anchor = String::new();
+    let mut after_provided = false;
+    for piece in pieces(text) {
+        let a = match piece {
+            Piece::Prose(chunk) => {
+                since_anchor.push_str(chunk);
                 if let Some(rest) = after_last_boundary(chunk) {
-                    pending.clear();
+                    if r.subject.is_none() {
+                        pending.clear();
+                    }
                     clause_prose.clear();
                     clause_prose.push_str(rest);
+                    clause_named = false;
                 } else {
                     clause_prose.push_str(chunk);
                 }
                 clause_prose.push(' ');
+                continue;
             }
-            continue;
-        }
-        let a = chunk.split_whitespace().collect::<Vec<_>>().join(" ");
+            Piece::Code(code) => code.split_whitespace().collect::<Vec<_>>().join(" "),
+        };
         if a.is_empty() || set_aside.contains(a.as_str()) {
             continue;
         }
@@ -1468,40 +1804,66 @@ fn read_sentence<'s>(
             let named = match &sig {
                 Some(sig) if !sig.name.is_empty() => resolve(&sig.name, surface),
                 Some(_) => None,
-                None => resolve(&a, surface),
+                None => resolve(&a, surface)
+                    .or_else(|| imported(&a).iter().find_map(|n| resolve(n, surface))),
             };
             (named, sig)
         };
-        let claims = if r.subject.is_some() {
-            &mut r.claims
-        } else {
-            &mut pending
-        };
-        match (named, sig) {
-            (Some(sym), sig) => {
-                if r.subject.is_none() {
-                    r.subject = Some(sym);
-                    r.subject_used = governed_by_use_word(&clause_prose);
-                    r.claims.append(&mut pending);
-                } else if r.subject != Some(sym) {
-                    r.claims.insert(sym.to_owned());
-                }
-                if let Some(sig) = sig {
-                    r.claims.insert(sig.canonical);
-                    r.claims.extend(sig.types);
-                }
-            }
-            (None, Some(sig)) if sig.name.is_empty() => {
-                claims.insert(sig.canonical);
-                claims.extend(sig.types);
-            }
-            (None, _) => {
+        let between = std::mem::take(&mut since_anchor);
+        let listed = std::mem::replace(&mut after_provided, false) && lists(&between);
+        // A bare function type (`fn(i64) -> i64`) claims its types.
+        let unnamed = sig.as_ref().is_some_and(|s| s.name.is_empty());
+        let sig_claims: Vec<String> = sig
+            .map(|s| s.canonical.into_iter().chain(s.types).collect())
+            .unwrap_or_default();
+        let Some(sym) = named else {
+            // Not a surface symbol: a claim about what the sentence names.
+            let new: Vec<String> = if unnamed {
+                sig_claims
+            } else {
                 if r.first_other.is_none() {
                     r.first_other = Some(a.clone());
                 }
-                claims.insert(a);
+                vec![a]
+            };
+            for (_, c) in &mut r.also {
+                c.extend(new.iter().cloned());
+            }
+            if r.subject.is_some() {
+                r.claims.extend(new);
+            } else {
+                pending.extend(new);
+            }
+            continue;
+        };
+        match r.subject {
+            None => {
+                r.subject = Some(sym);
+                r.subject_used = governed_by_use_word(&clause_prose);
+                r.claims.append(&mut pending);
+                after_provided = !r.subject_used;
+            }
+            Some(subject) if subject == sym => after_provided = !r.subject_used,
+            Some(_) => {
+                r.claims.insert(sym.to_owned());
+                let known = r.also.iter().any(|(s, _)| *s == sym);
+                let leads = !clause_named && leads_clause(&clause_prose);
+                if known {
+                    after_provided = true;
+                } else if (listed || leads) && !governed_by_use_word(&clause_prose) {
+                    r.also.push((sym, BTreeSet::new()));
+                    after_provided = true;
+                }
             }
         }
+        clause_named = true;
+        for (s, c) in &mut r.also {
+            if *s != sym {
+                c.insert(sym.to_owned());
+            }
+            c.extend(sig_claims.iter().cloned());
+        }
+        r.claims.extend(sig_claims);
     }
     r
 }
@@ -1543,8 +1905,7 @@ fn stated_in_prose(claim: &str, text: &str) -> bool {
     {
         return false;
     }
-    text.split('`')
-        .step_by(2)
+    prose_chunks(text)
         .flat_map(|chunk| chunk.split(|c: char| !(c.is_alphanumeric() || c == '_')))
         .any(|w| w == claim)
 }
@@ -1559,8 +1920,7 @@ const NEGATIONS: &[&str] = &[
 
 /// The prose of a sentence outside its anchors, lowercased words.
 fn prose_words(text: &str) -> Vec<String> {
-    text.split('`')
-        .step_by(2)
+    prose_chunks(text)
         .flat_map(|chunk| {
             chunk
                 .split(|c: char| !(c.is_alphanumeric() || c == '\''))
@@ -1694,6 +2054,7 @@ impl ArtifactText {
                 .content
                 .match_indices("fn ")
                 .chain(f.content.match_indices("def "))
+                .chain(f.content.match_indices("function "))
             {
                 let starts_word = f.content[..i]
                     .chars()
@@ -1706,11 +2067,12 @@ impl ArtifactText {
                 let end = rest.find(['{', ';', '\n']).unwrap_or(rest.len());
                 if let Some(sig) = signature(&rest[..end])
                     && let Some(name) = segments(&sig.name).last().filter(|n| !n.is_empty())
+                    && let Some(canonical) = sig.canonical
                 {
                     signatures
                         .entry((*name).to_owned())
                         .or_default()
-                        .insert(sig.canonical);
+                        .insert(canonical);
                 }
             }
         }
@@ -1814,11 +2176,17 @@ fn stub_writers<'p>(
 /// Mechanical, per 0031, as read by decision 0078:
 /// - every party states something, and makes at least one claim anchored to the
 ///   contract surface (0033). An anchor names a surface symbol bare, qualified
-///   (`crate::double::double`, `config.parse_config`) or as a signature's name;
+///   (`crate::double::double`, `config.parse_config`, `Class#method`), as a
+///   signature's or a call's name (`dotproduct(a, b)`), or in an import line
+///   (`from vectorops import dotproduct`, `use a::b;`, `import { b } from
+///   "a"`); an anchor is a CommonMark code span, so "`` `x` ``" anchors `x`;
 ///   party ids and paths are set aside, never read as symbols, except a path
 ///   that is itself a surface symbol (`pyproject.toml` on a surface of
 ///   files), a leading `./` or `/` ignored;
-/// - every surface symbol is provided by exactly one party. A provision of a
+/// - every surface symbol is provided by exactly one party. A provision
+///   provides its subject and every surface symbol it lists with it ("`a`
+///   (a package) and `b`") or that leads a later clause ("The symbol `b`
+///   ..."), each under the writer rule below. A provision of a
 ///   symbol off the surface is the party's own brief, which 0031 says carries no
 ///   information about the other party, so it is not a finding; an unanchored
 ///   provision still is;
@@ -1852,8 +2220,11 @@ fn stub_writers<'p>(
 /// a negation word ("ascending" against "descending"), a unit or type written
 /// outside backticks, a bare type whose position differs (`i64` stated alone
 /// matches `fn(i64) -> i32`), a module path that differs where the name matches
-/// (stub-compile builds the consumer against the stub, which pins the path), and
-/// any behavior neither party states. Those are the semantic class 0033 leaves to
+/// (stub-compile builds the consumer against the stub, which pins the path), a
+/// symbol a provision names only as contained ("`vectorops` containing
+/// `dotproduct`", read as a claim, so `dotproduct` is still unprovided), a
+/// signature whose types stand before or after the names without a colon (Go,
+/// C), and any behavior neither party states. Those are the semantic class 0033 leaves to
 /// the gates.
 ///
 /// Every party is taken to run at the same time as every other, so any path
@@ -1933,23 +2304,14 @@ pub fn compare_handshake_ordered(
     for s in statements {
         for text in &s.provide {
             let r = read(text);
+            // Each further subject of the sentence ("`a` and `b`") is
+            // provided as the first one is.
+            let mut subjects: Vec<(&str, BTreeSet<String>)> = r.also;
             match (r.subject, r.first_other) {
                 // Tests for the symbol, or its callers: the party's own brief,
                 // not a provision of the symbol.
                 (Some(_), _) if r.subject_used => {}
-                // A party that writes no stub file of the symbol cannot
-                // provide it: its work is about the symbol (tests of it,
-                // checks of it), not the symbol.
-                (Some(sym), _)
-                    if stub_writers(ic, sym, &party_ids, writes)
-                        .is_some_and(|w| !w.contains(s.party.as_str())) => {}
-                (Some(sym), _) => {
-                    provided.entry(sym).or_default().push((
-                        s.party.as_str(),
-                        text.as_str(),
-                        r.claims,
-                    ));
-                }
+                (Some(sym), _) => subjects.insert(0, (sym, r.claims)),
                 // Off the surface: the party's own brief (0031), no claim
                 // about the counterparty. A surface symbol nobody provides
                 // is still `SymbolUnprovided` below.
@@ -1961,6 +2323,20 @@ pub fn compare_handshake_ordered(
                     party: s.party.clone(),
                     text: text.clone(),
                 }),
+            }
+            for (sym, claims) in subjects {
+                // A party that writes no stub file of the symbol cannot
+                // provide it: its work is about the symbol (tests of it,
+                // checks of it), not the symbol.
+                if stub_writers(ic, sym, &party_ids, writes)
+                    .is_some_and(|w| !w.contains(s.party.as_str()))
+                {
+                    continue;
+                }
+                provided
+                    .entry(sym)
+                    .or_default()
+                    .push((s.party.as_str(), text.as_str(), claims));
             }
         }
     }
@@ -2755,3 +3131,9 @@ mod tests {
 #[cfg(test)]
 #[path = "handshake_diagnosis_tests.rs"]
 mod handshake_diagnosis_tests;
+
+#[cfg(test)]
+/// How a statement names a symbol: lists, code spans and language forms
+/// (decision 0078).
+#[path = "handshake_forms_tests.rs"]
+mod handshake_forms_tests;
