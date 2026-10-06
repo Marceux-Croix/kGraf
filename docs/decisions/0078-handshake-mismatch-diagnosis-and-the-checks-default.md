@@ -168,3 +168,13 @@ event names both parties with their routes and models on different routes, and t
 last `check_holds` entry holds the same parties and held contracts); `checks.rs`
 `a_party_states_its_handshake_on_its_own_route` (a routed statement names `b:mb` and `mb`, and a
 model's answer naming a route or a model is cleared).
+
+## Amendment (2026-10-06): a path that is a surface symbol is not set aside
+
+Paths were set aside as claims. On an interface whose symbols are files (`pyproject.toml`,
+`vectorops/__init__.py`), that left no claim any party could anchor, and a coherent handshake held
+on `no_claims` and `symbol_unprovided`. A path that is a surface symbol now names it; a path no
+surface symbol names is still set aside; a file symbol is provided by the party that writes that
+stub file; a path anchor or touch is one file whatever its leading `./` or `/`; and the prompt says
+`touch` lists only the paths the party will write. The details and tests are in decision 0030's
+amendment of 2026-10-06.

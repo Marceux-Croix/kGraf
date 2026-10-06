@@ -1,0 +1,180 @@
+{
+  "interface": {
+    "id": "re1.i_c1_c2",
+    "version": 1,
+    "parties": [
+      "re1.c1_setup",
+      "re1.c2_build"
+    ],
+    "symbols": [
+      "pyproject.toml",
+      "vectorops/__init__.py"
+    ],
+    "stub": [
+      {
+        "path": "pyproject.toml",
+        "content": "[build-system]\nrequires = ['setuptools']\nbuild-backend = 'setuptools'\n\n[project]\nname = 'wrongpkg'\nversion = '0.0.1'\n"
+      },
+      {
+        "path": "vectorops/__init__.py",
+        "content": "\ndef dotproduct(a, b):\n    return 0\n"
+      }
+    ],
+    "wrong": [],
+    "reference": [
+      {
+        "path": "pyproject.toml",
+        "content": "[build-system]\nrequires = ['setuptools>=61.0']\nbuild-backend = 'setuptools.build_meta'\n\n[project]\nname = 'vectorops'\nversion = '0.1.0'\n"
+      },
+      {
+        "path": "vectorops/__init__.py",
+        "content": "\ndef dotproduct(a, b):\n    return sum(x * y for x, y in zip(a, b))\n"
+      }
+    ],
+    "consumer": [],
+    "tests": [
+      {
+        "path": "test_c1.py",
+        "content": "import os\nimport unittest\n\nclass TestC1(unittest.TestCase):\n    def test_pyproject(self):\n        self.assertTrue(os.path.exists('pyproject.toml'))\n        with open('pyproject.toml') as f:\n            txt = f.read()\n        self.assertIn(\"name = 'vectorops'\", txt, \"Wrong package name in stub\")\n        self.assertIn(\"'0.1.0'\", txt, \"Wrong version in stub\")\n\n    def test_dotproduct(self):\n        with open('vectorops/__init__.py') as f:\n            code = f.read()\n        ns = {}\n        exec(code, ns)\n        res = ns['dotproduct']([1, 2], [3, 4])\n        self.assertEqual(res, 11, f\"Stub dotproduct returned {res}, expected 11\")\n\nif __name__ == '__main__':\n    unittest.main()\n"
+      }
+    ],
+    "compile": [
+      "python",
+      "-m",
+      "py_compile",
+      "test_c1.py"
+    ],
+    "test": [
+      "python",
+      "test_c1.py"
+    ],
+    "consulted": []
+  },
+  "handshake": [
+    {
+      "party": "re1.c1_setup",
+      "provide": [
+        "I will provide `pyproject.toml` defining package metadata and build configuration.",
+        "I will provide `vectorops/__init__.py` initializing the package directory with the requested implementation."
+      ],
+      "expect": [
+        "I assume you `re1.c2_build` will consume `pyproject.toml` and `vectorops/__init__.py` to build the distribution.",
+        "I assume you expect a valid Python environment capable of resolving setuptools as a build backend."
+      ],
+      "consume": [],
+      "touch": [
+        "pyproject.toml",
+        "vectorops/__init__.py"
+      ],
+      "route": "ollama:qwen3.6:35b",
+      "model": "qwen3.6:35b"
+    },
+    {
+      "party": "re1.c2_build",
+      "provide": [],
+      "expect": [
+        "I assume you provide `pyproject.toml` as the primary configuration for the project.",
+        "I assume you provide `/vectorops/__init__.py` as the source code initialization file."
+      ],
+      "consume": [
+        "I consume `pyproject.toml` to understand build requirements and metadata definitions.",
+        "I consume `/vectorops/__init__.py` to ensure the package contents are present for processing."
+      ],
+      "touch": [
+        "/pyproject.toml",
+        "/vectorops/__init__.py"
+      ],
+      "route": "ollama:qwen3.6:35b",
+      "model": "qwen3.6:35b"
+    }
+  ],
+  "recorded_findings": [
+    {
+      "finding": "no_claims",
+      "party": "re1.c1_setup"
+    },
+    {
+      "finding": "no_claims",
+      "party": "re1.c2_build"
+    },
+    {
+      "finding": "unanchored",
+      "party": "re1.c1_setup",
+      "text": "I will provide `pyproject.toml` defining package metadata and build configuration."
+    },
+    {
+      "finding": "unanchored",
+      "party": "re1.c1_setup",
+      "text": "I will provide `vectorops/__init__.py` initializing the package directory with the requested implementation."
+    },
+    {
+      "finding": "symbol_unprovided",
+      "symbol": "pyproject.toml"
+    },
+    {
+      "finding": "symbol_unprovided",
+      "symbol": "vectorops/__init__.py"
+    },
+    {
+      "finding": "unanchored",
+      "party": "re1.c1_setup",
+      "text": "I assume you `re1.c2_build` will consume `pyproject.toml` and `vectorops/__init__.py` to build the distribution."
+    },
+    {
+      "finding": "unanchored",
+      "party": "re1.c1_setup",
+      "text": "I assume you expect a valid Python environment capable of resolving setuptools as a build backend."
+    },
+    {
+      "finding": "unanchored",
+      "party": "re1.c2_build",
+      "text": "I assume you provide `pyproject.toml` as the primary configuration for the project."
+    },
+    {
+      "finding": "unanchored",
+      "party": "re1.c2_build",
+      "text": "I assume you provide `/vectorops/__init__.py` as the source code initialization file."
+    },
+    {
+      "finding": "unanchored",
+      "party": "re1.c2_build",
+      "text": "I consume `pyproject.toml` to understand build requirements and metadata definitions."
+    },
+    {
+      "finding": "unanchored",
+      "party": "re1.c2_build",
+      "text": "I consume `/vectorops/__init__.py` to ensure the package contents are present for processing."
+    },
+    {
+      "finding": "touch_outside_scope",
+      "party": "re1.c2_build",
+      "path": "/pyproject.toml"
+    },
+    {
+      "finding": "touch_outside_scope",
+      "party": "re1.c2_build",
+      "path": "/vectorops/__init__.py"
+    }
+  ],
+  "writes": {
+    "re1.c1_setup": [
+      {
+        "path": "vectorops/__init__.py"
+      },
+      {
+        "path": "pyproject.toml"
+      }
+    ],
+    "re1.c2_build": [
+      {
+        "path": "dist/vectorops-0.1.0-py3-none-any.whl"
+      }
+    ]
+  },
+  "depends_on": {
+    "re1.c1_setup": [],
+    "re1.c2_build": [
+      "re1.c1_setup"
+    ]
+  }
+}

@@ -996,7 +996,10 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   sent to a model, with a count of the lines removed; error lines stay. The run is never held
   for an interface the planner could not write. Before the first
   worker starts, the handshakes of a behavior interface's parties are compared too (a
-  compile-only interface has none). A contract
+  compile-only interface has none). An interface whose symbols are files (packaging metadata
+  such as `pyproject.toml`, a module file) is compared the same way: a party that names such a
+  file in backticks makes a claim about it, and the party that writes the file provides it. A
+  party's `touch` list holds only the files it will write. A contract
   whose interface fails at that point is held, with the file that failed named. Each
   handshake and each check names every party's route and model, and the run record keeps
   each hold with them, so you can see which models disagreed. A contract whose compiler or

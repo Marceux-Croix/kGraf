@@ -561,3 +561,43 @@ raised messages, the line reader, prose files),
 `plan::tests::a_placeholder_in_a_command_or_an_interface_file_is_refused_with_a_reason`, the
 `stub_land` masking tests, and `tests/plan_repo_intake.rs`
 `a_named_file_that_mentions_a_placeholder_only_in_text_is_not_refused`.
+
+## Amendment (2026-10-06): a surface of files is anchored in the handshake
+
+A live run that built a Python package was held before any work started. The plan registered an
+interface whose symbols are files: `pyproject.toml` and `vectorops/__init__.py`, with those files
+as its stub and reference, both written by the producer. Each party answered the handshake and
+named the files in backticks: the producer "I will provide `pyproject.toml` defining package
+metadata ...", the consumer "I assume you provide `pyproject.toml` ...". The comparator set every
+path anchor aside before it looked at the surface (decision 0078, rule 3), so no sentence had a
+subject: each party was `no_claims` and each file `symbol_unprovided`, four mismatches by
+construction. The other two were `touch_outside_scope`: the consumer listed files it only reads
+under `touch`, and the prompt gave the key with no meaning.
+
+- **A path that is a surface symbol names it** (`resolve_path`). A path anchor is compared with the
+  surface first; a path no surface symbol names is still set aside. A leading `./` or `/` is not
+  part of the path.
+- **A file is provided by the party that writes that stub file** (`stub_writers`). Before, the
+  symbol's last `.` segment (`toml`, `py`) was looked up as a word in the stub files, so a stub
+  file holding `import toml` made its writer the provider of `pyproject.toml`.
+- **A touch is one file however it is spelled**: the scope test and the overlap compare the same
+  normalized path, so `/a` from the party that writes `a` is in scope, and `./a` against `/a` from
+  two parties that may run at once is an overlap.
+- **The prompt says what `touch` is**: "`touch` lists only the paths you will write, from your
+  declared writes; a file you only read is not one you touch."
+
+Replayed on the recorded statements, the handshake finds no `no_claims` and no
+`symbol_unprovided`; it holds on the two `touch_outside_scope` findings, which are true of the
+statements as given. A party that names no surface symbol is still `no_claims` and holds.
+
+The same run's first plan had two edges with nothing to derive after its interface call was refused
+at its last ask; kGraf recorded both as `unchecked` with the asked reason and the cause of the
+missing compile check, counted in `not run`. That is correct behavior. The scenario canary now reads
+that case as honest too, only after the last ask and only with the cause stated.
+
+Tests: `kgraf-orchestrator` `handshake_diagnosis_tests.rs`
+`a_surface_of_files_binds_its_claims_and_only_real_findings_hold` (the recorded handshake, verbatim,
+as `tests/fixtures/handshake/files-as-contract-symbols.json`),
+`a_file_on_the_surface_is_provided_by_its_writer`, `a_surface_of_files_still_holds_real_disagreements`,
+`a_path_resolves_only_to_a_path_on_the_surface`, `a_touch_is_one_file_however_it_is_spelled`,
+`the_handshake_prompt_defines_touch_as_writes`.

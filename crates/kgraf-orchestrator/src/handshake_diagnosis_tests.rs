@@ -956,3 +956,260 @@ fn a_negated_assumption_about_the_provider_or_no_party_still_contradicts() {
         );
     }
 }
+
+// ------------------------------------------ a surface of files
+//
+// An interface over packaging files lists the files as its symbols: the
+// files hold no item a consumer calls by name. A path anchor that is a
+// surface symbol names it; every other path is still set aside.
+
+/// The recorded handshake of a Python packaging interface (`pyproject.toml`
+/// and `vectorops/__init__.py`, written by the producer, read by the build
+/// step). Both parties named the files in backticks; setting every path aside
+/// made each party `no_claims` and each file `symbol_unprovided`. Now the
+/// producer provides both files and the consumer's expectations bind to
+/// them. What still holds is real: the build step lists the producer's files
+/// under `touch`, outside its declared writes. The fixture is the record's
+/// interface, statements and findings, verbatim, with the plan's declared
+/// writes and dependency.
+#[test]
+fn a_surface_of_files_binds_its_claims_and_only_real_findings_hold() {
+    let r = replay(include_str!(
+        "../tests/fixtures/handshake/files-as-contract-symbols.json"
+    ));
+    let no_claims = |f: &[HandshakeFinding]| {
+        f.iter()
+            .filter(|x| matches!(x, HandshakeFinding::NoClaims { .. }))
+            .count()
+    };
+    let unprovided = |f: &[HandshakeFinding]| {
+        f.iter()
+            .filter(|x| matches!(x, HandshakeFinding::SymbolUnprovided { .. }))
+            .count()
+    };
+    assert_eq!(
+        (
+            no_claims(&r.recorded_findings),
+            unprovided(&r.recorded_findings)
+        ),
+        (2, 2),
+        "the record held both parties on no claims and both files unprovided"
+    );
+    let now = replayed(&r);
+    assert_eq!((no_claims(&now), unprovided(&now)), (0, 0), "{now:#?}");
+    assert_eq!(
+        holding(&now),
+        vec![
+            HandshakeFinding::TouchOutsideScope {
+                party: "re1.c2_build".into(),
+                path: "pyproject.toml".into(),
+            },
+            HandshakeFinding::TouchOutsideScope {
+                party: "re1.c2_build".into(),
+                path: "vectorops/__init__.py".into(),
+            },
+        ],
+        "{now:#?}"
+    );
+}
+
+/// The packaging interface with two files, written by `p`; `c` builds from
+/// them.
+fn files_ic() -> InterfaceContract {
+    InterfaceContract {
+        kind: crate::checks::InterfaceKind::Behavior,
+        id: "i_pkg".into(),
+        version: 1,
+        parties: vec!["p".into(), "c".into()],
+        symbols: vec!["pyproject.toml".into(), "pkg/__init__.py".into()],
+        stub: vec![
+            FileOverlay::new("pyproject.toml", "[project]\nname = 'wrong'\n"),
+            FileOverlay::new("pkg/__init__.py", "import toml\n\ndef f():\n    return 0\n"),
+        ],
+        wrong: vec![],
+        reference: vec![],
+        consumer: vec![],
+        tests: vec![],
+        compile: vec![],
+        test: vec![],
+        consulted: vec![],
+        replaces: vec![],
+    }
+}
+
+fn files_writes(p: &[&str], c: &[&str]) -> BTreeMap<String, Vec<WriteTarget>> {
+    let w = |l: &[&str]| {
+        l.iter()
+            .map(|path| WriteTarget {
+                path: (*path).into(),
+                node: None,
+            })
+            .collect()
+    };
+    [("p".to_owned(), w(p)), ("c".to_owned(), w(c))].into()
+}
+
+const FILES_PROVIDE: [&str; 2] = [
+    "I will provide `pyproject.toml` with the package name and version.",
+    "I will provide `./pkg/__init__.py` defining the package.",
+];
+
+/// Agreement on a surface of files passes; a file is provided by the party
+/// that writes it, even when another stub file holds the file's extension as
+/// a word (`import toml` in `pkg/__init__.py` does not make its writer the
+/// provider of `pyproject.toml`).
+#[test]
+fn a_file_on_the_surface_is_provided_by_its_writer() {
+    let f = compare_handshake(
+        &files_ic(),
+        &[
+            statement("p", &FILES_PROVIDE, &[], &[]),
+            statement(
+                "c",
+                &[],
+                &["I assume you provide `/pyproject.toml` and `pkg/__init__.py`."],
+                &["I consume `pyproject.toml` to build the wheel."],
+            ),
+        ],
+        &files_writes(&["pyproject.toml", "pkg/__init__.py"], &["dist/pkg.whl"]),
+    );
+    assert_eq!(holding(&f), vec![], "{f:#?}");
+    // One writer per file: `pyproject.toml` is provided by its own writer
+    // when the other file's writer is someone else.
+    let split = InterfaceContract {
+        parties: vec!["p".into(), "q".into(), "c".into()],
+        ..files_ic()
+    };
+    let mut writes = files_writes(&["pyproject.toml"], &[]);
+    writes.insert(
+        "q".into(),
+        vec![WriteTarget {
+            path: "pkg/__init__.py".into(),
+            node: None,
+        }],
+    );
+    let f = compare_handshake(
+        &split,
+        &[
+            statement("p", &FILES_PROVIDE[..1], &[], &[]),
+            statement("q", &FILES_PROVIDE[1..], &[], &[]),
+            statement("c", &[], &["I assume you provide `pyproject.toml`."], &[]),
+        ],
+        &writes,
+    );
+    assert_eq!(holding(&f), vec![], "{f:#?}");
+}
+
+/// REAL companions: a surface of files still holds a party that names no
+/// surface file, a second provider of one file, and a file nobody provides.
+#[test]
+fn a_surface_of_files_still_holds_real_disagreements() {
+    let ic = files_ic();
+    let writes = files_writes(&["pyproject.toml", "pkg/__init__.py"], &["dist/pkg.whl"]);
+    // `c` names only a path off the surface: no claim, still held.
+    let f = compare_handshake(
+        &ic,
+        &[
+            statement("p", &FILES_PROVIDE, &[], &[]),
+            statement("c", &[], &["I assume you provide `setup.cfg`."], &[]),
+        ],
+        &writes,
+    );
+    assert!(
+        f.contains(&HandshakeFinding::NoClaims { party: "c".into() }),
+        "{f:#?}"
+    );
+    // Both parties write and provide `pyproject.toml`: double provided.
+    let both = files_writes(&["pyproject.toml", "pkg/__init__.py"], &["pyproject.toml"]);
+    let f = compare_handshake_ordered(
+        &ic,
+        &[
+            statement("p", &FILES_PROVIDE, &[], &[]),
+            statement(
+                "c",
+                &["I will provide `pyproject.toml` with build settings."],
+                &[],
+                &[],
+            ),
+        ],
+        &both,
+        &ordered_pairs(&[("c".to_owned(), vec!["p".to_owned()])].into()),
+    );
+    assert!(
+        holding(&f).iter().any(|x| matches!(x,
+            HandshakeFinding::DoubleProvided { symbol, .. } if symbol == "pyproject.toml")),
+        "{f:#?}"
+    );
+    // Nobody provides `pkg/__init__.py`: still unprovided.
+    let f = compare_handshake(
+        &ic,
+        &[
+            statement("p", &FILES_PROVIDE[..1], &[], &[]),
+            statement("c", &[], &["I assume you provide `pyproject.toml`."], &[]),
+        ],
+        &writes,
+    );
+    assert!(
+        f.contains(&HandshakeFinding::SymbolUnprovided {
+            symbol: "pkg/__init__.py".into()
+        }),
+        "{f:#?}"
+    );
+}
+
+/// A path anchor names a surface symbol only when the surface holds that
+/// path; a leading `./` or `/` is not part of it.
+#[test]
+fn a_path_resolves_only_to_a_path_on_the_surface() {
+    let surface: BTreeSet<&str> = ["pyproject.toml", "pkg/__init__.py", "double"].into();
+    assert_eq!(
+        resolve_path("pyproject.toml", &surface),
+        Some("pyproject.toml")
+    );
+    assert_eq!(
+        resolve_path("/pyproject.toml", &surface),
+        Some("pyproject.toml")
+    );
+    assert_eq!(
+        resolve_path("./pkg/__init__.py", &surface),
+        Some("pkg/__init__.py")
+    );
+    assert_eq!(resolve_path("src/lib.rs", &surface), None);
+    assert_eq!(resolve_path("other/pyproject.toml", &surface), None);
+}
+
+/// A touch is one file however it is spelled: `/pyproject.toml` from the
+/// party that declares `pyproject.toml` is in scope, and two parties that may
+/// run at once, touching `./a.py` and `/a.py`, overlap.
+#[test]
+fn a_touch_is_one_file_however_it_is_spelled() {
+    let mut p = statement("p", &FILES_PROVIDE, &[], &[]);
+    p.touch = vec!["/pyproject.toml".into(), "./pkg/__init__.py".into()];
+    let mut c = statement("c", &[], &["I assume you provide `pyproject.toml`."], &[]);
+    c.touch = vec!["dist/pkg.whl".into()];
+    let writes = files_writes(&["pyproject.toml", "pkg/__init__.py"], &["dist/pkg.whl"]);
+    let f = compare_handshake(&files_ic(), &[p.clone(), c.clone()], &writes);
+    assert_eq!(holding(&f), vec![], "{f:#?}");
+    c.touch = vec!["/pkg/__init__.py".into()];
+    let both = files_writes(&["pyproject.toml", "pkg/__init__.py"], &["pkg/__init__.py"]);
+    let f = compare_handshake(&files_ic(), &[p, c], &both);
+    assert_eq!(
+        holding(&f),
+        vec![HandshakeFinding::TouchOverlap {
+            path: "pkg/__init__.py".into(),
+            parties: vec!["c".into(), "p".into()],
+        }],
+        "{f:#?}"
+    );
+}
+
+/// The handshake prompt says what `touch` means: the paths the party will
+/// write. A model given only the key `touch` listed files it reads, and the
+/// comparator holds every touch outside the declared writes.
+#[test]
+fn the_handshake_prompt_defines_touch_as_writes() {
+    assert!(
+        HANDSHAKE_SYSTEM.contains("\"touch\" lists only the paths you will write"),
+        "{HANDSHAKE_SYSTEM}"
+    );
+}
