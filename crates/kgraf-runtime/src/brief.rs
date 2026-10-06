@@ -312,6 +312,11 @@ pub struct WorkerResult {
     /// not spend, but the loss is reported, never swallowed (every token is attributed, fail loud).
     #[serde(default)]
     pub trace_failures: Vec<String>,
+    /// The brief's slices this worker was not given, each with its file and
+    /// the reason; the orchestrator traces one notice per item. Serde-defaulted
+    /// so an older record still loads.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub slices_left_out: Vec<crate::context::SliceLeftOut>,
     /// The worker's own account of its reasons, parsed from its final answer
     /// (`parse_rationale`), if it gave one. `None` when it did not: recorded
     /// as absent, never fabricated. Serde-defaulted so a record from before
@@ -377,6 +382,7 @@ impl WorkerResult {
             prefix_digest: String::new(),
             denied: 0,
             trace_failures: Vec::new(),
+            slices_left_out: Vec::new(),
             rationale: None,
             refused: Vec::new(),
             compaction: None,

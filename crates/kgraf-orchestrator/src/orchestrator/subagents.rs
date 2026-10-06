@@ -1926,6 +1926,14 @@ impl RunLoop {
                 "the end of subagent `{id}` could not be traced: {e}"
             ));
         }
+        if let Err(e) = self
+            .trace_slices_left_out(&c.contract, id.as_str(), &d.result.slices_left_out, now)
+            .await
+        {
+            self.subagents.errors.push(format!(
+                "the slices subagent `{id}` was not given could not be traced: {e}"
+            ));
+        }
         let outcome = d.result.outcome.clone();
         if c.ended_parent == Some(true) && matches!(outcome, WorkerOutcome::Cancelled) {
             // Stopped with its parent: the record and the row stay open.

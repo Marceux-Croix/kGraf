@@ -177,8 +177,22 @@ impl Tool for GraphSliceTool {
             let dir = fs_safety::open_workspace(TOOL, &root)?;
             fs_safety::check_readable(TOOL, &dir, &path, hard_links.permits(&path))?;
             let store = store.lock().unwrap_or_else(|p| p.into_inner());
+            // The worker's own tree first: the store's root is the user's
+            // checkout, which can lack a file the worker's base holds. A file
+            // the worker has since edited no longer matches the index there,
+            // so the indexed copy is read instead (stale, as the description
+            // says) rather than no slice at all.
             let slice =
-                kgraf_graph::slice::slice_for_node(&store, &node, budget).map_err(internal)?;
+                match kgraf_graph::slice::slice_for_node_in(&store, &node, budget, Some(&root)) {
+                    Ok(slice) => slice,
+                    Err(
+                        kgraf_graph::GraphError::StaleFile { .. }
+                        | kgraf_graph::GraphError::StaleSpan { .. }
+                        | kgraf_graph::GraphError::Io { .. },
+                    ) => kgraf_graph::slice::slice_for_node(&store, &node, budget)
+                        .map_err(internal)?,
+                    Err(e) => return Err(internal(e)),
+                };
             Ok(ToolOutput::text(slice.render()))
         })
         .await

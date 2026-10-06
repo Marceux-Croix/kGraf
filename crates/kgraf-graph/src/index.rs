@@ -1346,6 +1346,7 @@ struct CallCounts {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::SourceRootRepair;
     use std::fs;
     use std::time::{Duration, SystemTime};
 
@@ -2521,5 +2522,142 @@ mod tests {
             .expect("index");
         assert_eq!(report.skipped_too_large, 1);
         assert!(store.file_paths().expect("p").is_empty(), "as a walk would");
+    }
+
+    /// A checkout (the store's root), a worker's tree beside it, and a node
+    /// of `src/a.rs` indexed from the checkout.
+    fn checkout_and_tree() -> (Tree, std::path::PathBuf, GraphStore, NodeRecord) {
+        let tree = Tree::new();
+        tree.write("checkout/src/a.rs", "pub fn a() -> u8 {\n    1\n}\n");
+        let root = tree.path().join("checkout");
+        let store = GraphStore::open_in_memory(&root).expect("store");
+        Indexer::new(&store).index().expect("walk");
+        let node = store.resolve_symbol("a").expect("resolve")[0].clone();
+        let worker = tree.path().join("worker");
+        fs::create_dir_all(worker.join("src")).expect("mkdir");
+        (tree, worker, store, node)
+    }
+
+    /// The worker's tree is the one read when it is given: a file the
+    /// checkout no longer holds is read from it, a file absent from it is
+    /// absent even though the checkout holds it, and another version there is
+    /// stale rather than replaced by the checkout's copy.
+    #[test]
+    fn source_of_in_reads_only_the_workers_tree() {
+        let (tree, worker, store, node) = checkout_and_tree();
+        let indexed = "pub fn a() -> u8 {\n    1\n}\n";
+
+        // Absent from the worker's tree: NotFound, not the checkout's copy.
+        let err = store
+            .source_of_in(&node, Some(&worker))
+            .expect_err("absent from the worker's tree");
+        assert!(
+            matches!(&err, GraphError::Io { source, .. }
+                if source.kind() == std::io::ErrorKind::NotFound),
+            "{err:?}"
+        );
+
+        // Present in the worker's tree, gone from the checkout: read from the tree.
+        fs::write(worker.join("src/a.rs"), indexed).expect("write");
+        fs::remove_file(tree.path().join("checkout/src/a.rs")).expect("rm");
+        assert!(store.source_of(&node).is_err(), "the checkout lost it");
+        let text = store.source_of_in(&node, Some(&worker)).expect("tree");
+        assert!(text.contains("1"), "{text}");
+
+        // Another version in the worker's tree: stale, never the index's copy.
+        fs::write(worker.join("src/a.rs"), "pub fn a() -> u8 {\n    2\n}\n").expect("write");
+        assert!(matches!(
+            store.source_of_in(&node, Some(&worker)),
+            Err(GraphError::StaleFile { .. })
+        ));
+
+        // A tree that does not exist says nothing about the file: the store's
+        // reads apply (here the checkout, which lost it).
+        fs::write(tree.path().join("checkout/src/a.rs"), indexed).expect("restore");
+        let gone = tree.path().join("removed-probe");
+        assert!(store.source_of_in(&node, Some(&gone)).is_ok());
+    }
+
+    /// A file indexed from a tree that is then removed (the orchestrator's
+    /// conversation worktree, removed as soon as its files are committed) has a
+    /// recorded root that names nothing, and the checkout never received the
+    /// file: every read fails with "cannot read". Re-pointing the record at a
+    /// tree that holds the same content (the run's integration view) makes the
+    /// nodes readable again; a record whose file the checkout holds is cleared;
+    /// one no tree holds is reported, not guessed at.
+    #[test]
+    fn a_dead_source_root_is_repointed_at_a_tree_that_holds_the_file() {
+        let tree = Tree::new();
+        let root = tree.path().join("checkout");
+        fs::create_dir_all(&root).expect("mkdir");
+        let store = GraphStore::open_in_memory(&root).expect("store");
+        let comms = tree.path().join("comms-worktree");
+        let body = "# Conversation\n\n## m1 done from a to b\n\nhello\n";
+        let rel = format!("{}/a--b.md", crate::index::BUS_OWNED_DIRS[0]);
+        fs::create_dir_all(comms.join(&rel).parent().expect("parent")).expect("mkdir");
+        fs::write(comms.join(&rel), body).expect("write");
+        Indexer::new(&store)
+            .with_source_root(&comms)
+            .index_paths(std::slice::from_ref(&rel))
+            .expect("indexed from the conversation worktree");
+        let node = store.nodes_in_file(&rel).expect("nodes")[0].clone();
+        assert!(
+            store.source_of(&node).is_ok(),
+            "readable while the tree exists"
+        );
+
+        // The conversation worktree is removed once its files are committed.
+        fs::remove_dir_all(&comms).expect("remove");
+        let err = store
+            .source_of(&node)
+            .expect_err("the recorded root is gone");
+        assert!(
+            matches!(&err, GraphError::Io { path, source }
+                if path == &rel && source.kind() == std::io::ErrorKind::NotFound),
+            "{err:?}"
+        );
+
+        // The view holds the committed file: the record is re-pointed there.
+        let view = tree.path().join("view");
+        fs::create_dir_all(view.join(&rel).parent().expect("parent")).expect("mkdir");
+        fs::write(view.join(&rel), body).expect("write");
+        let repair = store.repair_source_roots(&view).expect("repair");
+        assert_eq!(repair.repointed, vec![rel.clone()]);
+        assert!(repair.cleared.is_empty() && repair.unresolved.is_empty());
+        assert_eq!(
+            store.file_source_root(&rel).expect("root"),
+            Some(view.clone())
+        );
+        assert!(
+            store
+                .source_of(&node)
+                .expect("readable")
+                .contains("m1 done")
+        );
+        // A root that holds the content is left alone.
+        let again = store
+            .repair_source_roots(&tree.path().join("x"))
+            .expect("repair");
+        assert_eq!(again, SourceRootRepair::default());
+
+        // The view moved on and the checkout holds the file as indexed: cleared.
+        fs::write(view.join(&rel), "other").expect("write");
+        fs::create_dir_all(root.join(&rel).parent().expect("parent")).expect("mkdir");
+        fs::write(root.join(&rel), body).expect("write");
+        let repair = store.repair_source_roots(&view).expect("repair");
+        assert_eq!(repair.cleared, vec![rel.clone()]);
+        assert_eq!(store.file_source_root(&rel).expect("root"), None);
+
+        // Recorded again from a tree that goes, and no tree holds it: reported.
+        let other = tree.path().join("other");
+        fs::create_dir_all(other.join(&rel).parent().expect("parent")).expect("mkdir");
+        fs::write(other.join(&rel), "# Conversation\n\n## m2 x\n").expect("write");
+        Indexer::new(&store)
+            .with_source_root(&other)
+            .index_paths(std::slice::from_ref(&rel))
+            .expect("indexed");
+        fs::remove_dir_all(&other).expect("remove");
+        let repair = store.repair_source_roots(&view).expect("repair");
+        assert_eq!(repair.unresolved, vec![rel.clone()]);
     }
 }

@@ -194,6 +194,18 @@ pub fn slice_for_node(
     requested: &NodeRecord,
     budget_tokens: u64,
 ) -> Result<ContextSlice> {
+    slice_for_node_in(store, requested, budget_tokens, None)
+}
+
+/// [`slice_for_node`], every member's text read from `tree` when it is given
+/// and exists ([`GraphStore::source_of_in`]): a worker's own worktree, so the
+/// slice shows what that worker's tree holds, never the checkout's copy.
+pub fn slice_for_node_in(
+    store: &GraphStore,
+    requested: &NodeRecord,
+    budget_tokens: u64,
+    tree: Option<&std::path::Path>,
+) -> Result<ContextSlice> {
     let mut candidates: Vec<(NodeRecord, SliceReason)> =
         vec![(requested.clone(), SliceReason::Requested)];
 
@@ -244,7 +256,7 @@ pub fn slice_for_node(
         // exits 0 would read as "nothing to know". A neighbor whose file has
         // moved on is listed as unreadable with the cause (not as a budget
         // omission), so one stale neighbor does not deny a worker its context.
-        let source = match store.source_of(&node) {
+        let source = match store.source_of_in(&node, tree) {
             Ok(source) => source,
             Err(error) if reason == SliceReason::Requested => return Err(error),
             Err(error) => {

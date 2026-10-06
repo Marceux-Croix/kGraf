@@ -771,6 +771,59 @@ async fn conversation_files_reach_the_branch_without_touching_the_checkout() {
     assert!(r.root.join(rel).is_file(), "the owner's merge brings it in");
 }
 
+/// A conversation file is indexed from the worktree the bus wrote it in,
+/// and that worktree is removed as soon as the file is committed: the file's
+/// recorded source root then names a tree that is gone, and the checkout never
+/// received the file, so its nodes read as "cannot read" from every reader
+/// without a worktree of its own. Re-pointed at the integration view, which
+/// holds the committed file, they read again.
+#[tokio::test]
+async fn a_conversation_node_reads_again_once_its_dead_root_is_repointed_at_the_view() {
+    let r = repo();
+    let rel = format!("{}/a--b.md", kgraf_graph::BUS_OWNED_DIRS[0]);
+    let root = r
+        .workspaces
+        .open_comms()
+        .await
+        .expect("open")
+        .expect("a worktree");
+    let path = root.join(&rel);
+    std::fs::create_dir_all(path.parent().expect("dir")).expect("mkdir");
+    std::fs::write(&path, "# Conversation\n\n## m1 done from a to b\n\nhello\n").expect("write");
+    let graph = GraphStore::open_in_memory(&r.root).expect("graph");
+    kgraf_graph::Indexer::new(&graph)
+        .with_source_root(&root)
+        .index_paths(std::slice::from_ref(&rel))
+        .expect("indexed from the conversation worktree");
+    let merged = r
+        .workspaces
+        .commit_comms(&root, std::slice::from_ref(&rel), "kgraf: agent message m1")
+        .await
+        .expect("commit");
+    assert!(matches!(merged, Integration::Merged { .. }), "{merged:?}");
+    assert!(!root.exists(), "the conversation worktree is retired");
+    let node = graph.nodes_in_file(&rel).expect("nodes")[0].clone();
+    let err = graph
+        .source_of(&node)
+        .expect_err("the recorded root is gone");
+    assert!(err.to_string().contains("cannot read"), "{err}");
+
+    let view = r
+        .workspaces
+        .integration_view()
+        .await
+        .expect("view")
+        .expect("a git provider keeps an integration view");
+    let repair = graph.repair_source_roots(&view).expect("repair");
+    assert_eq!(repair.repointed, vec![rel.clone()]);
+    assert!(
+        graph
+            .source_of(&node)
+            .expect("readable from the view")
+            .contains("m1 done from a to b")
+    );
+}
+
 /// An empty commit, or one that fails (here a tampered
 /// gitlink, refused before any git runs in the tree), leaves no worktree.
 #[tokio::test]
@@ -1163,6 +1216,120 @@ async fn a_re_verified_contract_never_collides_with_its_attempt_ref() {
         Integration::Merged { .. }
     ));
     assert_eq!(git_out(&r.root, &["show", "kgraf/r-1:a.txt"]), "done");
+}
+
+/// An attempt's slices are read from its own worktree. The shape seen live:
+/// the graph indexed a scaffold file, the checkout could not give it back,
+/// and every attempt of the contract died at spawn with "cannot render slice
+/// ... cannot read". Here the file is gone from the checkout but committed, so
+/// the attempt's worktree holds it: the slice is rendered from there, and a
+/// node whose file the worktree lacks is left out by name, not fatal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_attempts_slices_are_read_from_its_own_worktree() {
+    let dir = tempfile::tempdir().expect("dir");
+    let root = dir.path().join("repo");
+    let base = dir.path().join("ws");
+    let r = repo_in(
+        dir,
+        root,
+        &base,
+        &[(
+            "iface/src/lib.rs",
+            "pub fn order_total() -> i64 {\n    42\n}\n",
+        )],
+    );
+    let state = r._dir.path().join("state");
+    std::fs::create_dir_all(&state).expect("state");
+    let graph_path = state.join("graph.db");
+    let (node, lost) = {
+        let g = GraphStore::open(&graph_path, &r.root).expect("graph");
+        std::fs::write(r.root.join("untracked.rs"), "pub fn lost() {}\n").expect("write");
+        kgraf_graph::Indexer::new(&g).index().expect("index");
+        let id = |name: &str| {
+            kgraf_core::NodeId::new(g.resolve_symbol(name).expect("resolve")[0].id.clone())
+        };
+        (id("order_total"), id("lost"))
+    };
+    // The checkout no longer holds the committed file; the worktree, made
+    // from the commit, does. `untracked.rs` was never committed, so the
+    // worktree lacks it although the checkout has it.
+    std::fs::remove_file(r.root.join("iface/src/lib.rs")).expect("rm");
+    let ledger = Arc::new(Ledger::open(&state.join("ledger.db")).expect("ledger"));
+    let mut routes = BTreeMap::new();
+    routes.insert(
+        "fake:m".to_owned(),
+        RouteParts {
+            provider: Arc::new(ShellCaller),
+            vendor: "fake (fake)".into(),
+            vendor_name: "fake".into(),
+            model: "m".into(),
+        },
+    );
+    let assembler = AttemptAssembler {
+        root: r.root.clone(),
+        state: state.clone(),
+        graph_path,
+        indexed: true,
+        ledger: ledger.clone(),
+        config: WorkerConfig::with_servers(vec![]).expect("config"),
+        max_output_tokens: 1_000,
+        max_checkpoints: 3,
+        read_denies: vec![state.clone()],
+        workspaces: r.workspaces.clone(),
+        routes,
+        extra_tools: Vec::new(),
+        session_line: None,
+        prefixes: Arc::new(kgraf_runtime::PrefixRegistry::new()),
+        machine_gate: test_machine_gate(),
+        tbench_bridge_socket: None,
+        dependency_refetch: crate::deps::inert_refetch(),
+        skills: None,
+        skill_directory: Default::default(),
+        refusal_directory: Default::default(),
+        permissions: Arc::new(kgraf_tools::PermissionControl::manual()),
+    };
+    let route = Route {
+        name: "fake:m".into(),
+        vendor: "fake".into(),
+        env: Arc::new(kgraf_runtime::WorkerEnv::new(
+            ledger.clone(),
+            Arc::new(ShellCaller),
+            Arc::new(kgraf_tools::ToolRegistry::new()),
+            assemble_prefix(),
+        )),
+        context: ContextConfig::for_model(200_000).expect("context"),
+        readiness: Arc::new(kgraf_orchestrator::AlwaysReady),
+        local: false,
+    };
+    let ws = worktree(&r, "w-slices").await;
+    assert!(
+        ws.join("iface/src/lib.rs").is_file(),
+        "the worktree holds it"
+    );
+    let built = assembler
+        .build(&route, &ws, &"w-slices".into(), &"r9/c-slices".into())
+        .await
+        .expect("built");
+    let rendering = built
+        .env
+        .slices
+        .render(&[node.clone(), lost.clone()])
+        .expect("a stale node does not fail the rendering");
+    assert_eq!(rendering.slices.len(), 1, "{rendering:?}");
+    assert_eq!(rendering.slices[0].node, node);
+    assert!(rendering.slices[0].text.contains("42"), "{rendering:?}");
+    assert_eq!(rendering.left_out.len(), 1, "{rendering:?}");
+    assert_eq!(rendering.left_out[0].node, lost);
+    assert_eq!(rendering.left_out[0].path, "untracked.rs");
+    assert!(
+        rendering.left_out[0]
+            .reason
+            .contains("not in the worker's tree"),
+        "{rendering:?}"
+    );
+    if let Some(closer) = built.closer {
+        closer.close().await;
+    }
 }
 
 /// Item 2: each attempt's environment is assembled in its own worktree.

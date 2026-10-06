@@ -456,13 +456,37 @@ impl RunLoop {
         if paths.is_empty() {
             return;
         }
-        let root = match self.s.workspaces.integration_view().await {
-            Ok(Some(view)) => view,
-            Ok(None) => workspace.to_path_buf(),
+        self.reindex_from_view(&contract.contract, paths, Some(workspace), at)
+            .await;
+    }
+
+    /// Index `paths` from the integration view at the current tip (or from
+    /// `fallback` when the provider keeps no view), then re-point every
+    /// recorded source root that no longer holds its file at the view
+    /// ([`kgraf_graph::GraphStore::repair_source_roots`]). Without the repair
+    /// a file indexed from a tree that is gone (a conversation worktree,
+    /// removed once its files are committed; a view made again after git could
+    /// not move it) reads as "cannot read" from every reader that has no
+    /// worktree of its own: the store's root, the user's checkout, never
+    /// received it. A failure is traced, never silent, and does not undo the
+    /// integration.
+    pub(super) async fn reindex_from_view(
+        &mut self,
+        contract: &str,
+        paths: Vec<String>,
+        fallback: Option<&Path>,
+        at: i64,
+    ) {
+        let (root, view) = match self.s.workspaces.integration_view().await {
+            Ok(Some(view)) => (view, true),
+            Ok(None) => match fallback {
+                Some(workspace) => (workspace.to_path_buf(), false),
+                None => return,
+            },
             Err(e) => {
                 self.queue(TraceEvent::Notice {
                     at_ms: at,
-                    contract: contract.contract.clone(),
+                    contract: contract.to_owned(),
                     worker: String::new(),
                     detail: format!(
                         "reindex after merge failed, a later index will catch it up: the \
@@ -475,18 +499,25 @@ impl RunLoop {
         let graph = self.s.graph.clone();
         let result: Result<(), StoreError> = blocking(move || {
             let g = graph.lock().map_err(|_| StoreError::Poisoned)?;
-            kgraf_graph::Indexer::new(&g)
-                .with_source_root(&root)
-                .index_paths(&paths)
-                .map(|_| ())
-                .map_err(StoreError::from)
+            if !paths.is_empty() {
+                kgraf_graph::Indexer::new(&g)
+                    .with_source_root(&root)
+                    .index_paths(&paths)
+                    .map_err(StoreError::from)?;
+            }
+            // Only the view lives for the whole run; a fallback workspace is
+            // not a tree to re-point other files at.
+            if view {
+                g.repair_source_roots(&root).map_err(StoreError::from)?;
+            }
+            Ok(())
         });
         // A named-path index applies no extractor stamps, so its report has
         // no extractor changes to carry: the full walk owns them.
         if let Err(e) = result {
             self.queue(TraceEvent::Notice {
                 at_ms: at,
-                contract: contract.contract.clone(),
+                contract: contract.to_owned(),
                 worker: String::new(),
                 detail: format!("reindex after merge failed, a later index will catch it up: {e}"),
             });
@@ -1590,6 +1621,16 @@ impl RunLoop {
                 if let Integration::Merged { commit } = &i {
                     self.record.coordination.integration_tip = Some(commit.clone());
                     self.advance_check_base(commit)?;
+                    // The files were indexed from the conversation worktree,
+                    // which `commit_comms` just removed: index them from the
+                    // view, which now holds them, so their nodes stay readable.
+                    let indexed: Vec<String> = files
+                        .iter()
+                        .filter(|p| kgraf_graph::Language::from_path(p).is_some())
+                        .cloned()
+                        .collect();
+                    self.reindex_from_view(&env.from_contract, indexed, None, at)
+                        .await;
                 }
             }
             other => {

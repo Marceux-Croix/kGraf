@@ -77,7 +77,9 @@ Only `kgraf index` creates or rebuilds the index. `symbol`, `slice`, `query`, `p
 `demand` open it read-only, and every other command opens an existing index without
 rebuilding it. Where there is no index, or it was written by another schema version, they
 stop and say to run `kgraf index`. A slice reads each node's lines from the file, and it
-stops with an error when the file changed after it was indexed; run `kgraf index` first. A
+stops with an error when the file changed after it was indexed; run `kgraf index` first. (A
+worker in a run is different: a slice it cannot read is left out with a notice, see
+`kgraf orchestrate`.) A
 name that matches more than one node is refused with the candidates listed (an exact
 qualified name still picks its one node).
 
@@ -1591,8 +1593,23 @@ Behavior that differs from earlier builds. Each item names the decision that hol
   top-level symbols of the files it declares it writes (at most 8, about 4,000 tokens
   together). The trace has a `notice` naming the files, and each name that found nothing is
   still an `empty_graph_lookup`. The run report has a `slices` line: the dispatches given
-  slices, how many of those took the declared files' symbols, and the named lookups that
-  found nothing. A run that gave no worker a slice says so on that line.
+  slices, how many of those took the declared files' symbols, the named lookups that found
+  nothing, and the slices left out of a brief. A run that gave no worker a slice says so on
+  that line.
+- A worker's slices are read from its own worktree, at the commit it was dispatched from,
+  not from your checkout. A slice whose file is not in that tree, holds another version
+  there than the graph indexed, or cannot be read (or whose node the graph no longer holds)
+  is left out, and the worker starts anyway: its opening ends with a `slices left out` block
+  naming each node, its file and the reason, and the trace has one `notice` per slice
+  (`slice left out of the brief: node ... in ...: reason`). A read error carries the
+  operating system's reason. Only the graph's database failing stops a worker at its start.
+  The `graph_slice` tool reads the worker's tree first too, and the indexed copy when the
+  worker has changed the file since.
+- A conversation file the message bus writes is indexed from a worktree that is removed once
+  the file is committed. After the commit kGraf indexes it again from the run's integration
+  view, and after each merge it points any indexed file whose recorded tree is gone at the
+  view when the view holds the same content, so those nodes stay readable for the rest of
+  the run.
 - kGraf's own git runs no hook, filter, merge driver or diff driver from your repository or
   config, and reaches no remote (see "kGraf's own git"). A file stored through git-lfs or
   git-crypt is committed by kGraf in its stored form, and a file with a configured merge

@@ -126,6 +126,13 @@ pub enum WorkerEvent {
     Context {
         prefix_digest: String,
         slices: Vec<NodeId>,
+        /// The slices of `slices` the worker was not given, each with its file
+        /// and the reason (not in the worker's tree, another version there,
+        /// unreadable, gone from the graph). `slices` stays the brief's list,
+        /// so a resume compares the same list. Absent when every slice was
+        /// given, and in a transcript written before the field.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        slices_left_out: Vec<crate::context::SliceLeftOut>,
         /// The gitlink at the worktree root as read when the worker first
         /// started, before any of its calls ran; a resumed segment carries the
         /// first segment's. A resume reads the worktree status only against

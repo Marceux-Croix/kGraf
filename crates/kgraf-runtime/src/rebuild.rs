@@ -1388,6 +1388,7 @@ mod tests {
             WorkerEvent::Context {
                 prefix_digest: "d1".into(),
                 slices: vec![],
+                slices_left_out: Vec::new(),
                 gitlink: None,
                 no_gitlink: false,
             },
@@ -1405,6 +1406,7 @@ mod tests {
         events.push(WorkerEvent::Context {
             prefix_digest: "d1".into(),
             slices: vec![],
+            slices_left_out: Vec::new(),
             gitlink: None,
             no_gitlink: false,
         });
@@ -1435,6 +1437,7 @@ mod tests {
         let mut events = vec![WorkerEvent::Context {
             prefix_digest: "d1".into(),
             slices: vec![],
+            slices_left_out: Vec::new(),
             gitlink: None,
             no_gitlink: false,
         }];
@@ -1445,6 +1448,7 @@ mod tests {
         events.push(WorkerEvent::Context {
             prefix_digest: "d2".into(),
             slices: vec![],
+            slices_left_out: Vec::new(),
             gitlink: None,
             no_gitlink: false,
         });

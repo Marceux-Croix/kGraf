@@ -136,7 +136,8 @@ use crate::compaction::{
     RECALL_TOOL, SUMMARY_REQUEST, StopPointPolicy, SummarySource,
 };
 use crate::context::{
-    PrefixCheckError, PrefixRegistry, PrefixSnapshot, SliceError, SliceSource, opening_messages,
+    PrefixCheckError, PrefixRegistry, PrefixSnapshot, SliceError, SliceSource,
+    opening_messages_with,
 };
 use crate::dispatch::dependencies;
 use crate::event::{CancelPhase, EventSequence, WorkerEvent};
@@ -477,10 +478,14 @@ async fn prepare(
     env.prefixes.admit(&env.prefix)?;
     let source = env.slices.clone();
     let nodes = brief.slices.clone();
-    let slices = tokio::task::spawn_blocking(move || source.render(&nodes))
+    // A node whose file cannot be read for this worker is left out and named
+    // (in the opening, the `Context` event and the result), never the end of
+    // the spawn: only the graph itself failing is an error here.
+    let rendering = tokio::task::spawn_blocking(move || source.render(&nodes))
         .await
         .map_err(|e| WorkerError::SliceTask(e.to_string()))??;
-    let opening = opening_messages(&brief.instruction, &slices);
+    let opening = opening_messages_with(&brief.instruction, &rendering);
+    let slices_left_out = rendering.left_out;
     // On a resume, the tool calls of the earlier segment's last round are what
     // the next request carries results of: its tool round (see Trace).
     let resumed_tools = options
@@ -795,6 +800,7 @@ async fn prepare(
         history,
         archive,
         compaction,
+        slices_left_out,
     };
     Ok((worker, endpoint, handle))
 }
@@ -1077,6 +1083,9 @@ struct Worker {
     given_tools: Vec<String>,
     /// Trace writes the ledger refused, reported on the result.
     trace_failures: Vec<String>,
+    /// The brief's slices this worker was not given, with the reason each
+    /// was left out; recorded in the `Context` event and on the result.
+    slices_left_out: Vec<crate::context::SliceLeftOut>,
     /// The provider error that ended the run when it says the route is
     /// unreachable (`ProviderError::is_route_fault`), reported on the result.
     route_fault: Option<String>,
@@ -1289,6 +1298,7 @@ impl Worker {
             prefix_digest: self.env.prefix.digest().as_str().to_owned(),
             denied: self.denied,
             trace_failures: std::mem::take(&mut self.trace_failures),
+            slices_left_out: self.slices_left_out.clone(),
             route_fault: self.route_fault.take(),
             rationale,
             refused: self.refused.take(),
@@ -1480,6 +1490,7 @@ impl Worker {
         let context = WorkerEvent::Context {
             prefix_digest: self.env.prefix.digest().as_str().to_owned(),
             slices: self.brief.slices.clone(),
+            slices_left_out: self.slices_left_out.clone(),
             gitlink: self
                 .git_at_start
                 .as_ref()
@@ -3743,6 +3754,7 @@ mod resumed_git_entry_tests {
         WorkerEvent::Context {
             prefix_digest: "d".into(),
             slices: vec![],
+            slices_left_out: Vec::new(),
             gitlink: gitlink.map(str::to_owned),
             no_gitlink,
         }

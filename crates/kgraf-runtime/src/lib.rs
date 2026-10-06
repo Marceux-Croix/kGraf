@@ -76,8 +76,8 @@ pub use compaction::{
 };
 pub use context::{
     GraphSlices, NeutralPrefixEncoder, NoSlices, PrefixCheckError, PrefixInvalidation,
-    PrefixRegistry, PrefixSnapshot, RenderedSlice, SliceError, SliceSource, opening_messages,
-    render_system,
+    PrefixRegistry, PrefixSnapshot, RenderedSlice, SliceError, SliceLeftOut, SliceRendering,
+    SliceSource, left_out_notice, opening_messages, opening_messages_with, render_system,
 };
 pub use dispatch::dependencies;
 pub use event::{CancelPhase, EventSequence, NoticeKind, SequenceError, WorkerEvent};

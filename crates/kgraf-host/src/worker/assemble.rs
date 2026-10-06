@@ -601,7 +601,10 @@ pub async fn assemble(a: Assembly) -> Result<Assembled> {
                 GraphSliceTool::new(Arc::new(Mutex::new(graph.tool)))
                     .with_hardlink_reads(hard_links),
             ));
-            Arc::new(GraphSlices::new(graph.slices, 2_000))
+            // Read from this attempt's own worktree, at its dispatch base:
+            // the store's root is the user's checkout, which can lack a file
+            // the worker's tree holds or hold one it does not.
+            Arc::new(GraphSlices::new(graph.slices, 2_000).with_tree(a.workspace.root()))
         }
         None => Arc::new(NoSlices),
     };

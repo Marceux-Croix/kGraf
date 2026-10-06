@@ -5514,6 +5514,30 @@ impl RunLoop {
         Ok(())
     }
 
+    /// One notice per slice a worker's brief named that the worker was not
+    /// given, naming the node, its file and the reason, and the run's count.
+    /// The worker started without them (a stale node never ends a spawn), so
+    /// the trace is where the loss is said.
+    pub(super) async fn trace_slices_left_out(
+        &mut self,
+        contract: &str,
+        worker: &str,
+        left_out: &[kgraf_runtime::SliceLeftOut],
+        at: i64,
+    ) -> Result<(), OrchestratorError> {
+        for item in left_out {
+            self.record.counters.slices_left_out += 1;
+            self.trace(TraceEvent::Notice {
+                at_ms: at,
+                contract: contract.to_owned(),
+                worker: worker.to_owned(),
+                detail: format!("slice left out of the brief: {}", item.describe()),
+            })
+            .await?;
+        }
+        Ok(())
+    }
+
     fn slice_tokens(&self, nodes: &[NodeId]) -> Result<u64, OrchestratorError> {
         Ok(self.slice_token_list(nodes)?.iter().map(|(_, t)| t).sum())
     }
@@ -5541,9 +5565,13 @@ impl RunLoop {
     /// What each slice costs in a brief: the slice as the worker is given it,
     /// rendered by the route's slice source and counted. A slice is not its
     /// node's source (it grows with neighbors up to the per-slice budget), so
-    /// the node's source is no measure; the rendering is. A node that cannot be
-    /// rendered is left out. Without a route to render with, the node's source
-    /// bounded at [`WRITE_SLICE_EACH_TOKENS`] stands in.
+    /// the node's source is no measure; the rendering is. A node the rendering
+    /// leaves out (its file unreadable from here) counts at the per-slice bound
+    /// [`WRITE_SLICE_EACH_TOKENS`] and stays in the list: the worker's own
+    /// rendering may read it from the worker's tree, and when it cannot, the
+    /// spawn names it as left out. Dropping it here would leave it out with no
+    /// word. Without a route to render with, the node's source bounded at
+    /// [`WRITE_SLICE_EACH_TOKENS`] stands in.
     fn rendered_slice_sizes(
         &self,
         route: Option<&str>,
@@ -5566,12 +5594,16 @@ impl RunLoop {
                 nodes
                     .iter()
                     .filter_map(|n| {
+                        // The graph failing (not one node) is still left out:
+                        // the spawn renders again and fails loud there.
                         let rendered = source.render(std::slice::from_ref(n)).ok()?;
-                        let slice = rendered.first()?;
-                        Some((
-                            n.clone(),
-                            estimate_tokens(&format!("// slice {}\n{}", slice.node, slice.text)),
-                        ))
+                        let tokens = match rendered.slices.first() {
+                            Some(slice) => {
+                                estimate_tokens(&format!("// slice {}\n{}", slice.node, slice.text))
+                            }
+                            None => WRITE_SLICE_EACH_TOKENS,
+                        };
+                        Some((n.clone(), tokens))
                     })
                     .collect(),
             )
@@ -6213,6 +6245,13 @@ impl RunLoop {
             last_stop: f.result.last_stop,
             tool_calls: f.result.tool_calls,
         })
+        .await?;
+        self.trace_slices_left_out(
+            &f.contract,
+            f.worker.as_str(),
+            &f.result.slices_left_out,
+            now,
+        )
         .await?;
         self.observe_route_health(&f.contract, &f.worker, &route_name, &f.result, now)
             .await?;

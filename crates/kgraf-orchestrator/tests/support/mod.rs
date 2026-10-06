@@ -1018,6 +1018,11 @@ pub struct FakeIntegration {
     /// The integration view (`Workspaces::integration_view`): each merge
     /// copies the contract's written files into it. `None`: no view.
     pub view: Mutex<Option<PathBuf>>,
+    /// Give the message bus a fresh worktree per message, as the git provider
+    /// does (`Workspaces::open_comms`): seeded with the view's conversation
+    /// files, its committed files copied into the view, and removed once
+    /// committed or discarded.
+    pub comms_worktrees: AtomicBool,
     next: AtomicUsize,
 }
 
@@ -1035,6 +1040,7 @@ impl FakeIntegration {
             empty_for: Mutex::new(Default::default()),
             remove_on_merge: AtomicBool::new(false),
             view: Mutex::new(None),
+            comms_worktrees: AtomicBool::new(false),
             next: AtomicUsize::new(1),
         })
     }
@@ -1141,13 +1147,50 @@ impl kgraf_orchestrator::Workspaces for FakeIntegration {
         Ok(view)
     }
 
+    async fn open_comms(&self) -> Result<Option<PathBuf>, String> {
+        if !self.comms_worktrees.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
+        let root = self
+            .dirs
+            .base
+            .join(format!("comms-{}", self.next.load(Ordering::SeqCst)));
+        let dir = root.join(kgraf_graph::BUS_OWNED_DIRS[0]);
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        if let Some(view) = self.view.lock().expect("lock").clone() {
+            let seeded = view.join(kgraf_graph::BUS_OWNED_DIRS[0]);
+            if let Ok(entries) = std::fs::read_dir(&seeded) {
+                for entry in entries.flatten() {
+                    std::fs::copy(entry.path(), dir.join(entry.file_name()))
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+        }
+        Ok(Some(root))
+    }
+
+    async fn discard_comms(&self, root: &Path) {
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     async fn commit_comms(
         &self,
-        _root: &Path,
+        root: &Path,
         files: &[String],
         _message: &str,
     ) -> Result<kgraf_orchestrator::Integration, String> {
         self.comms.lock().expect("lock").push(files.to_vec());
+        if self.comms_worktrees.load(Ordering::SeqCst) {
+            if let Some(view) = self.view.lock().expect("lock").clone() {
+                for f in files {
+                    let to = view.join(f);
+                    std::fs::create_dir_all(to.parent().expect("parent"))
+                        .map_err(|e| e.to_string())?;
+                    std::fs::copy(root.join(f), &to).map_err(|e| e.to_string())?;
+                }
+            }
+            std::fs::remove_dir_all(root).map_err(|e| e.to_string())?;
+        }
         Ok(kgraf_orchestrator::Integration::Merged {
             commit: self.commit(),
         })

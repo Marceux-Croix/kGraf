@@ -94,3 +94,37 @@ right measurement is cost per successful task, not cost per cached token.
 would remove the fan-out this optimizes. Or a measured finding that grouping workers by
 vendor for cache sharing degrades task success, in which case vendor fitness wins and the
 saving is abandoned.
+
+
+## Amendment (2026-10-06): a worker's slices come from its own tree; an unreadable slice is left out, not fatal
+
+A contract's attempts could fail at spawn, before any model call, with "cannot render slice
+for node ...: cannot read `<file>`". The private remainder was read from the graph store's own
+trees (a file's recorded source root, then the user's checkout), never from the worker's
+worktree, and one node that could not be read failed the whole rendering. The operating
+system's reason was not part of the message.
+
+1. **The worker's own tree.** The private remainder is read from the worker's worktree at its
+   dispatch base (`GraphSlices::with_tree`, `GraphStore::source_of_in`). Only that tree is
+   read: a file absent from it, or holding another version than the indexed one, is not
+   replaced by the checkout's copy, which can hold code the worker does not have. A tree that
+   no longer exists (the probe worktree a run's routes are built in) says nothing about a
+   file, and the store's reads apply. The `graph_slice` tool reads the worker's tree first and
+   the indexed copy when the worker has changed the file.
+2. **Left out, not fatal.** A slice whose file cannot be read for the worker, or whose node the
+   graph no longer holds, is left out (`SliceLeftOut`: node, file, reason). The worker starts;
+   its opening ends with a `slices left out` block naming each one; the `Context` event and the
+   worker's result carry the list; the orchestrator traces one `notice` per slice and counts
+   them on the report's `slices` line. A read error carries its cause. Only the graph's
+   database failing ends the rendering. A brief that names slices with no graph configured is
+   still refused.
+3. **Dead source roots are repaired.** The message bus indexes a conversation file from a
+   worktree it removes as soon as the file is committed, so the recorded root named a tree
+   that was gone and every reader without a worktree of its own got "cannot read". After the
+   commit the file is indexed again from the integration view, and after every integration
+   `GraphStore::repair_source_roots` points each record whose tree no longer holds the file's
+   indexed content at the view, when the view holds that content (or clears it when the
+   checkout does). A view made again after git could not move it is repaired the same way.
+4. **Sizing.** A hand-back child's slice cap counts a slice it cannot render from here at the
+   per-slice bound and keeps it, so the spawn, not the sizing, is where a left-out slice is
+   named.

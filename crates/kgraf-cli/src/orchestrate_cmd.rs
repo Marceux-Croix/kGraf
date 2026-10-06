@@ -837,8 +837,12 @@ fn report_lines(report: &kgraf_orchestrator::RunReport) -> Vec<String> {
     } else {
         format!(
             "slices     given in {} of {} dispatch(es), {} from declared files; {} named \
-             lookup(s) found nothing",
-            n.sliced_dispatches, n.dispatches, n.slices_from_writes, n.empty_slice_lookups
+             lookup(s) found nothing; {} left out of a brief (unreadable for the worker)",
+            n.sliced_dispatches,
+            n.dispatches,
+            n.slices_from_writes,
+            n.empty_slice_lookups,
+            n.slices_left_out
         )
     });
     if report.contract_checks.enabled {
@@ -1080,6 +1084,7 @@ mod tests {
         report.counters.sliced_dispatches = 2;
         report.counters.slices_from_writes = 1;
         report.counters.empty_slice_lookups = 4;
+        report.counters.slices_left_out = 5;
         let lines = report_lines(&report);
         let line = lines
             .iter()
@@ -1088,6 +1093,7 @@ mod tests {
         assert!(line.contains("2 of 3 dispatch(es)"), "{line}");
         assert!(line.contains("1 from declared files"), "{line}");
         assert!(line.contains("4 named lookup(s) found nothing"), "{line}");
+        assert!(line.contains("5 left out of a brief"), "{line}");
 
         report.counters.sliced_dispatches = 0;
         report.counters.slices_from_writes = 0;

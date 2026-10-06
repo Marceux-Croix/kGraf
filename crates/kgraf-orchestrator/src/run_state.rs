@@ -527,6 +527,10 @@ pub struct RunCounters {
     /// Slice names the plan gave that found nothing in the graph, each traced
     /// as an `empty_graph_lookup`.
     pub empty_slice_lookups: u64,
+    /// Slices a worker's brief named that the worker was not given (the
+    /// node's file not in its tree, another version there, unreadable, or the
+    /// node gone), each traced as a notice naming the node and file.
+    pub slices_left_out: u64,
 }
 
 /// How the run stands.

@@ -809,6 +809,69 @@ impl GraphStore {
         }
     }
 
+    /// Re-point every recorded source root that no longer holds its file's
+    /// indexed content (the tree was removed, or moved on) at `tree`, when
+    /// `tree` holds exactly that content (content hash compared). A file the
+    /// store's root holds as indexed has its record cleared instead, as a walk
+    /// of the store's root would. A root that still holds the content is left
+    /// alone.
+    ///
+    /// The orchestrator records a merged file's root as the tree it indexed it
+    /// from. Conversation files are indexed from a worktree removed as soon as
+    /// they are committed, and a run's integration view is made again when git
+    /// cannot move it; either way the recorded root names a directory that is
+    /// gone, the store's root (the user's checkout) never received the file, and
+    /// every read of the file's nodes fails with "cannot read". The
+    /// orchestrator calls this with its long-lived integration view after each
+    /// integration, so those records name a tree that holds the file.
+    ///
+    /// Returns what it re-pointed and cleared, and the paths no tree it could
+    /// check holds as indexed: those stay unreadable, and a reader reports them.
+    pub fn repair_source_roots(&self, tree: &Path) -> Result<SourceRootRepair> {
+        let rows: Vec<(String, String, String, String)> = {
+            let stmt = self.conn.prepare(
+                "SELECT f.id, f.path, f.content_hash, r.root
+                 FROM file_source_roots r JOIN files f ON f.id = r.file_id
+                 ORDER BY f.path",
+            );
+            let mut stmt = match stmt {
+                Ok(stmt) => stmt,
+                // An index from before the table existed records no root.
+                Err(rusqlite::Error::SqliteFailure(_, Some(message)))
+                    if message.starts_with("no such table: file_source_roots") =>
+                {
+                    return Ok(SourceRootRepair::default());
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let mapped = stmt.query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?;
+            mapped.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let holds = |dir: &Path, path: &str, hash: &str| {
+            std::fs::read(dir.join(path))
+                .is_ok_and(|bytes| blake3::hash(&bytes).to_hex().as_str() == hash)
+        };
+        let mut repair = SourceRootRepair::default();
+        for (file_id, path, hash, root) in rows {
+            let root = Path::new(&root);
+            if holds(root, &path, &hash) {
+                continue;
+            }
+            if root != tree && holds(tree, &path, &hash) {
+                Self::set_source_root_on(&self.conn, &file_id, Some(tree))?;
+                repair.repointed.push(path);
+            } else if holds(&self.root, &path, &hash) {
+                Self::set_source_root_on(&self.conn, &file_id, None)?;
+                repair.cleared.push(path);
+            } else {
+                repair.unresolved.push(path);
+            }
+        }
+        Ok(repair)
+    }
+
     /// Remove a file and, by cascade, its nodes and their edges.
     ///
     /// Any node lease on one of this file's nodes is purged in the same transaction
@@ -1228,6 +1291,20 @@ impl GraphStore {
     /// longer file would return the wrong lines. A span that no longer fits the
     /// file raises [`GraphError::StaleSpan`].
     pub fn source_of(&self, node: &NodeRecord) -> Result<String> {
+        self.source_of_in(node, None)
+    }
+
+    /// [`GraphStore::source_of`], read from `tree` when it is given and is a
+    /// directory that exists: a worker's own worktree, so the text a worker is
+    /// given is the text its tree holds at its base, never the checkout's or
+    /// another tree's. Only `tree` is read then: a file absent from it raises
+    /// [`GraphError::Io`] (`NotFound`), and a file there with other content than
+    /// the indexed one raises [`GraphError::StaleFile`]; neither falls back to the
+    /// checkout, which may hold a file or a version the worker does not have.
+    /// A `tree` that does not exist (a probe worktree removed after a run's
+    /// build) says nothing about any file, so the reads of
+    /// [`GraphStore::source_of`] apply.
+    pub fn source_of_in(&self, node: &NodeRecord, tree: Option<&Path>) -> Result<String> {
         let indexed: Option<String> = self
             .conn
             .query_row(
@@ -1236,10 +1313,23 @@ impl GraphStore {
                 |row| row.get(0),
             )
             .optional()?;
-        let recorded = self.file_source_root(&node.path)?;
         let matches = |bytes: &[u8]| {
             indexed.as_deref() == Some(blake3::hash(bytes).to_hex().to_string().as_str())
         };
+        if let Some(tree) = tree.filter(|t| t.is_dir()) {
+            let bytes = std::fs::read(tree.join(&node.path)).map_err(|source| GraphError::Io {
+                path: node.path.clone(),
+                source,
+            })?;
+            if !matches(&bytes) {
+                return Err(GraphError::StaleFile {
+                    node: node.id.clone(),
+                    path: node.path.clone(),
+                });
+            }
+            return lines_of(node, bytes);
+        }
+        let recorded = self.file_source_root(&node.path)?;
         let from_recorded = recorded
             .and_then(|root| std::fs::read(root.join(&node.path)).ok())
             .filter(|bytes| matches(bytes));
@@ -1260,22 +1350,7 @@ impl GraphStore {
                 bytes
             }
         };
-        let text = String::from_utf8(bytes).map_err(|_| GraphError::NotUtf8 {
-            path: node.path.clone(),
-        })?;
-        let lines: Vec<&str> = text.lines().collect();
-        let start = node.start_line.saturating_sub(1) as usize;
-        let end = node.end_line as usize;
-        if start >= lines.len() || end > lines.len() {
-            return Err(GraphError::StaleSpan {
-                node: node.id.clone(),
-                path: node.path.clone(),
-                start: node.start_line,
-                end: node.end_line,
-                lines: lines.len() as u32,
-            });
-        }
-        Ok(lines[start..end].join("\n"))
+        lines_of(node, bytes)
     }
 
     // ---- change log -----------------------------------------------------
@@ -1288,6 +1363,37 @@ impl GraphStore {
                 row.get(0)
             })?)
     }
+}
+
+/// What [`GraphStore::repair_source_roots`] did, by path.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SourceRootRepair {
+    /// Files whose record now names the tree given.
+    pub repointed: Vec<String>,
+    /// Files the store's root holds as indexed: the record was dropped.
+    pub cleared: Vec<String>,
+    /// Files no checked tree holds as indexed: still unreadable.
+    pub unresolved: Vec<String>,
+}
+
+/// A node's recorded lines out of its file's bytes (already hash-checked).
+fn lines_of(node: &NodeRecord, bytes: Vec<u8>) -> Result<String> {
+    let text = String::from_utf8(bytes).map_err(|_| GraphError::NotUtf8 {
+        path: node.path.clone(),
+    })?;
+    let lines: Vec<&str> = text.lines().collect();
+    let start = node.start_line.saturating_sub(1) as usize;
+    let end = node.end_line as usize;
+    if start >= lines.len() || end > lines.len() {
+        return Err(GraphError::StaleSpan {
+            node: node.id.clone(),
+            path: node.path.clone(),
+            start: node.start_line,
+            end: node.end_line,
+            lines: lines.len() as u32,
+        });
+    }
+    Ok(lines[start..end].join("\n"))
 }
 
 enum ScrubOutcome {

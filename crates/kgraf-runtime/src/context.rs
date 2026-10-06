@@ -439,7 +439,10 @@ impl PrefixRegistry {
     }
 }
 
-/// A slice could not be rendered.
+/// The slices could not be rendered at all: the graph itself failed (its
+/// database refused a query), so no slice of this worker can be trusted. A
+/// node whose own file cannot be read is not this; it is left out
+/// ([`SliceLeftOut`]) and the worker starts.
 #[derive(Debug, thiserror::Error)]
 #[error("cannot render slice for node `{node}`: {reason}")]
 pub struct SliceError {
@@ -454,21 +457,59 @@ pub struct RenderedSlice {
     pub text: String,
 }
 
-/// Renders a worker's own graph slices.
-pub trait SliceSource: Send + Sync {
-    /// The slices for these nodes, in order. A node that cannot be rendered is an
-    /// error, never an empty slice (fail loud).
-    fn render(&self, nodes: &[NodeId]) -> Result<Vec<RenderedSlice>, SliceError>;
+/// A slice a brief named that the worker was not given, and why: the node's
+/// file is not in the worker's tree, holds another version there than the
+/// graph indexed, cannot be read, or the graph no longer holds the node.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SliceLeftOut {
+    pub node: NodeId,
+    /// The node's file; empty when the graph no longer holds the node.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub path: String,
+    pub reason: String,
 }
 
-/// No graph: refuses any slice. For a brief that names none.
+impl SliceLeftOut {
+    /// One line naming the node, its file and the reason.
+    pub fn describe(&self) -> String {
+        if self.path.is_empty() {
+            format!("node `{}`: {}", self.node, self.reason)
+        } else {
+            format!("node `{}` in `{}`: {}", self.node, self.path, self.reason)
+        }
+    }
+}
+
+/// What a [`SliceSource`] rendered: the slices, in the order asked, and every
+/// node it left out.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SliceRendering {
+    pub slices: Vec<RenderedSlice>,
+    pub left_out: Vec<SliceLeftOut>,
+}
+
+/// Renders a worker's own graph slices.
+pub trait SliceSource: Send + Sync {
+    /// The slices for these nodes, in order. A node that cannot be rendered on
+    /// its own (its file is not in the worker's tree, holds another version
+    /// there, cannot be read, or the graph no longer holds the node) is left out
+    /// and named with its reason in [`SliceRendering::left_out`]: never an empty
+    /// slice, and never the end of the whole rendering, since one stale node
+    /// must not cost a worker its start. An error is the graph itself failing
+    /// (fail loud).
+    fn render(&self, nodes: &[NodeId]) -> Result<SliceRendering, SliceError>;
+}
+
+/// No graph: refuses any slice. For a brief that names none. A brief that
+/// names slices with no graph configured is a wrong configuration, not a stale
+/// node, so it stays an error.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NoSlices;
 
 impl SliceSource for NoSlices {
-    fn render(&self, nodes: &[NodeId]) -> Result<Vec<RenderedSlice>, SliceError> {
+    fn render(&self, nodes: &[NodeId]) -> Result<SliceRendering, SliceError> {
         match nodes.first() {
-            None => Ok(Vec::new()),
+            None => Ok(SliceRendering::default()),
             Some(node) => Err(SliceError {
                 node: node.to_string(),
                 reason: "no graph is configured for this worker".into(),
@@ -482,9 +523,15 @@ impl SliceSource for NoSlices {
 /// The store is behind a mutex: `GraphStore` holds one SQLite connection, which is
 /// `Send` but not `Sync`. Rendering happens once per worker start, so the lock is
 /// not on the per-turn path.
+///
+/// With [`GraphSlices::with_tree`] every slice is read from the worker's own
+/// worktree, the tree it starts from at its dispatch base. Without one (a
+/// single `kgraf worker` run, tests) the store's reads apply: a file's recorded
+/// source root, then the store's root.
 pub struct GraphSlices {
     store: Mutex<kgraf_graph::GraphStore>,
     budget_tokens: u64,
+    tree: Option<std::path::PathBuf>,
 }
 
 impl GraphSlices {
@@ -493,35 +540,103 @@ impl GraphSlices {
         Self {
             store: Mutex::new(store),
             budget_tokens,
+            tree: None,
         }
+    }
+
+    /// Read every slice from `tree`, the worker's own worktree
+    /// ([`kgraf_graph::GraphStore::source_of_in`]). The store's root is the
+    /// user's checkout: it can lack a file the worker's base holds, or hold one
+    /// (or a version) the worker's base does not, so a slice read there can
+    /// name code the worker cannot see.
+    pub fn with_tree(mut self, tree: impl Into<std::path::PathBuf>) -> Self {
+        self.tree = Some(tree.into());
+        self
+    }
+
+    /// The worker's tree, when it is set and exists. A tree that no longer
+    /// exists (the probe worktree a run's routes were built in, removed after
+    /// the build) says nothing about a file, so the store's reads apply.
+    fn live_tree(&self) -> Option<&std::path::Path> {
+        self.tree.as_deref().filter(|t| t.is_dir())
+    }
+
+    /// Why `node`'s slice could not be rendered, in words a reader can act on.
+    fn left_out_reason(&self, path: &str, error: &kgraf_graph::GraphError) -> String {
+        if self.live_tree().is_some() {
+            match error {
+                kgraf_graph::GraphError::Io { source, .. }
+                    if source.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    return format!("`{path}` is not in the worker's tree");
+                }
+                kgraf_graph::GraphError::StaleFile { .. } => {
+                    return format!(
+                        "the worker's tree holds another version of `{path}` than the graph \
+                         indexed"
+                    );
+                }
+                _ => {}
+            }
+        }
+        error_chain(error)
     }
 }
 
+/// An error and every cause under it, joined: `GraphError::Io` prints only the
+/// path, and the operating system's reason (not found, permission denied, too
+/// many open files) is its source.
+fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut cause = error.source();
+    while let Some(c) = cause {
+        text.push_str(": ");
+        text.push_str(&c.to_string());
+        cause = c.source();
+    }
+    text
+}
+
 impl SliceSource for GraphSlices {
-    fn render(&self, nodes: &[NodeId]) -> Result<Vec<RenderedSlice>, SliceError> {
+    fn render(&self, nodes: &[NodeId]) -> Result<SliceRendering, SliceError> {
         let store = self
             .store
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        nodes
-            .iter()
-            .map(|node| {
-                let fail = |reason: String| SliceError {
-                    node: node.to_string(),
-                    reason,
-                };
-                let record = store
-                    .node(node.as_str())
-                    .map_err(|e| fail(e.to_string()))?
-                    .ok_or_else(|| fail("no such node in the graph".into()))?;
-                let slice = kgraf_graph::slice::slice_for_node(&store, &record, self.budget_tokens)
-                    .map_err(|e| fail(e.to_string()))?;
-                Ok(RenderedSlice {
+        let tree = self.live_tree();
+        let mut rendering = SliceRendering::default();
+        for node in nodes {
+            let fail = |error: &kgraf_graph::GraphError| SliceError {
+                node: node.to_string(),
+                reason: error_chain(error),
+            };
+            let record = match store.node(node.as_str()) {
+                Ok(Some(record)) => record,
+                Ok(None) => {
+                    rendering.left_out.push(SliceLeftOut {
+                        node: node.clone(),
+                        path: String::new(),
+                        reason: "the graph no longer holds this node".into(),
+                    });
+                    continue;
+                }
+                Err(error) => return Err(fail(&error)),
+            };
+            match kgraf_graph::slice::slice_for_node_in(&store, &record, self.budget_tokens, tree) {
+                Ok(slice) => rendering.slices.push(RenderedSlice {
                     node: node.clone(),
                     text: slice_text(&record.path, slice.render()),
-                })
-            })
-            .collect()
+                }),
+                // The database failing is the graph failing, not this node.
+                Err(error @ kgraf_graph::GraphError::Sqlite(_)) => return Err(fail(&error)),
+                Err(error) => rendering.left_out.push(SliceLeftOut {
+                    node: node.clone(),
+                    reason: self.left_out_reason(&record.path, &error),
+                    path: record.path,
+                }),
+            }
+        }
+        Ok(rendering)
     }
 }
 
@@ -553,6 +668,36 @@ pub fn opening_messages(instruction: &str, slices: &[RenderedSlice]) -> Vec<Mess
         role: kgraf_provider::Role::User,
         content,
     }]
+}
+
+/// [`opening_messages`] for a rendering: its slices, then, when it left any
+/// node out, one block naming each with its file and reason, so the worker
+/// knows what the brief meant to give it and can read those files itself.
+pub fn opening_messages_with(instruction: &str, rendering: &SliceRendering) -> Vec<Message> {
+    let mut messages = opening_messages(instruction, &rendering.slices);
+    if let Some(notice) = left_out_notice(&rendering.left_out)
+        && let Some(first) = messages.first_mut()
+    {
+        first.content.push(Content::text(notice));
+    }
+    messages
+}
+
+/// The block [`opening_messages_with`] adds for left-out slices; `None` when
+/// none was left out.
+pub fn left_out_notice(left_out: &[SliceLeftOut]) -> Option<String> {
+    if left_out.is_empty() {
+        return None;
+    }
+    let mut text = String::from(
+        "// slices left out: the brief named these graph nodes, but they could not be read \
+         for your tree; read their files with your tools if you need them",
+    );
+    for item in left_out {
+        text.push_str("\n// - ");
+        text.push_str(&item.describe());
+    }
+    Some(text)
 }
 
 #[cfg(test)]
@@ -778,7 +923,7 @@ mod tests {
 
     #[test]
     fn no_slices_refuses_a_named_node_and_accepts_none() {
-        assert!(NoSlices.render(&[]).expect("none").is_empty());
+        assert!(NoSlices.render(&[]).expect("none").slices.is_empty());
         assert!(NoSlices.render(&[NodeId::new("n1")]).is_err());
     }
 
@@ -828,7 +973,8 @@ mod tests {
         let code = NodeId::new(id("src/lib.rs", "code"));
         let slices = GraphSlices::new(store, 2_000)
             .render(&[comms, code])
-            .expect("render");
+            .expect("render")
+            .slices;
         let quoted = &slices[0].text;
         assert!(quoted.starts_with(&format!("<slice_data path=\"{comms_rel}\">")));
         assert_eq!(quoted.matches("</slice_data>").count(), 1, "{quoted}");
@@ -837,5 +983,127 @@ mod tests {
             !slices[1].text.contains("<slice_data"),
             "code is not quoted"
         );
+    }
+
+    /// A checkout with two indexed files, and a worker's tree holding only
+    /// `src/kept.rs`, as a worktree at a base without `src/gone.rs` would.
+    fn two_files() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        kgraf_graph::GraphStore,
+    ) {
+        let dir = tempfile::tempdir().expect("dir");
+        let root = dir.path().join("checkout");
+        std::fs::create_dir_all(root.join("src")).expect("mkdir");
+        std::fs::write(
+            root.join("src/kept.rs"),
+            "pub fn kept() -> u8 {\n    7\n}\n",
+        )
+        .expect("w");
+        std::fs::write(root.join("src/gone.rs"), "pub fn gone() {}\n").expect("w");
+        let store = kgraf_graph::GraphStore::open_in_memory(&root).expect("graph");
+        kgraf_graph::Indexer::new(&store).index().expect("index");
+        let tree = dir.path().join("worker");
+        std::fs::create_dir_all(tree.join("src")).expect("mkdir");
+        std::fs::copy(root.join("src/kept.rs"), tree.join("src/kept.rs")).expect("copy");
+        (dir, tree, store)
+    }
+
+    fn node_named(store: &kgraf_graph::GraphStore, name: &str) -> NodeId {
+        NodeId::new(store.resolve_symbol(name).expect("resolve")[0].id.clone())
+    }
+
+    /// A node whose file is not in the worker's tree is left out with its
+    /// file and the reason, the other slice is rendered, and nothing fails;
+    /// the opening names what was left out.
+    #[test]
+    fn a_node_whose_file_is_not_in_the_workers_tree_is_left_out_by_name() {
+        let (_dir, tree, store) = two_files();
+        let kept = node_named(&store, "kept");
+        let gone = node_named(&store, "gone");
+        let rendering = GraphSlices::new(store, 2_000)
+            .with_tree(&tree)
+            .render(&[gone.clone(), kept.clone()])
+            .expect("a stale node does not fail the rendering");
+        assert_eq!(rendering.slices.len(), 1);
+        assert_eq!(rendering.slices[0].node, kept);
+        assert!(rendering.slices[0].text.contains("7"));
+        assert_eq!(
+            rendering.left_out,
+            vec![SliceLeftOut {
+                node: gone.clone(),
+                path: "src/gone.rs".into(),
+                reason: "`src/gone.rs` is not in the worker's tree".into(),
+            }]
+        );
+        let opening = opening_messages_with("do it", &rendering);
+        let notice = opening[0]
+            .content
+            .last()
+            .and_then(|c| c.as_text())
+            .expect("a notice block");
+        assert!(notice.contains("slices left out"), "{notice}");
+        assert!(
+            notice.contains(&format!("node `{gone}` in `src/gone.rs`")),
+            "{notice}"
+        );
+        // Nothing left out: no notice block.
+        assert!(left_out_notice(&[]).is_none());
+    }
+
+    /// The worker's tree is the one read: a file the checkout lost is still
+    /// rendered from the tree, and a version of the file there other than the
+    /// indexed one is left out rather than shown from the checkout.
+    #[test]
+    fn slices_are_read_from_the_workers_tree_not_the_checkout() {
+        let (dir, tree, store) = two_files();
+        let kept = node_named(&store, "kept");
+        std::fs::remove_file(dir.path().join("checkout/src/kept.rs")).expect("rm");
+        let slices = GraphSlices::new(store, 2_000).with_tree(&tree);
+        let rendering = slices.render(std::slice::from_ref(&kept)).expect("render");
+        assert!(rendering.left_out.is_empty(), "{:?}", rendering.left_out);
+        assert!(rendering.slices[0].text.contains("7"));
+
+        std::fs::write(
+            tree.join("src/kept.rs"),
+            "pub fn kept() -> u8 {\n    8\n}\n",
+        )
+        .expect("w");
+        let rendering = slices.render(std::slice::from_ref(&kept)).expect("render");
+        assert!(rendering.slices.is_empty());
+        assert!(
+            rendering.left_out[0]
+                .reason
+                .contains("holds another version of `src/kept.rs`"),
+            "{:?}",
+            rendering.left_out
+        );
+    }
+
+    /// Without a worker's tree the store's reads apply, and a file the
+    /// checkout lost is left out with the operating system's reason (the
+    /// cause `GraphError::Io` does not print), not an error; a node the graph
+    /// no longer holds is left out the same way.
+    #[test]
+    fn without_a_tree_an_unreadable_node_is_left_out_with_its_cause() {
+        let (dir, _tree, store) = two_files();
+        let gone = node_named(&store, "gone");
+        std::fs::remove_file(dir.path().join("checkout/src/gone.rs")).expect("rm");
+        let rendering = GraphSlices::new(store, 2_000)
+            .render(&[gone.clone(), NodeId::new("no-such-node")])
+            .expect("render");
+        assert!(rendering.slices.is_empty());
+        assert_eq!(rendering.left_out.len(), 2);
+        let reason = &rendering.left_out[0].reason;
+        assert!(
+            reason.starts_with("cannot read `src/gone.rs`: "),
+            "{reason}"
+        );
+        assert!(
+            reason.len() > "cannot read `src/gone.rs`: ".len(),
+            "{reason}"
+        );
+        assert_eq!(rendering.left_out[1].path, "");
+        assert!(rendering.left_out[1].reason.contains("no longer holds"));
     }
 }
