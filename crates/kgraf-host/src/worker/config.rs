@@ -33,8 +33,14 @@
 //! worker with a declared write scope runs these and no other command that can
 //! write. Each entry is one of `cargo build`, `cargo check`, `cargo test`,
 //! `cargo clippy` or `cargo fmt --check`, held to that subcommand's argument
-//! rules (`kgraf_tools::execpolicy::BuildAllowlist`); any other entry fails the
-//! load. Absent means those five; `[]` means none. An orchestrated run also
+//! rules (`kgraf_tools::execpolicy::BuildAllowlist`), or one of `npm test`
+//! (npm, pnpm and yarn test and build scripts, `npx` test runners), `pytest`,
+//! `go test` (go build, test and vet), `mvn test`, `gradle test` or
+//! `dotnet test`, held to that language's argument rules, none of which
+//! allows an install, a publish or a fetch; any other entry fails the load.
+//! Absent means all of them (amended 2026-10-06: cargo's five alone held
+//! every other language's worker without a way to test its work); `[]`
+//! means none. An orchestrated run also
 //! allows its own acceptance command (`--verify`) and each configured
 //! `--gate-command`, exactly as configured ([`WorkerConfig::with_configured_commands`]).
 //!
@@ -167,14 +173,14 @@ pub struct WorkerConfig {
     granted_programs: Vec<String>,
 }
 
-/// No MCP servers, no hard-linked reads, the cargo build and test allowlist,
+/// No MCP servers, no hard-linked reads, the standard build and test allowlist,
 /// and the 600 s shell timeout: what a project without a `worker.json` gets.
 impl Default for WorkerConfig {
     fn default() -> Self {
         Self {
             mcp_servers: Vec::new(),
             hardlink_reads: AllowedHardlinkReads::default(),
-            build_allowlist: BuildAllowlist::cargo_default(),
+            build_allowlist: BuildAllowlist::standard(),
             shell_timeout: kgraf_tools::shell::DEFAULT_TIMEOUT,
             granted_programs: Vec::new(),
         }
@@ -201,11 +207,11 @@ impl WorkerConfig {
                 }
             })?;
         let build_allowlist = match raw.build_commands {
-            None => BuildAllowlist::cargo_default(),
+            None => BuildAllowlist::standard(),
             Some(entries) => entries
                 .iter()
                 .try_fold(BuildAllowlist::empty(), |list, entry| {
-                    BuildAllowlist::parse_cargo_entry(entry)
+                    BuildAllowlist::parse_entry(entry)
                         .map(|command| list.with(command))
                         .map_err(|source| WorkerConfigError::BuildCommand {
                             path: path.to_path_buf(),
@@ -426,15 +432,30 @@ mod tests {
         );
     }
 
-    /// Decision 0084: absent `build_commands` is the cargo default, `[]` is
-    /// none, and a list is exactly its entries. That these reach the shell is
-    /// tested through `assemble` in `kgraf-host`'s tests.
+    /// Decision 0084: absent `build_commands` is the standard list (cargo's
+    /// five and every other language's), `[]` is none, and a list is exactly
+    /// its entries. That these reach the shell is tested through `assemble`
+    /// in `kgraf-host`'s tests.
     #[test]
     fn build_commands_parse_absent_empty_and_listed() {
-        use kgraf_tools::execpolicy::{BuildCommand, CargoSubcommand};
+        use kgraf_tools::execpolicy::{BuildCommand, CargoSubcommand, ToolCommand};
         assert_eq!(
             parse("{}").expect("valid").build_allowlist(),
-            &BuildAllowlist::cargo_default()
+            &BuildAllowlist::standard()
+        );
+        assert_eq!(
+            WorkerConfig::default().build_allowlist(),
+            &BuildAllowlist::standard()
+        );
+        let tools =
+            parse(r#"{"build_commands": ["npm test", "pytest", "go test"]}"#).expect("valid");
+        assert_eq!(
+            tools.build_allowlist().commands(),
+            &[
+                BuildCommand::Tool(ToolCommand::NodeScripts),
+                BuildCommand::Tool(ToolCommand::Pytest),
+                BuildCommand::Tool(ToolCommand::Go)
+            ]
         );
         assert!(
             parse(r#"{"build_commands": []}"#)
@@ -532,6 +553,7 @@ mod tests {
         };
         let message = source.to_string();
         assert!(message.contains("`cargo fmt --check`"), "{message}");
+        assert!(message.contains("`npm test`"), "{message}");
         assert!(!message.contains("exact argv"), "{message}");
     }
 }

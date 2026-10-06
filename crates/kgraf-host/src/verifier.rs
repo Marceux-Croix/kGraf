@@ -529,7 +529,12 @@ pub(crate) fn worker_notices(excluded: &[Excluded]) -> Vec<String> {
     let mut package = Vec::new();
     let mut output = Vec::new();
     let mut cache = Vec::new();
-    for e in excluded {
+    // The links kGraf made to the checkout's installed dependencies are
+    // neither the worker's files nor the check's.
+    for e in excluded
+        .iter()
+        .filter(|e| !kgraf_sandbox::is_dependency_link(&e.path))
+    {
         match e.kind {
             GeneratedKind::Lockfile => notices.push(format!(
                 "the worker's run generated {} (made by the worker), which the project does not \
@@ -592,6 +597,7 @@ pub(crate) fn check_notices(command: &str, left: &Leftovers, excluded: &[Exclude
         .iter()
         .map(PathBuf::as_path)
         .filter(|p| !excluded.iter().any(|e| e.path == *p))
+        .filter(|p| !kgraf_sandbox::is_dependency_link(p))
         .collect();
     let (locks, other): (Vec<&Path>, Vec<&Path>) = created
         .into_iter()

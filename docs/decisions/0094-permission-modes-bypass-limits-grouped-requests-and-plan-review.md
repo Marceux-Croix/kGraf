@@ -1227,7 +1227,7 @@ the command policy and the ask routing; `permissions_prefix_tests.rs`:
 `a_program_given_as_an_argument_is_found_and_named`). Each regression test fails with the change
 reverted and passes with it restored.
 
-## Amendment (2026-10-06): runners, Windows shells, git settings, commands named by a variable, recipes and interpreter code are read
+## Amendment (2026-10-06, second): runners, Windows shells, git settings, commands named by a variable, recipes and interpreter code are read
 
 **Why.** The amendment above left five ways to run a program past a rule, and one way for a
 grant to fall short. With `deny = ["shell(curl*)"]`, each of these ran `curl` in Bypass, and

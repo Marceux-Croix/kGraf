@@ -1110,6 +1110,13 @@ work and produces a remediation node. Because a gate is itself a node, a
 failing gate is already a blocking node with a visible edge to what it holds
 up, needing no separate state model.
 
+Discovery takes `cargo test --workspace`, `npm test`, `python3 -m pytest`,
+`go test ./...`, `mvn -o test`, `./gradlew test --offline` or `gradle test --offline`,
+`dotnet test` and `make test` from
+the project's build files, each only when its tool is on `PATH` and the project's
+dependencies are installed; a gate that could not pass on correct work is left out, and
+the run says why and what to run (decision 0018, amended 2026-10-06).
+
 The discovered commands cover the whole project (`cargo test --workspace`),
 so a gate over part of the plan also runs tests of parts not built yet. When
 a gate below the root fails, the same commands run once per run at the
@@ -1381,9 +1388,26 @@ over the target the contract is dispatched unsplit, with a notice that gives
 the numbers. **Not built yet:** reindexing triggered directly by a worker's
 edits before its merge is accepted.
 
+A worker builds and tests its own work, in any supported language, against
+the dependencies the user installed. Each installed tree in the checkout
+(`node_modules/`, Yarn's Plug'n'Play files, a `.venv/` with its `pyvenv.cfg`,
+`vendor/`) is linked into the worktree, gate worktree or contract-check tree at
+the same place, and the sandbox lets a command read and run programs from it,
+never write it (`kgraf_sandbox::link_dependency_trees`,
+`SandboxPolicy::with_dependency_links`); a workspace install's links to its own
+packages resolve to the tree's copies, and the virtual environment of the folder a
+command works in is activated. Every check runs with a temporary folder of its own, so
+tool settings a worker left in its scratch folder never reach it. The package stores in the home folder (`~/.m2/repository`,
+`~/.gradle/caches`, `~/.nuget/packages`, `~/go/pkg/mod`, `~/.npm`,
+`~/.cargo/registry`, ...) are readable and their configuration and credential
+files are not. Other package managers are not fetched for: a missing install is
+named, with its command, at run start and after a failing check or gate
+(`kgraf_host::deps::installs`; decisions 0084 and 0087, amended 2026-10-06).
+
 A worker builds and tests its own work. A declared allowlist of build and
-test commands runs without approval in the sandbox with the network off
-(decision 0084); under a write scope nothing else that can write runs, unless
+test commands (cargo's, and each other language's test and build commands,
+never an install or a publish) runs without approval in the sandbox with the
+network off (decision 0084); under a write scope nothing else that can write runs, unless
 the user's permission mode grants it. A command line sent as one string is
 split into its words when it holds no shell syntax, and every check judges the
 split argv; one with shell syntax is refused with the way to write it. Workers

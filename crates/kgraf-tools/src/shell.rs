@@ -1132,10 +1132,21 @@ impl Tool for ShellTool {
                 output
             });
         }
-        let (mut policy, env) =
+        let (mut policy, env, notes) =
             sandbox_policy(ctx, self.workspace.as_ref(), self.checkout.as_deref())?;
         for dir in &self.read_denies {
             policy = policy.deny_read(dir.clone());
+        }
+        // `sh -c 'cd svc/api && python -m pytest'` runs with the virtual
+        // environment of `svc/api` (decision 0084, amended 2026-10-06). Unix
+        // only: Windows links no virtual environment.
+        #[cfg(unix)]
+        if let [shell, flag, script] = cmd.as_slice()
+            && matches!(basename(shell), "sh" | "bash")
+            && flag == "-c"
+            && let Some(dir) = kgraf_sandbox::script_start_dir(script)
+        {
+            policy = policy.with_command_dir(ctx.workspace_root.join(dir));
         }
         // Held across the command's whole run, not only its spawn: the slot
         // exists to bound how many builds and tests run at once, which is
@@ -1213,7 +1224,16 @@ impl Tool for ShellTool {
             }
         }
         register_named_secrets_files(&cmd, &ctx.workspace_root);
-        let output = run_sandboxed(&cmd, ctx, &policy, &env, self.timeout, self.output_cap).await;
+        let output = run_sandboxed(
+            &cmd,
+            ctx,
+            &policy,
+            &env,
+            &notes,
+            self.timeout,
+            self.output_cap,
+        )
+        .await;
         let output = match output {
             Ok(out) if window.is_some() => Ok(with_frozen_config_note(out)),
             other => other,
@@ -1695,14 +1715,20 @@ fn scrub_build_output(mut output: ToolOutput) -> ToolOutput {
 /// Environment a command gets on top of the sandbox's scrubbed environment.
 type ExtraEnv = Vec<(&'static str, std::ffi::OsString)>;
 
-/// The sandbox policy for one call, and the environment it adds: the bound
-/// workspace's (with `CARGO_TARGET_DIR`), or the narrower fallback built from
-/// the context's root (see the module docs).
+/// The sandbox policy for one call, the environment it adds, and notes to
+/// show after a failing command: the bound workspace's (with
+/// `CARGO_TARGET_DIR`), or the narrower fallback built from the context's
+/// root (see the module docs).
+///
+/// With a checkout, its installed dependency trees (`node_modules/`, a
+/// `.venv/`, `vendor/`) are linked into the worktree and readable, never
+/// writable (`kgraf_sandbox::link_dependency_trees`, decision 0084 amended
+/// 2026-10-06); a tree that could not be linked is a note.
 fn sandbox_policy(
     ctx: &ToolContext,
     workspace: Option<&Workspace>,
     checkout: Option<&std::path::Path>,
-) -> Result<(SandboxPolicy, ExtraEnv), ToolError> {
+) -> Result<(SandboxPolicy, ExtraEnv, Vec<String>), ToolError> {
     match workspace {
         Some(ws) => {
             // `Workspace::root` is canonical; compare against the canonical
@@ -1720,13 +1746,15 @@ fn sandbox_policy(
                     root.display()
                 )));
             }
+            let links = checkout.map(|root| kgraf_sandbox::link_dependency_trees(ws.root(), root));
             Ok((
                 // The checkout's cargo files above the worktree, and no
                 // further (Linux; see `with_ancestor_reads`).
-                match checkout {
-                    Some(root) => SandboxPolicy::for_workspace(ws, Network::Deny)
-                        .with_ancestor_reads(root.to_path_buf()),
-                    None => SandboxPolicy::for_workspace(ws, Network::Deny),
+                match (checkout, &links) {
+                    (Some(root), Some(links)) => SandboxPolicy::for_workspace(ws, Network::Deny)
+                        .with_ancestor_reads(root.to_path_buf())
+                        .with_dependency_links(links),
+                    _ => SandboxPolicy::for_workspace(ws, Network::Deny),
                 },
                 vec![
                     (
@@ -1739,6 +1767,7 @@ fn sandbox_policy(
                     // fails; with it, cargo resolves from the local cache at once.
                     ("CARGO_NET_OFFLINE", "true".into()),
                 ],
+                links.map(|l| l.notes).unwrap_or_default(),
             ))
         }
         None => {
@@ -1748,6 +1777,7 @@ fn sandbox_policy(
             Ok((
                 SandboxPolicy::new(vec![ctx.workspace_root.clone()], Network::Deny)
                     .with_tmp_dir(scratch),
+                Vec::new(),
                 Vec::new(),
             ))
         }
@@ -1760,6 +1790,7 @@ async fn run_sandboxed(
     ctx: &ToolContext,
     policy: &SandboxPolicy,
     env: &ExtraEnv,
+    notes: &[String],
     timeout: Duration,
     output_cap: usize,
 ) -> Result<ToolOutput, ToolError> {
@@ -1809,7 +1840,8 @@ async fn run_sandboxed(
 
     // Named after a failing command's output: cargo's
     // "Permission denied" alone does not say why a file was refused.
-    let refused = sandboxed.refused_reads().to_vec();
+    let mut refused = sandboxed.refused_reads().to_vec();
+    refused.extend(notes.iter().cloned());
     let (std_cmd, _probe) = sandboxed.into_parts();
     let mut tokio_cmd = tokio::process::Command::from(std_cmd);
     tokio_cmd.kill_on_drop(true);
@@ -2072,6 +2104,7 @@ async fn run_sandboxed(
     _ctx: &ToolContext,
     _policy: &SandboxPolicy,
     _env: &ExtraEnv,
+    _notes: &[String],
     _timeout: Duration,
     _output_cap: usize,
 ) -> Result<ToolOutput, ToolError> {
@@ -3868,6 +3901,81 @@ mod tests {
                     .expect_err("refused before it runs");
                 assert!(err.to_string().contains(needle), "{argv:?}: {err}");
             }
+        }
+
+        /// Decision 0084, amended 2026-10-06: a worker on an npm project runs
+        /// `npm test` unasked (the standard list), and the test finds the
+        /// package the user installed in the checkout's `node_modules`,
+        /// linked into the worktree and readable in the sandbox. Before, the
+        /// command was off the list, and the checkout was unreadable.
+        #[cfg(target_os = "macos")]
+        #[tokio::test]
+        async fn a_worker_s_npm_test_finds_the_checkout_s_installed_package() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let repo = tmp.path().join("repo");
+            std::fs::create_dir_all(&repo).expect("repo");
+            std::fs::write(
+                repo.join("package.json"),
+                r#"{"name":"fx","private":true,"scripts":{"test":"node -e \"process.exit(require('dep').answer === 42 ? 0 : 1)\""}}"#,
+            )
+            .expect("package.json");
+            std::fs::write(repo.join(".gitignore"), "node_modules/\n").expect("ignore");
+            git(&repo, &["init", "-q", "-b", "main"]);
+            git(&repo, &["add", "."]);
+            git(
+                &repo,
+                &[
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "commit",
+                    "-q",
+                    "-m",
+                    "init",
+                ],
+            );
+            std::fs::create_dir_all(repo.join("node_modules/dep")).expect("dep");
+            std::fs::write(
+                repo.join("node_modules/dep/index.js"),
+                "module.exports = { answer: 42 };\n",
+            )
+            .expect("index.js");
+            let manager = WorkspaceManager::open(&repo, &tmp.path().join("ws")).expect("manager");
+            let ws = manager
+                .create(&WorkspaceSpec {
+                    name: "w",
+                    base: "HEAD",
+                    branch: None,
+                })
+                .expect("worktree");
+            let policy =
+                ExecPolicy::default_kgraf_policy().with_build_allowlist(BuildAllowlist::standard());
+            let (tool, hook) = ShellTool::new(policy);
+            let tool = tool
+                .with_workspace(ws.clone())
+                .with_checkout(std::fs::canonicalize(&repo).expect("canonical"));
+            assert_eq!(
+                hook.review(&pending(&["npm", "test"])).await,
+                HookDecision::Allow
+            );
+            let out = tool
+                .call(
+                    call_input(&["npm", "test"]),
+                    &ctx(ws.root().to_path_buf()),
+                    &CallPermit::new(),
+                )
+                .await
+                .expect("ran");
+            let is_error = out.is_error;
+            let rendered = out.render();
+            assert!(!is_error, "{rendered}");
+            assert!(
+                std::fs::symlink_metadata(ws.root().join("node_modules"))
+                    .expect("link")
+                    .file_type()
+                    .is_symlink()
+            );
         }
 
         /// The allowlisted build runs in the sandbox with the network off:

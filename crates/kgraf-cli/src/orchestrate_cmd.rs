@@ -205,6 +205,9 @@ fn notice_line(n: &Notice) -> String {
             "deps       the offline dependency check could not decide, so nothing was fetched: \
              {why}"
         ),
+        Notice::DependenciesNotInstalled(missing) => {
+            format!("deps       not installed: {}", missing.join("; "))
+        }
         Notice::GateCommands(commands) if commands.is_empty() => {
             "gates      none: no test command was configured or found, so the run has no quality \
              gate"

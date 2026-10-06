@@ -286,7 +286,25 @@ pub fn dirty_paths(root: &Path, at_start: &GitEntry) -> Result<TreeStatus, Strin
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    Ok(parse_porcelain_z(&output.stdout))
+    let mut status = parse_porcelain_z(&output.stdout);
+    // The links kGraf makes to the checkout's installed dependencies
+    // (`kgraf_sandbox::link_dependency_trees`) are not the worker's changes.
+    // A `node_modules` kGraf made as a folder of links (a workspace install,
+    // `kgraf_sandbox::MIRROR_MARK`) is not theirs either: its mark and links.
+    let in_mirror = |p: &Path| {
+        p.ancestors().skip(1).any(|dir| {
+            !dir.as_os_str().is_empty()
+                && kgraf_sandbox::is_dependency_link(dir)
+                && root.join(dir).join(kgraf_sandbox::MIRROR_MARK).is_file()
+        }) && std::fs::symlink_metadata(root.join(p))
+            .is_ok_and(|m| m.file_type().is_symlink() || p.ends_with(kgraf_sandbox::MIRROR_MARK))
+    };
+    let is_link = |p: &Path| {
+        kgraf_sandbox::is_dependency_link(p)
+            && std::fs::symlink_metadata(root.join(p)).is_ok_and(|m| m.file_type().is_symlink())
+    };
+    status.paths.retain(|p| !(is_link(p) || in_mirror(p)));
+    Ok(status)
 }
 
 /// Parse `git status --porcelain=v1 -z`: entries are `XY path` separated by NUL,
@@ -371,6 +389,53 @@ mod tests {
         let status = dirty_paths(&wt, &at_start).expect("status");
         assert_eq!(status.nested_repositories, vec![PathBuf::from("vendored")]);
         assert_eq!(status.paths, vec![PathBuf::from("vendored")]);
+    }
+
+    /// A link kGraf made to the checkout's `node_modules` is not one of the
+    /// worker's changes; a folder or file the worker wrote is.
+    #[cfg(unix)]
+    #[test]
+    fn a_dependency_link_is_not_a_change_of_the_worker() {
+        let dir = tempfile::tempdir().expect("dir");
+        let repo = dir.path().join("repo");
+        let wt = dir.path().join("wt");
+        linked_worktree(&repo, &wt, |r| {
+            std::fs::write(r.join("package.json"), "{}").expect("package.json");
+            git(r, &["add", "package.json"]);
+        });
+        let at_start = git_entry(&wt).expect("entry");
+        let installed = dir.path().join("installed");
+        std::fs::create_dir_all(&installed).expect("installed");
+        std::os::unix::fs::symlink(&installed, wt.join("node_modules")).expect("link");
+        std::fs::write(wt.join("b.txt"), "b").expect("write");
+        let status = dirty_paths(&wt, &at_start).expect("status");
+        assert_eq!(status.paths, vec![PathBuf::from("b.txt")]);
+    }
+
+    /// The folder of links kGraf makes for a workspace install, in a tree
+    /// whose `.gitignore` does not name `node_modules`: its mark and links
+    /// are not the worker's changes; a file the worker wrote there is.
+    #[cfg(unix)]
+    #[test]
+    fn a_dependency_mirror_is_not_a_change_of_the_worker() {
+        let dir = tempfile::tempdir().expect("dir");
+        let repo = dir.path().join("repo");
+        let wt = dir.path().join("wt");
+        linked_worktree(&repo, &wt, |r| {
+            std::fs::write(r.join("package.json"), "{}").expect("package.json");
+            git(r, &["add", "package.json"]);
+        });
+        let at_start = git_entry(&wt).expect("entry");
+        let installed = dir.path().join("installed");
+        std::fs::create_dir_all(&installed).expect("installed");
+        let nm = wt.join("node_modules");
+        std::fs::create_dir_all(nm.join("@s")).expect("mkdir");
+        std::fs::write(nm.join(kgraf_sandbox::MIRROR_MARK), "1").expect("mark");
+        std::os::unix::fs::symlink(&installed, nm.join("dep")).expect("link");
+        std::os::unix::fs::symlink("../../packages/web", nm.join("@s/web")).expect("link");
+        std::fs::write(nm.join("own.js"), "x").expect("write");
+        let status = dirty_paths(&wt, &at_start).expect("status");
+        assert_eq!(status.paths, vec![PathBuf::from("node_modules/own.js")]);
     }
 
     #[cfg(target_os = "linux")]

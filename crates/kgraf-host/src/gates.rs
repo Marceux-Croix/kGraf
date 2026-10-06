@@ -22,9 +22,12 @@ use std::time::Duration;
 ///
 /// A gate that does not apply is said on stderr, never dropped silently: the
 /// pytest gate is left out, with the reason, when the project has Python
-/// tests but neither declares pytest nor has it importable; the `npm test`
-/// gate is left out when the test script is the one `npm init` writes, which
-/// only fails.
+/// tests and pytest is in neither its virtual environment nor the
+/// interpreter; the `npm test` gate is left out when the test script is the
+/// one `npm init` writes, which only fails. A gate whose dependencies are not
+/// installed is left out with the install it needs and the command that
+/// makes it (decision 0087, amended 2026-10-06), and so is a gate whose tool
+/// is not on `PATH`: either would fail every correct project.
 pub fn discover_validation_commands(root: &Path, configured: &[String]) -> Result<Vec<String>> {
     let (found, notes) = discover_with(root, configured, &pytest_importable)?;
     for note in notes {
@@ -40,7 +43,7 @@ fn python_program() -> &'static str {
 }
 
 /// Whether the interpreter can import pytest.
-fn pytest_importable() -> bool {
+pub(crate) fn pytest_importable() -> bool {
     std::process::Command::new(python_program())
         .args(["-c", "import pytest"])
         .stdin(std::process::Stdio::null())
@@ -50,6 +53,47 @@ fn pytest_importable() -> bool {
         .is_ok_and(|s| s.success())
 }
 
+/// Whether `program` is an executable file in a folder of `PATH`. The gate
+/// runs with the host's `PATH`, so a tool that is not there fails the gate.
+pub(crate) fn on_path(program: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    let names: Vec<String> = if cfg!(windows) {
+        ["exe", "cmd", "bat"]
+            .iter()
+            .map(|ext| format!("{program}.{ext}"))
+            .collect()
+    } else {
+        vec![program.to_owned()]
+    };
+    std::env::split_paths(&path).any(|dir| {
+        names.iter().any(|n| {
+            let file = dir.join(n);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::metadata(&file)
+                    .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            }
+            #[cfg(not(unix))]
+            {
+                file.is_file()
+            }
+        })
+    })
+}
+
+/// What gate discovery asks of the machine, injected so tests decide it.
+pub(crate) struct GateProbes<'a> {
+    /// The host interpreter imports pytest.
+    pub(crate) pytest_importable: &'a dyn Fn() -> bool,
+    /// A program is on `PATH` ([`on_path`]).
+    pub(crate) on_path: &'a dyn Fn(&str) -> bool,
+    /// Where the package stores are.
+    pub(crate) env: crate::deps::InstallEnv,
+}
+
 /// [`discover_validation_commands`] with the pytest import probe injected,
 /// returning the commands and a note for each gate that does not apply.
 pub(crate) fn discover_with(
@@ -57,11 +101,55 @@ pub(crate) fn discover_with(
     configured: &[String],
     pytest_importable: &dyn Fn() -> bool,
 ) -> Result<(Vec<String>, Vec<String>)> {
+    discover_probed(
+        root,
+        configured,
+        &GateProbes {
+            pytest_importable,
+            on_path: &on_path,
+            env: crate::deps::InstallEnv::current(),
+        },
+    )
+}
+
+/// [`discover_with`] with every probe injected.
+pub(crate) fn discover_probed(
+    root: &Path,
+    configured: &[String],
+    probes: &GateProbes<'_>,
+) -> Result<(Vec<String>, Vec<String>)> {
+    use crate::deps::Ecosystem;
+    use crate::deps::installs::{GRADLE_FILES, is_dotnet_project};
     if !configured.is_empty() {
         return Ok((configured.to_vec(), Vec::new()));
     }
     let mut notes = Vec::new();
     let mut found = Vec::new();
+    // Read once: the check walks the project and may ask the interpreter
+    // whether it imports pytest.
+    let all_missing = crate::deps::missing_installs(root, &probes.env, probes.pytest_importable);
+    // A root gate needs its ecosystem's root installs; a .NET solution needs
+    // every project restored, wherever it is.
+    let missing = |ecosystem: Ecosystem| -> Vec<crate::deps::MissingInstall> {
+        all_missing
+            .iter()
+            .filter(|m| {
+                m.ecosystem == ecosystem
+                    && (ecosystem == Ecosystem::Dotnet || m.dir.as_os_str().is_empty())
+            })
+            .cloned()
+            .collect()
+    };
+    let not_installed = |gate: &str, missing: &[crate::deps::MissingInstall]| {
+        let sentences: Vec<String> = missing.iter().map(|m| m.sentence()).collect();
+        format!("{gate} gate not applicable: {}", sentences.join("; "))
+    };
+    let not_on_path = |gate: &str, program: &str| {
+        format!(
+            "{gate} gate not applicable: `{program}` is not on PATH, so the gate could not \
+             run; install it or set gate commands"
+        )
+    };
     if root.join("Cargo.toml").is_file() {
         found.push("cargo test --workspace".to_owned());
     }
@@ -80,23 +168,106 @@ pub(crate) fn discover_with(
                  test script",
                 package.display()
             )),
-            Some(_) => found.push("npm test".to_owned()),
+            Some(_) => {
+                let missing = missing(Ecosystem::Npm);
+                if missing.is_empty() {
+                    found.push("npm test".to_owned());
+                } else {
+                    notes.push(not_installed("npm test", &missing));
+                }
+            }
             None => {}
         }
     }
     // A pyproject.toml alone is also what a Rust or Node project keeps its
     // tooling in (a formatter, a docs build): the pytest gate needs Python
-    // tests, or a pytest configuration, to be plausible.
+    // tests, or a pytest configuration, to be plausible. The command is the
+    // same with a virtual environment: the sandbox activates the root one,
+    // so `python3` is its interpreter.
     if has_python_tests(root) {
-        if pytest_declared(root) || pytest_importable() {
+        let missing = missing(Ecosystem::Python);
+        if !missing.is_empty() {
+            notes.push(format!(
+                "pytest gate not applicable: {} has Python tests and names pytest, but pytest \
+                 is in neither its virtual environment nor `{}`. {}",
+                root.display(),
+                python_program(),
+                not_installed("pytest", &missing)
+            ));
+        } else if crate::deps::installs::pytest_available(root, probes.pytest_importable) {
             found.push(format!("{} -m pytest", python_program()));
         } else {
             notes.push(format!(
-                "pytest gate not applicable: {} has Python tests, but pytest is neither declared \
-                 in its build files nor importable by `{}`; set gate commands to run them",
+                "pytest gate not applicable: {} has Python tests, but pytest is neither named \
+                 in its build files nor installed for `{}`; set gate commands to run them",
                 root.display(),
                 python_program()
             ));
+        }
+    }
+    if root.join("go.mod").is_file() {
+        let missing = missing(Ecosystem::Go);
+        if !(probes.on_path)("go") {
+            notes.push(not_on_path("go test", "go"));
+        } else if !missing.is_empty() {
+            notes.push(not_installed("go test", &missing));
+        } else {
+            found.push("go test ./...".to_owned());
+        }
+    }
+    if root.join("pom.xml").is_file() {
+        let missing = missing(Ecosystem::Maven);
+        if !(probes.on_path)("mvn") {
+            notes.push(not_on_path("Maven", "mvn"));
+        } else if !missing.is_empty() {
+            notes.push(not_installed("Maven", &missing));
+        } else {
+            // Offline: the network is off in the sandbox, and Maven would
+            // otherwise try the remote repositories before it fails.
+            found.push("mvn -o test".to_owned());
+        }
+    }
+    if GRADLE_FILES.iter().any(|f| root.join(f).is_file()) {
+        let missing = missing(Ecosystem::Gradle);
+        if root.join("gradlew").is_file() {
+            match gradle_wrapper_gate(root, probes.env.home.as_deref()) {
+                Ok(()) if missing.is_empty() => found.push("./gradlew test --offline".to_owned()),
+                Ok(()) => notes.push(not_installed("Gradle", &missing)),
+                Err(why) => notes.push(format!("Gradle gate not applicable: {why}")),
+            }
+        } else if !(probes.on_path)("gradle") {
+            notes.push(not_on_path("Gradle", "gradle"));
+        } else if !missing.is_empty() {
+            notes.push(not_installed("Gradle", &missing));
+        } else {
+            found.push("gradle test --offline".to_owned());
+        }
+    }
+    let dotnet_root = std::fs::read_dir(root).ok().is_some_and(|entries| {
+        entries.flatten().any(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            name.ends_with(".sln") || name.ends_with(".slnx") || is_dotnet_project(&name)
+        })
+    });
+    if dotnet_root {
+        let missing = missing(Ecosystem::Dotnet);
+        let packages = probes
+            .env
+            .home
+            .as_ref()
+            .is_some_and(|h| h.join(".nuget/packages").is_dir());
+        if !(probes.on_path)("dotnet") {
+            notes.push(not_on_path(".NET", "dotnet"));
+        } else if !missing.is_empty() {
+            notes.push(not_installed(".NET", &missing));
+        } else if !packages {
+            notes.push(
+                ".NET gate not applicable: there is no NuGet package folder \
+                 (~/.nuget/packages); run `dotnet restore` in the project root"
+                    .to_owned(),
+            );
+        } else {
+            found.push("dotnet test".to_owned());
         }
     }
     for name in ["Makefile", "makefile", "GNUmakefile"] {
@@ -113,37 +284,52 @@ pub(crate) fn discover_with(
     Ok((found, notes))
 }
 
+/// Whether the Gradle wrapper of the project at `root` can run offline in
+/// the sandbox: its distribution is unpacked in the user's Gradle home, from
+/// which the command's own Gradle home reaches it read-only
+/// (`kgraf_sandbox::gradle_wrapper`). `Err` says why not, and what to do.
+fn gradle_wrapper_gate(root: &Path, home: Option<&Path>) -> std::result::Result<(), String> {
+    use kgraf_sandbox::gradle_wrapper::{installed_distributions, wrapper_distribution};
+    if cfg!(windows) {
+        return Err(
+            "the Gradle wrapper's distribution is not made reachable from the \
+                    command's Gradle home on Windows; set gate commands to run Gradle another \
+                    way"
+            .to_owned(),
+        );
+    }
+    let Some(name) = wrapper_distribution(root) else {
+        return Err(format!(
+            "{} names no Gradle distribution the wrapper can use (distributionUrl); set gate \
+             commands to run Gradle another way",
+            root.join("gradle/wrapper/gradle-wrapper.properties")
+                .display()
+        ));
+    };
+    let unpacked =
+        home.is_some_and(|h| !installed_distributions(&h.join(".gradle"), &name).is_empty());
+    if unpacked {
+        Ok(())
+    } else {
+        Err(format!(
+            "the Gradle wrapper's distribution {name} is not unpacked in \
+             ~/.gradle/wrapper/dists; run `./gradlew --version` once in the project root, with \
+             the network on"
+        ))
+    }
+}
+
 /// Whether `script` is the test script `npm init` writes,
 /// `echo "Error: no test specified" && exit 1`, in any quoting.
 fn is_npm_init_test(script: &str) -> bool {
     script.contains("no test specified") && script.contains("exit 1")
 }
 
-/// Whether the project's Python build files name pytest (a dependency, a
-/// test extra, a configuration section).
-fn pytest_declared(root: &Path) -> bool {
-    root.join("pytest.ini").is_file()
-        || [
-            "pyproject.toml",
-            "setup.py",
-            "setup.cfg",
-            "tox.ini",
-            "requirements.txt",
-            "requirements-dev.txt",
-            "requirements-test.txt",
-        ]
-        .iter()
-        .any(|f| {
-            std::fs::read_to_string(root.join(f))
-                .is_ok_and(|t| t.to_ascii_lowercase().contains("pytest"))
-        })
-}
-
 /// Whether the project at `root` has Python tests: a `tests` or `test` folder
 /// holding a `test_*.py` or `*_test.py` file (searched a few levels down), or
 /// a pytest configuration (`pytest.ini`, `[tool.pytest` in `pyproject.toml`,
 /// `[tool:pytest]` in `setup.cfg`, `[pytest]` in `tox.ini`).
-fn has_python_tests(root: &Path) -> bool {
+pub(crate) fn has_python_tests(root: &Path) -> bool {
     let configured = |file: &str, marker: &str| {
         std::fs::read_to_string(root.join(file)).is_ok_and(|t| t.contains(marker))
     };
@@ -287,6 +473,34 @@ fn tail(text: &str, cap: usize) -> String {
     format!("[{} bytes cut]\n{}", start, &text[start..])
 }
 
+/// A check's own temporary folder inside a workspace's scratch folder,
+/// removed when dropped. Its name is new for every check and it is made
+/// with `create_dir`, which fails on anything already there, so nothing the
+/// worker left in the scratch folder (a file, a folder, a link) becomes it.
+/// Removal never follows a link inside it.
+struct CheckScratch(PathBuf);
+
+impl CheckScratch {
+    fn create(scratch: &Path) -> std::result::Result<Self, String> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = scratch.join(format!("check-{}-{}-{n}", std::process::id(), now_nanos()));
+        std::fs::create_dir(&dir)
+            .map_err(|e| format!("cannot make the check's folder {}: {e}", dir.display()))?;
+        Ok(Self(dir))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for CheckScratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// Run one command confined to `ws`, output to a log in its scratch directory,
 /// killed after `timeout`. Returns (success, output tail).
 ///
@@ -314,6 +528,14 @@ fn tail(text: &str, cap: usize) -> String {
 /// it, and those reads stop there (Linux; `with_ancestor_reads`). A cargo
 /// file there that the sandbox refused is named, with its cause, after a
 /// failing command's output.
+///
+/// The checkout's installed dependency trees (`node_modules/`, a `.venv/`,
+/// `vendor/`) are linked into the worktree and readable, never writable
+/// (`kgraf_sandbox::link_dependency_trees`, decision 0084 amended
+/// 2026-10-06). After a failing command's output come a tree that could not
+/// be linked, and each install the project needs and lacks, with the command
+/// that makes it ([`crate::deps::installs`]): "Cannot find module" alone
+/// reads like a fault in the work.
 pub(crate) fn run_confined(
     ws: &Workspace,
     checkout: &Path,
@@ -322,15 +544,29 @@ pub(crate) fn run_confined(
     timeout: Duration,
     cap: usize,
 ) -> std::result::Result<(bool, String), String> {
-    let mut policy =
-        SandboxPolicy::for_workspace(ws, Network::Deny).with_ancestor_reads(checkout.to_path_buf());
+    let links = kgraf_sandbox::link_dependency_trees(ws.root(), checkout);
+    // A temporary folder of the check's own, not the workspace's scratch
+    // folder: that one is the worker's `TMPDIR`, and tool settings the worker
+    // left there (npm's `.npmrc`, a Gradle or .NET home, a Go build cache,
+    // Python bytecode) would otherwise steer the check, up to a forged pass.
+    let tmp = CheckScratch::create(ws.scratch())?;
+    let mut policy = SandboxPolicy::for_workspace(ws, Network::Deny)
+        .with_tmp_dir(tmp.path().to_path_buf())
+        .with_ancestor_reads(checkout.to_path_buf())
+        .with_dependency_links(&links);
     for d in denies {
         policy = policy.deny_read(d.clone());
+    }
+    // `cd svc/api && python -m pytest` runs with the virtual environment of
+    // `svc/api`, the folder it works in.
+    if let Some(dir) = kgraf_sandbox::script_start_dir(command) {
+        policy = policy.with_command_dir(ws.root().join(dir));
     }
     let log = ws.scratch().join(format!("gate-{}.log", now_nanos()));
     let mut cmd = sandboxed_command(&policy, "sh", ws.root())
         .map_err(|e| format!("cannot sandbox `{command}`: {e}"))?;
-    let refused = refused_note(cmd.refused_reads());
+    let mut refused = refused_note(cmd.refused_reads());
+    refused.push_str(&refused_note(&links.notes));
     // The log path goes through the environment, never through the shell's
     // parser, so a path with spaces or quotes cannot change the command.
     cmd.args(["-c", &format!("exec >\"$KGRAF_GATE_LOG\" 2>&1\n{command}")])
@@ -339,7 +575,7 @@ pub(crate) fn run_confined(
         // Python bytecode goes to scratch, outside the worktree, as cargo's build
         // output does: an import in the check writes no `__pycache__` into the
         // tree (and none that the worker's run left is read: it was removed).
-        .env("PYTHONPYCACHEPREFIX", ws.scratch().join("pycache"))
+        .env("PYTHONPYCACHEPREFIX", tmp.path().join("pycache"))
         .stdin(Redirect::Null)
         .stdout(Redirect::Null)
         .stderr(Redirect::Null);
@@ -418,6 +654,7 @@ pub(crate) fn run_confined(
             text = format!("$ {command}\n{text}\n[{s}]");
             if !s.success() {
                 text.push_str(&refused);
+                text.push_str(&missing_installs_note(checkout));
             }
             Ok((s.success(), text))
         }
@@ -429,6 +666,21 @@ pub(crate) fn run_confined(
             ),
         )),
     }
+}
+
+/// Each install the checkout needs and lacks, as lines to append to a
+/// failing command's output, or nothing. Read only after a failure: the
+/// check reads manifests and folders and costs a walk of the checkout.
+fn missing_installs_note(checkout: &Path) -> String {
+    let missing = crate::deps::missing_installs(
+        checkout,
+        &crate::deps::InstallEnv::current(),
+        &pytest_importable,
+    );
+    missing
+        .iter()
+        .map(|m| format!("\n[dependencies] {}", m.sentence()))
+        .collect()
 }
 
 /// The sandbox's refused ancestor reads as lines to append to a failing

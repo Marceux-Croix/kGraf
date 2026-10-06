@@ -1680,3 +1680,45 @@ async fn a_base_that_does_not_build_or_a_check_that_cannot_run_gives_no_verdict(
         other => panic!("the program is missing: {other:?}"),
     }
 }
+
+/// Decision 0084, amended 2026-10-06: a contract check's tree is the base
+/// commit, so it has none of the dependencies the user installed in the
+/// checkout. They are linked into it and readable: a check that needs a
+/// package from the checkout's `node_modules` finds it, and the base's own
+/// install is untouched after the run. Real `node`, macOS.
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_check_finds_a_package_the_user_installed_in_the_checkout() {
+    let dir = tempfile::tempdir().expect("dir");
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("mkdir");
+    std::fs::write(repo.join("package.json"), r#"{"name":"fx","private":true}"#).expect("w");
+    std::fs::write(repo.join(".gitignore"), "node_modules/\n").expect("w");
+    commit_all(&repo);
+    std::fs::create_dir_all(repo.join("node_modules/dep")).expect("mkdir");
+    std::fs::write(
+        repo.join("node_modules/dep/index.js"),
+        "module.exports = { answer: 42 };\n",
+    )
+    .expect("w");
+    let r = runner_with(
+        dir.path(),
+        &repo,
+        vec![state_dir(dir.path())],
+        Duration::from_secs(60),
+    );
+    let argv: Vec<String> = [
+        "node",
+        "-e",
+        "process.exit(require('dep').answer === 42 ? 0 : 1)",
+    ]
+    .iter()
+    .map(|a| (*a).to_owned())
+    .collect();
+    let ran = r.run(&[], &argv).await.expect("ran");
+    assert!(ran.success, "{}", ran.tail);
+    assert_eq!(
+        std::fs::read_to_string(repo.join("node_modules/dep/index.js")).expect("read"),
+        "module.exports = { answer: 42 };\n"
+    );
+}

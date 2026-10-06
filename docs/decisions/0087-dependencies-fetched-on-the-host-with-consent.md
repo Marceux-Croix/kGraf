@@ -119,3 +119,38 @@ a project whose user allowed it, for dependency downloads only.
   `Caused by:` entry, the `--offline was specified` cause, or its offline-mode note). The
   words anywhere else (a test's own output, stdout, mid-line) no longer spend one of the
   run's bounded checks.
+
+## Amendment (2026-10-06): other package managers are not fetched for; a missing install is named
+
+Installed dependencies are now readable inside the sandbox (decision 0084, amended
+2026-10-06), so a project the user installed is runnable as it is. The consent-based fetch is
+not extended to npm, pnpm, yarn, pip, Go, Maven, Gradle or .NET.
+
+- **Why no fetch.** `cargo fetch` downloads and unpacks and runs no package code. The other
+  install commands run package code on the host, outside the sandbox: npm, pnpm and yarn run
+  install scripts, pip builds a source distribution by running its `setup.py`, Bundler and
+  Composer run plugins, and Gradle and Maven run build logic to resolve. The user's own
+  install, which the sandbox reads, makes the tree runnable; kGraf names the command.
+- **A missing install is named, never a generic test failure.** `kgraf_host::deps::installs`
+  checks, by reading files only: each package with declared dependencies has each one in a
+  `node_modules` at its folder or above it (or a `.pnp.cjs`); a Python project with tests whose
+  build files name pytest has it in its root virtual environment, or in the host interpreter
+  when it has none (a project that runs `unittest` needs none); each
+  module a root `go.mod` requires is in the module cache, unless it vendors; a root Maven
+  project has the test plugin in `~/.m2/repository`; a root Gradle project has
+  `~/.gradle/caches/modules-2`; each .NET project has `obj/project.assets.json`. Each missing
+  install says what is missing and the command that makes it, chosen from the lockfile where
+  there is one (`npm ci`, `pnpm install --frozen-lockfile`, `yarn install`, `bun install`,
+  `go mod download`, `dotnet restore`, a `python3 -m venv .venv` and `pip install` line).
+- **Where it is said.** At run start, as a notice after the cargo gate (the run goes on); after
+  a failing command's output in the verifier's check and the gate, as `[dependencies]` lines;
+  and in the gate discovery note of a gate left out for it (decision 0018, amended 2026-10-06).
+
+Tests: `kgraf-host` `deps/installs.rs`
+`an_npm_package_names_each_missing_package_and_its_lockfile_s_command`,
+`a_workspace_package_resolves_through_the_hoisted_node_modules`,
+`python_tests_need_pytest_in_the_venv_or_the_interpreter`,
+`a_project_that_never_names_pytest_needs_none`,
+`go_requires_are_read_in_both_forms_and_checked_in_the_module_cache`,
+`jvm_and_dotnet_projects_need_their_stores_and_restores`; `dependency_links_tests.rs`
+`a_missing_install_is_named_in_the_failure`.

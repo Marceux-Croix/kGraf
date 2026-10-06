@@ -116,6 +116,11 @@ pub enum Notice {
     /// cannot read, say); the run goes on, and workers' builds will show the
     /// same error.
     DependenciesUnchecked(String),
+    /// Installs the project needs and lacks for a package manager kGraf
+    /// does not fetch for (decision 0087, amended 2026-10-06): each names
+    /// the command that makes it. The run goes on; tests that need them
+    /// fail, and their failure says the same.
+    DependenciesNotInstalled(Vec<String>),
     /// The quality-gate commands this run uses (discovered, configured, or
     /// the approved plan's), or none: a run that passes its gates says which
     /// commands passed them.
@@ -710,6 +715,16 @@ impl Host {
                 summary: report.summary(),
             }),
             GateOutcome::Unchecked(why) => notices(Notice::DependenciesUnchecked(why)),
+        }
+        let missing = crate::deps::missing_installs(
+            &self.config.root,
+            &crate::deps::InstallEnv::current(),
+            &crate::gates::pytest_importable,
+        );
+        if !missing.is_empty() {
+            notices(Notice::DependenciesNotInstalled(
+                missing.iter().map(|m| m.sentence()).collect(),
+            ));
         }
         Ok(())
     }

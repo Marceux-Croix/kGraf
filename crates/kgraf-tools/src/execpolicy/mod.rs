@@ -9,13 +9,14 @@
 //! 0084) is kGraf's own as well.
 
 mod build;
+mod build_tools;
 mod decision;
 mod policy;
 mod rule;
 
 pub use build::split_command_line;
 pub use build::{
-    AllowlistMatch, BuildAllowlist, BuildCommand, CargoSubcommand, UnknownBuildCommand,
+    AllowlistMatch, BuildAllowlist, BuildCommand, CargoSubcommand, ToolCommand, UnknownBuildCommand,
 };
 pub(crate) use build::{cargo_rule_subject_allowed, has_shell_syntax, manifest_paths_of};
 pub use decision::Decision;

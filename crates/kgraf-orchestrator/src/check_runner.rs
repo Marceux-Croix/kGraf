@@ -671,7 +671,34 @@ impl SandboxRunner {
         for d in &self.read_denies {
             policy = policy.deny_read(d.clone());
         }
+        // The checkout's installed dependency trees (`node_modules/`, a
+        // `.venv/`, `vendor/`), linked into the tree and readable, never
+        // writable (decision 0084, amended 2026-10-06): a check of a
+        // TypeScript or Python contract needs the project's compiler and
+        // libraries. A tree copied from a directory already holds them.
+        if let Resolved::Commit { repo, .. } = &self.base {
+            let links = kgraf_sandbox::link_dependency_trees(&run_dir.join("tree"), repo);
+            policy = policy.with_dependency_links(&links);
+        }
         policy
+    }
+
+    /// [`Self::policy`] for one command: `sh -c 'cd svc/api && pytest'` runs
+    /// with the virtual environment of `svc/api`, the folder it works in.
+    fn policy_for(&self, run_dir: &Path, argv: &[String]) -> SandboxPolicy {
+        let policy = self.policy(run_dir);
+        match argv {
+            [shell, flag, script]
+                if matches!(shell.as_str(), "sh" | "bash" | "/bin/sh" | "/bin/bash")
+                    && flag == "-c" =>
+            {
+                match kgraf_sandbox::script_start_dir(script) {
+                    Some(dir) => policy.with_command_dir(run_dir.join("tree").join(dir)),
+                    None => policy,
+                }
+            }
+            _ => policy,
+        }
     }
 
     #[cfg(unix)]
@@ -688,8 +715,12 @@ impl SandboxRunner {
             return Err(CheckError::Config("an empty command".into()));
         };
         let program = program.clone();
-        let mut cmd = sandboxed_command(&self.policy(run_dir), &program, &run_dir.join("tree"))
-            .map_err(|e| CheckError::Sandbox(e.to_string()))?;
+        let mut cmd = sandboxed_command(
+            &self.policy_for(run_dir, argv),
+            &program,
+            &run_dir.join("tree"),
+        )
+        .map_err(|e| CheckError::Sandbox(e.to_string()))?;
         cmd.args(args)
             .env("CARGO_TARGET_DIR", run_dir.join("target"))
             .env("CARGO_NET_OFFLINE", "true")
@@ -847,8 +878,12 @@ impl SandboxRunner {
         let Some((program, args)) = argv.split_first() else {
             return Err(CheckError::Config("an empty command".into()));
         };
-        let mut cmd = sandboxed_command(&self.policy(run_dir), program, &run_dir.join("tree"))
-            .map_err(|e| CheckError::Sandbox(e.to_string()))?;
+        let mut cmd = sandboxed_command(
+            &self.policy_for(run_dir, argv),
+            program,
+            &run_dir.join("tree"),
+        )
+        .map_err(|e| CheckError::Sandbox(e.to_string()))?;
         cmd.args(args)
             .env("CARGO_TARGET_DIR", run_dir.join("target"))
             .env("CARGO_NET_OFFLINE", "true")

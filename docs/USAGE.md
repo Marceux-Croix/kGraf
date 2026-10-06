@@ -63,6 +63,51 @@ kgraf deps reset     # forget the answer; the next run that needs a fetch asks
   are ordinary files (0084).
 - Each fetch is a network event with no tokens; `kgraf diag show` counts them.
 
+For the other languages, install the dependencies in the checkout yourself, as you would to
+run the tests by hand (`npm ci`, `pnpm install`, `yarn install`, a `.venv` with
+`pip install -r requirements.txt`, `go mod download`, `mvn test` once, `dotnet restore`).
+kGraf does not fetch for them: their install commands run package code on this machine,
+outside the sandbox (decision 0087, amended 2026-10-06).
+
+- Workers, the verifier's check, the gates and the contract checks read what you installed,
+  and never write it. Each installed tree beside its project's manifest is linked into the
+  worktree at the same place: `node_modules/` (and Yarn's `.pnp.cjs`, `.pnp.loader.mjs`,
+  `.pnp.data.json` and `.yarn/`) beside a `package.json`, a `.venv/` or `venv/` with a
+  `pyvenv.cfg`, `vendor/` beside a `go.mod`, `composer.json` or `Gemfile`, and
+  `vendor/bundle/` beside a `Gemfile`. A write through a link is refused. The links are never
+  committed and are not reported as anyone's files (0084).
+- In an npm, pnpm or Yarn workspace, whose `node_modules` links its own packages
+  (`node_modules/@scope/web -> ../../packages/web`), the worktree gets a `node_modules` folder
+  of links instead: each workspace package resolves to the worktree's copy, so tests run the
+  worker's edits, and every other package to your install (0084).
+- The virtual environment of the folder a command works in is activated: the `.venv/` or
+  `venv/` of that folder or the nearest one above it, the root one by default, the one of
+  `svc/api` for `cd svc/api && python3 -m pytest`. `python3`, `pytest` and the environment's
+  other programs are the environment's, run from your checkout's folder.
+- The package stores in your home folder are readable, never writable: `~/.m2/repository`,
+  `~/.gradle/caches`, `~/.gradle/wrapper/dists`, `~/.nuget/packages`, `~/go/pkg/mod`,
+  `~/.npm`, `~/.cache/pip` and `~/.cargo/registry`. The configuration and credential files
+  beside them are not: `~/.m2/settings.xml`, `~/.m2/settings-security.xml`,
+  `~/.gradle/gradle.properties`, `~/.gradle/init.d`, Gradle's Develocity keys, NuGet's
+  `NuGet.Config`, `~/.npmrc`, pnpm's and Bun's global configuration, pip's `pip.conf`,
+  Poetry's `auth.toml` and uv's credential store (macOS: also at their `Library` locations),
+  and cargo's `credentials.toml`. Gradle and the .NET CLI get a home folder of their own in
+  the command's temporary folder, with your Gradle dependency cache and NuGet package folder
+  read-only; the .NET CLI's telemetry is off. A Gradle wrapper finds its distribution, when
+  you have unpacked it once (`./gradlew --version`), through that home, read-only.
+- The verifier's check, the gates and the contract checks each get a new temporary folder,
+  removed when they end: tool settings a worker left in its own scratch directory (an
+  `.npmrc`, a Gradle init script, a Go build cache, Python bytecode) never reach a check.
+- When the project declares dependencies that are not installed, the run start says which,
+  and the command to run; so does a failing check or gate, after its own output
+  (`[dependencies] npm dependencies are not installed: node_modules has no jest. Run
+  `npm ci` in the project root ...`).
+- Not covered: a link inside `node_modules` to a folder of the checkout that the worktree
+  does not have (an untracked package) stays unreadable. Windows makes no links: a root
+  package still finds the checkout's `node_modules` by Node's walk up from the worktree, but
+  a nested package's own `node_modules`, a virtual environment (not activated), `vendor/`
+  folders and the worktree's copy of a workspace package are not reached.
+
 ## The code graph
 
 Point it at a repository, including this one:
@@ -717,9 +762,17 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   runs without approval, inside the sandbox with the network off: by default `cargo build`,
   `cargo check`, `cargo test`, `cargo clippy` and `cargo fmt --check`, each under argument
   rules (for example, no `--manifest-path` outside the worktree, no `--config`, no `-Z`,
-  no `--target-dir`), plus the run's own `--verify` and `--gate-command` commands exactly
-  as configured, and each narrowed form of `--verify` (one test file or package). Set `build_commands` in `.kgraf/worker.json` to change the list (`[]`
-  turns it off). A worker with a declared write scope (every orchestrated attempt) runs
+  no `--target-dir`), and each other language's build and test commands under their own
+  rules: `npm test` and `npm run` of a build, test, lint, check or typecheck script (the same
+  with pnpm and yarn) and `npx` with a test runner; `pytest` and `python -m pytest`;
+  `go build`, `go test` and `go vet` (no `-exec`, `-toolexec`, `-modfile`); `mvn` up to
+  `verify` (no `install`, `deploy`, plugin goals or `-s`); `gradle` test and compile tasks (no
+  `-I`, `-D`, `-P`); `dotnet build` and `dotnet test` (no `-p:`, `--source`, `--output`). No
+  install, publish or fetch runs unasked. Plus the run's own `--verify` and `--gate-command`
+  commands exactly as configured, and each narrowed form of `--verify` (one test file or
+  package). Set `build_commands` in `.kgraf/worker.json` to change the list: each entry is a
+  cargo spelling or one of `npm test`, `pytest`, `go test`, `mvn test`, `gradle test`,
+  `dotnet test` (`[]` turns it off). A worker with a declared write scope (every orchestrated attempt) runs
   these and no other shell command that can write; the verifier still refuses any commit
   that changes a file outside the declared writes. The list is on unless `build_commands`
   says otherwise, for attended workers too, and a cargo command that breaks an argument rule
@@ -1692,6 +1745,14 @@ Behavior that differs from earlier builds. Each item names the decision that hol
   are never a scaffold (0086).
 - A `package.json` whose `test` script is the one `npm init` writes (`echo "Error: no test
   specified" && exit 1`) adds no `npm test` gate; the run says the gate does not apply (0018).
+- Gates are discovered for Go (`go test ./...`), Maven (`mvn -o test`), Gradle
+  (`./gradlew test --offline` with a Gradle wrapper, `gradle test --offline` without) and .NET
+  (`dotnet test`), each only when its tool is there and the project's dependencies are
+  installed. A gate that could not pass on correct work is left out with the reason and the
+  command that fixes it: an uninstalled dependency of an `npm test` gate, pytest missing from
+  both the project's virtual environment and `python3`, a Gradle wrapper whose distribution
+  is not unpacked in `~/.gradle/wrapper/dists` (run `./gradlew --version` once; on Windows
+  the wrapper gets no gate). Set `--gate-command` to run a gate yourself (0018).
 - A worker that reaches its context stop point before it has written anything is compacted
   once instead of handed back: a child would receive the same whole task and meet the same
   stop point. After that one compaction it goes on while its context fits the model's window;

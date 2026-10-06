@@ -158,6 +158,46 @@ pub const OUTPUT_DIRS: &[(&str, &[&str])] = &[
     ("vendor", &["composer.json"]),
 ];
 
+/// The paths kGraf links into a tree to reach the checkout's installed
+/// dependencies ([`crate::link_dependency_trees`]), as their last parts, with
+/// the manifests one stands beside (in the folder holding the first part).
+/// git lists a link as one file, never a folder, so these match the whole
+/// path's end, not a folder on it. An empty manifest list matches beside
+/// any folder: a virtual environment is linked by its `pyvenv.cfg`, with or
+/// without a Python manifest.
+pub const DEPENDENCY_LINKS: &[(&[&str], &[&str])] = &[
+    (&["node_modules"], &["package.json"]),
+    (&[".pnp.cjs"], &["package.json"]),
+    (&[".pnp.loader.mjs"], &["package.json"]),
+    (&[".pnp.data.json"], &["package.json"]),
+    (&[".yarn"], &["package.json"]),
+    (&[".yarn", "cache"], &["package.json"]),
+    (&[".yarn", "unplugged"], &["package.json"]),
+    (&[".yarn", "install-state.gz"], &["package.json"]),
+    (&[".venv"], &[]),
+    (&["venv"], &[]),
+    (&["vendor"], &["composer.json", "Gemfile", "go.mod"]),
+    (&["vendor", "bundle"], &["Gemfile"]),
+];
+
+/// For a path ending like a [`DEPENDENCY_LINKS`] entry: the folder it stands
+/// in and that entry's manifests.
+fn dependency_link(parts: &[String]) -> Option<(String, &'static [&'static str])> {
+    DEPENDENCY_LINKS.iter().find_map(|(tail, manifests)| {
+        let n = tail.len();
+        (parts.len() >= n && parts[parts.len() - n..].iter().eq(tail.iter()))
+            .then(|| (parts[..parts.len() - n].join("/"), *manifests))
+    })
+}
+
+/// Whether `path`, as git lists it (a link is one file), ends like a link
+/// kGraf makes to the checkout's installed dependencies
+/// ([`DEPENDENCY_LINKS`]). Such a path is neither the worker's file nor the
+/// check's: notices about what a run left skip it.
+pub fn is_dependency_link(path: &Path) -> bool {
+    dependency_link(&parts(path)).is_some()
+}
+
 /// The files any of which marks a folder as a Python project, for its
 /// virtual environment and coverage report.
 const PYTHON_PROJECT_FILES: &[&str] = &[
@@ -285,6 +325,9 @@ pub fn manifests_beside(path: &Path) -> Vec<PathBuf> {
     let parts = parts(path);
     for (i, manifests) in output_dirs(&parts) {
         out.extend(joined(&parts[..i].join("/"), manifests));
+    }
+    if let Some((dir, manifests)) = dependency_link(&parts) {
+        out.extend(joined(&dir, manifests));
     }
     out.extend(ts_sources(path));
     out
@@ -474,6 +517,11 @@ pub fn generated_kind(
     if any(built) {
         return Some(GeneratedKind::PackageBuild);
     }
+    if let Some((dir, manifests)) = dependency_link(&parts)
+        && (manifests.is_empty() || any(joined(&dir, manifests)))
+    {
+        return Some(GeneratedKind::BuildOutput);
+    }
     let in_output = output_dirs(&parts)
         .into_iter()
         .any(|(i, manifests)| any(joined(&parts[..i].join("/"), manifests)));
@@ -555,6 +603,46 @@ mod tests {
             "php/composer.json",
         ];
         move |m: &Path| present.iter().any(|p| manifest_matches(m, Path::new(p)))
+    }
+
+    /// The links kGraf makes to the checkout's installed dependencies are
+    /// generated beside their project, as git lists a link: one path, the
+    /// whole name. A virtual environment needs no manifest; the others do.
+    /// Without this a link was a write outside the declared scope, and the
+    /// attempt that ran the project's tests failed for it.
+    #[test]
+    fn a_dependency_link_is_generated_beside_its_project() {
+        for path in [
+            "web/node_modules",
+            "web/.pnp.cjs",
+            "web/.yarn",
+            "web/.yarn/cache",
+            ".venv",
+            "py/venv",
+            "php/vendor",
+            "ruby/vendor/bundle",
+        ] {
+            assert_eq!(
+                generated_kind(Path::new(path), projects(), no_head),
+                Some(GeneratedKind::BuildOutput),
+                "{path}"
+            );
+            assert!(is_dependency_link(Path::new(path)), "{path}");
+        }
+        for path in ["node_modules", "other/vendor", "web/vendor", "web/yarn"] {
+            assert_eq!(
+                generated_kind(Path::new(path), projects(), no_head),
+                None,
+                "{path}"
+            );
+        }
+        assert!(!is_dependency_link(Path::new(
+            "web/node_modules/x/index.js"
+        )));
+        assert!(
+            manifests_beside(Path::new("web/node_modules"))
+                .contains(&PathBuf::from("web/package.json"))
+        );
     }
 
     /// Each language's own build, install and test output is generated beside

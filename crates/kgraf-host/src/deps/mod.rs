@@ -35,9 +35,11 @@
 mod cargo;
 #[cfg(unix)]
 mod group;
+pub mod installs;
 mod refetch;
 
 pub use cargo::{CargoDeps, FetchSite};
+pub use installs::{Ecosystem, InstallEnv, MissingInstall, missing_installs};
 pub use refetch::{HostRefetch, MAX_WORKER_CHECKS, MAX_WORKER_FETCHES};
 
 use serde::{Deserialize, Serialize};

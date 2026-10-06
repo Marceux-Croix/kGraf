@@ -719,7 +719,7 @@ impl ExecPolicy {
                     Err(why) => return Some(uncovered(&format!(" ({why})"))),
                 }
             }
-            if !relaxed && self.build.allows_by_cargo_rules(words) {
+            if !relaxed && self.build.allows_by_rules(words) {
                 built = true;
                 continue;
             }

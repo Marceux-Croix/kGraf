@@ -14,8 +14,10 @@
 
 mod build_dir;
 mod confined;
+pub mod dependencies;
 mod error;
 pub mod git;
+pub mod gradle_wrapper;
 pub mod lifecycle;
 pub mod merge;
 /// The repository lock lives in `kgraf-core` so every crate that runs git on
@@ -29,14 +31,18 @@ mod workspace;
 
 pub use build_dir::{SeedError, SeedMethod, SeedReport, seed_target_dir, seed_workspace_target};
 pub use confined::{open_append_confined, remove_confined, write_confined, write_confined_mode};
+pub use dependencies::{
+    DependencyKind, DependencyLinks, DependencyTree, MIRROR_MARK, Names, VirtualEnv,
+    find_dependency_trees, link_dependency_trees, script_start_dir, walk_project_dirs,
+};
 pub use error::{SandboxError, WorkspaceError};
 pub use merge::{
     ATTEMPT_REF_PREFIX, Attempt, AttemptEvent, AttemptGroup, AttemptState, CommitOutcome,
     ConflictMessage, ConflictSide, ConflictedPath, Excluded, FinishOutcome, GeneratedKind,
     Identity, LOCKFILES, Leftovers, Limits, MergeBack, MergeConflict, MergeError, MergeOutcome,
     MergedWorktree, Refusal, RefusalReason, SelectFailure, TreeManifests, TrialMerge, file_head,
-    generated_kind, is_compiled_binary, is_python_bytecode, lockfile_manifests, manifest_matches,
-    manifests_beside,
+    generated_kind, is_compiled_binary, is_dependency_link, is_python_bytecode, lockfile_manifests,
+    manifest_matches, manifests_beside,
 };
 #[cfg(windows)]
 pub use sandbox::SandboxedChild;

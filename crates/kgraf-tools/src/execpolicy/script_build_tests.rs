@@ -119,6 +119,35 @@ async fn a_cd_into_the_worktree_then_allowlisted_cargo_commands_is_a_build() {
     }
 }
 
+/// Decision 0084, amended 2026-10-06: with the standard list, a script that
+/// changes into a package and runs its own tests is a build in every mode
+/// but Bypass, for each language; an install after the `cd` is not.
+#[test]
+fn a_cd_then_another_language_s_tests_is_a_build() {
+    for mode in PermissionMode::ALL {
+        let policy = ExecPolicy::default_kgraf_policy()
+            .with_build_allowlist(BuildAllowlist::standard())
+            .with_permissions(control(mode, &[], &[], &[]));
+        for script in [
+            "cd web && npm test",
+            "cd web && npm run build && npm test -- --ci",
+            "cd service && python3 -m pytest -q",
+            "cd svc && go vet ./... && go test ./...",
+        ] {
+            let v = policy.evaluate(&sh(script));
+            assert_eq!(v.decision, Decision::Allow, "{mode}: {script}: {v:?}");
+            if mode != PermissionMode::Bypass {
+                assert!(v.build && v.script_checked, "{mode}: {script}: {v:?}");
+            }
+        }
+        if mode != PermissionMode::Bypass {
+            let v = policy.evaluate(&sh("cd web && npm install"));
+            assert!(!v.build, "{mode}: {v:?}");
+            assert_ne!(v.decision, Decision::Allow, "{mode}: {v:?}");
+        }
+    }
+}
+
 /// No grant wider than the contract needs: a command outside the allowlist
 /// and every grant is still asked about after a `cd`, a refused cargo
 /// argument still refuses the script, a `cd` that can leave the worktree or

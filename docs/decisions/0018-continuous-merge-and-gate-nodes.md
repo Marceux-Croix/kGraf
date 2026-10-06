@@ -368,3 +368,50 @@ Tests: `kgraf-host` `scoped_check.rs`
 `maven_narrows_to_the_test_classes_and_the_listed_module`,
 `gradle_narrows_to_the_project_test_task_of_each_class`,
 `npm_workspaces_narrow_to_the_workspace_of_each_file`.
+
+## Amendment (2026-10-06, third): Go, Maven, Gradle and .NET gates, and no gate whose dependencies are missing
+
+Gate discovery found cargo, npm, pytest and `make test` only, so a Go, Maven, Gradle or .NET
+project had no gate. A gate that cannot pass on a correct project is worse than none: it opens
+a remediation contract no worker can satisfy and holds the run.
+
+- **New gates, each only when it can run.** `go test ./...` for a root `go.mod`, when `go` is
+  on `PATH` and each required module is in the module cache (or the project vendors);
+  `mvn -o test` for a root `pom.xml`, when `mvn` is on `PATH` and `~/.m2/repository` holds the
+  test plugin; `gradle test --offline` for a root Gradle build, when `gradle` is on `PATH`, the
+  project has no wrapper and `~/.gradle/caches/modules-2` exists; `dotnet test` for a root
+  solution or project file, when `dotnet` is on `PATH`, every project is restored and
+  `~/.nuget/packages` exists.
+- **The existing gates are held to the same rule.** `npm test` is no gate when a declared
+  dependency is not installed; the pytest gate needs pytest in the root virtual environment or
+  the host interpreter (declaring it is not installing it). With a virtual environment the
+  command stays `python3 -m pytest`: the sandbox activates the environment.
+- **Every gate left out is said,** with the missing install and its command, the missing
+  tool, or, for a Gradle wrapper, that the wrapper writes a lock file in the user's Gradle home,
+  which the sandbox keeps read-only, so the project needs a gate command of its own.
+
+Tests: `kgraf-host` `go_maven_gradle_and_dotnet_gates_need_their_tool_and_their_installs`,
+`an_npm_test_gate_needs_its_dependencies_installed`,
+`a_virtual_environment_with_pytest_is_the_gate_s_interpreter`,
+`a_setup_py_or_requirements_project_with_tests_gets_the_pytest_gate`.
+
+## Amendment (2026-10-06, fourth): a Gradle wrapper project gets a gate
+
+The third amendment above left a project with a Gradle wrapper without a gate: the wrapper takes
+a lock in its distribution folder under the Gradle home, and the user's home is read-only in the
+sandbox. A sandboxed command's Gradle home is now a folder of its own that reaches the user's
+unpacked distribution read-only (decision 0084, amended 2026-10-06, fifth), so the wrapper runs
+offline and writes its lock there.
+
+- **The rule.** A root Gradle build with `gradlew` gets `./gradlew test --offline` when its
+  `gradle/wrapper/gradle-wrapper.properties` names a distribution, that distribution is
+  unpacked in `~/.gradle/wrapper/dists` (a `<hash>` folder holding its `.zip.ok` mark), and
+  `~/.gradle/caches/modules-2` exists. `gradle` on `PATH` is not needed: the wrapper is the
+  program.
+- **Otherwise a note.** No distribution named: the properties file is named. Not unpacked:
+  "run `./gradlew --version` once in the project root, with the network on". On Windows the
+  distribution is not made reachable, so the wrapper gets no gate there and the note says so.
+
+Not run against a real Gradle installation; the layout follows the wrapper's own lookup.
+
+Test: `kgraf-host` `go_maven_gradle_and_dotnet_gates_need_their_tool_and_their_installs`.

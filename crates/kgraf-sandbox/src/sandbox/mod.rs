@@ -85,6 +85,15 @@ pub struct SandboxPolicy {
     /// Git directories made writable whose configuration stays read-only
     /// ([`Self::with_frozen_git_config`]).
     frozen_git: Vec<FrozenGit>,
+    /// Installed dependency trees in the checkout, readable and runnable,
+    /// never writable ([`Self::with_dependency_links`]).
+    dependency_reads: Vec<PathBuf>,
+    /// The virtual environments linked into the tree; the one owning the
+    /// command's folder is activated ([`Self::with_dependency_links`]).
+    virtual_envs: Vec<crate::dependencies::VirtualEnv>,
+    /// The folder that chooses the virtual environment, when it is not the
+    /// command's working directory ([`Self::with_command_dir`]).
+    command_dir: Option<PathBuf>,
 }
 
 /// A writable git directory whose configuration files stay read-only
@@ -137,6 +146,9 @@ impl SandboxPolicy {
             hold: None,
             user_cargo_home: None,
             frozen_git: Vec::new(),
+            dependency_reads: Vec::new(),
+            virtual_envs: Vec::new(),
+            command_dir: None,
         }
     }
 
@@ -210,6 +222,46 @@ impl SandboxPolicy {
     /// configuration writable.
     pub fn with_frozen_git_config(mut self, common_dir: PathBuf, files: Vec<PathBuf>) -> Self {
         self.frozen_git.push(FrozenGit { common_dir, files });
+        self
+    }
+
+    /// Let a command read, and run programs from, the checkout's installed
+    /// dependency trees that [`crate::link_dependency_trees`] linked into the
+    /// tree it works in: `links.reads`, never writable. And when the tree's
+    /// root virtual environment is one of them, run every command as if it
+    /// were activated: `VIRTUAL_ENV` names it and its `bin` folder comes
+    /// first on `PATH`, so `python`, `pytest` and the project's other entry
+    /// points are the environment's.
+    ///
+    /// **macOS**: re-allowed after the checkout deny and before the
+    /// credential deny list, so a link inside a tree that points at a
+    /// credential store stays denied. **Linux**: each tree is granted read
+    /// and execute (Landlock judges the resolved file, so a link inside a
+    /// tree that points outside every granted path stays unreadable).
+    /// **Windows** does not confine reads; no link is made there.
+    ///
+    /// A tree beneath a [`Self::deny_read`] path is refused when the command
+    /// is built ([`SandboxError::InvalidPolicy`]).
+    pub fn with_dependency_links(mut self, links: &crate::DependencyLinks) -> Self {
+        for read in &links.reads {
+            if !self.dependency_reads.contains(read) {
+                self.dependency_reads.push(read.clone());
+            }
+        }
+        for venv in &links.virtual_envs {
+            if !self.virtual_envs.contains(venv) {
+                self.virtual_envs.push(venv.clone());
+            }
+        }
+        self
+    }
+
+    /// The folder whose virtual environment a command runs with, when the
+    /// command does its work somewhere other than its working directory: a
+    /// script that starts with `cd services/api &&`
+    /// ([`crate::script_start_dir`]). Default: the working directory.
+    pub fn with_command_dir(mut self, dir: PathBuf) -> Self {
+        self.command_dir = Some(dir);
         self
     }
 
@@ -358,10 +410,38 @@ impl SandboxPolicy {
                 )));
             }
         }
+        let read_denied = resolve_all(&self.read_denies)?;
+        let dependency_reads = resolve_all(&self.dependency_reads)?;
+        // Each grant is the canonical path `link_dependency_trees` found.
+        // One that now resolves elsewhere (it, or a folder above it, became
+        // a link) would grant the link's target: refused, not followed.
+        if let Some((given, now)) = self
+            .dependency_reads
+            .iter()
+            .zip(&dependency_reads)
+            .find(|(given, now)| given != now)
+        {
+            return Err(SandboxError::InvalidPolicy(format!(
+                "dependency tree {} is a link, or lies below one, and now resolves to {}; \
+                 it is not granted",
+                given.display(),
+                now.display()
+            )));
+        }
+        if let Some(tree) = dependency_reads
+            .iter()
+            .find(|t| read_denied.iter().any(|d| t.starts_with(d)))
+        {
+            return Err(SandboxError::InvalidPolicy(format!(
+                "dependency tree {} lies beneath a path whose reads are denied",
+                tree.display()
+            )));
+        }
         Ok(Resolved {
             writable,
             readable: resolve_all(&self.readable_roots)?,
-            read_denied: resolve_all(&self.read_denies)?,
+            read_denied,
+            dependency_reads,
             // Sockets may not exist yet; resolve the parent directory.
             unix_sockets: self
                 .unix_sockets
@@ -441,6 +521,10 @@ struct Resolved {
     /// canonical, each file with its existing ancestors canonical. Enforced
     /// on macOS; the other backends refuse a non-empty list.
     frozen_git: Vec<FrozenGit>,
+    /// See [`SandboxPolicy::with_dependency_links`]: canonical, each a
+    /// folder or file in the checkout. Granted on macOS and Linux.
+    #[cfg_attr(windows, allow(dead_code))]
+    dependency_reads: Vec<PathBuf>,
 }
 
 /// `path` with its deepest existing ancestor canonical and the rest
@@ -683,6 +767,61 @@ fn scrub_env(cmd: &mut Command, inherited: impl Iterator<Item = OsString>, pass:
         let passed = name.to_str().is_some_and(|n| pass.iter().any(|p| p == n));
         if is_scrubbed(&name) && !passed {
             cmd.env_remove(&name);
+        }
+    }
+}
+
+/// Run as if the virtual environment `venv` were activated: what its
+/// `activate` script does, without running it. Its `bin` folder (`Scripts`
+/// on Windows) first on `PATH`, `VIRTUAL_ENV` naming it, and no
+/// `PYTHONHOME`, which would make its interpreter load another
+/// installation's standard library.
+fn activate_virtual_env(cmd: &mut Command, venv: &Path) {
+    let bin = venv.join(if cfg!(windows) { "Scripts" } else { "bin" });
+    let mut paths = vec![bin];
+    if let Some(path) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&path));
+    }
+    if let Ok(joined) = std::env::join_paths(paths) {
+        cmd.env("PATH", joined);
+    }
+    cmd.env("VIRTUAL_ENV", venv).env_remove("PYTHONHOME");
+}
+
+/// Package-manager settings that keep a command off the user's writable
+/// stores and credential files, given only where the command has a
+/// temporary folder (decision 0084, amended 2026-10-06):
+///
+/// - Go: `GOPROXY=off` with the network denied, so a module missing from
+///   the local cache fails at once, naming the module, instead of after a
+///   network timeout.
+/// - Gradle: its user home in the temporary folder (Gradle locks and writes
+///   its home on every build, and the user's holds `gradle.properties` and
+///   init scripts with repository passwords), with the user's dependency
+///   cache read-only beside it (`GRADLE_RO_DEP_CACHE`, the folder holding
+///   `modules-2`) when it exists.
+/// - .NET: the CLI home in the temporary folder (first-run files, and the
+///   user's `NuGet.Config` with package source passwords lives under it),
+///   the user's package folder kept as the global packages folder
+///   (`NUGET_PACKAGES`) when it exists, and the CLI's telemetry off: no
+///   telemetry leaves the machine.
+fn package_store_env(cmd: &mut Command, tmp: &Path, home: Option<&Path>, network: Network) {
+    if network == Network::Deny {
+        cmd.env("GOPROXY", "off");
+    }
+    cmd.env("GRADLE_USER_HOME", tmp.join("gradle-home"));
+    cmd.env("DOTNET_CLI_HOME", tmp.join("dotnet-home"))
+        .env("DOTNET_CLI_TELEMETRY_OPTOUT", "1")
+        .env("DOTNET_NOLOGO", "1")
+        .env("DOTNET_SKIP_FIRST_TIME_EXPERIENCE", "1");
+    if let Some(home) = home {
+        let gradle_cache = home.join(".gradle/caches");
+        if gradle_cache.join("modules-2").is_dir() {
+            cmd.env("GRADLE_RO_DEP_CACHE", gradle_cache);
+        }
+        let nuget = home.join(".nuget/packages");
+        if nuget.is_dir() {
+            cmd.env("NUGET_PACKAGES", nuget);
         }
     }
 }
@@ -979,6 +1118,16 @@ pub fn sandboxed_command(
             std::env::vars_os().map(|(k, _)| k),
             &policy.pass_env,
         );
+        // The environment owning the command's folder, or the nearest one
+        // above it (`DependencyLinks::virtual_env_for`).
+        let command_dir = policy.command_dir.as_deref().unwrap_or(cwd);
+        let command_dir =
+            std::fs::canonicalize(command_dir).unwrap_or_else(|_| command_dir.to_path_buf());
+        if let Some(venv) =
+            crate::dependencies::nearest_virtual_env(&policy.virtual_envs, &command_dir)
+        {
+            activate_virtual_env(&mut cmd, venv);
+        }
         // The user's cargo settings without the user's cargo secrets
         // (`cargo_home`, decision 0084).
         #[cfg(unix)]
@@ -1006,6 +1155,26 @@ pub fn sandboxed_command(
                     cmd.env("CARGO_HOME", home);
                 }
                 refused_reads.extend(prepared.notes);
+            }
+        }
+        // The Gradle wrapper's distribution, reachable from the command's own
+        // Gradle home (`crate::gradle_wrapper`): `./gradlew` runs offline,
+        // and writes its lock there, never in the user's home.
+        #[cfg(unix)]
+        if let (Some(tmp), Some(home)) = (&policy.tmp_dir, resolved.home.as_deref()) {
+            let tmp = resolve(tmp)?;
+            if let Some(root) = resolved
+                .writable
+                .iter()
+                .filter(|r| tmp.starts_with(r))
+                .max_by_key(|r| r.components().count())
+                && let Err(e) =
+                    crate::gradle_wrapper::prepare(&home.join(".gradle"), root, &tmp, &command_dir)
+            {
+                refused_reads.push(format!(
+                    "the Gradle wrapper's distribution could not be made reachable in the \
+                     command's Gradle home: {e}"
+                ));
             }
         }
         if let Some(tmp) = &policy.tmp_dir {
@@ -1042,6 +1211,7 @@ pub fn sandboxed_command(
             // writable roots. Cargo's build output already goes to scratch
             // (`CARGO_TARGET_DIR`); a per-workspace cache is a cold cache.
             cmd.env("GOCACHE", tmp.join("go-build"));
+            package_store_env(&mut cmd, tmp, resolved.home.as_deref(), policy.network);
         }
         // Windows cannot deny reads of the Credential Manager, so at least stop
         // git from asking it by default: an empty credential.helper resets the
@@ -1134,6 +1304,80 @@ mod tests {
             root.resolved(),
             Err(SandboxError::InvalidPolicy(_))
         ));
+    }
+
+    /// A dependency tree beneath a read-denied path (kGraf's own state) is
+    /// never granted: the policy is refused rather than reopening the state.
+    #[test]
+    fn a_dependency_tree_beneath_a_denied_path_is_refused() {
+        let work = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let state = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir_all(state.join("x/node_modules")).unwrap();
+        let links = crate::DependencyLinks {
+            reads: vec![state.join("x/node_modules")],
+            ..crate::DependencyLinks::default()
+        };
+        let policy = SandboxPolicy::new(vec![work.path().to_path_buf()], Network::Deny)
+            .deny_read(state.clone())
+            .with_dependency_links(&links);
+        assert!(matches!(
+            policy.resolved(),
+            Err(SandboxError::InvalidPolicy(why)) if why.contains("beneath a path whose reads are denied")
+        ));
+    }
+
+    /// A dependency read that is a link, or lies below one, is refused when
+    /// the sandbox is built: resolving it would grant the link's target.
+    #[cfg(unix)]
+    #[test]
+    fn a_dependency_read_through_a_link_is_refused() {
+        let work = tempfile::tempdir().unwrap();
+        let checkout = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(outside.path().join("pkg")).unwrap();
+        let c = std::fs::canonicalize(checkout.path()).unwrap();
+        std::os::unix::fs::symlink(outside.path(), c.join("node_modules")).unwrap();
+        for read in [c.join("node_modules"), c.join("node_modules/pkg")] {
+            let links = crate::DependencyLinks {
+                reads: vec![read.clone()],
+                ..crate::DependencyLinks::default()
+            };
+            let policy = SandboxPolicy::new(vec![work.path().to_path_buf()], Network::Deny)
+                .with_dependency_links(&links);
+            assert!(
+                matches!(
+                    policy.resolved(),
+                    Err(SandboxError::InvalidPolicy(why)) if why.contains("link")
+                ),
+                "{} was granted",
+                read.display()
+            );
+        }
+    }
+
+    /// The root virtual environment is activated: its `bin` first on `PATH`,
+    /// `VIRTUAL_ENV` naming it, no `PYTHONHOME`.
+    #[test]
+    fn a_virtual_environment_is_activated_for_the_command() {
+        let mut cmd = Command::new("true");
+        cmd.env("PYTHONHOME", "/elsewhere");
+        activate_virtual_env(&mut cmd, Path::new("/t/.venv"));
+        let envs: Vec<(OsString, Option<OsString>)> = cmd
+            .get_envs()
+            .map(|(k, v)| (k.to_owned(), v.map(OsStr::to_owned)))
+            .collect();
+        let get = |k: &str| {
+            envs.iter()
+                .find(|(n, _)| n == k)
+                .and_then(|(_, v)| v.clone())
+        };
+        let path = get("PATH").expect("PATH");
+        let first = std::env::split_paths(&path).next().expect("first");
+        let bin = if cfg!(windows) { "Scripts" } else { "bin" };
+        assert_eq!(first, Path::new("/t/.venv").join(bin));
+        assert_eq!(get("VIRTUAL_ENV"), Some(OsString::from("/t/.venv")));
+        assert!(envs.iter().any(|(k, v)| k == "PYTHONHOME" && v.is_none()));
     }
 
     #[test]

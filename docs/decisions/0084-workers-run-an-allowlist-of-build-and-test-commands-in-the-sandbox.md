@@ -507,3 +507,252 @@ Tests: `kgraf-core` `other_build_tools_configuration_is_build_configuration`; `k
 `the_size_bounds_count_only_what_the_commit_keeps`; `kgraf-ingest`
 `a_recognized_lockfile_is_skipped_even_with_a_code_extension`; `kgraf-runtime`
 `an_install_is_left_out_of_the_change_list_and_the_work_stays`.
+
+## Amendment (2026-10-06, fourth): installed dependencies are readable, never writable, and every language builds and tests
+
+A worktree holds only what git tracks, and every project ignores its installed dependencies.
+The sandbox denied reads of the checkout a worktree was made from (macOS,
+`crates/kgraf-sandbox/src/sandbox/macos.rs`, the checkout deny) or never granted them (Linux,
+`sandbox/linux.rs`, where reads are an allowlist), and the Linux allowlist named no JVM or .NET
+package store. So a correct npm project with jest, a pytest project in a `.venv`, a Maven,
+Gradle or .NET project failed every test inside kGraf: in the worker's shell, the verifier's
+acceptance check, the gate and the contract checks alike. And the worker's build allowlist
+named cargo only (`crates/kgraf-tools/src/execpolicy/build.rs`, `cargo_default`), so a worker
+on any other language could not run its own tests unasked.
+
+- **Installed trees are linked in and readable.** Before a command runs in a worktree, a gate
+  worktree or a contract-check tree, kGraf finds the checkout's installed trees beside their
+  project's manifest (`kgraf_sandbox::find_dependency_trees`: at most six folder levels and
+  20,000 folders, never through a link, never in `.git`, `.kgraf` or build output):
+  `node_modules/`, Yarn Plug'n'Play's `.pnp.cjs`, `.pnp.loader.mjs`, `.pnp.data.json` and
+  `.yarn/` (or its `cache/`, `unplugged/` and `install-state.gz` when the rest of `.yarn/` is
+  committed) beside a `package.json`; `.venv/` or `venv/` holding a `pyvenv.cfg`; `vendor/`
+  beside a `go.mod` (with `vendor/modules.txt`), a `composer.json` or a `Gemfile`, and
+  `vendor/bundle/` beside a `Gemfile`. Each one the tree lacks becomes a symbolic link at the
+  same place, pointing at the checkout's copy (`link_dependency_trees`), made relative to a
+  folder opened without following links, so a folder the worker swapped for a link can never
+  make the host create a link elsewhere. The sandbox then lets the command read and run
+  programs from each linked target (`SandboxPolicy::with_dependency_links`): on macOS an allow
+  after the checkout deny and before the credential deny list; on Linux a Landlock read and
+  execute grant on each tree.
+- **Never written.** No write rule names a target, and both backends judge the resolved path,
+  so a write through a link is refused ("Operation not permitted"). A link inside a tree that
+  points at a credential file is refused at its target: on macOS by the credential deny list,
+  which comes after the grant; on Linux because nothing outside the granted paths is readable.
+  A tree that is itself a link in the checkout, or that another user can change (the Linux
+  ownership test of the ancestor cargo files), is not linked, and the failing command's output
+  says why. A tree beneath a read-denied path (kGraf's state) refuses the policy.
+- **The root virtual environment is activated.** When the linked trees include the root
+  `.venv/` or `venv/`, every command runs with its `bin` folder first on `PATH`, `VIRTUAL_ENV`
+  naming it and no `PYTHONHOME`, so `python3 -m pytest`, the gate's own command, runs the
+  environment's interpreter and pytest.
+- **Package stores in the home folder, read-only, without their configuration.** macOS reads
+  were already open apart from the credential deny list; it now also denies
+  `~/.gradle/init.d`, `~/.gradle/init.gradle`, `~/.gradle/init.gradle.kts`,
+  `~/.nuget/NuGet/NuGet.Config` and `~/.config/NuGet/NuGet.Config` (repository and package
+  source passwords), beside the `~/.m2/settings.xml`, `~/.m2/settings-security.xml` and
+  `~/.gradle/gradle.properties` it denied before. Linux grants `~/.m2/repository`,
+  `~/.gradle/caches`, `~/.gradle/wrapper/dists` and `~/.nuget/packages`, each only where it
+  exists, beside the `~/go/pkg/mod`, `~/.npm`, `~/.cache/pip` and `~/.cargo/registry` it
+  granted before; never `~/.m2`, `~/.gradle` or `~/.nuget` themselves.
+- **The package managers are kept off the user's writable stores.** Where a command has a
+  temporary folder: `GRADLE_USER_HOME` is `<tmp>/gradle-home`, with the user's dependency cache
+  read-only beside it (`GRADLE_RO_DEP_CACHE`, when `~/.gradle/caches/modules-2` exists);
+  `DOTNET_CLI_HOME` is `<tmp>/dotnet-home`, `NUGET_PACKAGES` is `~/.nuget/packages` when it
+  exists, and the .NET CLI's telemetry is off; `GOPROXY=off` with the network denied, so a
+  module missing from the cache fails at once, naming it.
+- **A link is generated, not written.** git lists a link as one file, so a link is a
+  generated file beside its project, by its whole name (`kgraf_sandbox::DEPENDENCY_LINKS`):
+  `node_modules`, the Plug'n'Play files and `.yarn` paths beside a `package.json`, `.venv` and
+  `venv` anywhere, `vendor` beside a `composer.json`, `Gemfile` or `go.mod`, `vendor/bundle`
+  beside a `Gemfile`. Merge-back leaves it out of the commit and removes it before the check,
+  which links it again; the verifier's notices and the worker's own change list skip it, since
+  it is neither the worker's file nor the check's.
+- **Cost, measured.** The search reads one directory per folder: about 0.4 s for a checkout of
+  20,000 folders, its bound (macOS, APFS, release build; it was 0.8 to 0.95 s while each
+  folder's manifests were asked for one by one), a few milliseconds for a checkout of a few
+  hundred. One search of a checkout is reused for 30 s (`TREES_FRESH_FOR`), so a worker's
+  shell calls do not each pay it; a tree removed meanwhile is never linked.
+- **Every language's build and test commands are on the default allowlist.** The default is
+  now `BuildAllowlist::standard`: cargo's five entries and one entry per language
+  (`ToolCommand`), each held to argument rules. `npm test` covers `npm test`, `npm run SCRIPT`
+  and the same under pnpm and yarn for a build, test, lint, check, typecheck, compile or
+  coverage script (and `test:`, `build:`, `lint:`, `check:`, `typecheck:` names), with npm's
+  own `--silent`, `--if-present` and workspace options before `--` and anything after it, and
+  `npx` with jest, vitest, mocha, tsc, ava, eslint, tap, c8 or nyc. `pytest` covers `pytest`,
+  `python -m pytest` and `python -m unittest`. `go test` covers `go build`, `go test` and
+  `go vet` on packages of the worktree, with their common options; `-exec`, `-toolexec`,
+  `-modfile` and `-overlay` are refused. `mvn test` covers the lifecycle phases `clean`,
+  `validate`, `compile`, `test-compile`, `test` and `verify`, with `-o`, `-q`, `-B`, `-pl`,
+  `-am`, `-T` and only test-selection properties (`-Dtest=`, `-DskipTests`); `install`,
+  `deploy`, plugin goals, `-s` and other properties are refused. `gradle test` covers the
+  test, check, build, assemble and compile tasks; `-I`, `-D`, `-P` and `--project-dir` are
+  refused. `dotnet test` covers `dotnet build` and `dotnet test` with a project in the
+  worktree; `-p:`, `--source` and `--output` are refused. Installs, publishes and fetches
+  (`npm install`, `npm ci`, `npm exec`, `pnpm add`, `yarn dlx`, `go get`, `go run`,
+  `dotnet add`, `dotnet run`) are not listed, so the command policy asks, as before. A script
+  that changes into a package and runs these is judged command by command (decision 0094).
+  `build_commands` in `worker.json` accepts the six new spellings, and absent means all.
+- **Not covered.** A dependency link that resolves into the checkout outside a granted tree
+  (an npm workspace package linked as `node_modules/@scope/pkg -> ../../packages/pkg`) reaches
+  the checkout's copy, which stays unreadable; such a run fails with the permission error. A
+  nested virtual environment is linked and readable but not activated. Windows makes no links
+  (a symbolic link needs a privilege a user account lacks by default); a root package there
+  still finds the checkout's `node_modules` by walking up from the worktree, as Windows does
+  not confine reads. The Gradle wrapper takes a lock in `~/.gradle/wrapper/dists` before it
+  runs, which stays read-only, so a wrapper project needs a gate command of its own (decision
+  0018). Maven, Gradle and .NET runs inside the sandbox are built and unit-tested but were not
+  run against a real installation of those tools.
+
+Tests: `kgraf-sandbox` `dependencies.rs` `installs_are_found_beside_their_manifests_only`,
+`a_tree_that_is_a_link_is_named_and_never_followed`,
+`links_are_made_where_the_tree_lacks_them_and_kept_on_a_second_call`,
+`a_worker_s_own_folder_is_left_and_a_linked_parent_is_never_entered`,
+`the_search_is_bounded_in_depth`, `a_tree_removed_since_the_search_is_not_linked`, and the
+ignored measurement `walk_cost_at_the_folder_bound`; `sandbox/mod.rs`
+`a_dependency_tree_beneath_a_denied_path_is_refused`,
+`a_virtual_environment_is_activated_for_the_command`; `generated.rs`
+`a_dependency_link_is_generated_beside_its_project`; `tests/stores_macos.rs`
+`stores_and_dependency_trees_are_readable_and_credentials_beside_them_are_not`;
+`sandbox/linux.rs`
+`package_stores_and_dependency_trees_are_readable_but_credentials_beside_them_are_not`
+(Linux only); `kgraf-host` `dependency_links_tests.rs` (macOS, real `node` and `python3`)
+`node_test_with_a_package_from_the_checkout_node_modules_passes`,
+`a_check_cannot_write_the_checkout_install_through_the_link`,
+`a_python_test_importing_from_the_checkout_venv_passes`, and the ignored
+`pytest_from_the_checkout_venv_passes`; `kgraf-orchestrator` `tests/contract_checks.rs`
+`a_check_finds_a_package_the_user_installed_in_the_checkout` (macOS, real `node`);
+`kgraf-runtime` `worktree.rs` `a_dependency_link_is_not_a_change_of_the_worker`;
+`kgraf-tools` `shell.rs` `a_worker_s_npm_test_finds_the_checkout_s_installed_package` (macOS,
+real `npm` and `node`), `build_tools.rs` rule tests,
+`build.rs` `the_standard_list_covers_every_language_and_the_cargo_list_does_not`,
+`script_build_tests.rs` `a_cd_then_another_language_s_tests_is_a_build`; `kgraf-host`
+`worker/config.rs` `build_commands_parse_absent_empty_and_listed`.
+
+## Amendment (2026-10-06, fifth): a check never reads tool settings the worker left, a dependency grant never follows a link, workspace packages resolve to the tree, and the command's own virtual environment is activated
+
+A security review of the fourth amendment above tried to escape through the links, to run code
+or reach credentials it should not, and to steer later commands. Each finding below was shown
+by a test that failed before its fix.
+
+- **A check gets a temporary folder of its own.** The verifier's acceptance check runs in the
+  worker's tree, and it used the workspace's scratch folder as `TMPDIR`, the folder the
+  worker's own shell writes. Tool settings the worker left there steered the check: npm reads
+  its user config from `<tmp>/.npmrc` (a `script-shell=/usr/bin/true` there made `npm test`
+  pass a failing test), Gradle runs every init script in `<tmp>/gradle-home/init.d`, the .NET
+  CLI reads `NuGet.Config` under `<tmp>/dotnet-home`, Go reads its build and test cache in
+  `<tmp>/go-build`, and Python its bytecode under the cache prefix. None of them is in the
+  attempt's diff, so a forged pass would not be seen. Now every confined check
+  (`kgraf_host::gates::run_confined`: the verifier's checks, the gate and the probe at the
+  dispatch base) gets a new folder `check-<pid>-<nanoseconds>-<n>` in the scratch folder, made
+  with `create_dir` (anything already there fails it), used as `TMPDIR` and for every tool home
+  and the bytecode prefix, and removed when the check ends. The cargo target folder stays
+  shared (see "Not covered").
+- **A dependency grant is the path found, or nothing.** The grant is resolved when the sandbox
+  is built. A tree that became a link after the search (the search is reused for 30 s, and a
+  swap can come between search and grant) was resolved to the link's target and granted, on
+  Linux with read and execute. Now each tree is checked again right before its link and grant
+  (same canonical path, not a link, same kind, still only its owner can change it); one that
+  changed is not linked, and the command's output says why. `SandboxPolicy::resolved` also
+  refuses a dependency read whose canonical path is not the path given.
+- **The activated environment is the checkout's folder.** `VIRTUAL_ENV` and the first `PATH`
+  entry named the link in the worktree, which the worker can replace (from a parallel call,
+  between the link and the command's start) with a folder of its own, putting its programs
+  first on `PATH`. They now name the environment's canonical folder in the checkout, a granted
+  path no sandboxed command can write. The environment's console scripts already name that
+  interpreter in their first line.
+- **More credential files are denied on macOS, and uv's store on Linux.** The test of every
+  credential file a build or test can touch found these readable on macOS: pip's
+  `~/Library/Application Support/pip/pip.conf`, Poetry's
+  `~/Library/Application Support/pypoetry/auth.toml`, pnpm's `~/Library/Preferences/pnpm/rc`,
+  Bun's `~/.bunfig.toml`, uv's credential store `~/.local/share/uv/credentials`, and Gradle's
+  Develocity access keys in `~/.gradle/enterprise` and `~/.gradle/develocity`. All are now on
+  the deny list. On Linux the grant of `~/.local/share/uv` included uv's credential store; it
+  is now `~/.local/share/uv/python` and `~/.local/share/uv/tools` only. A tool that stops at a
+  denied file says so ("Operation not permitted"); pnpm with a global `rc` file was not run.
+- **Workspace packages resolve to the tree's copy.** In an npm, pnpm or Yarn workspace the
+  checkout's `node_modules` links each workspace package into the checkout
+  (`node_modules/@scope/web -> ../../packages/web`); through one link to that folder it
+  resolved to the checkout's copy, unreadable, and would have run the checkout's code, not the
+  worker's. When an install has such links, the tree gets a real `node_modules` folder of links
+  (`kgraf_sandbox::dependencies::mirror_plan`): each workspace link points at the same package
+  in the tree, every other entry at the checkout's entry, `.bin` is a folder of the same links
+  (relative links copied, so a workspace package's program is the tree's), and an `@scope`
+  folder with a workspace link is a folder of links. A mark file in the folder
+  (`MIRROR_MARK`) holds the modification times it was made from; a later call with the same
+  times keeps it, another adds what was installed since. Everything is made relative to
+  folders opened without following links; a folder without the mark (the worker's own
+  install) is left as it is. Measured: 2,000 entries, about 0.1 s to make, about 1 ms on each
+  later call (macOS, APFS, release build). The grant is the same checkout install; the mark and
+  the links are not the worker's changes (`kgraf_runtime::worktree::dirty_paths`).
+- **The command's own virtual environment is activated.** Every linked environment is kept
+  with the tree folder it belongs to. A command runs with the one owning the folder it works
+  in, or the nearest one above it: its working directory, or the folder a script starts with
+  (`cd svc/api && python3 -m pytest`, `kgraf_sandbox::script_start_dir`, read in the worker's
+  shell, the confined checks and the contract checks).
+- **The Gradle wrapper gates.** A sandboxed command's Gradle home is `<tmp>/gradle-home`. For
+  the distribution the project's `gradle/wrapper/gradle-wrapper.properties` names, each
+  finished unpack in `~/.gradle/wrapper/dists/<name>/<hash>/` (its `.zip.ok` mark) is made
+  again there (`kgraf_sandbox::gradle_wrapper`): the folder (the wrapper's lock goes in it), an
+  empty mark, and a link to the unpacked distribution, read-only. Nothing is copied and
+  nothing in the user's home is written; well under a millisecond per command. Gate discovery
+  adds `./gradlew test --offline` when that unpack exists (decision 0018, amended 2026-10-06).
+  Not run against a real Gradle; Windows gets no wrapper gate.
+
+**Judged and found not a defect**, with the reason:
+
+- *A write through a link, in any form.* Writing, creating, deleting, renaming, a hard link,
+  `chmod` and `touch` through the link all fail on macOS (Seatbelt checks the resolved path,
+  and a hard link needs write access to its source); on Linux Landlock handles the refer right,
+  so a link or rename out of a read-only tree fails with `EXDEV`. A copy-on-write clone
+  (`cp -c`) only makes a copy in the tree. Replacing the link in the tree is allowed and changes
+  nothing in the checkout; the next call grants nothing for the worker's folder.
+- *A link inside an install pointing at a credential, the checkout's `.git` or `.env`, kGraf's
+  state or another folder of the checkout.* Refused at its target on macOS (tested); on Linux
+  nothing outside the granted paths is readable.
+- *Worktree removal following the link.* `std::fs::remove_dir_all` and git's own removal
+  unlink a link and never follow it.
+- *Running programs the permission rules deny by name.* The build allowlist matches the
+  program name exactly as found on `PATH`; the activated environment's `bin` is the user's own
+  install, now named by its checkout path. Every allowlisted runner runs code the worker writes
+  (npm's `pretest` and `posttest`, a project `.npmrc` or `.mvn/maven.config`, Gradle build
+  scripts, a `Directory.Build.props`, a pytest `conftest.py`), as `cargo test` runs `build.rs`:
+  the options the rules refuse can also be set by project files. The sandbox stays the
+  boundary: writes confined, the network off in every sandbox that links dependencies, kGraf's
+  state unreadable. `npx` with a runner that is not installed tries the registry and fails with
+  the network off; `go test -exec` and `-toolexec` are refused, and `GOFLAGS` or a `go.work`
+  only choose programs inside the same sandbox; `GOPROXY=off` is a fast failure, the network
+  deny is the guard.
+- *A worker-written `pyvenv.cfg` or `home =` steering a later run.* The environments are found
+  in the checkout only, which no sandboxed command writes; `home =` decides which interpreter
+  the environment uses, never a grant (on Linux an interpreter outside the granted paths fails
+  loud).
+
+**Not covered**, stated: the cargo target folder of a check in the worker's tree is the
+workspace's `<scratch>/target`, which the worker's own builds fill; a worker that forges cargo's
+build records there could make a check run a stale test binary. A cold build for each check
+would cost minutes, so it stays, and this is recorded as an open gap. A Go check now starts
+with a cold build cache.
+
+Tests: `kgraf-host` `dependency_links_tests.rs`
+`tool_settings_the_worker_leaves_in_its_scratch_folder_never_reach_the_check`,
+`an_npm_workspace_package_resolves_to_the_tree_s_copy`,
+`the_virtual_environment_of_the_command_s_folder_is_activated`; `kgraf-sandbox`
+`dependencies.rs` `a_tree_swapped_for_a_link_after_the_search_is_never_granted`,
+`the_activated_environment_is_the_checkout_s_folder`,
+`workspace_package_links_resolve_to_the_tree_s_own_packages`,
+`a_worker_s_own_node_modules_is_never_turned_into_a_mirror`,
+`the_virtual_environment_is_the_nearest_one_above_the_command_folder`,
+`a_script_s_start_folder_is_read_from_a_leading_cd_only`, and the ignored measurement
+`mirror_cost`; `sandbox/mod.rs` `a_dependency_read_through_a_link_is_refused`;
+`gradle_wrapper.rs` `the_distribution_name_is_read_from_the_wrapper_properties`,
+`the_wrapper_distribution_is_reachable_and_the_user_home_is_not_written`;
+`tests/dependency_escapes_macos.rs`
+`a_command_cannot_change_the_checkout_install_through_its_link`,
+`links_inside_an_install_reach_nothing_the_sandbox_denies`,
+`a_swapped_venv_link_does_not_put_the_worker_s_programs_first_on_path`;
+`tests/stores_macos.rs`
+`stores_and_dependency_trees_are_readable_and_credentials_beside_them_are_not` (more
+credential files, and the wrapper's folder); `sandbox/linux.rs`
+`home_grants_exclude_git_credentials_and_local_share_data` (Linux only); `kgraf-runtime`
+`worktree.rs` `a_dependency_mirror_is_not_a_change_of_the_worker`.

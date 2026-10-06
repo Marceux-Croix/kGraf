@@ -16,6 +16,9 @@ kgraf-provider = { path = "../kgraf-provider" }
 kgraf-secrets = { path = "../kgraf-secrets" }
 kgraf-session = { path = "../kgraf-session" }
 kgraf-tools = { path = "../kgraf-tools" }
+# `is_dependency_link`: the worker's change list skips the links kGraf makes to
+# the checkout's installed dependencies. Already in the build through
+# kgraf-tools.
 kgraf-sandbox = { path = "../kgraf-sandbox" }
 async-trait = "0.1"
 blake3 = "1"

@@ -1708,9 +1708,12 @@ async fn the_assembled_prefix_digest_with_the_flag_off_is_pinned() {
     // description said the allowlisted cargo commands may also be given as a
     // `sh -c` script after one `cd` into the worktree: a worker that read only
     // the argv form took `cd crate && cargo check` for a command needing
-    // approval.
+    // approval. Re-pinned again (decision 0084, amended 2026-10-06) when the
+    // default allowlist took every language's build and test commands, which
+    // the shell tool description names (measured: with the cargo-only list
+    // the digest is the previous one).
     assert_eq!(
-        digest, "8adcbb226ba4811ed44590f5ef693f8d94b6f2e18ca7136a4b29581f6d73c26a",
+        digest, "a54601d72355ff810e5f5791ff5dcd94f25c3a94622f75a9d97f4753a0f3805f",
         "a change here means every worker's cache resets even with the \
          sessions flag off, which nothing in decision 0067 may cause \
          (re-pinned for the intentional `apply_patch` description \
@@ -3618,6 +3621,168 @@ fn discover_py(root: &std::path::Path, importable: bool) -> (Vec<String>, Vec<St
     crate::gates::discover_with(root, &[], &|| importable).expect("discover")
 }
 
+/// Discovery with every probe fixed: pytest importable or not, the programs
+/// on `PATH`, and a package store home.
+fn discover_probed(
+    root: &std::path::Path,
+    on_path: &[&str],
+    home: &std::path::Path,
+) -> (Vec<String>, Vec<String>) {
+    let on_path: Vec<String> = on_path.iter().map(|p| (*p).to_owned()).collect();
+    crate::gates::discover_probed(
+        root,
+        &[],
+        &crate::gates::GateProbes {
+            pytest_importable: &|| true,
+            on_path: &|p| on_path.iter().any(|o| o == p),
+            env: crate::deps::InstallEnv {
+                home: Some(home.to_path_buf()),
+                go_mod_cache: Some(home.join("go/pkg/mod")),
+            },
+        },
+    )
+    .expect("discover")
+}
+
+/// Decision 0018, amended 2026-10-06: Go, Maven, Gradle and .NET projects
+/// get a gate, but only when the tool is on `PATH` and the project's
+/// dependencies are installed; otherwise a note names what is missing and
+/// the command that installs it, and no gate is added that would fail every
+/// correct project.
+#[test]
+fn go_maven_gradle_and_dotnet_gates_need_their_tool_and_their_installs() {
+    let home = tempfile::tempdir().expect("home");
+    let h = home.path();
+    let all = ["go", "mvn", "gradle", "dotnet"];
+
+    let go = tempfile::tempdir().expect("go");
+    std::fs::write(
+        go.path().join("go.mod"),
+        "module x\nrequire rsc.io/quote v1.5.2\n",
+    )
+    .expect("w");
+    let (found, notes) = discover_probed(go.path(), &all, h);
+    assert!(found.is_empty(), "{found:?}");
+    assert!(notes[0].contains("go mod download"), "{notes:?}");
+    let cached = h.join("go/pkg/mod/cache/download/rsc.io/quote/@v");
+    std::fs::create_dir_all(&cached).expect("mkdir");
+    std::fs::write(cached.join("v1.5.2.mod"), "").expect("w");
+    assert_eq!(discover_probed(go.path(), &all, h).0, vec!["go test ./..."]);
+    let (found, notes) = discover_probed(go.path(), &[], h);
+    assert!(
+        found.is_empty() && notes[0].contains("`go` is not on PATH"),
+        "{notes:?}"
+    );
+
+    let mvn = tempfile::tempdir().expect("mvn");
+    std::fs::write(mvn.path().join("pom.xml"), "<project/>").expect("w");
+    let (found, notes) = discover_probed(mvn.path(), &all, h);
+    assert!(
+        found.is_empty() && notes[0].contains("mvn test"),
+        "{notes:?}"
+    );
+    std::fs::create_dir_all(
+        h.join(".m2/repository/org/apache/maven/plugins/maven-surefire-plugin"),
+    )
+    .expect("mkdir");
+    assert_eq!(discover_probed(mvn.path(), &all, h).0, vec!["mvn -o test"]);
+
+    let gradle = tempfile::tempdir().expect("gradle");
+    std::fs::write(gradle.path().join("build.gradle"), "").expect("w");
+    let (found, notes) = discover_probed(gradle.path(), &all, h);
+    assert!(
+        found.is_empty() && notes[0].contains("gradle build"),
+        "{notes:?}"
+    );
+    std::fs::create_dir_all(h.join(".gradle/caches/modules-2")).expect("mkdir");
+    assert_eq!(
+        discover_probed(gradle.path(), &all, h).0,
+        vec!["gradle test --offline"]
+    );
+    // The wrapper runs from the command's own Gradle home, which reaches the
+    // user's unpacked distribution read-only: a gate once the distribution
+    // the wrapper names is unpacked, a note before.
+    std::fs::write(gradle.path().join("gradlew"), "").expect("w");
+    let (found, notes) = discover_probed(gradle.path(), &all, h);
+    assert!(
+        found.is_empty() && notes[0].contains("distributionUrl"),
+        "{notes:?}"
+    );
+    std::fs::create_dir_all(gradle.path().join("gradle/wrapper")).expect("mkdir");
+    std::fs::write(
+        gradle
+            .path()
+            .join("gradle/wrapper/gradle-wrapper.properties"),
+        "distributionUrl=https\\://services.gradle.org/distributions/gradle-8.5-bin.zip\n",
+    )
+    .expect("w");
+    let (found, notes) = discover_probed(gradle.path(), &all, h);
+    assert!(
+        found.is_empty() && notes[0].contains("./gradlew --version"),
+        "{notes:?}"
+    );
+    let dist = h.join(".gradle/wrapper/dists/gradle-8.5-bin/abc123");
+    std::fs::create_dir_all(dist.join("gradle-8.5/lib")).expect("mkdir");
+    std::fs::write(dist.join("gradle-8.5-bin.zip.ok"), "").expect("w");
+    let (found, notes) = discover_probed(gradle.path(), &[], h);
+    if cfg!(windows) {
+        assert!(
+            found.is_empty() && notes[0].contains("Windows"),
+            "{notes:?}"
+        );
+    } else {
+        // No `gradle` on PATH is needed: the wrapper is the program.
+        assert_eq!(found, vec!["./gradlew test --offline"], "{notes:?}");
+    }
+
+    let dotnet = tempfile::tempdir().expect("dotnet");
+    std::fs::write(dotnet.path().join("App.csproj"), "<Project/>").expect("w");
+    let (found, notes) = discover_probed(dotnet.path(), &all, h);
+    assert!(
+        found.is_empty() && notes[0].contains("dotnet restore"),
+        "{notes:?}"
+    );
+    std::fs::create_dir_all(dotnet.path().join("obj")).expect("mkdir");
+    std::fs::write(dotnet.path().join("obj/project.assets.json"), "{}").expect("w");
+    let (found, notes) = discover_probed(dotnet.path(), &all, h);
+    assert!(
+        found.is_empty() && notes[0].contains("~/.nuget/packages"),
+        "{notes:?}"
+    );
+    std::fs::create_dir_all(h.join(".nuget/packages")).expect("mkdir");
+    assert_eq!(
+        discover_probed(dotnet.path(), &all, h).0,
+        vec!["dotnet test"]
+    );
+}
+
+/// A test script whose project's dependencies are not installed is no gate:
+/// it would fail every correct project with "Cannot find module". The note
+/// names the missing install and the lockfile's command.
+#[test]
+fn an_npm_test_gate_needs_its_dependencies_installed() {
+    let dir = tempfile::tempdir().expect("dir");
+    let home = tempfile::tempdir().expect("home");
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{"scripts":{"test":"jest"},"devDependencies":{"jest":"29"}}"#,
+    )
+    .expect("w");
+    std::fs::write(dir.path().join("package-lock.json"), "{}").expect("w");
+    let (found, notes) = discover_probed(dir.path(), &[], home.path());
+    assert!(found.is_empty(), "{found:?}");
+    assert!(
+        notes[0].contains("npm test gate not applicable"),
+        "{notes:?}"
+    );
+    assert!(notes[0].contains("Run `npm ci`"), "{notes:?}");
+    std::fs::create_dir_all(dir.path().join("node_modules/jest")).expect("mkdir");
+    assert_eq!(
+        discover_probed(dir.path(), &[], home.path()).0,
+        vec!["npm test"]
+    );
+}
+
 /// `npm init` writes a test script that only fails. A JavaScript project that
 /// kept it (a correct project with no tests yet) gets no `npm test` gate, and
 /// the note says why; a real test script is a gate.
@@ -3647,7 +3812,11 @@ fn the_npm_init_test_script_is_not_a_gate() {
 }
 
 /// A `setup.py`, `setup.cfg` or `requirements.txt` project with Python tests
-/// that declares pytest gets the pytest gate as a `pyproject.toml` one does.
+/// gets the pytest gate as a `pyproject.toml` one does, when pytest is
+/// installed. Declaring pytest is not installing it (decision 0087, amended
+/// 2026-10-06): with pytest neither importable nor in a virtual environment,
+/// the gate failed every correct project, so it is left out with the
+/// command that installs it.
 #[test]
 fn a_setup_py_or_requirements_project_with_tests_gets_the_pytest_gate() {
     for marker in ["setup.py", "setup.cfg", "requirements.txt"] {
@@ -3660,11 +3829,46 @@ fn a_setup_py_or_requirements_project_with_tests_gets_the_pytest_gate() {
         );
         std::fs::write(dir.path().join(marker), "pytest\n").expect("w");
         assert_eq!(
-            discover_py(dir.path(), false).0,
+            discover_py(dir.path(), true).0,
             vec![pytest_command()],
             "{marker}"
         );
+        let (found, notes) = discover_py(dir.path(), false);
+        assert!(found.is_empty(), "{marker}: {found:?}");
+        assert!(
+            notes.iter().any(|n| n.contains("-m venv .venv")),
+            "{marker}: {notes:?}"
+        );
     }
+}
+
+/// A project whose virtual environment has pytest gets the pytest gate
+/// though the host interpreter has none: the sandbox runs `python3` from
+/// that environment. A virtual environment without pytest is named, with
+/// the command that installs it.
+#[test]
+fn a_virtual_environment_with_pytest_is_the_gate_s_interpreter() {
+    let dir = tempfile::tempdir().expect("dir");
+    std::fs::create_dir_all(dir.path().join("tests")).expect("mkdir");
+    std::fs::write(dir.path().join("tests/test_a.py"), "def test_a(): pass\n").expect("w");
+    std::fs::write(
+        dir.path().join("pyproject.toml"),
+        "[project]\nname = \"a\"\n[project.optional-dependencies]\ntest = [\"pytest\"]\n",
+    )
+    .expect("w");
+    std::fs::create_dir_all(dir.path().join(".venv/lib/python3.12/site-packages")).expect("mkdir");
+    std::fs::write(dir.path().join(".venv/pyvenv.cfg"), "home = /usr/bin\n").expect("w");
+    let (found, notes) = discover_py(dir.path(), true);
+    assert!(found.is_empty(), "{found:?}");
+    assert!(
+        notes
+            .iter()
+            .any(|n| n.contains("the virtual environment .venv has no pytest")),
+        "{notes:?}"
+    );
+    std::fs::create_dir_all(dir.path().join(".venv/lib/python3.12/site-packages/pytest"))
+        .expect("mkdir");
+    assert_eq!(discover_py(dir.path(), false).0, vec![pytest_command()]);
 }
 
 /// Python tests with no pytest declared and none importable add no pytest
@@ -3718,14 +3922,15 @@ fn a_tooling_pyproject_in_a_rust_project_adds_no_pytest_gate() {
         discover_py(dir.path(), true).0,
         vec!["cargo test --workspace", pytest_command()]
     );
-    // So does a pytest configuration, with no test file yet.
+    // So does a pytest configuration, with no test file yet, when pytest is
+    // installed.
     let cfg = tempfile::tempdir().expect("dir");
     std::fs::write(
         cfg.path().join("pyproject.toml"),
         "[tool.pytest.ini_options]\naddopts = \"-q\"\n",
     )
     .expect("w");
-    assert_eq!(discover_py(cfg.path(), false).0, vec![pytest_command()]);
+    assert_eq!(discover_py(cfg.path(), true).0, vec![pytest_command()]);
     // A test file with no pyproject.toml is not a Python project's gate.
     let bare = tempfile::tempdir().expect("dir");
     std::fs::create_dir_all(bare.path().join("tests")).expect("mkdir");
@@ -6069,6 +6274,10 @@ mod rule_names;
 
 #[path = "protected_write_tests.rs"]
 mod protected_write;
+
+#[cfg(target_os = "macos")]
+#[path = "dependency_links_tests.rs"]
+mod dependency_links;
 
 /// A run's index pass does not hold the host's shared graph lock: another
 /// run's loop takes that lock for its session and lease calls, and holding it

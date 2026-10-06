@@ -40,7 +40,8 @@ pub(super) const STRENGTH: IsolationStrength = IsolationStrength {
     git_config_freezable: true,
     gaps: "reads outside the credential deny list are allowed (source code in other \
            repositories, most of $HOME), apart from the checkout a worktree was made \
-           from, whose files other than its cargo files can be stat()ed but not read; \
+           from, whose files other than its cargo files and its installed dependency trees \
+           (read, never written) can be stat()ed but not read; \
            a process that closes its inherited descriptors and starts a new session \
            outlives its command unseen; allowed mach services are reachable; \
            the state directories on the path to the worktree can be stat()ed \
@@ -110,6 +111,15 @@ pub(super) const DENIED_HOME_READS: &[&str] = &[
     ".m2/settings.xml",
     ".m2/settings-security.xml",
     ".gradle/gradle.properties",
+    // Gradle init scripts (they can carry repository passwords) and NuGet's
+    // per-user configuration (package source passwords), at its macOS and
+    // its XDG location. The package stores beside them stay readable:
+    // `~/.gradle/caches`, `~/.gradle/wrapper/dists`, `~/.nuget/packages`.
+    ".gradle/init.d",
+    ".gradle/init.gradle",
+    ".gradle/init.gradle.kts",
+    ".nuget/NuGet/NuGet.Config",
+    ".config/NuGet/NuGet.Config",
     ".config/containers/auth.json",
     ".huggingface",
     ".cache/huggingface/token",
@@ -127,6 +137,19 @@ pub(super) const DENIED_HOME_READS: &[&str] = &[
     ".yarnrc",
     ".yarnrc.yml",
     ".config/pypoetry/auth.toml",
+    // The same tools' macOS locations (pip's and Poetry's per-user folders
+    // under Application Support), pnpm's global config (`pnpm login` writes
+    // its tokens there), Bun's global config (registry tokens), uv's
+    // credential store (`uv auth login`), and Gradle's Develocity access
+    // keys (old and current folder name). Each is a login a build reads
+    // from the user's home, so a test that can read it can send it on.
+    "Library/Application Support/pip/pip.conf",
+    "Library/Application Support/pypoetry/auth.toml",
+    "Library/Preferences/pnpm/rc",
+    ".bunfig.toml",
+    ".local/share/uv/credentials",
+    ".gradle/enterprise",
+    ".gradle/develocity",
     // Cargo's per-user config can hold a registry token and a proxy URL with
     // a password. Seatbelt denies the stat too, and cargo skips a config file
     // it cannot stat (measured). Its non-secret settings (a source
@@ -419,6 +442,23 @@ pub(super) fn profile(policy: &Resolved, home: &Path) -> (String, Vec<(String, P
             ));
         }
     }
+    // The checkout's installed dependency trees, linked into the tree
+    // (`SandboxPolicy::with_dependency_links`): read and run, never written
+    // (no write rule names them). After the checkout deny, which they lie
+    // beneath, and before the credential deny, so a link inside a tree that
+    // points at a credential store is still denied at its target.
+    if !policy.dependency_reads.is_empty() {
+        let mut dependency_reads = Vec::new();
+        for (i, tree) in policy.dependency_reads.iter().enumerate() {
+            let key = format!("DEPENDENCY_READ_{i}");
+            dependency_reads.push(format!("(subpath (param \"{key}\"))"));
+            params.push((key, tree.clone()));
+        }
+        sections.push(format!(
+            "; installed dependency trees\n(allow file-read*\n  {}\n)",
+            dependency_reads.join("\n  ")
+        ));
+    }
     // After the re-allow, so no root reopens a credential store.
     sections.extend([format!(
         "; credential stores, browser profiles, histories\n(deny file-read*\n  {}\n)",
@@ -576,6 +616,7 @@ mod tests {
             ancestor_limit: None,
             cargo_homes: None,
             frozen_git: vec![],
+            dependency_reads: vec![],
         }
     }
 
@@ -698,6 +739,13 @@ mod tests {
             ".yarnrc",
             ".yarnrc.yml",
             ".config/pypoetry/auth.toml",
+            "Library/Application Support/pip/pip.conf",
+            "Library/Application Support/pypoetry/auth.toml",
+            "Library/Preferences/pnpm/rc",
+            ".bunfig.toml",
+            ".local/share/uv/credentials",
+            ".gradle/enterprise",
+            ".gradle/develocity",
             ".cargo/config.toml",
             ".cargo/config",
             ".dockercfg",

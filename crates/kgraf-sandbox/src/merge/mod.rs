@@ -71,7 +71,8 @@ use crate::workspace::{Workspace, WorkspaceManager};
 
 pub use generated::{
     Excluded, GeneratedKind, LOCKFILES, TreeManifests, file_head, generated_kind,
-    is_compiled_binary, is_python_bytecode, lockfile_manifests, manifest_matches, manifests_beside,
+    is_compiled_binary, is_dependency_link, is_python_bytecode, lockfile_manifests,
+    manifest_matches, manifests_beside,
 };
 use parse::{
     GITLINK_MODE, MIN_GIT, SYMLINK_MODE, is_protected, new_collisions, parse_merge_tree_z,

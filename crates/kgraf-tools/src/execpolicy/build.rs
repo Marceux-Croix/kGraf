@@ -9,10 +9,14 @@
 //! 0084 allows a declared set of build and test commands, and nothing else
 //! that can write, inside the OS sandbox with the network off.
 //!
-//! **What an entry is.** Either a cargo subcommand checked by the argument
-//! rules below ([`CargoSubcommand`]), or one exact argv ([`BuildCommand::Exact`]):
-//! the project's own configured acceptance or gate command, matched only when
-//! the worker's argv is identical to it.
+//! **What an entry is.** A cargo subcommand checked by the argument rules
+//! below ([`CargoSubcommand`]); another language's build and test commands,
+//! checked by their own rules ([`ToolCommand`], in `build_tools`: npm, pnpm
+//! and yarn scripts, pytest, go, Maven, Gradle, .NET, never an install or a
+//! publish); or one exact argv ([`BuildCommand::Exact`]): the project's own
+//! configured acceptance or gate command, matched only when the worker's argv
+//! is identical to it. The default ([`BuildAllowlist::standard`]) is every
+//! cargo and every language entry.
 //!
 //! **Argument rules are an allowlist, not a denylist.** A cargo argument is
 //! accepted only when it is on the list for its subcommand; everything else is
@@ -38,6 +42,8 @@
 //! candidates (decision 0055). No network search was made.
 
 use std::fmt;
+
+pub use super::build_tools::ToolCommand;
 
 /// A cargo subcommand the allowlist can name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -87,6 +93,9 @@ impl CargoSubcommand {
 pub enum BuildCommand {
     /// A cargo subcommand, held to that subcommand's argument rules.
     Cargo(CargoSubcommand),
+    /// Another language's build and test commands, held to their argument
+    /// rules (`build_tools`).
+    Tool(ToolCommand),
     /// Exactly this argv: nothing added, removed or reordered.
     Exact(Vec<String>),
 }
@@ -95,6 +104,7 @@ impl fmt::Display for BuildCommand {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Cargo(sub) => f.write_str(sub.spelling()),
+            Self::Tool(tool) => f.write_str(tool.spelling()),
             Self::Exact(argv) => write!(f, "exactly {argv:?}"),
         }
     }
@@ -104,7 +114,8 @@ impl fmt::Display for BuildCommand {
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[error(
     "`{entry}` is not a build command kGraf can allow; use one of `cargo build`, \
-     `cargo check`, `cargo test`, `cargo clippy`, `cargo fmt --check` (a run's own \
+     `cargo check`, `cargo test`, `cargo clippy`, `cargo fmt --check`, `npm test`, \
+     `pytest`, `go test`, `mvn test`, `gradle test`, `dotnet test` (a run's own \
      acceptance and gate commands are allowed without being listed here)"
 )]
 pub struct UnknownBuildCommand {
@@ -146,14 +157,29 @@ impl BuildAllowlist {
         }
     }
 
-    /// Parse the configuration spelling of the cargo entries
-    /// ([`CargoSubcommand::spelling`]), words separated by any whitespace.
-    pub fn parse_cargo_entry(entry: &str) -> Result<BuildCommand, UnknownBuildCommand> {
+    /// What a project that does not configure one gets: the five cargo
+    /// commands and every other language's build and test commands
+    /// ([`ToolCommand`]), each under its argument rules. A project in any
+    /// supported language can build and test its own work (decision 0084,
+    /// amended 2026-10-06).
+    pub fn standard() -> Self {
+        ToolCommand::ALL
+            .into_iter()
+            .fold(Self::cargo_default(), |list, tool| {
+                list.with(BuildCommand::Tool(tool))
+            })
+    }
+
+    /// Parse a configuration spelling: a cargo entry
+    /// ([`CargoSubcommand::spelling`]) or another language's
+    /// ([`ToolCommand::spelling`]), words separated by any whitespace.
+    pub fn parse_entry(entry: &str) -> Result<BuildCommand, UnknownBuildCommand> {
         let words: Vec<&str> = entry.split_whitespace().collect();
         CargoSubcommand::ALL
             .into_iter()
             .find(|sub| sub.spelling().split(' ').eq(words.iter().copied()))
             .map(BuildCommand::Cargo)
+            .or_else(|| ToolCommand::parse(entry).map(BuildCommand::Tool))
             .ok_or_else(|| UnknownBuildCommand {
                 entry: entry.to_owned(),
             })
@@ -224,6 +250,10 @@ impl BuildAllowlist {
                 cargo.join(", ")
             ));
         }
+        parts.extend(self.commands.iter().filter_map(|c| match c {
+            BuildCommand::Tool(tool) => Some(tool.summary().to_owned()),
+            _ => None,
+        }));
         parts.extend(
             self.commands
                 .iter()
@@ -242,6 +272,21 @@ impl BuildAllowlist {
             .any(|c| matches!(c, BuildCommand::Exact(exact) if exact == argv))
         {
             return AllowlistMatch::Allowed;
+        }
+        if let Some((tool, verdict)) = super::build_tools::classify(argv) {
+            if !self.commands.contains(&BuildCommand::Tool(tool)) {
+                return AllowlistMatch::NotListed;
+            }
+            return match verdict {
+                Ok(()) => AllowlistMatch::Allowed,
+                Err(why) => AllowlistMatch::Refused {
+                    reason: format!(
+                        "`{}` commands are on the build and test allowlist only under their \
+                         argument rules: {why}",
+                        tool.spelling()
+                    ),
+                },
+            };
         }
         let (Some(program), Some(word)) = (argv.first(), argv.get(1)) else {
             return AllowlistMatch::NotListed;
@@ -271,6 +316,19 @@ impl BuildAllowlist {
 }
 
 impl BuildAllowlist {
+    /// Whether `argv` passes a listed entry's argument rules: a cargo
+    /// subcommand ([`Self::allows_by_cargo_rules`]) or another language's
+    /// command ([`ToolCommand`]). Exact entries are not consulted, for the
+    /// reason given there.
+    pub fn allows_by_rules(&self, argv: &[String]) -> bool {
+        if self.allows_by_cargo_rules(argv) {
+            return true;
+        }
+        super::build_tools::classify(argv).is_some_and(|(tool, verdict)| {
+            verdict.is_ok() && self.commands.contains(&BuildCommand::Tool(tool))
+        })
+    }
+
     /// Whether `argv` is `cargo SUBCOMMAND ...` for a listed subcommand whose
     /// arguments pass its rules. Exact entries are not consulted: a script
     /// judged command by command (decision 0094) may run a command in a
@@ -349,7 +407,7 @@ fn is_shell_syntax(c: char) -> bool {
 
 /// A cargo option's shape.
 #[derive(Clone, Copy)]
-enum Opt {
+pub(super) enum Opt {
     /// Takes no value.
     Flag,
     /// Takes one value, checked by the function.
@@ -536,7 +594,7 @@ fn check_cargo(sub: CargoSubcommand, args: &[String]) -> Result<(), String> {
 
 /// Every argument must be a listed option (with a valid value), or one of at
 /// most `bare_allowed` bare words, each valid under `bare`.
-fn check_options(
+pub(super) fn check_options(
     args: &[String],
     lists: &[&[(&str, Opt)]],
     attachable: &[&str],
@@ -624,21 +682,21 @@ fn not_listed(name: &str) -> String {
     format!("the option `{name}` is not on the allowlist{hint}")
 }
 
-fn name_value(v: &str) -> Result<(), String> {
+pub(super) fn name_value(v: &str) -> Result<(), String> {
     if v.is_empty() || v.starts_with('-') {
         return Err("expected a name".into());
     }
     Ok(())
 }
 
-fn filter_value(v: &str) -> Result<(), String> {
+pub(super) fn filter_value(v: &str) -> Result<(), String> {
     if v.is_empty() {
         return Err("empty".into());
     }
     Ok(())
 }
 
-fn word_value(v: &str) -> Result<(), String> {
+pub(super) fn word_value(v: &str) -> Result<(), String> {
     if !v.is_empty()
         && v.chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ','))
@@ -649,7 +707,7 @@ fn word_value(v: &str) -> Result<(), String> {
     }
 }
 
-fn jobs_value(v: &str) -> Result<(), String> {
+pub(super) fn jobs_value(v: &str) -> Result<(), String> {
     let digits = v.strip_prefix('-').unwrap_or(v);
     if v == "default" || (!digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())) {
         Ok(())
@@ -1018,16 +1076,86 @@ mod tests {
     #[test]
     fn configuration_spellings_parse_and_unknown_ones_are_refused() {
         assert_eq!(
-            BuildAllowlist::parse_cargo_entry("cargo  fmt --check"),
+            BuildAllowlist::parse_entry("cargo  fmt --check"),
             Ok(BuildCommand::Cargo(CargoSubcommand::FmtCheck))
         );
         assert_eq!(
-            BuildAllowlist::parse_cargo_entry("cargo test"),
+            BuildAllowlist::parse_entry("cargo test"),
             Ok(BuildCommand::Cargo(CargoSubcommand::Test))
         );
-        for bad in ["cargo run", "cargo fmt", "cargo test --workspace", "make"] {
-            assert!(BuildAllowlist::parse_cargo_entry(bad).is_err(), "{bad}");
+        assert_eq!(
+            BuildAllowlist::parse_entry("npm  test"),
+            Ok(BuildCommand::Tool(ToolCommand::NodeScripts))
+        );
+        assert_eq!(
+            BuildAllowlist::parse_entry("dotnet test"),
+            Ok(BuildCommand::Tool(ToolCommand::Dotnet))
+        );
+        for bad in [
+            "cargo run",
+            "cargo fmt",
+            "cargo test --workspace",
+            "make",
+            "npm install",
+            "go get",
+        ] {
+            assert!(BuildAllowlist::parse_entry(bad).is_err(), "{bad}");
         }
+    }
+
+    /// Decision 0084, amended 2026-10-06: the default list runs every
+    /// language's build and test commands under their rules; the cargo-only
+    /// list, the old default, runs none of them unasked.
+    #[test]
+    fn the_standard_list_covers_every_language_and_the_cargo_list_does_not() {
+        let standard = BuildAllowlist::standard();
+        let cargo = BuildAllowlist::cargo_default();
+        for words in [
+            &["npm", "test"][..],
+            &["pnpm", "run", "build"],
+            &["npx", "jest", "src"],
+            &["pytest", "-q"],
+            &["python3", "-m", "pytest"],
+            &["go", "test", "./..."],
+            &["mvn", "-o", "test"],
+            &["gradle", "test", "--offline"],
+            &["dotnet", "test"],
+        ] {
+            assert_eq!(
+                standard.check(&argv(words)),
+                AllowlistMatch::Allowed,
+                "{words:?}"
+            );
+            assert!(standard.allows_by_rules(&argv(words)), "{words:?}");
+            assert_eq!(
+                cargo.check(&argv(words)),
+                AllowlistMatch::NotListed,
+                "{words:?}"
+            );
+            assert!(!cargo.allows_by_rules(&argv(words)), "{words:?}");
+        }
+        for words in [
+            &["npm", "install"][..],
+            &["npm", "publish"],
+            &["go", "get", "x"],
+            &["dotnet", "add", "package", "x"],
+        ] {
+            assert_eq!(
+                standard.check(&argv(words)),
+                AllowlistMatch::NotListed,
+                "{words:?}"
+            );
+        }
+        assert!(matches!(
+            standard.check(&argv(&["go", "test", "-exec", "/tmp/x"])),
+            AllowlistMatch::Refused { .. }
+        ));
+        assert_eq!(
+            standard.check(&argv(&["cargo", "test", "--workspace"])),
+            AllowlistMatch::Allowed
+        );
+        let described = standard.describe();
+        assert!(described.contains("npm test") && described.contains("go build"));
     }
 
     #[test]

@@ -228,6 +228,16 @@ const HOME_READS: &[&str] = &[
     // sources a build reads. Go takes private-module logins from `~/.netrc`
     // or a credential helper, never from here.
     "go/pkg/mod",
+    // The JVM and .NET package stores: the downloaded artifacts a build
+    // reads. Not `~/.m2` or `~/.gradle` or `~/.nuget` themselves: Maven's
+    // `settings.xml` and `settings-security.xml`, Gradle's
+    // `gradle.properties` and init scripts, and NuGet's `NuGet.Config`
+    // beside them hold repository passwords. Each is granted only where it
+    // exists.
+    ".m2/repository",
+    ".gradle/caches",
+    ".gradle/wrapper/dists",
+    ".nuget/packages",
     ".cache/pnpm",
     ".cache/yarn",
     // The compiler cache, node-gyp's downloaded headers, and pre-commit's
@@ -259,7 +269,11 @@ const HOME_READS: &[&str] = &[
     // per-user data (`.local/share`). Only the places tools install to.
     ".local/bin",
     ".local/lib",
-    ".local/share/uv",
+    // Not `~/.local/share/uv` itself: uv keeps its credential store
+    // (`uv auth login`) in `credentials/` there. Only the Pythons and the
+    // tool environments uv installs.
+    ".local/share/uv/python",
+    ".local/share/uv/tools",
     ".local/share/pnpm",
     // Version managers' and installers' toolchain trees: installed runtimes,
     // application virtualenvs and seed wheels. Their tokens, where they take
@@ -483,6 +497,15 @@ fn build_ruleset(
     }
     // Required: the caller named these; failing to grant one is an error.
     for path in &policy.readable {
+        let r = rule(path, read, Presence::Required)?.ok_or_else(|| gone(path))?;
+        ruleset = ruleset.add_rule(r).map_err(kernel)?;
+    }
+    // The checkout's installed dependency trees linked into the tree
+    // (`SandboxPolicy::with_dependency_links`): read and execute (a test
+    // runner in `node_modules/.bin`, a virtual environment's interpreter),
+    // never write. Landlock judges the resolved file, so a link inside a
+    // tree that points outside every granted path stays unreadable.
+    for path in &policy.dependency_reads {
         let r = rule(path, read, Presence::Required)?.ok_or_else(|| gone(path))?;
         ruleset = ruleset.add_rule(r).map_err(kernel)?;
     }
@@ -833,6 +856,7 @@ mod tests {
             ancestor_limit: None,
             cargo_homes: home.map(|h| vec![std::fs::canonicalize(h).unwrap().join(".cargo")]),
             frozen_git: vec![],
+            dependency_reads: vec![],
         }
     }
 
@@ -901,8 +925,9 @@ mod tests {
         (base, b)
     }
 
-    /// The home grants are narrow: git's credential-store file and the
-    /// per-user data under `~/.local/share` are unreadable, while the files
+    /// The home grants are narrow: git's credential-store file, uv's
+    /// credential store and the per-user data under `~/.local/share` are
+    /// unreadable, while the files
     /// git reads and the install directories stay readable. Fake fixtures
     /// under a temp HOME only. Needs Landlock ABI v3 or later.
     #[test]
@@ -912,13 +937,25 @@ mod tests {
         let work = b.join("work");
         std::fs::create_dir_all(home.join(".config/git")).unwrap();
         std::fs::create_dir_all(home.join(".local/share/keyrings")).unwrap();
-        std::fs::create_dir_all(home.join(".local/share/uv")).unwrap();
+        std::fs::create_dir_all(home.join(".local/share/uv/tools/t/bin")).unwrap();
+        std::fs::create_dir_all(home.join(".local/share/uv/python/cpython/bin")).unwrap();
+        std::fs::create_dir_all(home.join(".local/share/uv/credentials")).unwrap();
         std::fs::create_dir_all(home.join(".local/bin")).unwrap();
         std::fs::create_dir_all(&work).unwrap();
         std::fs::write(home.join(".config/git/credentials"), "FAKE-TOKEN").unwrap();
         std::fs::write(home.join(".config/git/config"), "[user]\n").unwrap();
         std::fs::write(home.join(".local/share/keyrings/login"), "FAKE-KEYRING").unwrap();
-        std::fs::write(home.join(".local/share/uv/tool"), "ok").unwrap();
+        std::fs::write(home.join(".local/share/uv/tools/t/bin/t"), "ok").unwrap();
+        std::fs::write(
+            home.join(".local/share/uv/python/cpython/bin/python3"),
+            "ok",
+        )
+        .unwrap();
+        std::fs::write(
+            home.join(".local/share/uv/credentials/credentials.toml"),
+            "FAKE-UV",
+        )
+        .unwrap();
         std::fs::write(home.join(".local/bin/tool"), "ok").unwrap();
         std::fs::create_dir_all(home.join(".cache/huggingface")).unwrap();
         std::fs::create_dir_all(home.join(".cache/pip")).unwrap();
@@ -930,7 +967,16 @@ mod tests {
         assert_refused(&policy, &home.join(".cache/huggingface/token"));
         assert_read(&policy, &home.join(".cache/pip/wheel"), "ok");
         assert_read(&policy, &home.join(".config/git/config"), "[user]\n");
-        assert_read(&policy, &home.join(".local/share/uv/tool"), "ok");
+        assert_refused(
+            &policy,
+            &home.join(".local/share/uv/credentials/credentials.toml"),
+        );
+        assert_read(&policy, &home.join(".local/share/uv/tools/t/bin/t"), "ok");
+        assert_read(
+            &policy,
+            &home.join(".local/share/uv/python/cpython/bin/python3"),
+            "ok",
+        );
         assert_read(&policy, &home.join(".local/bin/tool"), "ok");
         // Toolchain trees that version managers and build caches keep.
         for rel in [
@@ -973,6 +1019,83 @@ mod tests {
             std::fs::write(&path, "FAKE").unwrap();
             assert_refused(&policy, &path);
         }
+    }
+
+    /// The JVM and .NET package stores are readable; the credential files
+    /// beside them are not (decision 0084, amended 2026-10-06). An installed
+    /// dependency tree in the checkout is readable and runnable through its
+    /// grant, never writable, and a link inside it that points at a
+    /// credential file is refused at its target. Fake fixtures under a temp
+    /// HOME only. Needs Landlock ABI v3 or later.
+    #[test]
+    fn package_stores_and_dependency_trees_are_readable_but_credentials_beside_them_are_not() {
+        let (_base, b) = canonical_tempdir();
+        let home = b.join("home");
+        let work = b.join("work");
+        let checkout = b.join("checkout");
+        std::fs::create_dir_all(&work).unwrap();
+        for (rel, text) in [
+            (".m2/repository/org/x/x.jar", "ok"),
+            (".gradle/caches/modules-2/files/x.jar", "ok"),
+            (".gradle/wrapper/dists/gradle-8/bin/gradle", "ok"),
+            (".nuget/packages/x/1.0/x.nupkg", "ok"),
+            (".m2/settings.xml", "FAKE"),
+            (".m2/settings-security.xml", "FAKE"),
+            (".gradle/gradle.properties", "FAKE"),
+            (".gradle/init.d/repo.gradle", "FAKE"),
+            (".nuget/NuGet/NuGet.Config", "FAKE"),
+            (".ssh/id_test", "FAKE"),
+        ] {
+            let path = home.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, text).unwrap();
+        }
+        std::fs::create_dir_all(checkout.join("node_modules/dep")).unwrap();
+        std::fs::write(checkout.join("node_modules/dep/index.js"), "ok").unwrap();
+        std::fs::write(checkout.join(".env"), "FAKE").unwrap();
+        std::os::unix::fs::symlink(
+            home.join(".ssh/id_test"),
+            checkout.join("node_modules/evil"),
+        )
+        .unwrap();
+        let mut policy = policy(&work, Some(&home), Network::Deny);
+        policy.dependency_reads = vec![checkout.join("node_modules")];
+        for rel in [
+            ".m2/repository/org/x/x.jar",
+            ".gradle/caches/modules-2/files/x.jar",
+            ".gradle/wrapper/dists/gradle-8/bin/gradle",
+            ".nuget/packages/x/1.0/x.nupkg",
+        ] {
+            assert_read(&policy, &home.join(rel), "ok");
+        }
+        for rel in [
+            ".m2/settings.xml",
+            ".m2/settings-security.xml",
+            ".gradle/gradle.properties",
+            ".gradle/init.d/repo.gradle",
+            ".nuget/NuGet/NuGet.Config",
+        ] {
+            assert_refused(&policy, &home.join(rel));
+        }
+        assert_read(&policy, &checkout.join("node_modules/dep/index.js"), "ok");
+        assert_refused(&policy, &checkout.join("node_modules/evil"));
+        assert_refused(&policy, &checkout.join(".env"));
+        let target = checkout.join("node_modules/dep/index.js");
+        let out = run(
+            &policy,
+            Path::new("/bin/sh"),
+            &[
+                Path::new("-c"),
+                Path::new("echo changed > \"$1\""),
+                Path::new("sh"),
+                &target,
+            ],
+        );
+        assert!(!out.status.success(), "{out:?}");
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("node_modules/dep/index.js")).unwrap(),
+            "ok"
+        );
     }
 
     /// Needs a Linux kernel with Landlock ABI v3 or later.
