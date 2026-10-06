@@ -107,6 +107,9 @@ pub struct OrchestrateArgs {
     /// your rules block for workers (`--warn-rule-conflicts`, else the user
     /// setting, else off).
     pub warn_rule_conflicts: bool,
+    /// `--answer-wait`, else the user setting; `None` derives the wait per
+    /// call from the planner model's recent latencies.
+    pub answer_wait_secs: Option<u32>,
 }
 
 /// The per-project part of the flags, as the host takes it. What is per
@@ -132,6 +135,7 @@ fn run_config(root: &Path, args: &OrchestrateArgs) -> RunConfig {
         verify: args.verify.clone(),
         gate_commands: args.gate_commands.clone(),
         warn_rule_conflicts: args.warn_rule_conflicts,
+        answer_wait_secs: args.answer_wait_secs,
         gate_timeout: args.gate_timeout,
         rate_limits: args.rate_limits.clone(),
         contract_checks: args.contract_checks,
@@ -1319,6 +1323,7 @@ mod tests {
             permissions: Default::default(),
             approve_plan: false,
             warn_rule_conflicts: false,
+            answer_wait_secs: None,
         }
     }
 

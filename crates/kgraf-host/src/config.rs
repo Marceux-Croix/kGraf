@@ -96,6 +96,13 @@ pub struct RunConfig {
     /// warning never changes the run. Off unless set.
     #[serde(default)]
     pub warn_rule_conflicts: bool,
+    /// How long, in seconds, a worker's question waits for the orchestrator's
+    /// model to answer it, and how long a connection judgment may run
+    /// (`--answer-wait`, the `answer_wait_secs` user setting). Unset derives
+    /// it per call from the answering model's recent latencies (decision
+    /// 0067). A late answer still reaches the worker.
+    #[serde(default)]
+    pub answer_wait_secs: Option<u32>,
     /// Longest one gate command, or one run of the acceptance command
     /// (`verify`), may run (`--gate-timeout`, in seconds on disk).
     #[serde(default = "defaults::gate_timeout", with = "seconds")]
@@ -350,6 +357,7 @@ impl RunConfig {
             verify: defaults::verify(),
             gate_commands: Vec::new(),
             warn_rule_conflicts: crate::limits::DEFAULT_WARN_RULE_CONFLICTS,
+            answer_wait_secs: None,
             gate_timeout: defaults::gate_timeout(),
             rate_limits: Vec::new(),
             contract_checks: defaults::contract_checks(),
@@ -474,6 +482,11 @@ impl RunConfig {
             && let Some(v) = user.compaction_point
         {
             self.point = Some(v);
+        }
+        if unset("answer_wait_secs")
+            && let Some(v) = user.answer_wait_secs
+        {
+            self.answer_wait_secs = Some(v);
         }
     }
 
@@ -1355,6 +1368,7 @@ mod tests {
             window: Some(200_000),
             warn_rule_conflicts: Some(true),
             compaction_point: Some(60),
+            answer_wait_secs: Some(600),
         };
         std::fs::write(
             &path,
@@ -1374,9 +1388,15 @@ mod tests {
             c.warn_rule_conflicts,
             "the setting fills what the file omits"
         );
+        assert_eq!(
+            c.answer_wait_secs,
+            Some(600),
+            "the setting fills what the file omits"
+        );
         let c = RunConfig::load(dir.path(), &path).expect("load");
         assert_eq!(c.max_checkpoints, 10, "no setting: default");
         assert!(!c.warn_rule_conflicts, "off by default");
+        assert_eq!(c.answer_wait_secs, None, "no setting: measured per call");
         std::fs::write(
             &path,
             r#"{"routes": ["kimi:model"], "prices": "p.json", "warn_rule_conflicts": false}"#,

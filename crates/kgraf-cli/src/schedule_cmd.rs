@@ -65,6 +65,9 @@ pub struct RunNowArgs {
     pub planner_max_tokens: u32,
     /// `--warn-rule-conflicts`, else the user setting, else off.
     pub warn_rule_conflicts: bool,
+    /// The answer wait: the user setting, else derived per call (`run-now`
+    /// has no flag for it).
+    pub answer_wait_secs: Option<u32>,
     pub window: u64,
     /// `--verify`; without it, the first validation command the project's build
     /// files declare.
@@ -697,6 +700,7 @@ fn run_now_with(
             permissions: Default::default(),
             approve_plan: false,
             warn_rule_conflicts: args.warn_rule_conflicts,
+            answer_wait_secs: args.answer_wait_secs,
         },
     );
     let spend = match run_spend(root, &run_id, &prices_path) {
@@ -1145,6 +1149,7 @@ mod tests {
             max_tokens: 16,
             planner_max_tokens: 8_192,
             warn_rule_conflicts: false,
+            answer_wait_secs: None,
             window: 1000,
             verify: Some("true".to_owned()),
             force,

@@ -61,7 +61,7 @@ kgraf-provider-google = { path = "../kgraf-provider-google" }
 kgraf-core = { path = "../kgraf-core", features = ["test-support"] }
 # Tests corrupt a graph row directly to force an analytics failure.
 rusqlite = { workspace = true }
-tokio = { version = "1.53", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.53", features = ["macros", "rt", "rt-multi-thread", "sync", "test-util", "time"] }
 tempfile = "3"
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 

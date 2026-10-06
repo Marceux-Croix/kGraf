@@ -396,6 +396,14 @@ enum Command {
         /// setting, else 32,768.
         #[arg(long)]
         planner_max_tokens: Option<u32>,
+        /// Seconds a worker's question waits for the orchestrator's model to
+        /// answer it, and a connection judgment may run (30 to 1800). A
+        /// later answer still reaches the worker at its next round. Default:
+        /// the `answer_wait_secs` user setting, else derived per call from
+        /// the planner model's recent latencies (twice the 95th percentile,
+        /// 120 to 900 s; 300 s with too little history).
+        #[arg(long, value_parser = clap::value_parser!(u32).range(30..=1800))]
+        answer_wait: Option<u32>,
         /// With --resume: run this held or failed gate again, with a fresh
         /// remediation allowance. Needs --gate-note.
         #[arg(long, requires = "resume", requires = "gate_note")]
@@ -1123,6 +1131,7 @@ fn run_cli() -> Result<()> {
             container_sandbox,
             warn_rule_conflicts,
             no_warn_rule_conflicts,
+            answer_wait,
         } => {
             let limits = resolve_limits(
                 kgraf_host::limits::UserLimits {
@@ -1134,6 +1143,7 @@ fn run_cli() -> Result<()> {
                     warn_rule_conflicts: warn_choice(warn_rule_conflicts, no_warn_rule_conflicts),
                     // `--point` is read on its own; this field is the desktop's.
                     compaction_point: None,
+                    answer_wait_secs: answer_wait,
                 },
                 kgraf_host::limits::DEFAULT_ROUNDS_ORCHESTRATED,
                 true,
@@ -1192,6 +1202,7 @@ fn run_cli() -> Result<()> {
                     },
                     approve_plan,
                     warn_rule_conflicts: limits.warn_rule_conflicts.0,
+                    answer_wait_secs: limits.answer_wait_secs.0,
                 },
             )
         }
@@ -1229,6 +1240,7 @@ fn run_cli() -> Result<()> {
                     window,
                     warn_rule_conflicts: None,
                     compaction_point: None,
+                    answer_wait_secs: None,
                 },
                 kgraf_host::limits::DEFAULT_ROUNDS_SINGLE_WORKER,
                 false,
@@ -1317,6 +1329,7 @@ fn run_cli() -> Result<()> {
                             no_warn_rule_conflicts,
                         ),
                         compaction_point: None,
+                        answer_wait_secs: None,
                     },
                     kgraf_host::limits::DEFAULT_ROUNDS_ORCHESTRATED,
                     true,
@@ -1336,6 +1349,7 @@ fn run_cli() -> Result<()> {
                         max_tokens: limits.worker_max_tokens.0,
                         planner_max_tokens: limits.planner_max_tokens.0,
                         warn_rule_conflicts: limits.warn_rule_conflicts.0,
+                        answer_wait_secs: limits.answer_wait_secs.0,
                         window: limits.window.0,
                         verify,
                         force,
@@ -2684,6 +2698,7 @@ mod tests {
             window,
             warn_rule_conflicts: None,
             compaction_point: None,
+            answer_wait_secs: None,
         };
         let user = UserLimits {
             rounds: Some(40),
@@ -2738,6 +2753,54 @@ mod tests {
         assert_eq!(with.max_checkpoints, (2, Source::Flag));
         let without = ResolvedLimits::resolve(&parse(&[]), &user, 12);
         assert_eq!(without.max_checkpoints, (25, Source::Setting));
+    }
+
+    /// `--answer-wait` outranks the setting, no flag leaves the setting or the
+    /// derived wait, and a value outside 30 to 1800 s is refused.
+    #[test]
+    fn the_answer_wait_flag_outranks_the_setting_and_is_bounded() {
+        use kgraf_host::limits::{ResolvedLimits, Source, UserLimits};
+        let base = [
+            "kgraf",
+            "orchestrate",
+            "--route",
+            "ollama:llama3",
+            "--prices",
+            "p.json",
+        ];
+        let parse = |extra: &[&str]| {
+            Cli::try_parse_from(base.iter().chain(extra.iter()).copied()).map(|cli| {
+                let Command::Orchestrate { answer_wait, .. } = cli.command else {
+                    panic!("not orchestrate");
+                };
+                answer_wait
+            })
+        };
+        let set = UserLimits {
+            answer_wait_secs: Some(600),
+            ..UserLimits::default()
+        };
+        let resolve = |flag: Option<u32>, user: &UserLimits| {
+            let flags = UserLimits {
+                answer_wait_secs: flag,
+                ..UserLimits::default()
+            };
+            ResolvedLimits::resolve(&flags, user, 30).answer_wait_secs
+        };
+        assert_eq!(
+            resolve(parse(&[]).expect("parse"), &UserLimits::default()),
+            (None, Source::Default)
+        );
+        assert_eq!(
+            resolve(parse(&[]).expect("parse"), &set),
+            (Some(600), Source::Setting)
+        );
+        assert_eq!(
+            resolve(parse(&["--answer-wait", "90"]).expect("parse"), &set),
+            (Some(90), Source::Flag)
+        );
+        assert!(parse(&["--answer-wait", "10"]).is_err(), "below 30 s");
+        assert!(parse(&["--answer-wait", "4000"]).is_err(), "above 1800 s");
     }
 
     /// The warning flags reach the resolver: no flag leaves it to the user

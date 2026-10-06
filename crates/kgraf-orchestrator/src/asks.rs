@@ -763,6 +763,8 @@ impl QuestionAttendance {
 
 /// A question [`QuestionDesk::take_ended`] took off the desk.
 pub(crate) struct EndedQuestion {
+    /// Its desk id.
+    pub id: u64,
     pub session: AgentId,
     /// `true`: its deadline passed with the worker still waiting; `false`:
     /// the worker stopped waiting (its reply channel closed).
@@ -848,8 +850,9 @@ impl QuestionDesk {
             .collect();
         ended
             .into_iter()
-            .filter_map(|id| s.waiting.remove(&id))
-            .map(|p| EndedQuestion {
+            .filter_map(|id| s.waiting.remove(&id).map(|p| (id, p)))
+            .map(|(id, p)| EndedQuestion {
+                id,
                 session: p.session,
                 expired: !p.reply.is_closed(),
                 reply: p.reply,

@@ -395,7 +395,7 @@ type ReadLimit = fn(&kgraf_host::limits::UserLimits) -> Option<u64>;
 fn each_run_limit_slider_reaches_the_shared_value() {
     let mut f = open(SettingsTab::Runs, None);
     assert_eq!(f.shared.get(), kgraf_host::limits::UserLimits::default());
-    let read: [(&str, ReadLimit); 5] = [
+    let read: [(&str, ReadLimit); 6] = [
         ("rounds", |u| u.rounds.map(u64::from)),
         ("max_checkpoints", |u| u.max_checkpoints.map(u64::from)),
         ("worker_max_tokens", |u| u.worker_max_tokens.map(u64::from)),
@@ -403,6 +403,7 @@ fn each_run_limit_slider_reaches_the_shared_value() {
             u.planner_max_tokens.map(u64::from)
         }),
         ("window", |u| u.window),
+        ("answer_wait", |u| u.answer_wait_secs.map(u64::from)),
     ];
     for (n, (name, get)) in read.iter().enumerate() {
         f.nudge_slider(2 + n, egui::Key::ArrowLeft, 1);
@@ -417,6 +418,8 @@ fn each_run_limit_slider_reaches_the_shared_value() {
     assert_eq!(Some(config.max_tokens), user.worker_max_tokens);
     assert_eq!(Some(config.planner_max_tokens), user.planner_max_tokens);
     assert_eq!(Some(config.window), user.window);
+    assert_eq!(user.answer_wait_secs, Some(270), "one step down from 300 s");
+    assert_eq!(config.answer_wait_secs, user.answer_wait_secs);
 }
 
 /// The worktree switch reaches the retention every host is built with.

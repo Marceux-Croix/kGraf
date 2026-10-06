@@ -160,3 +160,13 @@ started after it, as the sliders do. A key in `.kgraf/run.json` counts as a flag
 project. The key is written only while on, so a user who never turned it on has no key. The
 control is a checkbox like the page's other toggles, until a switch widget exists
 (`STYLE_GUIDE.md` CMP-SET-4).
+
+## Amendment (2026-10-06): a sixth run limit, the answer wait
+
+`answer_wait_secs` (30 to 1,800 s) joins the run limits by the same path: a slider in
+Settings > Runs ("Answer wait (seconds)", steps of 30), a key in the user settings file, a
+`run.json` key, `--answer-wait` on `orchestrate` (the setting for `schedule run-now`), and a
+`limits` line with its source. Unlike the other five it has no fixed default: unset, each answer
+call derives its wait from the answering model's recent latencies (decision 0067, amendment of
+2026-10-06). The slider states that default in words, not as the number it rests at, and writes
+no key until moved.

@@ -62,6 +62,7 @@
 
 mod admission;
 mod answer_json;
+pub mod answer_wait;
 mod ask_tool;
 mod asks;
 mod box_port;
@@ -182,7 +183,7 @@ pub use interface_review::{
 pub use model_kinds::ModelKindCalls;
 pub use orchestrator::sessions::{
     AnswerOutput, AnswerRequest, ConnectionRequest, ConnectionVerdict, JudgeOutput, JudgeRequest,
-    QuestionAnswerer, SESSION_CALL_TIMEOUT, SessionNoticeSink,
+    QuestionAnswerer, SessionNoticeSink,
 };
 pub use orchestrator::{
     AttemptEnv, AttemptEnvs, CloseEnv, CompactError, DEFAULT_MAX_CONTRACTS_PER_PLAN,

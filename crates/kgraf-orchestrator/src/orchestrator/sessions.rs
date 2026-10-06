@@ -27,10 +27,17 @@
 //! recorded as a notice before it reaches the user.
 //!
 //! **Supervised, and bounded in time.** Each paid call runs in an inner
-//! task under a supervisor ([`spawn_session_call`]): a panic, or a call
-//! that does not finish within [`SESSION_CALL_TIMEOUT`], comes back as a
-//! failed result, so the asking worker is never left blocked and a pending
-//! judgment always clears.
+//! task under a supervisor ([`spawn_session_call`]). Its wait fits the
+//! answering model: the user's wait, else one derived from the model's
+//! recent latencies in the ledger, else a stated default
+//! ([`crate::answer_wait`]). A panic, or a judgment that does not finish
+//! within the wait, comes back as a failed result, so a pending judgment
+//! always clears. An answer call that passes the wait releases its worker
+//! (to the box, or with the assumption text) and runs on: a late answer
+//! answers the question if it is still open in the box, and is otherwise
+//! injected into the worker at its next round boundary, so it corrects the
+//! assumption. It is recorded either way. The asking worker is never left
+//! blocked.
 //!
 //! **Nothing waits forever.** A question the orchestrator could
 //! not answer waits for the user until the run's attendance deadline
@@ -39,6 +46,7 @@
 //! text, which tells the worker to state its assumption.
 
 use super::*;
+use crate::answer_wait::AnswerWait;
 use kgraf_core::session::{
     ConnectionBasis, ConnectionFacts, ConnectionState, Decider, InboxItem, SessionFacts, SessionId,
     SessionKind, connection_id,
@@ -62,6 +70,13 @@ pub trait QuestionAnswerer: Send + Sync {
     fn cost_basis(&self) -> CostBasis;
     /// Judge every pair in `request` in one call (decision 0067, point 6). A pair with no verdict in the output is refused.
     async fn judge_connections(&self, request: &JudgeRequest) -> Result<JudgeOutput, PlanError>;
+    /// The answering model's recent call latencies, from which the wait for
+    /// its answer is derived ([`crate::answer_wait`]). An error is a history
+    /// that cannot be read: the default wait applies and a notice says so.
+    /// The default implementation has no history, so the default wait applies.
+    fn latency_history(&self) -> Result<crate::answer_wait::LatencyHistory, String> {
+        Ok(crate::answer_wait::LatencyHistory::default())
+    }
 }
 
 /// One batched connection judgment: every queued pair, with what the judge
@@ -128,7 +143,28 @@ pub(super) enum SessionWork {
         id: u64,
         result: Result<AnswerOutput, PlanError>,
     },
+    /// Answer call `id` passed its wait ([`crate::answer_wait`]) with its
+    /// worker still waiting: the worker is released, and the call runs on.
+    AnswerOverdue {
+        id: u64,
+        wait: AnswerWait,
+    },
     Judged(Result<JudgeOutput, PlanError>),
+    /// A session call's wait fell back to the default because the latency
+    /// history could not be read: shown, never silent.
+    WaitNotice(String),
+}
+
+/// What happened to the asking worker while its answer call ran.
+enum Released {
+    /// It still waits on this call.
+    Waiting(oneshot::Sender<Result<String, SessionError>>),
+    /// The wait passed and it was told to state its assumption: a late
+    /// answer is injected at its next round boundary.
+    Assumed,
+    /// The wait passed and the question went to the box as desk question
+    /// `.0`: a late answer answers that question while it is still open.
+    AtDesk(u64),
 }
 
 /// An orchestrator-first answer call in flight.
@@ -136,7 +172,7 @@ struct Asking {
     reservation: Reservation,
     session: AgentId,
     question: UntrustedText,
-    reply: oneshot::Sender<Result<String, SessionError>>,
+    released: Released,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -147,12 +183,16 @@ pub(super) struct SessionRuntime {
     pub(super) question_timeout: Duration,
     /// The run is known to be unattended: a question is answered at once.
     pub(super) unattended: bool,
-    /// How long one paid session call may run ([`SESSION_CALL_TIMEOUT`]).
-    pub(super) call_timeout: Duration,
+    /// The user-set wait for one paid session call; `None` derives it from
+    /// the answering model's latency history ([`crate::answer_wait`]).
+    pub(super) answer_wait: Option<Duration>,
     /// Where session notices go besides the trace and the report: the box's
     /// `RunEvent::SessionNotice`.
     pub(super) notice_sink: Option<SessionNoticeSink>,
     asking: BTreeMap<u64, Asking>,
+    /// Desk questions that expired while the answer call that sent them
+    /// there still runs: the worker was told to state its assumption.
+    expired_desk: BTreeSet<u64>,
     next_id: u64,
     pub(super) judge: connections::JudgeQueue,
     pub(super) pacer: connections::Pacer,
@@ -164,12 +204,6 @@ pub(super) struct SessionRuntime {
 /// A callback that shows a session notice to the user.
 pub type SessionNoticeSink = Arc<dyn Fn(String) + Send + Sync>;
 
-/// How long one paid session call (an orchestrator-first answer, a
-/// connection judgment) may run before it counts as failed. Generous: one
-/// model call of a few hundred output tokens; a call that has not answered in
-/// this time is stuck, and the worker asking waits on it.
-pub const SESSION_CALL_TIMEOUT: Duration = Duration::from_secs(300);
-
 /// Aborts the call task when its supervisor is dropped: a run shutdown
 /// aborts the supervisor, and the call must not outlive it.
 struct AbortOnDrop(tokio::task::AbortHandle);
@@ -180,35 +214,93 @@ impl Drop for AbortOnDrop {
     }
 }
 
-/// Run one paid session call off the loop, supervised: `call` runs in its own
-/// task under `limit`; a panic or the limit becomes a failed result, and
-/// `wrap` of the result always reaches the loop. The error is a transport
+/// What the supervisor of one paid session call derives its wait from.
+pub(super) struct WaitFrom {
+    /// The user-set wait, which wins.
+    pub(super) user: Option<Duration>,
+    /// Whose latency history decides otherwise.
+    pub(super) answerer: Arc<dyn QuestionAnswerer>,
+}
+
+/// Called with the wait when an answer call passes it.
+pub(super) type Overdue = Box<dyn FnOnce(AnswerWait) -> SessionWork + Send>;
+
+/// Run one paid session call off the loop, supervised. The wait is derived
+/// first, off the loop ([`crate::answer_wait::answer_wait`]; the ledger read
+/// never blocks the loop). Then `call` runs in its own task:
+///
+/// - without `overdue` (a connection judgment), under the wait: a panic or
+///   the wait passing becomes a failed result;
+/// - with `overdue` (an answer), `overdue(wait)` reaches the loop when the
+///   wait passes, so the worker stops waiting, and the call runs on until
+///   [`crate::answer_wait::LATE_ANSWER_LIMIT`] (never less than the wait):
+///   its answer, when it comes, is not wasted.
+///
+/// `wrap` of the result always reaches the loop. A failure is a transport
 /// failure, since the request may have reached the provider: its hold is
 /// settled whole.
 pub(super) fn spawn_session_call<T, F>(
     tx: mpsc::Sender<LoopMsg>,
-    limit: Duration,
+    wait_from: WaitFrom,
     what: &'static str,
     call: F,
     wrap: impl FnOnce(Result<T, PlanError>) -> SessionWork + Send + 'static,
+    overdue: Option<Overdue>,
 ) -> tokio::task::JoinHandle<()>
 where
     T: Send + 'static,
     F: std::future::Future<Output = Result<T, PlanError>> + Send + 'static,
 {
-    let inner = tokio::spawn(tokio::time::timeout(limit, call));
     tokio::spawn(async move {
+        let WaitFrom { user, answerer } = wait_from;
+        let history = if user.is_some() {
+            Ok(crate::answer_wait::LatencyHistory::default())
+        } else {
+            tokio::task::spawn_blocking(move || answerer.latency_history())
+                .await
+                .unwrap_or_else(|e| Err(format!("the history read ended abnormally: {e}")))
+        };
+        let wait = crate::answer_wait::answer_wait(user, history);
+        if let crate::answer_wait::WaitSource::Default {
+            unreadable: Some(_),
+            ..
+        } = &wait.source
+        {
+            let notice = format!("the {what} call waits {}", wait.describe());
+            let _ = tx
+                .send(LoopMsg::Session(Box::new(SessionWork::WaitNotice(notice))))
+                .await;
+        }
+        let limit = if overdue.is_some() {
+            wait.wait.max(crate::answer_wait::LATE_ANSWER_LIMIT)
+        } else {
+            wait.wait
+        };
+        let mut inner = tokio::spawn(tokio::time::timeout(limit, call));
         let _abort = AbortOnDrop(inner.abort_handle());
+        let joined = match overdue {
+            Some(overdue) if limit > wait.wait => {
+                tokio::select! {
+                    joined = &mut inner => joined,
+                    () = tokio::time::sleep(wait.wait) => {
+                        let _ = tx.send(LoopMsg::Session(Box::new(overdue(wait)))).await;
+                        (&mut inner).await
+                    }
+                }
+            }
+            _ => inner.await,
+        };
         let failed = |reason: String| {
             PlanError::Provider(kgraf_provider::ProviderError::Transport {
                 adapter: "kgraf-orchestrator",
                 reason,
             })
         };
-        let result = match inner.await {
+        let result = match joined {
             Ok(Ok(result)) => result,
             Ok(Err(_elapsed)) => Err(failed(format!(
-                "the {what} call did not finish within {limit:?}"
+                "the {what} call did not finish within {} s",
+                limit.as_secs_f64()
             ))),
             Err(e) if e.is_panic() => Err(failed(format!("the {what} call panicked: {e}"))),
             Err(e) => Err(failed(format!("the {what} call ended abnormally: {e}"))),
@@ -222,14 +314,15 @@ impl SessionRuntime {
         question_timeout: Duration,
         unattended: bool,
         notice_sink: Option<SessionNoticeSink>,
-        call_timeout: Duration,
+        answer_wait: Option<Duration>,
     ) -> Self {
         Self {
             question_timeout,
             unattended,
-            call_timeout,
+            answer_wait,
             notice_sink,
             asking: BTreeMap::new(),
+            expired_desk: BTreeSet::new(),
             next_id: 0,
             judge: connections::JudgeQueue::default(),
             pacer: connections::Pacer::default(),
@@ -260,6 +353,16 @@ pub(super) fn no_answer_text(after: Duration) -> String {
          and nobody answered it. State the assumption you make instead, in your answer, and \
          continue.",
         after.as_secs()
+    )
+}
+
+/// What a worker is given at its next round boundary when the orchestrator's
+/// answer came after the worker was told to state its assumption.
+pub(super) fn late_answer_text(answer: &str) -> String {
+    format!(
+        "A late answer to your earlier question came from the orchestrator, after you were told \
+         to state an assumption. Where it differs from the assumption you stated, follow it.\n\n\
+         {answer}"
     )
 }
 
@@ -684,12 +787,20 @@ impl RunLoop {
         // unrelated save.
         self.save()?;
         let id = self.sessions_rt.next_id();
+        let wait_from = WaitFrom {
+            user: self.sessions_rt.answer_wait,
+            answerer: answerer.clone(),
+        };
         let task = spawn_session_call(
             self.tx.clone(),
-            self.sessions_rt.call_timeout,
+            wait_from,
             "answer",
             async move { answerer.try_answer(&request).await },
             move |result| SessionWork::Answered { id, result },
+            Some(Box::new(move |wait| SessionWork::AnswerOverdue {
+                id,
+                wait,
+            })),
         );
         self.sessions_rt.asking.insert(
             id,
@@ -697,7 +808,7 @@ impl RunLoop {
                 reservation,
                 session,
                 question,
-                reply,
+                released: Released::Waiting(reply),
                 task,
             },
         );
@@ -711,8 +822,47 @@ impl RunLoop {
     ) -> Result<(), OrchestratorError> {
         match w {
             SessionWork::Answered { id, result } => self.on_answered(id, result),
+            SessionWork::AnswerOverdue { id, wait } => self.on_answer_overdue(id, wait),
             SessionWork::Judged(result) => self.on_judged(result),
+            SessionWork::WaitNotice(detail) => {
+                self.session_notice("", "", detail);
+                Ok(())
+            }
         }
+    }
+
+    /// An answer call passed its wait with its worker still waiting: the
+    /// question goes on as if the orchestrator had no answer (to the box, or
+    /// answered at once with the assumption text), and the call runs on.
+    fn on_answer_overdue(&mut self, id: u64, wait: AnswerWait) -> Result<(), OrchestratorError> {
+        let Some(a) = self.sessions_rt.asking.get_mut(&id) else {
+            return Ok(());
+        };
+        let reply = match std::mem::replace(&mut a.released, Released::Assumed) {
+            Released::Waiting(reply) => reply,
+            other => {
+                a.released = other;
+                return Ok(());
+            }
+        };
+        let (session, question) = (a.session.clone(), a.question.clone());
+        let contract = self.contract_of(&session).unwrap_or_default();
+        self.session_notice(
+            &contract,
+            session.as_str(),
+            format!(
+                "{session}'s question skipped the orchestrator: its answer call did not finish \
+                 within its wait ({}), so it goes on as if the orchestrator had no answer; the \
+                 call runs on, and a late answer reaches the worker",
+                wait.describe()
+            ),
+        );
+        if let Some(desk) = self.ask_the_user(session, question, reply)
+            && let Some(a) = self.sessions_rt.asking.get_mut(&id)
+        {
+            a.released = Released::AtDesk(desk);
+        }
+        self.save()
     }
 
     fn on_answered(
@@ -724,52 +874,180 @@ impl RunLoop {
             return Ok(());
         };
         let contract = self.contract_of(&a.session).unwrap_or_default();
+        // Whether the box question this call sent on already expired (its
+        // worker was told to state its assumption). Taken here on every
+        // outcome, so the set holds only questions of calls still running.
+        let desk_expired = match a.released {
+            Released::AtDesk(desk) => self.sessions_rt.expired_desk.remove(&desk),
+            _ => false,
+        };
         match result {
             Ok(out) => {
                 self.note_malformed_retries("question", out.retried_calls.len());
                 let calls: Vec<CallId> = out.retried_calls.into_iter().chain(out.call).collect();
                 self.settle_call(a.reservation, Some(&calls))?;
-                match out.answer.filter(|t| !t.trim().is_empty()) {
-                    Some(answer) => {
+                let answer = out.answer.filter(|t| !t.trim().is_empty());
+                match (a.released, answer) {
+                    (Released::Waiting(reply), Some(answer)) => {
                         // A worker that stopped waiting (cancelled) never saw
                         // it: not recorded as an answer it was given.
-                        if !a.reply.is_closed() {
+                        if !reply.is_closed() {
                             self.record_answer(&a.session, InboxSource::Orchestrator, &answer);
-                            let _ = a
-                                .reply
+                            let _ = reply
                                 .send(Ok(kgraf_secrets::scrub_model_facing(&answer).into_owned()));
                         }
                     }
-                    None => self.ask_the_user(a.session, a.question, a.reply),
+                    (Released::Waiting(reply), None) => {
+                        self.ask_the_user(a.session, a.question, reply);
+                    }
+                    (released, Some(answer)) => {
+                        self.late_answer(&a.session, &contract, released, desk_expired, &answer);
+                    }
+                    (_, None) => self.session_notice(
+                        &contract,
+                        a.session.as_str(),
+                        format!(
+                            "{}'s late answer call found no answer in the run record; nothing \
+                             changes for the worker",
+                            a.session
+                        ),
+                    ),
                 }
             }
             Err(e) => {
                 self.settle_call(a.reservation, e.calls())?;
-                self.session_notice(
-                    &contract,
-                    a.session.as_str(),
-                    format!(
-                        "{}'s question skipped the orchestrator: its answer call failed ({e}), \
-                         so it went to the user",
-                        a.session
+                match a.released {
+                    Released::Waiting(reply) => {
+                        self.session_notice(
+                            &contract,
+                            a.session.as_str(),
+                            format!(
+                                "{}'s question skipped the orchestrator: its answer call failed \
+                                 ({e}), so it went to the user",
+                                a.session
+                            ),
+                        );
+                        self.ask_the_user(a.session, a.question, reply);
+                    }
+                    Released::Assumed | Released::AtDesk(_) => self.session_notice(
+                        &contract,
+                        a.session.as_str(),
+                        format!(
+                            "{}'s answer call failed after its wait passed ({e}); nothing \
+                             changes for the worker",
+                            a.session
+                        ),
                     ),
-                );
-                self.ask_the_user(a.session, a.question, a.reply);
+                }
             }
         }
         self.save()
     }
 
+    /// An orchestrator answer that came after its worker stopped waiting.
+    /// A question still open in the box is answered with it. A worker that
+    /// was told to state its assumption is given it at its next round
+    /// boundary (a `Notice` row, injected), so it can correct the
+    /// assumption; a worker that ended has it recorded only. An answer the
+    /// user already gave in the box stands. Each case is a notice.
+    fn late_answer(
+        &mut self,
+        session: &AgentId,
+        contract: &str,
+        released: Released,
+        desk_expired: bool,
+        answer: &str,
+    ) {
+        if let Released::AtDesk(desk) = released {
+            let for_model = kgraf_secrets::scrub_model_facing(answer).into_owned();
+            if let Some(asked) = self.question_desk.answer(desk, for_model) {
+                self.record_answer(&asked, InboxSource::Orchestrator, answer);
+                self.question_settled(&asked);
+                self.session_notice(
+                    contract,
+                    session.as_str(),
+                    format!(
+                        "{session}'s question was answered late by the orchestrator, while it \
+                         still waited in the box"
+                    ),
+                );
+                return;
+            }
+            if !desk_expired {
+                self.session_notice(
+                    contract,
+                    session.as_str(),
+                    format!(
+                        "{session}'s question was answered in the box before the \
+                         orchestrator's late answer came; the box answer stands, and the late \
+                         answer was: {answer}"
+                    ),
+                );
+                return;
+            }
+        }
+        match self.liveness_of(session) {
+            Liveness::Running | Liveness::Resumable => {
+                let now = self.now();
+                let n = self.sessions_rt.next_id();
+                let item = InboxItem {
+                    id: format!("late-answer-{session}-{now}-{n}"),
+                    session: session.clone(),
+                    source: InboxSource::Orchestrator,
+                    kind: InboxKind::Notice,
+                    mode: InjectMode::AtBoundary,
+                    text: late_answer_text(answer),
+                    received_ms: now,
+                    not_before_ms: now,
+                    delivered: None,
+                };
+                if let Err(e) = sessions_of(&self.s).push_inbox(&item) {
+                    self.session_notice(
+                        contract,
+                        session.as_str(),
+                        format!(
+                            "{session}'s late answer could not be recorded to its inbox ({e}), \
+                             so it was not delivered; the answer was: {answer}"
+                        ),
+                    );
+                    return;
+                }
+                self.inject_now_or_later(session, &item);
+                self.session_notice(
+                    contract,
+                    session.as_str(),
+                    format!(
+                        "{session}'s question was answered late by the orchestrator; the answer \
+                         reaches the worker at its next round boundary"
+                    ),
+                );
+            }
+            Liveness::Retired { .. } | Liveness::Unknown => {
+                self.record_answer(session, InboxSource::Orchestrator, answer);
+                self.session_notice(
+                    contract,
+                    session.as_str(),
+                    format!(
+                        "{session}'s question was answered late by the orchestrator after the \
+                         worker ended; the answer is recorded only"
+                    ),
+                );
+            }
+        }
+    }
+
     /// Queue a question for the user until the run's attendance deadline, and
-    /// show its contract as awaiting an answer.
+    /// show its contract as awaiting an answer. Returns the desk id when the
+    /// question waits in the box; `None` when it was answered at once (an
+    /// unattended run) or its worker stopped waiting.
     fn ask_the_user(
         &mut self,
         session: AgentId,
         question: UntrustedText,
         reply: oneshot::Sender<Result<String, SessionError>>,
-    ) {
+    ) -> Option<u64> {
         if reply.is_closed() {
-            return;
+            return None;
         }
         if self.sessions_rt.unattended {
             let text = unattended_answer_text();
@@ -784,10 +1062,10 @@ impl RunLoop {
                 ),
             );
             let _ = reply.send(Ok(text));
-            return;
+            return None;
         }
         let deadline = std::time::Instant::now() + self.sessions_rt.question_timeout;
-        self.question_desk.wait_for(
+        let desk = self.question_desk.wait_for(
             session.clone(),
             question.to_description(4_000),
             deadline,
@@ -796,6 +1074,7 @@ impl RunLoop {
         if let Some(c) = self.contract_of(&session) {
             self.note_wait(&c, crate::waits::WaitState::AwaitingAnswer);
         }
+        Some(desk)
     }
 
     /// The contract goes back to running once none of its sessions has a
@@ -826,6 +1105,17 @@ impl RunLoop {
         }
         for q in ended {
             if q.expired {
+                // An answer call that sent this question to the box may still
+                // answer it late: its worker now states an assumption, so the
+                // late answer is injected rather than dropped.
+                let pending_call = self
+                    .sessions_rt
+                    .asking
+                    .values()
+                    .any(|a| matches!(a.released, Released::AtDesk(d) if d == q.id));
+                if pending_call {
+                    self.sessions_rt.expired_desk.insert(q.id);
+                }
                 let after = self.sessions_rt.question_timeout;
                 let text = no_answer_text(after);
                 self.record_answer(&q.session, InboxSource::Orchestrator, &text);
@@ -1175,6 +1465,212 @@ mod unit_tests {
         ] {
             assert!(injectable(k), "{k:?}");
         }
+    }
+
+    /// An answerer whose calls take `takes` (tokio time) and whose ledger
+    /// history is `history` seconds per call.
+    struct Timed {
+        takes: Duration,
+        history: Option<Vec<u64>>,
+    }
+
+    #[async_trait::async_trait]
+    impl QuestionAnswerer for Timed {
+        async fn try_answer(&self, _r: &AnswerRequest) -> Result<AnswerOutput, PlanError> {
+            tokio::time::sleep(self.takes).await;
+            Ok(AnswerOutput {
+                answer: Some("the answer".into()),
+                call: None,
+                retried_calls: Vec::new(),
+            })
+        }
+        fn cost_basis(&self) -> CostBasis {
+            CostBasis {
+                model: "m".into(),
+                max_output_tokens: 1,
+            }
+        }
+        async fn judge_connections(&self, _r: &JudgeRequest) -> Result<JudgeOutput, PlanError> {
+            tokio::time::sleep(self.takes).await;
+            Ok(JudgeOutput {
+                verdicts: Vec::new(),
+                call: None,
+                retried_calls: Vec::new(),
+            })
+        }
+        fn latency_history(&self) -> Result<crate::answer_wait::LatencyHistory, String> {
+            match &self.history {
+                Some(h) => Ok(crate::answer_wait::LatencyHistory {
+                    answer_calls: h.iter().map(|s| s * 1_000).collect(),
+                    model_calls: Vec::new(),
+                }),
+                None => Err("the ledger is locked".into()),
+            }
+        }
+    }
+
+    /// What the supervisor of one answer call sends to the loop, in order,
+    /// with the tokio time each message arrived at. Paused time: the order is
+    /// decided by the timers, never by the machine's speed.
+    async fn answer_call(user: Option<Duration>, answerer: Timed) -> Vec<(u64, String)> {
+        let (tx, mut rx) = mpsc::channel(8);
+        let answerer: Arc<dyn QuestionAnswerer> = Arc::new(answerer);
+        let call = answerer.clone();
+        let start = tokio::time::Instant::now();
+        let request = AnswerRequest {
+            session: SessionId::new("w"),
+            original_instruction: String::new(),
+            question: UntrustedText::new("q".to_owned()),
+            verified: Vec::new(),
+            notes: Vec::new(),
+        };
+        spawn_session_call(
+            tx,
+            WaitFrom { user, answerer },
+            "answer",
+            async move { call.try_answer(&request).await },
+            |result| SessionWork::Answered { id: 1, result },
+            Some(Box::new(|wait| SessionWork::AnswerOverdue { id: 1, wait })),
+        );
+        let mut seen = Vec::new();
+        while let Some(LoopMsg::Session(w)) = rx.recv().await {
+            let at = start.elapsed().as_secs();
+            let what = match *w {
+                SessionWork::Answered { result, .. } => match result {
+                    Ok(out) => format!("answered {}", out.answer.unwrap_or_default()),
+                    Err(e) => format!("failed {e}"),
+                },
+                SessionWork::AnswerOverdue { wait, .. } => format!("overdue {}", wait.describe()),
+                SessionWork::WaitNotice(n) => format!("notice {n}"),
+                SessionWork::Judged(_) => "judged".into(),
+            };
+            let done = what.starts_with("answered") || what.starts_with("failed");
+            seen.push((at, what));
+            if done {
+                break;
+            }
+        }
+        seen
+    }
+
+    /// A slow route: calls of 350 s in its history give a wait of 700 s, so
+    /// a 400 s answer reaches the worker while it still waits. With the
+    /// former fixed 300 s, this answer came too late.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_route_waits_past_its_measured_latency() {
+        let seen = answer_call(
+            None,
+            Timed {
+                takes: Duration::from_secs(400),
+                history: Some(vec![350; 10]),
+            },
+        )
+        .await;
+        assert_eq!(seen, vec![(400, "answered the answer".to_owned())]);
+    }
+
+    /// No history: the stated default (300 s) releases the worker, and the
+    /// call runs on, so its answer still reaches the loop.
+    #[tokio::test(start_paused = true)]
+    async fn no_history_waits_the_default_and_the_late_answer_still_comes() {
+        let seen = answer_call(
+            None,
+            Timed {
+                takes: Duration::from_secs(400),
+                history: Some(Vec::new()),
+            },
+        )
+        .await;
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert_eq!(seen[0].0, 300, "{seen:?}");
+        assert!(
+            seen[0].1.starts_with("overdue 300 s, the default"),
+            "{seen:?}"
+        );
+        assert_eq!(seen[1], (400, "answered the answer".to_owned()));
+    }
+
+    /// The user's wait wins over a history that would wait longer.
+    #[tokio::test(start_paused = true)]
+    async fn the_user_wait_wins_over_the_history() {
+        let seen = answer_call(
+            Some(Duration::from_secs(30)),
+            Timed {
+                takes: Duration::from_secs(60),
+                history: Some(vec![350; 10]),
+            },
+        )
+        .await;
+        assert_eq!(seen[0], (30, "overdue 30 s, set by the user".to_owned()));
+        assert_eq!(seen[1], (60, "answered the answer".to_owned()));
+    }
+
+    /// A history that cannot be read is a notice, and the default applies.
+    #[tokio::test(start_paused = true)]
+    async fn an_unreadable_history_is_a_notice_and_the_default_applies() {
+        let seen = answer_call(
+            None,
+            Timed {
+                takes: Duration::from_secs(10),
+                history: None,
+            },
+        )
+        .await;
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert!(
+            seen[0].1.starts_with("notice the answer call waits 300 s")
+                && seen[0].1.contains("the ledger is locked"),
+            "{seen:?}"
+        );
+        assert_eq!(seen[1], (10, "answered the answer".to_owned()));
+    }
+
+    /// A judgment has no late path: it fails at its wait, which fits the
+    /// route the same way.
+    #[tokio::test(start_paused = true)]
+    async fn a_judgment_fails_at_its_route_fitted_wait() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let answerer: Arc<dyn QuestionAnswerer> = Arc::new(Timed {
+            takes: Duration::from_secs(1_000),
+            history: Some(vec![100; 10]),
+        });
+        let call = answerer.clone();
+        let start = tokio::time::Instant::now();
+        let request = JudgeRequest {
+            original_instruction: String::new(),
+            requests: Vec::new(),
+            agents: Vec::new(),
+        };
+        spawn_session_call(
+            tx,
+            WaitFrom {
+                user: None,
+                answerer,
+            },
+            "connection judgment",
+            async move { call.judge_connections(&request).await },
+            SessionWork::Judged,
+            None,
+        );
+        let Some(LoopMsg::Session(w)) = rx.recv().await else {
+            panic!("no result");
+        };
+        let SessionWork::Judged(Err(e)) = *w else {
+            panic!("not a failed judgment");
+        };
+        assert_eq!(start.elapsed().as_secs(), 200);
+        assert!(e.to_string().contains("did not finish within 200 s"), "{e}");
+    }
+
+    #[test]
+    fn the_late_answer_text_says_to_follow_it_over_the_assumption() {
+        let t = late_answer_text("use src/config.toml");
+        assert!(
+            t.contains("late answer")
+                && t.contains("follow it")
+                && t.ends_with("use src/config.toml"),
+            "{t}"
+        );
     }
 
     #[test]

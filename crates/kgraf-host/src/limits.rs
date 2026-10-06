@@ -1,7 +1,9 @@
 //! Run limits the user sets once, for every run: model rounds per worker, the
 //! most progress checkpoints a worker may reach (decision 0096), the output cap
-//! of a worker reply, the output cap of an orchestrator call, and the assumed
-//! context window.
+//! of a worker reply, the output cap of an orchestrator call, the assumed
+//! context window, and the wait for the orchestrator's model to answer a
+//! worker's question (unset: derived from the answering model's recent
+//! latencies, decision 0067).
 //!
 //! They live in the user-level `settings.toml` (the desktop's Settings sliders
 //! write them) and never in a project file a worker could write. Precedence,
@@ -40,6 +42,10 @@ pub const KEY_WINDOW: &str = "context_window";
 /// command runs a program the user's deny or ask rules refuse to workers.
 /// Off unless set.
 pub const KEY_WARN_RULE_CONFLICTS: &str = "warn_rule_conflicts";
+/// `settings.toml` key: how long, in seconds, a worker's question waits for
+/// the orchestrator's model to answer it (and how long a connection judgment
+/// may run). Unset derives it from the answering model's recent latencies.
+pub const KEY_ANSWER_WAIT: &str = "answer_wait_secs";
 
 /// Slider bounds (inclusive).
 pub const ROUNDS_BOUNDS: (u32, u32) = (4, 200);
@@ -47,6 +53,7 @@ pub const MAX_CHECKPOINTS_BOUNDS: (u32, u32) = (1, 50);
 pub const WORKER_MAX_TOKENS_BOUNDS: (u32, u32) = (1_024, 131_072);
 pub const PLANNER_MAX_TOKENS_BOUNDS: (u32, u32) = (4_096, 131_072);
 pub const WINDOW_BOUNDS: (u64, u64) = (8_192, 1_000_000);
+pub const ANSWER_WAIT_BOUNDS: (u32, u32) = (30, 1_800);
 
 /// Built-in defaults.
 pub const DEFAULT_ROUNDS_ORCHESTRATED: u32 = 30;
@@ -79,6 +86,10 @@ pub struct UserLimits {
     /// outranks it. Only the desktop sets it. [`UserLimits::from_toml_str`]
     /// does not read it, so the command line keeps `--point` and its default.
     pub compaction_point: Option<u8>,
+    /// The wait, in seconds, for the orchestrator's model to answer a
+    /// worker's question. `None` derives it per call from the answering
+    /// model's recent latencies (`kgraf_orchestrator::answer_wait`).
+    pub answer_wait_secs: Option<u32>,
 }
 
 fn read_bool_key(table: &toml::Table, key: &str) -> Result<Option<bool>> {
@@ -126,6 +137,7 @@ impl UserLimits {
             window: read_key(&table, KEY_WINDOW, WINDOW_BOUNDS.0, WINDOW_BOUNDS.1)?,
             warn_rule_conflicts: read_bool_key(&table, KEY_WARN_RULE_CONFLICTS)?,
             compaction_point: None,
+            answer_wait_secs: b32(KEY_ANSWER_WAIT, ANSWER_WAIT_BOUNDS)?,
         })
     }
 
@@ -201,6 +213,8 @@ pub struct ResolvedLimits {
     pub window: (u64, Source),
     /// Off by default.
     pub warn_rule_conflicts: (bool, Source),
+    /// `None` by default: derived per call from the answering model.
+    pub answer_wait_secs: (Option<u32>, Source),
 }
 
 impl ResolvedLimits {
@@ -229,6 +243,11 @@ impl ResolvedLimits {
                 flags.warn_rule_conflicts,
                 user.warn_rule_conflicts,
                 DEFAULT_WARN_RULE_CONFLICTS,
+            ),
+            answer_wait_secs: pick(
+                flags.answer_wait_secs.map(Some),
+                user.answer_wait_secs.map(Some),
+                None,
             ),
         }
     }
@@ -265,6 +284,18 @@ impl ResolvedLimits {
             self.window.0,
             self.window.1.label()
         ));
+        if planner {
+            lines.push(match self.answer_wait_secs.0 {
+                Some(s) => format!(
+                    "limits     answer wait {s} s ({})",
+                    self.answer_wait_secs.1.label()
+                ),
+                None => format!(
+                    "limits     answer wait measured from the answering model ({})",
+                    self.answer_wait_secs.1.label()
+                ),
+            });
+        }
         lines
     }
 }
@@ -480,6 +511,45 @@ mod tests {
             (32_768, None)
         );
         assert_eq!(clamp_output_with(1, std::iter::empty(), table), (1, None));
+    }
+
+    /// The answer wait: unset (measured) by default, read in seconds inside
+    /// its bounds, refused outside them by key, flag then setting then
+    /// default, and reported with its source.
+    #[test]
+    fn the_answer_wait_is_measured_unless_set_and_follows_the_precedence() {
+        let none = UserLimits::default();
+        let r = |f: &UserLimits, u: &UserLimits| ResolvedLimits::resolve(f, u, 30);
+        assert_eq!(r(&none, &none).answer_wait_secs, (None, Source::Default));
+        assert!(
+            r(&none, &none)
+                .report(true)
+                .iter()
+                .any(|l| l.contains("answer wait measured from the answering model")),
+        );
+        let set = UserLimits::from_toml_str("answer_wait_secs = 600\n").expect("set");
+        assert_eq!(set.answer_wait_secs, Some(600));
+        assert_eq!(
+            r(&none, &set).answer_wait_secs,
+            (Some(600), Source::Setting)
+        );
+        assert!(
+            r(&none, &set)
+                .report(true)
+                .contains(&"limits     answer wait 600 s (user setting)".to_owned())
+        );
+        let flag = UserLimits {
+            answer_wait_secs: Some(90),
+            ..none
+        };
+        assert_eq!(r(&flag, &set).answer_wait_secs, (Some(90), Source::Flag));
+        let e = UserLimits::from_toml_str("answer_wait_secs = 5\n")
+            .expect_err("below the bounds")
+            .to_string();
+        assert!(
+            e.contains("answer_wait_secs") && e.contains("30 to 1800"),
+            "{e}"
+        );
     }
 
     /// The warning setting: off when unset, read as a boolean from the same file,

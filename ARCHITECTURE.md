@@ -544,10 +544,20 @@ revision twice with the same content. Old traces without these fields still load
 
 **Built:** `ask_user_question`. The orchestrator first tries to answer from
 the run record in one reserved, accounted call; the user is asked only when
-it cannot. A question waits for the user a bounded amount of time (longer in
-an unattended run, shorter otherwise), then returns a recorded no-answer
-result that tells the worker to state its assumption instead. A run the host declares
-unattended answers at once with that result instead of waiting.
+it cannot. A question waits for the user a bounded amount of time (300 s in
+a run started from the orchestrator box, 60 s otherwise), then returns a
+recorded no-answer result that tells the worker to state its assumption
+instead. A run the host declares unattended answers at once with that result
+instead of waiting. The orchestrator's answer call waits a time that fits the
+answering model (decision 0067, amended 2026-10-06): the user's
+`answer_wait_secs`, else twice the 95th percentile of that model's last 50
+answer and judgment calls in the ledger (its other generative calls when it
+has fewer than 8), held between 120 s and 900 s, else 300 s. When the wait
+passes, the worker is released as if the orchestrator had no answer, and the
+call runs on (bounded at 900 s): its late answer answers the question if it
+still waits in the box, is otherwise injected at the worker's next round
+boundary, and is recorded only for a worker that ended. A connection
+judgment fails at the same derived wait.
 
 A worker receives a narrow brief and returns a compact structured result, so
 the orchestrator does not receive the worker's intermediate tokens. The

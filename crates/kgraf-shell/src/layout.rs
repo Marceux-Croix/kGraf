@@ -3080,7 +3080,8 @@ impl ShellApp {
         }
     }
 
-    /// The five global run limits as sliders, one row each.
+    /// The six global run limits as sliders, one row each (CMP-SET-1,
+    /// CMP-SET-2; the default legend and its return action, CMP-SET-3).
     fn settings_run_limits(&mut self, ui: &mut Ui, p: &Palette) {
         let worker = self.settings.limits.worker_max_tokens.value() as u32;
         let planner = self.settings.limits.planner_max_tokens.value() as u32;
@@ -3159,6 +3160,19 @@ impl ShellApp {
             "The window assumed for models. A single worker uses at most 100,000 tokens of it.",
             &mut limits.window,
             true,
+            &[],
+        );
+        settings_rows::divider(ui, p);
+        crate::interaction::limit_slider_row(
+            ui,
+            p,
+            "Answer wait (seconds)",
+            "How long a worker's question waits for the orchestrator's model to answer it. \
+             When the wait ends, the worker states an assumption and continues; an answer \
+             that comes later reaches it at its next round. Also how long a connection \
+             judgment may run.",
+            &mut limits.answer_wait,
+            false,
             &[],
         );
     }

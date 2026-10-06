@@ -592,13 +592,14 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   run stops. A plan that the interface checks hold before any work started (a handshake
   mismatch, or a check the last answer failed) is sent back to the planner once with the
   failures before the run ends on the hold; the re-planned contracts are named `re1.<id>`.
-- **Run limits.** Five limits are global settings, each with a slider in Settings > Runs
+- **Run limits.** Six limits are global settings, each with a slider in Settings > Runs
   and a key in the user-level `settings.toml`: rounds in one block per worker
   (`rounds_per_worker`, 4 to 200), the most blocks a worker may be granted while it makes
   measured progress (`max_checkpoints`, 1 to 50; 1 means the old fixed round limit), the output cap of one worker reply (`worker_max_tokens`,
   1,024 to 131,072), the output cap of one orchestrator call (`planner_max_tokens`, 4,096 to
-  131,072) and the context window assumed for models (`context_window`, 8,192 to
-  1,000,000). A flag outranks the setting, and the setting outranks the built-in default:
+  131,072), the context window assumed for models (`context_window`, 8,192 to
+  1,000,000) and the answer wait (`answer_wait_secs`, 30 to 1,800; see "Answer wait"
+  below). A flag outranks the setting, and the setting outranks the built-in default:
 
   | Limit | Flag | Built-in default |
   | --- | --- | --- |
@@ -607,6 +608,7 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   | Worker reply cap | `--max-tokens` | 16,384 |
   | Orchestrator call cap | `--planner-max-tokens` (`orchestrate`) | 32,768 |
   | Context window | `--window` | 128,000 |
+  | Answer wait (seconds) | `--answer-wait` (`orchestrate`) | measured per call |
 
   One setting covers rounds for both commands: a single `kgraf worker` run is one probe, not a
   share of a plan, so it keeps its own smaller default until you set a value. The commands
@@ -617,6 +619,20 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   command line reads `KGRAF_SETTINGS_PATH` when set, otherwise the app's settings file.
   A single worker still uses at most 100,000 tokens of the window (decision 0057), so a
   window above that changes the orchestrator's view only.
+- **Answer wait.** A worker's `ask_user_question` goes to the orchestrator's model first, and
+  the worker waits for that answer. The wait fits the model that answers: without a set value,
+  each call waits twice the 95th percentile of that model's last 50 answer and connection
+  judgment calls in the ledger (its other calls when it has fewer than 8 of those), held
+  between 120 s and 900 s; with fewer than 8 timed calls it waits 300 s. A set value (the
+  slider, `answer_wait_secs`, `--answer-wait`) wins. When the wait ends, the question goes on
+  as if the orchestrator had no answer: to you in the orchestrator box, or, in an unattended
+  run, back to the worker at once with the instruction to state its assumption. The model
+  call is not cancelled. Its answer, when it comes (within 900 s, or the set wait if longer),
+  answers the question if it still waits in the box; otherwise it is given to the worker at its
+  next round, so it can correct the assumption. A worker that already ended has the answer
+  recorded in its inbox. Each step is a session notice in the run output and the trace. A
+  connection judgment fails at the same wait. A history that cannot be read uses 300 s and
+  says so in a notice.
 - **Output caps are clamped to the model.** A cap above what a model supports (from the
   bundled model catalog) is lowered for that run and the run says so on a `clamped` line,
   never silently. Workers rotate across routes, so the worker cap is the lowest limit among
@@ -1556,6 +1572,10 @@ Behavior that differs from earlier builds. Each item names the decision that hol
   that the orchestrator cannot answer from the run record gets an answer at once, telling the
   worker to state its assumption, instead of waiting 60 s (0067). A run started from the
   orchestrator box still waits for you.
+- The wait for the orchestrator's own answer to a worker's question is no longer a fixed
+  300 s: it is derived from the answering model's recent latencies, or set with
+  `answer_wait_secs` (Settings > Runs > Answer wait, `--answer-wait`). An answer that comes
+  after the wait reaches the worker at its next round instead of being discarded (0067).
 - Workers are told that kGraf commits their worktree after its check, and the planner no
   longer writes acceptance that asks a worker to commit.
 - A planner answer that sends an optional list as `null` (`"depends_on": null`) is read as

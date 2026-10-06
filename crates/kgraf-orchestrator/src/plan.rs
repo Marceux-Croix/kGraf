@@ -1780,6 +1780,30 @@ impl crate::QuestionAnswerer for ModelAnswerer {
         self.0.cost_basis()
     }
 
+    /// The planner model's recent answer and judgment calls from the ledger,
+    /// and its other generative calls when those are too few. Keyed by the
+    /// model name the calls are made with: the caller does not hold a catalog
+    /// route id, and the model name is what its ledger rows carry.
+    fn latency_history(&self) -> Result<crate::answer_wait::LatencyHistory, String> {
+        use crate::answer_wait::{ANSWER_CALL_KINDS, LatencyHistory, MIN_SAMPLES, WINDOW};
+        let ledger = &self.0.ledger;
+        let model = &self.0.model;
+        let answer_calls = ledger
+            .recent_latencies_ms(model, Some(ANSWER_CALL_KINDS), WINDOW)
+            .map_err(|e| e.to_string())?;
+        let model_calls = if answer_calls.len() >= MIN_SAMPLES {
+            Vec::new()
+        } else {
+            ledger
+                .recent_latencies_ms(model, None, WINDOW)
+                .map_err(|e| e.to_string())?
+        };
+        Ok(LatencyHistory {
+            answer_calls,
+            model_calls,
+        })
+    }
+
     async fn try_answer(
         &self,
         request: &crate::AnswerRequest,

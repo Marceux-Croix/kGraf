@@ -7403,6 +7403,30 @@ fn a_model_with_no_known_limit_keeps_the_requested_cap() {
     );
 }
 
+/// The answer wait a run takes is the configured one: the orchestrator the
+/// host builds carries `answer_wait_secs`, and without it carries none, so
+/// each answer call derives its wait from the planner model's latencies.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_configured_answer_wait_reaches_the_orchestrator() {
+    for (n, set) in [(0, None), (1, Some(77u32))] {
+        let (_dir, mut config) = project();
+        config.answer_wait_secs = set;
+        let host = open_offline(config);
+        let run = RunId::new(format!("answer-wait-{n}"));
+        let orchestrator = host
+            .prepare(run.clone(), None, &mut |_| {})
+            .await
+            .expect("prepare")
+            .into_orchestrator(&host);
+        assert_eq!(
+            orchestrator.answer_wait(),
+            set.map(|s| std::time::Duration::from_secs(u64::from(s)))
+        );
+        drop(orchestrator);
+        host.finish_run(&run);
+    }
+}
+
 /// A host that lives for days keeps no per-run state of a run that ended: each
 /// run's tables fill while it is built and empty at `finish_run`, so many runs
 /// on one host leave the same counts the first one did (none).

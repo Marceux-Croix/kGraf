@@ -1832,7 +1832,14 @@ impl Host {
             // (`InteractiveRun::start` sets `Box` on the built orchestrator): a
             // question nobody can answer is answered at once, not after a wait.
             .with_question_attendance(kgraf_orchestrator::QuestionAttendance::Unattended)
-            .with_question_answerer(Arc::new(ModelAnswerer(self.caller(&run)?)));
+            .with_question_answerer(Arc::new(ModelAnswerer(self.caller(&run)?)))
+            // The user's answer wait; unset, each call's wait is derived from
+            // the planner model's recent latencies in this ledger.
+            .with_answer_wait(
+                self.config
+                    .answer_wait_secs
+                    .map(|s| std::time::Duration::from_secs(u64::from(s))),
+            );
         // Decision 0089: the planner is told the run's model routes by kind,
         // and the orchestrator may call them itself.
         let orchestrator = match model_calls {

@@ -201,6 +201,9 @@ pub struct WorkerFake {
     pub late_hold: Mutex<Option<(String, Arc<tokio::sync::Semaphore>)>>,
     /// Set when a [`Self::late_hold`] call is parked.
     pub late_parked: AtomicBool,
+    /// The round `hold` applies to: 0 unless a test sets it, so a test can
+    /// hold a worker between two later round boundaries.
+    pub hold_round: std::sync::atomic::AtomicUsize,
 }
 
 impl WorkerFake {
@@ -218,6 +221,7 @@ impl WorkerFake {
             hold: Mutex::new(None),
             late_hold: Mutex::new(None),
             late_parked: AtomicBool::new(false),
+            hold_round: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -308,7 +312,7 @@ impl Provider for WorkerFake {
         }
         let held = self.hold.lock().expect("lock").clone();
         if let Some((marker, permits)) = held
-            && round == 0
+            && round == self.hold_round.load(Ordering::SeqCst)
             && instruction.contains(&marker)
         {
             permits.acquire().await.map(|p| p.forget()).ok();
@@ -396,8 +400,8 @@ impl Provider for WorkerFake {
             // then the answer: longer than `config()`'s six-round budget, and
             // progress the runtime measures at every checkpoint (decision
             // 0096).
-            (r, Some(path)) if instruction.contains("LONGRUN") && r < 10 => (
-                vec![
+            (r, Some(path)) if instruction.contains("LONGRUN") && r < 10 => {
+                let mut content = vec![
                     Content::text("writing"),
                     Content::ToolUse {
                         id: format!("t{r}"),
@@ -405,9 +409,20 @@ impl Provider for WorkerFake {
                         input: json!({"path": path, "content": format!("{} v{r}", self.vendor)}),
                         signature: None,
                     },
-                ],
-                StopReason::ToolUse,
-            ),
+                ];
+                // `LONGRUN ASK`: round 0 also asks, so a test has rounds
+                // left after the question (decision 0067).
+                if r == 0 && instruction.contains("ASK") {
+                    let question = self.question.lock().expect("lock").clone();
+                    content.push(Content::ToolUse {
+                        id: "t3".into(),
+                        name: "ask_user_question".into(),
+                        input: json!({"question": question}),
+                        signature: None,
+                    });
+                }
+                (content, StopReason::ToolUse)
+            }
             (0, Some(path)) => {
                 let written = self
                     .content

@@ -204,18 +204,15 @@ pub fn limit_slider_row(
     if changed {
         slider.set_by_user(value);
     }
-    row::helper(
-        ui,
-        p,
-        &format!(
-            "Default: {}",
-            if grouped {
-                group_thousands(slider.default_value())
-            } else {
-                slider.default_value().to_string()
-            }
-        ),
-    );
+    // CMP-SET-3: the legend states the default. A default that is not one
+    // fixed number (the answer wait) is stated in words, never as the
+    // number the slider rests at.
+    let default = match slider.default_text() {
+        Some(text) => text.to_owned(),
+        None if grouped => group_thousands(slider.default_value()),
+        None => slider.default_value().to_string(),
+    };
+    row::helper(ui, p, &format!("Default: {default}"));
     if !slider.follows_default()
         && chrome::text_button(ui, p.primary, "Return to default").clicked()
     {
@@ -1511,6 +1508,44 @@ mod tests {
 
     /// The limit slider row states its default, offers "Return to default" only
     /// once moved, and shows a clamp note when given one (CMP-SET-3, CMP-SET-6).
+    #[test]
+    fn the_answer_wait_row_states_a_measured_default_and_a_move_sets_the_wait() {
+        use crate::settings::LimitSlider;
+        use egui_kittest::kittest::Queryable;
+        let mut h = egui_kittest::Harness::new_ui_state(
+            |ui, s: &mut LimitSlider| {
+                if !crate::theme::ensure(ui.ctx()) {
+                    return;
+                }
+                limit_slider_row(
+                    ui,
+                    &crate::theme::Palette::dark(),
+                    "Answer wait (seconds)",
+                    "How long a worker's question waits.",
+                    s,
+                    false,
+                    &[],
+                );
+            },
+            LimitSlider::answer_wait(),
+        );
+        h.run();
+        h.get_by_label_contains("Default: measured from the answering model");
+        assert!(
+            h.query_by_label("Default: 300").is_none(),
+            "the resting number is not stated as the default"
+        );
+        assert_eq!(h.state().chosen(), None, "no wait is set: measured");
+        h.get_by_role(egui::accesskit::Role::Slider).focus();
+        h.run();
+        h.key_press(egui::Key::ArrowRight);
+        h.run();
+        assert_eq!(h.state().chosen(), Some(330), "one step of 30 s");
+        h.get_by_label("Return to default").click();
+        h.run();
+        assert_eq!(h.state().chosen(), None, "back to the measured wait");
+    }
+
     #[test]
     fn a_limit_slider_row_offers_a_return_only_once_moved_and_shows_the_note() {
         use crate::settings::LimitSlider;

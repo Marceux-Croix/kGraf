@@ -108,6 +108,9 @@ struct Fake {
     answer_parks: bool,
     /// Every answer call panics.
     answer_panics: bool,
+    /// Every answer call waits for a permit before it answers, so a test
+    /// decides on an event when the answer arrives.
+    answer_gate: Option<Arc<tokio::sync::Semaphore>>,
     judged: Mutex<Vec<usize>>,
     asked: AtomicUsize,
 }
@@ -121,6 +124,9 @@ impl QuestionAnswerer for Fake {
         }
         if self.answer_panics {
             panic!("the answer call panicked, on purpose");
+        }
+        if let Some(gate) = &self.answer_gate {
+            gate.acquire().await.map(|p| p.forget()).ok();
         }
         if self.fail_answer {
             return Err(PlanError::Invalid(
@@ -544,7 +550,7 @@ async fn an_answer_call_that_panics_or_hangs_still_sends_the_question_to_the_use
         let o = Orchestrator::new(config(), p.services(WINDOW))
             .expect("orchestrator")
             .with_question_answerer(Arc::new(fake))
-            .with_session_call_timeout(Duration::from_millis(200))
+            .with_answer_wait(Some(Duration::from_millis(200)))
             .with_session_notices(sink);
         let handle = o.handle();
         let run = tokio::spawn(o.start(RunId::new("r1"), "make a".into()));
@@ -577,6 +583,268 @@ async fn an_answer_call_that_panics_or_hangs_still_sends_the_question_to_the_use
         handle.stop().await;
         let _ = run.await.expect("join");
     }
+}
+
+/// Decision 0067, amendment of 2026-10-06: an answer that comes after the
+/// worker stopped waiting is not lost. The worker passes its wait and is
+/// told to state its assumption; it goes on to its next round; the
+/// orchestrator's answer then arrives, is recorded as a `Notice` row, and is
+/// injected at the worker's next round boundary. Each step waits on an
+/// event: the answer is released by a permit, and the worker's round 1 is
+/// held by another until the late answer is queued.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_late_answer_reaches_the_running_worker_at_its_next_round_boundary() {
+    let dir = tempfile::tempdir().expect("dir");
+    let p = parts(
+        dir.path(),
+        &[c("a", "make a LONGRUN ASK HOLD", "src/a.rs", &[])],
+        Duration::from_millis(5),
+    );
+    let round_one = Arc::new(tokio::sync::Semaphore::new(0));
+    for fake in [&p.alpha, &p.beta] {
+        *fake.hold.lock().expect("lock") = Some(("HOLD".into(), round_one.clone()));
+        fake.hold_round.store(1, Ordering::SeqCst);
+    }
+    let answer_gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let fake = Arc::new(Fake {
+        answer: Some(ANSWER.into()),
+        answer_gate: Some(answer_gate.clone()),
+        ..Fake::default()
+    });
+    let (seen, sink) = notices_sink();
+    let (line, services) = with_tools(&p);
+    let o = Orchestrator::new(config(), services)
+        .expect("orchestrator")
+        .with_question_answerer(fake.clone())
+        .with_question_attendance(QuestionAttendance::Unattended)
+        .with_answer_wait(Some(Duration::from_millis(50)))
+        .with_session_notices(sink);
+    line.bind(o.handle()).expect("bind");
+    let handle = o.handle();
+    let run = tokio::spawn(o.start(RunId::new("r1"), "make a".into()));
+    let worker = AgentId::new("r1-a-r0-a0");
+    let notice = |needle: &str| {
+        seen.lock()
+            .expect("lock")
+            .iter()
+            .any(|t| t.contains(needle) && t.contains("r1-a-r0-a0"))
+    };
+    until("the wait passes and the worker is told to assume", || {
+        notice("did not finish within its wait") && notice("answered at once")
+    })
+    .await;
+    until("the worker reaches round 1 and is held there", || {
+        p.stats
+            .requests()
+            .iter()
+            .any(|r| r.1.contains("LONGRUN ASK HOLD") && r.2 == 1)
+    })
+    .await;
+    assert_eq!(fake.asked.load(Ordering::SeqCst), 1);
+    answer_gate.add_permits(1);
+    until("the late answer is queued for the worker", || {
+        notice("answered late by the orchestrator; the answer reaches the worker")
+    })
+    .await;
+    let queued = sessions(&p).undelivered(&worker).expect("inbox");
+    let late: Vec<_> = queued
+        .iter()
+        .filter(|i| i.kind == InboxKind::Notice && i.text.contains(ANSWER))
+        .collect();
+    assert_eq!(late.len(), 1, "one late-answer row: {queued:?}");
+    assert_eq!(late[0].source, InboxSource::Orchestrator);
+    round_one.add_permits(1);
+    until("the late answer is injected at the next boundary", || {
+        injected(&transcript_lines(&p, worker.as_str()))
+            .iter()
+            .any(|l| l.to_string().contains(ANSWER))
+    })
+    .await;
+    let lines = transcript_lines(&p, worker.as_str());
+    let told_to_assume = lines.iter().any(|l| {
+        let t = l.to_string();
+        t.contains("tool_call_finished") && t.contains("Nobody is attached")
+    });
+    assert!(
+        told_to_assume,
+        "the tool result was the assumption text: {lines:?}"
+    );
+    let text = injected(&lines)
+        .iter()
+        .map(|l| l.to_string())
+        .find(|t| t.contains(ANSWER))
+        .expect("injected");
+    assert!(text.contains("late answer"), "{text}");
+    handle.stop().await;
+    let _ = run.await.expect("join");
+}
+
+/// The product's answerer reads its wait history from the rows its own calls
+/// write: an answer call through the ledger is then one answer-call latency
+/// of the planner model, and a worker round of another model is not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_model_answerer_reads_its_own_answer_calls_as_history() {
+    let dir = tempfile::tempdir().expect("dir");
+    let p = parts(
+        dir.path(),
+        &[c("a", "make a", "src/a.rs", &[])],
+        Duration::from_millis(5),
+    );
+    let answerer = ModelAnswerer(plan_model_caller(&p, ScriptFake::new(answering)));
+    assert_eq!(
+        answerer.latency_history().expect("history"),
+        kgraf_orchestrator::answer_wait::LatencyHistory::default()
+    );
+    let out = answerer
+        .try_answer(&AnswerRequest {
+            session: AgentId::new("r1-a-r0-a0"),
+            original_instruction: "make a".into(),
+            question: kgraf_orchestrator::UntrustedText::new("which file?".to_owned()),
+            verified: Vec::new(),
+            notes: Vec::new(),
+        })
+        .await
+        .expect("answered");
+    assert_eq!(out.answer.as_deref(), Some(ANSWER));
+    let other = p
+        .ledger
+        .begin(
+            "w",
+            kgraf_core::Protocol::Additive,
+            "another-model",
+            "w",
+            "r1",
+        )
+        .expect("begin");
+    other
+        .settle(&kgraf_core::TokenUsage::default(), None)
+        .expect("settle");
+    let history = answerer.latency_history().expect("history");
+    assert_eq!(history.answer_calls.len(), 1, "{history:?}");
+    assert_eq!(
+        history.model_calls.len(),
+        1,
+        "too few answer calls: the model's own calls are read, not another model's: \
+         {history:?}"
+    );
+}
+
+/// In a box run, an answer call that passes its wait sends the question to
+/// the box, and a late orchestrator answer then answers that open question:
+/// the worker's tool result is the orchestrator's answer, and no question is
+/// left waiting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_late_answer_answers_the_question_still_open_in_the_box() {
+    let dir = tempfile::tempdir().expect("dir");
+    let p = parts(
+        dir.path(),
+        &[c("a", "make a HANG", "src/a.rs", &[])],
+        Duration::from_millis(5),
+    );
+    hang(&p);
+    let answer_gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let fake = Arc::new(Fake {
+        answer: Some(ANSWER.into()),
+        answer_gate: Some(answer_gate.clone()),
+        ..Fake::default()
+    });
+    let o = Orchestrator::new(config(), p.services(WINDOW))
+        .expect("orchestrator")
+        .with_question_answerer(fake.clone())
+        .with_question_attendance(QuestionAttendance::Box)
+        .with_answer_wait(Some(Duration::from_millis(50)));
+    let handle = o.handle();
+    let run = tokio::spawn(o.start(RunId::new("r1"), "make a".into()));
+    wait_hang(&p).await;
+    let asked = tokio::spawn({
+        let handle = handle.clone();
+        async move {
+            handle
+                .ask_question(AgentId::new("r1-a-r0-a0"), "which file?".into())
+                .await
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while handle.pending_questions().await.is_empty() {
+        assert!(Instant::now() < deadline, "no question reached the box");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    answer_gate.add_permits(1);
+    let answer = tokio::time::timeout(Duration::from_secs(10), asked)
+        .await
+        .expect("answered in time")
+        .expect("join")
+        .expect("answered");
+    assert_eq!(answer, ANSWER);
+    assert!(handle.pending_questions().await.is_empty());
+    unhang(&p);
+    handle.stop().await;
+    let _ = run.await.expect("join");
+}
+
+/// In a box run whose box wait also ends unanswered, the worker is told to
+/// state its assumption; the orchestrator's answer that comes after that is
+/// queued for the worker's next round boundary, not taken for a box answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_late_answer_after_the_box_wait_expired_is_queued_for_the_worker() {
+    let dir = tempfile::tempdir().expect("dir");
+    let p = parts(
+        dir.path(),
+        &[c("a", "make a HANG", "src/a.rs", &[])],
+        Duration::from_millis(5),
+    );
+    hang(&p);
+    let answer_gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let fake = Arc::new(Fake {
+        answer: Some(ANSWER.into()),
+        answer_gate: Some(answer_gate.clone()),
+        ..Fake::default()
+    });
+    let (seen, sink) = notices_sink();
+    let o = Orchestrator::new(config(), p.services(WINDOW))
+        .expect("orchestrator")
+        .with_question_answerer(fake.clone())
+        .with_question_attendance(QuestionAttendance::Box)
+        .with_question_timeout(Duration::from_millis(50))
+        .with_answer_wait(Some(Duration::from_millis(50)))
+        .with_session_notices(sink);
+    let handle = o.handle();
+    let run = tokio::spawn(o.start(RunId::new("r1"), "make a".into()));
+    wait_hang(&p).await;
+    let asked = tokio::spawn({
+        let handle = handle.clone();
+        async move {
+            handle
+                .ask_question(AgentId::new("r1-a-r0-a0"), "which file?".into())
+                .await
+        }
+    });
+    let told = tokio::time::timeout(Duration::from_secs(10), asked)
+        .await
+        .expect("the box wait ends")
+        .expect("join")
+        .expect("answered");
+    assert!(told.starts_with("No answer came within"), "{told}");
+    answer_gate.add_permits(1);
+    until("the late answer is queued for the worker", || {
+        seen.lock()
+            .expect("lock")
+            .iter()
+            .any(|t| t.contains("answered late by the orchestrator; the answer reaches the worker"))
+    })
+    .await;
+    let queued = sessions(&p)
+        .undelivered(&AgentId::new("r1-a-r0-a0"))
+        .expect("inbox");
+    assert!(
+        queued
+            .iter()
+            .any(|i| i.kind == InboxKind::Notice && i.text.contains(ANSWER)),
+        "{queued:?}"
+    );
+    unhang(&p);
+    handle.stop().await;
+    let _ = run.await.expect("join");
 }
 
 /// A judgment call that panics, or never returns, refuses its waiters with
@@ -614,7 +882,7 @@ async fn a_judgment_call_that_panics_or_hangs_refuses_and_clears() {
         let o = Orchestrator::new(config(), p.services(WINDOW))
             .expect("orchestrator")
             .with_question_answerer(judge.clone())
-            .with_session_call_timeout(Duration::from_millis(200));
+            .with_answer_wait(Some(Duration::from_millis(200)));
         let handle = o.handle();
         let run = tokio::spawn(o.start(RunId::new("r1"), "make a and b".into()));
         until("both park", || {

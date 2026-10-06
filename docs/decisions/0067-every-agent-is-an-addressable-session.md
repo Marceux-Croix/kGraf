@@ -166,3 +166,40 @@ Now:
 
 Tests: `mailbox_injection.rs` (injected at the next boundary; falls back to the next fresh
 brief; never delivered is traced and reported).
+
+## Amendment (2026-10-06): the wait for the orchestrator's answer fits the answering model
+
+The wait for the orchestrator's own answer to a worker's `ask_user_question` was a fixed
+300 s (`SESSION_CALL_TIMEOUT`), and the same limit bounded a connection judgment. A fixed limit
+cannot fit every route: a hosted model answers in seconds, while a local model under parallel
+load takes minutes per call on the same route. A call that passed the limit was aborted and its
+answer discarded, so its tokens were spent for nothing.
+
+The wait is now derived per call (`kgraf-orchestrator::answer_wait`), off the orchestrator's loop:
+
+1. A user-set wait wins: the `answer_wait_secs` run limit (30 to 1,800 s; Settings > Runs >
+   Answer wait, the user settings file, a `run.json` key, `--answer-wait`).
+2. Otherwise twice the 95th percentile of the answering model's last 50 counted
+   `answer_question` and `judge_connections` calls in the ledger, held between 120 s and
+   900 s. With fewer than 8 such calls, the model's other generative calls are used, since they
+   measure the same route under the same load.
+3. Otherwise 300 s. A latency history that cannot be read also gives 300 s, with a session
+   notice.
+
+An answer call that passes its wait releases the worker as if the orchestrator had no answer: to
+the box in a box run, or at once with the assumption text in an unattended run. The call is not
+cancelled; it runs on until 900 s (or the user's wait, if longer). Its answer, when it comes,
+answers the question if it still waits in the box. Otherwise it is recorded as a `Notice` inbox
+row from the orchestrator and injected at the worker's next round boundary, so the worker can
+correct the assumption it stated; a worker that ended has it recorded only. An answer the user
+already gave in the box stands, and the late one is reported in a notice. Every step is a
+session notice. A connection judgment keeps no late path and fails at the same derived wait.
+The wait for a person in the box (300 s in a box run, 60 s when attendance was never declared)
+is unchanged: it does not wait on a model.
+
+Tests: `answer_wait::tests` (the rule), `sessions::unit_tests` (the supervisor, on paused tokio
+time), `a_late_answer_reaches_the_running_worker_at_its_next_round_boundary`,
+`a_late_answer_answers_the_question_still_open_in_the_box`,
+`a_late_answer_after_the_box_wait_expired_is_queued_for_the_worker`,
+`the_model_answerer_reads_its_own_answer_calls_as_history`,
+`the_configured_answer_wait_reaches_the_orchestrator`.

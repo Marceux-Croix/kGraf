@@ -1803,9 +1803,10 @@ pub struct Orchestrator {
     /// question the orchestrator cannot answer is answered at once with the
     /// unattended text instead of waiting out [`Self::question_timeout`].
     pub(crate) question_unattended: bool,
-    /// How long one paid session call may run
-    /// ([`sessions::SESSION_CALL_TIMEOUT`] unless set).
-    pub(crate) session_call_timeout: Duration,
+    /// The user-set wait for one paid session call (an answer, a connection
+    /// judgment); `None` derives it from the answering model's recent
+    /// latencies ([`crate::answer_wait`]).
+    pub(crate) answer_wait: Option<Duration>,
     /// Where session notices are shown besides the trace and the report.
     pub(crate) session_notices: Option<sessions::SessionNoticeSink>,
     /// The full index pass's extractor report, traced once the run opens
@@ -1848,7 +1849,7 @@ impl Orchestrator {
             question_answerer: None,
             question_timeout: crate::asks::QuestionAttendance::Unattended.timeout(),
             question_unattended: false,
-            session_call_timeout: sessions::SESSION_CALL_TIMEOUT,
+            answer_wait: None,
             session_notices: None,
             index_extractor_changes: Vec::new(),
             start_notices: Vec::new(),
@@ -1898,12 +1899,20 @@ impl Orchestrator {
         self
     }
 
-    /// How long one paid session call (an answer, a connection judgment) may
-    /// run before it counts as failed. The default is
-    /// [`sessions::SESSION_CALL_TIMEOUT`].
-    pub fn with_session_call_timeout(mut self, timeout: Duration) -> Self {
-        self.session_call_timeout = timeout;
+    /// How long the worker asking a question waits for the orchestrator's
+    /// model to answer, and how long a connection judgment may run: the
+    /// user's run limit. `None` (the default) derives it from the answering
+    /// model's recent latencies, with a floor and a ceiling
+    /// ([`crate::answer_wait`]).
+    pub fn with_answer_wait(mut self, wait: Option<Duration>) -> Self {
+        self.answer_wait = wait;
         self
+    }
+
+    /// The user-set answer wait this run takes ([`Self::with_answer_wait`]);
+    /// `None` derives it per call.
+    pub fn answer_wait(&self) -> Option<Duration> {
+        self.answer_wait
     }
 
     /// Show session notices (an undelivered note, a question that skipped the
@@ -2340,7 +2349,7 @@ impl RunLoop {
             question_answerer,
             question_timeout,
             question_unattended,
-            session_call_timeout,
+            answer_wait,
             session_notices,
             index_extractor_changes,
             start_notices,
@@ -2506,7 +2515,7 @@ impl RunLoop {
                 question_timeout,
                 question_unattended,
                 session_notices,
-                session_call_timeout,
+                answer_wait,
             ),
             perms: permission_hooks::PermissionRuntime::new(perms),
         };

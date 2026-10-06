@@ -1832,6 +1832,51 @@ impl Ledger {
         })
     }
 
+    /// The latencies (`finished_ms - started_ms`, in milliseconds) of the
+    /// newest `limit` settled, counted calls on `model`, newest first.
+    /// `kinds: Some(list)` keeps only calls whose `call_kind` is in `list`;
+    /// `None` keeps every generative call (a non-generative call kind, as in
+    /// [`Self::route_round_stats`], is left out: an embedding's short time
+    /// says nothing about how long a model takes to answer).
+    ///
+    /// A refused, failed or open call is left out: it has no full latency.
+    /// Rows are read newest first and the read stops at `limit`, so the cost
+    /// is bounded by how far back the newest `limit` matches lie.
+    pub fn recent_latencies_ms(
+        &self,
+        model: &str,
+        kinds: Option<&[&str]>,
+        limit: usize,
+    ) -> Result<Vec<u64>, LedgerError> {
+        self.read(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT call_kind, finished_ms - started_ms FROM calls
+                 WHERE model = ?1 AND settlement = 'counted' AND finished_ms IS NOT NULL
+                 ORDER BY started_ms DESC",
+            )?;
+            let rows = stmt.query_map(params![model], |row| {
+                Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                if out.len() >= limit {
+                    break;
+                }
+                let (kind, ms) = row?;
+                let keep = match kinds {
+                    Some(list) => kind.as_deref().is_some_and(|k| list.contains(&k)),
+                    None => !kind
+                        .as_deref()
+                        .is_some_and(kgraf_core::is_non_generative_call_kind),
+                };
+                if keep {
+                    out.push(ms.max(0) as u64);
+                }
+            }
+            Ok(out)
+        })
+    }
+
     /// The calls that finished at or after `since_ms` (or, unfinished, started
     /// then), oldest first. Reads through the `started_ms` index, with
     /// [`CALL_SPAN_SLACK_MS`] of slack for a call that started earlier and
@@ -6120,6 +6165,71 @@ mod tests {
         let stats = ledger.route_round_stats("r").expect("stats");
         assert_eq!(stats.rounds, ROUTE_STATS_MIN_ROUNDS, "counted calls only");
         assert_eq!(stats.tokens_per_round, Some(1_011), "cache write included");
+    }
+
+    /// The recent latencies of one model: newest first, counted calls only,
+    /// filtered by call kind (or every generative kind), and capped.
+    #[test]
+    fn recent_latencies_read_the_newest_counted_calls_of_one_model_by_kind() {
+        let ledger = Ledger::open_in_memory().expect("ledger");
+        let call = |model: &str, kind: &str, started: i64, latency: i64, counted: bool| {
+            let token = ledger
+                .begin_traced(
+                    "a",
+                    Protocol::Inclusive,
+                    model,
+                    "orchestrator:r",
+                    "r",
+                    CallTrace {
+                        kind: Some(kind.to_owned()),
+                        ..CallTrace::default()
+                    },
+                )
+                .expect("begin");
+            let id = token.id().clone();
+            if counted {
+                token.settle(&usage(), None).expect("settle");
+            } else {
+                token.fail().expect("fail");
+            }
+            exec(
+                &ledger,
+                &format!(
+                    "UPDATE calls SET started_ms = {started}, finished_ms = {} WHERE id = '{}'",
+                    started + latency,
+                    id.as_str()
+                ),
+            );
+        };
+        call("m", "answer_question", 1_000, 40_000, true);
+        call("m", "worker_round", 2_000, 90_000, true);
+        call("m", "answer_question", 3_000, 120_000, true);
+        call("m", "answer_question", 4_000, 5, false);
+        call("other", "answer_question", 5_000, 1, true);
+        call("m", ModelKind::EMBEDDING.call_kind(), 6_000, 2, true);
+        assert_eq!(
+            ledger
+                .recent_latencies_ms("m", Some(&["answer_question"]), 10)
+                .expect("read"),
+            vec![120_000, 40_000],
+            "newest first, counted, this model and kind only"
+        );
+        assert_eq!(
+            ledger.recent_latencies_ms("m", None, 10).expect("read"),
+            vec![120_000, 90_000, 40_000],
+            "every generative kind; the embedding is left out"
+        );
+        assert_eq!(
+            ledger.recent_latencies_ms("m", None, 1).expect("read"),
+            vec![120_000],
+            "capped at the limit"
+        );
+        assert!(
+            ledger
+                .recent_latencies_ms("none", None, 10)
+                .expect("read")
+                .is_empty()
+        );
     }
 
     /// An embedding, rerank or decision call on a route shares its limiter and

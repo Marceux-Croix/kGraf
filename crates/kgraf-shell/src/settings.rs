@@ -258,6 +258,9 @@ pub struct LimitSlider {
     step: u64,
     default: u64,
     chosen: Option<u64>,
+    /// How the default is stated when it is not one fixed number (the answer
+    /// wait follows the answering model); `None` states `default`.
+    default_text: Option<&'static str>,
 }
 
 impl LimitSlider {
@@ -308,6 +311,26 @@ impl LimitSlider {
         )
     }
 
+    /// The wait, in seconds, for the orchestrator's model to answer a
+    /// worker's question (decision 0067): 30 to 1,800 in steps of 30. While
+    /// it follows its default, no wait is set and each call derives its own
+    /// from the answering model's recent latencies; the slider then rests at
+    /// the stated fallback of 300 s.
+    pub fn answer_wait() -> Self {
+        Self {
+            default_text: Some(
+                "measured from the answering model's recent answers (300 s until it has \
+                 enough)",
+            ),
+            ..Self::new(
+                u64::from(kgraf_host::limits::ANSWER_WAIT_BOUNDS.0),
+                u64::from(kgraf_host::limits::ANSWER_WAIT_BOUNDS.1),
+                30,
+                kgraf_orchestrator::answer_wait::DEFAULT.as_secs(),
+            )
+        }
+    }
+
     fn new(min: u64, max: u64, step: u64, default: u64) -> Self {
         Self {
             min,
@@ -315,7 +338,13 @@ impl LimitSlider {
             step,
             default,
             chosen: None,
+            default_text: None,
         }
+    }
+
+    /// The default as the control states it, when it is not one number.
+    pub fn default_text(&self) -> Option<&'static str> {
+        self.default_text
     }
 
     pub fn min(&self) -> u64 {
@@ -377,6 +406,8 @@ pub struct RunLimitSliders {
     pub worker_max_tokens: LimitSlider,
     pub planner_max_tokens: LimitSlider,
     pub window: LimitSlider,
+    /// The wait for the orchestrator's model to answer a worker's question.
+    pub answer_wait: LimitSlider,
     /// Warn at run start when your verify or gate command runs a program your
     /// deny or ask rules refuse to workers. Off by default; not a slider, but it
     /// rides in the same settings file and shared value as the limits.
@@ -391,6 +422,7 @@ impl Default for RunLimitSliders {
             worker_max_tokens: LimitSlider::worker_max_tokens(),
             planner_max_tokens: LimitSlider::planner_max_tokens(),
             window: LimitSlider::window(),
+            answer_wait: LimitSlider::answer_wait(),
             warn_rule_conflicts: kgraf_host::limits::DEFAULT_WARN_RULE_CONFLICTS,
         }
     }
@@ -408,6 +440,7 @@ impl RunLimitSliders {
             warn_rule_conflicts: self.warn_rule_conflicts.then_some(true),
             // Not one of these sliders: `Settings::run_limits` adds it.
             compaction_point: None,
+            answer_wait_secs: self.answer_wait.chosen().map(|v| v as u32),
         }
     }
 
@@ -427,6 +460,9 @@ impl RunLimitSliders {
         }
         if let Some(v) = u.window {
             s.window.load_exact(v);
+        }
+        if let Some(v) = u.answer_wait_secs {
+            s.answer_wait.load_exact(u64::from(v));
         }
         s.warn_rule_conflicts = u.warn_rule_conflicts.unwrap_or(s.warn_rule_conflicts);
         s
@@ -658,6 +694,9 @@ struct SettingsFile {
     /// Written only when on; absent means off.
     #[serde(skip_serializing_if = "Option::is_none")]
     warn_rule_conflicts: Option<bool>,
+    /// Absent means the wait is measured per call.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    answer_wait_secs: Option<i64>,
     appearance: Option<Appearance>,
     #[serde(skip_serializing_if = "Option::is_none")]
     color_vision: Option<kgraf_core::palette::Vision>,
@@ -790,6 +829,7 @@ impl Settings {
             planner_max_tokens: self.limits.planner_max_tokens.chosen().map(|v| v as i64),
             context_window: self.limits.window.chosen().map(|v| v as i64),
             warn_rule_conflicts: self.limits.warn_rule_conflicts.then_some(true),
+            answer_wait_secs: self.limits.answer_wait.chosen().map(|v| v as i64),
             appearance: Some(self.appearance),
             color_vision: (self.color_vision != kgraf_core::palette::Vision::default())
                 .then_some(self.color_vision),
@@ -1271,6 +1311,12 @@ mod tests {
             (4_096, 131_072, 1_024, 32_768)
         );
         assert_eq!(shape(&l.window), (8_192, 1_000_000, 1_024, 128_000));
+        assert_eq!(shape(&l.answer_wait), (30, 1_800, 30, 300));
+        assert!(
+            l.answer_wait
+                .default_text()
+                .is_some_and(|t| t.contains("measured"))
+        );
         assert_eq!(l.user_limits(), kgraf_host::limits::UserLimits::default());
     }
 
@@ -1309,6 +1355,7 @@ mod tests {
             "planner_max_tokens",
             "context_window",
             "warn_rule_conflicts",
+            "answer_wait_secs",
         ] {
             assert!(!text.contains(key), "{key} is not written while followed");
         }
@@ -1317,6 +1364,7 @@ mod tests {
         s.limits.planner_max_tokens.set_by_user(65_536);
         s.limits.window.set_by_user(204_800);
         s.limits.warn_rule_conflicts = true;
+        s.limits.answer_wait.set_by_user(600);
         s.save(&path).expect("save");
         let back = Settings::load(&path).expect("load");
         assert_eq!(back, s);
@@ -1332,6 +1380,7 @@ mod tests {
         assert_eq!(user.worker_max_tokens, None);
         assert_eq!(user.warn_rule_conflicts, Some(true));
         assert!(back.limits.warn_rule_conflicts);
+        assert_eq!(user.answer_wait_secs, Some(600));
     }
 
     #[test]
@@ -1356,6 +1405,8 @@ mod tests {
             "context_window = 5
 ",
             "warn_rule_conflicts = 3
+",
+            "answer_wait_secs = 10
 ",
         ] {
             let e = Settings::from_toml_str(bad).expect_err(bad).to_string();
