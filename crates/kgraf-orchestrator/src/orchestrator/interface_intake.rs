@@ -869,7 +869,14 @@ impl RunLoop {
             .map(|f| f.path.clone())
             .collect();
         let manifests = manifests_for(&runner, &files).await;
-        derive_interface::compile_command(&files, |f| package_in(&manifests, f))
+        let texts: Vec<(String, String)> = ic
+            .consumer
+            .iter()
+            .chain(&ic.tests)
+            .map(|f| (f.path.clone(), f.content.clone()))
+            .collect();
+        let build = build_facts_for(&runner, &files, &texts).await;
+        derive_interface::command_for(&files, |f| package_in(&manifests, f), &build).ok()
     }
 
     /// The mechanical checks of `ic`; when the stub-compile stage fails, the
@@ -1438,6 +1445,42 @@ async fn manifests_for(
     manifests
 }
 
+/// What [`derive_interface::command_for`] needs to know of the base and the
+/// machine for `files` ([`derive_interface::config_probes`]); `texts` gives
+/// the content of files the caller already holds. Nothing is read for Rust
+/// and Python files.
+async fn build_facts_for(
+    runner: &SandboxRunner,
+    files: &[String],
+    texts: &[(String, String)],
+) -> derive_interface::BuildFacts {
+    let (paths, dirs, programs) = derive_interface::config_probes(files);
+    let mut build = derive_interface::BuildFacts::default();
+    for p in paths {
+        let has = runner.base_has(&p).await;
+        build.present.insert(p, has);
+    }
+    for d in dirs {
+        let names = runner.list_base(&d).await;
+        build.listings.insert(d, names);
+    }
+    for p in programs {
+        if runner.has_program(p) {
+            build.programs.insert(p.to_owned());
+        }
+    }
+    for f in files.iter().filter(|f| f.ends_with(".java")) {
+        let text = match texts.iter().find(|(p, _)| p == f) {
+            Some((_, t)) => Some(t.clone()),
+            None => runner.read_base(f).await.ok().flatten(),
+        };
+        if let Some(t) = text {
+            build.texts.insert(f.clone(), t);
+        }
+    }
+    build
+}
+
 /// The Cargo package that holds `file`: the nearest manifest above it that
 /// declares one.
 fn package_in(manifests: &BTreeMap<String, Option<String>>, file: &str) -> Option<String> {
@@ -1474,6 +1517,7 @@ async fn derive_one(
     let stub = scaffold(derived);
     let files: Vec<String> = facts.users.iter().map(|(p, _)| p.clone()).collect();
     let manifests = manifests_for(runner, &files).await;
+    let build = build_facts_for(runner, &files, &facts.users).await;
     let package = |f: &str| package_in(&manifests, f);
     let stub_only = |stub: Vec<crate::checks::FileOverlay>| {
         (!stub.is_empty()).then(|| DerivedBase {
@@ -1484,8 +1528,11 @@ async fn derive_one(
     };
     let ic = match derive_interface::derive(
         facts,
-        |files| derive_interface::compile_command(files, package),
-        |files| derive_interface::no_command_reason(files, package),
+        |files| derive_interface::command_for(files, package, &build).ok(),
+        |files| match derive_interface::command_for(files, package, &build) {
+            Err(why) => why,
+            Ok(_) => derive_interface::no_command_reason(files, package),
+        },
     ) {
         Err(why) => {
             return (

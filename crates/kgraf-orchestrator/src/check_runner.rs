@@ -424,6 +424,52 @@ impl SandboxRunner {
         }
     }
 
+    /// Whether the base holds a file at `path` (any content, any size).
+    pub async fn base_has(&self, path: &str) -> bool {
+        // `base_differs` against empty content is true for any non-empty
+        // file, link or directory; an empty file is read as absent, which
+        // only makes a probe answer no.
+        self.base_differs(path, "").await.unwrap_or(false)
+    }
+
+    /// The names of the entries of directory `dir` (repository-relative,
+    /// `""` the root) in the base, as [`SandboxRunner::read_base`] reads.
+    /// Empty when there is no such directory or it cannot be read.
+    pub async fn list_base(&self, dir: &str) -> Vec<String> {
+        let rel = dir.trim().trim_start_matches("./").trim_end_matches('/');
+        match &self.base {
+            Resolved::Commit { repo, origin, .. } => {
+                let repo = repo.clone();
+                let spec = if rel.is_empty() {
+                    origin.clone()
+                } else {
+                    format!("{origin}:{rel}")
+                };
+                blocking(move || {
+                    let git = kgraf_sandbox::git::Git::discover()
+                        .map_err(|e| CheckError::Config(e.to_string()))?;
+                    git.run_str(&repo, ["ls-tree", "--name-only", &spec])
+                        .map_err(|e| CheckError::Config(e.to_string()))
+                })
+                .await
+                .map(|out| out.lines().map(str::to_owned).collect())
+                .unwrap_or_default()
+            }
+            Resolved::Directory(root) => std::fs::read_dir(root.join(rel))
+                .map(|it| {
+                    it.filter_map(Result::ok)
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Whether `program` (a bare name) is on the `PATH` a check runs with.
+    pub fn has_program(&self, program: &str) -> bool {
+        program_installed(program, Path::new("")).is_ok()
+    }
+
     /// The text of the file at `path` in the base: `None` when the base holds
     /// no file there (absent, a link, a directory, over the read bound, or not
     /// UTF-8). Read from the commit the runner was made from, as

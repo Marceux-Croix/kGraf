@@ -83,6 +83,47 @@ pub struct TreeStatus {
     /// each as one entry and never the files inside it, so the caller says
     /// so rather than let the list look complete.
     pub nested_repositories: Vec<PathBuf>,
+    /// The paths of [`TreeStatus::paths`] git lists as untracked (new).
+    pub untracked: Vec<PathBuf>,
+}
+
+impl TreeStatus {
+    /// `self` without the files a build or install generated as a side effect
+    /// (`kgraf_sandbox::generated_kind`: a lockfile beside its manifest,
+    /// `node_modules/`, `.venv/`, Maven's `target/`, bytecode, caches,
+    /// compiled programs), and how many were left out. Only an untracked path
+    /// outside `in_scope` is left out: the rule merge-back uses to leave the
+    /// same files out of the commit. An install of thousands of files then
+    /// costs the worker's change list and the progress measure nothing, as it
+    /// costs the commit nothing.
+    ///
+    /// Blocking: reads the tree. Call it through `spawn_blocking`.
+    pub fn without_generated(
+        mut self,
+        root: &Path,
+        in_scope: impl Fn(&Path) -> bool,
+    ) -> (TreeStatus, usize) {
+        let untracked: std::collections::HashSet<&PathBuf> = self.untracked.iter().collect();
+        let manifests = kgraf_sandbox::TreeManifests::new(root);
+        let mut generated: std::collections::HashSet<PathBuf> = Default::default();
+        for p in &self.paths {
+            if untracked.contains(p)
+                && !in_scope(p)
+                && kgraf_sandbox::generated_kind(
+                    p,
+                    |m| manifests.present(m),
+                    |f| kgraf_sandbox::file_head(root, f),
+                )
+                .is_some()
+            {
+                generated.insert(p.clone());
+            }
+        }
+        let left_out = generated.len();
+        self.paths.retain(|p| !generated.contains(p));
+        self.untracked.retain(|p| !generated.contains(p));
+        (self, left_out)
+    }
 }
 
 /// Read a short file whole, up to [`MAX_LINK_BYTES`].
@@ -265,6 +306,9 @@ fn parse_porcelain_z(bytes: &[u8]) -> TreeStatus {
                 .nested_repositories
                 .push(path_from_git(&path[..path.len() - 1]));
         }
+        if entry.starts_with(b"??") {
+            status.untracked.push(path_from_git(path));
+        }
         status.paths.push(path_from_git(path));
         if matches!(entry[0], b'R' | b'C')
             && let Some(old) = entries.next()
@@ -342,6 +386,48 @@ mod tests {
         std::fs::write(wt.join(odd), "a").expect("write");
         let status = dirty_paths(&wt, &at_start).expect("status");
         assert_eq!(status.paths, vec![PathBuf::from(odd)]);
+    }
+
+    /// An install in a worktree with no `.gitignore` (thousands of files
+    /// under `node_modules/`, a lockfile, a `.venv/`) is left out of the
+    /// worker's change list and the progress measure, as the commit leaves it
+    /// out; the work itself, a declared lockfile and a modified tracked file
+    /// stay. Before, every installed file was listed and hashed.
+    #[test]
+    fn an_install_is_left_out_of_the_change_list_and_the_work_stays() {
+        let dir = tempfile::tempdir().expect("dir");
+        let wt = dir.path().join("wt");
+        linked_worktree(&wt.with_extension("repo"), &wt, |root| {
+            std::fs::write(root.join("package.json"), "{}").expect("manifest");
+            std::fs::create_dir_all(root.join("py")).expect("py");
+            std::fs::write(root.join("py/pyproject.toml"), "").expect("py manifest");
+            std::fs::write(root.join("tracked.lock"), "a").expect("tracked");
+            git(root, &["add", "-A"]);
+        });
+        let at_start = git_entry(&wt).expect("entry");
+        for i in 0..300 {
+            let p = wt.join(format!("node_modules/pkg{i}/index.js"));
+            std::fs::create_dir_all(p.parent().expect("parent")).expect("dir");
+            std::fs::write(p, "x").expect("installed");
+        }
+        std::fs::write(wt.join("package-lock.json"), "{}").expect("lock");
+        std::fs::create_dir_all(wt.join("py/.venv/lib")).expect("venv");
+        std::fs::write(wt.join("py/.venv/lib/site.py"), "x").expect("venv file");
+        std::fs::write(wt.join("src.js"), "work").expect("work");
+        std::fs::write(wt.join("tracked.lock"), "b").expect("tracked change");
+        let status = dirty_paths(&wt, &at_start).expect("status");
+        assert!(status.paths.len() > 300, "{}", status.paths.len());
+        let (kept, left_out) = status.clone().without_generated(&wt, |_| false);
+        assert_eq!(left_out, 302, "{:?}", kept.paths);
+        let mut paths = kept.paths.clone();
+        paths.sort();
+        assert_eq!(
+            paths,
+            [PathBuf::from("src.js"), PathBuf::from("tracked.lock")]
+        );
+        // A lockfile the contract declares is its work, and stays.
+        let (kept, _) = status.without_generated(&wt, |p| p == Path::new("package-lock.json"));
+        assert!(kept.paths.contains(&PathBuf::from("package-lock.json")));
     }
 
     #[test]

@@ -1628,6 +1628,43 @@ fn cancel_for_lost_lease(in_flight: &mut BTreeMap<String, InFlight>, contracts: 
     }
 }
 
+/// Refuse a dispatch that would give `holder` a second write set while another
+/// contract under the same holder still has a flight. `in_flight` is each
+/// in-flight contract with its holder.
+///
+/// [`LeaseKeeper::insert`] replaces a holder's whole token set, and a lost
+/// lease cancels every contract under its holder. Both assume one write set in
+/// flight per holder. That holds today:
+/// - leases are acquired at one place, the dispatch of a contract, and only a
+///   `Planned` contract without a flight is dispatched (`RunLoop::eligible`);
+/// - the parallel attempts of a contract are one flight and one acquisition;
+/// - hand-back children share the parent's lineage root, but each child
+///   depends on the one before it and the parent is removed, so they run one
+///   after another;
+/// - a resolver shares its original's lineage root, but it is created only
+///   after the original's flight finished, and the original stays
+///   `Dispatched` (not eligible) until the resolver settles;
+/// - plan-split children are each their own lineage root; subagents and
+///   speculation take no registry lease.
+///
+/// If a change ever breaks that, the first write set's tokens would stop being
+/// renewed and lapse with no report. This guard makes the break loud instead.
+fn guard_one_write_set<'a>(
+    contract: &str,
+    holder: &str,
+    in_flight: impl IntoIterator<Item = (&'a str, String)>,
+) -> Result<(), OrchestratorError> {
+    for (other, other_holder) in in_flight {
+        if other != contract && other_holder == holder {
+            return Err(OrchestratorError::Invariant(format!(
+                "contract {contract} would take a second write set for lease holder {holder} \
+                 while contract {other} still has workers under it"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Release every lease, of both grains, a holder has.
 fn release_holder(reg: &LeaseRegistry<'_>, holder: &str) -> Result<(), OrchestratorError> {
     reg.release_all(holder)?;
@@ -1697,6 +1734,10 @@ impl LeaseKeeper {
     /// loss of the same holder and key stale: the loss was of an older
     /// generation, and the workers started under the new grant hold the new
     /// one.
+    ///
+    /// The new set replaces the holder's old one: one write set is in flight
+    /// per holder, and [`guard_one_write_set`] fails a dispatch that would
+    /// break that.
     fn insert(&self, holder: &str, leases: Vec<HeldLease>) {
         let mut map = self.map();
         {
@@ -5598,6 +5639,15 @@ impl RunLoop {
 
         // Leases: the whole write set, atomically, under the lineage root.
         let holder = self.holder(&contract);
+        guard_one_write_set(
+            id,
+            &holder,
+            self.in_flight.keys().filter_map(|k| {
+                self.record
+                    .contract(k)
+                    .map(|c| (k.as_str(), self.holder(c)))
+            }),
+        )?;
         match self.acquire_leases(&contract, &holder).await? {
             Ok(()) => {}
             Err(detail) => {
@@ -7333,6 +7383,12 @@ impl RunLoop {
         // just at the last renewal tick.
         if select(&flight.attempts, &flight.premerged).is_some() && !flight.lease_lost {
             let lost = self.renew_leases_now(&holder).await?;
+            // The renewal found the run lease lost: another orchestrator owns
+            // the run, so nothing is accepted here. Leave the contract
+            // Dispatched, as a stop does.
+            if self.run_lease_lost {
+                return self.save();
+            }
             if !lost.is_empty() {
                 // `renew_leases_now` counted each loss.
                 flight.lease_lost = true;
@@ -9889,6 +9945,31 @@ mod tests {
         let (paths, nodes) = RunLoop::lease_keys(&writes, &as_file);
         assert_eq!(paths, vec!["a.rs", "b.rs"]);
         assert!(nodes.is_empty());
+    }
+
+    /// The keeper holds one write set per holder. A dispatch that would put a
+    /// second one beside a flight under the same holder fails loud; another
+    /// holder's flight, or none, lets it through.
+    #[test]
+    fn a_second_write_set_under_one_holder_fails_loud() {
+        let err = guard_one_write_set(
+            "c1.h2",
+            "r1/c1@n",
+            [("b", "r1/b@n".to_owned()), ("c1.h1", "r1/c1@n".to_owned())],
+        )
+        .expect_err("refused");
+        assert!(
+            matches!(&err, OrchestratorError::Invariant(m)
+                if m.contains("c1.h2") && m.contains("c1.h1") && m.contains("r1/c1@n")),
+            "{err}"
+        );
+        guard_one_write_set("c1.h2", "r1/c1@n", [("b", "r1/b@n".to_owned())])
+            .expect("another holder's flight");
+        guard_one_write_set("c1.h2", "r1/c1@n", []).expect("no flight");
+        // The contract's own entry is skipped: its own write set taken again
+        // replaces the old one, which is not a second write set.
+        guard_one_write_set("c1.h2", "r1/c1@n", [("c1.h2", "r1/c1@n".to_owned())])
+            .expect("its own flight");
     }
 
     /// Sleep scenario: the wall clock jumps past every expiry while

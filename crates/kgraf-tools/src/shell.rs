@@ -1556,13 +1556,39 @@ fn confine_one_manifest(manifest: &str, ctx: &ToolContext) -> Result<(), ToolErr
 /// `target.<triple>.runner` name programs) and rustup's toolchain file (a
 /// `path` toolchain is any directory of binaries). Cargo and rustup read both
 /// from the directory a command runs in, the worktree root, and upward from
-/// it into the checkout, which the worker cannot write.
+/// it into the checkout, which the worker cannot write. The other build tools'
+/// and version managers' files at the root change what their builds run the
+/// same way (an `.npmrc` `node-options`, a `.mvn/jvm.config` agent, a
+/// `gradle.properties` JVM argument, a wrapper's distribution URL): the
+/// root-level names of `kgraf_core::paths::is_build_config_path`.
 const BUILD_CONFIG_FILES: &[&str] = &[
     ".cargo",
     ".cargo/config.toml",
     ".cargo/config",
     "rust-toolchain",
     "rust-toolchain.toml",
+    ".npmrc",
+    ".yarnrc",
+    ".yarnrc.yml",
+    ".pnpmfile.cjs",
+    ".mvn/jvm.config",
+    ".mvn/maven.config",
+    ".mvn/extensions.xml",
+    ".mvn/wrapper/maven-wrapper.properties",
+    "gradle.properties",
+    "gradle/wrapper/gradle-wrapper.properties",
+    "init.gradle",
+    "init.gradle.kts",
+    "pip.conf",
+    ".pypirc",
+    "NuGet.Config",
+    "nuget.config",
+    "Directory.Build.props",
+    "Directory.Build.targets",
+    ".bundle/config",
+    ".tool-versions",
+    ".python-version",
+    ".nvmrc",
 ];
 
 /// Decision 0084: the worktree's [`BUILD_CONFIG_FILES`] as they were when the
@@ -4404,6 +4430,20 @@ fn main() {
             assert!(err.to_string().contains("rust-toolchain.toml"), "{err}");
             std::fs::remove_file(root.join("rust-toolchain.toml")).expect("restore");
             assert!(tool.access(&test).expect("access").is_sandboxed_build());
+
+            // The other build tools' configuration at the root is the same.
+            for rel in [".npmrc", ".mvn/jvm.config", "gradle.properties", ".nvmrc"] {
+                let path = root.join(rel);
+                std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+                std::fs::write(&path, "x=1\n").expect("config");
+                let err = tool.access(&test).expect_err("config refused");
+                assert!(err.to_string().contains(rel), "{err}");
+                std::fs::remove_file(&path).expect("restore");
+                assert!(
+                    tool.access(&test).expect("access").is_sandboxed_build(),
+                    "{rel}"
+                );
+            }
         }
 
         /// A configuration the project committed, present when the tool was

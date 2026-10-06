@@ -25,10 +25,15 @@
 //! worker that meets the second defect anyway and asks for the missing file
 //! is held for a re-plan ([`member_hold`]).
 //!
-//! Other workspace tools were measured for the same load and do not have it:
-//! uv 0.11 skips a listed member with no `pyproject.toml`, and npm 11 runs
-//! with a listed workspace directory missing. Go workspaces (`go.work`) are
-//! not checked.
+//! Go workspaces and Maven reactors load the same way: a `go` command loads
+//! every module its `go.work` uses, and `mvn` every module its `pom.xml`
+//! lists, so a member whose `go.mod` or `pom.xml` comes later is the same
+//! defect ([`module_findings`]). Other workspace tools were measured for the
+//! same load and do not have it: uv 0.11 skips a listed member with no
+//! `pyproject.toml`, and npm 11 runs with a listed workspace directory
+//! missing (only `--workspace=<dir>` of the missing one fails). Gradle and
+//! pnpm are not checked: whether a listed project with no directory fails
+//! depends on their version.
 
 use crate::placeholder::has_placeholder_body;
 use crate::plan::{ContractSpec, PlanError};
@@ -706,7 +711,8 @@ fn within(dir: &str, run_dir: &str) -> bool {
     dir.is_empty() || run_dir == dir || run_dir.starts_with(&format!("{dir}/"))
 }
 
-/// Why `c`'s cargo acceptance cannot pass in the workspace it runs in.
+/// Why `c`'s acceptance cannot pass in the workspace it runs in: cargo
+/// ([`cargo_findings`]), Go and Maven ([`module_findings`]).
 ///
 /// Cargo loads the manifest of every member of the workspace before it runs
 /// any command: with `--workspace`, with `-p <package>`, with
@@ -718,6 +724,347 @@ fn within(dir: &str, run_dir: &str) -> bool {
 /// `c` or a contract it depends on, and a command run at the workspace's root
 /// needs the workspace manifest itself.
 fn workspace_findings<C: PlanContract>(specs: &[C], c: &C, repo: &dyn RepoView) -> Vec<Finding> {
+    let mut found = cargo_findings(specs, c, repo);
+    for f in module_findings(specs, c, repo) {
+        if !found.iter().any(|g| g.paths[0] == f.paths[0]) {
+            found.push(f);
+        }
+    }
+    found
+}
+
+/// A Go or Maven command of an acceptance, with the directory it runs in and
+/// the manifest it loads its members from.
+#[derive(Debug)]
+struct ToolRun {
+    command: String,
+    tool: ModuleTool,
+    dir: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModuleTool {
+    /// A `go` command that loads packages: it reads the nearest `go.work`
+    /// above its directory, and every module the file `use`s.
+    Go,
+    /// `mvn` or `./mvnw`: the `pom.xml` of its directory (or `-f`) and every
+    /// module that pom lists.
+    Maven,
+}
+
+/// `go` subcommands that load the workspace.
+const GO_LOADING_VERBS: &[&str] = &["build", "test", "vet", "run", "list", "install", "generate"];
+
+/// The Go and Maven commands `acceptance` runs, with their directories, as
+/// [`cargo_runs`] reads cargo's. A `go` command after `GOWORK=off` loads no
+/// workspace and is left out; so is a command in a directory that cannot be
+/// known.
+fn module_runs(acceptance: &str) -> Vec<ToolRun> {
+    fn segment(words: &[&str], cwd: &mut Option<String>, runs: &mut Vec<ToolRun>) {
+        if words.first() == Some(&"cd") {
+            *cwd = match (cwd.as_deref(), words.get(1)) {
+                (Some(base), Some(to)) => join(base, clean(to)),
+                _ => None,
+            };
+            return;
+        }
+        let Some(base) = cwd.clone() else {
+            return;
+        };
+        let no_work = words.iter().any(|w| w.starts_with("GOWORK="));
+        for (i, w) in words.iter().enumerate() {
+            let w = clean(w);
+            if w == "go" && !no_work {
+                let mut dir = Some(base.clone());
+                let mut j = i + 1;
+                while let Some(a) = words.get(j).map(|a| clean(a)) {
+                    if a == "-C" {
+                        dir = match (dir, words.get(j + 1)) {
+                            (Some(d), Some(to)) => join(&d, clean(to)),
+                            _ => None,
+                        };
+                        j += 2;
+                    } else {
+                        break;
+                    }
+                }
+                let verb = words.get(j).map(|v| clean(v)).unwrap_or_default();
+                if let Some(dir) = dir.filter(|_| GO_LOADING_VERBS.contains(&verb)) {
+                    runs.push(ToolRun {
+                        command: format!("go {verb}"),
+                        tool: ModuleTool::Go,
+                        dir,
+                    });
+                }
+            } else if w == "mvn" || w == "mvnw" || w == "./mvnw" {
+                let mut dir = Some(base.clone());
+                let mut j = i + 1;
+                while let Some(a) = words.get(j).map(|a| clean(a)) {
+                    if a == "-f" || a == "--file" {
+                        dir = match (dir, words.get(j + 1)) {
+                            (Some(d), Some(to)) => {
+                                let to = clean(to);
+                                let parent = if to.ends_with(".xml") {
+                                    to.rsplit_once('/').map_or("", |(p, _)| p)
+                                } else {
+                                    to
+                                };
+                                if parent.is_empty() {
+                                    Some(d)
+                                } else {
+                                    join(&d, parent)
+                                }
+                            }
+                            _ => None,
+                        };
+                        j += 2;
+                        continue;
+                    }
+                    j += 1;
+                    if !a.starts_with('-') {
+                        break;
+                    }
+                }
+                if let Some(dir) = dir {
+                    runs.push(ToolRun {
+                        command: "mvn".to_owned(),
+                        tool: ModuleTool::Maven,
+                        dir,
+                    });
+                }
+            }
+        }
+    }
+    let mut runs = Vec::new();
+    let mut cwd: Option<String> = Some(String::new());
+    let mut saved: Vec<Option<String>> = Vec::new();
+    let mut words: Vec<&str> = Vec::new();
+    let toks = tokens(acceptance);
+    for t in &toks {
+        match t {
+            Tok::Word(w) => words.push(w),
+            Tok::Sep | Tok::Open | Tok::Close => {
+                segment(&words, &mut cwd, &mut runs);
+                words.clear();
+                match t {
+                    Tok::Open => saved.push(cwd.clone()),
+                    Tok::Close => {
+                        if let Some(c) = saved.pop() {
+                            cwd = c;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    segment(&words, &mut cwd, &mut runs);
+    runs
+}
+
+/// The module directories a `go.work` file `use`s: `use ./a` and the lines of
+/// a `use ( ... )` block. A directory outside the repository is left out.
+fn go_work_uses(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_block = false;
+    for line in text.lines() {
+        let line = line.split("//").next().unwrap_or_default().trim();
+        if in_block {
+            if line.starts_with(')') {
+                in_block = false;
+            } else if !line.is_empty() {
+                out.push(line.trim_matches('"').to_owned());
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("use") {
+            let rest = rest.trim();
+            if rest.starts_with('(') {
+                in_block = true;
+                let inner = rest.trim_start_matches('(').trim();
+                if let Some(one) = inner.strip_suffix(')') {
+                    in_block = false;
+                    if !one.trim().is_empty() {
+                        out.push(one.trim().trim_matches('"').to_owned());
+                    }
+                }
+            } else if !rest.is_empty() {
+                out.push(rest.trim_matches('"').to_owned());
+            }
+        }
+    }
+    out
+}
+
+/// The modules a `pom.xml` lists in its `<modules>`, comments and profiles
+/// left out: a profile's modules load only when it is active.
+fn maven_modules(text: &str) -> Vec<String> {
+    let mut t = text.to_owned();
+    for (open, close) in [("<!--", "-->"), ("<profiles>", "</profiles>")] {
+        while let Some(a) = t.find(open) {
+            match t[a..].find(close) {
+                Some(b) => t.replace_range(a..a + b + close.len(), ""),
+                None => {
+                    t.truncate(a);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    let mut rest = t.as_str();
+    while let Some(a) = rest.find("<module>") {
+        let after = &rest[a + "<module>".len()..];
+        let Some(b) = after.find("</module>") else {
+            break;
+        };
+        let m = after[..b].trim();
+        if !m.is_empty() {
+            out.push(m.to_owned());
+        }
+        rest = &after[b..];
+    }
+    out
+}
+
+/// Why `c`'s Go or Maven acceptance cannot pass: a member its workspace or
+/// reactor lists whose manifest is neither in the repository nor written by
+/// `c` or a contract it depends on.
+///
+/// - **Go**: every `go` command that loads packages reads the nearest
+///   `go.work` above its directory and loads every module it `use`s; a used
+///   directory with no `go.mod` makes the command fail ("cannot load module
+///   ... listed in go.work file").
+/// - **Maven**: `mvn` builds the reactor of the `pom.xml` it runs on; a listed
+///   `<module>` with no `pom.xml` makes the build fail ("Child module ... does
+///   not exist").
+///
+/// Only a manifest the repository holds, and that `c` and its dependencies do
+/// not rewrite, is read: a manifest a contract writes has content the plan
+/// does not show, so it is not judged. A finding is only made when the load
+/// is certain; every other case is left unchecked. Measured not to load a
+/// missing member, and so not checked: npm (a listed workspace directory that
+/// is missing is skipped), uv. Not checked because the outcome depends on the
+/// version: Gradle (a project in `settings.gradle` with no directory is a
+/// deprecation warning in Gradle 8 and an error later), pnpm.
+fn module_findings<C: PlanContract>(specs: &[C], c: &C, repo: &dyn RepoView) -> Vec<Finding> {
+    let runs = module_runs(c.acceptance());
+    if runs.is_empty() {
+        return Vec::new();
+    }
+    let written = writes_of(specs);
+    let mut supplied: BTreeSet<&str> = ancestors(specs, c.id());
+    supplied.insert(c.id());
+    let by_supplied = |path: &str| {
+        written
+            .get(path)
+            .is_some_and(|ids| ids.iter().any(|id| supplied.contains(id)))
+    };
+    let reachable = |path: &str| repo.exists(path) || by_supplied(path);
+    let writers = |path: &str| -> String {
+        match written.get(path) {
+            None => "by no contract".to_owned(),
+            Some(ids) => format!(
+                "only by contract{} {}, which `{}` does not depend on",
+                if ids.len() == 1 { "" } else { "s" },
+                ids.iter()
+                    .map(|i| format!("`{i}`"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                c.id()
+            ),
+        }
+    };
+    let at = |dir: &str| -> String {
+        if dir.is_empty() {
+            String::new()
+        } else {
+            format!("{dir}/")
+        }
+    };
+    let mut found: Vec<Finding> = Vec::new();
+    for run in &runs {
+        // The manifest that lists the members, and the members.
+        let (manifest, members, member_file) = match run.tool {
+            ModuleTool::Go => {
+                let mut dir = Some(run.dir.clone());
+                let mut work = None;
+                while let Some(d) = dir {
+                    let p = format!("{}go.work", at(&d));
+                    if repo.exists(&p) || written.contains_key(p.as_str()) {
+                        work = Some((p, d.clone()));
+                        break;
+                    }
+                    dir = (!d.is_empty())
+                        .then(|| d.rsplit_once('/').map_or("", |(p, _)| p).to_owned());
+                }
+                let Some((manifest, wdir)) = work else {
+                    continue;
+                };
+                if by_supplied(&manifest) {
+                    continue;
+                }
+                let Some(text) = repo.read(&manifest) else {
+                    continue;
+                };
+                let members: Vec<String> = go_work_uses(&text)
+                    .into_iter()
+                    .filter_map(|u| join(&wdir, &u))
+                    .collect();
+                (manifest, members, "go.mod")
+            }
+            ModuleTool::Maven => {
+                let manifest = format!("{}pom.xml", at(&run.dir));
+                if by_supplied(&manifest) {
+                    continue;
+                }
+                let Some(text) = repo.read(&manifest) else {
+                    continue;
+                };
+                let members: Vec<String> = maven_modules(&text)
+                    .into_iter()
+                    .filter_map(|m| join(&run.dir, &m))
+                    .collect();
+                (manifest, members, "pom.xml")
+            }
+        };
+        for member in members {
+            let member_manifest = if member.ends_with(".xml") {
+                member.clone()
+            } else {
+                format!("{}{member_file}", at(&member))
+            };
+            if reachable(&member_manifest) || found.iter().any(|f| f.paths[0] == member_manifest) {
+                continue;
+            }
+            let (tool, load) = match run.tool {
+                ModuleTool::Go => (
+                    "the go command",
+                    "loads every module its `go.work` uses before it runs",
+                ),
+                ModuleTool::Maven => (
+                    "maven",
+                    "builds every module its `pom.xml` lists, and stops on a missing one",
+                ),
+            };
+            found.push(Finding {
+                paths: vec![member_manifest.clone()],
+                reason: format!(
+                    "contract `{id}` acceptance runs `{command}`, and {tool} {load}. \
+                     `{manifest}` lists `{member}`, but `{member_manifest}` does not exist and is \
+                     written {by}, so the command fails when `{id}` runs. Make `{id}` also write \
+                     `{member_manifest}`, or make `{id}` depend on the contract that writes it",
+                    id = c.id(),
+                    command = run.command,
+                    by = writers(&member_manifest),
+                ),
+            });
+        }
+    }
+    found
+}
+
+/// The cargo half of [`workspace_findings`], as its documentation describes.
+fn cargo_findings<C: PlanContract>(specs: &[C], c: &C, repo: &dyn RepoView) -> Vec<Finding> {
     let runs = cargo_runs(c.acceptance());
     if runs.is_empty() {
         return Vec::new();
@@ -1929,5 +2276,146 @@ pub fn f() {}
             }
             assert_eq!(refused_any, some_refused, "{name}");
         }
+    }
+
+    /// A `go.work` that uses a module whose `go.mod` a later contract
+    /// writes: every go command in the workspace fails on it, so the plan is
+    /// refused naming the file. Written by the contract itself or one it
+    /// depends on, or already in the repository: no refusal.
+    #[test]
+    fn a_go_work_member_written_later_is_refused_and_one_in_time_is_not() {
+        let repo = Fake::with(&[
+            (
+                "go.work",
+                "go 1.22\n\nuse (\n\t./core\n\t./cli // the binary\n)\n",
+            ),
+            ("core/go.mod", "module example.com/core\n"),
+        ]);
+        let late = vec![
+            spec("c1", "core", "go test ./...", &["core/a.go"], &[]),
+            spec(
+                "c2",
+                "cli",
+                "go test ./...",
+                &["cli/go.mod", "cli/main.go"],
+                &["c1"],
+            ),
+        ];
+        let why = reason(refusal(&late, &[], &repo));
+        assert!(
+            why.contains("`c1`")
+                && why.contains("`cli/go.mod`")
+                && why.contains("go.work")
+                && why.contains("only by contract `c2`"),
+            "{why}"
+        );
+        let in_time = vec![
+            spec(
+                "c1",
+                "cli",
+                "go test ./...",
+                &["cli/go.mod", "cli/main.go"],
+                &[],
+            ),
+            spec(
+                "c2",
+                "core",
+                "cd core && go vet ./...",
+                &["core/a.go"],
+                &["c1"],
+            ),
+        ];
+        assert!(refusal(&in_time, &[], &repo).is_none());
+        // GOWORK=off loads no workspace, and `go fmt`-like verbs load nothing.
+        let off = vec![spec(
+            "c1",
+            "core",
+            "GOWORK=off go test ./...",
+            &["core/a.go"],
+            &[],
+        )];
+        assert!(refusal(&off, &[], &repo).is_none());
+        let fmt = vec![spec("c1", "core", "go fmt ./...", &["core/a.go"], &[])];
+        assert!(refusal(&fmt, &[], &repo).is_none());
+    }
+
+    /// A Maven reactor that lists a module whose `pom.xml` comes later is
+    /// refused; a module only in an inactive profile, or behind a comment, is
+    /// not loaded and is not judged.
+    #[test]
+    fn a_maven_module_written_later_is_refused_and_a_profile_module_is_not() {
+        let pom = "<project>\n<modules>\n  <module>core</module>\n  <module>web</module>\n  \
+                   <!-- <module>old</module> -->\n</modules>\n<profiles><profile><modules>\
+                   <module>bench</module></modules></profile></profiles>\n</project>\n";
+        let repo = Fake::with(&[("pom.xml", pom), ("core/pom.xml", "<project/>")]);
+        let late = vec![
+            spec("c1", "core", "mvn -q test", &["core/src/A.java"], &[]),
+            spec("c2", "web", "mvn test", &["web/pom.xml"], &["c1"]),
+        ];
+        let why = reason(refusal(&late, &[], &repo));
+        assert!(
+            why.contains("`web/pom.xml`") && why.contains("maven"),
+            "{why}"
+        );
+        assert!(!why.contains("bench") && !why.contains("old/"), "{why}");
+        let in_time = vec![
+            spec("c1", "web", "mvn test", &["web/pom.xml"], &[]),
+            spec(
+                "c2",
+                "core",
+                "./mvnw -f pom.xml verify",
+                &["core/src/A.java"],
+                &["c1"],
+            ),
+        ];
+        assert!(refusal(&in_time, &[], &repo).is_none());
+        // A command in a module's own directory builds that module only.
+        let inner = vec![spec(
+            "c1",
+            "core",
+            "cd core && mvn test",
+            &["core/src/A.java"],
+            &[],
+        )];
+        assert!(refusal(&inner, &[], &repo).is_none());
+    }
+
+    /// The tools measured or known not to load a missing member are never
+    /// refused for one: npm and pnpm workspaces, Gradle settings, a Go
+    /// workspace or Maven pom the plan itself rewrites (its content is not
+    /// known).
+    #[test]
+    fn workspaces_that_do_not_load_a_missing_member_are_never_refused() {
+        let repo = Fake::with(&[
+            ("package.json", r#"{"workspaces":["a","b"]}"#),
+            ("pnpm-workspace.yaml", "packages:\n  - a\n  - b\n"),
+            ("settings.gradle", "include 'a', 'b'\n"),
+            ("go.work", "use ./b\n"),
+            ("pom.xml", "<modules><module>b</module></modules>"),
+        ]);
+        for acceptance in ["npm test", "pnpm -r test", "gradle test"] {
+            let plan = vec![
+                spec("c1", "a", acceptance, &["a/x.js"], &[]),
+                spec("c2", "b", acceptance, &["b/package.json"], &["c1"]),
+            ];
+            assert!(refusal(&plan, &[], &repo).is_none(), "{acceptance}");
+        }
+        let rewritten = vec![
+            spec(
+                "c1",
+                "a",
+                "go test ./... && mvn test",
+                &["go.work", "pom.xml"],
+                &[],
+            ),
+            spec(
+                "c2",
+                "b",
+                "go test ./...",
+                &["b/go.mod", "b/pom.xml"],
+                &["c1"],
+            ),
+        ];
+        assert!(refusal(&rewritten, &[], &repo).is_none());
     }
 }

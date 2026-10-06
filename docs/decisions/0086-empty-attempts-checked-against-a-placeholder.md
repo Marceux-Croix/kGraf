@@ -111,3 +111,31 @@ decision's first amendment refuses).
 Tests: `kgraf-host` `a_contract_whose_work_an_earlier_merge_delivered_is_accepted_empty_with_a_notice`,
 `an_empty_attempt_is_still_refused_when_its_check_passes_at_the_run_start`,
 `an_earlier_merge_of_other_files_does_not_excuse_an_empty_attempt`.
+
+## Amendment (2026-10-06): a scaffold left in place is found in every language kGraf reads
+
+The placeholder rule of this decision read `.rs` files only, so a Python, TypeScript, Go, Java,
+C#, Ruby, PHP or C-family scaffold that an empty attempt left as it was passed as finished work.
+It now reads every language kGraf has a grammar for (`stub_land::is_placeholder_source`, the
+general path through `placeholder_writes_left_in_place`):
+
+- **Rust** is read as before (every body one `todo!` or `unimplemented!` call; a mock's trait
+  impls next to real items are a finished file).
+- **Every other language with a grammar** (`placeholder::every_body_is_placeholder`): the file
+  has at least one function or method body, and every body is one placeholder statement and
+  nothing else: `raise NotImplementedError`, `throw new NotImplementedException()`, or a raised
+  "not implemented" message (`throw new Error("not implemented")`, `panic("not implemented")`).
+  The placeholder is counted by the same rule as every other placeholder check, so a Python or
+  Ruby abstract method is not one (decision 0030, 2026-10-06 amendment on abstract methods).
+- **Never a false refusal.** A body with any other code, a body of only `pass`, `...` or
+  nothing (a correct no-op or protocol method), a file with no function, a placeholder named
+  only in a string or a comment, and a file in a language with no grammar (shell, prose) are
+  never flagged. A nested function is part of the body that holds it. Only files in a language
+  with a grammar are read at all.
+
+Tests: `kgraf-orchestrator` `stub_land.rs`
+`a_scaffold_in_every_language_with_a_grammar_is_flagged`,
+`a_correct_file_in_any_language_is_never_flagged`,
+`a_path_with_no_placeholder_reader_is_not_read_for_the_placeholder_check` (was
+`a_non_rust_path_is_not_read_for_the_placeholder_check`, which asserted that only `.rs` paths
+are read), `a_prose_or_unknown_file_is_never_flagged` (was `a_non_rust_file_is_never_flagged`).

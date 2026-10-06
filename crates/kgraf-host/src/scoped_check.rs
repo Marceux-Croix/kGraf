@@ -23,7 +23,25 @@
 //!   `node --test`, `jest` or `vitest`: `<stem>.test.<ext>`, `<stem>.spec.<ext>`,
 //!   or `<stem>.<ext>` under a `test`, `tests` or `__tests__` directory;
 //! - `cargo test` / `cargo nextest run` over a workspace: the package each
-//!   declared file is in, selected with `-p <package>`.
+//!   declared file is in, selected with `-p <package>`;
+//! - `go test ./...` with options only, `go.mod` at the root: the package of
+//!   each declared `.go` file (`go test ./<dir>`); a file in a nested module
+//!   is not narrowed;
+//! - `rspec` / `bundle exec rspec` with options only: `<stem>_spec.rb`;
+//! - `mvn` / `./mvnw` with a test goal and no selection: the test classes
+//!   `<Stem>Test`, `<Stem>Tests`, `<Stem>IT`, `Test<Stem>` under
+//!   `src/test/`, selected with `-Dtest=<Class>` (and `-pl <module> -am` when
+//!   the root `pom.xml` lists the module);
+//! - `gradle test` / `./gradlew test` with no selection: the same classes,
+//!   selected with `:<project>:test --tests <fully.qualified.Class>` when
+//!   `settings.gradle` names the project;
+//! - `npm test --workspaces`, or `npm test` whose script is that: the
+//!   workspace each declared file is in, `npm test --workspace=<dir>`, when
+//!   that workspace has a `test` script (or `--if-present` is given).
+//!
+//! Each narrowed form runs only what a part of the whole command runs, so it
+//! cannot fail where the whole command, on the same tree, would pass for the
+//! same tests.
 //!
 //! A declared file that is itself such a test selects itself. One command runs
 //! per test file or package, joined with `&&`, so each part is a command the
@@ -106,7 +124,41 @@ enum Runner {
     /// `drop` is the token that selects all packages (`--workspace`, `--all`),
     /// removed when narrowing, or empty for a virtual manifest's default.
     Cargo { drop: String },
+    /// `go test ./...` with options only, in a module whose `go.mod` is at
+    /// the root: narrowed to the packages of the contract's files.
+    Go,
+    /// `rspec` or `bundle exec rspec`, options only: `<stem>_spec.rb`.
+    Rspec,
+    /// `mvn` (or `./mvnw`) with a goal that runs tests and no selection:
+    /// narrowed to the test classes of the contract's files.
+    Maven,
+    /// `gradle test` (or `./gradlew test`) with no selection: narrowed to
+    /// `:<project>:test --tests <class>` per test class.
+    Gradle,
+    /// `npm test --workspaces`, or `npm test` whose script is that: narrowed
+    /// to `npm test --workspace=<dir>` per workspace of the contract's files.
+    /// `extra` is the options kept (`--if-present`).
+    NpmWorkspaces { extra: Vec<String> },
 }
+
+/// Value options of `go test` that take the next token.
+const GO_VALUE_OPTS: &[&str] = &[
+    "-timeout",
+    "-count",
+    "-p",
+    "-parallel",
+    "-cpu",
+    "-tags",
+    "-covermode",
+    "-coverprofile",
+    "-coverpkg",
+];
+
+/// Maven goals that run the tests.
+const MAVEN_TEST_GOALS: &[&str] = &["test", "verify", "install", "package"];
+
+/// Extensions of JVM test sources Maven and Gradle compile.
+const JVM_EXTS: &[&str] = &["java", "kt", "groovy", "scala"];
 
 /// Whether `command`, run in `root`, is a whole-suite command this module can
 /// narrow.
@@ -161,6 +213,51 @@ pub(crate) fn scope(command: &str, root: &Path, writes: &[&str]) -> Scope {
                     .collect(),
             }
         }
+        Runner::Go => {
+            let packages: BTreeSet<String> = writes
+                .iter()
+                .filter_map(|w| go_package_of(root, w))
+                .collect();
+            if packages.is_empty() {
+                return Scope::Whole {
+                    why: "none of the contract's files is a Go file of the root module".into(),
+                };
+            }
+            Scope::Narrowed {
+                parts: packages.iter().map(|p| go_part(&tokens, p)).collect(),
+                selected: packages
+                    .into_iter()
+                    .map(|p| format!("package {p}"))
+                    .collect(),
+            }
+        }
+        Runner::NpmWorkspaces { extra } => {
+            let dirs = workspace_dirs(root);
+            let mut chosen: BTreeSet<&str> = BTreeSet::new();
+            for w in writes {
+                let w = w.trim_start_matches("./");
+                if let Some(d) = dirs
+                    .iter()
+                    .filter(|d| w.starts_with(&format!("{d}/")))
+                    .max_by_key(|d| d.len())
+                {
+                    chosen.insert(d);
+                }
+            }
+            // A workspace with no `test` script fails `npm test --workspace`
+            // unless the command allows it (`--if-present`).
+            let if_present = extra.iter().any(|a| a == "--if-present");
+            chosen.retain(|d| if_present || has_test_script(root, d));
+            if chosen.is_empty() {
+                return Scope::Whole {
+                    why: "none of the contract's files is in a workspace with a test script".into(),
+                };
+            }
+            Scope::Narrowed {
+                parts: chosen.iter().map(|d| workspace_part(extra, d)).collect(),
+                selected: chosen.iter().map(|d| format!("workspace {d}")).collect(),
+            }
+        }
         _ => {
             let tests = match test_files(&runner, root) {
                 Ok(t) => t,
@@ -170,20 +267,18 @@ pub(crate) fn scope(command: &str, root: &Path, writes: &[&str]) -> Scope {
             for w in writes {
                 selected.extend(tests_for_write(&runner, &tests, w));
             }
-            if selected.is_empty() {
+            let parts: Vec<(String, String)> = selected
+                .into_iter()
+                .filter_map(|t| file_part(&runner, &tokens, &t, root).map(|p| (p, t)))
+                .collect();
+            if parts.is_empty() {
                 return Scope::Whole {
                     why: "no test file belongs to the contract's files by the runner's naming"
                         .into(),
                 };
             }
-            let parts = selected
-                .iter()
-                .map(|t| file_part(&runner, &tokens, t))
-                .collect();
-            Scope::Narrowed {
-                parts,
-                selected: selected.into_iter().collect(),
-            }
+            let (parts, selected) = parts.into_iter().unzip();
+            Scope::Narrowed { parts, selected }
         }
     }
 }
@@ -206,15 +301,72 @@ pub(crate) fn variants(command: &str, root: &Path) -> Vec<String> {
                 .map(|p| cargo_part(&base, p))
                 .collect()
         }
+        Runner::Go => test_files(&runner, root)
+            .unwrap_or_default()
+            .iter()
+            .filter(|t| t.ends_with("_test.go"))
+            .filter_map(|t| go_package_of(root, t))
+            .map(|p| go_part(&tokens, &p))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect(),
+        Runner::NpmWorkspaces { extra } => workspace_dirs(root)
+            .iter()
+            .map(|d| workspace_part(extra, d))
+            .collect(),
         _ => test_files(&runner, root)
             .unwrap_or_default()
             .iter()
             .filter(|t| is_test_file(&runner, t))
-            .map(|t| file_part(&runner, &tokens, t))
+            .filter_map(|t| file_part(&runner, &tokens, t, root))
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect(),
     }
+}
+
+/// The Go package of `write` as `go test` names it from the root (`./dir`,
+/// `.` for the root), when it is a `.go` file of the root module: no `go.mod`
+/// between its directory and the root, since a nested module is not a package
+/// of the root module and `go test ./dir` would fail there.
+fn go_package_of(root: &Path, write: &str) -> Option<String> {
+    let write = write.trim_start_matches("./");
+    if !write.ends_with(".go") {
+        return None;
+    }
+    let dir = write.rsplit_once('/').map_or("", |(d, _)| d);
+    let mut up = PathBuf::from(dir);
+    while !up.as_os_str().is_empty() {
+        if root.join(&up).join("go.mod").is_file() {
+            return None;
+        }
+        if !up.pop() {
+            break;
+        }
+    }
+    Some(if dir.is_empty() {
+        ".".to_owned()
+    } else {
+        format!("./{dir}")
+    })
+}
+
+fn go_part(tokens: &[&str], package: &str) -> String {
+    tokens
+        .iter()
+        .map(|t| if *t == "./..." { package } else { t })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn workspace_part(extra: &[String], dir: &str) -> String {
+    let mut out = vec![
+        "npm".to_owned(),
+        "test".to_owned(),
+        format!("--workspace={dir}"),
+    ];
+    out.extend(extra.iter().cloned());
+    out.join(" ")
 }
 
 /// The text a worker's brief carries about its check. A narrowed check names
@@ -258,9 +410,206 @@ fn runner(command: &str, root: &Path) -> Result<Runner, String> {
             Ok(Runner::Node { npm: false })
         }
         ["npm", "test"] | ["npm", "t"] | ["npm", "run", "test"] => npm_test(root),
+        ["npm", "test" | "t", rest @ ..] | ["npm", "run", "test", rest @ ..] => {
+            npm_workspaces(rest, root)
+        }
         ["cargo", "test", rest @ ..] | ["cargo", "nextest", "run", rest @ ..] => cargo(rest, root),
+        ["go", "test", rest @ ..] => go_test(rest, root),
+        ["rspec", rest @ ..] | ["bundle", "exec", "rspec", rest @ ..] => rspec(rest),
+        [tool, rest @ ..] if is_tool(tool, "mvn") || is_tool(tool, "mvnw") => maven(rest, root),
+        [tool, rest @ ..] if is_tool(tool, "gradle") || is_tool(tool, "gradlew") => {
+            gradle(rest, root)
+        }
         _ => Err("the command is not a test runner kGraf can narrow to a contract's files".into()),
     }
+}
+
+/// Whether `token` runs `name`: the bare name or a relative path to it
+/// (`./mvnw`).
+fn is_tool(token: &str, name: &str) -> bool {
+    token == name || token.strip_prefix("./") == Some(name)
+}
+
+fn rspec(rest: &[&str]) -> Result<Runner, String> {
+    let mut i = 0;
+    while i < rest.len() {
+        let a = rest[i];
+        let flag = a.split_once('=').map_or(a, |(f, _)| f);
+        if matches!(
+            flag,
+            "-e" | "--example" | "-t" | "--tag" | "-P" | "--pattern"
+        ) {
+            return Err("the rspec command already selects its examples".into());
+        }
+        if matches!(
+            a,
+            "-f" | "--format" | "-r" | "--require" | "-o" | "--out" | "--seed" | "--order"
+        ) {
+            i += 2;
+        } else if a.starts_with('-') {
+            i += 1;
+        } else {
+            return Err("the rspec command already names what it runs".into());
+        }
+    }
+    Ok(Runner::Rspec)
+}
+
+fn go_test(rest: &[&str], root: &Path) -> Result<Runner, String> {
+    let mut all = false;
+    let mut i = 0;
+    while i < rest.len() {
+        let a = rest[i];
+        let flag = a.split_once('=').map_or(a, |(f, _)| f);
+        if matches!(flag, "-run" | "-skip" | "-bench" | "-list" | "-fuzz") {
+            return Err("the go test command already selects its tests".into());
+        }
+        if a == "./..." {
+            all = true;
+            i += 1;
+        } else if GO_VALUE_OPTS.contains(&a) {
+            i += 2;
+        } else if a.starts_with('-') {
+            i += 1;
+        } else {
+            return Err("the go test command already names its packages".into());
+        }
+    }
+    if !all {
+        return Err("the go test command does not test every package (`./...`)".into());
+    }
+    if !root.join("go.mod").is_file() {
+        return Err("no go.mod at the repository root".into());
+    }
+    Ok(Runner::Go)
+}
+
+fn maven(rest: &[&str], root: &Path) -> Result<Runner, String> {
+    let selects = |a: &&str| {
+        matches!(
+            *a,
+            "-pl" | "--projects" | "-f" | "--file" | "-rf" | "--resume-from"
+        ) || a.starts_with("-Dtest=")
+            || a.starts_with("-Dit.test=")
+    };
+    if rest.iter().any(selects) {
+        return Err("the maven command already selects its modules or tests".into());
+    }
+    if !rest.iter().any(|a| MAVEN_TEST_GOALS.contains(a)) {
+        return Err("the maven command runs no goal that runs the tests".into());
+    }
+    if rest
+        .iter()
+        .any(|a| !a.starts_with('-') && !MAVEN_TEST_GOALS.contains(a) && *a != "clean")
+    {
+        return Err("the maven command runs a goal kGraf does not narrow".into());
+    }
+    if !root.join("pom.xml").is_file() {
+        return Err("no pom.xml at the repository root".into());
+    }
+    Ok(Runner::Maven)
+}
+
+fn gradle(rest: &[&str], root: &Path) -> Result<Runner, String> {
+    if rest
+        .iter()
+        .any(|a| *a == "--tests" || a.starts_with("--tests=") || a.contains(':'))
+    {
+        return Err("the gradle command already selects its projects or tests".into());
+    }
+    let tasks: Vec<&&str> = rest.iter().filter(|a| !a.starts_with('-')).collect();
+    if tasks.as_slice() != [&"test"] {
+        return Err("the gradle command runs tasks other than `test`".into());
+    }
+    if rest
+        .iter()
+        .any(|a| a.starts_with('-') && !a.starts_with("--"))
+    {
+        // A short option may take a value (`-x check`, `-P key`), which would
+        // read as a task.
+        return Err("the gradle command has short options kGraf does not read".into());
+    }
+    let settings = gradle_settings(root);
+    if settings.contains("projectDir") {
+        return Err("settings.gradle moves a project's directory".into());
+    }
+    Ok(Runner::Gradle)
+}
+
+/// The text of `settings.gradle` or `settings.gradle.kts`; empty when there
+/// is none (a single-project build).
+fn gradle_settings(root: &Path) -> String {
+    ["settings.gradle", "settings.gradle.kts"]
+        .iter()
+        .find_map(|n| std::fs::read_to_string(root.join(n)).ok())
+        .unwrap_or_default()
+}
+
+/// `npm test --workspaces` (or `-ws`), with options only.
+fn npm_workspaces(rest: &[&str], root: &Path) -> Result<Runner, String> {
+    if !rest.iter().any(|a| *a == "--workspaces" || *a == "-ws") {
+        return Err("the npm command is not a test runner kGraf can narrow".into());
+    }
+    options_only(rest)?;
+    if rest
+        .iter()
+        .any(|a| *a == "--workspace" || a.starts_with("--workspace=") || *a == "-w")
+    {
+        return Err("the npm command already selects its workspaces".into());
+    }
+    if workspace_dirs(root).is_empty() {
+        return Err("package.json lists no workspace directory".into());
+    }
+    Ok(Runner::NpmWorkspaces {
+        extra: rest
+            .iter()
+            .filter(|a| **a != "--workspaces" && **a != "-ws")
+            .map(|a| a.to_string())
+            .collect(),
+    })
+}
+
+/// The workspace directories the root `package.json` lists that exist and
+/// hold a `package.json`: each explicit entry, and each directory under a
+/// `<prefix>/*` entry. Other globs are not expanded.
+fn workspace_dirs(root: &Path) -> Vec<String> {
+    let Some(json) = std::fs::read_to_string(root.join("package.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+    else {
+        return Vec::new();
+    };
+    let list = json.get("workspaces").and_then(|w| {
+        w.as_array()
+            .or_else(|| w.get("packages").and_then(|p| p.as_array()))
+    });
+    let mut out: BTreeSet<String> = BTreeSet::new();
+    for entry in list.into_iter().flatten().filter_map(|e| e.as_str()) {
+        let entry = entry.trim_start_matches("./").trim_end_matches('/');
+        if let Some(prefix) = entry.strip_suffix("/*") {
+            if prefix.contains('*') {
+                continue;
+            }
+            if let Ok(dirs) = std::fs::read_dir(root.join(prefix)) {
+                for d in dirs.flatten() {
+                    out.insert(format!("{prefix}/{}", d.file_name().to_string_lossy()));
+                }
+            }
+        } else if !entry.contains('*') {
+            out.insert(entry.to_owned());
+        }
+    }
+    out.into_iter()
+        .filter(|d| root.join(d).join("package.json").is_file())
+        .collect()
+}
+
+/// Whether the workspace at `dir` has a `test` script.
+fn has_test_script(root: &Path, dir: &str) -> bool {
+    std::fs::read_to_string(root.join(dir).join("package.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .is_some_and(|j| j.get("scripts").and_then(|s| s.get("test")).is_some())
 }
 
 fn is_shell_syntax(c: char) -> bool {
@@ -370,6 +719,9 @@ fn npm_test(root: &Path) -> Result<Runner, String> {
     }
     let tokens: Vec<&str> = script.split_whitespace().collect();
     let rest = match tokens.as_slice() {
+        ["npm", "test" | "t", rest @ ..] | ["npm", "run", "test", rest @ ..] => {
+            return npm_workspaces(rest, root);
+        }
         ["node", "--test", rest @ ..] => rest,
         ["jest", rest @ ..] | ["vitest", "run", rest @ ..] | ["vitest", rest @ ..] => rest,
         _ => {
@@ -512,8 +864,32 @@ fn is_test_file(runner: &Runner, path: &str) -> bool {
                         .split('/')
                         .any(|d| d == "test" || d == "tests" || d == "__tests__"))
         }
-        Runner::Cargo { .. } => false,
+        Runner::Rspec => name.ends_with("_spec.rb"),
+        Runner::Maven | Runner::Gradle => {
+            let (stem, ext) = split_ext(name);
+            JVM_EXTS.contains(&ext)
+                && jvm_test_split(path).is_some()
+                && (stem.ends_with("Test")
+                    || stem.ends_with("Tests")
+                    || stem.ends_with("IT")
+                    || stem.starts_with("Test"))
+        }
+        Runner::Cargo { .. } | Runner::Go | Runner::NpmWorkspaces { .. } => false,
     }
+}
+
+/// A JVM test source split at its `src/test/<language>/` directory: the
+/// module directory before it (`""` for the root project) and the class path
+/// after it (`shop/CartTest.java`).
+fn jvm_test_split(path: &str) -> Option<(&str, &str)> {
+    let (module, rest) = if let Some(rest) = path.strip_prefix("src/test/") {
+        ("", rest)
+    } else {
+        let at = path.find("/src/test/")?;
+        (&path[..at], &path[at + "/src/test/".len()..])
+    };
+    let (_, class) = rest.split_once('/')?;
+    Some((module, class))
 }
 
 /// The test files of `tests` that belong to `write`.
@@ -538,6 +914,18 @@ fn tests_for_write(runner: &Runner, tests: &[String], write: &str) -> Vec<String
                 ]
             })
             .collect(),
+        Runner::Rspec if ext == "rb" => vec![format!("{stem}_spec.rb")],
+        Runner::Maven | Runner::Gradle if JVM_EXTS.contains(&ext) => JVM_EXTS
+            .iter()
+            .flat_map(|e| {
+                [
+                    format!("{stem}Test.{e}"),
+                    format!("{stem}Tests.{e}"),
+                    format!("{stem}IT.{e}"),
+                    format!("Test{stem}.{e}"),
+                ]
+            })
+            .collect(),
         _ => return Vec::new(),
     };
     tests
@@ -554,8 +942,10 @@ fn tests_for_write(runner: &Runner, tests: &[String], write: &str) -> Vec<String
         .collect()
 }
 
-fn file_part(runner: &Runner, tokens: &[&str], test: &str) -> String {
-    match runner {
+/// The command that runs `test` alone, or `None` when the runner cannot
+/// select it from the root (a Gradle project kGraf cannot name).
+fn file_part(runner: &Runner, tokens: &[&str], test: &str, root: &Path) -> Option<String> {
+    Some(match runner {
         Runner::Unittest { .. } => {
             let mut t: Vec<String> = tokens.iter().map(|s| s.to_string()).collect();
             if t.len() == 3 {
@@ -567,8 +957,70 @@ fn file_part(runner: &Runner, tokens: &[&str], test: &str) -> String {
             t.join(" ")
         }
         Runner::Node { npm: true } => format!("{} -- {test}", tokens.join(" ")),
+        Runner::Maven => maven_part(tokens, test, root)?,
+        Runner::Gradle => gradle_part(tokens, test, root)?,
         _ => format!("{} {test}", tokens.join(" ")),
+    })
+}
+
+/// `mvn ... -Dtest=<Class> -Dsurefire.failIfNoSpecifiedTests=false`, with
+/// `-pl <module> -am` when the root `pom.xml` lists the module. `-am` builds
+/// the modules it depends on, which a module alone cannot resolve until they
+/// are installed; the test filter keeps their tests from running, and the
+/// surefire flag keeps a module with no matching test from failing.
+fn maven_part(tokens: &[&str], test: &str, root: &Path) -> Option<String> {
+    let (module, class) = jvm_test_split(test)?;
+    let (class, _) = split_ext(file_name(class));
+    let mut out: Vec<String> = tokens.iter().map(|t| t.to_string()).collect();
+    if !module.is_empty() {
+        let pom = std::fs::read_to_string(root.join("pom.xml")).unwrap_or_default();
+        if pom.contains(&format!("<module>{module}</module>")) {
+            out.extend(["-pl".to_owned(), module.to_owned(), "-am".to_owned()]);
+        }
     }
+    out.push(format!("-Dtest={class}"));
+    out.push("-Dsurefire.failIfNoSpecifiedTests=false".to_owned());
+    Some(out.join(" "))
+}
+
+/// `gradle :<project>:test --tests <fully.qualified.Class>`: the project
+/// path is the module directory with `/` as `:`, and must be named in
+/// `settings.gradle` (a single-project build at the root needs none). A
+/// project's `test` task builds what it depends on and runs no other
+/// project's tests.
+fn gradle_part(tokens: &[&str], test: &str, root: &Path) -> Option<String> {
+    let (module, class) = jvm_test_split(test)?;
+    let (class, _) = split_ext(class);
+    let fqcn = class.replace('/', ".");
+    let task = if module.is_empty() {
+        "test".to_owned()
+    } else {
+        let project = module.replace('/', ":");
+        let settings = gradle_settings(root);
+        let named = [
+            format!("'{project}'"),
+            format!("\"{project}\""),
+            format!("':{project}'"),
+            format!("\":{project}\""),
+        ];
+        if !named.iter().any(|n| settings.contains(n)) {
+            return None;
+        }
+        format!(":{project}:test")
+    };
+    let mut out: Vec<String> = tokens
+        .iter()
+        .map(|t| {
+            if *t == "test" {
+                task.clone()
+            } else {
+                t.to_string()
+            }
+        })
+        .collect();
+    out.push("--tests".to_owned());
+    out.push(fqcn);
+    Some(out.join(" "))
 }
 
 // -- cargo packages ------------------------------------------------------------------------
@@ -925,5 +1377,159 @@ mod tests {
             !text.contains("Failures in other contracts"),
             "a blanket exemption for other contracts' failures must not return: {text}"
         );
+    }
+
+    /// `go test ./...` narrows to the packages of the contract's Go files; a
+    /// file in a nested module, or a command that already selects, keeps
+    /// the whole command.
+    #[test]
+    fn go_test_narrows_to_the_packages_of_the_contracts_files() {
+        let t = tree(&[
+            ("go.mod", "module example.com/shop\n"),
+            ("price/price.go", ""),
+            ("price/price_test.go", ""),
+            ("cart/cart.go", ""),
+            ("main.go", ""),
+            ("tools/go.mod", "module example.com/tools\n"),
+            ("tools/gen/gen.go", ""),
+        ]);
+        let cmd = "go test -count=1 ./...";
+        let (parts, selected) = narrowed(&scope(cmd, t.path(), &["price/price.go", "main.go"]));
+        assert_eq!(parts, ["go test -count=1 .", "go test -count=1 ./price"]);
+        assert_eq!(selected, ["package .", "package ./price"]);
+        assert!(matches!(
+            scope(cmd, t.path(), &["tools/gen/gen.go"]),
+            Scope::Whole { .. }
+        ));
+        assert!(!narrowable("go test -run TestX ./...", t.path()));
+        assert!(!narrowable("go test ./price", t.path()));
+        assert_eq!(variants(cmd, t.path()), ["go test -count=1 ./price"]);
+        let bare = tree(&[("price/price.go", "")]);
+        assert!(!narrowable(cmd, bare.path()), "no go.mod at the root");
+    }
+
+    #[test]
+    fn rspec_narrows_to_the_spec_of_each_file() {
+        let t = tree(&[
+            ("lib/cart.rb", ""),
+            ("lib/price.rb", ""),
+            ("spec/cart_spec.rb", ""),
+            ("spec/price_spec.rb", ""),
+        ]);
+        for cmd in ["rspec", "bundle exec rspec --format progress"] {
+            let (parts, selected) = narrowed(&scope(cmd, t.path(), &["lib/cart.rb"]));
+            assert_eq!(parts, [format!("{cmd} spec/cart_spec.rb")]);
+            assert_eq!(selected, ["spec/cart_spec.rb"]);
+        }
+        assert!(!narrowable("rspec spec/cart_spec.rb", t.path()));
+    }
+
+    #[test]
+    fn maven_narrows_to_the_test_classes_and_the_listed_module() {
+        let t = tree(&[
+            ("pom.xml", "<modules><module>core</module></modules>"),
+            ("core/pom.xml", ""),
+            ("core/src/main/java/shop/Cart.java", ""),
+            ("core/src/test/java/shop/CartTest.java", ""),
+            ("src/main/java/app/App.java", ""),
+            ("src/test/java/app/AppTests.java", ""),
+        ]);
+        let cmd = "mvn -q test";
+        let (parts, selected) = narrowed(&scope(
+            cmd,
+            t.path(),
+            &[
+                "core/src/main/java/shop/Cart.java",
+                "src/main/java/app/App.java",
+            ],
+        ));
+        assert_eq!(
+            parts,
+            [
+                "mvn -q test -pl core -am -Dtest=CartTest -Dsurefire.failIfNoSpecifiedTests=false",
+                "mvn -q test -Dtest=AppTests -Dsurefire.failIfNoSpecifiedTests=false"
+            ]
+        );
+        assert_eq!(
+            selected,
+            [
+                "core/src/test/java/shop/CartTest.java",
+                "src/test/java/app/AppTests.java"
+            ]
+        );
+        assert!(narrowable("./mvnw verify", t.path()));
+        assert!(!narrowable("mvn -pl core test", t.path()));
+        assert!(!narrowable("mvn test -Dtest=CartTest", t.path()));
+        assert!(!narrowable("mvn compile", t.path()), "no test goal");
+    }
+
+    #[test]
+    fn gradle_narrows_to_the_project_test_task_of_each_class() {
+        let t = tree(&[
+            ("settings.gradle", "include 'core'\n"),
+            ("core/build.gradle", ""),
+            ("core/src/main/kotlin/shop/Cart.kt", ""),
+            ("core/src/test/kotlin/shop/CartTest.kt", ""),
+            ("extra/src/main/java/x/Thing.java", ""),
+            ("extra/src/test/java/x/ThingTest.java", ""),
+        ]);
+        let cmd = "./gradlew test";
+        let (parts, _) = narrowed(&scope(
+            cmd,
+            t.path(),
+            &["core/src/main/kotlin/shop/Cart.kt"],
+        ));
+        assert_eq!(parts, ["./gradlew :core:test --tests shop.CartTest"]);
+        // A project settings.gradle does not name: never guessed.
+        assert!(matches!(
+            scope(cmd, t.path(), &["extra/src/main/java/x/Thing.java"]),
+            Scope::Whole { .. }
+        ));
+        assert!(!narrowable("gradle check", t.path()));
+        assert!(!narrowable("gradle :core:test", t.path()));
+        assert!(!narrowable("gradle test --tests x", t.path()));
+        let moved = tree(&[(
+            "settings.gradle",
+            "include 'core'\nproject(':core').projectDir = file('lib')\n",
+        )]);
+        assert!(!narrowable(cmd, moved.path()));
+    }
+
+    #[test]
+    fn npm_workspaces_narrow_to_the_workspace_of_each_file() {
+        let t = tree(&[
+            (
+                "package.json",
+                r#"{"workspaces":["packages/*","tools"],"scripts":{"test":"npm test --workspaces"}}"#,
+            ),
+            (
+                "packages/cart/package.json",
+                r#"{"name":"cart","scripts":{"test":"node --test"}}"#,
+            ),
+            ("packages/cart/index.js", ""),
+            ("packages/price/package.json", r#"{"name":"price"}"#),
+            ("packages/price/index.js", ""),
+            ("tools/package.json", r#"{"scripts":{"test":"x"}}"#),
+        ]);
+        for cmd in ["npm test", "npm test --workspaces"] {
+            let (parts, selected) = narrowed(&scope(cmd, t.path(), &["packages/cart/index.js"]));
+            assert_eq!(parts, ["npm test --workspace=packages/cart"], "{cmd}");
+            assert_eq!(selected, ["workspace packages/cart"]);
+            // A workspace with no test script would fail `--workspace`: kept whole.
+            assert!(
+                matches!(
+                    scope(cmd, t.path(), &["packages/price/index.js"]),
+                    Scope::Whole { .. }
+                ),
+                "{cmd}"
+            );
+        }
+        let (parts, _) = narrowed(&scope(
+            "npm test --workspaces --if-present",
+            t.path(),
+            &["packages/price/index.js"],
+        ));
+        assert_eq!(parts, ["npm test --workspace=packages/price --if-present"]);
+        assert!(!narrowable("npm test --workspace=tools", t.path()));
     }
 }

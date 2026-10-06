@@ -60,7 +60,7 @@ mod parse;
 mod safe_git;
 mod state;
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -70,8 +70,8 @@ use crate::git::{Git, parse_porcelain_z};
 use crate::workspace::{Workspace, WorkspaceManager};
 
 pub use generated::{
-    Excluded, GeneratedKind, LOCKFILES, file_head, generated_kind, is_compiled_binary,
-    is_python_bytecode, lockfile_manifests, manifest_matches, manifests_beside,
+    Excluded, GeneratedKind, LOCKFILES, TreeManifests, file_head, generated_kind,
+    is_compiled_binary, is_python_bytecode, lockfile_manifests, manifest_matches, manifests_beside,
 };
 use parse::{
     GITLINK_MODE, MIN_GIT, SYMLINK_MODE, is_protected, new_collisions, parse_merge_tree_z,
@@ -401,8 +401,10 @@ impl MergeBack {
     ///   moment are recorded. What the command then writes is never part of the
     ///   attempt; [`MergeBack::discard_leftovers`] lists and removes it.
     /// - Files the worker's own run generated as a side effect are left out of
-    ///   the commit (after `add -A`, so the size checks still see them) and
-    ///   recorded in [`Attempt::excluded`]. A path is left out only when it is
+    ///   the commit and recorded in [`Attempt::excluded`]. The size bounds
+    ///   ([`Limits`]) count only what is committed: a file left out, such as
+    ///   an install's `node_modules/`, never makes an attempt too large. A path
+    ///   is left out only when it is
     ///   new against the base, outside the declared scope (`in_scope` false),
     ///   and either a lockfile name ([`LOCKFILES`]) with one of its manifests in
     ///   the same folder of the snapshot, `**/__pycache__/*.pyc|*.pyo`, or a
@@ -581,7 +583,46 @@ impl MergeBack {
             .filter(|p| !p.is_empty())
             .map(|p| String::from_utf8_lossy(p).into_owned())
             .collect();
-        let mut reasons = prescan(ws.root(), &ignored, &changed, &self.limits)?;
+        // The files the commit will leave out under `commit_retaining`'s rule,
+        // predicted from the tree before git reads it, so the size bounds count
+        // what is committed: a new file outside the scope that
+        // `generated_kind` classifies with its manifest on disk. The rule
+        // after `add -A` reads the manifests from the index; a file predicted
+        // here that it keeps is bounded again below (`size_reasons`).
+        let untracked: HashSet<String> = if retain.is_some() {
+            self.git
+                .ok_bytes(
+                    &wt,
+                    &[],
+                    ["ls-files", "-z", "--others", "--exclude-standard"],
+                    None,
+                )?
+                .split(|b| *b == 0)
+                .filter(|p| !p.is_empty())
+                .map(|p| String::from_utf8_lossy(p).into_owned())
+                .collect()
+        } else {
+            HashSet::new()
+        };
+        let manifests = TreeManifests::new(ws.root());
+        let predicted = |rel: &str| -> bool {
+            let Some(in_scope) = retain else {
+                return false;
+            };
+            untracked.contains(rel)
+                && !in_scope(Path::new(rel))
+                && generated_kind(
+                    Path::new(rel),
+                    |m| manifests.present(m),
+                    |p| file_head(ws.root(), p),
+                )
+                .is_some()
+        };
+        let Prescan {
+            mut reasons,
+            staged,
+            set_aside,
+        } = prescan(ws.root(), &ignored, &changed, &self.limits, &predicted)?;
         let mut excluded = Vec::new();
 
         if reasons.is_empty() {
@@ -624,6 +665,18 @@ impl MergeBack {
                     changes.retain(|c| !excluded.iter().any(|e| e.path == Path::new(&c.path)));
                 }
             }
+            // A file predicted generated that the commit kept is bounded with
+            // the rest; one it left out is never counted.
+            let left_out: HashSet<String> = excluded
+                .iter()
+                .map(|e| e.path.to_string_lossy().into_owned())
+                .collect();
+            let kept: Vec<(u64, String)> = set_aside
+                .into_iter()
+                .filter(|(p, _)| !left_out.contains(p))
+                .map(|(p, bytes)| (bytes, p))
+                .collect();
+            reasons.extend(size_reasons(staged, kept, &self.limits));
             // Two distinct paths the file system resolves as one (`Foo.rs` and
             // `foo.rs` on APFS or NTFS): one would overwrite the other in any
             // checkout there, and a declared write would match both
@@ -1489,14 +1542,23 @@ fn check_identity(identity: &Identity) -> Result<(), MergeError> {
 /// (FIFOs, sockets, devices) or that exceeds `limit`. Ignored paths (from
 /// `ls-files --others --ignored --directory`, directories ending in `/`) are
 /// not walked, and `.git` entries are git's own.
+///
+/// A file `generated` predicts the commit leaves out (a build's or an
+/// install's output, [`generated_kind`]) is not counted toward either bound:
+/// its size goes into the returned map instead, and the caller counts the ones
+/// the commit kept after all ([`size_reasons`]). So a `node_modules/` an
+/// install left in a tree with no `.gitignore` does not refuse the attempt,
+/// and a file predicted generated that is committed is still bounded.
 fn prescan(
     root: &Path,
     ignored: &HashSet<String>,
     changed: &HashSet<String>,
     limits: &Limits,
-) -> Result<Vec<RefusalReason>, MergeError> {
+    generated: &dyn Fn(&str) -> bool,
+) -> Result<Prescan, MergeError> {
     let limit = limits.max_file_bytes;
     let mut reasons = Vec::new();
+    let mut set_aside: HashMap<String, u64> = HashMap::new();
     // Every added or modified regular file, for the total-bytes bound.
     let mut staged: Vec<(u64, String)> = Vec::new();
     let mut stack = vec![(root.to_path_buf(), String::new())];
@@ -1525,6 +1587,10 @@ fn prescan(
             } else if ignored.contains(&rel) || kind.is_symlink() {
                 continue;
             } else if kind.is_file() {
+                if changed.contains(&rel) && generated(&rel) {
+                    set_aside.insert(rel, meta.len());
+                    continue;
+                }
                 if changed.contains(&rel) {
                     staged.push((meta.len(), rel.clone()));
                 }
@@ -1543,18 +1609,66 @@ fn prescan(
             }
         }
     }
+    reasons.extend(total_reason(staged.clone(), limits));
+    reasons.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+    Ok(Prescan {
+        reasons,
+        staged,
+        set_aside,
+    })
+}
+
+/// What [`prescan`] found.
+struct Prescan {
+    reasons: Vec<RefusalReason>,
+    /// Every changed regular file it counted, as (size, path).
+    staged: Vec<(u64, String)>,
+    /// The changed files it did not count because the commit is expected to
+    /// leave them out, with their sizes.
+    set_aside: HashMap<String, u64>,
+}
+
+/// [`RefusalReason::TooMuchData`] when the files of `staged` (size, path)
+/// add up to more than the bound.
+fn total_reason(mut staged: Vec<(u64, String)>, limits: &Limits) -> Option<RefusalReason> {
     let total: u64 = staged.iter().map(|(bytes, _)| bytes).sum();
-    if total > limits.max_total_bytes {
+    (total > limits.max_total_bytes).then(|| {
         staged.sort_by(|a, b| b.cmp(a));
-        reasons.push(RefusalReason::TooMuchData {
+        RefusalReason::TooMuchData {
             bytes: total,
             limit: limits.max_total_bytes,
             files: staged.len(),
             largest: staged.iter().take(5).map(|(_, p)| p.clone()).collect(),
-        });
+        }
+    })
+}
+
+/// The size refusals for the files [`prescan`] set aside as generated that
+/// the commit kept after all (`kept`), counted with the files it already
+/// bounded (`counted`: every other staged file, size and path). A file the
+/// commit left out is never counted.
+fn size_reasons(
+    counted: Vec<(u64, String)>,
+    kept: Vec<(u64, String)>,
+    limits: &Limits,
+) -> Vec<RefusalReason> {
+    if kept.is_empty() {
+        return Vec::new();
     }
-    reasons.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
-    Ok(reasons)
+    let mut reasons: Vec<RefusalReason> = kept
+        .iter()
+        .filter(|(bytes, _)| *bytes > limits.max_file_bytes)
+        .map(|(bytes, path)| RefusalReason::FileTooLarge {
+            path: path.clone(),
+            bytes: *bytes,
+            limit: limits.max_file_bytes,
+        })
+        .collect();
+    reasons.extend(total_reason(
+        counted.into_iter().chain(kept).collect(),
+        limits,
+    ));
+    reasons
 }
 
 #[cfg(unix)]

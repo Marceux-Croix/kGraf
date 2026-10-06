@@ -213,24 +213,94 @@ fn is_kgraf_state_name(f: &str) -> bool {
 /// every later build runs (a `build.rustc-wrapper`, a `path` toolchain, an
 /// `[alias]`). Compared as [`fold_name`] resolves names, with an NTFS stream
 /// suffix dropped; `CARGO~N` is the NTFS short name of `.cargo`.
+///
+/// The same holds for the configuration of the other build tools and version
+/// managers, each of which can name a program, a JVM option, a package source
+/// or a toolchain that every later build runs ([`BUILD_CONFIG_NAMES`]): npm
+/// (`.npmrc`), Yarn (`.yarnrc*`), pnpm (`.pnpmfile.cjs`), Maven (`.mvn/`),
+/// Gradle (`gradle.properties`, `gradle/wrapper/`, `init.gradle`), pip and
+/// PyPI (`pip.conf`, `pip.ini`, `.pypirc`), NuGet and MSBuild
+/// (`NuGet.Config`, `Directory.Build.props`, `Directory.Build.targets`),
+/// Bundler (`.bundle/config`), and the version files of asdf, pyenv and nvm
+/// (`.tool-versions`, `.python-version`, `.nvmrc`). A project manifest
+/// (`package.json`, `pom.xml`, `go.mod`, `go.work`, `pyproject.toml`, a
+/// `.csproj`) is ordinary work and is not one.
 pub fn is_build_config_path(path: &Path) -> bool {
-    path.components().any(|c| match c {
-        Component::Normal(name) => {
-            let f = fold_name_without_stream(&name.to_string_lossy());
-            // rustup reads exactly `rust-toolchain` and `rust-toolchain.toml`;
-            // `docs/rust-toolchain-notes.md` is an ordinary file. `RUST-T~N.TOM`
-            // is the NTFS short name of `rust-toolchain.toml` (`RUST-T~N` for
-            // the extensionless file).
-            f == ".cargo"
-                || short_name_of(&f, "cargo")
-                || f == "rust-toolchain"
-                || f == "rust-toolchain.toml"
-                || short_name_of(&f, "rust-t")
-                || f.strip_suffix(".tom")
-                    .is_some_and(|stem| short_name_of(stem, "rust-t"))
-        }
-        _ => false,
+    let names: Vec<String> = path
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(name) => Some(fold_name_without_stream(&name.to_string_lossy())),
+            _ => None,
+        })
+        .collect();
+    let is = |f: &str, long: &str| f == long || is_short_name_for(f, long);
+    names.iter().enumerate().any(|(i, f)| {
+        let next = names.get(i + 1).map(String::as_str);
+        // rustup reads exactly `rust-toolchain` and `rust-toolchain.toml`;
+        // `docs/rust-toolchain-notes.md` is an ordinary file. `RUST-T~N.TOM`
+        // is the NTFS short name of `rust-toolchain.toml` (`RUST-T~N` for
+        // the extensionless file).
+        f == ".cargo"
+            || short_name_of(f, "cargo")
+            || f == "rust-toolchain"
+            || f == "rust-toolchain.toml"
+            || short_name_of(f, "rust-t")
+            || f.strip_suffix(".tom")
+                .is_some_and(|stem| short_name_of(stem, "rust-t"))
+            || BUILD_CONFIG_NAMES.iter().any(|long| is(f, long))
+            || f.starts_with(".yarnrc")
+            || (is(f, "gradle") && next.is_some_and(|n| n == "wrapper"))
+            || (is(f, ".bundle") && next.is_some_and(|n| n == "config"))
     })
+}
+
+/// The build-tool and version-manager configuration names
+/// [`is_build_config_path`] finds at any depth, as [`fold_name`] folds them.
+/// `go.work` is not one: it lists the project's own module directories, and a
+/// contract that adds a module must add it there; its `toolchain` line is the
+/// same as `go.mod`'s, which is ordinary work too.
+pub const BUILD_CONFIG_NAMES: [&str; 17] = [
+    ".npmrc",
+    ".yarnrc",
+    ".yarnrc.yml",
+    ".pnpmfile.cjs",
+    ".mvn",
+    "gradle.properties",
+    "init.gradle",
+    "init.gradle.kts",
+    "pip.conf",
+    "pip.ini",
+    ".pypirc",
+    "nuget.config",
+    "directory.build.props",
+    "directory.build.targets",
+    ".tool-versions",
+    ".python-version",
+    ".nvmrc",
+];
+
+/// Whether `f` (folded) is an NTFS short name NTFS could give `long`: the
+/// leading dots dropped, the dots before the last removed, the first six
+/// characters of the stem, `~` and digits, then the first three characters of
+/// the extension (`.npmrc` is `NPMRC~1`, `gradle.properties` is
+/// `GRADLE~1.PRO`).
+fn is_short_name_for(f: &str, long: &str) -> bool {
+    let bare = long.trim_start_matches('.');
+    let (stem, ext) = match bare.rsplit_once('.') {
+        Some((s, e)) => (s.replace('.', ""), e),
+        None => (bare.to_owned(), ""),
+    };
+    let stem6: String = stem.chars().take(6).collect();
+    let ext3: String = ext.chars().take(3).collect();
+    let name = if ext3.is_empty() {
+        f
+    } else {
+        match f.strip_suffix(&format!(".{ext3}")) {
+            Some(n) => n,
+            None => return false,
+        }
+    };
+    short_name_of(name, &stem6)
 }
 
 /// The tracked files that steer git which a worker may write in the Bypass
@@ -519,6 +589,67 @@ mod tests {
             "rust-toolchains",
             "rust-toolchain.toml.bak",
             "rust-tools.md",
+        ] {
+            assert!(!is_build_config_path(Path::new(no)), "{no:?}");
+        }
+    }
+
+    /// The other build tools' and version managers' configuration is build
+    /// configuration too, at any depth and however spelled; the project's own
+    /// manifests are ordinary files.
+    #[test]
+    fn other_build_tools_configuration_is_build_configuration() {
+        for yes in [
+            ".npmrc",
+            "web/.npmrc",
+            ".NPMRC",
+            "NPMRC~1",
+            ".yarnrc",
+            ".yarnrc.yml",
+            "app/.yarnrc.yaml",
+            ".pnpmfile.cjs",
+            ".mvn/wrapper/maven-wrapper.properties",
+            ".mvn/jvm.config",
+            ".mvn/extensions.xml",
+            "core/.mvn/maven.config",
+            "gradle.properties",
+            "GRADLE~1.PRO",
+            "gradle/wrapper/gradle-wrapper.properties",
+            "sub/gradle/wrapper/gradle-wrapper.jar",
+            "init.gradle",
+            "init.gradle.kts",
+            "pip.conf",
+            ".venv/pip.conf",
+            "pip.ini",
+            ".pypirc",
+            "NuGet.Config",
+            "nuget.config",
+            "src/Directory.Build.props",
+            "Directory.Build.targets",
+            ".bundle/config",
+            ".tool-versions",
+            ".python-version",
+            ".nvmrc",
+        ] {
+            assert!(is_build_config_path(Path::new(yes)), "{yes:?}");
+        }
+        for no in [
+            "package.json",
+            "package-lock.json",
+            "pom.xml",
+            "build.gradle",
+            "settings.gradle.kts",
+            "gradle/libs.versions.toml",
+            "go.mod",
+            "go.work",
+            "pyproject.toml",
+            "App/App.csproj",
+            "Gemfile",
+            ".bundle/plugin/x.rb",
+            "docs/npmrc.md",
+            "src/gradle.rs",
+            "wrapper/gradle.txt",
+            "Directory.Packages.props",
         ] {
             assert!(!is_build_config_path(Path::new(no)), "{no:?}");
         }

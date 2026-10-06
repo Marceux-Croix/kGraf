@@ -3938,6 +3938,10 @@ async fn an_attempt_changing_cargo_or_rustup_configuration_is_refused() {
         ".cargo/config.toml",
         "crates/a/.cargo/config",
         "rust-toolchain.toml",
+        "web/.npmrc",
+        ".mvn/jvm.config",
+        "gradle.properties",
+        "Directory.Build.props",
     ]
     .into_iter()
     .enumerate()
@@ -3961,6 +3965,16 @@ async fn an_attempt_changing_cargo_or_rustup_configuration_is_refused() {
         assert!(!ws.join("CHECK_RAN").exists(), "the check ran for {path}");
     }
     assert!(build_config_changes(&["src/lib.rs".into(), "Cargo.toml".into()]).is_empty());
+    // A project manifest of another build tool is ordinary work.
+    assert!(
+        build_config_changes(&[
+            "package.json".into(),
+            "pom.xml".into(),
+            "go.work".into(),
+            "App/App.csproj".into(),
+        ])
+        .is_empty()
+    );
 }
 
 #[test]

@@ -487,8 +487,10 @@ pub fn sanitize_id(raw: &str) -> String {
 /// points and trailing dots, so `.GIT` or `.git\u{200C}` is refused on every
 /// volume, as merge-back refuses it.
 ///
-/// Cargo's and rustup's configuration (a `.cargo` folder, a `rust-toolchain`
-/// file: `kgraf_runtime::is_build_config_path`) is refused too. The verifier
+/// Build-tool configuration (a `.cargo` folder, a `rust-toolchain` file, and
+/// the other build tools' and version managers' files such as `.npmrc`,
+/// `.mvn/` or `gradle.properties`: `kgraf_runtime::is_build_config_path`) is
+/// refused too. The verifier
 /// never merges a change to it (decision 0084), so a plan or a stub that
 /// declared one would only fail later; the stub lander commits model-authored
 /// files straight to the integration tip, where the host's own cargo would
@@ -525,7 +527,8 @@ fn write_path_refusal(path: &str) -> String {
         return format!("names protected state: {why}");
     }
     if kgraf_runtime::is_build_config_path(p) {
-        return "is Cargo or rustup configuration, which kGraf never merges from a worker"
+        return "is Cargo, rustup or other build-tool configuration, which kGraf never merges \
+                from a worker"
             .to_owned();
     }
     "is not a path a worker may write".to_owned()
@@ -2407,7 +2410,9 @@ mod tests {
         assert!(state.contains("protected state"), "{state}");
         assert!(!state.contains("not a relative path"), "{state}");
         assert!(refusal("sub/.git/config").contains("protected state"));
-        assert!(refusal(".cargo/config.toml").contains("Cargo or rustup configuration"));
+        assert!(refusal(".cargo/config.toml").contains("rustup or other build-tool configuration"));
+        assert!(refusal("web/.npmrc").contains("other build-tool configuration"));
+        assert!(refusal("gradle.properties").contains("other build-tool configuration"));
         assert!(refusal("../x").contains("not a relative path inside the repository"));
         assert!(refusal("/abs/x").contains("not a relative path inside the repository"));
     }

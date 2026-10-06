@@ -659,6 +659,12 @@ impl RunLoop {
             && !flight.lease_lost
         {
             let lost = self.renew_leases_now(&holder).await?;
+            // The run lease was lost in that renewal: another orchestrator
+            // owns the run. Accept nothing and leave the resolver open, as a
+            // stop does.
+            if self.run_lease_lost {
+                return self.save();
+            }
             if lost.is_empty() {
                 let ws = flight.attempts[w].workspace.clone();
                 accepted = matches!(

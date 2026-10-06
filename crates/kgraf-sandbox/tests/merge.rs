@@ -1273,6 +1273,79 @@ fn an_attempt_over_the_total_byte_limit_is_refused_naming_its_largest_files() {
     );
 }
 
+/// The size bounds count what is committed. An install the commit leaves out
+/// (`node_modules/` beside `package.json`, a compiled program) is over both
+/// bounds and still commits under `commit_retaining`; the same tree under a
+/// plain commit, which leaves nothing out, is refused; and the worker's own
+/// files over the bound are refused with the install left out of the count.
+#[test]
+fn the_size_bounds_count_only_what_the_commit_keeps() {
+    let e = env();
+    let limits = Limits {
+        max_file_bytes: 100,
+        max_total_bytes: 250,
+        ..Limits::default()
+    };
+    let mb = MergeBack::open_with(
+        e.mgr.clone(),
+        BRANCH,
+        identity(),
+        limits,
+        Git::discover().unwrap(),
+    )
+    .unwrap();
+    let scope = |p: &Path| p == Path::new("package.json") || p.starts_with("src");
+    let install = |a: &Attempt| {
+        write(a, "package.json", "{}\n");
+        for i in 0..5 {
+            write(a, &format!("node_modules/p{i}/index.js"), &"x".repeat(90));
+        }
+        write(a, "node_modules/big/blob.bin", &"y".repeat(500));
+    };
+    let mut ok = attempt(&e, "install-ok");
+    install(&ok);
+    write(&ok, "src/a.js", "work\n");
+    let CommitOutcome::Committed { commit } =
+        mb.commit_retaining(&mut ok, "install", &scope).unwrap()
+    else {
+        panic!("an install left out of the commit must not refuse it");
+    };
+    let tree = git(&e.f.repo, &["ls-tree", "-r", "--name-only", &commit]);
+    assert!(
+        tree.contains("src/a.js") && !tree.contains("node_modules"),
+        "{tree}"
+    );
+    assert_eq!(ok.excluded().len(), 6);
+
+    let mut plain = attempt(&e, "install-plain");
+    install(&plain);
+    let reasons = refusal_of(mb.finish(&mut plain, "plain", NONE).unwrap());
+    assert!(
+        reasons
+            .iter()
+            .any(|r| matches!(r, RefusalReason::TooMuchData { .. })),
+        "{reasons:?}"
+    );
+
+    let mut heavy = attempt(&e, "install-heavy");
+    install(&heavy);
+    for i in 0..3 {
+        write(&heavy, &format!("src/data{i}.json"), &"z".repeat(95));
+    }
+    let CommitOutcome::Refused(refusal) = mb.commit_retaining(&mut heavy, "heavy", &scope).unwrap()
+    else {
+        panic!("the worker's own files over the bound are refused");
+    };
+    assert!(
+        refusal
+            .reasons
+            .iter()
+            .any(|r| matches!(r, RefusalReason::TooMuchData { files: 4, .. })),
+        "{:?}",
+        refusal.reasons
+    );
+}
+
 /// Every git child is bounded in time.
 #[cfg(unix)]
 #[test]

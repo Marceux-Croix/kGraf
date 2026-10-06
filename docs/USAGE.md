@@ -55,7 +55,12 @@ kgraf deps reset     # forget the answer; the next run that needs a fetch asks
 - With no `Cargo.toml` at the project root but one below it, nothing is checked or fetched,
   and each run start says so.
 - Workers cannot merge changes to a `.cargo` folder or a `rust-toolchain` file: make those
-  by hand.
+  by hand. The same holds for the other build tools' and version managers' configuration:
+  `.npmrc`, `.yarnrc*`, `.pnpmfile.cjs`, `.mvn/`, `gradle.properties`, `gradle/wrapper/`,
+  `init.gradle`, `pip.conf`, `pip.ini`, `.pypirc`, `NuGet.Config`, `Directory.Build.props`,
+  `Directory.Build.targets`, `.bundle/config`, `.tool-versions`, `.python-version` and
+  `.nvmrc`. Project manifests (`package.json`, `pom.xml`, `go.mod`, `go.work`, a `.csproj`)
+  are ordinary files (0084).
 - Each fetch is a network event with no tokens; `kgraf diag show` counts them.
 
 ## The code graph
@@ -528,9 +533,15 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   result (an `accept` line says so). Recognized: `python3 -m unittest discover [-s DIR]`
   (`test_<name>.py`), `pytest` with options only (`test_<name>.py`, `<name>_test.py`),
   `node --test`, and `npm test` running `node --test`, jest or vitest (`<name>.test.ts`,
-  `<name>.spec.ts`, or a file in a `test` folder), and `cargo test --workspace` (the package
-  of each file). A script such as `sh check.sh`, a command that already selects tests, a
-  contract whose files have no test, and a gate remediation run the command whole.
+  `<name>.spec.ts`, or a file in a `test` folder), `cargo test --workspace` (the package
+  of each file), `go test ./...` with `go.mod` at the root (`go test ./<dir>` for the package
+  of each `.go` file), `rspec` (`<name>_spec.rb`), `mvn test` or `./mvnw verify`
+  (`-Dtest=<Name>Test`, with `-pl <module> -am` when the root `pom.xml` lists the module),
+  `gradle test` or `./gradlew test` (`:<project>:test --tests <Class>` for a project named in
+  `settings.gradle`), and `npm test --workspaces` or an `npm test` script that runs it
+  (`npm test --workspace=<dir>` for a workspace with a `test` script). A script such as
+  `sh check.sh`, a command that already selects tests, a contract whose files have no test,
+  and a gate remediation run the command whole (0018).
 - `--verify` always runs as a root gate on the merged result too, narrowable or not, unless
   it is already a gate command (decision 0018). A whole command can fail on one contract only
   because other contracts of the plan have not merged yet: a check that needs files from two
@@ -996,7 +1007,10 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   the program the call ran, is grounded in it.
 - While a worker's worktree has a `.cargo/config.toml`, `.cargo/config`, `rust-toolchain` or
   `rust-toolchain.toml` that differs from the one it started with, every allowlisted command
-  is refused: those files can change what cargo runs whatever its arguments say.
+  is refused: those files can change what cargo runs whatever its arguments say. The same
+  holds for the other build tools' configuration at the worktree root (`.npmrc`, `.yarnrc`,
+  `.mvn/jvm.config`, `gradle.properties`, `NuGet.Config`, `Directory.Build.props`, `.nvmrc`,
+  and the rest of the list above).
 - On macOS a sandboxed build cannot read the rest of the checkout it runs in (only its cargo
   files), so a `.env` at the checkout root stays private. Every value in that `.env` is also
   removed from what a worker's model sees, and build and test output is scrubbed of key-shaped strings before the model sees it. A secrets file a worker reads anywhere in its worktree (`.env`, `.env.local`, `prod.env`, `.envrc`, `secrets.json` and the like, with `read_file`, `search_files`, or a shell command that names it) has its credential values removed from the worker's transcript, the trace and the run record; the worker's model still sees the file as it is.
@@ -1045,9 +1059,17 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   interface and the files, and a change they do not use does not. If the base does not build
   without the delivery either, or the compile cannot run, that is a notice, not a failure. In
   Rust the compile checks every item, signature and type the consumer files use; in Python the
-  import checks only the names they import when they load, not call shapes. Shell, TypeScript,
-  JavaScript and other languages get no derived compile check: the dependency is counted under
-  `not run` with the language named, and the producer is never held by it. The planner
+  import checks only the names they import when they load, not call shapes. TypeScript gets
+  `node node_modules/typescript/bin/tsc --noEmit -p <dir>` when a `tsconfig.json` and the
+  project's own compiler are in the repository; Go gets `go vet <packages>`; Java gets `javac`
+  over the consumer files and their sources only when no Maven, Gradle or Ant file is present;
+  C# gets `dotnet build --no-restore <project>` only when the project's
+  `obj/project.assets.json` is in the repository. Each needs its program on the `PATH`. A check
+  runs on a copy of the repository as git tracks it, so an installed `node_modules` or a
+  restored `obj/` that git ignores is not there. When a part is missing, the dependency is
+  counted under `not run` with the reason. Shell, JavaScript and other languages get no
+  derived compile check. A derived check that fails before the first worker starts is not
+  registered, so the producer is never held by a check that cannot apply. The planner
   is asked for a behavior check (a reference and a small test of the one producer) only when
   no test in the repository already exercises that producer alone and one could: when the only
   tests need several producers, whose code does not exist yet, no reference of one producer
@@ -1559,6 +1581,11 @@ Behavior that differs from earlier builds. Each item names the decision that hol
   after the word `member` or `members` to the end of the sentence, a word counts when the plan
   writes or the repository holds `<word>/Cargo.toml`. Before, a list in prose was not read,
   the plan was accepted, and the root contract failed on the later member's missing manifest.
+  The same check covers a Go workspace and a Maven reactor: a `go` command loads every module
+  the nearest `go.work` uses, and `mvn` every `<module>` of its `pom.xml`, so a member whose
+  `go.mod` or `pom.xml` comes from a later contract is refused the same way. npm and uv
+  workspaces skip a missing member, and Gradle and pnpm depend on their version, so those are
+  not checked (0030).
 - A worker that runs its contract's build script (`python -m build`, `pip wheel`, setuptools
   or Poetry) leaves `dist/*.whl`, `dist/*.tar.gz`, `*.egg-info/` or `build/lib*/` beside the
   project's `pyproject.toml`, `setup.py` or `setup.cfg`. These new files are not the worker's
@@ -1577,7 +1604,13 @@ Behavior that differs from earlier builds. Each item names the decision that hol
   a program a compiler wrote (`go build`, `make`, `cc`), told by its first bytes. One notice
   lists the build output and one the caches. The same folder names with no project manifest
   beside them, a tracked file a build changed, and an undeclared source file are still writes
-  outside the scope (0084).
+  outside the scope (0084). These files do not count toward the commit's size bounds (one file,
+  and 512 MiB in total), they are not in the worker's list of what its build changed (one line
+  gives their count), and the progress measure does not hash them, so a large install costs
+  the run nothing. Lockfiles are recognized for Cargo, npm, Yarn, pnpm, Bun, Poetry, uv, PDM,
+  Pipenv, Bundler, Go, Composer, Nix, Mix, Dart (`pubspec.lock`), SwiftPM
+  (`Package.resolved`), Gradle, NuGet (`packages.lock.json` beside a project file) and
+  CocoaPods (`Podfile.lock`), each beside its manifest (0084).
 - Go builds run in the sandbox: the go command's build cache is `GOCACHE=<scratch>/go-build`,
   a cold cache per worker, because the default location is outside what a sandboxed command
   may write. On Linux the module cache under `~/go/pkg/mod` is readable (0084).
@@ -1589,6 +1622,13 @@ Behavior that differs from earlier builds. Each item names the decision that hol
   derives from, or a message that says a subclass supplies it) is not a placeholder. A plan
   may name it without writing it. C#'s `throw new NotImplementedException()` is a placeholder
   (0030).
+- An attempt that changed nothing is refused when a file it was to write is still a scaffold:
+  every function body one placeholder (`todo!()`, `raise NotImplementedError`,
+  `throw new NotImplementedException()`, `throw new Error("not implemented")`,
+  `panic("not implemented")`). This reads every language kGraf has a grammar for (Rust,
+  Python, TypeScript, JavaScript, Go, Java, C, C++, Ruby, C#, PHP); before, only Rust. A body
+  with real code, `pass`, `...` or nothing, an abstract method, and a file with no function
+  are never a scaffold (0086).
 - A `package.json` whose `test` script is the one `npm init` writes (`echo "Error: no test
   specified" && exit 1`) adds no `npm test` gate; the run says the gate does not apply (0018).
 - A worker that reaches its context stop point before it has written anything is compacted

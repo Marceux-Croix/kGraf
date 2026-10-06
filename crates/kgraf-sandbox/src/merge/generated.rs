@@ -34,6 +34,9 @@ pub const LOCKFILES: &[(&str, &[&str])] = &[
     ("pubspec.lock", &["pubspec.yaml"]),
     ("Package.resolved", &["Package.swift"]),
     ("gradle.lockfile", &["build.gradle", "build.gradle.kts"]),
+    // NuGet's lock file (`RestorePackagesWithLockFile`), beside its project.
+    ("packages.lock.json", &["*.csproj", "*.fsproj", "*.vbproj"]),
+    ("Podfile.lock", &["Podfile"]),
 ];
 
 /// The manifests a lockfile named like `path` belongs to, or `None` when the
@@ -285,6 +288,51 @@ pub fn manifests_beside(path: &Path) -> Vec<PathBuf> {
     }
     out.extend(ts_sources(path));
     out
+}
+
+/// The manifests of a tree on disk, for [`generated_kind`]'s
+/// `manifest_present` when there is no index to ask: a literal manifest is a
+/// regular file at its path (a link is not followed), and a `*.ext` one is any
+/// file of that extension in its folder. Each folder is listed once.
+pub struct TreeManifests<'a> {
+    root: &'a Path,
+    folders: std::cell::RefCell<std::collections::HashMap<PathBuf, Vec<String>>>,
+}
+
+impl<'a> TreeManifests<'a> {
+    pub fn new(root: &'a Path) -> Self {
+        Self {
+            root,
+            folders: Default::default(),
+        }
+    }
+
+    /// Whether the manifest `pattern` (repository-relative) is in the tree.
+    pub fn present(&self, pattern: &Path) -> bool {
+        let name = pattern
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        let Some(ext) = name.strip_prefix("*.") else {
+            return std::fs::symlink_metadata(self.root.join(pattern)).is_ok_and(|m| m.is_file());
+        };
+        let dir = pattern.parent().map(Path::to_path_buf).unwrap_or_default();
+        let mut folders = self.folders.borrow_mut();
+        let names = folders.entry(dir.clone()).or_insert_with(|| {
+            std::fs::read_dir(self.root.join(&dir))
+                .map(|it| {
+                    it.filter_map(Result::ok)
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .collect()
+                })
+                .unwrap_or_default()
+        });
+        names.iter().any(|n| {
+            n.strip_suffix(ext)
+                .and_then(|s| s.strip_suffix('.'))
+                .is_some_and(|s| !s.is_empty())
+        })
+    }
 }
 
 /// Whether `candidate`, a repository path, is the manifest `pattern` names:
@@ -716,6 +764,42 @@ mod tests {
                 generated_kind(Path::new(lock), has, no_head),
                 Some(GeneratedKind::Lockfile),
                 "{lock}"
+            );
+        }
+        // The NuGet, CocoaPods, SwiftPM, Dart, Mix and Composer lockfiles,
+        // each beside its own manifest (a NuGet project file by extension).
+        let more = [
+            "App/App.csproj",
+            "ios/Podfile",
+            "swift/Package.swift",
+            "dart/pubspec.yaml",
+            "ex/mix.exs",
+            "php/composer.json",
+        ];
+        let beside = |m: &Path| more.iter().any(|p| manifest_matches(m, Path::new(p)));
+        for lock in [
+            "App/packages.lock.json",
+            "ios/Podfile.lock",
+            "swift/Package.resolved",
+            "dart/pubspec.lock",
+            "ex/mix.lock",
+            "php/composer.lock",
+        ] {
+            assert_eq!(
+                generated_kind(Path::new(lock), beside, no_head),
+                Some(GeneratedKind::Lockfile),
+                "{lock}"
+            );
+        }
+        for stray in [
+            "packages.lock.json",
+            "web/packages.lock.json",
+            "Podfile.lock",
+        ] {
+            assert_eq!(
+                generated_kind(Path::new(stray), beside, no_head),
+                None,
+                "{stray}"
             );
         }
         for stray in [

@@ -457,3 +457,53 @@ Tests: `kgraf-sandbox`
 `kgraf-orchestrator` `other_languages_build_output_is_not_an_out_of_scope_write`;
 `kgraf-tools` `a_go_or_makefile_patch_written_with_spaces_gets_the_file_s_tabs`, `replace.rs`
 `spaces_against_tabs_are_written_as_the_file_s_tabs`.
+
+## Amendment (2026-10-06, third): other build tools' configuration, more lockfiles, and generated files cost nothing
+
+Three parts of this decision covered Cargo and npm only.
+
+- **Build-tool configuration.** The tripwire of `.cargo` and `rust-toolchain`
+  (`kgraf_core::paths::is_build_config_path`) now also covers the files through which another
+  build tool or version manager runs a program, a JVM option, a package source or a toolchain
+  in every later build (`BUILD_CONFIG_NAMES`): `.npmrc`, `.yarnrc*`, `.pnpmfile.cjs`, `.mvn/`
+  (wrapper, `jvm.config`, `maven.config`, `extensions.xml`), `gradle.properties`,
+  `gradle/wrapper/`, `init.gradle(.kts)`, `pip.conf`, `pip.ini`, `.pypirc`, `NuGet.Config`,
+  `Directory.Build.props`, `Directory.Build.targets`, `.bundle/config`, `.tool-versions`,
+  `.python-version` and `.nvmrc`, at any depth, however spelled (case, Unicode folding, an NTFS
+  stream suffix or short name such as `NPMRC~1` or `GRADLE~1.PRO`). The handling is the same: a
+  plan or a stub that declares one is refused, an attempt that changes one is refused with the
+  advice to leave it and say so, and the shell tool refuses allowlisted builds once one of the
+  root-level files changed in the worktree. Not included: a project manifest (`package.json`,
+  `pom.xml`, `build.gradle`, `go.mod`, a `.csproj`), `pyproject.toml` (a build-backend change
+  there is ordinary work), and `go.work`, which lists the project's own modules (a contract
+  that adds a module must add it there) and whose `toolchain` line is the same as `go.mod`'s.
+  These files are now ones a worker cannot change; a project that needs such a change gets it
+  from the user, as with `rust-toolchain`.
+- **Lockfiles.** NuGet's `packages.lock.json` (beside a `.csproj`, `.fsproj` or `.vbproj`) and
+  CocoaPods' `Podfile.lock` (beside a `Podfile`) are lockfiles wherever Cargo's and npm's are
+  (`LOCKFILES`), next to the existing `Package.resolved`, `pubspec.lock`, `mix.lock` and
+  `composer.lock`. The index skips `packages.lock.json`, `Package.resolved`,
+  `npm-shrinkwrap.json`, `bun.lockb` and `gradle.lockfile` as lockfiles, as it skipped the
+  others.
+- **Generated files cost nothing.** The commit's size bounds (`Limits`: one file, the total)
+  counted generated files before they were left out, so an install larger than the total bound
+  refused the attempt it was left out of. `prescan` now sets aside each new file outside the
+  scope that `generated_kind` classifies with its manifest on disk, and counts only the rest; a
+  file set aside that the commit keeps after all is bounded again after the exclusion
+  (`size_reasons`), so the bound still holds for everything committed. The worker's change list
+  (the files a build or test command changed, on resume too) and the progress measure's digests
+  (decision 0096) leave the same files out
+  (`kgraf_runtime::worktree::TreeStatus::without_generated`): an untracked file outside the
+  declared scope that `generated_kind` classifies. One line says how many were left out. An
+  install of thousands of files then costs the worker's context and each checkpoint nothing.
+  This replaces the "Not covered" sentence of the amendment above on the size bound and the
+  change list.
+
+Tests: `kgraf-core` `other_build_tools_configuration_is_build_configuration`; `kgraf-host`
+`an_attempt_changing_cargo_or_rustup_configuration_is_refused`; `kgraf-orchestrator` `plan.rs`
+(the write-path refusal test); `kgraf-tools`
+`a_worker_written_cargo_alias_or_toolchain_file_refuses_builds`; `kgraf-sandbox`
+`a_lockfile_is_generated_only_beside_one_of_its_manifests`, `tests/merge.rs`
+`the_size_bounds_count_only_what_the_commit_keeps`; `kgraf-ingest`
+`a_recognized_lockfile_is_skipped_even_with_a_code_extension`; `kgraf-runtime`
+`an_install_is_left_out_of_the_change_list_and_the_work_stays`.

@@ -231,3 +231,15 @@ measured by a different rule than a Rust worker.
 Tests: `kgraf-runtime` `progress.rs` `scores_each_other_language_runner`,
 `a_first_block_is_measured_by_go_test_counts_as_by_cargo_s`,
 `a_first_block_whose_go_tests_improved_is_progress`.
+
+## Amendment (2026-10-06, second): generated files are no progress
+
+Signal (a) hashed every file git lists as dirty, so an install that a worktree with no
+`.gitignore` showed (thousands of files under `node_modules/`) counted as net file change, and
+each checkpoint hashed every one of them. The paths git lists are now read without the files a
+build or install generated outside the declared scope
+(`kgraf_runtime::worktree::TreeStatus::without_generated`, the rule merge-back uses to leave
+them out of the commit; decision 0084, 2026-10-06 third amendment). A lockfile or other
+generated file the contract declares is still measured.
+
+Tests: `kgraf-runtime` `an_install_is_left_out_of_the_change_list_and_the_work_stays`.

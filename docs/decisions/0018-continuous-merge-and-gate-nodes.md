@@ -329,3 +329,42 @@ remediation contract that no worker could satisfy, and held the run.
   pytest, and the run's own `--gate-command` or a real test script brings the gate back.
 
 Test: `kgraf-host` `the_npm_init_test_script_is_not_a_gate`.
+
+## Amendment (2026-10-06, second): acceptance narrowing for Go, RSpec, Maven, Gradle and npm workspaces
+
+A contract's acceptance was narrowed to the tests of its own files for unittest, pytest,
+`node --test`, jest, vitest and Cargo only; every other runner ran the whole command, which a
+split cannot pass per contract before its siblings merge. `scoped_check` now also narrows:
+
+- `go test ./...` with options only and `go.mod` at the root: `go test ./<dir>` for the
+  package of each declared `.go` file. A file in a nested module (a `go.mod` between it and the
+  root) is not narrowed, since `go test ./<dir>` fails there; `-run`, `-skip`, `-bench`,
+  `-list` and `-fuzz` are a selection, and the command runs whole.
+- `rspec` / `bundle exec rspec` with options only: `<stem>_spec.rb`; `-e`, `--tag` and
+  `--pattern` are a selection.
+- `mvn` / `./mvnw` with a test goal (`test`, `verify`, `package`, `install`) and no `-pl`,
+  `-f` or `-Dtest`: the test classes `<Stem>Test`, `<Stem>Tests`, `<Stem>IT` and `Test<Stem>`
+  under `src/test/`, run as `-Dtest=<Class> -Dsurefire.failIfNoSpecifiedTests=false`, with
+  `-pl <module> -am` when the root `pom.xml` lists the module. `-am` builds the modules it
+  depends on (a module alone cannot resolve them until they are installed); the test filter
+  keeps their tests from running.
+- `gradle test` / `./gradlew test` with no selection, no short option and no `projectDir`
+  in `settings.gradle`: `:<project>:test --tests <fully.qualified.Class>` per test class, the
+  project named by its directory and listed in `settings.gradle`; a single-project build runs
+  `test --tests <Class>`. A project's `test` task builds what it depends on and runs no other
+  project's tests. A test in a project the settings do not name is not narrowed.
+- `npm test --workspaces`, or `npm test` whose script is that: `npm test --workspace=<dir>`
+  for the workspace each declared file is in, only when that workspace has a `test` script or
+  the command passes `--if-present` (measured with npm 11: `--workspace=<dir>` runs the
+  workspace's script; a workspace with no script fails).
+
+`pytest <path>` was already a narrowed form. Each form runs only part of what the whole
+command runs; a narrowed check that fails is the contract's own failure, so a form is added
+only where it cannot fail for a reason the whole command would not.
+
+Tests: `kgraf-host` `scoped_check.rs`
+`go_test_narrows_to_the_packages_of_the_contracts_files`,
+`rspec_narrows_to_the_spec_of_each_file`,
+`maven_narrows_to_the_test_classes_and_the_listed_module`,
+`gradle_narrows_to_the_project_test_task_of_each_class`,
+`npm_workspaces_narrow_to_the_workspace_of_each_file`.

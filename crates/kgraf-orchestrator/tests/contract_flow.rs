@@ -3744,6 +3744,159 @@ async fn a_shell_producer_is_recorded_unchecked_with_its_reason_and_never_blocke
     );
 }
 
+/// Runs a two-contract plan over `files` (`c1` edits `producer`, `c2` edits
+/// `consumer`) to the end, and returns the report and the reason of each edge
+/// recorded unchecked.
+async fn run_producer_consumer(
+    files: &[(&str, &str)],
+    producer: &str,
+    consumer: &str,
+) -> (RunReport, Vec<String>) {
+    let dir = tempfile::tempdir().expect("dir");
+    let plan = plan_json(&[
+        c("c1", "change the producer", producer, &[]),
+        c("c2", "use the producer", consumer, &["c1"]),
+    ]);
+    let rig = Rig::with_files(
+        dir.path(),
+        files,
+        move |prompt| {
+            if prompt.contains("Accepted contracts (fixed;") {
+                r#"{"interfaces":[]}"#.to_owned()
+            } else {
+                plan.clone()
+            }
+        },
+        agreeing,
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    rig.index(files);
+    let report = rig
+        .orchestrator(vec![])
+        .start(RunId::new("r1"), "change".into())
+        .await
+        .expect("run");
+    let reasons = rig
+        .contract_events()
+        .await
+        .into_iter()
+        .filter_map(|e| match e {
+            ContractEvent::Unchecked { reason, .. } => Some(reason),
+            _ => None,
+        })
+        .collect();
+    (report, reasons)
+}
+
+/// A correct project in a language whose compile check the project does not
+/// allow (a Maven build a bare `javac` cannot stand in for, C# dependencies
+/// not restored, TypeScript with no compiler of its own in the repository) is
+/// recorded unchecked with the reason, and the run completes: no new check
+/// blocks it. A Go module is checked with `go vet` where `go` is installed,
+/// and unchecked with the reason where it is not; either way the run
+/// completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_correct_project_in_any_language_is_never_blocked_by_a_derived_check() {
+    // (what, files, producer, consumer, the words the unchecked reason holds)
+    type Case = (
+        &'static str,
+        Vec<(&'static str, &'static str)>,
+        &'static str,
+        &'static str,
+        &'static str,
+    );
+    let cases: [Case; 3] = [
+        (
+            "Java with Maven",
+            vec![
+                ("pom.xml", "<project></project>\n"),
+                (
+                    "src/main/java/shop/PriceTable.java",
+                    "package shop;\npublic class PriceTable {\n  public static int lookupPrice() { return 1; }\n}\n",
+                ),
+                (
+                    "src/main/java/shop/CartTotal.java",
+                    "package shop;\npublic class CartTotal {\n  public int total() { return PriceTable.lookupPrice(); }\n}\n",
+                ),
+            ],
+            "src/main/java/shop/PriceTable.java",
+            "src/main/java/shop/CartTotal.java",
+            "`pom.xml`",
+        ),
+        (
+            "C# not restored",
+            vec![
+                (
+                    "App/App.csproj",
+                    "<Project Sdk=\"Microsoft.NET.Sdk\"></Project>\n",
+                ),
+                (
+                    "App/PriceTable.cs",
+                    "namespace App {\n  public static class PriceTable {\n    public static int LookupPrice() { return 1; }\n  }\n}\n",
+                ),
+                (
+                    "App/CartTotal.cs",
+                    "namespace App {\n  public class CartTotal {\n    public int Total() { return PriceTable.LookupPrice(); }\n  }\n}\n",
+                ),
+            ],
+            "App/PriceTable.cs",
+            "App/CartTotal.cs",
+            "not restored",
+        ),
+        (
+            "TypeScript with no compiler",
+            vec![
+                ("web/tsconfig.json", "{}\n"),
+                (
+                    "web/price_table.ts",
+                    "export function lookupPrice(): number {\n  return 1;\n}\n",
+                ),
+                (
+                    "web/cart_total.ts",
+                    "import { lookupPrice } from './price_table';\nexport function cartTotal(): number {\n  return lookupPrice();\n}\n",
+                ),
+            ],
+            "web/price_table.ts",
+            "web/cart_total.ts",
+            "node_modules/typescript",
+        ),
+    ];
+    for (what, files, producer, consumer, why) in cases {
+        let (report, reasons) = run_producer_consumer(&files, producer, consumer).await;
+        assert_eq!(report.status, RunStatus::Completed, "{what}: {report:?}");
+        assert_eq!(
+            report.contracts.compile_only_registered, 0,
+            "{what}: {report:?}"
+        );
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("no compile check could be derived") && r.contains(why)),
+            "{what}: {reasons:?}"
+        );
+    }
+    let go = [
+        ("go.mod", "module example.com/shop\n\ngo 1.21\n"),
+        (
+            "price/price.go",
+            "package price\n\nfunc LookupPrice() int { return 1 }\n",
+        ),
+        (
+            "cart/cart.go",
+            "package cart\n\nimport \"example.com/shop/price\"\n\nfunc CartTotal() int { return price.LookupPrice() }\n",
+        ),
+    ];
+    let (report, reasons) = run_producer_consumer(&go, "price/price.go", "cart/cart.go").await;
+    assert_eq!(report.status, RunStatus::Completed, "Go: {report:?}");
+    if report.contracts.compile_only_registered == 0 {
+        assert!(
+            reasons.iter().any(|r| r.contains("Go (cart/cart.go)")),
+            "Go: {reasons:?}"
+        );
+    }
+}
+
 /// A repository with no test that reaches the producer: the planner is asked
 /// once, for a reference and a small test only. kGraf fills the stub (the
 /// scaffold, declared in `replaces`), the consumer files, the names and the

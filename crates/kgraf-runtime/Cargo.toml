@@ -16,6 +16,7 @@ kgraf-provider = { path = "../kgraf-provider" }
 kgraf-secrets = { path = "../kgraf-secrets" }
 kgraf-session = { path = "../kgraf-session" }
 kgraf-tools = { path = "../kgraf-tools" }
+kgraf-sandbox = { path = "../kgraf-sandbox" }
 async-trait = "0.1"
 blake3 = "1"
 # FuturesUnordered: a round's independent tool calls run concurrently inside the

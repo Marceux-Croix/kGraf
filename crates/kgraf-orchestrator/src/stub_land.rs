@@ -558,9 +558,14 @@ pub fn stub_left_in_place_failure(
 /// bodies a worker's own dispatched brief, or the project it was handed,
 /// leaves for work not yet done. `unreachable!` is not one (a mock of
 /// methods the code under test never calls is made of it), and a body of a
-/// placeholder call followed by anything else is real work. Only `.rs` files are
-/// recognized today, kGraf's own implementation language (decision 0054); a
-/// file with no function bodies, or with even one real one, is never
+/// placeholder call followed by anything else is real work. Every other
+/// language kGraf has a grammar for (Python, Ruby, TypeScript, JavaScript, Go,
+/// Java, C, C++, C#, PHP) is read by
+/// [`crate::placeholder::every_body_is_placeholder`]: every body is one
+/// placeholder statement (`raise NotImplementedError`, `throw new
+/// NotImplementedException()`, a raised "not implemented" message), and an
+/// abstract method of Python or Ruby is not one. A file in a language with no
+/// grammar is never flagged. A file with no function bodies, or with even one real one, is never
 /// flagged. Legitimately unchanged content cannot take this shape: a
 /// completed function does not consist solely of "not implemented yet"
 /// markers, and a check-only or already-accepted contract's write target is
@@ -577,8 +582,11 @@ pub fn stub_left_in_place_failure(
 /// struct and its all-placeholder trait impls alone are an abandoned stub. A file over
 /// [`MAX_SCANNED_BYTES`] is never a placeholder.
 pub fn is_placeholder_source(path: &str, content: &str) -> bool {
-    if !path.ends_with(".rs") || content.len() > MAX_SCANNED_BYTES {
+    if content.len() > MAX_SCANNED_BYTES || !has_placeholder_reader(path) {
         return false;
+    }
+    if !path.ends_with(".rs") {
+        return crate::placeholder::every_body_is_placeholder(path, content);
     }
     // Comments and literals removed by the shared lexer (`crate::placeholder`),
     // so a brace, quote, `fn ` or macro name in text is not code. A Rust
@@ -941,6 +949,12 @@ fn scan_items(content: &str, scan: &mut Scan) {
     }
 }
 
+/// Whether [`is_placeholder_source`] can read `path`: a language kGraf has a
+/// grammar for, prose excluded.
+fn has_placeholder_reader(path: &str) -> bool {
+    kgraf_graph::Language::from_path(path).is_some_and(|l| l != kgraf_graph::Language::Markdown)
+}
+
 /// Every write target in `writes` (repository-relative paths) whose content,
 /// read through `read`, [`is_placeholder_source`]. `read` returns `None` for
 /// a path with nothing to read (absent, or not a regular file), which is
@@ -951,9 +965,10 @@ pub fn placeholder_writes_left_in_place<'a>(
 ) -> Vec<&'a str> {
     writes
         .into_iter()
-        // Only `.rs` files can be one: the others are never read.
+        // Only a file in a language with a placeholder reader can be one: the
+        // others are never read.
         .filter(|path| {
-            path.ends_with(".rs")
+            has_placeholder_reader(path)
                 && read(path).is_some_and(|content| is_placeholder_source(path, &content))
         })
         .collect()
@@ -1871,20 +1886,128 @@ mod tests {
         assert!(!is_placeholder_source("src/lib.rs", &big));
     }
 
-    /// Only `.rs` paths are read at all.
+    /// Only paths in a language with a placeholder reader are read at all.
     #[test]
-    fn a_non_rust_path_is_not_read_for_the_placeholder_check() {
+    fn a_path_with_no_placeholder_reader_is_not_read_for_the_placeholder_check() {
         let read = |p: &str| -> Option<String> {
-            assert!(p.ends_with(".rs"), "{p} was read");
-            Some("fn f() { todo!() }".into())
+            assert!(p.ends_with(".rs") || p.ends_with(".py"), "{p} was read");
+            Some(if p.ends_with(".rs") {
+                "fn f() { todo!() }".into()
+            } else {
+                "def f():\n    raise NotImplementedError\n".into()
+            })
         };
-        let left = placeholder_writes_left_in_place(["big.bin", "a.rs", "notes.md"], read);
-        assert_eq!(left, vec!["a.rs"]);
+        let left = placeholder_writes_left_in_place(
+            ["big.bin", "a.rs", "notes.md", "b.py", "run.sh"],
+            read,
+        );
+        assert_eq!(left, vec!["a.rs", "b.py"]);
     }
 
     #[test]
-    fn a_non_rust_file_is_never_flagged() {
+    fn a_prose_or_unknown_file_is_never_flagged() {
         assert!(!is_placeholder_source("README.md", "todo!()"));
+        assert!(!is_placeholder_source(
+            "run.sh",
+            "f() { echo not implemented; exit 1; }\n"
+        ));
+    }
+
+    /// The left-in-place check reads every language `placeholder` lexes: a
+    /// file whose every body is one placeholder statement is an abandoned
+    /// scaffold. Before, only `.rs` files were read, so a Python, TypeScript,
+    /// Go, Java, C#, Ruby, PHP or C scaffold left as it was passed.
+    #[test]
+    fn a_scaffold_in_every_language_with_a_grammar_is_flagged() {
+        for (path, src) in [
+            (
+                "pkg/slug.py",
+                "\"\"\"Slugs.\"\"\"\n\ndef slugify(s):\n    \"\"\"Doc.\"\"\"\n    raise NotImplementedError\n\n\ndef lower(s):\n    raise NotImplementedError(\"lower\")\n",
+            ),
+            (
+                "src/slug.ts",
+                "export function slugify(s: string): string {\n  throw new Error(\"not implemented\");\n}\nexport const lower = (s: string): string => {\n  throw new Error(\"Not implemented yet\");\n};\n",
+            ),
+            (
+                "src/slug.js",
+                "function slugify(s) { throw new Error('not implemented'); }\nmodule.exports = { slugify };\n",
+            ),
+            (
+                "slug/slug.go",
+                "package slug\n\nfunc Slugify(s string) string {\n\tpanic(\"not implemented\")\n}\n",
+            ),
+            (
+                "src/main/java/a/Slug.java",
+                "package a;\npublic class Slug {\n  public static String slugify(String s) {\n    throw new UnsupportedOperationException(\"Not implemented\");\n  }\n}\n",
+            ),
+            (
+                "Slug/Slug.cs",
+                "namespace A {\n  public class Slug {\n    public string Slugify(string s) {\n      throw new NotImplementedException();\n    }\n    public string Lower(string s) => throw new System.NotImplementedException();\n  }\n}\n",
+            ),
+            (
+                "lib/slug.rb",
+                "module Slug\n  def self.slugify(s)\n    raise NotImplementedError\n  end\nend\n",
+            ),
+            (
+                "src/Slug.php",
+                "<?php\nfunction slugify($s) {\n  throw new Exception(\"not implemented\");\n}\n",
+            ),
+            (
+                "src/slug.cpp",
+                "int slugify(const char *s) {\n  throw std::logic_error(\"not implemented\");\n}\n",
+            ),
+        ] {
+            assert!(is_placeholder_source(path, src), "{path}: {src}");
+        }
+    }
+
+    /// Correct files in each language are never flagged: one real body, an
+    /// abstract method, a no-op body, a file with no function, a placeholder
+    /// named only in text.
+    #[test]
+    fn a_correct_file_in_any_language_is_never_flagged() {
+        for (path, src) in [
+            (
+                "pkg/slug.py",
+                "def slugify(s):\n    raise NotImplementedError\n\n\ndef lower(s):\n    return s.lower()\n",
+            ),
+            (
+                "pkg/shape.py",
+                "from abc import ABC, abstractmethod\n\n\nclass Shape(ABC):\n    @abstractmethod\n    def area(self):\n        raise NotImplementedError\n",
+            ),
+            (
+                "pkg/base.py",
+                "class Base:\n    def run(self):\n        raise NotImplementedError(\"subclasses override run\")\n",
+            ),
+            (
+                "pkg/proto.py",
+                "class P:\n    def run(self):\n        ...\n",
+            ),
+            ("pkg/noop.py", "def hook():\n    pass\n"),
+            ("pkg/consts.py", "LIMIT = 3\n"),
+            (
+                "pkg/doc.py",
+                "def brief():\n    return \"raise NotImplementedError is not implemented\"\n",
+            ),
+            (
+                "src/slug.ts",
+                "export function slugify(s: string): string {\n  if (!s) { throw new Error(\"not implemented for empty\"); }\n  return s.toLowerCase();\n}\n",
+            ),
+            (
+                "slug/slug.go",
+                "package slug\n\nfunc Slugify(s string) string {\n\treturn s\n}\n",
+            ),
+            (
+                "Slug/Slug.cs",
+                "namespace A { public class Slug { public string Slugify(string s) { return s; } } }\n",
+            ),
+            (
+                "lib/shape.rb",
+                "class Shape\n  def area\n    raise NotImplementedError\n  end\nend\nclass Circle < Shape\n  def area\n    3\n  end\nend\n",
+            ),
+        ] {
+            assert!(!is_placeholder_source(path, src), "{path}: {src}");
+        }
     }
 
     #[test]

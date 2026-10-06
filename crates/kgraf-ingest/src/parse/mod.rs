@@ -37,6 +37,11 @@ const LOCK_FILENAMES: &[&str] = &[
     "poetry.lock",
     "Pipfile.lock",
     "go.sum",
+    "npm-shrinkwrap.json",
+    "bun.lockb",
+    "packages.lock.json",
+    "Package.resolved",
+    "gradle.lockfile",
 ];
 
 fn is_lock_file(path: &Path) -> bool {
@@ -223,6 +228,23 @@ mod tests {
         match parse_file(&path, dir.path(), u64::MAX).expect("must not error") {
             ParseOutcome::Skipped(SkipReason::LockFile) => {}
             other => panic!("expected a lockfile skip, got {other:?}"),
+        }
+        // The other ecosystems' lockfiles with a code or data extension.
+        for name in [
+            "packages.lock.json",
+            "Package.resolved",
+            "npm-shrinkwrap.json",
+            "Podfile.lock",
+            "pubspec.lock",
+            "mix.lock",
+            "composer.lock",
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, "{}").expect("write fixture");
+            match parse_file(&path, dir.path(), u64::MAX).expect("must not error") {
+                ParseOutcome::Skipped(SkipReason::LockFile) => {}
+                other => panic!("{name}: expected a lockfile skip, got {other:?}"),
+            }
         }
     }
 

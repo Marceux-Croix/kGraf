@@ -4007,6 +4007,7 @@ dependencies = [
  "kgraf-provider",
  "kgraf-provider-anthropic",
  "kgraf-provider-openai",
+ "kgraf-sandbox",
  "kgraf-secrets",
  "kgraf-session",
  "kgraf-tools",

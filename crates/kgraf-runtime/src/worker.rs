@@ -723,14 +723,20 @@ async fn prepare(
     // above. What the worktree shows dirty now includes them.
     if saw_build {
         let root = brief.workspace_root.clone();
+        let scope = brief.write_scope.clone();
         // Checked against the gitlink the first segment recorded, not the
         // `.git` on disk now (`resumed_git_entry`).
         let at_start = git_at_start.clone();
-        match tokio::task::spawn_blocking(move || crate::worktree::dirty_paths(&root, &at_start?))
-            .await
+        match tokio::task::spawn_blocking(move || {
+            crate::worktree::dirty_paths(&root, &at_start?).map(|status| {
+                without_generated(&root, status, scope.as_deref(), "an earlier build")
+            })
+        })
+        .await
         {
-            Ok(Ok(status)) => {
+            Ok(Ok((status, note))) => {
                 note_nested_repositories(&mut trace_failures, &status);
+                done.extend(note);
                 for path in status.paths {
                     if changed.insert(path.clone()) {
                         done.push(format!(
@@ -1004,6 +1010,29 @@ fn note_nested_repositories(
             trace_failures.push(note);
         }
     }
+}
+
+/// `status` without the files a build or install generated outside `scope`
+/// ([`crate::worktree::TreeStatus::without_generated`]), and the line that
+/// says how many were left out, when any were. With no scope, every
+/// generated file is left out. Blocking: reads the tree.
+fn without_generated(
+    root: &std::path::Path,
+    status: crate::worktree::TreeStatus,
+    scope: Option<&[PathBuf]>,
+    tool: &str,
+) -> (crate::worktree::TreeStatus, Option<String>) {
+    let in_scope = |p: &std::path::Path| {
+        scope.is_some_and(|s| s.iter().any(|w| crate::paths::same_path(w, p)))
+    };
+    let (status, left_out) = status.without_generated(root, in_scope);
+    let note = (left_out > 0).then(|| {
+        format!(
+            "{tool} generated {left_out} file(s) (an install, build output, a lockfile or a \
+             cache) that the commit leaves out; they are not listed"
+        )
+    });
+    (status, note)
 }
 
 /// The notice that follows an output-ceiling stop: one continuation round.
@@ -1977,11 +2006,17 @@ impl Worker {
         Option<BTreeSet<PathBuf>>,
     ) {
         let root = self.brief.workspace_root.clone();
+        let scope = self.brief.write_scope.clone();
         let at_start = self.git_at_start.clone();
         let read = tokio::task::spawn_blocking(move || {
-            let status = at_start
-                .ok()
-                .map(|entry| crate::worktree::dirty_paths(&root, &entry));
+            // Generated files (an install, build output) are no progress and
+            // are not digested: an install of thousands of files would cost
+            // a hash each at every checkpoint.
+            let status = at_start.ok().map(|entry| {
+                crate::worktree::dirty_paths(&root, &entry).map(|status| {
+                    without_generated(&root, status, scope.as_deref(), "checkpoint").0
+                })
+            });
             let mut paths = tracked;
             let mut failure = None;
             let dirty = match status {
@@ -3532,13 +3567,22 @@ impl Worker {
     /// files the command wrote without saying so.
     async fn record_tree_changes(&mut self, tool: &str) {
         let root = self.brief.workspace_root.clone();
+        let scope = self.brief.write_scope.clone();
         let at_start = self.git_at_start.clone();
-        let read =
-            tokio::task::spawn_blocking(move || crate::worktree::dirty_paths(&root, &at_start?))
-                .await;
+        let label = tool.to_owned();
+        let read = tokio::task::spawn_blocking(move || {
+            crate::worktree::dirty_paths(&root, &at_start?)
+                .map(|status| without_generated(&root, status, scope.as_deref(), &label))
+        })
+        .await;
         match read {
-            Ok(Ok(status)) => {
+            Ok(Ok((status, note))) => {
                 note_nested_repositories(&mut self.trace_failures, &status);
+                if let Some(note) = note
+                    && !self.done.contains(&note)
+                {
+                    self.done.push(note);
+                }
                 for path in status.paths {
                     if self.changed.insert(path.clone()) {
                         self.done

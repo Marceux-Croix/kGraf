@@ -34,8 +34,9 @@ pub use merge::{
     ATTEMPT_REF_PREFIX, Attempt, AttemptEvent, AttemptGroup, AttemptState, CommitOutcome,
     ConflictMessage, ConflictSide, ConflictedPath, Excluded, FinishOutcome, GeneratedKind,
     Identity, LOCKFILES, Leftovers, Limits, MergeBack, MergeConflict, MergeError, MergeOutcome,
-    MergedWorktree, Refusal, RefusalReason, SelectFailure, TrialMerge, file_head, generated_kind,
-    is_compiled_binary, is_python_bytecode, lockfile_manifests, manifest_matches, manifests_beside,
+    MergedWorktree, Refusal, RefusalReason, SelectFailure, TreeManifests, TrialMerge, file_head,
+    generated_kind, is_compiled_binary, is_python_bytecode, lockfile_manifests, manifest_matches,
+    manifests_beside,
 };
 #[cfg(windows)]
 pub use sandbox::SandboxedChild;

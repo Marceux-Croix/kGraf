@@ -97,17 +97,142 @@ pub fn has_placeholder_body(path: &str, text: &str) -> bool {
         return false;
     }
     match lex(path, text) {
-        Some(l) => {
-            let abstract_lang = has_abstract_idiom(path);
-            let counts = |at: usize| !(abstract_lang && is_abstract_site(text, &l.code, at));
-            placeholder_sites(&l.code).into_iter().any(counts)
-                || l.literals
-                    .iter()
-                    .filter(|r| is_raised_not_implemented(text, &l.code, r))
-                    .any(|r| counts(r.start))
-        }
+        Some(l) => !counted_sites(path, text, &l).is_empty(),
         None => text.lines().any(line_has_placeholder),
     }
+}
+
+/// The offsets of the placeholders of a lexed file that count: every macro
+/// call, raise and raised "not implemented" message, less the abstract
+/// methods of [`has_placeholder_body`].
+fn counted_sites(path: &str, text: &str, l: &Lexed) -> Vec<usize> {
+    let abstract_lang = has_abstract_idiom(path);
+    let counts = |at: &usize| !(abstract_lang && is_abstract_site(text, &l.code, *at));
+    let mut sites: Vec<usize> = placeholder_sites(&l.code)
+        .into_iter()
+        .filter(counts)
+        .collect();
+    sites.extend(
+        l.literals
+            .iter()
+            .filter(|r| is_raised_not_implemented(text, &l.code, r))
+            .map(|r| r.start)
+            .filter(counts),
+    );
+    sites
+}
+
+/// Node kinds that are a function or method with a body, across the grammars
+/// kGraf reads (Python, Ruby, TypeScript, JavaScript, Go, Java, C, C++, C#,
+/// PHP). The body is the node's `body` field.
+const FUNCTION_KINDS: &[&str] = &[
+    "function_definition",
+    "function_declaration",
+    "function_expression",
+    "function",
+    "generator_function_declaration",
+    "arrow_function",
+    "method_definition",
+    "method_declaration",
+    "constructor_declaration",
+    "local_function_statement",
+    "method",
+    "singleton_method",
+];
+
+/// The words a body made only of a placeholder statement holds, across the
+/// languages: the raise word, the exception or error constructor, `return`.
+/// Any other identifier is real work.
+const PLACEHOLDER_STATEMENT_WORDS: &[&str] = &[
+    "raise",
+    "fail",
+    "throw",
+    "panic",
+    "new",
+    "return",
+    "Error",
+    "System",
+    "Exception",
+    "RuntimeException",
+    "UnsupportedOperationException",
+    "std",
+    "logic_error",
+    "runtime_error",
+    NOT_IMPLEMENTED_ERROR,
+    NOT_IMPLEMENTED_EXCEPTION,
+];
+
+/// Whether `text`, the content of `path` in a language with a grammar other
+/// than Rust, is an abandoned scaffold: it has at least one function or method
+/// body, and every body is one placeholder statement and nothing else
+/// (`raise NotImplementedError`, `throw new Error("not implemented")`,
+/// `panic("not implemented")`, `throw new NotImplementedException()`), each
+/// placeholder counted by the rules of [`has_placeholder_body`], so an abstract
+/// method of Python or Ruby is not one. A body with any other code, a file with
+/// no function, and a file in a language with no grammar are never one: when
+/// the shape is not certain, the answer is no. Rust has its own reader
+/// (`stub_land::is_placeholder_source`), which also tells a mock's trait impls
+/// from a stub.
+///
+/// Nested functions are part of the body that holds them. A body of only
+/// `pass`, `...` or nothing is not a placeholder: it is how a correct no-op
+/// or protocol method is written.
+pub fn every_body_is_placeholder(path: &str, text: &str) -> bool {
+    let Some(language) = Language::from_path(path) else {
+        return false;
+    };
+    if matches!(language, Language::Rust | Language::Markdown) {
+        return false;
+    }
+    let Some(l) = lex(path, text) else {
+        return false;
+    };
+    let Ok(grammar) = language.grammar() else {
+        return false;
+    };
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(&grammar).is_err() {
+        return false;
+    }
+    let Some(tree) = parser.parse(text, None) else {
+        return false;
+    };
+    // Local mutation: one pre-order walk that stops descending at the first
+    // function, so a nested function stays part of its parent's body.
+    let mut bodies: Vec<Range<usize>> = Vec::new();
+    let mut cursor = tree.walk();
+    'walk: loop {
+        let node = cursor.node();
+        let body = FUNCTION_KINDS
+            .contains(&node.kind())
+            .then(|| node.child_by_field_name("body"))
+            .flatten();
+        if let Some(body) = body {
+            bodies.push(body.byte_range());
+        } else if cursor.goto_first_child() {
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                continue 'walk;
+            }
+            if !cursor.goto_parent() {
+                break 'walk;
+            }
+        }
+    }
+    if bodies.is_empty() {
+        return false;
+    }
+    let sites = counted_sites(path, text, &l);
+    bodies.iter().all(|body| {
+        let has_site = sites.iter().any(|at| body.contains(at));
+        let only_placeholder = l.code[body.clone()]
+            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .filter(|w| !w.is_empty())
+            .all(|w| PLACEHOLDER_STATEMENT_WORDS.contains(&w));
+        has_site && only_placeholder
+    })
 }
 
 /// Whether `path` is in a language whose base classes raise

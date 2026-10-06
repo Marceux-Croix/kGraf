@@ -474,11 +474,12 @@ pub(crate) fn scope_violations(
         .collect()
 }
 
-/// The changed paths that are cargo's or rustup's configuration
-/// ([`is_build_config_path`]), declared or not. Such a change is never
-/// merged: once in the checkout, the host's own cargo reads it (the
-/// dependency fetch of decision 0087 runs with the checkout's
-/// configuration), and so does every later worker's build. Decision 0084's
+/// The changed paths that are build-tool configuration (cargo, rustup, and the
+/// other build tools and version managers: [`is_build_config_path`]),
+/// declared or not. Such a change is never merged: once in the checkout, the
+/// host's own cargo reads it (the dependency fetch of decision 0087 runs with
+/// the checkout's configuration), and so does every later worker's build and
+/// the user's own tools. Decision 0084's
 /// tripwire already refuses builds in the worktree that changed them; this
 /// refuses the attempt itself, so the change never reaches the checkout.
 pub(crate) fn build_config_changes(changed: &[String]) -> Vec<String> {
@@ -493,11 +494,12 @@ pub(crate) fn build_config_changes(changed: &[String]) -> Vec<String> {
 /// user alike.
 pub(crate) fn build_config_reason(paths: &[String]) -> String {
     format!(
-        "the attempt changes cargo or rustup configuration ({paths:?}), which kGraf never \
-         merges: a `.cargo` folder or a `rust-toolchain` file changes what every later build, \
-         and the host's own cargo, runs. Leave these files as they are and solve the task \
-         without them; if the project needs such a change, say so in your result so the user \
-         can make it by hand"
+        "the attempt changes build-tool configuration ({paths:?}), which kGraf never merges: \
+         a `.cargo` folder, a `rust-toolchain` file, or another build tool's or version \
+         manager's configuration (`.npmrc`, `.mvn/`, `gradle.properties`, `NuGet.Config`, \
+         `.nvmrc`, ...) changes what every later build, and the host's own tools, run. Leave \
+         these files as they are and solve the task without them; if the project needs such a \
+         change, say so in your result so the user can make it by hand"
     )
 }
 

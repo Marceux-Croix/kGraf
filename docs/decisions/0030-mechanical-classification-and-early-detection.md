@@ -753,7 +753,7 @@ Tests: `kgraf-orchestrator` `derive_interface.rs`
 ## Amendment (2026-10-06, fourth): an abstract method is not a scaffold, and a check that cannot apply to a language never blocks
 
 An audit of every check that can hold, refuse or fail a plan, a contract or an attempt, for
-assumptions that hold only for Rust, found the placeholder rule of the fourth amendment above
+assumptions that hold only for Rust, found the placeholder rule of the 2026-10-02 fourth amendment above
 too wide for Python and Ruby. In both, raising `NotImplementedError` is also how a correct base
 class makes a subclass supply a method. A plan whose instruction named such a module (so the
 worker could read the base) and wrote only the new subclass was refused as leaving an
@@ -784,3 +784,64 @@ a derived interface takes as the producer's stub.
 Tests: `kgraf-orchestrator` `placeholder.rs` `an_abstract_method_is_not_a_placeholder`,
 `a_csharp_not_implemented_exception_is_a_placeholder`; `plan_repo.rs`
 `a_named_abstract_base_class_is_not_an_unwritten_scaffold`.
+
+## Amendment (2026-10-06, fifth): derived compile checks and the member check reach other languages
+
+The derived compile command of the second 2026-10-02 amendment existed for Rust and Python only,
+and the member check of the 2026-10-06 amendment for Cargo only. A project in another language
+got no derived check and no member check: less protection, never a false hold. Each new check
+below obeys one rule: it never holds, refuses or fails a correct project. When kGraf cannot be
+sure, the edge or the plan is recorded unchecked with the reason.
+
+- **Derived compile commands for TypeScript, Go, Java and C#**
+  (`derive_interface::command_for`). Each runs only where a cheap, offline check exists and the
+  project and the machine allow it; every other case is an unchecked edge whose reason names the
+  missing part:
+
+  | Language | Command | Only when |
+  | --- | --- | --- |
+  | TypeScript | `node <tsc> --noEmit -p <dir>` | a `tsconfig.json` above every consumer file (one), the project's own compiler at `node_modules/typescript` in the repository, `node` on the `PATH` |
+  | Go | `go vet <packages>` (`go -C <module> vet ...` below the root) | one `go.mod` above every file, `go` on the `PATH` |
+  | Java | `javac -proc:none -d .kgraf-javac-out -sourcepath <roots> <files>` | no `pom.xml`, Gradle or Ant file above any file, a `package` line that matches each file's directory, `javac` on the `PATH` |
+  | C# | `dotnet build --no-restore <project>` | one `.csproj` above every file, its `obj/project.assets.json` in the repository (dependencies restored), `dotnet` on the `PATH` |
+
+  The check tree is made from the base commit, so only what the repository tracks is there: an
+  installed `node_modules` or a restored `obj/` that git ignores is not, and the edge is
+  unchecked with that reason. The command runs before dispatch as every derived command does:
+  one that fails at the base (a `go vet` finding the base already has, a broken toolchain such
+  as a `javac` stub with no JDK) is not registered and blocks nothing. `go vet` is used, not
+  `go build`, because it type-checks the test files as well. The run's report names what each
+  command checks (`derive_interface::coverage`).
+- **C# and Java test files are tests.** `derive_interface::is_test_path` also reads
+  `*Test.<ext>` and `*Tests.<ext>` (a capital `T` after a lower-case letter or digit, so
+  `Contest.java` is not one), `*_spec.<ext>`, a `Tests` directory and a .NET test project
+  directory (`App.Tests/`).
+- **Go and record names are read.** The keyword fallback `derive_interface::declared_names`
+  reads Go's `func` (a method's receiver is skipped) and `record`, so a Go or C# producer the
+  graph has not indexed still has names a consumer can use.
+- **The member check covers Go workspaces and Maven reactors** (`plan_repo::module_findings`).
+  A `go` command that loads packages reads the nearest `go.work` above its directory and every
+  module it `use`s; `mvn` builds every `<module>` of the `pom.xml` it runs on. A member whose
+  `go.mod` or `pom.xml` is neither in the repository nor written by the contract or one it
+  depends on fails the command, and the plan is refused naming the file, as for Cargo. Only a
+  manifest the repository holds and the contract's side does not rewrite is read; a
+  `GOWORK=off` command, a command in a module's own directory, and a module in a Maven profile
+  are not judged. Not checked: npm (measured with npm 11: a listed workspace that is missing is
+  skipped, and only `--workspace=<missing>` fails), uv (measured: skipped), Gradle and pnpm
+  (whether a listed project with no directory fails depends on their version).
+
+Known limits. The live type checks were exercised by their unit tests and by the never-block
+flow test; no TypeScript, Go, Java or C# compiler was present on the machine that built this, so
+the registered path of those four languages has not run against a real compiler there.
+
+Tests: `kgraf-orchestrator` `derive_interface.rs`
+`typescript_gets_a_type_check_only_with_its_own_compiler`,
+`go_gets_go_vet_of_the_packages_when_go_is_installed`,
+`java_gets_javac_only_without_a_build_tool`, `csharp_gets_dotnet_build_only_when_restored`,
+`config_probes_read_nothing_for_rust_and_python`,
+`test_paths_python_modules_and_cargo_packages_are_read_by_convention`,
+`declared_names_are_read_by_keyword`; `tests/contract_flow.rs`
+`a_correct_project_in_any_language_is_never_blocked_by_a_derived_check`; `plan_repo.rs`
+`a_go_work_member_written_later_is_refused_and_one_in_time_is_not`,
+`a_maven_module_written_later_is_refused_and_a_profile_module_is_not`,
+`workspaces_that_do_not_load_a_missing_member_are_never_refused`.
