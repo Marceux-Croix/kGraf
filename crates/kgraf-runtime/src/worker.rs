@@ -2943,10 +2943,19 @@ impl Worker {
         // worker's own archive, after approval like every call.
         let mut recalls: Vec<ApprovedCall> = Vec::new();
         self.capabilities.clear();
+        // The worktree the call's programs read their recipes, scripts and
+        // configuration from, so a refusal names the inner program a rule
+        // matched (decision 0094, amended 2026-10-06).
+        let read_ctx = kgraf_tools::permissions::ReadContext::in_worktree(
+            &self.brief.workspace_root,
+            std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .as_deref(),
+        );
         for (call_id, tool, input) in uses {
             self.capabilities.insert(
                 call_id.clone(),
-                crate::shortfall::CallCapability::of(&tool, &input),
+                crate::shortfall::CallCapability::of_in(&tool, &input, &read_ctx),
             );
             let pending = PendingCall {
                 call_id: call_id.clone(),

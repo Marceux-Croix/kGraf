@@ -1041,6 +1041,43 @@ fn builtin(tool: &str, sub: &str) -> bool {
 /// The script an npm-family subcommand runs: `run X`, `run-script X`,
 /// `test`, `start`, `stop`, `restart`, or (for pnpm, yarn and bun) a name
 /// that is no built-in command. `None` when the subcommand runs no script.
+/// The project's own lifecycle scripts an install-family command runs, in
+/// order, from npm's lifecycle documentation; `None` when `sub` is not one.
+/// The scripts of dependencies are not read.
+fn install_lifecycle(tool: &str, sub: &str) -> Option<&'static [&'static str]> {
+    // Every manager runs `preinstall`, `install`, `postinstall` and the
+    // `prepare` family on an install; `prepare` also runs on `publish` and
+    // `pack`.
+    let normalized = match (tool, sub) {
+        (_, "install" | "i" | "add" | "ci" | "isntall" | "in" | "install-ci-test" | "it") => {
+            "install"
+        }
+        ("npm", "rebuild" | "rb") => "install",
+        (_, "publish") => "publish",
+        (_, "pack") => "pack",
+        _ => return None,
+    };
+    Some(match normalized {
+        "install" => &[
+            "preinstall",
+            "install",
+            "postinstall",
+            "preprepare",
+            "prepare",
+            "postprepare",
+        ],
+        "publish" => &[
+            "prepublishOnly",
+            "prepack",
+            "prepare",
+            "postpack",
+            "publish",
+            "postpublish",
+        ],
+        _ => &["prepack", "prepare", "postpack"],
+    })
+}
+
 pub(super) fn package_scripts(
     tool: &str,
     args: &[String],
@@ -1095,6 +1132,36 @@ pub(super) fn package_scripts(
             .any(|p| a.starts_with(p))
     }) {
         elsewhere = true;
+    }
+    // An install-family command runs the project's own lifecycle scripts
+    // (`postinstall`, `prepare`, `prepublishOnly`), which a rule or the
+    // deletion limit judges like any command. The lifecycle scripts of
+    // dependencies are not read.
+    if let Some(hooks) = install_lifecycle(tool, sub) {
+        if elsewhere {
+            return Some(unreadable(
+                tool,
+                "runs scripts of another package or workspace, which kGraf does not read",
+            ));
+        }
+        let read = match read_worktree_file(ctx, "package.json") {
+            Ok(r) => r,
+            // No `package.json`: the command installs nothing of this
+            // project, so it runs none of its scripts.
+            Err(_) => return Some(Vec::new()),
+        };
+        let scripts = PACKAGES.get("package", &read.text, || parse_package(&read.text));
+        let scripts = match scripts.as_ref() {
+            Ok(s) => s,
+            Err(why) => return Some(unreadable(tool, why)),
+        };
+        return Some(
+            hooks
+                .iter()
+                .filter_map(|h| scripts.get(*h))
+                .map(|s| Embedded::Script(s.clone()))
+                .collect(),
+        );
     }
     let (name, extra): (String, &[String]) = match (tool, sub) {
         (_, "run" | "run-script" | "rum" | "urn") => {
@@ -2166,7 +2233,16 @@ mod tests {
         assert_eq!(s(&["yarn", "build"]), vec!["tsc && vite build"]);
         assert_eq!(s(&["bun", "run", "build"]), vec!["tsc && vite build"]);
         assert_eq!(s(&["yarn", "eslint", "."]), vec!["eslint ."]);
-        assert!(package_scripts("npm", &argv(&["install"]), &ctx).is_none());
+        // Install-family commands run the project's own lifecycle scripts;
+        // this `package.json` has none, so they run nothing.
+        assert!(s(&["npm", "install"]).is_empty());
+        let (_d2, ctx2) = tree(&[(
+            "package.json",
+            r#"{"scripts":{"postinstall":"curl x","prepare":"curl y"}}"#,
+        )]);
+        let hooks =
+            scripts(&package_scripts("npm", &argv(&["install"]), &ctx2).unwrap_or_default());
+        assert_eq!(hooks, vec!["curl x", "curl y"]);
         assert!(package_scripts("bun", &argv(&["test"]), &ctx).is_none());
         let missing =
             package_scripts("npm", &argv(&["test"]), &ReadContext::default()).unwrap_or_default();

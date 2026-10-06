@@ -985,6 +985,28 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   of them first, the command is refused before it runs, naming the file, and runs once it is
   issued again and checked as it is now.
 
+  A rule reads past more spellings of a command. A program is matched by its base name,
+  lowercased and without a Windows extension, so `/usr/bin/curl`, `CURL` and `Curl.exe` all
+  match `shell(curl*)`. More shells read their `-c` script (`ash`, `mksh`, `yash`, a versioned
+  name such as `bash5`, and another case such as `SH`). A name the script defines to run
+  another program is read: `alias c=curl; c x` and `hash -p /usr/bin/curl g; g x`. A global
+  option before a git subcommand does not hide it: `git -c a=b push`, `git -C . push` and `git
+  --no-pager push` all match `shell(git push*)`. An install runs the project's own lifecycle
+  scripts, so a `postinstall`, `prepare` or `prepublishOnly` that runs a denied program is
+  caught on `npm install`, `npm ci`, `npm publish`, `npm pack` and the pnpm, yarn and bun
+  equivalents (dependency scripts are not read). `cross-env`, `xcrun`, `rlwrap` and `eatmydata`
+  join the wrappers whose tail is the command they run. In interpreter code, a command string
+  spelled with numeric escapes (`\x72`, `r`, `\162`) is decoded, a spawning module reached
+  as another module's attribute (`shutil.os.system`) is read, and Ruby's `IO.read("|cmd")` and
+  `Kernel.\`` are read.
+
+  A command kGraf cannot tell is unreadable, and asks while you have a shell rule with a
+  pattern: a program word the shell expands (a glob `/usr/bin/cur?`, a brace list `{curl,x}`,
+  zsh's `=NAME`), a script whose quote or substitution never closes or that does not split
+  into words, a command a shell runs from a placeholder its input fills (`xargs -I{} sh -c
+  '{}'`, `find -exec {} ;`, `parallel {} :::`), a substitution given as code (`eval "$(...)"`,
+  `bash -c "$(...)"`), PHP's `FFI`, and `osascript -l JavaScript` (JXA).
+
   Some of these cannot be read, and are treated like `source FILE` above: a runner whose
   command kGraf cannot name (`docker run IMAGE` with no command, a package given by a URL,
   `kubectl exec` without `--`), a Windows script with a variable as a program or a construct

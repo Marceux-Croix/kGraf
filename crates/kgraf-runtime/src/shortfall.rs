@@ -151,12 +151,35 @@ pub(crate) struct CallCapability {
 }
 
 impl CallCapability {
+    /// Of a call read with no worktree: the recipes, scripts and
+    /// configuration its programs run are unread, so only what the call
+    /// names itself is seen. [`CallCapability::of_in`] reads them.
     pub(crate) fn of(tool: &str, input: &serde_json::Value) -> Self {
+        Self::of_in(
+            tool,
+            input,
+            &kgraf_tools::permissions::ReadContext::default(),
+        )
+    }
+
+    /// Of a call read with the worktree `ctx`: a rule or a grant that
+    /// matches a program inside a recipe, a script or a configuration value
+    /// (`make deploy` whose recipe runs `curl`) names that inner program,
+    /// not the call's own (decision 0094, amended 2026-10-06).
+    pub(crate) fn of_in(
+        tool: &str,
+        input: &serde_json::Value,
+        ctx: &kgraf_tools::permissions::ReadContext,
+    ) -> Self {
         let capability = capability_of(tool, input);
         let mut programs = vec![capability.clone()];
-        if tool == "shell" {
-            for p in kgraf_tools::programs_run(input) {
-                if !programs.contains(&p) {
+        if tool == "shell"
+            && let Some(argv) = kgraf_tools::command_argv(input)
+        {
+            for command in kgraf_tools::permissions::simple_commands_in(&argv, ctx) {
+                if let Some(p) = command.into_iter().next()
+                    && !programs.contains(&p)
+                {
                     programs.push(p);
                 }
             }
@@ -165,13 +188,15 @@ impl CallCapability {
             tool: tool.to_owned(),
             capability,
             programs,
-            subjects: kgraf_tools::permissions::subjects(tool, input),
+            subjects: kgraf_tools::permissions::subjects_in(tool, input, ctx),
             patch_target: (tool == "apply_patch")
                 .then(|| kgraf_tools::patch_target(input))
                 .flatten(),
             grant_programs: if tool == "shell" {
                 kgraf_tools::command_argv(input)
-                    .and_then(|argv| kgraf_tools::permissions::programs_to_grant(&argv).ok())
+                    .and_then(|argv| {
+                        kgraf_tools::permissions::programs_to_grant_in(&argv, ctx).ok()
+                    })
                     .unwrap_or_default()
             } else {
                 Vec::new()
@@ -627,6 +652,39 @@ mod tests {
         }))
         .expect("old record");
         assert!(old.held.is_empty());
+    }
+
+    /// A rule that matches a command inside a recipe names the inner program
+    /// in the refusal record, not the recipe runner. Without a reading
+    /// context the recipe is invisible and the refusal would name `make`.
+    #[test]
+    fn a_rule_inside_a_recipe_names_the_inner_program_not_the_runner() {
+        use kgraf_tools::permissions::ReadContext;
+        let dir = tempfile::tempdir().expect("dir");
+        std::fs::write(
+            dir.path().join("Makefile"),
+            "deploy:\n\tcurl -X POST https://x\n",
+        )
+        .expect("makefile");
+        let input = serde_json::json!({"command": ["make", "deploy"]});
+        let ctx = ReadContext::in_worktree(dir.path(), None);
+        let call = CallCapability::of_in("shell", &input, &ctx);
+        let refused = call.refusal(
+            kgraf_tools::permissions::PERMISSION_RULES_HOOK,
+            "ERROR: denied by user-permission-rules: your deny rule `shell(curl*)` blocks this \
+             call in every permission mode",
+            None,
+        );
+        assert_eq!(refused.capability, "curl", "{refused:?}");
+        // With no context the recipe is unread, so the runner is named: the
+        // old behavior this fix corrects.
+        let blind = CallCapability::of("shell", &input).refusal(
+            kgraf_tools::permissions::PERMISSION_RULES_HOOK,
+            "ERROR: denied by user-permission-rules: your deny rule `shell(curl*)` blocks this \
+             call in every permission mode",
+            None,
+        );
+        assert_eq!(blind.capability, "make");
     }
 
     /// The directory sees each refusal and input error while the worker

@@ -976,8 +976,15 @@ fn osascript_call(program: &str, args: &[String], ctx: &ReadContext) -> Option<V
             _ => break,
         }
     }
+    // JavaScript for Automation reaches `doShellScript` and the Objective-C
+    // bridge through any name; it has no reader.
+    if javascript {
+        return Some(unreadable(
+            program,
+            "runs JavaScript for Automation, which kGraf does not read",
+        ));
+    }
     let lang = Lang::AppleScript;
-    let _ = javascript;
     if !code.is_empty() {
         return Some(inline(program, lang, &code.join("\n"), ctx));
     }
@@ -1027,10 +1034,32 @@ fn named_children(node: Node<'_>) -> Vec<Node<'_>> {
     node.named_children(&mut cursor).collect()
 }
 
-/// Resolve the common backslash escapes of a quoted literal.
+/// Resolve the backslash escapes of a quoted literal, the numeric ones
+/// included (`\x72`, `r`, `\u{72}`, `\U00000072`, `\162`): a command
+/// string spelled with them names the program they decode to.
 fn unescape(raw: &str) -> String {
     let mut out = String::new();
-    let mut chars = raw.chars();
+    let mut chars = raw.chars().peekable();
+    // Up to `max` digits of `radix` from `chars`, as a character.
+    let number = |chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+                  radix: u32,
+                  max: usize,
+                  first: Option<char>|
+     -> Option<char> {
+        let mut digits: String = first.into_iter().collect();
+        while digits.len() < max {
+            match chars.peek() {
+                Some(d) if d.is_digit(radix) => {
+                    digits.push(*d);
+                    chars.next();
+                }
+                _ => break,
+            }
+        }
+        u32::from_str_radix(&digits, radix)
+            .ok()
+            .and_then(char::from_u32)
+    };
     while let Some(c) = chars.next() {
         if c != '\\' {
             out.push(c);
@@ -1040,7 +1069,33 @@ fn unescape(raw: &str) -> String {
             Some('n') => out.push('\n'),
             Some('t') => out.push('\t'),
             Some('r') => out.push('\r'),
-            Some('0') => out.push('\0'),
+            Some('a') => out.push('\x07'),
+            Some('b') => out.push('\x08'),
+            Some('f') => out.push('\x0c'),
+            Some('v') => out.push('\x0b'),
+            Some('e') => out.push('\x1b'),
+            Some('\n') => {}
+            Some(d @ '0'..='7') => out.push(number(&mut chars, 8, 3, Some(d)).unwrap_or(d)),
+            Some('x') => match number(&mut chars, 16, 2, None) {
+                Some(ch) => out.push(ch),
+                None => out.push('x'),
+            },
+            Some('u') if chars.peek() == Some(&'{') => {
+                chars.next();
+                let hex: String = chars.by_ref().take_while(|c| *c != '}').collect();
+                match u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+                    Some(ch) => out.push(ch),
+                    None => out.push('u'),
+                }
+            }
+            Some('u') => match number(&mut chars, 16, 4, None) {
+                Some(ch) => out.push(ch),
+                None => out.push('u'),
+            },
+            Some('U') => match number(&mut chars, 16, 8, None) {
+                Some(ch) => out.push(ch),
+                None => out.push('U'),
+            },
             Some(o) => out.push(o),
             None => out.push('\\'),
         }
@@ -1130,6 +1185,7 @@ mod python {
         "multiprocessing",
         "concurrent",
         "pyautogui",
+        "webbrowser",
         "builtins",
         "__builtin__",
     ];
@@ -1193,8 +1249,17 @@ mod python {
         Start,
     }
 
+    /// How the function `q` names takes its command. A spawning module
+    /// reached as another module's attribute (`shutil.os.system`,
+    /// `tempfile._os.system`, `asyncio.subprocess`) is that module.
     fn form(q: &str) -> Option<Form> {
         let (module, name) = q.rsplit_once('.')?;
+        std::iter::once(module)
+            .chain(module.split('.').map(|s| s.trim_start_matches('_')))
+            .find_map(|m| form_of(m, name))
+    }
+
+    fn form_of(module: &str, name: &str) -> Option<Form> {
         let module = match module {
             "posix" | "nt" => "os",
             m => m,
@@ -1205,9 +1270,10 @@ mod python {
             ("commands", "getoutput" | "getstatusoutput") => Form::Shell,
             ("platform", "popen") => Form::Shell,
             ("popen2", _) => Form::Shell,
-            ("asyncio", "create_subprocess_shell") => Form::Shell,
+            ("asyncio" | "subprocess", "create_subprocess_shell") => Form::Shell,
+            ("distutils.spawn" | "spawn", "spawn") => Form::Pty,
             ("subprocess", "run" | "call" | "check_call" | "check_output" | "Popen") => Form::Popen,
-            ("asyncio", "create_subprocess_exec") => Form::ExecArgs,
+            ("asyncio" | "subprocess", "create_subprocess_exec") => Form::ExecArgs,
             ("os", "execl" | "execle" | "execlp" | "execlpe") => Form::ExecL,
             ("os", "execv" | "execve" | "execvp" | "execvpe" | "fexecve") => Form::ExecV,
             ("os", "spawnl" | "spawnle" | "spawnlp" | "spawnlpe") => Form::SpawnL,
@@ -1458,10 +1524,12 @@ mod python {
                 "identifier" | "attribute" => {
                     // A spawning function referred to other than as a
                     // call's function, or a spawning module other than as
-                    // an attribute's object.
+                    // an attribute's object. A spawning function as an
+                    // attribute's object (`os.system.__call__`) is a value.
                     let parent = n.parent();
                     if parent.is_some_and(|p| p.kind() == "attribute")
                         && parent.and_then(|p| p.child_by_field_name("object")) == Some(*n)
+                        && qualified(*n, code, &aliases).is_none_or(|q| form(&q).is_none())
                     {
                         continue;
                     }
@@ -1782,7 +1850,12 @@ mod js {
             return None;
         }
         let f = node.child_by_field_name("function")?;
-        if !matches!(text(f, code), "require" | "import") {
+        // `require` reached as a method loads a module too
+        // (`module.require`, `process.mainModule.require`).
+        let as_method = f.kind() == "member_expression"
+            && f.child_by_field_name("property")
+                .is_some_and(|p| text(p, code) == "require");
+        if !as_method && !matches!(text(f, code), "require" | "import") {
             return None;
         }
         let args = node.child_by_field_name("arguments")?;
@@ -1978,7 +2051,16 @@ mod js {
                                 }
                             }
                         } else if is_spawn_module(&m)
-                            && n.parent().is_none_or(|p| p.kind() != "member_expression")
+                            && n.parent().is_none_or(|p| {
+                                // Only a spawning function read from it
+                                // (`require('child_process').exec`) is
+                                // followed; `.then(...)` hands it on.
+                                p.kind() != "member_expression"
+                                    || p.child_by_field_name("property").is_none_or(|prop| {
+                                        spawn_function(&format!("{m}.{}", text(prop, code)))
+                                            .is_none()
+                                    })
+                            })
                         {
                             return Err(dynamic("the process module used as a value"));
                         }
@@ -2099,6 +2181,12 @@ mod js {
                     }
                     if is_spawn_module(&q) || q == "eval" || q == "Function" {
                         return Err(dynamic("the process module or `eval` used as a value"));
+                    }
+                    if matches!(
+                        q.as_str(),
+                        "process.binding" | "process._linkedBinding" | "process.dlopen"
+                    ) {
+                        return Err("loads native code kGraf does not read".into());
                     }
                 }
                 _ => {}
@@ -2286,6 +2374,10 @@ mod ruby {
             ) => "kernel",
             (Some("PTY"), "spawn" | "getpty") => "kernel",
             (None | Some("Kernel") | Some("URI") | Some("IO"), "open") => "open",
+            // `IO.read("|cmd")` and its kin start cmd (Ruby before 4.0).
+            (Some("IO"), "read" | "readlines" | "write" | "foreach" | "binread" | "binwrite") => {
+                "io_path"
+            }
             _ => return None,
         })
     }
@@ -2380,6 +2472,18 @@ mod ruby {
                                 None => {}
                             }
                         }
+                        "io_path" => match list.first().and_then(|f| literal(*f, code)) {
+                            Some(s) => {
+                                if let Some(cmd) = s.strip_prefix('|') {
+                                    found.push(Embedded::Script(cmd.to_owned()));
+                                }
+                            }
+                            None => {
+                                return Err(dynamic(&format!(
+                                    "`IO.{method}` given a value that may start with `|`"
+                                )));
+                            }
+                        },
                         "popen" => match list.first() {
                             Some(f) => match (literal(*f, code), literal_list(*f, code)) {
                                 (Some(s), _) => found.push(Embedded::Script(s)),
@@ -2389,7 +2493,18 @@ mod ruby {
                             None => return Err(not_literal()),
                         },
                         _ => {
+                            // A backquote literal is a `subshell`, read
+                            // above; the method called by name
+                            // (`Kernel.`("cmd")`) runs its argument as a
+                            // script.
                             if method == "`" {
+                                if receiver.is_none() && args.is_none() {
+                                    continue;
+                                }
+                                match list.first().and_then(|f| literal(*f, code)) {
+                                    Some(s) => found.push(Embedded::Script(s)),
+                                    None => return Err(not_literal()),
+                                }
                                 continue;
                             }
                             let Some(first) = list.first() else {
@@ -2608,6 +2723,16 @@ mod php {
                         .is_some_and(|m| m.kind() != "name") =>
                 {
                     return Err(dynamic("a method named by a value"));
+                }
+                // `FFI::cdef(...)` calls any C function, `system` included.
+                "scoped_call_expression"
+                    if n.child_by_field_name("scope").is_some_and(|s| {
+                        text(s, code)
+                            .trim_start_matches('\\')
+                            .eq_ignore_ascii_case("ffi")
+                    }) =>
+                {
+                    return Err("calls native code through FFI, which kGraf does not read".into());
                 }
                 "object_creation_expression" => {
                     let t = text(n, code).to_ascii_lowercase();

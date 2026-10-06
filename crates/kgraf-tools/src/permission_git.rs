@@ -22,7 +22,7 @@
 //! Which configuration keys run commands is a list (decision 0094), taken
 //! from git-config(1).
 
-use super::{Embedded, ReadContext};
+use super::{Embedded, ReadContext, program_key};
 use std::path::{Path, PathBuf};
 
 fn unreadable(why: &str) -> Vec<Embedded> {
@@ -332,6 +332,31 @@ const GLOBAL_VALUED: &[&str] = &[
 ];
 
 /// The commands `git` (at `words[at]`) runs besides itself.
+/// `git [GLOBAL OPTIONS] SUBCOMMAND ARGS` as `git SUBCOMMAND ARGS`, so a
+/// rule on the subcommand (`shell(git push*)`) matches however the global
+/// options are written (`git -c a=b push`, `git -C . push`, `git
+/// --no-pager push`). `None` when `words[at]` is not `git` or names no
+/// subcommand. The command still runs as written; this is only the subject
+/// a rule reads (decision 0094, amended 2026-10-06).
+pub(super) fn normalized(words: &[String], at: usize) -> Option<Vec<String>> {
+    if program_key(&words[at]) != "git" {
+        return None;
+    }
+    let args = &words[at + 1..];
+    let mut i = 0;
+    while let Some(a) = args.get(i) {
+        if !a.starts_with('-') {
+            break;
+        }
+        let takes = GLOBAL_VALUED.contains(&a.as_str());
+        i += if takes { 2 } else { 1 };
+    }
+    let sub = args.get(i)?;
+    let mut out = vec!["git".to_owned(), sub.clone()];
+    out.extend(args[i + 1..].iter().cloned());
+    Some(out)
+}
+
 pub(super) fn git(words: &[String], at: usize, ctx: &ReadContext) -> Vec<Embedded> {
     let args = &words[at + 1..];
     let mut out: Vec<Embedded> = Vec::new();

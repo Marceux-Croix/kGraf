@@ -3563,6 +3563,10 @@ mod tests {
             json!({ "command": argv })
         }
 
+        fn call_input_owned(argv: &[String]) -> Value {
+            json!({ "command": argv })
+        }
+
         fn pending(argv: &[&str]) -> PendingCall {
             PendingCall {
                 call_id: "c1".into(),
@@ -5175,8 +5179,14 @@ fn main() {
         }
 
         /// Through the real sandbox: two workers' commands that do not touch
-        /// git run at the same time. Each sleeps 0.8 s; run one after the
-        /// other they would take at least 1.6 s.
+        /// git run at the same time. Each writes its own start marker, then
+        /// waits for the other's before it finishes. Run at the same time
+        /// both markers appear and both finish; run one after the other the
+        /// first would wait forever for a marker the second has not written,
+        /// so the whole thing never finishes and the generous timeout below
+        /// fails the test. The proof needs no wall-clock threshold on the
+        /// work itself, which under load was flaky (1.48 s against a 1.4 s
+        /// bound).
         #[tokio::test]
         async fn bypass_runs_two_workers_commands_in_parallel() {
             let f = fixture(PLAIN_BUILD_RS);
@@ -5190,26 +5200,40 @@ fn main() {
                 .expect("second worktree");
             let (t1, g1) = guarded_tool_in(&f, &f.ws, "w1");
             let (t2, g2) = guarded_tool_in(&f, &ws2, "w2");
-            let words = ["sh", "-c", "sleep 0.8; echo built > out.txt"];
-            let (c1, c2) = (
-                ctx(f.ws.root().to_path_buf()),
-                ctx(ws2.root().to_path_buf()),
-            );
+            let (r1, r2) = (f.ws.root().to_path_buf(), ws2.root().to_path_buf());
+            // Each command writes its own marker in its worktree, then waits
+            // for the other worktree's marker (a read across worktrees, which
+            // the sandbox allows; only writes are confined). A long cap keeps
+            // a stuck loop from running forever; the outer timeout, well
+            // under it, is what the test asserts.
+            let wait_for = |mine: &Path, theirs: &Path| {
+                let line = format!(
+                    "touch {my}; n=0; while [ ! -e {their} ]; do sleep 0.02; n=$((n+1)); \
+                     if [ $n -gt 2500 ]; then exit 9; fi; done; echo built > out.txt",
+                    my = mine.join(".started").display(),
+                    their = theirs.join(".started").display(),
+                );
+                ["sh".to_owned(), "-c".to_owned(), line]
+            };
+            let w1 = wait_for(&r1, &r2);
+            let w2 = wait_for(&r2, &r1);
+            let (c1, c2) = (ctx(r1.clone()), ctx(r2.clone()));
             let (p1, p2) = (CallPermit::new(), CallPermit::new());
-            let start = std::time::Instant::now();
-            let (o1, o2) = tokio::join!(
-                t1.call(call_input(&words), &c1, &p1),
-                t2.call(call_input(&words), &c2, &p2),
-            );
-            let elapsed = start.elapsed();
+            let both = async {
+                tokio::join!(
+                    t1.call(call_input_owned(&w1), &c1, &p1),
+                    t2.call(call_input_owned(&w2), &c2, &p2),
+                )
+            };
+            // Parallel: both finish in well under a second. Serial: the first
+            // blocks on a marker the second never writes, so this times out.
+            let (o1, o2) = tokio::time::timeout(Duration::from_secs(20), both)
+                .await
+                .expect("the commands did not overlap: each blocked on the other's marker");
             for out in [o1.expect("w1 ran"), o2.expect("w2 ran")] {
                 let is_error = out.is_error;
                 assert!(!is_error, "{}", out.render());
             }
-            assert!(
-                elapsed < Duration::from_millis(1400),
-                "the commands ran one after the other: {elapsed:?}"
-            );
             assert!(f.ws.root().join("out.txt").is_file() && ws2.root().join("out.txt").is_file());
             g1.finish().expect("w1 stands");
             g2.finish().expect("w2 stands");

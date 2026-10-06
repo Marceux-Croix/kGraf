@@ -1801,7 +1801,10 @@ fn file_paths(tool: &str, input: &serde_json::Value) -> Vec<String> {
 }
 
 /// Shell interpreters whose `-c` script is read as commands.
-const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "fish"];
+const SHELLS: &[&str] = &[
+    "sh", "bash", "zsh", "dash", "ksh", "fish", "ash", "mksh", "lksh", "oksh", "pdksh", "posh",
+    "yash", "rbash", "bosh",
+];
 
 /// How deep [`simple_commands`] follows a command started by another
 /// (`sh -c "bash -c 'curl x'"`, `find . -exec sh -c 'curl x' \;`). Each
@@ -2061,11 +2064,11 @@ fn named_by_expansion(words: &[String]) -> Option<String> {
         .into_iter()
         .filter(|(_, role)| matches!(role, WordRole::Program | WordRole::Wrapper))
         .map(|(i, _)| &words[i])
-        .find(|w| w.contains(['$', '`']))
+        .find(|w| w.contains(['$', '`']) || w.contains("{}"))
         .map(|w| {
             format!(
-                "the command `{}` is named by a variable or a substitution, so kGraf cannot tell \
-                 what it runs",
+                "the command `{}` is named by a variable, a substitution or a placeholder, so \
+                 kGraf cannot tell what it runs",
                 w.escape_debug()
             )
         })
@@ -2192,12 +2195,30 @@ fn push_found(
             push_embedded(&argv, depth + 1, ctx, reading);
         }
         Embedded::Script(script) => {
-            let b = base_name(&words[at]);
-            let same_shell = b == "eval" || SHELLS.contains(&b);
-            let (segments, by_substitution) = split_script_flagged(&script);
-            if by_substitution {
+            let b = program_key(&words[at]);
+            let same_shell = b == "eval" || shell_name(&b).is_some();
+            let split = split_script_parts(&script);
+            if split.by_substitution {
                 reading.unreadable(
                     "a command is named by a substitution, so kGraf cannot tell what it runs"
+                        .into(),
+                );
+            }
+            // A script whose quotes never close, or a command that does not
+            // split into words, is read otherwise by the shell: kGraf
+            // cannot tell its commands, so it never reads it as readable.
+            if split.unbalanced {
+                reading.unreadable(
+                    "a quote or a substitution of the script never closes, so kGraf cannot tell \
+                     its commands"
+                        .into(),
+                );
+            }
+            // fish runs `(...)` as a command substitution anywhere in a word.
+            if shell_name(&b) == Some("fish") && script.contains('(') {
+                reading.unreadable(
+                    "the fish script holds a command substitution, so kGraf cannot tell what it \
+                     runs"
                         .into(),
                 );
             }
@@ -2205,30 +2226,57 @@ fn push_found(
             // files they read (`cd web && npm test` reads web's
             // `package.json`).
             let mut here = ctx.clone();
-            for segment in segments {
-                let words = shlex::split(&segment)
-                    .unwrap_or_else(|| segment.split_whitespace().map(str::to_owned).collect());
-                if words.is_empty() {
-                    continue;
-                }
-                for why in [named_by_expansion(&words), changes_path(&words)]
+            for (segment, body) in split.parts {
+                let words = match shlex::split(&segment) {
+                    Some(w) => w,
+                    None => {
+                        if !body {
+                            reading.unreadable(format!(
+                                "the command `{}` does not split into words, so kGraf cannot \
+                                 tell what it runs",
+                                segment.escape_debug()
+                            ));
+                        }
+                        segment.split_whitespace().map(str::to_owned).collect()
+                    }
+                };
+                for words in split_at_braces(words) {
+                    if words.is_empty() {
+                        continue;
+                    }
+                    for why in [
+                        named_by_expansion(&words),
+                        changes_path(&words),
+                        expanded_program(&words),
+                    ]
                     .into_iter()
                     .flatten()
-                {
-                    reading.unreadable(why);
-                }
-                reading.commands.push(Nested {
-                    depth,
-                    words: words.clone(),
-                    same_shell,
-                    dir: dir_of(&here),
-                });
-                push_embedded(&words, depth + 1, &here, reading);
-                if let Some(moved) = after_directory_change(&words, &here) {
-                    here = moved;
-                }
-                if let Some(assigned) = after_assignment(&words, &here) {
-                    here = assigned;
+                    {
+                        reading.unreadable(why);
+                    }
+                    for value in prompt_assignments(&words) {
+                        push_found(
+                            &words,
+                            0,
+                            Embedded::Script(value),
+                            depth + 1,
+                            &here,
+                            reading,
+                        );
+                    }
+                    reading.commands.push(Nested {
+                        depth,
+                        words: words.clone(),
+                        same_shell,
+                        dir: dir_of(&here),
+                    });
+                    push_embedded(&words, depth + 1, &here, reading);
+                    if let Some(moved) = after_directory_change(&words, &here) {
+                        here = moved;
+                    }
+                    if let Some(assigned) = after_assignment(&words, &here) {
+                        here = assigned;
+                    }
                 }
             }
         }
@@ -2333,10 +2381,151 @@ fn dash_c(args: &[String], long: &[&str]) -> Option<String> {
             }
         }
         if arg.starts_with('-') && !arg.starts_with("--") && arg.contains('c') {
-            return it.next().cloned();
+            // `bash -c -- SCRIPT`: `--` ends the options, and the script
+            // follows it.
+            let next = it.next();
+            if next.is_some_and(|n| n == "--") {
+                return it.next().cloned();
+            }
+            return next.cloned();
         }
     }
     None
+}
+
+/// The shell of [`SHELLS`] a program key ([`program_key`]) names, without
+/// a version suffix (`bash5`, `bash-5.2`, `ksh93`): its `-c` argument is a
+/// script. The key is lowercase, so `SH` and `Bash`, which a
+/// case-insensitive file system runs as `sh` and `bash`, are shells too.
+fn shell_name(key: &str) -> Option<&'static str> {
+    let stem = key.trim_end_matches(|c: char| c.is_ascii_digit() || matches!(c, '.' | '-' | '_'));
+    SHELLS.iter().copied().find(|s| *s == stem)
+}
+
+/// A command's words split where a brace group opens or closes (`{`, `}`)
+/// after its first word: zsh runs `if true { curl x }`, and a word after
+/// `{` is a program in every shell. Each brace word starts the command
+/// after it, where [`command_starts`] skips it.
+fn split_at_braces(words: Vec<String>) -> Vec<Vec<String>> {
+    if !words.iter().skip(1).any(|w| w == "{" || w == "}") {
+        return vec![words];
+    }
+    let mut out: Vec<Vec<String>> = vec![Vec::new()];
+    for (i, w) in words.into_iter().enumerate() {
+        if i > 0 && (w == "{" || w == "}") {
+            out.push(Vec::new());
+        }
+        if let Some(last) = out.last_mut() {
+            last.push(w);
+        }
+    }
+    out
+}
+
+/// Why a command of a script names a program the shell expands into
+/// another name: a program word holding a glob (`/usr/bin/cur?`), a brace
+/// list or range (`cu{r,}l`, `{curl,x}`), or zsh's `=NAME` (the path of
+/// NAME). kGraf cannot tell which program such a word names (decision 0094,
+/// amended 2026-10-06).
+fn expanded_program(words: &[String]) -> Option<String> {
+    let braces = |w: &str| -> bool {
+        w.find('{').is_some_and(|open| {
+            w[open..].find('}').is_some_and(|close| {
+                let inside = &w[open + 1..open + close];
+                inside.contains(',') || inside.contains("..")
+            })
+        })
+    };
+    let roles = command_roles(words);
+    let equals = roles
+        .iter()
+        .map(|&(i, _)| words[i].as_str())
+        .find(|w| w.len() > 1 && w.starts_with('='));
+    let expanded = roles
+        .iter()
+        .filter(|(_, role)| matches!(role, WordRole::Program | WordRole::Wrapper))
+        .map(|&(i, _)| words[i].as_str())
+        .find(|w| {
+            *w != "["
+                && *w != "[["
+                && (w.contains(['*', '?']) || (w.contains('[') && w.contains(']')) || braces(w))
+        });
+    expanded.or(equals).map(|w| {
+        format!(
+            "the program word `{}` is expanded by the shell, so kGraf cannot tell which program \
+             it names",
+            w.escape_debug()
+        )
+    })
+}
+
+/// Variables a shell expands as commands or command substitutions without
+/// a command naming them: the prompts (`PS4` on every traced command with
+/// `set -x`; `PS0`, `PS1`, `PS2` and `PROMPT_COMMAND` in an interactive
+/// shell).
+const PROMPT_VARIABLES: &[&str] = &["PS0", "PS1", "PS2", "PS4", "PROMPT_COMMAND"];
+
+/// The values a command assigns to a [`PROMPT_VARIABLES`] variable, each
+/// read as a script (`PS4='$(curl x)'`).
+fn prompt_assignments(words: &[String]) -> Vec<String> {
+    words
+        .iter()
+        .filter_map(|w| w.split_once('='))
+        .filter(|(name, _)| PROMPT_VARIABLES.contains(name))
+        .map(|(_, value)| value.to_owned())
+        .collect()
+}
+
+/// The placeholder `xargs` fills from its input when it has one: `-I R`,
+/// `-IR`, `-J R` (BSD), `-i[R]` and `--replace[=R]` (`{}` by default).
+fn xargs_placeholder(args: &[String]) -> Option<String> {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--" || !a.starts_with('-') {
+            break;
+        }
+        for name in ["-I", "-J"] {
+            if a == name {
+                return it.next().cloned();
+            }
+            if let Some(v) = a.strip_prefix(name).filter(|v| !v.is_empty()) {
+                return Some(v.to_owned());
+            }
+        }
+        if a == "-i" || a == "--replace" {
+            return Some("{}".to_owned());
+        }
+        if let Some(v) = a
+            .strip_prefix("--replace=")
+            .or_else(|| a.strip_prefix("-i"))
+        {
+            return Some(v.to_owned());
+        }
+    }
+    None
+}
+
+/// Why the command an input filler runs (`xargs`, `find -exec`, `parallel`)
+/// is named by its input: the placeholder stands in its program word, or in
+/// any argument of a program that runs its argument as code (a shell,
+/// `eval`, an interpreter). Elsewhere a placeholder is an argument like any
+/// other (`xargs -I{} cp {} d/`).
+fn placeholder_runs(argv: &[String], placeholder: &str) -> Option<String> {
+    let starts = command_starts(argv);
+    let program = starts.last().copied()?;
+    let key = program_key(&argv[program]);
+    let runs_code = shell_name(&key).is_some()
+        || key == "eval"
+        || code::interpreter(&key).is_some()
+        || matches!(key.as_str(), "cmd" | "powershell" | "pwsh");
+    let named = starts.iter().any(|&i| argv[i].contains(placeholder))
+        || (runs_code && argv[program + 1..].iter().any(|a| a.contains(placeholder)));
+    named.then(|| {
+        format!(
+            "the command it runs is filled in from its input at `{placeholder}`, so kGraf \
+             cannot tell what it runs"
+        )
+    })
 }
 
 /// The string of `env -S STRING` (`--split-string`), which `env` splits into
@@ -2663,7 +2852,7 @@ fn embedded_at(words: &[String], at: usize, ctx: &ReadContext) -> Vec<Embedded> 
     if b == "eval" {
         return vec![Embedded::Script(args.join(" "))];
     }
-    if SHELLS.contains(&b) {
+    if shell_name(&program_key(&words[at])).is_some() {
         if let Some(script) = dash_c(args, &[]) {
             return vec![Embedded::Script(script)];
         }
@@ -2689,7 +2878,12 @@ fn embedded_at(words: &[String], at: usize, ctx: &ReadContext) -> Vec<Embedded> 
                         .position(|w| matches!(w.as_str(), ";" | "\\;" | "+"))
                         .map_or(args.len(), |p| i + 1 + p);
                     if end > i + 1 {
-                        out.push(Embedded::Argv(args[i + 1..end].to_vec()));
+                        let argv = args[i + 1..end].to_vec();
+                        let filled = placeholder_runs(&argv, "{}");
+                        out.push(Embedded::Argv(argv));
+                        if let Some(why) = filled {
+                            out.push(Embedded::Unreadable(format!("`find` {why}")));
+                        }
                     }
                     i = end + 1;
                 } else {
@@ -2834,6 +3028,46 @@ fn embedded_at(words: &[String], at: usize, ctx: &ReadContext) -> Vec<Embedded> 
             }
         }
         "source" | "." => unreadable("runs the commands of a file"),
+        // `xargs -I R CMD`: the wrapper scan reads CMD; a placeholder in
+        // its program word or in code it runs is filled from the input.
+        "xargs" => {
+            let Some(r) = xargs_placeholder(args) else {
+                return Vec::new();
+            };
+            match tails(words.len()).first() {
+                Some(&p) => placeholder_runs(&words[p..], &r)
+                    .map(|why| unreadable(&why))
+                    .unwrap_or_default(),
+                None => Vec::new(),
+            }
+        }
+        // A name the script defines to run something else: `alias c=curl`
+        // runs `curl` as `c`, `hash -p /usr/bin/curl g` runs it as `g`. The
+        // value is read as the command it runs.
+        "alias" => args
+            .iter()
+            .filter_map(|a| a.split_once('='))
+            .map(|(_, v)| Embedded::Script(v.to_owned()))
+            .collect(),
+        "hash" => {
+            let mut out = Vec::new();
+            let mut it = args.iter();
+            while let Some(a) = it.next() {
+                if a == "-p"
+                    && let Some(path) = it.next()
+                {
+                    out.push(Embedded::Argv(vec![path.clone()]));
+                }
+            }
+            out
+        }
+        // Builtins that run text kGraf does not see: history (`fc`), a
+        // loaded builtin (`enable -f`), a function file (`autoload`).
+        "fc" => unreadable("runs commands from the shell's history"),
+        "enable" if args.iter().any(|a| a.starts_with('-') && a.contains('f')) => {
+            unreadable("loads a builtin from a file")
+        }
+        "autoload" => unreadable("loads functions from files kGraf does not read"),
         "env" => env_split_string(args)
             .map(|s| vec![Embedded::Script(s)])
             .unwrap_or_default(),
@@ -2859,10 +3093,18 @@ fn embedded_at(words: &[String], at: usize, ctx: &ReadContext) -> Vec<Embedded> 
                 .iter()
                 .position(sep)
                 .map_or(words.len(), |p| at + p);
-            // GNU parallel hands its command, joined, to a shell.
+            // GNU parallel hands its command, joined, to a shell. Its
+            // placeholders (`{}`, `{.}`, `{1}`) are filled from the input.
             let commands: Vec<Embedded> = tails(end)
                 .into_iter()
-                .map(|p| Embedded::Script(words[p..end].join(" ")))
+                .flat_map(|p| {
+                    let script = words[p..end].join(" ");
+                    let as_words = shlex::split(&script)
+                        .unwrap_or_else(|| script.split_whitespace().map(str::to_owned).collect());
+                    let filled = placeholder_runs(&as_words, "{")
+                        .map(|why| Embedded::Unreadable(format!("`parallel` {why}")));
+                    std::iter::once(Embedded::Script(script)).chain(filled)
+                })
                 .collect();
             if !commands.is_empty() {
                 return commands;
@@ -3082,20 +3324,92 @@ fn split_script(script: &str) -> Vec<String> {
     split_script_flagged(script).0
 }
 
-/// [`split_script`], and whether a command of the script is named by a
-/// command substitution (`$(which curl) x`, `` `echo curl` x ``, `env
-/// $(cmd)`): the substitution's output is the program, which kGraf cannot
-/// read (decision 0094, amended 2026-10-06). A substitution elsewhere in a
-/// command (`echo $(date)`, `x=$(date)`) is split out and read as a command
-/// of its own.
+/// A script split by [`split_script_parts`].
+struct ScriptSplit {
+    /// Each command's text, in order, with a flag for a line of a here-doc
+    /// body: its quotes are literal, so a body line that does not split
+    /// into words is no sign of a misread script.
+    parts: Vec<(String, bool)>,
+    /// A command of the script is named by a command substitution.
+    by_substitution: bool,
+    /// A quote, a `$'...'`, a backquote or a `$(` never closes: the shell
+    /// refuses the script or reads it otherwise, so kGraf cannot tell its
+    /// commands.
+    unbalanced: bool,
+}
+
+/// The word a command substitution leaves in the command around it: a
+/// variable, so a program or a script made of it is named by an expansion
+/// ([`named_by_expansion`]).
+const SUBSTITUTION_WORD: &str = "$__kgraf_substitution";
+
+/// [`split_script`], and whether kGraf cannot tell the script's commands:
+/// a command is named by a command substitution (`$(which curl) x`, ``
+/// `echo curl` x ``, `env $(cmd)`), whose output is the program, or a quote
+/// never closes (decision 0094, amended 2026-10-06). A substitution
+/// elsewhere in a command (`echo $(date)`, `x=$(date)`) is split out and
+/// read as a command of its own.
 fn split_script_flagged(script: &str) -> (Vec<String>, bool) {
-    let mut parts = Vec::new();
+    let split = split_script_parts(script);
+    (
+        split.parts.into_iter().map(|(p, _)| p).collect(),
+        split.by_substitution || split.unbalanced,
+    )
+}
+
+/// One open parenthesis or backquote of [`split_script_parts`].
+enum Opened {
+    /// `$(` or a backquote: the text of the command around it, resumed
+    /// with [`SUBSTITUTION_WORD`] when it closes, and whether double quotes
+    /// were open outside it.
+    Substitution {
+        outer: String,
+        double: bool,
+        backquote: bool,
+    },
+    /// A plain `(`: a subshell, a function's `()`, a process substitution.
+    Group { double: bool },
+}
+
+/// The delimiter of a here-doc whose `<<` is at `chars[at]`, unquoted, and
+/// whether `<<-` strips leading tabs from its body, with the index after
+/// the delimiter.
+fn heredoc_delimiter(chars: &[char], at: usize) -> (String, bool, usize) {
+    let mut j = at + 2;
+    let strip = chars.get(j) == Some(&'-');
+    if strip {
+        j += 1;
+    }
+    while chars.get(j).is_some_and(|c| *c == ' ' || *c == '\t') {
+        j += 1;
+    }
+    let mut delimiter = String::new();
+    while let Some(&d) = chars.get(j) {
+        if d.is_whitespace() || matches!(d, ';' | '|' | '&' | '<' | '>' | '(' | ')') {
+            break;
+        }
+        if !matches!(d, '\'' | '"' | '\\') {
+            delimiter.push(d);
+        }
+        j += 1;
+    }
+    (delimiter, strip, j)
+}
+
+/// Split a script into its commands as a POSIX shell reads it: on `;`,
+/// `&`, `|`, `&&`, `||` and newlines outside quotes, with backslash escapes,
+/// `$'...'`, line continuations, comments, here-doc bodies, and each
+/// command substitution read as a command of its own (decision 0094,
+/// amended 2026-10-06). Every part is read again as words by `shlex`.
+fn split_script_parts(script: &str) -> ScriptSplit {
+    let mut parts: Vec<(String, bool)> = Vec::new();
     let mut cur = String::new();
-    let (mut single, mut double, mut backtick) = (false, false, false);
-    // For each open parenthesis, whether double quotes were open outside
-    // it: `"$(cmd "a b")"` reads the inner quotes afresh, as the shell does.
-    let mut opened: Vec<bool> = Vec::new();
+    let (mut single, mut double, mut ansi) = (false, false, false);
+    let mut opened: Vec<Opened> = Vec::new();
     let mut by_substitution = false;
+    // Here-docs started on the current line: each delimiter, and whether
+    // `<<-` strips leading tabs from the body.
+    let mut heredocs: Vec<(String, bool)> = Vec::new();
     // Whether a substitution opening after `before` stands where the
     // command's program is: the words before it name no program yet.
     let at_program = |before: &str| -> bool {
@@ -3116,49 +3430,187 @@ fn split_script_flagged(script: &str) -> (Vec<String>, bool) {
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
+        if single {
+            single = c != '\'';
+            cur.push(c);
+            i += 1;
+            continue;
+        }
+        if ansi {
+            cur.push(c);
+            if c == '\\' {
+                if let Some(&n) = chars.get(i + 1) {
+                    cur.push(n);
+                }
+                i += 2;
+                continue;
+            }
+            ansi = c != '\'';
+            i += 1;
+            continue;
+        }
         match c {
-            '\'' if !double => single = !single,
-            '"' if !single => double = !double,
+            '\\' => {
+                match chars.get(i + 1) {
+                    // A line continuation joins the lines.
+                    Some('\n') => {}
+                    Some(&n) => {
+                        cur.push(c);
+                        cur.push(n);
+                    }
+                    None => cur.push(c),
+                }
+                i += 2;
+                continue;
+            }
+            '$' if !double && chars.get(i + 1) == Some(&'\'') => {
+                ansi = true;
+                cur.push_str("$'");
+                i += 2;
+                continue;
+            }
+            '\'' if !double => single = true,
+            '"' => double = !double,
+            // A comment runs to the end of the line, where a word starts.
+            '#' if !double && (cur.is_empty() || cur.ends_with(char::is_whitespace)) => {
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            '<' if !double
+                && chars.get(i + 1) == Some(&'<')
+                && chars.get(i + 2) != Some(&'<')
+                && !cur.ends_with('<') =>
+            {
+                let (delimiter, strip, end) = heredoc_delimiter(&chars, i);
+                if !delimiter.is_empty() {
+                    heredocs.push((delimiter, strip));
+                }
+                cur.extend(&chars[i..end]);
+                i = end;
+                continue;
+            }
             // `>&` and `<&` duplicate a descriptor (`2>&1`); they separate
             // nothing.
-            '&' if !single && !double && i > 0 && matches!(chars[i - 1], '>' | '<') => {}
-            ';' | '\n' | '|' | '&' if !single && !double => {
-                parts.push(std::mem::take(&mut cur));
+            '&' if !double && i > 0 && matches!(chars[i - 1], '>' | '<') => {}
+            ';' | '\n' | '|' | '&' if !double => {
+                parts.push((std::mem::take(&mut cur), false));
                 // `&&` and `||` are one separator.
                 if (c == '&' || c == '|') && chars.get(i + 1) == Some(&c) {
                     i += 1;
                 }
                 i += 1;
+                // The bodies of the here-docs this line started. Each line
+                // is read as commands too: an unquoted body runs its
+                // substitutions, and a body a shell reads runs its lines.
+                // Its quotes are literal, so they open nothing.
+                if c == '\n' {
+                    for (delimiter, strip) in std::mem::take(&mut heredocs) {
+                        while i < chars.len() {
+                            let end = chars[i..]
+                                .iter()
+                                .position(|&c| c == '\n')
+                                .map_or(chars.len(), |p| i + p);
+                            let line: String = chars[i..end].iter().collect();
+                            i = (end + 1).min(chars.len());
+                            let bare = if strip {
+                                line.trim_start_matches('\t')
+                            } else {
+                                line.as_str()
+                            };
+                            if bare == delimiter {
+                                break;
+                            }
+                            let inner = split_script_parts(&line);
+                            by_substitution |= inner.by_substitution;
+                            parts.extend(inner.parts.into_iter().map(|(p, _)| (p, true)));
+                        }
+                    }
+                }
                 continue;
             }
-            // `$(...)` and backticks run commands too: split there so the
-            // inner command is seen.
-            '`' if !single => {
-                if !backtick && at_program(&cur) {
-                    by_substitution = true;
+            '`' => {
+                let closes = matches!(
+                    opened.last(),
+                    Some(Opened::Substitution {
+                        backquote: true,
+                        ..
+                    })
+                );
+                if closes {
+                    if let Some(Opened::Substitution {
+                        outer, double: d, ..
+                    }) = opened.pop()
+                    {
+                        parts.push((std::mem::take(&mut cur), false));
+                        cur = outer;
+                        cur.push_str(SUBSTITUTION_WORD);
+                        double = d;
+                    }
+                } else {
+                    if at_program(cur.trim_end_matches('"')) {
+                        by_substitution = true;
+                    }
+                    opened.push(Opened::Substitution {
+                        outer: std::mem::take(&mut cur),
+                        double,
+                        backquote: true,
+                    });
+                    double = false;
                 }
-                backtick = !backtick;
-                parts.push(std::mem::take(&mut cur));
                 i += 1;
                 continue;
             }
-            '(' if !single && (!double || cur.ends_with('$')) => {
-                // `"$(cmd)"` inside double quotes runs `cmd` too.
+            '(' if !double || cur.ends_with('$') => {
                 if cur.ends_with('$') {
+                    // `$(cmd)`, also inside double quotes.
                     cur.pop();
                     if at_program(cur.trim_end_matches('"')) {
                         by_substitution = true;
                     }
+                    opened.push(Opened::Substitution {
+                        outer: std::mem::take(&mut cur),
+                        double,
+                        backquote: false,
+                    });
+                } else {
+                    opened.push(Opened::Group { double });
+                    parts.push((std::mem::take(&mut cur), false));
                 }
-                opened.push(double);
                 double = false;
-                parts.push(std::mem::take(&mut cur));
                 i += 1;
                 continue;
             }
-            ')' if !single && !double => {
-                double = opened.pop().unwrap_or(false);
-                parts.push(std::mem::take(&mut cur));
+            ')' if !double => {
+                match opened.pop() {
+                    Some(Opened::Substitution {
+                        outer,
+                        double: d,
+                        backquote: false,
+                    }) => {
+                        parts.push((std::mem::take(&mut cur), false));
+                        cur = outer;
+                        cur.push_str(SUBSTITUTION_WORD);
+                        double = d;
+                    }
+                    // A `)` inside a backquote substitution closes no
+                    // backquote: the substitution stays open.
+                    Some(
+                        frame @ Opened::Substitution {
+                            backquote: true, ..
+                        },
+                    ) => {
+                        opened.push(frame);
+                        parts.push((std::mem::take(&mut cur), false));
+                    }
+                    Some(Opened::Group { double: d }) => {
+                        parts.push((std::mem::take(&mut cur), false));
+                        double = d;
+                    }
+                    // A `case` pattern's `)`.
+                    None => parts.push((std::mem::take(&mut cur), false)),
+                }
                 i += 1;
                 continue;
             }
@@ -3167,13 +3619,23 @@ fn split_script_flagged(script: &str) -> (Vec<String>, bool) {
         cur.push(c);
         i += 1;
     }
-    parts.push(cur);
+    parts.push((cur, false));
+    let unbalanced = single
+        || double
+        || ansi
+        || opened
+            .iter()
+            .any(|o| matches!(o, Opened::Substitution { .. }));
     let parts = parts
         .into_iter()
-        .map(|p| p.trim().to_owned())
-        .filter(|p| !p.is_empty())
+        .map(|(p, body)| (p.trim().to_owned(), body))
+        .filter(|(p, _)| !p.is_empty())
         .collect();
-    (parts, by_substitution)
+    ScriptSplit {
+        parts,
+        by_substitution,
+        unbalanced,
+    }
 }
 
 /// The program a simple command runs: its first word that is not a
@@ -3189,7 +3651,8 @@ fn program_of_command(words: &[String]) -> Option<&str> {
 /// or a subshell opened or closed, `!`, and the keywords that begin a clause
 /// (`if curl x; then curl y; fi` runs `curl` twice). Never a program.
 const COMMAND_SYNTAX: &[&str] = &[
-    "{", "}", "(", ")", "!", "if", "then", "else", "elif", "while", "until", "do", "time", "coproc",
+    "{", "}", "(", ")", "!", "if", "then", "else", "elif", "while", "until", "do", "time",
+    "coproc", "repeat",
 ];
 
 /// Leading words that run the rest of the command as a command: as another
@@ -3238,6 +3701,10 @@ const WRAPPERS: &[&str] = &[
     "systemd-run",
     "dbus-run-session",
     "faketime",
+    "cross-env",
+    "xcrun",
+    "rlwrap",
+    "eatmydata",
 ];
 
 /// Wrappers whose first operand comes before the command they run
@@ -3249,7 +3716,11 @@ const OPERAND_WRAPPERS: &[&str] = &["timeout", "chroot", "flock", "taskset", "ch
 /// `>>`, `&>`, `<`, `>&`): empty when the target is the next word, `None`
 /// when `word` is not a redirection.
 fn redirection(word: &str) -> Option<&str> {
-    let rest = word.trim_start_matches(|c: char| c.is_ascii_digit());
+    // A descriptor number (`2>`) or a variable bash stores it in (`{fd}>`).
+    let rest = match word.strip_prefix('{').and_then(|r| r.split_once('}')) {
+        Some((name, rest)) if name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') => rest,
+        _ => word.trim_start_matches(|c: char| c.is_ascii_digit()),
+    };
     if !(rest.starts_with('>') || rest.starts_with('<') || rest.starts_with("&>")) {
         return None;
     }
@@ -3290,6 +3761,10 @@ fn command_roles<S: AsRef<str>>(words: &[S]) -> Vec<(usize, WordRole)> {
             target_due = false;
             WordRole::Prefix
         } else if COMMAND_SYNTAX.contains(&w) {
+            WordRole::Prefix
+        } else if w == "function" {
+            // `function NAME { ... }`: the name is no program.
+            target_due = true;
             WordRole::Prefix
         } else if let Some(rest) = redirection(w) {
             target_due = rest.is_empty();
@@ -4750,6 +5225,26 @@ fn subjects_of(reading: &CallReading) -> Vec<String> {
             if !out.contains(&line) {
                 out.push(line);
             }
+            // The program by its name alone, as a rule names it: a path
+            // (`/usr/bin/curl`), another case (`CURL`, which a
+            // case-insensitive file system runs as `curl`) or a Windows
+            // extension (`curl.exe`) runs the same program.
+            let key = program_key(&command[at]);
+            if !key.is_empty() && key != command[at] {
+                let mut named = vec![key];
+                named.extend(command[at + 1..].iter().cloned());
+                let line = named.join(" ");
+                if !out.contains(&line) {
+                    out.push(line);
+                }
+            }
+            // `git [GLOBAL OPTIONS] SUBCOMMAND` as `git SUBCOMMAND`, so a
+            // rule on the subcommand matches past the options.
+            if let Some(line) = git::normalized(command, at).map(|w| w.join(" "))
+                && !out.contains(&line)
+            {
+                out.push(line);
+            }
         }
     }
     out
@@ -5360,6 +5855,10 @@ pub fn group_requests<T: Raised + Clone>(items: &[T]) -> Vec<Vec<T>> {
 #[cfg(test)]
 #[path = "permissions_prefix_tests.rs"]
 mod prefix_tests;
+
+#[cfg(test)]
+#[path = "permissions_review_tests.rs"]
+mod review_tests;
 
 #[cfg(test)]
 #[path = "permission_names_tests.rs"]

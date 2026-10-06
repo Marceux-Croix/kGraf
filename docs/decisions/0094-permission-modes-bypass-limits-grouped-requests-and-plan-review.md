@@ -1559,3 +1559,60 @@ starting `curl`, or one kGraf cannot find, is asked about); `permissions.rs`
 `a_wrapped_command_is_granted_with_every_program_it_runs` (a hosted run through the real ask
 path). Each regression test fails with its part of the change reverted and passes with it
 restored.
+
+## Amendment (2026-10-06, third): the readers close more ways a program was run past a rule
+
+Spellings of a command that still ran a program past `deny = ["shell(curl*)"]` in every mode,
+Bypass included, are now refused (the program is read and the rule matches) or asked about in
+every mode (kGraf cannot read it, and a shell rule with a pattern exists); fail closed, never
+readable-and-empty.
+
+- **Script quoting.** The script splitter tracks single quotes, double quotes, `$'...'`, line
+  continuations, comments and here-doc bodies, and reads each command substitution as a
+  command of its own. A quote or substitution that never closes, and a command that does not
+  split into words, make the script unreadable instead of being read as a split on spaces. A
+  here-doc body's lines are read as commands. `eval "$(...)"` and `bash -c "$(...)"` are
+  unreadable.
+- **A program the shell expands.** A program word holding a glob (`/usr/bin/cur?`), a brace
+  list or range (`cu{r,}l`) or zsh's `=NAME` is unreadable. A fish script holding `(...)` is
+  unreadable.
+- **A rule matches its program by path, case and extension.** A subject is also offered under
+  the program's base name, lowercased and without a Windows extension, so `/usr/bin/curl`,
+  `CURL` and `Curl.exe` all match `shell(curl*)`.
+- **More shells, more names.** `ash`, `mksh`, `lksh`, `oksh`, `pdksh`, `posh`, `yash`,
+  `rbash`, `bosh`, a versioned name (`bash5`, `bash-5.2`) and another case (`SH`, `Bash`) read
+  their `-c` script; `bash -c -- SCRIPT` reads past the `--`.
+- **Names the script defines.** `alias c=curl; c x` and `hash -p /usr/bin/curl g; g x` read
+  the value as the command it runs; a `function NAME { ... }` name is no program; `fc`,
+  `enable -f`, `autoload` and a `PS4`/`PROMPT_COMMAND` assignment are read or made unreadable.
+- **Placeholders filled from input.** A `{}` (xargs `-I`/`-i`/`--replace`/`-J`), a `find
+  -exec {}` and a `parallel {}` that stands in the program word, or in code an inner shell or
+  interpreter runs, is unreadable; an ordinary placeholder argument (`xargs -I{} cp {} d/`) is
+  read as before.
+- **Tool wrappers.** `cross-env`, `xcrun`, `rlwrap` and `eatmydata` run the command after
+  their options.
+- **git global options.** A rule on a subcommand matches past the global options: `git -c
+  a=b push`, `git -C . push`, `git --no-pager push` and `git --git-dir=.git push` are offered
+  the subject `git push`.
+- **An install runs the project's own lifecycle scripts.** `npm install` (and `i`, `ci`,
+  `add`, `rebuild`), `npm publish` and `npm pack`, and the pnpm, yarn and bun equivalents, run
+  the project's own `preinstall`, `install`, `postinstall`, `prepare` family, `prepublishOnly`
+  and `prepack`/`postpack` scripts. Dependency lifecycle scripts are still not read.
+- **Interpreter code.** Numeric escapes in a command string are decoded (`\x72`, `r`,
+  `\u{72}`, `\U00000072`, `\162`, and the C escapes). A spawning module reached as another
+  module's attribute (`shutil.os.system`, `asyncio.subprocess`, `distutils.spawn`) is read; a
+  spawning function called through `__call__` is a value; Python's `webbrowser` is opaque. In
+  JavaScript, `require` reached as a method, a dynamic `import()` handed on, and
+  `process.dlopen` are handled. Ruby's `Kernel.\`` called by name and `IO.read`, `readlines`,
+  `write` and `foreach` of a `"|cmd"` path are read. PHP's `FFI::cdef(...)` is unreadable.
+  `osascript -l JavaScript` (JXA) is unreadable.
+- **The refusal names the inner program.** A rule that matches a command inside a recipe, a
+  script or a configuration value now names the inner program (`curl`) in the refusal record,
+  not the recipe runner (`make`): the refusal subjects are read with the worker's worktree.
+
+Known limits: the window between a file's review and the command's exec is narrowed, not
+closed; third-party task chainers (`npm-run-all`, `run-s`) and debugger, profiler and
+file-watcher wrappers (`gdb --args`, `perf stat`, `entr`) are opaque and ask in every attended
+mode; environment variables that name a command (`EDITOR`, `PAGER`, `MANPAGER`, `LESSOPEN`)
+are read only for git; bash's `/dev/tcp` redirection is network egress no `shell(curl*)` rule
+names.
