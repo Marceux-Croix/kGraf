@@ -826,16 +826,54 @@ async fn an_instructions_report_about_a_sibling_contracts_file_is_answered_not_a
     );
 }
 
-/// A worker that finished after a refusal it never retried, or a contract
-/// whose check is `true`, is reported unverified, never plainly done.
+/// A worker refused `cp` that wrote the file another way, and whose real
+/// check then passed, is verified: the refusal is kept as a notice and a
+/// trace `notice` event, never dropped and never an unverified mark
+/// (decision 0093, amended 2026-10-05). The shape seen in a real run: a
+/// worker refused `grep` of its own edit ran `cargo test`, which passed,
+/// and the contract was reported unverified.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_refused_then_finished_worker_or_a_vacuous_check_is_unverified() {
-    let manual = || control(kgraf_tools::PermissionMode::Manual);
+async fn a_refusal_beside_a_passing_check_is_a_fact_not_an_unverified_mark() {
     let (report, trace, _) = run(
         Worker::RefusedThenWrites,
-        manual(),
+        control(kgraf_tools::PermissionMode::Manual),
         "test -f a.txt",
-        "sf-unverified",
+        "sf-refused-verified",
+    )
+    .await;
+    assert_eq!(
+        report.status,
+        kgraf_orchestrator::RunStatus::Completed,
+        "{report:?}\n{trace}"
+    );
+    assert_eq!(report.verified, vec!["a".to_owned()], "{report:?}");
+    assert!(report.unverified.is_empty(), "{report:?}");
+    assert!(!trace.contains(r#""event":"unverified""#), "{trace}");
+    let fact = "contract a: verified by `test -f a.txt`; the worker finished after a policy \
+                refused `cp` and never ran it";
+    assert!(
+        report.notices.iter().any(|n| n == fact),
+        "{:?}",
+        report.notices
+    );
+    assert!(
+        trace
+            .lines()
+            .any(|l| l.contains(r#""event":"notice""#) && l.contains(fact)),
+        "{trace}"
+    );
+}
+
+/// A contract whose check is `true` is reported unverified, never plainly
+/// done, and a refusal its worker never retried is part of the reason, not
+/// a notice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refusal_beside_a_vacuous_check_is_unverified() {
+    let (report, trace, _) = run(
+        Worker::RefusedThenWrites,
+        control(kgraf_tools::PermissionMode::Manual),
+        "true",
+        "sf-refused-vacuous",
     )
     .await;
     assert_eq!(
@@ -845,13 +883,43 @@ async fn a_refused_then_finished_worker_or_a_vacuous_check_is_unverified() {
     );
     assert_eq!(report.unverified.len(), 1, "{report:?}");
     assert_eq!(report.unverified[0].0, "a");
-    assert!(
-        report.unverified[0].1.contains("never ran it") && report.unverified[0].1.contains("`cp`"),
-        "{:?}",
-        report.unverified
+    assert_eq!(
+        report.unverified[0].1,
+        "the acceptance command `true` checks nothing; the worker finished after a policy \
+         refused `cp` and never ran it"
     );
     assert!(trace.contains(r#""event":"unverified""#), "{trace}");
+    assert!(
+        !report.notices.iter().any(|n| n.contains("verified by")),
+        "{:?}",
+        report.notices
+    );
+}
 
+/// A refused worker whose check fails merges nothing, so nothing is
+/// reported verified beside the refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refusal_beside_a_failing_check_is_never_called_verified() {
+    let (report, trace, _) = run(
+        Worker::RefusedThenWrites,
+        control(kgraf_tools::PermissionMode::Manual),
+        "test -f never.txt",
+        "sf-refused-fails",
+    )
+    .await;
+    assert!(report.verified.is_empty(), "{report:?}\n{trace}");
+    assert!(
+        !report.notices.iter().any(|n| n.contains("verified by")),
+        "{:?}",
+        report.notices
+    );
+}
+
+/// A contract whose check is `true` is unverified with no refusal at all; a
+/// real check with none is plainly verified.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_vacuous_check_is_unverified_and_a_real_one_is_not() {
+    let manual = || control(kgraf_tools::PermissionMode::Manual);
     let (report, _, _) = run(Worker::Writes, manual(), "true", "sf-vacuous").await;
     assert_eq!(report.status, kgraf_orchestrator::RunStatus::Completed);
     assert_eq!(report.unverified.len(), 1, "{report:?}");
@@ -1060,6 +1128,21 @@ async fn a_held_shortfall_whose_in_scope_result_verifies_is_merged_and_kept_as_a
         .unwrap_or_else(|| panic!("the shortfall is kept as a fact: {report:?}"));
     assert!(fact.contains("`test -f a.txt`"), "{fact}");
     assert!(fact.contains("cfg.toml"), "{fact}");
+    // The refused write is a fact on a verified contract, not an unverified
+    // mark, and the attempt the orchestrator cancelled is not said to have
+    // finished.
+    assert!(report.unverified.is_empty(), "{report:?}");
+    let refused = report
+        .notices
+        .iter()
+        .find(|n| n.starts_with("contract a: verified by `test -f a.txt`;"))
+        .unwrap_or_else(|| panic!("the refusal is kept as a fact: {report:?}"));
+    assert!(
+        refused.contains(
+            "the worker was cancelled after a policy refused `apply_patch` on `cfg.toml`"
+        ),
+        "{refused}"
+    );
     assert!(!script.saw_grant.load(Ordering::SeqCst), "nothing granted");
     assert_eq!(script.attempts.load(Ordering::SeqCst), 1, "one attempt");
     assert!(

@@ -615,9 +615,11 @@ pub struct RunStateRecord {
     #[serde(default)]
     pub consumer_tests: crate::consumer_tests::ConsumerTestBook,
     /// Verified contracts whose acceptance says nothing about the work
-    /// (decision 0093): the check always passes, or the accepted worker
-    /// finished after a policy refused a call it never ran. Contract id to
-    /// reason. The run reports them as unverified, never as plainly done.
+    /// (decision 0093, amended 2026-10-05): the check always passes and no
+    /// gate command ran beside it. A refusal the worker never retried is part
+    /// of the reason; beside a real check that passed it is a notice instead.
+    /// Contract id to reason. The run reports them as unverified, never as
+    /// plainly done.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub unverified: BTreeMap<String, String>,
     /// Times the whole plan was sent back to the planner because the

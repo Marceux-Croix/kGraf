@@ -321,8 +321,9 @@ pub struct WorkerResult {
     /// Calls a policy refused (the write scope, the command policy, a skill's
     /// `allowed-tools`, an unattended approval, a fence), each with whether a
     /// later call of the same capability ran without error (decision 0093).
-    /// An attempt that finished with an unretried refusal is reported
-    /// unverified. Serde-defaulted so an older record still loads.
+    /// An accepted attempt's unretried refusal is reported: as part of its
+    /// unverified reason when its check checks nothing, else as a notice.
+    /// Serde-defaulted so an older record still loads.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub refused: Vec<crate::shortfall::RefusedCall>,
     /// The runtime's compaction notice, when this worker compacted (decision

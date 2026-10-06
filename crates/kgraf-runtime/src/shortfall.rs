@@ -14,8 +14,9 @@
 //!   refusal by its capability ([`capability_of`]: the program for a shell
 //!   call, the tool name otherwise), the policy that refused it, the path a
 //!   write-scope refusal named, and whether a later call of the same
-//!   capability ran without error. The orchestrator reports an attempt that
-//!   finished with an unretried refusal as unverified.
+//!   capability ran without error. The orchestrator reports an unretried
+//!   refusal of an accepted attempt: in its unverified reason when the check
+//!   checks nothing, else as a notice beside the verified contract.
 //! - **A report is grounded in the record.** While the worker runs, its
 //!   refusals are mirrored into a [`RefusalDirectory`] the run's
 //!   `report_shortfall` reads, so the orchestrator decides on what a policy

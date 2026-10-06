@@ -243,3 +243,54 @@ Tests: `kgraf-host` `shortfall_tests.rs`
 `a_held_shortfall_whose_in_scope_result_verifies_is_merged_and_kept_as_a_fact`,
 `a_held_shortfall_whose_in_scope_result_fails_its_check_stays_held`,
 `a_vacuous_check_does_not_overrule_a_held_shortfall`.
+
+## Amendment (2026-10-05): a refusal beside a real check that passed is a fact, not an unverified mark
+
+A worker added a trait with `apply_patch`, read the file back, then tried
+`sh -c 'grep -q "pub trait Greeter" src/lib.rs && ...'` to check its own edit. Manual mode with
+nobody attending denied it, because `grep` is not on the build and test allowlist. The worker
+then ran `cargo test` (exit 0) and finished. The contract's `cargo test` passed, the change
+merged, and the root gate passed, yet kGraf printed "unverified c1: the worker finished after a
+policy refused `grep` and never ran it". In recorded local runs, every `unverified` line came
+from such a refusal (of `sh`, `bash`, `cd`, `grep`, `diff`, `od` or a `cargo` form, each a
+self-check or a build the acceptance command repeated), none from a check that checks nothing,
+and where an independent check existed it passed.
+
+- **The rule.** `unverified` means kGraf could not confirm the work. A check that always passes,
+  with no gate command beside it, confirms nothing: the contract is unverified, and a refusal its
+  worker never retried is added to the reason, as before. A real check that passed did confirm
+  the work: the verifier runs it on the committed change whatever the worker did, so a call the
+  worker did not make does not weaken it. The contract is verified, and the refusals the worker
+  never retried are kept as a fact: a `notice` line and a trace `notice` event, "contract c1:
+  verified by `cargo test`; the worker finished after a policy refused `grep` and never ran it"
+  (`accepted_standing` in `kgraf-orchestrator/src/shortfall.rs`). A check deferred to the root
+  gate counts as real: the run cannot complete until that gate passes.
+- **The verb follows the worker's outcome.** A merged attempt that the orchestrator cancelled
+  after its shortfall report (the previous amendment) read "the worker finished after ...". It
+  now reads "was cancelled", and the other outcomes read "ran out of rounds", "stalled", "handed
+  its work back" or "failed". A refusal that named a path is named with it ("`apply_patch` on
+  `cfg.toml`"), because the tool itself may have run before.
+- **Fail loud holds.** No refusal is hidden: it is in the unverified reason, or in a notice and
+  the trace. A check that fails still merges nothing. The verifier, not the worker's trajectory,
+  decides whether the contract is met.
+- **What is given up.** A worker refused the program its task needed, that worked around it, and
+  whose check is weak but not vacuous (`test -f answer.txt`), is now reported verified with a
+  notice. That check is weak with or without a refusal, and marking every refused self-check
+  unverified made the mark noise in Manual mode. The Terminal-Bench bridge, which uses `true`, is
+  still unverified.
+
+Rejected: keeping the mark only when the worker changed files after the refusal. A successful
+shell call can write, so this needs a tree comparison after each call, and a worker's next call
+is often a shell call (`cargo test`) that writes `target/`. Rejected: the stricter reading of the
+option "Fail a contract whose worker was refused and finished" above. It was written for a `true`
+check, and its own words give the reason kept here: the work may be right, because the worker
+found another way within policy or the refused call was incidental.
+
+Tests: `kgraf-orchestrator` `shortfall.rs`
+`a_vacuous_check_is_unverified_and_a_refusal_beside_a_real_check_is_a_fact`,
+`a_refusal_names_how_the_worker_ended`; `kgraf-host` `shortfall_tests.rs`
+`a_refusal_beside_a_passing_check_is_a_fact_not_an_unverified_mark`,
+`a_refusal_beside_a_vacuous_check_is_unverified`,
+`a_refusal_beside_a_failing_check_is_never_called_verified`,
+`a_vacuous_check_is_unverified_and_a_real_one_is_not`, and
+`a_held_shortfall_whose_in_scope_result_verifies_is_merged_and_kept_as_a_fact`.

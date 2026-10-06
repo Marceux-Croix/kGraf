@@ -1357,7 +1357,8 @@ pub struct RunReport {
     /// nothing they name was merged.
     pub notices: Vec<String>,
     /// Verified contracts whose acceptance says nothing about the work, with
-    /// why (decision 0093). A run with any is completed but unverified.
+    /// why (decision 0093): the check always passes and no gate command ran.
+    /// A run with any is completed but unverified.
     pub unverified: Vec<(String, String)>,
 }
 
@@ -7125,27 +7126,44 @@ impl RunLoop {
                 }
             }
             let result = flight.attempts[winner].result.clone();
-            // Decision 0093: accepted on a check that says nothing about the
-            // work (it always passes, or the worker finished after a policy
-            // refused a call it never ran): reported unverified.
-            if let Some(Verdict::Pass { by, .. }) = &flight.attempts[winner].verdict
-                && let Some(reason) = crate::shortfall::unverified_reason(
+            // Decision 0093 (amended 2026-10-05): accepted on a check that
+            // says nothing about the work is reported unverified, with any
+            // refusal the worker never retried as part of the reason. A
+            // refusal on an attempt whose real check passed is reported as a
+            // notice: the check confirmed the work, and the refusal is a fact.
+            if let Some(Verdict::Pass { by, .. }) = &flight.attempts[winner].verdict {
+                let standing = crate::shortfall::accepted_standing(
+                    &id,
                     by,
                     !contract.gate_commands.is_empty(),
                     result.as_ref(),
-                )
-            {
-                let at = self.now();
-                self.trace(TraceEvent::Unverified {
-                    at_ms: at,
-                    contract: id.clone(),
-                    worker: flight.attempts[winner].worker.to_string(),
-                    reason: reason.clone(),
-                })
-                .await?;
-                self.record
-                    .unverified
-                    .insert(id.clone(), kgraf_secrets::scrub_persist_owned(reason));
+                );
+                let worker = flight.attempts[winner].worker.to_string();
+                if let Some(reason) = standing.unverified {
+                    let at = self.now();
+                    self.trace(TraceEvent::Unverified {
+                        at_ms: at,
+                        contract: id.clone(),
+                        worker: worker.clone(),
+                        reason: reason.clone(),
+                    })
+                    .await?;
+                    self.record
+                        .unverified
+                        .insert(id.clone(), kgraf_secrets::scrub_persist_owned(reason));
+                }
+                if let Some(detail) = standing.refusal_notice {
+                    let detail = kgraf_secrets::scrub_persist_owned(detail);
+                    self.notices.insert(detail.clone());
+                    let at = self.now();
+                    self.trace(TraceEvent::Notice {
+                        at_ms: at,
+                        contract: id.clone(),
+                        worker,
+                        detail,
+                    })
+                    .await?;
+                }
             }
             self.announce_verified(&contract, result.as_ref()).await?;
             self.clear_wait(&id);

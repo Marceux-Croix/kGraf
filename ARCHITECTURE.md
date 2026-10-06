@@ -1312,8 +1312,8 @@ a script of allowlisted cargo commands, with or without that `cd`, is a build in
 every mode; the shell tool checks the `cd` target on disk and runs the
 allowlist's checks in the directory each cargo command starts in before the
 script runs. A script refused whole records the programs it held and counts as
-retried once each has run, so its contract is not reported unverified when the
-worker ran them as argv. The user may turn on each such construct group (variables, subshells,
+retried once each has run, so it is not reported as a refusal never retried
+when the worker ran them as argv. The user may turn on each such construct group (variables, subshells,
 background jobs, input redirects, escapes, outside redirects; all off by
 default) in Settings, `permissions.toml` or `--script-constructs`, never
 `run.json`. Settings > Permissions also holds the rule editor
@@ -1406,9 +1406,7 @@ contract for shortfalls. A shortfall the orchestrator would hold is verified fir
 approves the plan in the box. On the command line, which nobody attends, a new
 run with plan review on and no `--approve-plan` is refused before the project is
 opened, so it creates no state, branch or trace (decision 0094, amended
-2026-10-02). A contract accepted on a check that always
-passes, or after a refusal its worker never retried, is reported unverified
-(decision 0093). A dependency missing from the local cargo cache is fetched by the host, outside
+2026-10-02). A contract accepted on a check that always passes (and no gate command) is reported unverified, with any refusal its worker never retried in the reason. A refusal its worker never retried beside a real check that passed is a notice and a trace `notice` event ("verified by `<check>`; the worker finished after a policy refused `<program>` and never ran it"), not an unverified mark: the check ran on the committed change whatever the worker did. The verb follows how the worker ended, so an attempt cancelled after its report is not said to have finished (decision 0093, amended 2026-10-05). A dependency missing from the local cargo cache is fetched by the host, outside
 the sandbox, only with the project's consent, checked at every run start
 before anything is built (decision 0087). An attempt that changed no file is
 refused when a declared Rust write target holds only placeholder bodies, and

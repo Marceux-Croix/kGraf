@@ -915,10 +915,16 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   unless `--approve-plan` approves the plan for you. On the command line the refusal comes
   before kGraf opens the project: it prints the refusal alone and creates no `.kgraf`, database,
   branch or worktree, and leaves what earlier runs made as it was.
-- A contract whose check always passes (`--verify true`, `:`, `exit 0`), or whose worker
-  finished after a policy refused a call it never ran, is printed as `unverified <id>:
-  <reason>` after the `verified` line. The run still completes; the line says the check did
-  not look at the work. A refusal names the program a rule matched: `sh -c "mkdir x && python3
+- A contract whose check always passes (`--verify true`, `:`, `exit 0`) is printed as
+  `unverified <id>: <reason>` after the `verified` line. The run still completes; the line says
+  the check did not look at the work. If the worker also finished after a policy refused a call
+  it never ran, the reason says so too.
+- A contract whose real check passed, but whose worker finished after a policy refused a call
+  it never ran, is verified, and the refusal is printed as a `notice` line, for example
+  "notice contract c1: verified by `cargo test`; the worker finished after a policy refused
+  `grep` and never ran it". The check ran on the committed change, so the call the worker did not make does not
+  weaken it; the notice keeps the refusal in view. A worker the orchestrator stopped after a
+  shortfall report reads "was cancelled", not "finished". A refusal names the program a rule matched: `sh -c "mkdir x && python3
   ..."` under a deny rule on `python3` is a refusal of `python3` (0094). Only a refusal that
   matched one command does that (your deny or ask rule, the deletion limit, or the mode naming
   the command of a script it did not grant). A skill's `allowed-tools`, or a rule on the whole

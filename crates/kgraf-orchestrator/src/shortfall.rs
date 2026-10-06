@@ -766,41 +766,99 @@ pub fn vacuous_check(command: &str) -> bool {
     )
 }
 
-/// Why an accepted attempt is unverified, if it is: its check always passes
-/// (and no gate command of the contract ran beside it, `gate_checked`), or
-/// its worker finished after a policy refused a call it never ran
-/// successfully afterwards.
-pub fn unverified_reason(
+/// What an accepted attempt's check and its worker's refusals say about it
+/// (decision 0093 point 8, amended 2026-10-05).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AcceptedStanding {
+    /// Why kGraf could not confirm the work, if it could not: reported as
+    /// `unverified <id>: <reason>`.
+    pub unverified: Option<String>,
+    /// The refusals the worker never retried, on an attempt whose check did
+    /// confirm the work: a fact the run reports as a notice, not a doubt
+    /// about the check.
+    pub refusal_notice: Option<String>,
+}
+
+/// How an accepted attempt stands: unverified, or verified with its
+/// unretried refusals kept as a fact.
+///
+/// `verified_by` is the passing verdict's `by`; `gate_checked` says a gate
+/// command of the contract ran beside it.
+///
+/// - **Unverified** when the check confirms nothing: it always passes
+///   ([`vacuous_check`]) and no gate command ran. An unretried refusal is
+///   then part of the reason: with no check to say otherwise, a worker that
+///   went on without the refused call may have guessed (the case that caused
+///   the rule: a worker refused `python3` wrote an empty answer and a `true`
+///   check accepted it).
+/// - **Verified, with a fact** when a real check passed and the worker never
+///   ran a refused call afterwards. The check runs on the committed change
+///   whatever the worker did, so a call the worker did not make does not
+///   weaken it. The usual case is a refused self-check (`grep` of the
+///   worker's own edit, then the acceptance command). A check deferred to the
+///   root gate counts as real: the run cannot complete until that gate
+///   passes. The refusal is still reported, as a notice and a trace `notice`
+///   event.
+///
+/// The verb follows the worker's outcome, so an attempt cancelled after its
+/// report (a held shortfall verified in scope) is never said to have
+/// finished.
+pub fn accepted_standing(
+    contract: &str,
     verified_by: &str,
     gate_checked: bool,
     result: Option<&WorkerResult>,
-) -> Option<String> {
-    let mut reasons = Vec::new();
-    if !gate_checked && vacuous_check(verified_by) {
-        reasons.push(format!(
-            "the acceptance command `{}` checks nothing",
-            verified_by.trim()
-        ));
-    }
-    if let Some(r) = result {
-        let unretried: BTreeSet<&str> = r
+) -> AcceptedStanding {
+    let refused = result.and_then(|r| {
+        // A refusal that named a path (a write scope, a rule on a file
+        // tool) is named by it: the tool itself may have run before it.
+        let unretried: BTreeSet<String> = r
             .refused
             .iter()
             .filter(|c| !c.retried_ok)
-            .map(|c| c.capability.as_str())
+            .map(|c| match &c.path {
+                Some(path) => format!("`{}` on `{path}`", c.capability),
+                None => format!("`{}`", c.capability),
+            })
             .collect();
-        if !unretried.is_empty() {
-            reasons.push(format!(
-                "the worker finished after a policy refused {} and never ran it",
-                unretried
-                    .iter()
-                    .map(|c| format!("`{c}`"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-        }
+        (!unretried.is_empty()).then(|| {
+            format!(
+                "the worker {} after a policy refused {} and never ran it",
+                outcome_verb(&r.outcome),
+                unretried.into_iter().collect::<Vec<_>>().join(", ")
+            )
+        })
+    });
+    let by = verified_by.trim();
+    if gate_checked || !vacuous_check(verified_by) {
+        return AcceptedStanding {
+            unverified: None,
+            refusal_notice: refused
+                .map(|r| format!("contract {contract}: verified by `{by}`; {r}")),
+        };
     }
-    (!reasons.is_empty()).then(|| reasons.join("; "))
+    let checks_nothing = format!("the acceptance command `{by}` checks nothing");
+    AcceptedStanding {
+        unverified: Some(match refused {
+            Some(r) => format!("{checks_nothing}; {r}"),
+            None => checks_nothing,
+        }),
+        refusal_notice: None,
+    }
+}
+
+/// How a worker's run ended, as the past-tense verb of an unverified reason
+/// or a refusal notice.
+fn outcome_verb(outcome: &kgraf_runtime::WorkerOutcome) -> &'static str {
+    use kgraf_runtime::WorkerOutcome as O;
+    match outcome {
+        O::Completed => "finished",
+        O::HandedBack { .. } => "handed its work back",
+        O::BudgetExhausted => "ran out of rounds",
+        O::Stalled { .. } => "stalled",
+        O::Cancelled => "was cancelled",
+        O::Failed { .. } => "failed",
+    }
 }
 
 /// Cap a worker-written field and scrub it for storage.
@@ -2125,21 +2183,89 @@ mod tests {
         assert!(matches!(d, ShortfallDecision::Hold { .. }), "{d:?}");
     }
 
+    /// A vacuous check is unverified, with an unretried refusal in its
+    /// reason; a real check that passed is verified, and an unretried
+    /// refusal beside it is a notice, never dropped (decision 0093, amended
+    /// 2026-10-05). The shape seen in a real run: a worker refused
+    /// `grep` of its own edit ran `cargo test`, which passed, and the
+    /// contract was reported unverified.
     #[test]
-    fn a_vacuous_check_or_an_unretried_refusal_is_unverified() {
+    fn a_vacuous_check_is_unverified_and_a_refusal_beside_a_real_check_is_a_fact() {
         assert!(vacuous_check("true"));
         assert!(vacuous_check("  exit 0 "));
         assert!(!vacuous_check("test -f /app/answer.txt"));
         let mut r = WorkerResult::bare("t", "w", kgraf_runtime::WorkerOutcome::Completed);
-        assert_eq!(unverified_reason("cargo test", false, Some(&r)), None);
+        let clean = accepted_standing("c1", "cargo test", false, Some(&r));
+        assert_eq!(clean, AcceptedStanding::default());
         // A remediation's gate commands ran beside a `true` acceptance.
-        assert_eq!(unverified_reason("true", true, Some(&r)), None);
-        r.refused.push(refused_program("python3", "access"));
-        let reason = unverified_reason("cargo test", false, Some(&r)).expect("unverified");
-        assert!(reason.contains("`python3`"), "{reason}");
+        assert_eq!(
+            accepted_standing("c1", "true", true, Some(&r)),
+            AcceptedStanding::default()
+        );
+        assert!(
+            accepted_standing("c1", "true", false, None)
+                .unverified
+                .is_some_and(|u| u.contains("checks nothing"))
+        );
+
+        r.refused.push(refused_program("grep", "user"));
+        let real = accepted_standing("c1", "cargo test", false, Some(&r));
+        assert_eq!(real.unverified, None, "{real:?}");
+        assert_eq!(
+            real.refusal_notice.as_deref(),
+            Some(
+                "contract c1: verified by `cargo test`; the worker finished after a policy \
+                 refused `grep` and never ran it"
+            )
+        );
+        // Deferred to the root gate, which must pass before the run completes.
+        let deferred = accepted_standing(
+            "c1",
+            "cargo test (deferred to the root gate)",
+            false,
+            Some(&r),
+        );
+        assert_eq!(deferred.unverified, None, "{deferred:?}");
+        assert!(deferred.refusal_notice.is_some());
+
+        let vacuous = accepted_standing("c1", "true", false, Some(&r));
+        assert_eq!(vacuous.refusal_notice, None);
+        assert_eq!(
+            vacuous.unverified.as_deref(),
+            Some(
+                "the acceptance command `true` checks nothing; the worker finished after a \
+                 policy refused `grep` and never ran it"
+            )
+        );
+
+        // A refusal retried successfully is neither.
         r.refused[0].retried_ok = true;
-        assert_eq!(unverified_reason("cargo test", false, Some(&r)), None);
-        assert!(unverified_reason("true", false, None).is_some());
+        assert_eq!(
+            accepted_standing("c1", "cargo test", false, Some(&r)),
+            AcceptedStanding::default()
+        );
+    }
+
+    /// An attempt cancelled after its report (a held shortfall verified in
+    /// scope) is never said to have finished.
+    #[test]
+    fn a_refusal_names_how_the_worker_ended() {
+        let mut r = WorkerResult::bare("t", "w", kgraf_runtime::WorkerOutcome::Cancelled);
+        r.refused.push(refused_path("Cargo.toml"));
+        let s = accepted_standing("c10", "cargo test", false, Some(&r));
+        let notice = s.refusal_notice.expect("a notice");
+        assert!(
+            notice.contains(
+                "the worker was cancelled after a policy refused `apply_patch` on `Cargo.toml`"
+            ),
+            "{notice}"
+        );
+        assert!(!notice.contains("finished"), "{notice}");
+        r.outcome = kgraf_runtime::WorkerOutcome::BudgetExhausted;
+        let u = accepted_standing("c10", "true", false, Some(&r))
+            .unverified
+            .expect("unverified");
+        assert!(u.contains("the worker ran out of rounds after"), "{u}");
     }
 
     /// Model text cannot set a mode or a setting through the tool: the input
