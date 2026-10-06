@@ -176,7 +176,15 @@ fn a_cd_never_widens_what_a_script_may_run() {
 /// mixing it with an allowlisted cargo command is granted, not a build.
 #[test]
 fn a_cd_then_a_granted_program_is_granted_as_its_commands() {
-    let policy = worker_policy(control(PermissionMode::Auto, &["python3"], &[], &[]));
+    // The script the grant covers is read from where the `cd` leads; it
+    // starts no program (decision 0094, amended 2026-10-06).
+    let dir = tempfile::tempdir().expect("dir");
+    std::fs::create_dir_all(dir.path().join("tools")).expect("mkdir");
+    std::fs::write(dir.path().join("tools/gen.py"), "print(1)\n").expect("write");
+    let policy =
+        worker_policy(control(PermissionMode::Auto, &["python3"], &[], &[])).with_read_context(
+            crate::permissions::ReadContext::in_worktree(dir.path(), None),
+        );
     let v = policy.evaluate(&sh("cd tools && python3 gen.py"));
     assert!(
         v.decision == Decision::Allow && v.granted && !v.build && v.script_checked,
@@ -192,6 +200,21 @@ fn a_cd_then_a_granted_program_is_granted_as_its_commands() {
         reason.contains("granted or on the build and test allowlist")
             && reason.contains("`cd` into `tools`"),
         "{reason}"
+    );
+    // A script that starts a program the grant does not cover is asked
+    // about, and so is one kGraf cannot find where the `cd` leads.
+    std::fs::write(
+        dir.path().join("tools/gen.py"),
+        "import subprocess\nsubprocess.run(['curl', 'x'])\n",
+    )
+    .expect("write");
+    assert_eq!(
+        policy.evaluate(&sh("cd tools && python3 gen.py")).decision,
+        Decision::Prompt
+    );
+    assert_eq!(
+        policy.evaluate(&sh("python3 gen.py")).decision,
+        Decision::Prompt
     );
 }
 

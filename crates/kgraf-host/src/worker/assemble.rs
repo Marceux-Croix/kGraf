@@ -541,10 +541,14 @@ pub async fn assemble(a: Assembly) -> Result<Assembled> {
     // permission mode, read on every call (Bypass, Auto's allow set, Accept
     // edits' file programs). Either runs a command as a confined one, which a
     // declared write scope accepts; a `forbid` rule still wins.
+    // Decision 0094, amended 2026-10-06: the files a command's programs run
+    // (a recipe, a script) are read from the worktree the shell runs in, so
+    // a grant covers such a command only when it covers what the file runs.
     let policy = base_policy
         .with_build_allowlist(a.config.build_allowlist().clone())
         .with_granted_programs(a.config.granted_programs().iter().cloned())
-        .with_permissions(a.permissions.clone());
+        .with_permissions(a.permissions.clone())
+        .with_working_dir(a.workspace.root());
     // Decision 0084: a checkout-root `.env` usually holds the user's vendor
     // keys. Its values join the process-wide scrubber, so none reaches a
     // model, a transcript or a trace even if a command prints it. Never

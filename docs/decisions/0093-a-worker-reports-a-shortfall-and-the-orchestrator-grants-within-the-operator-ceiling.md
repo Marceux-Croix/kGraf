@@ -308,3 +308,30 @@ Tests: `kgraf-tools` `tests/inner_programs.rs`
 `a_grant_of_the_outer_program_does_not_grant_the_inner_one` and
 `a_command_runs_when_every_program_it_runs_is_granted`, each with the grant made to the contract
 in every mode.
+
+## Amendment (2026-10-06): a report of a wrapped command is granted every program it runs
+
+A refusal of a command that runs several programs (`env curl x`, `xargs curl`, `npx -c 'curl
+x'`) named only its first word, `env`, because a refused call's capability was its `argv[0]`
+(`capability_of` in `kgraf-runtime` `shortfall.rs`). A worker that reported `curl`, the program
+it needed, was answered that no policy refused `curl`; one that reported `env` got a grant of
+`env`, and the next attempt was refused again, since a program grant covers that program only
+(the amendment above).
+
+Now, when a grant could lift the refusal (the command policy's, the access check's, a write
+scope's refusal of a command that declares no paths, or an unattended ask), the refusal on
+record lists every program a grant must name for the command to run, the innermost first
+(`RefusedCall::needs`), and its capability is the innermost. A report may name any of them. The
+orchestrator grounds the report in that refusal and grants, together, the named program and
+every other one it lists that the contract and the user's mode do not already grant
+(`Grant::Programs`, recorded as one grant record per program); each is checked against the
+user's deny and ask rules first, deny over ask, and an unattended hold says how to allow all of
+them (`--allow curl --allow env`). A waiting request keeps the list (`PendingPermission::with`)
+and grants it whole when the user or a mode change answers. A command of one program, a script
+refused whole, and a refusal by a user rule are unchanged. The command policy's question names
+the programs that still lack a grant, the innermost first.
+
+Tests: `kgraf-host` `shortfall_tests.rs` `a_wrapped_command_is_granted_with_every_program_it_runs`
+(a hosted run: a worker refused `env cp ...` reports `cp`, the orchestrator grants `cp` and
+`env`, and the fresh attempt runs the command); with the change reverted, the worker is
+answered that nothing refused `cp` and the run is blocked.

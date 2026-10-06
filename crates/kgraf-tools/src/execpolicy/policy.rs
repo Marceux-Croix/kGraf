@@ -79,7 +79,22 @@ pub struct ExecPolicy {
     /// Decision 0094: the user's live permission mode, read on every
     /// evaluation, so a mode change reaches a running worker's next command.
     live: Option<LivePermissions>,
+    /// Decision 0094, amended 2026-10-06: where the files a command's
+    /// programs run (a recipe, a script) are read from. None by default, so
+    /// every such command is granted by nothing.
+    reading: crate::permissions::ReadContext,
+    /// The files each command's review read, with a hash of each, keyed by
+    /// the command line. Shared by the shell tool and its approval hook (one
+    /// policy, cloned), so the tool refuses to run a command whose files
+    /// changed after it was judged ([`Self::files_changed_since_review`]).
+    reviewed: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Witness>>>,
 }
+
+/// The files a review read, each with a hash of its text.
+type Witness = Vec<(std::path::PathBuf, blake3::Hash)>;
+
+/// How many reviewed command lines a policy remembers before it starts over.
+const MAX_REVIEWED: usize = 1_024;
 
 /// The live permission control, shared; `Debug` names only the mode.
 #[derive(Clone)]
@@ -101,7 +116,87 @@ impl ExecPolicy {
             granted: std::collections::BTreeSet::new(),
             unrestricted: false,
             live: None,
+            reading: crate::permissions::ReadContext::default(),
+            reviewed: std::sync::Arc::default(),
         }
+    }
+
+    /// Note the files the review of `argv` read (decision 0094, amended
+    /// 2026-10-06). Called by the approval hook when it judges a command, so
+    /// the tool can tell, when the command runs, whether another call of the
+    /// round rewrote what the judgment rested on.
+    pub fn note_reviewed(&self, argv: &[String]) {
+        if self.reading.root.is_none() {
+            return;
+        }
+        let seen = self.reading.witnessed(argv);
+        let mut reviewed = self.reviewed.lock().unwrap_or_else(|p| p.into_inner());
+        if reviewed.len() >= MAX_REVIEWED {
+            reviewed.clear();
+        }
+        reviewed.insert(crate::quote_argv(argv), seen);
+    }
+
+    /// Why `argv` must not run now: a file its review read (a recipe, a
+    /// script) has changed since, or one appeared or went away, so the
+    /// judgment no longer holds (decision 0094, amended 2026-10-06). `None`
+    /// when nothing changed, or the command was never reviewed here.
+    pub fn files_changed_since_review(&self, argv: &[String]) -> Option<String> {
+        self.reading.root.as_ref()?;
+        let before = self
+            .reviewed
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&crate::quote_argv(argv))
+            .cloned()?;
+        let now = self.reading.witnessed(argv);
+        if now == before {
+            return None;
+        }
+        let changed: Vec<String> = before
+            .iter()
+            .chain(now.iter())
+            .filter(|f| !(before.contains(f) && now.contains(f)))
+            .map(|(p, _)| {
+                let shown = self
+                    .reading
+                    .root
+                    .as_deref()
+                    .and_then(|r| p.strip_prefix(r).ok())
+                    .unwrap_or(p);
+                format!("`{}`", shown.display())
+            })
+            .fold(Vec::new(), |mut acc, f| {
+                if !acc.contains(&f) {
+                    acc.push(f);
+                }
+                acc
+            });
+        Some(format!(
+            "the files this command runs changed after it was checked ({}); run it again to have \
+             it checked as it is now",
+            changed.join(", ")
+        ))
+    }
+
+    /// Read the files a command's programs run (a Makefile recipe, a
+    /// `package.json` script, a script given to an interpreter) from the
+    /// worktree `root`, where the shell runs its commands (decision 0094,
+    /// amended 2026-10-06). A grant covers such a command only when it
+    /// covers every program the file makes it run. The user's home
+    /// directory, for git's configuration, is read from `HOME`.
+    pub fn with_working_dir(self, root: &std::path::Path) -> Self {
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        self.with_read_context(crate::permissions::ReadContext::in_worktree(
+            root,
+            home.as_deref(),
+        ))
+    }
+
+    /// [`Self::with_working_dir`] with every directory given (tests).
+    pub fn with_read_context(mut self, reading: crate::permissions::ReadContext) -> Self {
+        self.reading = reading;
+        self
     }
 
     /// Read the user's permission mode on every evaluation (decision 0094):
@@ -330,6 +425,14 @@ impl ExecPolicy {
                     {
                         return scripted;
                     }
+                    let grants_any =
+                        !self.granted.is_empty() || live.is_some_and(|l| l.0.grants_programs());
+                    if !from_rule && !verdict.read_only && grants_any {
+                        return PolicyVerdict {
+                            script_note: self.lacking_note(argv),
+                            ..verdict
+                        };
+                    }
                     return verdict;
                 }
                 PolicyVerdict {
@@ -363,17 +466,18 @@ impl ExecPolicy {
         // (`sh -c 'git push --force'`, `find -exec`, `ssh HOST CMD`), each
         // from every place its program may stand. The call's own first word
         // was matched by the caller.
-        let places: Vec<(bool, Vec<String>, usize)> = crate::permissions::simple_commands(argv)
-            .into_iter()
-            .enumerate()
-            .flat_map(|(n, words)| {
-                crate::permissions::command_starts(&words)
-                    .into_iter()
-                    .filter(move |&at| n > 0 || at > 0)
-                    .map(move |at| (n > 0, words.clone(), at))
-                    .collect::<Vec<_>>()
-            })
-            .collect();
+        let places: Vec<(bool, Vec<String>, usize)> =
+            crate::permissions::simple_commands_in(argv, &self.reading)
+                .into_iter()
+                .enumerate()
+                .flat_map(|(n, words)| {
+                    crate::permissions::command_starts(&words)
+                        .into_iter()
+                        .filter(move |&at| n > 0 || at > 0)
+                        .map(move |at| (n > 0, words.clone(), at))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
         self.rules
             .iter()
             .filter(|rule| rule.decision == Decision::Forbidden)
@@ -422,9 +526,50 @@ impl ExecPolicy {
     /// runs on grants only when each program it runs, wrappers and the
     /// programs they run included, is granted.
     fn granted_by_grants(&self, words: &[String]) -> Option<Vec<String>> {
-        crate::permissions::programs_to_grant(words)
+        self.granted_by_grants_in(words, &self.reading)
+    }
+
+    /// [`Self::granted_by_grants`], reading files in `ctx` (a command of a
+    /// script after its `cd`).
+    fn granted_by_grants_in(
+        &self,
+        words: &[String],
+        ctx: &crate::permissions::ReadContext,
+    ) -> Option<Vec<String>> {
+        crate::permissions::programs_to_grant_in(words, ctx)
             .ok()
             .filter(|ps| !ps.is_empty() && ps.iter().all(|p| self.grants_program(p)))
+    }
+
+    /// For a command a grant would let run but that runs programs with no
+    /// grant (`env curl x` with `env` granted), the note the approval
+    /// question carries: the programs that still lack a grant, the innermost
+    /// first, so the user, and a shortfall report, name the program that
+    /// runs and not only its wrapper (decision 0094, amended 2026-10-06).
+    /// `None` when nothing is granted, or the command runs one program.
+    fn lacking_note(&self, argv: &[String]) -> Option<String> {
+        let ps = crate::permissions::programs_to_grant_in(argv, &self.reading).ok()?;
+        if ps.len() < 2 {
+            return None;
+        }
+        let lacking: Vec<&String> = ps
+            .iter()
+            .rev()
+            .filter(|p| !self.grants_program(p))
+            .collect();
+        let first = lacking.first()?;
+        Some(format!(
+            "The {}{first}` (`{}`); a command runs without asking only when every program it \
+             runs is granted, and {} {} no grant.",
+            crate::permissions::COMMAND_RUNS_LEAD,
+            crate::quote_argv(argv),
+            lacking
+                .iter()
+                .map(|p| format!("`{p}`"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            if lacking.len() == 1 { "has" } else { "have" }
+        ))
     }
 
     /// Whether a grant lets `program` run without approval: granted to this
@@ -531,7 +676,19 @@ impl ExecPolicy {
         let mut needs_grant = false;
         let mut built = false;
         let mut cd: Option<&str> = None;
+        // The files a command reads are read from where the script's `cd`
+        // took it.
+        let mut here = self.reading.clone();
+        let mut previous: Option<&Vec<String>> = None;
         for words in &commands {
+            // An assignment of the script (`export GIT_PAGER=...`) is seen by
+            // the commands after it.
+            if let Some(p) = previous
+                && let Some(assigned) = crate::permissions::after_assignment(p, &here)
+            {
+                here = assigned;
+            }
+            previous = Some(words);
             let uncovered = |extra: &str| {
                 asked(format!(
                     "The {SCRIPT_RUNS_LEAD}{}` (`{}`), which no grant covers{extra}; a script \
@@ -544,6 +701,14 @@ impl ExecPolicy {
                 match change {
                     Ok(dir) if cd.is_none() => {
                         cd = Some(dir);
+                        here = crate::permissions::ReadContext {
+                            cwd: here
+                                .cwd
+                                .as_ref()
+                                .map(|c| c.join(dir))
+                                .filter(|_| here.root.is_some()),
+                            ..here.clone()
+                        };
                         continue;
                     }
                     Ok(_) => {
@@ -558,7 +723,7 @@ impl ExecPolicy {
                 built = true;
                 continue;
             }
-            if self.granted_by_grants(words).is_some() {
+            if self.granted_by_grants_in(words, &here).is_some() {
                 needs_grant = true;
                 continue;
             }
@@ -823,8 +988,10 @@ mod tests {
     /// wins over a grant; the match is on the exact `argv[0]`.
     #[test]
     fn a_granted_program_is_allowed_and_nothing_else_changes() {
+        let (_dir, ctx) = scripts_tree();
         let policy = ExecPolicy::default_kgraf_policy()
-            .with_granted_programs(["python3".to_owned(), "rm".to_owned()]);
+            .with_granted_programs(["python3".to_owned(), "rm".to_owned()])
+            .with_read_context(ctx);
         let granted = policy.evaluate(&argv(&["python3", "fetch.py"]));
         assert_eq!(granted.decision, Decision::Allow);
         assert!(granted.granted && !granted.build && !granted.read_only);
@@ -847,7 +1014,10 @@ mod tests {
     fn the_live_mode_changes_the_verdict_of_a_policy_already_built() {
         use crate::permissions::{AllowSet, ModeSource, PermissionControl, PermissionMode};
         let control = std::sync::Arc::new(PermissionControl::manual());
-        let policy = ExecPolicy::default_kgraf_policy().with_permissions(control.clone());
+        let (_dir, ctx) = scripts_tree();
+        let policy = ExecPolicy::default_kgraf_policy()
+            .with_permissions(control.clone())
+            .with_read_context(ctx);
         let py = argv(&["python3", "fetch.py"]);
         let mk = argv(&["mkdir", "out"]);
         assert_eq!(policy.evaluate(&py).decision, Decision::Prompt);
@@ -924,6 +1094,20 @@ mod tests {
         argv(&["sh", "-c", script])
     }
 
+    /// A worktree holding the scripts these tests run, each starting no
+    /// program: a grant of `python3` covers a script only when kGraf can
+    /// read it (decision 0094, amended 2026-10-06).
+    fn scripts_tree() -> (tempfile::TempDir, crate::permissions::ReadContext) {
+        let dir = tempfile::tempdir().expect("dir");
+        for name in ["fetch.py", "gen.py", "a.py", "b.py", "x.py", "tools/gen.py"] {
+            let p = dir.path().join(name);
+            std::fs::create_dir_all(p.parent().expect("parent")).expect("mkdir");
+            std::fs::write(p, "print(1)\n").expect("write");
+        }
+        let ctx = crate::permissions::ReadContext::in_worktree(dir.path(), None);
+        (dir, ctx)
+    }
+
     /// The question the real shell hook asks about `argv` under `policy`.
     fn question(policy: &ExecPolicy, argv: &[String]) -> String {
         tokio::runtime::Builder::new_current_thread()
@@ -954,10 +1138,13 @@ mod tests {
     #[test]
     fn auto_grants_a_script_when_it_grants_every_command() {
         use crate::permissions::PermissionMode;
-        let policy = ExecPolicy::default_kgraf_policy().with_permissions(control_in(
-            PermissionMode::Auto,
-            &["python3", "cp", "mkdir"],
-        ));
+        let (_dir, ctx) = scripts_tree();
+        let policy = ExecPolicy::default_kgraf_policy()
+            .with_permissions(control_in(
+                PermissionMode::Auto,
+                &["python3", "cp", "mkdir"],
+            ))
+            .with_read_context(ctx);
         let v = policy.evaluate(&sh(
             "mkdir -p out && cp templates/greeting.txt out/greeting.txt",
         ));
@@ -1038,7 +1225,10 @@ mod tests {
         assert!(q.contains("The script runs `python3`"), "{q}");
         // A program granted to the contract after a shortfall counts, with
         // or without a live mode.
-        let granted = ExecPolicy::default_kgraf_policy().with_granted_programs(["python3".into()]);
+        let (_dir, ctx) = scripts_tree();
+        let granted = ExecPolicy::default_kgraf_policy()
+            .with_granted_programs(["python3".into()])
+            .with_read_context(ctx.clone());
         assert!(
             granted
                 .evaluate(&sh("python3 a.py && python3 b.py"))
@@ -1048,7 +1238,8 @@ mod tests {
         assert!(q.contains("The script runs `mkdir`"), "{q}");
         let both = ExecPolicy::default_kgraf_policy()
             .with_granted_programs(["python3".into()])
-            .with_permissions(control_in(PermissionMode::Auto, &["mkdir"]));
+            .with_permissions(control_in(PermissionMode::Auto, &["mkdir"]))
+            .with_read_context(ctx);
         assert!(both.evaluate(&sh("mkdir out && python3 a.py")).granted);
         // `git` allowed, but `git push --force` is forbidden: the script is
         // refused, naming the command.
@@ -1119,9 +1310,11 @@ mod tests {
         // A contract's grant under Manual.
         let manual = control_in(PermissionMode::Manual, &[]);
         manual.set_script_construct(ScriptConstruct::Background, true);
+        let (_dir, ctx) = scripts_tree();
         let granted = ExecPolicy::default_kgraf_policy()
             .with_granted_programs(["python3".into()])
-            .with_permissions(manual);
+            .with_permissions(manual)
+            .with_read_context(ctx);
         assert!(granted.evaluate(&sh("python3 a.py & python3 b.py")).granted);
         assert!(!granted.evaluate(&sh("python3 a.py & mkdir b")).granted);
     }

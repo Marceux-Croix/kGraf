@@ -833,8 +833,10 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   (Auto with an allow set, Accept edits, a program granted to the contract), when a grant covers
   every program kGraf can see in it, the programs inside `$(...)`, backquotes, subshells and
   groups included. What you accept: kGraf cannot see what a variable or a substitution will
-  run, so a command named by a variable (`$CMD`) runs with no check, the refusal to delete
-  system paths included. What still holds: your deny and ask rules match every command kGraf
+  run, so a command named by a variable (`$CMD`) is granted with no check of what it runs, the
+  refusal to delete system paths included. While you have a deny or ask rule on `shell` with a
+  pattern, such a command asks instead, in every mode (see the commands kGraf cannot read,
+  below). What still holds: your deny and ask rules match every command kGraf
   can see, and for a script judged only because of a switch, a deny or ask rule whose program
   appears anywhere in the script text as a word refuses or asks (`deny = ["shell(curl*)"]`
   refuses `sh -c "ls && C=curl; $C u"`). This match is broad on purpose: `shell(git push*)`
@@ -889,16 +891,75 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   `sudo -i`, `script FILE` with no command, and `parallel` with commands from a file or its
   input. While you have a deny or ask rule on `shell` with a pattern, such a call asks in every
   mode, Bypass included, because kGraf cannot check it against your rule. With no such rule the
-  mode decides, but no grant covers it. What kGraf does not read as a command: a command named
-  by a variable, and a program an interpreter runs from its own code (`python3 x.py`,
-  `npm run test`, `make`).
+  mode decides, but no grant covers it.
+
+  Runners, Windows shells and git settings are read the same way. A package runner runs the
+  package's program: `npx PKG` (and `npx -p PKG CMD`, `npx -c 'CMD'`), `npm exec`, `npm init
+  PKG` (which runs `create-PKG`), `pnpm dlx`, `pnpm exec`, `yarn dlx`, `yarn exec`, `bunx`,
+  `bun x`, `uvx` and `pipx run`. A container or remote runner runs its command: `docker exec
+  CONTAINER CMD`, `docker run IMAGE CMD` (and `--entrypoint`), the same for `podman` and
+  `nerdctl`, `docker compose exec` and `run`, `kubectl exec POD -- CMD` (also `run` and `debug`
+  after `--`), `lxc exec` and `incus exec`, `vagrant ssh -c`, `adb shell CMD` and `wsl CMD`.
+  `cmd /c` and `cmd /k` scripts are split on `&`, `&&`, `||` and `|`; `powershell` and `pwsh`
+  with `-Command` (or `-c`), and `powershell` given its script as plain arguments, are split on
+  `;`, `|`, `&&`, `||`, newlines and braces; `-EncodedCommand` is decoded (base64 of UTF-16LE
+  text) and read. git runs a command from a configuration value: `git -c core.sshCommand=`,
+  `core.pager`, `core.editor`, `core.fsmonitor`, `credential.helper`, `alias.NAME=!CMD`,
+  `diff.external`, `gpg.program`, filter and merge drivers and the like, and from
+  `GIT_SSH_COMMAND`, `GIT_EXTERNAL_DIFF`, `GIT_PAGER`, `GIT_EDITOR`, `PAGER` and `EDITOR`
+  set before `git` or exported earlier in the script. `git config KEY VALUE` with such a key
+  is read as the command it will run. `git NAME`, where NAME is no git command, runs the alias
+  your repository's or your user
+  configuration defines (`!CMD` runs CMD), or else the program `git-NAME`. `git rebase --exec`,
+  `git bisect run`, `git submodule foreach`, `git filter-branch --*-filter` and `git difftool
+  --extcmd` run their command too.
+
+  Build-tool recipes are shell commands, read from the worktree: `make TARGET` reads the
+  Makefile's recipe lines for the target and its prerequisites (variables, `$(shell ...)`,
+  `-C DIR` and `-f FILE` included); `npm run X`, `npm test`, `npm start`, `pnpm run X`,
+  `pnpm X`, `yarn X` and `bun run X` read the `package.json` script with its `pre` and `post`
+  scripts; `just RECIPE` reads the justfile recipe and its dependencies; `cargo NAME` reads the
+  alias `.cargo/config.toml` defines, and `cargo run`, `test`, `build` and the other commands
+  that compile read its `runner`, `rustc-wrapper` and `linker` settings. Each recipe line is
+  judged as a command. Interpreter code is read for the calls that start programs: inline code
+  (`python3 -c`, `node -e` and `-p`, `deno eval`, `bun -e`, `perl -e`, `ruby -e`, `php -r`, an
+  `awk` program, `osascript -e`) and script files (`python3 x.py`, `python3 -m MODULE` for a
+  module of the worktree, `node x.js`, `tsx`, `deno run`, `perl x.pl`, `ruby x.rb`, `php x.php`,
+  `awk -f`, and a `#!` file run by its path, such as `./run.py`). A call with literal arguments
+  is read as a command: `os.system("curl x")` and `subprocess.run(["curl", "x"])` run `curl`.
+  The modules a script imports from the worktree are read one level deep. A command is judged
+  on its files as they were when it was checked; if another call of the same round rewrites one
+  of them first, the command is refused before it runs, naming the file, and runs once it is
+  issued again and checked as it is now.
+
+  Some of these cannot be read, and are treated like `source FILE` above: a runner whose
+  command kGraf cannot name (`docker run IMAGE` with no command, a package given by a URL,
+  `kubectl exec` without `--`), a Windows script with a variable as a program or a construct
+  kGraf does not read (`iex`, `[...]::`, `-File`), a git value it cannot see (`--config-env`,
+  `core.hooksPath`, an included configuration file), a command named by a variable or a
+  substitution (`$CMD x`, `"$@"`, `${X}`, `$(which curl) x`, `eval "$X"`), a command that sets
+  `PATH` (`PATH=./bin ls`) or a variable that makes a program load code first (`LD_PRELOAD`,
+  `NODE_OPTIONS`, `PYTHONPATH`, `BASH_ENV` and the like), a missing or unparseable recipe file
+  or script, a recipe file kGraf finds only in a parent directory, a spawning call whose
+  arguments are not literal
+  (`os.system(cmd)`), code that runs text as code (`eval`, `exec`), a local module that imports
+  another local module, and an interpreter kGraf has no reader for (`lua`, `Rscript`, `julia`,
+  `tclsh` and others) given code or a script. While you have a deny or ask rule on `shell`
+  with a pattern, each asks in every mode, Bypass included; with no such rule the mode decides,
+  and no grant covers it. A test runner (`pytest`, `cargo test`, `node --test`) runs your test
+  code, which kGraf does not read, as before.
 
   A grant of a program does not grant what it runs. In Auto's allow set, Accept edits' file
   programs and a program granted to the contract, every program a command runs needs its own
   grant: a wrapper and the program after it (`env curl x` runs on grants only when `env` and
   `curl` are both granted), every command of a script it hands to a shell (`su -c`, `bash -c`),
   and a word that may be an option's value or the program (`sudo -u bob curl` names `bob` too,
-  so it asks). As in Claude Code, no program grant ever covers `watch`, `setsid`, `ionice` or
+  so it asks). The same holds for a runner, a Windows shell, git, a build tool and an
+  interpreter: `npx -c 'curl x'`, `docker exec web curl x`, `cmd /c curl x`, `make deploy`
+  whose recipe runs `curl`, and `python3 x.py` whose code runs `curl` each run on grants only
+  when `curl` is granted too. With only `npm` in the allow set, `npm test` asks unless its
+  script's programs (`jest`) are there too. As in Claude Code, no program grant ever covers
+  `watch`, `setsid`, `ionice` or
   `flock` with a command, or `find` with `-exec`, `-execdir`, `-ok`, `-okdir` or `-delete`;
   kGraf adds `ssh HOST CMD` and every command it cannot read. Manual asks for these, the
   orchestrator decides them in Orchestrator decides, and Bypass runs them unless a rule above
@@ -1654,6 +1715,20 @@ Behavior that differs from earlier builds. Each item names the decision that hol
   is recorded when the approval chain lets the call run; when a deny rule (or another hook)
   refuses the call after the mode allowed it, the trace has one `grant_refused` event naming
   the subject, the mode, and the refusing hook with its reason (0094).
+- What a runner, a Windows shell, a git setting, a build-tool recipe or interpreter code runs
+  is a command (0094): with `deny = ["shell(curl*)"]`, `npx -c 'curl x'`, `docker exec web curl
+  x`, `cmd /c curl x`, `powershell -EncodedCommand ...`, `git -c core.pager='curl x' log`,
+  `make deploy` whose recipe runs `curl`, `npm run deploy`, `just deploy`, `python3 -c
+  "import os; os.system('curl x')"` and `python3 x.py` whose code does the same are refused in
+  every mode, Bypass included. A command named by a variable (`$CMD x`), a runner whose command
+  kGraf cannot name, a missing recipe file and a spawning call with arguments that are not
+  literal ask in every mode while you have a shell rule with a pattern. A grant of the runner,
+  the shell, `git`, the build tool or the interpreter no longer grants what it runs: with
+  `npm` in the allow set, `npm test` asks unless its script's programs are there too. A
+  shortfall report of a command that runs several programs (`env curl x`) names each program
+  that still lacks a grant, the innermost first, and the orchestrator grants them together.
+  With no rules, `cargo test` and `pytest` are decided as before in every mode, and so is
+  `npm test`, except in Auto when the allow set lacks its script's programs.
 - A program given to another program as an argument is a command (0094): your deny and ask
   rules, the refusal to delete system paths and your policy's `forbid` rules see `find -exec`,
   `su -c`, `ssh HOST CMD`, `script -c`, `trap`, `watch`, `parallel` and the like in every mode,

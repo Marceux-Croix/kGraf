@@ -9287,6 +9287,7 @@ mod tests {
             path: None,
             whole_tool: false,
             held: Vec::new(),
+            needs: Vec::new(),
         }
     }
 

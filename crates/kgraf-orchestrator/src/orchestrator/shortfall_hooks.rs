@@ -113,6 +113,9 @@ impl RunLoop {
         // runs later, holds the contract for a re-plan. Answering "do not
         // edit it" would leave the worker at a check that cannot pass.
         let mut plan_shape_hold: Option<String> = None;
+        // The other programs a refused command runs (decision 0094, amended
+        // 2026-10-06), granted with the one the report names.
+        let mut with: Vec<String> = Vec::new();
         let (need, why) = match (kind, grounding) {
             (ShortfallKind::Instructions, _) => {
                 plan_shape_hold = self.member_hold(&contract_id, &format!("{asked} {why}"));
@@ -148,7 +151,15 @@ impl RunLoop {
                     .answer_shortfall(&contract_id, &worker, kind, &asked, &why, answer, true)
                     .await;
             }
-            (ShortfallKind::Permission, Some(Grounding::Refused { subject, reason })) => {
+            (
+                ShortfallKind::Permission,
+                Some(Grounding::Refused {
+                    subject,
+                    reason,
+                    with: others,
+                }),
+            ) => {
+                with = others;
                 if scope == RequestScope::File {
                     plan_shape_hold = self.member_hold(&contract_id, &subject);
                 }
@@ -180,6 +191,7 @@ impl RunLoop {
             kind,
             scope,
             &need,
+            &with,
             &why,
             &contract,
             &self.authority(),

@@ -1226,3 +1226,336 @@ the command policy and the ask routing; `permissions_prefix_tests.rs`:
 `sh -c 'rm -rf /'` to be refused); `kgraf-host` (`rule_conflicts.rs`:
 `a_program_given_as_an_argument_is_found_and_named`). Each regression test fails with the change
 reverted and passes with it restored.
+
+## Amendment (2026-10-06): runners, Windows shells, git settings, commands named by a variable, recipes and interpreter code are read
+
+**Why.** The amendment above left five ways to run a program past a rule, and one way for a
+grant to fall short. With `deny = ["shell(curl*)"]`, each of these ran `curl` in Bypass, and
+Auto granted it to a user who allowed only the outer program:
+
+1. Package, container and remote runners: `npx -c 'curl x'`, `pnpm dlx curl`, `yarn dlx`,
+   `bunx`, `docker exec web curl x`, `docker run alpine curl x`, `podman`, `kubectl exec POD --
+   curl x`. `embedded_at` (`permissions.rs`) had no case for them, and its fallback, the
+   subcommand runners (`uv run`, `direnv exec`), named none of them.
+2. Windows shells: `cmd /c`, `cmd /k`, `powershell -Command`, `-EncodedCommand`, `pwsh`. Only
+   the POSIX shells of `SHELLS` were read, by a base name that split on `/` alone.
+3. git configuration values that run a command: `git -c core.sshCommand=... fetch`,
+   `core.pager`, `core.editor`, `core.fsmonitor`, `credential.helper`, `alias.X=!CMD`,
+   `diff.external`, `gpg.program`, `GIT_SSH_COMMAND=` and the like before `git`, and `git
+   ALIAS` for an alias defined with `!`. git had no reader.
+4. A command named by a variable: `sh -c '$CMD x'` read as the program `CMD`, because
+   `split_script` trimmed a leading `$` from every part
+   (`.trim_start_matches('$')`), meant for the `$` before `$(`; `"$@"`, `${X}`, `$(which curl)
+   x` and `eval "$X"` were read the same way, with no reader marking the command unreadable.
+5. Interpreter code and build-tool recipes: `python3 -c "import os; os.system('curl x')"`,
+   `python3 x.py`, `node -e`, `perl -e`, `ruby -e`, `php -r`, `awk 'BEGIN{system("curl x")}'`,
+   `make deploy`, `npm run deploy`, `just deploy`, `cargo run` with a `runner` in
+   `.cargo/config.toml`. No reader looked at code or at a file: `embedded_at` had no
+   directory to read one from.
+6. A shortfall naming the wrapper: when `env curl x` was refused, the refusal on record named
+   `env` (`capability_of` in `kgraf-runtime` `shortfall.rs` takes `argv[0]`), so a worker that
+   reported `curl` was answered that nothing refused it, and a grant of `env` left the command
+   refused, since 0094's amendment above needs `curl` granted too.
+
+**The change: reading context.** The readers now take a `ReadContext`: the worktree, the
+directory the command starts in, and the user's home directory (for git's user
+configuration), with the variables the call itself sets for a program: assignments before it
+(`GIT_PAGER=x git log`, `env A=1 make`) and assignments earlier in its script (`export
+GIT_SSH_COMMAND=x; git fetch`). The rules hook reads it from the worker's workspace, and the command policy
+from `ExecPolicy::with_working_dir`, which the host sets to the worktree the shell runs in.
+With no context, no file is read: every command that runs what a file says is unreadable, and
+so is a program named by a relative path (it may be a script of the worktree).
+A `cd DIR` in a script moves where the commands after it read their files (`cd web && npm
+test` reads `web/package.json`); a `cd` kGraf cannot follow (`cd $X`, `cd -`), a wrapper that
+changes the directory (`env -C`, `sudo -D`, `chroot`) and a runner's directory option
+(`uv run --directory`, `npm --prefix`) leave it unknown. Files are read only inside the
+worktree, regular files of at most 1 MiB, opened confined to it (`fs_safety::read_capped`),
+never a FIFO or a device. What a file was parsed into is cached by a hash of its text, and a
+file's text by its version (below).
+
+**The change: runners** (`permission_readers.rs`). The package runners run the package's
+program with its arguments (the name without a scope or a version): `npx PKG`, `npx -p PKG
+CMD`, `npx -c 'CMD'` (a script), `pnpx`, `bunx`, `npm exec` and `npm x`, `npm init PKG` and
+`npm create PKG` (which run `create-PKG`), `pnpm dlx`, `pnpm exec`, `pnpm create`, `yarn dlx`,
+`yarn exec`, `yarn create`, `yarn node`, `bun x`, `bun exec`, `bun create`, `uvx`, `uv tool
+run`, `pipx run`. A package given by a path, a URL or a git spec is unreadable. The container
+and remote runners run their command after their options: `docker exec CONTAINER CMD`,
+`docker run IMAGE CMD` (with `--entrypoint` naming the program, and `--health-cmd` read as a
+script), `docker container exec|run`, `docker compose exec|run`, the same for `podman`,
+`nerdctl`, `docker-compose` and `podman-compose`; `kubectl exec`, `run` and `debug` (and `oc`)
+after `--`; `lxc exec` and `incus exec`; `vagrant ssh -c`; `adb shell CMD`; `wsl CMD` (a
+script) and `wsl -e CMD` (an argv); `busybox APPLET`. Unreadable: `docker run IMAGE` with no
+command (the image's own command), an option kGraf cannot place, `kubectl exec` without `--`,
+`kubectl run --overrides`, `vagrant ssh`, `adb shell` and `wsl` with no command. A program
+named by a path to a file of the worktree runs that file whatever its name (`./make`,
+`bin/sh`): a `#!` file is read as its interpreter given the file (`./run.py` with
+`#!/usr/bin/env python3` is `/usr/bin/env python3 ./run.py`), a text file with no `#!` line is
+unreadable (a shell runs it), and a compiled program is not read. A command that sets `PATH`
+(`PATH=./bin ls`, `env PATH=... ls`, `export PATH=...`) is unreadable: a name it runs may be
+any file. So is one that sets a variable that makes a program load code before its own:
+`LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`, `DYLD_INSERT_LIBRARIES`, `DYLD_LIBRARY_PATH`,
+`DYLD_FRAMEWORK_PATH`, `BASH_ENV`, `ENV`, `ZDOTDIR`, `PYTHONPATH`, `PYTHONSTARTUP`,
+`PYTHONHOME`, `PYTHONUSERBASE`, `NODE_OPTIONS`, `NODE_PATH`, `PERL5OPT`, `PERL5LIB`,
+`PERLLIB`, `RUBYOPT`, `RUBYLIB`, `PHPRC` and `PHP_INI_SCAN_DIR`. `uv run FILE.py` runs the
+file with Python and is read as `python3 FILE.py`.
+
+**The change: Windows shells** (`permission_windows.rs`). `cmd /c` and `/k` (after `/q`,
+`/d`, `/s`, `/v:on` and the like) is split on `&`, `&&`, `||` and `|` outside double quotes,
+`^` escaping, redirections dropped; `call PROG` and `start ["title"] [/opts] PROG` name their
+program. Unreadable: a parenthesized group, `if` and `for`, a program word holding `%` (or `!`
+with `/v:on`), `call :label`, and `cmd` with no `/c` or `/k`. `powershell` and `pwsh` read
+`-Command` (`-c`, `-CommandWithArgs`), `-EncodedCommand` (`-e`, `-ec`, `-enc`; base64 of
+UTF-16LE, decoded), and, for `powershell`, a script given as plain arguments; options are
+matched by PowerShell's prefix rule. A script is split into statements on `;`, `|`, `&&`,
+`||`, newlines, braces and parentheses outside quotes; a statement that starts with a
+variable, a literal or a keyword is no command (the right side of `=` is read again), `&
+'PROG'` names PROG, and `Start-Process PROG -ArgumentList ...` names PROG. Unreadable:
+`Invoke-Expression` (`iex`), `Invoke-Command`, `Start-Job`, `Add-Type`, `New-Object`,
+`Set-Alias`, `Import-Module`, `Invoke-WebRequest`, `.Invoke`, a .NET call (`[`, `::`), a
+subexpression (`$(`, `@(`), a backtick escape, `&` or `.` on a variable, dot-sourcing, a program
+word holding `$`, `-File` (and `pwsh FILE`), `-Command -`, `-NoExit`, an option kGraf cannot
+place, and text that does not decode.
+
+**The change: git** (`permission_git.rs`). A configuration value that names a command is read
+as the command git runs (through a shell, as git runs most of them), from `git -c KEY=VALUE`,
+from `git config KEY VALUE` (and `git config set`), and from an environment assignment before
+`git` or exported earlier in the call's script. The keys: `core.sshCommand`, `core.pager`, `core.editor`, `core.askPass`,
+`core.gitProxy`, `core.fsmonitor` (unless `true` or `false`), `core.alternateRefsCommand`,
+`sequence.editor`, `credential.helper` and `credential.URL.helper` (`!CMD`, a path, or `NAME`
+for `git-credential-NAME`), `diff.external`, `diff.DRIVER.command` and `textconv`,
+`merge.DRIVER.driver`, `filter.DRIVER.clean`, `smudge` and `process`, `gpg.program` and
+`gpg.FORMAT.program`, `gpg.ssh.defaultKeyCommand`, `pager.CMD`, `interactive.diffFilter`,
+`uploadpack.packObjectsHook`, `remote.NAME.uploadpack`, `receivepack` and `vcs`,
+`web.browser`, `browser|difftool|mergetool|man.TOOL.cmd` and `path`, `sendemail.sendmailCmd`,
+`toCmd`, `ccCmd` and `smtpServer`, `submodule.NAME.update=!CMD`, `hook.NAME.command` and
+`instaweb.httpd`. The variables: `GIT_SSH_COMMAND`, `GIT_SSH`, `GIT_EXTERNAL_DIFF`,
+`GIT_PAGER`, `PAGER`, `GIT_EDITOR`, `EDITOR`, `VISUAL`, `GIT_SEQUENCE_EDITOR`,
+`GIT_PROXY_COMMAND`, `GIT_ASKPASS` and `SSH_ASKPASS`. Unreadable: `core.hooksPath`,
+`include.path` and `includeIf.*.path`, `--config-env` for such a key, `--exec-path=DIR`,
+`GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT` and its keys, `GIT_CONFIG`, `GIT_CONFIG_GLOBAL`,
+`GIT_CONFIG_SYSTEM`, `GIT_EXEC_PATH` and `GIT_TEMPLATE_DIR`. `git NAME`, where NAME is not
+one of git's commands (`git help -a`, git 2.54), is an alias: from `-c alias.NAME=`, else from
+the repository's configuration (the worktree's `.git` file or directory, its common
+directory's `config`, and `config.worktree`) and the user's (`~/.gitconfig`,
+`~/.config/git/config`), the last definition winning. `!CMD` runs CMD with the arguments after
+it; any other alias runs `git` with its words. A name no read file defines runs the program
+`git-NAME`; when a read file includes another, or `-C`, `--git-dir` or `GIT_DIR` points
+elsewhere, it is unreadable. The system configuration is not read. `git rebase --exec` (`-x`),
+`git bisect run`, `git submodule foreach`, `git filter-branch --*-filter`, `git difftool
+--extcmd` (`-x`) and `git send-email --sendmail-cmd` run their command too.
+
+**The change: commands named by a variable** (`permissions.rs`). `split_script` keeps a
+variable's `$` and drops only the `$` of `$(`; it also tracks quotes across substitutions, so
+`"$(curl x)"` is read. A command a shell expands whose program word (or a wrapper's) holds `$`
+or a backquote (`$CMD x`, `"$@"`, `${X}`, `eval "$X"`), and a command whose program is a
+command substitution (`$(which curl) x`, `` `echo curl` x ``, `env $(cmd)`), is unreadable. A
+call's own argv is not expanded by any shell, so a literal `$` there is a name. With the
+`variables` script construct on, a mode may still grant a script holding such a command, as
+the switch says; the rules hook asks about it in every mode while a shell rule with a pattern
+exists, because no rule can check it, and the switch never lifts a rule.
+
+**The change: build-tool recipes** (`permission_recipes.rs`). Each recipe line is returned as
+a script, so the rules, the `forbid` rules, the deletion limit and the grants judge it:
+
+- `make TARGET` (and `gmake`): the recipe lines of each target named (or the default goal) and
+  of its prerequisites, from `GNUmakefile`, `makefile` or `Makefile` (or `-f FILE`), in the
+  directory `-C DIR` names; `$(shell ...)` and `!=` assignments are read as the commands they
+  run; variables defined once (`=`, `:=`, `::=`, `?=`, `+=`), make's built-in programs (`MAKE`,
+  `CC`, `RM` and the like) and the automatic variables are expanded; a variable given before
+  `make`, exported earlier in its script, or given as `VAR=value` on its command line is an
+  override; an undefined variable is empty,
+  as in make; `define` blocks expand to their lines; pattern rules' recipes are read for a
+  target without a rule of its own. A variable defined more than once is left unresolved (a
+  program word holding it is unreadable), and is unreadable outright when one of its values, or
+  a function call's arguments, may hold shell syntax; `$(call)`, `$(value)`, `$(eval)`,
+  `$(foreach)` and `$(file)` are unreadable. Unreadable: `include`, `.RECIPEPREFIX`, a `SHELL`
+  that is not a POSIX shell, `--eval`, and no makefile. Both branches of a conditional are
+  read. make's built-in implicit rules are not read.
+- `npm run X` (`run-script`), `npm test` (`t`), `npm start`, `stop`, `restart`, `pnpm run X`,
+  `pnpm X`, `yarn X`, `bun run X` and `bun X`: the script of `package.json` with its `pre` and
+  `post` scripts and the arguments after `--`; npm's default `node server.js` for a missing
+  start script; for pnpm, yarn and bun, the package's program of that name when no script has
+  it; `bun run FILE` reads the file as code. Unreadable: a workspace or directory option
+  (`-w`, `--workspace`, `-ws`, `--prefix`, `-C`, `--dir`, `--filter`, `-r`), a `script-shell`
+  in the directory's `.npmrc` or `npm_config_script_shell` in the environment, and no
+  `package.json`. `npm install` and the lifecycle scripts
+  of dependencies are not read.
+- `just RECIPE ARGS`: the recipe's lines and its dependencies' (`dep`, `(dep args)`, `&& dep`),
+  with `{{ }}` interpolation of a variable assigned a literal (anything else unresolved), the
+  backtick commands of assignments and lines, aliases, parameters counted to tell recipes from
+  their arguments, and `-f`, `-d`. Unreadable: `import`, `mod`, a shebang recipe, a `[script]`
+  recipe, `[working-directory]` and `[no-cd]`, `set shell` that is not a POSIX shell, `set
+  windows-powershell`, `set working-directory`, `--shell`, `--command`, `--choose`, and an
+  unknown recipe.
+- `cargo NAME`: an alias from `--config alias.NAME=...`, `CARGO_ALIAS_NAME=`, or `[alias]` of
+  `.cargo/config.toml` (or `.cargo/config`) in each directory from the worktree root down to the
+  command's, deeper winning, expanded as `cargo WORDS ARGS`; for the commands that compile or
+  run (`build`, `check`, `test`, `run`, `bench`, `clippy`, `doc`, `rustc`, `rustdoc`, `fix`,
+  `install`, `miri` and the built-in aliases), `build.rustc-wrapper`,
+  `build.rustc-workspace-wrapper`, `build.rustc`, `build.rustdoc` and `[target.*] linker`, and,
+  for `run`, `test` and `bench`, `[target.*] runner`, from those files and from `RUSTC_WRAPPER`,
+  `RUSTC`, `CARGO_TARGET_*_RUNNER` and the like. A name that is not one of cargo's commands and
+  no alias is an external `cargo-NAME` program, as before. Unreadable: a configuration file
+  that does not parse or holds `include`, `--config FILE`, `CARGO_HOME=`, `-C DIR`, and a
+  directory kGraf cannot tell. What cargo builds and runs (`build.rs`, tests) is not read.
+
+Files are read from the command's directory only, never from a parent directory (npm, just
+and cargo search parents); a recipe kGraf does not find there leaves the command unreadable.
+
+**The change: interpreter code** (`permission_code.rs`). The calls that start a program are
+found and their literal arguments read as commands: a string is a script, a list of strings an
+argv. Python, JavaScript and TypeScript, Ruby and PHP are parsed with the tree-sitter grammars
+kGraf already builds; a parse error makes the code unreadable.
+
+- Python (`python`, `python3`, `python3.N`, `pypy`, `py`; `-c`, a script, `-m MODULE` for a
+  module of the worktree, an installed module being a program as before): `os.system`,
+  `os.popen`, `subprocess.run`, `call`, `check_call`, `check_output`, `Popen`, `getoutput` and
+  `getstatusoutput`, `os.exec*`, `os.spawn*`, `os.posix_spawn` and `posix_spawnp`,
+  `os.startfile`, `pty.spawn`, `asyncio.create_subprocess_exec` and `_shell`,
+  `platform.popen`, `commands.*`, through any import alias, with `shell=True`, `executable=`
+  and `cwd=` read. Unreadable: such a call with arguments that are not literal (`*args`,
+  `**kwargs` included), such a function or module used as a value, `exec`, `eval`, `compile`,
+  `__import__`, `globals`, `locals`, `vars`, `getattr` on a spawning module, a spawning
+  module's own `__` attributes (`os.__dict__`), `sys.modules`, a string naming a spawning
+  function in code that imports a spawning module (`methodcaller("system")`), an event loop's
+  `subprocess_exec`, `from os import *`, and the import of `builtins`, `ctypes`, `cffi`, `sh`, `plumbum`,
+  `pexpect`, `invoke`, `fabric`, `delegator`, `envoy`, `sarge`, `importlib`, `runpy`, `code`,
+  `codeop`, `pickle`, `dill`, `cloudpickle`, `marshal`, `shelve`, `multiprocessing`,
+  `concurrent` or `pyautogui`.
+- JavaScript and TypeScript (`node -e`, `-p`, a script, `-r ./x` and `--import ./x`; `tsx`,
+  `ts-node`; `deno eval`, `deno run FILE`; `bun -e`): `child_process` `exec`, `execSync`
+  (scripts), `execFile`, `execFileSync`, `spawn`, `spawnSync` (argvs; `{ shell: true }` makes a
+  script), `fork` (`node FILE`), through `require` or `import` under any name;
+  `Bun.spawn`, `Bun.spawnSync` and ``Bun.$`...` `` (a substitution there is one argument);
+  `new Deno.Command` and `Deno.run`. Unreadable: such a call with arguments that are not
+  literal or spread, such a function used as a value, a computed lookup on it (on a
+  `require(...)` too), a string naming one of its functions in code that loads the module
+  (`Reflect.get(cp, "exec")`), `eval`,
+  `Function`, a string given to `setTimeout`, `process.binding` and `dlopen`, `require` or
+  `import()` of a name that is not literal, and the modules `vm`, `worker_threads`, `module`,
+  `inspector`, `repl`, `shelljs`, `execa`, `zx`, `cross-spawn`, `child-process-promise`,
+  `node-pty`, `ffi-napi` and `koffi`. `deno run` of a URL and `deno task` are unreadable.
+- Ruby (`ruby -e`, a script, `-r ./x`): `system`, `exec`, `spawn`, backquotes and `%x()`,
+  `Process.spawn`, `IO.popen`, `Open3.*`, `PTY.spawn`, `open("|CMD")`. Unreadable: such a call
+  with arguments that are not literal, a substitution in backquotes, `open` given a value,
+  `eval` and its kin, `send`, `public_send`, `method`, `define_method`, `const_get`, `load`,
+  `syscall`, a symbol naming a spawning method, and `require` of a name that is not literal.
+- PHP (`php -r`, `-B`, `-R`, `-E`, `-f`, a script): `system`, `exec`, `shell_exec`,
+  `passthru`, `popen`, `proc_open`, `pcntl_exec`, backquotes. Unreadable: such a call with
+  arguments that are not literal, a variable function, a method named by a value,
+  `eval`, `assert`, `create_function`, `call_user_func` and the functions that call a callback
+  by name, reflection, a string naming a spawning function, `include` of a name that is not
+  literal, `-a`, `-S`, and `auto_prepend_file`.
+- Perl, awk and AppleScript have no grammar here; their text is scanned. Perl (`-e`, `-E`, a
+  script): `system` and `exec` given literal lists, `readpipe`, `qx`, backquotes, and `open`
+  with `-|`, `|-` or a two-argument pipe; unreadable: those with a value, `eval` of a string,
+  `do FILE`, `require FILE`, `&$`, `&{`, `->$`, `*{`, `->can(`, `s///e`, `-x`, `-d`, `-S`, and
+  `IPC::Open2`, `IPC::Open3`, `IPC::Run`, `IPC::Run3`, `IPC::Cmd`, `IPC::System::Simple`,
+  `Capture::Tiny`, `Expect`, `Shell`, `Proc::Background`, `Proc::Simple`, `Inline` or
+  `FFI::Platypus`. awk (`awk`, `gawk`, `mawk`, `nawk`; the program, `-e`, `-f`):
+  `system("CMD")`, `"CMD" | getline`, `print | "CMD"` (and `|&`), regular expressions and
+  strings skipped; unreadable: those with a value, `@load`, `@include`, `-i`, `-l`.
+  AppleScript (`osascript -e`, a text script file): `do shell script "CMD"`, `do script "CMD"`,
+  `doShellScript("CMD")`; unreadable: those given a value or text joined to one, `run
+  script`, `load script`, `store script`, `keystroke`, `key code`, raw events, and the
+  JavaScript bridge (`ObjC`, `$.NSTask`). A spawning word in a comment or a string is read too:
+  the scan errs toward unreadable.
+- Local modules: a script's imports of modules of the worktree (`import helper`, `from . import
+  x`, `require('./x')`, `require_relative 'x'`, `include 'x.php'`) are scanned too, one level
+  deep; a local module that imports another local module makes the command unreadable, and so
+  does a relative import kGraf cannot find. Installed packages are not read, apart from the
+  modules listed above. Without a directory, an import that may be local is unreadable.
+- An interpreter with no reader (`lua`, `luajit`, `Rscript`, `R`, `julia`, `tclsh`, `wish`,
+  `expect`, `guile`, `racket`, `elixir`, `erl`, `escript`, `scala`, `groovy`, `swift`,
+  `jshell`, `csh`, `tcsh`, `nu`, `xonsh`, `elvish`) given code or a script is unreadable; asked
+  only for its version or help, it runs nothing.
+- Asked for its version, its help, or a syntax check (`node -c`, `php -l`), an interpreter
+  runs nothing; given no code and no file, it reads its input, which is unreadable.
+
+Test runners (`pytest`, `cargo test`, `node --test`, `bun test`, `deno test`) run the
+project's test code, which kGraf does not read, as before.
+
+**The change: grants.** `programs_to_grant_in` reads with the same context and refuses what is
+unreadable, so a grant of `npx`, `docker`, `cmd`, `powershell`, `git`, `make`, `npm`, `just`,
+`cargo` or an interpreter covers none of what it runs: each program needs its own grant, as
+for `env` above. A container command is granted when the runner and every program it runs are
+granted; `docker run IMAGE` with no command never is. In Auto, a user who allowed only `npm`
+now needs the programs of the script too (`jest`); `cargo test` needs a grant for a `runner`
+or wrapper the configuration names. The command policy's grant check of a script reads each
+command's files from where the script's `cd` took it. `PermissionControl::route_ask`, which
+has no directory, grants only what needs no file, so it is never looser than the command
+policy.
+
+**The change: the shortfall names what lacks a grant.** A refused command that runs several
+programs (`env curl x`, `npx -c 'curl x'`) is recorded with every program a grant must name,
+the innermost first (`RefusedCall::needs`), and its capability is the innermost (`curl`), when
+a grant could lift the refusal (the command policy's, the access check's, a write scope's
+refusal of a command that declares no paths, an unattended ask). The command policy's
+question names those programs (`The command runs `curl` (`env curl x`); ... `curl`, `env` have
+no grant.`), and a refusal it quotes is grounded in the first. A grant made for the report
+covers every one of them that the contract and the mode do not already grant
+(`Grant::Programs`), so the next attempt runs the command; each is checked against the user's
+rules, deny over ask. A grant the mode records names each program (`granted `cp` and `env``).
+See decision 0093's amendment of the same day.
+
+**Compared with Claude Code.** Claude Code matches a Bash rule against the command line and
+the commands of a compound command; it does not read what `npx`, `docker exec`, `cmd /c`, a
+git setting, a recipe or interpreter code runs, and a prefix rule for the outer program
+(`Bash(npm run:*)`, `Bash(make:*)`, `Bash(python3:*)`) approves whatever it runs (Claude Code
+documentation, "Configure permissions", Bash section, read 2026-10-06). kGraf matches a deny or
+ask rule against each of these inner commands, asks where it cannot read, and needs a grant
+for the inner program. It is never looser.
+
+**Cost.** Broad by design, each cost erring toward asking. While any shell rule with a pattern
+exists, a command kGraf cannot read asks in every mode: `docker run IMAGE`, `make` with an
+`include`, a Python script importing a package of the worktree that imports another, `node
+x.js` requiring a module kGraf cannot find, `$PYTHON x.py`. In Auto, an allow set naming only
+the build tool or the interpreter asks for what its recipe or script runs. A spawning word in a
+Perl, awk or AppleScript comment can make the command unreadable. The scan is not a sandbox:
+code can reach a program in ways no static reading sees (a module installed outside the
+worktree, data that becomes code), so the mode and the sandbox stay the boundary; the scan
+makes the user's rules see every program the code names plainly.
+
+**The change: a judgment rests on the files it read.** Every call of a round is reviewed
+before any of them runs, so another call of the round (an `apply_patch`) could rewrite a
+recipe or a script between its review and its run. The shell hook notes the files its review
+read, each with a hash of its text (`ExecPolicy::note_reviewed`, through
+`ReadContext::witnessed`), and the shell tool refuses to run the command when one of them has
+changed, appeared or gone away since (`ExecPolicy::files_changed_since_review`), naming the
+files and asking for the command to be run again, so it is judged as it is now.
+
+**Performance.** The check is on the harness path, so its cost was measured with `cargo bench
+-p kgraf-tools --bench permission_reading` (criterion, release build; Apple M4 Max, 16 cores,
+macOS 27.0; `rustc 1.95.0`): per call, the rules hook (`hard_limit`), the shell hook
+(`ExecPolicy::evaluate` and `note_reviewed`) and the tool's file check together, in Auto with a
+deny and an ask rule, the worktree's files a minute old. Before the change the first two cost
+1.2 to 1.6 microseconds a call (10.9 for `sh -c 'cd crates/x && cargo check -q'`). After: `git
+status` 3.1, `cargo test -p kgraf-tools` 14.0 (it now looks for `.cargo/config.toml`), the `sh
+-c` script 64, `npm test` 88, `make build` 56, `python3 script.py` (a 200-line script) 43, and
+562 for the first check of a script kGraf has not seen (it reads and parses it once). A first
+version took 170 to 210 for the file-reading cases; one reading per hook instead of three, and
+a cache of each file's text by its inode, length and modification and change times (a file
+changed within the last two seconds is always read again, as git does for its index) brought
+them down. For scale, the lightest sandboxed shell call (`shell/sandboxed_echo` in `benches/
+tools.rs`) takes 15.5 milliseconds on the same machine, so the largest of these is under 1% of
+a call.
+
+Evidence: `kgraf-tools` `tests/runners_and_code.rs` (each case over every mode through the
+rules hook, the command policy and the ask routing, in a real worktree:
+`a_rule_judges_what_a_runner_a_setting_a_recipe_or_code_runs_in_every_mode`,
+`a_rule_does_not_refuse_what_runs_another_program`,
+`an_unreadable_command_asks_under_a_rule_and_is_never_granted`,
+`a_grant_of_the_runner_or_the_interpreter_does_not_grant_what_it_runs`,
+`ordinary_commands_with_no_rules_are_decided_as_before`,
+`a_forbid_rule_sees_what_a_runner_or_code_runs_in_bypass`); `shell.rs`
+`a_command_whose_files_changed_after_its_review_is_refused` (through the real hook and tool);
+unit tests in
+`permission_readers.rs`, `permission_windows.rs`, `permission_git.rs`,
+`permission_recipes.rs` and `permission_code_tests.rs`; `execpolicy/policy.rs` and
+`execpolicy/script_build_tests.rs`, whose `python3` grants now read the scripts from a
+worktree (`a_cd_then_a_granted_program_is_granted_as_its_commands` also checks that a script
+starting `curl`, or one kGraf cannot find, is asked about); `permissions.rs`
+`each_mode_routes_an_ask`; `kgraf-host` `shortfall_tests.rs`
+`a_wrapped_command_is_granted_with_every_program_it_runs` (a hosted run through the real ask
+path). Each regression test fails with its part of the change reverted and passes with it
+restored.

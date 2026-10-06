@@ -294,6 +294,10 @@ pub struct PendingPermission {
     pub scope: crate::shortfall::RequestScope,
     /// The program or path asked for.
     pub subject: String,
+    /// The other programs a command grant names with `subject` (decision
+    /// 0094, amended 2026-10-06).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub with: Vec<String>,
     /// The worker whose report asked, and its words (scrubbed, capped).
     pub worker: String,
     pub need: String,

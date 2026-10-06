@@ -55,9 +55,25 @@ impl ModeResolver {
     }
 }
 
-/// What a grant names: a shell call's program, or the tool.
+/// What a grant names: a shell call's program, or the tool. A command that
+/// runs several programs (`env curl x`) names each, the innermost first,
+/// so the record says what ran and not only its wrapper (decision 0094,
+/// amended 2026-10-06).
 fn subject_of(tool: &str, input: &serde_json::Value) -> String {
-    format!("`{}`", crate::shortfall::capability_of(tool, input))
+    let programs = (tool == "shell")
+        .then(|| kgraf_tools::command_argv(input))
+        .flatten()
+        .and_then(|argv| kgraf_tools::permissions::programs_to_grant(&argv).ok())
+        .filter(|ps| ps.len() > 1);
+    match programs {
+        Some(ps) => ps
+            .iter()
+            .rev()
+            .map(|p| format!("`{p}`"))
+            .collect::<Vec<_>>()
+            .join(" and "),
+        None => format!("`{}`", crate::shortfall::capability_of(tool, input)),
+    }
 }
 
 #[async_trait::async_trait]
@@ -221,20 +237,19 @@ mod tests {
         let control = Arc::new(PermissionControl::manual());
         let (inner, asked) = person(deny(), 0);
         let r = ModeResolver::new(inner, control.clone(), true);
+        // A program that runs no code of its own: an interpreter given no
+        // code reads its input, which no grant covers (decision 0094,
+        // amended 2026-10-06).
         assert_eq!(
-            r.answer(&paused("shell", "shell", &["python3"])).await,
+            r.answer(&paused("shell", "shell", &["jq", "."])).await,
             deny()
         );
-        control.set_allow(
-            AllowSet::default()
-                .with_programs(["python3"])
-                .expect("allow"),
-        );
+        control.set_allow(AllowSet::default().with_programs(["jq"]).expect("allow"));
         control
             .set_mode(PermissionMode::Auto, ModeSource::UserInterface)
             .expect("auto");
         assert_eq!(
-            r.answer(&paused("shell", "shell", &["python3"])).await,
+            r.answer(&paused("shell", "shell", &["jq", "."])).await,
             UserAnswer::Allow
         );
         assert_eq!(r.answer(&paused("shell", "shell", &["curl"])).await, deny());

@@ -75,6 +75,14 @@ pub struct RefusedCall {
     /// `sh`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub held: Vec<String>,
+    /// For a shell command that runs several programs, refused for lack of
+    /// a grant (`env curl x`, `xargs curl`): every program a grant must
+    /// name for it to run, the innermost first, so `capability` is the
+    /// program that runs and a grant covers its wrappers too (decision
+    /// 0094, amended 2026-10-06). Empty for a command of one program, a
+    /// script refused whole, and a refusal no grant lifts (a user rule).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub needs: Vec<String>,
 }
 
 impl RefusedCall {
@@ -136,6 +144,10 @@ pub(crate) struct CallCapability {
     subjects: Vec<String>,
     /// The file an `apply_patch` call's patch names first.
     pub(crate) patch_target: Option<kgraf_tools::PatchTarget>,
+    /// Every program a grant must name for a shell call to run, outermost
+    /// first ([`kgraf_tools::permissions::programs_to_grant`]); empty when no
+    /// program grant can cover the call.
+    grant_programs: Vec<String>,
 }
 
 impl CallCapability {
@@ -157,6 +169,13 @@ impl CallCapability {
             patch_target: (tool == "apply_patch")
                 .then(|| kgraf_tools::patch_target(input))
                 .flatten(),
+            grant_programs: if tool == "shell" {
+                kgraf_tools::command_argv(input)
+                    .and_then(|argv| kgraf_tools::permissions::programs_to_grant(&argv).ok())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            },
         }
     }
 
@@ -186,15 +205,64 @@ impl CallCapability {
             path,
             whole_tool: false,
             held: Vec::new(),
+            needs: Vec::new(),
         };
-        match kgraf_tools::refused_subject_of(&self.tool, &self.subjects, by, reason) {
+        let subject = kgraf_tools::refused_subject_of(&self.tool, &self.subjects, by, reason);
+        let by_rule = matches!(&subject, Some(RefusedSubject::Program(_)))
+            && !reason.contains(kgraf_tools::permissions::SCRIPT_RUNS_LEAD)
+            && !reason.contains(kgraf_tools::permissions::COMMAND_RUNS_LEAD);
+        match subject {
             Some(RefusedSubject::Tool) => call.whole_tool = true,
             Some(RefusedSubject::Program(p)) => call.capability = p,
             Some(RefusedSubject::Path(p)) if call.path.is_none() => call.path = Some(p),
             Some(RefusedSubject::Path(_)) | None => {}
         }
         call.held = self.held_by_script(&call);
+        if !by_rule {
+            call.needs = self.needs_for(&call, by);
+            if let Some(first) = call.needs.first()
+                && call.capability == self.capability
+            {
+                call.capability = first.clone();
+            }
+        }
         call
+    }
+
+    /// Every program a grant must name for this refused command to run, the
+    /// innermost first ([`RefusedCall::needs`]), when the command runs
+    /// several and a grant could lift the refusal: the command policy's (in
+    /// its hook, or quoted by the access check), a write scope's refusal of
+    /// a command that declares no paths, or an unattended ask's. A script refused whole keeps its own
+    /// record ([`RefusedCall::held`]).
+    fn needs_for(&self, call: &RefusedCall, by: &str) -> Vec<String> {
+        let grantable = by == kgraf_tools::shell::SHELL_POLICY_HOOK
+            || by == kgraf_tools::approval::USER
+            || (by == "access" && call.reason.contains("forbidden by command policy"))
+            // A command a write scope refused for declaring no paths runs
+            // confined once every program it runs is granted.
+            || (by.is_empty() && call.path.is_none());
+        if self.tool != "shell"
+            || !grantable
+            || call.whole_tool
+            || call.path.is_some()
+            || !call.held.is_empty()
+            || self.grant_programs.len() < 2
+        {
+            return Vec::new();
+        }
+        // The program a command-level match named comes first; the rest,
+        // innermost first.
+        let mut needs: Vec<String> = Vec::new();
+        if self.grant_programs.contains(&call.capability) && call.capability != self.capability {
+            needs.push(call.capability.clone());
+        }
+        for p in self.grant_programs.iter().rev() {
+            if !needs.contains(p) {
+                needs.push(p.clone());
+            }
+        }
+        needs
     }
 
     /// The programs a script refused whole held ([`RefusedCall::held`]):
@@ -408,6 +476,7 @@ mod tests {
             path: None,
             whole_tool: false,
             held: Vec::new(),
+            needs: Vec::new(),
         }
     }
 

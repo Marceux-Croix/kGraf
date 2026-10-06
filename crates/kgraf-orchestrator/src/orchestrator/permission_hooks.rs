@@ -22,7 +22,7 @@ use super::*;
 use crate::review_desk::{PermissionRequestView, ReviewDesk};
 use crate::run_state::PendingPermission;
 use crate::shortfall::{
-    Authority, Grant, GrantRecord, RequestScope, ShortfallDecision, ShortfallKind, decide_in_plan,
+    Authority, Grant, GrantRecord, ShortfallDecision, ShortfallKind, decide_in_plan,
 };
 use kgraf_tools::permissions::PermissionControl;
 
@@ -235,7 +235,13 @@ impl RunLoop {
         at_ms: i64,
     ) {
         match grant {
-            Grant::Program(p) => c.granted_programs.push(p.clone()),
+            Grant::Program(_) | Grant::Programs(_) => {
+                for p in grant.programs() {
+                    if !c.granted_programs.iter().any(|g| g == p) {
+                        c.granted_programs.push(p.to_owned());
+                    }
+                }
+            }
             Grant::Path(p) => {
                 if !c.writes.iter().any(|w| w.path == *p) {
                     c.writes.push(WriteTarget {
@@ -245,14 +251,21 @@ impl RunLoop {
                 }
             }
         }
-        c.grants.push(GrantRecord {
-            program: grant.subject().to_owned(),
-            scope: grant.scope(),
-            worker: worker.to_owned(),
-            why: why.to_owned(),
-            at_ms,
-            by: by.to_owned(),
-        });
+        // One record per program a grant names, or one for its path.
+        let subjects: Vec<String> = match grant {
+            Grant::Path(p) => vec![p.clone()],
+            _ => grant.programs().into_iter().map(str::to_owned).collect(),
+        };
+        for subject in subjects {
+            c.grants.push(GrantRecord {
+                program: subject,
+                scope: grant.scope(),
+                worker: worker.to_owned(),
+                why: why.to_owned(),
+                at_ms,
+                by: by.to_owned(),
+            });
+        }
         c.shortfall_redispatches += 1;
     }
 
@@ -261,9 +274,10 @@ impl RunLoop {
     /// so it is refused instead.
     pub(super) fn grant_unappliable(&self, grant: &Grant) -> Option<String> {
         match grant {
-            Grant::Program(p) if self.attempt_envs.is_none() => Some(format!(
-                "`{p}` would be granted, but this run builds no per-attempt environment that \
-                 could apply a grant"
+            Grant::Program(_) | Grant::Programs(_) if self.attempt_envs.is_none() => Some(format!(
+                "{} would be granted, but this run builds no per-attempt environment that \
+                 could apply a grant",
+                grant.describe()
             )),
             _ => None,
         }
@@ -284,6 +298,7 @@ impl RunLoop {
             id,
             scope: grant.scope(),
             subject: grant.subject().to_owned(),
+            with: grant.with(),
             worker: worker.to_owned(),
             need: need.to_owned(),
             why: why.to_owned(),
@@ -376,10 +391,7 @@ impl RunLoop {
         }) else {
             return Ok(());
         };
-        let wanted = match p.scope {
-            RequestScope::File => Grant::Path(p.subject.clone()),
-            _ => Grant::Program(p.subject.clone()),
-        };
+        let wanted = Grant::of(p.scope, &p.subject, &p.with);
         let outcome = if !grant {
             Err(format!("denied by the user: {}", p.question))
         } else if let Some(why) = self.grant_unappliable(&wanted) {
@@ -411,6 +423,7 @@ impl RunLoop {
                 ShortfallKind::Permission,
                 p.scope,
                 &p.need,
+                &p.with,
                 &p.why,
                 &snapshot,
                 &authority,

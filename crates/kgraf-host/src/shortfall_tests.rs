@@ -33,6 +33,9 @@ pub(super) enum Worker {
     /// Runs `cp`; if refused, reports the shortfall; with a grant, runs `cp`
     /// and answers.
     ReportsThenRuns,
+    /// As `ReportsThenRuns`, through a wrapper: runs `env cp ...`; if
+    /// refused, reports the shortfall naming `cp`, the program that runs.
+    WrappedReportsThenRuns,
     /// Runs `cp`, then reports a `cp` shortfall whether or not it ran.
     AlwaysReports,
     /// Reports a `cp` shortfall every round without running anything.
@@ -109,6 +112,10 @@ fn tool(name: &str, input: serde_json::Value, round: usize) -> Content {
 
 fn cp() -> serde_json::Value {
     serde_json::json!({"command": ["cp", "README.md", "a.txt"]})
+}
+
+fn env_cp() -> serde_json::Value {
+    serde_json::json!({"command": ["env", "cp", "README.md", "a.txt"]})
 }
 
 fn script() -> serde_json::Value {
@@ -205,6 +212,10 @@ impl Provider for Script {
                 (Worker::ReportsThenRuns, _, 0) => Some(tool("shell", cp(), round)),
                 // A `cp` that ran needs no report.
                 (Worker::ReportsThenRuns, false, 1) if !seen.contains("exit status: 0") => {
+                    Some(tool(kgraf_runtime::SHORTFALL_TOOL, report(), round))
+                }
+                (Worker::WrappedReportsThenRuns, _, 0) => Some(tool("shell", env_cp(), round)),
+                (Worker::WrappedReportsThenRuns, false, 1) if !seen.contains("exit status: 0") => {
                     Some(tool(kgraf_runtime::SHORTFALL_TOOL, report(), round))
                 }
                 (Worker::AlwaysReports, _, 0) => Some(tool("shell", cp(), round)),
@@ -497,6 +508,40 @@ async fn orchestrator_decides_grants_a_shortfall_and_the_next_attempt_runs_it() 
     assert!(
         script.granted_ran.load(Ordering::SeqCst),
         "the fresh attempt ran the granted command"
+    );
+    assert_eq!(script.attempts.load(Ordering::SeqCst), 2);
+}
+
+/// Decision 0094, amended 2026-10-06, through the real ask path: a worker
+/// refused `env cp ...` reports the program that runs, `cp`. The refusal on
+/// record names every program the command runs that lacks a grant, the
+/// innermost first, so the orchestrator grants `cp` and `env` together and
+/// the fresh attempt runs the command. Granting the program the worker named
+/// alone, or the wrapper alone, would leave the command refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wrapped_command_is_granted_with_every_program_it_runs() {
+    let (report, trace, script) = run(
+        Worker::WrappedReportsThenRuns,
+        control(kgraf_tools::PermissionMode::OrchestratorDecides),
+        "test -f a.txt",
+        "sf-wrapped",
+    )
+    .await;
+    assert_eq!(
+        report.status,
+        kgraf_orchestrator::RunStatus::Completed,
+        "{report:?}\n{trace}"
+    );
+    let lines = shortfall_lines(&trace);
+    assert_eq!(lines.len(), 1, "{trace}");
+    assert!(
+        lines[0].contains("granted `cp` and `env` (orchestrator)"),
+        "{}",
+        lines[0]
+    );
+    assert!(
+        script.granted_ran.load(Ordering::SeqCst),
+        "the fresh attempt ran the wrapped command\n{trace}"
     );
     assert_eq!(script.attempts.load(Ordering::SeqCst), 2);
 }

@@ -4171,6 +4171,7 @@ name = "kgraf-tools"
 version = "0.7.8"
 dependencies = [
  "async-trait",
+ "base64 0.23.1",
  "blake3",
  "cap-std",
  "criterion",
@@ -4194,7 +4195,11 @@ dependencies = [
  "toml 1.1.6+spec-1.1.0",
  "toml_edit 0.25.15+spec-1.1.0",
  "tree-sitter",
+ "tree-sitter-javascript",
+ "tree-sitter-php",
  "tree-sitter-python",
+ "tree-sitter-ruby",
+ "tree-sitter-typescript",
  "trybuild",
 ]
 

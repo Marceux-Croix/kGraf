@@ -51,6 +51,18 @@ toml_edit = "0.25.15"
 # kgraf-graph and kgraf-instructions, so they add no new crate to the build.
 tree-sitter.workspace = true
 tree-sitter-python.workspace = true
+# The permission check reads the code an interpreter is given (`node -e`,
+# `ruby -e`, `php -r`, a script file) for the calls that start programs
+# (decision 0094). These grammars are already built for kgraf-graph, so they
+# add no new crate to the build.
+tree-sitter-javascript.workspace = true
+tree-sitter-typescript.workspace = true
+tree-sitter-ruby.workspace = true
+tree-sitter-php.workspace = true
+# `powershell -EncodedCommand` is base64 of UTF-16LE text; the permission
+# check decodes it to read the commands. MIT OR Apache-2.0; already in the
+# lockfile.
+base64 = "0.23"
 serde_yaml_ng.workspace = true
 blake3 = "1"
 serde ={ version = "1", features = ["derive"] }
@@ -81,4 +93,8 @@ criterion = { version = "0.8.2", default-features = false, features = ["cargo_be
 
 [[bench]]
 name = "tools"
+harness = false
+
+[[bench]]
+name = "permission_reading"
 harness = false

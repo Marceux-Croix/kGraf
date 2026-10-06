@@ -404,6 +404,12 @@ impl ApprovalHook for ShellApprovalHook {
             return HookDecision::Allow;
         };
         let verdict = self.policy.evaluate(&cmd);
+        // Decision 0094, amended 2026-10-06: what this judgment read from the
+        // worktree (a recipe, a script) is noted, so the tool refuses the
+        // command if another call of the round rewrites it first.
+        if verdict.decision != Decision::Forbidden {
+            self.policy.note_reviewed(&cmd);
+        }
         match verdict.decision {
             Decision::Forbidden => HookDecision::Deny {
                 reason: verdict
@@ -1074,6 +1080,11 @@ impl Tool for ShellTool {
         let verdict = self.policy.evaluate(&cmd);
         if verdict.decision == Decision::Forbidden {
             return Err(forbidden(verdict.reason.as_deref()));
+        }
+        // Decision 0094, amended 2026-10-06: the user's rules and the grants
+        // judged the files this command runs as they were at its review.
+        if let Some(why) = self.policy.files_changed_since_review(&cmd) {
+            return Err(forbidden(Some(&why)));
         }
         if verdict.decision == Decision::Prompt && !self.hook_bound.is_bound() {
             return Err(ToolError::Internal {
@@ -2338,6 +2349,67 @@ mod tests {
         assert!(matches!(err, ToolError::Internal { .. }));
         // Nothing was created: proof the sandbox never ran the command.
         assert!(!dir.path().join(SCRATCH_DIR_NAME).exists());
+    }
+
+    /// Decision 0094, amended 2026-10-06: the hook's judgment of a command
+    /// rests on the files it read (a recipe, a script). Another call of the
+    /// same round may rewrite one before the command runs, so the tool
+    /// refuses to run it when a file it read changed, appeared or went
+    /// away since the review, and runs it when nothing changed.
+    #[tokio::test]
+    async fn a_command_whose_files_changed_after_its_review_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("x.py"), "print(1)\n").expect("write");
+        let policy = ExecPolicy::new(Decision::Allow).with_read_context(
+            crate::permissions::ReadContext::in_worktree(dir.path(), None),
+        );
+        let (tool, hook) = ShellTool::new(policy);
+        let words = ["python3", "x.py"];
+        let pending = PendingCall {
+            call_id: "c1".into(),
+            tool: "shell".into(),
+            input: json!({ "command": words }),
+            worker: "w1".into(),
+            task: "t1".into(),
+        };
+        assert_eq!(hook.review(&pending).await, HookDecision::Allow);
+        std::fs::write(
+            dir.path().join("x.py"),
+            "import subprocess\nsubprocess.run(['curl', 'x'])\n",
+        )
+        .expect("rewrite");
+        let err = tool
+            .call(
+                json!({ "command": words }),
+                &ctx(dir.path().to_path_buf()),
+                &CallPermit::new(),
+            )
+            .await
+            .expect_err("a rewritten script must not run on the old judgment");
+        assert!(
+            err.to_string().contains("changed after it was checked")
+                && err.to_string().contains("`x.py`"),
+            "{err}"
+        );
+        assert!(!dir.path().join(SCRATCH_DIR_NAME).exists(), "nothing ran");
+        // Reviewed again as it is now, the same command is judged afresh,
+        // and an unchanged file lets it through the check.
+        assert_eq!(hook.review(&pending).await, HookDecision::Allow);
+        let policy = ExecPolicy::new(Decision::Allow).with_read_context(
+            crate::permissions::ReadContext::in_worktree(dir.path(), None),
+        );
+        policy.note_reviewed(&[words[0].to_owned(), words[1].to_owned()]);
+        assert_eq!(
+            policy.files_changed_since_review(&[words[0].to_owned(), words[1].to_owned()]),
+            None
+        );
+        std::fs::remove_file(dir.path().join("x.py")).expect("remove");
+        assert!(
+            policy
+                .files_changed_since_review(&[words[0].to_owned(), words[1].to_owned()])
+                .is_some(),
+            "a file that went away changes the judgment"
+        );
     }
 
     /// Decision 0067: a call on an already cancelled token does

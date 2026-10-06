@@ -47,6 +47,19 @@ use std::sync::{Arc, Mutex};
 
 #[path = "permission_names.rs"]
 pub mod permission_names;
+
+// What programs run from their arguments and from the worktree's files
+// (decision 0094, amended 2026-10-06), one reader per family.
+#[path = "permission_code.rs"]
+mod code;
+#[path = "permission_git.rs"]
+mod git;
+#[path = "permission_readers.rs"]
+mod readers;
+#[path = "permission_recipes.rs"]
+mod recipes;
+#[path = "permission_windows.rs"]
+mod windows;
 pub use permission_names::{
     BUILTIN_TOOLS, CLAUDE_CODE_ALIASES, CLAUDE_CODE_WITHOUT_COUNTERPART, claude_code_alias,
     counterpart_notice, tool_hint, unmatched_entries, without_counterpart,
@@ -714,7 +727,8 @@ impl ScriptConstruct {
             Self::Variables => {
                 "kGraf cannot see what a variable holds or what a substitution prints. It checks \
                  the programs it can read, those inside $(...) and backquotes too; a command \
-                 named by a variable, such as $CMD, runs with no check at all."
+                 named by a variable, such as $CMD, is granted with no check of what it runs, \
+                 and asks instead while you have a deny or ask rule on the shell."
             }
             Self::Subshells => {
                 "The commands inside the parentheses or braces are checked like every other \
@@ -823,9 +837,10 @@ programs: Auto with your allow set, Accept edits for file programs, and programs
 piece of work. With a switch on, a script that uses the construct is granted when every program \
 kGraf can see in it is granted. kGraf cannot see what a variable or a substitution will run, so \
 you accept that a program it cannot see runs unchecked, the refusal to delete system paths \
-included. Your deny and ask rules still apply to every command kGraf can see, and a deny or ask \
-rule whose program is named anywhere in the script text still refuses or asks. The sandbox does \
-not change. Manual still asks, and Bypass already allows these scripts.";
+included. Your deny and ask rules still apply to every command kGraf can see, a deny or ask \
+rule whose program is named anywhere in the script text still refuses or asks, and while you \
+have a deny or ask rule on the shell, a command named by a variable asks. The sandbox does not \
+change. Manual still asks, and Bypass already allows these scripts.";
 
 /// Everything the user set: the mode, Auto's allow set, the rules, plan
 /// review, and the bypass switches.
@@ -1798,17 +1813,31 @@ const MAX_SHELL_DEPTH: usize = 32;
 /// itself and every command it starts ([`Embedded`]): for `sh -c SCRIPT` (or
 /// `-lc`, `-ec`) and `eval`, each command of the script split on `;`, `&&`,
 /// `||`, `|`, `&` and newlines; the argv a program runs from its arguments
-/// (`find -exec PROG ... ;`, `script FILE PROG`, `uv run PROG`); and the
-/// script text a program hands to a shell (`su -c`, `ssh HOST CMD`, `script
-/// -c`, `trap CMD SIG`, `watch CMD`, `flock F -c`, `env -S`, `parallel CMD
-/// :::`). The starting program may stand after prefix words
-/// ([`command_starts`]: `env sh -c ...`, `nohup bash -c ...`), and each
-/// command found is read the same way, its commands listed after it. A
-/// script that cannot be split (unbalanced quotes) yields its words split on
-/// whitespace, so a rule still sees them. What a call starts that kGraf
-/// cannot read (`source FILE`) is listed by [`unreadable_commands`].
+/// (`find -exec PROG ... ;`, `script FILE PROG`, `uv run PROG`, `npx PKG`,
+/// `docker exec CONTAINER PROG`); the script text a program hands to a shell
+/// (`su -c`, `ssh HOST CMD`, `script -c`, `trap CMD SIG`, `watch CMD`,
+/// `flock F -c`, `env -S`, `parallel CMD :::`, `cmd /c`, `powershell
+/// -Command`, a git configuration value that runs a command); and, with a
+/// [`ReadContext`], what a file in the worktree makes a program run (a
+/// Makefile recipe, a `package.json` script, a justfile recipe, a cargo
+/// alias, the calls of interpreter code that start programs). The starting
+/// program may stand after prefix words ([`command_starts`]: `env sh -c
+/// ...`, `nohup bash -c ...`), and each command found is read the same way,
+/// its commands listed after it. A script that cannot be split (unbalanced
+/// quotes) yields its words split on whitespace, so a rule still sees them.
+/// What a call starts that kGraf cannot read (`source FILE`, `$CMD`) is
+/// listed by [`unreadable_commands`].
+///
+/// With no [`ReadContext`], no file is read: every command that runs what a
+/// file says is unreadable.
 pub fn simple_commands(argv: &[String]) -> Vec<Vec<String>> {
-    read_call(argv)
+    simple_commands_in(argv, &ReadContext::default())
+}
+
+/// [`simple_commands`], reading the files the call's programs run from
+/// `ctx`'s directory.
+pub fn simple_commands_in(argv: &[String], ctx: &ReadContext) -> Vec<Vec<String>> {
+    read_call_in(argv, ctx)
         .commands
         .into_iter()
         .map(|c| c.words)
@@ -1818,11 +1847,157 @@ pub fn simple_commands(argv: &[String]) -> Vec<Vec<String>> {
 /// What a call starts that kGraf cannot read, each as the reason
 /// ([`Embedded::Unreadable`]): `source FILE`, `. FILE`, a shell given a file
 /// or its input instead of `-c`, `ssh HOST` with no command, `su` with no
-/// command. Empty when every command the call runs is in
-/// [`simple_commands`].
+/// command, a command named by a variable or a substitution, a recipe or
+/// script file that is missing or cannot be parsed, interpreter code that
+/// starts a program with arguments kGraf cannot see. Empty when every
+/// command the call runs is in [`simple_commands`].
 pub fn unreadable_commands(argv: &[String]) -> Vec<String> {
-    read_call(argv).unreadable
+    unreadable_commands_in(argv, &ReadContext::default())
 }
+
+/// [`unreadable_commands`], reading files from `ctx`'s directory.
+pub fn unreadable_commands_in(argv: &[String], ctx: &ReadContext) -> Vec<String> {
+    read_call_in(argv, ctx).unreadable
+}
+
+/// Where the files a call's programs read are found: a Makefile, a
+/// `package.json`, a justfile, `.cargo/config.toml`, a script file given to
+/// an interpreter, git's configuration (decision 0094, amended 2026-10-06).
+/// The default knows no directory, so every command that runs what a file
+/// says is unreadable.
+#[derive(Clone, Debug, Default)]
+pub struct ReadContext {
+    /// The worktree. No file outside it is read, git's configuration aside.
+    pub root: Option<PathBuf>,
+    /// The directory the command starts in, inside `root`. `None` when
+    /// kGraf cannot tell, as after a `cd` it cannot follow.
+    pub cwd: Option<PathBuf>,
+    /// The user's home directory, for git's user configuration.
+    pub home: Option<PathBuf>,
+    /// Variables the command sees that the call itself set: assignments
+    /// before the program (`GIT_PAGER=x git log`, `env A=1 make`) and
+    /// earlier in its script (`export GIT_SSH_COMMAND=x; git fetch`). A
+    /// reader treats them as the program would (git's command variables,
+    /// make's variables, cargo's wrappers).
+    pub(crate) env: Vec<(String, String)>,
+    /// Where each file read and a hash of its text are noted, when the
+    /// caller wants to know what a decision rested on
+    /// ([`ReadContext::witnessed`]).
+    pub(crate) witness: Option<Arc<Mutex<FilesRead>>>,
+}
+
+/// The files a reading read, each with a hash of its text, in order.
+pub(crate) type FilesRead = Vec<(PathBuf, blake3::Hash)>;
+
+/// Two contexts are equal when they read the same files; where a reading
+/// is noted does not change what it reads.
+impl PartialEq for ReadContext {
+    fn eq(&self, other: &Self) -> bool {
+        self.root == other.root
+            && self.cwd == other.cwd
+            && self.home == other.home
+            && self.env == other.env
+    }
+}
+
+impl Eq for ReadContext {}
+
+impl ReadContext {
+    /// Commands that start in the worktree root `root`.
+    pub fn in_worktree(root: &Path, home: Option<&Path>) -> Self {
+        Self {
+            root: Some(root.to_path_buf()),
+            cwd: Some(root.to_path_buf()),
+            home: home.map(Path::to_path_buf),
+            env: Vec::new(),
+            witness: None,
+        }
+    }
+
+    /// The value the command sees for variable `name`, if the call set it.
+    pub(crate) fn var(&self, name: &str) -> Option<&str> {
+        self.env
+            .iter()
+            .rev()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// The same context with `assignments` (`NAME=value` words) added.
+    pub(crate) fn with_assignments<'a>(
+        &self,
+        assignments: impl IntoIterator<Item = &'a String>,
+    ) -> Self {
+        let mut next = self.clone();
+        for w in assignments {
+            if is_assignment(w)
+                && let Some((name, value)) = w.split_once('=')
+            {
+                next.env
+                    .push((name.trim_end_matches('+').to_owned(), value.to_owned()));
+            }
+        }
+        next
+    }
+
+    /// Every file reading `argv` in this context reads, each with a hash of
+    /// its text, in the order read: what a decision on the call rested on.
+    /// A command the files of the worktree make run something else after
+    /// the decision (another call of the same round rewrote them) is found
+    /// by comparing this before and after.
+    pub fn witnessed(&self, argv: &[String]) -> Vec<(PathBuf, blake3::Hash)> {
+        let witness = Arc::new(Mutex::new(Vec::new()));
+        let ctx = Self {
+            witness: Some(witness.clone()),
+            ..self.clone()
+        };
+        let _ = read_call_in(argv, &ctx);
+        witness.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// Note that `path` was read with `text`.
+    fn witness(&self, path: &Path, text: &str) {
+        if let Some(w) = &self.witness {
+            w.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push((path.to_path_buf(), blake3::hash(text.as_bytes())));
+        }
+    }
+
+    /// The same context, starting in `dir` instead: a relative `dir` is
+    /// taken from the current directory. The directory is unknown when the
+    /// current one is, when `dir` holds an expansion, or when it leads out
+    /// of the worktree.
+    fn moved_to(&self, dir: &str) -> Self {
+        let cwd = match (&self.cwd, &self.root) {
+            (Some(cwd), Some(root))
+                if !dir.is_empty()
+                    && !dir.contains(['$', '`', '~', '*', '?', '['])
+                    && dir != "-" =>
+            {
+                lexical_normalize(&cwd.join(dir)).filter(|p| p.starts_with(root))
+            }
+            _ => None,
+        };
+        Self {
+            cwd,
+            ..self.clone()
+        }
+    }
+
+    /// The same context with an unknown current directory.
+    fn lost(&self) -> Self {
+        Self {
+            cwd: None,
+            ..self.clone()
+        }
+    }
+}
+
+/// How many commands one call may start before kGraf stops reading it, as
+/// unreadable: a recipe or script that runs another, which runs another,
+/// can fan out without bound; real calls stay far below this.
+const MAX_READ_COMMANDS: usize = 2_000;
 
 /// One command of a call, from [`read_call`].
 struct Nested {
@@ -1834,6 +2009,10 @@ struct Nested {
     /// `cd` anywhere else (`find -exec cd`, `ssh host cd`) moves no later
     /// command.
     same_shell: bool,
+    /// The directory the command starts in, when a program or a `cd` moved
+    /// it there (`make -C DIR`, `cd DIR && ...`); `None` for the worktree
+    /// root, or when the directory is not known.
+    dir: Option<PathBuf>,
 }
 
 /// A call read as every command it runs ([`simple_commands`]) and what it
@@ -1843,55 +2022,217 @@ struct CallReading {
     unreadable: Vec<String>,
 }
 
+impl CallReading {
+    fn unreadable(&mut self, why: String) {
+        if !self.unreadable.contains(&why) {
+            self.unreadable.push(why);
+        }
+    }
+}
+
 fn read_call(argv: &[String]) -> CallReading {
+    read_call_in(argv, &ReadContext::default())
+}
+
+fn read_call_in(argv: &[String], ctx: &ReadContext) -> CallReading {
     let mut reading = CallReading {
         commands: vec![Nested {
             depth: 0,
             words: argv.to_vec(),
             same_shell: true,
+            dir: None,
         }],
         unreadable: Vec::new(),
     };
-    push_embedded(argv, 1, &mut reading);
+    if let Some(why) = changes_path(argv) {
+        reading.unreadable(why);
+    }
+    push_embedded(argv, 1, ctx, &mut reading);
     reading
 }
 
-fn push_embedded(words: &[String], depth: usize, reading: &mut CallReading) {
+/// Why a command a shell expands is named by an expansion: its program word
+/// holds a variable, a substitution or a placeholder kGraf could not
+/// resolve (`$CMD x`, `"$@"`, `${X}`). Such a command runs whatever the
+/// expansion holds, which no rule or grant can check (decision 0094, amended
+/// 2026-10-06).
+fn named_by_expansion(words: &[String]) -> Option<String> {
+    command_roles(words)
+        .into_iter()
+        .filter(|(_, role)| matches!(role, WordRole::Program | WordRole::Wrapper))
+        .map(|(i, _)| &words[i])
+        .find(|w| w.contains(['$', '`']))
+        .map(|w| {
+            format!(
+                "the command `{}` is named by a variable or a substitution, so kGraf cannot tell \
+                 what it runs",
+                w.escape_debug()
+            )
+        })
+}
+
+/// Why a command changes where program names are found: it sets `PATH`
+/// for a program (`PATH=./bin ls`, `env PATH=./bin ls`) or for the commands
+/// after it (`export PATH=./bin`, `PATH=./bin` alone). A name such a command
+/// runs may be any file, which no rule on the name checks (decision 0094,
+/// amended 2026-10-06).
+fn changes_path(words: &[String]) -> Option<String> {
+    let set = |w: &String| -> Option<&'static str> {
+        let name = w.split_once('=')?.0.trim_end_matches('+');
+        CODE_VARIABLES.iter().find(|v| **v == name).copied()
+    };
+    let roles = command_roles(words);
+    let prefix_sets = roles
+        .iter()
+        .filter(|&&(_, role)| role == WordRole::Prefix)
+        .find_map(|&(i, _)| set(&words[i]));
+    let exported = matches!(
+        words.first().map(String::as_str),
+        Some("export" | "declare" | "typeset" | "readonly" | "local")
+    )
+    .then(|| words[1..].iter().find_map(set))
+    .flatten();
+    prefix_sets.or(exported).map(|name| {
+        if name == "PATH" {
+            "the command sets PATH, so kGraf cannot tell which file a program name runs".to_owned()
+        } else {
+            format!(
+                "the command sets `{name}`, which makes a program load code kGraf does not read"
+            )
+        }
+    })
+}
+
+/// Environment variables that choose which file a program name runs
+/// (`PATH`) or make a program load code before its own (decision 0094,
+/// amended 2026-10-06): the dynamic loader's preload and search paths, the
+/// shell's startup file for scripts, and the interpreters' startup and
+/// module paths.
+const CODE_VARIABLES: &[&str] = &[
+    "PATH",
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "LD_AUDIT",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_FRAMEWORK_PATH",
+    "BASH_ENV",
+    "ENV",
+    "ZDOTDIR",
+    "PYTHONPATH",
+    "PYTHONSTARTUP",
+    "PYTHONHOME",
+    "PYTHONUSERBASE",
+    "NODE_OPTIONS",
+    "NODE_PATH",
+    "PERL5OPT",
+    "PERL5LIB",
+    "PERLLIB",
+    "RUBYOPT",
+    "RUBYLIB",
+    "PHPRC",
+    "PHP_INI_SCAN_DIR",
+];
+
+/// The context a directory change moves the next commands of a script to
+/// (`cd DIR`, `pushd DIR`, `popd`); `None` when `words` changes no
+/// directory. The directory stays known only for a plain `cd` to a literal
+/// path in the worktree.
+fn after_directory_change(words: &[String], ctx: &ReadContext) -> Option<ReadContext> {
+    let at = command_starts(words)
+        .into_iter()
+        .find(|&i| DIRECTORY_CHANGERS.contains(&base_name(&words[i])))?;
+    let plain = at == 0 && base_name(&words[0]) == "cd";
+    Some(match &words[1..] {
+        [dir] if plain && !dir.starts_with('-') => ctx.moved_to(dir),
+        _ => ctx.lost(),
+    })
+}
+
+fn push_embedded(words: &[String], depth: usize, ctx: &ReadContext, reading: &mut CallReading) {
     if depth > MAX_SHELL_DEPTH {
         return;
     }
-    for (at, found) in embedded(words) {
-        match found {
-            Embedded::Argv(argv) => {
+    for (at, found) in embedded(words, ctx) {
+        push_found(words, at, found, depth, ctx, reading);
+    }
+}
+
+fn push_found(
+    words: &[String],
+    at: usize,
+    found: Embedded,
+    depth: usize,
+    ctx: &ReadContext,
+    reading: &mut CallReading,
+) {
+    if reading.commands.len() >= MAX_READ_COMMANDS {
+        reading.unreadable("it starts more commands than kGraf reads".into());
+        return;
+    }
+    let dir_of = |c: &ReadContext| c.cwd.clone().filter(|d| Some(d) != c.root.as_ref());
+    match found {
+        Embedded::In(moved, inner) => push_found(words, at, *inner, depth, &moved, reading),
+        Embedded::Argv(argv) => {
+            if argv.is_empty() {
+                return;
+            }
+            for why in [named_by_expansion(&argv), changes_path(&argv)]
+                .into_iter()
+                .flatten()
+            {
+                reading.unreadable(why);
+            }
+            reading.commands.push(Nested {
+                depth,
+                words: argv.clone(),
+                same_shell: false,
+                dir: dir_of(ctx),
+            });
+            push_embedded(&argv, depth + 1, ctx, reading);
+        }
+        Embedded::Script(script) => {
+            let b = base_name(&words[at]);
+            let same_shell = b == "eval" || SHELLS.contains(&b);
+            let (segments, by_substitution) = split_script_flagged(&script);
+            if by_substitution {
+                reading.unreadable(
+                    "a command is named by a substitution, so kGraf cannot tell what it runs"
+                        .into(),
+                );
+            }
+            // A `cd` in the script moves the commands after it, for the
+            // files they read (`cd web && npm test` reads web's
+            // `package.json`).
+            let mut here = ctx.clone();
+            for segment in segments {
+                let words = shlex::split(&segment)
+                    .unwrap_or_else(|| segment.split_whitespace().map(str::to_owned).collect());
+                if words.is_empty() {
+                    continue;
+                }
+                for why in [named_by_expansion(&words), changes_path(&words)]
+                    .into_iter()
+                    .flatten()
+                {
+                    reading.unreadable(why);
+                }
                 reading.commands.push(Nested {
                     depth,
-                    words: argv.clone(),
-                    same_shell: false,
+                    words: words.clone(),
+                    same_shell,
+                    dir: dir_of(&here),
                 });
-                push_embedded(&argv, depth + 1, reading);
-            }
-            Embedded::Script(script) => {
-                let b = base_name(&words[at]);
-                let same_shell = b == "eval" || SHELLS.contains(&b);
-                for segment in split_script(&script) {
-                    let words = shlex::split(&segment)
-                        .unwrap_or_else(|| segment.split_whitespace().map(str::to_owned).collect());
-                    if !words.is_empty() {
-                        reading.commands.push(Nested {
-                            depth,
-                            words: words.clone(),
-                            same_shell,
-                        });
-                        push_embedded(&words, depth + 1, reading);
-                    }
+                push_embedded(&words, depth + 1, &here, reading);
+                if let Some(moved) = after_directory_change(&words, &here) {
+                    here = moved;
                 }
-            }
-            Embedded::Unreadable(why) => {
-                if !reading.unreadable.contains(&why) {
-                    reading.unreadable.push(why);
+                if let Some(assigned) = after_assignment(&words, &here) {
+                    here = assigned;
                 }
             }
         }
+        Embedded::Unreadable(why) => reading.unreadable(why),
     }
 }
 
@@ -1910,6 +2251,10 @@ enum Embedded {
     /// FILE`), a shell's input (`bash` with no `-c`), a shell on another
     /// machine (`ssh HOST`), an interactive shell (`su USER`, `script FILE`).
     Unreadable(String),
+    /// What the inner value runs, read with another context: a command
+    /// that starts in another directory (`make -C DIR`, a recipe of a
+    /// Makefile there), or one whose directory kGraf cannot tell.
+    In(ReadContext, Box<Embedded>),
 }
 
 /// What a word of a command is, as [`command_roles`] reads it.
@@ -1930,13 +2275,13 @@ enum WordRole {
 /// Every command a command's arguments start, each with the index of the
 /// word that starts it. Read at each place [`command_roles`] lists that may
 /// hold a program, so a wrapper hides none of them.
-fn embedded(words: &[String]) -> Vec<(usize, Embedded)> {
+fn embedded(words: &[String], ctx: &ReadContext) -> Vec<(usize, Embedded)> {
     let mut out = Vec::new();
     for (at, role) in command_roles(words) {
         if role == WordRole::Prefix {
             continue;
         }
-        for found in embedded_at(words, at) {
+        for found in embedded_at(words, at, ctx) {
             out.push((at, found));
         }
     }
@@ -2040,8 +2385,265 @@ fn option_values(args: &[String], names: &[&str]) -> Vec<String> {
     out
 }
 
-/// The commands the program at `words[at]` starts from its arguments.
-fn embedded_at(words: &[String], at: usize) -> Vec<Embedded> {
+/// The largest file the permission check reads (a recipe file, a script):
+/// a larger one is unreadable. Real recipe and script files are far
+/// smaller; the cap bounds the time and memory a check can take.
+const MAX_READ_FILE_BYTES: u64 = 1024 * 1024;
+
+/// A text file of the worktree, read by the permission check.
+struct ReadFile {
+    /// Where it was found, lexically normalized.
+    path: PathBuf,
+    text: Arc<str>,
+}
+
+/// What identifies one version of a file without reading it: its inode,
+/// length, and modification and change times. A rewrite changes the change
+/// time, which no program can set back.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileVersion {
+    ino: u64,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    changed_ns: i128,
+}
+
+impl FileVersion {
+    fn of(meta: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        let (ino, changed_ns) = {
+            use std::os::unix::fs::MetadataExt;
+            (
+                meta.ino(),
+                i128::from(meta.ctime()) * 1_000_000_000 + i128::from(meta.ctime_nsec()),
+            )
+        };
+        #[cfg(not(unix))]
+        let (ino, changed_ns) = (
+            0,
+            meta.created()
+                .ok()
+                .and_then(|c| c.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_nanos() as i128),
+        );
+        Self {
+            ino,
+            len: meta.len(),
+            modified: meta.modified().ok(),
+            changed_ns,
+        }
+    }
+
+    /// Whether the file changed within the last two seconds: a file system
+    /// whose clock ticks coarsely can give two quick writes one time, so a
+    /// recent version is always read again (the rule git uses for its
+    /// index).
+    fn recent(&self) -> bool {
+        self.modified.is_none_or(|m| {
+            std::time::SystemTime::now()
+                .duration_since(m)
+                .map_or(true, |age| age < std::time::Duration::from_secs(2))
+        })
+    }
+}
+
+/// The text of each file the permission check read, by path and version, so
+/// a repeated check stats a file instead of reading it again (decision 0094,
+/// amended 2026-10-06). Process-wide on purpose, as [`ContentCache`]: an
+/// entry is used only for the very version it was read from. Bounded:
+/// cleared when full.
+static FILE_TEXTS: std::sync::LazyLock<Mutex<FileTexts>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// Each read file's text by path, with the version it was read from.
+type FileTexts = std::collections::HashMap<PathBuf, (FileVersion, Arc<str>)>;
+
+/// Read `name` (relative to `ctx`'s directory, or absolute) as UTF-8 text,
+/// for the permission check: only a regular file lexically inside the
+/// worktree, at most [`MAX_READ_FILE_BYTES`], opened confined to the
+/// worktree so a link cannot lead out of it, never a FIFO or a device
+/// ([`crate::fs_safety::read_capped`]). `Err` says why it cannot be read.
+fn read_worktree_file(ctx: &ReadContext, name: &str) -> Result<ReadFile, String> {
+    let (Some(root), Some(cwd)) = (&ctx.root, &ctx.cwd) else {
+        return Err(format!(
+            "kGraf cannot tell which directory `{}` is read from",
+            name.escape_debug()
+        ));
+    };
+    if name.is_empty() || name.contains(['$', '`', '*', '?']) || name.starts_with('~') {
+        return Err(format!(
+            "`{}` is not a literal file name",
+            name.escape_debug()
+        ));
+    }
+    let path = lexical_normalize(&cwd.join(name))
+        .filter(|p| p.starts_with(root))
+        .ok_or_else(|| format!("`{}` is outside the worktree", name.escape_debug()))?;
+    let rel = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
+    let version = std::fs::metadata(&path).ok().map(|m| FileVersion::of(&m));
+    let cached = version.filter(|v| !v.recent()).and_then(|v| {
+        FILE_TEXTS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&path)
+            .filter(|(seen, _)| *seen == v)
+            .map(|(_, text)| text.clone())
+    });
+    let text = match cached {
+        Some(text) => text,
+        None => {
+            let dir = crate::fs_safety::open_workspace("shell", root).map_err(|e| e.to_string())?;
+            let bytes =
+                crate::fs_safety::read_capped("shell", &dir, &rel, MAX_READ_FILE_BYTES, true)
+                    .map_err(|e| format!("`{}` cannot be read: {e}", rel.display()))?;
+            let text: Arc<str> = String::from_utf8(bytes)
+                .map_err(|_| format!("`{}` is not UTF-8 text", rel.display()))?
+                .into();
+            if let Some(v) = version {
+                let mut texts = FILE_TEXTS.lock().unwrap_or_else(|p| p.into_inner());
+                if texts.len() >= CONTENT_CACHE_ENTRIES {
+                    texts.clear();
+                }
+                texts.insert(path.clone(), (v, text.clone()));
+            }
+            text
+        }
+    };
+    ctx.witness(&path, &text);
+    Ok(ReadFile { path, text })
+}
+
+/// Whether `name` exists in `ctx`'s directory as a regular file (following
+/// links), lexically inside the worktree.
+fn worktree_file_exists(ctx: &ReadContext, name: &str) -> bool {
+    let (Some(root), Some(cwd)) = (&ctx.root, &ctx.cwd) else {
+        return false;
+    };
+    lexical_normalize(&cwd.join(name))
+        .filter(|p| p.starts_with(root))
+        .and_then(|p| std::fs::metadata(p).ok())
+        .is_some_and(|m| m.is_file())
+}
+
+/// A memo of what the permission check parsed out of a file or a piece of
+/// code, keyed by a hash of the text it was parsed from (decision 0094,
+/// amended 2026-10-06). Process-wide on purpose: the key is the content,
+/// so an entry can never go stale and holds no policy state, and the check
+/// runs on every shell call, often on the same `package.json` or script.
+/// Bounded: cleared when full.
+struct ContentCache<T> {
+    entries: std::sync::LazyLock<Mutex<std::collections::HashMap<blake3::Hash, Arc<T>>>>,
+}
+
+/// How many parsed texts a [`ContentCache`] keeps before it starts over.
+const CONTENT_CACHE_ENTRIES: usize = 256;
+
+impl<T> ContentCache<T> {
+    const fn new() -> Self {
+        Self {
+            entries: std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new())),
+        }
+    }
+    /// The parse of `text` under `kind`, computed by `parse` once per
+    /// distinct text.
+    fn get(&self, kind: &str, text: &str, parse: impl FnOnce() -> T) -> Arc<T> {
+        let mut h = blake3::Hasher::new();
+        h.update(kind.as_bytes());
+        h.update(&[0]);
+        h.update(text.as_bytes());
+        let key = h.finalize();
+        if let Some(hit) = self
+            .entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&key)
+        {
+            return hit.clone();
+        }
+        let value = Arc::new(parse());
+        let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        if entries.len() >= CONTENT_CACHE_ENTRIES {
+            entries.clear();
+        }
+        entries.insert(key, value.clone());
+        value
+    }
+}
+
+/// A program name as Windows and the shells compare it: the last path
+/// component after `/` or `\`, lowercase, without `.exe`, `.cmd` or `.bat`.
+fn program_key(word: &str) -> String {
+    let last = word.rsplit(['/', '\\']).next().unwrap_or(word);
+    let lower = last.to_ascii_lowercase();
+    for ext in [".exe", ".cmd", ".bat", ".com"] {
+        if let Some(stem) = lower.strip_suffix(ext) {
+            return stem.to_owned();
+        }
+    }
+    lower
+}
+
+/// The context the program at `words[at]` reads its files in, after the
+/// prefix words before it: a wrapper that changes the directory (`env -C
+/// DIR`, `sudo -D DIR`, `nsenter -w`) or the root (`chroot`) leaves it
+/// unknown, so no file a different directory holds is mistaken for the one
+/// that runs.
+fn prefix_context(words: &[String], at: usize, ctx: &ReadContext) -> ReadContext {
+    let mut i = 0;
+    while i < at {
+        let b = base_name(&words[i]);
+        let rest = &words[i + 1..at];
+        let moves = match b {
+            "chroot" => true,
+            "env" => rest.iter().any(|w| {
+                w == "-C" || w == "--chdir" || w.starts_with("--chdir=") || w.starts_with("-C")
+            }),
+            "sudo" => rest.iter().any(|w| {
+                w == "-D" || w == "--chdir" || w.starts_with("--chdir=") || w.starts_with("-D")
+            }),
+            "nsenter" => rest
+                .iter()
+                .any(|w| w.starts_with("-w") || w.starts_with("--wd") || w.starts_with("-r")),
+            "doas" | "su" | "runuser" | "setpriv" | "unshare" | "firejail" | "systemd-run" => {
+                rest.iter().any(|w| {
+                    w.contains("chdir") || w.contains("cwd") || w.contains("working-directory")
+                })
+            }
+            _ => false,
+        };
+        if moves {
+            return ctx.lost().with_assignments(&words[..at]);
+        }
+        i += 1;
+    }
+    ctx.with_assignments(&words[..at])
+}
+
+/// The context an assignment command of a script leaves the commands after
+/// it in (`X=1`, `export X=1`, `declare -x X=1`); `None` when `words`
+/// assigns nothing.
+pub(crate) fn after_assignment(words: &[String], ctx: &ReadContext) -> Option<ReadContext> {
+    let all_assignments = !words.is_empty() && words.iter().all(|w| is_assignment(w));
+    let declares = matches!(
+        words.first().map(String::as_str),
+        Some("export" | "declare" | "typeset" | "readonly" | "local")
+    );
+    if all_assignments {
+        return Some(ctx.with_assignments(words));
+    }
+    if declares {
+        return Some(ctx.with_assignments(&words[1..]));
+    }
+    None
+}
+
+/// The commands the program at `words[at]` starts from its arguments, read
+/// in `ctx` (a file it runs is read from there).
+fn embedded_at(words: &[String], at: usize, ctx: &ReadContext) -> Vec<Embedded> {
+    let ctx = &prefix_context(words, at, ctx);
+    if let Some(found) = readers::embedded_by_reader(words, at, ctx) {
+        return found;
+    }
     let b = base_name(&words[at]);
     let args = &words[at + 1..];
     let unreadable = |why: &str| vec![Embedded::Unreadable(format!("`{b}` {why}"))];
@@ -2294,12 +2896,41 @@ fn embedded_at(words: &[String], at: usize) -> Vec<Embedded> {
             .find(|(p, sub, _)| *p == b && args.first().is_some_and(|a| a == sub))
             .map(|&(_, _, operands)| {
                 let tail = args.get(1 + operands..).unwrap_or_default();
+                // `uv run --directory DIR`, `direnv exec DIR`, `mise exec
+                // -C DIR`: the command starts elsewhere, so a file it reads
+                // is not read from here.
+                let moved = operands > 0
+                    || tail.iter().any(|w| {
+                        [
+                            "--directory",
+                            "--project",
+                            "--cwd",
+                            "--dir",
+                            "-C",
+                            "--chdir",
+                        ]
+                        .iter()
+                        .any(|o| w == o || w.starts_with(&format!("{o}=")))
+                    });
                 command_roles(tail)
                     .into_iter()
                     .filter(|&(_, role)| {
                         matches!(role, WordRole::ValueOrProgram | WordRole::Program)
                     })
-                    .map(|(i, _)| Embedded::Argv(tail[i..].to_vec()))
+                    .map(|(i, _)| {
+                        // `uv run x.py` runs the file with Python, not a
+                        // program of that name.
+                        let mut argv = tail[i..].to_vec();
+                        if b == "uv" && argv[0].ends_with(".py") {
+                            argv.insert(0, "python3".to_owned());
+                        }
+                        let argv = Embedded::Argv(argv);
+                        if moved {
+                            Embedded::In(ctx.lost(), Box::new(argv))
+                        } else {
+                            argv
+                        }
+                    })
                     .collect()
             })
             .unwrap_or_default(),
@@ -2318,18 +2949,45 @@ fn embedded_at(words: &[String], at: usize) -> Vec<Embedded> {
 /// an action of [`FIND_ACTIONS`], a command kGraf cannot read
 /// ([`unreadable_commands`]) and a script the strict reader does not judge.
 pub fn programs_to_grant(words: &[String]) -> Result<Vec<String>, String> {
+    programs_to_grant_in(words, &ReadContext::default())
+}
+
+/// [`programs_to_grant`], reading the files the command's programs run
+/// (a recipe, a script, a configuration value) from `ctx`'s directory: a
+/// grant of `make`, `npm`, `just` or `python3` covers none of what the file
+/// makes them run, which needs its own grants; a file kGraf cannot read
+/// leaves the command to no grant (decision 0094, amended 2026-10-06).
+pub fn programs_to_grant_in(words: &[String], ctx: &ReadContext) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
-    collect_programs_to_grant(words, 0, &mut out)?;
+    let mut visits = 0;
+    collect_programs_to_grant(words, 0, ctx, &mut visits, &mut out)?;
     Ok(out)
 }
 
 fn collect_programs_to_grant(
     words: &[String],
     depth: usize,
+    ctx: &ReadContext,
+    visits: &mut usize,
     out: &mut Vec<String>,
 ) -> Result<(), String> {
     if depth > MAX_SHELL_DEPTH {
         return Err("its commands nest too deeply to read".into());
+    }
+    *visits += 1;
+    if *visits > MAX_READ_COMMANDS {
+        return Err("it starts more commands than kGraf reads".into());
+    }
+    // A command a shell expands whose program is a variable or a
+    // substitution runs what no grant names. The call's own argv is not
+    // expanded by any shell.
+    if depth > 0
+        && let Some(why) = named_by_expansion(words)
+    {
+        return Err(why);
+    }
+    if let Some(why) = changes_path(words) {
+        return Err(why);
     }
     for (at, role) in command_roles(words) {
         let w = &words[at];
@@ -2366,39 +3024,94 @@ fn collect_programs_to_grant(
         if !out.contains(w) {
             out.push(w.clone());
         }
-        for found in embedded_at(words, at) {
-            match found {
-                Embedded::Argv(argv) => collect_programs_to_grant(&argv, depth + 1, out)?,
-                Embedded::Script(script) => {
-                    let as_script = ["sh".to_owned(), "-c".to_owned(), script];
-                    match strict_script_commands(&as_script) {
-                        Script::Commands(commands) => {
-                            for c in commands {
-                                collect_programs_to_grant(&c, depth + 1, out)?;
-                            }
-                        }
-                        Script::Unjudged(why) => {
-                            return Err(format!(
-                                "the script `{b}` runs is not judged command by command: {why}"
-                            ));
-                        }
-                        Script::NotAScript => {
-                            return Err(format!("`{b}` runs a script kGraf cannot read"));
-                        }
-                    }
-                }
-                Embedded::Unreadable(why) => return Err(why),
-            }
+        for found in embedded_at(words, at, ctx) {
+            collect_found(b, found, depth, ctx, visits, out)?;
         }
     }
     Ok(())
 }
 
+fn collect_found(
+    starter: &str,
+    found: Embedded,
+    depth: usize,
+    ctx: &ReadContext,
+    visits: &mut usize,
+    out: &mut Vec<String>,
+) -> Result<(), String> {
+    match found {
+        Embedded::In(moved, inner) => collect_found(starter, *inner, depth, &moved, visits, out),
+        Embedded::Argv(argv) => collect_programs_to_grant(&argv, depth + 1, ctx, visits, out),
+        Embedded::Script(script) => {
+            if split_script_flagged(&script).1 {
+                return Err(
+                    "a command is named by a substitution, so kGraf cannot tell what it runs"
+                        .into(),
+                );
+            }
+            let as_script = ["sh".to_owned(), "-c".to_owned(), script];
+            match strict_script_commands(&as_script) {
+                Script::Commands(commands) => {
+                    // A `cd` moves the commands after it, for the files
+                    // they read.
+                    let mut here = ctx.clone();
+                    for c in commands {
+                        collect_programs_to_grant(&c, depth + 1, &here, visits, out)?;
+                        if let Some(moved) = after_directory_change(&c, &here) {
+                            here = moved;
+                        }
+                        if let Some(assigned) = after_assignment(&c, &here) {
+                            here = assigned;
+                        }
+                    }
+                    Ok(())
+                }
+                Script::Unjudged(why) => Err(format!(
+                    "the script `{starter}` runs is not judged command by command: {why}"
+                )),
+                Script::NotAScript => Err(format!("`{starter}` runs a script kGraf cannot read")),
+            }
+        }
+        Embedded::Unreadable(why) => Err(why),
+    }
+}
+
 /// Split a script on command separators outside quotes.
+#[cfg(test)]
 fn split_script(script: &str) -> Vec<String> {
+    split_script_flagged(script).0
+}
+
+/// [`split_script`], and whether a command of the script is named by a
+/// command substitution (`$(which curl) x`, `` `echo curl` x ``, `env
+/// $(cmd)`): the substitution's output is the program, which kGraf cannot
+/// read (decision 0094, amended 2026-10-06). A substitution elsewhere in a
+/// command (`echo $(date)`, `x=$(date)`) is split out and read as a command
+/// of its own.
+fn split_script_flagged(script: &str) -> (Vec<String>, bool) {
     let mut parts = Vec::new();
     let mut cur = String::new();
-    let (mut single, mut double) = (false, false);
+    let (mut single, mut double, mut backtick) = (false, false, false);
+    // For each open parenthesis, whether double quotes were open outside
+    // it: `"$(cmd "a b")"` reads the inner quotes afresh, as the shell does.
+    let mut opened: Vec<bool> = Vec::new();
+    let mut by_substitution = false;
+    // Whether a substitution opening after `before` stands where the
+    // command's program is: the words before it name no program yet.
+    let at_program = |before: &str| -> bool {
+        let mut words: Vec<String> = before.split_whitespace().map(str::to_owned).collect();
+        match words.last_mut() {
+            // The substitution continues the last word (`x=$(cmd)`).
+            Some(last) if !before.ends_with(char::is_whitespace) => {
+                last.push_str("SUBSTITUTION");
+            }
+            _ => words.push("SUBSTITUTION".into()),
+        }
+        let n = words.len() - 1;
+        command_roles(&words)
+            .into_iter()
+            .any(|(i, role)| i == n && matches!(role, WordRole::Program | WordRole::ValueOrProgram))
+    };
     let chars: Vec<char> = script.chars().collect();
     let mut i = 0;
     while i < chars.len() {
@@ -2421,11 +3134,30 @@ fn split_script(script: &str) -> Vec<String> {
             // `$(...)` and backticks run commands too: split there so the
             // inner command is seen.
             '`' if !single => {
+                if !backtick && at_program(&cur) {
+                    by_substitution = true;
+                }
+                backtick = !backtick;
                 parts.push(std::mem::take(&mut cur));
                 i += 1;
                 continue;
             }
-            '(' | ')' if !single && !double => {
+            '(' if !single && (!double || cur.ends_with('$')) => {
+                // `"$(cmd)"` inside double quotes runs `cmd` too.
+                if cur.ends_with('$') {
+                    cur.pop();
+                    if at_program(cur.trim_end_matches('"')) {
+                        by_substitution = true;
+                    }
+                }
+                opened.push(double);
+                double = false;
+                parts.push(std::mem::take(&mut cur));
+                i += 1;
+                continue;
+            }
+            ')' if !single && !double => {
+                double = opened.pop().unwrap_or(false);
                 parts.push(std::mem::take(&mut cur));
                 i += 1;
                 continue;
@@ -2436,11 +3168,12 @@ fn split_script(script: &str) -> Vec<String> {
         i += 1;
     }
     parts.push(cur);
-    parts
+    let parts = parts
         .into_iter()
-        .map(|p| p.trim().trim_start_matches('$').trim().to_owned())
+        .map(|p| p.trim().to_owned())
         .filter(|p| !p.is_empty())
-        .collect()
+        .collect();
+    (parts, by_substitution)
 }
 
 /// The program a simple command runs: its first word that is not a
@@ -2645,6 +3378,12 @@ pub enum RefusedSubject {
 /// ([`crate::execpolicy::ExecPolicy::evaluate`]).
 pub const SCRIPT_RUNS_LEAD: &str = "script runs `";
 
+/// How the mode's command policy names the program of a command that still
+/// lacks a grant while a program it runs has one (`env curl x` with `env`
+/// granted): ``the command runs `PROGRAM` (`COMMAND`)``, the innermost
+/// program first (decision 0094, amended 2026-10-06).
+pub const COMMAND_RUNS_LEAD: &str = "command runs `";
+
 /// What the policy `by` refused when it refused a call of `tool` with
 /// `input`, giving `reason`; `None` when the call's own capability stands
 /// (a shell call's program, another tool's name).
@@ -2710,7 +3449,11 @@ pub fn refused_subject_of(
         });
     }
     if by == crate::shell::SHELL_POLICY_HOOK || by == crate::approval::USER {
-        let rest = &reason[reason.rfind(SCRIPT_RUNS_LEAD)? + SCRIPT_RUNS_LEAD.len()..];
+        let lead = [SCRIPT_RUNS_LEAD, COMMAND_RUNS_LEAD]
+            .into_iter()
+            .filter_map(|l| reason.rfind(l).map(|at| (at, l)))
+            .max_by_key(|(at, _)| *at)?;
+        let rest = &reason[lead.0 + lead.1.len()..];
         let (program, _) = rest.split_once('`')?;
         return is_plain_program(program).then(|| RefusedSubject::Program(program.to_owned()));
     }
@@ -3981,23 +4724,35 @@ pub fn construct_rule_limit(
 /// x`, `env A=1 curl x` and `command curl x` all give `curl x` too; or a file
 /// tool's paths. The whole call comes first.
 pub fn subjects(tool: &str, input: &serde_json::Value) -> Vec<String> {
+    subjects_in(tool, input, &ReadContext::default())
+}
+
+/// [`subjects`], with the commands the files of `ctx`'s directory make the
+/// call's programs run (a recipe, a script's literal calls).
+pub fn subjects_in(tool: &str, input: &serde_json::Value, ctx: &ReadContext) -> Vec<String> {
     if tool == "shell" {
-        let mut out: Vec<String> = Vec::new();
-        for command in simple_commands(&shell_argv(input)) {
-            if command.is_empty() {
-                out.push(String::new());
-                continue;
-            }
-            for at in command_starts(&command) {
-                let line = command[at..].join(" ");
-                if !out.contains(&line) {
-                    out.push(line);
-                }
-            }
-        }
-        return out;
+        return subjects_of(&read_call_in(&shell_argv(input), ctx));
     }
     file_paths(tool, input)
+}
+
+/// A shell call's rule subjects ([`subjects`]) from its reading.
+fn subjects_of(reading: &CallReading) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for command in &reading.commands {
+        let command = &command.words;
+        if command.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        for at in command_starts(command) {
+            let line = command[at..].join(" ");
+            if !out.contains(&line) {
+                out.push(line);
+            }
+        }
+    }
+    out
 }
 
 /// What a limit no mode lifts decided about one call.
@@ -4027,6 +4782,21 @@ pub fn critical_deletion(
     home: Option<&Path>,
     workspace: Option<&Path>,
 ) -> Option<HardLimit> {
+    // The commands a file in the workspace makes a program run (a recipe, a
+    // script's literal calls) are read too (decision 0094, amended
+    // 2026-10-06).
+    let ctx = workspace
+        .map(|ws| ReadContext::in_worktree(ws, home))
+        .unwrap_or_default();
+    critical_deletion_of(&read_call_in(argv, &ctx), home, workspace)
+}
+
+/// [`critical_deletion`] over a call already read.
+fn critical_deletion_of(
+    reading: &CallReading,
+    home: Option<&Path>,
+    workspace: Option<&Path>,
+) -> Option<HardLimit> {
     let mut ask: Option<HardLimit> = None;
     // Where a relative operand may point. The first entry is the workspace,
     // moved by each plain `cd` (the first word of a script's own command), as
@@ -4044,8 +4814,10 @@ pub fn critical_deletion(
         depth,
         words: command,
         same_shell,
-    } in read_call(argv).commands
+        dir,
+    } in &reading.commands
     {
+        let (depth, same_shell) = (*depth, *same_shell);
         let words: Vec<&str> = command.iter().map(String::as_str).collect();
         let starts = command_starts(&words);
         if let Some(&at) = starts
@@ -4079,6 +4851,16 @@ pub fn critical_deletion(
         };
         let program = base_name(words[at]);
         let rest = &words[at + 1..];
+        // A command a program started in another directory (`make -C DIR`,
+        // a recipe there, a command after `cd DIR`) is also judged from
+        // there.
+        let mut judged = cwds.clone();
+        if let Some(d) = &dir {
+            let d = Cwd::Known(d.clone());
+            if !judged.contains(&d) {
+                judged.push(d);
+            }
+        }
         if program == "find" {
             // Only a `-delete` search deletes; its roots are the words before
             // the first expression. Deleting under a root is not deleting the
@@ -4090,7 +4872,7 @@ pub fn critical_deletion(
                 .iter()
                 .take_while(|w| !w.starts_with('-') && **w != "(" && **w != "!")
             {
-                for cwd in &cwds {
+                for cwd in &judged {
                     if let Target::System(p) = classify(w, home, cwd, workspace) {
                         return Some(system_refusal(&p));
                     }
@@ -4131,7 +4913,7 @@ pub fn critical_deletion(
             if !operands_only && w.starts_with('-') {
                 continue;
             }
-            for cwd in &cwds {
+            for cwd in &judged {
                 match classify(w, home, cwd, workspace) {
                     Target::System(p) => return Some(system_refusal(&p)),
                     Target::Critical(p) => {
@@ -4365,18 +5147,27 @@ pub fn hard_limit(
     home: Option<&Path>,
     workspace: Option<&Path>,
 ) -> Option<HardLimit> {
-    let subjects = subjects(&call.tool, &call.input);
+    // The files of the workspace a call's programs run (a recipe, a
+    // script) are read from it (decision 0094, amended 2026-10-06).
+    let ctx = workspace
+        .map(|ws| ReadContext::in_worktree(ws, home))
+        .unwrap_or_default();
+    // One reading serves the rules, the deletion limit and the unreadable
+    // check: each would otherwise read the same files again.
+    let reading = (call.tool == "shell").then(|| read_call_in(&shell_argv(&call.input), &ctx));
+    let subjects = match &reading {
+        Some(r) => subjects_of(r),
+        None => file_paths(&call.tool, &call.input),
+    };
     if let Some(rule) = rules.deny.iter().find(|r| r.matches(&call.tool, &subjects)) {
         return Some(HardLimit::Deny(format!(
             "your deny rule `{}` blocks this call in every permission mode",
             rule.text()
         )));
     }
-    let deletion = if call.tool == "shell" {
-        critical_deletion(&shell_argv(&call.input), home, workspace)
-    } else {
-        None
-    };
+    let deletion = reading
+        .as_ref()
+        .and_then(|r| critical_deletion_of(r, home, workspace));
     if let Some(HardLimit::Deny(reason)) = &deletion {
         return Some(HardLimit::Deny(reason.clone()));
     }
@@ -4390,8 +5181,7 @@ pub fn hard_limit(
     // may run what a shell rule names, so while the user has one the call is
     // asked about in every mode, Bypass too (decision 0094, amended
     // 2026-10-06). A rule with no pattern already matched above.
-    if call.tool == "shell"
-        && let Some(why) = unreadable_commands(&shell_argv(&call.input)).first()
+    if let Some(why) = reading.as_ref().and_then(|r| r.unreadable.first())
         && let Some((kind, rule)) = rules
             .deny
             .iter()
@@ -5525,7 +6315,10 @@ mod tests {
     #[test]
     fn each_mode_routes_an_ask() {
         let c = PermissionControl::manual();
-        let py = json!({"command": ["python3", "x.py"]});
+        // Inline code the mode can read whole: a script file is read from
+        // the worker's directory, which routing does not know (below).
+        let py = json!({"command": ["python3", "-c", "print(1)"]});
+        let py_file = json!({"command": ["python3", "x.py"]});
         let mk = json!({"command": ["mkdir", "out"]});
         let patch = json!({"patch": "*** Begin Patch\n*** Add File: src/a.rs\n+x\n*** End Patch"});
         assert_eq!(c.route_ask("shell", &py), AskRoute::User);
@@ -5548,6 +6341,10 @@ mod tests {
                 .expect("allow"),
         );
         assert_eq!(c.route_ask("shell", &py), AskRoute::Grant { by: "mode" });
+        // A script file kGraf cannot read here is granted by no allow set
+        // (decision 0094, amended 2026-10-06); the worker's command policy,
+        // which reads it from the worktree, grants it there.
+        assert_eq!(c.route_ask("shell", &py_file), AskRoute::User);
         assert_eq!(c.route_ask("shell", &mk), AskRoute::User);
         c.set_mode(PermissionMode::OrchestratorDecides, ModeSource::CommandLine)
             .expect("mode");

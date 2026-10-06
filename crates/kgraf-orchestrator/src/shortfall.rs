@@ -154,6 +154,11 @@ pub struct Authority {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Grant {
     Program(String),
+    /// Every program one command runs that still lacks a grant, the one
+    /// the report named first (`curl`, `env` for `env curl x`): a grant of
+    /// one of them alone would leave the command refused (decision 0094,
+    /// amended 2026-10-06).
+    Programs(Vec<String>),
     Path(String),
 }
 
@@ -161,12 +166,43 @@ impl Grant {
     pub fn subject(&self) -> &str {
         match self {
             Self::Program(p) | Self::Path(p) => p,
+            Self::Programs(ps) => ps.first().map(String::as_str).unwrap_or_default(),
+        }
+    }
+
+    /// The programs a program grant names; empty for a path.
+    pub fn programs(&self) -> Vec<&str> {
+        match self {
+            Self::Program(p) => vec![p.as_str()],
+            Self::Programs(ps) => ps.iter().map(String::as_str).collect(),
+            Self::Path(_) => Vec::new(),
+        }
+    }
+
+    /// The programs other than [`Self::subject`] a grant names.
+    pub fn with(&self) -> Vec<String> {
+        match self {
+            Self::Programs(ps) => ps.iter().skip(1).cloned().collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// A program grant of `subject` and `with`, or a path grant.
+    pub fn of(scope: RequestScope, subject: &str, with: &[String]) -> Self {
+        match scope {
+            RequestScope::File => Self::Path(subject.to_owned()),
+            _ if with.is_empty() => Self::Program(subject.to_owned()),
+            _ => {
+                let mut ps = vec![subject.to_owned()];
+                ps.extend(with.iter().filter(|p| *p != subject).cloned());
+                Self::Programs(ps)
+            }
         }
     }
 
     pub fn scope(&self) -> RequestScope {
         match self {
-            Self::Program(_) => RequestScope::Command,
+            Self::Program(_) | Self::Programs(_) => RequestScope::Command,
             Self::Path(_) => RequestScope::File,
         }
     }
@@ -174,6 +210,11 @@ impl Grant {
     pub fn describe(&self) -> String {
         match self {
             Self::Program(p) => format!("`{p}`"),
+            Self::Programs(ps) => ps
+                .iter()
+                .map(|p| format!("`{p}`"))
+                .collect::<Vec<_>>()
+                .join(" and "),
             Self::Path(p) => format!("writes to `{p}`"),
         }
     }
@@ -274,7 +315,14 @@ pub fn path_of(need: &str, bypass_git_files: bool) -> Result<String, String> {
 pub enum Grounding {
     /// One subject a policy refused this worker: a program (scope command),
     /// a repository path (file) or a tool (tool), with the refusal it saw.
-    Refused { subject: String, reason: String },
+    /// `with`: the other programs the refused command runs that a grant must
+    /// also name (`env` for `env curl x` grounded in `curl`), innermost
+    /// first ([`RefusedCall::needs`]).
+    Refused {
+        subject: String,
+        reason: String,
+        with: Vec<String>,
+    },
     /// No unretried policy refusal matches: the answer for the worker.
     NothingRefused { answer: String },
     /// The need does not single out one refused subject: the answer for the
@@ -286,6 +334,21 @@ pub enum Grounding {
 /// A refusal of the whole shell tool (a skill's `allowed-tools`, a user rule
 /// with no pattern) offers the tool to scope tool and the program the call
 /// ran to scope command: both name what was refused.
+fn subjects_of(scope: RequestScope, c: &RefusedCall) -> Vec<String> {
+    // A command that runs several programs offers each one a grant must
+    // name (decision 0094, amended 2026-10-06): a worker refused `env curl
+    // x` may name `curl` or `env`.
+    let mut out: Vec<String> = subject_of(scope, c).into_iter().collect();
+    if scope == RequestScope::Command && c.tool == "shell" && c.path.is_none() {
+        for p in &c.needs {
+            if !out.contains(p) {
+                out.push(p.clone());
+            }
+        }
+    }
+    out
+}
+
 fn subject_of(scope: RequestScope, c: &RefusedCall) -> Option<String> {
     match (scope, &c.path) {
         (RequestScope::File, Some(p)) => Some(p.trim_start_matches("./").to_owned()),
@@ -305,6 +368,16 @@ fn describe_refusal(c: &RefusedCall) -> String {
         None if c.tool == "shell" && c.whole_tool => format!(
             "the tool `shell` (scope tool), running `{}` (scope command)",
             c.capability
+        ),
+        None if c.tool == "shell" && c.needs.len() > 1 => format!(
+            "`{}` (scope command; it also runs {}, which a grant names with it)",
+            c.capability,
+            c.needs
+                .iter()
+                .filter(|p| **p != c.capability)
+                .map(|p| format!("`{p}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
         None if c.tool == "shell" => format!("`{}` (scope command)", c.capability),
         None => format!("`{}` (scope tool)", c.tool),
@@ -348,7 +421,10 @@ pub fn ground(scope: RequestScope, need: &str, record: &RefusalRecord) -> Ground
     // Distinct subjects in order, each with its newest refusal.
     let mut candidates: Vec<(String, &RefusedCall)> = Vec::new();
     for c in &unretried {
-        if let Some(s) = subject_of(scope, c) {
+        let offered = subjects_of(scope, c);
+        // One candidate per refusal: the first subject it offers, and the
+        // others it needs only when the worker named one of them.
+        if let Some(s) = offered.first().cloned() {
             match candidates.iter_mut().find(|(have, _)| *have == s) {
                 Some(slot) => slot.1 = c,
                 None => candidates.push((s, c)),
@@ -356,16 +432,15 @@ pub fn ground(scope: RequestScope, need: &str, record: &RefusalRecord) -> Ground
         }
     }
     let token = program_of(need).map(|t| t.trim_start_matches("./").to_owned());
+    let offers =
+        |c: &RefusedCall, word: &str| subjects_of(scope, c).iter().any(|s| names(scope, s, word));
     let picked: Vec<&(String, &RefusedCall)> = match &token {
-        Some(t) => candidates
-            .iter()
-            .filter(|(s, _)| names(scope, s, t))
-            .collect(),
+        Some(t) => candidates.iter().filter(|(_, c)| offers(c, t)).collect(),
         None => {
             let said = words(need);
             let mentioned: Vec<_> = candidates
                 .iter()
-                .filter(|(s, _)| said.iter().any(|w| names(scope, s, w)))
+                .filter(|(_, c)| said.iter().any(|w| offers(c, w)))
                 .collect();
             if mentioned.is_empty() && candidates.len() == 1 {
                 candidates.iter().collect()
@@ -378,6 +453,11 @@ pub fn ground(scope: RequestScope, need: &str, record: &RefusalRecord) -> Ground
         [(subject, c)] => Grounding::Refused {
             subject: subject.clone(),
             reason: c.reason.clone(),
+            with: if scope == RequestScope::Command {
+                c.needs.iter().filter(|p| *p != subject).cloned().collect()
+            } else {
+                Vec::new()
+            },
         },
         [] if !candidates.is_empty() && token.is_none() => Grounding::Ambiguous {
             answer: format!(
@@ -454,11 +534,21 @@ fn granted_by(authority: &Authority, grant: &Grant) -> Option<String> {
     match (authority.mode, grant) {
         (PermissionMode::Bypass, _) => by_mode(),
         (PermissionMode::OrchestratorDecides, _) => Some("orchestrator".to_owned()),
-        (PermissionMode::Auto, Grant::Program(p)) if authority.allow.allows_program(p) => by_mode(),
+        (PermissionMode::Auto, Grant::Program(_) | Grant::Programs(_))
+            if grant
+                .programs()
+                .iter()
+                .all(|p| authority.allow.allows_program(p)) =>
+        {
+            by_mode()
+        }
         (PermissionMode::Auto, Grant::Path(p)) if authority.allow.allows_path(p) => by_mode(),
         (PermissionMode::AcceptEdits, Grant::Path(_)) => by_mode(),
-        (PermissionMode::AcceptEdits, Grant::Program(p))
-            if FILE_EDIT_PROGRAMS.contains(&p.rsplit('/').next().unwrap_or(p)) =>
+        (PermissionMode::AcceptEdits, Grant::Program(_) | Grant::Programs(_))
+            if grant
+                .programs()
+                .iter()
+                .all(|p| FILE_EDIT_PROGRAMS.contains(&p.rsplit('/').next().unwrap_or(p))) =>
         {
             by_mode()
         }
@@ -471,6 +561,13 @@ fn how_to_allow(grant: &Grant) -> String {
     match grant {
         Grant::Program(p) => format!(
             "run again with `--allow {p}` (Auto), or choose a permission mode that grants it"
+        ),
+        Grant::Programs(ps) => format!(
+            "run again with {} (Auto), or choose a permission mode that grants them",
+            ps.iter()
+                .map(|p| format!("`--allow {p}`"))
+                .collect::<Vec<_>>()
+                .join(" ")
         ),
         Grant::Path(p) => {
             format!("run again with `--allow-path {p}` (Auto) or `--permission-mode accept-edits`")
@@ -576,7 +673,7 @@ pub fn decide(
     contract: &OpenContract,
     authority: &Authority,
 ) -> ShortfallDecision {
-    decide_in_plan(kind, scope, need, why, contract, authority, None)
+    decide_in_plan(kind, scope, need, &[], why, contract, authority, None)
 }
 
 /// [`decide`] with the run's open contracts, when they are known. A file a
@@ -585,10 +682,17 @@ pub fn decide(
 /// for a re-plan, instead of pointing at `--allow-path`, which would let one
 /// attempt write a file the plan never assigned. With `plan` as `None` the
 /// hold keeps the permission wording.
+///
+/// `with`: for a command report, the other programs the refused command
+/// runs ([`Grounding::Refused`]); the grant names each of them that the
+/// contract and the mode do not already grant, with `need`, so the command
+/// runs on the next attempt (decision 0094, amended 2026-10-06).
+#[allow(clippy::too_many_arguments)]
 pub fn decide_in_plan(
     kind: ShortfallKind,
     scope: RequestScope,
     need: &str,
+    with: &[String],
     why: &str,
     contract: &OpenContract,
     authority: &Authority,
@@ -623,7 +727,29 @@ pub fn decide_in_plan(
             ));
         }
         RequestScope::Command => match program_of(need) {
-            Some(p) => Grant::Program(p),
+            Some(p) => {
+                // The other programs the command runs that still lack a
+                // grant: not the contract's, and not the mode's own.
+                let mode_grants = |q: &str| match authority.mode {
+                    PermissionMode::Auto => authority.allow.allows_program(q),
+                    PermissionMode::AcceptEdits => {
+                        FILE_EDIT_PROGRAMS.contains(&q.rsplit('/').next().unwrap_or(q))
+                    }
+                    _ => false,
+                };
+                let lacking: Vec<String> = with
+                    .iter()
+                    .filter(|q| {
+                        **q != p && !contract.granted_programs.contains(q) && !mode_grants(q)
+                    })
+                    .cloned()
+                    .collect();
+                if contract.granted_programs.contains(&p) && !lacking.is_empty() {
+                    Grant::of(RequestScope::Command, &lacking[0], &lacking[1..])
+                } else {
+                    Grant::of(RequestScope::Command, &p, &lacking)
+                }
+            }
             None => {
                 return hold(format!(
                     "a worker reported a permission shortfall naming no command ({why})"
@@ -636,7 +762,10 @@ pub fn decide_in_plan(
         },
     };
     let already = match &grant {
-        Grant::Program(p) => contract.granted_programs.contains(p),
+        Grant::Program(_) | Grant::Programs(_) => grant
+            .programs()
+            .iter()
+            .all(|p| contract.granted_programs.iter().any(|g| g == p)),
         Grant::Path(p) => contract
             .grants
             .iter()
@@ -653,11 +782,20 @@ pub fn decide_in_plan(
     // decides included: a grant against a deny rule would be refused again
     // on the next attempt, and one against an ask rule would skip a question
     // the user asked to be put.
-    let subject = match &grant {
-        Grant::Program(p) => GrantSubject::Program(p),
-        Grant::Path(p) => GrantSubject::Path(p),
+    let subjects: Vec<GrantSubject<'_>> = match &grant {
+        Grant::Program(_) | Grant::Programs(_) => grant
+            .programs()
+            .into_iter()
+            .map(GrantSubject::Program)
+            .collect(),
+        Grant::Path(p) => vec![GrantSubject::Path(p)],
     };
-    match rule_on_grant(&authority.rules, subject) {
+    // Deny wins over ask, over every program the grant names.
+    let met = subjects
+        .iter()
+        .filter_map(|s| rule_on_grant(&authority.rules, *s))
+        .min_by_key(|l| matches!(l, HardLimit::Ask(_)));
+    match met {
         Some(HardLimit::Deny(rule)) => {
             return hold(format!(
                 "a worker needs {} ({why}); {rule}: remove or narrow the rule to allow it",
@@ -995,6 +1133,7 @@ pub fn ground_report(
             Grounding::Refused {
                 subject: tool,
                 reason: c.reason.clone(),
+                with: Vec::new(),
             },
             Some(refusal),
         ),
@@ -1175,6 +1314,7 @@ mod tests {
             path: None,
             whole_tool: false,
             held: Vec::new(),
+            needs: Vec::new(),
         }
     }
 
@@ -1189,6 +1329,7 @@ mod tests {
             path: Some(path.into()),
             whole_tool: false,
             held: Vec::new(),
+            needs: Vec::new(),
         }
     }
 
@@ -1388,7 +1529,10 @@ mod tests {
             loop_like,
         )
         .await;
-        let Some(Grounding::Refused { subject, reason }) = grounding_of(&control) else {
+        let Some(Grounding::Refused {
+            subject, reason, ..
+        }) = grounding_of(&control)
+        else {
             panic!("{control:?}");
         };
         assert_eq!(subject, "checkout/src/lib.rs");
@@ -1424,6 +1568,7 @@ mod tests {
             Some(Grounding::Refused {
                 subject: "checkout/src/lib.rs".into(),
                 reason: refused_path("checkout/src/lib.rs").reason,
+                with: Vec::new(),
             })
         );
         let (control, out) = drive(record(vec![]), None, input, loop_like).await;
@@ -2349,6 +2494,7 @@ mod tests {
                 ShortfallKind::Permission,
                 RequestScope::File,
                 need,
+                &[],
                 "the build needs it",
                 &mine,
                 &a,
@@ -2376,6 +2522,7 @@ mod tests {
             ShortfallKind::Permission,
             RequestScope::File,
             "docs/new.md",
+            &[],
             "x",
             &mine,
             &attended,
