@@ -1,13 +1,14 @@
 //! Plan intake against the repository: a plan that leaves a named scaffold
-//! file unwritten, or whose acceptance builds a workspace before its members
-//! exist, is refused with a reason the planner can act on and is asked again.
+//! file unwritten, or whose acceptance runs cargo in a workspace before its
+//! members exist (in any form: `--workspace`, `-p`, ...), is refused with a reason the planner can act on and is asked again.
 //!
 //! Round evidence: conflicts-tier2 gave the clearance discount to a contract
 //! that wrote only `catalog/src/lib.rs`, leaving the stub
 //! `discount_clearance/src/lib.rs` to no contract, and its worker was held at
 //! the file; greenfield wrote `Cargo.toml` with members `wcl-core` and `wcl` in
 //! one contract and `wcl` in another, with `cargo test --workspace` accepting
-//! the first. The planner, grounder and workers are fake providers.
+//! the first, then `cargo test -p wcl-core` once that was refused. The
+//! planner, grounder and workers are fake providers.
 
 mod support;
 
@@ -258,4 +259,74 @@ async fn a_workspace_acceptance_before_its_members_exist_is_refused_then_accepte
         refused[0]
     );
     assert_eq!(prompts.len(), 2, "one ask, one re-ask");
+}
+
+/// Round 8 greenfield: after the first refusal the planner moved the root
+/// contract's acceptance to `cargo test -p wcl-core`, as the refusal then
+/// advised, and that plan was accepted. Cargo loads every member manifest
+/// for `-p` too, so it could never pass. It is refused now, and the remedy
+/// the refusal names (the root contract writes a minimal manifest and source
+/// for each member it lists) is accepted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_package_form_before_its_members_exist_is_refused_then_the_named_remedy_is_accepted() {
+    let bin = |instruction: &str| {
+        let mut c = contract(
+            "c2-bin",
+            instruction,
+            "cargo test --workspace && echo SUCCESS",
+            &["wcl/Cargo.toml", "wcl/src/main.rs"],
+        );
+        c["depends_on"] = serde_json::json!(["c1-core"]);
+        c
+    };
+    let deadlock = plan(serde_json::json!([
+        contract(
+            "c1-core",
+            "Create the workspace root and `wcl-core` library.\n1. Write `Cargo.toml` as:\n[workspace]\nmembers = [\"wcl-core\", \"wcl\"]\n",
+            "cargo test -p wcl-core && echo SUCCESS",
+            &["Cargo.toml", "wcl-core/Cargo.toml", "wcl-core/src/lib.rs"]
+        ),
+        bin("Create the `wcl` binary crate."),
+    ]));
+    let remedy = plan(serde_json::json!([
+        contract(
+            "c1-core",
+            "Create the workspace root and `wcl-core` library.\n1. Write `Cargo.toml` as:\n[workspace]\nmembers = [\"wcl-core\", \"wcl\"]\n2. Write a minimal `wcl` crate for the binary contract to fill in.",
+            "cargo test -p wcl-core && echo SUCCESS",
+            &[
+                "Cargo.toml",
+                "wcl-core/Cargo.toml",
+                "wcl-core/src/lib.rs",
+                "wcl/Cargo.toml",
+                "wcl/src/main.rs"
+            ]
+        ),
+        bin("Fill in the `wcl` binary crate."),
+    ]));
+    let (prompts, refused) = planned(
+        &[("README.md", "a word counter\n")],
+        "Build a word-count tool as a Cargo workspace with wcl-core and wcl.",
+        deadlock,
+        remedy,
+    )
+    .await;
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert!(refused[0].contains("`c1-core`"), "{}", refused[0]);
+    assert!(
+        refused[0].contains("`cargo test -p wcl-core`"),
+        "{}",
+        refused[0]
+    );
+    assert!(refused[0].contains("`wcl/Cargo.toml`"), "{}", refused[0]);
+    assert!(
+        !refused[0].contains("cargo test -p <package>"),
+        "{}",
+        refused[0]
+    );
+    assert_eq!(prompts.len(), 2, "one ask, one re-ask");
+    assert!(
+        prompts[1].contains("also write `wcl/Cargo.toml`"),
+        "{}",
+        prompts[1]
+    );
 }

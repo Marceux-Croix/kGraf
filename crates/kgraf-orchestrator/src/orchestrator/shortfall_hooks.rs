@@ -4,7 +4,9 @@
 //! 1. `on_shortfall`: the report arrives while the worker runs. A permission
 //!    report that its worker's refusals do not ground, or that asks for a
 //!    path needing no grant or owned by another contract, is answered and the
-//!    worker continues (`answer_shortfall`, bounded). Otherwise the
+//!    worker continues (`answer_shortfall`, bounded), unless the path is one
+//!    the contract's cargo acceptance cannot pass without and only a later
+//!    contract writes it: that holds for a re-plan (`member_hold`). Otherwise the
 //!    orchestrator decides at once under the user's permission mode (grant,
 //!    amend, ask the user, or hold), records the decision on the contract and
 //!    in the trace, answers the worker, then cancels the attempt so the
@@ -34,6 +36,27 @@ use crate::shortfall::{
 const MAX_HELD_CHECK_CHARS: usize = 400;
 
 impl RunLoop {
+    /// The plan-shape hold for a worker of `contract` whose report names a
+    /// file its cargo acceptance cannot pass without, when only a contract
+    /// that runs later writes it ([`crate::plan_repo::member_hold`]).
+    /// `text` is the reported path, or an instructions report's words.
+    fn member_hold(&self, contract: &str, text: &str) -> Option<String> {
+        let root = self.s.workspaces.repo_root()?;
+        let named: Vec<&str> = text
+            .split(|c: char| {
+                c.is_whitespace() || matches!(c, '`' | '\'' | '"' | '(' | ')' | ',' | ';')
+            })
+            .map(|t| t.trim_end_matches(['.', ':']))
+            .filter(|t| !t.is_empty())
+            .collect();
+        crate::plan_repo::member_hold(
+            &self.record.open_contracts,
+            contract,
+            &named,
+            &crate::plan_repo::DiskRepo(root),
+        )
+    }
+
     /// Seven arguments: the six fields of the report as the control carries
     /// them, plus `self`. Bundling them would rebuild the control variant.
     #[allow(clippy::too_many_arguments)]
@@ -85,15 +108,25 @@ impl RunLoop {
         // to another contract, is answered and the worker continues.
         let asked = stored(&need);
         let why = stored(&why);
+        // Decision 0030, amended 2026-10-06: a file the contract's cargo
+        // acceptance cannot pass without, written only by a contract that
+        // runs later, holds the contract for a re-plan. Answering "do not
+        // edit it" would leave the worker at a check that cannot pass.
+        let mut plan_shape_hold: Option<String> = None;
         let (need, why) = match (kind, grounding) {
             (ShortfallKind::Instructions, _) => {
+                plan_shape_hold = self.member_hold(&contract_id, &format!("{asked} {why}"));
                 // Decision 0093, amended 2026-10-01: a report that asks for a
                 // change to a file another contract owns is answered, not
                 // written into this contract's own instruction, where it
                 // would change nothing.
-                if let Some(answer) =
-                    instructions_answer(&asked, &why, &contract, &self.record.open_contracts)
-                {
+                let answer = plan_shape_hold
+                    .is_none()
+                    .then(|| {
+                        instructions_answer(&asked, &why, &contract, &self.record.open_contracts)
+                    })
+                    .flatten();
+                if let Some(answer) = answer {
                     return self
                         .answer_shortfall(&contract_id, &worker, kind, &asked, &why, answer, false)
                         .await;
@@ -116,7 +149,10 @@ impl RunLoop {
                     .await;
             }
             (ShortfallKind::Permission, Some(Grounding::Refused { subject, reason })) => {
-                let answer = (scope == RequestScope::File)
+                if scope == RequestScope::File {
+                    plan_shape_hold = self.member_hold(&contract_id, &subject);
+                }
+                let answer = (scope == RequestScope::File && plan_shape_hold.is_none())
                     .then(|| path_answer(&subject, &contract, &self.record.open_contracts, &reason))
                     .flatten();
                 if let Some(answer) = answer {
@@ -149,6 +185,10 @@ impl RunLoop {
             &self.authority(),
             Some(&self.record.open_contracts),
         );
+        let decision = match plan_shape_hold {
+            Some(reason) => ShortfallDecision::Hold { reason },
+            None => decision,
+        };
         let decision = match decision {
             ShortfallDecision::Grant { grant, .. } | ShortfallDecision::AskUser { grant, .. }
                 if self.grant_unappliable(&grant).is_some() =>

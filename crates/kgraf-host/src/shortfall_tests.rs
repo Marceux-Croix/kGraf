@@ -9,7 +9,8 @@
 //! user's yes, re-plans on a change, and fails loud with nobody to approve.
 //! A report nothing refused is answered and the worker continues; three
 //! such reports end the attempt as stuck; a file another contract owns is
-//! answered, never granted, even in Bypass. A worker that finished after a
+//! answered, never granted, even in Bypass, unless the contract's cargo
+//! acceptance cannot pass without it: that holds for a re-plan. A worker that finished after a
 //! refusal it never retried is reported unverified. A shortfall that would
 //! hold the contract is verified in scope first: a pass merges it, a failure
 //! keeps the hold. A run check a dependent split cannot pass on its first
@@ -58,6 +59,13 @@ pub(super) enum Worker {
     /// `b`, which depends on `a`, writes `b.txt`. Each worker writes its own
     /// file and answers.
     DependentSplit,
+    /// The plan of [`MEMBER_PLAN`]: contract `a` writes the root
+    /// `Cargo.toml` (members `core` and `cli`) and accepts on `cargo test -p
+    /// core`; `cli/Cargo.toml` belongs to `b`, which depends on `a`. The
+    /// worker of `a` first removes the checkout's untracked
+    /// `cli/Cargo.toml` (see [`Script::root`]), tries to write
+    /// `cli/Cargo.toml`, is refused, and reports a file shortfall for it.
+    NeedsLaterMember,
 }
 
 pub(super) struct Script {
@@ -72,6 +80,8 @@ pub(super) struct Script {
     planner_calls: AtomicUsize,
     /// The newest decomposition request, as text.
     last_planner_request: std::sync::Mutex<String>,
+    /// The project checkout, for [`Worker::NeedsLaterMember`].
+    root: std::sync::Mutex<Option<PathBuf>>,
 }
 
 impl Script {
@@ -83,6 +93,7 @@ impl Script {
             granted_ran: AtomicBool::new(false),
             planner_calls: AtomicUsize::new(0),
             last_planner_request: std::sync::Mutex::new(String::new()),
+            root: std::sync::Mutex::new(None),
         })
     }
 }
@@ -130,6 +141,10 @@ const SIBLING_PLAN: &str = r#"{"contracts":[{"id":"a","instruction":"TASK-A: wri
 /// cannot pass on `a` alone.
 const DEPENDENT_PLAN: &str = r#"{"contracts":[{"id":"a","instruction":"TASK-A: write a.txt","acceptance":"a.txt exists","writes":[{"path":"a.txt"}],"tools":[]},{"id":"b","instruction":"TASK-B: write b.txt","acceptance":"b.txt exists","writes":[{"path":"b.txt"}],"tools":[],"depends_on":["a"]}]}"#;
 
+/// The round 8 greenfield shape: the root manifest's contract accepts on
+/// `-p core`, and the member `cli` comes from a contract that runs later.
+const MEMBER_PLAN: &str = r#"{"contracts":[{"id":"a","instruction":"TASK-A: write `Cargo.toml` with members = [\"core\", \"cli\"] and the core crate","acceptance":"cargo test -p core","writes":[{"path":"Cargo.toml"},{"path":"core/Cargo.toml"},{"path":"core/src/lib.rs"}],"tools":[]},{"id":"b","instruction":"TASK-B: write the cli crate","acceptance":"cargo test --workspace","writes":[{"path":"cli/Cargo.toml"},{"path":"cli/src/main.rs"}],"tools":[],"depends_on":["a"]}]}"#;
+
 #[async_trait::async_trait]
 impl Provider for Script {
     fn adapter(&self) -> &'static str {
@@ -156,6 +171,8 @@ impl Provider for Script {
                         SIBLING_PLAN
                     } else if self.worker == Worker::DependentSplit {
                         DEPENDENT_PLAN
+                    } else if self.worker == Worker::NeedsLaterMember {
+                        MEMBER_PLAN
                     } else {
                         r#"{"contracts":[{"id":"a","instruction":"copy README.md to a.txt","acceptance":"a.txt exists","writes":[{"path":"a.txt"}],"tools":[]}]}"#
                     },
@@ -257,6 +274,30 @@ impl Provider for Script {
                 (Worker::DependentSplit, _, 0) => {
                     Some(tool("apply_patch", add_file("b.txt"), round))
                 }
+                (Worker::NeedsLaterMember, _, r) if seen.contains("TASK-A") => match r {
+                    0 => {
+                        // The plan was checked while the checkout held an
+                        // untracked `cli/Cargo.toml`; it is gone now, as a
+                        // repository view that no longer holds.
+                        let root = self.root.lock().unwrap_or_else(|p| p.into_inner()).clone();
+                        if let Some(root) = root {
+                            let _ = std::fs::remove_file(root.join("cli/Cargo.toml"));
+                        }
+                        Some(tool("apply_patch", add_file("cli/Cargo.toml"), round))
+                    }
+                    1 => Some(tool(
+                        kgraf_runtime::SHORTFALL_TOOL,
+                        serde_json::json!({
+                            "kind": "permission",
+                            "scope": "file",
+                            "need": "cli/Cargo.toml",
+                            "why": "the root Cargo.toml lists cli, and cargo refuses to load the \
+                                    workspace without cli/Cargo.toml"
+                        }),
+                        round,
+                    )),
+                    _ => None,
+                },
                 (Worker::RunsScript, _, 0) => Some(tool("shell", script(), round)),
                 (Worker::RunsScript, _, 1) if !seen.contains("exit status: 0") => {
                     let mut input = report();
@@ -1272,5 +1313,55 @@ async fn a_deferred_run_check_that_never_passes_does_not_complete_the_run() {
     assert!(
         !report.verified.contains(&"b".to_owned()),
         "b is checked whole and fails: {report:?}"
+    );
+}
+
+/// Decision 0030, amended 2026-10-06, through a hosted run. Round 8
+/// greenfield: the worker of the contract that writes the root manifest asked
+/// for a member manifest a later contract writes, and was told "do not edit
+/// it; your attempt is judged by its own acceptance check", which could not
+/// pass. Here the plan passed intake against a checkout that still held the
+/// member's manifest; the worker's report now holds the contract for a
+/// re-plan, and nothing is granted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_member_manifest_a_later_contract_writes_holds_for_a_replan() {
+    let (_dir, mut config) = project();
+    config.routes = vec!["mine:llama3".into()];
+    config.verify = "test -f README.md".into();
+    let root = config.root.clone();
+    std::fs::create_dir_all(root.join("cli")).expect("mkdir");
+    std::fs::write(root.join("cli/Cargo.toml"), "[package]\nname = \"cli\"\n").expect("write");
+    let script = Script::new(Worker::NeedsLaterMember);
+    *script.root.lock().unwrap_or_else(|p| p.into_inner()) = Some(root.clone());
+    let host = Host::open(config)
+        .expect("open")
+        .with_permissions(control(kgraf_tools::PermissionMode::Manual))
+        .with_route_provider("mine", script.clone())
+        .expect("a used route");
+    let outcome = host
+        .prepare(RunId::new("sf-member"), None, &mut |_| {})
+        .await
+        .expect("prepare")
+        .run(RunStart::Instruction("build a two-crate workspace".into()))
+        .await
+        .expect("run");
+    let trace =
+        std::fs::read_to_string(root.join(".kgraf/runs/sf-member/trace.jsonl")).expect("trace");
+    let lines = shortfall_lines(&trace);
+    assert_eq!(lines.len(), 1, "{trace}");
+    assert!(lines[0].contains("plan-shape error"), "{}", lines[0]);
+    assert!(lines[0].contains("Re-plan"), "{}", lines[0]);
+    assert!(lines[0].contains("`cli/Cargo.toml`"), "{}", lines[0]);
+    assert!(lines[0].contains("cargo test -p core"), "{}", lines[0]);
+    assert!(
+        !lines[0].contains("judged by its own acceptance"),
+        "{}",
+        lines[0]
+    );
+    assert!(!script.saw_grant.load(Ordering::SeqCst), "nothing granted");
+    assert!(
+        !outcome.report.verified.contains(&"b".to_owned()),
+        "{:?}",
+        outcome.report
     );
 }

@@ -1459,9 +1459,17 @@ Behavior that differs from earlier builds. Each item names the decision that hol
   and that no contract writes is refused, naming the file. Only code counts: a file that
   mentions `todo!()` inside a string literal, a raw string or a comment holds no placeholder.
   Files are lexed with the grammar of their language; a language kGraf has no grammar for is
-  read line by line, skipping comment lines. A contract whose acceptance builds
-  a whole Cargo workspace (`--workspace`) is refused when a member's manifest does not exist
-  and no contract it depends on writes it. The planner is asked again with the reason (0030).
+  read line by line, skipping comment lines. A contract whose acceptance runs cargo in a
+  Cargo workspace is refused when a member's manifest does not exist and neither that contract
+  nor one it depends on writes it. Cargo loads every member's manifest before any command, so
+  this holds for every form: `--workspace`, `-p <package>`, `--manifest-path
+  <member>/Cargo.toml`, `cd <member> && cargo test`, a bare `cargo test` and `cargo fmt`. A
+  member manifest needs a source file too (`src/lib.rs` or `src/main.rs`); cargo refuses one
+  with no targets. The planner is asked again with the reason and the fixes that build: the
+  contract that writes the root `Cargo.toml` also writes a minimal manifest and source for
+  each member it lists, or the root lists only the members that exist and each later member's
+  contract adds itself. A worker that still asks for such a file, written only by a contract
+  that runs later, holds its contract as a plan-shape error that asks for a re-plan (0030).
 - A worker that reaches its context stop point before it has written anything is compacted
   once instead of handed back: a child would receive the same whole task and meet the same
   stop point. After that one compaction it goes on while its context fits the model's window;

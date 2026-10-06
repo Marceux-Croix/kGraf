@@ -601,3 +601,63 @@ as `tests/fixtures/handshake/files-as-contract-symbols.json`),
 `a_file_on_the_surface_is_provided_by_its_writer`, `a_surface_of_files_still_holds_real_disagreements`,
 `a_path_resolves_only_to_a_path_on_the_surface`, `a_touch_is_one_file_however_it_is_spelled`,
 `the_handshake_prompt_defines_touch_as_writes`.
+
+## Amendment (2026-10-06): every cargo command in a workspace loads every member
+
+The workspace check of the 2026-10-02 amendment looked only at `--workspace` and `--all`, and
+its remedy told the planner to use `cargo test -p <package>`. Cargo loads the manifest of every
+workspace member before it runs any command, so that remedy fails the same way. A plan whose
+root-manifest contract accepted on `cargo test -p <member>`, while another member's manifest
+came from a contract that depends on it, was accepted and could never pass. Its worker asked
+for the missing manifest and was told to continue, since its own check judges it.
+
+- **Measured with cargo 1.95.** With a root `Cargo.toml` that lists a member whose directory
+  has no `Cargo.toml`, all of these fail with "failed to load manifest for workspace member":
+  `cargo test -p <other>`, `cargo test --manifest-path <other>/Cargo.toml`, `cd <other> &&
+  cargo test`, a bare `cargo test` at the root, `cargo fmt --all -- --check` (through `cargo
+  metadata`), and `cargo metadata`. An empty member directory, a glob member (`crates/*`) with
+  a directory that has no manifest, and `default-members` that leave the member out fail the
+  same way. A member manifest with no target (no `src/lib.rs`, no `src/main.rs`, no target
+  section) fails with "no targets specified in the manifest". These pass: the root contract
+  also writes `<member>/Cargo.toml` (a `[package]` with name, version and edition) and
+  `<member>/src/main.rs` or `src/lib.rs`; the root lists only the members that exist, and a
+  later contract adds its member to the list; a package built from its own manifest with no
+  workspace manifest above it.
+- **The check reads every cargo command an acceptance runs.** Each subcommand that loads the
+  workspace (`build`, `test`, `check`, `clippy`, `run`, `bench`, `doc`, `fmt`, `metadata`,
+  `tree`, `fix` and the like) is found in the acceptance, also inside prose, with the
+  directory it runs in (after `cd`, `-C`, or the directory of `--manifest-path`; a directory
+  outside the repository or unknown is left out). The workspace is the nearest manifest
+  above that directory that has members: one the plan writes, or the repository's root
+  `Cargo.toml`. The member list is the one the contract sees: from the instruction of the
+  last contract among it and its dependencies that writes the manifest, else from the
+  repository's file, with `exclude` honored. A `<prefix>/*` member counts every directory
+  under the prefix that the contract or its dependencies write into.
+- **Refused:** a member manifest that is neither in the repository nor written by the
+  contract or one it depends on; a member manifest the plan writes when no Rust source under
+  that member is in the repository or written in time; a command at a workspace's root when
+  the workspace manifest comes from a contract that runs later. The reason names the
+  command, the file and the measured remedies. "Make it depend on the contract that writes
+  it" is offered only when that contract does not depend on this one, so the edge makes no
+  cycle.
+- **A worker that meets this shape asks for a re-plan.** When a worker reports a file
+  shortfall (or an instructions report naming the file) for a file its contract's cargo
+  acceptance cannot pass without, and only an open contract that runs later writes it, the
+  contract is held as a plan-shape error that asks for a re-plan. The answer "do not edit it;
+  your attempt is judged by its own acceptance check" is no longer given for such a file, as
+  that check cannot pass. A file no open contract writes keeps the existing plan-shape hold.
+  As with every hold, the attempt's in-scope result is verified first.
+- **Other workspace tools.** uv 0.11 workspaces skip a listed member that has no
+  `pyproject.toml`, and npm 11 runs with a listed workspace directory missing, so neither
+  has this failure and neither is checked. Go workspaces (`go.work`) are not checked.
+- **Limits.** The command reader is not a shell: quotes only end words, and variables are not
+  expanded. A member package with its own `[workspace]` table, or `package.workspace`, is
+  read as a member of the workspace above it.
+
+Tests: `kgraf-orchestrator` `plan_repo.rs` unit tests (every cargo form, the remedies, a
+manifest with no source, glob and exclude members, a complete workspace not refused, the
+re-plan hold, and `the_check_agrees_with_cargo`, which runs cargo over each plan shape and
+requires the check's verdict on every contract to match cargo's),
+`tests/plan_repo_intake.rs`
+`the_package_form_before_its_members_exist_is_refused_then_the_named_remedy_is_accepted`, and
+`kgraf-host` `a_member_manifest_a_later_contract_writes_holds_for_a_replan`.

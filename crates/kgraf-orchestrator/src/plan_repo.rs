@@ -9,18 +9,30 @@
 //!   instruction names, but that no contract writes. The work it stands for is
 //!   then done by nobody, or a worker meets the file outside its write scope
 //!   and the contract is held.
-//! - **A workspace the acceptance builds whole before its members exist.** A
-//!   contract's acceptance runs `cargo build|test|check|clippy --workspace`
-//!   (or `--all`), but a member of the workspace has no manifest yet and is
-//!   written by no contract, or only by a contract this one does not depend on.
-//!   The build fails on the missing manifest, and the contract that would
-//!   create it never runs first.
+//! - **A cargo acceptance in a workspace whose members are not there yet.**
+//!   Cargo loads the manifest of every workspace member before it runs any
+//!   command, whatever its form: `--workspace`, `-p <package>`,
+//!   `--manifest-path <member>/Cargo.toml`, or a bare command at the root or
+//!   in a member's directory. A contract whose acceptance runs cargo in a
+//!   workspace that lists a member whose manifest (or any Rust source) is
+//!   neither in the repository nor written by that contract or one it depends
+//!   on fails on the missing manifest, and the contract that would create it
+//!   never runs first. So does a command at the workspace's root when the
+//!   workspace manifest itself comes later.
 //!
 //! Both are refused as [`PlanError::Invalid`], which the planner is asked
-//! again with; the reason names the file and the fix.
+//! again with; the reason names the file and a fix measured to build. A
+//! worker that meets the second defect anyway and asks for the missing file
+//! is held for a re-plan ([`member_hold`]).
+//!
+//! Other workspace tools were measured for the same load and do not have it:
+//! uv 0.11 skips a listed member with no `pyproject.toml`, and npm 11 runs
+//! with a listed workspace directory missing. Go workspaces (`go.work`) are
+//! not checked.
 
 use crate::placeholder::has_placeholder_body;
 use crate::plan::{ContractSpec, PlanError};
+use crate::run_state::OpenContract;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
@@ -67,11 +79,11 @@ fn norm(path: &str) -> &str {
     path.trim_start_matches("./")
 }
 
-fn writes_of(specs: &[ContractSpec]) -> BTreeMap<&str, Vec<&str>> {
+fn writes_of<C: PlanContract>(specs: &[C]) -> BTreeMap<&str, Vec<&str>> {
     let mut by_path: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for c in specs {
-        for w in &c.writes {
-            by_path.entry(norm(&w.path)).or_default().push(&c.id);
+        for w in c.write_paths() {
+            by_path.entry(norm(w)).or_default().push(c.id());
         }
     }
     by_path
@@ -114,57 +126,332 @@ fn scaffold_refusal(
     ))
 }
 
+/// A contract as the workspace check reads it: a plan's [`ContractSpec`] at
+/// intake, or an [`OpenContract`] when a worker reports a shortfall.
+pub(crate) trait PlanContract {
+    fn id(&self) -> &str;
+    fn instruction(&self) -> &str;
+    fn acceptance(&self) -> &str;
+    fn write_paths(&self) -> Vec<&str>;
+    fn dependencies(&self) -> &[String];
+}
+
+impl PlanContract for ContractSpec {
+    fn id(&self) -> &str {
+        &self.id
+    }
+    fn instruction(&self) -> &str {
+        &self.instruction
+    }
+    fn acceptance(&self) -> &str {
+        &self.acceptance
+    }
+    fn write_paths(&self) -> Vec<&str> {
+        self.writes.iter().map(|w| w.path.as_str()).collect()
+    }
+    fn dependencies(&self) -> &[String] {
+        &self.depends_on
+    }
+}
+
+impl PlanContract for OpenContract {
+    fn id(&self) -> &str {
+        &self.contract
+    }
+    fn instruction(&self) -> &str {
+        &self.instruction
+    }
+    fn acceptance(&self) -> &str {
+        &self.acceptance
+    }
+    fn write_paths(&self) -> Vec<&str> {
+        self.writes.iter().map(|w| w.path.as_str()).collect()
+    }
+    fn dependencies(&self) -> &[String] {
+        &self.depends_on
+    }
+}
+
 /// The contracts `id` depends on, directly or through others, `id` excluded.
-fn ancestors<'a>(specs: &'a [ContractSpec], id: &str) -> BTreeSet<&'a str> {
+fn ancestors<'a, C: PlanContract>(specs: &'a [C], id: &str) -> BTreeSet<&'a str> {
     let mut seen: BTreeSet<&str> = BTreeSet::new();
     let mut stack: Vec<&str> = vec![id];
     while let Some(next) = stack.pop() {
-        let Some(c) = specs.iter().find(|c| c.id == next) else {
+        let Some(c) = specs.iter().find(|c| c.id() == next) else {
             continue;
         };
-        for d in &c.depends_on {
-            if let Some(dep) = specs.iter().find(|c| &c.id == d)
-                && seen.insert(&dep.id)
+        for d in c.dependencies() {
+            if let Some(dep) = specs.iter().find(|c| c.id() == d)
+                && seen.insert(dep.id())
             {
-                stack.push(&dep.id);
+                stack.push(dep.id());
             }
         }
     }
     seen
 }
 
-/// Whether `acceptance` builds a whole Cargo workspace.
-fn builds_whole_workspace(acceptance: &str) -> Option<String> {
-    let words: Vec<&str> = acceptance
-        .split(|c: char| c.is_whitespace() || matches!(c, '`' | ',' | ';' | '\'' | '"'))
-        .filter(|w| !w.is_empty())
-        .collect();
-    for (i, w) in words.iter().enumerate() {
-        if *w != "cargo" {
-            continue;
-        }
-        let Some(verb) = words.get(i + 1) else {
-            continue;
-        };
-        if !matches!(*verb, "build" | "test" | "check" | "clippy") {
-            continue;
-        }
-        // The flags up to the next command or the `--` that starts the
-        // arguments of the program cargo runs.
-        let flag = words[i + 2..]
-            .iter()
-            .take_while(|w| !matches!(**w, "cargo" | "&&" | "||" | "--"))
-            .find(|w| **w == "--workspace" || **w == "--all");
-        if let Some(flag) = flag {
-            return Some(format!("cargo {verb} {flag}"));
+/// The cargo subcommands that load the workspace before they act. Measured
+/// with cargo 1.95 for `test`, `fmt` (through `cargo metadata`) and
+/// `metadata`; the rest build a `Workspace` the same way.
+const LOADING_VERBS: &[&str] = &[
+    "build",
+    "b",
+    "test",
+    "t",
+    "check",
+    "c",
+    "clippy",
+    "run",
+    "r",
+    "bench",
+    "doc",
+    "d",
+    "fmt",
+    "metadata",
+    "tree",
+    "fix",
+    "rustc",
+    "rustdoc",
+    "nextest",
+    "llvm-cov",
+    "miri",
+    "fetch",
+    "update",
+    "generate-lockfile",
+    "package",
+];
+
+/// The flags of a cargo subcommand that take a value, for the command shown.
+const VALUE_FLAGS: &[&str] = &[
+    "-p",
+    "--package",
+    "--manifest-path",
+    "--bin",
+    "--test",
+    "--example",
+    "--bench",
+    "--features",
+    "-F",
+    "--target",
+    "--exclude",
+    "-j",
+    "--jobs",
+    "--profile",
+    "--target-dir",
+    "--color",
+    "--config",
+    "-Z",
+    "--message-format",
+];
+
+/// One cargo command an acceptance runs: the command as shown in a refusal,
+/// and the repository directory cargo looks for the manifest in (`""` is the
+/// root).
+#[derive(Debug, PartialEq)]
+struct CargoRun {
+    command: String,
+    dir: String,
+}
+
+#[derive(Debug, PartialEq)]
+enum Tok {
+    Word(String),
+    /// `&&`, `||`, `;`, `|`, `&` or a line end.
+    Sep,
+    Open,
+    Close,
+}
+
+/// The words of a shell-like acceptance. An acceptance is often prose around
+/// a command, so quotes and backticks only end words; nothing is unquoted.
+fn tokens(text: &str) -> Vec<Tok> {
+    fn flush(word: &mut String, out: &mut Vec<Tok>) {
+        if !word.is_empty() {
+            out.push(Tok::Word(std::mem::take(word)));
         }
     }
-    None
+    let mut out = Vec::new();
+    let mut word = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            ';' | '\n' | '&' | '|' => {
+                flush(&mut word, &mut out);
+                if matches!(ch, '&' | '|') && chars.peek() == Some(&ch) {
+                    chars.next();
+                }
+                out.push(Tok::Sep);
+            }
+            '(' => {
+                flush(&mut word, &mut out);
+                out.push(Tok::Open);
+            }
+            ')' => {
+                flush(&mut word, &mut out);
+                out.push(Tok::Close);
+            }
+            c if c.is_whitespace() || matches!(c, '`' | '\'' | '"' | ',') => {
+                flush(&mut word, &mut out);
+            }
+            c => word.push(c),
+        }
+    }
+    flush(&mut word, &mut out);
+    out
+}
+
+/// A word without the sentence punctuation prose leaves on it (`test.`).
+fn clean(word: &str) -> &str {
+    let t = word.trim_end_matches(['.', ':']);
+    if t.is_empty() { word } else { t }
+}
+
+/// `rel` from the repository directory `base`; `None` when it leaves the
+/// repository or cannot be known (absolute, home or a variable).
+fn join(base: &str, rel: &str) -> Option<String> {
+    if rel.is_empty() || rel == "-" || rel.starts_with(['/', '~', '$', '\\']) {
+        return None;
+    }
+    let mut parts: Vec<&str> = base.split('/').filter(|p| !p.is_empty()).collect();
+    for p in rel.split('/') {
+        match p {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            p => parts.push(p),
+        }
+    }
+    Some(parts.join("/"))
+}
+
+/// The cargo command `words` (the words after `cargo`) start, run from `cwd`.
+fn cargo_run(words: &[&str], cwd: Option<&str>) -> Option<CargoRun> {
+    let mut dir = cwd.map(str::to_owned);
+    let mut manifest: Option<&str> = None;
+    let mut i = 0;
+    // The toolchain and the global flags before the subcommand.
+    while let Some(w) = words.get(i).map(|w| clean(w)) {
+        if w.starts_with('+') {
+            i += 1;
+        } else if let Some(v) = w.strip_prefix("--manifest-path=") {
+            manifest = Some(v);
+            i += 1;
+        } else if w == "--manifest-path" {
+            manifest = words.get(i + 1).map(|w| clean(w));
+            i += 2;
+        } else if w == "-C" {
+            dir = match (dir, words.get(i + 1)) {
+                (Some(d), Some(to)) => join(&d, clean(to)),
+                _ => None,
+            };
+            i += 2;
+        } else if matches!(w, "-Z" | "--config" | "--color") {
+            i += 2;
+        } else if w.starts_with('-') {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    let verb = clean(words.get(i)?);
+    if !LOADING_VERBS.contains(&verb) {
+        return None;
+    }
+    let mut shown = vec!["cargo", verb];
+    let mut j = i + 1;
+    // The subcommand's flags, up to the `--` that starts the arguments of
+    // the program cargo runs, or the first word that is not a flag.
+    while let Some(w) = words.get(j).map(|w| clean(w)) {
+        if w == "--" || !w.starts_with('-') {
+            break;
+        }
+        shown.push(w);
+        if let Some(v) = w.strip_prefix("--manifest-path=") {
+            manifest = Some(v);
+        }
+        if VALUE_FLAGS.contains(&w)
+            && let Some(v) = words.get(j + 1).map(|w| clean(w))
+        {
+            if w == "--manifest-path" {
+                manifest = Some(v);
+            }
+            shown.push(v);
+            j += 1;
+        }
+        j += 1;
+    }
+    let mut dir = dir?;
+    if let Some(m) = manifest {
+        let parent = m.rsplit_once('/').map_or("", |(p, _)| p);
+        if !parent.is_empty() {
+            dir = join(&dir, parent)?;
+        }
+    }
+    Some(CargoRun {
+        command: shown.join(" "),
+        dir,
+    })
+}
+
+/// Every cargo command `acceptance` runs that loads a workspace, with the
+/// directory it runs in: after a `cd`, from `--manifest-path`'s directory or
+/// `-C`, else the repository root. A command in a directory that cannot be
+/// known is left out.
+fn cargo_runs(acceptance: &str) -> Vec<CargoRun> {
+    fn segment(words: &[&str], cwd: &mut Option<String>, runs: &mut Vec<CargoRun>) {
+        if words.first() == Some(&"cd") {
+            *cwd = match (cwd.as_deref(), words.get(1)) {
+                (Some(base), Some(to)) => join(base, clean(to)),
+                // A bare `cd` goes home, out of the repository.
+                _ => None,
+            };
+            return;
+        }
+        let starts: Vec<usize> = words
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| **w == "cargo")
+            .map(|(i, _)| i)
+            .collect();
+        for (k, at) in starts.iter().enumerate() {
+            let end = starts.get(k + 1).copied().unwrap_or(words.len());
+            if let Some(run) = cargo_run(&words[at + 1..end], cwd.as_deref()) {
+                runs.push(run);
+            }
+        }
+    }
+    let toks = tokens(acceptance);
+    let mut runs = Vec::new();
+    let mut cwd: Option<String> = Some(String::new());
+    let mut saved: Vec<Option<String>> = Vec::new();
+    let mut words: Vec<&str> = Vec::new();
+    for t in &toks {
+        match t {
+            Tok::Word(w) => words.push(w),
+            Tok::Sep | Tok::Open | Tok::Close => {
+                segment(&words, &mut cwd, &mut runs);
+                words.clear();
+                match t {
+                    Tok::Open => saved.push(cwd.clone()),
+                    Tok::Close => {
+                        if let Some(c) = saved.pop() {
+                            cwd = c;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    segment(&words, &mut cwd, &mut runs);
+    runs
 }
 
 /// The member directories a workspace names in `text`: the quoted strings of
 /// the list after `members`, as `members = ["a", "b"]` or `members: ["a"]`
-/// reads. A glob member is not listed.
+/// reads. Globs are kept; [`Members::from_list`] sorts them out.
 fn members_in(text: &str) -> Vec<String> {
     let Some(at) = text.find("members") else {
         return Vec::new();
@@ -188,132 +475,389 @@ fn members_in(text: &str) -> Vec<String> {
         .skip(1)
         .step_by(2)
         .map(|m| m.trim().trim_start_matches("./").trim_end_matches('/'))
-        .filter(|m| !m.is_empty() && !m.contains('*'))
+        .filter(|m| !m.is_empty())
         .map(str::to_owned)
         .collect()
 }
 
-/// The members of the workspace a contract writes a manifest for, with the
-/// manifest path of each: from the manifest already in the repository when it
-/// has `[workspace]` members, else from the members the contract's
-/// instruction lists.
-fn workspace_members(
-    spec: &ContractSpec,
-    manifest: &str,
-    repo: &dyn RepoView,
-) -> Vec<(String, String)> {
-    let base = manifest.strip_suffix("Cargo.toml").unwrap_or("");
-    let listed: Vec<String> = match repo
-        .read(manifest)
-        .and_then(|t| t.parse::<toml::Table>().ok())
-    {
-        Some(table) => table
-            .get("workspace")
-            .and_then(|w| w.get("members"))
+/// A workspace's members as one contract sees them, relative to the
+/// workspace's directory.
+#[derive(Debug, Default, PartialEq)]
+struct Members {
+    explicit: Vec<String>,
+    /// The `<prefix>` of each `<prefix>/*` member. Other globs are not read.
+    globs: Vec<String>,
+    exclude: Vec<String>,
+}
+
+impl Members {
+    fn from_list(list: impl IntoIterator<Item = String>, exclude: Vec<String>) -> Self {
+        let mut m = Members {
+            exclude,
+            ..Members::default()
+        };
+        for item in list {
+            let item = item.trim_start_matches("./").trim_end_matches('/');
+            if item.is_empty() || item == "." {
+                continue;
+            }
+            match item.strip_suffix("/*") {
+                Some(prefix) if !prefix.contains(['*', '?', '[']) => {
+                    m.globs.push(prefix.to_owned());
+                }
+                _ if item.contains(['*', '?', '[']) => {}
+                _ => m.explicit.push(item.to_owned()),
+            }
+        }
+        m
+    }
+
+    fn is_empty(&self) -> bool {
+        self.explicit.is_empty() && self.globs.is_empty()
+    }
+}
+
+/// The members of `manifest` as the repository holds it; `None` when the file
+/// is absent, does not parse or has no `[workspace]`.
+fn repo_members(manifest: &str, repo: &dyn RepoView) -> Option<Members> {
+    let table = repo.read(manifest)?.parse::<toml::Table>().ok()?;
+    let ws = table.get("workspace")?;
+    let strings = |key: &str| -> Vec<String> {
+        ws.get(key)
             .and_then(|m| m.as_array())
             .map(|m| {
                 m.iter()
                     .filter_map(|x| x.as_str())
-                    .map(|m| m.trim_start_matches("./").trim_end_matches('/').to_owned())
-                    .filter(|m| !m.contains('*'))
+                    .map(|x| x.trim_start_matches("./").trim_end_matches('/').to_owned())
                     .collect()
             })
-            .unwrap_or_default(),
-        // Only the root manifest: a nested one the plan writes is a member's,
-        // and the instruction's member list is not about it.
-        None if manifest == "Cargo.toml" => members_in(&spec.instruction),
-        None => Vec::new(),
+            .unwrap_or_default()
     };
-    listed
-        .into_iter()
-        .map(|m| (m.clone(), format!("{base}{m}/Cargo.toml")))
-        .collect()
+    Some(Members::from_list(strings("members"), strings("exclude")))
 }
 
-/// A contract whose acceptance builds the whole workspace although a member's
-/// manifest is neither in the repository nor written by that contract or one
-/// it depends on, or although the workspace's own manifest is not.
-fn workspace_refusal(specs: &[ContractSpec], repo: &dyn RepoView) -> Option<String> {
+/// The members `writer`'s instruction lists for `manifest`. Only for the root
+/// manifest: a nested one the plan writes is a member's, and the
+/// instruction's member list is not about it.
+fn instruction_members<C: PlanContract>(writer: &C, manifest: &str) -> Members {
+    if manifest == "Cargo.toml" {
+        Members::from_list(members_in(writer.instruction()), Vec::new())
+    } else {
+        Members::default()
+    }
+}
+
+/// The members of `manifest` as a contract that can count on `supplied` sees
+/// them, or `None` when the manifest is neither in the repository nor written
+/// by a contract of `supplied`. The last writer's instruction wins, then the
+/// repository's file.
+fn seen_members<C: PlanContract>(
+    specs: &[C],
+    supplied: &BTreeSet<&str>,
+    manifest: &str,
+    repo: &dyn RepoView,
+) -> Option<Members> {
+    let writers: Vec<&C> = specs
+        .iter()
+        .filter(|s| supplied.contains(s.id()))
+        .filter(|s| s.write_paths().iter().any(|w| norm(w) == manifest))
+        .collect();
+    let from_repo = || repo_members(manifest, repo);
+    let Some(first) = writers.first().copied() else {
+        return repo
+            .exists(manifest)
+            .then(|| from_repo().unwrap_or_default());
+    };
+    // The last writer: one every other writer here comes before. The
+    // contract itself, when it writes the file, since the rest of `supplied`
+    // are its dependencies.
+    let last = writers
+        .iter()
+        .find(|w| {
+            let before = ancestors(specs, w.id());
+            writers
+                .iter()
+                .all(|o| o.id() == w.id() || before.contains(o.id()))
+        })
+        .copied()
+        .unwrap_or(first);
+    let listed = instruction_members(last, manifest);
+    Some(if listed.is_empty() {
+        from_repo().unwrap_or_default()
+    } else {
+        Members {
+            exclude: from_repo().map(|m| m.exclude).unwrap_or_default(),
+            ..listed
+        }
+    })
+}
+
+/// One reason a contract's cargo acceptance cannot pass, and the files it is
+/// about: the missing file first, then the files its remedy writes with it.
+#[derive(Debug)]
+struct Finding {
+    paths: Vec<String>,
+    reason: String,
+}
+
+/// The directory of a `Cargo.toml` path, `""` for the root.
+fn dir_of(manifest: &str) -> &str {
+    manifest
+        .strip_suffix("Cargo.toml")
+        .unwrap_or("")
+        .trim_end_matches('/')
+}
+
+fn within(dir: &str, run_dir: &str) -> bool {
+    dir.is_empty() || run_dir == dir || run_dir.starts_with(&format!("{dir}/"))
+}
+
+/// Why `c`'s cargo acceptance cannot pass in the workspace it runs in.
+///
+/// Cargo loads the manifest of every member of the workspace before it runs
+/// any command: with `--workspace`, with `-p <package>`, with
+/// `--manifest-path <member>/Cargo.toml` and from a member's directory alike
+/// (measured with cargo 1.95: "failed to load manifest for workspace
+/// member"). A member manifest with no target is refused the same way ("no
+/// targets specified in the manifest"). So every member the workspace lists
+/// must have its manifest and a Rust source in the repository, or written by
+/// `c` or a contract it depends on, and a command run at the workspace's root
+/// needs the workspace manifest itself.
+fn workspace_findings<C: PlanContract>(specs: &[C], c: &C, repo: &dyn RepoView) -> Vec<Finding> {
+    let runs = cargo_runs(c.acceptance());
+    if runs.is_empty() {
+        return Vec::new();
+    }
     let written = writes_of(specs);
-    // Every workspace the plan writes the manifest of, with its members.
-    let mut workspaces: Vec<(String, Vec<(String, String)>)> = Vec::new();
-    for c in specs {
-        for w in &c.writes {
-            let path = norm(&w.path);
-            if path.rsplit('/').next() == Some("Cargo.toml") {
-                let members = workspace_members(c, path, repo);
-                if !members.is_empty() {
-                    workspaces.push((path.to_owned(), members));
+    let mut manifests: BTreeSet<&str> = written
+        .keys()
+        .copied()
+        .filter(|p| *p == "Cargo.toml" || p.ends_with("/Cargo.toml"))
+        .collect();
+    if repo.exists("Cargo.toml") {
+        manifests.insert("Cargo.toml");
+    }
+    let everyone: BTreeSet<&str> = specs.iter().map(|s| s.id()).collect();
+    // The workspaces: a manifest some writer's instruction or the repository
+    // gives members. Nearest first, as cargo searches up from a directory.
+    let mut workspaces: Vec<&str> = manifests
+        .into_iter()
+        .filter(|m| seen_members(specs, &everyone, m, repo).is_some_and(|w| !w.is_empty()))
+        .collect();
+    workspaces.sort_by_key(|m| std::cmp::Reverse(m.matches('/').count()));
+    if workspaces.is_empty() {
+        return Vec::new();
+    }
+    let mut supplied: BTreeSet<&str> = ancestors(specs, c.id());
+    supplied.insert(c.id());
+    let by_supplied = |ids: &Vec<&str>| ids.iter().any(|id| supplied.contains(id));
+    let reachable = |path: &str| repo.exists(path) || written.get(path).is_some_and(&by_supplied);
+    let writers = |path: &str| -> String {
+        match written.get(path) {
+            None => "by no contract".to_owned(),
+            Some(ids) => format!(
+                "only by contract{} {}, which `{}` does not depend on",
+                if ids.len() == 1 { "" } else { "s" },
+                ids.iter()
+                    .map(|i| format!("`{i}`"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                c.id()
+            ),
+        }
+    };
+    // A writer of `path` that `c` may depend on: one that does not depend on
+    // `c`, so the edge makes no cycle.
+    let free_writer = |path: &str| -> Option<&str> {
+        written
+            .get(path)?
+            .iter()
+            .copied()
+            .find(|w| !ancestors(specs, w).contains(c.id()))
+    };
+    let mut found: Vec<Finding> = Vec::new();
+    let mut push = |f: Finding| {
+        if !found.iter().any(|g| g.paths[0] == f.paths[0]) {
+            found.push(f);
+        }
+    };
+    for run in &runs {
+        for manifest in workspaces.iter().copied() {
+            let dir = dir_of(manifest);
+            if !within(dir, &run.dir) {
+                continue;
+            }
+            let Some(members) = seen_members(specs, &supplied, manifest, repo) else {
+                // Not in the repository and not written in time. From a
+                // member's own directory cargo finds that member's manifest
+                // alone; at the workspace's root it finds none.
+                if run.dir == dir {
+                    let depend = free_writer(manifest)
+                        .map(|w| format!(" or depend on `{w}`, which writes it"))
+                        .unwrap_or_default();
+                    push(Finding {
+                        paths: vec![manifest.to_owned()],
+                        reason: format!(
+                            "contract `{id}` acceptance runs `{command}` at {at}, but the \
+                             workspace manifest `{manifest}` is not in the repository and is \
+                             written {by}, so cargo finds no manifest when `{id}` runs. Make \
+                             `{id}` write `{manifest}`{depend}",
+                            id = c.id(),
+                            command = run.command,
+                            at = if dir.is_empty() {
+                                "the repository root".to_owned()
+                            } else {
+                                format!("`{dir}`")
+                            },
+                            by = writers(manifest),
+                        ),
+                    });
+                    break;
+                }
+                continue;
+            };
+            if members.is_empty() {
+                // A package's manifest: cargo searches further up.
+                continue;
+            }
+            let base = if dir.is_empty() {
+                String::new()
+            } else {
+                format!("{dir}/")
+            };
+            let mut dirs: Vec<String> = members
+                .explicit
+                .iter()
+                .filter(|m| !members.exclude.contains(m))
+                .cloned()
+                .collect();
+            // A `<prefix>/*` member is every directory under `<prefix>`,
+            // and a directory a contract writes into exists in its worktree.
+            for g in &members.globs {
+                let prefix = format!("{base}{g}/");
+                for (path, ids) in &written {
+                    if !by_supplied(ids) {
+                        continue;
+                    }
+                    if let Some(rest) = path.strip_prefix(&prefix)
+                        && let Some((name, _)) = rest.split_once('/')
+                    {
+                        let member = format!("{g}/{name}");
+                        if !members.exclude.contains(&member) && !dirs.contains(&member) {
+                            dirs.push(member);
+                        }
+                    }
                 }
             }
-        }
-    }
-    if workspaces.is_empty() {
-        return None;
-    }
-    for c in specs {
-        let Some(command) = builds_whole_workspace(&c.acceptance) else {
-            continue;
-        };
-        let mut supplied: BTreeSet<&str> = ancestors(specs, &c.id);
-        supplied.insert(&c.id);
-        // The paths this contract can count on: in the repository, or written
-        // by it or by a contract it depends on.
-        let reachable = |path: &str| {
-            repo.exists(path)
-                || written
-                    .get(path)
-                    .is_some_and(|ids| ids.iter().any(|id| supplied.contains(id)))
-        };
-        let writers = |path: &str| -> String {
-            match written.get(path) {
-                None => "by no contract".to_owned(),
-                Some(ids) => format!(
-                    "only by contract{} {}, which `{}` does not depend on",
-                    if ids.len() == 1 { "" } else { "s" },
-                    ids.iter()
-                        .map(|i| format!("`{i}`"))
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    c.id
-                ),
-            }
-        };
-        for (manifest, members) in &workspaces {
-            if !reachable(manifest) {
-                return Some(format!(
-                    "contract `{}` acceptance builds the whole workspace (`{command}`), but \
-                     the workspace manifest `{manifest}` is not in the repository and is \
-                     written {}, so that command fails when `{}` runs. Make `{}` write \
-                     `{manifest}` or depend on the contract that does, or give it an \
-                     acceptance that builds only its own package (`cargo test -p <package>`)",
-                    c.id,
-                    writers(manifest),
-                    c.id,
-                    c.id
-                ));
-            }
-            for (member, member_manifest) in members {
-                if reachable(member_manifest) {
+            for member in dirs {
+                let member_manifest = format!("{base}{member}/Cargo.toml");
+                let src = format!("{base}{member}/src");
+                if !reachable(&member_manifest) {
+                    let depend = free_writer(&member_manifest)
+                        .map(|w| format!("; or make `{}` depend on `{w}`", c.id()))
+                        .unwrap_or_default();
+                    push(Finding {
+                        paths: vec![
+                            member_manifest.clone(),
+                            format!("{src}/lib.rs"),
+                            format!("{src}/main.rs"),
+                        ],
+                        reason: format!(
+                            "contract `{id}` acceptance runs `{command}`, and cargo loads the \
+                             manifest of every member of the workspace `{manifest}` before it \
+                             runs any command, with `-p`, with `--manifest-path` or from a \
+                             member's directory alike. `{manifest}` lists member `{member}`, \
+                             but `{member_manifest}` does not exist and is written {by}, so \
+                             cargo fails on the missing manifest when `{id}` runs. Fix it in one \
+                             of these ways: make `{id}` also write `{member_manifest}` (a \
+                             `[package]` with name, version and edition) and a source file \
+                             `{src}/lib.rs` or `{src}/main.rs`, which a later contract may \
+                             fill in; or have `{manifest}` list only the members that exist or \
+                             that `{id}` and the contracts it depends on write, and make the \
+                             contract that writes `{member_manifest}` also write `{manifest}` \
+                             to add `{member}` to its members{depend}",
+                            id = c.id(),
+                            command = run.command,
+                            by = writers(&member_manifest),
+                        ),
+                    });
                     continue;
                 }
-                return Some(format!(
-                    "contract `{}` acceptance builds the whole workspace (`{command}`), but \
-                     the workspace `{manifest}` lists member `{member}` and `{member_manifest}` \
-                     does not exist and is written {}, so cargo fails on the missing manifest \
-                     when `{}` runs. Make `{}` also write `{member_manifest}` (and the \
-                     member's sources), make it depend on the contract that does, or give it \
-                     an acceptance that builds only its own package (`cargo test -p \
-                     <package>`)",
-                    c.id,
-                    writers(member_manifest),
-                    c.id,
-                    c.id
-                ));
+                if repo.exists(&member_manifest) {
+                    continue;
+                }
+                let has_source = repo.exists(&format!("{src}/lib.rs"))
+                    || repo.exists(&format!("{src}/main.rs"))
+                    || written.iter().any(|(p, ids)| {
+                        p.starts_with(&format!("{base}{member}/"))
+                            && p.ends_with(".rs")
+                            && by_supplied(ids)
+                    });
+                if !has_source {
+                    push(Finding {
+                        paths: vec![format!("{src}/lib.rs"), format!("{src}/main.rs")],
+                        reason: format!(
+                            "contract `{id}` acceptance runs `{command}`, and cargo loads every \
+                             member of the workspace `{manifest}` first. Member `{member}` gets \
+                             its manifest `{member_manifest}`, but no Rust source under \
+                             `{base}{member}/` is in the repository or written by `{id}` or a \
+                             contract it depends on, and cargo refuses a manifest with no \
+                             targets (\"no targets specified in the manifest\"). Make the \
+                             contract that writes `{member_manifest}` also write \
+                             `{src}/lib.rs` or `{src}/main.rs` (a minimal one is enough)",
+                            id = c.id(),
+                            command = run.command,
+                        ),
+                    });
+                }
             }
+            break;
         }
     }
-    None
+    found
+}
+
+/// The first contract whose cargo acceptance cannot pass in its workspace.
+fn workspace_refusal(specs: &[ContractSpec], repo: &dyn RepoView) -> Option<String> {
+    specs
+        .iter()
+        .find_map(|c| workspace_findings(specs, c, repo).into_iter().next())
+        .map(|f| f.reason)
+}
+
+/// The hold for a worker of `id` that asked for one of the files `named`,
+/// when that file is one the contract's cargo acceptance cannot pass without
+/// and only a contract that runs later writes it. Answering "do not edit it"
+/// would leave the worker at a check that cannot pass, and a grant would
+/// break disjoint writes: the plan's shape is wrong, so the contract is held
+/// for a re-plan. A file no open contract writes is left to the plan-shape
+/// hold of [`crate::shortfall::decide_in_plan`]; a file a finished contract
+/// wrote is in the attempt's base and never asked for here.
+pub(crate) fn member_hold(
+    open: &[OpenContract],
+    id: &str,
+    named: &[&str],
+    repo: &dyn RepoView,
+) -> Option<String> {
+    let c = open.iter().find(|c| c.contract == id)?;
+    let written = writes_of(open);
+    let (finding, path) = workspace_findings(open, c, repo)
+        .into_iter()
+        .find_map(|f| {
+            let path = named
+                .iter()
+                .map(|n| norm(n))
+                .find(|n| f.paths.iter().any(|p| p == n) && written.contains_key(n))?;
+            Some((f, path.to_owned()))
+        })?;
+    Some(format!(
+        "a worker of `{id}` needs `{path}`, which `{id}` may not write and its acceptance check \
+         (`{acceptance}`) cannot pass without. That is a plan-shape error, not a missing \
+         permission: a grant would break disjoint writes, and the check cannot pass as \
+         planned. Re-plan, then run again. The plan check reads: {reason}",
+        acceptance = c.acceptance.trim(),
+        reason = finding.reason,
+    ))
 }
 
 #[cfg(test)]
@@ -485,10 +1029,10 @@ pub fn f() {}
         assert!(why.contains("`crates/h/src/real.rs`"), "{why}");
     }
 
-    /// Round evidence (greenfield): c1 writes `Cargo.toml` listing members
-    /// `wcl-core` and `wcl` and accepts on `cargo test --workspace`; `wcl` is
-    /// written only by c2, which c1 does not depend on. The attempt could not
-    /// pass.
+    /// Round evidence (greenfield, first plan): c1 writes `Cargo.toml` listing
+    /// members `wcl-core` and `wcl` and accepts on `cargo test --workspace`;
+    /// `wcl` is written only by c2, which c1 does not depend on. The attempt
+    /// could not pass.
     fn greenfield(c1_deps: &[&str], c2_deps: &[&str]) -> [ContractSpec; 2] {
         [
             spec(
@@ -508,6 +1052,31 @@ pub fn f() {}
         ]
     }
 
+    /// Round 8 evidence (greenfield, the plan accepted after the first
+    /// refusal, verbatim but for the long instruction bodies): c1-core writes
+    /// the root manifest with members `wcl-core` and `wcl` and accepts on
+    /// `cargo test -p wcl-core`; `wcl/Cargo.toml` belongs to c2-bin, which
+    /// depends on c1-core. Cargo loads `wcl/Cargo.toml` for `-p wcl-core`
+    /// too, so neither attempt of c1-core could pass.
+    fn round8_second_plan() -> [ContractSpec; 2] {
+        [
+            spec(
+                "c1-core",
+                "Create the workspace root and `wcl-core` library.\n1. Write `Cargo.toml` as:\n[workspace]\nmembers = [\"wcl-core\", \"wcl\"]\n\n2. Write `wcl-core/Cargo.toml` with package name `wcl-core`, version `0.1.0`, and `[lib] path = \"src/lib.rs\"`.\n3. Write `wcl-core/src/lib.rs`.",
+                "cargo test -p wcl-core && echo SUCCESS",
+                &["Cargo.toml", "wcl-core/Cargo.toml", "wcl-core/src/lib.rs"],
+                &[],
+            ),
+            spec(
+                "c2-bin",
+                "Create the `wcl` binary crate and verify the full workspace.\n1. Write `wcl/Cargo.toml` with package name `wcl`.\n2. Write `wcl/src/main.rs`.",
+                "cargo test --workspace && echo SUCCESS",
+                &["wcl/Cargo.toml", "wcl/src/main.rs"],
+                &["c1-core"],
+            ),
+        ]
+    }
+
     #[test]
     fn a_workspace_acceptance_with_a_member_another_contract_writes_is_refused() {
         let repo = Fake::default();
@@ -520,6 +1089,139 @@ pub fn f() {}
             "{why}"
         );
         assert!(why.contains("also write `wcl/Cargo.toml`"), "{why}");
+        // c2 does not depend on c1, so c1 may depend on c2.
+        assert!(why.contains("make `c1` depend on `c2`"), "{why}");
+    }
+
+    /// The round 8 fault: the `-p` form loads every member as well.
+    #[test]
+    fn the_package_form_with_a_member_a_later_contract_writes_is_refused() {
+        let why = reason(refusal(&round8_second_plan(), &[], &Fake::default()));
+        assert!(why.contains("`c1-core`"), "{why}");
+        assert!(why.contains("`cargo test -p wcl-core`"), "{why}");
+        assert!(why.contains("`wcl/Cargo.toml`"), "{why}");
+        assert!(
+            why.contains("only by contract `c2-bin`, which `c1-core` does not depend on"),
+            "{why}"
+        );
+        // The remedies are the measured ones; `-p` is not one of them.
+        assert!(
+            why.contains("also write `wcl/Cargo.toml`")
+                && why.contains("`wcl/src/lib.rs` or `wcl/src/main.rs`"),
+            "{why}"
+        );
+        assert!(why.contains("to add `wcl` to its members"), "{why}");
+        assert!(!why.contains("cargo test -p <package>"), "{why}");
+        // c2-bin depends on c1-core: the reverse edge would be a cycle, so it
+        // is not offered.
+        assert!(!why.contains("depend on `c2-bin`"), "{why}");
+    }
+
+    /// Every form cargo runs in the workspace loads the members: measured
+    /// with cargo 1.95 for `-p`, `--manifest-path`, `cd <member>`, a bare
+    /// command at the root and `cargo fmt` (through `cargo metadata`).
+    #[test]
+    fn every_cargo_form_in_the_workspace_is_refused() {
+        for acceptance in [
+            "cargo test -p wcl-core",
+            "cargo test --manifest-path wcl-core/Cargo.toml",
+            "cargo test --manifest-path=./wcl-core/Cargo.toml",
+            "cd wcl-core && cargo test",
+            "(cd wcl-core; cargo build --offline)",
+            "cargo test",
+            "Run cargo test. It must pass.",
+            "cargo +stable --offline check -p wcl-core",
+            "cargo clippy -p wcl-core -- -D warnings",
+            "cargo fmt --all -- --check",
+            "cargo build -p wcl-core 2>&1 | tail -n 5",
+        ] {
+            let mut specs = round8_second_plan();
+            specs[0].acceptance = acceptance.into();
+            let why = reason(refusal(&specs, &[], &Fake::default()));
+            assert!(why.contains("`wcl/Cargo.toml`"), "{acceptance}: {why}");
+            assert!(why.contains("`c1-core`"), "{acceptance}: {why}");
+        }
+        // Not cargo in this workspace: nothing to refuse.
+        for acceptance in [
+            "rustc --test wcl-core/src/lib.rs && ./lib",
+            "cargo new wcl",
+            "cargo --version",
+            "the cargo is loaded",
+            "cd /tmp/elsewhere && cargo test",
+            "cd .. && cargo test",
+        ] {
+            let mut specs = round8_second_plan();
+            specs[0].acceptance = acceptance.into();
+            assert!(
+                refusal(&specs, &[], &Fake::default()).is_none(),
+                "{acceptance}: {:?}",
+                refusal(&specs, &[], &Fake::default())
+            );
+        }
+    }
+
+    /// The two remedies the refusal names, as a planner would write them.
+    /// Both are accepted, and both build with cargo
+    /// (`the_check_agrees_with_cargo`).
+    fn remedy_stub_members() -> [ContractSpec; 2] {
+        let [mut c1, mut c2] = round8_second_plan();
+        c1.writes.extend(
+            ["wcl/Cargo.toml", "wcl/src/main.rs"]
+                .iter()
+                .map(|p| WriteTarget {
+                    path: (*p).into(),
+                    node: None,
+                }),
+        );
+        c2.instruction = "Fill in the `wcl` binary crate.".into();
+        [c1, c2]
+    }
+
+    fn remedy_members_add_themselves() -> [ContractSpec; 2] {
+        let [mut c1, mut c2] = round8_second_plan();
+        c1.instruction =
+            "Write `Cargo.toml` as:\n[workspace]\nmembers = [\"wcl-core\"]\n\nand the `wcl-core` crate."
+                .into();
+        c2.instruction =
+            "Write the `wcl` crate and add it to the workspace: `Cargo.toml` with members = [\"wcl-core\", \"wcl\"]."
+                .into();
+        c2.writes.push(WriteTarget {
+            path: "Cargo.toml".into(),
+            node: None,
+        });
+        [c1, c2]
+    }
+
+    #[test]
+    fn the_remedies_the_refusal_names_are_accepted() {
+        let repo = Fake::default();
+        for (name, specs) in [
+            ("stub members", remedy_stub_members()),
+            ("members add themselves", remedy_members_add_themselves()),
+        ] {
+            let got = refusal(&specs, &[], &repo);
+            assert!(got.is_none(), "{name}: {got:?}");
+        }
+    }
+
+    /// A member manifest with no Rust source is refused by cargo ("no targets
+    /// specified in the manifest"), measured with cargo 1.95.
+    #[test]
+    fn a_member_manifest_with_no_source_in_time_is_refused() {
+        let [mut c1, c2] = round8_second_plan();
+        c1.writes.push(WriteTarget {
+            path: "wcl/Cargo.toml".into(),
+            node: None,
+        });
+        let why = reason(refusal(&[c1, c2], &[], &Fake::default()));
+        assert!(
+            why.contains("no targets specified in the manifest"),
+            "{why}"
+        );
+        assert!(
+            why.contains("`wcl/src/lib.rs` or `wcl/src/main.rs`"),
+            "{why}"
+        );
     }
 
     #[test]
@@ -530,22 +1232,25 @@ pub fn f() {}
         let why = reason(refusal(&specs, &[], &repo));
         assert!(why.contains("written by no contract"), "{why}");
         assert!(why.contains("`wcl/Cargo.toml`"), "{why}");
+        assert!(!why.contains("depend on `"), "{why}");
     }
 
     #[test]
     fn a_workspace_acceptance_is_accepted_when_the_members_come_first_or_exist() {
         // The member's contract is a dependency of the one that builds the
-        // whole workspace; the member's own acceptance builds its package only.
+        // whole workspace. The member's own check runs from its manifest:
+        // with no root manifest yet, cargo builds it alone.
         let mut specs = greenfield(&["c2"], &[]);
-        specs[1].acceptance = "cargo test -p wcl".into();
+        specs[1].acceptance = "cargo test --manifest-path wcl/Cargo.toml".into();
         assert!(
             refusal(&specs, &[], &Fake::default()).is_none(),
             "{:?}",
             refusal(&specs, &[], &Fake::default())
         );
-        // The member already exists in the repository.
+        // The member already exists in the repository, and its contract
+        // runs after the root's.
         let repo = Fake::with(&[("wcl/Cargo.toml", "[package]\nname = \"wcl\"\n")]);
-        let mut specs = greenfield(&[], &[]);
+        let mut specs = greenfield(&[], &["c1"]);
         specs[1].acceptance = "cargo test -p wcl".into();
         assert!(refusal(&specs, &[], &repo).is_none());
         // One contract writes the whole workspace.
@@ -553,15 +1258,142 @@ pub fn f() {}
             "c1",
             "Create the workspace: `Cargo.toml` with members = [\"a\", \"b\"]",
             "cargo build --workspace",
-            &["Cargo.toml", "a/Cargo.toml", "b/Cargo.toml"],
+            &[
+                "Cargo.toml",
+                "a/Cargo.toml",
+                "a/src/lib.rs",
+                "b/Cargo.toml",
+                "b/src/main.rs",
+            ],
             &[],
         )];
         assert!(refusal(&one, &[], &Fake::default()).is_none());
     }
 
+    /// A plan that is already fine is not refused: an existing workspace
+    /// whose members are all there, contracts that edit their own crates,
+    /// and acceptances that are not cargo.
+    #[test]
+    fn a_plan_in_a_complete_workspace_is_not_refused() {
+        let repo = Fake::with(&[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"core\", \"cli\", \"crates/*\"]\nexclude = [\"crates/old\"]\n",
+            ),
+            ("core/Cargo.toml", "[package]\nname = \"core\"\n"),
+            ("core/src/lib.rs", "pub fn f() {}\n"),
+            ("cli/Cargo.toml", "[package]\nname = \"cli\"\n"),
+            ("cli/src/main.rs", "fn main() {}\n"),
+            ("crates/io/Cargo.toml", "[package]\nname = \"io\"\n"),
+        ]);
+        let specs = [
+            spec(
+                "a",
+                "edit core",
+                "cargo test -p core",
+                &["core/src/lib.rs"],
+                &[],
+            ),
+            spec(
+                "b",
+                "edit cli",
+                "cd cli && cargo test",
+                &["cli/src/main.rs"],
+                &[],
+            ),
+            spec(
+                "c",
+                "add io",
+                "cargo test --workspace",
+                &["crates/io/src/lib.rs"],
+                &[],
+            ),
+            spec("d", "docs", "test -f README.md", &["README.md"], &[]),
+            spec(
+                "e",
+                "old crate, excluded",
+                "cargo test -p core",
+                &["crates/old/src/lib.rs"],
+                &[],
+            ),
+        ];
+        let got = refusal(&specs, &[], &repo);
+        assert!(got.is_none(), "{got:?}");
+    }
+
+    /// This repository's own workspace, read from disk: ordinary plans in a
+    /// complete workspace, in every cargo form, are not refused.
+    #[test]
+    fn this_repository_with_ordinary_plans_is_not_refused() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("root");
+        let repo = DiskRepo(root);
+        assert!(
+            repo_members("Cargo.toml", &repo).is_some_and(|m| !m.is_empty()),
+            "the root manifest is read as a workspace"
+        );
+        let specs = [
+            spec(
+                "c1",
+                "edit the plan check",
+                "cargo test -p kgraf-orchestrator --lib plan_repo",
+                &["crates/kgraf-orchestrator/src/plan_repo.rs"],
+                &[],
+            ),
+            spec(
+                "c2",
+                "add a crate",
+                "cargo clippy --workspace --all-targets -- -D warnings",
+                &["crates/kgraf-new/Cargo.toml", "crates/kgraf-new/src/lib.rs"],
+                &[],
+            ),
+            spec(
+                "c3",
+                "edit the host",
+                "cd crates/kgraf-host && cargo test",
+                &["crates/kgraf-host/src/lib.rs"],
+                &[],
+            ),
+        ];
+        let got = refusal(&specs, &[], &repo);
+        assert!(got.is_none(), "{got:?}");
+    }
+
+    /// A directory a contract writes into under a `<prefix>/*` member is a
+    /// member; cargo refuses it without a manifest (measured with an empty
+    /// directory and with one that holds only sources).
+    #[test]
+    fn a_glob_member_directory_without_a_manifest_is_refused() {
+        let repo = Fake::with(&[
+            ("Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n"),
+            ("crates/a/Cargo.toml", "[package]\nname = \"a\"\n"),
+        ]);
+        let specs = [
+            spec(
+                "c1",
+                "add crate b",
+                "cargo test -p a",
+                &["crates/b/src/lib.rs"],
+                &[],
+            ),
+            spec(
+                "c2",
+                "b's manifest",
+                "cargo test -p b",
+                &["crates/b/Cargo.toml"],
+                &[],
+            ),
+        ];
+        let why = reason(refusal(&specs, &[], &repo));
+        assert!(why.contains("`crates/b/Cargo.toml`"), "{why}");
+        assert!(why.contains("`c1`"), "{why}");
+    }
+
     #[test]
     fn a_workspace_manifest_only_a_later_contract_writes_is_refused() {
-        // c2's acceptance builds the workspace whose root manifest only c1 writes.
+        // c2's acceptance runs at the root, whose manifest only c1 writes.
         let repo = Fake::default();
         let mut specs = greenfield(&[], &[]);
         specs[0].acceptance = "cargo test -p wcl-core".into();
@@ -569,9 +1401,19 @@ pub fn f() {}
             path: "wcl/Cargo.toml".into(),
             node: None,
         });
+        specs[0].writes.push(WriteTarget {
+            path: "wcl/src/main.rs".into(),
+            node: None,
+        });
         specs[1].writes.retain(|w| w.path != "wcl/Cargo.toml");
         let why = reason(refusal(&specs, &[], &repo));
         assert!(why.contains("`c2`"), "{why}");
+        assert!(why.contains("workspace manifest `Cargo.toml`"), "{why}");
+        assert!(why.contains("cargo finds no manifest"), "{why}");
+        // The `-p` form at the root fails the same way (measured: "could
+        // not find `Cargo.toml`").
+        specs[1].acceptance = "cargo test -p wcl".into();
+        let why = reason(refusal(&specs, &[], &repo));
         assert!(why.contains("workspace manifest `Cargo.toml`"), "{why}");
     }
 
@@ -594,26 +1436,71 @@ pub fn f() {}
         let why = reason(refusal(&specs, &[], &repo));
         assert!(why.contains("`b/Cargo.toml`"), "{why}");
         assert!(!why.contains("crates"), "{why}");
+        // A plan that does not write the root manifest is checked against
+        // the repository's too.
+        let specs = [spec(
+            "c1",
+            "edit a",
+            "cargo test -p a",
+            &["a/src/lib.rs"],
+            &[],
+        )];
+        let why = reason(refusal(&specs, &[], &repo));
+        assert!(why.contains("`b/Cargo.toml`"), "{why}");
     }
 
     #[test]
     fn the_command_and_member_readers_are_exact() {
+        let runs = |a: &str| -> Vec<(String, String)> {
+            cargo_runs(a)
+                .into_iter()
+                .map(|r| (r.command, r.dir))
+                .collect()
+        };
+        let one = |c: &str, d: &str| vec![(c.to_owned(), d.to_owned())];
         assert_eq!(
-            builds_whole_workspace("run `cargo test --workspace` locally").as_deref(),
-            Some("cargo test --workspace")
+            runs("run `cargo test --workspace` locally"),
+            one("cargo test --workspace", "")
         );
         assert_eq!(
-            builds_whole_workspace("cargo clippy --all -- -D warnings").as_deref(),
-            Some("cargo clippy --all")
+            runs("cargo clippy --all -- -D warnings"),
+            one("cargo clippy --all", "")
+        );
+        assert_eq!(
+            runs("cargo test -p wcl-core && echo SUCCESS"),
+            one("cargo test -p wcl-core", "")
+        );
+        assert_eq!(
+            runs("cargo test --manifest-path crates/a/Cargo.toml"),
+            one("cargo test --manifest-path crates/a/Cargo.toml", "crates/a")
+        );
+        assert_eq!(
+            runs("cd crates && cargo -C a build"),
+            one("cargo build", "crates/a")
+        );
+        assert_eq!(
+            runs("(cd a && cargo test); cargo build"),
+            vec![
+                ("cargo test".to_owned(), "a".to_owned()),
+                ("cargo build".to_owned(), String::new())
+            ]
+        );
+        assert_eq!(
+            runs("cargo build and cargo test --offline"),
+            vec![
+                ("cargo build".to_owned(), String::new()),
+                ("cargo test --offline".to_owned(), String::new())
+            ]
         );
         for no in [
-            "cargo test -p wcl-core",
-            "cargo build",
-            "cargo fmt --all",
-            "the workspace builds",
-            "cargo test -p a && echo --workspace",
+            "cargo new x",
+            "cargo install ripgrep",
+            "the cargo is loaded",
+            "cd && cargo test",
+            "cd $HOME && cargo test",
+            "cargo test --manifest-path /abs/Cargo.toml",
         ] {
-            assert_eq!(builds_whole_workspace(no), None, "{no}");
+            assert!(runs(no).is_empty(), "{no}: {:?}", runs(no));
         }
         assert_eq!(
             members_in("with members `[\"wcl-core\", \"wcl\"]` and more"),
@@ -621,6 +1508,199 @@ pub fn f() {}
         );
         assert_eq!(members_in("members = ['a']"), vec!["a".to_owned()]);
         assert!(members_in("members of the team [\"x\"]").is_empty());
-        assert!(members_in("members = [\"crates/*\"]").is_empty());
+        assert_eq!(
+            Members::from_list(
+                members_in("members = [\"crates/*\", \"x/**\", \"b\"]"),
+                vec![]
+            ),
+            Members {
+                explicit: vec!["b".into()],
+                globs: vec!["crates".into()],
+                exclude: vec![],
+            }
+        );
+    }
+
+    fn open(id: &str, acceptance: &str, writes: &[&str], deps: &[&str]) -> OpenContract {
+        let mut c = OpenContract::planned(id, kgraf_core::TaskId::new(id), "", acceptance);
+        c.writes = writes
+            .iter()
+            .map(|p| WriteTarget {
+                path: (*p).into(),
+                node: None,
+            })
+            .collect();
+        c.depends_on = deps.iter().map(|d| (*d).to_owned()).collect();
+        c
+    }
+
+    /// Round 8: attempt 2 of c1-core asked three times for `wcl/Cargo.toml`
+    /// and was told "do not edit it; your attempt is judged by its own
+    /// acceptance check", which could not pass. That report now holds the
+    /// contract for a re-plan; a file the check does not need, or one a
+    /// contract that runs first writes, does not.
+    #[test]
+    fn a_member_manifest_a_later_contract_writes_holds_for_a_replan() {
+        let [s1, s2] = round8_second_plan();
+        let mut c1 = open(
+            "c1-core",
+            "cargo test -p wcl-core && echo SUCCESS",
+            &["Cargo.toml", "wcl-core/Cargo.toml", "wcl-core/src/lib.rs"],
+            &[],
+        );
+        c1.instruction = s1.instruction;
+        let mut c2 = open(
+            "c2-bin",
+            "cargo test --workspace",
+            &["wcl/Cargo.toml", "wcl/src/main.rs"],
+            &["c1-core"],
+        );
+        c2.instruction = s2.instruction;
+        let plan = [c1, c2];
+        let repo = Fake::default();
+        let hold = member_hold(&plan, "c1-core", &["./wcl/Cargo.toml"], &repo).expect("held");
+        assert!(hold.contains("`wcl/Cargo.toml`"), "{hold}");
+        assert!(hold.contains("plan-shape error"), "{hold}");
+        assert!(hold.contains("Re-plan"), "{hold}");
+        assert!(hold.contains("cargo test -p wcl-core"), "{hold}");
+        assert!(!hold.contains("judged by its own acceptance"), "{hold}");
+        // The source the remedy writes with it holds too.
+        assert!(member_hold(&plan, "c1-core", &["wcl/src/main.rs"], &repo).is_some());
+        // A file the check does not need: answered as before.
+        assert!(member_hold(&plan, "c1-core", &["README.md"], &repo).is_none());
+        // c2-bin depends on c1-core: what it needs comes first.
+        assert!(member_hold(&plan, "c2-bin", &["Cargo.toml"], &repo).is_none());
+        // A member no open contract writes is the plan-shape hold of
+        // `decide_in_plan`, not this one.
+        let mut alone = plan.clone();
+        alone[1].writes.clear();
+        assert!(member_hold(&alone, "c1-core", &["wcl/Cargo.toml"], &repo).is_none());
+    }
+
+    /// Writes the files contract `id` can count on, its own and its
+    /// dependencies' writes over `repo`, with minimal contents as a worker
+    /// that did its part leaves them, and runs its acceptance with cargo.
+    #[cfg(unix)]
+    fn cargo_passes(specs: &[ContractSpec], id: &str, repo: &[(&str, &str)]) -> (bool, String) {
+        let dir = tempfile::tempdir().expect("dir");
+        let root = dir.path();
+        let put = |rel: &str, text: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            std::fs::write(path, text).expect("write");
+        };
+        for (rel, text) in repo {
+            put(rel, text);
+        }
+        let fake = Fake::with(repo);
+        let mut supplied = ancestors(specs, id);
+        supplied.insert(id);
+        for c in specs.iter().filter(|c| supplied.contains(c.id.as_str())) {
+            for w in &c.writes {
+                let rel = norm(&w.path);
+                let text = if rel == "Cargo.toml" {
+                    let m = seen_members(specs, &supplied, rel, &fake).unwrap_or_default();
+                    let list = m
+                        .explicit
+                        .iter()
+                        .map(|m| format!("\"{m}\""))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("[workspace]\nmembers = [{list}]\nresolver = \"2\"\n")
+                } else if let Some(d) = rel.strip_suffix("/Cargo.toml") {
+                    let name = d.rsplit('/').next().unwrap_or(d);
+                    format!(
+                        "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
+                    )
+                } else if rel.ends_with("src/lib.rs") {
+                    "pub fn one() -> u8 { 1 }\n#[test]\nfn t() { assert_eq!(one(), 1); }\n"
+                        .to_owned()
+                } else if rel.ends_with("src/main.rs") {
+                    "fn main() {}\n".to_owned()
+                } else {
+                    String::new()
+                };
+                put(rel, &text);
+            }
+        }
+        let c = specs.iter().find(|c| c.id == id).expect("contract");
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+        let bin = std::path::Path::new(&cargo)
+            .parent()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        let path = format!("{bin}:{}", std::env::var("PATH").unwrap_or_default());
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&c.acceptance)
+            .current_dir(root)
+            .env("PATH", path)
+            .env("CARGO_TARGET_DIR", root.join("target"))
+            .env("CARGO_NET_OFFLINE", "true")
+            .output()
+            .expect("sh");
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
+    /// The check's verdict on each contract is cargo's: every contract the
+    /// check refuses fails in a real cargo run over the files it can count
+    /// on, and every contract it accepts passes. Covers the round 8 plan,
+    /// both remedies, the manifest with no source, the root manifest that
+    /// comes later, and a member built alone from its manifest.
+    #[cfg(unix)]
+    #[test]
+    fn the_check_agrees_with_cargo() {
+        let mut no_source = round8_second_plan();
+        no_source[0].writes.push(WriteTarget {
+            path: "wcl/Cargo.toml".into(),
+            node: None,
+        });
+        // Commands only: the shell runs them as they are written.
+        let mut root_later = greenfield(&[], &[]);
+        root_later[0].acceptance = "cargo test --workspace".into();
+        root_later[1].acceptance = "cargo test -p wcl".into();
+        let mut alone = greenfield(&["c2"], &[]);
+        alone[0].acceptance = "cargo test --workspace".into();
+        alone[1].acceptance = "cargo test --manifest-path wcl/Cargo.toml".into();
+        let cases: Vec<(&str, Vec<ContractSpec>, bool)> = vec![
+            ("round 8 plan", round8_second_plan().to_vec(), true),
+            ("stub members", remedy_stub_members().to_vec(), false),
+            (
+                "members add themselves",
+                remedy_members_add_themselves().to_vec(),
+                false,
+            ),
+            ("manifest with no source", no_source.to_vec(), true),
+            ("root manifest later", root_later.to_vec(), true),
+            ("member alone", alone.to_vec(), false),
+        ];
+        let repo = Fake::default();
+        for (name, specs, some_refused) in cases {
+            let mut refused_any = false;
+            for c in &specs {
+                let findings = workspace_findings(&specs, c, &repo);
+                let (passed, stderr) = cargo_passes(&specs, &c.id, &[]);
+                assert_eq!(
+                    findings.is_empty(),
+                    passed,
+                    "{name}, `{}`: check {findings:?}, cargo {stderr}",
+                    c.id
+                );
+                // A failure is cargo's, on the workspace, not the shell's.
+                if !passed {
+                    assert!(
+                        stderr.contains("failed to load manifest for workspace member")
+                            || stderr.contains("could not find `Cargo.toml`"),
+                        "{name}, `{}`: {stderr}",
+                        c.id
+                    );
+                }
+                refused_any |= !findings.is_empty();
+            }
+            assert_eq!(refused_any, some_refused, "{name}");
+        }
     }
 }
