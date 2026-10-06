@@ -57,6 +57,17 @@ async fn wait_hang(a: &Arc<WorkerFake>, b: &Arc<WorkerFake>) {
     }
 }
 
+/// Wait until both parallel attempts are parked in their hang (round 1). The
+/// fakes hang from round 1 on, so one attempt parked says nothing about its
+/// sibling: that one may still be at a round boundary, where a message to it
+/// is injected and so is no longer undelivered. Use this for tests that
+/// address a sibling attempt (`attempts: 2`).
+async fn wait_both_hang(a: &Arc<WorkerFake>, b: &Arc<WorkerFake>) {
+    while !(a.hang_reached.load(Ordering::SeqCst) && b.hang_reached.load(Ordering::SeqCst)) {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
 // ---------------------------------------------------------------- send_to_session
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -446,7 +457,7 @@ async fn sibling_attempts_are_connected_by_rule_and_a_message_between_them_deliv
     let o = Orchestrator::new(config(), p.services(WINDOW)).expect("orchestrator");
     let handle = o.handle();
     let run = tokio::spawn(o.start(RunId::new("r1"), "make a".into()));
-    wait_hang(&p.alpha, &p.beta).await;
+    wait_both_hang(&p.alpha, &p.beta).await;
 
     let a0 = AgentId::new("r1-a-r0-a0");
     let a1 = AgentId::new("r1-a-r0-a1");
@@ -624,7 +635,7 @@ async fn stopping_one_attempt_leaves_its_sibling_running() {
     let o = Orchestrator::new(config(), p.services(WINDOW)).expect("orchestrator");
     let handle = o.handle();
     let run = tokio::spawn(o.start(RunId::new("r1"), "make a".into()));
-    wait_hang(&p.alpha, &p.beta).await;
+    wait_both_hang(&p.alpha, &p.beta).await;
 
     // `alpha` and `beta` each run one of the two attempts (round-robin
     // routing), each with its own `live` set. Stop whichever attempt is on
@@ -1051,7 +1062,7 @@ async fn twenty_messages_in_a_minute_are_paced_with_growing_delay_and_one_notice
     let o = Orchestrator::new(config(), p.services(WINDOW)).expect("orchestrator");
     let handle = o.handle();
     let run = tokio::spawn(o.start(RunId::new("r1"), "make a".into()));
-    wait_hang(&p.alpha, &p.beta).await;
+    wait_both_hang(&p.alpha, &p.beta).await;
 
     let a0 = AgentId::new("r1-a-r0-a0");
     let a1 = AgentId::new("r1-a-r0-a1");
