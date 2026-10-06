@@ -1837,16 +1837,13 @@ async fn a_parent_that_answers_first_is_held_until_its_child_is_merged() {
     let o = rig.orchestrator();
     let handle = o.handle();
     let running = tokio::spawn(o.start(RunId::new(RUN), "do the work".into()));
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !provider
-        .answered()
-        .iter()
-        .any(|(i, r)| i.contains("PARENT-LATE") && *r == 1)
-    {
-        assert!(Instant::now() < deadline, "the parent never answered");
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    // The parent has answered; its child has not written yet.
+    // Not "the provider answered": a stop that lands before the worker
+    // takes the answer cancels the parent instead of finding it held.
+    wait_for("the parent never finished", || {
+        ended_its_turn(&rig, "r1-a-r0-a0")
+    })
+    .await;
+    // The parent has finished; its child has not written yet.
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(rig.parts.verifier.started.load(Ordering::SeqCst), 0, "held");
     handle.stop().await;
@@ -1877,6 +1874,17 @@ async fn a_parent_that_answers_first_is_held_until_its_child_is_merged() {
         .expect("read")
         .expect("known");
     assert!(ended.is_some(), "the child settled");
+}
+
+/// Whether `worker`'s transcript holds the `stop` that ends its last turn.
+/// The worker writes it only once it has taken the model's final answer, so
+/// its attempt has completed: a stop after this point can no longer cancel
+/// it, and a parent with live children is held. A provider's answer alone
+/// is not that point: the worker may still be about to take it.
+fn ended_its_turn(rig: &Rig, worker: &str) -> bool {
+    read(&rig.transcript(worker))
+        .lines()
+        .any(|l| l.contains(r#""type":"stop""#) && l.contains(r#""reason":"end_turn""#))
 }
 
 async fn wait_for(what: &str, mut ok: impl FnMut() -> bool) {
@@ -1933,12 +1941,11 @@ async fn a_second_stop_stops_a_finished_parents_children_resumably() {
     let o = rig.orchestrator();
     let handle = o.handle();
     let running = tokio::spawn(o.start(RunId::new(RUN), "do the work".into()));
-    let answered = provider.clone();
-    wait_for("the parent never answered", || {
-        answered
-            .answered()
-            .iter()
-            .any(|(i, r)| i.contains("PARENT-S2") && *r == 1)
+    // Not "the provider answered": a stop between that answer and the
+    // worker taking it cancels the parent mid-call instead of finding it
+    // held (that case is its own test below).
+    wait_for("the parent never finished", || {
+        ended_its_turn(&rig, "r1-a-r0-a0")
     })
     .await;
     handle.stop().await;
@@ -1988,6 +1995,13 @@ async fn a_second_stop_stops_a_finished_parents_children_resumably() {
         "child c",
         "the child continued and was merged before the parent was verified"
     );
+    let (ended, paused) = rig
+        .sessions()
+        .lifecycle(&child)
+        .expect("read")
+        .expect("known");
+    assert!(ended.is_some(), "the continued child settled");
+    assert_eq!(paused, None, "its restart cleared the paused mark");
     let inbox = rig
         .sessions()
         .undelivered(&AgentId::new("r1-a-r0-a0"))
@@ -1999,6 +2013,110 @@ async fn a_second_stop_stops_a_finished_parents_children_resumably() {
             && i.text.contains("over the limit")),
         "the over-limit notice is in the parent's inbox: {inbox:?}"
     );
+}
+
+/// The other side of the race above, made certain: the stop lands while the
+/// parent's last model call is still open, so the parent is cancelled
+/// mid-call, not held. Its child is stopped with it, resumably, and its
+/// session shows paused exactly as a held parent's child does; a resume
+/// continues the child, merges its work, and clears the mark.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_during_a_parents_last_call_stops_its_children_resumably() {
+    let dir = tempfile::tempdir().expect("dir");
+    let go = Arc::new(AtomicBool::new(false));
+    let release = go.clone();
+    // The parent's last call hangs once (until the stop cancels it) and
+    // answers when the resume asks it again.
+    let hung = Arc::new(AtomicBool::new(false));
+    let reached = Arc::new(AtomicBool::new(false));
+    let (hung_s, reached_s) = (hung.clone(), reached.clone());
+    let provider = Scripted::new(move |s| {
+        if s.is("CHILD-MID") {
+            return match s.round {
+                0 => Step::After(release.clone(), vec![write("c", "src/c.rs", "child c")]),
+                _ => Step::Reply(answer("wrote c")),
+            };
+        }
+        match s.round {
+            0 => Step::Reply(vec![
+                spawn_writer("CHILD-MID write c", &["src/c.rs"]),
+                write("a", "src/a.rs", "parent"),
+            ]),
+            _ if !hung_s.swap(true, Ordering::SeqCst) => Step::Hang(reached_s.clone()),
+            _ => Step::Reply(answer("done after my child")),
+        }
+    });
+    let the_plan = plan(&[("a", "PARENT-MID make a", &["src/a.rs", "src/c.rs"])]);
+    let rig = Rig::open(
+        dir.path(),
+        the_plan.clone(),
+        Limits::default(),
+        provider.clone(),
+        false,
+    );
+    let o = rig.orchestrator();
+    let handle = o.handle();
+    let running = tokio::spawn(o.start(RunId::new(RUN), "do the work".into()));
+    wait_for("the parent's last call never started", || {
+        reached.load(Ordering::SeqCst)
+    })
+    .await;
+    handle.stop().await;
+    let report = tokio::time::timeout(Duration::from_secs(10), running)
+        .await
+        .expect("one stop ended the run: nothing was held")
+        .expect("join")
+        .expect("run");
+    assert_eq!(report.status, RunStatus::Stopped, "{report:?}");
+    assert_eq!(
+        rig.parts.verifier.started.load(Ordering::SeqCst),
+        0,
+        "the cancelled parent was not verified"
+    );
+    let parent = read(&rig.transcript("r1-a-r0-a0"));
+    assert!(
+        parent.contains(r#""type":"cancelled""#) && !ended_its_turn(&rig, "r1-a-r0-a0"),
+        "the parent was cancelled mid-call, not held: {parent}"
+    );
+    let child = AgentId::new("r1-a-r0-a0.s1");
+    let (ended, paused) = rig
+        .sessions()
+        .lifecycle(&child)
+        .expect("read")
+        .expect("known");
+    assert!(ended.is_none(), "stopped resumably, not ended");
+    assert!(paused.is_some(), "the session view shows it stopped");
+    drop(rig);
+
+    // ---- resume: the parent asks its last call again, the child continues.
+    go.store(true, Ordering::SeqCst);
+    let rig = Rig::open(
+        dir.path(),
+        the_plan,
+        Limits::default(),
+        provider.clone(),
+        false,
+    );
+    let report = tokio::time::timeout(
+        Duration::from_secs(60),
+        rig.orchestrator().resume(RunId::new(RUN)),
+    )
+    .await
+    .expect("the resume ended in time")
+    .expect("resume");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    assert_eq!(
+        read(&rig.worktree("r1-a-r0-a0").join("src/c.rs")),
+        "child c",
+        "the child continued and was merged"
+    );
+    let (ended, paused) = rig
+        .sessions()
+        .lifecycle(&child)
+        .expect("read")
+        .expect("known");
+    assert!(ended.is_some(), "the continued child settled");
+    assert_eq!(paused, None, "its restart cleared the paused mark");
 }
 
 /// Stop a run while its parent naps and its writer child waits on `gate`:
@@ -3083,6 +3201,27 @@ async fn a_grandchild_cancelled_by_a_pause_its_parent_outran_is_adopted_again() 
     assert_eq!(
         ended.map(|(o, _)| o),
         Some(kgraf_core::session::SessionOutcome::Completed)
+    );
+    // The report reached the resumed child of the first attempt, which then
+    // completed: a second attempt's child getting it proves nothing about
+    // the resumed one (its old worker's injector refused the report, and it
+    // napped to its round budget).
+    let (ended, _) = rig
+        .sessions()
+        .lifecycle(&child)
+        .expect("read")
+        .expect("known");
+    assert_eq!(
+        ended.map(|(o, _)| o),
+        Some(kgraf_core::session::SessionOutcome::Completed),
+        "the resumed child itself completed with the report"
+    );
+    assert!(
+        provider
+            .seen()
+            .iter()
+            .all(|s| !s.instruction.contains("r1-a-r1-")),
+        "no second attempt was needed"
     );
 }
 

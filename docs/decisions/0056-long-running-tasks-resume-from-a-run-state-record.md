@@ -146,3 +146,12 @@ Tests: `kgraf-runtime` `worker_loop.rs`
 removed); `handle.rs` `stored_resolves_only_when_the_reader_asks_past_every_earlier_event`
 and `stored_gives_way_to_a_cancel`; `kgraf-orchestrator` `subagents.rs`
 `a_kill_while_a_child_runs_then_resume_wakes_the_parent_once_and_repeats_no_round`.
+
+## Amendment (2026-10-06): a stopped run's subagents are resumed with it
+
+This decision was silent on subagents. A stop leaves every live subagent of a stopped parent
+resumable: its spawn record and session stay open, and its session is marked paused, both
+when the stop cancels the parent mid-call and when it finds the parent finished and held for
+its children. `--resume` continues each one from its transcript when its parent is
+dispatched again, and clears the mark. The details, and the defects this closed, are in the
+fourth 2026-10-06 amendment of 0067.

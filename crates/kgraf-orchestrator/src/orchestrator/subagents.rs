@@ -45,7 +45,11 @@
 //! a parent that is stopped cancels them resumably. A run stop does not
 //! cancel the children of a parent that already finished: they run to their
 //! end, because cancelling them would let the parent's attempt be verified
-//! without their work; the stop waits for them.
+//! without their work; the stop waits for them, up to the grace or a second
+//! stop. Then every held parent's children are stopped resumably, also
+//! those of a parent whose finish reaches the loop later. Whichever way a
+//! stop reaches a child (its parent cancelled mid-call or held), the child
+//! is left resumable and marked paused; its restart clears the mark.
 //!
 //! Admission: a writer child takes one work item and one agent slot through
 //! `AdmissionGate::try_admit(1)`, the gate every dispatch uses. A read-only
@@ -228,11 +232,14 @@ pub(super) struct Subagents {
     orchestrator_row: bool,
     /// Spawns a killed process left `preparing`: `(contract, child)`.
     never_started: BTreeSet<(String, AgentId)>,
-    /// Stop requests seen, the first one's time, and whether the children of
-    /// finished parents were already stopped.
+    /// Stop requests seen, the first one's time, and whether the second stop
+    /// or the grace has come (from then on, every held parent's children are
+    /// stopped, also those of a parent held later), with the held parents
+    /// whose children were already stopped.
     stops: u32,
     stop_at_ms: Option<i64>,
-    stopped_held: bool,
+    stop_held_due: bool,
+    stopped_held: BTreeSet<AgentId>,
 }
 
 /// A settled child's calls whose spend has not been charged yet.
@@ -800,13 +807,22 @@ impl RunLoop {
 
     /// The parent ended without finishing its work: cancel every descendant.
     /// `resumable`: the parent was stopped and will be continued, so the
-    /// children's sessions stay open to be adopted again.
+    /// children's sessions stay open to be adopted again, and each is marked
+    /// paused, the state the session view shows. The mark is written here,
+    /// on every path that stops a child with its parent (a parent cancelled
+    /// mid-call, a held parent stopped by a second stop or the grace, a
+    /// child paused by the user), so no path leaves a resumable child that
+    /// the session view shows as neither paused nor ended. Its restart
+    /// clears the mark (`restart_children`).
     async fn end_children(
         &mut self,
         parent: &AgentId,
         resumable: bool,
     ) -> Result<(), OrchestratorError> {
         for child in self.children_of(parent) {
+            if resumable {
+                self.mark_paused(&child, true);
+            }
             let running = match self.subagents.live.get_mut(&child) {
                 Some(c) => {
                     c.ended_parent = Some(resumable);
@@ -832,6 +848,20 @@ impl RunLoop {
             }
         }
         Ok(())
+    }
+
+    /// Write (`paused`) or clear a child's paused mark. A store failure is
+    /// kept in `errors` and traced on the next tick: the stop or restart
+    /// itself already happened.
+    fn mark_paused(&mut self, child: &AgentId, paused: bool) {
+        let at = paused.then(|| self.now());
+        let store = self.sessions();
+        if let Err(e) = blocking(|| store.set_paused(child, at)) {
+            let what = if paused { "written" } else { "cleared" };
+            self.subagents.errors.push(format!(
+                "`{child}`: its paused mark could not be {what}: {e}"
+            ));
+        }
     }
 
     fn unstarted_result(&self, child: &AgentId) -> WorkerResult {
@@ -871,10 +901,22 @@ impl RunLoop {
         if !self.subagents.never_started.is_empty() {
             self.discard_never_started().await?;
         }
-        if self.stopping && !self.subagents.stopped_held {
+        if self.stopping {
             let now = self.now();
             let first = *self.subagents.stop_at_ms.get_or_insert(now);
             if self.subagents.stops >= 2 || now - first >= SUBAGENT_STOP_GRACE_MS {
+                self.subagents.stop_held_due = true;
+            }
+            // Not one-shot: a parent whose finish reaches the loop after the
+            // second stop (or after the grace) is held then, and its children
+            // must stop too, or the run waits on them without a bound.
+            if self.subagents.stop_held_due
+                && self
+                    .subagents
+                    .parked
+                    .keys()
+                    .any(|p| !self.subagents.stopped_held.contains(p))
+            {
                 self.stop_held_children().await?;
             }
         }
@@ -909,34 +951,34 @@ impl RunLoop {
         }
     }
 
-    /// Stop the children of every held (finished) parent, resumably: each
-    /// held finish becomes a stop, so its attempt is kept for the resume
-    /// rather than verified without its children's work, and each child's
-    /// session is marked paused, the state the session view shows.
+    /// Stop the children of every held (finished) parent not stopped yet,
+    /// resumably: each held finish becomes a stop, so its attempt is kept for
+    /// the resume rather than verified without its children's work, and each
+    /// child's session is marked paused (`end_children`), the state the
+    /// session view shows.
     async fn stop_held_children(&mut self) -> Result<(), OrchestratorError> {
-        self.subagents.stopped_held = true;
-        let now = self.now();
-        for parked in self.subagents.parked.values_mut() {
-            match parked {
-                Parked::Attempt(f) => f.result.outcome = WorkerOutcome::Cancelled,
-                Parked::Child(d) => d.result.outcome = WorkerOutcome::Cancelled,
+        let held: Vec<AgentId> = self
+            .subagents
+            .parked
+            .keys()
+            .filter(|p| !self.subagents.stopped_held.contains(*p))
+            .cloned()
+            .collect();
+        // Every held finish becomes a stop before any child is ended: ending
+        // one parent's children can release another held finish (a nested
+        // child's), which must already read as a stop.
+        for parent in &held {
+            match self.subagents.parked.get_mut(parent) {
+                Some(Parked::Attempt(f)) => f.result.outcome = WorkerOutcome::Cancelled,
+                Some(Parked::Child(d)) => d.result.outcome = WorkerOutcome::Cancelled,
+                None => {}
             }
+            self.subagents.stopped_held.insert(parent.clone());
         }
-        let held: Vec<AgentId> = self.subagents.parked.keys().cloned().collect();
         let mut stopped = Vec::new();
         for parent in held {
-            for child in self.children_of(&parent) {
-                stopped.push(child);
-            }
+            stopped.extend(self.children_of(&parent));
             self.end_children(&parent, true).await?;
-        }
-        let store = self.sessions();
-        for child in &stopped {
-            if let Err(e) = blocking(|| store.set_paused(child, Some(now))) {
-                self.subagents.errors.push(format!(
-                    "`{child}` stopped; its paused mark could not be written: {e}"
-                ));
-            }
         }
         if !stopped.is_empty() {
             self.subagents.errors.push(format!(
@@ -1330,7 +1372,7 @@ impl RunLoop {
 
     /// Start (or continue) a child's worker on its own task.
     fn start_child(&mut self, id: &AgentId) -> Result<(), String> {
-        let (facts, task, workspace, fence, injector, cancel, contract) = {
+        let (facts, task, workspace, fence, cancel, contract) = {
             let Some(c) = self.subagents.live.get(id) else {
                 return Err(format!("subagent `{id}` is not live"));
             };
@@ -1339,11 +1381,16 @@ impl RunLoop {
                 c.task.clone(),
                 c.workspace.clone(),
                 c.fence.clone(),
-                c.injector.clone(),
                 c.cancel.clone(),
                 c.contract.clone(),
             )
         };
+        // A fresh injector slot at every start. The worker fills the slot it
+        // is given once (`OnceLock`), so a child paused by the user and
+        // resumed would otherwise keep its ended worker's injector: every
+        // report and message to it would be refused as "answered before it
+        // reached it", and the new worker would never see them.
+        let injector: Arc<OnceLock<Injector>> = Arc::new(OnceLock::new());
         // A fresh slot at every start: a restarted child's policy is its new
         // worker's, which its own children inherit from.
         let skills = AttemptSkills {
@@ -1386,6 +1433,7 @@ impl RunLoop {
             c.running = true;
             c.ended = Some(ended_rx);
             c.skills = skills.slot.clone();
+            c.injector = injector.clone();
         }
         // Local-only diagnostics (decision 0069), after this function's one
         // early failure (the route lookup), as `start_attempt` records it.
@@ -1676,16 +1724,22 @@ impl RunLoop {
             };
             // Its own children fence it before it can write.
             self.adopt_children_of(&contract, &id, &workspace, &own_fence);
-            if let Err(e) = self.start_child(&id) {
-                let mut result = self.unstarted_result(&id);
-                result.outcome = WorkerOutcome::Failed { error: e.clone() };
-                self.settle_child(ChildDone {
-                    child: id.clone(),
-                    result,
-                    env_failure: Some(e),
-                    recovered: None,
-                })
-                .await?;
+            match self.start_child(&id) {
+                // Running again: a paused mark from the stop that left it is
+                // cleared, or the session view would show it paused while it
+                // runs.
+                Ok(()) => self.mark_paused(&id, false),
+                Err(e) => {
+                    let mut result = self.unstarted_result(&id);
+                    result.outcome = WorkerOutcome::Failed { error: e.clone() };
+                    self.settle_child(ChildDone {
+                        child: id.clone(),
+                        result,
+                        env_failure: Some(e),
+                        recovered: None,
+                    })
+                    .await?;
+                }
             }
         }
         Ok(())
@@ -1736,6 +1790,10 @@ impl RunLoop {
         let (admitted, reservation, task) = match self.subagents.live.get_mut(&id) {
             Some(c) => {
                 c.running = false;
+                // Its worker has ended: a report for it while it is paused is
+                // held in its inbox (and offered again at its restart), not
+                // refused by the ended worker's injector as "answered".
+                c.injector = Arc::new(OnceLock::new());
                 (c.admitted.take(), c.reservation.take(), c.task.clone())
             }
             None => return Ok(()),

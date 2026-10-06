@@ -1798,6 +1798,16 @@ Behavior that differs from earlier builds. Each item names the decision that hol
   `report_delivered` once, from its inbox row's mark. Before, it could stay with no fate in
   the trace, or be called `report_after_parent_finished` although the parent had read it
   (0067).
+- A stop leaves every subagent of a stopped parent resumable, and its session shows paused,
+  whether the stop cancelled the parent mid-call or found it finished and waiting for its
+  children (those keep running until a second stop or the stop's grace). A resume continues
+  them and clears the paused mark. Before, a child whose parent was cancelled mid-call was
+  resumable but showed neither paused nor ended, and a second stop that came just before a
+  parent finished did not stop that parent's children, so the run waited on them (0067).
+- A subagent you stop and resume from its session gets the reports and messages sent to it.
+  While it is paused they wait in its inbox (`report_held`), and it gets them when it runs
+  again. Before, a resumed subagent refused them as if it had already answered, and ran on
+  without them (0067).
 - kGraf's own git runs no hook, filter, merge driver or diff driver from your repository or
   config, and reaches no remote (see "kGraf's own git"). A file stored through git-lfs or
   git-crypt is committed by kGraf in its stored form, and a file with a configured merge

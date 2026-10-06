@@ -1610,6 +1610,19 @@ fn release_holder(reg: &LeaseRegistry<'_>, holder: &str) -> Result<(), Orchestra
     Ok(())
 }
 
+/// [`MixedAcquisition`] after [`LeaseKeeper::acquire_held`]: a grant's
+/// tokens are already in the keeper, so only `(path, node, generation)` per
+/// lease is returned.
+enum KeptAcquisition {
+    Granted(Vec<(String, Option<String>, i64)>),
+    Blocked {
+        paths: Vec<kgraf_graph::Conflict>,
+        nodes: Vec<kgraf_graph::NodeConflict>,
+    },
+    Unstable(Vec<String>),
+    Vanished(Vec<String>),
+}
+
 /// Leases this run holds, renewed by their own task (so a busy or blocked loop
 /// never lets them lapse). The map is shared with the loop, which adds and
 /// removes; the renewal task only renews and reports losses.
@@ -1720,6 +1733,57 @@ impl LeaseKeeper {
                 map.remove(holder);
             }
             Ok(lost)
+        })
+    }
+
+    /// Acquire `paths` and `nodes` for `holder` and, on a grant, put the new
+    /// tokens in the keeper's map before the graph lock is released.
+    ///
+    /// Every grant writes a new generation, also when `holder` already holds
+    /// the row (a resolver or a retry takes its contract's own write set again
+    /// under the same lineage root). [`Self::renew_all`] renews by generation
+    /// under the same graph lock, and it treats a row of this holder at
+    /// another generation as taken by someone else in between. If the map
+    /// still held the old token after the grant, a renewal in that gap would
+    /// report a loss of a lease this run holds, and the loop would cancel the
+    /// workers that just started under it. One lock across the grant and the
+    /// map update closes the gap: a renewal sees either the old row and the
+    /// old token, or the new row and the new token.
+    ///
+    /// Returns the grant as `(path, node, generation)` per lease, for the run
+    /// record's admitted leases.
+    fn acquire_held(
+        &self,
+        holder: &str,
+        task: &str,
+        paths: &[String],
+        nodes: &[String],
+        node_path: &BTreeMap<String, String>,
+        now: i64,
+    ) -> Result<KeptAcquisition, OrchestratorError> {
+        let g = self.graph.lock().map_err(|_| StoreError::Poisoned)?;
+        let reg = LeaseRegistry::new(&g).with_ttl_ms(self.ttl_ms);
+        Ok(match reg.acquire(holder, task, paths, &[], nodes, now)? {
+            MixedAcquisition::Granted { paths, nodes } => {
+                let mut granted = Vec::new();
+                let mut held = Vec::new();
+                for l in paths {
+                    granted.push((l.path().to_owned(), None, l.generation()));
+                    held.push(HeldLease::Path(l));
+                }
+                for l in nodes {
+                    let path = node_path.get(l.node_id()).cloned().unwrap_or_default();
+                    granted.push((path.clone(), Some(l.node_id().to_owned()), l.generation()));
+                    held.push(HeldLease::Node { path, lease: l });
+                }
+                if !held.is_empty() {
+                    self.insert(holder, held);
+                }
+                KeptAcquisition::Granted(granted)
+            }
+            MixedAcquisition::Vanished(ids) => KeptAcquisition::Vanished(ids),
+            MixedAcquisition::Unstable(ids) => KeptAcquisition::Unstable(ids),
+            MixedAcquisition::Blocked { paths, nodes } => KeptAcquisition::Blocked { paths, nodes },
         })
     }
 
@@ -5441,8 +5505,8 @@ impl RunLoop {
 
         // Leases: the whole write set, atomically, under the lineage root.
         let holder = self.holder(&contract);
-        let leases = match self.acquire_leases(&contract, &holder).await? {
-            Ok(l) => l,
+        match self.acquire_leases(&contract, &holder).await? {
+            Ok(()) => {}
             Err(detail) => {
                 // No worker exists yet: the flight's drop returns its slot.
                 drop(flight);
@@ -5453,7 +5517,7 @@ impl RunLoop {
                 self.defer(id, DeferReason::Lease, detail).await?;
                 return Ok(());
             }
-        };
+        }
 
         // Budget: one pinned reservation per attempt, after the leases so that a
         // lease wait does not churn reservations.
@@ -5469,9 +5533,6 @@ impl RunLoop {
             );
             self.record.counters.budget_admitted += 1;
             flight.reservations.insert(w.clone(), r);
-        }
-        if !leases.is_empty() {
-            self.keeper.insert(&holder, leases);
         }
         self.deferred_logged.retain(|(c, _)| c != id);
         self.readiness_waits.remove(id);
@@ -5722,37 +5783,29 @@ impl RunLoop {
     /// Acquire the contract's write set through combined admission. A declared
     /// node the graph no longer has is traced and leased as its file;
     /// a node whose identity is unstable is leased as its file (0050 rule 4).
+    /// Take the contract's whole write set for `holder`. A grant is already
+    /// in the keeper when this returns ([`LeaseKeeper::acquire_held`]): `Ok(Ok(()))`.
     async fn acquire_leases(
         &mut self,
         contract: &OpenContract,
         holder: &str,
-    ) -> Result<Result<Vec<HeldLease>, String>, OrchestratorError> {
+    ) -> Result<Result<(), String>, OrchestratorError> {
         if contract.writes.is_empty() {
-            return Ok(Ok(Vec::new()));
+            return Ok(Ok(()));
         }
         let mut as_file: BTreeSet<String> = BTreeSet::new();
+        let node_path = node_paths(&contract.writes);
         // At most two rounds: one to learn which nodes must be files, one to take.
         for _ in 0..3 {
             let (paths, nodes) = Self::lease_keys(&contract.writes, &as_file);
-            let graph = self.s.graph.clone();
             let now = self.now();
-            let ttl = self.config.lease_ttl_ms;
             let task = contract.task.to_string();
-            let holder_owned = holder.to_owned();
             let outcome = blocking(|| {
-                let g = graph.lock().map_err(|_| StoreError::Poisoned)?;
-                let reg = LeaseRegistry::new(&g).with_ttl_ms(ttl);
-                Ok::<_, OrchestratorError>(reg.acquire(
-                    &holder_owned,
-                    &task,
-                    &paths,
-                    &[],
-                    &nodes,
-                    now,
-                )?)
+                self.keeper
+                    .acquire_held(holder, &task, &paths, &nodes, &node_path, now)
             })?;
             match outcome {
-                MixedAcquisition::Vanished(ids) => {
+                KeptAcquisition::Vanished(ids) => {
                     for id in ids {
                         let at = self.now();
                         self.trace(TraceEvent::EmptyGraphLookup {
@@ -5764,35 +5817,22 @@ impl RunLoop {
                         as_file.insert(id);
                     }
                 }
-                MixedAcquisition::Unstable(ids) => as_file.extend(ids),
-                MixedAcquisition::Granted { paths, nodes } => {
+                KeptAcquisition::Unstable(ids) => as_file.extend(ids),
+                KeptAcquisition::Granted(granted) => {
                     self.record
                         .admitted_leases
                         .retain(|l| l.agent.as_str() != holder);
-                    let node_path = node_paths(&contract.writes);
-                    let mut held = Vec::new();
-                    for l in paths {
+                    for (path, node, generation) in granted {
                         self.record.admitted_leases.push(AdmittedLease {
-                            path: l.path().to_owned(),
-                            node: None,
+                            path,
+                            node: node.map(NodeId::new),
                             agent: AgentId::new(holder),
-                            generation: l.generation(),
+                            generation,
                         });
-                        held.push(HeldLease::Path(l));
                     }
-                    for l in nodes {
-                        let path = node_path.get(l.node_id()).cloned().unwrap_or_default();
-                        self.record.admitted_leases.push(AdmittedLease {
-                            path: path.clone(),
-                            node: Some(NodeId::new(l.node_id())),
-                            agent: AgentId::new(holder),
-                            generation: l.generation(),
-                        });
-                        held.push(HeldLease::Node { path, lease: l });
-                    }
-                    return Ok(Ok(held));
+                    return Ok(Ok(()));
                 }
-                MixedAcquisition::Blocked { paths, nodes } => {
+                KeptAcquisition::Blocked { paths, nodes } => {
                     let mut holders: Vec<(String, i64, String)> = paths
                         .iter()
                         .map(|c| (c.held_by.clone(), c.expires_ms, c.path.clone()))
@@ -9779,6 +9819,80 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         task.abort();
+    }
+
+    /// A holder that takes its own write set again (a resolver under its
+    /// contract's lineage root) gets a new generation. The keeper renews the
+    /// new token from the moment the grant exists: a renewal right after the
+    /// grant reports no loss, and the row keeps the granted generation.
+    ///
+    /// Before the fix the loop put the new token in the keeper only after the
+    /// grant returned. A renewal in that gap renewed the old generation, read
+    /// the row at the new one as taken by someone else, and reported the lease
+    /// lost, so the loop cancelled the resolver it had just started.
+    #[test]
+    fn a_holder_that_takes_its_own_lease_again_is_never_reported_lost() {
+        let dir = tempfile::tempdir().expect("dir");
+        let graph: SharedGraph = Arc::new(Mutex::new(
+            kgraf_graph::GraphStore::open_in_memory(dir.path()).expect("graph"),
+        ));
+        let ttl = 100_000;
+        let now = 1_000_000;
+        let keeper = LeaseKeeper {
+            graph: graph.clone(),
+            ttl_ms: ttl,
+            clock: Arc::new(crate::clock::ManualClock::new(now)),
+            held: Arc::new(Mutex::new(BTreeMap::new())),
+        };
+        let holder = "r1/a@n";
+        let paths = vec!["src/a.rs".to_owned()];
+        let generation_of = |grant: KeptAcquisition| match grant {
+            KeptAcquisition::Granted(g) => {
+                assert_eq!(g.len(), 1, "{g:?}");
+                g[0].2
+            }
+            _ => panic!("not granted"),
+        };
+        // The contract's own attempt: its token is in the keeper, as after any
+        // dispatch.
+        let lease = {
+            let g = graph.lock().expect("lock");
+            match LeaseRegistry::new(&g)
+                .with_ttl_ms(ttl)
+                .acquire_all(holder, "t", &paths, &[], now)
+                .expect("acquire")
+            {
+                Acquisition::Granted(mut l) => l.remove(0),
+                Acquisition::Blocked(_) => panic!("blocked"),
+            }
+        };
+        let first = lease.generation();
+        keeper.insert(holder, vec![HeldLease::Path(lease)]);
+        // Its resolver, under the same holder, while the first token is held.
+        let second = generation_of(
+            keeper
+                .acquire_held(holder, "t", &paths, &[], &BTreeMap::new(), now + 10)
+                .expect("acquire"),
+        );
+        assert!(second > first, "a grant writes a new generation");
+        // The keeper's next renewal, before the loop does anything else.
+        let lost = keeper.renew_all().expect("renew");
+        assert!(
+            lost.is_empty(),
+            "a lease this holder still holds was reported lost: {lost:?}"
+        );
+        let row = {
+            let g = graph.lock().expect("lock");
+            LeaseRegistry::new(&g)
+                .holder_of("src/a.rs", now + 10)
+                .expect("registry")
+                .expect("held")
+        };
+        assert_eq!(row.agent_id, holder);
+        assert_eq!(
+            row.generation, second,
+            "the renewal kept the granted token; it did not take the row again"
+        );
     }
 
     /// Decision 0088 with 0067: a worktree a handoff child inherited is in use

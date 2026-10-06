@@ -289,3 +289,54 @@ Tests (each fails with its part of the fix reverted): `mailbox_injection.rs`
 stopped again); `subagents.rs` (`a_report_marked_delivered_before_a_kill_is_traced_once_after_resume`,
 `a_report_in_the_transcript_but_unmarked_at_a_kill_is_traced_once_after_resume`,
 `a_report_whose_fate_was_traced_before_a_kill_is_not_traced_again`).
+
+## Amendment (2026-10-06, fifth): a stop leaves every child of a stopped parent resumable and paused
+
+Point 5 says a parent's stop cascades to its children, and the data model says `paused_ms`
+is set when the user stops the session. Both were silent on how a run stop reaches a child,
+and two paths disagreed. A run stop that found the parent already finished and held (its
+finish parked until its children settle) stopped the children after a second stop or the
+grace and marked each one paused. A run stop that landed while the parent's last model call
+was still open cancelled the parent mid-call; its children were cancelled resumably, but no
+paused mark was written, so the session view showed a resumable child as neither paused nor
+ended.
+
+A second defect sat on the held path: the stop of held parents' children ran once. When the
+second stop (or the grace) came before the parent's finish reached the loop, it ran with
+nothing held and never ran again; the parent was held later, and the run waited on its
+children with no bound.
+
+Measured on a loaded machine, 4 parallel copies of the `subagents` test binary per
+iteration: the second-stop test failed 9 of 224 runs, 4 with the child not marked paused (the
+parent was cancelled after the provider answered and before the worker took the answer) and
+5 with a timeout (both stops were handled before the parent was held). The test waited for
+"the provider answered", which is neither state.
+
+- **One place writes the mark.** `end_children` with `resumable` marks each child it ends
+  paused, at every depth, so every path that stops a child with its parent writes it: a
+  parent cancelled mid-call, a held parent stopped by a second stop or the grace, a child
+  paused by the user (its own children).
+- **Its restart clears it.** A child started again (adopted by its resumed parent, or
+  resumed by the user) has its paused mark cleared. `paused_ms` is set while a child is
+  stopped resumably, whoever stopped it, and cleared when it runs again.
+- **Not one-shot.** Once the second stop or the grace has come, every held parent's children
+  are stopped, also those of a parent held later; each held parent is stopped once.
+- **The tests wait for the state they assert.** A held parent is waited for by the `stop`
+  that ends its last turn in its transcript; the worker writes it only after it has taken
+  the final answer, so a stop after it cannot cancel the attempt.
+
+- **A resumed child gets a fresh injector.** A child paused by the user and resumed kept its
+  ended worker's injector slot: the worker fills the slot it is given once, so the new
+  worker's injector was dropped, and every report and message to the resumed child was
+  refused as "answered before the report reached it". The resumed child then ran to its round
+  budget, and its test passed only through a second attempt. Now every start of a child gets
+  a fresh slot, and a pause clears it, so a report to a paused child is held in its inbox and
+  offered again at its restart.
+
+Tests: `subagents.rs` `a_stop_during_a_parents_last_call_stops_its_children_resumably`
+(fails without the mark), `a_second_stop_stops_a_finished_parents_children_resumably` (fails
+without the clear), `a_parent_that_answers_first_is_held_until_its_child_is_merged`, and
+`a_grandchild_cancelled_by_a_pause_its_parent_outran_is_adopted_again` (fails without the
+fresh slot). The "not one-shot" fix has no deterministic test: the order of a stop and a
+worker's finish in the loop cannot be set from outside it; the second-stop test covers it
+under load.
