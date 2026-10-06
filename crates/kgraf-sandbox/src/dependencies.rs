@@ -34,18 +34,33 @@
 //! command starts in: the one owning that folder, or the nearest above it
 //! ([`DependencyLinks::virtual_env_for`]).
 //!
+//! **pnpm.** A pnpm install keeps every package as a real folder in
+//! `node_modules/.pnpm` and links workspace packages there too
+//! (`.pnpm/node_modules/@scope/web -> ../../../../packages/web`, its hidden
+//! hoisting folder). Node resolves a package from its real path, so a
+//! package reached through any link into the checkout's `.pnpm` looks up its
+//! own dependencies in the checkout's folders, never the tree's: no folder
+//! of links can point those lookups at the tree. When a pnpm install has
+//! workspace links, the tree gets a copy-on-write clone of it instead
+//! ([`unix::clone_install`]): pnpm's links are relative, so in the clone
+//! every one of them, nested ones included, resolves inside the tree, and a
+//! workspace package to the tree's own copy. A clone costs one file system
+//! call per file and no data (APFS `clonefile`, a Linux reflink); where no
+//! clone can be made the install gets a folder of links as before, and the
+//! output says that nested workspace links reach the checkout's copies.
+//!
+//! **Windows.** A symbolic link needs a privilege a user account lacks by
+//! default, so a folder is reached through a directory junction and a file
+//! (`.pnp.cjs`) is copied ([`by_path`]). The writable root's ACL is set
+//! before the first junction is made in it. Junctions are made by path, not
+//! relative to an open folder; see [`by_path`] for what that leaves.
+//!
 //! **Not covered**, stated rather than hidden: a dependency link that
 //! resolves into the checkout to a folder the tree does not have (a package
 //! that is not tracked) stays unreadable; such a run fails with the
-//! permission error. Windows makes no links (creating one needs a privilege
-//! a user account does not have by default). There a root package still
-//! finds the checkout's `node_modules` by Node's walk up from the worktree
-//! (`<checkout>/.kgraf/worktrees/<name>` lies below the checkout, and
-//! Windows does not confine reads); a nested package's own `node_modules`,
-//! a virtual environment (no walk up; not activated), Composer's and
-//! Bundler's `vendor/` and Go's vendored modules are not reached, and a
-//! workspace package resolves to the checkout's copy, not the worker's
-//! edits.
+//! permission error. A third-party package of a pnpm install whose own
+//! folder (`.pnpm/<name>@<version>/node_modules`) links a workspace package
+//! reaches the tree's copy only through a clone.
 //!
 //! Written new. Searched: this repository (the cargo dependency gate, decision
 //! 0087, handles cargo's own cache only) and the sandboxes it ports (codex-rs
@@ -53,6 +68,8 @@
 //! to install trees.
 
 use std::path::{Path, PathBuf};
+
+pub(crate) mod by_path;
 
 /// Deepest folder level searched for a project's manifest, from the checkout
 /// root: `packages/web/app` is three. A monorepo's packages sit at two or
@@ -115,7 +132,6 @@ pub struct DependencyTree {
 /// that only its owner can change. Asked right before each link and grant,
 /// so neither a reused search ([`TREES_FRESH_FOR`]) nor a swap after the
 /// search makes the sandbox resolve a grant to a link's target.
-#[cfg(unix)]
 fn changed_since_search(tree: &DependencyTree) -> Option<String> {
     let meta = match std::fs::symlink_metadata(&tree.source) {
         Ok(meta) => meta,
@@ -383,93 +399,171 @@ pub fn find_dependency_trees(checkout: &Path) -> (Vec<DependencyTree>, Vec<Strin
 /// only where its parent folder already exists in the tree as a real folder,
 /// reached without crossing a link.
 pub fn link_dependency_trees(tree: &Path, checkout: &Path) -> DependencyLinks {
-    if cfg!(not(unix)) {
-        return DependencyLinks::default();
-    }
     let (trees, notes) = recent_trees(checkout);
-    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut out = DependencyLinks {
         notes,
         ..DependencyLinks::default()
     };
+    if cfg!(not(any(unix, windows))) {
+        return out;
+    }
+    let checkout_root = std::fs::canonicalize(checkout).unwrap_or_else(|_| checkout.to_path_buf());
+    // Canonical, as the command folder it is compared with.
+    let tree_root = std::fs::canonicalize(tree).unwrap_or_else(|_| tree.to_path_buf());
     #[cfg(unix)]
+    let Ok(root) = crate::confined::open_root(tree) else {
+        return out;
+    };
+    // The writable root's ACL is set before any junction is in it, so its
+    // inheritable entries are never written while a junction is there.
+    #[cfg(windows)]
+    if !trees.is_empty()
+        && let Err(e) = crate::sandbox::prepare_windows_root(&tree_root)
     {
-        let Ok(root) = crate::confined::open_root(tree) else {
-            return out;
+        out.notes.push(format!(
+            "the installed dependencies are not linked into the tree: its access control \
+             could not be set first: {e}"
+        ));
+        return out;
+    }
+    for found in trees {
+        if let Some(why) = changed_since_search(&found) {
+            out.notes.push(format!(
+                "the installed {} in the checkout {why} since it was found, so it is not \
+                 linked into the sandbox",
+                found.rel.display()
+            ));
+            continue;
+        }
+        // An install whose workspace packages are links into the checkout
+        // gets a folder of links instead of one link ([`mirror_plan`]), or,
+        // for pnpm, a clone ([`unix::clone_install`]). A folder made from the
+        // install as it is now (its stamp, [`mirror_stamp`]) is kept as is.
+        let stamp = match found.kind {
+            DependencyKind::NodeModules => mirror_stamp(&found.source),
+            _ => None,
         };
-        let checkout_root =
-            std::fs::canonicalize(checkout).unwrap_or_else(|_| checkout.to_path_buf());
-        // Canonical, as the command folder it is compared with.
-        let tree_root = std::fs::canonicalize(tree).unwrap_or_else(|_| tree.to_path_buf());
-        for found in trees {
-            if let Some(why) = changed_since_search(&found) {
-                out.notes.push(format!(
-                    "the installed {} in the checkout {why} since it was found, so it is not \
-                     linked into the sandbox",
-                    found.rel.display()
-                ));
-                continue;
-            }
-            // An install whose workspace packages are links into the
-            // checkout gets a folder of links instead of one link
-            // ([`mirror_plan`]): its workspace links resolve to the tree's own
-            // copies of those packages.
-            // A folder of links already made from the install as it is now
-            // (its stamp, [`mirror_stamp`]) is kept without a new plan.
-            let stamp = match found.kind {
-                DependencyKind::NodeModules => mirror_stamp(&found.source),
+        #[cfg(unix)]
+        let current = stamp
+            .as_deref()
+            .is_some_and(|stamp| unix::mirror_is_current(&root, &found.rel, stamp));
+        #[cfg(windows)]
+        let current = stamp.as_deref().is_some_and(|stamp| {
+            by_path::mirror_is_current(&by_path::Junctions, &tree_root, &found.rel, stamp)
+        });
+        #[cfg(not(any(unix, windows)))]
+        let current = false;
+        let plan = match (&stamp, current) {
+            (Some(_), false) => mirror_plan(&found.source, &checkout_root),
+            _ => None,
+        };
+        let pnpm_clone = stamp.is_some()
+            && !current
+            && is_pnpm(&found.source)
+            && (plan.is_some() || pnpm_hoists_workspace(&found.source, &checkout_root));
+        #[cfg(unix)]
+        let linked = {
+            let cloned = match (&stamp, pnpm_clone) {
+                (Some(stamp), true) => {
+                    match unix::clone_install(&root, &tree_root, &found.rel, &found.source, stamp) {
+                        Ok(Ok(linked)) => Some(Ok(linked)),
+                        Ok(Err(why)) => {
+                            out.notes.push(pnpm_unclonable(&found.rel, &why));
+                            None
+                        }
+                        Err(e) => Some(Err(e)),
+                    }
+                }
                 _ => None,
             };
-            let current = stamp
-                .as_deref()
-                .is_some_and(|stamp| unix::mirror_is_current(&root, &found.rel, stamp));
-            let plan = match (&stamp, current) {
-                (Some(_), false) => mirror_plan(&found.source, &checkout_root),
-                _ => None,
-            };
-            let linked = match (&plan, &stamp) {
-                _ if current => Ok(unix::Linked::Kept),
-                (Some(plan), Some(stamp)) => {
+            match (cloned, &plan, &stamp) {
+                (Some(linked), _, _) => linked,
+                _ if current => Ok(Linked::Kept),
+                (None, Some(plan), Some(stamp)) => {
                     unix::mirror(&root, &found.rel, &found.source, plan, stamp)
                 }
                 _ => unix::link(&root, &found.rel, &found.source),
-            };
-            match linked {
-                Ok(unix::Linked::Made | unix::Linked::Kept) => {
-                    if found.kind == DependencyKind::PythonVenv {
-                        let dir = tree_root.join(found.rel.parent().unwrap_or(Path::new("")));
-                        if !out.virtual_envs.iter().any(|v| v.dir == dir) {
-                            // The checkout's folder, not the link in the tree:
-                            // the worker can swap the link for a folder of
-                            // its own before the command starts.
-                            out.virtual_envs.push(VirtualEnv {
-                                dir,
-                                source: found.source.clone(),
-                            });
-                        }
-                    }
-                    out.reads.push(found.source);
-                    out.linked.push(found.rel);
-                }
-                Ok(unix::Linked::Present | unix::Linked::NoParent) => {}
-                Err(e) => out.notes.push(format!(
-                    "cannot link the installed {} into the tree: {e}",
-                    found.rel.display()
-                )),
             }
+        };
+        #[cfg(windows)]
+        let linked = {
+            if pnpm_clone {
+                out.notes.push(pnpm_unclonable(
+                    &found.rel,
+                    "Windows makes no copy-on-write clone here",
+                ));
+            }
+            match (&plan, &stamp) {
+                _ if current => Ok(Linked::Kept),
+                (Some(plan), Some(stamp)) => by_path::mirror(
+                    &by_path::Junctions,
+                    &tree_root,
+                    &found.rel,
+                    &found.source,
+                    plan,
+                    stamp,
+                ),
+                _ => by_path::link(&by_path::Junctions, &tree_root, &found.rel, &found.source),
+            }
+        };
+        #[cfg(not(any(unix, windows)))]
+        let linked: std::io::Result<Linked> = {
+            let _ = (pnpm_clone, &plan);
+            Ok(Linked::NoParent)
+        };
+        match linked {
+            Ok(Linked::Made | Linked::Kept) => {
+                if found.kind == DependencyKind::PythonVenv {
+                    let dir = tree_root.join(found.rel.parent().unwrap_or(Path::new("")));
+                    if !out.virtual_envs.iter().any(|v| v.dir == dir) {
+                        // The checkout's folder, not the link in the tree: the
+                        // worker can swap the link for a folder of its own
+                        // before the command starts.
+                        out.virtual_envs.push(VirtualEnv {
+                            dir,
+                            source: found.source.clone(),
+                        });
+                    }
+                }
+                out.reads.push(found.source);
+                out.linked.push(found.rel);
+            }
+            Ok(Linked::Present | Linked::NoParent) => {}
+            Err(e) => out.notes.push(format!(
+                "cannot link the installed {} into the tree: {e}",
+                found.rel.display()
+            )),
         }
     }
-    #[cfg(not(unix))]
-    {
-        let _ = (tree, trees);
-    }
     out
+}
+
+/// The note for a pnpm install with workspace links that could not be
+/// cloned into the tree.
+fn pnpm_unclonable(rel: &Path, why: &str) -> String {
+    format!(
+        "the pnpm install {} got a folder of links, not a clone ({why}): a workspace package \
+         that another package of the install links inside node_modules/.pnpm resolves to the \
+         checkout's copy, which the sandbox does not grant",
+        rel.display()
+    )
+}
+
+/// What one link call did.
+pub(crate) enum Linked {
+    /// The link was made now.
+    Made,
+    /// The same link was already there.
+    Kept,
+    /// Something else is at the path: left as it is.
+    Present,
+    /// The parent folder is not in the tree (or is a link): no link.
+    NoParent,
 }
 
 /// One entry of a `node_modules` folder of links ([`mirror_plan`]): a link
 /// at `name` (one or two components: `dep`, `@scope/pkg`, `.bin/jest`)
 /// whose text is the second path, or a folder at `name` holding such links.
-#[cfg(unix)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum MirrorEntry {
     Dir(PathBuf),
@@ -483,12 +577,25 @@ pub(crate) enum MirrorEntry {
 /// would have had.
 pub const MIRROR_MARK: &str = ".kgraf-dependency-mirror";
 
+/// What a clone's mark ([`MIRROR_MARK`]) starts with, before its stamp: a
+/// pnpm install kGraf cloned into the tree, whose files are all kGraf's
+/// ([`is_dependency_clone`]).
+const CLONE_PREFIX: &str = "clone ";
+
+/// Whether the folder at `dir` is a pnpm install kGraf cloned into a tree:
+/// its mark, a regular file, names a clone. Every file in it is a copy of
+/// the user's install, not the worker's work.
+pub fn is_dependency_clone(dir: &Path) -> bool {
+    let mark = dir.join(MIRROR_MARK);
+    std::fs::symlink_metadata(&mark).is_ok_and(|m| m.is_file())
+        && std::fs::read_to_string(&mark).is_ok_and(|t| t.starts_with(CLONE_PREFIX))
+}
+
 /// What a folder of links made from the install at `source` depends on: the
 /// modification times of `source`, of its `.bin` and of each `@scope`
 /// folder (an install adds or removes an entry in one of them). Written in
 /// the mark; a later call that reads the same stamp keeps the folder as it
 /// is. `None` when `source` cannot be read.
-#[cfg(unix)]
 pub(crate) fn mirror_stamp(source: &Path) -> Option<String> {
     use std::fmt::Write as _;
     let time = |meta: &std::fs::Metadata| -> u128 {
@@ -513,7 +620,56 @@ pub(crate) fn mirror_stamp(source: &Path) -> Option<String> {
     for (name, t) in dirs {
         let _ = write!(stamp, " {name}={t}");
     }
+    // pnpm keeps its packages in `.pnpm` and hoists them into
+    // `.pnpm/node_modules`: an install changes one of them.
+    for sub in [".pnpm", ".pnpm/node_modules"] {
+        if let Ok(meta) = std::fs::metadata(source.join(sub)) {
+            let _ = write!(stamp, " {sub}={}", time(&meta));
+        }
+    }
     Some(stamp)
+}
+
+/// The path of the workspace package the link `entry` of the install at
+/// `source` points at, relative to the checkout: a link whose target is a
+/// folder of the checkout outside this install. `None` for any other entry.
+fn workspace_target(entry: &Path, source: &Path, checkout: &Path) -> Option<PathBuf> {
+    let target = std::fs::canonicalize(entry).ok()?;
+    if target.starts_with(checkout) && !target.starts_with(source) {
+        target.strip_prefix(checkout).ok().map(Path::to_path_buf)
+    } else {
+        None
+    }
+}
+
+/// Whether the install at `source` is pnpm's: its packages are in a real
+/// `.pnpm` folder.
+fn is_pnpm(source: &Path) -> bool {
+    std::fs::symlink_metadata(source.join(".pnpm")).is_ok_and(|m| m.is_dir())
+}
+
+/// Whether pnpm's hidden hoisting folder `.pnpm/node_modules` of the install
+/// at `source` links a workspace package, directly or in an `@scope` folder.
+fn pnpm_hoists_workspace(source: &Path, checkout: &Path) -> bool {
+    let hoisted = source.join(".pnpm/node_modules");
+    let Ok(entries) = std::fs::read_dir(&hoisted) else {
+        return false;
+    };
+    let linked = |e: &std::fs::DirEntry| {
+        e.file_type().is_ok_and(|k| k.is_symlink())
+            && workspace_target(&e.path(), source, checkout).is_some()
+    };
+    entries.flatten().any(|e| {
+        if linked(&e) {
+            return true;
+        }
+        let scoped = e.file_name().to_string_lossy().starts_with('@')
+            && e.file_type().is_ok_and(|k| k.is_dir());
+        scoped
+            && std::fs::read_dir(e.path())
+                .map(|inner| inner.flatten().any(|c| linked(&c)))
+                .unwrap_or(false)
+    })
 }
 
 /// How a tree's `node_modules` is made when the checkout's copy holds
@@ -537,16 +693,8 @@ pub(crate) fn mirror_stamp(source: &Path) -> Option<String> {
 /// `mirror_cost`): an install of 2,000 entries takes about 0.1 s to mirror
 /// the first time and about 1 ms on each later call while the install is
 /// unchanged ([`mirror_stamp`]); one link costs one call.
-#[cfg(unix)]
 pub(crate) fn mirror_plan(source: &Path, checkout: &Path) -> Option<Vec<MirrorEntry>> {
-    let workspace_target = |entry: &Path| -> Option<PathBuf> {
-        let target = std::fs::canonicalize(entry).ok()?;
-        if target.starts_with(checkout) && !target.starts_with(source) {
-            target.strip_prefix(checkout).ok().map(Path::to_path_buf)
-        } else {
-            None
-        }
-    };
+    let workspace_target = |entry: &Path| workspace_target(entry, source, checkout);
     let up = |levels: usize| -> PathBuf { (0..levels).map(|_| "..").collect() };
     // From a link directly in the tree's copy of `source` to the tree root.
     let depth = source.strip_prefix(checkout).ok()?.components().count();
@@ -670,16 +818,7 @@ mod unix {
     use std::os::unix::ffi::OsStrExt;
     use std::path::{Component, Path, PathBuf};
 
-    pub(super) enum Linked {
-        /// The link was made now.
-        Made,
-        /// The same link was already there.
-        Kept,
-        /// Something else is at the path: left as it is.
-        Present,
-        /// The parent folder is not in the tree (or is a link): no link.
-        NoParent,
-    }
+    use super::Linked;
 
     fn symlink_at(dir: &File, name: &Path, target: &Path) -> io::Result<()> {
         let to = CString::new(target.as_os_str().as_bytes())?;
@@ -754,7 +893,8 @@ mod unix {
             return false;
         };
         let mut text = String::new();
-        mark.read_to_string(&mut text).is_ok() && text == stamp
+        mark.read_to_string(&mut text).is_ok()
+            && (text == stamp || text.strip_prefix(super::CLONE_PREFIX) == Some(stamp))
     }
 
     /// Make `rel` beneath `root` a folder of links ([`super::mirror_plan`]),
@@ -846,6 +986,109 @@ mod unix {
             ._cap_fs_ext_follow(FollowSymlinks::No);
         std::io::Write::write_all(&mut open(&dir, mark, &options)?, stamp.as_bytes())?;
         Ok(if made { Linked::Made } else { Linked::Kept })
+    }
+
+    fn rename_at(from_dir: &File, from: &Path, to_dir: &File, to: &Path) -> io::Result<()> {
+        let from = CString::new(from.as_os_str().as_bytes())?;
+        let to = CString::new(to.as_os_str().as_bytes())?;
+        // SAFETY: both strings are NUL-terminated and both folders are open.
+        let rc = unsafe {
+            libc::renameat(
+                from_dir.as_raw_fd(),
+                from.as_ptr(),
+                to_dir.as_raw_fd(),
+                to.as_ptr(),
+            )
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    /// Make `rel` beneath `root` a copy-on-write clone of the install at
+    /// `source` (pnpm's, [`super::is_pnpm`]), or replace kGraf's own link or
+    /// folder of links there with one; then write `stamp` in its mark.
+    /// `Ok(Err(why))`: no clone can be made here (another volume, no
+    /// copy-on-write), and nothing was changed.
+    ///
+    /// The clone is made in a new folder beside the tree (`tree`'s parent:
+    /// the workspace base or a check run's folder, which no sandboxed
+    /// command of this tree writes), then moved into place with `renameat`
+    /// relative to folders opened without following links, so a folder the
+    /// worker swapped for a link never makes the host write outside the
+    /// tree. What it replaces is moved out the same way and removed there.
+    pub(super) fn clone_install(
+        root: &File,
+        tree: &Path,
+        rel: &Path,
+        source: &Path,
+        stamp: &str,
+    ) -> io::Result<Result<Linked, String>> {
+        use cap_primitives::ambient_authority;
+        use cap_primitives::fs::open_ambient_dir;
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let Some((parent, last)) = open_parent(root, rel)? else {
+            return Ok(Ok(Linked::NoParent));
+        };
+        let mark = Path::new(super::MIRROR_MARK);
+        let replaces = match stat(&parent, last, FollowSymlinks::No) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                if read_link_at(&parent, last).as_deref() != Some(source.as_os_str().as_bytes()) {
+                    return Ok(Ok(Linked::Present));
+                }
+                true
+            }
+            Ok(meta) if meta.is_dir() => {
+                let ours = open_dir_nofollow(&parent, last)
+                    .is_ok_and(|d| stat(&d, mark, FollowSymlinks::No).is_ok_and(|m| m.is_file()));
+                if !ours {
+                    // A folder that is not kGraf's (the worker's own install).
+                    return Ok(Ok(Linked::Present));
+                }
+                true
+            }
+            Ok(_) => return Ok(Ok(Linked::Present)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+            Err(e) => return Err(e),
+        };
+        let Some(beside) = tree.parent() else {
+            return Ok(Err("the tree has no parent folder".into()));
+        };
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let staging = beside.join(format!(".kgraf-install-{}-{nanos}-{n}", std::process::id()));
+        std::fs::create_dir(&staging)?;
+        let result = (|| -> io::Result<Result<Linked, String>> {
+            let made = staging.join("install");
+            if let Err(why) = crate::build_dir::clone_tree(source, &made) {
+                return Ok(Err(why));
+            }
+            std::fs::write(made.join(mark), format!("{}{stamp}", super::CLONE_PREFIX))?;
+            let staged = open_ambient_dir(&staging, ambient_authority())?;
+            if replaces {
+                rename_at(&parent, last, &staged, Path::new("replaced"))?;
+            }
+            match rename_at(&staged, Path::new("install"), &parent, last) {
+                Ok(()) => Ok(Ok(Linked::Made)),
+                // Something was put there meanwhile: left as it is.
+                Err(e)
+                    if matches!(
+                        e.raw_os_error(),
+                        Some(libc::EEXIST | libc::ENOTEMPTY | libc::ENOTDIR | libc::EISDIR)
+                    ) =>
+                {
+                    Ok(Ok(Linked::Present))
+                }
+                Err(e) => Err(e),
+            }
+        })();
+        // The staging folder is the host's; nothing in it is followed.
+        let _ = std::fs::remove_dir_all(&staging);
+        result
     }
 
     /// Make `rel` beneath `root` a symbolic link to `target`, reaching its
@@ -1242,6 +1485,151 @@ mod tests {
 
     /// A command's virtual environment is the one owning its folder, or the
     /// nearest above it; a sibling project's is not its.
+    /// A pnpm workspace install, laid out by hand as pnpm documents it
+    /// ("Symlinked `node_modules` structure"; pnpm is not installed here):
+    /// every package a real folder in `.pnpm/<name>@<version>/node_modules`,
+    /// the root's entries relative links into it, the workspace packages
+    /// linked at the root and in the hidden hoisting folder
+    /// `.pnpm/node_modules`, all links relative.
+    fn pnpm_checkout() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("dir");
+        let c = std::fs::canonicalize(dir.path()).expect("canonical");
+        write(&c.join("package.json"), r#"{"name":"root","private":true}"#);
+        write(
+            &c.join("pnpm-workspace.yaml"),
+            "packages:\n  - packages/*\n",
+        );
+        write(&c.join("packages/web/index.js"), "checkout web");
+        write(&c.join("packages/util/index.js"), "checkout util");
+        let nm = c.join("node_modules");
+        write(&nm.join(".modules.yaml"), "layoutVersion: 5\n");
+        // A third-party package that requires the workspace package
+        // `@s/util`, found through the hoisting folder.
+        write(
+            &nm.join(".pnpm/dep@1.0.0/node_modules/dep/index.js"),
+            "module.exports = require('@s/util');",
+        );
+        let link = |target: &str, at: &Path| {
+            std::fs::create_dir_all(at.parent().expect("parent")).expect("mkdir");
+            std::os::unix::fs::symlink(target, at).expect("ln");
+        };
+        link(
+            "../../../../packages/util",
+            &nm.join(".pnpm/node_modules/@s/util"),
+        );
+        link(
+            "../dep@1.0.0/node_modules/dep",
+            &nm.join(".pnpm/node_modules/dep"),
+        );
+        link(".pnpm/dep@1.0.0/node_modules/dep", &nm.join("dep"));
+        link("../../packages/web", &nm.join("@s/web"));
+        (dir, c)
+    }
+
+    /// Node resolves a package from its real path. With the install linked
+    /// (one link or a folder of links), `dep` resolves into the checkout's
+    /// `.pnpm`, and its `require('@s/util')` walks the checkout's folders to
+    /// the checkout's `packages/util`. The tree gets a clone, so `dep`'s real
+    /// path is in the tree and the hoisted workspace link resolves to the
+    /// tree's own `packages/util`, as the root's `@s/web` does.
+    #[test]
+    fn pnpm_workspace_links_inside_the_store_resolve_to_the_tree_s_packages() {
+        let (_c, c) = pnpm_checkout();
+        // The tree in a folder of its own, so the check below of what is left
+        // beside it sees no other test's staging folder.
+        let outer = tempfile::tempdir().expect("outer");
+        let t = std::fs::canonicalize(outer.path())
+            .expect("canonical")
+            .join("tree");
+        write(&t.join("package.json"), r#"{"name":"root","private":true}"#);
+        write(&t.join("packages/web/index.js"), "tree web");
+        write(&t.join("packages/util/index.js"), "tree util");
+
+        let links = link_dependency_trees(&t, &c);
+        assert_eq!(
+            links.linked,
+            vec![PathBuf::from("node_modules")],
+            "{links:?}"
+        );
+        let nm = t.join("node_modules");
+        assert!(nm.join(MIRROR_MARK).is_file(), "{links:?}");
+        // Where Node finds `dep`, and the folders it then looks in for
+        // `@s/util`, as Node's own lookup from `dep`'s real path does.
+        let dep = std::fs::canonicalize(nm.join("dep")).expect("dep");
+        assert!(
+            dep.starts_with(&t),
+            "dep resolves into the checkout: {}",
+            dep.display()
+        );
+        // Node's lookup folders: `<a>/node_modules` for each folder `a` above
+        // the package's real path that is not itself a `node_modules`.
+        let util = dep
+            .ancestors()
+            .filter(|a| a.file_name().is_some_and(|n| n != "node_modules"))
+            .map(|a| a.join("node_modules/@s/util/index.js"))
+            .find(|p| p.is_file())
+            .expect("@s/util is found from dep");
+        assert_eq!(std::fs::read_to_string(&util).expect("read"), "tree util");
+        assert_eq!(
+            std::fs::read_to_string(nm.join("@s/web/index.js")).expect("read"),
+            "tree web"
+        );
+        // Kept on a second call; the checkout's install is unchanged.
+        let again = link_dependency_trees(&t, &c);
+        assert_eq!(again.linked, links.linked);
+        assert!(
+            std::fs::symlink_metadata(c.join("node_modules/dep"))
+                .expect("checkout dep")
+                .file_type()
+                .is_symlink()
+        );
+        assert!(!c.join("node_modules").join(MIRROR_MARK).exists());
+        // Nothing is left beside the tree.
+        let beside: Vec<_> = std::fs::read_dir(t.parent().expect("parent"))
+            .expect("read")
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".kgraf-install-")
+            })
+            .collect();
+        assert!(beside.is_empty(), "{beside:?}");
+    }
+
+    /// A worker's own `node_modules` folder in a pnpm workspace is left as
+    /// it is; kGraf's earlier folder of links is replaced by the clone.
+    #[test]
+    fn a_pnpm_clone_replaces_only_kgraf_s_own_install() {
+        let (_c, c) = pnpm_checkout();
+        let own = tempfile::tempdir().expect("tree");
+        write(&own.path().join("package.json"), "{}");
+        write(&own.path().join("node_modules/own/index.js"), "own");
+        let links = link_dependency_trees(own.path(), &c);
+        assert!(links.linked.is_empty(), "{links:?}");
+        assert!(!own.path().join("node_modules").join(MIRROR_MARK).exists());
+
+        let tree = tempfile::tempdir().expect("tree");
+        write(&tree.path().join("package.json"), "{}");
+        std::fs::create_dir_all(tree.path().join("node_modules")).expect("mkdir");
+        write(
+            &tree.path().join("node_modules").join(MIRROR_MARK),
+            "old stamp",
+        );
+        let links = link_dependency_trees(tree.path(), &c);
+        assert_eq!(
+            links.linked,
+            vec![PathBuf::from("node_modules")],
+            "{links:?}"
+        );
+        // A clone: `.pnpm` is a real folder in the tree, not a link.
+        assert!(
+            std::fs::symlink_metadata(tree.path().join("node_modules/.pnpm"))
+                .expect(".pnpm")
+                .is_dir()
+        );
+    }
+
     #[test]
     fn the_virtual_environment_is_the_nearest_one_above_the_command_folder() {
         let c = tempfile::tempdir().expect("dir");

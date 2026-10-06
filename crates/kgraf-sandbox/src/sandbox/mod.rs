@@ -851,6 +851,13 @@ impl From<Redirect> for Stdio {
 #[cfg(windows)]
 pub use windows::SandboxedChild;
 
+/// Set the write ACL and Low label of the writable root `root` before a
+/// dependency junction is made in it (`crate::dependencies`).
+#[cfg(windows)]
+pub(crate) fn prepare_windows_root(root: &Path) -> Result<(), SandboxError> {
+    windows::prepare_root(root)
+}
+
 /// A confined command, not yet spawned. Add arguments, environment and stdio,
 /// then spawn it once.
 #[derive(Debug)]
@@ -1160,7 +1167,7 @@ pub fn sandboxed_command(
         // The Gradle wrapper's distribution, reachable from the command's own
         // Gradle home (`crate::gradle_wrapper`): `./gradlew` runs offline,
         // and writes its lock there, never in the user's home.
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         if let (Some(tmp), Some(home)) = (&policy.tmp_dir, resolved.home.as_deref()) {
             let tmp = resolve(tmp)?;
             if let Some(root) = resolved

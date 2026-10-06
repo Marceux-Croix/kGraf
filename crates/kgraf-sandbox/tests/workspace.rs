@@ -665,3 +665,31 @@ fn startup_removes_holds_no_worktree_uses() {
     mgr.startup().unwrap();
     assert!(!holds.join("old-worker").exists());
 }
+
+/// A check's own folder is outside the worker's writable roots (its
+/// worktree and scratch folder), is removed when dropped, and one left by
+/// a process that has ended is removed by startup while a live process's
+/// folder stays.
+#[test]
+fn check_folders_live_outside_the_worker_s_roots_and_are_cleaned() {
+    let f = fixture();
+    let mgr = WorkspaceManager::open(&f.repo, &f.base).unwrap();
+    mgr.startup().unwrap();
+    let ws = mgr.create(&spec("w1")).unwrap();
+    let check = kgraf_sandbox::CheckFolder::create(&ws).unwrap();
+    assert!(check.tmp().is_dir());
+    assert!(!check.path().starts_with(ws.root()));
+    assert!(!check.path().starts_with(ws.scratch()));
+    assert!(check.path().starts_with(ws.checks_dir()));
+    let path = check.path().to_path_buf();
+    drop(check);
+    assert!(!path.exists());
+
+    let live = kgraf_sandbox::CheckFolder::create(&ws).unwrap();
+    let dead = ws.checks_dir().join(format!("{}-0-1-0", dead_pid()));
+    std::fs::create_dir_all(dead.join("target")).unwrap();
+    mgr.startup().unwrap();
+    assert!(!dead.exists(), "a folder of an ended process is removed");
+    assert!(live.path().is_dir(), "a live process's folder stays");
+    assert!(ws.root().is_dir(), "the worktree is not touched");
+}

@@ -16,6 +16,8 @@
 //!                                this base; also the cross-process lock file
 //! <base>/<name>/                 the linked worktree (writable in the sandbox)
 //! <base>/.scratch/<name>/        per-workspace TMPDIR (writable, outside git)
+//! <base>/.checks/<owner>-<n>/    one check's own folder ([`CheckFolder`]),
+//!                                outside every worker's writable roots
 //! ```
 //!
 //! Concurrency: `create` and `remove` hold a shared lock, orphan cleanup an
@@ -60,6 +62,78 @@ const SCRATCH: &str = ".scratch";
 /// Hold files, one per workspace, outside every writable root (a worker cannot
 /// replace its own).
 const HOLDS: &str = ".holds";
+/// One folder per running check ([`CheckFolder`]), outside every writable
+/// root a worker's shell has.
+const CHECKS: &str = ".checks";
+
+/// A folder of one check's own, `<base>/.checks/<pid>-<start>-<nanos>-<n>`:
+/// its temporary folder, tool homes and cargo target folder. Made by the
+/// host with `create_dir` after the worker's processes have stopped, in a
+/// place no worker's sandbox can write (a worker's writable roots are its
+/// worktree and its scratch folder), so nothing a worker left, and no
+/// process of the worker that escaped the hold check, can change what the
+/// check reads there. Removed on drop (never through a link); a folder left
+/// by a process that has ended is removed by the next startup cleanup.
+#[derive(Debug)]
+pub struct CheckFolder {
+    path: PathBuf,
+}
+
+impl CheckFolder {
+    /// Make a new check folder for `ws`, with its `tmp` folder.
+    pub fn create(ws: &Workspace) -> Result<Self, WorkspaceError> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let parent = ws.checks_dir();
+        std::fs::create_dir_all(&parent).map_err(|e| WorkspaceError::io(&parent, e))?;
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let me = ProcessIdentity::current();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let path = parent.join(format!("{}-{}-{nanos}-{n}", me.pid, me.start.unwrap_or(0)));
+        // `create_dir`, not `create_dir_all`: anything already there fails.
+        std::fs::create_dir(&path).map_err(|e| WorkspaceError::io(&path, e))?;
+        let folder = Self { path };
+        let tmp = folder.tmp();
+        std::fs::create_dir(&tmp).map_err(|e| WorkspaceError::io(&tmp, e))?;
+        Ok(folder)
+    }
+
+    /// The folder itself: the check's writable root.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The check's `TMPDIR`, and where its tool homes go.
+    pub fn tmp(&self) -> PathBuf {
+        self.path.join("tmp")
+    }
+
+    /// The check's cargo target folder (`CARGO_TARGET_DIR`). Not made here:
+    /// a clone of a warm folder makes it, or cargo does.
+    pub fn target(&self) -> PathBuf {
+        self.path.join("target")
+    }
+
+    /// The process that made the folder named `name`, read from the name.
+    fn owner(name: &str) -> Option<ProcessIdentity> {
+        let mut parts = name.split('-');
+        let pid = parts.next()?.parse().ok()?;
+        let start: u64 = parts.next()?.parse().ok()?;
+        Some(ProcessIdentity {
+            pid,
+            start: (start != 0).then_some(start),
+            host: None,
+        })
+    }
+}
+
+impl Drop for CheckFolder {
+    fn drop(&mut self) {
+        // `remove_dir_all` removes a link inside, never what it points at.
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
 
 /// What to create.
 #[derive(Debug, Clone)]
@@ -100,6 +174,18 @@ impl Workspace {
     /// Canonical per-workspace scratch directory, used as TMPDIR.
     pub fn scratch(&self) -> &Path {
         &self.scratch
+    }
+    /// `<base>/.checks`, where [`CheckFolder::create`] makes a check's own
+    /// folder. No writable root of a worker's sandbox is in it or above it.
+    pub fn checks_dir(&self) -> PathBuf {
+        // `scratch` is `<base>/.scratch/<name>` (canonical, set by `create`
+        // and `reopen`).
+        let base = self
+            .scratch
+            .parent()
+            .and_then(Path::parent)
+            .unwrap_or(&self.scratch);
+        base.join(CHECKS)
     }
     /// The repository's shared git directory. Read-only in the sandbox; git
     /// inside the worktree needs to read objects and refs from it.
@@ -428,6 +514,7 @@ impl WorkspaceManager {
         if !any_registered {
             remove_dir_if_empty(&self.base.join(HOLDS))?;
             remove_dir_if_empty(&self.base.join(SCRATCH))?;
+            remove_dir_if_empty(&self.base.join(CHECKS))?;
         }
         Ok(())
     }
@@ -590,7 +677,9 @@ impl WorkspaceManager {
 
         let registered: HashSet<PathBuf> = self.list()?.into_iter().map(|e| e.path).collect();
         for dir in read_subdirs(&self.base)? {
-            if dir.file_name().is_some_and(|n| n == SCRATCH || n == HOLDS)
+            if dir
+                .file_name()
+                .is_some_and(|n| n == SCRATCH || n == HOLDS || n == CHECKS)
                 || registered.contains(&dir)
             {
                 continue;
@@ -612,6 +701,17 @@ impl WorkspaceManager {
                     path: dir,
                     cause: OrphanCause::Unregistered,
                 });
+            }
+        }
+        // Check folders whose process has ended (a check cut short by a crash).
+        // A live process's folder is left: its check may still run.
+        for dir in read_subdirs(&self.base.join(CHECKS))? {
+            let owner = dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(CheckFolder::owner);
+            if owner.is_some_and(|o| !o.is_alive()) {
+                remove_dir_if_exists(&dir)?;
             }
         }
         // Holds earlier runs left: kGraf's own lock files, not worktrees, so

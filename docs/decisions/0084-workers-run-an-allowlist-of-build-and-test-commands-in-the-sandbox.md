@@ -756,3 +756,112 @@ Tests: `kgraf-host` `dependency_links_tests.rs`
 credential files, and the wrapper's folder); `sandbox/linux.rs`
 `home_grants_exclude_git_credentials_and_local_share_data` (Linux only); `kgraf-runtime`
 `worktree.rs` `a_dependency_mirror_is_not_a_change_of_the_worker`.
+
+## Amendment (2026-10-06, sixth): nothing a worker's run built decides its check, pnpm workspaces resolve to the tree, and Windows links by junction
+
+The fifth amendment above left one gap open, and two parts of the fourth amendment did not
+reach pnpm and Windows. Each change below was shown by a test that failed before it.
+
+- **The check's cargo target folder is its own.** The verifier's check used the workspace's
+  `<scratch>/target` as `CARGO_TARGET_DIR`, the folder the worker's shell builds into. Cargo
+  trusts the build records it finds: a worker that replaced its test binary with a script that
+  exits 0 and dated the fingerprints, dep-info and binary in the future made `cargo test` run
+  the script, and the check passed broken code. Now every confined check
+  (`kgraf_host::gates::run_confined`) runs in a new `kgraf_sandbox::CheckFolder`,
+  `<base>/.checks/<pid>-<start>-<nanoseconds>-<n>`, made with `create_dir` after the worker's
+  processes have stopped, outside every writable root a worker's sandbox has (its worktree
+  and its scratch folder): the check's temporary folder and tool homes are in `tmp/`, its
+  `CARGO_TARGET_DIR` is `target/`, and its log is there too. The folder is removed when the
+  check ends; one left by a process that ended is removed by the next startup cleanup, one of
+  a live process is left. So no process of the worker, not even one that escaped the hold
+  check, can change what the check reads there.
+- **Warm, not cold.** The verifier's check target starts with a copy-on-write clone of the
+  checkout's `target/debug` (the warm folder of decision 0060, which the user builds and no
+  sandboxed command writes; `kgraf_sandbox::clone_target_dir`, a clone or nothing, never a
+  byte copy). Only the `debug` profile: a clone costs one call per file, and a `target/`
+  also holds release builds, other targets and documentation; a check that builds another
+  profile builds it cold. Cargo then rebuilds the project's own crates, whose sources in the worktree are
+  newer, and reuses the rest. Without a `target/`, or where no clone can be made, the check
+  builds cold and a failing check's output says so. The gate and the dispatch-base probe build
+  cold, as before: their worktrees are new.
+- **Ignored files are removed before the check.** What git ignores is never merged, but a
+  check in the worker's tree read it, and every build tool keeps records there of work it
+  takes as done: Gradle's `.gradle/` and `build/`, .NET's `obj/` and `bin/`, TypeScript's
+  `*.tsbuildinfo`, a `make` target, Python bytecode with no source beside it, a `conftest.py`
+  a committed `.gitignore` hides, an install of the worker's own. Before the check, every
+  ignored file and folder in the worktree is removed (`MergeBack::remove_ignored`,
+  `git ls-files --others --ignored --exclude-standard --directory`, removal that never follows
+  a link); the dependency links are made again. The check then sees the commit plus the
+  links, as the gate sees a new worktree of the merged commit. On Windows, where the
+  descriptor-relative removal is refused, these paths are removed by path
+  (`kgraf_sandbox::confined::remove_stopped`): every folder on the way must be a real folder,
+  and a junction or link is removed itself; safe because no process of the worker runs any
+  more.
+- **The other languages' caches.** Go's build cache, npm's and jest's caches, Gradle's and
+  the .NET CLI's homes and Python's bytecode prefix were already in the check's temporary
+  folder (fifth amendment); that folder is now outside the worker's reach as well. Gradle
+  build folders, .NET `obj/` and `bin/`, TypeScript build info and bytecode in the tree are
+  ignored files, removed as above.
+- **Measured** (macOS, APFS, 2 jobs, 2026-10-06). This repository, `cargo test -p
+  kgraf-sandbox --no-run`, target 640 MB in 4,905 files: cold 19.9 s; the old reuse of the
+  worker's folder 0.2 s; the new check 0.7 s to clone plus 5.6 s to build, 6.3 s. A two-crate
+  workspace: cold 0.5 s, old 0.1 s, new 0.4 s. A clone costs about 0.14 ms per file of the
+  warm folder.
+- **pnpm workspaces resolve to the tree.** pnpm keeps every package as a real folder in
+  `node_modules/.pnpm/<name>@<version>/node_modules/` and links workspace packages there and in
+  its hidden hoisting folder `.pnpm/node_modules`. Node resolves a package from its real path,
+  so a package reached through a link into the checkout's `.pnpm` looked up its own
+  dependencies in the checkout's folders: a workspace package it required was the checkout's
+  copy, which the sandbox does not grant ("Operation not permitted"), and no folder of links
+  can change where those lookups go. A pnpm install whose root or hoisting folder links a
+  workspace package now becomes a copy-on-write clone in the tree (`unix::clone_install`):
+  pnpm's links are relative, so in the clone every one resolves inside the tree. The clone is
+  made in a new folder beside the tree and moved into place with `renameat` relative to
+  folders opened without following links; it carries the mirror mark and stamp (which now
+  also covers `.pnpm` and `.pnpm/node_modules`), so a later call keeps it. Measured: 24,002
+  entries, 2.8 s (macOS, APFS), once per worktree and once per check. Where no clone can be
+  made the folder of links is used and the output says that nested workspace links reach the
+  checkout's copies.
+- **Windows links by junction.** A directory junction needs no privilege. On Windows each
+  installed folder (`node_modules/`, a `.venv/`, `vendor/`, `vendor/bundle/`, `.yarn/`) is a
+  junction at the same place, a Plug'n'Play file (`.pnp.cjs`, `.pnp.loader.mjs`,
+  `.pnp.data.json`, `.yarn/install-state.gz`) is copied with `create_new`, and a workspace
+  install gets a folder of junctions, its `.bin` files copied (`dependencies::by_path`, the
+  `junction` crate, MIT). Every folder on the way is checked to be a real folder right before
+  each junction, and the junction's folder is resolved again after it; one that left the tree
+  is removed and reported. A virtual environment is activated with its `Scripts` folder. The
+  Gradle wrapper's folders in the command's Gradle home are made the same way, with a junction
+  to each unpacked distribution, and gate discovery adds the wrapper gate on Windows too.
+  Read-only: a junction target is judged by its own ACL, and the restricted token writes only
+  where a writable root's capability SID is granted, at Low integrity; the checkout's installs
+  have neither. The writable root's ACL is written before the first junction is made in it
+  (`sandbox::prepare_windows_root`), so its inheritable entries are never propagated while a
+  junction is there.
+
+**Not covered**, stated: the Windows code is compile-checked with `cargo xwin clippy` and its
+by-path logic is unit-tested on macOS with symbolic links in place of junctions; none of it
+has run on Windows. Whether Windows propagates a root's ACL through a junction is not
+verified; the Low label is written again on each command. Junctions are made by path: a
+folder swapped for a junction in the moment between the check and the creation can place one
+junction or copy outside the tree until it is found and removed. A pnpm package whose own
+folder in `.pnpm` links a workspace package, while neither the root nor the hoisting folder
+does, gets the folder of links, not a clone. On Windows a pnpm install gets the folder of
+junctions, with the note. The code under test still runs in the check: a test of the worker's
+own can still pass itself. A check now needs what the merged tree needs: an install the worker
+made in its tree (with the user's approval) is removed before the check, as the gate never had
+it.
+
+Tests: `kgraf-host` `check_inputs_tests.rs`
+`a_forged_test_binary_in_the_worker_s_target_folder_never_passes_the_check`,
+`an_up_to_date_build_output_the_worker_left_never_passes_the_check`,
+`the_check_starts_from_the_checkout_s_build_folder_and_leaves_it_as_it_was`;
+`dependency_links_tests.rs`
+`a_pnpm_package_requiring_a_workspace_package_gets_the_tree_s_copy` (macOS, real `node`),
+`tool_settings_the_worker_leaves_in_its_scratch_folder_never_reach_the_check` (the check's
+folders are outside the scratch folder); `tests.rs` retention tests (the ignored build output
+in the tree is removed by the check); `kgraf-sandbox` `dependencies.rs`
+`pnpm_workspace_links_inside_the_store_resolve_to_the_tree_s_packages`,
+`a_pnpm_clone_replaces_only_kgraf_s_own_install`; `dependencies/by_path.rs`
+`links_and_copies_are_made_only_where_nothing_is`,
+`the_mirror_by_path_resolves_workspace_packages_to_the_tree`,
+`gradle_folders_and_links_by_path`.

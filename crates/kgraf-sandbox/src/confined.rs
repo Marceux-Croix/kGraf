@@ -161,6 +161,73 @@ pub fn remove_confined(root: &Path, rel: &Path) -> io::Result<bool> {
     Ok(remove(&open_root(root)?, rel)? == Removal::Removed)
 }
 
+/// Remove `rel` beneath `root` on Windows, in a tree no process can write
+/// any more (the worker's processes ended with their job objects, and the
+/// caller checked it): with no writer, no folder can be swapped for a
+/// junction between the check below and the removal, which is what the
+/// descriptor-relative removal guards against elsewhere. Every folder on the
+/// way must be a real folder, not a junction or a link (else nothing is
+/// removed); a last component that is a junction or a link is removed
+/// itself, never what it points at; a real folder is removed by
+/// `std::fs::remove_dir_all`, which does not follow a junction or a link
+/// inside it. Not run on Windows here: compile-checked only.
+#[cfg(windows)]
+pub(crate) fn remove_stopped(root: &Path, rel: &Path) -> io::Result<Removal> {
+    use std::os::windows::fs::MetadataExt;
+    const REPARSE: u32 = 0x400; // FILE_ATTRIBUTE_REPARSE_POINT
+    let mut at = root.to_path_buf();
+    let names: Vec<_> = rel.components().collect();
+    let Some((last, parents)) = names.split_last() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "an empty path names the worktree root",
+        ));
+    };
+    for c in parents {
+        let std::path::Component::Normal(name) = c else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} is not a plain relative path", rel.display()),
+            ));
+        };
+        at.push(name);
+        match std::fs::symlink_metadata(&at) {
+            Ok(m) if m.is_dir() && m.file_attributes() & REPARSE == 0 => {}
+            Ok(_) => return Ok(Removal::Gone),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Removal::Gone),
+            Err(e) => return Err(e),
+        }
+    }
+    let std::path::Component::Normal(name) = last else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a plain relative path", rel.display()),
+        ));
+    };
+    at.push(name);
+    let meta = match std::fs::symlink_metadata(&at) {
+        Ok(m) => m,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Removal::Gone),
+        Err(e) => return Err(e),
+    };
+    if meta.file_attributes() & REPARSE != 0 {
+        // A junction or a directory link is removed as a folder entry, a
+        // file link as a file; neither call follows it. (`is_dir` is false
+        // for a reparse point; its directory attribute says which it is.)
+        const DIRECTORY: u32 = 0x10; // FILE_ATTRIBUTE_DIRECTORY
+        if meta.file_attributes() & DIRECTORY != 0 {
+            std::fs::remove_dir(&at)?;
+        } else {
+            std::fs::remove_file(&at)?;
+        }
+    } else if meta.is_dir() {
+        std::fs::remove_dir_all(&at)?;
+    } else {
+        std::fs::remove_file(&at)?;
+    }
+    Ok(Removal::Removed)
+}
+
 #[cfg(windows)]
 fn windows_refusal(what: &str, rel: &Path) -> io::Error {
     io::Error::new(

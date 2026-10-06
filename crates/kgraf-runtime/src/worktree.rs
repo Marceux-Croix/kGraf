@@ -290,14 +290,24 @@ pub fn dirty_paths(root: &Path, at_start: &GitEntry) -> Result<TreeStatus, Strin
     // The links kGraf makes to the checkout's installed dependencies
     // (`kgraf_sandbox::link_dependency_trees`) are not the worker's changes.
     // A `node_modules` kGraf made as a folder of links (a workspace install,
-    // `kgraf_sandbox::MIRROR_MARK`) is not theirs either: its mark and links.
+    // `kgraf_sandbox::MIRROR_MARK`) is not theirs either: its mark and links;
+    // nor anything in a pnpm install kGraf cloned into the tree
+    // (`kgraf_sandbox::is_dependency_clone`).
     let in_mirror = |p: &Path| {
-        p.ancestors().skip(1).any(|dir| {
+        let marked = |dir: &Path| {
             !dir.as_os_str().is_empty()
                 && kgraf_sandbox::is_dependency_link(dir)
                 && root.join(dir).join(kgraf_sandbox::MIRROR_MARK).is_file()
-        }) && std::fs::symlink_metadata(root.join(p))
-            .is_ok_and(|m| m.file_type().is_symlink() || p.ends_with(kgraf_sandbox::MIRROR_MARK))
+        };
+        let in_clone = p
+            .ancestors()
+            .skip(1)
+            .any(|dir| marked(dir) && kgraf_sandbox::is_dependency_clone(&root.join(dir)));
+        in_clone
+            || p.ancestors().skip(1).any(marked)
+                && std::fs::symlink_metadata(root.join(p)).is_ok_and(|m| {
+                    m.file_type().is_symlink() || p.ends_with(kgraf_sandbox::MIRROR_MARK)
+                })
     };
     let is_link = |p: &Path| {
         kgraf_sandbox::is_dependency_link(p)
@@ -436,6 +446,28 @@ mod tests {
         std::fs::write(nm.join("own.js"), "x").expect("write");
         let status = dirty_paths(&wt, &at_start).expect("status");
         assert_eq!(status.paths, vec![PathBuf::from("node_modules/own.js")]);
+    }
+
+    /// A pnpm install kGraf cloned into a tree whose `.gitignore` does not
+    /// name `node_modules`: none of its files are the worker's changes.
+    #[cfg(unix)]
+    #[test]
+    fn a_dependency_clone_is_not_a_change_of_the_worker() {
+        let dir = tempfile::tempdir().expect("dir");
+        let repo = dir.path().join("repo");
+        let wt = dir.path().join("wt");
+        linked_worktree(&repo, &wt, |r| {
+            std::fs::write(r.join("package.json"), "{}").expect("package.json");
+            git(r, &["add", "package.json"]);
+        });
+        let at_start = git_entry(&wt).expect("entry");
+        let nm = wt.join("node_modules");
+        std::fs::create_dir_all(nm.join(".pnpm/dep@1.0.0/node_modules/dep")).expect("mkdir");
+        std::fs::write(nm.join(".pnpm/dep@1.0.0/node_modules/dep/index.js"), "x").expect("write");
+        std::fs::write(nm.join(kgraf_sandbox::MIRROR_MARK), "clone 1").expect("mark");
+        std::fs::write(wt.join("a.txt"), "work").expect("write");
+        let status = dirty_paths(&wt, &at_start).expect("status");
+        assert_eq!(status.paths, vec![PathBuf::from("a.txt")]);
     }
 
     #[cfg(target_os = "linux")]

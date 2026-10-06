@@ -29,11 +29,14 @@ mod sandbox;
 pub mod trust;
 mod workspace;
 
-pub use build_dir::{SeedError, SeedMethod, SeedReport, seed_target_dir, seed_workspace_target};
+pub use build_dir::{
+    SeedError, SeedMethod, SeedReport, clone_target_dir, seed_target_dir, seed_workspace_target,
+};
 pub use confined::{open_append_confined, remove_confined, write_confined, write_confined_mode};
 pub use dependencies::{
     DependencyKind, DependencyLinks, DependencyTree, MIRROR_MARK, Names, VirtualEnv,
-    find_dependency_trees, link_dependency_trees, script_start_dir, walk_project_dirs,
+    find_dependency_trees, is_dependency_clone, link_dependency_trees, script_start_dir,
+    walk_project_dirs,
 };
 pub use error::{SandboxError, WorkspaceError};
 pub use merge::{
@@ -55,6 +58,7 @@ pub use sandbox::{
 #[cfg(target_os = "linux")]
 pub use sandbox::{LinuxConfinement, linux_confinement};
 pub use workspace::{
-    HostId, LEGACY_LOCK_TAG, LOCK_TAG, Liveness, OrphanCause, OrphanRemoval, ProcessIdentity,
-    QuietGuard, ReopenSpec, Workspace, WorkspaceManager, WorkspaceSpec, lock_owner_may_be_running,
+    CheckFolder, HostId, LEGACY_LOCK_TAG, LOCK_TAG, Liveness, OrphanCause, OrphanRemoval,
+    ProcessIdentity, QuietGuard, ReopenSpec, Workspace, WorkspaceManager, WorkspaceSpec,
+    lock_owner_may_be_running,
 };

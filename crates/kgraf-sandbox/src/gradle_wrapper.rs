@@ -23,7 +23,8 @@
 //!
 //! Measured (macOS, APFS, debug build, 2026-10-06, test
 //! `the_wrapper_distribution_is_reachable_and_the_user_home_is_not_written`):
-//! well under a millisecond per command; nothing is copied.
+//! well under a millisecond per command; nothing is copied (the test counts
+//! the files and bytes made instead of timing the call).
 //!
 //! Not run here: a real `./gradlew` (Gradle was not installed on the machine
 //! this was written on). The layout follows the wrapper's documented
@@ -123,6 +124,54 @@ pub(crate) fn prepare(
         for folder in unpacked {
             if let Some(leaf) = folder.file_name() {
                 unix::link(&dir, Path::new(leaf), folder)?;
+            }
+        }
+    }
+    Ok(installed.len())
+}
+
+/// [`prepare`] on Windows, by path ([`crate::dependencies`]'s by-path
+/// links): each folder is made only through real folders, the mark with
+/// `create_new`, and each unpacked distribution is reached through a
+/// directory junction (a symbolic link needs a privilege there). Runs after
+/// the sandbox set the writable root's ACL. Not run on Windows here.
+#[cfg(windows)]
+pub(crate) fn prepare(
+    gradle_home: &Path,
+    root: &Path,
+    tmp: &Path,
+    project: &Path,
+) -> std::io::Result<usize> {
+    use crate::dependencies::by_path::{Junctions, make_dirs, replace_with_link};
+    let Some(name) = wrapper_distribution(project) else {
+        return Ok(0);
+    };
+    let installed = installed_distributions(gradle_home, &name);
+    if installed.is_empty() {
+        return Ok(0);
+    }
+    let rel = tmp
+        .strip_prefix(root)
+        .map_err(|_| std::io::Error::other("the temporary folder is not under its root"))?
+        .join("gradle-home/wrapper/dists")
+        .join(&name);
+    for (hash_dir, unpacked) in &installed {
+        let Some(hash) = hash_dir.file_name() else {
+            continue;
+        };
+        let dir = make_dirs(&Junctions, root, &rel.join(hash))?;
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(dir.join(format!("{name}.zip.ok")))
+        {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+        for folder in unpacked {
+            if let Some(leaf) = folder.file_name() {
+                replace_with_link(&Junctions, &dir, Path::new(leaf), folder)?;
             }
         }
     }
@@ -235,6 +284,25 @@ distributionUrl=https\\://services.gradle.org/distributions/gradle-8.5-bin.zip\n
         assert_eq!(wrapper_distribution(p.path()), None);
     }
 
+    /// Regular files, their total bytes and symlinks under `dir`, counting a
+    /// symlink as one entry and never following it.
+    fn count_entries(dir: &Path) -> (usize, u64, usize) {
+        let mut total = (0, 0, 0);
+        for entry in std::fs::read_dir(dir).expect("list").flatten() {
+            let meta = std::fs::symlink_metadata(entry.path()).expect("meta");
+            if meta.file_type().is_symlink() {
+                total.2 += 1;
+            } else if meta.is_dir() {
+                let (f, b, l) = count_entries(&entry.path());
+                total = (total.0 + f, total.1 + b, total.2 + l);
+            } else {
+                total.0 += 1;
+                total.1 += meta.len();
+            }
+        }
+        total
+    }
+
     /// The command's Gradle home gets the wrapper's folder for each
     /// finished unpack: a writable folder (the wrapper's lock goes there),
     /// the `.ok` mark, and a link to the user's unpacked distribution. The
@@ -262,13 +330,15 @@ distributionUrl=https\\://services.gradle.org/distributions/gradle-8.5-bin.zip\n
         let scratch = tempfile::tempdir().expect("scratch");
         let root = std::fs::canonicalize(scratch.path()).expect("canonical");
         let tmp = root.clone();
-        let started = std::time::Instant::now();
         assert_eq!(
             prepare(&g, &root, &tmp, project.path()).expect("prepare"),
             1
         );
-        let took = started.elapsed();
-        assert!(took < std::time::Duration::from_millis(50), "{took:?}");
+        // Nothing is copied: the only regular file made is the empty `.ok`
+        // mark, and the distribution is one link. Counted by content, not
+        // by wall-clock time, which a loaded machine bends.
+        let (files, bytes, links) = count_entries(&tmp.join("gradle-home"));
+        assert_eq!((files, bytes, links), (1, 0, 1));
         let mine = tmp.join("gradle-home/wrapper/dists/gradle-8.5-bin/abc123");
         assert!(mine.join("gradle-8.5-bin.zip.ok").is_file());
         assert_eq!(

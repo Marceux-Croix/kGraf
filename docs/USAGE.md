@@ -79,7 +79,18 @@ outside the sandbox (decision 0087, amended 2026-10-06).
 - In an npm, pnpm or Yarn workspace, whose `node_modules` links its own packages
   (`node_modules/@scope/web -> ../../packages/web`), the worktree gets a `node_modules` folder
   of links instead: each workspace package resolves to the worktree's copy, so tests run the
-  worker's edits, and every other package to your install (0084).
+  worker's edits, and every other package to your install (0084). A pnpm install with
+  workspace packages gets a copy-on-write clone of your `node_modules` instead (APFS, or a
+  Linux file system with reflinks): pnpm links workspace packages inside
+  `node_modules/.pnpm` too, and only in a clone do those links, all relative, resolve to the
+  worktree's copies. A clone costs no space until written and about 0.12 ms per file (24,000
+  files: 2.8 s, macOS), once per worktree and once per check. Where no clone can be made,
+  the folder of links is used and a failing check says that such nested links reach your
+  copies.
+- On Windows the links are directory junctions, which need no privilege, and the
+  Plug'n'Play files are copied; a write through a junction is refused by the sandbox's
+  access control, as through a link elsewhere. A pnpm install gets the folder of
+  junctions (no clone). Built and compile-checked; not yet run on Windows.
 - The virtual environment of the folder a command works in is activated: the `.venv/` or
   `venv/` of that folder or the nearest one above it, the root one by default, the one of
   `svc/api` for `cd svc/api && python3 -m pytest`. `python3`, `pytest` and the environment's
@@ -94,19 +105,31 @@ outside the sandbox (decision 0087, amended 2026-10-06).
   and cargo's `credentials.toml`. Gradle and the .NET CLI get a home folder of their own in
   the command's temporary folder, with your Gradle dependency cache and NuGet package folder
   read-only; the .NET CLI's telemetry is off. A Gradle wrapper finds its distribution, when
-  you have unpacked it once (`./gradlew --version`), through that home, read-only.
+  you have unpacked it once (`./gradlew --version`), through that home, read-only (on
+  Windows through a junction; not yet run there).
 - The verifier's check, the gates and the contract checks each get a new temporary folder,
   removed when they end: tool settings a worker left in its own scratch directory (an
   `.npmrc`, a Gradle init script, a Go build cache, Python bytecode) never reach a check.
+- Nothing a worker's run built is an input of its verifier check. The check's cargo build
+  folder is a new folder of its own, outside the worker's reach, never the worker's build
+  folder: cargo trusts the build records it finds, and forged ones (a test binary replaced
+  by one that exits 0, its records dated in the future) made a check pass broken code. The
+  folder's `debug` profile starts as a copy-on-write clone of your checkout's
+  `target/debug` when you have one (decision 0060), so only the project's own crates are
+  built again: on this repository
+  (`cargo test -p kgraf-sandbox --no-run`, macOS, 2 jobs) 0.7 s to clone and 5.6 s to build,
+  against 19.9 s cold and 0.2 s when it reused the worker's folder; a two-crate project
+  0.4 s, against 0.5 s cold. Without a `target/` the check builds cold. And before the check
+  runs, every file git ignores is removed from the worktree (a Gradle `build/` or
+  `.gradle/`, .NET `obj/` and `bin/`, a `*.tsbuildinfo`, a worker's own install): each
+  build tool takes such files as work already done. The links to your installs are made
+  again. A check therefore needs what the merged tree needs, as the gate does.
 - When the project declares dependencies that are not installed, the run start says which,
   and the command to run; so does a failing check or gate, after its own output
   (`[dependencies] npm dependencies are not installed: node_modules has no jest. Run
   `npm ci` in the project root ...`).
 - Not covered: a link inside `node_modules` to a folder of the checkout that the worktree
-  does not have (an untracked package) stays unreadable. Windows makes no links: a root
-  package still finds the checkout's `node_modules` by Node's walk up from the worktree, but
-  a nested package's own `node_modules`, a virtual environment (not activated), `vendor/`
-  folders and the worktree's copy of a workspace package are not reached.
+  does not have (an untracked package) stays unreadable.
 
 ## The code graph
 

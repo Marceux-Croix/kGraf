@@ -922,6 +922,52 @@ impl MergeBack {
         self.remove_confined(attempt, &excluded)
     }
 
+    /// Remove every ignored file and folder in the attempt's worktree, before
+    /// a check, and return their paths. What git ignores is never in the
+    /// commit, so it is never merged, but a check run in the worktree reads
+    /// it: a build tool's own records of what it built (Gradle's `.gradle/`
+    /// and `build/`, .NET's `obj/` and `bin/`, TypeScript's `*.tsbuildinfo`,
+    /// a `make` target, Python bytecode with no source beside it, a
+    /// `conftest.py` a committed `.gitignore` hides, an install of the
+    /// worker's own). Each can make a tool skip the build or the test of the
+    /// committed sources and report a pass for work that fails (decision
+    /// 0084, amended 2026-10-06). After this the check sees the commit plus
+    /// the dependency links kGraf makes again before it runs, as the gate
+    /// sees a new worktree of the merged commit.
+    ///
+    /// The caller must have stopped every process that could still write the
+    /// worktree (the worker's, checked by the hold). Removal never follows a
+    /// link ([`crate::confined`]); on Windows, where that removal is refused,
+    /// see [`crate::confined::remove_stopped`].
+    pub fn remove_ignored(&self, attempt: &Attempt) -> Result<Vec<PathBuf>, MergeError> {
+        let git_dir = Self::worktree_admin(&attempt.workspace)?;
+        let wt = Target::Worktree {
+            git_dir: &git_dir,
+            work_tree: attempt.workspace.root(),
+        };
+        // `--directory`: an ignored folder is one entry, removed whole.
+        let ignored = self.list_paths(
+            &wt,
+            &[
+                "ls-files",
+                "-z",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "--directory",
+            ],
+        )?;
+        #[cfg(not(windows))]
+        self.remove_confined(attempt, &ignored)?;
+        #[cfg(windows)]
+        for rel in &ignored {
+            let root = attempt.workspace.root();
+            crate::confined::remove_stopped(root, rel)
+                .map_err(|e| WorkspaceError::io(root.join(rel), e))?;
+        }
+        Ok(ignored)
+    }
+
     /// Put the worktree back to the snapshot [`MergeBack::commit_retaining`]
     /// took, and return what was not in it. The caller must have stopped every
     /// process that could still write the worktree (killed the command's

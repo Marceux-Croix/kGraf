@@ -2167,7 +2167,7 @@ time.sleep(0.01)\n' >/dev/null 2>&1"
     let mut attempts = 0;
     let text = loop {
         attempts += 1;
-        let _ = run_confined(&live, &r.root, &[], &script, timeout, 2_000).expect("ran");
+        let _ = run_confined(&live, &r.root, &[], &script, timeout, 2_000, None).expect("ran");
         // A child that escaped just as the budget ran out writes its pid a
         // moment later: look for a little while before running again.
         let seen = std::time::Instant::now();
@@ -6279,6 +6279,10 @@ mod protected_write;
 #[path = "dependency_links_tests.rs"]
 mod dependency_links;
 
+#[cfg(unix)]
+#[path = "check_inputs_tests.rs"]
+mod check_inputs;
+
 /// A run's index pass does not hold the host's shared graph lock: another
 /// run's loop takes that lock for its session and lease calls, and holding it
 /// for a large project's whole pass stalls that loop. With the lock held
@@ -6413,7 +6417,10 @@ async fn a_worktree_whose_acceptance_check_failed_follows_the_policy() {
         assert!(matches!(verdict, Verdict::Fail { .. }), "{verdict:?}");
         r.workspaces.release(&ws, false).await;
         assert_eq!(ws.exists(), stays, "{retention:?}");
-        assert_eq!(in_tree.exists(), stays, "{retention:?}");
+        // The check removed the ignored build output the worker left in the
+        // tree (decision 0084, amended 2026-10-06); its scratch folder
+        // follows the policy.
+        assert!(!in_tree.exists(), "{retention:?}");
         assert_eq!(in_scratch.exists(), stays, "{retention:?}");
         assert!(r.workspaces.take_problems().is_empty());
     }
@@ -6481,7 +6488,8 @@ async fn a_merged_attempts_worktree_and_build_follow_the_policy() {
         );
         r.workspaces.release(&ws, true).await;
         assert_eq!(ws.exists(), stays, "{retention:?}");
-        assert_eq!(in_tree.exists(), stays, "{retention:?}");
+        // Removed by the check (decision 0084, amended 2026-10-06).
+        assert!(!in_tree.exists(), "{retention:?}");
         assert_eq!(in_scratch.exists(), stays, "{retention:?}");
         assert_eq!(
             git_out(
@@ -6527,7 +6535,8 @@ async fn a_discarded_losers_worktree_and_build_follow_the_policy() {
         assert!(verdict.passed(), "{verdict:?}");
         r.workspaces.release(&ws, false).await;
         assert_eq!(ws.exists(), stays, "{retention:?}");
-        assert_eq!(in_tree.exists(), stays, "{retention:?}");
+        // Removed by the check (decision 0084, amended 2026-10-06).
+        assert!(!in_tree.exists(), "{retention:?}");
         assert_eq!(in_scratch.exists(), stays, "{retention:?}");
         assert_eq!(attempt_refs(&r, "w-loser"), "", "{retention:?}");
         assert!(r.workspaces.take_problems().is_empty(), "{retention:?}");
@@ -6780,7 +6789,10 @@ async fn every_kind_of_attempt_follows_the_policy() {
         ));
         r.workspaces.release(&we, true).await;
         assert_eq!(we.exists(), stays, "{retention:?} empty");
-        assert_eq!(tree_e.exists() && scratch_e.exists(), stays);
+        // The check removed the ignored build output in the tree (decision
+        // 0084, amended 2026-10-06); the scratch folder follows the policy.
+        assert!(!tree_e.exists());
+        assert_eq!(scratch_e.exists(), stays);
 
         // Empty, refused: a placeholder left in a declared target.
         let dir = tempfile::tempdir().expect("dir");
@@ -6813,11 +6825,12 @@ async fn every_kind_of_attempt_follows_the_policy() {
         let wb = prepared(&r, &b, "w-b").await;
         std::fs::write(wa.join("same.txt"), "from a\n").expect("write");
         std::fs::write(wb.join("same.txt"), "from b\n").expect("write");
-        let (tree_b, _) = write_build_output(&r, &wb);
         for (c, ws) in [(&a, &wa), (&b, &wb)] {
             let v = verifier(&r, "true").verify(c, ws, &result()).await;
             assert!(v.expect("ran").passed());
         }
+        // Written after the check, which removes ignored output in the tree.
+        let (tree_b, _) = write_build_output(&r, &wb);
         r.workspaces.integrate(&a, &wa).await.expect("a");
         r.workspaces.release(&wa, true).await;
         assert!(matches!(

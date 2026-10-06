@@ -29,10 +29,12 @@ use std::time::Duration;
 ///    contract declared, compared as a case- and normalization-insensitive
 ///    volume resolves names, and none may be repository metadata or cargo's
 ///    or rustup's configuration ([`build_config_changes`]);
-/// 4. the acceptance command, narrowed to the tests of the contract's own
-///    files when its runner allows ([`crate::scoped_check`]; a gate
-///    remediation keeps the whole command), runs **inside the sandbox** of that worktree
-///    (writes confined to the worktree and its scratch directory, network off,
+/// 4. every ignored file the worker's run left in the tree is removed
+///    (`MergeBack::remove_ignored`); then the acceptance command, narrowed
+///    to the tests of the contract's own files when its runner allows
+///    ([`crate::scoped_check`]; a gate remediation keeps the whole command),
+///    runs **inside the sandbox** of that worktree (writes confined to the
+///    worktree, its scratch directory and the check's own folder, network off,
 ///    kGraf's state unreadable, the same policy as the worker's shell),
 ///    bounded by the gate timeout; when its shell exits, its process group is
 ///    killed;
@@ -47,20 +49,21 @@ use std::time::Duration;
 /// up whatever the check wrote, so the scope check refused the worker for a
 /// file its check generated ("changes outside the declared write scope:
 /// [\"Cargo.lock\"]"). Running the check on a throwaway worktree of the commit
-/// was the other option, rejected: it loses the worker's warm build directory
-/// and the ignored environment directories (`node_modules`, `.venv`) a check
-/// may need, so a check that passes in the worker's tree could fail there for
-/// reasons that are not the work; the quality gate already gives the
-/// clean-checkout judgment on the merged tree.
+/// was the other option, not taken: it costs a checkout per check, and the
+/// check's leftovers (step 6) are judged against the worker's tree. What the
+/// worker's run left is kept out of the check instead (below).
 ///
-/// **Known limit: worker-controlled caches are check inputs.** The check sees
-/// the worker's scratch directory (`CARGO_TARGET_DIR` at `<scratch>/target`,
-/// Python bytecode at `<scratch>/pycache`) and ignored files in the tree, all of
-/// which the worker's run could have written. A worker can therefore make its
-/// own check pass with build output that does not match the committed
-/// sources. This verdict selects among attempts; only the quality gate, which
-/// runs the project's commands on a clean checkout of the merged commit,
-/// judges the merged tree.
+/// **Nothing the worker's run left is a check input** (decision 0084, amended
+/// 2026-10-06). The check's temporary folder, tool homes and cargo target
+/// folder are a new folder of its own outside the worker's writable roots
+/// (`crate::gates::run_confined`), its target folder's `debug` profile a
+/// copy-on-write clone of the checkout's ([`warm_build_folder`]), never the worker's
+/// `<scratch>/target`; and ignored files in the tree are removed before it
+/// runs. A forged test binary or forged build records in the worker's build
+/// folder, or an up-to-date mark of any tool in the tree, no longer make the
+/// check pass. The code under test still runs in the check, as in any test
+/// run: a test of the worker's own can still pass itself, and only the
+/// contract's tests and the quality gate judge that.
 pub(crate) struct CommandVerifier {
     pub(crate) command: String,
     pub(crate) repo: PathBuf,
@@ -107,6 +110,18 @@ fn quiesce_retrying(
 
 /// Output a failed check's reason keeps, from the end.
 const CHECK_OUTPUT_CAP: usize = 1_000;
+
+/// The build folder a check's own cargo target folder starts from: the
+/// checkout's `target/`, as for a worker's worktree (decision 0060), when it
+/// is a real folder. The user builds it; no sandboxed command can write it.
+/// Never the worker's `<scratch>/target`: the worker's shell writes that
+/// folder, and cargo trusts the build records in it.
+pub(crate) fn warm_build_folder(checkout: &Path) -> Option<PathBuf> {
+    let target = checkout.join("target");
+    std::fs::symlink_metadata(&target)
+        .is_ok_and(|m| m.is_dir())
+        .then_some(target)
+}
 
 /// An accepted no-op attempt's own notice (decision 0086): every attempt
 /// verified with `Integration::Empty` is reported, not only traced, so a run
@@ -170,6 +185,7 @@ fn passes_at(
         command,
         timeout,
         CHECK_OUTPUT_CAP,
+        None,
     );
     let removed = manager.remove(ws);
     let (passed, _) = ran?;
@@ -671,6 +687,7 @@ impl Verifier for CommandVerifier {
         let workspaces = self.workspaces.clone();
         let attempt_root = workspace.to_path_buf();
         let timeout = self.timeout;
+        let warm = warm_build_folder(&self.repo);
         // Read once, at the start: the commit and the scope check judge the
         // attempt under one mode.
         let bypass_git_files =
@@ -780,6 +797,16 @@ impl Verifier for CommandVerifier {
                     format!("cannot remove the files the worker's run generated: {e}"),
                 );
             }
+            // Nor anything git ignores that the worker's run left: a build
+            // tool's records of what it built would let the check skip the
+            // build or the test of the committed sources (decision 0084,
+            // amended 2026-10-06). The dependency links are made again.
+            if let Err(e) = merge_back.remove_ignored(&attempt) {
+                return fail(
+                    attempt,
+                    format!("cannot remove the ignored files the worker's run left: {e}"),
+                );
+            }
             // 4. The acceptance command, confined, in the worker's tree; its
             // process group is killed when its shell exits. Narrowed to the
             // tests of the contract's files (decision 0018 amendment): the
@@ -793,6 +820,7 @@ impl Verifier for CommandVerifier {
                 &command,
                 timeout,
                 CHECK_OUTPUT_CAP,
+                warm.as_deref(),
             )?;
             // A gate remediation must also pass the failing gate's own
             // commands: the run's check alone can pass on the code the gate
@@ -806,6 +834,7 @@ impl Verifier for CommandVerifier {
                     gate_command,
                     timeout,
                     CHECK_OUTPUT_CAP,
+                    warm.as_deref(),
                 )?;
                 if !ok {
                     (passed, output, failing) = (false, out, gate_command.clone());

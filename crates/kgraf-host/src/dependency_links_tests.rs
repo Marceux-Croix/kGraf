@@ -199,10 +199,13 @@ async fn tool_settings_the_worker_leaves_in_its_scratch_folder_never_reach_the_c
     // And the settings homes a check sees are not the ones planted, nor the
     // worker's scratch folder itself.
     let live = r.workspaces.get(&ws).expect("live");
+    // Neither the temporary folder nor the cargo target folder is in the
+    // worker's scratch folder.
     let probe = format!(
         "test ! -e \"$GRADLE_USER_HOME/init.d/pass.gradle\" && \
          ! grep -q script-shell \"$NPM_CONFIG_USERCONFIG\" && \
-         test \"$TMPDIR\" != '{}' && test -d \"$TMPDIR\"",
+         test -d \"$TMPDIR\" && \
+         case \"$TMPDIR $CARGO_TARGET_DIR\" in *'{}'*) exit 1;; esac",
         scratch.display()
     );
     let (ok, out) = run_confined(
@@ -212,15 +215,15 @@ async fn tool_settings_the_worker_leaves_in_its_scratch_folder_never_reach_the_c
         &probe,
         Duration::from_secs(30),
         4_000,
+        None,
     )
     .expect("ran");
     assert!(ok, "{out}");
     // The check's own folder is gone once it ends.
-    let left: Vec<_> = std::fs::read_dir(&scratch)
-        .expect("scratch")
+    let left: Vec<_> = std::fs::read_dir(live.checks_dir())
+        .expect("checks")
         .flatten()
         .map(|e| e.file_name())
-        .filter(|n| n.to_string_lossy().starts_with("check-"))
         .collect();
     assert!(left.is_empty(), "{left:?}");
 }
@@ -354,6 +357,92 @@ self.assertTrue(sys.prefix.endswith('svc/.venv'), sys.prefix)\n";
         ),
         "expected a pass, got {verdict:?}"
     );
+}
+
+/// A pnpm workspace, laid out by hand as pnpm documents it (pnpm is not
+/// installed here): a third-party package in `node_modules/.pnpm` requires
+/// the workspace package `@fx/util`, which pnpm links in its hidden
+/// hoisting folder `.pnpm/node_modules`. Node resolves `dep` from its real
+/// path; through links into the checkout that path was the checkout's
+/// `.pnpm`, so `@fx/util` was the checkout's copy (unreadable in the
+/// sandbox). The tree gets a clone of the install, and the worker's edit of
+/// `packages/util` is what `dep` loads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pnpm_package_requiring_a_workspace_package_gets_the_tree_s_copy() {
+    let (r, denies) = checkout(&[
+        (
+            "package.json",
+            r#"{"name":"fx","private":true,"scripts":{"test":"node --test"}}"#,
+        ),
+        ("pnpm-workspace.yaml", "packages:\n  - packages/*\n"),
+        (
+            "packages/util/package.json",
+            r#"{"name":"@fx/util","version":"1.0.0","main":"index.js"}"#,
+        ),
+        ("packages/util/index.js", "module.exports = 'base';\n"),
+    ]);
+    let nm = r.root.join("node_modules");
+    write(&nm.join(".modules.yaml"), "layoutVersion: 5\n");
+    let store = nm.join(".pnpm/dep@1.0.0/node_modules/dep");
+    write(
+        &store.join("package.json"),
+        r#"{"name":"dep","version":"1.0.0","main":"index.js"}"#,
+    );
+    write(
+        &store.join("index.js"),
+        "module.exports = require('@fx/util');\n",
+    );
+    let link = |target: &str, at: &Path| {
+        std::fs::create_dir_all(at.parent().expect("parent")).expect("mkdir");
+        std::os::unix::fs::symlink(target, at).expect("link");
+    };
+    link(
+        "../../../../packages/util",
+        &nm.join(".pnpm/node_modules/@fx/util"),
+    );
+    link(".pnpm/dep@1.0.0/node_modules/dep", &nm.join("dep"));
+    link("../../packages/util", &nm.join("@fx/util"));
+
+    let mut c = named("packages/util/index.js", "w-pnpm");
+    c.writes.push(kgraf_orchestrator::WriteTarget {
+        path: "test/dep.test.js".into(),
+        node: None,
+    });
+    let ws = prepared(&r, &c, "w-pnpm").await;
+    write(
+        &ws.join("packages/util/index.js"),
+        "module.exports = 'edited';\n",
+    );
+    write(
+        &ws.join("test/dep.test.js"),
+        "const test = require('node:test');\n\
+const assert = require('node:assert');\n\
+test('dep loads the tree copy of the workspace package', () => \
+assert.strictEqual(require('dep'), 'edited'));\n",
+    );
+    let v = CommandVerifier {
+        read_denies: denies,
+        ..verifier(&r, "npm test")
+    };
+    let verdict = v.verify(&c, &ws, &result()).await.expect("ran");
+    assert!(
+        matches!(
+            verdict,
+            Verdict::Pass {
+                commit: Some(_),
+                ..
+            }
+        ),
+        "expected a pass, got {verdict:?}"
+    );
+    // The checkout's install is as the user made it.
+    assert!(
+        std::fs::symlink_metadata(nm.join("dep"))
+            .expect("dep")
+            .file_type()
+            .is_symlink()
+    );
+    assert!(!nm.join(kgraf_sandbox::MIRROR_MARK).exists());
 }
 
 /// An npm workspace: the checkout's `node_modules/@fx/web` is a link to

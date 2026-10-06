@@ -52,6 +52,11 @@ landlock = "0.4.7"
 seccompiler = "0.5.0"
 
 [target.'cfg(windows)'.dependencies]
+# MIT, read from the crate's Cargo.toml 2026-10-06 (github.com/tesuji/junction).
+# Directory junctions for dependency links on Windows, where a symbolic link
+# needs a privilege a user account lacks by default. Default features off:
+# `unstable_admin` would enable the backup and restore privileges.
+junction = { version = "2.1.0", default-features = false }
 # MIT OR Apache-2.0, verified on crates.io 2026-09-26. 0.61.2 is the
 # windows-sys release shipped with `windows` 0.62.2 (the sandboxing evidence's
 # "pin to 0.62"; no windows-sys 0.62 exists). Already in Cargo.lock through

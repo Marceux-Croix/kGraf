@@ -1396,8 +1396,14 @@ the same place, and the sandbox lets a command read and run programs from it,
 never write it (`kgraf_sandbox::link_dependency_trees`,
 `SandboxPolicy::with_dependency_links`); a workspace install's links to its own
 packages resolve to the tree's copies, and the virtual environment of the folder a
-command works in is activated. Every check runs with a temporary folder of its own, so
-tool settings a worker left in its scratch folder never reach it. The package stores in the home folder (`~/.m2/repository`,
+command works in is activated; a pnpm install with workspace packages is cloned
+copy-on-write instead, so its nested workspace links resolve in the tree too, and on
+Windows the links are directory junctions. Every check runs with a temporary folder of
+its own, so tool settings a worker left in its scratch folder never reach it. The
+verifier's check also builds into a cargo target folder of its own, outside the worker's
+writable roots and cloned from the checkout's `target/debug` when there is one, and the worker's
+ignored files are removed from the tree first (`kgraf_sandbox::CheckFolder`,
+`MergeBack::remove_ignored`): build records the worker left never decide a check. The package stores in the home folder (`~/.m2/repository`,
 `~/.gradle/caches`, `~/.nuget/packages`, `~/go/pkg/mod`, `~/.npm`,
 `~/.cargo/registry`, ...) are readable and their configuration and credential
 files are not. Other package managers are not fetched for: a missing install is

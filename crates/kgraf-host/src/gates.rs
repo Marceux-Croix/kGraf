@@ -5,8 +5,8 @@ use crate::error::{Result, ResultExt};
 use crate::workspaces::now_nanos;
 use kgraf_orchestrator::{GateRequest, GateRunner, GateVerdict, UntrustedText};
 use kgraf_sandbox::{
-    MergeBack, Network, Redirect, SandboxPolicy, Workspace, WorkspaceManager, WorkspaceSpec,
-    sandboxed_command,
+    CheckFolder, MergeBack, Network, Redirect, SandboxPolicy, Workspace, WorkspaceManager,
+    WorkspaceSpec, sandboxed_command,
 };
 // The process lifecycle (WNOWAIT, group kill until the hold is free, then
 // reap) lives in the sandbox crate so the contract-check runner shares it.
@@ -290,14 +290,6 @@ pub(crate) fn discover_probed(
 /// (`kgraf_sandbox::gradle_wrapper`). `Err` says why not, and what to do.
 fn gradle_wrapper_gate(root: &Path, home: Option<&Path>) -> std::result::Result<(), String> {
     use kgraf_sandbox::gradle_wrapper::{installed_distributions, wrapper_distribution};
-    if cfg!(windows) {
-        return Err(
-            "the Gradle wrapper's distribution is not made reachable from the \
-                    command's Gradle home on Windows; set gate commands to run Gradle another \
-                    way"
-            .to_owned(),
-        );
-    }
     let Some(name) = wrapper_distribution(root) else {
         return Err(format!(
             "{} names no Gradle distribution the wrapper can use (distributionUrl); set gate \
@@ -473,34 +465,6 @@ fn tail(text: &str, cap: usize) -> String {
     format!("[{} bytes cut]\n{}", start, &text[start..])
 }
 
-/// A check's own temporary folder inside a workspace's scratch folder,
-/// removed when dropped. Its name is new for every check and it is made
-/// with `create_dir`, which fails on anything already there, so nothing the
-/// worker left in the scratch folder (a file, a folder, a link) becomes it.
-/// Removal never follows a link inside it.
-struct CheckScratch(PathBuf);
-
-impl CheckScratch {
-    fn create(scratch: &Path) -> std::result::Result<Self, String> {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = scratch.join(format!("check-{}-{}-{n}", std::process::id(), now_nanos()));
-        std::fs::create_dir(&dir)
-            .map_err(|e| format!("cannot make the check's folder {}: {e}", dir.display()))?;
-        Ok(Self(dir))
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for CheckScratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 /// Run one command confined to `ws`, output to a log in its scratch directory,
 /// killed after `timeout`. Returns (success, output tail).
 ///
@@ -536,6 +500,20 @@ impl Drop for CheckScratch {
 /// be linked, and each install the project needs and lacks, with the command
 /// that makes it ([`crate::deps::installs`]): "Cannot find module" alone
 /// reads like a fault in the work.
+///
+/// **The check's own folder.** Its temporary folder, every tool home and its
+/// cargo target folder are in a new [`CheckFolder`] (`<base>/.checks/...`),
+/// outside the worker's writable roots, never the workspace's scratch folder:
+/// that one is the worker's `TMPDIR` and holds its build output, and what the
+/// worker left there (npm's `.npmrc`, a Gradle or .NET home, a Go build
+/// cache, cargo's build records and test binaries) could otherwise steer the
+/// check, up to a forged pass (decision 0084, amended 2026-10-06). With
+/// `warm`, the target folder's `debug` profile starts as a copy-on-write
+/// clone of that build folder's (the user's own, which no sandboxed command
+/// writes; decision 0060), so the check rebuilds only the project's own
+/// crates; without it,
+/// or where no clone can be made, the check builds cold, and a failing
+/// check's output says so.
 pub(crate) fn run_confined(
     ws: &Workspace,
     checkout: &Path,
@@ -543,15 +521,28 @@ pub(crate) fn run_confined(
     command: &str,
     timeout: Duration,
     cap: usize,
+    warm: Option<&Path>,
 ) -> std::result::Result<(bool, String), String> {
     let links = kgraf_sandbox::link_dependency_trees(ws.root(), checkout);
-    // A temporary folder of the check's own, not the workspace's scratch
-    // folder: that one is the worker's `TMPDIR`, and tool settings the worker
-    // left there (npm's `.npmrc`, a Gradle or .NET home, a Go build cache,
-    // Python bytecode) would otherwise steer the check, up to a forged pass.
-    let tmp = CheckScratch::create(ws.scratch())?;
+    let check =
+        CheckFolder::create(ws).map_err(|e| format!("cannot make the check's folder: {e}"))?;
+    let target = check.target();
+    let mut build_note = String::new();
+    // Only the `debug` profile, the one a check's `cargo test` and `cargo
+    // build` use: a clone costs one call per file, and a user's `target/`
+    // also holds release builds, other targets and documentation.
+    if let Some(warm) = warm.map(|w| w.join("debug"))
+        && let Err(e) = kgraf_sandbox::clone_target_dir(&warm, &target.join("debug"))
+    {
+        build_note = format!(
+            "\n[build] the check built cold: its build folder could not start from {}: {e}",
+            warm.display()
+        );
+    }
+    let tmp = check.tmp();
     let mut policy = SandboxPolicy::for_workspace(ws, Network::Deny)
-        .with_tmp_dir(tmp.path().to_path_buf())
+        .with_writable_root(check.path().to_path_buf())
+        .with_tmp_dir(tmp.clone())
         .with_ancestor_reads(checkout.to_path_buf())
         .with_dependency_links(&links);
     for d in denies {
@@ -562,7 +553,7 @@ pub(crate) fn run_confined(
     if let Some(dir) = kgraf_sandbox::script_start_dir(command) {
         policy = policy.with_command_dir(ws.root().join(dir));
     }
-    let log = ws.scratch().join(format!("gate-{}.log", now_nanos()));
+    let log = check.path().join(format!("gate-{}.log", now_nanos()));
     let mut cmd = sandboxed_command(&policy, "sh", ws.root())
         .map_err(|e| format!("cannot sandbox `{command}`: {e}"))?;
     let mut refused = refused_note(cmd.refused_reads());
@@ -571,11 +562,11 @@ pub(crate) fn run_confined(
     // parser, so a path with spaces or quotes cannot change the command.
     cmd.args(["-c", &format!("exec >\"$KGRAF_GATE_LOG\" 2>&1\n{command}")])
         .env("KGRAF_GATE_LOG", &log)
-        .env("CARGO_TARGET_DIR", ws.scratch().join("target"))
-        // Python bytecode goes to scratch, outside the worktree, as cargo's build
-        // output does: an import in the check writes no `__pycache__` into the
-        // tree (and none that the worker's run left is read: it was removed).
-        .env("PYTHONPYCACHEPREFIX", tmp.path().join("pycache"))
+        .env("CARGO_TARGET_DIR", &target)
+        // Python bytecode goes to the check's folder, outside the worktree, as
+        // cargo's build output does: an import in the check writes no
+        // `__pycache__` into the tree, and reads none the worker's run left.
+        .env("PYTHONPYCACHEPREFIX", tmp.join("pycache"))
         .stdin(Redirect::Null)
         .stdout(Redirect::Null)
         .stderr(Redirect::Null);
@@ -654,6 +645,7 @@ pub(crate) fn run_confined(
             text = format!("$ {command}\n{text}\n[{s}]");
             if !s.success() {
                 text.push_str(&refused);
+                text.push_str(&build_note);
                 text.push_str(&missing_installs_note(checkout));
             }
             Ok((s.success(), text))
@@ -661,7 +653,7 @@ pub(crate) fn run_confined(
         None => Ok((
             false,
             format!(
-                "$ {command}\n{text}\n[killed after {}s]{refused}",
+                "$ {command}\n{text}\n[killed after {}s]{refused}{build_note}",
                 timeout.as_secs()
             ),
         )),
@@ -719,7 +711,8 @@ impl GateRunner for CommandGateRunner {
             let mut passed = true;
             let mut output = String::new();
             for command in &request.commands {
-                match run_confined(&ws, manager.repo(), &denies, command, timeout, cap) {
+                // The gate builds cold: its worktree is new, and so is its build.
+                match run_confined(&ws, manager.repo(), &denies, command, timeout, cap, None) {
                     Ok((ok, text)) => {
                         output.push_str(&text);
                         output.push('\n');

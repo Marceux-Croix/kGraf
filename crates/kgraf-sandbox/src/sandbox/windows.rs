@@ -241,7 +241,7 @@ pub(super) fn env_block(
 #[cfg(windows)]
 pub use imp::SandboxedChild;
 #[cfg(windows)]
-pub(super) use imp::{Prepared, default_stdio, output, prepare, spawn, status};
+pub(super) use imp::{Prepared, default_stdio, output, prepare, prepare_root, spawn, status};
 
 #[cfg(windows)]
 mod imp {
@@ -813,6 +813,24 @@ mod imp {
     /// Confirm the restricted token is actually granted write on `root` and on
     /// a child, with `AccessCheck`, not just that the ACE is present: a partial
     /// propagation must fail loud.
+    /// The write ACL and the Low label [`prepare`] gives one writable root,
+    /// set before kGraf makes a dependency junction in it
+    /// (`crate::dependencies`). Writing a folder's ACL propagates its
+    /// inheritable entries to what is in it, and the write grant is written
+    /// only while it is absent ([`grant_writable_root`]), so a junction made
+    /// afterwards never sees that propagation. Unverified on Windows: whether
+    /// the propagation would follow a junction at all; the Low label is
+    /// written again on each command (see `gaps`).
+    pub(in crate::sandbox) fn prepare_root(root: &Path) -> Result<(), SandboxError> {
+        let root = strip_verbatim(root);
+        let sid = Sid::from_string(&capability_sid_string(&root.to_string_lossy()))?;
+        refuse_reparse(&root)?;
+        require_acl_volume(&root)?;
+        grant_writable_root(&root, &sid)?;
+        label_root_low(&root)?;
+        verify_effective_write(&root, &sid)
+    }
+
     fn verify_effective_write(root: &Path, cap: &Sid) -> Result<(), SandboxError> {
         let token = restricted_token_for(std::slice::from_ref(cap))?.0;
         // An impersonation token, which is what AccessCheck requires.

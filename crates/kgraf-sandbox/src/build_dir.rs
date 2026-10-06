@@ -44,6 +44,8 @@ pub enum SeedError {
     DestExists(PathBuf),
     #[error("warm directory {warm} and destination {dest} overlap")]
     Overlap { warm: PathBuf, dest: PathBuf },
+    #[error("no copy-on-write clone could be made: {0}")]
+    NoClone(String),
     #[error("I/O error at {path}: {source}")]
     Io {
         path: PathBuf,
@@ -68,6 +70,18 @@ pub fn seed_workspace_target(warm: &Path, ws: &Workspace) -> Result<SeedReport, 
 /// Make `dest` a copy of the build directory `warm`, by copy-on-write clone
 /// where the file system allows it. `dest` must not exist.
 pub fn seed_target_dir(warm: &Path, dest: &Path) -> Result<SeedReport, SeedError> {
+    seed(warm, dest, true)
+}
+
+/// [`seed_target_dir`] by copy-on-write clone only: where no clone can be
+/// made, `dest` is left absent and the error says why. For a seed made once
+/// per check, where a byte copy of a large build folder would cost more than
+/// the build it saves.
+pub fn clone_target_dir(warm: &Path, dest: &Path) -> Result<SeedReport, SeedError> {
+    seed(warm, dest, false)
+}
+
+fn seed(warm: &Path, dest: &Path, may_copy: bool) -> Result<SeedReport, SeedError> {
     let started = Instant::now();
     if !warm.is_dir() {
         return Err(SeedError::NoWarmDir(warm.to_path_buf()));
@@ -92,10 +106,14 @@ pub fn seed_target_dir(warm: &Path, dest: &Path) -> Result<SeedReport, SeedError
 
     let method = match clone_tree(&warm, &dest_abs) {
         Ok(method) => method,
-        Err(reason) => {
+        Err(reason) if may_copy => {
             remove_partial(&dest_abs)?;
             copy_tree(&warm, &dest_abs)?;
             SeedMethod::Copy { reason }
+        }
+        Err(reason) => {
+            remove_partial(&dest_abs)?;
+            return Err(SeedError::NoClone(reason));
         }
     };
     Ok(SeedReport {
@@ -106,7 +124,7 @@ pub fn seed_target_dir(warm: &Path, dest: &Path) -> Result<SeedReport, SeedError
 }
 
 /// Clone with the platform `cp`, or say why not.
-fn clone_tree(warm: &Path, dest: &Path) -> Result<SeedMethod, String> {
+pub(crate) fn clone_tree(warm: &Path, dest: &Path) -> Result<SeedMethod, String> {
     let (flags, method): (&[&str], SeedMethod) = if cfg!(target_os = "macos") {
         (&["-c", "-R"], SeedMethod::Clone)
     } else if cfg!(target_os = "linux") {
