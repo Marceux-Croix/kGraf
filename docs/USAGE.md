@@ -853,9 +853,43 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   more than the command runs, never less. The refusal to delete system paths reads commands
   the same way, and a directory change behind a prefix word (`command cd /`, `pushd /`) moves
   where it resolves a relative path. Your policy's `forbid` rules (`git push --force`) also
-  refuse their command behind a prefix word (`env git push --force`). What kGraf does not read
-  as a command: a program named as an argument (`find . -exec curl`, `su -c`, `ssh host
-  curl`, `trap 'curl' EXIT`), and a command named by a variable.
+  refuse their command behind a prefix word (`env git push --force`).
+
+  A program given to another program as an argument is read as a command too: `find -exec`,
+  `-execdir`, `-ok` and `-okdir` (up to `;` or `+`), `su -c` and `runuser -c`, `sg GROUP CMD`,
+  `ssh HOST CMD` (it runs on the other machine; your rules still judge it), `script -c` and BSD
+  `script FILE CMD`, `trap 'CMD' SIG`, `watch CMD`, `flock FILE -c CMD`, `env -S`,
+  `parallel CMD :::` and `parallel ::: CMD ...`, and `direnv exec`, `mise exec`, `devbox run`,
+  `uv run`, `poetry run`, `pipenv run`, `bundle exec` and `conda run`, and an option whose
+  value is a program (`ssh -o ProxyCommand=`, `rg --pre`, `tar --to-command` and `-I`,
+  `rsync -e`). So
+  `deny = ["shell(curl*)"]` refuses `find . -exec curl x \;`, `su -c 'curl x'` and
+  `ssh host curl x` in every mode, Bypass included, and the refusal to delete system paths sees
+  `find . -exec rm -rf / \;`. A recursive deletion of a placeholder (`find / -exec rm -rf {}
+  \;`) or of what `xargs` or `parallel` reads from its input asks. Your policy's `forbid` rules
+  refuse their command inside a script and in every command a call starts, in Bypass too.
+
+  Some commands run what kGraf cannot read: `source FILE`, `. FILE`, a shell given a file or its
+  input instead of `-c` (`bash run.sh`, `cat x | sh`), `ssh HOST` with no command, `su USER`,
+  `sudo -i`, `script FILE` with no command, and `parallel` with commands from a file or its
+  input. While you have a deny or ask rule on `shell` with a pattern, such a call asks in every
+  mode, Bypass included, because kGraf cannot check it against your rule. With no such rule the
+  mode decides, but no grant covers it. What kGraf does not read as a command: a command named
+  by a variable, and a program an interpreter runs from its own code (`python3 x.py`,
+  `npm run test`, `make`).
+
+  A grant of a program does not grant what it runs. In Auto's allow set, Accept edits' file
+  programs and a program granted to the contract, every program a command runs needs its own
+  grant: a wrapper and the program after it (`env curl x` runs on grants only when `env` and
+  `curl` are both granted), every command of a script it hands to a shell (`su -c`, `bash -c`),
+  and a word that may be an option's value or the program (`sudo -u bob curl` names `bob` too,
+  so it asks). As in Claude Code, no program grant ever covers `watch`, `setsid`, `ionice` or
+  `flock` with a command, or `find` with `-exec`, `-execdir`, `-ok`, `-okdir` or `-delete`;
+  kGraf adds `ssh HOST CMD` and every command it cannot read. Manual asks for these, the
+  orchestrator decides them in Orchestrator decides, and Bypass runs them unless a rule above
+  applies. Claude Code does not match a deny rule inside `sh -c` and strips wrappers such as
+  `timeout` and `nice` before matching an allow rule; kGraf matches inside every script and
+  needs a grant for the wrapper too, so it is never looser.
 
   You can edit every list of `permissions.toml` in Settings > Permissions, with no file
   editing. "Rules" holds Deny rules and Ask rules; "Allowed in Auto" holds the allow set:
@@ -1549,6 +1583,15 @@ Behavior that differs from earlier builds. Each item names the decision that hol
   is recorded when the approval chain lets the call run; when a deny rule (or another hook)
   refuses the call after the mode allowed it, the trace has one `grant_refused` event naming
   the subject, the mode, and the refusing hook with its reason (0094).
+- A program given to another program as an argument is a command (0094): your deny and ask
+  rules, the refusal to delete system paths and your policy's `forbid` rules see `find -exec`,
+  `su -c`, `ssh HOST CMD`, `script -c`, `trap`, `watch`, `parallel` and the like in every mode,
+  Bypass included. A command that runs what kGraf cannot read (`source FILE`, `bash run.sh`)
+  asks in every mode while you have a shell rule with a pattern. A grant of a program no longer
+  grants what it runs: with `env` in the allow set, `env curl x` asks unless `curl` is there
+  too, and `watch`, `flock`, `find -exec` and `ssh HOST CMD` are never granted by a program
+  grant. Before, these ran past your rules, and a grant of the wrapper granted everything it
+  ran.
 - In Auto, Accept edits, or with a program granted to the contract, a worker's `sh -c` script
   of simple commands runs without asking when every command's program is granted; before, the
   shell itself had to be granted, so `sh -c "mkdir -p out && cp a out/a"` was asked about (and

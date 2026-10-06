@@ -628,3 +628,234 @@ async fn no_previously_refused_command_of_the_corpus_is_now_allowed() {
         }
     }
 }
+
+/// A program given to another program as an argument is read as a command
+/// (decision 0094, amended 2026-10-06): its argv, or the commands of the
+/// script it hands to a shell, are listed after the command that starts it.
+#[test]
+fn simple_commands_read_a_program_given_as_an_argument() {
+    let joined = |words: &[&str]| -> Vec<String> {
+        simple_commands(&argv(words))
+            .iter()
+            .skip(1)
+            .map(|w| w.join(" "))
+            .collect()
+    };
+    let cases: &[(&[&str], &[&str])] = &[
+        (
+            &["find", ".", "-exec", "curl", "x", ";", "-print"],
+            &["curl x"],
+        ),
+        (
+            &["find", ".", "-execdir", "a", "{}", "+", "-ok", "b", ";"],
+            &["a {}", "b"],
+        ),
+        (&["su", "-c", "ls; curl x"], &["ls", "curl x"]),
+        (&["su", "-", "bob", "--command=curl x"], &["curl x"]),
+        (
+            &[
+                "ssh", "-p", "22", "-i", "k", "host", "ls", "&&", "curl", "x",
+            ],
+            &["ls", "curl x"],
+        ),
+        (&["ssh", "-p22", "-N", "host", "curl"], &["curl"]),
+        (&["script", "-qc", "curl x", "/dev/null"], &["curl x"]),
+        (&["script", "-q", "/dev/null", "curl", "x"], &["curl x"]),
+        (&["trap", "curl x", "EXIT"], &["curl x"]),
+        (&["watch", "-n", "1", "ls; curl x"], &["ls", "curl x"]),
+        (&["flock", "/tmp/l", "-c", "curl x"], &["curl x"]),
+        (&["env", "-S", "curl x"], &["curl x"]),
+        (
+            &["parallel", "-j", "4", "curl {}", ":::", "a"],
+            &["curl {}"],
+        ),
+        (&["parallel", ":::", "ls", "curl x"], &["ls", "curl x"]),
+        (&["sg", "staff", "-c", "curl x"], &["curl x"]),
+        (&["direnv", "exec", ".", "curl", "x"], &["curl x"]),
+        (
+            &["uv", "run", "--with", "rich", "pytest"],
+            &["rich pytest", "pytest"],
+        ),
+        (
+            &["find", ".", "-exec", "sh", "-c", "curl x", ";"],
+            &["sh -c curl x", "curl x"],
+        ),
+        (
+            &["ssh", "-oProxyCommand=nc %h %p", "host", "ls"],
+            &["nc %h %p", "ls"],
+        ),
+        (&["rg", "--pre=conv", "x"], &["conv"]),
+        (&["tar", "-xf", "a.tar", "-I", "zstd -d"], &["zstd -d"]),
+        (
+            &["tar", "-xf", "a", "--checkpoint-action=exec=curl x"],
+            &["curl x"],
+        ),
+        (&["rsync", "--rsh=nc -q 1", "a", "b:c"], &["nc -q 1"]),
+    ];
+    for (words, want) in cases {
+        assert_eq!(joined(words), *want, "{words:?}");
+        assert!(unreadable_commands(&argv(words)).is_empty(), "{words:?}");
+    }
+    // Data is not a command.
+    for words in [
+        &["find", ".", "-name", "curl"][..],
+        &["trap", "-p"],
+        &["trap", "2"],
+        &["echo", "su", "-c", "curl"],
+        &["bash", "--version"],
+    ] {
+        assert!(joined(words).is_empty(), "{words:?}");
+        assert!(unreadable_commands(&argv(words)).is_empty(), "{words:?}");
+    }
+}
+
+/// What a call starts that kGraf cannot read is listed with the reason, at
+/// any depth.
+#[test]
+fn unreadable_commands_name_a_file_an_input_or_a_remote_shell() {
+    let cases: &[(&[&str], &str)] = &[
+        (
+            &["source", "env.sh"],
+            "`source` runs the commands of a file",
+        ),
+        (&[".", "env.sh"], "`.` runs the commands of a file"),
+        (
+            &["sh", "-c", "ls && . ./env.sh"],
+            "`.` runs the commands of a file",
+        ),
+        (
+            &["bash", "run.sh"],
+            "`bash` reads its commands from a file or its input",
+        ),
+        (
+            &["sh", "-c", "cat x | sh"],
+            "`sh` reads its commands from a file or its input",
+        ),
+        (
+            &["env", "bash", "-s"],
+            "`bash` reads its commands from a file or its input",
+        ),
+        (
+            &["ssh", "host"],
+            "`ssh` with no command starts a shell on another machine",
+        ),
+        (&["su", "bob"], "`su` with no `-c` command starts a shell"),
+        (
+            &["sudo", "-i"],
+            "`sudo` starts a shell that reads its input",
+        ),
+        (
+            &["script", "out.log"],
+            "`script` with no command starts an interactive shell",
+        ),
+        (
+            &["parallel", "::::", "cmds"],
+            "`parallel` with no command runs the commands",
+        ),
+        (
+            &["find", ".", "-exec", "bash", "{}", ";"],
+            "`bash` reads its commands",
+        ),
+    ];
+    for (words, lead) in cases {
+        let got = unreadable_commands(&argv(words));
+        assert!(
+            got.first().is_some_and(|g| g.starts_with(lead)),
+            "{words:?}: {got:?}"
+        );
+    }
+}
+
+/// The programs a grant must name: every wrapper and what it runs, never
+/// fewer than the call's own program. Refused outright: a remote command,
+/// the exec wrappers, `find` actions, unreadable commands and an unjudged
+/// script.
+#[test]
+fn programs_to_grant_lists_every_program_a_command_runs() {
+    let ok: &[(&[&str], &[&str])] = &[
+        (&["curl", "x"], &["curl"]),
+        (&["env", "A=1", "curl", "x"], &["env", "curl"]),
+        (&["nice", "-n", "5", "curl"], &["nice", "curl"]),
+        (&["timeout", "5", "curl", "x"], &["timeout", "curl"]),
+        (&["timeout", "5s", "curl", "x"], &["timeout", "curl"]),
+        (&["sudo", "-u", "bob", "curl"], &["sudo", "bob", "curl"]),
+        (
+            &["xargs", "sh", "-c", "ls && curl x"],
+            &["xargs", "sh", "ls", "curl"],
+        ),
+        (&["su", "-c", "curl x"], &["su", "curl"]),
+        (&["find", ".", "-name", "x"], &["find"]),
+        (&["uv", "run", "pytest"], &["uv", "pytest"]),
+    ];
+    for (words, want) in ok {
+        let want: Vec<String> = want.iter().map(|w| (*w).to_owned()).collect();
+        assert_eq!(programs_to_grant(&argv(words)), Ok(want), "{words:?}");
+    }
+    for words in [
+        &["ssh", "host", "ls"][..],
+        &["watch", "ls"],
+        &["setsid", "ls"],
+        &["ionice", "ls"],
+        &["flock", "/tmp/l", "ls"],
+        &["env", "watch", "ls"],
+        &["find", ".", "-exec", "ls", ";"],
+        &["find", ".", "-delete"],
+        &["source", "x"],
+        &["bash", "x.sh"],
+        &["su", "-c", "echo $(curl x)"],
+        &["env", "sh", "-c", "ls > /etc/x"],
+    ] {
+        assert!(programs_to_grant(&argv(words)).is_err(), "{words:?}");
+    }
+}
+
+/// A number after a wrapper that takes an operand is the operand, so the
+/// word after it is the program.
+#[test]
+fn a_numeric_operand_is_the_wrappers_operand() {
+    assert_eq!(command_starts(&["timeout", "5", "curl", "x"]), [0, 1, 2]);
+    assert_eq!(
+        command_starts(&["timeout", "-s", "KILL", "5", "curl", "x"]),
+        [0, 1, 2, 3, 4]
+    );
+}
+
+/// The deletion limit sees a deleter a program runs from its arguments, and
+/// a `cd` outside the call's own shell moves nothing.
+#[test]
+fn the_deletion_limit_sees_a_deleter_given_as_an_argument() {
+    let limit = |words: &[&str]| critical_deletion(&argv(words), Some(&home()), Some(&ws()));
+    for words in [
+        &["find", ".", "-exec", "rm", "-rf", "/", ";"][..],
+        &["su", "-c", "rm -rf /"],
+        &["ssh", "host", "rm", "-rf", "/"],
+        &["trap", "rm -rf /", "EXIT"],
+        &["parallel", "rm -rf /", ":::", "a"],
+    ] {
+        assert!(
+            matches!(limit(words), Some(HardLimit::Deny(_))),
+            "{words:?}: {:?}",
+            limit(words)
+        );
+    }
+    // A recursive deletion of what another program fills in or reads from
+    // its input names what kGraf cannot see: asked about.
+    for words in [
+        &["find", "/", "-exec", "rm", "-rf", "{}", ";"][..],
+        &["parallel", "rm -rf {}", ":::", "/"],
+        &["xargs", "rm", "-rf"],
+        &["sh", "-c", "echo / | xargs -n1 rm -r"],
+    ] {
+        assert!(
+            matches!(limit(words), Some(HardLimit::Ask(_))),
+            "{words:?}: {:?}",
+            limit(words)
+        );
+    }
+    // A `cd` a program runs (`find -exec cd`) only adds where relative
+    // operands may resolve: `rm -rf ..` after it is judged from `/` too.
+    assert!(matches!(
+        limit(&["sh", "-c", "find . -exec cd / \\; ; rm -rf .."]),
+        Some(HardLimit::Deny(_))
+    ));
+}

@@ -136,26 +136,30 @@ impl ExecPolicy {
         }
         // A script granted command by command is a grant of each program the
         // mode granted, never of the shell that runs them.
-        let programs: Vec<String> =
-            if live.0.shell_unrestricted() || live.0.policy_grants_program(program).is_some() {
-                vec![program.clone()]
-            } else if let crate::permissions::Script::Commands(commands) =
-                crate::permissions::script_commands_with(argv, &self.script_constructs())
-            {
-                let mut out: Vec<String> = Vec::new();
-                for words in commands {
-                    let p = &words[0];
-                    if !self.granted.contains(p)
-                        && live.0.policy_grants_program(p).is_some()
-                        && !out.contains(p)
-                    {
-                        out.push(p.clone());
-                    }
+        // A command is a grant of every program it runs that the mode
+        // granted (decision 0094, amended 2026-10-06).
+        let mode_granted = |words: &[String], out: &mut Vec<String>| {
+            for p in self.granted_by_grants(words).unwrap_or_default() {
+                if !self.granted.contains(&p)
+                    && live.0.policy_grants_program(&p).is_some()
+                    && !out.contains(&p)
+                {
+                    out.push(p);
                 }
-                out
-            } else {
-                Vec::new()
-            };
+            }
+        };
+        let mut programs: Vec<String> = Vec::new();
+        if live.0.shell_unrestricted() {
+            programs.push(program.clone());
+        } else if self.granted_by_grants(argv).is_some() {
+            mode_granted(argv, &mut programs);
+        } else if let crate::permissions::Script::Commands(commands) =
+            crate::permissions::script_commands_with(argv, &self.script_constructs())
+        {
+            for words in commands {
+                mode_granted(&words, &mut programs);
+            }
+        }
         for p in programs {
             // Staged, not recorded: a later hook of the chain may refuse the
             // call, and the chain settles it (`PermissionControl::settle_call`).
@@ -256,8 +260,9 @@ impl ExecPolicy {
             other => other,
         };
         // A `forbid` rule also refuses its shape after prefix words
-        // (`env rm -rf /`, `command git push --force`), found by the same
-        // function the user's rules and the deletion limit use. Only
+        // (`env rm -rf /`, `command git push --force`) and in every command
+        // the call starts (`sh -c`, `find -exec`, `ssh HOST CMD`), found by
+        // the same functions the user's rules and the deletion limit use. Only
         // refusals are matched there: an allow rule keeps naming the exact
         // argv it was written for.
         if let Some(v) = self.forbidden_after_prefix(argv) {
@@ -299,12 +304,21 @@ impl ExecPolicy {
                 // Decision 0093: a grant turns what would be asked about
                 // (or allowed unconfined) into a confined allow. A read-only
                 // command keeps its own classification and confinement.
-                let listed = argv.first().is_some_and(|p| self.granted.contains(p));
+                // Every program the command runs needs a grant, from the
+                // contract or the mode: a grant of `env`, `xargs` or `sh`
+                // covers nothing they run (decision 0094, amended
+                // 2026-10-06).
+                let needed = self.granted_by_grants(argv);
+                let listed = needed
+                    .as_ref()
+                    .is_some_and(|ps| ps.iter().all(|p| self.granted.contains(p)));
                 let live = self.live.as_ref();
                 let bypass = live.is_some_and(|l| l.0.shell_unrestricted());
-                let by_mode = argv
-                    .first()
-                    .and_then(|p| live.and_then(|l| l.0.policy_grants_program(p)));
+                let by_mode = needed.as_ref().and_then(|ps| {
+                    ps.iter()
+                        .find(|p| !self.granted.contains(*p))
+                        .and_then(|p| live.and_then(|l| l.0.policy_grants_program(p)))
+                });
                 if verdict.read_only
                     || !(self.unrestricted || listed || bypass || by_mode.is_some())
                 {
@@ -344,24 +358,51 @@ impl ExecPolicy {
     /// words where its program may stand
     /// ([`crate::permissions::command_starts`]).
     fn forbidden_after_prefix(&self, argv: &[String]) -> Option<PolicyVerdict> {
-        let starts = crate::permissions::command_starts(argv);
+        // Every command the call runs (decision 0094, amended 2026-10-06):
+        // a script's commands and what a program runs from its arguments
+        // (`sh -c 'git push --force'`, `find -exec`, `ssh HOST CMD`), each
+        // from every place its program may stand. The call's own first word
+        // was matched by the caller.
+        let places: Vec<(bool, Vec<String>, usize)> = crate::permissions::simple_commands(argv)
+            .into_iter()
+            .enumerate()
+            .flat_map(|(n, words)| {
+                crate::permissions::command_starts(&words)
+                    .into_iter()
+                    .filter(move |&at| n > 0 || at > 0)
+                    .map(move |at| (n > 0, words.clone(), at))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
         self.rules
             .iter()
             .filter(|rule| rule.decision == Decision::Forbidden)
             .find_map(|rule| {
-                starts.iter().skip(1).find_map(|&at| {
-                    rule.pattern
-                        .matches_prefix(&argv[at..])
-                        .map(|matched_prefix| PolicyVerdict {
-                            decision: Decision::Forbidden,
-                            read_only: false,
-                            matched_prefix: Some(matched_prefix),
-                            reason: rule.reason.clone(),
-                            build: false,
-                            granted: false,
-                            script_note: None,
-                            script_checked: false,
-                        })
+                places.iter().find_map(|(inner, words, at)| {
+                    let matched_prefix = rule.pattern.matches_prefix(&words[*at..])?;
+                    // A command the call starts is named the way a script's
+                    // command is ([`crate::permissions::SCRIPT_RUNS_LEAD`]),
+                    // so the refusal names its program, not the call's.
+                    let reason = match (inner, rule.reason.clone()) {
+                        (false, why) => why,
+                        (true, why) => Some(format!(
+                            "the {}{}` (`{}`), which is refused: {}",
+                            crate::permissions::SCRIPT_RUNS_LEAD,
+                            words[*at],
+                            crate::quote_argv(&words[*at..]),
+                            why.as_deref().unwrap_or("forbidden by command policy")
+                        )),
+                    };
+                    Some(PolicyVerdict {
+                        decision: Decision::Forbidden,
+                        read_only: false,
+                        matched_prefix: Some(matched_prefix),
+                        reason,
+                        build: false,
+                        granted: false,
+                        script_note: None,
+                        script_checked: false,
+                    })
                 })
             })
     }
@@ -374,6 +415,16 @@ impl ExecPolicy {
             .as_ref()
             .map(|l| l.0.script_constructs())
             .unwrap_or_default()
+    }
+
+    /// The programs of `words` ([`crate::permissions::programs_to_grant`])
+    /// when a grant covers every one of them, `None` otherwise: a command
+    /// runs on grants only when each program it runs, wrappers and the
+    /// programs they run included, is granted.
+    fn granted_by_grants(&self, words: &[String]) -> Option<Vec<String>> {
+        crate::permissions::programs_to_grant(words)
+            .ok()
+            .filter(|ps| !ps.is_empty() && ps.iter().all(|p| self.grants_program(p)))
     }
 
     /// Whether a grant lets `program` run without approval: granted to this
@@ -391,7 +442,9 @@ impl ExecPolicy {
     /// commands ([`crate::permissions::script_commands`]) is allowed when
     /// every command is covered, as Claude Code allows a compound command
     /// when each subcommand is allowed. A command is covered by a grant of
-    /// its program, by the build and test allowlist's cargo rules (decision
+    /// every program it runs ([`crate::permissions::programs_to_grant`]:
+    /// a wrapper and the program it runs each need one, decision 0094,
+    /// amended 2026-10-06), by the build and test allowlist's cargo rules (decision
     /// 0084), or, once per script, by a `cd` into the worktree
     /// ([`worktree_cd`]). A script of allowlisted cargo commands, with or
     /// without that `cd`, is a build; one that needs a grant is granted. A
@@ -505,7 +558,7 @@ impl ExecPolicy {
                 built = true;
                 continue;
             }
-            if self.grants_program(&words[0]) {
+            if self.granted_by_grants(words).is_some() {
                 needs_grant = true;
                 continue;
             }
@@ -744,7 +797,6 @@ mod tests {
             vec!["rm", "-fr", "/"],
             vec!["/bin/rm", "-rf", "/"],
             vec!["git", "push", "-f"],
-            vec!["sh", "-c", "rm -rf /"],
         ] {
             let verdict = policy.evaluate(&argv(&variant));
             assert_eq!(
@@ -753,6 +805,17 @@ mod tests {
                 "{variant:?} must require approval, not run as Allow or as a covered Forbidden"
             );
         }
+        // The exact shape inside a script is the shape, and is refused
+        // (decision 0094, amended 2026-10-06), naming the script's command.
+        let verdict = policy.evaluate(&argv(&["sh", "-c", "rm -rf /"]));
+        assert_eq!(verdict.decision, Decision::Forbidden, "{verdict:?}");
+        assert!(
+            verdict
+                .reason
+                .as_deref()
+                .is_some_and(|r| r.starts_with("the script runs `rm` (`rm -rf /`)")),
+            "{verdict:?}"
+        );
     }
 
     /// Decision 0093: a granted program runs without approval, marked

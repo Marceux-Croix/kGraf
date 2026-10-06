@@ -185,6 +185,30 @@ mod tests {
         }
     }
 
+    /// A program another program runs from its arguments is found and named
+    /// (decision 0094, amended 2026-10-06). A file the command sources names
+    /// no program, so it is no conflict: the warning names only what the
+    /// rules block.
+    #[test]
+    fn a_program_given_as_an_argument_is_found_and_named() {
+        let r = rules(&["shell(python3*)"], &[]);
+        for line in [
+            "find . -name '*.py' -exec python3 check.py {} \\;",
+            "ssh host python3 check.py",
+            "su -c 'python3 check.py'",
+            "timeout 60 python3 check.py",
+            "trap 'python3 check.py' EXIT; make",
+            "ls | xargs -n1 python3 check.py",
+        ] {
+            assert_eq!(
+                programs(&find(&r, &[("verify", line)])),
+                ["python3"],
+                "{line:?}"
+            );
+        }
+        assert!(find(&r, &[("verify", ". ./env.sh && make")]).is_empty());
+    }
+
     #[test]
     fn the_deletion_limit_is_not_a_rule_conflict() {
         // `rm -rf /` is refused by the deletion limit, not by a user rule.

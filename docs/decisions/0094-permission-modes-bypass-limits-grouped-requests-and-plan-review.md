@@ -1106,3 +1106,123 @@ which now also traces the `WebFetch` notice in a real run); `kgraf-shell` (`perm
 `a_bad_allow_entry_keeps_the_mode`,
 `a_file_whose_mode_cannot_start_falls_back_to_manual_and_says_so`). Each regression test fails
 with its part of the change reverted and passes with it restored.
+
+## Amendment (2026-10-06): a program given as an argument is a command, and a grant of a wrapper grants nothing it runs
+
+**Why.** Two gaps remained after the 2026-10-02 prefix-word amendment, both recorded there as
+"not read as a command". First, a program another program runs from its arguments was not
+read: `find -exec PROG`, `su -c CMD`, `ssh HOST CMD`, `script -c CMD`, `trap 'CMD' SIG`,
+`parallel CMD :::`, `watch 'CMD'`, `flock FILE -c CMD`, `env -S CMD`. With
+`deny = ["shell(curl*)"]`, `find . -exec curl x \;` and `su -c 'curl x'` ran in Bypass and were
+granted by Auto, and `source FILE` ran whatever the file held with no rule consulted. The root
+cause was in `permissions.rs`: `push_script_commands` followed only a shell's `-c` script and
+`eval` (`shell_script`), so `simple_commands`, and with it `subjects`, the deletion limit and
+the rule-conflict warning, never saw these commands. Second, every grant named `argv[0]` only:
+`ExecPolicy::evaluate` (`listed` and `by_mode`), `ExecPolicy::script_verdict`
+(`grants_program(&words[0])`) and `PermissionControl::route_ask` (Auto's allow set, Accept
+edits' file programs) each looked at the first word. A user who put `env`, `xargs`, `sh`,
+`find` or `ssh` in the Auto allow set, or a contract granted one, granted whatever it ran. The
+command policy's `forbid` rules also matched only the call's own words, so Bypass ran
+`sh -c 'git push --force'`.
+
+**The change: reading.** `simple_commands` now reads, at each place `command_starts` lists, what
+the program there starts (`Embedded`, `embedded_at` in `permissions.rs`), and reads each found
+command the same way, to a depth of 32:
+
+- an argv: `find -exec`, `-execdir`, `-ok`, `-okdir` up to `;` or `+`; BSD `script FILE PROG`;
+  `direnv exec DIR PROG`, `mise exec`, `mise x`, `devbox run`, `uv run`, `poetry run`,
+  `pipenv run`, `bundle exec`, `conda run`;
+- a script, split like a `sh -c` script: `sh -c` and `eval` as before; `su -c` and
+  `runuser -c` (also `-lc`, `--command`), `sg GROUP CMD`, `ssh HOST CMD` (after `ssh`'s
+  options and their values), `script -c`, `trap CMD SIG`, `watch CMD` (its words joined, as
+  `watch` hands them to `sh -c`), `flock FILE -c CMD`, `env -S`, `parallel CMD :::` (and each
+  input of `parallel ::: CMD...`); an option whose value is a program the command runs on this
+  machine: `ssh -o ProxyCommand=` and `-o LocalCommand=`, `rg --pre` and `--hostname-bin`,
+  `tar --to-command`, `-I` (`--use-compress-program`), `--rsh-command`, `-F`
+  (`--info-script`), `--new-volume-script` and `--checkpoint-action=exec=`, and `rsync -e`
+  (`--rsh`);
+- unreadable, with the reason (`unreadable_commands`): `source FILE`, `. FILE`, a shell given a
+  file or its input instead of `-c` (`bash run.sh`, `cat x | sh`; `--version`, `--help` and
+  `-n` run nothing), `ssh HOST` with no command, `su USER` and `runuser USER` with no command,
+  `sudo -i` and `sudo -s` with no command, `script FILE` with no command, and `parallel` with
+  commands from a file or its input.
+
+The wrapper list adds `valgrind`, `parallel`, `runuser`, `pkexec`, `unshare`, `nsenter`,
+`setpriv`, `firejail`, `torsocks`, `proxychains`, `proxychains4`, `sandbox-exec`, `arch`,
+`systemd-run`, `dbus-run-session` and `faketime` (with an operand), and a number after a wrapper
+that takes an operand is that operand (`timeout 5 curl`: the program is `curl`, where the scan
+before read `curl` as the operand and listed `x` as well).
+
+So the user's deny and ask rules, the deletion limit and the rule-conflict warning see these
+commands in every mode, Bypass included. The deletion limit also asks about a recursive deletion
+of a placeholder (`find / -exec rm -rf {} \;`, `parallel rm -rf {} :::`; a word holding `{` and
+`}` is unresolved, a brace expansion too) and of what `xargs` or `parallel` reads from its input
+(`echo / | xargs rm -rf`). A `cd` that a program runs (`find -exec cd`, `ssh host cd`) only adds
+a place a relative operand may resolve against; only a `cd` in the call's own shell moves the
+first place.
+
+**The change: unreadable commands.** While the user has a deny or ask rule on the shell with a
+pattern, a call that starts a command kGraf cannot read is asked about in every mode, Bypass
+included (`hard_limit`): the question names the command and the rule it cannot be checked
+against. A rule with no pattern already matches every call. With no such rule, the mode decides
+as for any command; no grant covers it (below), so Manual, Accept edits and Auto ask, the
+orchestrator decides in Orchestrator decides, and Bypass runs it.
+
+**The change: grants.** `programs_to_grant` lists every program a command runs that a grant must
+name: each wrapper, the program after it, each word that may be an option's value or the program
+(`sudo -u bob curl` names `bob`, which errs toward asking; a number does not count), and every
+command of a script a program hands to a shell, read by the strict reader. It refuses outright,
+so no program grant covers: a command run on another machine (`ssh HOST CMD`), the exec wrappers
+`watch`, `setsid`, `ionice` and `flock`, `find` with `-exec`, `-execdir`, `-ok`, `-okdir` or
+`-delete`, an unreadable command, and a script the strict reader does not judge. Claude Code
+does the same for the exec wrappers and the `find` actions: a prefix rule never approves them,
+only an exact rule for the whole command line, and kGraf's grants name programs, never command
+lines. The command policy (`ExecPolicy::evaluate`, `script_verdict`, `record_mode_grant`) and
+`route_ask` grant a command only when a grant covers every listed program, each from the
+contract or the mode. A grant of `env` grants `env curl x` only with `curl` granted too; a
+grant of `sh` and `curl` grants `sh -c 'curl x'`; a script is still granted command by command
+with the shell itself ungranted, as before. A recorded mode grant names every program the mode
+granted. The strict reader's cross-check against `simple_commands` counts the commands of the
+script's own shell and of a nested shell, as before, but not a command another program starts
+from its arguments: the grant check of the command that starts it covers that one, so
+`sh -c 'uv run pytest'` is granted when `uv` and `pytest` are.
+
+**The change: `forbid` rules.** A `forbid` rule of the command policy also refuses its shape in
+every command the call starts (`sh -c 'git push --force'`, `find . -exec git push --force \;`,
+`su -c`, `ssh HOST CMD`), in Bypass too, and names that command the way a script's refused
+command is named (`the script runs `git` (...)`), so the refusal names its program.
+
+**Compared with Claude Code.** Claude Code strips `timeout`, `time`, `nice`, `nohup`, `stdbuf`,
+`command`, `builtin`, `noglob` and bare `xargs` before matching, does not match a deny rule
+inside `sh -c` or `bash -c`, and does not approve `watch`, `setsid`, `ionice`, `flock` or
+`find -exec` / `-delete` by a prefix rule (Claude Code documentation, "Configure permissions",
+Bash section, read 2026-10-06). kGraf is at least as strict on each point: a rule matches inside
+every script and every command a program runs, a wrapper needs its own grant where Claude Code
+strips it, and the same exec wrappers and `find` actions are never granted. kGraf is never
+looser.
+
+**Cost.** Broad by design, and each cost errs toward asking. A command that sources a file
+(`. ./venv/bin/activate && pytest`) asks in every mode while any shell rule with a pattern
+exists. A user who allowed `uv`, `env` or `timeout` now also needs the program it runs in the
+allow set. `ssh HOST CMD` is never granted by a program grant. A command named by a variable,
+and a program an interpreter runs from its own code (`python3 x.py`, `npm run test`, `make`),
+are still not read as commands: kGraf does not read program code.
+
+Evidence: `kgraf-tools` (`tests/inner_programs.rs`:
+`a_deny_rule_refuses_the_inner_program_in_every_mode`,
+`a_deny_rule_does_not_refuse_another_inner_program_or_data`,
+`an_unreadable_inner_command_is_asked_about_and_never_granted`,
+`a_grant_of_the_outer_program_does_not_grant_the_inner_one`,
+`a_command_runs_when_every_program_it_runs_is_granted`,
+`a_forbid_rule_sees_the_inner_command_in_bypass`, each over every mode through the rules hook,
+the command policy and the ask routing; `permissions_prefix_tests.rs`:
+`simple_commands_read_a_program_given_as_an_argument`,
+`unreadable_commands_name_a_file_an_input_or_a_remote_shell`,
+`programs_to_grant_lists_every_program_a_command_runs`,
+`a_numeric_operand_is_the_wrappers_operand`,
+`the_deletion_limit_sees_a_deleter_given_as_an_argument`, and the unchanged
+`no_previously_refused_command_of_the_corpus_is_now_allowed`; `execpolicy/policy.rs`:
+`a_different_spelling_of_a_forbidden_shape_falls_to_prompt_not_allow`, which now expects
+`sh -c 'rm -rf /'` to be refused); `kgraf-host` (`rule_conflicts.rs`:
+`a_program_given_as_an_argument_is_found_and_named`). Each regression test fails with the change
+reverted and passes with it restored.

@@ -323,7 +323,9 @@ pub struct UserRules {
 /// What Auto grants without asking.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AllowSet {
-    /// Shell programs, each an exact `argv[0]`.
+    /// Shell programs, each an exact program word. A command is granted only
+    /// when every program it runs is listed ([`programs_to_grant`]): `env`
+    /// listed grants `env curl` only with `curl` listed too.
     pub programs: BTreeSet<String>,
     /// Tools by wire name, or an MCP server's tools (`mcp__<server>`,
     /// `mcp__<server>__*`). Read through [`AllowSet::with_tools`].
@@ -1628,8 +1630,10 @@ impl PermissionControl {
         self.mode() == PermissionMode::Bypass
     }
 
-    /// Whether the current mode lets the shell run `program` as a granted,
-    /// confined command: Auto's allow set, or Accept edits' file programs.
+    /// Whether the current mode grants the one program `program`: Auto's
+    /// allow set, or Accept edits' file programs. A command runs on grants
+    /// only when every program it runs is granted ([`programs_to_grant`]);
+    /// a grant of `env` or `sh` grants nothing they run.
     pub fn policy_grants_program(&self, program: &str) -> Option<&'static str> {
         let s = self.state();
         match s.settings.mode {
@@ -1668,11 +1672,13 @@ impl PermissionControl {
             PermissionMode::OrchestratorDecides => AskRoute::Grant { by: "orchestrator" },
             PermissionMode::Auto => {
                 let allow = &s.settings.allow;
+                // Every program the command runs needs its own entry: an
+                // entry for `env` or `sh` grants nothing they run.
                 let granted = allow.allows_tool(tool)
                     || (tool == "shell"
-                        && shell_argv(input)
-                            .first()
-                            .is_some_and(|p| allow.allows_program(p)))
+                        && programs_to_grant(&shell_argv(input)).is_ok_and(|ps| {
+                            !ps.is_empty() && ps.iter().all(|p| allow.allows_program(p))
+                        }))
                     || (FILE_EDIT_TOOLS.contains(&tool) && {
                         let paths = file_paths(tool, input);
                         !paths.is_empty() && paths.iter().all(|p| allow.allows_path(p))
@@ -1686,9 +1692,12 @@ impl PermissionControl {
             PermissionMode::AcceptEdits => {
                 let edit = FILE_EDIT_TOOLS.contains(&tool)
                     || (tool == "shell"
-                        && shell_argv(input)
-                            .first()
-                            .is_some_and(|p| FILE_EDIT_PROGRAMS.contains(&base_name(p))));
+                        && programs_to_grant(&shell_argv(input)).is_ok_and(|ps| {
+                            !ps.is_empty()
+                                && ps
+                                    .iter()
+                                    .all(|p| FILE_EDIT_PROGRAMS.contains(&base_name(p)))
+                        }));
                 if edit {
                     AskRoute::Grant { by: "mode" }
                 } else {
@@ -1779,70 +1788,610 @@ fn file_paths(tool: &str, input: &serde_json::Value) -> Vec<String> {
 /// Shell interpreters whose `-c` script is read as commands.
 const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "fish"];
 
-/// How deep [`simple_commands`] follows a shell started inside a script
-/// (`sh -c "bash -c 'curl x'"`). Each level's script is a strict part of the
-/// level above, so real commands stop long before this; the bound only keeps
-/// recursion finite.
+/// How deep [`simple_commands`] follows a command started by another
+/// (`sh -c "bash -c 'curl x'"`, `find . -exec sh -c 'curl x' \;`). Each
+/// level is a strict part of the level above, so real commands stop long
+/// before this; the bound only keeps recursion finite.
 const MAX_SHELL_DEPTH: usize = 32;
 
 /// Every simple command a shell call runs, as argv lists: the call's argv
-/// itself and, for `sh -c SCRIPT` (or `-lc`, `-ec`), each command of the
-/// script split on `;`, `&&`, `||`, `|`, `&` and newlines. The shell may stand
-/// after prefix words ([`command_starts`]: `env sh -c ...`, `nohup bash -c
-/// ...`), and a shell or an `eval` started by a command of the script is
-/// split the same way, its commands listed after the command that starts it.
-/// A script that
-/// cannot be split (unbalanced quotes) yields its words split on whitespace,
-/// so a rule still sees them.
+/// itself and every command it starts ([`Embedded`]): for `sh -c SCRIPT` (or
+/// `-lc`, `-ec`) and `eval`, each command of the script split on `;`, `&&`,
+/// `||`, `|`, `&` and newlines; the argv a program runs from its arguments
+/// (`find -exec PROG ... ;`, `script FILE PROG`, `uv run PROG`); and the
+/// script text a program hands to a shell (`su -c`, `ssh HOST CMD`, `script
+/// -c`, `trap CMD SIG`, `watch CMD`, `flock F -c`, `env -S`, `parallel CMD
+/// :::`). The starting program may stand after prefix words
+/// ([`command_starts`]: `env sh -c ...`, `nohup bash -c ...`), and each
+/// command found is read the same way, its commands listed after it. A
+/// script that cannot be split (unbalanced quotes) yields its words split on
+/// whitespace, so a rule still sees them. What a call starts that kGraf
+/// cannot read (`source FILE`) is listed by [`unreadable_commands`].
 pub fn simple_commands(argv: &[String]) -> Vec<Vec<String>> {
-    nested_commands(argv).into_iter().map(|(_, c)| c).collect()
+    read_call(argv)
+        .commands
+        .into_iter()
+        .map(|c| c.words)
+        .collect()
 }
 
-/// [`simple_commands`] with each command's depth: 0 for the call's argv, 1
-/// for a command of its script, 2 for a command of a script a depth-1
-/// command starts, and so on.
-fn nested_commands(argv: &[String]) -> Vec<(usize, Vec<String>)> {
-    let mut out = vec![(0, argv.to_vec())];
-    push_script_commands(argv, 1, &mut out);
-    out
+/// What a call starts that kGraf cannot read, each as the reason
+/// ([`Embedded::Unreadable`]): `source FILE`, `. FILE`, a shell given a file
+/// or its input instead of `-c`, `ssh HOST` with no command, `su` with no
+/// command. Empty when every command the call runs is in
+/// [`simple_commands`].
+pub fn unreadable_commands(argv: &[String]) -> Vec<String> {
+    read_call(argv).unreadable
 }
 
-fn push_script_commands(words: &[String], depth: usize, out: &mut Vec<(usize, Vec<String>)>) {
+/// One command of a call, from [`read_call`].
+struct Nested {
+    /// 0 for the call's argv, 1 for a command it starts, and so on.
+    depth: usize,
+    words: Vec<String>,
+    /// Whether the command runs in the shell of the command that started
+    /// it: the call itself, or a command of a `sh -c` or `eval` script. A
+    /// `cd` anywhere else (`find -exec cd`, `ssh host cd`) moves no later
+    /// command.
+    same_shell: bool,
+}
+
+/// A call read as every command it runs ([`simple_commands`]) and what it
+/// starts that cannot be read ([`unreadable_commands`]).
+struct CallReading {
+    commands: Vec<Nested>,
+    unreadable: Vec<String>,
+}
+
+fn read_call(argv: &[String]) -> CallReading {
+    let mut reading = CallReading {
+        commands: vec![Nested {
+            depth: 0,
+            words: argv.to_vec(),
+            same_shell: true,
+        }],
+        unreadable: Vec::new(),
+    };
+    push_embedded(argv, 1, &mut reading);
+    reading
+}
+
+fn push_embedded(words: &[String], depth: usize, reading: &mut CallReading) {
     if depth > MAX_SHELL_DEPTH {
         return;
     }
-    let Some(script) = shell_script(words) else {
-        return;
-    };
-    for segment in split_script(&script) {
-        let words = shlex::split(&segment)
-            .unwrap_or_else(|| segment.split_whitespace().map(str::to_owned).collect());
-        if !words.is_empty() {
-            out.push((depth, words.clone()));
-            push_script_commands(&words, depth + 1, out);
+    for (at, found) in embedded(words) {
+        match found {
+            Embedded::Argv(argv) => {
+                reading.commands.push(Nested {
+                    depth,
+                    words: argv.clone(),
+                    same_shell: false,
+                });
+                push_embedded(&argv, depth + 1, reading);
+            }
+            Embedded::Script(script) => {
+                let b = base_name(&words[at]);
+                let same_shell = b == "eval" || SHELLS.contains(&b);
+                for segment in split_script(&script) {
+                    let words = shlex::split(&segment)
+                        .unwrap_or_else(|| segment.split_whitespace().map(str::to_owned).collect());
+                    if !words.is_empty() {
+                        reading.commands.push(Nested {
+                            depth,
+                            words: words.clone(),
+                            same_shell,
+                        });
+                        push_embedded(&words, depth + 1, reading);
+                    }
+                }
+            }
+            Embedded::Unreadable(why) => {
+                if !reading.unreadable.contains(&why) {
+                    reading.unreadable.push(why);
+                }
+            }
         }
     }
 }
 
-/// The script a command runs, when its program, at any place
-/// [`command_starts`] lists, is a shell of [`SHELLS`] (the word after the
-/// first short option holding `c`) or `eval` (its arguments joined with
-/// spaces, as `eval` joins them).
-fn shell_script(words: &[String]) -> Option<String> {
-    let at = command_starts(words).into_iter().find(|&i| {
-        let b = base_name(&words[i]);
-        b == "eval" || SHELLS.contains(&b)
-    })?;
-    if base_name(&words[at]) == "eval" {
-        return Some(words[at + 1..].join(" "));
+/// What a command runs besides its own program, read from its arguments
+/// (decision 0094, amended 2026-10-06).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Embedded {
+    /// An argv run as a command: `find -exec PROG ARGS ;`, `script FILE
+    /// PROG` (BSD), `direnv exec DIR PROG`, `uv run PROG`.
+    Argv(Vec<String>),
+    /// Text a shell reads as a script: `sh -c`, `eval`, `su -c`, `ssh HOST
+    /// CMD`, `script -c`, `trap CMD SIG`, `watch CMD`, `flock F -c`, `env
+    /// -S`, `parallel CMD :::`.
+    Script(String),
+    /// Commands kGraf cannot read, and why: a file (`source FILE`, `bash
+    /// FILE`), a shell's input (`bash` with no `-c`), a shell on another
+    /// machine (`ssh HOST`), an interactive shell (`su USER`, `script FILE`).
+    Unreadable(String),
+}
+
+/// What a word of a command is, as [`command_roles`] reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WordRole {
+    /// Shell syntax, an assignment, a redirection or its target, an option,
+    /// a number or a wrapper's operand: never a program.
+    Prefix,
+    /// A wrapper of [`WRAPPERS`]: a program that runs the rest.
+    Wrapper,
+    /// The value an option may take, or the program (`sudo -u bob curl`):
+    /// read as both.
+    ValueOrProgram,
+    /// The first word that is surely not a prefix: the program.
+    Program,
+}
+
+/// Every command a command's arguments start, each with the index of the
+/// word that starts it. Read at each place [`command_roles`] lists that may
+/// hold a program, so a wrapper hides none of them.
+fn embedded(words: &[String]) -> Vec<(usize, Embedded)> {
+    let mut out = Vec::new();
+    for (at, role) in command_roles(words) {
+        if role == WordRole::Prefix {
+            continue;
+        }
+        for found in embedded_at(words, at) {
+            out.push((at, found));
+        }
     }
-    let mut it = words[at + 1..].iter();
+    out
+}
+
+/// Programs that run their command on another machine: the command is read
+/// for the user's rules, and no local grant covers it.
+const REMOTE_RUNNERS: &[&str] = &["ssh"];
+
+/// Wrappers that run another command and that no program grant covers, as
+/// in Claude Code, where only an exact rule for the whole command line
+/// approves them; kGraf's grants name programs, never command lines.
+const EXEC_WRAPPERS: &[&str] = &["watch", "setsid", "ionice", "flock"];
+
+/// `find` actions that run a program or delete what is found. A grant of
+/// `find` covers none of them, as in Claude Code.
+const FIND_ACTIONS: &[&str] = &["-exec", "-execdir", "-ok", "-okdir", "-delete"];
+
+/// Programs that run a command given after a subcommand and that many
+/// operands: `direnv exec DIR PROG`, `uv run PROG`.
+const SUBCOMMAND_RUNNERS: &[(&str, &str, usize)] = &[
+    ("direnv", "exec", 1),
+    ("mise", "exec", 0),
+    ("mise", "x", 0),
+    ("devbox", "run", 0),
+    ("uv", "run", 0),
+    ("poetry", "run", 0),
+    ("pipenv", "run", 0),
+    ("bundle", "exec", 0),
+    ("conda", "run", 0),
+];
+
+/// The value of a `-c` option among `args`: the word after the first short
+/// option holding `c` (`-c CMD`, `-lc CMD`), or after a long name in `long`
+/// (`--command CMD`, `--command=CMD`). `None` when there is none.
+fn dash_c(args: &[String], long: &[&str]) -> Option<String> {
+    let mut it = args.iter();
     while let Some(arg) = it.next() {
-        if arg.starts_with('-') && arg.contains('c') && !arg.starts_with("--") {
+        for name in long {
+            if arg == name {
+                return it.next().cloned();
+            }
+            if let Some(v) = arg
+                .strip_prefix(name)
+                .and_then(|rest| rest.strip_prefix('='))
+            {
+                return Some(v.to_owned());
+            }
+        }
+        if arg.starts_with('-') && !arg.starts_with("--") && arg.contains('c') {
             return it.next().cloned();
         }
     }
     None
+}
+
+/// The string of `env -S STRING` (`--split-string`), which `env` splits into
+/// the command it runs.
+fn env_split_string(args: &[String]) -> Option<String> {
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        if arg == "-S" || arg == "--split-string" {
+            return it.next().cloned();
+        }
+        if let Some(v) = arg
+            .strip_prefix("--split-string=")
+            .or_else(|| arg.strip_prefix("-S").filter(|v| !v.is_empty()))
+        {
+            return Some(v.to_owned());
+        }
+    }
+    None
+}
+
+/// The values of the options `names` among `args`: a one-letter name as
+/// `-X VALUE` or `-XVALUE`, a longer one as `--NAME VALUE` or
+/// `--NAME=VALUE`.
+fn option_values(args: &[String], names: &[&str]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        for name in names {
+            let (exact, attached) = if name.len() == 1 {
+                (format!("-{name}"), format!("-{name}"))
+            } else {
+                (format!("--{name}"), format!("--{name}="))
+            };
+            if *arg == exact {
+                if let Some(v) = it.next() {
+                    out.push(v.clone());
+                }
+                break;
+            }
+            if let Some(v) = arg.strip_prefix(&attached).filter(|v| !v.is_empty()) {
+                out.push(v.to_owned());
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// The commands the program at `words[at]` starts from its arguments.
+fn embedded_at(words: &[String], at: usize) -> Vec<Embedded> {
+    let b = base_name(&words[at]);
+    let args = &words[at + 1..];
+    let unreadable = |why: &str| vec![Embedded::Unreadable(format!("`{b}` {why}"))];
+    // Each place a wrapper-like program's command may start, among
+    // `words[at..end]` (`watch -n 1 CMD`, `parallel -j 4 CMD`).
+    let tails = |end: usize| -> Vec<usize> {
+        command_roles(&words[at..end])
+            .into_iter()
+            .filter(|&(i, role)| {
+                i > 0
+                    && matches!(role, WordRole::ValueOrProgram | WordRole::Program)
+                    && words[at + i].parse::<f64>().is_err()
+            })
+            .map(|(i, _)| at + i)
+            .collect()
+    };
+    if b == "eval" {
+        return vec![Embedded::Script(args.join(" "))];
+    }
+    if SHELLS.contains(&b) {
+        if let Some(script) = dash_c(args, &[]) {
+            return vec![Embedded::Script(script)];
+        }
+        // Asked for its version or help, or to check a script's syntax, a
+        // shell runs nothing.
+        let inert = args
+            .iter()
+            .any(|a| matches!(a.as_str(), "--version" | "--help" | "-n" | "--noexec"));
+        return if inert {
+            Vec::new()
+        } else {
+            unreadable("reads its commands from a file or its input")
+        };
+    }
+    match b {
+        "find" => {
+            let mut out = Vec::new();
+            let mut i = 0;
+            while i < args.len() {
+                if matches!(args[i].as_str(), "-exec" | "-execdir" | "-ok" | "-okdir") {
+                    let end = args[i + 1..]
+                        .iter()
+                        .position(|w| matches!(w.as_str(), ";" | "\\;" | "+"))
+                        .map_or(args.len(), |p| i + 1 + p);
+                    if end > i + 1 {
+                        out.push(Embedded::Argv(args[i + 1..end].to_vec()));
+                    }
+                    i = end + 1;
+                } else {
+                    i += 1;
+                }
+            }
+            out
+        }
+        "su" | "runuser" => match dash_c(args, &["--command", "--session-command"]) {
+            Some(script) => vec![Embedded::Script(script)],
+            // `runuser -u USER PROG` runs PROG as an argv, which the wrapper
+            // scan reads; `su USER` and `runuser USER` start a shell.
+            None if b == "runuser" && args.iter().any(|a| a == "-u" || a == "--user") => Vec::new(),
+            None => unreadable("with no `-c` command starts a shell that reads its input"),
+        },
+        "sg" => {
+            // `sg GROUP [-c] CMD`: the command is a script.
+            let rest: Vec<&str> = args
+                .iter()
+                .skip(1)
+                .map(String::as_str)
+                .filter(|a| *a != "-c")
+                .collect();
+            if rest.is_empty() {
+                unreadable("with no command starts a shell that reads its input")
+            } else {
+                vec![Embedded::Script(rest.join(" "))]
+            }
+        }
+        "ssh" => {
+            // Options that take a value, as `ssh(1)` lists them.
+            const VALUED: &str = "BbcDEeFIiJLlmOoPpQRSWw";
+            let mut i = 0;
+            while let Some(a) = args.get(i) {
+                if a == "--" {
+                    i += 1;
+                    break;
+                }
+                let Some(flags) = a.strip_prefix('-').filter(|f| !f.is_empty()) else {
+                    break;
+                };
+                i += 1;
+                // A valued option's value is the rest of its word, or the
+                // next word when the option ends its word.
+                if let Some(k) = flags.find(|c| VALUED.contains(c))
+                    && k + 1 == flags.len()
+                {
+                    i += 1;
+                }
+            }
+            // `-o ProxyCommand=CMD` and `-o LocalCommand=CMD` run CMD on
+            // this machine, through a shell.
+            let mut out: Vec<Embedded> = option_values(args, &["o"])
+                .into_iter()
+                .filter_map(|v| {
+                    let (key, value) = v.split_once(['=', ' '])?;
+                    matches!(
+                        key.to_ascii_lowercase().as_str(),
+                        "proxycommand" | "localcommand"
+                    )
+                    .then(|| Embedded::Script(value.trim_start_matches('=').trim().to_owned()))
+                })
+                .collect();
+            match args.get(i + 1..) {
+                Some(rest) if !rest.is_empty() => out.push(Embedded::Script(rest.join(" "))),
+                _ => out.extend(unreadable(
+                    "with no command starts a shell on another machine",
+                )),
+            }
+            out
+        }
+        // Options whose value is a program the command runs: ripgrep's
+        // preprocessor, tar's filters and scripts, rsync's remote shell.
+        "rg" | "ripgrep" => option_values(args, &["pre", "hostname-bin"])
+            .into_iter()
+            .map(|v| Embedded::Argv(vec![v]))
+            .collect(),
+        "tar" | "gtar" | "bsdtar" => {
+            let mut out: Vec<Embedded> = option_values(
+                args,
+                &[
+                    "to-command",
+                    "use-compress-program",
+                    "I",
+                    "rsh-command",
+                    "info-script",
+                    "new-volume-script",
+                    "F",
+                ],
+            )
+            .into_iter()
+            .map(Embedded::Script)
+            .collect();
+            out.extend(
+                option_values(args, &["checkpoint-action"])
+                    .into_iter()
+                    .filter_map(|v| {
+                        v.strip_prefix("exec=")
+                            .map(|c| Embedded::Script(c.to_owned()))
+                    }),
+            );
+            out
+        }
+        "rsync" => option_values(args, &["e", "rsh"])
+            .into_iter()
+            .map(Embedded::Script)
+            .collect(),
+        "script" => {
+            if let Some(cmd) = dash_c(args, &["--command"]) {
+                return vec![Embedded::Script(cmd)];
+            }
+            // BSD and macOS: `script [-q] [FILE [PROG ARGS]]`. Options that
+            // take a value, util-linux's and BSD's, skip it.
+            const VALUED: &[&str] = &["-E", "-I", "-O", "-B", "-T", "-m", "-o", "-F", "-t"];
+            let mut i = 0;
+            while let Some(a) = args.get(i) {
+                if a == "--" {
+                    i += 1;
+                    break;
+                }
+                if !a.starts_with('-') {
+                    break;
+                }
+                i += if VALUED.contains(&a.as_str()) { 2 } else { 1 };
+            }
+            match args.get(i + 1..) {
+                Some(rest) if !rest.is_empty() => vec![Embedded::Argv(rest.to_vec())],
+                _ => unreadable("with no command starts an interactive shell"),
+            }
+        }
+        "trap" => {
+            let args: Vec<&String> = args.iter().filter(|a| *a != "--").collect();
+            match args.as_slice() {
+                [handler, _signal, ..]
+                    if !handler.is_empty()
+                        && !handler.starts_with('-')
+                        && handler.parse::<u32>().is_err() =>
+                {
+                    vec![Embedded::Script((*handler).clone())]
+                }
+                _ => Vec::new(),
+            }
+        }
+        "source" | "." => unreadable("runs the commands of a file"),
+        "env" => env_split_string(args)
+            .map(|s| vec![Embedded::Script(s)])
+            .unwrap_or_default(),
+        // `flock FILE -c CMD`; `flock FILE PROG ARGS` is read by the wrapper
+        // scan.
+        "flock" => dash_c(args.get(1..).unwrap_or_default(), &["--command"])
+            .map(|s| vec![Embedded::Script(s)])
+            .unwrap_or_default(),
+        "watch" => {
+            // `watch` hands its command words, joined, to `sh -c`; with
+            // `-x` it runs them as an argv, which the wrapper scan reads.
+            if args.iter().any(|a| a == "-x" || a == "--exec") {
+                return Vec::new();
+            }
+            tails(words.len())
+                .into_iter()
+                .map(|p| Embedded::Script(words[p..].join(" ")))
+                .collect()
+        }
+        "parallel" => {
+            let sep = |w: &String| matches!(w.as_str(), ":::" | "::::" | ":::+" | "::::+");
+            let end = words[at..]
+                .iter()
+                .position(sep)
+                .map_or(words.len(), |p| at + p);
+            // GNU parallel hands its command, joined, to a shell.
+            let commands: Vec<Embedded> = tails(end)
+                .into_iter()
+                .map(|p| Embedded::Script(words[p..end].join(" ")))
+                .collect();
+            if !commands.is_empty() {
+                return commands;
+            }
+            // No command: each input is a command. Inputs from a file or
+            // from standard input cannot be read.
+            if end == words.len() || words[end..].iter().any(|w| w.starts_with("::::")) {
+                return unreadable(
+                    "with no command runs the commands it reads from its input or a file",
+                );
+            }
+            words[end..]
+                .iter()
+                .filter(|w| !sep(w))
+                .map(|w| Embedded::Script(w.clone()))
+                .collect()
+        }
+        "sudo" | "doas" => {
+            // `sudo -s` and `sudo -i` with no command start a shell.
+            let shell = args
+                .iter()
+                .any(|a| matches!(a.as_str(), "-s" | "-i" | "--shell" | "--login"));
+            if shell && tails(words.len()).is_empty() {
+                unreadable("starts a shell that reads its input")
+            } else {
+                Vec::new()
+            }
+        }
+        _ => SUBCOMMAND_RUNNERS
+            .iter()
+            .find(|(p, sub, _)| *p == b && args.first().is_some_and(|a| a == sub))
+            .map(|&(_, _, operands)| {
+                let tail = args.get(1 + operands..).unwrap_or_default();
+                command_roles(tail)
+                    .into_iter()
+                    .filter(|&(_, role)| {
+                        matches!(role, WordRole::ValueOrProgram | WordRole::Program)
+                    })
+                    .map(|(i, _)| Embedded::Argv(tail[i..].to_vec()))
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
+/// Every program a command runs that a program grant must name, in order,
+/// or why no program grant covers the command (decision 0094, amended
+/// 2026-10-06). A grant of a program that runs another (`env`, `xargs`,
+/// `sudo`, `sh -c`, `su -c`) does not grant what it runs: each wrapper, the
+/// program it runs, every word that may be either (`sudo -u bob curl` names
+/// `bob` too, which errs toward asking) and every command of a script it
+/// hands to a shell (read by the strict reader, [`script_commands`]) is
+/// listed. Refused: a command started on another machine
+/// ([`REMOTE_RUNNERS`]), the exec wrappers ([`EXEC_WRAPPERS`]), `find` with
+/// an action of [`FIND_ACTIONS`], a command kGraf cannot read
+/// ([`unreadable_commands`]) and a script the strict reader does not judge.
+pub fn programs_to_grant(words: &[String]) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    collect_programs_to_grant(words, 0, &mut out)?;
+    Ok(out)
+}
+
+fn collect_programs_to_grant(
+    words: &[String],
+    depth: usize,
+    out: &mut Vec<String>,
+) -> Result<(), String> {
+    if depth > MAX_SHELL_DEPTH {
+        return Err("its commands nest too deeply to read".into());
+    }
+    for (at, role) in command_roles(words) {
+        let w = &words[at];
+        let named = match role {
+            WordRole::Prefix => false,
+            WordRole::Wrapper | WordRole::Program => true,
+            WordRole::ValueOrProgram => w.parse::<f64>().is_err(),
+        };
+        if !named {
+            continue;
+        }
+        let b = base_name(w);
+        if REMOTE_RUNNERS.contains(&b) {
+            return Err(format!(
+                "`{b}` runs its command on another machine, and no grant covers that"
+            ));
+        }
+        if EXEC_WRAPPERS.contains(&b) {
+            return Err(format!(
+                "`{b}` runs another command, and a program grant never covers it"
+            ));
+        }
+        if b == "find"
+            && words[at + 1..]
+                .iter()
+                .any(|a| FIND_ACTIONS.contains(&a.as_str()))
+        {
+            return Err(
+                "`find` with `-exec`, `-execdir`, `-ok`, `-okdir` or `-delete` does more than a \
+                 grant of `find` covers"
+                    .into(),
+            );
+        }
+        if !out.contains(w) {
+            out.push(w.clone());
+        }
+        for found in embedded_at(words, at) {
+            match found {
+                Embedded::Argv(argv) => collect_programs_to_grant(&argv, depth + 1, out)?,
+                Embedded::Script(script) => {
+                    let as_script = ["sh".to_owned(), "-c".to_owned(), script];
+                    match strict_script_commands(&as_script) {
+                        Script::Commands(commands) => {
+                            for c in commands {
+                                collect_programs_to_grant(&c, depth + 1, out)?;
+                            }
+                        }
+                        Script::Unjudged(why) => {
+                            return Err(format!(
+                                "the script `{b}` runs is not judged command by command: {why}"
+                            ));
+                        }
+                        Script::NotAScript => {
+                            return Err(format!("`{b}` runs a script kGraf cannot read"));
+                        }
+                    }
+                }
+                Embedded::Unreadable(why) => return Err(why),
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Split a script on command separators outside quotes.
@@ -1940,11 +2489,28 @@ const WRAPPERS: &[&str] = &[
     "watch",
     "strace",
     "ltrace",
+    "valgrind",
+    "parallel",
+    "runuser",
+    "pkexec",
+    "unshare",
+    "nsenter",
+    "setpriv",
+    "firejail",
+    "torsocks",
+    "proxychains",
+    "proxychains4",
+    "sandbox-exec",
+    "arch",
+    "systemd-run",
+    "dbus-run-session",
+    "faketime",
 ];
 
 /// Wrappers whose first operand comes before the command they run
-/// (`timeout 5s curl`, `chroot /srv curl`, `flock /tmp/l curl`).
-const OPERAND_WRAPPERS: &[&str] = &["timeout", "chroot", "flock", "taskset", "chrt"];
+/// (`timeout 5s curl`, `chroot /srv curl`, `flock /tmp/l curl`, `faketime
+/// 2020-01-01 curl`).
+const OPERAND_WRAPPERS: &[&str] = &["timeout", "chroot", "flock", "taskset", "chrt", "faketime"];
 
 /// The text after a redirection operator at the start of `word` (`2>`,
 /// `>>`, `&>`, `<`, `>&`): empty when the target is the next word, `None`
@@ -1973,46 +2539,58 @@ fn redirection(word: &str) -> Option<&str> {
 /// the command policy's `forbid` rules, so a prefix word hides a program from
 /// none of them.
 pub(crate) fn command_starts<S: AsRef<str>>(words: &[S]) -> Vec<usize> {
-    let mut starts = Vec::new();
+    command_roles(words).into_iter().map(|(i, _)| i).collect()
+}
+
+/// [`command_starts`] with what each listed word is ([`WordRole`]). The last
+/// entry is the program ([`WordRole::Program`]) unless every word is a prefix
+/// word.
+fn command_roles<S: AsRef<str>>(words: &[S]) -> Vec<(usize, WordRole)> {
+    let mut roles = Vec::new();
     // Local mutable state, scoped to one scan: what the previous word asked
     // of this one.
     let (mut operand_due, mut value_due, mut target_due) = (false, false, false);
     for (i, w) in words.iter().enumerate() {
         let w = w.as_ref();
-        starts.push(i);
         let b = base_name(w);
-        let prefix = if target_due {
+        let role = if target_due {
             target_due = false;
-            true
+            WordRole::Prefix
         } else if COMMAND_SYNTAX.contains(&w) {
-            true
+            WordRole::Prefix
         } else if let Some(rest) = redirection(w) {
             target_due = rest.is_empty();
-            true
+            WordRole::Prefix
         } else if w.contains('=') {
             // `VAR=value`, and anything else holding `=` (`--opt=v`).
-            true
+            WordRole::Prefix
         } else if WRAPPERS.contains(&b) {
             operand_due = OPERAND_WRAPPERS.contains(&b);
             value_due = false;
-            true
+            WordRole::Wrapper
         } else if w.starts_with('-') {
             value_due = true;
-            true
+            WordRole::Prefix
         } else if value_due {
             value_due = false;
-            true
+            WordRole::ValueOrProgram
         } else if w.parse::<f64>().is_ok() {
-            true
+            // A number is a wrapper's operand when one is due
+            // (`timeout 5 curl`).
+            operand_due = false;
+            WordRole::Prefix
+        } else if std::mem::take(&mut operand_due) {
+            // A wrapper's operand (`timeout 5s`), once.
+            WordRole::Prefix
         } else {
-            // A wrapper's operand (`timeout 5s`), once; otherwise the program.
-            std::mem::take(&mut operand_due)
+            WordRole::Program
         };
-        if !prefix {
+        roles.push((i, role));
+        if role == WordRole::Program {
             break;
         }
     }
-    starts
+    roles
 }
 
 /// Whether a command names a directory changer ([`DIRECTORY_CHANGERS`]) in
@@ -2258,11 +2836,16 @@ fn strict_script_commands(argv: &[String]) -> Script {
         Err(why) => return Script::Unjudged(why),
     };
     // The user's rules match `simple_commands`; a script it splits otherwise
-    // is not judged here.
-    let theirs: Vec<Option<String>> = simple_commands(argv)
+    // is not judged here. A command another program starts from its
+    // arguments (`find -exec`, `su -c`) is not a command of this shell: the
+    // grant of the command that starts it covers it ([`programs_to_grant`]).
+    // A nested shell's commands are, and leave the script unjudged.
+    let theirs: Vec<Option<String>> = read_call(argv)
+        .commands
         .iter()
         .skip(1)
-        .map(|c| program_of_command(c).map(str::to_owned))
+        .filter(|c| c.same_shell)
+        .map(|c| program_of_command(&c.words).map(str::to_owned))
         .collect();
     let mine: Vec<Option<String>> = commands.iter().map(|c| c.first().cloned()).collect();
     if theirs != mine {
@@ -3457,7 +4040,12 @@ pub fn critical_deletion(
         Some(ws) => Cwd::Known(ws.to_path_buf()),
         None => Cwd::NoWorkspace,
     }];
-    for (depth, command) in nested_commands(argv) {
+    for Nested {
+        depth,
+        words: command,
+        same_shell,
+    } in read_call(argv).commands
+    {
         let words: Vec<&str> = command.iter().map(String::as_str).collect();
         let starts = command_starts(&words);
         if let Some(&at) = starts
@@ -3468,7 +4056,7 @@ pub fn critical_deletion(
                 .iter()
                 .map(|c| change_directory(c, &words[at..], home))
                 .collect();
-            let plain = depth <= 1 && at == 0 && base_name(words[0]) == "cd";
+            let plain = depth <= 1 && same_shell && at == 0 && base_name(words[0]) == "cd";
             if plain {
                 for c in cwds.iter_mut() {
                     *c = cd(c, words.get(1).copied(), home);
@@ -3517,6 +4105,23 @@ pub fn critical_deletion(
                         && !w.starts_with("--")
                         && (w.contains('r') || w.contains('R')))
             });
+        // `xargs rm -rf` and `parallel rm -rf` take more operands from
+        // their input, which kGraf cannot see.
+        if recursive
+            && words[..at]
+                .iter()
+                .any(|w| matches!(base_name(w), "xargs" | "parallel"))
+        {
+            ask.get_or_insert(HardLimit::Ask(format!(
+                "{DELETES_LEAD}what `{}` reads from its input recursively, and kGraf cannot tell \
+                 what it names; allow it?",
+                words[..at]
+                    .iter()
+                    .rev()
+                    .find(|w| matches!(base_name(w), "xargs" | "parallel"))
+                    .map_or("xargs", |w| base_name(w))
+            )));
+        }
         let mut operands_only = false;
         for w in rest {
             if !operands_only && *w == "--" {
@@ -3654,7 +4259,10 @@ fn classify(word: &str, home: Option<&Path>, cwd: &Cwd, workspace: Option<&Path>
     }
     // `~` and `$HOME` name the home directory.
     let w = expand_home(word, home).unwrap_or_else(|| word.to_owned());
-    if w.contains('$') || w.contains('`') {
+    // A variable, a substitution, or a placeholder another program fills in
+    // (`find -exec rm -rf {} ;`, `parallel rm -rf {} :::`, a brace
+    // expansion) names what kGraf cannot see.
+    if w.contains('$') || w.contains('`') || (w.contains('{') && w.contains('}')) {
         return Target::Unresolved(word.to_owned());
     }
     let path = PathBuf::from(&w);
@@ -3775,6 +4383,24 @@ pub fn hard_limit(
     if let Some(rule) = rules.ask.iter().find(|r| r.matches(&call.tool, &subjects)) {
         return Some(HardLimit::Ask(format!(
             "your ask rule `{}` asks about this call in every permission mode; allow it?",
+            rule.text()
+        )));
+    }
+    // A command kGraf cannot read (`source FILE`, `bash FILE`, `ssh HOST`)
+    // may run what a shell rule names, so while the user has one the call is
+    // asked about in every mode, Bypass too (decision 0094, amended
+    // 2026-10-06). A rule with no pattern already matched above.
+    if call.tool == "shell"
+        && let Some(why) = unreadable_commands(&shell_argv(&call.input)).first()
+        && let Some((kind, rule)) = rules
+            .deny
+            .iter()
+            .map(|r| ("deny", r))
+            .chain(rules.ask.iter().map(|r| ("ask", r)))
+            .find(|(_, r)| r.names_tool("shell") && r.pattern.is_some())
+    {
+        return Some(HardLimit::Ask(format!(
+            "{why}, so kGraf cannot check what it runs against your {kind} rule `{}`; allow it?",
             rule.text()
         )));
     }

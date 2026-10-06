@@ -294,3 +294,17 @@ Tests: `kgraf-orchestrator` `shortfall.rs`
 `a_refusal_beside_a_failing_check_is_never_called_verified`,
 `a_vacuous_check_is_unverified_and_a_real_one_is_not`, and
 `a_held_shortfall_whose_in_scope_result_verifies_is_merged_and_kept_as_a_fact`.
+
+## Amendment (2026-10-06): a program granted to a contract grants nothing it runs
+
+A program granted to a contract is still an exact program word, but it now covers that program
+only, never what it runs (decision 0094, amendment of 2026-10-06). A command runs on grants only
+when every program it runs is granted, each by the contract or the user's mode: a grant of `env`
+or `xargs` covers `env curl x` or `xargs curl` only with `curl` granted too, and no program grant
+covers `ssh HOST CMD`, `watch`, `setsid`, `ionice`, `flock` with a command, `find` with `-exec`,
+`-execdir`, `-ok`, `-okdir` or `-delete`, or a command kGraf cannot read (`source FILE`).
+
+Tests: `kgraf-tools` `tests/inner_programs.rs`
+`a_grant_of_the_outer_program_does_not_grant_the_inner_one` and
+`a_command_runs_when_every_program_it_runs_is_granted`, each with the grant made to the contract
+in every mode.
