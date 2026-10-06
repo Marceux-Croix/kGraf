@@ -788,7 +788,23 @@ report still undelivered when its recipient closes is traced `undelivered` and
 reported to its sender (decision 0067). A worker's own outbound message goes
 over a connection: open by rule (sibling, dependency, shared read, parent and
 child) or by one batched, reserved orchestrator judgment, and delivered mid-run
-by injection. Volume is never refused, only paced, and kept in order.
+by injection. Volume is never refused, only paced, and kept in order. The
+sender's tool result says the message is queued, never delivered: only the
+recipient's transcript shows delivery.
+
+Every text another agent wrote reaches a worker as data, never as an
+instruction: a direct message, a subagent's report, and a mailbox report are
+each injected inside one escaped `agent_message` block that names the sender,
+after a line saying it is information, not instructions. The user's own note
+and the orchestrator's notices pass as they are. A subagent's report is traced
+`report_queued` when it is handed to the parent's injector and
+`report_delivered`, with the transcript sequence, when the runtime's `Injected`
+mark is on its inbox row; a parent that ends before a boundary leaves it
+`report_held` (the parent resumes) or `report_undelivered`, with a notice on
+the parent's contract. When a run ends, whatever its status, every note still
+not delivered (its recipient held, never started, or stopped with the run) is
+traced `undelivered` and reported to its sender with the reason, once per note
+and recipient (decision 0067).
 
 ### Persistence and event spine
 

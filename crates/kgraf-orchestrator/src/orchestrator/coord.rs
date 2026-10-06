@@ -1922,27 +1922,98 @@ impl RunLoop {
     /// `undelivered` and reported to its sender, never lost silently.
     pub(super) fn report_undelivered_mail(&mut self, contract: &str, closure: &str) {
         let _ = self.settle_copies(true);
+        let why = format!(
+            "{contract} closed ({closure}) before a round boundary or a fresh brief carried it"
+        );
+        self.report_lost_mail(contract, &why);
+    }
+
+    /// The run ends (any status): every mailbox note still not delivered to
+    /// a recipient, and not reported already (its recipient closed first), is
+    /// traced `undelivered` and reported to its sender with the reason: the
+    /// recipient was held, never started, or the run stopped or ended first.
+    /// A recipient that is not running when the run ends is not a close, but
+    /// nothing carries the note any more in this run, so silence here would
+    /// lose it unseen. A later resume of the run can still deliver it; the
+    /// trace then shows that too.
+    pub(super) fn report_undelivered_mail_at_run_end(&mut self) {
+        let _ = self.settle_copies(true);
+        let mut recipients: BTreeSet<String> = BTreeSet::new();
+        for m in &self.record.coordination.mailbox.messages {
+            for a in &m.to {
+                if !m.delivered_to.contains(&a.contract)
+                    && !m.reported_undelivered.contains(&a.contract)
+                {
+                    recipients.insert(a.contract.clone());
+                }
+            }
+        }
+        for contract in recipients {
+            let why = self.why_undelivered_at_run_end(&contract);
+            self.report_lost_mail(&contract, &why);
+        }
+    }
+
+    /// How the run ended, for an `undelivered` reason.
+    pub(super) fn run_end_phrase(&self) -> &'static str {
+        match &self.record.status {
+            RunStatus::Stopped => "the run stopped",
+            RunStatus::Blocked { .. } => "the run ended blocked",
+            RunStatus::Completed => "the run completed",
+            RunStatus::Running => "the run ended",
+        }
+    }
+
+    /// Why a note to `contract` was not delivered by the end of the run.
+    fn why_undelivered_at_run_end(&self, contract: &str) -> String {
+        let ended = self.run_end_phrase();
+        match self.record.contract(contract) {
+            Some(c) => match &c.status {
+                // The hold's own reason can be a long gate log: its first
+                // 200 characters name it.
+                ContractStatus::Held { reason } => format!(
+                    "the recipient {contract} was held ({}) when {ended}, so no brief or round \
+                     boundary carried it",
+                    reason.chars().take(200).collect::<String>()
+                ),
+                _ if c.workers.is_empty() => {
+                    format!("the recipient {contract} never started before {ended}")
+                }
+                _ => format!(
+                    "{ended} before a round boundary or a fresh brief of {contract} carried it"
+                ),
+            },
+            None => {
+                format!("{ended} with the recipient {contract} not open, and nothing carried it")
+            }
+        }
+    }
+
+    /// Trace each note still undelivered to `contract`, and not reported for
+    /// it yet, as `undelivered` with `why`, and report it to its sender as a
+    /// notice on the sender's record. Each (note, recipient) is reported once.
+    fn report_lost_mail(&mut self, contract: &str, why: &str) {
         let lost: Vec<(String, String, AgentId)> = self
             .record
             .coordination
             .mailbox
             .undelivered(contract)
             .into_iter()
+            .filter(|m| !m.reported_undelivered.contains(contract))
             .map(|m| (m.id.clone(), m.from_contract.clone(), m.from_worker.clone()))
             .collect();
         let at = self.now();
         for (id, from, from_worker) in lost {
-            let why = format!(
-                "{contract} closed ({closure}) before a round boundary or a fresh brief \
-                 carried it"
-            );
+            if let Some(m) = self.record.coordination.mailbox.get_mut(&id) {
+                m.reported_undelivered.insert(contract.to_owned());
+            }
             self.queue(TraceEvent::Message {
                 at_ms: at,
                 id: id.clone(),
                 action: "undelivered".into(),
                 from: from.clone(),
                 to: vec![contract.to_owned()],
-                detail: why.clone(),
+                detail: why.to_owned(),
             });
             self.session_notice(
                 &from,

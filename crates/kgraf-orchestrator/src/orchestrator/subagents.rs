@@ -200,6 +200,13 @@ pub(super) struct Subagents {
     /// result's `changed_paths` when its finish is released.
     merged_paths: BTreeMap<AgentId, Vec<PathBuf>>,
     wakes: BTreeMap<String, Wake>,
+    /// Reports handed to a parent's injector (`report_queued`) and not yet
+    /// seen in its transcript: row id to parent. The runtime's `Injected`
+    /// mark on the inbox row makes it `report_delivered`; the parent's end
+    /// before a boundary makes it `report_held` or `report_undelivered`
+    /// ([`RunLoop::settle_reports`]). Loop-only: after a restart, adoption
+    /// offers an undelivered row again and it is queued anew.
+    queued_reports: BTreeMap<String, AgentId>,
     /// Adopted children waiting for a slot.
     restart: BTreeSet<AgentId>,
     /// Parents already given the soft-children notice.
@@ -702,14 +709,12 @@ impl RunLoop {
                     if item.id.starts_with(SUBAGENT_REPORT_PREFIX)
                         || item.id.starts_with(SUBAGENT_NOTICE_PREFIX)
                     {
-                        let injection = Injection {
-                            id: item.id.clone(),
-                            source: item.source,
-                            kind: item.kind,
-                            mode: item.mode,
-                            // The model's copy (decision 0071).
-                            text: kgraf_secrets::model_copy(&item.text).into_owned(),
-                        };
+                        // The model's copy (decision 0071), framed by its
+                        // source.
+                        let injection = super::sessions::injection_of(
+                            &item,
+                            &kgraf_secrets::model_copy(&item.text),
+                        );
                         self.subagents.wakes.insert(
                             item.id,
                             Wake {
@@ -846,6 +851,9 @@ impl RunLoop {
         }
         if !self.subagents.wakes.is_empty() {
             self.deliver_wakes().await?;
+        }
+        if !self.subagents.queued_reports.is_empty() {
+            self.settle_reports(None);
         }
         Ok(())
     }
@@ -1700,6 +1708,8 @@ impl RunLoop {
         if let Some(a) = admitted {
             self.s.admission.gate().release(a);
         }
+        // Paused, so it resumes: a report it never reached is held for that.
+        self.settle_reports(Some((&id, true)));
         self.charge_child(&id, &task, reservation, &d.result.calls)
             .await;
         Box::pin(self.end_children(&id, true)).await?;
@@ -1883,6 +1893,9 @@ impl RunLoop {
             return Ok(());
         };
         self.subagents.restart.remove(&id);
+        // As a parent itself: its own children's reports it never reached a
+        // boundary for are known now.
+        self.reports_attempt_ended(&id, &d.result.outcome);
         let parent = AgentId::new(c.facts.parent.clone());
         let now = self.now();
         if let Some(a) = c.admitted.take() {
@@ -2156,7 +2169,17 @@ impl RunLoop {
 
     fn push_report(&mut self, parent: &AgentId, child: &AgentId, report: &SubagentReport) {
         let id = format!("{SUBAGENT_REPORT_PREFIX}{child}");
-        self.push_to_parent(parent, child, id, InboxKind::Message, report.render());
+        // The child's own answer is in it: from the child, so it reaches the
+        // parent quoted as data (`sessions::model_text`).
+        let source = InboxSource::Agent { id: child.clone() };
+        self.push_to_parent(
+            parent,
+            child,
+            id,
+            source,
+            InboxKind::Message,
+            report.render(),
+        );
     }
 
     /// A notice about `child` to its parent's inbox (and transcript): the
@@ -2168,7 +2191,16 @@ impl RunLoop {
     fn notify_parent(&mut self, parent: &AgentId, child: &AgentId, what: &str, text: &str) {
         let (now, n) = (self.now(), self.sessions_rt.next_id());
         let id = format!("{SUBAGENT_NOTICE_PREFIX}{child}:{what}:{now}-{n}");
-        self.push_to_parent(parent, child, id, InboxKind::Notice, text.to_owned());
+        // Written by the orchestrator, not the child: an instruction-grade
+        // notice, so its source says so and it is not quoted as a peer's.
+        self.push_to_parent(
+            parent,
+            child,
+            id,
+            InboxSource::Orchestrator,
+            InboxKind::Notice,
+            text.to_owned(),
+        );
         self.subagents.errors.push(text.to_owned());
     }
 
@@ -2177,6 +2209,7 @@ impl RunLoop {
         parent: &AgentId,
         child: &AgentId,
         id: String,
+        source: InboxSource,
         kind: InboxKind,
         text: String,
     ) {
@@ -2184,7 +2217,7 @@ impl RunLoop {
         let item = InboxItem {
             id: id.clone(),
             session: parent.clone(),
-            source: InboxSource::Agent { id: child.clone() },
+            source,
             kind,
             mode: InjectMode::AtBoundary,
             // Raw: the inbox store takes it in (decision 0071).
@@ -2202,14 +2235,10 @@ impl RunLoop {
                 "the report of `{child}` could not be written to the inbox of `{parent}`: {e}"
             ));
         }
-        let injection = Injection {
-            id: item.id.clone(),
-            source: item.source,
-            kind: item.kind,
-            mode: item.mode,
-            // The model-facing copy of the raw report (decision 0071).
-            text: kgraf_secrets::scrub_model_facing(&item.text).into_owned(),
-        };
+        // The model-facing copy of the raw report (decision 0071), framed by
+        // its source.
+        let injection =
+            super::sessions::injection_of(&item, &kgraf_secrets::scrub_model_facing(&item.text));
         self.subagents.wakes.insert(
             id,
             Wake {
@@ -2260,28 +2289,53 @@ impl RunLoop {
     /// Hand each pending report to its parent's worker. A parent not running
     /// in this process keeps the report in its inbox; adoption offers it
     /// again when the parent is dispatched.
+    ///
+    /// Handing a report to the injector only queues it: `report_queued`. It
+    /// is `report_delivered` once the runtime's `Injected` mark is on its
+    /// inbox row, with that transcript sequence ([`Self::settle_reports`]).
     async fn deliver_wakes(&mut self) -> Result<(), OrchestratorError> {
         let ids: Vec<String> = self.subagents.wakes.keys().cloned().collect();
         for id in ids {
             let Some(parent) = self.subagents.wakes.get(&id).map(|w| w.parent.clone()) else {
                 continue;
             };
-            let action = match self.injector_state(&parent) {
+            let (action, detail) = match self.injector_state(&parent) {
                 Slot::NotYet => continue,
                 Slot::Gone => {
                     self.subagents.wakes.remove(&id);
-                    "report_held"
+                    (
+                        "report_held",
+                        "its parent is not running here; the report stays in its inbox".to_owned(),
+                    )
                 }
                 Slot::Ready(injector) => {
                     let Some(w) = self.subagents.wakes.remove(&id) else {
                         continue;
                     };
                     match injector.inject(w.injection) {
-                        Ok(()) => "report_delivered",
+                        Ok(()) => {
+                            self.subagents
+                                .queued_reports
+                                .insert(id.clone(), parent.clone());
+                            (
+                                "report_queued",
+                                format!(
+                                    "queued for {parent} at its next round boundary; \
+                                     report_delivered follows when it reaches the transcript"
+                                ),
+                            )
+                        }
                         // Already in the parent's transcript: delivered once.
                         Err(InjectError::Duplicate { .. }) => continue,
-                        Err(InjectError::Finished { .. }) => "report_after_parent_finished",
-                        Err(InjectError::NotBuilt) => "report_not_injectable",
+                        Err(InjectError::Finished { .. }) => {
+                            let why = format!(
+                                "{parent} answered before the report reached it; the report \
+                                 stays in its inbox and the run record"
+                            );
+                            self.report_not_reached(&id, &parent, &why);
+                            ("report_after_parent_finished", why)
+                        }
+                        Err(InjectError::NotBuilt) => ("report_not_injectable", String::new()),
                     }
                 }
             };
@@ -2290,20 +2344,119 @@ impl RunLoop {
                 at_ms: at,
                 id: id.clone(),
                 action: action.into(),
-                from: id.trim_start_matches(SUBAGENT_REPORT_PREFIX).to_owned(),
+                from: report_sender(&id),
                 to: vec![parent.to_string()],
-                detail: match action {
-                    "report_held" => "its parent is not running here; the report stays in its inbox",
-                    "report_after_parent_finished" => {
-                        "its parent answered first; the report stays in its inbox and the run record"
-                    }
-                    _ => "",
-                }
-                .into(),
+                detail,
             })
             .await?;
         }
         Ok(())
+    }
+
+    /// Trace each queued report the runtime has injected since the last
+    /// pass: `report_delivered`, at the time and transcript sequence its
+    /// inbox row was marked with. With `ended` (a parent's attempt ended,
+    /// and whether it can resume), each of that parent's reports still not
+    /// marked is settled too: `report_held` if the parent resumes (adoption
+    /// offers the row again), else `report_undelivered`, reported on the
+    /// parent's contract. The runtime marks every injection before the
+    /// attempt's result is sent, so a row still unmarked then never arrives.
+    /// A store query is made only while a report is queued.
+    pub(super) fn settle_reports(&mut self, ended: Option<(&AgentId, bool)>) {
+        if self.subagents.queued_reports.is_empty() {
+            return;
+        }
+        let store = self.sessions();
+        let waiting: Vec<(String, AgentId)> = self
+            .subagents
+            .queued_reports
+            .iter()
+            .map(|(id, p)| (id.clone(), p.clone()))
+            .collect();
+        for (id, parent) in waiting {
+            let delivered = match store.inbox_item(&id) {
+                Ok(item) => item.and_then(|i| i.delivered),
+                Err(e) => {
+                    self.subagents
+                        .errors
+                        .push(format!("the inbox row `{id}` could not be read: {e}"));
+                    None
+                }
+            };
+            let (action, detail, at) = match (delivered, ended) {
+                (Some((seq, at_ms)), _) => (
+                    "report_delivered",
+                    format!("injected into {parent} at a round boundary (transcript seq {seq})"),
+                    at_ms,
+                ),
+                (None, Some((who, resumable))) if *who == parent => {
+                    let at = self.now();
+                    if resumable {
+                        (
+                            "report_held",
+                            format!(
+                                "{parent} stopped before a round boundary; the report stays in \
+                                 its inbox and is offered again when {parent} resumes"
+                            ),
+                            at,
+                        )
+                    } else {
+                        let why = format!(
+                            "{parent} ended before a round boundary carried it; the report \
+                             stays in its inbox and the run record"
+                        );
+                        self.report_not_reached(&id, &parent, &why);
+                        ("report_undelivered", why, at)
+                    }
+                }
+                _ => continue,
+            };
+            self.subagents.queued_reports.remove(&id);
+            self.queue(TraceEvent::Message {
+                at_ms: at,
+                id: id.clone(),
+                action: action.into(),
+                from: report_sender(&id),
+                to: vec![parent.to_string()],
+                detail,
+            });
+        }
+    }
+
+    /// `worker` (a contract's attempt or a subagent) ended with `outcome`:
+    /// its queued reports are settled ([`Self::settle_reports`]). Only a
+    /// cancelled attempt resumes.
+    pub(super) fn reports_attempt_ended(&mut self, worker: &AgentId, outcome: &WorkerOutcome) {
+        let resumable = matches!(outcome, WorkerOutcome::Cancelled);
+        self.settle_reports(Some((worker, resumable)));
+    }
+
+    /// A subagent's report that will not reach `parent`: a notice on the
+    /// parent's contract (trace, run report, the box), never silence. A
+    /// notice row about a child is the orchestrator's own and already in
+    /// `errors`, so it gets none.
+    fn report_not_reached(&mut self, id: &str, parent: &AgentId, why: &str) {
+        let Some(child) = id.strip_prefix(SUBAGENT_REPORT_PREFIX) else {
+            return;
+        };
+        let contract = self.contract_of(parent).unwrap_or_default();
+        self.session_notice(
+            &contract,
+            parent.as_str(),
+            format!("the report of subagent {child} was not delivered to {parent}: {why}"),
+        );
+    }
+}
+
+/// The child a report or notice row is about, for the trace's `from`.
+fn report_sender(id: &str) -> String {
+    match id.strip_prefix(SUBAGENT_REPORT_PREFIX) {
+        Some(child) => child.to_owned(),
+        None => id
+            .strip_prefix(SUBAGENT_NOTICE_PREFIX)
+            .and_then(|rest| rest.split(':').next())
+            .unwrap_or(id)
+            .to_owned(),
     }
 }
 

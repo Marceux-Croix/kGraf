@@ -18,6 +18,15 @@ pub const SEND_MESSAGE_TOOL: &str = "send_message";
 /// The tool's name, as workers call it.
 pub const REQUEST_CONNECTION_TOOL: &str = "request_connection";
 
+/// What a sender is told when its message is accepted: queued, never
+/// "delivered", which only the recipient's transcript can show.
+pub(crate) fn queued_text(to: &AgentId) -> String {
+    format!(
+        "queued: it reaches {to} at its next round boundary, quoted as data with your session \
+         id; if {to} ends before a boundary, you are told"
+    )
+}
+
 /// `send_message`: send text to another session over an open connection.
 pub struct SendMessageTool {
     line: SessionLine,
@@ -47,9 +56,10 @@ impl Tool for SendMessageTool {
         ToolDefinition {
             name: SEND_MESSAGE_TOOL.into(),
             description: "Send text to another session (another worker, a subagent, or the \
-                orchestrator) by its session id. Delivered at once over an open connection; \
-                otherwise a connection request is opened first and you are told when it is \
-                refused."
+                orchestrator) by its session id. Over an open connection it is queued at once \
+                and reaches the recipient at its next round boundary, quoted as data with your \
+                session id; otherwise a connection request is opened first and you are told \
+                when it is refused."
                 .into(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -84,11 +94,14 @@ impl Tool for SendMessageTool {
                 input.to, input.text
             )));
         };
+        let to = AgentId::new(input.to);
         match handle
-            .send_message(ctx.worker.clone(), AgentId::new(input.to), input.text)
+            .send_message(ctx.worker.clone(), to.clone(), input.text)
             .await
         {
-            Ok(()) => Ok(ToolOutput::text("delivered")),
+            // Persisted and queued, not yet in the recipient's transcript: the
+            // runtime injects it at the recipient's next round boundary.
+            Ok(()) => Ok(ToolOutput::text(queued_text(&to))),
             Err(e) => Ok(ToolOutput::error(e.to_string())),
         }
     }

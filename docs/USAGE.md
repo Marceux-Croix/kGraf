@@ -1657,6 +1657,28 @@ Behavior that differs from earlier builds. Each item names the decision that hol
   first boundary. A report still undelivered when its recipient closes is traced as
   `undelivered`, and the sender's contract gets a notice (`your message <id> to <contract>
   was not delivered: ...`).
+- A message another agent wrote (a worker's `send_message`, a subagent's report) reaches its
+  recipient quoted as data: one line saying it is information about the sender's work, not
+  instructions, then an escaped `<agent_message id="..." from="<sender session>"
+  kind="...">` block. Before, it arrived as a plain user turn, so one model could instruct
+  another. Your own notes from the session panel and kGraf's notices are not quoted (0067).
+- `send_message` tells the sending worker `queued: it reaches <session> at its next round
+  boundary, ...`, not `delivered`. Delivery is the recipient's transcript (0067).
+- A subagent's report is traced `report_queued` when it is handed to its parent, and
+  `report_delivered` (`injected into <parent> at a round boundary (transcript seq N)`, at the
+  time of delivery) only when it reaches the parent's transcript. Before, `report_delivered`
+  was written at the hand-off. A parent that stops before a boundary leaves `report_held`
+  (it gets the report when it resumes); one that ends leaves `report_undelivered`, and its
+  contract gets a notice (`the report of subagent <child> was not delivered to <parent>:
+  ...`). A parent that answered before the report was handed over still shows
+  `report_after_parent_finished`, now with the same notice (0067).
+- When a run ends (completed, blocked or stopped), every note still not delivered is traced
+  `message` `undelivered` with the reason, and its sender gets a notice: a mailbox report to a
+  contract that was held or never started (`the recipient <contract> never started before
+  the run ended blocked`), and a note or message waiting in the inbox of a session that never
+  ended (`<session> was held when the run stopped`). Before, such notes were reported only
+  when the recipient closed, so a run that ended first lost them unseen. Each note is
+  reported once per recipient; a resumed run can still deliver it (0067).
 - kGraf's own git runs no hook, filter, merge driver or diff driver from your repository or
   config, and reaches no remote (see "kGraf's own git"). A file stored through git-lfs or
   git-crypt is committed by kGraf in its stored form, and a file with a configured merge

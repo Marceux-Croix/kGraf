@@ -13,7 +13,10 @@
 //!   reason. A refusal is recorded on the pair, so the run never
 //!   pays to judge it again.
 //! - **Delivery**: a message over an open connection is persisted to the
-//!   recipient's inbox, then injected. It is never refused for volume, only
+//!   recipient's inbox (raw), then injected quoted as data with its sender
+//!   named (`sessions::model_text`): another model's words never reach the
+//!   recipient as instructions. The sender is told it is queued, never
+//!   delivered. It is never refused for volume, only
 //!   paced: past the soft rate of 12 per minute per sender
 //!   per connection, measured over a true sliding 60 s window, delivery waits
 //!   `5 s * excess` (at most 5 minutes) through `not_before_ms`, and never
@@ -664,7 +667,8 @@ impl RunLoop {
             source,
             kind: InboxKind::Message,
             mode: InjectMode::AtBoundary,
-            // Raw: the inbox store takes it in (decision 0071).
+            // Raw: the inbox store takes it in (decision 0071); every
+            // injection quotes it as data (`sessions::model_text`).
             text,
             received_ms: now,
             not_before_ms: paced.not_before_ms,
@@ -748,13 +752,10 @@ impl RunLoop {
                     self.sessions_rt.recheck.pace(&session, item.not_before_ms);
                     continue;
                 }
-                match injector.inject(Injection {
-                    id: item.id,
-                    source: item.source,
-                    kind: item.kind,
-                    mode: item.mode,
-                    text: kgraf_secrets::model_copy(&item.text).into_owned(),
-                }) {
+                match injector.inject(super::sessions::injection_of(
+                    &item,
+                    &kgraf_secrets::model_copy(&item.text),
+                )) {
                     Ok(()) | Err(InjectError::Duplicate { .. }) => {}
                     Err(InjectError::Finished { .. }) => break,
                     // Not built yet: the rows stay undelivered, so the

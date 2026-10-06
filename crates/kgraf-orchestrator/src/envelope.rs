@@ -30,12 +30,16 @@
 //!   or inside an open tool round; the copy is a session inbox row
 //!   ([`queued_row_id`]), so the runtime's `Injected` event marks it. A copy
 //!   the attempt never reached a boundary for falls back to the next fresh
-//!   brief. A message still undelivered when its recipient closes is traced as
-//!   `undelivered` and reported to its sender. Every delivery is recorded per
+//!   brief. A message still undelivered when its recipient closes, or when the
+//!   run ends with its recipient held, never started or stopped, is traced as
+//!   `undelivered` and reported to its sender, once per recipient
+//!   ([`Envelope::reported_undelivered`]). Every delivery is recorded per
 //!   recipient. (A worker's own `send_message` uses the same injector over a
 //!   connection: `orchestrator/connections.rs`.)
 //! - **Untrusted.** A body is another model's text: it enters a prompt only
-//!   through [`UntrustedText::quote_as_data`].
+//!   through [`UntrustedText::quote_as_data`]. Every other agent-written row
+//!   (`send_message`, a subagent's report) is quoted the same way when it is
+//!   injected (`orchestrator/sessions.rs`, `model_text`).
 //!
 //! Written new. The pairwise-file layout is 0026's; A2A's message shape (0005) is
 //! mirrored in the field names (id, role of the sender, parts as prose); no
@@ -142,6 +146,12 @@ pub struct Envelope {
     /// after a process restart.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub queued: Vec<QueuedCopy>,
+    /// Recipients it was traced `undelivered` to and reported to its sender
+    /// for: when the recipient closed, or when a run ended with it still
+    /// open. Persisted, so a resumed run that ends again, or closes the
+    /// recipient later, does not report the same note twice.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub reported_undelivered: BTreeSet<String>,
 }
 
 /// A copy of a message queued for one running attempt of a recipient.
@@ -259,6 +269,7 @@ impl Mailbox {
             nodes: Vec::new(),
             delivered_to: BTreeSet::new(),
             queued: Vec::new(),
+            reported_undelivered: BTreeSet::new(),
         };
         self.messages.push(env.clone());
         Ok(env)

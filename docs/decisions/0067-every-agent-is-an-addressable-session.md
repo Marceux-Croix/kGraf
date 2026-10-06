@@ -203,3 +203,42 @@ time), `a_late_answer_reaches_the_running_worker_at_its_next_round_boundary`,
 `a_late_answer_after_the_box_wait_expired_is_queued_for_the_worker`,
 `the_model_answerer_reads_its_own_answer_calls_as_history`,
 `the_configured_answer_wait_reaches_the_orchestrator`.
+
+## Amendment (2026-10-06, third): peer text is quoted as data; report and run-end delivery are honest
+
+Three more defects were found in the messaging paths of the mailbox amendment above.
+
+1. **Another agent's words reached a worker as a plain user turn.** A direct message was
+   stored raw and every injection site passed it to the runtime as it was, so it was appended
+   as a user message. A subagent's report, which carries the child's answer, went the same
+   way. Only mailbox notes were quoted. One model could instruct another.
+   Now every injection site builds its text with one function, `sessions::model_text`: a row
+   whose source is another agent is quoted as data, one line saying it is information about
+   the sender's work, not instructions, then an escaped `agent_message` block with the row
+   id, the sender's session id and the kind. A mailbox copy (id prefix `mail-`, written only
+   by the orchestrator) already holds its block and passes as it is. The user's own note and
+   the orchestrator's notices pass as they are; a notice about a child to its parent now has
+   the orchestrator as its source, since the orchestrator writes it. The `send_message` tool
+   result says `queued: ...`, not `delivered`, because delivery is the recipient's transcript.
+2. **A subagent's `report_delivered` was written when the report was queued.** It was written
+   when the parent's injector accepted the report, which only puts it in the steering queue.
+   Now that point is `report_queued`; `report_delivered` is written, with the transcript
+   sequence and time, when the runtime's `Injected` mark is on the report's inbox row. A
+   parent that ends before a boundary leaves the report `report_held` if it resumes, else
+   `report_undelivered`, with a notice on the parent's contract;
+   `report_after_parent_finished` gets the same notice.
+3. **A note was never reported when the run ended with its recipient held or not started.**
+   Undelivered notes were reported only when their recipient closed. The last bullet of the
+   mailbox amendment above is replaced: when a run ends, whatever its status, every mailbox note still
+   undelivered to a recipient is traced `message` `undelivered` with the reason (the recipient
+   was held, never started, or the run stopped or ended first) and reported to its sender as a
+   notice. The same holds for a note, redirect or message still in the inbox of a session that
+   never ended. Each (note, recipient) is reported once (`Envelope.reported_undelivered` is
+   persisted). A resumed run can still deliver it.
+
+Tests: `peer_messages.rs`, the report-event and `send_message` tool tests in `subagents.rs`,
+the `model_text` unit tests in `sessions.rs`, and `mailbox_injection.rs`.
+
+Not changed: a hand-back child's instruction is the runtime's remainder of the worker's own
+brief, and a subagent's task is its parent's delegation; both are instructions by design and
+pass the delegation guards.

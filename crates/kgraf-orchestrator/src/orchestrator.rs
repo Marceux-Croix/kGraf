@@ -3911,6 +3911,10 @@ impl RunLoop {
             }
             return Err(e);
         }
+        // Every attempt has ended: a note nothing carried is reported now,
+        // whatever the status (decision 0067, amendment of 2026-10-06).
+        self.report_undelivered_mail_at_run_end();
+        self.report_undelivered_inbox_at_run_end();
         self.shutdown()?;
         self.flush_coord().await?;
         self.save()?;
@@ -6105,6 +6109,9 @@ impl RunLoop {
         let Some(f) = self.hold_for_subagents(f).await? else {
             return Ok(());
         };
+        // Its subagents' reports it never reached a boundary for are known
+        // now (`subagents.rs`), whatever happens to the result next.
+        self.reports_attempt_ended(&f.worker, &f.result.outcome);
         let Some(mut flight) = self.in_flight.remove(&f.contract) else {
             return Ok(());
         };
@@ -8644,14 +8651,9 @@ async fn run_attempt(
     let injections: Vec<Injection> = undelivered
         .into_iter()
         .filter(|item| sessions::injectable(item.kind) && item.not_before_ms <= now_ms)
-        .map(|item| Injection {
-            id: item.id,
-            source: item.source,
-            kind: item.kind,
-            mode: item.mode,
-            // The model's copy of the stored row (decision 0071).
-            text: kgraf_secrets::model_copy(&item.text).into_owned(),
-        })
+        // The model's copy of the stored row (decision 0071), framed by its
+        // source (a peer's words quoted as data).
+        .map(|item| sessions::injection_of(&item, &kgraf_secrets::model_copy(&item.text)))
         .collect();
     let spawned = spawn_worker(
         env,
