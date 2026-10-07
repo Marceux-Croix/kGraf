@@ -592,22 +592,43 @@ fn resolve_socket(path: &Path) -> Result<PathBuf, SandboxError> {
 /// Without the fallback an unset `HOME` removed every rule that hangs off
 /// the home directory (the macOS credential deny list among them).
 fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
+    home_dir_from(std::env::var_os("HOME"), passwd_home)
+}
+
+/// [`home_dir`] with `$HOME` and the password database lookup given.
+fn home_dir_from(
+    home_env: Option<OsString>,
+    passwd: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    home_env
         .filter(|h| !h.is_empty())
         .map(PathBuf::from)
-        .or_else(passwd_home)
+        .or_else(passwd)
         .and_then(|h| std::fs::canonicalize(h).ok())
 }
 
 /// The cargo homes ancestor reads never enter ([`Resolved::cargo_homes`]).
 /// A home that does not exist is kept as written: no file lies beneath it.
 fn cargo_homes() -> Option<Vec<PathBuf>> {
+    cargo_homes_from(
+        std::env::var_os("HOME"),
+        passwd_home(),
+        std::env::var_os("CARGO_HOME"),
+    )
+}
+
+/// [`cargo_homes`] with its three inputs given, so a test needs no
+/// environment change: `$HOME`, the password database's home and
+/// `$CARGO_HOME`. An empty `$HOME` or `$CARGO_HOME` counts as unset.
+fn cargo_homes_from(
+    home_env: Option<OsString>,
+    passwd: Option<PathBuf>,
+    cargo_home_env: Option<OsString>,
+) -> Option<Vec<PathBuf>> {
     let canonical = |p: PathBuf| std::fs::canonicalize(&p).unwrap_or(p);
     let homes: Vec<PathBuf> = [
-        std::env::var_os("HOME")
-            .filter(|h| !h.is_empty())
-            .map(PathBuf::from),
-        passwd_home(),
+        home_env.filter(|h| !h.is_empty()).map(PathBuf::from),
+        passwd,
     ]
     .into_iter()
     .flatten()
@@ -617,7 +638,7 @@ fn cargo_homes() -> Option<Vec<PathBuf>> {
         return None;
     }
     let mut out = homes;
-    if let Some(cargo_home) = std::env::var_os("CARGO_HOME").filter(|h| !h.is_empty()) {
+    if let Some(cargo_home) = cargo_home_env.filter(|h| !h.is_empty()) {
         out.push(canonical(PathBuf::from(cargo_home)));
     }
     Some(out)
@@ -1449,6 +1470,163 @@ mod tests {
         let more = policy.with_writable_root(PathBuf::from("/c"));
         assert_eq!(more.writable_roots().len(), 3);
         assert_eq!(more.writable_roots()[2], PathBuf::from("/c"));
+    }
+
+    /// The policy reports whether it opted in to partial isolation.
+    #[test]
+    fn the_policy_reports_the_partial_isolation_opt_in() {
+        let policy = SandboxPolicy::new(vec![PathBuf::from("/a")], Network::Deny);
+        assert!(!policy.accepts_partial_isolation());
+        let policy = policy.accept_partial_isolation(true);
+        assert!(policy.accepts_partial_isolation());
+        assert!(
+            !policy
+                .accept_partial_isolation(false)
+                .accepts_partial_isolation()
+        );
+    }
+
+    /// `$HOME` first (empty counts as unset), then the password database;
+    /// the result is canonical, and a home that does not exist is no home.
+    #[cfg(unix)]
+    #[test]
+    fn the_home_is_the_environment_then_the_password_database() {
+        let base = tempfile::tempdir().unwrap();
+        let real = std::fs::canonicalize(base.path()).unwrap();
+        let env_home = real.join("env");
+        let pw_home = real.join("pw");
+        std::fs::create_dir(&env_home).unwrap();
+        std::fs::create_dir(&pw_home).unwrap();
+        let pw = || Some(pw_home.clone());
+        let got = home_dir_from(Some(env_home.clone().into_os_string()), pw);
+        assert_eq!(got, Some(env_home.clone()));
+        assert_eq!(
+            home_dir_from(Some(OsString::new()), pw),
+            Some(pw_home.clone())
+        );
+        assert_eq!(home_dir_from(None, pw), Some(pw_home.clone()));
+        assert_eq!(home_dir_from(None, || None), None);
+        // The environment wins without asking the password database.
+        let asked = std::cell::Cell::new(false);
+        let _ = home_dir_from(Some(env_home.clone().into_os_string()), || {
+            asked.set(true);
+            None
+        });
+        assert!(!asked.get());
+        // A link is resolved; a missing path yields nothing.
+        let link = real.join("link");
+        std::os::unix::fs::symlink(&pw_home, &link).unwrap();
+        assert_eq!(
+            home_dir_from(Some(link.into_os_string()), || None),
+            Some(pw_home)
+        );
+        let gone = env_home.join("missing");
+        assert_eq!(home_dir_from(Some(gone.into_os_string()), || None), None);
+    }
+
+    /// Every cargo home an ancestor read must never enter: `$HOME/.cargo`,
+    /// the password database's `.cargo`, `$CARGO_HOME`; an empty variable is
+    /// unset; no home at all gives `None`; a missing home is kept as written.
+    #[cfg(unix)]
+    #[test]
+    fn the_cargo_homes_cover_the_environment_the_database_and_cargo_home() {
+        let base = tempfile::tempdir().unwrap();
+        let real = std::fs::canonicalize(base.path()).unwrap();
+        let env_home = real.join("env");
+        let pw_home = real.join("pw");
+        let custom = real.join("custom");
+        for d in [&env_home, &pw_home, &custom] {
+            std::fs::create_dir(d).unwrap();
+        }
+        let all = cargo_homes_from(
+            Some(env_home.clone().into_os_string()),
+            Some(pw_home.clone()),
+            Some(custom.clone().into_os_string()),
+        );
+        assert_eq!(
+            all,
+            Some(vec![
+                env_home.join(".cargo"),
+                pw_home.join(".cargo"),
+                custom.clone()
+            ])
+        );
+        // Empty variables are unset: the database home alone remains.
+        let empty = cargo_homes_from(
+            Some(OsString::new()),
+            Some(pw_home.clone()),
+            Some(OsString::new()),
+        );
+        assert_eq!(empty, Some(vec![pw_home.join(".cargo")]));
+        let only_env = cargo_homes_from(Some(env_home.clone().into_os_string()), None, None);
+        assert_eq!(only_env, Some(vec![env_home.join(".cargo")]));
+        assert_eq!(cargo_homes_from(None, None, None), None);
+        assert_eq!(
+            cargo_homes_from(Some(OsString::new()), None, Some(custom.into_os_string())),
+            None,
+            "a cargo home alone is no home directory"
+        );
+        // A link is resolved; a missing path stays as written.
+        let link = real.join("link");
+        std::os::unix::fs::symlink(&pw_home, &link).unwrap();
+        let missing = real.join("nope");
+        let got = cargo_homes_from(
+            Some(link.into_os_string()),
+            Some(missing.clone()),
+            Some(missing.clone().into_os_string()),
+        );
+        assert_eq!(
+            got,
+            Some(vec![
+                pw_home.join(".cargo"),
+                missing.join(".cargo"),
+                missing
+            ])
+        );
+    }
+
+    /// An error other than "already there" while the command's `.npmrc` is
+    /// made stops the command; an `.npmrc` already there is left as it is.
+    #[cfg(unix)]
+    #[test]
+    fn a_failure_making_the_npmrc_is_reported_and_an_existing_one_is_kept() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(base.path()).unwrap();
+        let tmp = root.join("tmp");
+        std::fs::create_dir(&tmp).unwrap();
+        let policy = SandboxPolicy::new(vec![root.clone()], Network::Deny)
+            .with_tmp_dir(tmp.clone())
+            .with_user_cargo_home(root.join("no-cargo-home"));
+        std::fs::write(tmp.join(".npmrc"), "keep").unwrap();
+        sandboxed_command(&policy, "true", &root).expect("an existing .npmrc is fine");
+        assert_eq!(std::fs::read_to_string(tmp.join(".npmrc")).unwrap(), "keep");
+        std::fs::remove_file(tmp.join(".npmrc")).unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let writable_anyway = std::fs::File::create(tmp.join("probe")).is_ok();
+        let result = sandboxed_command(&policy, "true", &root);
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if writable_anyway {
+            return; // rights that ignore the mode, such as root
+        }
+        match result {
+            Err(SandboxError::Io { path, .. }) => assert_eq!(path, tmp.join(".npmrc")),
+            other => panic!("expected an Io error, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    /// The wrappers read the real environment: a user with a password
+    /// database entry has a home and a cargo home beside it.
+    #[cfg(unix)]
+    #[test]
+    fn the_wrappers_find_this_users_home_and_cargo_homes() {
+        let home = home_dir().expect("a home");
+        assert!(home.is_absolute(), "{home:?}");
+        let homes = cargo_homes().expect("cargo homes");
+        assert!(
+            homes.iter().any(|h| h.ends_with(".cargo")),
+            "{homes:?} lists no $HOME/.cargo"
+        );
     }
 
     /// Only Linux has ancestor reads to refuse; elsewhere the list is empty.

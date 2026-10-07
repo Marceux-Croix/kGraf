@@ -1006,4 +1006,198 @@ mod tests {
         let ctx = ReadContext::in_worktree(&wt, None);
         assert_eq!(scripts(&read(&["git", "bad"], &ctx)), vec!["curl x"]);
     }
+
+    /// A worktree whose configuration defines no alias, so a name that is no
+    /// git command resolves to the program `git-NAME` unless something moved
+    /// the configuration.
+    fn plain_worktree() -> (tempfile::TempDir, ReadContext) {
+        let dir = tempfile::tempdir().expect("dir");
+        let root = dir.path().join("wt");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(root.join(".git")).expect("git dir");
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::write(root.join(".git/config"), "[core]\n\tbare = false\n").expect("config");
+        let ctx = ReadContext::in_worktree(&root, Some(&home));
+        (dir, ctx)
+    }
+
+    /// A credential helper that is a path, or has a backslash (a Windows
+    /// path), runs as the program it names; a bare name is `git-credential-NAME`.
+    #[test]
+    fn a_credential_helper_path_runs_as_named() {
+        let none = ReadContext::default();
+        for (value, want) in [
+            ("/usr/bin/curl x", "/usr/bin/curl x"),
+            ("C:\\tools\\helper.exe x", "C:\\tools\\helper.exe x"),
+            ("tools\\helper x", "tools\\helper x"),
+            ("store --file f", "git-credential-store --file f"),
+        ] {
+            let setting = format!("credential.helper={value}");
+            let found = read(&["git", "-c", &setting, "fetch"], &none);
+            assert_eq!(scripts(&found), vec![want], "{value}");
+        }
+    }
+
+    /// The program variables run what they hold, and the variables that
+    /// replace git's configuration keep the call unreadable; a variable git
+    /// does not read is ignored.
+    #[test]
+    fn environment_variables_that_run_or_replace_configuration_are_read() {
+        let none = ReadContext::default();
+        for name in ["GIT_SSH", "GIT_ASKPASS", "SSH_ASKPASS"] {
+            let assignment = format!("{name}=curl x");
+            let found = read(&[&assignment, "git", "fetch"], &none);
+            assert_eq!(scripts(&found), vec!["curl x"], "{name}");
+        }
+        for name in [
+            "GIT_SSH_COMMAND",
+            "GIT_EXTERNAL_DIFF",
+            "GIT_PAGER",
+            "PAGER",
+            "GIT_EDITOR",
+            "EDITOR",
+            "VISUAL",
+            "GIT_SEQUENCE_EDITOR",
+            "GIT_PROXY_COMMAND",
+        ] {
+            assert_eq!(env_runs(name), Some(KeyRuns::Script), "{name}");
+        }
+        for name in [
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_SYSTEM",
+            "GIT_EXEC_PATH",
+            "GIT_TEMPLATE_DIR",
+            "GIT_CONFIG_KEY_0",
+            "GIT_CONFIG_VALUE_7",
+        ] {
+            assert_eq!(env_runs(name), Some(KeyRuns::Opaque), "{name}");
+            let assignment = format!("{name}=x");
+            assert!(opaque(&read(&[&assignment, "git", "log"], &none)), "{name}");
+        }
+        for name in ["FOO", "GIT_CONFIG_KEY", "GIT_CONFIG_VAL", "HOME", "GIT_DIR"] {
+            assert_eq!(env_runs(name), None, "{name}");
+        }
+        assert!(read(&["FOO=bar", "git", "status"], &none).is_empty());
+    }
+
+    /// A call that moves git's configuration or directory (`HOME`, `-C`,
+    /// `--git-dir`, `--work-tree`) cannot be matched to an alias, each alone;
+    /// a short option with an `=` is not split, and an option given after an
+    /// attached value still counts.
+    #[test]
+    fn a_moved_configuration_or_directory_makes_a_name_unreadable() {
+        let (_keep, ctx) = plain_worktree();
+        assert_eq!(scripts(&read(&["git", "lfs"], &ctx)), vec!["git-lfs"]);
+        for words in [
+            vec!["HOME=/x", "git", "lfs"],
+            vec!["XDG_CONFIG_HOME=/x", "git", "lfs"],
+            vec!["GIT_DIR=/x", "git", "lfs"],
+            vec!["GIT_COMMON_DIR=/x", "git", "lfs"],
+            vec!["git", "-C", "/x", "lfs"],
+            vec!["git", "--git-dir=/x", "lfs"],
+            vec!["git", "--git-dir", "/x", "lfs"],
+            vec!["git", "--work-tree", "/w", "lfs"],
+        ] {
+            assert!(opaque(&read(&words, &ctx)), "{words:?}");
+        }
+        // `-C=/x` is no option git knows; it moves nothing here.
+        assert_eq!(
+            scripts(&read(&["git", "-C=/x", "lfs"], &ctx)),
+            vec!["git-lfs"]
+        );
+        // A valued option with its value attached does not take the next word.
+        let found = read(
+            &["git", "--work-tree=/w", "-c", "core.pager=curl x", "log"],
+            &ReadContext::default(),
+        );
+        assert_eq!(scripts(&found), vec!["curl x"]);
+        // `--exec-path` alone prints the path; with a value it is refused.
+        assert!(read(&["git", "--exec-path"], &ReadContext::default()).is_empty());
+        assert!(opaque(&read(
+            &["git", "--exec-path", "/x", "status"],
+            &ReadContext::default()
+        )));
+    }
+
+    /// Subcommands that run a command given as an option value or word.
+    #[test]
+    fn subcommand_options_that_run_commands_are_read() {
+        let none = ReadContext::default();
+        for (words, want) in [
+            (vec!["git", "difftool", "-x", "curl x"], vec!["curl x"]),
+            (vec!["git", "difftool", "--extcmd=curl x"], vec!["curl x"]),
+            (vec!["git", "difftool", "-xcurl x"], vec!["curl x"]),
+            (
+                vec!["git", "send-email", "--sendmail-cmd=curl x", "a.patch"],
+                vec!["curl x"],
+            ),
+            (
+                vec!["git", "send-email", "--smtp-server", "/bin/x"],
+                vec!["/bin/x"],
+            ),
+            (vec!["git", "send-email", "--to-cmd=curl x"], vec!["curl x"]),
+            (
+                vec!["git", "send-email", "--cc-cmd", "curl x"],
+                vec!["curl x"],
+            ),
+            (
+                vec!["git", "config", "set", "core.pager", "curl x"],
+                vec!["curl x"],
+            ),
+            (
+                vec!["git", "config", "set", "alias.x", "!curl x"],
+                vec!["curl x"],
+            ),
+            (
+                vec!["git", "config", "--file", "cfg", "core.pager", "curl x"],
+                vec!["curl x"],
+            ),
+            (
+                vec!["git", "config", "-f", "cfg", "core.pager", "curl x"],
+                vec!["curl x"],
+            ),
+            (
+                vec!["git", "config", "--type", "bool", "core.pager", "curl x"],
+                vec!["curl x"],
+            ),
+            (
+                vec!["git", "submodule", "foreach", "-q", "curl x"],
+                vec!["curl x"],
+            ),
+            (
+                vec![
+                    "git",
+                    "submodule",
+                    "foreach",
+                    "--quiet",
+                    "--recursive",
+                    "curl",
+                    "x",
+                ],
+                vec!["curl x"],
+            ),
+        ] {
+            assert_eq!(scripts(&read(&words, &none)), want, "{words:?}");
+        }
+    }
+
+    /// Words that look like the arms above but run nothing.
+    #[test]
+    fn subcommand_words_that_run_nothing_are_not_read_as_commands() {
+        let none = ReadContext::default();
+        for words in [
+            vec!["git", "rebase", "-Xours", "main"],
+            vec!["git", "rebase", "-i", "main"],
+            vec!["git", "bisect", "good"],
+            vec!["git", "bisect", "start", "HEAD~2"],
+            vec!["git", "bisect", "run"],
+            vec!["git", "submodule", "update"],
+            vec!["git", "config", "user.name", "x"],
+        ] {
+            assert!(read(&words, &none).is_empty(), "{words:?}");
+        }
+    }
 }

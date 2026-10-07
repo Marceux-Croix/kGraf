@@ -1512,4 +1512,181 @@ mod tests {
             "{cmd_accepted} {ps_accepted}"
         );
     }
+
+    /// `start` runs the program after its options; a quoted first word is a
+    /// title only when a program follows it.
+    #[test]
+    fn cmd_start_drops_a_quoted_title_only_when_a_program_follows() {
+        let run = |script: &str| cmd(&argv(&["/c", script]));
+        assert_eq!(
+            argvs(&run("start curl")),
+            vec![argv(&["start", "curl"]), argv(&["curl"])]
+        );
+        assert_eq!(
+            argvs(&run("start curl x")),
+            vec![argv(&["start", "curl", "x"]), argv(&["curl", "x"])]
+        );
+        assert_eq!(
+            argvs(&run("start /b curl x")),
+            vec![argv(&["start", "/b", "curl", "x"]), argv(&["curl", "x"])]
+        );
+        // A lone quoted word is the program, not a title.
+        assert_eq!(
+            argvs(&run("start \"t\"")),
+            vec![argv(&["start", "t"]), argv(&["t"])]
+        );
+        assert_eq!(
+            argvs(&run("start \"t\" curl x")),
+            vec![argv(&["start", "t", "curl", "x"]), argv(&["curl", "x"])]
+        );
+        assert!(unreadable_found(&run("start")));
+        assert!(unreadable_found(&run("start /b")));
+    }
+
+    /// `call :label` runs a batch file's label, which is not read; `call
+    /// PROGRAM` runs the program.
+    #[test]
+    fn cmd_call_runs_its_program_and_refuses_a_label() {
+        let run = |script: &str| cmd(&argv(&["/c", script]));
+        let label = run("call :end");
+        assert!(unreadable_found(&label));
+        assert!(argvs(&label).is_empty(), "a label is no program: {label:?}");
+        assert_eq!(argvs(&run("call curl x")), vec![argv(&["curl", "x"])]);
+        assert!(argvs(&run("call")).is_empty());
+    }
+
+    /// Quotes keep a `^` as text; outside quotes it escapes the next character.
+    #[test]
+    fn cmd_words_keep_a_caret_inside_quotes() {
+        assert_eq!(
+            cmd_words("echo \"a^b\" c^ d e^^f"),
+            argv(&["echo", "a^b", "c d", "e^f"])
+        );
+    }
+
+    /// A redirection and its target leave the command's words; a target
+    /// written after the operator is its own word, one joined to it is not.
+    #[test]
+    fn cmd_redirections_take_only_their_own_target() {
+        let run = |script: &str| argvs(&cmd(&argv(&["/c", script])));
+        for script in [
+            "dir >out more",
+            "dir > out more",
+            "dir >> log more",
+            "dir 2>&1 more",
+            "dir >&2 more",
+            "dir <in more",
+            "dir < in more",
+            "dir 2> err more",
+        ] {
+            assert_eq!(run(script), vec![argv(&["dir", "more"])], "{script}");
+        }
+        assert_eq!(run("dir more >out"), vec![argv(&["dir", "more"])]);
+    }
+
+    /// Every PowerShell option name, in the spellings PowerShell accepts
+    /// (any unambiguous prefix, either dash or a slash, any case), reads as
+    /// its kind; an ambiguous or unknown name reads as none.
+    #[test]
+    fn each_powershell_option_name_has_its_kind() {
+        use PsOption::*;
+        for (kind, names) in [
+            (
+                Command,
+                &[
+                    "c",
+                    "com",
+                    "comm",
+                    "command",
+                    "commandw",
+                    "commandwithargs",
+                    "cwa",
+                ][..],
+            ),
+            (Encoded, &["e", "ec", "en", "enc", "encodedcommand"][..]),
+            (File, &["f", "fi", "file"][..]),
+            (
+                Valued,
+                &[
+                    "ex",
+                    "ep",
+                    "exe",
+                    "executionpolicy",
+                    "w",
+                    "wi",
+                    "windowstyle",
+                    "if",
+                    "inp",
+                    "inputformat",
+                    "o",
+                    "of",
+                    "ou",
+                    "outputformat",
+                    "v",
+                    "ve",
+                    "version",
+                    "config",
+                    "con",
+                    "configurationname",
+                    "psc",
+                    "psconsolefile",
+                    "wd",
+                    "wor",
+                    "workingdirectory",
+                    "set",
+                    "settingsfile",
+                    "cus",
+                    "custompipename",
+                    "ea",
+                    "encodedar",
+                    "encodedarguments",
+                ][..],
+            ),
+            (
+                Interactive,
+                &["noe", "noexit", "i", "int", "interactive"][..],
+            ),
+            (
+                Flag,
+                &[
+                    "nop",
+                    "nopr",
+                    "noprofile",
+                    "noni",
+                    "nonint",
+                    "noninteractive",
+                    "nol",
+                    "nolo",
+                    "nologo",
+                    "mta",
+                    "sta",
+                    "l",
+                    "lo",
+                    "login",
+                    "?",
+                    "h",
+                    "he",
+                    "help",
+                    "noprofilel",
+                    "noprofileloadtime",
+                ][..],
+            ),
+        ] {
+            for name in names {
+                for spelled in [
+                    format!("-{name}"),
+                    format!("/{name}"),
+                    format!("-{}", name.to_ascii_uppercase()),
+                ] {
+                    assert!(
+                        ps_option(&spelled) == Some(kind),
+                        "{spelled} is not the expected kind"
+                    );
+                }
+            }
+        }
+        for name in ["-", "-zz", "-co", "-in", "-n", "-no", "-encodeda", "-noni1"] {
+            assert!(ps_option(name).is_none(), "{name}");
+        }
+    }
 }

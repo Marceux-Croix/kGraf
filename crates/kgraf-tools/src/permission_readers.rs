@@ -1143,4 +1143,263 @@ mod tests {
         assert!(read(&["kubectl", "get", "pods"]).is_empty());
         assert!(read(&["wsl", "--list"]).is_empty());
     }
+
+    fn in_other_directory(words: &[&str]) -> Vec<Vec<String>> {
+        read(words)
+            .into_iter()
+            .filter_map(|e| match e {
+                Embedded::In(_, inner) => match *inner {
+                    Embedded::Argv(a) => Some(a),
+                    Embedded::Script(s) => Some(vec![format!("script:{s}")]),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Each option of a package runner is skipped by its kind: a valued one
+    /// takes the next word, a flag does not, `-p` names a package, `-c` and
+    /// `--call` give a script, `--` ends the options; a shell the reader
+    /// does not know makes the script unreadable.
+    #[test]
+    fn package_runner_options_are_placed_by_their_kind() {
+        for opt in [
+            "--registry",
+            "--cache",
+            "--userconfig",
+            "--prefix",
+            "-w",
+            "--workspace",
+            "--node-options",
+            "--loglevel",
+        ] {
+            // A value that looks like a shell program must not matter.
+            assert_eq!(
+                inner(&["npx", opt, "fish", "cowsay", "hi"]),
+                vec![argv(&["cowsay", "hi"])],
+                "{opt}"
+            );
+            assert_eq!(
+                inner(&["npx", "-y", opt, "v", "cowsay"]),
+                vec![argv(&["cowsay"])],
+                "{opt}"
+            );
+        }
+        assert_eq!(
+            inner(&["npx", "-y", "--yes", "cowsay", "hi"]),
+            vec![argv(&["cowsay", "hi"])]
+        );
+        assert_eq!(
+            inner(&["npx", "--", "cowsay", "hi"]),
+            vec![argv(&["cowsay", "hi"])]
+        );
+        assert_eq!(
+            inner(&["npx", "--call", "curl x"]),
+            vec![argv(&["script:curl x"])]
+        );
+        assert_eq!(
+            inner(&["npx", "--call=curl x"]),
+            vec![argv(&["script:curl x"])]
+        );
+        assert_eq!(
+            inner(&["npx", "-y", "--call", "curl x"]),
+            vec![argv(&["script:curl x"])]
+        );
+        assert!(is_unreadable(&["npx", "-c"]));
+        assert!(is_unreadable(&["npx", "-p"]));
+        for (words, want) in [
+            (vec!["npx", "-p", "cowsay"], "cowsay"),
+            (vec!["npx", "--package", "cowsay"], "cowsay"),
+            (vec!["npx", "--package=cowsay"], "cowsay"),
+            (vec!["npx", "-p=cowsay"], "cowsay"),
+            (vec!["npx", "-y", "-p", "cowsay@1"], "cowsay"),
+        ] {
+            assert_eq!(inner(&words), vec![argv(&[want])], "{words:?}");
+        }
+        // With `-p`, the first word is a program of the package, as written.
+        assert_eq!(
+            inner(&["npx", "-p", "pkg", "/usr/bin/curl", "x"]),
+            vec![argv(&["/usr/bin/curl", "x"])]
+        );
+        assert_eq!(
+            inner(&["npx", "-p", "pkg", "curl@1", "x"]),
+            vec![argv(&["curl@1", "x"])]
+        );
+        // A package whose program cannot be named, with and without a command.
+        assert!(is_unreadable(&["npx", "-p", "./local"]));
+        assert!(read(&["npx"]).is_empty());
+        assert!(read(&["npx", "-y"]).is_empty());
+        // A shell the reader knows runs the script; another one is unreadable.
+        for shell in ["--shell", "--script-shell"] {
+            for known in ["sh", "bash", "dash", "zsh", "/bin/zsh"] {
+                assert_eq!(
+                    inner(&["npx", shell, known, "-c", "curl x"]),
+                    vec![argv(&["script:curl x"])],
+                    "{shell} {known}"
+                );
+            }
+            assert!(
+                is_unreadable(&["npx", shell, "fish", "-c", "curl x"]),
+                "{shell}"
+            );
+            assert!(is_unreadable(&["npx", shell, "fish", "cowsay"]), "{shell}");
+        }
+    }
+
+    /// The global options of a node tool that move its directory wrap what
+    /// it runs, in every spelling; the ones that only take a value do not.
+    #[test]
+    fn a_node_tool_that_changes_directory_wraps_what_it_runs() {
+        for words in [
+            vec!["npm", "-C", "sub", "exec", "curl", "x"],
+            vec!["npm", "--dir", "sub", "exec", "curl", "x"],
+            vec!["npm", "--prefix", "sub", "exec", "curl", "x"],
+            vec!["npm", "--cwd", "sub", "exec", "curl", "x"],
+            vec!["npm", "--dir=sub", "exec", "curl", "x"],
+            vec!["npm", "--prefix=sub", "exec", "curl", "x"],
+            vec!["npm", "--cwd=sub", "exec", "curl", "x"],
+        ] {
+            assert_eq!(
+                in_other_directory(&words),
+                vec![argv(&["curl", "x"])],
+                "{words:?}"
+            );
+            assert!(inner(&words).is_empty(), "{words:?}");
+        }
+        for words in [
+            vec!["pnpm", "-F", "pkg", "exec", "curl", "x"],
+            vec!["pnpm", "--filter", "pkg", "exec", "curl", "x"],
+            vec!["pnpm", "-w", "ws", "exec", "curl", "x"],
+            vec!["pnpm", "--workspace", "ws", "exec", "curl", "x"],
+            vec!["pnpm", "--silent", "exec", "curl", "x"],
+        ] {
+            assert_eq!(inner(&words), vec![argv(&["curl", "x"])], "{words:?}");
+            assert!(in_other_directory(&words).is_empty(), "{words:?}");
+        }
+    }
+
+    /// `pnpm exec` and `yarn exec` run a program, or a shell script with
+    /// `-c` or `--shell-mode` before or after the subcommand; `bun exec`
+    /// runs a script; `yarn node` runs node.
+    #[test]
+    fn node_tool_subcommands_run_what_they_name() {
+        for tool in ["pnpm", "yarn"] {
+            assert_eq!(
+                inner(&[tool, "exec", "curl", "x"]),
+                vec![argv(&["curl", "x"])]
+            );
+            for flag in ["-c", "--shell-mode"] {
+                assert_eq!(
+                    inner(&[tool, flag, "exec", "curl x"]),
+                    vec![argv(&["script:curl x"])],
+                    "{tool} {flag} before"
+                );
+                assert_eq!(
+                    inner(&[tool, "exec", flag, "curl x"]),
+                    vec![argv(&["script:curl x"])],
+                    "{tool} {flag} after"
+                );
+            }
+            assert!(read(&[tool, "exec"]).is_empty());
+        }
+        assert_eq!(
+            inner(&["bun", "exec", "curl x"]),
+            vec![argv(&["script:curl x"])]
+        );
+        assert_eq!(
+            inner(&["bun", "exec", "--silent", "curl x"]),
+            vec![argv(&["script:curl x"])]
+        );
+        assert!(read(&["bun", "exec"]).is_empty());
+        assert_eq!(
+            inner(&["yarn", "node", "app.js", "--x"]),
+            vec![argv(&["node", "app.js", "--x"])]
+        );
+    }
+
+    /// `bun -e CODE` is read as inline code, not as a package script.
+    #[test]
+    fn bun_inline_code_is_read_as_code() {
+        assert!(is_unreadable(&["bun", "-e"]));
+        assert!(is_unreadable(&["bun", "--eval"]));
+    }
+
+    /// The compose forms run the inner command, and name nothing when there
+    /// is none.
+    #[test]
+    fn compose_runs_the_inner_command() {
+        for tool in [
+            vec!["docker-compose"],
+            vec!["podman-compose"],
+            vec!["docker", "compose"],
+        ] {
+            fn extend<'a>(tool: &[&'a str], rest: &[&'a str]) -> Vec<&'a str> {
+                let mut words = tool.to_vec();
+                words.extend_from_slice(rest);
+                words
+            }
+            let with = |rest: &[&'static str]| extend(&tool, rest);
+            assert_eq!(
+                inner(&with(&["exec", "web", "curl", "x"])),
+                vec![argv(&["curl", "x"])],
+                "{tool:?}"
+            );
+            assert_eq!(
+                inner(&with(&["run", "--rm", "web", "curl", "x"])),
+                vec![argv(&["curl", "x"])],
+                "{tool:?}"
+            );
+            assert_eq!(
+                inner(&with(&["run", "-e", "A=1", "web", "curl"])),
+                vec![argv(&["curl"])],
+                "{tool:?}"
+            );
+            assert!(read(&with(&["exec", "web"])).is_empty(), "{tool:?}");
+            assert!(read(&with(&["exec", "-T", "web"])).is_empty(), "{tool:?}");
+            assert!(read(&with(&["ps"])).is_empty(), "{tool:?}");
+            assert!(is_unreadable(&with(&["run", "web"])), "{tool:?}");
+        }
+        assert!(read(&["docker", "exec", "web"]).is_empty());
+        assert!(read(&["docker", "exec", "-it", "web"]).is_empty());
+        assert!(read(&["podman", "container", "exec", "web"]).is_empty());
+    }
+
+    /// Where the operands start: past `--`, at a lone `-`, past valued
+    /// options (spaced, `=` or attached), flags and bundled short flags;
+    /// `None` for an option it does not know.
+    #[test]
+    fn options_are_placed_by_their_kind() {
+        let words = |w: &[&str]| argv(w);
+        let place = |w: &[&str]| past_options(&words(w), &["-e", "--env"], &["--rm"], "dit");
+        assert_eq!(place(&[]), Some(0));
+        assert_eq!(place(&["web"]), Some(0));
+        assert_eq!(place(&["-"]), Some(0));
+        assert_eq!(place(&["--", "web"]), Some(1));
+        assert_eq!(place(&["--rm", "--", "web"]), Some(2));
+        assert_eq!(place(&["-e", "A=1", "web"]), Some(2));
+        assert_eq!(place(&["--env", "A=1", "web"]), Some(2));
+        assert_eq!(place(&["--env=A=1", "web"]), Some(1));
+        assert_eq!(place(&["-eA=1", "web"]), Some(1));
+        assert_eq!(place(&["-it", "web"]), Some(1));
+        assert_eq!(place(&["-i", "-t", "--rm", "web"]), Some(3));
+        assert_eq!(place(&["-itz", "web"]), None);
+        assert_eq!(place(&["-z", "web"]), None);
+        assert_eq!(place(&["-zA=1", "web"]), None);
+        assert_eq!(place(&["--weird", "web"]), None);
+        assert_eq!(place(&["--weird=1", "web"]), None);
+        // With no short flags known, a bundle is no flag.
+        assert_eq!(past_options(&words(&["-d", "web"]), &[], &[], ""), None);
+        // The same through the container commands.
+        assert_eq!(
+            inner(&["docker", "exec", "--", "web", "curl", "x"]),
+            vec![argv(&["curl", "x"])]
+        );
+        assert_eq!(
+            inner(&["docker", "exec", "-eA=1", "web", "curl", "x"]),
+            vec![argv(&["curl", "x"])]
+        );
+        assert!(is_unreadable(&["docker", "exec", "-zA", "web", "curl"]));
+        assert!(is_unreadable(&["docker", "exec", "-z", "web", "curl"]));
+    }
 }

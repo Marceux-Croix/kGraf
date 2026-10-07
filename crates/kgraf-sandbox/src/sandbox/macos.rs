@@ -917,6 +917,25 @@ mod tests {
         assert!(!params.iter().any(|(k, _)| k.starts_with("ANCESTOR_FILE_")));
     }
 
+    /// The IP network rules appear for `Network::Allow` and for no other
+    /// setting; a denied network gets no IP rule and no resolver policy.
+    #[test]
+    fn the_ip_network_rules_follow_the_network_setting() {
+        let (open, _) = profile(&resolved("/x", Network::Allow), Path::new("/home/u"));
+        for rule in [
+            "(allow network-outbound (remote ip \"*:*\"))",
+            "(allow network-inbound (local ip \"*:*\"))",
+            "(allow network-bind (local ip \"*:*\"))",
+            MDNS_SOCKET,
+        ] {
+            assert!(open.contains(rule), "{rule} missing when open");
+        }
+        let (shut, _) = profile(&resolved("/x", Network::Deny), Path::new("/home/u"));
+        for rule in ["remote ip", "local ip", MDNS_SOCKET, NETWORK_POLICY] {
+            assert!(!shut.contains(rule), "{rule} present when denied");
+        }
+    }
+
     #[test]
     fn outbound_is_never_unqualified() {
         for network in [Network::Allow, Network::Deny] {
