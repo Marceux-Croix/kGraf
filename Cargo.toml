@@ -49,6 +49,9 @@ members = [
     # Host in one process, one JSON line of process resources per run. `publish = false`,
     # `dist = false`, same reasoning as kgraf-crosslimit-hammer above.
     "crates/kgraf-soak",
+    # Dev-only: the Windows self-test runner shipped in the bundle that
+    # scripts/package-wintest.sh builds. `publish = false`, `dist = false`.
+    "crates/kgraf-wintest",
 ]
 
 [workspace.package]

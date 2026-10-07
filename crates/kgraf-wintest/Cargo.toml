@@ -1,0 +1,50 @@
+[package]
+name = "kgraf-wintest"
+version.workspace = true
+description = "Windows self-test runner: runs kGraf's cross-built Windows test binaries and end-to-end checks on a Windows machine without Rust, writes one report, and leaves nothing else behind. Never published, never packaged by dist."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+# A test tool, not a product artifact.
+publish = false
+
+# `dist` auto-detects any crate with a `[[bin]]` as a release artifact; this one is
+# shipped only in the self-test bundle that scripts/package-wintest.sh builds.
+[package.metadata.dist]
+dist = false
+
+[[bin]]
+name = "kgraf-wintest"
+path = "src/main.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+# Free memory and disk at the start and end of a run, and the CPU name.
+sysinfo.workspace = true
+# The secret patterns the report text is scrubbed with: the same rules kGraf
+# scrubs transcripts with, not a second list.
+kgraf-secrets.workspace = true
+# `sandbox-run` and the Git Bash search use kGraf's own code, not a copy.
+kgraf-sandbox.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# MIT OR Apache-2.0; the same windows-sys release kgraf-sandbox pins. Job Object
+# for the test processes, console mode, the Ctrl+C handler, the Desktop known
+# folder, the native machine type and the volume file system.
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Console",
+    "Win32_System_JobObjects",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+] }
+
+[dev-dependencies]
+tempfile.workspace = true

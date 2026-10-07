@@ -9,6 +9,74 @@ Run every command in **Windows PowerShell or PowerShell 7, as a normal user** (n
 administrator"): the sandbox is made for a user without administrator rights, and an
 elevated shell would test something else.
 
+## 0. The self-test bundle (the first choice)
+
+Most of the steps below are automated in one program, `kgraf-wintest.exe`, shipped in a zip
+with kGraf's test binaries cross-built for Windows. It needs Git for Windows and nothing
+else: no Rust, no build tools, no API key, no administrator rights. It installs nothing.
+
+1. Build the zip on macOS (or Linux) with `scripts/package-wintest.sh`. It writes
+   `dist/wintest/kgraf-wintest-<version>-<commit>-windows-x86_64.zip`.
+2. On the Windows machine: unblock the zip (Properties, "Unblock"), unzip it, double-click
+   `kgraf-wintest.exe`, answer whether to run the extended set (or wait 20 seconds for yes).
+3. Send back the one report it writes to the Desktop,
+   `kgraf-wintest-report-<date>-<time>.md`. Delete the unzipped folder.
+
+What it runs, in this order: the machine facts (Windows build and edition, architecture and
+emulation, processor, memory, Git for Windows and Git Bash, winget, Defender, SmartScreen
+and Smart App Control, locale); the core set (every kgraf-sandbox test binary, the
+`windows` tests of kgraf-tools, the network notice, dependency link and check input tests
+of kgraf-host, the orchestrator's network notice test); end-to-end checks with the real
+`kgraf.exe` (sections 5, 6 and 6a below, with a scripted model on 127.0.0.1 in place of a
+provider); then, if chosen, the extended set (every other test binary of the workspace that
+runs without Rust, a model, Docker or the internet). Each test binary runs with
+`--test-threads=1`. The report has a summary table first, then every failure with its
+output, the per-binary counts and times, what was not run and why, and the same data as
+JSON at the end. It replaces the user name and computer name, and records no environment
+variables.
+
+How it runs tests built on another machine: a test binary holds its package folder as the
+build machine spelled it (`env!("CARGO_MANIFEST_DIR")`) and reads fixtures and starts
+programs (`CARGO_BIN_EXE_*`) under it. The runner copies the sources and programs into its
+work folder at that same relative path, maps a free drive letter there with `subst`, and
+runs each binary on that drive, so those paths resolve with no change to the tests. Tests
+that build a helper with cargo at run time, need a model key or Docker, or read the
+repository's git history are left out; the manifest in the zip lists each with its reason.
+
+What it leaves behind: the report only. Every file the run makes (the sources, the test
+processes' `TEMP`, kGraf's diagnostics and settings files, the end-to-end repositories, the
+folders the sandbox labels) is in one work folder under `%TEMP%`. At the end, also after
+Ctrl+C, it removes the drive letter and the work folder (resetting permissions and retrying
+once if needed; links are removed, never followed), then checks that both are gone, that no
+`kgraf-escape-*` file or Run key value from an escape test remains, and that no kGraf folder
+appeared under `%APPDATA%` or `%LOCALAPPDATA%`; the report lists what was created and
+removed. It offers to delete the unzipped folder after it exits.
+
+What stays manual: installing the prerequisites and building from source (sections 2 and
+3), the winget install itself and its question in the app and on a terminal (section 6a
+cases 1 to 3; the runner simulates a missing Git Bash with `KGRAF_GIT_BASH_PATH` naming a
+missing file and with `winget` taken off `PATH`, and marks those checks SIMULATED), the
+different Git install locations (case 4), the desktop app window and installer, and the
+Windows Firewall test in `MANUAL-NETWORK-TEST.txt` in the zip. For manual tests,
+`kgraf-wintest.exe sandbox-run -- <program> [args...]` runs one program inside kGraf's
+sandbox in a temporary folder and prints its exit code.
+
+Zip layout:
+
+```
+kgraf-wintest-<version>-<commit>-windows-x86_64/
+  kgraf-wintest.exe        the runner
+  README.txt               the steps above
+  MANUAL-NETWORK-TEST.txt  the Windows Firewall test (administrator)
+  bundle-manifest.json     what runs, in which set, and what is left out and why
+  tests\                   the test binaries
+  programs\                kgraf.exe and the programs tests start by path
+  src\                     the sources and fixtures the tests read
+```
+
+The bundle is built for x86_64 only; on ARM64 it runs under emulation, and the report says
+so. The steps below remain the fallback, and the way to test a native ARM64 build.
+
 ## 1. Find out which machine you have
 
 ```powershell

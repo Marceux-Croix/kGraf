@@ -1,0 +1,30 @@
+kGraf manual network test (Windows Firewall)
+==============================================
+Purpose: find out whether Windows can block network access for kGraf's sandboxed processes only.
+Safety: the rule applies only to a private copy of curl.exe in C:\kgraf-fwtest. Nothing else on the machine is affected. Step 6 removes everything.
+Run these in PowerShell opened with "Run as administrator", from this unzipped folder.
+
+1. Make a test copy of curl:
+   New-Item -ItemType Directory C:\kgraf-fwtest; Copy-Item C:\Windows\System32\curl.exe C:\kgraf-fwtest\curl.exe
+
+2. Control, before any rule (both should print 200):
+   C:\kgraf-fwtest\curl.exe -sS -o NUL -w "%{http_code}`n" https://example.com
+   .\kgraf-wintest.exe sandbox-run -- C:\kgraf-fwtest\curl.exe -sS -o NUL -w "%{http_code}`n" https://example.com
+
+3. Get your user ID:
+   $sid = ([System.Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
+
+4. Add the block rule (it blocks the test curl for processes Windows matches to your user ID):
+   New-NetFirewallRule -DisplayName "kgraf-fwtest" -Direction Outbound -Action Block -Program C:\kgraf-fwtest\curl.exe -LocalUser "D:(A;;CC;;;$sid)"
+
+5. Run both commands from step 2 again. Copy their output.
+
+6. Clean up:
+   Remove-NetFirewallRule -DisplayName "kgraf-fwtest"; Remove-Item -Recurse C:\kgraf-fwtest
+
+Send back: the output of steps 2 and 5 (and of step 4 if step 5 shows the normal curl still connects).
+
+What the result means:
+- Normal blocked, sandbox blocked: Windows sees the sandbox as you; the current sandbox cannot be told apart.
+- Normal blocked, sandbox connected: Windows can tell the sandbox apart; network isolation is possible with the current sandbox.
+- Normal connected: the rule did not take effect; the test is not valid.
