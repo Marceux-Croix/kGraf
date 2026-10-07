@@ -693,3 +693,82 @@ fn check_folders_live_outside_the_worker_s_roots_and_are_cleaned() {
     assert!(live.path().is_dir(), "a live process's folder stays");
     assert!(ws.root().is_dir(), "the worktree is not touched");
 }
+
+/// A check folder holds the check's `tmp` folder and names its cargo target
+/// folder without making it; each folder is new and named for its process.
+#[test]
+fn a_check_folder_names_its_tmp_and_target_and_is_new_each_time() {
+    let f = fixture();
+    let mgr = WorkspaceManager::open(&f.repo, &f.base).unwrap();
+    mgr.startup().unwrap();
+    let ws = mgr.create(&spec("w1")).unwrap();
+    let one = kgraf_sandbox::CheckFolder::create(&ws).unwrap();
+    let two = kgraf_sandbox::CheckFolder::create(&ws).unwrap();
+    assert_ne!(one.path(), two.path());
+    for check in [&one, &two] {
+        assert!(check.path().is_dir());
+        assert_eq!(check.tmp(), check.path().join("tmp"));
+        assert!(check.tmp().is_dir());
+        assert_eq!(check.target(), check.path().join("target"));
+        assert!(!check.target().exists(), "the target folder is not made");
+        assert_eq!(check.path().parent(), Some(ws.checks_dir().as_path()));
+        // `<pid>-<start>-<nanos>-<n>`.
+        let name = check.path().file_name().unwrap().to_str().unwrap();
+        let parts: Vec<&str> = name.split('-').collect();
+        assert_eq!(parts.len(), 4, "{name}");
+        assert_eq!(parts[0], std::process::id().to_string());
+        assert!(parts.iter().all(|p| p.parse::<u128>().is_ok()), "{name}");
+    }
+    let (a, b) = (
+        one.path().file_name().unwrap().to_owned(),
+        two.path().file_name().unwrap().to_owned(),
+    );
+    assert_ne!(a, b);
+}
+
+/// Startup removes a check folder of a process that has ended, and one whose
+/// process id names a live process that did not start it (the id was reused);
+/// a folder of a live process whose start time is not recorded stays.
+#[test]
+fn startup_reads_the_owner_of_a_check_folder_from_its_name() {
+    let f = fixture();
+    let mgr = WorkspaceManager::open(&f.repo, &f.base).unwrap();
+    mgr.startup().unwrap();
+    let ws = mgr.create(&spec("w1")).unwrap();
+    let pid = std::process::id();
+    let unrecorded = ws.checks_dir().join(format!("{pid}-0-1-1"));
+    std::fs::create_dir_all(unrecorded.join("target")).unwrap();
+    let live = kgraf_sandbox::CheckFolder::create(&ws).unwrap();
+    let unreadable = ws.checks_dir().join("not-a-check-folder");
+    std::fs::create_dir_all(&unreadable).unwrap();
+    let bad_start = ws.checks_dir().join(format!("{pid}-x-1-2"));
+    std::fs::create_dir_all(&bad_start).unwrap();
+    let dead = ws.checks_dir().join(format!("{}-0-1-3", dead_pid()));
+    std::fs::create_dir_all(&dead).unwrap();
+    let dead_started = ws.checks_dir().join(format!("{}-12345-1-4", dead_pid()));
+    std::fs::create_dir_all(&dead_started).unwrap();
+    mgr.startup().unwrap();
+    assert!(
+        unrecorded.is_dir(),
+        "a live process with no recorded start stays"
+    );
+    assert!(live.path().is_dir(), "a live process's own folder stays");
+    assert!(unreadable.is_dir(), "a name that names no process is left");
+    assert!(bad_start.is_dir(), "a name with no start time is left");
+    assert!(!dead.exists(), "an ended process's folder is removed");
+    assert!(
+        !dead_started.exists(),
+        "an ended process's folder is removed"
+    );
+    // A live process id with another start time is a reused id.
+    let started = kgraf_sandbox::ProcessIdentity::current().start;
+    if let Some(start) = started {
+        let reused = ws
+            .checks_dir()
+            .join(format!("{pid}-{}-1-5", start.wrapping_add(1_000_000)));
+        std::fs::create_dir_all(&reused).unwrap();
+        mgr.startup().unwrap();
+        assert!(!reused.exists(), "a reused process id is removed");
+        assert!(live.path().is_dir());
+    }
+}

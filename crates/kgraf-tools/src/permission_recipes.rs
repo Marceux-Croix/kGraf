@@ -358,7 +358,15 @@ fn parse_makefile(text: &str) -> Makefile {
             match op {
                 "!=" => {
                     mf.at_parse.push(value.clone());
-                    mf.vars.entry(name).or_default().push(UNRESOLVED.to_owned());
+                    // Stored escaped (`$$`), so that expanding the value gives
+                    // `UNRESOLVED` (which holds `$`) and not the text after a
+                    // variable named `_`: a program word holding `$` is
+                    // unreadable, a word `_unresolved` would be judged as a
+                    // program of that name.
+                    mf.vars
+                        .entry(name)
+                        .or_default()
+                        .push(format!("${UNRESOLVED}"));
                 }
                 "+=" => {
                     let entry = mf.vars.entry(name).or_default();
@@ -2305,3 +2313,7 @@ mod tests {
         assert!(cargo(&argv(&["cargo", "fmt"]), 0, &ReadContext::default()).is_none());
     }
 }
+
+#[cfg(test)]
+#[path = "permission_recipes_tests.rs"]
+mod more_tests;

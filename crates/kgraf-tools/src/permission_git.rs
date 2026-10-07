@@ -1201,3 +1201,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "permission_git_more_tests.rs"]
+mod more_tests;

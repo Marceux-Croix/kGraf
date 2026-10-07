@@ -1954,3 +1954,51 @@ fn sweep_attempt_refs_deletes_only_the_named_attempts() {
     assert!(mb.sweep_attempt_refs(&[]).unwrap().is_empty());
     assert!(ref_exists(&e.f.repo, &refs[1]));
 }
+
+/// Everything git ignores that a worker's run left in the tree is removed
+/// before a check, and returned; tracked files, the committed `.gitignore`
+/// and untracked files that are not ignored stay.
+#[test]
+fn remove_ignored_removes_what_git_ignores_and_nothing_else() {
+    let e = env();
+    let mb = merger(&e);
+    let mut w = attempt(&e, "ign");
+    write(&w, ".gitignore", "*.log\nbuild/\n.gradle/\n");
+    write(&w, "src.txt", "kept\n");
+    write(&w, "dir/tracked.txt", "kept\n");
+    let CommitOutcome::Committed { .. } = mb.commit(&mut w, "ign").unwrap() else {
+        panic!("committed");
+    };
+    // What the run left: ignored files and folders, and a file git sees.
+    write(&w, "run.log", "x");
+    write(&w, "sub/deep.log", "x");
+    write(&w, "build/out/x.bin", "x");
+    write(&w, ".gradle/state", "x");
+    write(&w, "untracked.txt", "not ignored");
+    let root = w.workspace().root().to_path_buf();
+    let mut removed: Vec<String> = mb
+        .remove_ignored(&w)
+        .unwrap()
+        .iter()
+        .map(|p| p.to_string_lossy().trim_end_matches('/').to_owned())
+        .collect();
+    removed.sort();
+    // A folder whose every file is ignored may be listed whole or by file.
+    for listed in [".gradle", "build", "run.log"] {
+        assert!(removed.iter().any(|r| r == listed), "{listed}: {removed:?}");
+    }
+    assert!(removed.iter().any(|r| r.starts_with("sub")), "{removed:?}");
+    assert!(
+        removed
+            .iter()
+            .all(|r| r != "untracked.txt" && r != "src.txt")
+    );
+    for gone in ["run.log", "sub/deep.log", "build", ".gradle"] {
+        assert!(!root.join(gone).exists(), "{gone}");
+    }
+    for kept in [".gitignore", "src.txt", "dir/tracked.txt", "untracked.txt"] {
+        assert!(root.join(kept).is_file(), "{kept}");
+    }
+    // A second call finds nothing.
+    assert!(mb.remove_ignored(&w).unwrap().is_empty());
+}

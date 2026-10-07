@@ -816,10 +816,35 @@ fn ruby_call(program: &str, args: &[String], ctx: &ReadContext) -> Option<Vec<Em
 }
 
 fn php_call(program: &str, args: &[String], ctx: &ReadContext) -> Option<Vec<Embedded>> {
-    if only_version(args) || args.iter().any(|a| a == "-l" || a == "--syntax-check") {
+    // Questions that run no code: a version, a syntax check, the build
+    // information and the reflection options, which print and exit without
+    // reading a script from input.
+    const NO_CODE: &[&str] = &[
+        "-l",
+        "--syntax-check",
+        "-i",
+        "--info",
+        "-m",
+        "--modules",
+        "--ini",
+        "--rf",
+        "--rc",
+        "--re",
+        "--rz",
+        "--ri",
+        "--rextension",
+        "--rfunction",
+        "--rclass",
+        "--rzendextension",
+        "--rextinfo",
+    ];
+    if only_version(args) || args.iter().any(|a| NO_CODE.contains(&a.as_str())) {
         return None;
     }
     let mut out = Vec::new();
+    // Whether `-r` or a like option gave code: with no code and no script,
+    // php reads its code from its input, as with no options at all.
+    let mut code_given = false;
     let mut i = 0;
     while let Some(a) = args.get(i) {
         let next = args.get(i + 1);
@@ -834,6 +859,7 @@ fn php_call(program: &str, args: &[String], ctx: &ReadContext) -> Option<Vec<Emb
                     return Some(unreadable(program, "names no code"));
                 };
                 out.extend(inline(program, Lang::PhpOnly, code, ctx));
+                code_given = true;
                 i += 2;
                 continue;
             }
@@ -877,7 +903,7 @@ fn php_call(program: &str, args: &[String], ctx: &ReadContext) -> Option<Vec<Emb
             _ => break,
         }
     }
-    if !out.is_empty() || i > 0 && args.get(i).is_none() {
+    if code_given {
         return Some(out);
     }
     match args.get(i) {
@@ -2778,7 +2804,7 @@ mod lexical {
     /// the rest. `interpolates`: a double-quoted literal that holds `$` or
     /// `@` is not literal. Perl's `q(...)`, `qq(...)`, `qw(...)` forms are
     /// read when `perl` is set.
-    fn quoted(s: &str, perl: bool) -> Option<(Vec<String>, &str)> {
+    pub(super) fn quoted(s: &str, perl: bool) -> Option<(Vec<String>, &str)> {
         let s = s.trim_start();
         let mut chars = s.char_indices();
         let (_, first) = chars.next()?;
@@ -2860,7 +2886,7 @@ mod lexical {
     /// A list of literals at the start of `s`, in parentheses or not,
     /// separated by `,` or `=>`, ending at `)`, `;`, a newline, `}` or the
     /// end. `None` when anything in it is not a literal.
-    fn literal_list(s: &str, perl: bool) -> Option<Vec<String>> {
+    pub(super) fn literal_list(s: &str, perl: bool) -> Option<Vec<String>> {
         let mut rest = s.trim_start();
         let paren = rest.starts_with('(');
         if paren {
@@ -2894,7 +2920,7 @@ mod lexical {
     }
 
     /// Every position of `word` in `code` as a whole word.
-    fn word_at(code: &str, word: &str) -> Vec<usize> {
+    pub(super) fn word_at(code: &str, word: &str) -> Vec<usize> {
         let mut out = Vec::new();
         let bytes = code.as_bytes();
         let mut from = 0;
@@ -3058,7 +3084,7 @@ mod lexical {
     }
 
     /// Whether `code` holds an `s///` substitution with the `e` flag.
-    fn substitution_with_e(code: &str) -> bool {
+    pub(super) fn substitution_with_e(code: &str) -> bool {
         for at in word_at(code, "s") {
             let rest = &code[at + 1..];
             let Some(open) = rest.chars().next() else {
@@ -3122,8 +3148,25 @@ mod lexical {
                             c => c,
                         };
                         let base = rest.len() - after.len();
-                        if let Some(e) = after[1..].find(c2) {
-                            end = Some(base + 1 + e + 1);
+                        // The replacement ends at its own closing bracket:
+                        // brackets inside it nest, and a backslash escapes.
+                        let mut nested = 0;
+                        let mut escaped2 = false;
+                        for (j, ch) in after[o2.len_utf8()..].char_indices() {
+                            if escaped2 {
+                                escaped2 = false;
+                            } else if ch == '\\' {
+                                escaped2 = true;
+                            } else if o2 != c2 && ch == o2 {
+                                nested += 1;
+                            } else if ch == c2 {
+                                if nested > 0 {
+                                    nested -= 1;
+                                } else {
+                                    end = Some(base + o2.len_utf8() + j + ch.len_utf8());
+                                    break;
+                                }
+                            }
                         }
                         break;
                     }
@@ -3145,14 +3188,14 @@ mod lexical {
     /// An awk program's tokens of interest: string literals, `|` operators
     /// and the rest, with regular expressions and comments skipped.
     #[derive(Debug, PartialEq, Eq)]
-    enum AwkToken {
+    pub(super) enum AwkToken {
         Str(String),
         Pipe,
         Word(String),
         Other(char),
     }
 
-    fn awk_tokens(code: &str) -> Vec<AwkToken> {
+    pub(super) fn awk_tokens(code: &str) -> Vec<AwkToken> {
         let chars: Vec<char> = code.chars().collect();
         let mut out = Vec::new();
         let mut i = 0;
@@ -3325,3 +3368,11 @@ mod lexical {
 #[cfg(test)]
 #[path = "permission_code_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "permission_code_more_tests.rs"]
+mod more_tests;
+
+#[cfg(test)]
+#[path = "permission_code_scan_tests.rs"]
+mod scan_tests;

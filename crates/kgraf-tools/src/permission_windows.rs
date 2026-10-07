@@ -1690,3 +1690,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "permission_windows_more_tests.rs"]
+mod more_tests;

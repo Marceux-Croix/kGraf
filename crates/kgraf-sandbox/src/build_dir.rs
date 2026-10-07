@@ -259,4 +259,118 @@ mod tests {
             Err(SeedError::Overlap { .. })
         ));
     }
+
+    /// A clone only: the seed is a copy-on-write clone, or there is none and
+    /// the destination is left absent. It never falls back to a byte copy.
+    #[test]
+    fn a_clone_only_seed_is_a_clone_or_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let warm = warm_dir(tmp.path());
+        let dest = tmp.path().join("wt/target/debug");
+        match clone_target_dir(&warm, &dest) {
+            Ok(report) => {
+                assert!(matches!(
+                    report.method,
+                    SeedMethod::Clone | SeedMethod::Reflink
+                ));
+                assert_eq!(report.dest, std::fs::canonicalize(&dest).unwrap());
+                assert_eq!(
+                    std::fs::read(dest.join("debug/deps/libx.rlib")).unwrap(),
+                    b"artifact"
+                );
+                assert_eq!(std::fs::read(dest.join(".rustc_info.json")).unwrap(), b"{}");
+            }
+            Err(SeedError::NoClone(why)) => {
+                assert!(!why.is_empty());
+                assert!(!dest.exists(), "no partial seed is left");
+            }
+            Err(other) => panic!("{other}"),
+        }
+        // The same folder, cloned from its own `debug` profile.
+        let dest = tmp.path().join("wt2/target/debug");
+        match clone_target_dir(&warm.join("debug"), &dest) {
+            Ok(report) => {
+                assert!(matches!(
+                    report.method,
+                    SeedMethod::Clone | SeedMethod::Reflink
+                ));
+                assert_eq!(
+                    std::fs::read(dest.join("deps/libx.rlib")).unwrap(),
+                    b"artifact"
+                );
+                // Writing the clone never reaches the warm folder.
+                std::fs::write(dest.join("deps/libx.rlib"), b"changed").unwrap();
+                assert_eq!(
+                    std::fs::read(warm.join("debug/deps/libx.rlib")).unwrap(),
+                    b"artifact"
+                );
+            }
+            Err(SeedError::NoClone(_)) => assert!(!dest.exists()),
+            Err(other) => panic!("{other}"),
+        }
+    }
+
+    #[test]
+    fn a_clone_only_seed_refuses_what_a_seed_refuses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let warm = warm_dir(tmp.path());
+        let taken = tmp.path().join("taken");
+        std::fs::create_dir(&taken).unwrap();
+        assert!(matches!(
+            clone_target_dir(&warm, &taken),
+            Err(SeedError::DestExists(_))
+        ));
+        assert!(matches!(
+            clone_target_dir(&tmp.path().join("nope"), &tmp.path().join("d")),
+            Err(SeedError::NoWarmDir(_))
+        ));
+        assert!(matches!(
+            clone_target_dir(&warm, &warm.join("inner")),
+            Err(SeedError::Overlap { .. })
+        ));
+    }
+
+    /// Where `cp` cannot clone (a file it cannot read), a clone-only seed
+    /// reports it and leaves nothing behind, where a seed with a copy
+    /// fallback would have tried a byte copy.
+    #[cfg(unix)]
+    #[test]
+    fn a_clone_that_fails_leaves_no_partial_folder() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let warm = warm_dir(tmp.path());
+        let locked = warm.join("debug/deps/locked.rlib");
+        std::fs::write(&locked, b"x").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // A process allowed to read it anyway (root) cannot show the failure.
+        if std::fs::read(&locked).is_ok() {
+            return;
+        }
+        let dest = tmp.path().join("wt/target");
+        let err = clone_target_dir(&warm, &dest).expect_err("a file cp cannot read");
+        assert!(matches!(err, SeedError::NoClone(_)), "{err}");
+        assert!(!dest.exists(), "no partial seed is left");
+        // A seed that may copy tries the byte copy, which fails the same way.
+        let dest2 = tmp.path().join("wt2/target");
+        assert!(seed_target_dir(&warm, &dest2).is_err());
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    /// A partial seed is removed whole; one that is not there is no error;
+    /// anything else that stops the removal is.
+    #[test]
+    fn a_partial_seed_is_removed_and_a_missing_one_is_not_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let partial = tmp.path().join("partial");
+        std::fs::create_dir_all(partial.join("a/b")).unwrap();
+        std::fs::write(partial.join("a/b/f"), b"x").unwrap();
+        remove_partial(&partial).unwrap();
+        assert!(!partial.exists());
+        remove_partial(&tmp.path().join("never-made")).unwrap();
+        // A file is not a folder: the removal fails, and says so.
+        let file = tmp.path().join("file");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(matches!(remove_partial(&file), Err(SeedError::Io { .. })));
+        assert!(file.exists());
+    }
 }

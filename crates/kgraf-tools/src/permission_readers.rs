@@ -1403,3 +1403,7 @@ mod tests {
         assert!(is_unreadable(&["docker", "exec", "-z", "web", "curl"]));
     }
 }
+
+#[cfg(test)]
+#[path = "permission_readers_more_tests.rs"]
+mod more_tests;

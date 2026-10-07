@@ -86,3 +86,34 @@ async fn the_open_network_decision_changes_what_the_check_can_reach() {
     let (reached, text) = run(CheckNetwork::deny());
     assert!(!reached, "the denied network does not: {text}");
 }
+
+/// A check that started from no warm build folder says so when it fails, and
+/// only then: a pass ends with no build note.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failing_check_that_built_cold_says_so_and_a_passing_one_does_not() {
+    let r = repo();
+    let c = named("b.txt", "w-cold");
+    let ws_path = prepared(&r, &c, "w-cold").await;
+    let live = r.workspaces.get(&ws_path).expect("live");
+    let missing = r.root.join("no-such-warm-folder");
+    let run = |command: &str| {
+        crate::gates::run_confined_on(
+            CheckNetwork::deny(),
+            &live,
+            &r.root,
+            &[],
+            command,
+            Duration::from_secs(30),
+            2_000,
+            Some(&missing),
+        )
+        .expect("the check ran")
+    };
+    let (ok, text) = run("echo fine");
+    assert!(ok, "{text}");
+    assert!(!text.contains("[build]"), "{text}");
+    let (ok, text) = run("exit 3");
+    assert!(!ok, "{text}");
+    assert!(text.contains("[build] the check built cold"), "{text}");
+    assert!(text.contains("no-such-warm-folder"), "{text}");
+}

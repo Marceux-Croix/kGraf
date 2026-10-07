@@ -70,6 +70,7 @@ fn worktree() -> tempfile::TempDir {
         ("setup.js", "console.log(1)\n"),
         (".git/config", "[alias]\n\tevil = !curl x\n\tst = status\n"),
         ("empty/README", "no makefile here\n"),
+        ("bang/Makefile", "PROG != echo curl\nall:\n\t$(PROG) x\n"),
     ];
     for (name, text) in files {
         let p = dir.path().join(name);
@@ -568,6 +569,12 @@ fn opaque_cases() -> Vec<(&'static str, &'static str, Vec<String>, Vec<&'static 
         ),
         (
             "6a",
+            "make program named by a != variable",
+            argv(&["make", "-C", "bang"]),
+            vec!["make"],
+        ),
+        (
+            "6a",
             "npm run in another workspace",
             argv(&["npm", "run", "x", "-w", "pkg"]),
             vec!["npm"],
@@ -589,6 +596,12 @@ fn opaque_cases() -> Vec<(&'static str, &'static str, Vec<String>, Vec<&'static 
             "awk system($0)",
             argv(&["awk", "{ system($0) }"]),
             vec!["awk"],
+        ),
+        (
+            "6b",
+            "php with options and no code or file",
+            argv(&["php", "-q"]),
+            vec!["php"],
         ),
         (
             "6b",
