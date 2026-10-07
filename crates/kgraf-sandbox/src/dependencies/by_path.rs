@@ -519,4 +519,349 @@ mod tests {
         assert!(make_dirs(&Symlinks, &r, Path::new("tmp/elsewhere/x")).is_err());
         assert!(std::fs::read_dir(&o).expect("read").next().is_none());
     }
+
+    /// Symbolic links with the failures a parallel command could cause: a
+    /// `link_dir` that fails with a chosen error, and a hook run right after
+    /// a link is removed (to swap what is there).
+    type AfterRemove = Box<dyn Fn(&Path)>;
+
+    struct Hooked {
+        link_dir_error: Option<io::ErrorKind>,
+        after_remove: Option<AfterRemove>,
+        removed: std::cell::Cell<usize>,
+    }
+
+    impl Hooked {
+        fn new() -> Self {
+            Self {
+                link_dir_error: None,
+                after_remove: None,
+                removed: std::cell::Cell::new(0),
+            }
+        }
+        fn failing(kind: io::ErrorKind) -> Self {
+            Self {
+                link_dir_error: Some(kind),
+                ..Self::new()
+            }
+        }
+    }
+
+    impl LinkOps for Hooked {
+        fn is_link(&self, path: &Path) -> bool {
+            Symlinks.is_link(path)
+        }
+        fn link_target(&self, path: &Path) -> Option<PathBuf> {
+            Symlinks.link_target(path)
+        }
+        fn link_dir(&self, target: &Path, at: &Path) -> io::Result<()> {
+            match self.link_dir_error {
+                Some(kind) => Err(io::Error::from(kind)),
+                None => Symlinks.link_dir(target, at),
+            }
+        }
+        fn remove_link(&self, at: &Path) -> io::Result<()> {
+            Symlinks.remove_link(at)?;
+            self.removed.set(self.removed.get() + 1);
+            if let Some(hook) = &self.after_remove {
+                hook(at);
+            }
+            Ok(())
+        }
+    }
+
+    /// A checkout with a workspace install, its `node_modules` and the plan.
+    fn workspace_install() -> (tempfile::TempDir, PathBuf, Vec<MirrorEntry>) {
+        let (c, root) = canonical_tempdir();
+        write(&root.join("packages/web/index.js"), "checkout");
+        write(&root.join("node_modules/dep/index.js"), "dep");
+        std::fs::create_dir_all(root.join("node_modules/@s")).expect("mkdir");
+        std::os::unix::fs::symlink("../../packages/web", root.join("node_modules/@s/web"))
+            .expect("ln");
+        let source = root.join("node_modules");
+        let plan = super::super::mirror_plan(&source, &root).expect("a workspace install");
+        (c, source, plan)
+    }
+
+    fn is_real_dir(p: &Path) -> bool {
+        std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir())
+    }
+
+    /// Nothing is made under a folder the tree does not have.
+    #[test]
+    fn a_link_is_not_made_under_an_absent_folder() {
+        let (_c, c) = canonical_tempdir();
+        write(&c.join("node_modules/dep/index.js"), "dep");
+        let nm = c.join("node_modules");
+        let (_t, t) = canonical_tempdir();
+        assert!(matches!(
+            link(&Symlinks, &t, Path::new("gone/node_modules"), &nm),
+            Ok(Linked::NoParent)
+        ));
+        assert!(!t.join("gone").exists());
+    }
+
+    /// A made entry whose folder resolves outside the tree is removed again
+    /// and reported, for a folder link and for a file copy.
+    #[test]
+    fn an_entry_made_outside_the_tree_is_removed_and_reported() {
+        let (_c, c) = canonical_tempdir();
+        write(&c.join("node_modules/dep/index.js"), "dep");
+        write(&c.join(".pnp.cjs"), "pnp");
+        let (_t, t) = canonical_tempdir();
+        let (_o, o) = canonical_tempdir();
+        std::os::unix::fs::symlink(&o, t.join("svc")).expect("ln");
+        let nm = c.join("node_modules");
+        assert!(make(&Symlinks, &t, &nm, &t.join("svc/x")).is_err());
+        assert!(std::fs::symlink_metadata(o.join("x")).is_err(), "link left");
+        assert!(make(&Symlinks, &t, &c.join(".pnp.cjs"), &t.join("svc/y")).is_err());
+        assert!(std::fs::symlink_metadata(o.join("y")).is_err(), "copy left");
+    }
+
+    /// Only "already exists" (a parallel command made it first) is kept as
+    /// present; any other failure is reported.
+    #[test]
+    fn link_failures_are_kept_as_present_only_when_the_entry_exists() {
+        let (_c, c) = canonical_tempdir();
+        write(&c.join("node_modules/dep/index.js"), "dep");
+        let nm = c.join("node_modules");
+        let (_t, t) = canonical_tempdir();
+        let raced = Hooked::failing(io::ErrorKind::AlreadyExists);
+        assert!(matches!(
+            link(&raced, &t, Path::new("node_modules"), &nm),
+            Ok(Linked::Present)
+        ));
+        let denied = Hooked::failing(io::ErrorKind::PermissionDenied);
+        let err = link(&denied, &t, Path::new("node_modules"), &nm).err();
+        assert_eq!(err.map(|e| e.kind()), Some(io::ErrorKind::PermissionDenied));
+    }
+
+    /// A mirror counts as current only when every part holds.
+    #[test]
+    fn a_mirror_is_current_only_when_folder_mark_and_stamp_all_hold() {
+        let (_w, source, plan) = workspace_install();
+        let rel = Path::new("node_modules");
+        let (_t, t) = canonical_tempdir();
+        assert!(!mirror_is_current(&Symlinks, &t, rel, "s"), "absent");
+        mirror(&Symlinks, &t, rel, &source, &plan, "s").expect("mirror");
+        assert!(mirror_is_current(&Symlinks, &t, rel, "s"));
+        assert!(!mirror_is_current(&Symlinks, &t, rel, "other stamp"));
+        // The mark is a link to a file with the right stamp.
+        let mark = t.join("node_modules").join(MIRROR_MARK);
+        let real = t.join("stamp-file");
+        std::fs::write(&real, "s").expect("write");
+        std::fs::remove_file(&mark).expect("rm");
+        std::os::unix::fs::symlink(&real, &mark).expect("ln");
+        assert!(
+            !mirror_is_current(&Symlinks, &t, rel, "s"),
+            "mark is a link"
+        );
+        std::fs::remove_file(&mark).expect("rm");
+        assert!(!mirror_is_current(&Symlinks, &t, rel, "s"), "no mark");
+        // The folder is a link to a folder holding a right mark.
+        let (_o, o) = canonical_tempdir();
+        write(&o.join(MIRROR_MARK), "s");
+        std::os::unix::fs::symlink(&o, t.join("linked")).expect("ln");
+        assert!(!mirror_is_current(&Symlinks, &t, Path::new("linked"), "s"));
+        // A parent that is a link to a folder holding a right mirror.
+        std::fs::create_dir_all(o.join("node_modules")).expect("mkdir");
+        write(&o.join("node_modules").join(MIRROR_MARK), "s");
+        std::os::unix::fs::symlink(&o, t.join("svc")).expect("ln");
+        assert!(!mirror_is_current(
+            &Symlinks,
+            &t,
+            Path::new("svc/node_modules"),
+            "s"
+        ));
+        // A file where the folder goes.
+        std::fs::write(t.join("file"), "s").expect("write");
+        assert!(!mirror_is_current(&Symlinks, &t, Path::new("file"), "s"));
+    }
+
+    /// kGraf's own earlier link is replaced by the folder; a link to
+    /// something else is left, and nothing is written through it.
+    #[test]
+    fn the_mirror_replaces_its_own_link_and_leaves_a_foreign_one() {
+        let (_w, source, plan) = workspace_install();
+        let rel = Path::new("node_modules");
+        let (_t, t) = canonical_tempdir();
+        std::os::unix::fs::symlink(&source, t.join("node_modules")).expect("ln");
+        let made = mirror(&Symlinks, &t, rel, &source, &plan, "s").expect("mirror");
+        assert!(matches!(made, Linked::Made));
+        assert!(is_real_dir(&t.join("node_modules")));
+        assert!(t.join("node_modules").join(MIRROR_MARK).is_file());
+
+        let (_f, f) = canonical_tempdir();
+        let (_o, o) = canonical_tempdir();
+        std::os::unix::fs::symlink(&o, f.join("node_modules")).expect("ln");
+        let left = mirror(&Symlinks, &f, rel, &source, &plan, "s").expect("mirror");
+        assert!(matches!(left, Linked::Present));
+        assert!(Symlinks.is_link(&f.join("node_modules")));
+        assert!(std::fs::read_dir(&o).expect("read").next().is_none());
+        // A file where the folder goes is left too.
+        let (_g, g) = canonical_tempdir();
+        std::fs::write(g.join("node_modules"), "x").expect("write");
+        let file = mirror(&Symlinks, &g, rel, &source, &plan, "s").expect("mirror");
+        assert!(matches!(file, Linked::Present));
+    }
+
+    /// A parallel command that swaps what the mirror works in, between the
+    /// check and the write, makes the mirror stop and write nothing there.
+    #[test]
+    fn the_mirror_stops_when_its_folder_is_swapped_for_a_link() {
+        let (_w, source, plan) = workspace_install();
+        let rel = Path::new("node_modules");
+        // Swapped for a link to another folder of the tree.
+        let (_t, t) = canonical_tempdir();
+        std::os::unix::fs::symlink(&source, t.join("node_modules")).expect("ln");
+        let inner = t.join("inner");
+        std::fs::create_dir(&inner).expect("mkdir");
+        let mut ops = Hooked::new();
+        let target = inner.clone();
+        ops.after_remove = Some(Box::new(move |at| {
+            std::os::unix::fs::symlink(&target, at).expect("swap");
+        }));
+        let out = mirror(&ops, &t, rel, &source, &plan, "s").expect("mirror");
+        assert!(matches!(out, Linked::Present));
+        assert!(std::fs::read_dir(&inner).expect("read").next().is_none());
+        // Swapped: a folder above it becomes a link out of the tree.
+        let (_u, u) = canonical_tempdir();
+        let (_o, o) = canonical_tempdir();
+        std::fs::create_dir(u.join("svc")).expect("mkdir");
+        std::os::unix::fs::symlink(&source, u.join("svc/node_modules")).expect("ln");
+        let mut ops = Hooked::new();
+        let (svc, out_dir) = (u.join("svc"), o.clone());
+        ops.after_remove = Some(Box::new(move |_| {
+            std::fs::remove_dir(&svc).expect("rmdir");
+            std::os::unix::fs::symlink(&out_dir, &svc).expect("swap");
+        }));
+        let out = mirror(&ops, &u, Path::new("svc/node_modules"), &source, &plan, "s");
+        assert!(matches!(out, Ok(Linked::Present)));
+        assert!(!o.join("node_modules").join(MIRROR_MARK).exists());
+        assert!(!o.join("node_modules/dep").exists());
+    }
+
+    /// A folder made by a parallel command first is taken as it is.
+    #[test]
+    fn the_mirror_goes_on_when_its_folder_appears_first() {
+        let (_w, source, plan) = workspace_install();
+        let (_t, t) = canonical_tempdir();
+        std::os::unix::fs::symlink(&source, t.join("node_modules")).expect("ln");
+        let mut ops = Hooked::new();
+        ops.after_remove = Some(Box::new(|at| {
+            std::fs::create_dir(at).expect("made first");
+        }));
+        let out = mirror(&ops, &t, Path::new("node_modules"), &source, &plan, "s");
+        assert!(matches!(out, Ok(Linked::Made)));
+        assert!(t.join("node_modules").join(MIRROR_MARK).is_file());
+    }
+
+    /// A workspace package the tree lacks and an entry that exists are
+    /// skipped; any other failure is reported.
+    #[test]
+    fn mirror_link_failures_are_skipped_only_when_expected() {
+        let (_w, source, plan) = workspace_install();
+        let rel = Path::new("node_modules");
+        for kind in [io::ErrorKind::AlreadyExists, io::ErrorKind::NotFound] {
+            let (_t, t) = canonical_tempdir();
+            let out = mirror(&Hooked::failing(kind), &t, rel, &source, &plan, "s");
+            assert!(matches!(out, Ok(Linked::Made)), "{kind:?}");
+        }
+        let (_t, t) = canonical_tempdir();
+        let denied = Hooked::failing(io::ErrorKind::PermissionDenied);
+        let err = mirror(&denied, &t, rel, &source, &plan, "s").err();
+        assert_eq!(err.map(|e| e.kind()), Some(io::ErrorKind::PermissionDenied));
+    }
+
+    /// A folder entry is made, an existing one is kept, and a failure is
+    /// reported.
+    #[test]
+    fn mirror_folder_entries_are_made_kept_or_reported() {
+        let (_w, source, _) = workspace_install();
+        let rel = Path::new("node_modules");
+        let (_t, t) = canonical_tempdir();
+        let plan = vec![MirrorEntry::Dir(PathBuf::from("@s"))];
+        mirror(&Symlinks, &t, rel, &source, &plan, "1").expect("first");
+        assert!(t.join("node_modules/@s").is_dir());
+        mirror(&Symlinks, &t, rel, &source, &plan, "2").expect("second keeps it");
+        let deep = vec![MirrorEntry::Dir(PathBuf::from("no/such/parent"))];
+        let err = mirror(&Symlinks, &t, rel, &source, &deep, "3").err();
+        assert_eq!(err.map(|e| e.kind()), Some(io::ErrorKind::NotFound));
+    }
+
+    /// A folder that cannot be made or a mark that cannot be replaced is
+    /// reported as that failure.
+    #[cfg(unix)]
+    #[test]
+    fn mirror_write_failures_are_reported_as_they_are() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_w, source, _) = workspace_install();
+        let rel = Path::new("node_modules");
+        let set = |p: &Path, mode| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).expect("chmod");
+        };
+        // The tree cannot take a new folder.
+        let (_t, t) = canonical_tempdir();
+        set(&t, 0o500);
+        let probe = std::fs::File::create(t.join("probe"));
+        if probe.is_ok() {
+            set(&t, 0o700);
+            return; // running as a user that ignores permissions
+        }
+        let err = mirror(&Symlinks, &t, rel, &source, &[], "s").err();
+        set(&t, 0o700);
+        assert_eq!(err.map(|e| e.kind()), Some(io::ErrorKind::PermissionDenied));
+        // The folder cannot take a new mark.
+        mirror(&Symlinks, &t, rel, &source, &[], "s").expect("first");
+        let folder = t.join("node_modules");
+        set(&folder, 0o500);
+        let err = mirror(&Symlinks, &t, rel, &source, &[], "t").err();
+        set(&folder, 0o700);
+        assert_eq!(err.map(|e| e.kind()), Some(io::ErrorKind::PermissionDenied));
+    }
+
+    /// Gradle folders: an existing folder is reused, a file in the way is an
+    /// error, and a failure to make one is that failure.
+    #[test]
+    fn gradle_folders_reuse_folders_and_refuse_a_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_r, r) = canonical_tempdir();
+        make_dirs(&Symlinks, &r, Path::new("a/b")).expect("first");
+        make_dirs(&Symlinks, &r, Path::new("a/b")).expect("existing folders");
+        std::fs::write(r.join("a/file"), "x").expect("write");
+        assert!(make_dirs(&Symlinks, &r, Path::new("a/file")).is_err());
+        std::fs::set_permissions(&r, std::fs::Permissions::from_mode(0o500)).expect("chmod");
+        let can_write = std::fs::File::create(r.join("probe")).is_ok();
+        let err = make_dirs(&Symlinks, &r, Path::new("new")).err();
+        std::fs::set_permissions(&r, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        if !can_write {
+            assert_eq!(err.map(|e| e.kind()), Some(io::ErrorKind::PermissionDenied));
+        }
+    }
+
+    /// A link is removed as a link; a file is removed as a file; a real
+    /// folder is an error and stays; an absent name is simply linked.
+    #[test]
+    fn replace_with_link_treats_a_link_a_file_a_folder_and_nothing_apart() {
+        let (_d, d) = canonical_tempdir();
+        let (_u, u) = canonical_tempdir();
+        let (_v, v) = canonical_tempdir();
+        let ops = Hooked::new();
+        replace_with_link(&ops, &d, Path::new("fresh"), &u).expect("absent");
+        assert_eq!(std::fs::canonicalize(d.join("fresh")).expect("c"), u);
+        assert_eq!(ops.removed.get(), 0);
+        replace_with_link(&ops, &d, Path::new("fresh"), &v).expect("a link");
+        assert_eq!(std::fs::canonicalize(d.join("fresh")).expect("c"), v);
+        assert_eq!(ops.removed.get(), 1, "a link goes through remove_link");
+        std::fs::write(d.join("file"), "x").expect("write");
+        replace_with_link(&ops, &d, Path::new("file"), &u).expect("a file");
+        assert!(Symlinks.is_link(&d.join("file")));
+        assert_eq!(ops.removed.get(), 1, "a file is not removed as a link");
+        std::fs::create_dir(d.join("real")).expect("mkdir");
+        let err = replace_with_link(&ops, &d, Path::new("real"), &u)
+            .err()
+            .map(|e| e.to_string());
+        assert!(err.is_some_and(|m| m.contains("is a folder")));
+        assert!(is_real_dir(&d.join("real")));
+    }
 }

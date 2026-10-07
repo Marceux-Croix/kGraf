@@ -1365,4 +1365,178 @@ mod tests {
         let v = bypass.evaluate(&sh("mkdir out && cp $(ls) out/"));
         assert!(v.decision == Decision::Allow && v.granted, "{v:?}");
     }
+
+    /// A mode's grant is recorded once per program the mode granted, and
+    /// never for a verdict the mode did not decide: a verdict that is not a
+    /// grant, an unrestricted shell, or a program granted to the contract
+    /// (even when the mode would grant it too).
+    #[test]
+    fn a_mode_grant_is_recorded_only_for_programs_the_mode_granted() {
+        use crate::permissions::{PermissionEvent, PermissionMode};
+        let granted_subjects = |control: &crate::permissions::PermissionControl| {
+            let mut s: Vec<String> = control
+                .settle_call("w1", "c1", None)
+                .into_iter()
+                .filter_map(|e| match e {
+                    PermissionEvent::Granted { subject, .. } => Some(subject),
+                    _ => None,
+                })
+                .collect();
+            s.sort();
+            s
+        };
+        let script = sh("mkdir out && mkdir out2 && cp a out/");
+        let record = |policy: &ExecPolicy, verdict: &PolicyVerdict| {
+            policy.record_mode_grant("w1", "c1", &script, verdict);
+        };
+        // The mode granted `mkdir` and `cp`: each is recorded once.
+        let control = control_in(PermissionMode::Auto, &["mkdir", "cp"]);
+        let policy = ExecPolicy::default_kgraf_policy().with_permissions(control.clone());
+        let v = policy.evaluate(&script);
+        assert!(v.granted, "{v:?}");
+        record(&policy, &v);
+        assert_eq!(granted_subjects(&control), ["`cp`", "`mkdir`"]);
+        // A verdict that is not a grant records nothing.
+        let control = control_in(PermissionMode::Auto, &["mkdir", "cp"]);
+        let policy = ExecPolicy::default_kgraf_policy().with_permissions(control.clone());
+        let mut v = policy.evaluate(&script);
+        v.granted = false;
+        record(&policy, &v);
+        assert_eq!(granted_subjects(&control), Vec::<String>::new());
+        // An unrestricted shell is the container's grant, not the mode's.
+        let control = control_in(PermissionMode::Auto, &["mkdir", "cp"]);
+        let policy = ExecPolicy::default_kgraf_policy()
+            .with_permissions(control.clone())
+            .with_unrestricted_shell(true);
+        let v = policy.evaluate(&script);
+        assert!(v.granted, "{v:?}");
+        record(&policy, &v);
+        assert_eq!(granted_subjects(&control), Vec::<String>::new());
+        // `cp` is granted to the contract, so the mode records only `mkdir`.
+        let control = control_in(PermissionMode::Auto, &["mkdir", "cp"]);
+        let policy = ExecPolicy::default_kgraf_policy()
+            .with_permissions(control.clone())
+            .with_granted_programs(["cp".to_string()]);
+        let v = policy.evaluate(&script);
+        assert!(v.granted, "{v:?}");
+        record(&policy, &v);
+        assert_eq!(granted_subjects(&control), ["`mkdir`"]);
+        // A command that is itself a contract-granted program records nothing.
+        let control = control_in(PermissionMode::Auto, &["mkdir"]);
+        let policy = ExecPolicy::default_kgraf_policy()
+            .with_permissions(control.clone())
+            .with_granted_programs(["mkdir".to_string()]);
+        let one = argv(&["mkdir", "out"]);
+        let v = policy.evaluate(&one);
+        assert!(v.granted, "{v:?}");
+        policy.record_mode_grant("w1", "c1", &one, &v);
+        assert_eq!(granted_subjects(&control), Vec::<String>::new());
+    }
+
+    /// The reason a granted script gives lists each program once, in order.
+    #[test]
+    fn a_granted_script_names_each_program_once() {
+        let policy = ExecPolicy::default_kgraf_policy().with_permissions(control_in(
+            crate::permissions::PermissionMode::Auto,
+            &["mkdir", "cp"],
+        ));
+        let v = policy.evaluate(&sh("mkdir a && mkdir b && cp x y && mkdir c"));
+        assert!(v.granted, "{v:?}");
+        let why = v.reason.expect("reason");
+        assert_eq!(why.matches("mkdir").count(), 1, "{why}");
+        assert!(why.contains("`cp`"), "{why}");
+        assert!(why.find("mkdir") < why.find("`cp`"), "{why}");
+    }
+
+    /// What a review read is remembered for each reviewed command, so a file
+    /// changed after the review of any of them is found; the policy's debug
+    /// text names the live mode.
+    #[test]
+    fn a_changed_recipe_is_found_for_every_reviewed_command() {
+        let dir = tempfile::tempdir().expect("dir");
+        let makefile = dir.path().join("Makefile");
+        std::fs::write(&makefile, "t:\n\techo one\nu:\n\techo two\n").expect("write");
+        let ctx = crate::permissions::ReadContext::in_worktree(dir.path(), None);
+        let policy = ExecPolicy::default_kgraf_policy().with_read_context(ctx);
+        let (t, u) = (argv(&["make", "t"]), argv(&["make", "u"]));
+        policy.note_reviewed(&t);
+        policy.note_reviewed(&u);
+        assert_eq!(policy.files_changed_since_review(&t), None);
+        std::fs::write(&makefile, "t:\n\techo changed\nu:\n\techo two\n").expect("write");
+        for call in [&t, &u] {
+            let why = policy.files_changed_since_review(call).expect("changed");
+            assert!(why.to_lowercase().contains("`makefile`"), "{why}");
+        }
+        let live = ExecPolicy::default_kgraf_policy()
+            .with_permissions(control_in(crate::permissions::PermissionMode::Auto, &[]));
+        assert!(format!("{live:?}").contains("LivePermissions("), "{live:?}");
+    }
+
+    /// An allow rule that names the call first decides it, yet a `forbid`
+    /// rule still refuses a program that call runs after its prefix words
+    /// (`env rm x`); the refusal gives the rule's own reason, and a command
+    /// a script starts is named as such.
+    #[test]
+    fn a_forbid_rule_refuses_after_prefix_words_even_past_an_allow_rule() {
+        let policy = ExecPolicy::new(Decision::Prompt)
+            .allow_read_only(&["env"], "env is listed")
+            .forbid(&["rm"], "no deletes");
+        let v = policy.evaluate(&argv(&["env", "rm", "x"]));
+        assert_eq!(v.decision, Decision::Forbidden, "{v:?}");
+        // The call's own program is named as the rule wrote it.
+        assert_eq!(v.reason.as_deref(), Some("no deletes"));
+        let v = policy.evaluate(&sh("echo a; rm x"));
+        assert_eq!(v.decision, Decision::Forbidden, "{v:?}");
+        let why = v.reason.expect("reason");
+        assert!(
+            why.contains("`rm`") && why.ends_with("which is refused: no deletes"),
+            "{why}"
+        );
+    }
+
+    /// The first rule that names the call decides it: an allow rule written
+    /// before a `forbid` rule for the same argv keeps the call allowed, as
+    /// the rule order says.
+    #[test]
+    fn a_rule_naming_the_whole_call_decides_before_a_later_forbid_rule() {
+        let policy = ExecPolicy::new(Decision::Prompt)
+            .allow_read_only(&["git"], "listed first")
+            .forbid(&["git", "push"], "listed second");
+        let v = policy.evaluate(&argv(&["git", "push", "origin"]));
+        assert!(v.decision == Decision::Allow && v.read_only, "{v:?}");
+    }
+
+    /// A call that runs a program with no grant is asked about with a note
+    /// naming the programs that lack one, innermost first; a call of one
+    /// program, and a call a rule named, carry no note.
+    #[test]
+    fn a_command_with_an_ungranted_inner_program_is_asked_with_a_note() {
+        let one = ExecPolicy::default_kgraf_policy().with_granted_programs(["env".to_string()]);
+        let v = one.evaluate(&argv(&["env", "curl", "x"]));
+        assert!(v.decision == Decision::Prompt && !v.granted, "{v:?}");
+        let note = v.script_note.expect("a note");
+        assert!(note.contains("`curl`"), "{note}");
+        assert!(note.ends_with("and `curl` has no grant."), "{note}");
+        // Two programs lack a grant.
+        let other = ExecPolicy::default_kgraf_policy().with_granted_programs(["ls".to_string()]);
+        let note = other
+            .evaluate(&argv(&["env", "curl", "x"]))
+            .script_note
+            .expect("a note");
+        assert!(note.contains("`curl`, `env` have no grant."), "{note}");
+        // A command of one program has no inner program to name.
+        assert_eq!(one.evaluate(&argv(&["curl", "x"])).script_note, None);
+        // A rule that named the whole call decides it, with no note.
+        let ruled = ExecPolicy::new(Decision::Prompt)
+            .with_rule(CommandRule {
+                pattern: PrefixPattern::exact(&["env", "curl"]),
+                decision: Decision::Prompt,
+                read_only: false,
+                reason: None,
+            })
+            .with_granted_programs(["env".to_string()]);
+        let v = ruled.evaluate(&argv(&["env", "curl", "x"]));
+        assert_eq!(v.decision, Decision::Prompt);
+        assert_eq!(v.script_note, None);
+    }
 }

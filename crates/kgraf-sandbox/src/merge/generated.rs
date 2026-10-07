@@ -819,6 +819,74 @@ mod tests {
         }
     }
 
+    /// Only a tool's own tree (build output, a cache) may hold a file under a
+    /// protected folder name; a lockfile, bytecode or a package build may not.
+    #[test]
+    fn only_build_output_and_tool_caches_are_tool_trees() {
+        assert!(GeneratedKind::BuildOutput.is_tool_tree());
+        assert!(GeneratedKind::ToolCache.is_tool_tree());
+        assert!(!GeneratedKind::Lockfile.is_tool_tree());
+        assert!(!GeneratedKind::PythonBytecode.is_tool_tree());
+        assert!(!GeneratedKind::PackageBuild.is_tool_tree());
+    }
+
+    /// A manifest on disk is a regular file at its path, or a file of the
+    /// named extension in its folder. A folder, a link, a bare extension and
+    /// another folder's file are not one.
+    #[test]
+    fn tree_manifests_see_files_not_folders_links_or_bare_extensions() {
+        let dir = tempfile::tempdir().expect("dir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("app/Cargo.toml")).expect("dir named like a file");
+        std::fs::create_dir_all(root.join("dotnet")).expect("dir");
+        std::fs::create_dir_all(root.join("bare")).expect("dir");
+        std::fs::create_dir_all(root.join("other")).expect("dir");
+        std::fs::write(root.join("package.json"), b"{}").expect("write");
+        std::fs::write(root.join("dotnet/App.csproj"), b"").expect("write");
+        std::fs::write(root.join("bare/.csproj"), b"").expect("write");
+        std::fs::write(root.join("other/x.fsproj"), b"").expect("write");
+        let m = TreeManifests::new(root);
+        assert!(m.present(Path::new("package.json")));
+        assert!(!m.present(Path::new("absent.json")));
+        assert!(!m.present(Path::new("app/Cargo.toml")), "a folder");
+        assert!(m.present(Path::new("dotnet/*.csproj")));
+        assert!(m.present(Path::new("dotnet/*.csproj")), "listed once, kept");
+        assert!(!m.present(Path::new("bare/*.csproj")), "an empty stem");
+        assert!(!m.present(Path::new("other/*.csproj")), "another extension");
+        assert!(!m.present(Path::new("gone/*.csproj")), "an absent folder");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.join("package.json"), root.join("linked.json"))
+                .expect("link");
+            assert!(
+                !m.present(Path::new("linked.json")),
+                "a link is not followed"
+            );
+        }
+    }
+
+    /// A pipe named like a binary is read without blocking and without
+    /// yielding bytes: the open must not wait for a writer.
+    #[cfg(unix)]
+    #[test]
+    fn file_head_does_not_block_on_a_pipe() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("pipe");
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("cstring");
+        // SAFETY: mkfifo on a path in a temp dir this test owns.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let root = dir.path().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(file_head(&root, Path::new("pipe")));
+        });
+        let got = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("file_head blocked on a pipe");
+        assert_eq!(got, None);
+    }
+
     #[test]
     fn names_are_classified_by_file_name_and_folder() {
         assert_eq!(

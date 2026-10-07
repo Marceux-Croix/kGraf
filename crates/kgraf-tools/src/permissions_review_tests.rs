@@ -378,3 +378,17 @@ fn a_tool_wrapper_does_not_hide_the_program_it_runs() {
         None,
     );
 }
+
+/// A command kGraf cannot read is asked about only for a rule that names
+/// the shell tool with a pattern; a rule on another tool, or one with no
+/// pattern to check a command against, adds no question.
+#[test]
+fn an_unreadable_command_asks_only_for_a_shell_rule_with_a_pattern() {
+    let unreadable = ["source", "x.sh"];
+    match decided("shell(curl*)", &unreadable, None) {
+        Some(HardLimit::Ask(why)) => assert!(why.contains("cannot check what it runs"), "{why}"),
+        other => panic!("expected an ask, got {other:?}"),
+    }
+    assert_eq!(decided("apply_patch(secrets/*)", &unreadable, None), None);
+    assert_eq!(decided("mcp__web__fetch", &unreadable, None), None);
+}

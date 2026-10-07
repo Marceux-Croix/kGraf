@@ -6947,4 +6947,346 @@ programs = ["python3"]
         assert!("dont_ask".parse::<PermissionMode>().is_err());
         assert!("plan".parse::<PermissionMode>().is_err());
     }
+
+    /// `split_script_parts` cuts a script on exactly the separators the shell
+    /// reads, one or two characters wide, and reads a here-doc only for a
+    /// `<<` that is not a here-string (`<<<`), not a `<`, and not quoted.
+    /// A mutated width, index or guard moves a part, or turns a command
+    /// into a here-doc body that is read with literal quotes.
+    #[test]
+    fn a_script_is_cut_on_its_separators_and_a_here_doc_only_where_one_starts() {
+        fn parts(script: &str) -> Vec<(String, bool)> {
+            split_script_parts(script).parts
+        }
+        fn plain(texts: &[&str]) -> Vec<(String, bool)> {
+            texts.iter().map(|t| ((*t).to_owned(), false)).collect()
+        }
+        for (script, expected) in [
+            ("a && b", plain(&["a", "b"])),
+            ("a&&b", plain(&["a", "b"])),
+            ("a||b", plain(&["a", "b"])),
+            ("a|b", plain(&["a", "b"])),
+            ("a & b", plain(&["a", "b"])),
+            ("a;b", plain(&["a", "b"])),
+            // An empty command between separators is dropped.
+            ("a;;b", plain(&["a", "b"])),
+            ("a\n\nb", plain(&["a", "b"])),
+            ("a&;b", plain(&["a", "b"])),
+            // A descriptor copy separates nothing; a lone `&` at the start
+            // starts nothing.
+            ("ls 2>&1", plain(&["ls 2>&1"])),
+            ("cat <&3", plain(&["cat <&3"])),
+            ("& x", plain(&["x"])),
+            // A `<` redirect, a here-string and a quoted `<<` start no
+            // here-doc: the next line stays a command of its own.
+            ("cat < in\nrm x\nin", plain(&["cat < in", "rm x", "in"])),
+            ("cat <<< hi\nrm x\nhi", plain(&["cat <<< hi", "rm x", "hi"])),
+            (
+                "echo \"<<EOF\"\nrm x\nEOF",
+                plain(&["echo \"<<EOF\"", "rm x", "EOF"]),
+            ),
+            // Quotes of one kind inside the other, a `#` that starts no
+            // comment, a `(` inside quotes, and an escaped quote inside
+            // `$'...'` change no cut.
+            ("echo \"it's\"; rm x", plain(&["echo \"it's\"", "rm x"])),
+            ("echo \"a # b\"; rm x", plain(&["echo \"a # b\"", "rm x"])),
+            ("echo a#b; rm x", plain(&["echo a#b", "rm x"])),
+            ("echo # c; rm x\nls", plain(&["echo", "ls"])),
+            (
+                "echo \"a (b) c\"; rm x",
+                plain(&["echo \"a (b) c\"", "rm x"]),
+            ),
+            ("echo $'it\\'s'; rm x", plain(&["echo $'it\\'s'", "rm x"])),
+        ] {
+            assert_eq!(parts(script), expected, "{script:?}");
+        }
+        // A subshell's commands are cut out of its parentheses.
+        assert_eq!(parts("(ls; rm x)"), plain(&["ls", "rm x"]));
+        // A here-doc at the start of the script, and one never closed, read
+        // their lines as body.
+        assert_eq!(
+            parts("<<EOF\nbody\nEOF"),
+            vec![("<<EOF".to_owned(), false), ("body".to_owned(), true)]
+        );
+        assert_eq!(
+            parts("cat <<EOF\nbody"),
+            vec![("cat <<EOF".to_owned(), false), ("body".to_owned(), true)]
+        );
+        // A command a here-doc body names by substitution counts.
+        assert!(split_script_parts("cat <<EOF\n$(which curl) x\nEOF").by_substitution);
+        // A script with a quote, `$'`, backquote or `$(` left open is
+        // unbalanced, each on its own.
+        for (script, open) in [
+            ("echo 'a'", false),
+            ("echo \"a\"", false),
+            ("echo $'a'", false),
+            ("echo $(a)", false),
+            ("echo 'a", true),
+            ("echo \"a", true),
+            ("echo $'a", true),
+            ("echo $(a", true),
+            ("echo `a", true),
+        ] {
+            assert_eq!(split_script_parts(script).unbalanced, open, "{script:?}");
+        }
+        // A here-doc body is read line by line, flagged, up to its delimiter.
+        assert_eq!(
+            parts("cat <<EOF\nbody\nEOF\nrm x"),
+            vec![
+                ("cat <<EOF".to_owned(), false),
+                ("body".to_owned(), true),
+                ("rm x".to_owned(), false),
+            ]
+        );
+    }
+
+    /// Auto grants a file-edit call only when it is an edit tool and every
+    /// path it writes is allowed; another tool that carries a `path` is not
+    /// an edit, and one path outside the allow set asks the user.
+    #[test]
+    fn auto_grants_an_edit_only_when_every_path_is_allowed() {
+        let c = PermissionControl::manual();
+        c.set_mode(PermissionMode::Auto, ModeSource::CommandLine)
+            .expect("mode");
+        let allow = PermissionSettings::from_toml_str("[allow]\npaths = [\"docs/*\"]\n")
+            .expect("parse")
+            .allow;
+        c.set_allow(allow);
+        let patch = |files: &[&str]| {
+            let body: String = files
+                .iter()
+                .map(|f| format!("*** Add File: {f}\n+x\n"))
+                .collect();
+            json!({ "patch": format!("*** Begin Patch\n{body}*** End Patch") })
+        };
+        assert_eq!(
+            c.route_ask("apply_patch", &patch(&["docs/a.md"])),
+            AskRoute::Grant { by: "mode" }
+        );
+        assert_eq!(
+            c.route_ask("apply_patch", &patch(&["src/a.rs"])),
+            AskRoute::User
+        );
+        assert_eq!(
+            c.route_ask("apply_patch", &patch(&["docs/a.md", "src/a.rs"])),
+            AskRoute::User
+        );
+        assert_eq!(c.route_ask("apply_patch", &patch(&[])), AskRoute::User);
+        // A tool that is no edit tool is not granted by a path it names.
+        assert_eq!(
+            c.route_ask("mcp__web__fetch", &json!({"path": "docs/a.md"})),
+            AskRoute::User
+        );
+    }
+
+    /// A file that cannot be read as settings applies Manual with the reason;
+    /// the desktop's reading keeps the bypass switches the file sets.
+    #[test]
+    fn an_unreadable_file_forces_manual_and_the_bypass_switches_are_read() {
+        let load = SettingsLoad::unreadable("bad bytes");
+        assert!(load.unreadable);
+        let why = load.forced_manual.clone().expect("forced");
+        assert!(why.ends_with("could not be read: bad bytes"), "{why}");
+        assert_eq!(load.effective().mode, PermissionMode::Manual);
+        let load = PermissionSettings::read_entries(
+            "disable_bypass = true\nallow_bypass = true\nbypass_warning_accepted = true\n",
+        )
+        .expect("read");
+        assert!(load.settings.disable_bypass);
+        assert!(load.settings.allow_bypass);
+        assert!(load.settings.bypass_warning_accepted);
+        let load = PermissionSettings::read_entries("").expect("read");
+        assert!(!load.settings.disable_bypass && !load.settings.allow_bypass);
+    }
+
+    /// A directory change that is not a plain `cd` to a literal path leaves
+    /// the current directory unknown, so a file read there is not read.
+    #[test]
+    fn a_directory_change_that_cannot_be_followed_loses_the_directory() {
+        let dir = tempfile::tempdir().expect("dir");
+        let ctx = ReadContext::in_worktree(dir.path(), None);
+        assert!(ctx.lost().cwd.is_none());
+        assert_eq!(ctx.lost().root, ctx.root);
+        let words = |w: &[&str]| w.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let after = after_directory_change(&words(&["cd", "-P", "x"]), &ctx).expect("a change");
+        assert!(after.cwd.is_none());
+        let after = after_directory_change(&words(&["pushd", "x"]), &ctx).expect("a change");
+        assert!(after.cwd.is_none());
+        let after = after_directory_change(&words(&["cd", "x"]), &ctx).expect("a change");
+        assert_eq!(after.cwd.as_deref(), Some(dir.path().join("x").as_path()));
+        assert!(after_directory_change(&words(&["ls"]), &ctx).is_none());
+    }
+
+    /// The relaxed reader (every construct switched on) reads each separator,
+    /// continuation, descriptor and brace group the way the shell does: the
+    /// commands it returns are the commands the shell runs, and a `}` or `{`
+    /// that closes or opens nothing is a word, never a way to stop reading,
+    /// so no command after it is hidden.
+    #[test]
+    fn the_relaxed_reader_reads_every_separator_and_group_as_the_shell_does() {
+        fn commands(script: &str) -> Vec<Vec<String>> {
+            RelaxedReader::new(script, &all())
+                .read()
+                .unwrap_or_else(|why| panic!("{script:?}: expected commands, got {why}"))
+        }
+        fn refused(script: &str) {
+            assert!(
+                RelaxedReader::new(script, &all()).read().is_err(),
+                "{script:?} must not be judged"
+            );
+        }
+        let words = |w: &[&str]| w.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let ls_cp = vec![words(&["ls"]), words(&["cp", "a", "b"])];
+        for script in [
+            "ls && cp a b",
+            "ls || cp a b",
+            "ls | cp a b",
+            "ls |& cp a b",
+            "ls ; cp a b",
+            "ls\ncp a b",
+            "ls & cp a b",
+            "ls\t&&\tcp a b",
+        ] {
+            assert_eq!(commands(script), ls_cp, "{script:?}");
+        }
+        assert_eq!(commands("ls &>out.txt"), vec![words(&["ls"])]);
+        // `&>` needs no background switch.
+        let no_background = all_but(ScriptConstruct::Background);
+        assert_eq!(
+            RelaxedReader::new("ls &>out.txt", &no_background).read(),
+            Ok(vec![words(&["ls"])])
+        );
+        assert_eq!(commands("ls # note\ncp a b"), ls_cp);
+        assert_eq!(commands("ls \\\n a"), vec![words(&["ls", "a"])]);
+        assert_eq!(commands("ls \\\nb"), vec![words(&["ls", "b"])]);
+        assert_eq!(commands("ls |cp a b"), ls_cp);
+        assert_eq!(commands("ls ||cp a b"), ls_cp);
+        assert_eq!(commands("ls &&cp a b"), ls_cp);
+        assert_eq!(commands("ls |&cp a b"), ls_cp);
+        assert_eq!(
+            RelaxedReader::new("ls | cp a b", &no_background).read(),
+            Ok(ls_cp.clone())
+        );
+        assert_eq!(commands("ls \\\n && cp a b"), ls_cp);
+        // A backslash before another character stays part of its word.
+        assert_eq!(
+            commands("echo a \\; b"),
+            vec![words(&["echo", "a", ";", "b"])]
+        );
+        // Digits before a redirect are a descriptor; other digits are a word.
+        assert_eq!(
+            commands("echo hi 2>/dev/null"),
+            vec![words(&["echo", "hi"])]
+        );
+        assert_eq!(commands("echo 12 3"), vec![words(&["echo", "12", "3"])]);
+        // A group opens at a `{` followed by a blank or a newline, and
+        // closes at a `}` that stands where a command starts.
+        for script in ["{ ls; }", "{\tls; }", "{\nls\n}", "{ ls; } "] {
+            assert_eq!(commands(script), vec![words(&["ls"])], "{script:?}");
+        }
+        let why = RelaxedReader::new("{ls", &all())
+            .read()
+            .expect_err("refused");
+        assert!(why.contains("plain program name"), "{why}");
+        // A `}` that closes no group hides nothing after it.
+        assert_eq!(
+            commands("echo }x; curl y"),
+            vec![words(&["echo", "}x"]), words(&["curl", "y"])]
+        );
+        refused("{ echo a }");
+        refused("{ ls; }x");
+        refused("{ ls");
+    }
+
+    /// A program that runs another program from its arguments exposes that
+    /// program to a rule, and only for the forms that run one: `busybox
+    /// APPLET`, `uv tool run X`, `pipx run X`.
+    #[test]
+    fn a_runner_exposes_the_program_it_runs_only_in_its_running_forms() {
+        let all_of = |words: &[&str]| {
+            let argv: Vec<String> = words.iter().map(|s| (*s).to_owned()).collect();
+            simple_commands(&argv)
+        };
+        let curl = vec!["curl".to_owned(), "x".to_owned()];
+        for words in [
+            &["busybox", "curl", "x"][..],
+            &["uv", "tool", "run", "curl", "x"],
+            &["uv", "tool", "x", "curl", "x"],
+            &["pipx", "run", "curl", "x"],
+        ] {
+            assert!(all_of(words).contains(&curl), "{words:?}");
+        }
+        for words in [
+            &["busybox", "--list"][..],
+            &["uv", "tool", "install", "curl"],
+            &["uv", "tool", "list"],
+            &["uv", "run"],
+            &["pipx", "install", "curl"],
+            &["pipx", "list"],
+        ] {
+            let found = all_of(words);
+            assert!(
+                found.iter().all(|c| c[0] != "curl" && c[0] != "--list"),
+                "{words:?}: {found:?}"
+            );
+        }
+    }
+
+    /// A process substitution is a word kGraf cannot resolve: as a
+    /// redirection target it is refused unless outside redirects are
+    /// switched on.
+    #[test]
+    fn a_process_substitution_is_an_opaque_word() {
+        match read_with(
+            "echo hi > >(cat)",
+            &all_but(ScriptConstruct::OutsideRedirects),
+        ) {
+            Script::Unjudged(why) => assert!(why.contains("cannot resolve"), "{why}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(matches!(
+            read_with("echo hi > >(cat)", &all()),
+            Script::Commands(_)
+        ));
+    }
+
+    /// A rule's subject names the program by its bare name too, once, and
+    /// never as an empty program: `CURL x` and `/usr/bin/curl.exe x` give
+    /// `curl x`, `curl x` gives itself only, and a word with no name left
+    /// (`dir/`) gives no nameless subject.
+    #[test]
+    fn a_rule_subject_names_the_bare_program_once_and_never_an_empty_one() {
+        let subjects_of_argv = |argv: &[&str]| subjects("shell", &json!({ "command": argv }));
+        assert_eq!(subjects_of_argv(&["curl", "x"]), ["curl x"]);
+        assert_eq!(subjects_of_argv(&["CURL", "x"]), ["CURL x", "curl x"]);
+        assert_eq!(
+            subjects_of_argv(&["/usr/bin/curl.exe", "x"]),
+            ["/usr/bin/curl.exe x", "curl x"]
+        );
+        assert_eq!(subjects_of_argv(&["dir/", "x"]), ["dir/ x"]);
+        assert_eq!(subjects_of_argv(&[".exe", "x"]), [".exe x"]);
+    }
+
+    /// A command substitution names a command's program only where the
+    /// program stands: `$(which curl) x` and `env $(cmd)` do; `echo $(date)`
+    /// and `x=$(date)` hold one inside an argument or an assignment.
+    #[test]
+    fn a_substitution_names_the_program_only_where_the_program_stands() {
+        for (script, named) in [
+            ("$(which curl) x", true),
+            ("env $(cmd)", true),
+            ("FOO=1 $(cmd)", true),
+            ("`which curl` x", true),
+            ("echo $(date)", false),
+            ("x=$(date)", false),
+            ("echo `date`", false),
+            ("echo \"$(date)\"", false),
+        ] {
+            assert_eq!(
+                split_script_parts(script).by_substitution,
+                named,
+                "{script:?}"
+            );
+        }
+    }
 }

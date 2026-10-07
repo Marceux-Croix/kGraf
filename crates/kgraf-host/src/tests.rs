@@ -2041,6 +2041,11 @@ async fn the_gate_runs_the_commands_in_a_worktree_of_the_pinned_integration_comm
         &["test -f made.txt", "echo checked"],
         Duration::from_secs(30),
     );
+    // The runner names the commands it runs (the orchestrator reads them).
+    assert_eq!(
+        GateRunner::commands(&pass),
+        vec!["test -f made.txt".to_owned(), "echo checked".to_owned()]
+    );
     let v = pass.run(request(&pass, &commit)).await.expect("ran");
     assert!(v.passed, "{v:?}");
     assert!(v.by.contains(&commit));

@@ -1717,4 +1717,572 @@ mod tests {
         let (trees, _) = find_dependency_trees(c.path());
         assert!(trees.is_empty(), "{trees:?}");
     }
+
+    fn canonical_dir() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = std::fs::canonicalize(dir.path()).expect("canonical");
+        (dir, path)
+    }
+
+    fn names(list: &[&str]) -> Names {
+        list.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    fn link_at(target: impl AsRef<Path>, at: &Path) {
+        std::fs::create_dir_all(at.parent().expect("parent")).expect("mkdir");
+        std::os::unix::fs::symlink(target, at).expect("ln");
+    }
+
+    /// A Go vendor folder needs `go.mod`, the folder and `vendor/modules.txt`
+    /// together; the evidence of one is not the evidence of the others.
+    #[test]
+    fn a_go_vendor_folder_needs_its_whole_evidence() {
+        let (_d, d) = canonical_dir();
+        let vendor = |n: &Names| {
+            candidates(&d, n)
+                .iter()
+                .any(|(name, _, _)| *name == "vendor")
+        };
+        write(&d.join("vendor/modules.txt"), "");
+        assert!(vendor(&names(&["go.mod", "vendor"])));
+        assert!(!vendor(&names(&["vendor"])), "no go.mod");
+        assert!(!vendor(&names(&["go.mod"])), "no vendor folder");
+        std::fs::remove_file(d.join("vendor/modules.txt")).expect("rm");
+        assert!(!vendor(&names(&["go.mod", "vendor"])), "no modules.txt");
+        assert!(vendor(&names(&["composer.json"])));
+        assert!(vendor(&names(&["Gemfile"])));
+    }
+
+    /// `cd a b` is not one plain folder.
+    #[test]
+    fn a_cd_with_two_words_names_no_start_folder() {
+        assert_eq!(script_start_dir("cd a b && pytest"), None);
+        assert_eq!(script_start_dir("cd a && pytest"), Some(PathBuf::from("a")));
+    }
+
+    /// A folder above a tree swapped for a link: the tree's own path is not a
+    /// link, but it no longer resolves to itself.
+    #[test]
+    fn a_folder_above_a_tree_swapped_for_a_link_is_caught() {
+        let (_d, d) = canonical_dir();
+        write(&d.join("real/node_modules/x/index.js"), "");
+        link_at(d.join("real"), &d.join("alias"));
+        let tree = DependencyTree {
+            rel: PathBuf::from("node_modules"),
+            source: d.join("alias/node_modules"),
+            kind: DependencyKind::NodeModules,
+            is_dir: true,
+        };
+        let why = changed_since_search(&tree).expect("caught");
+        assert!(why.contains("now resolves to"), "{why}");
+        let honest = DependencyTree {
+            source: d.join("real/node_modules"),
+            ..tree
+        };
+        assert_eq!(changed_since_search(&honest), None);
+    }
+
+    /// A candidate reached through a folder that is a link resolves outside
+    /// the checkout and is never a tree (`.yarn` a link, `.yarn/cache` a real
+    /// folder behind it).
+    #[test]
+    fn a_tree_that_resolves_outside_the_checkout_is_not_found() {
+        let (_c, c) = canonical_dir();
+        let (_o, o) = canonical_dir();
+        write(&c.join("package.json"), "{}");
+        std::fs::create_dir_all(o.join("cache")).expect("mkdir");
+        link_at(&o, &c.join(".yarn"));
+        let (trees, notes) = find_dependency_trees(&c);
+        assert!(trees.is_empty(), "{trees:?}");
+        assert!(notes.iter().any(|n| n.contains(".yarn is a symbolic link")));
+    }
+
+    /// The notes of the search reach the caller of the link step.
+    #[test]
+    fn the_search_notes_are_returned_with_the_links() {
+        let (_c, c) = canonical_dir();
+        let (_o, o) = canonical_dir();
+        write(&c.join("package.json"), "{}");
+        link_at(&o, &c.join("node_modules"));
+        let (_t, t) = canonical_dir();
+        let links = link_dependency_trees(&t, &c);
+        assert!(links.linked.is_empty());
+        assert!(
+            links.notes.iter().any(|n| n.contains("symbolic link")),
+            "{links:?}"
+        );
+    }
+
+    /// A search is reused for a while (an install made right after is linked
+    /// later), and one checkout's search does not drop another's.
+    #[test]
+    fn a_recent_search_is_reused_and_kept_per_checkout() {
+        let (_a, a) = canonical_dir();
+        let (_b, b) = canonical_dir();
+        write(&a.join("package.json"), "{}");
+        write(&b.join("package.json"), "{}");
+        let (_t, t) = canonical_dir();
+        assert!(link_dependency_trees(&t, &a).linked.is_empty());
+        assert!(link_dependency_trees(&t, &b).linked.is_empty());
+        write(&a.join("node_modules/dep/index.js"), "");
+        write(&b.join("node_modules/dep/index.js"), "");
+        assert!(
+            link_dependency_trees(&t, &a).linked.is_empty(),
+            "the search of a is reused"
+        );
+        assert!(
+            link_dependency_trees(&t, &b).linked.is_empty(),
+            "the search of b is reused"
+        );
+    }
+
+    /// The search stops at the folder bound: exactly the bound is searched
+    /// whole, one folder more is cut short and says so.
+    #[test]
+    fn the_search_stops_at_the_folder_bound() {
+        let (_c, c) = canonical_dir();
+        for i in 0..MAX_DIRS {
+            std::fs::create_dir(c.join(format!("d{i:05}"))).expect("mkdir");
+        }
+        let mut visited = 0usize;
+        assert_eq!(walk_project_dirs(&c, |_, _, _| visited += 1), None);
+        assert_eq!(visited, MAX_DIRS + 1);
+        std::fs::create_dir(c.join("d99999")).expect("mkdir");
+        let mut visited = 0usize;
+        let cut = walk_project_dirs(&c, |_, _, _| visited += 1);
+        assert!(cut.is_some_and(|n| n.contains("more than")));
+        assert!(visited <= MAX_DIRS + 1, "the walk stopped: {visited}");
+    }
+
+    fn pnpm_install(
+        workspace_in_root: bool,
+        workspace_hoisted: bool,
+    ) -> (tempfile::TempDir, PathBuf) {
+        let (dir, c) = canonical_dir();
+        write(&c.join("package.json"), "{}");
+        write(&c.join("packages/web/index.js"), "web");
+        write(&c.join("packages/util/index.js"), "util");
+        let nm = c.join("node_modules");
+        write(&nm.join(".modules.yaml"), "layoutVersion: 5\n");
+        write(&nm.join(".pnpm/dep@1.0.0/node_modules/dep/index.js"), "dep");
+        link_at(".pnpm/dep@1.0.0/node_modules/dep", &nm.join("dep"));
+        if workspace_in_root {
+            link_at("../../packages/web", &nm.join("@s/web"));
+        }
+        if workspace_hoisted {
+            link_at(
+                "../../../../packages/util",
+                &nm.join(".pnpm/node_modules/@s/util"),
+            );
+        }
+        (dir, c)
+    }
+
+    /// A pnpm install is cloned when a workspace package is linked in its
+    /// root, or only in its hoisting folder; with none it is one link.
+    #[test]
+    fn a_pnpm_install_is_cloned_for_a_workspace_link_in_either_place() {
+        for (root, hoisted, clone) in [
+            (true, false, true),
+            (false, true, true),
+            (true, true, true),
+            (false, false, false),
+        ] {
+            let (_c, c) = pnpm_install(root, hoisted);
+            let (_t, t) = canonical_dir();
+            write(&t.join("package.json"), "{}");
+            let links = link_dependency_trees(&t, &c);
+            assert_eq!(
+                links.linked,
+                vec![PathBuf::from("node_modules")],
+                "{links:?}"
+            );
+            assert_eq!(
+                is_dependency_clone(&t.join("node_modules")),
+                clone,
+                "root {root}, hoisted {hoisted}"
+            );
+            let is_link = std::fs::symlink_metadata(t.join("node_modules"))
+                .expect("meta")
+                .file_type()
+                .is_symlink();
+            assert_eq!(is_link, !root && !hoisted, "root {root}, hoisted {hoisted}");
+        }
+    }
+
+    /// kGraf's own earlier link to the whole install is replaced by a folder
+    /// of links or a clone; a link to anything else is left alone.
+    #[test]
+    fn kgraf_s_own_earlier_link_is_replaced_and_a_foreign_link_is_left() {
+        let (_o, o) = canonical_dir();
+        for pnpm in [false, true] {
+            let (c, source) = if pnpm {
+                let (d, c) = pnpm_install(true, true);
+                (d, c.join("node_modules"))
+            } else {
+                let (d, c) = canonical_dir();
+                write(&c.join("package.json"), "{}");
+                write(&c.join("packages/web/index.js"), "web");
+                write(&c.join("node_modules/dep/index.js"), "dep");
+                link_at("../../packages/web", &c.join("node_modules/@s/web"));
+                (d, c.join("node_modules"))
+            };
+            let checkout = source.parent().expect("parent").to_path_buf();
+            let (_t, t) = canonical_dir();
+            write(&t.join("package.json"), "{}");
+            link_at(&source, &t.join("node_modules"));
+            let links = link_dependency_trees(&t, &checkout);
+            assert_eq!(
+                links.linked,
+                vec![PathBuf::from("node_modules")],
+                "{links:?}"
+            );
+            let meta = std::fs::symlink_metadata(t.join("node_modules")).expect("meta");
+            assert!(meta.is_dir(), "pnpm {pnpm}: replaced by a folder");
+            assert!(t.join("node_modules").join(MIRROR_MARK).is_file());
+            assert_eq!(is_dependency_clone(&t.join("node_modules")), pnpm);
+
+            let (_f, f) = canonical_dir();
+            write(&f.join("package.json"), "{}");
+            link_at(&o, &f.join("node_modules"));
+            let links = link_dependency_trees(&f, &checkout);
+            assert!(links.linked.is_empty(), "pnpm {pnpm}: {links:?}");
+            assert!(
+                std::fs::symlink_metadata(f.join("node_modules"))
+                    .expect("meta")
+                    .file_type()
+                    .is_symlink()
+            );
+            assert!(std::fs::read_dir(&o).expect("read").next().is_none());
+            drop(c);
+        }
+    }
+
+    /// Only a regular mark that names a clone makes a clone.
+    #[test]
+    fn a_folder_is_a_clone_only_by_its_own_regular_mark() {
+        let (_d, d) = canonical_dir();
+        let dir = |name: &str| {
+            let p = d.join(name);
+            std::fs::create_dir_all(&p).expect("mkdir");
+            p
+        };
+        let cloned = dir("cloned");
+        std::fs::write(cloned.join(MIRROR_MARK), "clone 123").expect("write");
+        assert!(is_dependency_clone(&cloned));
+        let linked = dir("linked");
+        std::fs::write(linked.join(MIRROR_MARK), "123 .bin=1").expect("write");
+        assert!(!is_dependency_clone(&linked), "a folder of links");
+        assert!(!is_dependency_clone(&dir("bare")), "no mark");
+        let forged = dir("forged");
+        std::fs::write(d.join("elsewhere"), "clone 123").expect("write");
+        link_at(d.join("elsewhere"), &forged.join(MIRROR_MARK));
+        assert!(!is_dependency_clone(&forged), "a link as the mark");
+    }
+
+    /// The stamp holds the times of the install, its `.bin` and `@scope`
+    /// folders, and pnpm's folders: not another folder, not a file.
+    #[test]
+    fn the_mirror_stamp_covers_the_folders_an_install_changes() {
+        let (_d, d) = canonical_dir();
+        let src = d.join("node_modules");
+        for dir in [".bin", "@s", "dep"] {
+            std::fs::create_dir_all(src.join(dir)).expect("mkdir");
+        }
+        std::fs::write(src.join("@file"), "").expect("write");
+        let stamp = mirror_stamp(&src).expect("stamp");
+        assert!(stamp.contains(" .bin="), "{stamp}");
+        assert!(stamp.contains(" @s="), "{stamp}");
+        assert!(!stamp.contains(" dep="), "{stamp}");
+        assert!(!stamp.contains(" @file="), "{stamp}");
+        assert!(!stamp.contains(".pnpm"), "{stamp}");
+        std::fs::create_dir_all(src.join(".pnpm/node_modules")).expect("mkdir");
+        let stamp = mirror_stamp(&src).expect("stamp");
+        assert!(stamp.contains(" .pnpm="), "{stamp}");
+        assert!(stamp.contains(" .pnpm/node_modules="), "{stamp}");
+        assert!(mirror_stamp(&d.join("absent")).is_none());
+        // A file named `.bin` is not a folder to watch.
+        let other = d.join("other");
+        std::fs::create_dir_all(&other).expect("mkdir");
+        std::fs::write(other.join(".bin"), "").expect("write");
+        assert!(!mirror_stamp(&other).expect("stamp").contains(" .bin="));
+    }
+
+    /// A workspace package is a link into the checkout outside the install.
+    #[test]
+    fn a_workspace_target_is_in_the_checkout_and_outside_the_install() {
+        let (_c, c) = canonical_dir();
+        let (_o, o) = canonical_dir();
+        write(&c.join("packages/web/index.js"), "");
+        write(&c.join("node_modules/dep/index.js"), "");
+        let nm = c.join("node_modules");
+        link_at("../packages/web", &nm.join("web"));
+        link_at("dep", &nm.join("inner"));
+        link_at(&o, &nm.join("out"));
+        let target = |name: &str| workspace_target(&nm.join(name), &nm, &c);
+        assert_eq!(target("web"), Some(PathBuf::from("packages/web")));
+        assert_eq!(target("inner"), None, "inside the install");
+        assert_eq!(target("out"), None, "outside the checkout");
+        assert_eq!(target("dep"), None, "a plain folder");
+        assert_eq!(target("absent"), None);
+    }
+
+    /// The hoisting folder links a workspace package directly or in a scope
+    /// folder; links to other things and plain folders do not count.
+    #[test]
+    fn pnpm_hoisting_is_a_workspace_link_directly_or_in_a_scope() {
+        let hoists = |build: &dyn Fn(&Path, &Path)| -> bool {
+            let (_c, c) = canonical_dir();
+            write(&c.join("packages/web/index.js"), "");
+            let nm = c.join("node_modules");
+            write(&nm.join(".pnpm/dep@1/node_modules/dep/index.js"), "");
+            build(&c, &nm.join(".pnpm/node_modules"));
+            pnpm_hoists_workspace(&nm, &c)
+        };
+        assert!(!hoists(&|_, _| {}), "no hoisting folder");
+        assert!(hoists(&|_, h| link_at(
+            "../../../packages/web",
+            &h.join("web")
+        )));
+        assert!(hoists(&|_, h| link_at(
+            "../../../../packages/web",
+            &h.join("@s/web")
+        )));
+        assert!(
+            !hoists(&|_, h| link_at("../dep@1/node_modules/dep", &h.join("dep"))),
+            "a link inside the install"
+        );
+        assert!(
+            !hoists(&|_, h| link_at("../../../../packages/web", &h.join("plain/web"))),
+            "a plain folder holding a link is not a scope"
+        );
+        assert!(
+            !hoists(&|_, h| write(&h.join("@file"), "")),
+            "a file named like a scope"
+        );
+        assert!(
+            !hoists(&|_, h| link_at("../dep@1/node_modules/dep", &h.join("@s/dep"))),
+            "a scope with no workspace link"
+        );
+    }
+
+    /// The plan: a plain folder is one link, never opened as a scope; a file
+    /// named like a scope is one link; a `.bin` link with an absolute target
+    /// is the checkout's entry as it is.
+    #[test]
+    fn the_mirror_plan_opens_only_scopes_and_the_bin_folder() {
+        let (_c, c) = canonical_dir();
+        write(&c.join("packages/web/index.js"), "");
+        let nm = c.join("node_modules");
+        write(&nm.join("dep/index.js"), "");
+        link_at("../../packages/web", &nm.join("dep/web"));
+        write(&nm.join("@file"), "");
+        link_at("../packages/web", &nm.join("web"));
+        link_at("/usr/bin/true", &nm.join(".bin/abs"));
+        let plan = mirror_plan(&nm, &c).expect("a workspace install");
+        assert!(plan.contains(&MirrorEntry::Link(PathBuf::from("dep"), nm.join("dep"))));
+        assert!(!plan.contains(&MirrorEntry::Dir(PathBuf::from("dep"))));
+        assert!(plan.contains(&MirrorEntry::Link(PathBuf::from("@file"), nm.join("@file"))));
+        assert!(plan.contains(&MirrorEntry::Link(
+            PathBuf::from(".bin/abs"),
+            nm.join(".bin/abs")
+        )));
+        assert!(plan.contains(&MirrorEntry::Dir(PathBuf::from(".bin"))));
+    }
+
+    /// The note for a pnpm install that could not be cloned says which
+    /// install, why, and what that costs.
+    #[test]
+    fn the_pnpm_unclonable_note_names_the_install_and_the_reason() {
+        let note = pnpm_unclonable(Path::new("web/node_modules"), "another volume");
+        assert!(note.contains("web/node_modules"), "{note}");
+        assert!(note.contains("another volume"), "{note}");
+        assert!(note.contains("folder of links, not a clone"), "{note}");
+    }
+
+    fn root_of(path: &Path) -> std::fs::File {
+        crate::confined::open_root(path).expect("root")
+    }
+
+    /// Whether this process ignores folder permissions (a test cannot make a
+    /// folder unwritable for it).
+    fn ignores_permissions(dir: &Path) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o500)).expect("chmod");
+        let writes = std::fs::File::create(dir.join(".probe")).is_ok();
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        let _ = std::fs::remove_file(dir.join(".probe"));
+        writes
+    }
+
+    fn make_unwritable(dir: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o500)).expect("chmod");
+    }
+
+    fn make_writable(dir: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    }
+
+    /// A folder is current only by its own regular mark: the stamp, or the
+    /// stamp after a clone's prefix. A parent that is a link is not entered.
+    #[test]
+    fn a_mirror_is_current_by_its_mark_alone() {
+        let (_t, t) = canonical_dir();
+        let root = root_of(&t);
+        let rel = Path::new("node_modules");
+        assert!(!unix::mirror_is_current(&root, rel, "s1"), "absent");
+        std::fs::create_dir(t.join("node_modules")).expect("mkdir");
+        assert!(!unix::mirror_is_current(&root, rel, "s1"), "no mark");
+        let mark = t.join("node_modules").join(MIRROR_MARK);
+        std::fs::write(&mark, "s1").expect("write");
+        assert!(unix::mirror_is_current(&root, rel, "s1"));
+        assert!(!unix::mirror_is_current(&root, rel, "s2"));
+        std::fs::write(&mark, "clone s1").expect("write");
+        assert!(unix::mirror_is_current(&root, rel, "s1"), "a clone's mark");
+        assert!(!unix::mirror_is_current(&root, rel, "s2"));
+        std::fs::write(&mark, "other s1").expect("write");
+        assert!(!unix::mirror_is_current(&root, rel, "s1"), "another prefix");
+        // A mark that is a link is not read.
+        std::fs::remove_file(&mark).expect("rm");
+        std::fs::write(t.join("elsewhere"), "s1").expect("write");
+        link_at(t.join("elsewhere"), &mark);
+        assert!(!unix::mirror_is_current(&root, rel, "s1"), "a link as mark");
+        // A parent that is a link.
+        let (_o, o) = canonical_dir();
+        std::fs::create_dir(o.join("node_modules")).expect("mkdir");
+        std::fs::write(o.join("node_modules").join(MIRROR_MARK), "s1").expect("write");
+        link_at(&o, &t.join("svc"));
+        assert!(!unix::mirror_is_current(
+            &root,
+            Path::new("svc/node_modules"),
+            "s1"
+        ));
+    }
+
+    /// A current folder is kept as it is: an entry removed from it is not
+    /// made again until the install changes.
+    #[test]
+    fn a_current_mirror_is_not_walked_again() {
+        let (_c, c) = canonical_dir();
+        write(&c.join("package.json"), "{}");
+        write(&c.join("packages/web/index.js"), "web");
+        write(&c.join("node_modules/dep/index.js"), "dep");
+        link_at("../../packages/web", &c.join("node_modules/@s/web"));
+        let (_t, t) = canonical_dir();
+        write(&t.join("package.json"), "{}");
+        let first = link_dependency_trees(&t, &c);
+        assert_eq!(
+            first.linked,
+            vec![PathBuf::from("node_modules")],
+            "{first:?}"
+        );
+        std::fs::remove_file(t.join("node_modules/dep")).expect("rm");
+        let second = link_dependency_trees(&t, &c);
+        assert_eq!(second.linked, vec![PathBuf::from("node_modules")]);
+        assert!(
+            std::fs::symlink_metadata(t.join("node_modules/dep")).is_err(),
+            "the fast path leaves a current folder alone"
+        );
+    }
+
+    /// A folder, a link or a mark that cannot be made is reported as that
+    /// failure, never as "present".
+    #[test]
+    fn the_unix_mirror_reports_what_it_cannot_make() {
+        let (_c, c) = canonical_dir();
+        write(&c.join("node_modules/dep/index.js"), "dep");
+        let source = c.join("node_modules");
+        let (_t, t) = canonical_dir();
+        let root = root_of(&t);
+        let rel = Path::new("node_modules");
+        if !ignores_permissions(&t) {
+            make_unwritable(&t);
+            let err = unix::mirror(&root, rel, &source, &[], "s").err();
+            make_writable(&t);
+            assert_eq!(
+                err.map(|e| e.kind()),
+                Some(std::io::ErrorKind::PermissionDenied)
+            );
+        }
+        let bad_dir = [MirrorEntry::Dir(PathBuf::from("no/such/parent"))];
+        let err = unix::mirror(&root, rel, &source, &bad_dir, "s").err();
+        assert_eq!(err.map(|e| e.kind()), Some(std::io::ErrorKind::NotFound));
+        // A folder the failed call made has no mark, so use a fresh tree.
+        let (_u, u) = canonical_dir();
+        let long = "x".repeat(300);
+        let bad_link = [MirrorEntry::Link(PathBuf::from(&long), source.join("dep"))];
+        assert!(unix::mirror(&root_of(&u), rel, &source, &bad_link, "s").is_err());
+    }
+
+    /// A link whose folder is not the one just opened is skipped.
+    #[test]
+    fn the_unix_mirror_skips_a_link_whose_folder_was_not_opened() {
+        let (_c, c) = canonical_dir();
+        write(&c.join("node_modules/dep/index.js"), "dep");
+        let source = c.join("node_modules");
+        let (_t, t) = canonical_dir();
+        let root = root_of(&t);
+        let plan = [
+            MirrorEntry::Dir(PathBuf::from("@a")),
+            MirrorEntry::Link(PathBuf::from("@b/x"), source.join("dep")),
+        ];
+        let out = unix::mirror(&root, Path::new("node_modules"), &source, &plan, "s");
+        assert!(matches!(out, Ok(Linked::Made)));
+        let a = t.join("node_modules/@a");
+        assert!(a.is_dir());
+        assert!(std::fs::read_dir(&a).expect("read").next().is_none());
+        assert!(!t.join("node_modules/@b").exists());
+    }
+
+    /// A clone that cannot be moved into place is reported, not taken as
+    /// "something is there".
+    #[test]
+    fn a_clone_that_cannot_be_moved_into_place_is_an_error() {
+        let (_c, c) = pnpm_install(true, true);
+        let source = c.join("node_modules");
+        let (_b, base) = canonical_dir();
+        let tree = base.join("tree");
+        std::fs::create_dir(&tree).expect("mkdir");
+        if ignores_permissions(&tree) {
+            return;
+        }
+        let root = root_of(&tree);
+        make_unwritable(&tree);
+        let out = unix::clone_install(&root, &tree, Path::new("node_modules"), &source, "s");
+        make_writable(&tree);
+        let kind = match out {
+            Err(e) => Some(e.kind()),
+            Ok(_) => None,
+        };
+        assert_eq!(kind, Some(std::io::ErrorKind::PermissionDenied));
+        assert!(
+            std::fs::read_dir(&base)
+                .expect("read")
+                .all(|e| { e.expect("entry").file_name() == "tree" }),
+            "the staging folder was removed"
+        );
+    }
+
+    /// A link to something else is left (never counted as kGraf's), one to
+    /// the install itself is kept.
+    #[test]
+    fn a_plain_link_is_kept_only_when_it_points_at_the_install() {
+        let (_c, c) = canonical_dir();
+        write(&c.join("node_modules/dep/index.js"), "dep");
+        let source = c.join("node_modules");
+        let (_o, o) = canonical_dir();
+        let (_t, t) = canonical_dir();
+        let root = root_of(&t);
+        let rel = Path::new("node_modules");
+        assert!(matches!(unix::link(&root, rel, &source), Ok(Linked::Made)));
+        assert!(matches!(unix::link(&root, rel, &source), Ok(Linked::Kept)));
+        assert!(matches!(unix::link(&root, rel, &o), Ok(Linked::Present)));
+        std::fs::write(t.join("file"), "x").expect("write");
+        assert!(matches!(
+            unix::link(&root, Path::new("file"), &source),
+            Ok(Linked::Present)
+        ));
+    }
 }

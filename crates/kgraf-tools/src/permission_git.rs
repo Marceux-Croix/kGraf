@@ -795,6 +795,68 @@ fn unquote_config_value(value: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Every configuration key that names a command git runs is read as the
+    /// kind of command it is, in any case, and a key near it is not.
+    #[test]
+    fn each_command_running_key_is_known_by_its_kind() {
+        use KeyRuns::*;
+        for (key, kind) in [
+            ("core.sshCommand", Script),
+            ("core.fsmonitor", Script),
+            ("core.alternateRefsCommand", Script),
+            ("core.hooksPath", Opaque),
+            ("sequence.editor", Script),
+            ("credential.helper", Helper),
+            ("credential.https://x.example.helper", Helper),
+            ("diff.external", Script),
+            ("diff.x.command", Script),
+            ("diff.x.textconv", Script),
+            ("merge.x.driver", Script),
+            ("filter.x.clean", Script),
+            ("filter.x.smudge", Script),
+            ("filter.x.process", Script),
+            ("gpg.program", Program),
+            ("gpg.ssh.program", Program),
+            ("gpg.x.defaultKeyCommand", Script),
+            ("pager.log", Script),
+            ("interactive.diffFilter", Script),
+            ("uploadpack.packObjectsHook", Script),
+            ("remote.x.uploadpack", Program),
+            ("remote.x.receivepack", Program),
+            ("remote.x.vcs", Program),
+            ("web.browser", Program),
+            ("browser.x.cmd", Script),
+            ("difftool.x.cmd", Script),
+            ("mergetool.x.cmd", Script),
+            ("man.x.cmd", Script),
+            ("browser.x.path", Program),
+            ("difftool.x.path", Program),
+            ("mergetool.x.path", Program),
+            ("man.x.path", Program),
+            ("sendemail.sendmailCmd", Script),
+            ("sendemail.toCmd", Script),
+            ("sendemail.ccCmd", Script),
+            ("sendemail.smtpServer", Script),
+            ("submodule.x.update", Script),
+            ("hook.x.command", Script),
+            ("instaweb.httpd", Program),
+            ("include.path", Opaque),
+            ("includeIf.gitdir:x.path", Opaque),
+        ] {
+            assert_eq!(key_runs(key), Some(kind), "{key}");
+        }
+        for key in [
+            "user.name",
+            "core.bare",
+            "diff.x.algorithm",
+            "merge.x.name",
+            "pager",
+            "submodule.update",
+        ] {
+            assert_eq!(key_runs(key), None, "{key}");
+        }
+    }
+
     fn argv(words: &[&str]) -> Vec<String> {
         words.iter().map(|w| (*w).to_owned()).collect()
     }

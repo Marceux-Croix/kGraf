@@ -377,4 +377,70 @@ distributionUrl=https\\://services.gradle.org/distributions/gradle-8.5-bin.zip\n
             .collect();
         assert_eq!(names, ["wrapper"]);
     }
+
+    /// A real folder where the distribution link goes is refused by name,
+    /// and left in place.
+    #[test]
+    fn a_real_folder_where_the_distribution_link_goes_is_refused_by_name() {
+        let home = tempfile::tempdir().expect("home");
+        let g = home.path().join(".gradle");
+        let real = g.join("wrapper/dists/gradle-8.5-bin/abc123");
+        write(&real.join("gradle-8.5-bin.zip.ok"), "");
+        write(&real.join("gradle-8.5/x"), "");
+        let project = tempfile::tempdir().expect("project");
+        write(
+            &project
+                .path()
+                .join("gradle/wrapper/gradle-wrapper.properties"),
+            PROPERTIES,
+        );
+        let scratch = tempfile::tempdir().expect("scratch");
+        let root = std::fs::canonicalize(scratch.path()).expect("canonical");
+        let mine = root.join("gradle-home/wrapper/dists/gradle-8.5-bin/abc123/gradle-8.5");
+        std::fs::create_dir_all(&mine).expect("mkdir");
+        let err = prepare(&g, &root, &root, project.path())
+            .expect_err("a folder in the way")
+            .to_string();
+        assert!(
+            err.contains("is a folder in the command's Gradle home"),
+            "{err}"
+        );
+        assert!(mine.is_dir());
+    }
+
+    /// A folder that cannot be made is that failure, not a later one from
+    /// opening a folder that is not there.
+    #[test]
+    fn a_folder_that_cannot_be_made_is_reported_as_it_is() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().expect("home");
+        let g = home.path().join(".gradle");
+        write(
+            &g.join("wrapper/dists/gradle-8.5-bin/abc123/gradle-8.5-bin.zip.ok"),
+            "",
+        );
+        write(
+            &g.join("wrapper/dists/gradle-8.5-bin/abc123/gradle-8.5/x"),
+            "",
+        );
+        let project = tempfile::tempdir().expect("project");
+        write(
+            &project
+                .path()
+                .join("gradle/wrapper/gradle-wrapper.properties"),
+            PROPERTIES,
+        );
+        let scratch = tempfile::tempdir().expect("scratch");
+        let root = std::fs::canonicalize(scratch.path()).expect("canonical");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o500)).expect("chmod");
+        let can_write = std::fs::File::create(root.join(".probe")).is_ok();
+        let err = prepare(&g, &root, &root, project.path()).err();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        if !can_write {
+            assert_eq!(
+                err.map(|e| e.kind()),
+                Some(std::io::ErrorKind::PermissionDenied)
+            );
+        }
+    }
 }

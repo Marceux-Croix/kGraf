@@ -1334,6 +1334,116 @@ mod tests {
         }
     }
 
+    /// The check's cargo folder starts from the checkout's own `target/`
+    /// when it is a real folder, never from a link or a file.
+    #[test]
+    fn the_warm_build_folder_is_the_checkouts_own_real_target_folder() {
+        let dir = tempfile::tempdir().expect("dir");
+        let c = dir.path();
+        assert_eq!(warm_build_folder(c), None, "absent");
+        std::fs::write(c.join("target"), "x").expect("write");
+        assert_eq!(warm_build_folder(c), None, "a file");
+        std::fs::remove_file(c.join("target")).expect("rm");
+        std::fs::create_dir(c.join("elsewhere")).expect("mkdir");
+        std::os::unix::fs::symlink(c.join("elsewhere"), c.join("target")).expect("ln");
+        assert_eq!(warm_build_folder(c), None, "a link to a folder");
+        std::fs::remove_file(c.join("target")).expect("rm");
+        std::fs::create_dir(c.join("target")).expect("mkdir");
+        assert_eq!(warm_build_folder(c), Some(c.join("target")));
+    }
+
+    /// A gate remediation is always checked whole; any other attempt is
+    /// narrowed to the tests of its declared files when it can be.
+    #[test]
+    fn a_remediation_is_checked_whole_and_another_attempt_is_narrowed() {
+        let dir = tempfile::tempdir().expect("dir");
+        for (path, text) in [("pkg/a.py", ""), ("tests/test_a.py", "")] {
+            let p = dir.path().join(path);
+            std::fs::create_dir_all(p.parent().expect("parent")).expect("mkdir");
+            std::fs::write(p, text).expect("write");
+        }
+        let plain = contract_writing(&["pkg/a.py"]);
+        let narrowed = check_scope("pytest", &plain, dir.path());
+        assert!(
+            matches!(narrowed, crate::scoped_check::Scope::Narrowed { .. }),
+            "{narrowed:?}"
+        );
+        let mut remediation = contract_writing(&["pkg/a.py"]);
+        remediation.gate_commands = vec!["cargo test".to_owned()];
+        let whole = check_scope("pytest", &remediation, dir.path());
+        assert!(
+            matches!(whole, crate::scoped_check::Scope::Whole { .. }),
+            "{whole:?}"
+        );
+    }
+
+    /// Start `command` in `ws` on another thread and wait until it has begun
+    /// (its first line writes the marker), so the worktree reads busy.
+    fn hold_busy<'a>(
+        scope: &'a std::thread::Scope<'a, '_>,
+        manager: &'a kgraf_sandbox::WorkspaceManager,
+        ws: &'a kgraf_sandbox::Workspace,
+        command: &'a str,
+    ) -> std::thread::ScopedJoinHandle<'a, ()> {
+        let handle = scope.spawn(move || {
+            let _ = run_confined(
+                ws,
+                manager.repo(),
+                &[],
+                command,
+                Duration::from_secs(30),
+                1_000,
+                None,
+            );
+        });
+        let marker = ws.root().join("started.txt");
+        let waited = std::time::Instant::now();
+        while !marker.exists() && waited.elapsed() < Duration::from_secs(30) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(marker.exists(), "the command started");
+        handle
+    }
+
+    /// The hold check waits for a command that is stopping and gives up on
+    /// one that keeps running: the wait is bounded, and it is not skipped.
+    #[test]
+    fn the_hold_check_waits_a_moment_and_then_gives_up() {
+        let (dir, sha) = git_repo_with("a.txt", "x");
+        let base = tempfile::tempdir().expect("base");
+        let manager =
+            kgraf_sandbox::WorkspaceManager::open(dir.path(), base.path()).expect("manager");
+        let ws = manager
+            .create(&kgraf_sandbox::WorkspaceSpec {
+                name: "quiesce-probe",
+                base: &sha,
+                branch: None,
+            })
+            .expect("worktree");
+        std::thread::scope(|s| {
+            // A command that ends within the wait: the check retries and holds.
+            let h = hold_busy(s, &manager, &ws, "echo go > started.txt; sleep 0.4");
+            let guard = quiesce_retrying(&manager, &ws);
+            assert!(guard.is_ok(), "waited for the command to end");
+            drop(guard);
+            h.join().expect("join");
+            std::fs::remove_file(ws.root().join("started.txt")).expect("rm");
+            // A command that outlasts the wait: busy is returned, after waiting.
+            let h = hold_busy(s, &manager, &ws, "echo go > started.txt; sleep 6");
+            let began = std::time::Instant::now();
+            let busy = quiesce_retrying(&manager, &ws);
+            let waited = began.elapsed();
+            assert!(
+                matches!(busy, Err(kgraf_sandbox::WorkspaceError::Busy { .. })),
+                "busy after the last try"
+            );
+            assert!(waited >= Duration::from_millis(700), "retried: {waited:?}");
+            drop(busy);
+            h.join().expect("join");
+        });
+        manager.remove(ws).expect("remove");
+    }
+
     #[test]
     fn a_committed_attempt_that_skipped_a_dispatch_placeholder_is_named() {
         let c = contract_writing(&["src/a.rs", "src/b.rs", "src/c.rs"]);

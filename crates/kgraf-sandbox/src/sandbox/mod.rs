@@ -1391,6 +1391,126 @@ mod tests {
         assert!(home.is_absolute(), "{home:?}");
     }
 
+    /// The policy reports the writable roots it was given.
+    #[test]
+    fn the_policy_reports_its_writable_roots() {
+        let roots = vec![PathBuf::from("/a"), PathBuf::from("/b")];
+        let policy = SandboxPolicy::new(roots.clone(), Network::Deny);
+        assert_eq!(policy.writable_roots(), roots.as_slice());
+        let more = policy.with_writable_root(PathBuf::from("/c"));
+        assert_eq!(more.writable_roots().len(), 3);
+        assert_eq!(more.writable_roots()[2], PathBuf::from("/c"));
+    }
+
+    /// Only Linux has ancestor reads to refuse; elsewhere the list is empty.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn no_ancestor_refusals_off_linux() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = SandboxPolicy::new(vec![dir.path().to_path_buf()], Network::Deny);
+        assert_eq!(policy.ancestor_refusals().unwrap(), Vec::<String>::new());
+    }
+
+    /// The package managers' stores: Go goes offline when the network is
+    /// denied; Gradle and .NET homes are in the command's temporary folder;
+    /// the user's caches are named only when they exist.
+    #[test]
+    fn package_store_variables_follow_the_network_and_the_home() {
+        let env_of = |network: Network, home: Option<&Path>| {
+            let mut cmd = Command::new("true");
+            package_store_env(&mut cmd, Path::new("/tmp/x"), home, network);
+            cmd.get_envs()
+                .map(|(k, v)| {
+                    (
+                        k.to_string_lossy().into_owned(),
+                        v.map(|v| v.to_string_lossy().into_owned()),
+                    )
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let deny = env_of(Network::Deny, None);
+        assert_eq!(deny["GOPROXY"].as_deref(), Some("off"));
+        assert_eq!(
+            deny["GRADLE_USER_HOME"].as_deref(),
+            Some("/tmp/x/gradle-home")
+        );
+        assert_eq!(
+            deny["DOTNET_CLI_HOME"].as_deref(),
+            Some("/tmp/x/dotnet-home")
+        );
+        assert_eq!(deny["DOTNET_CLI_TELEMETRY_OPTOUT"].as_deref(), Some("1"));
+        assert!(!deny.contains_key("GRADLE_RO_DEP_CACHE"));
+        assert!(!deny.contains_key("NUGET_PACKAGES"));
+        assert!(!env_of(Network::Allow, None).contains_key("GOPROXY"));
+        let home = tempfile::tempdir().unwrap();
+        let empty = env_of(Network::Allow, Some(home.path()));
+        assert!(!empty.contains_key("GRADLE_RO_DEP_CACHE"));
+        assert!(!empty.contains_key("NUGET_PACKAGES"));
+        std::fs::create_dir_all(home.path().join(".gradle/caches/modules-2")).unwrap();
+        std::fs::create_dir_all(home.path().join(".nuget/packages")).unwrap();
+        let full = env_of(Network::Allow, Some(home.path()));
+        let cache = home
+            .path()
+            .join(".gradle/caches")
+            .to_string_lossy()
+            .into_owned();
+        let nuget = home
+            .path()
+            .join(".nuget/packages")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(full["GRADLE_RO_DEP_CACHE"].as_deref(), Some(cache.as_str()));
+        assert_eq!(full["NUGET_PACKAGES"].as_deref(), Some(nuget.as_str()));
+    }
+
+    /// Each redirect applies to its own stream: stdout and stdin set to null
+    /// leave stderr piped.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn each_redirect_applies_to_its_own_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let policy = SandboxPolicy::new(vec![root.clone()], Network::Deny);
+        let mut cmd = sandboxed_command(&policy, "/bin/sh", &root).unwrap();
+        // `output` pipes a stream nobody set, so each stream is set here and
+        // the stream set last must not undo another: stderr first, then the
+        // two that are discarded.
+        cmd.args(["-c", "echo out; echo err >&2; cat; echo after"])
+            .stderr(Redirect::Piped)
+            .stdin(Redirect::Null)
+            .stdout(Redirect::Null);
+        let out = cmd.output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+        assert_eq!(String::from_utf8_lossy(&out.stderr), "err\n");
+    }
+
+    /// A user cargo setting withheld for a login in its URL is reported with
+    /// the command.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_withheld_cargo_setting_is_reported_with_the_command() {
+        let work = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(work.path()).unwrap();
+        let cargo = root.join("cargo-home");
+        std::fs::create_dir_all(&cargo).unwrap();
+        std::fs::write(
+            cargo.join("config.toml"),
+            "[registries.priv]\nindex = \"https://user:secret@example.com/index\"\n",
+        )
+        .unwrap();
+        let tmp = root.join("tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let policy = SandboxPolicy::new(vec![root.clone()], Network::Deny)
+            .with_tmp_dir(tmp)
+            .with_user_cargo_home(cargo);
+        let cmd = sandboxed_command(&policy, "/usr/bin/true", &root).unwrap();
+        assert_eq!(cmd.refused_reads().len(), 1, "{:?}", cmd.refused_reads());
+        assert!(cmd.refused_reads()[0].contains("carries a login"));
+        let plain = SandboxPolicy::new(vec![root.clone()], Network::Deny);
+        let cmd = sandboxed_command(&plain, "/usr/bin/true", &root).unwrap();
+        assert!(cmd.refused_reads().is_empty());
+    }
+
     #[test]
     fn empty_policy_is_rejected() {
         let err = SandboxPolicy::new(vec![], Network::Allow)

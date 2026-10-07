@@ -782,7 +782,37 @@ impl GateRunner for CommandGateRunner {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::read_log;
+    use super::{gradle_wrapper_gate, read_log};
+
+    /// The wrapper gate holds only when the project names its distribution
+    /// and the user's Gradle home has a finished unpack of it.
+    #[test]
+    fn the_gradle_wrapper_gate_needs_a_named_and_unpacked_distribution() {
+        let project = tempfile::tempdir().expect("project");
+        let home = tempfile::tempdir().expect("home");
+        let p = project.path();
+        let h = home.path();
+        let err = gradle_wrapper_gate(p, Some(h)).expect_err("no wrapper");
+        assert!(err.contains("names no Gradle distribution"), "{err}");
+        let props = p.join("gradle/wrapper/gradle-wrapper.properties");
+        std::fs::create_dir_all(props.parent().expect("parent")).expect("mkdir");
+        std::fs::write(
+            &props,
+            "distributionUrl=https\\://services.gradle.org/distributions/gradle-8.5-bin.zip\n",
+        )
+        .expect("write");
+        let err = gradle_wrapper_gate(p, Some(h)).expect_err("nothing unpacked");
+        assert!(err.contains("gradle-8.5-bin is not unpacked"), "{err}");
+        let err = gradle_wrapper_gate(p, None).expect_err("no home");
+        assert!(err.contains("is not unpacked"), "{err}");
+        let dist = h.join(".gradle/wrapper/dists/gradle-8.5-bin/abc123");
+        std::fs::create_dir_all(&dist).expect("mkdir");
+        std::fs::write(dist.join("gradle-8.5-bin.zip.ok"), "").expect("write");
+        let err = gradle_wrapper_gate(p, Some(h)).expect_err("a mark without a folder");
+        assert!(err.contains("is not unpacked"), "{err}");
+        std::fs::create_dir_all(dist.join("gradle-8.5")).expect("mkdir");
+        assert_eq!(gradle_wrapper_gate(p, Some(h)), Ok(()));
+    }
 
     /// Decision 0083: a gate command replaces its own log with a link or a
     /// hard link to a file outside; the host reads neither into the verdict.
@@ -828,5 +858,57 @@ mod tests {
         assert!(text.len() < 4096 + 64, "{}", text.len());
         assert!(text.starts_with("[") && text.contains("bytes cut]"));
         assert!(text.ends_with("h\u{e9}llo END\n"));
+    }
+
+    /// The refused reads are lines for the check's output, one each.
+    #[test]
+    fn refused_reads_are_one_sandbox_line_each() {
+        assert_eq!(super::refused_note(&[]), "");
+        assert_eq!(
+            super::refused_note(&["a".to_owned(), "b".to_owned()]),
+            "\n[sandbox] a\n[sandbox] b"
+        );
+    }
+
+    /// The count of cut bytes is exact: the file's size less what is kept,
+    /// whether the cut falls on a character or inside one.
+    #[test]
+    fn the_cut_byte_count_is_exact() {
+        let dir = tempfile::tempdir().expect("dir");
+        let log = dir.path().join("gate-1.log");
+        let ten = "y".repeat(10);
+        // Cut on a character boundary.
+        std::fs::write(&log, "x".repeat(100)).expect("write");
+        assert_eq!(
+            read_log(&log, 10),
+            format!("[90 bytes cut]\n{}", "x".repeat(10))
+        );
+        // The read starts inside a two-byte character.
+        std::fs::write(&log, format!("{}\u{e9}{}", "x".repeat(20), "y".repeat(13))).expect("write");
+        assert_eq!(read_log(&log, 10), format!("[25 bytes cut]\n{ten}"));
+        // The cut itself falls inside a two-byte character: it moves on to
+        // the next boundary.
+        std::fs::write(
+            &log,
+            format!("{}abc\u{e9}{}", "x".repeat(50), "y".repeat(9)),
+        )
+        .expect("write");
+        assert_eq!(
+            read_log(&log, 10),
+            format!("[55 bytes cut]\n{}", "y".repeat(9))
+        );
+        // A short file that begins with stray continuation bytes is shown
+        // as it is; nothing is cut.
+        std::fs::write(&log, [0x80u8, b'a']).expect("write");
+        assert_eq!(read_log(&log, 10), "\u{fffd}a");
+        // Short files are cut by `tail` alone.
+        std::fs::write(&log, "abcdef").expect("write");
+        assert_eq!(read_log(&log, 6), "abcdef");
+        std::fs::write(&log, "abcdefg").expect("write");
+        assert_eq!(read_log(&log, 6), "[1 bytes cut]\nbcdefg");
+        std::fs::write(&log, "\u{e9}abcd").expect("write");
+        assert_eq!(read_log(&log, 5), "[2 bytes cut]\nabcd");
+        assert_eq!(super::tail("abcdef", 6), "abcdef");
+        assert_eq!(super::tail("abcdefg", 6), "[1 bytes cut]\nbcdefg");
     }
 }
