@@ -350,14 +350,81 @@ fn https_certificate_validation_works_with_network_allowed() {
         "/usr/bin/curl -sS -o /dev/null -w '%{http_code}' https://index.crates.io/config.json",
     );
     assert_eq!(String::from_utf8_lossy(&index.stdout), "200", "{index:?}");
-    // Validation is really on inside the sandbox: an expired certificate is
-    // rejected (curl exit 60), not waved through.
-    let expired = sh(
-        &e.ws,
-        Network::Allow,
-        "/usr/bin/curl -sS -o /dev/null https://expired.badssl.com",
-    );
-    assert_eq!(expired.status.code(), Some(60), "{expired:?}");
+    // Validation is really on inside the sandbox: a certificate the system
+    // does not trust is rejected (curl exit 60), not waved through. The
+    // server is local, so no third-party host is involved.
+    let server = UntrustedTlsServer::start(e.outside.path());
+    let url = format!("https://localhost:{}", server.port);
+    let curl = format!("/usr/bin/curl -sS -o /dev/null {CURL_VALIDATION_FLAGS} {url}");
+    let control = Command::new("/bin/sh")
+        .args(["-c", &curl])
+        .output()
+        .unwrap();
+    assert_eq!(control.status.code(), Some(60), "control: {control:?}");
+    let rejected = sh(&e.ws, Network::Allow, &curl);
+    assert_eq!(rejected.status.code(), Some(60), "{rejected:?}");
+}
+
+/// Extra curl flags for the local rejection check. Empty keeps validation on.
+const CURL_VALIDATION_FLAGS: &str = "";
+
+/// A local TLS server on 127.0.0.1 with a self-signed certificate for
+/// `localhost` that no trust store holds. The name matches, so the only
+/// reason curl can reject it is trust. The child is killed on drop.
+struct UntrustedTlsServer {
+    child: std::process::Child,
+    port: u16,
+}
+
+impl UntrustedTlsServer {
+    fn start(dir: &Path) -> Self {
+        let (cert, key) = (dir.join("cert.pem"), dir.join("key.pem"));
+        let made = Command::new("/usr/bin/openssl")
+            .args([
+                "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+            ])
+            .args(["-subj", "/CN=localhost"])
+            .args(["-addext", "subjectAltName=DNS:localhost"])
+            .arg("-keyout")
+            .arg(&key)
+            .arg("-out")
+            .arg(&cert)
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "openssl req failed: {made:?}");
+        // Pick a free port, release it, then let the server take it.
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let child = Command::new("/usr/bin/openssl")
+            .args(["s_server", "-www", "-accept"])
+            .arg(port.to_string())
+            .arg("-cert")
+            .arg(&cert)
+            .arg("-key")
+            .arg(&key)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let server = Self { child, port };
+        let up = (0..100).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
+        });
+        assert!(up, "local TLS server did not start");
+        server
+    }
+}
+
+impl Drop for UntrustedTlsServer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 /// Needs internet: a fresh CARGO_HOME inside the workspace scratch fetches
