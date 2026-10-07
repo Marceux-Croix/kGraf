@@ -45,9 +45,18 @@
 //! ([`unix::clone_install`]): pnpm's links are relative, so in the clone
 //! every one of them, nested ones included, resolves inside the tree, and a
 //! workspace package to the tree's own copy. A clone costs one file system
-//! call per file and no data (APFS `clonefile`, a Linux reflink); where no
-//! clone can be made the install gets a folder of links as before, and the
+//! call per file and no data (APFS `clonefile`, a Linux reflink on btrfs,
+//! XFS or bcachefs). Where no clone can be made (ext4, overlayfs, another
+//! volume), the install is copied byte for byte when it is within
+//! [`INSTALL_COPY_BOUND`] ([`copy_install`]), and the output says so with
+//! its size. A larger install gets a folder of links as before, and the
 //! output says that nested workspace links reach the checkout's copies.
+//!
+//! A folder made from an install is kept while the install's stamp
+//! ([`mirror_stamp`]) is the same, except a stamp read within
+//! [`RACY_WITHIN`] of the install's last change ([`stamp_is_racy`]): a file
+//! system that keeps a folder's time in steps would hide an entry added in
+//! the same step.
 //!
 //! **Windows.** A symbolic link needs a privilege a user account lacks by
 //! default, so a folder is reached through a directory junction and a file
@@ -60,7 +69,7 @@
 //! that is not tracked) stays unreadable; such a run fails with the
 //! permission error. A third-party package of a pnpm install whose own
 //! folder (`.pnpm/<name>@<version>/node_modules`) links a workspace package
-//! reaches the tree's copy only through a clone.
+//! reaches the tree's copy only through a clone or a copy.
 //!
 //! Written new. Searched: this repository (the cargo dependency gate, decision
 //! 0087, handles cargo's own cache only) and the sandboxes it ports (codex-rs
@@ -443,14 +452,17 @@ pub fn link_dependency_trees(tree: &Path, checkout: &Path) -> DependencyLinks {
             DependencyKind::NodeModules => mirror_stamp(&found.source),
             _ => None,
         };
+        // A racy stamp is never current: the folder is brought up to date.
+        let trusted = stamp.as_deref().filter(|s| !stamp_is_racy(s));
         #[cfg(unix)]
-        let current = stamp
-            .as_deref()
-            .is_some_and(|stamp| unix::mirror_is_current(&root, &found.rel, stamp));
+        let current =
+            trusted.is_some_and(|stamp| unix::mirror_is_current(&root, &found.rel, stamp));
         #[cfg(windows)]
-        let current = stamp.as_deref().is_some_and(|stamp| {
+        let current = trusted.is_some_and(|stamp| {
             by_path::mirror_is_current(&by_path::Junctions, &tree_root, &found.rel, stamp)
         });
+        #[cfg(not(any(unix, windows)))]
+        let _ = trusted;
         #[cfg(not(any(unix, windows)))]
         let current = false;
         let plan = match (&stamp, current) {
@@ -465,8 +477,20 @@ pub fn link_dependency_trees(tree: &Path, checkout: &Path) -> DependencyLinks {
         let linked = {
             let cloned = match (&stamp, pnpm_clone) {
                 (Some(stamp), true) => {
-                    match unix::clone_install(&root, &tree_root, &found.rel, &found.source, stamp) {
-                        Ok(Ok(linked)) => Some(Ok(linked)),
+                    match unix::clone_install(
+                        &root,
+                        &tree_root,
+                        &found.rel,
+                        &found.source,
+                        stamp,
+                        INSTALL_COPY_BOUND,
+                    ) {
+                        Ok(Ok(cloned)) => {
+                            if let Some((why, count)) = &cloned.copied {
+                                out.notes.push(pnpm_copied(&found.rel, why, *count));
+                            }
+                            Some(Ok(cloned.linked))
+                        }
                         Ok(Err(why)) => {
                             out.notes.push(pnpm_unclonable(&found.rel, &why));
                             None
@@ -538,14 +562,26 @@ pub fn link_dependency_trees(tree: &Path, checkout: &Path) -> DependencyLinks {
     out
 }
 
-/// The note for a pnpm install with workspace links that could not be
-/// cloned into the tree.
+/// The note for a pnpm install with workspace links that could be neither
+/// cloned nor copied into the tree.
 fn pnpm_unclonable(rel: &Path, why: &str) -> String {
     format!(
-        "the pnpm install {} got a folder of links, not a clone ({why}): a workspace package \
-         that another package of the install links inside node_modules/.pnpm resolves to the \
-         checkout's copy, which the sandbox does not grant",
+        "the pnpm install {} got a folder of links, not a clone or a copy ({why}): a workspace \
+         package that another package of the install links inside node_modules/.pnpm resolves \
+         to the checkout's copy, which the sandbox does not grant",
         rel.display()
+    )
+}
+
+/// The note for a pnpm install copied into the tree because no clone could
+/// be made: a copy uses its full size on disk.
+#[cfg(unix)]
+fn pnpm_copied(rel: &Path, why: &str, count: CopyCount) -> String {
+    format!(
+        "the pnpm install {} was copied into the tree, not cloned ({why}): {} entries, {} MiB",
+        rel.display(),
+        count.entries,
+        count.bytes.div_ceil(1 << 20)
     )
 }
 
@@ -591,6 +627,150 @@ pub fn is_dependency_clone(dir: &Path) -> bool {
         && std::fs::read_to_string(&mark).is_ok_and(|t| t.starts_with(CLONE_PREFIX))
 }
 
+/// The most a byte copy of a pnpm install may hold, where no copy-on-write
+/// clone can be made ([`copy_install`]). Unlike a clone, a copy uses its full
+/// size on disk in each tree and each check, so it is bounded; a larger
+/// install gets the folder of links, and the output says why.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CopyBound {
+    /// Entries: files, links and folders.
+    pub entries: u64,
+    /// Bytes of the regular files.
+    pub bytes: u64,
+}
+
+/// The bound of a pnpm install's byte copy. Measured (Linux 6.8, ext4
+/// under overlayfs, no reflink, release build, 2026-10-07, the ignored
+/// test `install_copy_cost`): 30,001 entries (24,000 files of 8 KiB),
+/// 188 MiB, take 59 ms to count and 0.48 s to count and copy. At the bound,
+/// 100,000 entries or 1 GiB, that is a few seconds and up to 1 GiB of disk
+/// per tree and per check, once per install change. A monorepo's pnpm
+/// install is commonly tens of thousands of entries.
+pub const INSTALL_COPY_BOUND: CopyBound = CopyBound {
+    entries: 100_000,
+    bytes: 1 << 30,
+};
+
+/// What [`copy_install`] copied.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CopyCount {
+    pub entries: u64,
+    pub bytes: u64,
+}
+
+/// Count the entries and bytes beneath `source`, never following a link,
+/// and stop as soon as either passes `bound`: the error says which. Special
+/// files (a socket, a pipe) are not counted: [`copy_install`] skips them.
+#[cfg(unix)]
+pub(crate) fn count_install(source: &Path, bound: CopyBound) -> Result<CopyCount, String> {
+    let mut count = CopyCount::default();
+    let mut dirs = vec![source.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        let read = std::fs::read_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        for entry in read {
+            let entry = entry.map_err(|e| format!("{}: {e}", dir.display()))?;
+            let kind = entry
+                .file_type()
+                .map_err(|e| format!("{}: {e}", entry.path().display()))?;
+            if kind.is_dir() {
+                dirs.push(entry.path());
+            } else if kind.is_file() {
+                let meta = entry
+                    .metadata()
+                    .map_err(|e| format!("{}: {e}", entry.path().display()))?;
+                count.bytes += meta.len();
+            } else if !kind.is_symlink() {
+                continue;
+            }
+            count.entries += 1;
+            if count.entries > bound.entries {
+                return Err(format!(
+                    "the install holds more than {} entries, the bound of a copy",
+                    bound.entries
+                ));
+            }
+            if count.bytes > bound.bytes {
+                return Err(format!(
+                    "the install holds more than {} MiB, the bound of a copy",
+                    bound.bytes >> 20
+                ));
+            }
+        }
+    }
+    Ok(count)
+}
+
+/// A regular file beneath `source`, reached without following a link, to
+/// probe whether a clone can be made from its file system; `None` when the
+/// first 1,000 folders hold none. pnpm writes `.modules.yaml` at the top.
+#[cfg(unix)]
+pub(crate) fn first_file(source: &Path) -> Option<PathBuf> {
+    // Depth first: a pnpm store is wide (one folder per package) and its
+    // files are a few levels down.
+    let mut dirs = vec![source.to_path_buf()];
+    let mut opened = 0;
+    while let Some(dir) = dirs.pop() {
+        opened += 1;
+        if opened > 1_000 {
+            return None;
+        }
+        let Ok(read) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in read.flatten() {
+            match entry.file_type() {
+                Ok(kind) if kind.is_file() => return Some(entry.path()),
+                Ok(kind) if kind.is_dir() => dirs.push(entry.path()),
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+/// Make `dest` (absent) a byte copy of the pnpm install at `source`, when
+/// it is within `bound`: folders made new, links made again with the same
+/// text (pnpm's links are relative, so in the copy they resolve inside the
+/// tree, as in a clone), regular files copied with their permissions,
+/// special files skipped. Nothing is followed.
+///
+/// Why a copy and not hard links: a hard link is the checkout's own file
+/// (and, for pnpm, the file in its global store). The sandbox judges a write
+/// by path, and the tree is writable, so a command could change the
+/// user's install through it. Why not file links in real folders: Node
+/// resolves a module from its file's real path, which a link to the
+/// checkout's file puts back in the checkout.
+///
+/// `std::fs::copy` on Linux uses `copy_file_range`, which shares blocks
+/// where the file system can (btrfs, XFS) and copies in the kernel
+/// otherwise. An error leaves a partial `dest` for the caller to remove.
+#[cfg(unix)]
+pub(crate) fn copy_install(
+    source: &Path,
+    dest: &Path,
+    bound: CopyBound,
+) -> Result<CopyCount, String> {
+    fn copy(from: &Path, to: &Path) -> std::io::Result<()> {
+        std::fs::create_dir(to)?;
+        for entry in std::fs::read_dir(from)? {
+            let entry = entry?;
+            let (src, dst) = (entry.path(), to.join(entry.file_name()));
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                copy(&src, &dst)?;
+            } else if kind.is_symlink() {
+                std::os::unix::fs::symlink(std::fs::read_link(&src)?, &dst)?;
+            } else if kind.is_file() {
+                std::fs::copy(&src, &dst)?;
+            }
+        }
+        Ok(())
+    }
+    let count = count_install(source, bound)?;
+    copy(source, dest).map_err(|e| format!("the copy failed: {e}"))?;
+    Ok(count)
+}
+
 /// What a folder of links made from the install at `source` depends on: the
 /// modification times of `source`, of its `.bin` and of each `@scope`
 /// folder (an install adds or removes an entry in one of them). Written in
@@ -604,7 +784,9 @@ pub(crate) fn mirror_stamp(source: &Path) -> Option<String> {
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map_or(0, |d| d.as_nanos())
     };
-    let mut stamp = format!("{}", time(&std::fs::metadata(source).ok()?));
+    let first = time(&std::fs::metadata(source).ok()?);
+    let mut newest = first;
+    let mut stamp = format!("{first}");
     let mut dirs: Vec<(String, u128)> = std::fs::read_dir(source)
         .ok()?
         .flatten()
@@ -618,16 +800,48 @@ pub(crate) fn mirror_stamp(source: &Path) -> Option<String> {
         .collect();
     dirs.sort();
     for (name, t) in dirs {
+        newest = newest.max(t);
         let _ = write!(stamp, " {name}={t}");
     }
     // pnpm keeps its packages in `.pnpm` and hoists them into
     // `.pnpm/node_modules`: an install changes one of them.
     for sub in [".pnpm", ".pnpm/node_modules"] {
         if let Ok(meta) = std::fs::metadata(source.join(sub)) {
-            let _ = write!(stamp, " {sub}={}", time(&meta));
+            let t = time(&meta);
+            newest = newest.max(t);
+            let _ = write!(stamp, " {sub}={t}");
         }
     }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    if now.saturating_sub(newest) < RACY_WITHIN.as_nanos() {
+        stamp.push_str(RACY);
+    }
     Some(stamp)
+}
+
+/// How recent a folder's modification time must be for its stamp to be
+/// racy ([`stamp_is_racy`]). A file system keeps a folder's time in steps:
+/// measured 1 ms on Linux 6.8 ext4 under overlayfs (the kernel's coarse
+/// clock), up to 10 ms at a 100 Hz tick, 2 s on FAT; APFS keeps nanoseconds.
+/// An entry added in the same step as the stamp was read leaves the time,
+/// and the stamp, as they were, so a folder made from the install before the
+/// entry would be kept without it. One second covers every step but FAT's
+/// and costs one more build of the folder per call made within a second of
+/// an install's last change.
+const RACY_WITHIN: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// What ends a racy stamp ([`RACY_WITHIN`]).
+const RACY: &str = " racy";
+
+/// Whether a stamp read by [`mirror_stamp`] cannot tell a later change from
+/// none: the install changed less than [`RACY_WITHIN`] before it was read.
+/// A folder made from such a stamp is never current, so the next call makes
+/// it again from the install as it is then (as git does for an index entry
+/// written in the second its file changed).
+pub(crate) fn stamp_is_racy(stamp: &str) -> bool {
+    stamp.ends_with(RACY)
 }
 
 /// The path of the workspace package the link `entry` of the install at
@@ -1007,11 +1221,29 @@ mod unix {
         }
     }
 
+    /// What [`clone_install`] did, and, for a byte copy, why no clone was
+    /// made and what was copied.
+    pub(super) struct Cloned {
+        pub(super) linked: Linked,
+        pub(super) copied: Option<(String, super::CopyCount)>,
+    }
+
+    impl Cloned {
+        fn only(linked: Linked) -> Self {
+            Cloned {
+                linked,
+                copied: None,
+            }
+        }
+    }
+
     /// Make `rel` beneath `root` a copy-on-write clone of the install at
     /// `source` (pnpm's, [`super::is_pnpm`]), or replace kGraf's own link or
-    /// folder of links there with one; then write `stamp` in its mark.
-    /// `Ok(Err(why))`: no clone can be made here (another volume, no
-    /// copy-on-write), and nothing was changed.
+    /// folder of links there with one; then write `stamp` in its mark. Where
+    /// no clone can be made (another volume, no copy-on-write: Linux on
+    /// ext4 or overlayfs), a byte copy within `bound`
+    /// ([`super::copy_install`]). `Ok(Err(why))`: neither can be made, and
+    /// nothing was changed.
     ///
     /// The clone is made in a new folder beside the tree (`tree`'s parent:
     /// the workspace base or a check run's folder, which no sandboxed
@@ -1025,18 +1257,19 @@ mod unix {
         rel: &Path,
         source: &Path,
         stamp: &str,
-    ) -> io::Result<Result<Linked, String>> {
+        bound: super::CopyBound,
+    ) -> io::Result<Result<Cloned, String>> {
         use cap_primitives::ambient_authority;
         use cap_primitives::fs::open_ambient_dir;
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let Some((parent, last)) = open_parent(root, rel)? else {
-            return Ok(Ok(Linked::NoParent));
+            return Ok(Ok(Cloned::only(Linked::NoParent)));
         };
         let mark = Path::new(super::MIRROR_MARK);
         let replaces = match stat(&parent, last, FollowSymlinks::No) {
             Ok(meta) if meta.file_type().is_symlink() => {
                 if read_link_at(&parent, last).as_deref() != Some(source.as_os_str().as_bytes()) {
-                    return Ok(Ok(Linked::Present));
+                    return Ok(Ok(Cloned::only(Linked::Present)));
                 }
                 true
             }
@@ -1045,11 +1278,11 @@ mod unix {
                     .is_ok_and(|d| stat(&d, mark, FollowSymlinks::No).is_ok_and(|m| m.is_file()));
                 if !ours {
                     // A folder that is not kGraf's (the worker's own install).
-                    return Ok(Ok(Linked::Present));
+                    return Ok(Ok(Cloned::only(Linked::Present)));
                 }
                 true
             }
-            Ok(_) => return Ok(Ok(Linked::Present)),
+            Ok(_) => return Ok(Ok(Cloned::only(Linked::Present))),
             Err(e) if e.kind() == io::ErrorKind::NotFound => false,
             Err(e) => return Err(e),
         };
@@ -1062,18 +1295,41 @@ mod unix {
             .map_or(0, |d| d.as_nanos());
         let staging = beside.join(format!(".kgraf-install-{}-{nanos}-{n}", std::process::id()));
         std::fs::create_dir(&staging)?;
-        let result = (|| -> io::Result<Result<Linked, String>> {
+        let result = (|| -> io::Result<Result<Cloned, String>> {
             let made = staging.join("install");
-            if let Err(why) = crate::build_dir::clone_tree(source, &made) {
-                return Ok(Err(why));
-            }
+            // One file first: a `cp` that cannot clone goes on past each
+            // file and makes the whole tree of empty files before it fails
+            // (measured 0.6 s for 30,000 entries, Linux overlayfs).
+            let cloned = match super::first_file(source) {
+                Some(file) => {
+                    let probed = crate::build_dir::clone_tree(&file, &staging.join("probe"));
+                    let _ = std::fs::remove_file(staging.join("probe"));
+                    probed.and_then(|_| crate::build_dir::clone_tree(source, &made))
+                }
+                None => crate::build_dir::clone_tree(source, &made),
+            };
+            let copied = match cloned {
+                Ok(_) => None,
+                Err(no_clone) => {
+                    // `cp` may have left part of a clone.
+                    match std::fs::remove_dir_all(&made) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(e),
+                    }
+                    match super::copy_install(source, &made, bound) {
+                        Ok(count) => Some((no_clone, count)),
+                        Err(no_copy) => return Ok(Err(format!("{no_clone}; {no_copy}"))),
+                    }
+                }
+            };
             std::fs::write(made.join(mark), format!("{}{stamp}", super::CLONE_PREFIX))?;
             let staged = open_ambient_dir(&staging, ambient_authority())?;
             if replaces {
                 rename_at(&parent, last, &staged, Path::new("replaced"))?;
             }
-            match rename_at(&staged, Path::new("install"), &parent, last) {
-                Ok(()) => Ok(Ok(Linked::Made)),
+            let linked = match rename_at(&staged, Path::new("install"), &parent, last) {
+                Ok(()) => Linked::Made,
                 // Something was put there meanwhile: left as it is.
                 Err(e)
                     if matches!(
@@ -1081,10 +1337,11 @@ mod unix {
                         Some(libc::EEXIST | libc::ENOTEMPTY | libc::ENOTDIR | libc::EISDIR)
                     ) =>
                 {
-                    Ok(Ok(Linked::Present))
+                    Linked::Present
                 }
-                Err(e) => Err(e),
-            }
+                Err(e) => return Err(e),
+            };
+            Ok(Ok(Cloned { linked, copied }))
         })();
         // The staging folder is the host's; nothing in it is followed.
         let _ = std::fs::remove_dir_all(&staging);
@@ -1529,9 +1786,10 @@ mod tests {
     /// Node resolves a package from its real path. With the install linked
     /// (one link or a folder of links), `dep` resolves into the checkout's
     /// `.pnpm`, and its `require('@s/util')` walks the checkout's folders to
-    /// the checkout's `packages/util`. The tree gets a clone, so `dep`'s real
-    /// path is in the tree and the hoisted workspace link resolves to the
-    /// tree's own `packages/util`, as the root's `@s/web` does.
+    /// the checkout's `packages/util`. The tree gets a clone (APFS, a Linux
+    /// reflink) or, where the file system makes none, a copy, so `dep`'s
+    /// real path is in the tree and the hoisted workspace link resolves to
+    /// the tree's own `packages/util`, as the root's `@s/web` does.
     #[test]
     fn pnpm_workspace_links_inside_the_store_resolve_to_the_tree_s_packages() {
         let (_c, c) = pnpm_checkout();
@@ -1553,6 +1811,7 @@ mod tests {
         );
         let nm = t.join("node_modules");
         assert!(nm.join(MIRROR_MARK).is_file(), "{links:?}");
+        assert_cloned_or_copied(&links, &c, &t);
         // Where Node finds `dep`, and the folders it then looks in for
         // `@s/util`, as Node's own lookup from `dep`'s real path does.
         let dep = std::fs::canonicalize(nm.join("dep")).expect("dep");
@@ -1598,7 +1857,8 @@ mod tests {
     }
 
     /// A worker's own `node_modules` folder in a pnpm workspace is left as
-    /// it is; kGraf's earlier folder of links is replaced by the clone.
+    /// it is; kGraf's earlier folder of links is replaced by the clone or,
+    /// where none can be made, the copy.
     #[test]
     fn a_pnpm_clone_replaces_only_kgraf_s_own_install() {
         let (_c, c) = pnpm_checkout();
@@ -1622,12 +1882,8 @@ mod tests {
             vec![PathBuf::from("node_modules")],
             "{links:?}"
         );
-        // A clone: `.pnpm` is a real folder in the tree, not a link.
-        assert!(
-            std::fs::symlink_metadata(tree.path().join("node_modules/.pnpm"))
-                .expect(".pnpm")
-                .is_dir()
-        );
+        // `.pnpm` is a real folder in the tree, not a link.
+        assert_cloned_or_copied(&links, &c, tree.path());
     }
 
     #[test]
@@ -1731,6 +1987,61 @@ mod tests {
     fn link_at(target: impl AsRef<Path>, at: &Path) {
         std::fs::create_dir_all(at.parent().expect("parent")).expect("mkdir");
         std::os::unix::fs::symlink(target, at).expect("ln");
+    }
+
+    /// Whether a copy-on-write clone can be made from `from`'s file system
+    /// to `beside`'s: APFS (macOS) yes; Linux on btrfs, XFS or bcachefs yes;
+    /// Linux on ext4, tmpfs or overlayfs (a container) no. Probed with the
+    /// same call the product makes, so each test states what this machine
+    /// does instead of assuming one platform.
+    fn clones_here(from: &Path, beside: &Path) -> bool {
+        let src = tempfile::tempdir_in(from).expect("probe source");
+        std::fs::write(src.path().join("f"), "x").expect("write");
+        let dst = tempfile::tempdir_in(beside).expect("probe dest");
+        crate::build_dir::clone_tree(src.path(), &dst.path().join("c")).is_ok()
+    }
+
+    /// The note a pnpm install that was copied, not cloned, leaves.
+    fn copied_note(links: &DependencyLinks) -> Option<&String> {
+        links
+            .notes
+            .iter()
+            .find(|n| n.contains("was copied into the tree, not cloned"))
+    }
+
+    /// The pnpm install in `tree` is kGraf's clone or copy, as this machine
+    /// makes it: no note for a clone; for a copy, the note with its size.
+    fn assert_cloned_or_copied(links: &DependencyLinks, source: &Path, tree: &Path) {
+        let nm = tree.join("node_modules");
+        assert!(is_dependency_clone(&nm), "{links:?}");
+        let pnpm = std::fs::symlink_metadata(nm.join(".pnpm")).expect(".pnpm");
+        assert!(pnpm.is_dir(), "a real .pnpm folder in the tree: {links:?}");
+        if clones_here(source, tree.parent().expect("parent")) {
+            assert_eq!(copied_note(links), None, "a clone, not a copy");
+        } else {
+            let note = copied_note(links).expect("a copy says so");
+            assert!(note.contains(" entries, "), "{note}");
+            assert!(note.contains("cp "), "names why no clone: {note}");
+        }
+    }
+
+    /// Set the modification time of `dir` and every folder beneath it,
+    /// never through a link, to a minute ago: a stamp read after this is
+    /// not racy ([`stamp_is_racy`]).
+    fn age(dir: &Path) {
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        let mut dirs = vec![dir.to_path_buf()];
+        while let Some(d) = dirs.pop() {
+            for e in std::fs::read_dir(&d).expect("read").flatten() {
+                if e.file_type().expect("type").is_dir() {
+                    dirs.push(e.path());
+                }
+            }
+            std::fs::File::open(&d)
+                .expect("open")
+                .set_modified(past)
+                .expect("set time");
+        }
     }
 
     /// A Go vendor folder needs `go.mod`, the folder and `vendor/modules.txt`
@@ -1878,8 +2189,9 @@ mod tests {
         (dir, c)
     }
 
-    /// A pnpm install is cloned when a workspace package is linked in its
-    /// root, or only in its hoisting folder; with none it is one link.
+    /// A pnpm install is cloned (or copied, where no clone can be made) when
+    /// a workspace package is linked in its root, or only in its hoisting
+    /// folder; with none it is one link.
     #[test]
     fn a_pnpm_install_is_cloned_for_a_workspace_link_in_either_place() {
         for (root, hoisted, clone) in [
@@ -1900,8 +2212,13 @@ mod tests {
             assert_eq!(
                 is_dependency_clone(&t.join("node_modules")),
                 clone,
-                "root {root}, hoisted {hoisted}"
+                "root {root}, hoisted {hoisted}: {links:?}"
             );
+            if clone {
+                assert_cloned_or_copied(&links, &c, &t);
+            } else {
+                assert_eq!(copied_note(&links), None);
+            }
             let is_link = std::fs::symlink_metadata(t.join("node_modules"))
                 .expect("meta")
                 .file_type()
@@ -1940,7 +2257,14 @@ mod tests {
             let meta = std::fs::symlink_metadata(t.join("node_modules")).expect("meta");
             assert!(meta.is_dir(), "pnpm {pnpm}: replaced by a folder");
             assert!(t.join("node_modules").join(MIRROR_MARK).is_file());
-            assert_eq!(is_dependency_clone(&t.join("node_modules")), pnpm);
+            assert_eq!(
+                is_dependency_clone(&t.join("node_modules")),
+                pnpm,
+                "{links:?}"
+            );
+            if pnpm {
+                assert_cloned_or_copied(&links, &checkout, &t);
+            }
 
             let (_f, f) = canonical_dir();
             write(&f.join("package.json"), "{}");
@@ -2097,7 +2421,10 @@ mod tests {
         let note = pnpm_unclonable(Path::new("web/node_modules"), "another volume");
         assert!(note.contains("web/node_modules"), "{note}");
         assert!(note.contains("another volume"), "{note}");
-        assert!(note.contains("folder of links, not a clone"), "{note}");
+        assert!(
+            note.contains("folder of links, not a clone or a copy"),
+            "{note}"
+        );
     }
 
     fn root_of(path: &Path) -> std::fs::File {
@@ -2170,6 +2497,8 @@ mod tests {
         write(&c.join("packages/web/index.js"), "web");
         write(&c.join("node_modules/dep/index.js"), "dep");
         link_at("../../packages/web", &c.join("node_modules/@s/web"));
+        // An install last changed a minute ago: its stamp is not racy.
+        age(&c.join("node_modules"));
         let (_t, t) = canonical_dir();
         write(&t.join("package.json"), "{}");
         let first = link_dependency_trees(&t, &c);
@@ -2185,6 +2514,264 @@ mod tests {
             std::fs::symlink_metadata(t.join("node_modules/dep")).is_err(),
             "the fast path leaves a current folder alone"
         );
+    }
+
+    /// A stamp read within a second of the install's last change is racy;
+    /// one read later is not, and is the same on each read.
+    #[test]
+    fn a_stamp_read_right_after_a_change_is_racy() {
+        let (_c, c) = canonical_dir();
+        write(&c.join("node_modules/dep/index.js"), "dep");
+        write(&c.join("node_modules/.pnpm/x/index.js"), "x");
+        let nm = c.join("node_modules");
+        let fresh = mirror_stamp(&nm).expect("stamp");
+        assert!(stamp_is_racy(&fresh), "{fresh}");
+        age(&nm);
+        let old = mirror_stamp(&nm).expect("stamp");
+        assert!(!stamp_is_racy(&old), "{old}");
+        assert_eq!(mirror_stamp(&nm).as_deref(), Some(old.as_str()));
+        // A change inside `.pnpm` alone makes it racy again.
+        write(&nm.join(".pnpm/y/index.js"), "y");
+        assert!(stamp_is_racy(&mirror_stamp(&nm).expect("stamp")));
+    }
+
+    /// An entry added in the same time step as the folder of links was made
+    /// leaves the install's times as they were. The folder made from a racy
+    /// stamp is made again on the next call, so the entry is linked.
+    #[test]
+    fn an_entry_added_in_the_same_time_step_is_linked_on_the_next_call() {
+        let (_c, c) = canonical_dir();
+        write(&c.join("package.json"), "{}");
+        write(&c.join("packages/web/index.js"), "web");
+        write(&c.join("node_modules/dep/index.js"), "dep");
+        link_at("../../packages/web", &c.join("node_modules/@s/web"));
+        let nm = c.join("node_modules");
+        let times: Vec<(PathBuf, std::time::SystemTime)> = [nm.clone(), nm.join("@s")]
+            .into_iter()
+            .map(|d| {
+                let t = std::fs::metadata(&d)
+                    .expect("meta")
+                    .modified()
+                    .expect("time");
+                (d, t)
+            })
+            .collect();
+        let (_t, t) = canonical_dir();
+        write(&t.join("package.json"), "{}");
+        let first = link_dependency_trees(&t, &c);
+        assert_eq!(first.linked, vec![PathBuf::from("node_modules")]);
+        // A coarse clock: the entry is added, the times stay as they were.
+        write(&nm.join("later/index.js"), "later");
+        for (d, time) in &times {
+            std::fs::File::open(d)
+                .expect("open")
+                .set_modified(*time)
+                .expect("set time");
+        }
+        let again = link_dependency_trees(&t, &c);
+        assert_eq!(again.linked, first.linked, "{again:?}");
+        assert_eq!(
+            std::fs::read_to_string(t.join("node_modules/later/index.js")).expect("later"),
+            "later"
+        );
+    }
+
+    /// A pnpm install's byte copy: folders made new, links made again with
+    /// their own text (relative ones resolve inside the copy, absolute ones
+    /// where they did), files with their content and permissions, a pipe
+    /// skipped; nothing in the source is followed or changed.
+    #[test]
+    fn an_install_copy_keeps_links_as_links_and_files_with_their_mode() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::PermissionsExt;
+        let (_c, c) = canonical_dir();
+        let (_o, o) = canonical_dir();
+        write(&o.join("outside/secret"), "outside");
+        let nm = c.join("node_modules");
+        write(&nm.join(".pnpm/dep@1/node_modules/dep/index.js"), "dep");
+        write(&nm.join(".pnpm/dep@1/node_modules/dep/bin.js"), "#!");
+        let bin = nm.join(".pnpm/dep@1/node_modules/dep/bin.js");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        link_at(".pnpm/dep@1/node_modules/dep", &nm.join("dep"));
+        link_at(o.join("outside"), &nm.join("abs"));
+        let fifo = std::ffi::CString::new(nm.join("pipe").as_os_str().as_bytes()).expect("c");
+        // SAFETY: `fifo` is NUL-terminated.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+
+        let (_d, d) = canonical_dir();
+        let dest = d.join("install");
+        let count = copy_install(&nm, &dest, INSTALL_COPY_BOUND).expect("copy");
+        // Folders .pnpm, dep@1, node_modules, dep; files index.js, bin.js;
+        // links dep, abs. The pipe is neither counted nor copied.
+        assert_eq!(count.entries, 8, "{count:?}");
+        assert_eq!(count.bytes, 5, "{count:?}");
+        assert!(std::fs::symlink_metadata(dest.join("pipe")).is_err());
+        let dep = std::fs::symlink_metadata(dest.join("dep")).expect("dep");
+        assert!(dep.file_type().is_symlink());
+        assert_eq!(
+            std::fs::canonicalize(dest.join("dep")).expect("dep"),
+            dest.join(".pnpm/dep@1/node_modules/dep")
+        );
+        assert_eq!(
+            std::fs::read_link(dest.join("abs")).expect("abs"),
+            o.join("outside")
+        );
+        let copied = dest.join(".pnpm/dep@1/node_modules/dep/bin.js");
+        assert_eq!(
+            std::fs::metadata(&copied)
+                .expect("bin")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        // A real file, not a hard link to the source's.
+        std::fs::write(&copied, "changed").expect("write");
+        assert_eq!(std::fs::read_to_string(&bin).expect("source"), "#!");
+        assert_eq!(
+            std::fs::read_to_string(o.join("outside/secret")).expect("o"),
+            "outside"
+        );
+    }
+
+    /// The clone probe's file is a regular file of the install, found
+    /// without entering a link; none in an install of links and folders.
+    #[test]
+    fn the_clone_probe_file_is_found_without_following_a_link() {
+        let (_o, o) = canonical_dir();
+        write(&o.join("elsewhere/file"), "x");
+        let (_c, c) = canonical_dir();
+        let nm = c.join("node_modules");
+        link_at(o.join("elsewhere"), &nm.join("a"));
+        std::fs::create_dir_all(nm.join("b/c")).expect("mkdir");
+        assert_eq!(first_file(&nm), None);
+        write(&nm.join("b/c/index.js"), "");
+        assert_eq!(first_file(&nm), Some(nm.join("b/c/index.js")));
+    }
+
+    /// An install past either bound is refused before anything is copied,
+    /// and the reason names the bound.
+    #[test]
+    fn an_install_past_the_copy_bound_is_not_copied() {
+        let (_c, c) = canonical_dir();
+        let nm = c.join("node_modules");
+        for i in 0..5 {
+            write(&nm.join(format!("p{i}/index.js")), "0123456789");
+        }
+        let (_d, d) = canonical_dir();
+        let dest = d.join("install");
+        let few = CopyBound {
+            entries: 9,
+            bytes: 1 << 20,
+        };
+        let why = copy_install(&nm, &dest, few).expect_err("past the entry bound");
+        assert!(why.contains("more than 9 entries"), "{why}");
+        assert!(std::fs::symlink_metadata(&dest).is_err(), "nothing copied");
+        let small = CopyBound {
+            entries: 100,
+            bytes: 49,
+        };
+        let why = copy_install(&nm, &dest, small).expect_err("past the byte bound");
+        assert!(why.contains("MiB, the bound of a copy"), "{why}");
+        assert!(std::fs::symlink_metadata(&dest).is_err(), "nothing copied");
+        let exact = CopyBound {
+            entries: 10,
+            bytes: 50,
+        };
+        assert_eq!(
+            copy_install(&nm, &dest, exact),
+            Ok(CopyCount {
+                entries: 10,
+                bytes: 50
+            })
+        );
+    }
+
+    /// Where no clone can be made, a pnpm install past the bound is left
+    /// as it was and the reason names the clone's failure and the bound;
+    /// where a clone can be made, the bound does not apply.
+    #[test]
+    fn a_pnpm_install_past_the_bound_is_cloned_or_left() {
+        let (_c, c) = pnpm_install(true, true);
+        let source = c.join("node_modules");
+        let (_b, base) = canonical_dir();
+        let tree = base.join("tree");
+        std::fs::create_dir(&tree).expect("mkdir");
+        let root = root_of(&tree);
+        let none = CopyBound {
+            entries: 1,
+            bytes: 1,
+        };
+        let out = unix::clone_install(&root, &tree, Path::new("node_modules"), &source, "s", none)
+            .expect("no I/O error");
+        if clones_here(&c, &base) {
+            let cloned = out.expect("a clone");
+            assert!(matches!(cloned.linked, Linked::Made));
+            assert!(cloned.copied.is_none());
+            assert!(is_dependency_clone(&tree.join("node_modules")));
+        } else {
+            let why = match out {
+                Err(why) => why,
+                Ok(_) => panic!("copied past the bound"),
+            };
+            assert!(why.contains("cp "), "{why}");
+            assert!(why.contains("the bound of a copy"), "{why}");
+            assert!(std::fs::symlink_metadata(tree.join("node_modules")).is_err());
+        }
+        assert!(
+            std::fs::read_dir(&base)
+                .expect("read")
+                .all(|e| e.expect("entry").file_name() == "tree"),
+            "the staging folder was removed"
+        );
+    }
+
+    #[test]
+    #[ignore = "a measurement: copies 24,000 files of 8 KiB"]
+    fn install_copy_cost() {
+        let (_c, c) = canonical_dir();
+        let nm = c.join("node_modules");
+        let body = vec![b'x'; 8 << 10];
+        for p in 0..2_000 {
+            let dir = nm.join(format!(".pnpm/p{p}@1.0.0/node_modules/p{p}"));
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            for f in 0..12 {
+                std::fs::write(dir.join(format!("f{f}.js")), &body).expect("write");
+            }
+        }
+        let (_d, d) = canonical_dir();
+        let started = std::time::Instant::now();
+        let count = count_install(&nm, INSTALL_COPY_BOUND).expect("count");
+        let counted = started.elapsed();
+        let started = std::time::Instant::now();
+        let copied = copy_install(&nm, &d.join("copy"), INSTALL_COPY_BOUND).expect("copy");
+        let copy = started.elapsed();
+        let started = std::time::Instant::now();
+        let clone = crate::build_dir::clone_tree(&nm, &d.join("clone"));
+        let cloned = started.elapsed();
+        // What a tree pays: the probe, then the clone or the copy.
+        let tree = d.join("tree");
+        std::fs::create_dir(&tree).expect("mkdir");
+        let root = root_of(&tree);
+        let started = std::time::Instant::now();
+        let made = unix::clone_install(
+            &root,
+            &tree,
+            Path::new("node_modules"),
+            &nm,
+            "s",
+            INSTALL_COPY_BOUND,
+        )
+        .expect("io")
+        .expect("made");
+        println!(
+            "{count:?}: count {counted:?}, count and copy {copy:?}; cp clone {cloned:?} {:?}; \
+             clone_install {:?}, copied {}",
+            clone.map_err(|e| e.chars().take(60).collect::<String>()),
+            started.elapsed(),
+            made.copied.is_some()
+        );
+        assert_eq!(copied, count);
     }
 
     /// A folder, a link or a mark that cannot be made is reported as that
@@ -2250,7 +2837,14 @@ mod tests {
         }
         let root = root_of(&tree);
         make_unwritable(&tree);
-        let out = unix::clone_install(&root, &tree, Path::new("node_modules"), &source, "s");
+        let out = unix::clone_install(
+            &root,
+            &tree,
+            Path::new("node_modules"),
+            &source,
+            "s",
+            INSTALL_COPY_BOUND,
+        );
         make_writable(&tree);
         let kind = match out {
             Err(e) => Some(e.kind()),

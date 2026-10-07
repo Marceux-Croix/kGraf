@@ -865,3 +865,76 @@ in the tree is removed by the check); `kgraf-sandbox` `dependencies.rs`
 `links_and_copies_are_made_only_where_nothing_is`,
 `the_mirror_by_path_resolves_workspace_packages_to_the_tree`,
 `gradle_folders_and_links_by_path`.
+
+## Amendment (2026-10-07): a pnpm workspace resolves to the tree on Linux too, and a folder made within a time step of an install's change is made again
+
+The sixth amendment's pnpm clone did not reach Linux. On a file system without copy-on-write
+(ext4, tmpfs, overlayfs, so every container on Docker's default storage), `cp -R
+--reflink=always` fails ("Operation not supported"), and a pnpm workspace install fell back to
+the folder of links: a third-party package in `node_modules/.pnpm` that requires a workspace
+package still resolved into the checkout, which the sandbox does not grant. The Linux test run
+(`rust:trixie`, Linux 6.8, overlayfs over ext4) failed four `kgraf-sandbox` tests that pass on
+macOS, and a fifth intermittently. Each change below was shown by a test that failed before it,
+on that Linux run.
+
+- **A byte copy where no clone can be made.** `unix::clone_install` now copies the install
+  byte for byte when the clone fails and the install is within `INSTALL_COPY_BOUND` (100,000
+  entries and 1 GiB; `dependencies::copy_install`). Folders are made new, links are made again
+  with the same text (pnpm's links are relative, so in the copy they resolve inside the tree, as
+  in a clone), regular files are copied with their permissions, and special files are skipped;
+  nothing in the source is followed. `std::fs::copy` on Linux uses `copy_file_range`, which
+  shares blocks where the file system can and copies in the kernel otherwise. The copy carries
+  the same mark as a clone, and the output says the install was copied, why no clone was made,
+  and its entries and size. Past the bound the folder of links is used, and the output names the
+  clone's failure and the bound. The bound is counted before anything is copied.
+- **Hard links rejected.** A hard link is the checkout's own file, and for pnpm also the file
+  in its global store. The sandbox judges a write by path and the tree is writable, so a
+  command could change the user's install, and every project's copy of the package, through a
+  hard link in the tree. Links to files in real folders were rejected too: Node resolves a
+  module from its file's real path, and a link to the checkout's file puts it back in the
+  checkout.
+- **One file is probed first.** A `cp` that cannot clone goes on past each failed file and
+  makes the whole tree of empty files before it exits. A regular file of the install (found
+  depth first, never through a link) is cloned first; when that fails the tree clone is not
+  tried.
+- **A racy stamp is never current.** A folder of links or a clone is kept while the install's
+  stamp (the modification times of `node_modules`, `.bin`, each `@scope`, `.pnpm` and
+  `.pnpm/node_modules`) is the same. Linux 6.8 on ext4 keeps a folder's time in steps of the
+  kernel's coarse clock (1 ms measured; 10 ms at a 100 Hz tick), so an entry added in the same
+  step as kGraf made its folder left the stamp as it was, and the folder stayed without the
+  entry until the install changed again. APFS keeps nanoseconds, so macOS never showed it. A
+  stamp read less than one second after the install's newest time is now racy
+  (`dependencies::stamp_is_racy`) and never current, so the next call makes the folder again
+  from the install as it is then, as git does for an index entry written in the second its
+  file changed. Cost: one more build of the folder per call made within a second of an
+  install's last change.
+- **Measured** (release build, 2026-10-07, the ignored test `install_copy_cost`, 24,000 files
+  of 8 KiB in 2,000 pnpm package folders: 30,001 entries, 188 MiB). Linux 6.8, overlayfs over
+  ext4 in a Colima VM: count 59 ms, `clone_install` with the copy 0.48 s (it was 1.15 s before
+  the probe; the failed `cp -R --reflink=always` alone took 0.57 s). Linux on btrfs (a loop
+  device): the reflink `cp` 0.35 s, `clone_install` 0.56 s, no copy. macOS, APFS: the clone
+  4.0 to 4.2 s, a byte copy of the same install 3.2 to 3.5 s; the clone is kept first because it
+  uses no space until written. At the bound a copy is about 1 GiB of disk per tree and per
+  check, made once per install change.
+- **Windows is unchanged.** A pnpm install gets the folder of junctions with the note. pnpm on
+  Windows links packages by junctions with absolute targets, so a copy would not move them into
+  the tree.
+
+**Not covered**, stated: the bound is a size, not a free-space check; a copy can still fill a
+small disk. A network file system whose clock differs from this machine's by more than a
+second can make a stamp look older than it is. The racy window does not cover FAT's two-second
+steps.
+
+Tests: `kgraf-sandbox` `dependencies.rs`, each stating what this machine does by probing the
+same clone call the product makes (a clone on APFS and on btrfs, a copy on ext4, tmpfs and
+overlayfs): `pnpm_workspace_links_inside_the_store_resolve_to_the_tree_s_packages`,
+`a_pnpm_clone_replaces_only_kgraf_s_own_install`,
+`a_pnpm_install_is_cloned_for_a_workspace_link_in_either_place`,
+`kgraf_s_own_earlier_link_is_replaced_and_a_foreign_link_is_left`,
+`a_pnpm_install_past_the_bound_is_cloned_or_left`,
+`an_install_copy_keeps_links_as_links_and_files_with_their_mode`,
+`an_install_past_the_copy_bound_is_not_copied`,
+`the_clone_probe_file_is_found_without_following_a_link`,
+`a_stamp_read_right_after_a_change_is_racy`,
+`an_entry_added_in_the_same_time_step_is_linked_on_the_next_call`;
+`a_current_mirror_is_not_walked_again` now ages the install first.

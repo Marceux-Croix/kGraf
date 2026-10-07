@@ -84,9 +84,15 @@ outside the sandbox (decision 0087, amended 2026-10-06).
   Linux file system with reflinks): pnpm links workspace packages inside
   `node_modules/.pnpm` too, and only in a clone do those links, all relative, resolve to the
   worktree's copies. A clone costs no space until written and about 0.12 ms per file (24,000
-  files: 2.8 s, macOS), once per worktree and once per check. Where no clone can be made,
-  the folder of links is used and a failing check says that such nested links reach your
-  copies.
+  files: 2.8 s, macOS), once per worktree and once per check. Where no clone can be made
+  (Linux on ext4, tmpfs or overlayfs, which includes most containers; another volume), the
+  install is copied byte for byte if it holds at most 100,000 entries and 1 GiB: about 0.5 s
+  for 30,000 entries (188 MiB, Linux), and its full size on disk in each worktree and check.
+  The output says it was copied and how large the copy is. A larger install gets the folder
+  of links, and a failing check says that such nested links reach your copies.
+- The folder made from your `node_modules` is kept until the install changes. A change less
+  than one second old is not trusted to show in the folder times (Linux keeps them in steps
+  of about 1 ms), so a command started in that second makes the folder again.
 - On Windows the links are directory junctions, which need no privilege, and the
   Plug'n'Play files are copied; a write through a junction is refused by the sandbox's
   access control, as through a link elsewhere. A pnpm install gets the folder of
