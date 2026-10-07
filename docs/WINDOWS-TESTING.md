@@ -78,6 +78,26 @@ kgraf-wintest-<version>-<commit>-windows-x86_64/
 The bundle is built for x86_64 only; on ARM64 it runs under emulation, and the report says
 so. The steps below remain the fallback, and the way to test a native ARM64 build.
 
+### Running the bundle in GitHub Actions
+
+The `wintest.yml` workflow builds the bundle natively on a GitHub-hosted Windows runner
+(`KGRAF_WINTEST_NATIVE=1 scripts/package-wintest.sh`), runs `kgraf-wintest.exe --all
+--no-wait`, and runs the Windows Firewall test (`scripts/wintest-firewall.ps1`). It has a
+manual trigger only:
+
+```
+gh workflow run wintest.yml
+gh run watch
+gh run download <run id> -n kgraf-windows-selftest
+```
+
+The artifact holds `report\kgraf-wintest-report-*.md` and `firewall.txt`. It bills Windows
+minutes (twice the Linux rate on a private repository). A failing test does not fail the
+job; a missing report file does. Two things differ from a standard user's machine: the
+runner account is an administrator, so the sandbox and firewall checks run elevated, and
+the runner has Git for Windows, so the worker shell finds `sh`. A result from the runner
+does not replace a run on a standard-user machine without Git for Windows.
+
 ## 1. Find out which machine you have
 
 ```powershell

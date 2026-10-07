@@ -1,0 +1,98 @@
+# Windows self-test on a GitHub-hosted Windows machine.
+#
+# Manual trigger only: gh workflow run wintest.yml. There is no push,
+# pull_request or schedule trigger.
+#
+# What it runs:
+#   1. Builds the self-test bundle natively with scripts/package-wintest.sh
+#      (every workspace test binary, kgraf.exe, the kgraf-wintest runner).
+#   2. Runs the bundle with `kgraf-wintest.exe --all --no-wait`.
+#   3. Runs the Windows Firewall network test (scripts/wintest-firewall.ps1).
+#   4. Uploads the report and the firewall output as one artifact.
+#
+# Cost: this bills Windows minutes, at twice the Linux rate on a private
+# repository. The job stops after 120 minutes.
+#
+# Two things differ from a standard user's machine, so read the results with
+# them in mind:
+#   - The runner account is elevated (administrator). A standard user is not.
+#   - The runner has Git for Windows (Git Bash) installed, so tools that need
+#     `sh` find it. A machine without Git for Windows does not have them.
+#
+# A failing test does not fail the job: the report is the result. The job
+# fails when the build fails or when no report file was written.
+name: Windows self-test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wintest-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  wintest:
+    name: Windows self-test
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      # The same moving `stable` alias that ci.yml uses; see the comment there.
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, as of 2026-09-26
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # The package script builds in its own target folder.
+          workspaces: ". -> target/wintest"
+
+      - name: Build the self-test bundle
+        shell: bash
+        env:
+          KGRAF_WINTEST_NATIVE: "1"
+          JOBS: "4"
+        run: scripts/package-wintest.sh
+
+      - name: Run the bundle
+        shell: bash
+        run: |
+          set -u
+          stage="$(ls -d target/wintest/bundle/kgraf-wintest-*/ | head -1)"
+          report_dir="$GITHUB_WORKSPACE/wintest-out/report"
+          mkdir -p "$report_dir"
+          cd "$stage"
+          # A failed test is a result, not a job failure.
+          ./kgraf-wintest.exe --all --no-wait --report-dir "$(cygpath -w "$report_dir")" || echo "kgraf-wintest.exe exited with $?"
+          # The report file is the result: no file, no result.
+          if ! ls "$report_dir"/kgraf-wintest-report-*.md >/dev/null 2>&1; then
+            echo "no report file in $report_dir" >&2
+            ls -la "$report_dir" >&2
+            exit 1
+          fi
+          ls -la "$report_dir"
+
+      - name: Run the firewall network test
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          $stage = (Get-ChildItem target/wintest/bundle -Directory -Filter 'kgraf-wintest-*' | Select-Object -First 1).FullName
+          New-Item -ItemType Directory -Force wintest-out | Out-Null
+          # The runner account is already an administrator; the script
+          # reports whether the process is elevated.
+          & scripts/wintest-firewall.ps1 -Bundle $stage -Out "$env:GITHUB_WORKSPACE\wintest-out\firewall.txt"
+          exit 0
+
+      - name: Upload the report and the firewall output
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: kgraf-windows-selftest
+          path: wintest-out/
+          if-no-files-found: error
+          retention-days: 14

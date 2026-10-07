@@ -261,10 +261,25 @@ fn file_name(path: &str) -> &str {
     path.rsplit(['/', '\\']).next().unwrap_or(path)
 }
 
+/// Cuts `root` off the front of `path`. Both are compared with one
+/// separator and without case, because a native Windows build reports
+/// backslashes, a drive letter whose case may differ from the root's, and
+/// sometimes the `\\?\` prefix. Each normalizing step keeps byte offsets, so
+/// the result is a slice of the original.
 fn relative<'a>(path: &'a str, root: &str) -> &'a str {
-    path.strip_prefix(root)
-        .map(|p| p.trim_start_matches(['/', '\\']))
-        .unwrap_or(path)
+    fn norm(s: &str) -> String {
+        s.replace('\\', "/").to_ascii_lowercase()
+    }
+    let verbatim = path.strip_prefix(r"\\?\").unwrap_or(path);
+    let root = root.strip_prefix(r"\\?\").unwrap_or(root);
+    let (p, r) = (norm(verbatim), norm(root));
+    let r = r.trim_end_matches('/');
+    match p.strip_prefix(r) {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => {
+            verbatim[r.len()..].trim_start_matches(['/', '\\'])
+        }
+        _ => path,
+    }
 }
 
 /// The runs, programs and left-out binaries for the artifacts of one build.
@@ -463,6 +478,42 @@ mod tests {
                 build_path: "target/x86_64-pc-windows-msvc/debug/kgraf.exe".into(),
             }]
         );
+    }
+
+    #[test]
+    fn native_windows_paths_are_made_relative() {
+        let root = r"D:\a\k\k";
+        let exe = r"d:\a\k\k\target\wintest\debug\kgraf.exe";
+        let want = r"target\wintest\debug\kgraf.exe";
+        assert_eq!(relative(exe, root), want);
+        // The root in forward slashes, the path in backslashes.
+        assert_eq!(relative(exe, "D:/a/k/k"), want);
+        // The verbatim prefix and a trailing separator.
+        assert_eq!(
+            relative(r"\\?\D:\a\k\k\crates\x", r"D:\a\k\k\"),
+            r"crates\x"
+        );
+        // A sibling folder that shares the prefix is not inside the root.
+        assert_eq!(relative(r"D:\a\k\k2\x", root), r"D:\a\k\k2\x");
+        // The Unix spelling is unchanged.
+        assert_eq!(relative("/src/k/crates/x", "/src/k"), "crates/x");
+    }
+
+    #[test]
+    fn native_windows_messages_plan_relative_paths() {
+        let line = serde_json::json!({
+            "reason": "compiler-artifact",
+            "manifest_path": r"D:\a\k\k\crates\kgraf-cli\Cargo.toml",
+            "target": {"kind": ["bin"], "name": "kgraf"},
+            "profile": {"test": false},
+            "executable": r"D:\a\k\k\target\wintest\debug\kgraf.exe",
+        })
+        .to_string();
+        let artifacts = artifacts_from_messages(&line);
+        assert_eq!(artifacts[0].package, "kgraf-cli");
+        let (_, programs, _) = plan_from_messages(&artifacts, r"D:\a\k\k");
+        assert_eq!(programs[0].exe, "programs/kgraf.exe");
+        assert_eq!(programs[0].build_path, r"target\wintest\debug\kgraf.exe");
     }
 
     #[test]
