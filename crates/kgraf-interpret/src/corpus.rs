@@ -102,8 +102,21 @@ impl Corpus {
     }
 }
 
+/// `path` under `root`, written with `/` on every platform. The brief, the
+/// graph and the planning documents all name a file with `/` (the brief counts
+/// its folders by it), so a Windows `\` is rewritten here, once.
 fn relative(root: &std::path::Path, path: &std::path::Path) -> PathBuf {
-    path.strip_prefix(root).unwrap_or(path).to_path_buf()
+    let Ok(rel) = path.strip_prefix(root) else {
+        return path.to_path_buf();
+    };
+    if std::path::MAIN_SEPARATOR == '/' {
+        return rel.to_path_buf();
+    }
+    let parts: Vec<_> = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect();
+    PathBuf::from(parts.join("/"))
 }
 
 /// Index the store's root incrementally and ingest its documents.

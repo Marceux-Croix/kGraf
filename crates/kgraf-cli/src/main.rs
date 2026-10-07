@@ -989,7 +989,7 @@ fn run_cli() -> Result<()> {
     // it only means diagnostics scrubbing falls back to hashing everything
     // under that root instead of showing it relative, which is safe, just
     // less readable.
-    let root = root.canonicalize().unwrap_or(root);
+    let root = kgraf_core::plain_path::canonicalize(&root).unwrap_or(root);
 
     // Local-only diagnostics (decision 0069): usage counts
     // and errors in one capped, per-user file, shared with the desktop shell.
@@ -1087,8 +1087,7 @@ fn run_cli() -> Result<()> {
         Command::Providers { verified_only } => providers(verified_only),
         Command::Allow { tool, note, revoke } => {
             let state = state_dir(&root)?;
-            let project = root
-                .canonicalize()
+            let project = kgraf_core::plain_path::canonicalize(&root)
                 .with_context(|| format!("cannot resolve {}", root.display()))?
                 .to_string_lossy()
                 .into_owned();
@@ -1750,8 +1749,7 @@ fn instructions(root: &Path, action: InstructionsAction) -> Result<()> {
             return Ok(());
         }
         InstructionsAction::Import { folder } => {
-            let folder = folder
-                .canonicalize()
+            let folder = kgraf_core::plain_path::canonicalize(&folder)
                 .with_context(|| format!("cannot open {}", folder.display()))?;
             if !folder.is_dir() {
                 bail!("{} is not a folder", folder.display());

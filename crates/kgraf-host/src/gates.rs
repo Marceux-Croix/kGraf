@@ -38,8 +38,7 @@ pub fn discover_validation_commands(root: &Path, configured: &[String]) -> Resul
 
 /// The Python interpreter name the platform installs.
 fn python_program() -> &'static str {
-    // Windows installs `python`, not `python3`.
-    if cfg!(windows) { "python" } else { "python3" }
+    kgraf_sandbox::python_program()
 }
 
 /// Whether the interpreter can import pytest.

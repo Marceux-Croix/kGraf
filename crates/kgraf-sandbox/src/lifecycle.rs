@@ -90,6 +90,160 @@ pub fn kill_group_until_hold_free(pid: u32, hold: &Path) {
     }
 }
 
+/// macOS: the processes that have `file` open, read from the kernel in this
+/// process (libproc), never this process or a child of it. Matched by the
+/// file's device and inode, not its path.
+///
+/// A child of this process is left out because the only way one holds the
+/// file is a descriptor copied by a fork in another thread while this
+/// process had the file open for a moment ([`hold_free`]); the copy is gone
+/// at the child's exec. A sandboxed command that holds it is never a child
+/// here once its leader is reaped: what it starts is a child of its own
+/// processes, or of launchd after its parent exits.
+///
+/// In this process and not through `lsof`: one scan of about 500 processes
+/// took 0.1 s, and 0.23 s with four CPU-bound processes per core, where one
+/// `lsof` run took 0.4 s and 0.5 to 1.1 s. A caller that kills what this
+/// names (a process that left its group) must find it before it does its
+/// work.
+///
+/// An error when the process list cannot be read. A process that ends
+/// during the scan is skipped.
+#[cfg(target_os = "macos")]
+pub fn holders(file: &Path) -> std::io::Result<Vec<libc::pid_t>> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(file)?;
+    // `vinfo_stat` keeps the device as 32 bits, as `stat` does on macOS.
+    let (dev, ino) = (meta.dev() as u32, meta.ino());
+    let me = std::process::id() as libc::pid_t;
+    let mut found = Vec::new();
+    for pid in all_pids()? {
+        if pid <= 1 || pid == me || !has_open(pid, dev, ino) {
+            continue;
+        }
+        if parent_of(pid) == Some(me) {
+            continue;
+        }
+        found.push(pid);
+    }
+    Ok(found)
+}
+
+/// Every process ID on the system.
+#[cfg(target_os = "macos")]
+fn all_pids() -> std::io::Result<Vec<libc::pid_t>> {
+    // SAFETY: a null buffer asks for the count only.
+    let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    if count <= 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // Room for processes started meanwhile.
+    let mut pids = vec![0 as libc::pid_t; count as usize + 256];
+    let bytes = (pids.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int;
+    // SAFETY: `pids` has `bytes` bytes; the call writes at most that many and
+    // returns the number of PIDs written.
+    let n = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
+    if n <= 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    pids.truncate(n as usize);
+    Ok(pids)
+}
+
+/// The parent of `pid`, or `None` when it cannot be read (it ended).
+#[cfg(target_os = "macos")]
+fn parent_of(pid: libc::pid_t) -> Option<libc::pid_t> {
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: zeroed proc_bsdinfo is a valid out-parameter.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    // SAFETY: proc_pidinfo writes at most `size` bytes into `info`.
+    let got = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    (got == size).then_some(info.pbi_ppid as libc::pid_t)
+}
+
+/// `struct proc_fileinfo` of `<sys/proc_info.h>` (not in the libc crate).
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct ProcFileInfo {
+    fi_openflags: u32,
+    fi_status: u32,
+    fi_offset: libc::off_t,
+    fi_type: i32,
+    fi_guardflags: u32,
+}
+
+/// `struct vnode_fdinfo` of `<sys/proc_info.h>` (not in the libc crate).
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct VnodeFdInfo {
+    pfi: ProcFileInfo,
+    pvi: libc::vnode_info,
+}
+
+/// `PROC_PIDFDVNODEINFO` of `<sys/proc_info.h>` (not in the libc crate).
+#[cfg(target_os = "macos")]
+const PROC_PIDFDVNODEINFO: libc::c_int = 1;
+
+/// Whether `pid` has a descriptor open on the file `dev`/`ino`. `false` for a
+/// process that cannot be read: another user's, or one that ended.
+#[cfg(target_os = "macos")]
+fn has_open(pid: libc::pid_t, dev: u32, ino: u64) -> bool {
+    use std::mem::size_of;
+    // SAFETY: a null buffer asks for the size of the descriptor list only.
+    let need =
+        unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
+    if need <= 0 {
+        return false;
+    }
+    // Room for descriptors opened in between.
+    let mut fds: Vec<libc::proc_fdinfo> =
+        Vec::with_capacity(need as usize / size_of::<libc::proc_fdinfo>() + 32);
+    let bytes = (fds.capacity() * size_of::<libc::proc_fdinfo>()) as libc::c_int;
+    // SAFETY: the buffer has room for `bytes` bytes; the call returns how many
+    // it wrote, whole entries only.
+    let used = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDLISTFDS,
+            0,
+            fds.as_mut_ptr().cast(),
+            bytes,
+        )
+    };
+    if used <= 0 {
+        return false;
+    }
+    // SAFETY: proc_pidinfo initialized `used` bytes of plain-data entries,
+    // within the capacity.
+    unsafe { fds.set_len(used as usize / size_of::<libc::proc_fdinfo>()) };
+    let size = size_of::<VnodeFdInfo>() as libc::c_int;
+    fds.iter()
+        .filter(|fd| fd.proc_fdtype == libc::PROX_FDTYPE_VNODE as u32)
+        .any(|fd| {
+            // SAFETY: zeroed VnodeFdInfo is a valid out-parameter (plain data).
+            let mut info: VnodeFdInfo = unsafe { std::mem::zeroed() };
+            // SAFETY: proc_pidfdinfo writes at most `size` bytes into `info`.
+            let got = unsafe {
+                libc::proc_pidfdinfo(
+                    pid,
+                    fd.proc_fd,
+                    PROC_PIDFDVNODEINFO,
+                    (&mut info as *mut VnodeFdInfo).cast(),
+                    size,
+                )
+            };
+            got == size && info.pvi.vi_stat.vst_dev == dev && info.pvi.vi_stat.vst_ino == ino
+        })
+}
+
 /// `RLIMIT_CPU` seconds to give a command bounded by a `timeout` wall-clock
 /// budget: twice the timeout, at least one second.
 ///
@@ -171,5 +325,61 @@ mod tests {
         // workspace run), the very leak `kgraf_core::flock` describes.
         drop(kgraf_core::flock::HeldLock::new(holder));
         assert!(hold_free(&hold));
+    }
+
+    /// The lister names a process that has the file open and left this
+    /// process's tree (its own `setsid`, parent gone), and leaves out a child
+    /// of this process that has it open, and this process itself.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn holders_names_a_detached_holder_and_not_a_child_or_this_process() {
+        use std::io::BufRead;
+        use std::process::{Command, Stdio};
+        let dir = tempfile::tempdir().expect("dir");
+        let hold = dir.path().join("hold");
+        std::fs::File::create(&hold).expect("hold");
+        let other = dir.path().join("other");
+        std::fs::File::create(&other).expect("other");
+        let _mine = std::fs::File::open(&hold).expect("open");
+        // Prints the detached holder's PID once it has the file open.
+        let mut spawner = Command::new("perl")
+            .arg("-e")
+            .arg(
+                "use POSIX; open(my $f, '<', $ARGV[0]) or die; my $p = fork(); \
+                 if ($p) { print \"$p\\n\"; exit 0 } POSIX::setsid(); \
+                 close(STDOUT); sleep 30;",
+            )
+            .arg(&hold)
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("perl");
+        let mut line = String::new();
+        std::io::BufReader::new(spawner.stdout.take().expect("stdout"))
+            .read_line(&mut line)
+            .expect("read");
+        spawner.wait().expect("wait");
+        let detached: libc::pid_t = line.trim().parse().expect("pid");
+        let mut child = Command::new("perl")
+            .arg("-e")
+            .arg("$| = 1; open(my $f, '<', $ARGV[0]) or die; print \"ok\\n\"; sleep 30;")
+            .arg(&hold)
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("perl");
+        let mut ok = String::new();
+        std::io::BufReader::new(child.stdout.take().expect("stdout"))
+            .read_line(&mut ok)
+            .expect("read");
+        let found = super::holders(&hold);
+        let none = super::holders(&other);
+        // SAFETY: kills the two processes this test started.
+        unsafe {
+            libc::kill(detached, libc::SIGKILL);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        let found = found.expect("list");
+        assert_eq!(found, vec![detached], "child {}", child.id());
+        assert_eq!(none.expect("list"), Vec::<libc::pid_t>::new());
     }
 }

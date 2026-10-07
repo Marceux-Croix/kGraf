@@ -937,8 +937,7 @@ impl MergeBack {
     ///
     /// The caller must have stopped every process that could still write the
     /// worktree (the worker's, checked by the hold). Removal never follows a
-    /// link ([`crate::confined`]); on Windows, where that removal is refused,
-    /// see [`crate::confined::remove_stopped`].
+    /// link ([`crate::confined`]).
     pub fn remove_ignored(&self, attempt: &Attempt) -> Result<Vec<PathBuf>, MergeError> {
         let git_dir = Self::worktree_admin(&attempt.workspace)?;
         let wt = Target::Worktree {
@@ -957,14 +956,7 @@ impl MergeBack {
                 "--directory",
             ],
         )?;
-        #[cfg(not(windows))]
         self.remove_confined(attempt, &ignored)?;
-        #[cfg(windows)]
-        for rel in &ignored {
-            let root = attempt.workspace.root();
-            crate::confined::remove_stopped(root, rel)
-                .map_err(|e| WorkspaceError::io(root.join(rel), e))?;
-        }
         Ok(ignored)
     }
 

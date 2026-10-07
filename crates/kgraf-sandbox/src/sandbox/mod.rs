@@ -648,7 +648,7 @@ fn resolve_lenient(path: &Path) -> Result<PathBuf, SandboxError> {
     let mut rest = Vec::new();
     let mut cur = path;
     loop {
-        if let Ok(real) = std::fs::canonicalize(cur) {
+        if let Ok(real) = kgraf_core::plain_path::canonicalize(cur) {
             let mut out = real;
             for part in rest.iter().rev() {
                 out.push(part);
@@ -672,7 +672,7 @@ fn resolve(path: &Path) -> Result<PathBuf, SandboxError> {
             path.display()
         )));
     }
-    std::fs::canonicalize(path).map_err(|source| SandboxError::Io {
+    kgraf_core::plain_path::canonicalize(path).map_err(|source| SandboxError::Io {
         path: path.to_path_buf(),
         source,
     })
@@ -708,7 +708,7 @@ fn home_dir_from(
         .filter(|h| !h.is_empty())
         .map(PathBuf::from)
         .or_else(passwd)
-        .and_then(|h| std::fs::canonicalize(h).ok())
+        .and_then(|h| kgraf_core::plain_path::canonicalize(h).ok())
 }
 
 /// The cargo homes ancestor reads never enter ([`Resolved::cargo_homes`]).
@@ -729,7 +729,7 @@ fn cargo_homes_from(
     passwd: Option<PathBuf>,
     cargo_home_env: Option<OsString>,
 ) -> Option<Vec<PathBuf>> {
-    let canonical = |p: PathBuf| std::fs::canonicalize(&p).unwrap_or(p);
+    let canonical = |p: PathBuf| kgraf_core::plain_path::canonicalize(&p).unwrap_or(p);
     let homes: Vec<PathBuf> = [
         home_env.filter(|h| !h.is_empty()).map(PathBuf::from),
         passwd,
@@ -848,6 +848,22 @@ pub const NETWORK_OPEN_NOTICE: &str = "network not blocked: the Windows sandbox 
 pub const SHELL_NETWORK_OPEN_NOTICE: &str = "network not blocked: the Windows sandbox cannot \
     deny network access without administrator rights (decision 0011); shell commands run with \
     the network open";
+
+/// The line a shell result carries on Windows when a command's output shows
+/// the Windows TLS stack (Schannel) refused to start: that stack cannot run
+/// inside the sandbox (decision 0011), and tools with their own TLS library
+/// can.
+pub const TLS_UNAVAILABLE_HINT: &str = "the Windows TLS stack (Schannel) cannot run inside \
+    kGraf's sandbox (decision 0011); git and the curl of Git for Windows use OpenSSL here, \
+    and tools that bring their own TLS library work";
+
+/// [`TLS_UNAVAILABLE_HINT`] when `output` holds the Schannel refusal
+/// (`SEC_E_NO_CREDENTIALS`, status `0x8009030E`), otherwise `None`.
+pub fn tls_unavailable_hint(output: &str) -> Option<&'static str> {
+    let lower = output.to_ascii_lowercase();
+    (lower.contains("sec_e_no_credentials") || lower.contains("0x8009030e"))
+        .then_some(TLS_UNAVAILABLE_HINT)
+}
 
 /// The network a verifier check, a quality gate, a contract check or a
 /// worker's shell command asks for (decision 0011, amended 2026-10-06 and
@@ -1396,8 +1412,8 @@ pub fn sandboxed_command(
         // The environment owning the command's folder, or the nearest one
         // above it (`DependencyLinks::virtual_env_for`).
         let command_dir = policy.command_dir.as_deref().unwrap_or(cwd);
-        let command_dir =
-            std::fs::canonicalize(command_dir).unwrap_or_else(|_| command_dir.to_path_buf());
+        let command_dir = kgraf_core::plain_path::canonicalize(command_dir)
+            .unwrap_or_else(|_| command_dir.to_path_buf());
         if let Some(venv) =
             crate::dependencies::nearest_virtual_env(&policy.virtual_envs, &command_dir)
         {
@@ -1501,6 +1517,14 @@ pub fn sandboxed_command(
         // the helper directly still reaches it; STRENGTH says so. If the host
         // already sets GIT_CONFIG_COUNT, append at index N and bump the count,
         // rather than dropping the reset.
+        //
+        // With the network open, the same count also carries
+        // `http.sslBackend=openssl`: the Windows TLS stack cannot run under
+        // this token (see the Schannel section in `windows.rs`), and Git for
+        // Windows ships OpenSSL beside it. `CURL_SSL_BACKEND=openssl` does
+        // the same for the multi-backend curl of Git for Windows. Both are
+        // set here, before a caller's own `env` calls, so a caller can still
+        // override either; the host environment is not read to decide.
         #[cfg(windows)]
         {
             let next = match std::env::var("GIT_CONFIG_COUNT") {
@@ -1514,17 +1538,19 @@ pub fn sandboxed_command(
                     ));
                 }
             };
-            match next {
-                Some(n) => {
-                    cmd.env(format!("GIT_CONFIG_KEY_{n}"), "credential.helper")
-                        .env(format!("GIT_CONFIG_VALUE_{n}"), "")
-                        .env("GIT_CONFIG_COUNT", (n + 1).to_string());
-                }
-                None => {
-                    return Err(SandboxError::InvalidPolicy(
-                        "GIT_CONFIG_COUNT is set to a value that is not a number".into(),
-                    ));
-                }
+            let Some(n) = next else {
+                return Err(SandboxError::InvalidPolicy(
+                    "GIT_CONFIG_COUNT is set to a value that is not a number".into(),
+                ));
+            };
+            let network_open = matches!(policy.network, Network::Allow);
+            let (entries, count) = windows::git_config_entries(n, network_open);
+            for (key, value) in entries {
+                cmd.env(key, value);
+            }
+            cmd.env("GIT_CONFIG_COUNT", count.to_string());
+            if network_open {
+                cmd.env(windows::CURL_SSL_BACKEND_VAR, windows::TLS_BACKEND);
             }
         }
         // The stores kGraf filled for this project, read-only, used in place
@@ -1561,6 +1587,23 @@ pub fn workspace_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The hint fires on the Schannel refusal in either spelling and on
+    /// nothing else; it names the decision.
+    #[test]
+    fn the_tls_hint_fires_on_the_schannel_refusal_only() {
+        for text in [
+            "curl: (35) schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS (0x8009030E)",
+            "The request failed with status 0x8009030e",
+            "sec_e_no_credentials",
+        ] {
+            let hint = tls_unavailable_hint(text).expect(text);
+            assert!(hint.contains("0011") && hint.contains("OpenSSL"), "{hint}");
+        }
+        for text in ["", "curl: (6) Could not resolve host", "0x80090300"] {
+            assert_eq!(tls_unavailable_hint(text), None, "{text}");
+        }
+    }
 
     /// Only the Windows backend, which cannot deny the network, gets it open
     /// and a notice; every backend that can deny keeps `Deny` and says nothing.
@@ -1660,7 +1703,7 @@ mod tests {
     #[test]
     fn the_home_is_the_environment_then_the_password_database() {
         let base = tempfile::tempdir().unwrap();
-        let real = std::fs::canonicalize(base.path()).unwrap();
+        let real = kgraf_core::plain_path::canonicalize(base.path()).unwrap();
         let env_home = real.join("env");
         let pw_home = real.join("pw");
         std::fs::create_dir(&env_home).unwrap();
@@ -1699,7 +1742,7 @@ mod tests {
     #[test]
     fn the_cargo_homes_cover_the_environment_the_database_and_cargo_home() {
         let base = tempfile::tempdir().unwrap();
-        let real = std::fs::canonicalize(base.path()).unwrap();
+        let real = kgraf_core::plain_path::canonicalize(base.path()).unwrap();
         let env_home = real.join("env");
         let pw_home = real.join("pw");
         let custom = real.join("custom");
@@ -1760,7 +1803,7 @@ mod tests {
     fn a_failure_making_the_npmrc_is_reported_and_an_existing_one_is_kept() {
         use std::os::unix::fs::PermissionsExt;
         let base = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(base.path()).unwrap();
+        let root = kgraf_core::plain_path::canonicalize(base.path()).unwrap();
         let tmp = root.join("tmp");
         std::fs::create_dir(&tmp).unwrap();
         let policy = SandboxPolicy::new(vec![root.clone()], Network::Deny)
@@ -1812,7 +1855,7 @@ mod tests {
     #[test]
     fn the_projects_own_stores_are_named_and_readable_never_writable() {
         let checkout = tempfile::tempdir().unwrap();
-        let c = std::fs::canonicalize(checkout.path()).unwrap();
+        let c = kgraf_core::plain_path::canonicalize(checkout.path()).unwrap();
         for rel in ["go", "maven", "gradle", "nuget"] {
             crate::mark_store_complete(&c, rel).unwrap();
         }
@@ -1872,13 +1915,20 @@ mod tests {
         };
         let deny = env_of(Network::Deny, None);
         assert_eq!(deny["GOPROXY"].as_deref(), Some("off"));
+        // `join` writes the native separator, so build the expected value the same way.
+        let under = |leaf: &str| {
+            Path::new("/tmp/x")
+                .join(leaf)
+                .to_string_lossy()
+                .into_owned()
+        };
         assert_eq!(
             deny["GRADLE_USER_HOME"].as_deref(),
-            Some("/tmp/x/gradle-home")
+            Some(under("gradle-home").as_str())
         );
         assert_eq!(
             deny["DOTNET_CLI_HOME"].as_deref(),
-            Some("/tmp/x/dotnet-home")
+            Some(under("dotnet-home").as_str())
         );
         assert_eq!(deny["DOTNET_CLI_TELEMETRY_OPTOUT"].as_deref(), Some("1"));
         assert!(!deny.contains_key("GRADLE_RO_DEP_CACHE"));
@@ -1911,7 +1961,7 @@ mod tests {
     #[test]
     fn each_redirect_applies_to_its_own_stream() {
         let dir = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let root = kgraf_core::plain_path::canonicalize(dir.path()).unwrap();
         let policy = SandboxPolicy::new(vec![root.clone()], Network::Deny);
         let mut cmd = sandboxed_command(&policy, "/bin/sh", &root).unwrap();
         // `output` pipes a stream nobody set, so each stream is set here and
@@ -1932,7 +1982,7 @@ mod tests {
     #[test]
     fn a_withheld_cargo_setting_is_reported_with_the_command() {
         let work = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(work.path()).unwrap();
+        let root = kgraf_core::plain_path::canonicalize(work.path()).unwrap();
         let cargo = root.join("cargo-home");
         std::fs::create_dir_all(&cargo).unwrap();
         std::fs::write(
@@ -1981,7 +2031,7 @@ mod tests {
     fn a_dependency_tree_beneath_a_denied_path_is_refused() {
         let work = tempfile::tempdir().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let state = std::fs::canonicalize(dir.path()).unwrap();
+        let state = kgraf_core::plain_path::canonicalize(dir.path()).unwrap();
         std::fs::create_dir_all(state.join("x/node_modules")).unwrap();
         let links = crate::DependencyLinks {
             reads: vec![state.join("x/node_modules")],
@@ -2005,7 +2055,7 @@ mod tests {
         let checkout = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(outside.path().join("pkg")).unwrap();
-        let c = std::fs::canonicalize(checkout.path()).unwrap();
+        let c = kgraf_core::plain_path::canonicalize(checkout.path()).unwrap();
         std::os::unix::fs::symlink(outside.path(), c.join("node_modules")).unwrap();
         for read in [c.join("node_modules"), c.join("node_modules/pkg")] {
             let links = crate::DependencyLinks {

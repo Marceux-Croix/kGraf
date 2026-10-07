@@ -404,7 +404,7 @@ pub(super) fn profile(policy: &Resolved, home: &Path) -> (String, Vec<(String, P
         // readable at its target unless the target is denied too. The
         // spelled path stays denied as well, for a path that does not exist
         // yet or a link created after this profile was built.
-        if let Ok(real) = std::fs::canonicalize(&path)
+        if let Ok(real) = kgraf_core::plain_path::canonicalize(&path)
             && real != path
         {
             let real_key = format!("DENY_READ_REAL_{i}");
@@ -744,7 +744,7 @@ mod tests {
     #[test]
     fn a_symlinked_home_credential_directory_is_denied_at_its_target() {
         let base = tempfile::tempdir().expect("tempdir");
-        let home = std::fs::canonicalize(base.path()).expect("canonical");
+        let home = kgraf_core::plain_path::canonicalize(base.path()).expect("canonical");
         let target = home.join("elsewhere/keys");
         std::fs::create_dir_all(&target).expect("target");
         std::os::unix::fs::symlink(&target, home.join(".ssh")).expect("link");

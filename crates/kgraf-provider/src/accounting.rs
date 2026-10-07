@@ -3831,12 +3831,18 @@ fn write_tip_file(path: &Path, tip: &Tip) -> Result<(), LedgerError> {
     let tmp = path.with_extension("tip.tmp");
     std::fs::write(&tmp, format!("{}\t{}\n", tip.seq, tip.chain_hash)).map_err(sqlite_io_error)?;
     {
-        let file = std::fs::File::open(&tmp).map_err(sqlite_io_error)?;
+        // Opened for writing: Windows refuses to flush a read-only handle.
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&tmp)
+            .map_err(sqlite_io_error)?;
         fsync_as_the_database_does(&file).map_err(sqlite_io_error)?;
     }
     std::fs::rename(&tmp, path).map_err(sqlite_io_error)?;
     // The rename is an update to the directory; without flushing the directory
-    // a crash can leave the old anchor (or none) in place.
+    // a crash can leave the old anchor (or none) in place. Windows cannot open
+    // a directory as a file (and NTFS journals the rename), so it skips this.
+    #[cfg(not(windows))]
     if let Some(parent) = path.parent() {
         let dir = std::fs::File::open(if parent.as_os_str().is_empty() {
             Path::new(".")

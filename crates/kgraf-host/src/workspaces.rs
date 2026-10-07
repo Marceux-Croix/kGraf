@@ -205,7 +205,7 @@ pub fn clean(root: &Path, name: &str, force: bool) -> Result<PathBuf> {
     let mut kept = Vec::new();
     for base in WORKTREE_BASES {
         let dir = state.join(base);
-        let canonical = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+        let canonical = kgraf_core::plain_path::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
         let mut names: Vec<String> = entries
             .iter()
             .filter(|e| e.path.parent() == Some(canonical.as_path()))

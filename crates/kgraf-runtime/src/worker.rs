@@ -984,6 +984,18 @@ pub const CANCEL_BEFORE_SEND_REASON: &str = "the worker was cancelled before the
 /// Why the final round's tool calls do not run.
 const FINAL_ROUND_WHY: &str = "the step budget is spent";
 
+/// A repository path as text, with `/` on every platform: a refusal record
+/// names the path the way the repository does, not with a Windows `\`.
+fn repo_path_text(path: &std::path::Path) -> String {
+    if std::path::MAIN_SEPARATOR == '/' {
+        return path.to_string_lossy().into_owned();
+    }
+    path.components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// The result a call gets when the final round issues it. The call never reached
 /// the stall check, so a replay must not count it.
 pub(crate) fn final_round_refusal() -> String {
@@ -1237,7 +1249,7 @@ impl Worker {
                     Some(Err(why)) => {
                         return Some((
                             format!("{} is not writable by a worker: {why}", path.display()),
-                            Some(path.to_string_lossy().into_owned()),
+                            Some(repo_path_text(path)),
                         ));
                     }
                     None => {}
@@ -1248,7 +1260,7 @@ impl Worker {
                 if !inside {
                     return Some((
                         format!("{} is outside the declared write scope", path.display()),
-                        Some(path.to_string_lossy().into_owned()),
+                        Some(repo_path_text(path)),
                     ));
                 }
             }

@@ -1092,7 +1092,7 @@ pub fn write_settings_file(path: &Path, text: &str) -> Result<(), SettingsFileEr
 
 fn refuse_inside_project(path: &Path, root: Option<&Path>) -> Result<(), SettingsFileError> {
     let Some(root) = root else { return Ok(()) };
-    let root_c = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let root_c = kgraf_core::plain_path::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let abs = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -1104,7 +1104,7 @@ fn refuse_inside_project(path: &Path, root: Option<&Path>) -> Result<(), Setting
     let mut probe = abs.as_path();
     let mut tail = Vec::new();
     let resolved = loop {
-        if let Ok(c) = probe.canonicalize() {
+        if let Ok(c) = kgraf_core::plain_path::canonicalize(probe) {
             let mut r = c;
             for t in tail.iter().rev() {
                 r.push(t);

@@ -955,6 +955,41 @@ mod tests {
         );
     }
 
+    /// The Windows form of the test above: a junction (which any account
+    /// can make) planted as `docs` never steers the append outside, and the
+    /// append into a plain tree works.
+    #[cfg(windows)]
+    #[test]
+    fn a_planted_junction_never_steers_the_comms_append_outside_the_tree() {
+        let dir = tempfile::tempdir().expect("dir");
+        let root = dir.path().join("tip");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        std::fs::create_dir_all(&outside).expect("mkdir");
+        let lock = dir.path().join("state/comms.lock");
+        let m = Mailbox::default().post(draft(&["b"])).expect("post");
+
+        let link = root.join("docs");
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&outside)
+            .output()
+            .expect("run mklink");
+        assert!(made.status.success(), "mklink /J: {made:?}");
+        let e = append_to_comms_at(&root, &lock, &m).expect_err("junction");
+        assert!(e.to_string().contains("crosses the junction docs"), "{e}");
+        assert_eq!(
+            std::fs::read_dir(&outside).expect("list").count(),
+            0,
+            "nothing was created outside"
+        );
+
+        std::fs::remove_dir(&link).expect("remove the junction itself");
+        append_to_comms_at(&root, &lock, &m).expect("plain append");
+        assert!(root.join(pair_file("a", "b")).is_file());
+    }
+
     #[test]
     fn the_feed_shows_sent_and_received_verbatim() {
         let mut mb = Mailbox::default();

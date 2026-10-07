@@ -168,7 +168,7 @@ fn main() -> Result<()> {
     // A path that is not a directory is a usage error at launch, not a panel state.
     let project = match args.project {
         Some(p) => Some(
-            std::fs::canonicalize(&p)
+            kgraf_core::plain_path::canonicalize(&p)
                 .ok()
                 .filter(|p| p.is_dir())
                 .with_context(|| format!("--project {} is not a directory", p.display()))?,

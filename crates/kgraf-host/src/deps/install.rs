@@ -653,9 +653,9 @@ impl InstallRunner for SandboxedInstall {
             install: install.clone(),
             detail,
         };
-        let checkout = std::fs::canonicalize(checkout)
+        let checkout = kgraf_core::plain_path::canonicalize(checkout)
             .map_err(|e| DepsError::io(format!("cannot resolve {}", checkout.display()), e))?;
-        let dir = std::fs::canonicalize(checkout.join(&install.dir))
+        let dir = kgraf_core::plain_path::canonicalize(checkout.join(&install.dir))
             .map_err(|e| DepsError::io(format!("cannot resolve {}", install.dir.display()), e))?;
         if !dir.starts_with(&checkout) {
             return Err(failed(format!(
@@ -813,22 +813,10 @@ impl InstallRunner for SandboxedInstall {
 }
 
 /// Write the file `rel` beneath `stores` from the host, making its folders,
-/// never through a link (`kgraf_sandbox::write_confined`). Windows has no
-/// no-follow walk there (a junction can steer it) and writes by path; the
-/// backend's other gaps are of the same kind and reported.
+/// never through a link or (on Windows) a junction
+/// (`kgraf_sandbox::write_confined`).
 fn host_write(stores: &Path, rel: &str, content: &[u8]) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        kgraf_sandbox::write_confined(stores, Path::new(rel), content)
-    }
-    #[cfg(not(unix))]
-    {
-        let path = stores.join(rel);
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        std::fs::write(path, content)
-    }
+    kgraf_sandbox::write_confined(stores, Path::new(rel), content)
 }
 
 /// The package store an ecosystem installs into, for those that install
@@ -961,85 +949,106 @@ impl Drop for HoldFile {
     }
 }
 
-/// macOS: the processes that still hold `hold`, each seen twice 100 ms
-/// apart (so a descriptor another thread's fork copied for a moment is not
-/// taken for one), never this process. `lsof` lists them; macOS has no
-/// other public way to name the holders of a file. Linux needs none: the
-/// install is PID 1 of its own PID namespace, and the kernel ends every
-/// process left in it when the install's first process exits.
-#[cfg(target_os = "macos")]
-fn hold_holders(hold: &Path) -> Vec<libc::pid_t> {
-    let list = || -> std::collections::BTreeSet<libc::pid_t> {
-        std::process::Command::new("/usr/sbin/lsof")
-            .arg("-t")
-            .arg("--")
-            .arg(hold)
-            .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .map(|o| {
-                String::from_utf8_lossy(&o.stdout)
-                    .split_whitespace()
-                    .filter_map(|p| p.parse::<libc::pid_t>().ok())
-                    .filter(|p| *p > 1 && *p as u32 != std::process::id())
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-    let first = list();
-    if first.is_empty() {
-        return Vec::new();
-    }
-    std::thread::sleep(Duration::from_millis(100));
-    list().intersection(&first).copied().collect()
-}
-
 /// After the install's group is gone: if a process it started still holds
 /// `hold`, it left the group (its own `setsid`) and would go on writing the
-/// checkout. On macOS it is killed by name ([`hold_holders`]); either way the
-/// install fails. `None` when nothing was left behind.
+/// checkout. On macOS it is killed by name ([`stop_holders`]); either way the
+/// install fails. `None` when nothing was left behind. Linux needs no names:
+/// the install is PID 1 of its own PID namespace, and the kernel ends every
+/// process left in it when the install's first process exits.
 ///
 /// What escapes this too: a process that closes the descriptors it inherited
 /// and leaves the group (decision 0084's known gap on macOS); a build
 /// daemon is kept from starting by [`install_env`].
 #[cfg(unix)]
 fn left_behind(hold: &Path) -> Option<String> {
-    if kgraf_sandbox::lifecycle::hold_free(hold) {
-        return None;
-    }
     #[cfg(target_os = "macos")]
     {
-        let deadline = Instant::now() + kgraf_sandbox::lifecycle::GROUP_EXIT_GRACE;
-        let mut killed = std::collections::BTreeSet::new();
-        while !kgraf_sandbox::lifecycle::hold_free(hold) && Instant::now() < deadline {
-            for pid in hold_holders(hold) {
-                // SAFETY: signals a process that holds the install's own hold
-                // file, which only the install's processes ever open.
-                unsafe {
-                    libc::kill(pid, libc::SIGKILL);
-                }
-                killed.insert(pid);
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        if kgraf_sandbox::lifecycle::hold_free(hold) {
-            return Some(format!(
-                "a process it started left its process group and kept running; kGraf stopped \
-                 it (process {}). An install that leaves a process behind is not taken as done",
-                killed
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-        }
+        stop_holders(
+            hold,
+            kgraf_sandbox::lifecycle::holders,
+            kgraf_sandbox::lifecycle::GROUP_EXIT_GRACE,
+        )
     }
-    Some(
-        "a process it started left its process group and is still running, and kGraf could \
-         not stop it; it can still change files in the project. Find it and stop it before \
-         you start again"
-            .to_owned(),
-    )
+    #[cfg(not(target_os = "macos"))]
+    {
+        if kgraf_sandbox::lifecycle::hold_free(hold) {
+            return None;
+        }
+        Some(STILL_RUNNING.to_owned())
+    }
+}
+
+/// What a failure says when a process that left the group still runs.
+#[cfg(unix)]
+const STILL_RUNNING: &str = "a process it started left its process group and is still \
+     running, and kGraf could not stop it; it can still change files in the project. Find it \
+     and stop it before you start again";
+
+/// macOS: kill every process `list` names as a holder of `hold`, again and
+/// again until the hold is free or `grace` runs out, and say what happened.
+/// `None` when the hold is free at once.
+///
+/// Each holder is killed the moment it is named, and the lister reads the
+/// process table in this process
+/// (`kgraf_sandbox::lifecycle::holders`): a process that left the group goes
+/// on with its work while kGraf looks for it, so the time from the group kill
+/// to its own kill is the time it has to change files. A listing that names
+/// no one is tried again. A hold that frees with no one killed is said as
+/// such: the process ended by itself, maybe after it changed files, and kGraf
+/// did not stop it.
+#[cfg(target_os = "macos")]
+fn stop_holders(
+    hold: &Path,
+    mut list: impl FnMut(&Path) -> std::io::Result<Vec<libc::pid_t>>,
+    grace: Duration,
+) -> Option<String> {
+    use kgraf_sandbox::lifecycle::hold_free;
+    if hold_free(hold) {
+        return None;
+    }
+    let deadline = Instant::now() + grace;
+    let mut killed = std::collections::BTreeSet::new();
+    let mut list_failed = None;
+    while !hold_free(hold) && Instant::now() < deadline {
+        match list(hold) {
+            Ok(pids) => {
+                for pid in pids {
+                    // SAFETY: signals a process that holds the install's own
+                    // hold file, which only the install's processes ever
+                    // open, and that is not a child of this process.
+                    unsafe {
+                        libc::kill(pid, libc::SIGKILL);
+                    }
+                    killed.insert(pid);
+                }
+            }
+            Err(e) => list_failed = Some(e),
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    if !hold_free(hold) {
+        let why = list_failed
+            .map(|e| format!(" (the process list could not be read: {e})"))
+            .unwrap_or_default();
+        return Some(format!("{STILL_RUNNING}{why}"));
+    }
+    if killed.is_empty() {
+        return Some(
+            "a process it started left its process group and kept running until it ended by \
+             itself; kGraf did not find it in time to stop it, so it may have changed files in \
+             the project. An install that leaves a process behind is not taken as done"
+                .to_owned(),
+        );
+    }
+    let named = killed
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "a process it started left its process group and kept running; kGraf stopped it \
+         (process {named}). An install that leaves a process behind is not taken as done"
+    ))
 }
 
 /// Wait for the install to end, its timeout, or `stop`; killed at either of

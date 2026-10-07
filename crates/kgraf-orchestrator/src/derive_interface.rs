@@ -26,7 +26,7 @@
 //! | Language | Command | What it checks |
 //! | --- | --- | --- |
 //! | Rust | `cargo test --no-run -p <consumer packages>` | every item, signature and type the consumer files use |
-//! | Python | `python3 -c "import <consumer modules>"` | the names the consumer modules import when they load; call shapes and attribute uses are not checked |
+//! | Python | `python3 -c "import <consumer modules>"` (`python` on Windows) | the names the consumer modules import when they load; call shapes and attribute uses are not checked |
 //! | TypeScript | `node <project tsc> --noEmit -p <dir>` | every file the tsconfig.json includes; only with the project's own compiler in the repository |
 //! | Go | `go vet <packages>` | each package of the consumer files, with its test files |
 //! | Java | `javac -d <scratch> -sourcepath <roots> <files>` | the consumer files and the sources they use; only with no Maven, Gradle or Ant build |
@@ -248,7 +248,7 @@ pub fn compile_command(
             imports.push(format!("import {}", python_module(f)?));
         }
         return Some(vec![
-            "python3".to_owned(),
+            kgraf_sandbox::python_program().to_owned(),
             "-c".to_owned(),
             imports.join("; "),
         ]);
@@ -678,7 +678,7 @@ pub fn no_command_reason(files: &[String], package: impl Fn(&str) -> Option<Stri
 pub fn coverage(compile: &[String]) -> &'static str {
     match compile.first().map(String::as_str) {
         Some("cargo") => "Rust: every item, signature and type the files use is type-checked",
-        Some("python3") => {
+        Some("python3" | "python") => {
             "Python: the import resolves the names the files import when they load; call shapes \
              and attribute uses are not checked"
         }
@@ -1112,6 +1112,7 @@ mod tests {
         assert!(reason(&["a/x.rs".into(), "b/y.py".into()]).contains("more than one language"));
         assert!(reason(&["my-pkg/x.py".into()]).contains("not importable"));
         assert!(coverage(&["python3".into()]).contains("call shapes"));
+        assert!(coverage(&["python".into()]).contains("call shapes"));
         assert!(coverage(&["cargo".into()]).contains("signature"));
     }
 
@@ -1361,7 +1362,7 @@ mod tests {
         assert_eq!(
             compile_command(&["tests/test_library.py".into()], |_| None),
             Some(vec![
-                "python3".into(),
+                kgraf_sandbox::python_program().into(),
                 "-c".into(),
                 "import tests.test_library".into()
             ])

@@ -285,3 +285,77 @@ backend or refused.
 
 Tests: `kgraf-sandbox` `tests/egress.rs` (macOS and Linux, real backends), `windows.rs`
 `a_hidden_folder_denies_the_roots_above_it_only` (the Windows plan, on every platform).
+
+## Amendment (2026-10-07): Schannel TLS fails inside the Windows sandbox; the fix is open
+
+**Found.** On a Windows Server 2025 host, `curl.exe` from System32 reaches an
+HTTPS site as the user and fails in the sandbox, with the network allowed:
+`curl: (35) schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS
+(0x8009030E)`. Every program that uses the Windows TLS stack fails the same way
+before it sends a byte: System32 `curl.exe`, PowerShell `Invoke-WebRequest`,
+.NET `HttpClient` and `SslStream`, WinHTTP and WinINet clients, installers built
+on them, git with `http.sslBackend=schannel`. Programs with their own TLS
+library (OpenSSL in Git for Windows, Node, Python, rustls) are not affected.
+
+**Cause: the restricting SIDs, not the environment.** The sandbox does not
+substitute `USERPROFILE`, `APPDATA` or `LOCALAPPDATA`, and the token keeps the
+user's SID, logon session and registry hive. Schannel's
+`AcquireCredentialsHandle` is served inside LSA, which gives each security
+package a `SECPKG_CLIENT_INFO` whose `Restricted` member says whether the caller
+"is restricted in its ability to access securable objects" (Microsoft Learn,
+`ntsecpkg.h`), the wording Microsoft uses for a restricted token. Microsoft does
+not document that Schannel refuses such a caller, but it is measured
+(openai/codex issue 17459): under impersonation of tokens made with
+`CreateRestrictedToken`, the user's token, `DISABLE_MAX_PRIVILEGE` alone and
+`LUA_TOKEN` alone get `SEC_E_OK`; one restricting SID (Everyone), with or
+without `WRITE_RESTRICTED`, gets `0x8009030E`, and NTLM and Negotiate refuse
+default credentials the same way. This backend's token always carries
+restricting SIDs: they are its write boundary. No change to the environment,
+the ACLs or the profile access fixes it.
+
+**Tests (written for Windows).** `kgraf-sandbox` `src/sandbox/windows.rs`,
+module `schannel`, asks Schannel for a client credential under each token: the
+user's own token and a Low copy of it get `SEC_E_OK`; the sandbox token and a
+token with one restricting SID get `SEC_E_NO_CREDENTIALS`. `tests/tls_windows.rs`
+runs System32 `curl.exe -k` against a TCP listener on 127.0.0.1 and asserts a TLS
+handshake record arrives: outside the sandbox (the control) and inside it (fails
+until a fix lands).
+
+**Options, not yet chosen (each is a security trade-off).**
+
+1. Keep the restricted token; steer git and multi-backend curl to OpenSSL; detect
+   `SEC_E_NO_CREDENTIALS` in output and name the cause. Strength unchanged;
+   System32 curl, PowerShell, .NET and WinHTTP still fail; git trusts Git for
+   Windows' CA bundle instead of the Windows store and loses Schannel's
+   revocation check.
+2. Drop the restricting SIDs and make the Low integrity level the write
+   boundary, with Medium labels for the gitlink and hidden folders. Schannel
+   works if the measured premise holds; writes are then confined to Low-labeled
+   locations, not per root, so other workspaces' roots and `LocalLow` become
+   writable and cross-sandbox process access needs other protection.
+3. A one-time elevated setup with a dedicated sandbox user, a loaded profile and
+   no restricting SIDs. Needs administrator rights once, against this decision's
+   constraint; also makes network denial possible.
+4. An AppContainer tier for network-open commands. AppContainer processes use
+   Schannel, but the toolchains this decision found broken there are the ones
+   that need the network.
+
+A TLS proxy outside the sandbox does not help: a Schannel client needs its own
+credential before it sends a ClientHello.
+
+**Status.** The cause is documented in the backend and its strength gaps. No
+option is built. Nothing here ran on Windows.
+
+**Note (2026-10-07): option 1 is built.** With the network open, every sandboxed command on
+Windows gets `CURL_SSL_BACKEND=openssl`, and `http.sslBackend=openssl` is appended to the
+`GIT_CONFIG_COUNT` entries after the host's own and the `credential.helper` reset
+(`git_config_entries` in `windows.rs`). `GIT_CONFIG_NOSYSTEM` and `GIT_CONFIG_GLOBAL` are not
+touched, so the frozen git configuration keeps its effect. The values are set before a caller's
+own environment, so a caller can still override them; the host environment is not read. A
+shell result on Windows whose output holds `SEC_E_NO_CREDENTIALS` or `0x8009030E` gets one
+line that names this decision. `tests/tls_windows.rs` now asserts the documented state: the
+System32 `curl.exe` control passes outside the sandbox; the curl of Git for Windows
+(`mingw64\bin\curl.exe`) reaches the listener inside it; System32 `curl.exe` still fails
+with `SEC_E_NO_CREDENTIALS` inside it. Still fails inside the sandbox: any tool whose only TLS
+stack is Schannel (System32 `curl.exe`, PowerShell, .NET, WinHTTP installers). Options 2 to 4
+are not built. Compile-checked for Windows; nothing here ran on Windows.

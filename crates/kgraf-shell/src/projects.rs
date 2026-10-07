@@ -291,7 +291,7 @@ pub fn results_count(runs: &[StoredRun]) -> u64 {
 /// `path` in canonical form, or as given when it cannot be resolved (a folder
 /// that is gone stays listed with its reason; it is never dropped).
 pub fn canonical(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    kgraf_core::plain_path::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// What a project's run records say needs the user (a failure needs input, so it is

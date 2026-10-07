@@ -201,8 +201,7 @@ pub fn project_desk(
         // The store refuses a path inside a worktree; worktrees live here.
         let worktrees = state.join("worktrees");
         std::fs::create_dir_all(&worktrees).map_err(|e| e.to_string())?;
-        let key = project
-            .canonicalize()
+        let key = kgraf_core::plain_path::canonicalize(project)
             .map_err(|e| e.to_string())?
             .to_string_lossy()
             .into_owned();

@@ -28,7 +28,7 @@ fn write(path: &Path, text: &str) {
 }
 
 fn canonical(dir: &tempfile::TempDir) -> PathBuf {
-    std::fs::canonicalize(dir.path()).expect("canonical")
+    kgraf_core::plain_path::canonicalize(dir.path()).expect("canonical")
 }
 
 /// Run `script` with `sh -c` under `policy`, in `cwd`.

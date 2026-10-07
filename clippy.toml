@@ -1,0 +1,8 @@
+# `std::fs::canonicalize` returns a verbatim path on Windows (`\\?\C:\...`),
+# which git and most other programs reject and which does not compare equal to
+# the same path in plain form. `kgraf_core::plain_path::canonicalize` returns
+# the plain form.
+disallowed-methods = [
+    { path = "std::fs::canonicalize", reason = "use kgraf_core::plain_path::canonicalize: on Windows the standard one returns a verbatim path that git rejects" },
+    { path = "std::path::Path::canonicalize", reason = "use kgraf_core::plain_path::canonicalize: on Windows the standard one returns a verbatim path that git rejects" },
+]

@@ -465,8 +465,10 @@ mod platform {
             let _ = std::fs::create_dir_all(&dir);
             let path = dir.join("kgraf-app.log");
             let mut content = vec![b'a'; (LOG_SIZE_CAP_BYTES as usize) + 100];
-            // Mark the tail distinctly so "kept the end" is a real assertion, not an
-            // accident of an all-identical buffer.
+            // Mark both ends distinctly so "kept the end, dropped the start" is a
+            // real assertion, not an accident of an all-identical buffer: the
+            // first 100 bytes are what the cap drops.
+            content[..100].fill(b'h');
             content[(LOG_SIZE_CAP_BYTES as usize)..].fill(b'z');
             std::fs::write(&path, &content).unwrap();
 
@@ -480,7 +482,7 @@ mod platform {
                 "the most recent bytes must be kept"
             );
             assert!(
-                !kept.starts_with(b"aaaa"),
+                !kept.contains(&b'h'),
                 "the oldest bytes must be dropped, not kept"
             );
 

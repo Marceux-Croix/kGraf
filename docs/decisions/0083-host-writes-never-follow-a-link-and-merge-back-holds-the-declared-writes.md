@@ -53,3 +53,14 @@ case) are also refused as a collision.
   earlier in the pipeline.** Rejected: that earlier check is the first line of defense, but a
   second, independent check inside the merge step itself catches the case where the earlier
   one was skipped or bypassed by mistake.
+
+## Amendment (2026-10-07): the protection now covers Windows
+
+The Windows limitation above is replaced: host writes and removals on Windows no longer fail
+with "not supported". Each step of a path is opened by itself, relative to the folder opened
+before it, without ever following what is there (`NtCreateFile` with a root directory handle and
+`FILE_OPEN_REPARSE_POINT`). A symbolic link, a junction or any other reparse point found at any
+step is refused, naming it; a file with more than one hard link is refused; a name Windows
+programs could not open by path (a reserved device name, a trailing dot or space, a stream
+suffix) is refused. A removal deletes through the handle it opened, so a link or junction is
+only ever removed itself, never what it points to.

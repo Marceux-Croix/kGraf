@@ -316,7 +316,7 @@ fn a_script_path_is_read_as_its_interpreter_given_the_file() {
     w("sh.sh", b"#!/bin/sh -e\nls\n");
     w("bare.sh", b"#!/bin/bash\nls\n");
     w("plain.txt", b"just text\n");
-    w("nul.bin", b"\0\x01\x02 binary");
+    w("zero.bin", b"\0\x01\x02 binary");
     w("utf.bin", &[0xff, 0xfe, 0x00, 0x01]);
     w("space.sh", b"#!  /bin/sh   -x  \nls\n");
     let ctx = ReadContext::in_worktree(dir.path(), None);
@@ -348,7 +348,7 @@ fn a_script_path_is_read_as_its_interpreter_given_the_file() {
     let found = p("plain.txt", &[]).expect("read");
     assert!(why(&found).contains("no `#!` line"), "{}", why(&found));
     // A compiled program, a file that is not there, or a binary with a NUL.
-    assert_eq!(p("nul.bin", &[]), None);
+    assert_eq!(p("zero.bin", &[]), None);
     assert_eq!(p("utf.bin", &[]), None);
     assert_eq!(p("missing", &[]), None);
 }

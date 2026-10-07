@@ -409,7 +409,13 @@ fn node_takes_its_options_and_finds_the_script() {
         );
         runs(&ctx, "node", &[flag, "pkg", "main.js"], &["curl x"]);
     }
-    let absolute = format!("{}/pre.js", ctx.root.as_ref().expect("root").display());
+    let absolute = ctx
+        .root
+        .as_ref()
+        .expect("root")
+        .join("pre.js")
+        .display()
+        .to_string();
     runs(
         &ctx,
         "node",
@@ -662,7 +668,13 @@ fn ruby_takes_its_options_and_finds_the_code() {
         &["-r./lib.rb", "x.rb"],
         &["curl lib", "curl x"],
     );
-    let absolute = format!("{}/lib.rb", ctx.root.as_ref().expect("root").display());
+    let absolute = ctx
+        .root
+        .as_ref()
+        .expect("root")
+        .join("lib.rb")
+        .display()
+        .to_string();
     runs(
         &ctx,
         "ruby",

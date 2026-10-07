@@ -226,8 +226,8 @@ impl SandboxRunner {
             )));
         }
         std::fs::create_dir_all(&scratch).map_err(io(&scratch))?;
-        let root = std::fs::canonicalize(&root).map_err(io(&root))?;
-        let scratch = std::fs::canonicalize(&scratch).map_err(io(&scratch))?;
+        let root = kgraf_core::plain_path::canonicalize(&root).map_err(io(&root))?;
+        let scratch = kgraf_core::plain_path::canonicalize(&scratch).map_err(io(&scratch))?;
         if scratch.starts_with(&root) {
             return Err(CheckError::Config(format!(
                 "scratch {} is inside the base {}",
@@ -246,9 +246,11 @@ impl SandboxRunner {
             .map(|d| root.join(d))
             .filter(|p| p.exists()),
         ) {
-            read_denies.push(std::fs::canonicalize(&d).map_err(|source| CheckError::Io {
-                path: d.clone(),
-                source,
+            read_denies.push(kgraf_core::plain_path::canonicalize(&d).map_err(|source| {
+                CheckError::Io {
+                    path: d.clone(),
+                    source,
+                }
             })?);
         }
         let base = match base {
@@ -385,7 +387,7 @@ impl SandboxRunner {
 
     /// Whether reads of `path` are denied inside the sandbox.
     pub fn denies(&self, path: &Path) -> bool {
-        let Ok(p) = std::fs::canonicalize(path) else {
+        let Ok(p) = kgraf_core::plain_path::canonicalize(path) else {
             return false;
         };
         self.read_denies.iter().any(|d| p.starts_with(d))

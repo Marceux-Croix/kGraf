@@ -16,8 +16,11 @@ fn doc_path() -> PathBuf {
 #[test]
 fn docs_errors_matches_the_generated_glossary() {
     let path = doc_path();
+    // A Windows checkout may convert line endings to CRLF; the generator
+    // writes LF. The words are what must match.
     let committed = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
+        .replace("\r\n", "\n");
     let generated = kgraf_diag::docs::render_markdown();
     assert_eq!(
         committed,

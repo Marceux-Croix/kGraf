@@ -2430,9 +2430,7 @@ mod tests {
     ];
 
     fn workspace_root() -> std::path::PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .canonicalize()
+        kgraf_core::plain_path::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))
             .expect("the workspace root")
     }
 

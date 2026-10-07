@@ -946,10 +946,13 @@ mod tests {
 
     #[test]
     fn argument_smuggling_is_refused_with_the_argument_named() {
-        refused(
-            &["cargo", "test", "--manifest-path", "/elsewhere/Cargo.toml"],
-            "relative",
-        );
+        // An absolute path needs a drive letter on Windows.
+        let elsewhere = if cfg!(windows) {
+            "C:/elsewhere/Cargo.toml"
+        } else {
+            "/elsewhere/Cargo.toml"
+        };
+        refused(&["cargo", "test", "--manifest-path", elsewhere], "relative");
         refused(
             &["cargo", "test", "--manifest-path=../other/Cargo.toml"],
             "no `..`",

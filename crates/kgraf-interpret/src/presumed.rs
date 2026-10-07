@@ -266,8 +266,8 @@ pub fn presume_roadmaps(
         };
         // A symbolic link (the file, or a directory on its way) may point out of
         // the project; what is read must resolve inside it.
-        let resolved = path.canonicalize().map_err(unreadable)?;
-        let root = store.root().canonicalize().map_err(unreadable)?;
+        let resolved = kgraf_core::plain_path::canonicalize(&path).map_err(unreadable)?;
+        let root = kgraf_core::plain_path::canonicalize(store.root()).map_err(unreadable)?;
         if !resolved.starts_with(&root) {
             return Err(InterpretError::RoadmapPath { path: source });
         }

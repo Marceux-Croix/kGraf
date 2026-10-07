@@ -556,7 +556,12 @@ pub fn normalize_plan(
     let mut notices: BTreeSet<String> = BTreeSet::new();
     let roots: Vec<std::path::PathBuf> = repo_root
         .into_iter()
-        .flat_map(|r| [Some(r.to_path_buf()), r.canonicalize().ok()])
+        .flat_map(|r| {
+            [
+                Some(r.to_path_buf()),
+                kgraf_core::plain_path::canonicalize(r).ok(),
+            ]
+        })
         .flatten()
         .collect();
     for c in &mut contracts {
@@ -594,9 +599,15 @@ pub fn normalize_plan(
                             .components()
                             .any(|c| matches!(c, std::path::Component::ParentDir))
                 });
-            if let Some(rel) = inside
-                && let Some(rel) = rel.to_str()
-            {
+            // A plan names a write with `/` on every platform, so the
+            // relative path is joined from its parts, not printed natively.
+            let slashed = inside.and_then(|rel| {
+                rel.components()
+                    .map(|c| c.as_os_str().to_str())
+                    .collect::<Option<Vec<_>>>()
+                    .map(|parts| parts.join("/"))
+            });
+            if let Some(rel) = slashed.as_deref() {
                 notices.insert(format!(
                     "contract `{}` declared the absolute write `{}`; it was taken as the \
                      repository-relative `{rel}`",

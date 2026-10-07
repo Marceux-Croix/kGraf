@@ -30,9 +30,7 @@ fn prices_path() -> PathBuf {
 /// This repository's own root: `CARGO_MANIFEST_DIR` is
 /// `<repo>/crates/kgraf-host`, so the self-test reads two levels up.
 fn this_repository() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
+    kgraf_core::plain_path::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))
         .expect("this repository's root resolves")
 }
 

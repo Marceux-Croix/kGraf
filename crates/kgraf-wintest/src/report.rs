@@ -106,8 +106,11 @@ pub struct Totals {
 /// counted apart: they say what the machine lacks, not what kGraf does.
 pub fn classify_failure(tail: &str) -> String {
     let lower = tail.to_lowercase();
+    // `program not found` is std's wording; the sandbox's spawn error names the
+    // program between the words (`program cargo not found`), matched per tool below.
     let not_found = [
         "program not found",
+        "not found",
         "cannot find the file specified",
         "os error 2",
         "is not recognized as an internal or external command",
@@ -125,6 +128,7 @@ pub fn classify_failure(tail: &str) -> String {
                 format!("\"{tool}\""),
                 format!("{tool}.exe"),
                 format!("'{tool}'"),
+                format!("program {tool} not found"),
             ];
             if quoted.iter().any(|q| lower.contains(q.as_str())) {
                 return format!("needs `{tool}`, not on this machine");
@@ -480,12 +484,16 @@ mod tests {
                     "called `Result::unwrap()` on an `Err` value: program not found: `cargo`",
                 ),
                 ("t2", "assertion `left == right` failed"),
+                (
+                    "t3",
+                    "check: cannot run `cargo` in C:\\t\n\nCaused by:\n    0: spawn failed: program cargo not found\n    1: program cargo not found",
+                ),
             ],
         ));
         let t = totals(&r);
-        assert_eq!(t.passed, 4);
+        assert_eq!(t.passed, 3);
         assert_eq!(t.failed, 1);
-        assert_eq!(t.failed_needs_tool, 1);
+        assert_eq!(t.failed_needs_tool, 2);
         assert_eq!(t.binaries_clean, 1);
         assert!(verdict(&t, &r).starts_with("FAILURES: 1 test(s)"));
     }

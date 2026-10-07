@@ -954,14 +954,40 @@ fn push_forms<'a>(pairs: &mut Vec<(String, &'a str)>, path: &Path, placeholder: 
     let given = path.to_string_lossy().trim_end_matches('/').to_owned();
     // A bare "/" or an empty path would replace every slash.
     if given.len() > 1 {
-        pairs.push((given.clone(), placeholder));
-        push_encoded(pairs, &given, placeholder);
+        push_spellings(pairs, &given, placeholder, true);
     }
-    if let Ok(resolved) = path.canonicalize() {
+    if let Ok(resolved) = kgraf_core::plain_path::canonicalize(path) {
         let resolved = resolved.to_string_lossy().trim_end_matches('/').to_owned();
         if resolved.len() > 1 && resolved != given {
-            push_encoded(pairs, &resolved, placeholder);
-            pairs.push((resolved, placeholder));
+            push_spellings(pairs, &resolved, placeholder, false);
+        }
+    }
+}
+
+/// One path as a message may spell it: as written, and with `/` for each
+/// backslash and without a `\\?\` prefix, which is how a `file://` URL names
+/// a Windows path. `plain_first` keeps the order each caller pushed in.
+fn push_spellings<'a>(
+    pairs: &mut Vec<(String, &'a str)>,
+    spelled: &str,
+    placeholder: &'a str,
+    plain_first: bool,
+) {
+    let mut forms = vec![spelled.to_owned()];
+    let slashed = spelled.replace('\\', "/");
+    if slashed != spelled {
+        if let Some(bare) = slashed.strip_prefix("//?/") {
+            forms.push(bare.to_owned());
+        }
+        forms.push(slashed);
+    }
+    for form in forms {
+        if plain_first {
+            pairs.push((form.clone(), placeholder));
+            push_encoded(pairs, &form, placeholder);
+        } else {
+            push_encoded(pairs, &form, placeholder);
+            pairs.push((form, placeholder));
         }
     }
 }

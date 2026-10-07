@@ -3789,6 +3789,7 @@ name = "kgraf-instructions"
 version = "0.7.8"
 dependencies = [
  "blake3",
+ "kgraf-core",
  "serde",
  "serde_json",
  "serde_yaml_ng",
@@ -4074,6 +4075,7 @@ name = "kgraf-secrets"
 version = "0.7.8"
 dependencies = [
  "criterion",
+ "kgraf-core",
  "regex",
  "tracing",
 ]

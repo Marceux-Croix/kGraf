@@ -62,13 +62,19 @@ junction = { version = "2.1.0", default-features = false }
 # "pin to 0.62"; no windows-sys 0.62 exists). Already in Cargo.lock through
 # other crates. `win32job` was not taken: it pulls `windows` 0.61 and
 # thiserror 1, a second copy of each, for four job-object calls.
+# `Wdk_Foundation`, `Wdk_Storage_FileSystem` and `Win32_System_IO`: host writes
+# and removals in a worker's tree open each name relative to its folder's
+# handle with `NtCreateFile` (`confined.rs`), never following a reparse point.
 windows-sys = { version = "0.61.2", features = [
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System_Console",
+    "Win32_System_IO",
     "Win32_System_JobObjects",
     "Win32_System_Pipes",
     "Win32_System_Registry",
@@ -85,8 +91,15 @@ criterion = { version = "0.8.2", default-features = false, features = ["cargo_be
 [target.'cfg(windows)'.dev-dependencies]
 # The Windows escape-test probe calls these directly (desktop name, console,
 # OpenProcess, registry, hard links, SendInput, waiting on a process handle).
+# The Schannel tests ask for a TLS client credential under each token
+# (`Authentication_Identity`, `Credentials`, and `Cryptography` for
+# `SCHANNEL_CRED`).
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authentication_Identity",
+    "Win32_Security_Credentials",
+    "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
     "Win32_System_Console",
     "Win32_System_Registry",

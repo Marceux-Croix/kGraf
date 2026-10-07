@@ -200,7 +200,7 @@ is marked `#[ignore]`: the Windows-only test files compile only on Windows, so a
 process environment.
 
 1. The sandbox's unit tests (the Git Bash search, the argument transport, the network
-   decision):
+   decision, and which token property makes Schannel refuse a TLS credential):
 
    ```powershell
    cargo test -p kgraf-sandbox --lib 2>&1 | Tee-Object "$r\1-sandbox-lib.txt"
@@ -218,6 +218,26 @@ process environment.
    ```powershell
    cargo test -p kgraf-sandbox --test escape_windows -- --test-threads=1 2>&1 | Tee-Object "$r\3-escape-windows.txt"
    ```
+
+   **3a.** HTTPS inside the sandbox, with a listener on 127.0.0.1 (no internet needed). The
+   test runs three checks: `curl.exe` from System32 (Schannel) outside the sandbox, the curl of
+   Git for Windows (`mingw64\bin\curl.exe`, OpenSSL) inside it, and `curl.exe` from System32
+   inside it:
+
+   ```powershell
+   cargo test -p kgraf-sandbox --test tls_windows 2>&1 | Tee-Object "$r\3a-tls-windows.txt"
+   ```
+
+   Expected: all three pass. The Git for Windows test prints a "skipped" line and passes if
+   Git for Windows is not found. The System32 test passes because `curl.exe` still fails inside
+   the sandbox with `schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS`: Schannel
+   refuses a client credential to a restricted token, which every sandboxed command runs with
+   (decision 0011, amendment "Schannel"). The sandbox sets `CURL_SSL_BACKEND=openssl` and
+   `http.sslBackend=openssl` for git, so git and the curl of Git for Windows work; tools
+   whose only TLS stack is Schannel (System32 `curl.exe`, PowerShell, .NET) still fail. If the
+   System32 test fails because a handshake arrived, the gap is closed: report it. The four
+   `schannel` tests in step 1 measure which token property causes it, so keep the step 1
+   output too.
 
 4. The worker's shell tool on Windows (a plain program and a `sh -c` line run and return
    their output, the network notice comes once, an exit status comes back, a timeout and

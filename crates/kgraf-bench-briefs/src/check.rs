@@ -610,9 +610,8 @@ struct CargoRun {
 /// The test executables in cargo's `--message-format=json` build output, only
 /// those that lie under `target`.
 fn test_executables(cargo_json: &str, target: &Path) -> Vec<PathBuf> {
-    let target = target
-        .canonicalize()
-        .unwrap_or_else(|_| target.to_path_buf());
+    let target =
+        kgraf_core::plain_path::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
     let mut found: Vec<PathBuf> = Vec::new();
     for line in cargo_json.lines() {
         let Ok(message) = serde_json::from_str::<serde_json::Value>(line) else {
@@ -625,7 +624,7 @@ fn test_executables(cargo_json: &str, target: &Path) -> Vec<PathBuf> {
             continue;
         };
         let exe = PathBuf::from(exe);
-        let exe = exe.canonicalize().unwrap_or(exe);
+        let exe = kgraf_core::plain_path::canonicalize(&exe).unwrap_or(exe);
         if exe.starts_with(&target) && !found.contains(&exe) {
             found.push(exe);
         }

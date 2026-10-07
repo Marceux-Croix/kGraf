@@ -1963,8 +1963,7 @@ Behavior that differs from earlier builds. Each item names the decision that hol
   installed. A gate that could not pass on correct work is left out with the reason and the
   command that fixes it: an uninstalled dependency of an `npm test` gate, pytest missing from
   both the project's virtual environment and `python3`, a Gradle wrapper whose distribution
-  is not unpacked in `~/.gradle/wrapper/dists` (run `./gradlew --version` once; on Windows
-  the wrapper gets no gate). Set `--gate-command` to run a gate yourself (0018).
+  is not unpacked in `~/.gradle/wrapper/dists` (run `./gradlew --version` once). Set `--gate-command` to run a gate yourself (0018).
 - A worker that reaches its context stop point before it has written anything is compacted
   once instead of handed back: a child would receive the same whole task and meet the same
   stop point. After that one compaction it goes on while its context fits the model's window;

@@ -942,7 +942,10 @@ async fn a_streamed_function_call_arrives_whole_with_its_thinking() {
 #[tokio::test]
 async fn a_stream_cut_before_its_finish_reason_is_truncated_with_a_floor() {
     let server = MockServer::start().await;
+    // The cut is made at the blank lines between events, so read the fixture
+    // with LF line endings even when a Windows checkout converted them.
     let cut: String = STREAM_TEXT
+        .replace("\r\n", "\n")
         .split("\n\n")
         .take(3)
         .collect::<Vec<_>>()

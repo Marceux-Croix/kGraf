@@ -457,8 +457,8 @@ fn py_ic() -> InterfaceContract {
             "from config import parse_config, Config\n",
         )],
         tests: vec![FileOverlay::new("test_contract.py", PY_TEST)],
-        compile: s(&["python3", "-c", "import consumer, test_contract"]),
-        test: s(&["python3", "-m", "unittest", "-q", "test_contract"]),
+        compile: s(&[py(), "-c", "import consumer, test_contract"]),
+        test: s(&[py(), "-m", "unittest", "-q", "test_contract"]),
         consulted: vec![],
         replaces: vec![],
     }
@@ -973,7 +973,7 @@ fn escapee(delay_secs: f64, parent: &[&str]) -> String {
 fn escapee_argv(program: &str, alive: &Path) -> Vec<String> {
     std::fs::write(alive, "").expect("alive file");
     vec![
-        "python3".to_owned(),
+        py().to_owned(),
         "-c".to_owned(),
         program.to_owned(),
         alive.display().to_string(),
@@ -1353,7 +1353,7 @@ fn compile_only_ic() -> InterfaceContract {
             "from config import parse_config, Config\n",
         )],
         tests: vec![],
-        compile: s(&["python3", "-c", "import consumer"]),
+        compile: s(&[py(), "-c", "import consumer"]),
         test: vec![],
         consulted: vec![],
         replaces: vec![],
@@ -1420,7 +1420,7 @@ async fn a_compile_only_revision_is_classified_by_compatibility_alone() {
     // The revised interface's own consumers do not need parse_config; the
     // prior ones do, and fail to compile against the revised stub.
     breaking.consumer[0].content = "from config import Config\n".into();
-    breaking.compile = s(&["python3", "-c", "import consumer"]);
+    breaking.compile = s(&[py(), "-c", "import consumer"]);
     let c = classify(&r, &prior, &breaking, &writes(), 0, 2)
         .await
         .expect("ran")
@@ -1634,7 +1634,7 @@ fn current_code_py_ic(app: &str) -> InterfaceContract {
         reference: vec![],
         consumer: vec![FileOverlay::new("shop/app.py", app)],
         tests: vec![],
-        compile: s(&["python3", "-c", "import shop.app"]),
+        compile: s(&[py(), "-c", "import shop.app"]),
         test: vec![],
         consulted: vec![],
         replaces: vec![],

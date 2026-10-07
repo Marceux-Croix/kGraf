@@ -957,7 +957,7 @@ async fn clean_finds_kept_worktrees_of_runs_and_of_kgraf_worker() {
 
     assert_eq!(
         crate::clean(&r.root, "w-worker", false).expect("worker's"),
-        std::fs::canonicalize(&worker_kept).unwrap_or(worker_kept.clone())
+        kgraf_core::plain_path::canonicalize(&worker_kept).unwrap_or(worker_kept.clone())
     );
     assert!(!worker_kept.exists());
     assert!(crate::clean(&r.root, "w-run", false).is_ok());
@@ -1804,7 +1804,7 @@ async fn an_mcp_tool_allowed_with_kgraf_allow_runs_in_an_unattended_delegate() {
     let mut outcomes = Vec::new();
     for (allowed, worker) in [(false, "w-deny"), (true, "w-allow")] {
         if allowed {
-            let project = r.root.canonicalize().expect("root");
+            let project = kgraf_core::plain_path::canonicalize(&r.root).expect("root");
             crate::worker::ask::allow_mcp_tool(
                 &state,
                 &project.to_string_lossy(),
@@ -2285,7 +2285,11 @@ async fn cargo_gates_pass_in_worktrees_under_the_read_denied_state_directory() {
         .prepare(&c, &"w-cargo".into())
         .await
         .expect("worktree");
-    assert!(ws.canonicalize().expect("ws").starts_with(&denies[0]));
+    assert!(
+        kgraf_core::plain_path::canonicalize(&ws)
+            .expect("ws")
+            .starts_with(&denies[0])
+    );
     std::fs::write(
         ws.join("src/lib.rs"),
         "pub fn two() -> u8 { 1 + 1 }\n#[test]\nfn is_two() { assert_eq!(two(), 2); }\n",
@@ -3731,15 +3735,10 @@ fn go_maven_gradle_and_dotnet_gates_need_their_tool_and_their_installs() {
     std::fs::create_dir_all(dist.join("gradle-8.5/lib")).expect("mkdir");
     std::fs::write(dist.join("gradle-8.5-bin.zip.ok"), "").expect("w");
     let (found, notes) = discover_probed(gradle.path(), &[], h);
-    if cfg!(windows) {
-        assert!(
-            found.is_empty() && notes[0].contains("Windows"),
-            "{notes:?}"
-        );
-    } else {
-        // No `gradle` on PATH is needed: the wrapper is the program.
-        assert_eq!(found, vec!["./gradlew test --offline"], "{notes:?}");
-    }
+    // No `gradle` on PATH is needed: the wrapper is the program. Windows runs
+    // it through Git Bash and reaches the distribution by a junction, so the
+    // gate is the same there (decision 0084).
+    assert_eq!(found, vec!["./gradlew test --offline"], "{notes:?}");
 
     let dotnet = tempfile::tempdir().expect("dotnet");
     std::fs::write(dotnet.path().join("App.csproj"), "<Project/>").expect("w");

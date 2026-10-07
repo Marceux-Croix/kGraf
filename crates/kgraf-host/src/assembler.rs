@@ -116,9 +116,7 @@ impl AttemptAssembler {
         };
         let (allow_store, _) = PersistedAllowStore::open(allow_store_path(&self.state), ws.root())
             .step("cannot open the project's allow rules")?;
-        let project = self
-            .root
-            .canonicalize()
+        let project = kgraf_core::plain_path::canonicalize(&self.root)
             .with_step(|| format!("cannot resolve {}", self.root.display()))?
             .to_string_lossy()
             .into_owned();

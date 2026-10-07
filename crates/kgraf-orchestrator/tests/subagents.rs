@@ -446,11 +446,14 @@ fn files_under(root: &Path) -> BTreeMap<String, Vec<u8>> {
             if path.is_dir() {
                 walk(root, &path, out);
             } else if let Ok(bytes) = std::fs::read(&path) {
+                // Keys use `/`, as the declared write paths do.
                 let rel = path
                     .strip_prefix(root)
                     .expect("under root")
-                    .to_string_lossy()
-                    .into_owned();
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/");
                 out.insert(rel, bytes);
             }
         }

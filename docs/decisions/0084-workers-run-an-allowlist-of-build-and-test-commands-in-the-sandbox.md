@@ -966,3 +966,11 @@ commands of the project must find it.
   this was built. That each tool reads its store read-only and offline (Maven may try to write
   its tracking files) is taken from their documentation and untested; the grants and the
   variables are unit-tested (`package_stores.rs`, `sandbox/mod.rs`).
+
+## Amendment (2026-10-07): ignored files are removed through the handle walk on Windows too
+
+The sixth amendment's Windows removal by path (`kgraf_sandbox::confined::remove_stopped`) is
+replaced. Decision 0083's helpers now work on Windows (its 2026-10-07 amendment), so
+`MergeBack::remove_ignored` removes through the same removal on every platform: each name is
+opened relative to its folder's handle without following a reparse point, and deleted through
+that handle. It no longer relies on no writer being left.

@@ -451,3 +451,34 @@ needs `perl`), `package_manager_configuration_from_the_environment_is_removed`,
 `look_alike_names_never_match_an_allowed_host`. `kgraf-shell`:
 `allow_once_on_the_fetch_card_does_not_run_the_install`,
 `an_earlier_allow_once_is_given_again_to_the_run_that_starts`.
+
+## Amendment (2026-10-07, third): a process left behind is named in kGraf's own process, and a stop is said only when one happened
+
+Changes item 3 of the amendment above, on macOS.
+
+1. **The holders of the hold file are read from the process table in kGraf's own process**
+   (`kgraf_sandbox::lifecycle::holders`: libproc, each open file matched by device and inode),
+   not with `lsof`. One scan of about 500 processes took 0.1 s, and 0.23 s with four CPU-bound
+   processes per core; one `lsof` run took 0.4 s idle and 0.5 to 1.1 s under that load, and it
+   ran twice, 100 ms apart. A process that left the group goes on with its work while kGraf
+   looks for it: under that load a script that waited 2 s and then wrote into the checkout
+   wrote first in 4 of 8 runs, before kGraf killed it.
+2. **Each holder is killed the moment it is named**; the listing is tried again until the hold
+   is free or the grace (5 s) runs out. The second look 100 ms later, which kept a descriptor
+   copied by another thread's fork from being taken for a holder, is replaced by a rule: a
+   child of kGraf is never named. Such a copy is only ever in a child of kGraf, and gone at its
+   exec; an install process is never a child of kGraf once the install's first process is
+   reaped.
+3. **A stop is said only when one happened.** A hold that freed with nobody killed was
+   reported as "kGraf stopped it (process )": the process had ended by itself, after its work.
+   That case now says the process ended by itself before kGraf found it and may have changed
+   files. A listing that fails is named in the failure.
+
+**Tests.** `kgraf-host` `deps/install/tests.rs`:
+`a_holder_that_ends_unnamed_is_not_reported_as_stopped`,
+`a_listing_that_fails_leaves_the_holder_reported_as_running`,
+`a_holder_that_left_the_group_is_killed_before_its_work`, and
+`an_install_process_that_leaves_its_group_is_stopped_and_fails_the_install`, whose script now
+leaves the group before its parent exits (else the group kill can end it first and nothing
+escapes) and which checks that the stop names a process. `kgraf-sandbox` `lifecycle.rs`:
+`holders_names_a_detached_holder_and_not_a_child_or_this_process`.

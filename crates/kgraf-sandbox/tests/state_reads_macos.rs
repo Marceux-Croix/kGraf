@@ -269,7 +269,7 @@ fn a_worktree_build_cannot_read_the_checkout_env_but_reads_its_cargo_files() {
     )
     .unwrap();
     std::fs::write(work.join("src/main.rs"), "fn main() {}\n").unwrap();
-    let canonical = repo.canonicalize().unwrap();
+    let canonical = kgraf_core::plain_path::canonicalize(&repo).unwrap();
     let env_path = canonical.join(".env");
     let notes_path = canonical.join("notes.txt");
     std::fs::write(

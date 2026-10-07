@@ -18,5 +18,16 @@
 # target, and static CRT linking has known trade-offs (a larger binary, and every
 # process gets its own copy of CRT globals) that are a deliberate, scoped choice for
 # this one target, not a workspace-wide default.
+#
+# Main-thread stack. Windows reserves 1 MB for an executable's main thread unless the
+# PE header asks for more; macOS and Linux give 8 MB. A debug build of `kgraf` needs
+# more than 1 MB just to parse its command line (clap builds the whole subcommand tree
+# on the main thread), so every command died with STACK_OVERFLOW (0xC00000FD) before
+# it printed anything. `/STACK:8388608` raises the reserve to 8 MB for every binary
+# in the workspace, test binaries and the GUI included. A linker flag is used, not a
+# worker thread, because the GUI event loop must stay on the main thread. Pages are
+# reserved, not committed, so a binary that never uses the space pays nothing.
+# This line sets rustflags for the target; a RUSTFLAGS environment variable replaces it,
+# so a build that sets RUSTFLAGS must repeat both flags.
 [target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "target-feature=+crt-static"]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=/STACK:8388608"]

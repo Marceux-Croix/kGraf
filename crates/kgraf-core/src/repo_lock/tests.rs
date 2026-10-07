@@ -27,7 +27,7 @@ fn git(dir: &Path, args: &[&str]) {
 /// A repository with one commit and a linked worktree `wt`.
 fn repo() -> (tempfile::TempDir, PathBuf, PathBuf) {
     let dir = tempfile::tempdir().expect("tempdir");
-    let base = dir.path().canonicalize().expect("canonical");
+    let base = crate::plain_path::canonicalize(dir.path()).expect("canonical");
     let main = base.join("main");
     std::fs::create_dir_all(main.join("sub")).expect("mkdir");
     git(&main, &["init", "-q", "-b", "main"]);

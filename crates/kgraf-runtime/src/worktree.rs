@@ -182,11 +182,9 @@ fn outside_root(named: &str, base: &Path, root: &Path, what: &str) -> Result<Pat
     } else {
         base.join(named)
     };
-    let resolved = path
-        .canonicalize()
+    let resolved = kgraf_core::plain_path::canonicalize(&path)
         .map_err(|e| format!("cannot resolve the {what} {}: {e}", path.display()))?;
-    let root = root
-        .canonicalize()
+    let root = kgraf_core::plain_path::canonicalize(root)
         .map_err(|e| format!("cannot resolve {}: {e}", root.display()))?;
     if resolved.starts_with(&root) {
         return Err(format!(

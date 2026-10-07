@@ -33,7 +33,7 @@ fn checkout(files: &[(&str, &str)]) -> (Repo, Vec<PathBuf>) {
     let mut all = vec![(".gitignore", GITIGNORE)];
     all.extend_from_slice(files);
     let r = repo_in(dir, root.clone(), &base, &all);
-    let state = std::fs::canonicalize(root.join(".kgraf")).expect("state");
+    let state = kgraf_core::plain_path::canonicalize(root.join(".kgraf")).expect("state");
     (r, vec![state])
 }
 

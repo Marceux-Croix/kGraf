@@ -615,8 +615,16 @@ mod tests {
             &["go", "test", "-modfile=/tmp/go.mod"],
             "not on the allowlist",
         );
+        // An absolute path needs a drive letter on Windows.
+        let abs = |p: &str| {
+            if cfg!(windows) {
+                format!("C:{p}")
+            } else {
+                p.to_owned()
+            }
+        };
         refused(
-            &["go", "build", "-o", "/usr/local/bin/x"],
+            &["go", "build", "-o", &abs("/usr/local/bin/x")],
             "relative to the worktree",
         );
         refused(&["go", "test", "../other/..."], "inside the worktree");
@@ -682,8 +690,15 @@ mod tests {
             &["dotnet", "build", "-o", "/tmp/out"],
             "not on the allowlist",
         );
+        let abs = |p: &str| {
+            if cfg!(windows) {
+                format!("C:{p}")
+            } else {
+                p.to_owned()
+            }
+        };
         refused(
-            &["dotnet", "build", "/abs/App.csproj"],
+            &["dotnet", "build", &abs("/abs/App.csproj")],
             "relative to the worktree",
         );
         not_listed(&["dotnet", "run"]);

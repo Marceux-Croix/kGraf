@@ -732,7 +732,7 @@ impl WorkspaceManager {
             let target = text.trim().strip_prefix("gitdir:").map(str::trim);
             !target.is_some_and(|t| {
                 let t = Path::new(t);
-                std::fs::canonicalize(t)
+                kgraf_core::plain_path::canonicalize(t)
                     .unwrap_or_else(|_| t.to_path_buf())
                     .starts_with(&self.common_dir)
             })
@@ -1494,7 +1494,9 @@ fn stamp_or_check_marker(marker: &Path, repo: &Path) -> Result<(), WorkspaceErro
     let text = std::fs::read_to_string(marker).map_err(|e| WorkspaceError::io(marker, e))?;
     let stamped = text.lines().find_map(|l| l.strip_prefix("repo="));
     match stamped {
-        Some(holder) if Path::new(holder) == repo => Ok(()),
+        // A marker written before canonical paths were made plain holds the
+        // verbatim form (`\\?\C:\...`) on Windows; it is the same repository.
+        Some(holder) if kgraf_core::plain_path::simplify(Path::new(holder)) == repo => Ok(()),
         Some(holder) => Err(WorkspaceError::UnsafeBaseDir {
             path: marker.parent().unwrap_or(marker).to_path_buf(),
             reason: format!("base belongs to repository {holder}"),
@@ -1507,7 +1509,7 @@ fn stamp_or_check_marker(marker: &Path, repo: &Path) -> Result<(), WorkspaceErro
 }
 
 fn canonical(path: &Path) -> Result<PathBuf, WorkspaceError> {
-    std::fs::canonicalize(path).map_err(|e| WorkspaceError::io(path, e))
+    kgraf_core::plain_path::canonicalize(path).map_err(|e| WorkspaceError::io(path, e))
 }
 
 fn validate_name(name: &str) -> Result<(), WorkspaceError> {

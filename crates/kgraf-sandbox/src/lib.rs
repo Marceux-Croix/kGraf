@@ -33,6 +33,13 @@ pub mod trust;
 mod win_command_line;
 mod workspace;
 
+/// The name of the Python interpreter the platform installs: Windows installs
+/// `python` (`python3` there is at most a Store stub), the others `python3`.
+/// Every command kGraf writes for Python uses this name.
+pub fn python_program() -> &'static str {
+    if cfg!(windows) { "python" } else { "python3" }
+}
+
 pub use build_dir::{
     SeedError, SeedMethod, SeedReport, clone_target_dir, seed_target_dir, seed_workspace_target,
 };
@@ -62,7 +69,8 @@ pub use sandbox::SetupProbe;
 pub use sandbox::{
     Backend, CheckNetwork, FROZEN_GIT_FILES, FrozenGit, IsolationStrength, NETWORK_OPEN_NOTICE,
     Network, ReadConfinement, Redirect, SHELL_NETWORK_OPEN_NOTICE, SandboxPolicy, SandboxedCommand,
-    platform_isolation, sandboxed_command, workspace_command,
+    TLS_UNAVAILABLE_HINT, platform_isolation, sandboxed_command, tls_unavailable_hint,
+    workspace_command,
 };
 #[cfg(target_os = "linux")]
 pub use sandbox::{LinuxConfinement, linux_confinement};

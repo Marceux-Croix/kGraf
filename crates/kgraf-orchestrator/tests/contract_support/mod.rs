@@ -7,6 +7,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+/// The Python interpreter the platform installs (`python` on Windows).
+pub fn py() -> &'static str {
+    kgraf_sandbox::python_program()
+}
+
 pub fn s(v: &[&str]) -> Vec<String> {
     v.iter().map(|x| (*x).to_owned()).collect()
 }

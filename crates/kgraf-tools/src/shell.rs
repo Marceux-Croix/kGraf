@@ -1386,6 +1386,16 @@ impl Tool for ShellTool {
                 text: crate::UntrustedText::new(format!("\n[sandbox] {notice}")),
             });
         }
+        // Decision 0011: where the network is open because the backend cannot
+        // deny it (Windows), a command that hit the Windows TLS stack's
+        // refusal gets one line saying why and what works.
+        if self.network.shell_notice().is_some()
+            && let Some(hint) = kgraf_sandbox::tls_unavailable_hint(&output.clone().render())
+        {
+            output.parts.push(crate::OutputPart::Text {
+                text: crate::UntrustedText::new(format!("\n[sandbox] {hint}")),
+            });
+        }
         if !verdict.build {
             return Ok(output);
         }
@@ -1876,7 +1886,7 @@ fn sandbox_policy_on(
         Some(ws) => {
             // `Workspace::root` is canonical; compare against the canonical
             // context root so `/var` and `/private/var` are not two trees.
-            let root = ctx.workspace_root.canonicalize().map_err(|e| {
+            let root = kgraf_core::plain_path::canonicalize(&ctx.workspace_root).map_err(|e| {
                 internal(format!(
                     "cannot resolve the workspace root {}: {e}",
                     ctx.workspace_root.display()
@@ -3002,6 +3012,43 @@ mod tests {
             .expect("call")
             .render();
         assert!(!out.contains("network not blocked"), "{out}");
+    }
+
+    /// Decision 0011: where the network is open because the backend cannot
+    /// deny it (stood in for here with the Windows decision), a result that
+    /// holds the Schannel refusal gets the TLS hint on every such result; a
+    /// result without it, and a tool whose network is denied, get none.
+    #[tokio::test]
+    async fn a_schannel_refusal_gets_the_tls_hint_where_the_network_is_open() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let c = ctx(dir.path().to_path_buf());
+        let line = format!("[sandbox] {}", kgraf_sandbox::TLS_UNAVAILABLE_HINT);
+        let refusal = json!({"command": ["/bin/echo", "AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS"]});
+        let plain = json!({"command": ["/bin/echo", "hi"]});
+        let (tool, _hook) = ShellTool::new(policy());
+        let tool = tool.with_network_decision(CheckNetwork::open_with_notice());
+        for _ in 0..2 {
+            let out = tool
+                .call(refusal.clone(), &c, &CallPermit::new())
+                .await
+                .expect("call")
+                .render();
+            assert!(out.contains(&line), "{out}");
+        }
+        let out = tool
+            .call(plain, &c, &CallPermit::new())
+            .await
+            .expect("call")
+            .render();
+        assert!(!out.contains("Schannel"), "{out}");
+        let (denied, _hook) = ShellTool::new(policy());
+        let denied = denied.with_network_decision(CheckNetwork::deny());
+        let out = denied
+            .call(refusal, &c, &CallPermit::new())
+            .await
+            .expect("call")
+            .render();
+        assert!(!out.contains(&line), "{out}");
     }
 
     /// The sandbox policy of a call takes its network, and whether partial
@@ -4521,7 +4568,7 @@ mod tests {
             let (tool, hook) = ShellTool::new(policy);
             let tool = tool
                 .with_workspace(ws.clone())
-                .with_checkout(std::fs::canonicalize(&repo).expect("canonical"));
+                .with_checkout(kgraf_core::plain_path::canonicalize(&repo).expect("canonical"));
             assert_eq!(
                 hook.review(&pending(&["npm", "test"])).await,
                 HookDecision::Allow

@@ -230,8 +230,7 @@ impl CargoDeps {
         }
         let roots = [
             mirror.to_path_buf(),
-            mirror
-                .canonicalize()
+            kgraf_core::plain_path::canonicalize(mirror)
                 .map_err(|e| DepsError::io("cannot resolve the manifest mirror", e))?,
         ];
         let mut found = declared_other_sources(&out.stdout, &roots)?;
@@ -1140,6 +1139,23 @@ mod tests {
         std::fs::write(p, text).unwrap();
     }
 
+    /// A source finding with its path separators written as `/`: the finding
+    /// names the manifest with the platform's own separator.
+    fn slashed(finding: &str) -> String {
+        finding.replace('\\', "/")
+    }
+
+    /// A `file://` URL for a local path that is safe inside a TOML string:
+    /// forward slashes, and the extra slash a drive letter needs.
+    fn file_url(path: &Path) -> String {
+        let text = path.display().to_string().replace('\\', "/");
+        if text.starts_with('/') {
+            format!("file://{text}")
+        } else {
+            format!("file:///{text}")
+        }
+    }
+
     /// Real cargo that cannot reach the network.
     fn offline_cargo() -> CargoDeps {
         CargoDeps {
@@ -1460,7 +1476,7 @@ mod tests {
         assert_eq!(found.sources.len(), 5, "{found:?}");
         assert!(found.escapes.is_empty());
         assert!(
-            found.sources[0].contains("vendor/x/Cargo.toml"),
+            slashed(&found.sources[0]).contains("vendor/x/Cargo.toml"),
             "names the manifest: {found:?}"
         );
         assert!(
@@ -1591,7 +1607,7 @@ mod tests {
             assert!(
                 sources.iter().any(|s| s.contains("metadata")
                     && s.contains(key)
-                    && s.contains("vendor/v/Cargo.toml")),
+                    && slashed(s).contains("vendor/v/Cargo.toml")),
                 "{key}: {sources:?}"
             );
             // A workspace member.
@@ -1751,7 +1767,7 @@ mod tests {
             sources
                 .iter()
                 .any(|s| s.contains("attacker.example/evil.git")
-                    && s.contains("vendor/itoa/Cargo.toml")),
+                    && slashed(s).contains("vendor/itoa/Cargo.toml")),
             "{sources:?}"
         );
     }
@@ -1779,7 +1795,8 @@ mod tests {
         assert!(
             sources
                 .iter()
-                .any(|s| s.contains("attacker.example/itoa.git") && s.contains("ws/Cargo.toml")),
+                .any(|s| s.contains("attacker.example/itoa.git")
+                    && slashed(s).contains("ws/Cargo.toml")),
             "{sources:?}"
         );
     }
@@ -1825,8 +1842,8 @@ mod tests {
             root,
             "Cargo.toml",
             &format!(
-                "{PKG}[dependencies]\nsecret = {{ git = \"file://{}\" }}\n[workspace]\n",
-                secret.display()
+                "{PKG}[dependencies]\nsecret = {{ git = \"{}\" }}\n[workspace]\n",
+                file_url(&secret)
             ),
         );
         write(root, "src/lib.rs", "");
@@ -1848,15 +1865,15 @@ mod tests {
             "vendor/v/Cargo.toml",
             &format!(
                 "[package]\nname = \"v\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
-                 [dependencies]\nsecret = {{ git = \"file://{}\" }}\n",
-                secret.display()
+                 [dependencies]\nsecret = {{ git = \"{}\" }}\n",
+                file_url(&secret)
             ),
         );
         let sources = refused_sources(root);
         assert!(
             sources
                 .iter()
-                .any(|s| s.contains("file://") && s.contains("vendor/v/Cargo.toml")),
+                .any(|s| s.contains("file://") && slashed(s).contains("vendor/v/Cargo.toml")),
             "{sources:?}"
         );
     }
@@ -2383,7 +2400,7 @@ mod tests {
         write(root, ".hidden/Cargo.toml", PKG);
         match run(root) {
             super::super::GateOutcome::Unchecked(why) => {
-                assert!(why.contains("tools/x/Cargo.toml"), "{why}");
+                assert!(slashed(&why).contains("tools/x/Cargo.toml"), "{why}");
                 assert!(why.contains("cargo fetch"), "{why}");
             }
             other => panic!("not said: {other:?}"),

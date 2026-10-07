@@ -748,15 +748,24 @@ fn a_percent_encoded_path_is_redacted() {
     let odd = dir.path().join("Want To Develop, 100% (a)");
     std::fs::create_dir_all(&odd).unwrap();
     let plain = odd.display().to_string();
-    let upper = plain
+    // A URL names a Windows path with `/` and a leading `/` before the drive,
+    // and the percent-encoded forms write `:` as `%3A`.
+    let slashed = plain.replace('\\', "/");
+    let url_path = if slashed.starts_with('/') {
+        slashed
+    } else {
+        format!("/{slashed}")
+    };
+    let upper = url_path
         .replace('%', "%25")
         .replace(' ', "%20")
         .replace(',', "%2C")
         .replace('(', "%28")
-        .replace(')', "%29");
-    let lower = upper.replace("%2C", "%2c");
+        .replace(')', "%29")
+        .replace(':', "%3A");
+    let lower = upper.replace("%2C", "%2c").replace("%3A", "%3a");
     // What the `url` crate writes: only the space and the percent sign.
-    let path_set = plain.replace('%', "%25").replace(' ', "%20");
+    let path_set = url_path.replace('%', "%25").replace(' ', "%20");
     let text = format!(
         "error: file://{upper}/x and file://{lower}/y and {plain}/z and file://{path_set}/w"
     );

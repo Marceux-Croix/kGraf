@@ -37,8 +37,8 @@ fn env() -> Env {
             branch: None,
         })
         .unwrap();
-    let common = std::fs::canonicalize(ws.git_common_dir()).unwrap();
-    let include = std::fs::canonicalize(ws.root())
+    let common = kgraf_core::plain_path::canonicalize(ws.git_common_dir()).unwrap();
+    let include = kgraf_core::plain_path::canonicalize(ws.root())
         .unwrap()
         .join("conf/extra.cfg");
     Env {
@@ -96,11 +96,11 @@ fn the_git_configuration_stays_read_only_in_a_writable_git_directory() {
     let c = &e.common;
     let config = c.join("config");
     let admin = e.ws.admin_dir().expect("admin dir");
-    let admin = std::fs::canonicalize(admin).unwrap();
+    let admin = kgraf_core::plain_path::canonicalize(admin).unwrap();
     let commondir = admin.join("commondir");
     let before_config = std::fs::read(&config).unwrap();
     let before_commondir = std::fs::read(&commondir).unwrap();
-    let elsewhere = std::fs::canonicalize(e.ws.scratch()).unwrap();
+    let elsewhere = kgraf_core::plain_path::canonicalize(e.ws.scratch()).unwrap();
     let evil = "[merge \"evil\"]\n\tdriver = touch /tmp/never\n";
     std::fs::write(elsewhere.join("evil.cfg"), evil).unwrap();
 
@@ -152,8 +152,10 @@ fn the_git_configuration_stays_read_only_in_a_writable_git_directory() {
 #[test]
 fn a_replacement_admin_directory_cannot_be_moved_in() {
     let e = env();
-    let admin = std::fs::canonicalize(e.ws.admin_dir().unwrap()).unwrap();
-    let built = std::fs::canonicalize(e.ws.scratch()).unwrap().join("admin");
+    let admin = kgraf_core::plain_path::canonicalize(e.ws.admin_dir().unwrap()).unwrap();
+    let built = kgraf_core::plain_path::canonicalize(e.ws.scratch())
+        .unwrap()
+        .join("admin");
     let script = format!(
         "cp -R {a} {b} && echo /tmp/planted > {b}/commondir && mv {a} {a}.gone",
         a = q(&admin),

@@ -675,7 +675,7 @@ mod tests {
              [source.v]\ndirectory = \"/srv/vendor\"\n",
         );
         let root = tempfile::tempdir().expect("root");
-        let root = root.path().canonicalize().expect("canonical");
+        let root = kgraf_core::plain_path::canonicalize(root.path()).expect("canonical");
         let tmp = root.join("scratch");
         std::fs::create_dir(&tmp).expect("scratch");
         let p = prepare(&cargo, &root, &tmp).expect("prepared");
@@ -702,7 +702,7 @@ mod tests {
     fn planted_entries_are_replaced_not_followed() {
         let (_home, cargo) = user_home("[net]\noffline = true\n");
         let root = tempfile::tempdir().expect("root");
-        let root = root.path().canonicalize().expect("canonical");
+        let root = kgraf_core::plain_path::canonicalize(root.path()).expect("canonical");
         let tmp = root.join("scratch");
         let own = tmp.join(DIR_NAME);
         std::fs::create_dir_all(&own).expect("own");
@@ -735,7 +735,7 @@ mod tests {
         let (_home, cargo) = user_home("[net]\noffline = true\n");
         std::fs::remove_dir(cargo.join("registry")).expect("no user cache yet");
         let root = tempfile::tempdir().expect("root");
-        let root = root.path().canonicalize().expect("canonical");
+        let root = kgraf_core::plain_path::canonicalize(root.path()).expect("canonical");
         let tmp = root.join("scratch");
         std::fs::create_dir(&tmp).expect("scratch");
         let own = tmp.join(DIR_NAME);
@@ -779,7 +779,7 @@ mod tests {
     fn a_linked_cargo_home_is_not_followed() {
         let (_home, cargo) = user_home("[net]\noffline = true\n");
         let root = tempfile::tempdir().expect("root");
-        let root = root.path().canonicalize().expect("canonical");
+        let root = kgraf_core::plain_path::canonicalize(root.path()).expect("canonical");
         let tmp = root.join("scratch");
         std::fs::create_dir(&tmp).expect("scratch");
         let outside = tempfile::tempdir().expect("outside");
@@ -801,7 +801,7 @@ mod tests {
         let cargo = home.path().join(".cargo");
         std::fs::create_dir_all(&cargo).expect("cargo");
         let root = tempfile::tempdir().expect("root");
-        let root = root.path().canonicalize().expect("canonical");
+        let root = kgraf_core::plain_path::canonicalize(root.path()).expect("canonical");
         let p = prepare(&cargo, &root, &root).expect("prepared");
         assert!(p.home.is_none() && p.notes.is_empty());
         assert!(!root.join(DIR_NAME).exists());

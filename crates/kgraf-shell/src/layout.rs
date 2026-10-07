@@ -348,6 +348,12 @@ pub fn resolve_typed_path(typed: &str, home: Option<&Path>) -> Result<PathBuf, S
     if let Some(rest) = t.strip_prefix("~/") {
         return home_or(rest);
     }
+    // Windows users type `~\src\p` as often as `~/src/p`.
+    if cfg!(windows)
+        && let Some(rest) = t.strip_prefix("~\\")
+    {
+        return home_or(rest);
+    }
     let p = PathBuf::from(t);
     if p.is_absolute() {
         Ok(p)
@@ -4200,9 +4206,17 @@ mod tests {
             resolve_typed_path(" ~/src/p ", Some(home)),
             Ok(PathBuf::from("/home/u/src/p"))
         );
+        if cfg!(windows) {
+            assert_eq!(
+                resolve_typed_path(r" ~\src\p ", Some(home)),
+                Ok(PathBuf::from("/home/u/src/p"))
+            );
+        }
+        // An absolute path is platform-specific: `/abs/p` has no drive on Windows.
+        let abs = std::env::temp_dir().join("abs-p");
         assert_eq!(
-            resolve_typed_path("/abs/p", Some(home)),
-            Ok(PathBuf::from("/abs/p"))
+            resolve_typed_path(&abs.to_string_lossy(), Some(home)),
+            Ok(abs.clone())
         );
         let err = resolve_typed_path("src/p", Some(home)).expect_err("relative");
         assert!(err.contains("relative path") && err.contains('~'), "{err}");

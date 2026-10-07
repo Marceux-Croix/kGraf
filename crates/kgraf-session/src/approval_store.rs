@@ -603,17 +603,19 @@ impl Drop for FileLock {
 /// different path for the store," while a missed case-insensitive alias is
 /// the vulnerability this exists to close.
 fn is_inside(candidate: &Path, root: &Path) -> Result<bool, SessionError> {
-    let root_canon = std::fs::canonicalize(root).map_err(|e| SessionError::ApprovalStore {
-        path: root.to_path_buf(),
-        reason: format!("could not canonicalize the workspace root: {e}"),
-    })?;
+    let root_canon =
+        kgraf_core::plain_path::canonicalize(root).map_err(|e| SessionError::ApprovalStore {
+            path: root.to_path_buf(),
+            reason: format!("could not canonicalize the workspace root: {e}"),
+        })?;
     let absolute_candidate = lexically_normalize(candidate);
     let (existing, tail) = nearest_existing_ancestor_and_tail(&absolute_candidate);
-    let existing_canon =
-        std::fs::canonicalize(&existing).map_err(|e| SessionError::ApprovalStore {
+    let existing_canon = kgraf_core::plain_path::canonicalize(&existing).map_err(|e| {
+        SessionError::ApprovalStore {
             path: existing.clone(),
             reason: format!("could not canonicalize {}: {e}", existing.display()),
-        })?;
+        }
+    })?;
     let candidate_canon = existing_canon.join(tail);
 
     let fold = |p: &Path| p.to_string_lossy().to_lowercase();
@@ -1531,7 +1533,8 @@ mod tests {
         // path under `/var/folders/...`, while `canonicalize`d it resolves
         // through `/private/var/folders/...`. Both name the same directory.
         let workspace = tempdir().expect("tempdir");
-        let canonical_workspace = workspace.path().canonicalize().expect("canonicalize");
+        let canonical_workspace =
+            kgraf_core::plain_path::canonicalize(workspace.path()).expect("canonicalize");
         let err =
             PersistedAllowStore::open(canonical_workspace.join("allow.json"), workspace.path())
                 .expect_err("the canonical alias of the workspace root must be refused");

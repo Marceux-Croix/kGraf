@@ -255,8 +255,8 @@ pub(crate) fn resolves_inside(store: &GraphStore, rel: &str) -> bool {
         return false;
     }
     let (Ok(full), Ok(root)) = (
-        store.root().join(rel).canonicalize(),
-        store.root().canonicalize(),
+        kgraf_core::plain_path::canonicalize(store.root().join(rel)),
+        kgraf_core::plain_path::canonicalize(store.root()),
     ) else {
         return false;
     };

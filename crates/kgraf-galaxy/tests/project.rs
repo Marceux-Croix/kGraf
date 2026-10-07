@@ -699,6 +699,10 @@ fn is_data(e: &FeedEvent) -> bool {
     matches!(e, FeedEvent::Loaded { .. } | FeedEvent::Changes { .. })
 }
 
+// Unix only: a replaced index is a deleted file that an open connection keeps
+// reading. Windows refuses to delete a database file while a connection holds
+// it open (sharing violation), so that state cannot arise there.
+#[cfg(unix)]
 #[test]
 fn a_replaced_index_is_reopened_not_read_stale() {
     let dir = repo();

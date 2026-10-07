@@ -57,9 +57,13 @@ impl LinkOps for Junctions {
         std::fs::symlink_metadata(path).is_ok_and(|m| m.file_attributes() & REPARSE != 0)
     }
     fn link_target(&self, path: &Path) -> Option<PathBuf> {
+        // `get_target` drops the `\??\` prefix; `read_link` gives a symbolic
+        // link's target as `\\?\C:\...`. Both are put in plain form so the
+        // target compares equal to a canonical source path.
         junction::get_target(path)
             .ok()
             .or_else(|| std::fs::read_link(path).ok())
+            .map(|target| kgraf_core::plain_path::simplify(&target).into_owned())
     }
     fn link_dir(&self, target: &Path, at: &Path) -> io::Result<()> {
         junction::create(target, at)
@@ -132,7 +136,10 @@ fn still_inside(tree: &Path, made: &Path) -> bool {
     let Some(parent) = made.parent() else {
         return false;
     };
-    match (std::fs::canonicalize(parent), std::fs::canonicalize(tree)) {
+    match (
+        kgraf_core::plain_path::canonicalize(parent),
+        kgraf_core::plain_path::canonicalize(tree),
+    ) {
         (Ok(p), Ok(t)) => p.starts_with(t),
         _ => false,
     }
@@ -189,7 +196,7 @@ pub(crate) fn link<O: LinkOps>(
         Ok(_) if ops.is_link(&at) => {
             let same = ops
                 .link_target(&at)
-                .and_then(|t| std::fs::canonicalize(t).ok())
+                .and_then(|t| kgraf_core::plain_path::canonicalize(t).ok())
                 .is_some_and(|t| t == source);
             Ok(if same { Linked::Kept } else { Linked::Present })
         }
@@ -240,7 +247,7 @@ pub(crate) fn mirror<O: LinkOps>(
         Ok(_) if ops.is_link(&at) => {
             let ours = ops
                 .link_target(&at)
-                .and_then(|t| std::fs::canonicalize(t).ok())
+                .and_then(|t| kgraf_core::plain_path::canonicalize(t).ok())
                 .is_some_and(|t| t == source);
             if !ours {
                 return Ok(Linked::Present);
@@ -385,7 +392,7 @@ mod tests {
 
     fn canonical_tempdir() -> (tempfile::TempDir, PathBuf) {
         let d = tempfile::tempdir().expect("dir");
-        let p = std::fs::canonicalize(d.path()).expect("canonical");
+        let p = kgraf_core::plain_path::canonicalize(d.path()).expect("canonical");
         (d, p)
     }
 
@@ -397,8 +404,8 @@ mod tests {
         write(&c.join("node_modules/dep/index.js"), "dep");
         write(&c.join(".pnp.cjs"), "pnp");
         let (_t, t) = canonical_tempdir();
-        let nm = std::fs::canonicalize(c.join("node_modules")).expect("nm");
-        let pnp = std::fs::canonicalize(c.join(".pnp.cjs")).expect("pnp");
+        let nm = kgraf_core::plain_path::canonicalize(c.join("node_modules")).expect("nm");
+        let pnp = kgraf_core::plain_path::canonicalize(c.join(".pnp.cjs")).expect("pnp");
         assert!(matches!(
             link(&Symlinks, &t, Path::new("node_modules"), &nm).expect("link"),
             Linked::Made
@@ -848,10 +855,16 @@ mod tests {
         let (_v, v) = canonical_tempdir();
         let ops = Hooked::new();
         replace_with_link(&ops, &d, Path::new("fresh"), &u).expect("absent");
-        assert_eq!(std::fs::canonicalize(d.join("fresh")).expect("c"), u);
+        assert_eq!(
+            kgraf_core::plain_path::canonicalize(d.join("fresh")).expect("c"),
+            u
+        );
         assert_eq!(ops.removed.get(), 0);
         replace_with_link(&ops, &d, Path::new("fresh"), &v).expect("a link");
-        assert_eq!(std::fs::canonicalize(d.join("fresh")).expect("c"), v);
+        assert_eq!(
+            kgraf_core::plain_path::canonicalize(d.join("fresh")).expect("c"),
+            v
+        );
         assert_eq!(ops.removed.get(), 1, "a link goes through remove_link");
         std::fs::write(d.join("file"), "x").expect("write");
         replace_with_link(&ops, &d, Path::new("file"), &u).expect("a file");

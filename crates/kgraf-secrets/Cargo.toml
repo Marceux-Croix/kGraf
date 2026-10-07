@@ -13,6 +13,8 @@ regex.workspace = true
 tracing = "0.1"
 
 [dev-dependencies]
+# The workspace root path in plain form for the tracked-file test (`git -C`).
+kgraf-core.workspace = true
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 
 [[bench]]

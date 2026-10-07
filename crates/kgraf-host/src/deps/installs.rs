@@ -210,7 +210,7 @@ pub fn missing_installs(
     python_ready: &dyn Fn() -> bool,
 ) -> Vec<MissingInstall> {
     let mut out = Vec::new();
-    let Ok(root) = std::fs::canonicalize(checkout) else {
+    let Ok(root) = kgraf_core::plain_path::canonicalize(checkout) else {
         return out;
     };
     kgraf_sandbox::walk_project_dirs(&root, |dir, rel, names| {

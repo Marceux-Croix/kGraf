@@ -993,14 +993,20 @@ mod tests {
 
     fn policy(work: &Path, home: Option<&Path>, network: Network) -> Resolved {
         Resolved {
-            writable: vec![std::fs::canonicalize(work).unwrap()],
+            writable: vec![kgraf_core::plain_path::canonicalize(work).unwrap()],
             readable: vec![],
             read_denied: vec![],
             unix_sockets: vec![],
             network,
-            home: home.map(|h| std::fs::canonicalize(h).unwrap()),
+            home: home.map(|h| kgraf_core::plain_path::canonicalize(h).unwrap()),
             ancestor_limit: None,
-            cargo_homes: home.map(|h| vec![std::fs::canonicalize(h).unwrap().join(".cargo")]),
+            cargo_homes: home.map(|h| {
+                vec![
+                    kgraf_core::plain_path::canonicalize(h)
+                        .unwrap()
+                        .join(".cargo"),
+                ]
+            }),
             frozen_git: vec![],
             dependency_reads: vec![],
             hidden: vec![],
@@ -1011,7 +1017,7 @@ mod tests {
     /// `limit`, with `cargo_homes` as given (`None`: no home was found).
     fn opted(work: &Path, limit: &Path, cargo_homes: Option<Vec<PathBuf>>) -> Resolved {
         Resolved {
-            ancestor_limit: Some(std::fs::canonicalize(limit).unwrap()),
+            ancestor_limit: Some(kgraf_core::plain_path::canonicalize(limit).unwrap()),
             cargo_homes,
             ..policy(work, None, Network::Deny)
         }
@@ -1068,7 +1074,7 @@ mod tests {
 
     fn canonical_tempdir() -> (tempfile::TempDir, PathBuf) {
         let base = tempfile::tempdir().unwrap();
-        let b = std::fs::canonicalize(base.path()).unwrap();
+        let b = kgraf_core::plain_path::canonicalize(base.path()).unwrap();
         (base, b)
     }
 

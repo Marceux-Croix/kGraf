@@ -40,7 +40,7 @@ pub(crate) fn git(dir: &Path, args: &[&str]) -> String {
 /// worktree on branch `work`, and a state directory beside the worktrees.
 pub(crate) fn repo() -> Repo {
     let dir = tempfile::tempdir().expect("tempdir");
-    let base = dir.path().canonicalize().expect("canonical");
+    let base = kgraf_core::plain_path::canonicalize(dir.path()).expect("canonical");
     let checkout = base.join("project");
     std::fs::create_dir_all(&checkout).expect("mkdir");
     git(&checkout, &["init", "-q", "-b", "main"]);

@@ -658,7 +658,7 @@ impl ShellApp {
     /// Opens a folder from the switcher: canonical, a directory, not open yet.
     /// Shows it. Returns why not, when refused.
     pub fn open_project(&mut self, path: &std::path::Path) -> Result<usize, String> {
-        let root = std::fs::canonicalize(path)
+        let root = kgraf_core::plain_path::canonicalize(path)
             .ok()
             .filter(|p| p.is_dir())
             .ok_or_else(|| format!("{} is not a folder", path.display()))?;

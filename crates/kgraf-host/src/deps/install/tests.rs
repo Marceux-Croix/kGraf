@@ -62,7 +62,7 @@ struct Project {
 /// A project with one npm dependency and nothing installed.
 fn project() -> Project {
     let dir = tempfile::tempdir().expect("dir");
-    let root = std::fs::canonicalize(dir.path()).expect("canonical");
+    let root = kgraf_core::plain_path::canonicalize(dir.path()).expect("canonical");
     write(
         &root.join("package.json"),
         r#"{"dependencies":{"dep":"1"}}"#,
@@ -314,7 +314,10 @@ fn the_install_environment_names_no_user_configuration() {
     assert_eq!(env["GRADLE_USER_HOME"], stores.join("gradle").as_os_str());
     let maven = env["MAVEN_OPTS"].to_string_lossy().into_owned();
     assert!(
-        maven.contains("-Dmaven.repo.local=/p/.kgraf/package-stores/maven"),
+        maven.contains(&format!(
+            "-Dmaven.repo.local={}",
+            stores.join("maven").display()
+        )),
         "{maven}"
     );
     assert!(
@@ -458,11 +461,11 @@ fn a_real_install_succeeds_and_its_script_is_confined() {
         return;
     }
     let outside_dir = tempfile::tempdir().expect("outside");
-    let outside = std::fs::canonicalize(outside_dir.path())
+    let outside = kgraf_core::plain_path::canonicalize(outside_dir.path())
         .expect("canonical")
         .join("escaped.txt");
     let dir = tempfile::tempdir().expect("project");
-    let root = std::fs::canonicalize(dir.path()).expect("canonical");
+    let root = kgraf_core::plain_path::canonicalize(dir.path()).expect("canonical");
     std::fs::create_dir_all(root.join(".git/hooks")).expect("git");
     std::fs::create_dir_all(root.join(".kgraf")).expect("state");
     let (forbidden_port, forbidden_hits) = forbidden();
@@ -578,7 +581,7 @@ fn a_failing_install_shows_its_output_and_the_blocked_host() {
         return;
     }
     let dir = tempfile::tempdir().expect("project");
-    let root = std::fs::canonicalize(dir.path()).expect("canonical");
+    let root = kgraf_core::plain_path::canonicalize(dir.path()).expect("canonical");
     std::fs::create_dir_all(root.join(".kgraf")).expect("state");
     write(
         &root.join("package.json"),
@@ -626,7 +629,7 @@ fn a_failing_install_shows_its_output_and_the_blocked_host() {
 #[test]
 fn a_link_an_install_left_in_the_stores_is_never_followed_by_kgraf() {
     let dir = tempfile::tempdir().expect("project");
-    let root = std::fs::canonicalize(dir.path()).expect("canonical");
+    let root = kgraf_core::plain_path::canonicalize(dir.path()).expect("canonical");
     std::fs::create_dir_all(root.join(".kgraf")).expect("state");
     let target = tempfile::tempdir().expect("target");
     let stores = kgraf_sandbox::package_stores_root(&root);
@@ -779,13 +782,18 @@ fn an_install_process_that_leaves_its_group_is_stopped_and_fails_the_install() {
         return;
     }
     let dir = tempfile::tempdir().expect("project");
-    let root = std::fs::canonicalize(dir.path()).expect("canonical");
+    let root = kgraf_core::plain_path::canonicalize(dir.path()).expect("canonical");
     std::fs::create_dir_all(root.join(".kgraf")).expect("state");
     let install = MissingInstall {
         ecosystem: Ecosystem::Npm,
         dir: PathBuf::new(),
         what: "no node_modules".into(),
-        command: "perl -e 'use POSIX; exit 0 if fork(); POSIX::setsid(); sleep 2; \
+        // The parent waits for the child's `setsid` before it exits: else the
+        // group kill at its exit can reach the child before it leaves the
+        // group, nothing escapes, and the install rightly succeeds.
+        command: "perl -e 'use POSIX; pipe(my $r, my $w); \
+                  if (fork()) { close($w); <$r>; exit 0 } \
+                  close($r); POSIX::setsid(); close($w); sleep 2; \
                   open(my $f, \">\", \"escaped\"); close($f);'"
             .into(),
     };
@@ -797,8 +805,163 @@ fn an_install_process_that_leaves_its_group_is_stopped_and_fails_the_install() {
     );
     if cfg!(target_os = "macos") {
         let err = result.expect_err("an install that left a process behind fails");
-        assert!(err.to_string().contains("left its process group"), "{err}");
+        let text = err.to_string();
+        assert!(text.contains("left its process group"), "{text}");
+        // It names the process it stopped: a stop with nobody named is no stop.
+        let named = text
+            .split_once("kGraf stopped it (process ")
+            .and_then(|(_, rest)| rest.chars().next());
+        assert!(named.is_some_and(|c| c.is_ascii_digit()), "{text}");
     }
+}
+
+/// A process with a shared lock on `hold` that left this process's tree
+/// (its parent exits at once, then it calls `setsid`), as an install process
+/// that left its group is. It runs the Perl `then` once the returned pipe is
+/// dropped, and exits: its timing starts when the test says, not when a
+/// loaded machine gets round to it. Its PID and that pipe.
+#[cfg(target_os = "macos")]
+fn detached_holder(hold: &Path, then: &str) -> (libc::pid_t, std::process::ChildStdin) {
+    use std::io::BufRead;
+    let mut spawner = std::process::Command::new("perl")
+        .arg("-e")
+        .arg(format!(
+            "use POSIX; use Fcntl ':flock'; open(my $f, '<', $ARGV[0]) or die; \
+             flock($f, LOCK_SH) or die; my $p = fork(); \
+             if ($p) {{ print \"$p\\n\"; exit 0 }} POSIX::setsid(); close(STDOUT); \
+             my @go = <STDIN>; {then}"
+        ))
+        .arg(hold)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("perl");
+    let go = spawner.stdin.take().expect("stdin");
+    let mut line = String::new();
+    std::io::BufReader::new(spawner.stdout.take().expect("stdout"))
+        .read_line(&mut line)
+        .expect("read");
+    spawner.wait().expect("wait");
+    (line.trim().parse().expect("pid"), go)
+}
+
+#[cfg(target_os = "macos")]
+fn gone_soon(pid: libc::pid_t) -> bool {
+    // A process that has exited stays in the table until launchd reaps it.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    // SAFETY: signal 0 only probes whether the process exists.
+    while unsafe { libc::kill(pid, 0) == 0 } && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // SAFETY: as above.
+    unsafe { libc::kill(pid, 0) != 0 }
+}
+
+/// A hold file in a fresh folder.
+#[cfg(target_os = "macos")]
+fn hold_in(dir: &tempfile::TempDir) -> PathBuf {
+    let hold = dir.path().join("hold");
+    std::fs::File::create(&hold).expect("hold");
+    hold
+}
+
+/// A holder no listing names, that then ends by itself, was not stopped by
+/// kGraf, and the failure must not say it was. Before, it said "kGraf
+/// stopped it (process )": the hold freed when the process ended after its
+/// work, with nobody killed.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_holder_that_ends_unnamed_is_not_reported_as_stopped() {
+    if !on_path("perl") {
+        eprintln!("skipped: no perl on PATH");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("dir");
+    let hold = hold_in(&dir);
+    let (pid, go) = detached_holder(&hold, "select(undef, undef, undef, 0.3);");
+    // Let it go at the first listing, so it ends while kGraf looks for it.
+    let mut go = Some(go);
+    let unnamed = |_: &Path| {
+        go.take();
+        Ok(Vec::new())
+    };
+    let why = stop_holders(&hold, unnamed, Duration::from_secs(5)).expect("a holder was left");
+    assert!(gone_soon(pid), "the holder still runs");
+    assert!(!why.contains("kGraf stopped"), "{why}");
+    assert!(why.contains("ended by itself"), "{why}");
+    assert!(why.contains("left its process group"), "{why}");
+}
+
+/// A listing that fails while the holder runs past the grace: the failure
+/// says the process still runs, and why kGraf could not name it.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_listing_that_fails_leaves_the_holder_reported_as_running() {
+    if !on_path("perl") {
+        eprintln!("skipped: no perl on PATH");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("dir");
+    let hold = hold_in(&dir);
+    // Kept: the holder waits on it, past the grace.
+    let (pid, _go) = detached_holder(&hold, "");
+    let why = stop_holders(
+        &hold,
+        |_| Err(std::io::Error::other("listing refused")),
+        Duration::from_millis(300),
+    )
+    .expect("a holder was left");
+    // SAFETY: kills the holder this test started.
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
+    assert!(why.contains("is still running"), "{why}");
+    assert!(why.contains("listing refused"), "{why}");
+}
+
+/// A holder that left the group and does its work 1 s later is killed
+/// before that work: the real listing names it in time (0.1 to 0.25 s).
+/// Before, two `lsof` runs 100 ms apart took 0.45 to 1 s on an idle machine
+/// and 1.4 to 2.4 s with four CPU-bound processes per core, and under that
+/// load the holder wrote first in half the runs.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_holder_that_left_the_group_is_killed_before_its_work() {
+    if !on_path("perl") {
+        eprintln!("skipped: no perl on PATH");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("dir");
+    let hold = hold_in(&dir);
+    let marker = dir.path().join("worked");
+    let (pid, go) = detached_holder(
+        &hold,
+        &format!(
+            "select(undef, undef, undef, 1.0); open(my $w, '>', '{}'); close($w);",
+            marker.display()
+        ),
+    );
+    // The holder's second starts now, as a process's work goes on from the
+    // moment its group is killed.
+    drop(go);
+    let started = Instant::now();
+    let why = stop_holders(
+        &hold,
+        kgraf_sandbox::lifecycle::holders,
+        kgraf_sandbox::lifecycle::GROUP_EXIT_GRACE,
+    )
+    .expect("a holder was left");
+    let took = started.elapsed();
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(
+        !marker.exists(),
+        "the holder did its work first; the stop took {took:?} ({why})"
+    );
+    assert!(gone_soon(pid), "the holder still runs");
+    assert!(
+        why.contains(&format!("kGraf stopped it (process {pid})")),
+        "{why}"
+    );
 }
 
 /// The package managers read their configuration from the environment as

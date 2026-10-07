@@ -131,6 +131,26 @@ pub const NOT_SHIPPED: &[(&str, &str)] = &[
         "kgraf-provider/test/crosslimit_processes",
         "builds its helper program with cargo at run time; needs Rust",
     ),
+    // trybuild compiles each fixture against the crate's source with cargo and
+    // compares the compiler's words with a recorded file: it needs Rust and the
+    // source tree, and a rustc release that rewords an error fails it. It is a
+    // check of the code, not of Windows behavior.
+    (
+        "kgraf-interpret/test/compile_fail",
+        "trybuild compiles fixtures from the source tree with cargo; needs Rust and the source",
+    ),
+    (
+        "kgraf-provider/test/compile_fail",
+        "trybuild compiles fixtures from the source tree with cargo; needs Rust and the source",
+    ),
+    (
+        "kgraf-session/test/compile_fail",
+        "trybuild compiles fixtures from the source tree with cargo; needs Rust and the source",
+    ),
+    (
+        "kgraf-tools/test/compile_fail",
+        "trybuild compiles fixtures from the source tree with cargo; needs Rust and the source",
+    ),
     (
         "kgraf-mcp/test/stdio_live",
         "builds its MCP test server with cargo at run time; needs Rust",
@@ -181,6 +201,9 @@ pub const CORE: &[(&str, &[&str], f64)] = &[
     ("kgraf-sandbox/test/shell_windows", &[], 2.0),
     // Writes outside, the profile, the registry, junctions, other sandboxes.
     ("kgraf-sandbox/test/escape_windows", &[], 2.0),
+    // HTTPS inside the sandbox: the curl of Git for Windows (OpenSSL) works,
+    // and System32 curl.exe (Schannel) is asserted to fail as documented.
+    ("kgraf-sandbox/test/tls_windows", &[], 2.0),
     ("kgraf-sandbox/test/workspace", &[], 0.5),
     ("kgraf-sandbox/test/merge", &[], 0.3),
     ("kgraf-sandbox/test/reopen", &[], 0.5),
@@ -425,6 +448,13 @@ mod tests {
                 true,
                 "deps/walk_rules-4.exe",
             ),
+            msg(
+                "kgraf-tools",
+                "test",
+                "compile_fail",
+                true,
+                "deps/compile_fail-5.exe",
+            ),
             msg("kgraf-cli", "bin", "kgraf", false, "kgraf.exe"),
             msg("kgraf-cli", "lib", "kgraf_cli", false, "ignored.exe"),
             "{\"reason\":\"build-finished\",\"success\":true}".to_owned(),
@@ -468,8 +498,11 @@ mod tests {
                 .iter()
                 .any(|s| s.reason.contains("needs Rust"))
         );
-        assert_eq!(not_shipped.len(), 1);
+        assert_eq!(not_shipped.len(), 2);
         assert!(not_shipped[0].what.ends_with("live_sessions"));
+        // A trybuild binary needs Rust and the source tree: left out, not run.
+        assert!(not_shipped[1].what.ends_with("compile_fail"));
+        assert!(not_shipped[1].reason.contains("needs Rust"));
         assert_eq!(
             programs,
             vec![BuiltProgram {

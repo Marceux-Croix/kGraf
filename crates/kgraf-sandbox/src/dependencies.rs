@@ -156,7 +156,7 @@ fn changed_since_search(tree: &DependencyTree) -> Option<String> {
     if let Some(why) = crate::trust::untrusted_reason(&meta) {
         return Some(why);
     }
-    match std::fs::canonicalize(&tree.source) {
+    match kgraf_core::plain_path::canonicalize(&tree.source) {
         Ok(now) if now == tree.source => None,
         Ok(now) => Some(format!("now resolves to {}", now.display())),
         Err(e) => Some(format!("cannot be resolved ({e})")),
@@ -200,7 +200,7 @@ impl DependencyLinks {
     /// tools find a project's `.venv`. `None` when no linked environment
     /// owns `dir` (a `.venv` in a sibling project is not this command's).
     pub fn virtual_env_for(&self, dir: &Path) -> Option<&Path> {
-        let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        let dir = kgraf_core::plain_path::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
         nearest_virtual_env(&self.virtual_envs, &dir)
     }
 }
@@ -310,7 +310,7 @@ pub fn walk_project_dirs(
     checkout: &Path,
     mut visit: impl FnMut(&Path, &Path, &Names),
 ) -> Option<String> {
-    let root = std::fs::canonicalize(checkout).ok()?;
+    let root = kgraf_core::plain_path::canonicalize(checkout).ok()?;
     // (absolute folder, relative folder, depth).
     let mut queue = std::collections::VecDeque::from([(root, PathBuf::new(), 0usize)]);
     let mut opened = 0usize;
@@ -359,7 +359,7 @@ pub fn walk_project_dirs(
 pub fn find_dependency_trees(checkout: &Path) -> (Vec<DependencyTree>, Vec<String>) {
     let mut trees = Vec::new();
     let mut notes = Vec::new();
-    let Ok(root) = std::fs::canonicalize(checkout) else {
+    let Ok(root) = kgraf_core::plain_path::canonicalize(checkout) else {
         return (trees, notes);
     };
     let cut = walk_project_dirs(&root, |dir, rel, names| {
@@ -388,7 +388,7 @@ pub fn find_dependency_trees(checkout: &Path) -> (Vec<DependencyTree>, Vec<Strin
                 ));
                 continue;
             }
-            match std::fs::canonicalize(&path) {
+            match kgraf_core::plain_path::canonicalize(&path) {
                 Ok(source) if source.starts_with(&root) => trees.push(DependencyTree {
                     rel: shown,
                     source,
@@ -420,9 +420,11 @@ pub fn link_dependency_trees(tree: &Path, checkout: &Path) -> DependencyLinks {
     if cfg!(not(any(unix, windows))) {
         return out;
     }
-    let checkout_root = std::fs::canonicalize(checkout).unwrap_or_else(|_| checkout.to_path_buf());
+    let checkout_root =
+        kgraf_core::plain_path::canonicalize(checkout).unwrap_or_else(|_| checkout.to_path_buf());
     // Canonical, as the command folder it is compared with.
-    let tree_root = std::fs::canonicalize(tree).unwrap_or_else(|_| tree.to_path_buf());
+    let tree_root =
+        kgraf_core::plain_path::canonicalize(tree).unwrap_or_else(|_| tree.to_path_buf());
     #[cfg(unix)]
     let Ok(root) = crate::confined::open_root(tree) else {
         return out;
@@ -852,7 +854,7 @@ pub(crate) fn stamp_is_racy(stamp: &str) -> bool {
 /// `source` points at, relative to the checkout: a link whose target is a
 /// folder of the checkout outside this install. `None` for any other entry.
 fn workspace_target(entry: &Path, source: &Path, checkout: &Path) -> Option<PathBuf> {
-    let target = std::fs::canonicalize(entry).ok()?;
+    let target = kgraf_core::plain_path::canonicalize(entry).ok()?;
     if target.starts_with(checkout) && !target.starts_with(source) {
         target.strip_prefix(checkout).ok().map(Path::to_path_buf)
     } else {
@@ -1001,7 +1003,8 @@ fn recent_trees(checkout: &Path) -> Found {
     use std::time::Instant;
     static KEPT: OnceLock<Mutex<Vec<(PathBuf, Instant, Found)>>> = OnceLock::new();
     let kept = KEPT.get_or_init(|| Mutex::new(Vec::new()));
-    let key = std::fs::canonicalize(checkout).unwrap_or_else(|_| checkout.to_path_buf());
+    let key =
+        kgraf_core::plain_path::canonicalize(checkout).unwrap_or_else(|_| checkout.to_path_buf());
     let fresh = {
         let list = kept.lock().unwrap_or_else(|p| p.into_inner());
         list.iter()
@@ -1475,7 +1478,7 @@ mod tests {
             ],
             "{notes:?}"
         );
-        let real = std::fs::canonicalize(c.path()).expect("canonical");
+        let real = kgraf_core::plain_path::canonicalize(c.path()).expect("canonical");
         assert!(trees.iter().all(|t| t.source.starts_with(&real)));
     }
 
@@ -1522,7 +1525,7 @@ mod tests {
         assert_eq!(
             first.virtual_env_for(t),
             Some(
-                std::fs::canonicalize(c.path().join(".venv"))
+                kgraf_core::plain_path::canonicalize(c.path().join(".venv"))
                     .expect("venv")
                     .as_path()
             )
@@ -1662,7 +1665,7 @@ mod tests {
         write(&c.path().join(".venv/pyvenv.cfg"), "home = /usr/bin\n");
         let tree = tempfile::tempdir().expect("tree");
         let links = link_dependency_trees(tree.path(), c.path());
-        let real = std::fs::canonicalize(c.path().join(".venv")).expect("canonical");
+        let real = kgraf_core::plain_path::canonicalize(c.path().join(".venv")).expect("canonical");
         assert_eq!(links.virtual_env_for(tree.path()), Some(real.as_path()));
     }
 
@@ -1676,7 +1679,7 @@ mod tests {
     #[test]
     fn workspace_package_links_resolve_to_the_tree_s_own_packages() {
         let c = tempfile::tempdir().expect("dir");
-        let c = std::fs::canonicalize(c.keep()).expect("canonical");
+        let c = kgraf_core::plain_path::canonicalize(c.keep()).expect("canonical");
         write(&c.join("package.json"), r#"{"workspaces":["packages/*"]}"#);
         write(&c.join("packages/web/index.js"), "checkout");
         write(&c.join("packages/web/cli.js"), "checkout cli");
@@ -1691,7 +1694,7 @@ mod tests {
         std::os::unix::fs::symlink("../@s/web/cli.js", c.join("node_modules/.bin/webcli"))
             .expect("ln");
         let tree = tempfile::tempdir().expect("tree");
-        let t = std::fs::canonicalize(tree.path()).expect("canonical");
+        let t = kgraf_core::plain_path::canonicalize(tree.path()).expect("canonical");
         write(&t.join("package.json"), r#"{"workspaces":["packages/*"]}"#);
         write(&t.join("packages/web/index.js"), "tree");
         write(&t.join("packages/web/cli.js"), "tree cli");
@@ -1754,7 +1757,7 @@ mod tests {
     /// `.pnpm/node_modules`, all links relative.
     fn pnpm_checkout() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().expect("dir");
-        let c = std::fs::canonicalize(dir.path()).expect("canonical");
+        let c = kgraf_core::plain_path::canonicalize(dir.path()).expect("canonical");
         write(&c.join("package.json"), r#"{"name":"root","private":true}"#);
         write(
             &c.join("pnpm-workspace.yaml"),
@@ -1800,7 +1803,7 @@ mod tests {
         // The tree in a folder of its own, so the check below of what is left
         // beside it sees no other test's staging folder.
         let outer = tempfile::tempdir().expect("outer");
-        let t = std::fs::canonicalize(outer.path())
+        let t = kgraf_core::plain_path::canonicalize(outer.path())
             .expect("canonical")
             .join("tree");
         write(&t.join("package.json"), r#"{"name":"root","private":true}"#);
@@ -1818,7 +1821,7 @@ mod tests {
         assert_cloned_or_copied(&links, &c, &t);
         // Where Node finds `dep`, and the folders it then looks in for
         // `@s/util`, as Node's own lookup from `dep`'s real path does.
-        let dep = std::fs::canonicalize(nm.join("dep")).expect("dep");
+        let dep = kgraf_core::plain_path::canonicalize(nm.join("dep")).expect("dep");
         assert!(
             dep.starts_with(&t),
             "dep resolves into the checkout: {}",
@@ -1901,12 +1904,13 @@ mod tests {
         );
         write(&c.path().join("svc/web/pyproject.toml"), "");
         let tree = tempfile::tempdir().expect("tree");
-        let t = std::fs::canonicalize(tree.path()).expect("canonical");
+        let t = kgraf_core::plain_path::canonicalize(tree.path()).expect("canonical");
         write(&t.join("svc/api/pyproject.toml"), "");
         write(&t.join("svc/web/pyproject.toml"), "");
         let links = link_dependency_trees(&t, c.path());
-        let root_env = std::fs::canonicalize(c.path().join(".venv")).expect("root");
-        let api_env = std::fs::canonicalize(c.path().join("svc/api/.venv")).expect("api");
+        let root_env = kgraf_core::plain_path::canonicalize(c.path().join(".venv")).expect("root");
+        let api_env =
+            kgraf_core::plain_path::canonicalize(c.path().join("svc/api/.venv")).expect("api");
         assert_eq!(links.virtual_env_for(&t), Some(root_env.as_path()));
         assert_eq!(
             links.virtual_env_for(&t.join("svc/api/tests")),
@@ -1980,7 +1984,7 @@ mod tests {
 
     fn canonical_dir() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().expect("dir");
-        let path = std::fs::canonicalize(dir.path()).expect("canonical");
+        let path = kgraf_core::plain_path::canonicalize(dir.path()).expect("canonical");
         (dir, path)
     }
 
@@ -2613,7 +2617,7 @@ mod tests {
         let dep = std::fs::symlink_metadata(dest.join("dep")).expect("dep");
         assert!(dep.file_type().is_symlink());
         assert_eq!(
-            std::fs::canonicalize(dest.join("dep")).expect("dep"),
+            kgraf_core::plain_path::canonicalize(dest.join("dep")).expect("dep"),
             dest.join(".pnpm/dep@1/node_modules/dep")
         );
         assert_eq!(

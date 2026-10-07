@@ -35,7 +35,7 @@ fn git(root: &Path, args: &[&str]) -> String {
 /// paths the test compares are spelled the same.
 fn repo() -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().expect("dir");
-    let root = std::fs::canonicalize(dir.path()).expect("canonical");
+    let root = kgraf_core::plain_path::canonicalize(dir.path()).expect("canonical");
     git(&root, &["init", "-q", "-b", "main"]);
     std::fs::write(root.join("a.txt"), "a").expect("write");
     git(&root, &["add", "a.txt"]);
@@ -318,7 +318,7 @@ fn a_haustoria_project_moves_to_kgraf_with_worktrees_records_and_ledger_intact()
 #[test]
 fn both_directories_present_is_refused_naming_both() {
     let dir = tempfile::tempdir().expect("dir");
-    let root = std::fs::canonicalize(dir.path()).expect("canonical");
+    let root = kgraf_core::plain_path::canonicalize(dir.path()).expect("canonical");
     std::fs::create_dir_all(root.join(LEGACY_STATE_DIR)).expect("old");
     std::fs::create_dir_all(root.join(STATE_DIR)).expect("new");
     std::fs::write(root.join(LEGACY_STATE_DIR).join("ledger.db"), "old").expect("write");
@@ -351,7 +351,7 @@ fn both_directories_present_is_refused_naming_both() {
 #[test]
 fn a_directory_a_process_still_runs_in_is_not_moved() {
     let dir = tempfile::tempdir().expect("dir");
-    let root = std::fs::canonicalize(dir.path()).expect("canonical");
+    let root = kgraf_core::plain_path::canonicalize(dir.path()).expect("canonical");
     let holds = root.join(LEGACY_STATE_DIR).join("worktrees/.holds");
     std::fs::create_dir_all(&holds).expect("holds");
     let hold = std::fs::File::create(holds.join("w1")).expect("hold");
@@ -412,7 +412,7 @@ fn an_interrupted_move_is_finished_by_the_next_use() {
 #[test]
 fn a_linked_migration_lock_is_refused_and_its_target_untouched() {
     let dir = tempfile::tempdir().expect("dir");
-    let root = std::fs::canonicalize(dir.path()).expect("canonical");
+    let root = kgraf_core::plain_path::canonicalize(dir.path()).expect("canonical");
     let victim = root.join("victim.txt");
     std::fs::write(&victim, "precious").expect("victim");
     std::fs::create_dir_all(root.join(LEGACY_STATE_DIR)).expect("old");
@@ -440,7 +440,7 @@ fn a_linked_migration_lock_is_refused_and_its_target_untouched() {
 fn links_in_the_old_state_directory_are_refused_before_the_move() {
     for planted in ["worker.json", "graph.db", "worktrees/.holds/w1"] {
         let dir = tempfile::tempdir().expect("dir");
-        let root = std::fs::canonicalize(dir.path()).expect("canonical");
+        let root = kgraf_core::plain_path::canonicalize(dir.path()).expect("canonical");
         let old = root.join(LEGACY_STATE_DIR);
         let victim = root.join("victim.txt");
         let text = format!("{{\"p\":\"{}/x\"}}", old.display());
@@ -518,7 +518,7 @@ fn concurrent_first_uses_move_once() {
     const N: usize = 8;
     for _ in 0..5 {
         let dir = tempfile::tempdir().expect("dir");
-        let root = Arc::new(std::fs::canonicalize(dir.path()).expect("canonical"));
+        let root = Arc::new(kgraf_core::plain_path::canonicalize(dir.path()).expect("canonical"));
         std::fs::create_dir_all(root.join(LEGACY_STATE_DIR).join("runs")).expect("old");
         std::fs::write(root.join(LEGACY_STATE_DIR).join("run.json"), "{}").expect("run.json");
         let barrier = Arc::new(std::sync::Barrier::new(N));
@@ -550,7 +550,7 @@ fn concurrent_first_uses_move_once() {
 #[test]
 fn a_path_the_rewrite_cannot_match_is_named_in_the_notice() {
     let dir = tempfile::tempdir().expect("dir");
-    let root = std::fs::canonicalize(dir.path()).expect("canonical");
+    let root = kgraf_core::plain_path::canonicalize(dir.path()).expect("canonical");
     let old = root.join(LEGACY_STATE_DIR);
     std::fs::create_dir_all(&old).expect("old");
     std::fs::write(

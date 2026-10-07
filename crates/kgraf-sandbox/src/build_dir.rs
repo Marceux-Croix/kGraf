@@ -89,10 +89,10 @@ fn seed(warm: &Path, dest: &Path, may_copy: bool) -> Result<SeedReport, SeedErro
     if dest.symlink_metadata().is_ok() {
         return Err(SeedError::DestExists(dest.to_path_buf()));
     }
-    let warm = std::fs::canonicalize(warm).map_err(io(warm))?;
+    let warm = kgraf_core::plain_path::canonicalize(warm).map_err(io(warm))?;
     let parent = dest.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(parent).map_err(io(parent))?;
-    let parent = std::fs::canonicalize(parent).map_err(io(parent))?;
+    let parent = kgraf_core::plain_path::canonicalize(parent).map_err(io(parent))?;
     let dest_abs = match dest.file_name() {
         Some(name) => parent.join(name),
         None => return Err(SeedError::DestExists(dest.to_path_buf())),
@@ -273,7 +273,10 @@ mod tests {
                     report.method,
                     SeedMethod::Clone | SeedMethod::Reflink
                 ));
-                assert_eq!(report.dest, std::fs::canonicalize(&dest).unwrap());
+                assert_eq!(
+                    report.dest,
+                    kgraf_core::plain_path::canonicalize(&dest).unwrap()
+                );
                 assert_eq!(
                     std::fs::read(dest.join("debug/deps/libx.rlib")).unwrap(),
                     b"artifact"

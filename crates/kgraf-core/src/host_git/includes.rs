@@ -295,7 +295,7 @@ mod tests {
     #[test]
     fn every_include_target_is_found_and_cached_until_a_file_changes() {
         let tmp = tempfile::tempdir().expect("tmp");
-        let root = std::fs::canonicalize(tmp.path()).expect("canonical");
+        let root = crate::plain_path::canonicalize(tmp.path()).expect("canonical");
         let repo = root.join("repo");
         std::fs::create_dir_all(&repo).expect("repo");
         git(&repo, &["init", "-q", "-b", "main"]);

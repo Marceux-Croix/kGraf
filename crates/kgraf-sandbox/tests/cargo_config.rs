@@ -82,7 +82,7 @@ fn a_source_replacement_in_the_user_config_applies_without_its_token() {
         .unwrap();
     project(&ws);
     let user = tempfile::tempdir().unwrap();
-    let user = user.path().canonicalize().unwrap();
+    let user = kgraf_core::plain_path::canonicalize(user.path()).unwrap();
     user_cargo_home(&user);
     let policy = |home: &Path| {
         SandboxPolicy::for_workspace(&ws, Network::Deny)

@@ -1899,10 +1899,10 @@ pub fn f() {}
     /// complete workspace, in every cargo form, are not refused.
     #[test]
     fn this_repository_with_ordinary_plans_is_not_refused() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .canonicalize()
-            .expect("root");
+        let root = kgraf_core::plain_path::canonicalize(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."),
+        )
+        .expect("root");
         let repo = DiskRepo(root);
         assert!(
             repo_members("Cargo.toml", &repo).is_some_and(|m| !m.is_empty()),

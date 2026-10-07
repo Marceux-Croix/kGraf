@@ -439,6 +439,8 @@ mod tests {
             err.contains(DOWNLOAD_URL) && err.contains(GIT_BASH_PATH_VAR),
             "{err}"
         );
+        // `Path::join` writes the native separator, so compare with one spelling.
+        let err = err.replace('\\', "/");
         assert!(err.contains("C:/Program Files/Git/bin/bash.exe"), "{err}");
         assert!(!err.contains("System32/bash.exe"), "{err}");
     }

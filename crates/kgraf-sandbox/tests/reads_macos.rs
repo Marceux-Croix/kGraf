@@ -167,7 +167,7 @@ fn credential_paths_are_unreadable_and_secrets_are_scrubbed() {
     let inner = home.path().join(".claude/project/wt");
     std::fs::create_dir_all(&inner).unwrap();
     std::fs::write(inner.join("src.txt"), "project text").unwrap();
-    let inner = std::fs::canonicalize(&inner).unwrap();
+    let inner = kgraf_core::plain_path::canonicalize(&inner).unwrap();
     let inner_policy = SandboxPolicy::new(vec![inner.clone()], Network::Deny);
     let run = |program: &str, args: &[&Path]| {
         sandboxed_command(&inner_policy, program, &inner)

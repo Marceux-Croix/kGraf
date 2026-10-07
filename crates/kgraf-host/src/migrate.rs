@@ -671,19 +671,24 @@ fn repair(root: &Path, old: &Path, new: &Path, git: Option<&Git>) -> Result<Migr
     Ok(report)
 }
 
-/// The spellings of `path` a record may hold: as given, canonical, and on
-/// Windows canonical without the `\\?\` prefix.
+/// The spellings of `path` a record may hold: as given, canonical (plain),
+/// and on Windows canonical with the `\\?\` prefix, which older versions
+/// wrote because the standard canonicalization returns it.
 fn path_forms(path: &Path) -> Vec<PathBuf> {
     let mut forms = vec![path.to_path_buf()];
     let canonical = path
         .parent()
-        .and_then(|p| std::fs::canonicalize(p).ok())
+        .and_then(|p| kgraf_core::plain_path::canonicalize(p).ok())
         .zip(path.file_name())
         .map(|(p, n)| p.join(n));
     if let Some(c) = canonical {
-        let text = c.to_string_lossy().into_owned();
-        if let Some(stripped) = text.strip_prefix(r"\\?\") {
-            forms.push(PathBuf::from(stripped));
+        if cfg!(windows) {
+            let text = c.to_string_lossy();
+            let verbatim = match text.strip_prefix(r"\\") {
+                Some(unc) => format!(r"\\?\UNC\{unc}"),
+                None => format!(r"\\?\{text}"),
+            };
+            forms.push(PathBuf::from(verbatim));
         }
         forms.push(c);
     }
@@ -697,7 +702,9 @@ fn prefix_pairs(root: &Path) -> Vec<(String, String)> {
     let mut pairs: Vec<(String, String)> = olds
         .iter()
         .filter_map(|o| {
-            let parent = o.parent()?;
+            // The new path is written in plain form even for a verbatim old
+            // spelling: git, which reads some of these records, rejects `\\?\`.
+            let parent = kgraf_core::plain_path::simplify(o.parent()?).into_owned();
             Some((
                 o.to_string_lossy().into_owned(),
                 parent.join(STATE_DIR).to_string_lossy().into_owned(),
@@ -832,7 +839,7 @@ fn normalize(path: &Path) -> PathBuf {
 }
 
 fn canonical_or(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| normalize(path))
+    kgraf_core::plain_path::canonicalize(path).unwrap_or_else(|_| normalize(path))
 }
 
 fn move_attempt_refs(git: &Git, root: &Path, report: &mut MigrationReport) -> Result<()> {
@@ -1169,7 +1176,7 @@ mod tests {
     /// worktree with uncommitted work.
     fn legacy_repo() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().expect("dir");
-        let root = std::fs::canonicalize(dir.path()).expect("canonical");
+        let root = kgraf_core::plain_path::canonicalize(dir.path()).expect("canonical");
         git_in(&root, &["init", "-q", "-b", "main"]);
         std::fs::write(root.join("a.txt"), "a").expect("write");
         git_in(&root, &["add", "a.txt"]);

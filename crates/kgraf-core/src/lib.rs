@@ -17,6 +17,7 @@ pub mod output_limit;
 pub mod palette;
 pub mod parallel;
 pub mod paths;
+pub mod plain_path;
 pub mod repo_lock;
 pub mod session;
 pub mod usage;

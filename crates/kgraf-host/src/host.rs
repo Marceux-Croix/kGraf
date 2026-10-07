@@ -2835,7 +2835,7 @@ fn unsafe_scratch_root(dir: &Path) -> Option<String> {
 #[cfg(unix)]
 fn foreign_cargo_file_above(dir: &Path) -> Option<String> {
     use kgraf_sandbox::trust::untrusted_reason;
-    let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let dir = kgraf_core::plain_path::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
     for ancestor in dir.ancestors() {
         for rel in ["Cargo.toml", ".cargo/config.toml", ".cargo/config"] {
             let file = ancestor.join(rel);

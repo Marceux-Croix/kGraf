@@ -255,7 +255,7 @@ fn open(path: &Path) -> std::io::Result<File> {
 /// an ancestor, when it is a git directory (`HEAD` and `objects` in it; an
 /// admin directory with `commondir`). `None` outside any repository.
 pub fn common_dir_of(dir: &Path) -> Option<PathBuf> {
-    let start = std::fs::canonicalize(dir).ok()?;
+    let start = crate::plain_path::canonicalize(dir).ok()?;
     for cur in start.ancestors() {
         if let Some(common) = git_dir_common(cur) {
             return Some(common);
@@ -291,10 +291,10 @@ fn git_dir_common(dir: &Path) -> Option<PathBuf> {
         } else {
             dir.join(rel)
         };
-        return std::fs::canonicalize(common).ok();
+        return crate::plain_path::canonicalize(common).ok();
     }
     if dir.join("objects").is_dir() {
-        return std::fs::canonicalize(dir).ok();
+        return crate::plain_path::canonicalize(dir).ok();
     }
     None
 }

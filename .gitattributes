@@ -2,3 +2,7 @@
 docs/** linguist-documentation
 third_party/** linguist-vendored
 *.wgsl linguist-language=WGSL
+# Test fixtures and generated docs are compared byte for byte (events are cut at
+# blank lines, files are compared with generator output): keep LF on Windows.
+crates/*/tests/fixtures/** text eol=lf
+docs/ERRORS.md text eol=lf

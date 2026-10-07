@@ -16,7 +16,7 @@
 mod contract_support;
 mod support;
 
-use contract_support::{commit_all, runner_with, state_dir};
+use contract_support::{commit_all, py, runner_with, state_dir};
 use kgraf_core::{AgentId, RunId};
 use kgraf_orchestrator::{
     Basis, Challenge, Challenger, CheckStage, ConsumerTestRequest, ConsumerTestWriter,
@@ -63,8 +63,8 @@ fn py_ic() -> InterfaceContract {
             "from config import parse_config, Config\n",
         )],
         tests: vec![FileOverlay::new("test_contract.py", PY_TEST)],
-        compile: s(&["python3", "-c", "import consumer, test_contract"]),
-        test: s(&["python3", "-m", "unittest", "-q", "test_contract"]),
+        compile: s(&[py(), "-c", "import consumer, test_contract"]),
+        test: s(&[py(), "-m", "unittest", "-q", "test_contract"]),
         consulted: s(&[DECISION]),
         replaces: vec![],
     }
@@ -980,7 +980,7 @@ async fn slow_checks_run_off_the_loop_other_work_dispatches_and_stop_is_prompt()
         Duration::from_millis(20),
     );
     let mut ic = py_ic();
-    ic.compile = s(&["python3", "-c", "import time; time.sleep(60)"]);
+    ic.compile = s(&[py(), "-c", "import time; time.sleep(60)"]);
     let o = rig.orchestrator(vec![ic]);
     let h = o.handle();
     let run =
@@ -2633,12 +2633,18 @@ fn producer_check_ic() -> InterfaceContract {
             "# contract check placeholder\n",
         )],
         compile: vec![
-            "python3".into(),
+            py().into(),
             "-c".into(),
             "import ast\nfor p in ('producer.py', 'contract_check.py'):\n    ast.parse(open(p).read())\n"
                 .into(),
         ],
-        test: vec!["grep".into(), "-q".into(), REF_MARK.into(), "producer.py".into()],
+        // Passes only when the file holds the marker (`grep -q`, without
+        // needing a Unix program on the machine).
+        test: vec![
+            py().into(),
+            "-c".into(),
+            format!("import sys; sys.exit(0 if '{REF_MARK}' in open('producer.py').read() else 1)"),
+        ],
         consulted: s(&[DECISION]),
     }
 }
@@ -2895,7 +2901,7 @@ fn current_code_ic() -> InterfaceContract {
         )],
         replaces: vec![],
         tests: vec![],
-        compile: s(&["python3", "-c", "import consumer"]),
+        compile: s(&[py(), "-c", "import consumer"]),
         test: vec![],
         consulted: vec![],
     }
@@ -3245,7 +3251,7 @@ async fn with_no_interface_a_compile_check_is_derived_from_the_scaffold() {
         "kGraf derived a compile check from the repository",
         "stub: the scaffold of config.py",
         "files: consumer.py",
-        "`python3 -c import consumer`",
+        &format!("`{} -c import consumer`", py()),
         "it passed (2 run(s): stub-compile and canaries)",
         "registered as a compile-only interface",
         "no behavior interface the planner wrote was accepted",
@@ -3671,7 +3677,7 @@ async fn a_producer_that_edits_existing_code_gets_a_compile_check_of_its_current
     assert!(derived.stub_is_current_code(), "{derived:?}");
     assert_eq!(derived.stub[0].path, "discount/flat.py");
     assert!(
-        derived.compile.first().is_some_and(|p| p == "python3"),
+        derived.compile.first().is_some_and(|p| p == py()),
         "{derived:?}"
     );
     let reason = events
@@ -3933,7 +3939,7 @@ fn flat_answer(extra: serde_json::Value) -> String {
         "parties": ["c1", "c2"],
         "reference": [{"path": "discount/flat.py", "content": "def flat(x):\n    return x * 2\n"}],
         "tests": [{"path": "test_flat_contract.py", "content": FLAT_CONTRACT_TEST}],
-        "test": ["python3", "-m", "unittest", "-q", "test_flat_contract"],
+        "test": [py(), "-m", "unittest", "-q", "test_flat_contract"],
     });
     if let (Some(base), Some(more)) = (entry.as_object_mut(), extra.as_object()) {
         base.extend(more.clone());
@@ -4027,7 +4033,7 @@ async fn a_producer_no_test_reaches_is_asked_once_for_a_reference_and_a_test_onl
     assert_eq!(behavior.symbols, ["flat"]);
     assert_eq!(
         behavior.compile,
-        ["python3", "-c", "import pricing; import test_flat_contract"]
+        [py(), "-c", "import pricing; import test_flat_contract"]
     );
 }
 
@@ -4039,7 +4045,7 @@ async fn a_compile_command_that_does_not_build_the_files_is_repaired_without_a_r
     let dir = tempfile::tempdir().expect("dir");
     let rig = flat_rig(
         dir.path(),
-        flat_answer(serde_json::json!({"compile": ["python3", "-c", "pass"]})),
+        flat_answer(serde_json::json!({"compile": [py(), "-c", "pass"]})),
     );
     let report = plan_then_stop(rig.orchestrator(vec![])).await;
     assert_eq!(
@@ -4049,10 +4055,11 @@ async fn a_compile_command_that_does_not_build_the_files_is_repaired_without_a_r
     );
     assert_eq!(report.contracts.interfaces_registered, 2, "{report:?}");
     assert!(
-        report.notices.iter().any(|n| n.contains(
+        report.notices.iter().any(|n| n.contains(&format!(
             "the answer's compile command did not build every file; kGraf replaced it with \
-             `python3 -c import pricing; import test_flat_contract`"
-        )),
+             `{} -c import pricing; import test_flat_contract`",
+            py()
+        ))),
         "{:?}",
         report.notices
     );
@@ -4069,7 +4076,7 @@ async fn a_compile_command_that_does_not_build_the_files_is_repaired_without_a_r
         .expect("registered");
     assert_eq!(
         behavior.compile,
-        ["python3", "-c", "import pricing; import test_flat_contract"]
+        [py(), "-c", "import pricing; import test_flat_contract"]
     );
 }
 
@@ -4080,7 +4087,9 @@ async fn a_command_that_cannot_run_in_the_sandbox_is_replaced_not_refused() {
     let dir = tempfile::tempdir().expect("dir");
     let rig = flat_rig(
         dir.path(),
-        flat_answer(serde_json::json!({"compile": ["python3 -c 'import test_flat_contract'"]})),
+        flat_answer(
+            serde_json::json!({"compile": [format!("{} -c 'import test_flat_contract'", py())]}),
+        ),
     );
     let report = plan_then_stop(rig.orchestrator(vec![])).await;
     assert_eq!(rig.parts.planner.prompts().len(), 2, "no re-ask");
@@ -4156,7 +4165,7 @@ async fn a_re_ask_covers_only_the_refused_interface() {
                 "import unittest\nfrom {} import f\n\nclass T(unittest.TestCase):\n    def test_f(self):\n        {body}\n",
                 path.trim_end_matches(".py").replace('/', ".")
             )}],
-            "test": ["python3", "-m", "unittest", "-q", test_name],
+            "test": [py(), "-m", "unittest", "-q", test_name],
         })
     };
     let good = entry(

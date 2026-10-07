@@ -356,7 +356,9 @@ const FAKE_DOTENV_KEY: &str = "sk-HOSTTESTKEY9f8e7d6c5b4a3210zyxwvQ";
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_checkout_env_is_unreadable_from_a_worktree_build_and_scrubbed() {
     let (r, _denies) = lockless_crate();
-    let dotenv = r.root.canonicalize().expect("root").join(".env");
+    let dotenv = kgraf_core::plain_path::canonicalize(&r.root)
+        .expect("root")
+        .join(".env");
     std::fs::write(&dotenv, format!("VENDOR_API_KEY={FAKE_DOTENV_KEY}\n")).expect("env");
     let check = format!("cat '{}'", dotenv.display());
     let config = WorkerConfig::default().with_configured_commands([check.as_str()]);

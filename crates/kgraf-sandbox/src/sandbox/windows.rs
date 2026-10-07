@@ -63,6 +63,33 @@
 //! all of this, and the runner refuses unless the policy opts in to partial
 //! isolation (fail loud).
 //!
+//! **TLS through Schannel does not work in this sandbox.** A program that
+//! uses the Windows TLS stack (`curl.exe` from System32, PowerShell
+//! `Invoke-WebRequest`, .NET `HttpClient` and `SslStream`, WinHTTP and
+//! WinINet, git with `http.sslBackend=schannel`) fails before it sends a
+//! byte: `AcquireCredentialsHandle` returns `SEC_E_NO_CREDENTIALS`, even for
+//! a client with no certificate and with the network allowed. Schannel's
+//! credential calls are served inside LSA, which tells a security package
+//! whether its caller is restricted (`SECPKG_CLIENT_INFO::Restricted`), and
+//! the outbound credential is refused to a caller whose token has
+//! restricting SIDs. Microsoft does not document the refusal; it is
+//! measured (openai/codex issue 17459: one restricting SID, Everyone, with
+//! or without `WRITE_RESTRICTED`, is enough, and NTLM and Negotiate refuse
+//! default credentials the same way). Every token here has restricting
+//! SIDs: they are the write boundary. The environment is not the cause
+//! (`USERPROFILE`, `APPDATA` and the registry hive are the user's own). The
+//! `schannel` tests below measure it per token property: the user's token
+//! and a Low copy of it get a credential; a token with a restricting SID
+//! does not. A program with its own TLS library
+//! (OpenSSL in Git for Windows, Node, Python, Rust with rustls) is not
+//! affected. Removing the restricting SIDs would remove the per-root write
+//! confinement, so it is not done here (decision 0011, amendment
+//! "Schannel"). With the network open, the command's environment steers the
+//! tools that can switch: `CURL_SSL_BACKEND=openssl` for the curl of Git for
+//! Windows, and `http.sslBackend=openssl` through `GIT_CONFIG_COUNT` for git
+//! (see `git_config_entries`). A tool whose only TLS stack is Schannel
+//! (curl.exe from System32, PowerShell, .NET) still fails.
+//!
 //! **POSIX shells.** A command whose program is `sh` or `bash` runs through
 //! Git Bash, with its argv carried in the environment (see
 //! [`SHELL_TRAMPOLINE`] and the section above it); with no Git Bash it is not
@@ -114,10 +141,46 @@ pub(super) const STRENGTH: IsolationStrength = IsolationStrength {
            is open, so a read there is exfiltratable; network egress is not blocked; a DACL \
            that grants write to Everyone still needs a Low label to be writable, but a Low, \
            Everyone-writable location (some temp and shared paths) is writable; named pipes \
-           and sockets are confined only by their own ACLs and integrity labels; the gitlink \
+           and sockets are confined only by their own ACLs and integrity labels; HTTPS \
+           through the Windows TLS stack (Schannel: curl.exe from System32, PowerShell, \
+           .NET, WinHTTP) fails with SEC_E_NO_CREDENTIALS, because Schannel refuses a client \
+           credential to a token with restricting SIDs (git and the curl of Git for Windows \
+           are set to OpenSSL, and tools with their own TLS library work); the gitlink \
            deny, the Low label on the writable roots, and cross-sandbox write denial are \
            unverified on Windows",
 };
+
+/// The TLS library tools are steered to inside this sandbox. The Windows
+/// stack (Schannel) cannot run under the sandbox token (see the module
+/// header); Git for Windows ships OpenSSL beside it.
+pub(super) const TLS_BACKEND: &str = "openssl";
+
+/// The variable the multi-backend curl of Git for Windows (and git's own
+/// libcurl) reads to pick its TLS backend.
+pub(super) const CURL_SSL_BACKEND_VAR: &str = "CURL_SSL_BACKEND";
+
+/// The `GIT_CONFIG_KEY_n` / `GIT_CONFIG_VALUE_n` pairs the sandbox adds from
+/// index `start` (the host's own `GIT_CONFIG_COUNT`, or 0), and the new
+/// count. The first entry resets the credential helper list, so git does not
+/// ask the Credential Manager. With the network open, a second selects
+/// OpenSSL for git's HTTPS (`http.sslBackend`), because Schannel cannot run
+/// under the sandbox token. The entries are appended after the host's, never
+/// replacing them; neither touches `GIT_CONFIG_NOSYSTEM` or
+/// `GIT_CONFIG_GLOBAL`, which keep their effect.
+pub(super) fn git_config_entries(start: u32, network_open: bool) -> (Vec<(String, String)>, u32) {
+    let mut pairs: Vec<(&str, &str)> = vec![("credential.helper", "")];
+    if network_open {
+        pairs.push(("http.sslBackend", TLS_BACKEND));
+    }
+    let mut entries = Vec::with_capacity(pairs.len() * 2);
+    for (offset, (key, value)) in (0u32..).zip(pairs.iter()) {
+        let n = start + offset;
+        entries.push((format!("GIT_CONFIG_KEY_{n}"), (*key).to_owned()));
+        entries.push((format!("GIT_CONFIG_VALUE_{n}"), (*value).to_owned()));
+    }
+    let count = start + pairs.len() as u32;
+    (entries, count)
+}
 
 /// The capability SID for one writable root. Deterministic, so repeated runs
 /// reuse one ACE instead of adding one per run (and re-propagating it through
@@ -748,14 +811,15 @@ mod imp {
         )
     }
 
-    /// `\\?\C:\x` -> `C:\x`. `fs::canonicalize` returns verbatim paths;
-    /// codex strips them (`dunce`) before the ACL calls, and so does this.
+    /// `\\?\C:\x` -> `C:\x`, through the one rule in
+    /// `kgraf_core::plain_path`. Policy paths are canonical and so already
+    /// plain; this covers a verbatim path given from elsewhere. A verbatim path
+    /// whose plain form names a different file (`\\?\C:\a.` is not `C:\a`)
+    /// stays verbatim, so an ACL never lands on a different object. The
+    /// capability SID is derived from this string, so every root goes through
+    /// this one function before its SID is made.
     fn strip_verbatim(path: &Path) -> PathBuf {
-        let s = path.as_os_str().to_string_lossy();
-        match s.strip_prefix(r"\\?\") {
-            Some(rest) if rest.as_bytes().get(1) == Some(&b':') => PathBuf::from(rest),
-            _ => path.to_path_buf(),
-        }
+        kgraf_core::plain_path::simplify(path).into_owned()
     }
 
     // ---- reparse, volume and integrity-label guards ----------------------------
@@ -2192,6 +2256,168 @@ mod imp {
             stdio[2].unwrap_or(Redirect::Inherit),
         ]
     }
+
+    /// Which token property makes the Windows TLS stack (Schannel) refuse a
+    /// client credential. Schannel's `AcquireCredentialsHandle` is served
+    /// inside LSA, which reads the calling thread's token, so a thread that
+    /// impersonates a token gets the answer a process running with that
+    /// token gets. No network and no server: the refusal comes before any
+    /// connection. See "TLS through Schannel" at the top of this file.
+    #[cfg(test)]
+    mod schannel {
+        use super::*;
+        use windows_sys::Win32::Foundation::{SEC_E_NO_CREDENTIALS, SEC_E_OK};
+        use windows_sys::Win32::Security::Authentication::Identity::{
+            AcquireCredentialsHandleW, FreeCredentialsHandle, SCH_CRED_MANUAL_CRED_VALIDATION,
+            SCH_CRED_NO_DEFAULT_CREDS, SCHANNEL_CRED, SCHANNEL_CRED_VERSION, SECPKG_CRED_OUTBOUND,
+            UNISP_NAME_W,
+        };
+        use windows_sys::Win32::Security::Credentials::SecHandle;
+        use windows_sys::Win32::Security::{RevertToSelf, TokenPrimary};
+        use windows_sys::Win32::System::Threading::SetThreadToken;
+
+        fn hex(status: i32) -> String {
+            format!("{:#010x}", status as u32)
+        }
+
+        /// The status of an outbound Schannel credential request from a new
+        /// thread that impersonates `token`. The request is the one curl's
+        /// Schannel backend makes: no client certificate, server checked by
+        /// the caller.
+        fn client_credential_status(token: &OwnedHandle) -> i32 {
+            // A HANDLE is a pointer and not `Send`; the thread is joined
+            // before `token` can close.
+            let raw = token.as_raw_handle() as usize;
+            std::thread::spawn(move || {
+                let mut imp: HANDLE = ptr::null_mut();
+                // SAFETY: `raw` is a token handle that stays open until this
+                // thread is joined; the output is written on success.
+                let ok = unsafe {
+                    DuplicateTokenEx(
+                        raw as HANDLE,
+                        TOKEN_QUERY | TOKEN_IMPERSONATE,
+                        ptr::null(),
+                        SecurityImpersonation,
+                        TokenImpersonation,
+                        &mut imp,
+                    )
+                };
+                assert_ne!(ok, 0, "DuplicateTokenEx: {}", io::Error::last_os_error());
+                let imp = owned(imp, "DuplicateTokenEx").unwrap();
+                // SAFETY: a null thread pointer means the calling thread;
+                // `imp` is a valid impersonation token.
+                let ok = unsafe { SetThreadToken(ptr::null(), imp.as_raw_handle()) };
+                assert_ne!(ok, 0, "SetThreadToken: {}", io::Error::last_os_error());
+                let cred = SCHANNEL_CRED {
+                    dwVersion: SCHANNEL_CRED_VERSION,
+                    dwFlags: SCH_CRED_NO_DEFAULT_CREDS | SCH_CRED_MANUAL_CRED_VALIDATION,
+                    ..Default::default()
+                };
+                let mut handle = SecHandle {
+                    dwLower: 0,
+                    dwUpper: 0,
+                };
+                let mut expiry = 0i64;
+                // SAFETY: the package name is a static NUL-terminated string,
+                // `cred` is a valid SCHANNEL_CRED, and both outputs are valid.
+                let status = unsafe {
+                    AcquireCredentialsHandleW(
+                        ptr::null(),
+                        UNISP_NAME_W,
+                        SECPKG_CRED_OUTBOUND,
+                        ptr::null(),
+                        ptr::addr_of!(cred).cast(),
+                        None,
+                        ptr::null(),
+                        &mut handle,
+                        &mut expiry,
+                    )
+                };
+                if status == SEC_E_OK {
+                    // SAFETY: a credential handle acquired above, freed once.
+                    unsafe { FreeCredentialsHandle(&handle) };
+                }
+                // SAFETY: ends this thread's impersonation; no arguments.
+                unsafe { RevertToSelf() };
+                status
+            })
+            .join()
+            .unwrap()
+        }
+
+        /// A primary copy of this process's token, which can be changed
+        /// without changing the process.
+        fn own_token_copy() -> OwnedHandle {
+            let mut raw: HANDLE = ptr::null_mut();
+            // SAFETY: pseudo-handle of this process; output written on success.
+            let ok = unsafe {
+                OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_QUERY, &mut raw)
+            };
+            assert_ne!(ok, 0, "OpenProcessToken: {}", io::Error::last_os_error());
+            let base = owned(raw, "OpenProcessToken").unwrap();
+            let mut dup: HANDLE = ptr::null_mut();
+            // SAFETY: a valid token opened for duplication; output written on
+            // success.
+            let ok = unsafe {
+                DuplicateTokenEx(
+                    base.as_raw_handle(),
+                    TOKEN_DUPLICATE
+                        | TOKEN_QUERY
+                        | TOKEN_IMPERSONATE
+                        | TOKEN_ADJUST_DEFAULT
+                        | TOKEN_ASSIGN_PRIMARY,
+                    ptr::null(),
+                    SecurityImpersonation,
+                    TokenPrimary,
+                    &mut dup,
+                )
+            };
+            assert_ne!(ok, 0, "DuplicateTokenEx: {}", io::Error::last_os_error());
+            owned(dup, "DuplicateTokenEx").unwrap()
+        }
+
+        /// The control: without it a refusal below could be a broken probe.
+        #[test]
+        fn schannel_gives_the_users_own_token_a_client_credential() {
+            let status = client_credential_status(&own_token_copy());
+            assert_eq!(status, SEC_E_OK, "got {}", hex(status));
+        }
+
+        /// The cause, pinned: the token every sandboxed command runs with is
+        /// refused, so Schannel HTTPS (curl.exe, PowerShell, .NET, git with
+        /// its Schannel backend) fails in the sandbox with
+        /// `SEC_E_NO_CREDENTIALS` before it sends a byte. A change that makes
+        /// Schannel work in the sandbox makes this test fail; it must then
+        /// assert `SEC_E_OK`.
+        #[test]
+        fn schannel_refuses_the_sandbox_token_a_client_credential() {
+            let (token, _, _) = build_sandbox_token(&[]).unwrap();
+            let status = client_credential_status(&token);
+            assert_eq!(status, SEC_E_NO_CREDENTIALS, "got {}", hex(status));
+        }
+
+        /// Restricting SIDs alone cause the refusal: no Low integrity level,
+        /// no default DACL change, one restricting SID (Everyone).
+        #[test]
+        fn restricting_sids_alone_make_schannel_refuse() {
+            let everyone = Sid::from_string("S-1-1-0").unwrap();
+            let (token, _, _) = restricted_token_for(&[everyone]).unwrap();
+            let status = client_credential_status(&token);
+            assert_eq!(status, SEC_E_NO_CREDENTIALS, "got {}", hex(status));
+        }
+
+        /// The Low integrity level alone does not cause it: a token with no
+        /// restricting SID, lowered to Low, still gets a credential. A write
+        /// boundary built on the integrity level without restricting SIDs
+        /// would therefore keep Schannel working.
+        #[test]
+        fn low_integrity_alone_keeps_schannel_working() {
+            let token = own_token_copy();
+            set_integrity_low(&token).unwrap();
+            let status = client_credential_status(&token);
+            assert_eq!(status, SEC_E_OK, "got {}", hex(status));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2442,5 +2668,56 @@ mod tests {
             "<zero>[a b][it's][*.rs][C:\\\\dir\\\\][\"q\"][{x,y}][~][@file][new\nline][]{unset}\n\
              a.rs b.rs\n"
         );
+    }
+
+    fn lookup<'a>(entries: &'a [(String, String)], key: &str) -> Option<&'a str> {
+        entries
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// With the network open the sandbox adds the credential-helper reset and
+    /// the OpenSSL selection, after the host's own entries.
+    #[test]
+    fn git_config_entries_append_after_the_hosts_with_the_network_open() {
+        let (entries, count) = git_config_entries(2, true);
+        assert_eq!(count, 4);
+        assert_eq!(
+            lookup(&entries, "GIT_CONFIG_KEY_2"),
+            Some("credential.helper")
+        );
+        assert_eq!(lookup(&entries, "GIT_CONFIG_VALUE_2"), Some(""));
+        assert_eq!(
+            lookup(&entries, "GIT_CONFIG_KEY_3"),
+            Some("http.sslBackend")
+        );
+        assert_eq!(lookup(&entries, "GIT_CONFIG_VALUE_3"), Some("openssl"));
+        assert_eq!(entries.len(), 4);
+        // Nothing below the host's count is written.
+        assert!(lookup(&entries, "GIT_CONFIG_KEY_0").is_none());
+        assert!(lookup(&entries, "GIT_CONFIG_KEY_1").is_none());
+    }
+
+    /// Without an open network only the credential-helper reset is added.
+    #[test]
+    fn git_config_entries_keep_the_tls_backend_out_without_open_network() {
+        let (entries, count) = git_config_entries(0, false);
+        assert_eq!(count, 1);
+        assert_eq!(
+            lookup(&entries, "GIT_CONFIG_KEY_0"),
+            Some("credential.helper")
+        );
+        assert!(entries.iter().all(|(_, v)| v != "openssl"));
+    }
+
+    /// The config entries never name the variables that freeze git's own
+    /// configuration, so their effect is intact.
+    #[test]
+    fn git_config_entries_leave_the_frozen_config_variables_alone() {
+        let (entries, _) = git_config_entries(0, true);
+        assert!(entries.iter().all(|(k, _)| {
+            k.starts_with("GIT_CONFIG_KEY_") || k.starts_with("GIT_CONFIG_VALUE_")
+        }));
     }
 }

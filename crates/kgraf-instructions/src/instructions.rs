@@ -57,7 +57,7 @@ fn read_one(
     layers: &mut Vec<InstructionLayer>,
     problems: &mut Vec<Problem>,
 ) {
-    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_owned());
+    let canonical = kgraf_core::plain_path::canonicalize(path).unwrap_or_else(|_| path.to_owned());
     if chain.contains(&canonical) {
         problems.push(Problem {
             path: path.to_owned(),

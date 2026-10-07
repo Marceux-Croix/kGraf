@@ -328,7 +328,7 @@ distributionUrl=https\\://services.gradle.org/distributions/gradle-8.5-bin.zip\n
             PROPERTIES,
         );
         let scratch = tempfile::tempdir().expect("scratch");
-        let root = std::fs::canonicalize(scratch.path()).expect("canonical");
+        let root = kgraf_core::plain_path::canonicalize(scratch.path()).expect("canonical");
         let tmp = root.clone();
         assert_eq!(
             prepare(&g, &root, &tmp, project.path()).expect("prepare"),
@@ -363,7 +363,7 @@ distributionUrl=https\\://services.gradle.org/distributions/gradle-8.5-bin.zip\n
 
         // A link planted where the command home goes is never followed.
         let other = tempfile::tempdir().expect("other");
-        let root2 = std::fs::canonicalize(other.path()).expect("canonical");
+        let root2 = kgraf_core::plain_path::canonicalize(other.path()).expect("canonical");
         std::os::unix::fs::symlink(&g, root2.join("gradle-home")).expect("plant");
         assert!(prepare(&g, &root2, &root2, project.path()).is_err());
         assert!(
@@ -395,7 +395,7 @@ distributionUrl=https\\://services.gradle.org/distributions/gradle-8.5-bin.zip\n
             PROPERTIES,
         );
         let scratch = tempfile::tempdir().expect("scratch");
-        let root = std::fs::canonicalize(scratch.path()).expect("canonical");
+        let root = kgraf_core::plain_path::canonicalize(scratch.path()).expect("canonical");
         let mine = root.join("gradle-home/wrapper/dists/gradle-8.5-bin/abc123/gradle-8.5");
         std::fs::create_dir_all(&mine).expect("mkdir");
         let err = prepare(&g, &root, &root, project.path())
@@ -431,7 +431,7 @@ distributionUrl=https\\://services.gradle.org/distributions/gradle-8.5-bin.zip\n
             PROPERTIES,
         );
         let scratch = tempfile::tempdir().expect("scratch");
-        let root = std::fs::canonicalize(scratch.path()).expect("canonical");
+        let root = kgraf_core::plain_path::canonicalize(scratch.path()).expect("canonical");
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o500)).expect("chmod");
         let can_write = std::fs::File::create(root.join(".probe")).is_ok();
         let err = prepare(&g, &root, &root, project.path()).err();

@@ -25,7 +25,7 @@ fn write(path: &Path, text: &str) {
 #[test]
 fn stores_and_dependency_trees_are_readable_and_credentials_beside_them_are_not() {
     let home = tempfile::tempdir().expect("home");
-    let h = std::fs::canonicalize(home.path()).expect("canonical");
+    let h = kgraf_core::plain_path::canonicalize(home.path()).expect("canonical");
     // SAFETY: the only test of this binary, run before it starts a thread.
     unsafe { std::env::set_var("HOME", &h) };
     let stores = [
@@ -77,7 +77,7 @@ fn stores_and_dependency_trees_are_readable_and_credentials_beside_them_are_not(
     }
 
     let checkout = tempfile::tempdir().expect("checkout");
-    let c = std::fs::canonicalize(checkout.path()).expect("canonical");
+    let c = kgraf_core::plain_path::canonicalize(checkout.path()).expect("canonical");
     write(&c.join("package.json"), "{}");
     write(&c.join("node_modules/dep/index.js"), "dep");
     write(&c.join(".env"), FAKE);
@@ -85,7 +85,7 @@ fn stores_and_dependency_trees_are_readable_and_credentials_beside_them_are_not(
     std::os::unix::fs::symlink(c.join(".env"), c.join("node_modules/dotenv-link")).expect("link");
 
     let tree = tempfile::tempdir().expect("tree");
-    let t = std::fs::canonicalize(tree.path()).expect("canonical");
+    let t = kgraf_core::plain_path::canonicalize(tree.path()).expect("canonical");
     write(&t.join("package.json"), "{}");
     let links = link_dependency_trees(&t, &c);
     assert_eq!(links.reads, vec![c.join("node_modules")], "{links:?}");

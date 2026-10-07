@@ -467,8 +467,7 @@ fn drive(d: DriveArgs<'_>) -> Result<kgraf_runtime::WorkerResult> {
                 rule.scope, rule.tool
             );
         }
-        let project = root
-            .canonicalize()
+        let project = kgraf_core::plain_path::canonicalize(root)
             .with_context(|| format!("cannot resolve {}", root.display()))?
             .to_string_lossy()
             .into_owned();

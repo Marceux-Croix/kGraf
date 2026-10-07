@@ -267,7 +267,7 @@ fn repo() -> Repo {
     std::fs::write(root.join(".gitignore"), ".kgraf/\n").expect("gitignore");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-q", "-m", "init"]);
-    let root = root.canonicalize().expect("canonical");
+    let root = kgraf_core::plain_path::canonicalize(&root).expect("canonical");
     let state = root.join(".kgraf");
     std::fs::create_dir_all(&state).expect("state");
     let manager =
@@ -1635,13 +1635,9 @@ async fn a_stdio_mcp_server_starts_outside_the_worktree_and_never_runs_a_planted
         "the server connected"
     );
     let cwd = PathBuf::from(std::fs::read_to_string(&out).expect("cwd recorded").trim());
-    let home = assembled
-        .mcp_home
-        .clone()
-        .expect("a home")
-        .canonicalize()
+    let home = kgraf_core::plain_path::canonicalize(assembled.mcp_home.clone().expect("a home"))
         .expect("home");
-    assert!(home.starts_with(repo.state.canonicalize().expect("state")));
+    assert!(home.starts_with(kgraf_core::plain_path::canonicalize(&repo.state).expect("state")));
     assert_eq!(cwd, home, "a clean directory under the state directory");
     assert!(!cwd.starts_with(ws.root()), "never the worktree");
     assert_eq!(

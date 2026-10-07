@@ -74,21 +74,12 @@ pub const STORE_COMPLETE: &str = ".kgraf-store-complete";
 
 /// Mark the store `rel` (a [`layout`] name) of the project at `checkout` as
 /// filled by a successful install. The install could write the stores, so
-/// the marker is written without following a link (decision 0083); on
-/// Windows, which has no such walk, by path.
+/// the marker is written without following a link (decision 0083).
 pub fn mark_store_complete(checkout: &Path, rel: &str) -> std::io::Result<()> {
     let root = package_stores_root(checkout);
     std::fs::create_dir_all(&root)?;
     let file = Path::new(rel).join(STORE_COMPLETE);
-    #[cfg(unix)]
-    {
-        crate::write_confined(&root, &file, b"")
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::create_dir_all(root.join(rel))?;
-        std::fs::write(root.join(file), "")
-    }
+    crate::write_confined(&root, &file, b"")
 }
 
 impl PackageStores {
@@ -103,9 +94,9 @@ impl PackageStores {
             if !meta.is_dir() || !path.join(STORE_COMPLETE).is_file() {
                 return None;
             }
-            let canonical = std::fs::canonicalize(&path).ok()?;
+            let canonical = kgraf_core::plain_path::canonicalize(&path).ok()?;
             // A link anywhere on the way resolves elsewhere.
-            let expected = std::fs::canonicalize(checkout)
+            let expected = kgraf_core::plain_path::canonicalize(checkout)
                 .ok()?
                 .join(kgraf_core::legacy::STATE_DIR)
                 .join(PACKAGE_STORES_DIR)
@@ -155,8 +146,8 @@ pub fn jvm_path(path: &Path) -> PathBuf {
         // process.
         let mut h = std::collections::hash_map::DefaultHasher::new();
         path.hash(&mut h);
-        let tmp =
-            std::fs::canonicalize(std::env::temp_dir()).unwrap_or_else(|_| std::env::temp_dir());
+        let tmp = kgraf_core::plain_path::canonicalize(std::env::temp_dir())
+            .unwrap_or_else(|_| std::env::temp_dir());
         let alias = tmp.join(format!("kgraf-jvm-{:016x}", h.finish()));
         if alias.to_string_lossy().chars().any(char::is_whitespace) {
             return path.to_path_buf();
@@ -195,7 +186,7 @@ mod tests {
     #[test]
     fn a_path_with_white_space_gets_a_jvm_safe_link() {
         let dir = tempfile::tempdir().expect("dir");
-        let plain = std::fs::canonicalize(dir.path())
+        let plain = kgraf_core::plain_path::canonicalize(dir.path())
             .expect("canonical")
             .join("store");
         std::fs::create_dir_all(&plain).expect("mkdir");
@@ -217,7 +208,7 @@ mod tests {
     #[test]
     fn only_real_store_folders_are_found() {
         let dir = tempfile::tempdir().expect("dir");
-        let c = std::fs::canonicalize(dir.path()).expect("canonical");
+        let c = kgraf_core::plain_path::canonicalize(dir.path()).expect("canonical");
         assert!(PackageStores::find(&c).is_empty());
         let root = package_stores_root(&c);
         std::fs::create_dir_all(root.join("go")).expect("go");

@@ -257,11 +257,11 @@ where
             // the handle is settled again before the error is mapped: only a
             // cancellation mid-await leaves it unsettled.
             t.settled = false;
-            let truncated = t.file.set_len(torn.valid_prefix_len).await;
+            let truncated = t.set_len_to(torn.valid_prefix_len).await;
             t.settled = true;
             truncated.map_err(|source| io_err(&t.path, source))?;
             t.settled = false;
-            let synced = t.file.sync_all().await;
+            let synced = t.sync().await;
             t.settled = true;
             synced.map_err(|source| io_err(&t.path, source))?;
         }
@@ -380,7 +380,7 @@ where
             });
         }
         if self.fsync
-            && let Err(source) = self.file.sync_all().await
+            && let Err(source) = self.sync().await
         {
             // The write reached the page cache but durability is not
             // confirmed; treated the same as a write failure rather than
@@ -395,6 +395,36 @@ where
         Ok(())
     }
 
+    /// Set the file's length. Windows opens an append handle without the right
+    /// to change the length (`FILE_WRITE_DATA`), so the change goes through a
+    /// second handle opened for writing; the append handle goes on writing at
+    /// the new end. Elsewhere the one handle does it.
+    async fn set_len_to(&self, len: u64) -> std::io::Result<()> {
+        #[cfg(windows)]
+        {
+            let writer = OpenOptions::new().write(true).open(&self.path).await?;
+            writer.set_len(len).await
+        }
+        #[cfg(not(windows))]
+        {
+            self.file.set_len(len).await
+        }
+    }
+
+    /// Flush the file to disk (see [`Self::set_len_to`] for why Windows uses a
+    /// second handle).
+    async fn sync(&self) -> std::io::Result<()> {
+        #[cfg(windows)]
+        {
+            let writer = OpenOptions::new().write(true).open(&self.path).await?;
+            writer.sync_all().await
+        }
+        #[cfg(not(windows))]
+        {
+            self.file.sync_all().await
+        }
+    }
+
     /// Undo a failed (or unconfirmed) write by truncating back to `pre_len`.
     /// If that itself fails, poison the handle: a length we
     /// cannot restore is a state no further append may build on.
@@ -403,7 +433,7 @@ where
     /// caller that cancels mid-rollback leaves the write pending and the next
     /// call redoes the check and the rollback (both are idempotent).
     async fn recover_or_poison(&mut self, pre_len: u64) {
-        if self.file.set_len(pre_len).await.is_err() || self.file.sync_all().await.is_err() {
+        if self.set_len_to(pre_len).await.is_err() || self.sync().await.is_err() {
             self.poisoned = true;
         }
         self.pending = None;

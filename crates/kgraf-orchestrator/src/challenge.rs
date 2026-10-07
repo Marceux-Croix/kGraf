@@ -1269,8 +1269,9 @@ pub fn read_artifact(root: &Path, artifact: &str) -> Result<String, String> {
     if !valid_write_path(artifact) {
         return Err(format!("`{artifact}` is not a path inside the repository"));
     }
-    let root = std::fs::canonicalize(root).map_err(|e| format!("{}: {e}", root.display()))?;
-    let path: PathBuf = std::fs::canonicalize(root.join(artifact))
+    let root = kgraf_core::plain_path::canonicalize(root)
+        .map_err(|e| format!("{}: {e}", root.display()))?;
+    let path: PathBuf = kgraf_core::plain_path::canonicalize(root.join(artifact))
         .map_err(|e| format!("artifact `{artifact}`: {e}"))?;
     if !path.starts_with(&root) {
         return Err(format!(

@@ -759,8 +759,7 @@ pub fn state_read_denies(
     ledger: &std::path::Path,
     transcript: &std::path::Path,
 ) -> Result<Vec<PathBuf>> {
-    let state = state
-        .canonicalize()
+    let state = kgraf_core::plain_path::canonicalize(state)
         .with_context(|| format!("cannot resolve {}", state.display()))?;
     let mut ledger_files = vec![ledger.to_path_buf()];
     for suffix in ["-wal", "-shm"] {
@@ -776,7 +775,7 @@ pub fn state_read_denies(
         .chain(ledger_files)
         .chain(std::iter::once(transcript.to_path_buf()));
     for file in files {
-        let Ok(resolved) = file.canonicalize() else {
+        let Ok(resolved) = kgraf_core::plain_path::canonicalize(&file) else {
             continue;
         };
         if !resolved.starts_with(&state) && !denies.contains(&resolved) {
@@ -893,7 +892,8 @@ mod tests {
         std::fs::write(home.path().join("ledger.db-wal"), "x").expect("wal");
         let inside = state.join("worker-w.jsonl");
         std::fs::write(&inside, "x").expect("inside");
-        let canon = |p: &std::path::Path| p.canonicalize().expect("canonical");
+        let canon =
+            |p: &std::path::Path| kgraf_core::plain_path::canonicalize(p).expect("canonical");
 
         let denies =
             state_read_denies(&state, Some(&config), &ledger, &transcript).expect("denies");
