@@ -1251,7 +1251,15 @@ own strength and gaps. Because Windows cannot deny the network, the
 verifier's check, the gates and the contract checks run there with the network
 open and a notice in their output, the run's trace, the run report and the
 run-start list (decision 0011, amended 2026-10-06); macOS and Linux keep it
-denied. **Not built yet:** a per-platform strength indicator in
+denied. The worker's shell runs on Windows under the same decision (amended
+2026-10-07): the network open, the backend's partial isolation accepted, and
+the notice in the tool's description, its first result, the run's trace and
+the run-start list. On Windows `sh` and `bash` run with Git Bash, the argv
+carried in an environment variable under a fixed trampoline script, because
+the MSYS2 runtime splits a command line with its own quoting and globbing
+rules; with no Git Bash the command fails and says how to get one. Compiled
+for Windows, not yet run there; the test steps are in
+`docs/WINDOWS-TESTING.md`. **Not built yet:** a per-platform strength indicator in
 the interface rather than one shared badge.
 
 `kgraf-sandbox` holds worktrees through the git CLI; macOS Seatbelt; on

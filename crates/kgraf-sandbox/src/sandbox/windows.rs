@@ -56,11 +56,17 @@
 //! profiles and the Credential Manager API stay readable, and a Low process
 //! can open the Medium harness process for `PROCESS_VM_READ`. Network egress
 //! is not blocked (only AppContainer or administrator-installed filtering
-//! rules can do that), so [`Network::Deny`] is refused here. Checks and gates
-//! ask through [`super::CheckNetwork`] instead, which runs them with the
-//! network open and a notice (decision 0011, amended 2026-10-06); the worker's
-//! shell does not. [`STRENGTH`] reports all of this, and the runner
-//! refuses unless the policy opts in to partial isolation (fail loud).
+//! rules can do that), so [`Network::Deny`] is refused here. Checks, gates and
+//! the worker's shell ask through [`super::CheckNetwork`] instead, which runs
+//! them with the network open, the partial isolation accepted, and a notice
+//! (decision 0011, amended 2026-10-06 and 2026-10-07). [`STRENGTH`] reports
+//! all of this, and the runner refuses unless the policy opts in to partial
+//! isolation (fail loud).
+//!
+//! **POSIX shells.** A command whose program is `sh` or `bash` runs through
+//! Git Bash, with its argv carried in the environment (see
+//! [`SHELL_TRAMPOLINE`] and the section above it); with no Git Bash it is not
+//! run.
 //!
 //! **Provenance.** The token construction (restricting-SID order, flags,
 //! default DACL, `SeChangeNotifyPrivilege`), the write-ACE mask without
@@ -241,6 +247,200 @@ pub(super) fn env_block(
     block
 }
 
+// ---- POSIX shells through Git Bash ------------------------------------------
+//
+// A command whose program is `sh` or `bash` (a worker's `["sh", "-c", line]`,
+// a gate's `sh -c`, a contract check's argv) runs on Windows through Git Bash,
+// the `bin\bash.exe` of Git for Windows. Chosen because the command policy reads
+// an `sh -c` script as POSIX shell text (its commands, redirects and grants), so
+// the text must run in a POSIX shell: PowerShell or cmd would run a different
+// language than the one that was judged. Claude Code makes the same choice
+// (Git Bash for its Bash tool, `CLAUDE_CODE_GIT_BASH_PATH` to name it); Codex
+// defaults to PowerShell on Windows, which fits a model told to write
+// PowerShell, not kGraf's POSIX-judged `sh -c`. With no Git Bash the spawn
+// fails and says how to install or name one; it never falls back to another
+// shell. A model can still run `powershell -Command` or `cmd /c` as a program.
+//
+// **Why the arguments go through the environment.** Git Bash is an MSYS2
+// program, and the MSYS2 runtime splits a command line from a Windows parent
+// with its own rules, not the MSVC rules `append_arg` writes for (msys2-runtime
+// `winsup/cygwin/dcrt0.cc`, `build_argv`, `quoted`, `globify`): single quotes
+// quote, `\\` inside quotes becomes `\`, a quote escaped as `\"` can end a
+// quoted run early and split the word, unquoted words are globbed with braces
+// and `~`, and a word starting with `@` names a file of more arguments. A
+// script holds all of these. So the command line carries one fixed script,
+// [`SHELL_TRAMPOLINE`], with no quote or backslash in it, that both parsers
+// read the same way, and the real argv goes in [`SHELL_COMMAND_VAR`],
+// single-quoted for the shell. The trampoline evaluates it with no field
+// splitting and no globbing, and that `exec`s `/usr/bin/sh` or
+// `/usr/bin/bash` with the exact argv. MSYS2 passes an argv to an MSYS2 child
+// without a command line, so nothing is parsed twice.
+
+/// The variable that carries a POSIX shell's argv, single-quoted, to Git Bash.
+/// The evaluated text unsets it before the shell runs, so the command does
+/// not see it.
+pub(super) const SHELL_COMMAND_VAR: &str = "KGRAF_SHELL_COMMAND";
+
+/// Names the Git Bash to run (its `bin\bash.exe`), in place of the search.
+pub(super) const GIT_BASH_PATH_VAR: &str = "KGRAF_GIT_BASH_PATH";
+
+/// The script Git Bash gets on its command line: evaluate
+/// [`SHELL_COMMAND_VAR`] as one word. `IFS=` stops field splitting and
+/// `set -f` stops globbing of the expansion, so the text reaches `eval`
+/// byte for byte. It holds no quote and no backslash, the only characters
+/// that the MSVC and the MSYS2 rules read differently inside a quoted word.
+pub(super) const SHELL_TRAMPOLINE: &str = "IFS=;set -f;eval $KGRAF_SHELL_COMMAND";
+
+/// `"sh"` or `"bash"` when `program` names a POSIX shell that runs through
+/// Git Bash: the bare name (with or without `.exe`, any case) or its usual
+/// POSIX path. A Windows path to a particular `bash.exe` is run as given.
+/// A bare `bash` is never looked up on `PATH`: `C:\Windows\System32\bash.exe`
+/// is the WSL launcher, which runs the command in a Linux machine outside
+/// this sandbox.
+pub(super) fn posix_shell(program: &str) -> Option<&'static str> {
+    let lower = program.to_ascii_lowercase();
+    let name = match lower.as_str() {
+        "/bin/sh" | "/usr/bin/sh" => return Some("sh"),
+        "/bin/bash" | "/usr/bin/bash" => return Some("bash"),
+        other => other.strip_suffix(".exe").unwrap_or(other),
+    };
+    match name {
+        "sh" => Some("sh"),
+        "bash" => Some("bash"),
+        _ => None,
+    }
+}
+
+/// `arg` as one POSIX shell word: single-quoted, each `'` written `'\''`.
+/// Every byte is literal inside single quotes, so no argument can change
+/// the command it is part of.
+pub(super) fn posix_quote(arg: &str) -> String {
+    format!("'{}'", arg.replace('\'', r"'\''"))
+}
+
+/// The text the trampoline evaluates: unset the carrier variable, restore
+/// globbing and the default field separators (an `exec`ed shell starts with
+/// its own, but a `SHELLOPTS` the parent exported would carry `noglob` on),
+/// then `exec` `shell` (a path inside Git Bash) with `args`, each quoted.
+pub(super) fn shell_command_text(shell: &str, args: &[&str]) -> String {
+    let mut text = format!(
+        "unset {SHELL_COMMAND_VAR}; set +f; IFS=$' \\t\\n'; exec {}",
+        posix_quote(shell)
+    );
+    for arg in args {
+        text.push(' ');
+        text.push_str(&posix_quote(arg));
+    }
+    text
+}
+
+/// Longest value Windows allows one environment variable to hold, in UTF-16
+/// units, without its terminating NUL.
+const MAX_ENV_VALUE: usize = 32_766;
+
+/// How a POSIX shell command starts on Windows: `program` (Git Bash) with
+/// `args`, and [`SHELL_COMMAND_VAR`] set to `command`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ShellLaunch {
+    pub program: std::path::PathBuf,
+    pub args: [&'static str; 2],
+    pub command: String,
+}
+
+/// The launch of `shell` (`"sh"` or `"bash"`, from [`posix_shell`]) with
+/// `args` under the Git Bash at `bash`. Refused, with the reason, for an
+/// argument that is not Unicode or holds a NUL (an environment value cannot
+/// carry either), and for a command longer than one variable may hold.
+pub(super) fn shell_launch(
+    shell: &str,
+    args: &[&std::ffi::OsStr],
+    bash: std::path::PathBuf,
+) -> Result<ShellLaunch, String> {
+    let mut words = Vec::with_capacity(args.len());
+    for arg in args {
+        let word = arg
+            .to_str()
+            .ok_or_else(|| format!("an argument to `{shell}` is not valid Unicode"))?;
+        if word.contains('\0') {
+            return Err(format!("an argument to `{shell}` holds a NUL character"));
+        }
+        words.push(word);
+    }
+    let command = shell_command_text(&format!("/usr/bin/{shell}"), &words);
+    let units = command.encode_utf16().count();
+    if units > MAX_ENV_VALUE {
+        return Err(format!(
+            "the `{shell}` command is {units} UTF-16 units long; Windows passes at most \
+             {MAX_ENV_VALUE} in one environment variable"
+        ));
+    }
+    Ok(ShellLaunch {
+        program: bash,
+        args: ["-c", SHELL_TRAMPOLINE],
+        command,
+    })
+}
+
+/// Find Git Bash, the `bin\bash.exe` of Git for Windows.
+///
+/// - `override_path` ([`GIT_BASH_PATH_VAR`]): used when set, and an error
+///   when it is not a file; the search does not run.
+/// - Each `PATH` directory holding `git.exe` (Git's `cmd` or `mingw64\bin`):
+///   `..\bin\bash.exe` and `..\..\bin\bash.exe` beside it.
+/// - Each install root (`%ProgramFiles%`, `%ProgramW6432%`,
+///   `%ProgramFiles(x86)%`, `%LOCALAPPDATA%\Programs`): `Git\bin\bash.exe`.
+///
+/// `bin\bash.exe` is Git's launcher: it puts `usr\bin` and `mingw64\bin` on
+/// `PATH` and passes its command line on unchanged (Git for Windows
+/// `git-wrapper.c`). `usr\bin\bash.exe` alone would not find `ls` or `grep`.
+pub(super) fn find_git_bash(
+    override_path: Option<&std::path::Path>,
+    path_dirs: &[std::path::PathBuf],
+    install_roots: &[std::path::PathBuf],
+    is_file: impl Fn(&std::path::Path) -> bool,
+) -> Result<std::path::PathBuf, String> {
+    if let Some(path) = override_path {
+        return if is_file(path) {
+            Ok(path.to_path_buf())
+        } else {
+            Err(format!(
+                "{GIT_BASH_PATH_VAR} names {}, which is not a file; set it to the bin\\bash.exe \
+                 of Git for Windows",
+                path.display()
+            ))
+        };
+    }
+    let mut looked = Vec::new();
+    let beside_git = path_dirs
+        .iter()
+        .filter(|dir| is_file(&dir.join("git.exe")))
+        .flat_map(|dir| {
+            [
+                dir.join("..").join("bin").join("bash.exe"),
+                dir.join("..").join("..").join("bin").join("bash.exe"),
+            ]
+        });
+    let installed = install_roots
+        .iter()
+        .map(|root| root.join("Git").join("bin").join("bash.exe"));
+    for candidate in beside_git.chain(installed) {
+        if is_file(&candidate) {
+            return Ok(candidate);
+        }
+        looked.push(candidate.display().to_string());
+    }
+    Err(format!(
+        "on Windows, kGraf runs `sh` and `bash` with Git Bash from Git for Windows \
+         (https://gitforwindows.org/), and none was found; install Git for Windows, or set \
+         {GIT_BASH_PATH_VAR} to its bin\\bash.exe. Looked in: {}",
+        if looked.is_empty() {
+            "no candidate (no git.exe on PATH and no install folder set)".to_owned()
+        } else {
+            looked.join(", ")
+        }
+    ))
+}
+
 #[cfg(windows)]
 pub use imp::SandboxedChild;
 #[cfg(windows)]
@@ -319,7 +519,10 @@ mod imp {
     };
 
     use super::super::{Network, Redirect, Resolved};
-    use super::{BACKEND_NAME, append_arg, capability_sid_string, env_block, is_batch_file};
+    use super::{
+        BACKEND_NAME, GIT_BASH_PATH_VAR, SHELL_COMMAND_VAR, ShellLaunch, append_arg,
+        capability_sid_string, env_block, find_git_bash, is_batch_file, posix_shell, shell_launch,
+    };
     use crate::error::SandboxError;
 
     // ---- errors -------------------------------------------------------------
@@ -1591,11 +1794,13 @@ mod imp {
 
     // ---- program and command line --------------------------------------------
 
-    fn final_env(cmd: &Command) -> (Vec<u16>, Option<OsString>) {
+    /// The child's environment block and its `PATH`. `extra` is set last,
+    /// over everything else (a POSIX shell's [`SHELL_COMMAND_VAR`]).
+    fn final_env(cmd: &Command, extra: Option<(&str, &str)>) -> (Vec<u16>, Option<OsString>) {
         let inherited: Vec<_> = std::env::vars_os()
             .map(|(k, v)| (k.encode_wide().collect(), v.encode_wide().collect()))
             .collect();
-        let overrides: Vec<_> = cmd
+        let mut overrides: Vec<_> = cmd
             .get_envs()
             .map(|(k, v)| {
                 (
@@ -1604,6 +1809,12 @@ mod imp {
                 )
             })
             .collect();
+        if let Some((name, value)) = extra {
+            overrides.push((
+                name.encode_utf16().collect(),
+                Some(value.encode_utf16().collect()),
+            ));
+        }
         let block = env_block(inherited, overrides);
         // PATH as the child will see it, for program lookup.
         let path = cmd
@@ -1651,6 +1862,33 @@ mod imp {
                 format!("program {} not found", p.display()),
             ))
         })
+    }
+
+    /// The Git Bash launch of the POSIX shell `shell` with `cmd`'s
+    /// arguments; a spawn error, saying how to get Git Bash, when none is
+    /// found (fail loud: no other shell is tried).
+    fn git_bash_launch(shell: &str, cmd: &Command) -> Result<ShellLaunch, SandboxError> {
+        let not_run = |kind, why: String| SandboxError::Spawn(io::Error::new(kind, why));
+        let override_path = std::env::var_os(GIT_BASH_PATH_VAR)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from);
+        let path_dirs: Vec<PathBuf> = std::env::var_os("PATH")
+            .map(|p| std::env::split_paths(&p).collect())
+            .unwrap_or_default();
+        let install_roots: Vec<PathBuf> = ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"]
+            .iter()
+            .filter_map(|v| std::env::var_os(v).map(PathBuf::from))
+            .chain(std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("Programs")))
+            .collect();
+        let bash = find_git_bash(
+            override_path.as_deref(),
+            &path_dirs,
+            &install_roots,
+            Path::is_file,
+        )
+        .map_err(|why| not_run(io::ErrorKind::NotFound, why))?;
+        let args: Vec<&OsStr> = cmd.get_args().collect();
+        shell_launch(shell, &args, bash).map_err(|why| not_run(io::ErrorKind::InvalidInput, why))
     }
 
     // ---- spawn ----------------------------------------------------------------
@@ -1833,8 +2071,21 @@ mod imp {
         let cwd = cmd.get_current_dir().ok_or_else(|| {
             SandboxError::InvalidPolicy("sandboxed command has no working directory".into())
         })?;
-        let (env, path) = final_env(cmd);
-        let program = resolve_program(cmd.get_program(), cwd, path.as_deref())?;
+        // `sh` and `bash` run through Git Bash (see `SHELL_TRAMPOLINE`).
+        let launch = match cmd.get_program().to_str().and_then(posix_shell) {
+            Some(shell) => Some(git_bash_launch(shell, cmd)?),
+            None => None,
+        };
+        let (env, path) = final_env(
+            cmd,
+            launch
+                .as_ref()
+                .map(|l| (SHELL_COMMAND_VAR, l.command.as_str())),
+        );
+        let program = match &launch {
+            Some(l) => l.program.clone(),
+            None => resolve_program(cmd.get_program(), cwd, path.as_deref())?,
+        };
         let program_text = program.to_string_lossy();
         if is_batch_file(&program_text) {
             return Err(SandboxError::Spawn(io::Error::new(
@@ -1852,10 +2103,22 @@ mod imp {
         let mut line: Vec<u16> = Vec::new();
         // argv[0] is always quoted and never escaped, as std does.
         line.push(u16::from(b'"'));
-        line.extend(cmd.get_program().encode_wide());
+        match &launch {
+            Some(l) => line.extend(l.program.as_os_str().encode_wide()),
+            None => line.extend(cmd.get_program().encode_wide()),
+        }
         line.push(u16::from(b'"'));
-        for arg in cmd.get_args() {
-            append_arg(&mut line, &arg.encode_wide().collect::<Vec<_>>());
+        match &launch {
+            Some(l) => {
+                for arg in l.args {
+                    append_arg(&mut line, &arg.encode_utf16().collect::<Vec<_>>());
+                }
+            }
+            None => {
+                for arg in cmd.get_args() {
+                    append_arg(&mut line, &arg.encode_wide().collect::<Vec<_>>());
+                }
+            }
         }
         line.push(0);
 
@@ -2082,5 +2345,221 @@ mod tests {
     #[test]
     fn empty_env_block_is_two_nuls() {
         assert_eq!(env_block(vec![], vec![]), vec![0, 0]);
+    }
+
+    /// The bare names and POSIX paths of `sh` and `bash` go to Git Bash; a
+    /// Windows path to one particular `bash.exe`, and every other shell, run
+    /// as given.
+    #[test]
+    fn only_sh_and_bash_by_name_or_posix_path_go_to_git_bash() {
+        for (program, shell) in [
+            ("sh", "sh"),
+            ("bash", "bash"),
+            ("SH.EXE", "sh"),
+            ("bash.exe", "bash"),
+            ("/bin/sh", "sh"),
+            ("/usr/bin/sh", "sh"),
+            ("/bin/bash", "bash"),
+            ("/usr/bin/bash", "bash"),
+        ] {
+            assert_eq!(posix_shell(program), Some(shell), "{program}");
+        }
+        for program in [
+            "zsh",
+            "dash",
+            "pwsh",
+            "cmd",
+            "shx",
+            "",
+            r"C:\Program Files\Git\bin\bash.exe",
+            "/usr/local/bin/bash",
+        ] {
+            assert_eq!(posix_shell(program), None, "{program}");
+        }
+    }
+
+    #[test]
+    fn a_posix_word_is_single_quoted_with_each_quote_escaped() {
+        assert_eq!(posix_quote("plain"), "'plain'");
+        assert_eq!(posix_quote(""), "''");
+        assert_eq!(posix_quote("it's"), r"'it'\''s'");
+        assert_eq!(posix_quote(r#"$HOME `x` \\ "q""#), r#"'$HOME `x` \\ "q"'"#);
+    }
+
+    /// The trampoline holds no quote and no backslash, the characters MSVC
+    /// and MSYS2 parse differently, so on the command line it is one word
+    /// under both: the MSVC writer puts it in plain double quotes, and the
+    /// MSYS2 reader takes a double-quoted run with nothing inside it to
+    /// interpret.
+    #[test]
+    fn the_trampoline_is_one_word_for_both_command_line_parsers() {
+        assert!(
+            !SHELL_TRAMPOLINE.contains(['"', '\'', '\\']),
+            "{SHELL_TRAMPOLINE}"
+        );
+        assert!(SHELL_TRAMPOLINE.ends_with(&format!("eval ${SHELL_COMMAND_VAR}")));
+        assert_eq!(
+            line(&["-c", SHELL_TRAMPOLINE]),
+            r#"-c "IFS=;set -f;eval $KGRAF_SHELL_COMMAND""#
+        );
+    }
+
+    #[test]
+    fn a_shell_launch_runs_git_bash_with_the_trampoline_and_carries_the_argv() {
+        let args = [
+            std::ffi::OsStr::new("-c"),
+            std::ffi::OsStr::new("echo 'a b'"),
+        ];
+        let launch = shell_launch("sh", &args, "G:/Git/bin/bash.exe".into()).unwrap();
+        assert_eq!(
+            launch.program,
+            std::path::PathBuf::from("G:/Git/bin/bash.exe")
+        );
+        assert_eq!(launch.args, ["-c", SHELL_TRAMPOLINE]);
+        assert_eq!(
+            launch.command,
+            r"unset KGRAF_SHELL_COMMAND; set +f; IFS=$' \t\n'; exec '/usr/bin/sh' '-c' 'echo '\''a b'\'''"
+        );
+    }
+
+    #[test]
+    fn a_shell_launch_refuses_what_an_environment_value_cannot_carry() {
+        let bash = || std::path::PathBuf::from("G:/Git/bin/bash.exe");
+        let nul = shell_launch("sh", &[std::ffi::OsStr::new("a\0b")], bash()).unwrap_err();
+        assert!(nul.contains("NUL"), "{nul}");
+        let long = "x".repeat(MAX_ENV_VALUE);
+        let err = shell_launch("bash", &[std::ffi::OsStr::new(&long)], bash()).unwrap_err();
+        assert!(err.contains("at most 32766"), "{err}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let err =
+                shell_launch("sh", &[std::ffi::OsStr::from_bytes(b"\xff")], bash()).unwrap_err();
+            assert!(err.contains("not valid Unicode"), "{err}");
+        }
+    }
+
+    /// The transport itself, run by a real bash on this host: the trampoline
+    /// on the command line, the quoted argv in the variable. Each argument
+    /// arrives byte for byte (spaces, quotes, backslashes, a glob that
+    /// matches files, braces, `~`, `@`, a newline, an empty one), the
+    /// variable is gone, globbing works again inside the script, and the
+    /// exit status comes back. Only the first hop differs on Windows: Git
+    /// Bash reads the trampoline from a command line, which the test above
+    /// pins.
+    #[cfg(unix)]
+    #[test]
+    fn the_trampoline_hands_the_exact_argv_to_the_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "").unwrap();
+        std::fs::write(dir.path().join("b.rs"), "").unwrap();
+        let script = r#"printf '<%s>' "$0"; for a; do printf '[%s]' "$a"; done; printf '{%s}' "${KGRAF_SHELL_COMMAND-unset}"; echo; echo *.rs; exit 7"#;
+        let args = [
+            "-c",
+            script,
+            "zero",
+            "a b",
+            "it's",
+            "*.rs",
+            r"C:\\dir\\",
+            r#""q""#,
+            "{x,y}",
+            "~",
+            "@file",
+            "new\nline",
+            "",
+        ];
+        let text = shell_command_text("/bin/sh", &args);
+        let out = std::process::Command::new("/bin/bash")
+            .args(["-c", SHELL_TRAMPOLINE])
+            .env(SHELL_COMMAND_VAR, &text)
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(7), "{out:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "<zero>[a b][it's][*.rs][C:\\\\dir\\\\][\"q\"][{x,y}][~][@file][new\nline][]{unset}\n\
+             a.rs b.rs\n"
+        );
+    }
+
+    #[test]
+    fn the_override_names_git_bash_and_a_missing_one_is_an_error() {
+        let named = std::path::Path::new("D:/tools/Git/bin/bash.exe");
+        let found = find_git_bash(Some(named), &[], &[], |p| p == named).unwrap();
+        assert_eq!(found, named);
+        let err = find_git_bash(Some(named), &[], &[], |_| false).unwrap_err();
+        assert!(
+            err.contains(GIT_BASH_PATH_VAR) && err.contains("not a file"),
+            "{err}"
+        );
+    }
+
+    /// Git Bash is found beside the `git.exe` on `PATH`, then in the install
+    /// folders; the WSL launcher in System32 is never taken, and a search
+    /// that finds nothing says where it looked and how to fix it.
+    #[test]
+    fn git_bash_is_found_beside_git_then_in_the_install_folders_never_wsl() {
+        use std::path::{Path, PathBuf};
+        fn exists(files: &'static [&'static str]) -> impl Fn(&Path) -> bool {
+            move |p: &Path| files.iter().any(|f| Path::new(f) == p)
+        }
+        let system32 = PathBuf::from("C:/Windows/System32");
+        let found = find_git_bash(
+            None,
+            &[system32.clone(), PathBuf::from("E:/Git/cmd")],
+            &[PathBuf::from("C:/Program Files")],
+            exists(&[
+                "C:/Windows/System32/bash.exe",
+                "E:/Git/cmd/git.exe",
+                "E:/Git/cmd/../bin/bash.exe",
+                "C:/Program Files/Git/bin/bash.exe",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(found, PathBuf::from("E:/Git/cmd/../bin/bash.exe"));
+        let found = find_git_bash(
+            None,
+            &[PathBuf::from("E:/Git/mingw64/bin")],
+            &[],
+            exists(&[
+                "E:/Git/mingw64/bin/git.exe",
+                "E:/Git/mingw64/bin/../../bin/bash.exe",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            found,
+            PathBuf::from("E:/Git/mingw64/bin/../../bin/bash.exe")
+        );
+        let found = find_git_bash(
+            None,
+            std::slice::from_ref(&system32),
+            &[
+                PathBuf::from("C:/Program Files"),
+                PathBuf::from("L:/AppData/Local/Programs"),
+            ],
+            exists(&[
+                "C:/Windows/System32/bash.exe",
+                "L:/AppData/Local/Programs/Git/bin/bash.exe",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            found,
+            PathBuf::from("L:/AppData/Local/Programs/Git/bin/bash.exe")
+        );
+        let err = find_git_bash(
+            None,
+            &[system32],
+            &[PathBuf::from("C:/Program Files")],
+            exists(&["C:/Windows/System32/bash.exe"]),
+        )
+        .unwrap_err();
+        assert!(err.contains("gitforwindows.org"), "{err}");
+        assert!(err.contains(GIT_BASH_PATH_VAR), "{err}");
+        assert!(err.contains("C:/Program Files/Git/bin/bash.exe"), "{err}");
+        assert!(!err.contains("System32/bash.exe"), "{err}");
     }
 }

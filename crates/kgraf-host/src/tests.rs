@@ -6352,6 +6352,34 @@ fn the_open_network_notice_is_announced_only_where_the_network_is_open() {
     assert!(said.is_empty(), "{said:?}");
 }
 
+/// The shell's run-start notice: named, printed, and returned for the trace,
+/// only where the workers' shell runs with the network open.
+#[test]
+fn the_open_shell_network_notice_is_announced_only_where_the_network_is_open() {
+    let mut said = Vec::new();
+    let sentence = crate::host::announce_open_shell_network(
+        kgraf_sandbox::CheckNetwork::open_with_notice(),
+        &mut |n| said.push(n),
+    );
+    assert_eq!(
+        sentence.as_deref(),
+        Some(kgraf_sandbox::SHELL_NETWORK_OPEN_NOTICE)
+    );
+    assert_eq!(
+        said,
+        vec![crate::Notice::ShellNetworkOpen(
+            kgraf_sandbox::SHELL_NETWORK_OPEN_NOTICE.to_owned()
+        )]
+    );
+    let mut said = Vec::new();
+    let sentence =
+        crate::host::announce_open_shell_network(kgraf_sandbox::CheckNetwork::deny(), &mut |n| {
+            said.push(n)
+        });
+    assert_eq!(sentence, None);
+    assert!(said.is_empty(), "{said:?}");
+}
+
 /// A run's index pass does not hold the host's shared graph lock: another
 /// run's loop takes that lock for its session and lease calls, and holding it
 /// for a large project's whole pass stalls that loop. With the lock held

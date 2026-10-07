@@ -1508,22 +1508,58 @@ an inventory is there.
 
 The orchestrator's own planning calls use no tools, so skills apply to workers only.
 
-## Windows sandbox: checks run with the network open
+## Windows sandbox: checks and the worker shell run with the network open
 
 The Windows sandbox cannot deny network access without administrator rights (decision
-0011). The verifier's check, the quality gates and the contract checks therefore run there
-with the network open, and say so:
+0011). The verifier's check, the quality gates, the contract checks and the workers' shell
+commands therefore run there with the network open, and say so:
 
 - Each such check and gate ends its output with `[sandbox] network not blocked: the Windows
   sandbox cannot deny network access without administrator rights (decision 0011); this
   check ran with the network open`, a passing one included.
-- The run command prints the same sentence as a `sandbox` line when a run opens. The run's
-  trace holds it once, and the run report lists it among its notices.
-- The code a check runs can reach any host, and on Windows it can also read every file you
-  can read. A check that passes there proves less than one that passes on macOS or Linux,
-  where the network is denied.
-- macOS and Linux are not changed: the network stays denied for checks and gates.
-- The worker's own shell tool does not run on Windows yet, so this does not apply to it.
+- Each worker's shell tool says it in its description, which the model reads on every
+  turn, and in the first result of the tool: `[sandbox] network not blocked: the Windows
+  sandbox cannot deny network access without administrator rights (decision 0011); shell
+  commands run with the network open`.
+- The run command prints both sentences as `sandbox` lines when a run opens. The run's
+  trace holds each once, and the run report lists the check sentence among its notices.
+- The code a check or a command runs can reach any host, and on Windows it can also read
+  every file you can read. A check that passes there proves less than one that passes on
+  macOS or Linux, where the network is denied.
+- Builds still run with cargo offline (`CARGO_NET_OFFLINE=true`): they use only the crates
+  you already fetched, as on macOS and Linux, and the sandbox could not write a download
+  into your cargo folder anyway.
+- macOS and Linux are not changed: the network stays denied for checks, gates and the
+  worker shell.
+
+## Windows: the worker shell
+
+On Windows the worker's `shell` tool runs commands under the same restricted-token sandbox
+as the checks (decision 0011). A command runs as the argv the model gives, with the same
+output caps, timeout, cancel and permission checks as on macOS and Linux. The timeout, a
+cancel and a normal exit each end every process the command started, through the job
+object.
+
+- **`sh` and `bash` run with Git Bash**, the `bin\bash.exe` of
+  [Git for Windows](https://gitforwindows.org/), so `["sh", "-c", "<line>"]` takes the same
+  POSIX shell syntax that kGraf's permission checks read. kGraf finds Git Bash beside the
+  `git.exe` on your `PATH`, then under `%ProgramFiles%\Git`, `%ProgramFiles(x86)%\Git` and
+  `%LOCALAPPDATA%\Programs\Git`. It never uses `C:\Windows\System32\bash.exe`, which is the
+  WSL launcher. To name another one, set `KGRAF_GIT_BASH_PATH` to its `bin\bash.exe` (not
+  `usr\bin\bash.exe`, which does not set up the tools' `PATH`).
+- **No Git Bash, no shell line.** A `sh` or `bash` command then fails with a message that
+  says to install Git for Windows or set `KGRAF_GIT_BASH_PATH`. kGraf does not fall back
+  to PowerShell or cmd: they would run a different language than the one that was checked.
+  A model can still run `powershell -Command ...` or `cmd /c ...` as a program; the
+  permission rules read those scripts too.
+- **Programs that are not `.exe` files** (a `.cmd` or `.bat` file, or a shell script such
+  as Node's `npm`) do not run as a plain argv. The error says to run them through Git Bash:
+  `["sh", "-c", "npm test"]`.
+- **Git** gets the same safety settings as on macOS and Linux (no `core.fsmonitor`, no
+  hooks, no system or global configuration), and the sandbox also turns off git's
+  credential helper.
+- **Not yet run on Windows.** This is built and compile-checked for Windows only. The steps
+  to test it on a Windows 11 machine are in [WINDOWS-TESTING.md](WINDOWS-TESTING.md).
 
 ## Linux sandbox: cargo files above a worktree
 
@@ -1657,6 +1693,12 @@ Behavior that differs from earlier builds. Each item names the decision that hol
 
 **Runs**
 
+- On Windows the worker's shell tool runs commands. Earlier builds refused every call there.
+  `sh` and `bash` run with Git Bash, the network is open and the tool says so, and a missing
+  Git Bash fails the call with how to fix it (0011).
+- On Windows the verifier's check, the gates and the contract checks accept the sandbox's
+  partial isolation, which the Windows backend always has; earlier builds refused them
+  before they started (0011).
 - A contract waiting on a route that is not ready is held after 2,400 checks from the first
   failure (20 minutes at the default tick). The hold says how long it waited and how to try
   again: fix the route, then `kgraf orchestrate --resume <run>`. Earlier builds waited without

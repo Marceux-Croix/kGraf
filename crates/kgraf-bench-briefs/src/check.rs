@@ -12,8 +12,9 @@
 //!
 //! **The attempt's code is untrusted.** `cargo test` runs the worker's tests
 //! and any `build.rs` it wrote, and a script check runs the worker's shell
-//! script. Every such process runs through `kgraf_sandbox`: network off,
-//! writes limited to the attempt directory and a scratch directory, a cleared
+//! script. Every such process runs through `kgraf_sandbox`: network off
+//! (open on Windows, whose sandbox cannot deny it, and an unsatisfied verdict
+//! says so; decision 0011), writes limited to the attempt directory and a scratch directory, a cleared
 //! environment (only what a build needs), a wall-clock timeout, and a kill of
 //! the whole process group at the timeout.
 //!
@@ -38,7 +39,7 @@ use crate::brief::{Brief, Check, DocFact, Mutation, ScriptCase};
 use crate::gitutil;
 use crate::structure;
 use anyhow::{Context, Result, bail};
-use kgraf_sandbox::{Network, Redirect, SandboxPolicy, sandboxed_command};
+use kgraf_sandbox::{CheckNetwork, Redirect, SandboxPolicy, sandboxed_command};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
@@ -115,6 +116,23 @@ fn unmet<T>(reason: impl Into<String>) -> Result<Judged<T>> {
 /// brief's check holds, and (for a named test) the test fails on every
 /// mutated copy of the fixture's function.
 pub fn verify(brief: &Brief, attempt: &Attempt<'_>, env: &CheckEnv<'_>) -> Result<Verdict> {
+    verify_on(brief, attempt, env).map(|v| with_network_notice(v, CheckNetwork::current()))
+}
+
+/// An unsatisfied verdict reached with the network open says so: the
+/// attempt's code ran with the network open (decision 0011, amended
+/// 2026-10-06). A satisfied verdict carries no text; the notice is in the
+/// platform's strength and the run-start list instead.
+fn with_network_notice(verdict: Verdict, network: CheckNetwork) -> Verdict {
+    match (verdict, network.notice()) {
+        (Verdict::Unsatisfied(why), Some(notice)) => {
+            Verdict::Unsatisfied(format!("{why} [sandbox] {notice}"))
+        }
+        (verdict, _) => verdict,
+    }
+}
+
+fn verify_on(brief: &Brief, attempt: &Attempt<'_>, env: &CheckEnv<'_>) -> Result<Verdict> {
     let touched =
         gitutil::changed_protected(attempt.repo, attempt.base, attempt.commit, brief.protected)?;
     if !touched.is_empty() {
@@ -256,6 +274,7 @@ pub fn run(check: &Check, dir: &Path, env: &CheckEnv<'_>) -> Result<bool> {
 /// [`run`], with the reason an unsatisfied check gives.
 pub fn run_verdict(check: &Check, dir: &Path, env: &CheckEnv<'_>) -> Result<Verdict> {
     run_guarded(check, dir, env, &Guard::none())
+        .map(|v| with_network_notice(v, CheckNetwork::current()))
 }
 
 /// The verdict for a cargo run that must pass and must run at least
@@ -399,7 +418,8 @@ fn toolchain_reads(cargo_home: Option<&Path>, rustup_home: Option<&Path>) -> Vec
 }
 
 /// Run `program args` in `dir` under the sandbox. `dir` and `env.scratch`
-/// are the only writable roots; the network is off.
+/// are the only writable roots; the network is off where the sandbox can
+/// deny it ([`CheckNetwork`]).
 fn sandboxed(
     dir: &Path,
     program: &str,
@@ -423,10 +443,16 @@ fn sandboxed_with(
     std::fs::create_dir_all(&target)
         .with_context(|| format!("cannot create {}", target.display()))?;
     let vars = build_env(env.scratch, &target);
+    // The network decision of every check (decision 0011, amended
+    // 2026-10-06): denied on macOS and Linux; open on the Windows backend,
+    // which cannot deny it, with its partial isolation accepted, and the
+    // notice in the failure reason (`with_network_notice`).
+    let network = CheckNetwork::current();
     let mut policy = SandboxPolicy::new(
         vec![dir.to_path_buf(), env.scratch.to_path_buf()],
-        Network::Deny,
+        network.network(),
     )
+    .accept_partial_isolation(network.accepts_partial_isolation())
     .with_tmp_dir(env.scratch.to_path_buf())
     .holding(env.scratch.join("hold"));
     let var = |name: &str| {
@@ -448,7 +474,8 @@ fn sandboxed_with(
         cmd.env(k, v);
     }
     // Builds must not reach a registry even if the sandbox's network rule
-    // were ever bypassed; a fixture crate has no dependencies.
+    // were ever bypassed, nor where the network is open (Windows); a fixture
+    // crate has no dependencies.
     cmd.env("CARGO_NET_OFFLINE", "true");
     cmd.args(args)
         .stdin(Redirect::Null)
@@ -1042,6 +1069,30 @@ mod tests {
         super::script_cases(dir, script, cases, env).map(|v| v.is_satisfied())
     }
 
+    /// Where the network is open (the Windows decision, stood in for here),
+    /// an unsatisfied verdict says so; a satisfied one, and every verdict
+    /// where the network is denied, is unchanged.
+    #[test]
+    fn an_unsatisfied_verdict_with_the_network_open_says_so() {
+        let open = CheckNetwork::open_with_notice();
+        let failed = Verdict::Unsatisfied("1 test(s) failed: t".into());
+        assert_eq!(
+            with_network_notice(failed.clone(), open),
+            Verdict::Unsatisfied(format!(
+                "1 test(s) failed: t [sandbox] {}",
+                kgraf_sandbox::NETWORK_OPEN_NOTICE
+            ))
+        );
+        assert_eq!(
+            with_network_notice(Verdict::Satisfied, open),
+            Verdict::Satisfied
+        );
+        assert_eq!(
+            with_network_notice(failed.clone(), CheckNetwork::deny()),
+            failed
+        );
+    }
+
     fn run_guarded(check: &Check, dir: &Path, env: &CheckEnv<'_>, guard: &Guard) -> Result<bool> {
         super::run_guarded(check, dir, env, guard).map(|v| v.is_satisfied())
     }
@@ -1343,7 +1394,7 @@ mod tests {
         let scratch = tempfile::tempdir().expect("scratch");
         let mut policy = SandboxPolicy::new(
             vec![dir.path().to_path_buf(), scratch.path().to_path_buf()],
-            Network::Deny,
+            kgraf_sandbox::Network::Deny,
         )
         .with_tmp_dir(scratch.path().to_path_buf());
         for root in toolchain_reads(Some(&cargo), None) {

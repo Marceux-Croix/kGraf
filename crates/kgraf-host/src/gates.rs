@@ -571,6 +571,9 @@ pub(crate) fn run_confined_on(
     }
     let tmp = check.tmp();
     let mut policy = SandboxPolicy::for_workspace(ws, network.network())
+        // The Windows backend is always partial; a gate runs there under the
+        // decision that opens its network, and says so (decision 0011).
+        .accept_partial_isolation(network.accepts_partial_isolation())
         .with_writable_root(check.path().to_path_buf())
         .with_tmp_dir(tmp.clone())
         .with_ancestor_reads(checkout.to_path_buf())

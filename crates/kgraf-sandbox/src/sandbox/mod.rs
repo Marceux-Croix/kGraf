@@ -385,6 +385,10 @@ impl SandboxPolicy {
     pub fn network(&self) -> Network {
         self.network
     }
+    /// Whether [`Self::accept_partial_isolation`] opted in.
+    pub fn accepts_partial_isolation(&self) -> bool {
+        self.accept_partial
+    }
 
     /// Canonicalize and check every root. Seatbelt matches resolved paths
     /// (`/var` is `/private/var` on macOS), so an unresolved root would
@@ -714,12 +718,19 @@ pub const NETWORK_OPEN_NOTICE: &str = "network not blocked: the Windows sandbox 
     network access without administrator rights (decision 0011); this check ran with the \
     network open";
 
-/// The network a verifier check, a quality gate or a contract check asks for
-/// (decision 0011, amended 2026-10-06). One decision, made from the backend's
-/// own capability: it is [`Network::Deny`] wherever the backend can deny it
-/// or refuse to run (macOS, Linux), and [`Network::Allow`] with a notice only
-/// on the Windows restricted-token backend, which cannot deny it and would
-/// otherwise run no check at all. It never applies to the worker's shell.
+/// The sentence the worker's shell carries when its commands run with the
+/// network open because the backend cannot deny it ([`CheckNetwork`]).
+pub const SHELL_NETWORK_OPEN_NOTICE: &str = "network not blocked: the Windows sandbox cannot \
+    deny network access without administrator rights (decision 0011); shell commands run with \
+    the network open";
+
+/// The network a verifier check, a quality gate, a contract check or a
+/// worker's shell command asks for (decision 0011, amended 2026-10-06 and
+/// 2026-10-07). One decision, made from the backend's own capability: it is
+/// [`Network::Deny`] wherever the backend can deny it or refuse to run
+/// (macOS, Linux), and [`Network::Allow`] with a notice only on the Windows
+/// restricted-token backend, which cannot deny it and would otherwise run
+/// nothing at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CheckNetwork {
     network: Network,
@@ -768,6 +779,23 @@ impl CheckNetwork {
     /// Set where the network is open: the sentence every such run carries.
     pub fn notice(&self) -> Option<&'static str> {
         self.notice
+    }
+
+    /// Set where the network is open: the sentence the worker's shell says
+    /// ([`SHELL_NETWORK_OPEN_NOTICE`]).
+    pub fn shell_notice(&self) -> Option<&'static str> {
+        self.notice.map(|_| SHELL_NETWORK_OPEN_NOTICE)
+    }
+
+    /// Whether a run under this decision accepts the backend's partial
+    /// isolation ([`SandboxPolicy::accept_partial_isolation`]). True exactly
+    /// where the network is open with the notice: the Windows restricted-token
+    /// backend is always partial (reads and the network are not confined), so
+    /// a run there either accepts that, said by the notice and by the
+    /// strength's `gaps`, or runs nothing. False everywhere else, so a
+    /// partial Linux backend still refuses as before.
+    pub fn accepts_partial_isolation(&self) -> bool {
+        self.notice.is_some()
     }
 }
 
@@ -1372,6 +1400,27 @@ mod tests {
         let decided = CheckNetwork::for_strength(&linux);
         assert_eq!(decided.network(), Network::Deny);
         assert_eq!(decided.notice(), None);
+    }
+
+    /// The worker's shell follows the same decision: its own sentence, and
+    /// the partial isolation accepted, only where the network is open; a
+    /// backend that denies keeps refusing a partial isolation.
+    #[test]
+    fn the_shell_notice_and_partial_isolation_follow_the_open_network() {
+        let open = CheckNetwork::for_strength(&windows::STRENGTH);
+        assert_eq!(open.shell_notice(), Some(SHELL_NETWORK_OPEN_NOTICE));
+        assert!(open.accepts_partial_isolation());
+        assert!(SHELL_NETWORK_OPEN_NOTICE.contains("network not blocked"));
+        assert!(SHELL_NETWORK_OPEN_NOTICE.contains("shell commands run with the network open"));
+        let linux = IsolationStrength {
+            backend: Backend::LinuxLandlock,
+            network_deniable: false,
+            ..windows::STRENGTH
+        };
+        for denied in [CheckNetwork::deny(), CheckNetwork::for_strength(&linux)] {
+            assert_eq!(denied.shell_notice(), None);
+            assert!(!denied.accepts_partial_isolation());
+        }
     }
 
     /// On this host the decision is the platform's: macOS and Linux keep

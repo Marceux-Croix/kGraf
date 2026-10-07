@@ -36,11 +36,26 @@
 //! shared object store will not find it. **Reported, not silently narrowed
 //! (fail loud).**
 //!
-//! **Network is always denied.** A worker's shell calls do not need outbound
-//! network by default; a capability to allow it for one call is a future,
-//! explicitly approved extension, not a default. A workspace-bound tool also
-//! sets `CARGO_NET_OFFLINE=true`, so cargo resolves from the local cache at once
-//! instead of retrying the index (decision 0084).
+//! **The network is denied wherever the sandbox can deny it.** A worker's
+//! shell calls do not need outbound network; a capability to allow it for one
+//! call is a future, explicitly approved extension, not a default. The network
+//! comes from [`kgraf_sandbox::CheckNetwork`], the decision checks and gates
+//! use (decision 0011, amended 2026-10-07): denied on macOS and Linux; open on
+//! Windows, whose sandbox cannot deny it without administrator rights and
+//! would otherwise run no command at all. There the tool says so in its
+//! description, in the first result of each tool (a `[sandbox]` line), and
+//! the host traces it once when a run opens. A workspace-bound tool also sets
+//! `CARGO_NET_OFFLINE=true` on every platform, so cargo resolves from the
+//! local cache at once instead of retrying the index (decision 0084); on
+//! Windows it still keeps a build off the registry, which the sandbox cannot
+//! write into anyway.
+//!
+//! **Windows.** Commands run under the restricted-token backend
+//! (`kgraf_sandbox`, decision 0011): output captured and capped as on Unix,
+//! the timeout and a cancel end the whole process tree through its job
+//! object, and so does a normal exit, so no background process outlives its
+//! command. `sh` and `bash` run with Git Bash (see the Windows backend); a
+//! missing Git Bash fails the call with how to install or name one.
 //!
 //! **Build and test commands (decision 0084).** A command on the policy's
 //! build and test allowlist ([`crate::execpolicy::BuildAllowlist`]) runs without
@@ -85,21 +100,17 @@ use crate::approval::{ApprovalHook, HookDecision, PendingCall};
 use crate::execpolicy::{Decision, ExecPolicy};
 use crate::external::ExternalExecutor;
 use crate::{Access, CallPermit, Tool, ToolContext, ToolDefinition, ToolError, ToolOutput};
-// `OutputPart`/`UntrustedText` and `sandboxed_command` are used only by this file's
-// `#[cfg(unix)]`-gated real sandboxed-execution path (`run_sandboxed`, `stream_part`,
-// `render_output` and friends, below); a non-unix build (Windows cross-compilation --
-// the packaging path found this) compiles a stub `run_sandboxed` instead and
-// never touches either import, which made both plain, unconditional `use` items
-// "unused" there under `-D warnings`. Gating the imports themselves, not just their
-// call sites, keeps a unix build's `use` list unchanged while a non-unix build no
-// longer imports something it cannot use.
+// `sandboxed_command` is used only by this file's real sandboxed-execution paths
+// (`run_sandboxed` for Unix and for Windows, below); any other platform compiles a
+// stub `run_sandboxed` and never touches it, so the import is gated with them and
+// stays used under `-D warnings`.
 // Used by `render_output`/`stream_part` (shared between the unix-only
 // `run_sandboxed` path and the platform-independent `run_external` bridge
 // path, below), so no longer gated to unix alone.
 use crate::{OutputPart, UntrustedText};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use kgraf_sandbox::sandboxed_command;
-use kgraf_sandbox::{Network, SandboxPolicy, Workspace};
+use kgraf_sandbox::{CheckNetwork, Network, SandboxPolicy, Workspace};
 use serde_json::{Value, json};
 use std::time::Duration;
 
@@ -113,11 +124,16 @@ pub const DEFAULT_OUTPUT_CAP: usize = 64 * 1024;
 /// How long a stream reader gets, after the direct child has exited, to flush
 /// whatever it already buffered before this tool stops waiting on it (a
 /// grandchild that inherited the write end of a pipe and kept it open must not
-/// turn a command that already finished into a false timeout). `#[cfg(unix)]`
-/// for the same reason as the imports above: only the real, unix-only
-/// `run_sandboxed` path ever reads this.
-#[cfg(unix)]
+/// turn a command that already finished into a false timeout). Only the real
+/// sandboxed `run_sandboxed` paths (Unix, Windows) read this.
+#[cfg(any(unix, windows))]
 const DRAIN_GRACE: Duration = Duration::from_millis(200);
+/// How often the Windows path asks whether its command has exited.
+/// `SandboxedChild` has no async wait (std cannot spawn under another token,
+/// so tokio's child handle is not available); a 20 ms poll costs nothing next
+/// to a process start, and the check runner polls the same way.
+#[cfg(windows)]
+const EXIT_POLL: Duration = Duration::from_millis(20);
 const SCRATCH_DIR_NAME: &str = ".kgraf-shell-scratch";
 
 /// Whether a [`ShellTool`] was ever paired with the [`ShellApprovalHook`] a
@@ -217,6 +233,12 @@ pub struct ShellTool {
     /// command also gets the repository's git directory as a writable root,
     /// snapshotted before and checked after it runs.
     protected: Option<std::sync::Arc<crate::ProtectedWrites>>,
+    /// The network commands run with, and the notice where it is open
+    /// (decision 0011, amended 2026-10-07; see the module docs).
+    network: CheckNetwork,
+    /// Set once a result carried the open-network notice: it is said in the
+    /// first result of this tool, and the description says it always.
+    network_notice_said: std::sync::atomic::AtomicBool,
 }
 
 impl ShellTool {
@@ -240,6 +262,8 @@ impl ShellTool {
             external: None,
             refetch: None,
             protected: None,
+            network: CheckNetwork::current(),
+            network_notice_said: std::sync::atomic::AtomicBool::new(false),
         };
         (tool, ShellApprovalHook::new(policy))
     }
@@ -264,6 +288,8 @@ impl ShellTool {
             external: None,
             refetch: None,
             protected: None,
+            network: CheckNetwork::current(),
+            network_notice_said: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -359,6 +385,15 @@ impl ShellTool {
     /// guard's snapshot and check. Other modes are unchanged.
     pub fn with_protected_writes(mut self, guard: std::sync::Arc<crate::ProtectedWrites>) -> Self {
         self.protected = Some(guard);
+        self
+    }
+
+    /// Decide the network commands run with. The default is the platform's
+    /// ([`CheckNetwork::current`]: denied on macOS and Linux, open with a
+    /// notice on Windows); a test passes [`CheckNetwork::open_with_notice`]
+    /// to stand in for the Windows backend.
+    pub fn with_network_decision(mut self, network: CheckNetwork) -> Self {
+        self.network = network;
         self
     }
 
@@ -652,6 +687,58 @@ fn basename(program: &str) -> &str {
     program.rsplit('/').next().unwrap_or(program)
 }
 
+/// Whether a Windows program names git: its last path part, after `/` or
+/// `\`, is `git` or `git.exe` in any case (Windows file names ignore case).
+#[cfg(any(windows, test))]
+fn windows_is_git(program: &str) -> bool {
+    let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    name.eq_ignore_ascii_case("git") || name.eq_ignore_ascii_case("git.exe")
+}
+
+/// The `-c` overrides every `git` gets ahead of its own arguments, so an
+/// approved `git status` cannot run a `core.fsmonitor` or `core.hooksPath`
+/// program planted in `.git/config` (see `run_sandboxed`). Git for Windows
+/// reads `/dev/null` as its null device.
+#[cfg(any(unix, windows))]
+const GIT_SAFETY_ARGS: [&str; 4] = ["-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null"];
+
+/// The environment every `git` gets: no system configuration, and the null
+/// device as its global one, so neither sets the overrides back.
+#[cfg(any(unix, windows))]
+const GIT_SAFETY_ENV: [(&str, &str); 2] = [
+    ("GIT_CONFIG_NOSYSTEM", "1"),
+    ("GIT_CONFIG_GLOBAL", "/dev/null"),
+];
+
+/// The error of a Windows spawn that failed. A program that was not found,
+/// or that is not an executable (a `.cmd` or `.bat` file, or a shell script
+/// such as Node's `npm`), gets the way to run it: through Git Bash, which
+/// runs both.
+#[cfg(any(windows, test))]
+fn windows_spawn_failed(program: &str, error: &str) -> String {
+    let unrunnable = error.contains("not found")
+        || error.contains("batch files are refused")
+        || error.contains("os error 193");
+    let shell = matches!(
+        program.to_ascii_lowercase().as_str(),
+        "sh" | "bash"
+            | "sh.exe"
+            | "bash.exe"
+            | "/bin/sh"
+            | "/bin/bash"
+            | "/usr/bin/sh"
+            | "/usr/bin/bash"
+    );
+    if unrunnable && !shell {
+        format!(
+            "{error}. On Windows a program that is a .cmd or .bat file, or a shell script \
+             (such as npm), runs through Git Bash: give [\"sh\", \"-c\", \"<command line>\"]"
+        )
+    } else {
+        error.to_owned()
+    }
+}
+
 /// `NAME=value`: an environment-assignment prefix, the shell-only idiom
 /// `FOO=1 cmd` relies on. A plain `execve` never treats a leading argv
 /// element this way, but a persisted rule must not name `FOO=1 rm` as if it
@@ -933,15 +1020,35 @@ impl Tool for ShellTool {
         // Decision 0084: the model is told the allowlist, so a refusal under a
         // write scope is never a surprise. Derived from configuration only, so
         // the definition stays byte-identical across the run's workers (0043).
-        // Only where sandboxed commands run at all (Unix): elsewhere every
-        // call fails, and the list would promise what cannot run.
+        // Only where sandboxed commands run at all (Unix, Windows): elsewhere
+        // every call fails, and the list would promise what cannot run.
         let build = self.policy.build_allowlist();
-        if cfg!(unix) && !build.is_empty() {
+        let network_off = self.network.network() == Network::Deny;
+        if cfg!(any(unix, windows)) && !build.is_empty() {
             description.push_str(&format!(
-                " Build and test commands on this allowlist run without approval, with \
-                 the network off: {}. With a declared write scope, no other command that can write runs.",
+                " Build and test commands on this allowlist run without approval{}: {}. With a \
+                 declared write scope, no other command that can write runs.",
+                if network_off {
+                    ", with the network off"
+                } else {
+                    ""
+                },
                 build.describe()
             ));
+        }
+        // Decision 0011, amended 2026-10-07: said on every turn where the
+        // sandbox cannot deny the network. A platform setting, so the
+        // definition stays byte-identical across the run's workers (0043).
+        if !network_off {
+            description.push_str(
+                " Commands run with the network open: this platform's sandbox cannot deny it.",
+            );
+        }
+        if cfg!(windows) {
+            description.push_str(
+                " On this Windows machine `sh` and `bash` run with Git Bash, so \
+                 [\"sh\", \"-c\", \"<line>\"] takes POSIX shell syntax.",
+            );
         }
         // Decision 0093: a run-wide operator setting, so the definition is
         // still byte-identical across the run's workers (0043). A grant to one
@@ -1132,8 +1239,12 @@ impl Tool for ShellTool {
                 output
             });
         }
-        let (mut policy, env, notes) =
-            sandbox_policy(ctx, self.workspace.as_ref(), self.checkout.as_deref())?;
+        let (mut policy, env, notes) = sandbox_policy(
+            ctx,
+            self.workspace.as_ref(),
+            self.checkout.as_deref(),
+            self.network,
+        )?;
         for dir in &self.read_denies {
             policy = policy.deny_read(dir.clone());
         }
@@ -1261,6 +1372,18 @@ impl Tool for ShellTool {
         if let Some(note) = read_only_note {
             output.parts.push(crate::OutputPart::Text {
                 text: crate::UntrustedText::new(note),
+            });
+        }
+        // Decision 0011, amended 2026-10-07: where the sandbox cannot deny
+        // the network, the first command that ran says so; the description
+        // says it on every turn, so later results do not repeat it.
+        if let Some(notice) = self.network.shell_notice()
+            && !self
+                .network_notice_said
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            output.parts.push(crate::OutputPart::Text {
+                text: crate::UntrustedText::new(format!("\n[sandbox] {notice}")),
             });
         }
         if !verdict.build {
@@ -1724,10 +1847,30 @@ type ExtraEnv = Vec<(&'static str, std::ffi::OsString)>;
 /// `.venv/`, `vendor/`) are linked into the worktree and readable, never
 /// writable (`kgraf_sandbox::link_dependency_trees`, decision 0084 amended
 /// 2026-10-06); a tree that could not be linked is a note.
+///
+/// The network, and whether the backend's partial isolation is accepted,
+/// come from `network` ([`CheckNetwork`]): denied and refused-if-partial on
+/// macOS and Linux, open and accepted on the Windows backend.
 fn sandbox_policy(
     ctx: &ToolContext,
     workspace: Option<&Workspace>,
     checkout: Option<&std::path::Path>,
+    network: CheckNetwork,
+) -> Result<(SandboxPolicy, ExtraEnv, Vec<String>), ToolError> {
+    let (policy, env, notes) = sandbox_policy_on(ctx, workspace, checkout, network.network())?;
+    Ok((
+        policy.accept_partial_isolation(network.accepts_partial_isolation()),
+        env,
+        notes,
+    ))
+}
+
+/// [`sandbox_policy`] before the partial-isolation choice.
+fn sandbox_policy_on(
+    ctx: &ToolContext,
+    workspace: Option<&Workspace>,
+    checkout: Option<&std::path::Path>,
+    network: Network,
 ) -> Result<(SandboxPolicy, ExtraEnv, Vec<String>), ToolError> {
     match workspace {
         Some(ws) => {
@@ -1751,20 +1894,26 @@ fn sandbox_policy(
                 // The checkout's cargo files above the worktree, and no
                 // further (Linux; see `with_ancestor_reads`).
                 match (checkout, &links) {
-                    (Some(root), Some(links)) => SandboxPolicy::for_workspace(ws, Network::Deny)
+                    (Some(root), Some(links)) => SandboxPolicy::for_workspace(ws, network)
                         .with_ancestor_reads(root.to_path_buf())
                         .with_dependency_links(links),
-                    _ => SandboxPolicy::for_workspace(ws, Network::Deny),
+                    _ => SandboxPolicy::for_workspace(ws, network),
                 },
                 vec![
                     (
                         "CARGO_TARGET_DIR",
                         ShellTool::target_dir(ws).into_os_string(),
                     ),
-                    // Decision 0084: the network is always denied here, so cargo
-                    // is told so. Measured 2026-09-28: without it, a build with no
-                    // lockfile spends about 11 s retrying the index before it
-                    // fails; with it, cargo resolves from the local cache at once.
+                    // Decision 0084: the network is denied here (macOS, Linux), so
+                    // cargo is told so. Measured 2026-09-28: without it, a build
+                    // with no lockfile spends about 11 s retrying the index before
+                    // it fails; with it, cargo resolves from the local cache at
+                    // once. Kept where the network is open (Windows): the sandbox
+                    // cannot write the user's cargo home there either (a Low
+                    // integrity process cannot write the user's files), so a fetch
+                    // could only fail after its download; offline fails at once,
+                    // with the hint, and the build uses only what the user fetched,
+                    // as on every other platform.
                     ("CARGO_NET_OFFLINE", "true".into()),
                 ],
                 links.map(|l| l.notes).unwrap_or_default(),
@@ -1775,8 +1924,7 @@ fn sandbox_policy(
             std::fs::create_dir_all(&scratch)
                 .map_err(|e| internal(format!("cannot create {}: {e}", scratch.display())))?;
             Ok((
-                SandboxPolicy::new(vec![ctx.workspace_root.clone()], Network::Deny)
-                    .with_tmp_dir(scratch),
+                SandboxPolicy::new(vec![ctx.workspace_root.clone()], network).with_tmp_dir(scratch),
                 Vec::new(),
                 Vec::new(),
             ))
@@ -1812,7 +1960,7 @@ async fn run_sandboxed(
     // Not exhaustive (`include.path` inside `.git/config` is not covered by
     // any of this), which is why `git` also still requires approval.
     if basename(&cmd[0]) == "git" {
-        sandboxed.args(["-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null"]);
+        sandboxed.args(GIT_SAFETY_ARGS);
     }
     sandboxed.args(&cmd[1..]);
     sandboxed
@@ -1821,10 +1969,9 @@ async fn run_sandboxed(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     if basename(&cmd[0]) == "git" {
-        sandboxed
-            .command_mut()
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null");
+        for (key, value) in GIT_SAFETY_ENV {
+            sandboxed.command_mut().env(key, value);
+        }
     }
     // No separate `process_group(0)` is set here. `kgraf_sandbox`'s
     // child setup already calls `setsid()` before exec (every sandboxed child
@@ -2018,7 +2165,7 @@ fn kill_group(pgid: Option<u32>) {
 /// Whole line starts, never a substring anywhere: every match costs one of
 /// the run's bounded dependency checks on the host, and a test or a program
 /// that merely prints "failed to download" must not spend them.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const DEPENDENCY_NOT_READY: &[&str] = &[
     "error: failed to unpack package",
     "  failed to unpack package",
@@ -2033,7 +2180,7 @@ const DEPENDENCY_NOT_READY: &[&str] = &[
 /// Decision 0084: a failed allowlisted build that could not get a dependency
 /// says why and what fixes it, rather than leaving a bare cargo error.
 /// Whether a failed build's stderr shows a dependency that is not ready.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn dependency_not_ready(output: &ToolOutput) -> bool {
     output.is_error
         && output.parts.iter().any(|part| {
@@ -2056,7 +2203,7 @@ fn dependency_not_ready(output: &ToolOutput) -> bool {
 /// `--- stdout` or `--- stderr` line starts a build script's output that cargo
 /// quotes, indented, in its failure report. Dependency resolution happens
 /// before any of them, so a dependency line after one is not cargo's.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn hands_over_to_another_program(line: &str) -> bool {
     let status = line.trim_start();
     status.starts_with("Running ")
@@ -2065,18 +2212,18 @@ fn hands_over_to_another_program(line: &str) -> bool {
         || status == "--- stderr"
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn dependency_not_ready(_output: &ToolOutput) -> bool {
     false
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn with_dependency_hint(mut output: ToolOutput) -> ToolOutput {
     if dependency_not_ready(&output) {
         output.parts.push(OutputPart::Text {
             text: UntrustedText::new(
                 "[kgraf] A dependency is not ready in the local cargo cache. Builds here run \
-                 with the network off and cannot write ~/.cargo, so they can use only crates \
+                 with cargo offline and cannot write ~/.cargo, so they can use only crates \
                  already downloaded and unpacked. Run `cargo fetch` in the project, outside \
                  kGraf, to make them ready; a new dependency cannot be added from here.",
             ),
@@ -2085,7 +2232,7 @@ fn with_dependency_hint(mut output: ToolOutput) -> ToolOutput {
     output
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn with_dependency_hint(output: ToolOutput) -> ToolOutput {
     output
 }
@@ -2098,7 +2245,146 @@ fn killed_marker(timeout: Duration) -> String {
     )
 }
 
-#[cfg(not(unix))]
+/// Windows: the same contract as the Unix path, through the restricted-token
+/// backend. The argv runs as given (`sh` and `bash` through Git Bash, in the
+/// backend), with the same environment, working directory, git overrides,
+/// output caps, timeout marker and cancel. The job object stands in for the
+/// process group: a timeout, a cancel and a normal exit each end every
+/// process the command started (no breakaway is allowed, so none escapes
+/// it), and closing the job's handle does the same if this future is
+/// dropped.
+#[cfg(windows)]
+async fn run_sandboxed(
+    cmd: &[String],
+    ctx: &ToolContext,
+    policy: &SandboxPolicy,
+    env: &ExtraEnv,
+    notes: &[String],
+    timeout: Duration,
+    output_cap: usize,
+) -> Result<ToolOutput, ToolError> {
+    use kgraf_sandbox::Redirect;
+    let mut sandboxed = sandboxed_command(policy, &cmd[0], &ctx.workspace_root)
+        .map_err(|e| internal(format!("cannot build sandbox: {e}")))?;
+    for (key, value) in env {
+        sandboxed.env(key, value);
+    }
+    let git = windows_is_git(&cmd[0]);
+    if git {
+        sandboxed.args(GIT_SAFETY_ARGS);
+    }
+    sandboxed.args(&cmd[1..]);
+    if git {
+        for (key, value) in GIT_SAFETY_ENV {
+            sandboxed.env(key, value);
+        }
+    }
+    sandboxed
+        .stdin(Redirect::Null)
+        .stdout(Redirect::Piped)
+        .stderr(Redirect::Piped);
+    let mut refused = sandboxed.refused_reads().to_vec();
+    refused.extend(notes.iter().cloned());
+    // Decision 0067: the cancel check that keeps a stopped round from
+    // spawning is at the top of `ShellTool::call`; a cancel after it is
+    // caught by the loop below, which ends the job.
+    let mut child = sandboxed
+        .spawn()
+        .map_err(|e| internal(windows_spawn_failed(&cmd[0], &e.to_string())))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| internal("no stdout pipe"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| internal("no stderr pipe"))?;
+    let (mut stdout_task, stdout_buf) = spawn_blocking_reader(stdout, output_cap);
+    let (mut stderr_task, stderr_buf) = spawn_blocking_reader(stderr, output_cap);
+
+    enum Ended {
+        Cancelled,
+        TimedOut,
+        Exited(std::process::ExitStatus),
+    }
+    let deadline = tokio::time::Instant::now() + timeout;
+    let ended = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ended::Exited(status),
+            Ok(None) => {}
+            Err(e) => {
+                let _ = child.kill();
+                return Err(internal(format!("wait failed: {e}")));
+            }
+        }
+        tokio::select! {
+            _ = ctx.cancel.cancelled() => break Ended::Cancelled,
+            () = tokio::time::sleep_until(deadline) => break Ended::TimedOut,
+            () = tokio::time::sleep(EXIT_POLL) => {}
+        }
+    };
+    // Every process still in the job ends here, after a normal exit too: a
+    // background descendant (`cmd &`) would keep running and hold the
+    // worktree, so the verifier would see a tree that is not final. Dropping
+    // the child closes the job, which ends them if the terminate call failed.
+    let _ = child.kill();
+    drop(child);
+    match ended {
+        Ended::Cancelled => {
+            stdout_task.abort();
+            stderr_task.abort();
+            Err(ToolError::Cancelled {
+                tool: "shell".into(),
+            })
+        }
+        Ended::Exited(status) => {
+            // The job is gone, so the pipes close and the readers end; the
+            // grace bounds the wait as on Unix.
+            let (stdout_bytes, stdout_trunc) =
+                drain_with_cap(&mut stdout_task, &stdout_buf, DRAIN_GRACE).await;
+            let (stderr_bytes, stderr_trunc) =
+                drain_with_cap(&mut stderr_task, &stderr_buf, DRAIN_GRACE).await;
+            let mut output = render_output(
+                status.success(),
+                status.code(),
+                stdout_bytes,
+                stdout_trunc,
+                stderr_bytes,
+                stderr_trunc,
+                output_cap,
+            );
+            if !status.success() && !refused.is_empty() {
+                let lines: Vec<String> = refused.iter().map(|r| format!("[sandbox] {r}")).collect();
+                output.parts.push(OutputPart::Text {
+                    text: UntrustedText::new(lines.join("\n")),
+                });
+            }
+            Ok(output)
+        }
+        Ended::TimedOut => {
+            // Decision 0084, item C: the output up to the kill is kept.
+            let (stdout_bytes, stdout_trunc) =
+                drain_with_cap(&mut stdout_task, &stdout_buf, DRAIN_GRACE).await;
+            let (stderr_bytes, stderr_trunc) =
+                drain_with_cap(&mut stderr_task, &stderr_buf, DRAIN_GRACE).await;
+            let mut output = render_output(
+                false,
+                None,
+                stdout_bytes,
+                stdout_trunc,
+                stderr_bytes,
+                stderr_trunc,
+                output_cap,
+            );
+            output.parts[0] = OutputPart::Text {
+                text: UntrustedText::new(killed_marker(timeout)),
+            };
+            Ok(output)
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 async fn run_sandboxed(
     _cmd: &[String],
     _ctx: &ToolContext,
@@ -2109,7 +2395,7 @@ async fn run_sandboxed(
     _output_cap: usize,
 ) -> Result<ToolOutput, ToolError> {
     Err(internal(
-        "sandboxed shell execution is implemented for macOS and Linux only",
+        "sandboxed shell execution is implemented for macOS, Linux and Windows only",
     ))
 }
 
@@ -2222,7 +2508,7 @@ fn render_external(
 
 /// What a reader task has kept of one pipe: at most `cap` bytes, and whether
 /// anything after them was dropped.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Default)]
 struct Captured {
     bytes: Vec<u8>,
@@ -2231,7 +2517,7 @@ struct Captured {
 
 /// Shared view of a reader's buffer. A std mutex is right here: it is held
 /// only for a copy of one chunk, never across an await.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 type SharedCapture = std::sync::Arc<std::sync::Mutex<Captured>>;
 
 /// Reads a pipe on its own task and keeps at most `cap` bytes. It keeps
@@ -2253,24 +2539,58 @@ fn spawn_reader(
         loop {
             match reader.read(&mut chunk).await {
                 Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    let mut kept = task_shared
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let room = cap.saturating_sub(kept.bytes.len());
-                    let take = room.min(n);
-                    kept.bytes.extend_from_slice(&chunk[..take]);
-                    if take < n {
-                        kept.truncated = true;
-                    }
-                }
+                Ok(n) => keep_chunk(&task_shared, &chunk[..n], cap),
             }
         }
-        std::mem::take(
-            &mut *task_shared
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        )
+        take_captured(&task_shared)
+    });
+    (handle, shared)
+}
+
+/// Keep what fits of `chunk` under `cap`, and mark the capture truncated if
+/// anything did not fit.
+#[cfg(any(unix, windows))]
+fn keep_chunk(shared: &SharedCapture, chunk: &[u8], cap: usize) {
+    let mut kept = shared
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let room = cap.saturating_sub(kept.bytes.len());
+    let take = room.min(chunk.len());
+    kept.bytes.extend_from_slice(&chunk[..take]);
+    if take < chunk.len() {
+        kept.truncated = true;
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn take_captured(shared: &SharedCapture) -> Captured {
+    std::mem::take(
+        &mut *shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+}
+
+/// [`spawn_reader`] for a blocking pipe (Windows: `SandboxedChild` hands out
+/// std pipes). The read runs on the blocking pool; it ends at EOF, which
+/// comes once the command's job is ended, since no process can leave the job
+/// holding the pipe.
+#[cfg(windows)]
+fn spawn_blocking_reader(
+    mut reader: impl std::io::Read + Send + 'static,
+    cap: usize,
+) -> (tokio::task::JoinHandle<Captured>, SharedCapture) {
+    let shared: SharedCapture = SharedCapture::default();
+    let task_shared = shared.clone();
+    let handle = tokio::task::spawn_blocking(move || {
+        let mut chunk = [0u8; 8192];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => keep_chunk(&task_shared, &chunk[..n], cap),
+            }
+        }
+        take_captured(&task_shared)
     });
     (handle, shared)
 }
@@ -2278,7 +2598,7 @@ fn spawn_reader(
 /// Waits for a [`spawn_reader`] task for at most `grace`. EOF ends it early;
 /// `grace` elapsing (a grandchild still holds the pipe open) ends the wait
 /// anyway, and the task is aborted and its buffer read as it stands.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 async fn drain_with_cap(
     handle: &mut tokio::task::JoinHandle<Captured>,
     shared: &SharedCapture,
@@ -2339,6 +2659,175 @@ fn stream_part(label: &str, bytes: Vec<u8>, truncated: bool, cap: usize) -> Outp
             }
         }
         binary @ OutputPart::Binary(_) => binary,
+    }
+}
+
+/// The Windows path's decisions, pure, so they run on every host.
+#[cfg(test)]
+mod windows_decision_tests {
+    use super::*;
+
+    /// Every `git` gets the safety overrides on Windows, by any path and in
+    /// any case; a program that only contains the word does not.
+    #[test]
+    fn git_is_recognized_by_its_windows_file_name() {
+        for program in [
+            "git",
+            "git.exe",
+            "GIT.EXE",
+            r"C:\Program Files\Git\cmd\git.exe",
+            "C:/Program Files/Git/cmd/git",
+        ] {
+            assert!(windows_is_git(program), "{program}");
+        }
+        for program in ["gitk", "git-lfs.exe", r"C:\git\cargo.exe", "legit", ""] {
+            assert!(!windows_is_git(program), "{program}");
+        }
+    }
+
+    /// A program the backend could not run gets the way to run it through
+    /// Git Bash; a shell's own failure, or any other error, is left as it is.
+    #[test]
+    fn a_program_windows_cannot_run_is_pointed_at_git_bash() {
+        for error in [
+            "spawn failed: program npm not found",
+            "spawn failed: batch files are refused: cmd.exe parses their arguments differently",
+            "spawn failed: %1 is not a valid Win32 application. (os error 193)",
+        ] {
+            let said = windows_spawn_failed("npm", error);
+            assert!(said.starts_with(error), "{said}");
+            assert!(said.contains(r#"["sh", "-c", "<command line>"]"#), "{said}");
+        }
+        let missing_bash = "spawn failed: on Windows, kGraf runs `sh` and `bash` with Git Bash \
+                            from Git for Windows (https://gitforwindows.org/), and none was found";
+        assert_eq!(windows_spawn_failed("sh", missing_bash), missing_bash);
+        assert_eq!(
+            windows_spawn_failed("/bin/bash", missing_bash),
+            missing_bash
+        );
+        let other = "spawn failed: Access is denied. (os error 5)";
+        assert_eq!(windows_spawn_failed("cargo", other), other);
+    }
+}
+
+/// The Windows path end to end, on real Windows only. Written for Windows
+/// and NOT YET RUN there; it needs Git for Windows installed. Run with
+/// `cargo test -p kgraf-tools --lib windows_tests -- --test-threads=1`.
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use crate::CancellationToken;
+
+    fn ctx(root: std::path::PathBuf) -> ToolContext {
+        ToolContext {
+            worker: "w1".into(),
+            task: "t1".into(),
+            workspace_root: root,
+            cancel: CancellationToken::new(),
+            progress: crate::ProgressSink::default(),
+        }
+    }
+
+    fn tool() -> ShellTool {
+        ShellTool::new(ExecPolicy::default_kgraf_policy()).0
+    }
+
+    /// A plain program and a POSIX shell line both run, their output comes
+    /// back, and the open-network notice comes with the first result only.
+    #[tokio::test]
+    async fn commands_run_and_the_first_result_says_the_network_is_open() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let c = ctx(dir.path().to_path_buf());
+        let tool = tool();
+        let first = tool
+            .call(
+                json!({"command": ["cmd", "/d", "/c", "echo plain-program"]}),
+                &c,
+                &CallPermit::new(),
+            )
+            .await
+            .expect("call")
+            .render();
+        assert!(first.contains("plain-program"), "{first}");
+        assert!(
+            first.contains(kgraf_sandbox::SHELL_NETWORK_OPEN_NOTICE),
+            "{first}"
+        );
+        let second = tool
+            .call(
+                json!({"command": ["sh", "-c", "printf '%s|' \"a b\" 'c\"d'"]}),
+                &c,
+                &CallPermit::new(),
+            )
+            .await
+            .expect("call")
+            .render();
+        assert!(second.contains("a b|c\"d|"), "{second}");
+        assert!(!second.contains("network not blocked"), "{second}");
+    }
+
+    #[tokio::test]
+    async fn a_failing_command_returns_its_exit_status() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = tool()
+            .call(
+                json!({"command": ["sh", "-c", "echo to-stderr >&2; exit 3"]}),
+                &ctx(dir.path().to_path_buf()),
+                &CallPermit::new(),
+            )
+            .await
+            .expect("call");
+        assert!(out.is_error);
+        let text = out.render();
+        assert!(
+            text.contains("exit status: 3") && text.contains("to-stderr"),
+            "{text}"
+        );
+    }
+
+    /// The timeout ends the whole tree: a background `sleep` does not hold
+    /// the call open, and the output so far comes back under the marker.
+    #[tokio::test]
+    async fn a_timed_out_command_and_its_background_child_are_killed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let started = std::time::Instant::now();
+        let out = tool()
+            .with_timeout(Duration::from_secs(3))
+            .call(
+                json!({"command": ["sh", "-c", "echo before; sleep 60 & sleep 60"]}),
+                &ctx(dir.path().to_path_buf()),
+                &CallPermit::new(),
+            )
+            .await
+            .expect("call");
+        assert!(started.elapsed() < Duration::from_secs(30), "{out:?}");
+        let text = out.render();
+        assert!(
+            text.contains("killed after 3 s") && text.contains("before"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_command_is_an_error_and_is_ended() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let c = ctx(dir.path().to_path_buf());
+        let cancel = c.cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            cancel.cancel();
+        });
+        let started = std::time::Instant::now();
+        let err = tool()
+            .call(
+                json!({"command": ["sh", "-c", "sleep 60"]}),
+                &c,
+                &CallPermit::new(),
+            )
+            .await
+            .expect_err("a cancel is an error");
+        assert!(matches!(err, ToolError::Cancelled { .. }), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(30));
     }
 }
 
@@ -2477,6 +2966,80 @@ mod tests {
             .expect("call");
         assert!(!out.is_error);
         assert!(out.render().contains("hello-from-sandbox"));
+    }
+
+    /// Decision 0011, amended 2026-10-07: where the backend cannot deny the
+    /// network (stood in for here with the Windows decision), the first
+    /// command that runs says so, once per tool; a tool whose network is
+    /// denied never says it.
+    #[tokio::test]
+    async fn the_open_network_notice_comes_with_the_first_command_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let c = ctx(dir.path().to_path_buf());
+        let line = format!("[sandbox] {}", kgraf_sandbox::SHELL_NETWORK_OPEN_NOTICE);
+        let (tool, _hook) = ShellTool::new(policy());
+        let tool = tool.with_network_decision(CheckNetwork::open_with_notice());
+        let input = || json!({"command": ["/bin/echo", "hi"]});
+        let first = tool
+            .call(input(), &c, &CallPermit::new())
+            .await
+            .expect("call");
+        assert!(!first.is_error);
+        let first = first.render();
+        assert!(first.contains("hi") && first.contains(&line), "{first}");
+        let second = tool
+            .call(input(), &c, &CallPermit::new())
+            .await
+            .expect("call")
+            .render();
+        assert!(second.contains("hi"), "{second}");
+        assert!(!second.contains("network not blocked"), "{second}");
+        let (denied, _hook) = ShellTool::new(policy());
+        let denied = denied.with_network_decision(CheckNetwork::deny());
+        let out = denied
+            .call(input(), &c, &CallPermit::new())
+            .await
+            .expect("call")
+            .render();
+        assert!(!out.contains("network not blocked"), "{out}");
+    }
+
+    /// The sandbox policy of a call takes its network, and whether partial
+    /// isolation is accepted, from the tool's decision: open and accepted
+    /// for the Windows decision, denied and refused for every other.
+    #[test]
+    fn the_shell_policy_follows_the_network_decision() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let c = ctx(dir.path().to_path_buf());
+        let (open, _, _) =
+            sandbox_policy(&c, None, None, CheckNetwork::open_with_notice()).expect("policy");
+        assert_eq!(open.network(), Network::Allow);
+        assert!(open.accepts_partial_isolation());
+        let (denied, _, _) = sandbox_policy(&c, None, None, CheckNetwork::deny()).expect("policy");
+        assert_eq!(denied.network(), Network::Deny);
+        assert!(!denied.accepts_partial_isolation());
+    }
+
+    /// The description says the network is open wherever it is, and keeps
+    /// saying "with the network off" only where it is denied.
+    #[test]
+    fn the_description_says_whether_the_network_is_open() {
+        let (open, _hook) = ShellTool::new(policy());
+        let open = open
+            .with_network_decision(CheckNetwork::open_with_notice())
+            .definition()
+            .description;
+        assert!(
+            open.contains("Commands run with the network open"),
+            "{open}"
+        );
+        assert!(!open.contains("with the network off"), "{open}");
+        let (denied, _hook) = ShellTool::new(policy());
+        let denied = denied
+            .with_network_decision(CheckNetwork::deny())
+            .definition()
+            .description;
+        assert!(!denied.contains("network open"), "{denied}");
     }
 
     #[tokio::test]

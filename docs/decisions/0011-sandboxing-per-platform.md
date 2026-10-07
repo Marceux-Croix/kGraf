@@ -188,3 +188,60 @@ passes where the network is denied.
 
 **Status.** Built and compile-checked for Windows; the decision logic is tested
 on macOS with a stand-in capability. Nothing ran on Windows.
+
+## Amendment (2026-10-07): the worker shell runs on Windows, through Git Bash, with the network open
+
+**Problem.** Workers could not run a shell command on Windows: the shell tool's
+non-Unix path refused every call. Every policy on Windows was also refused
+before it started, because the backend is always partial and no production
+caller opted in to that, so the checks and gates of the 2026-10-06 amendment
+could not run there either. And a POSIX shell command (`sh -c`) finds no `sh`
+on a default Windows `PATH`.
+
+**Decision.**
+
+1. **Network.** The worker shell takes its network from the same
+   `CheckNetwork` decision as checks: denied on macOS and Linux, open on the
+   Windows restricted-token backend. Where it is open, the notice "network not
+   blocked: the Windows sandbox cannot deny network access without
+   administrator rights (decision 0011); shell commands run with the network
+   open" is in the tool's description, in the first result of each tool, once
+   in the run's trace, and in the list the run command prints.
+2. **Partial isolation follows the same decision.**
+   `CheckNetwork::accepts_partial_isolation` is true exactly where the network
+   is open with the notice; the worker shell, the contract check runner, the
+   gates and the benchmark-brief checks pass it to the policy. Elsewhere it is
+   false, so a partial Linux backend still refuses.
+3. **Git Bash for `sh` and `bash`, with no fallback.** A command whose program
+   is `sh` or `bash` runs with Git Bash (`bin\bash.exe` of Git for Windows);
+   every other argv runs as given. Claude Code makes the same choice for its
+   Bash tool; Codex defaults to PowerShell. Git Bash is chosen because kGraf's
+   permission checks read an `sh -c` script as POSIX shell text, and running it
+   in PowerShell or cmd would run a different language than the one judged.
+   With no Git Bash the command fails and says to install Git for Windows or
+   set `KGRAF_GIT_BASH_PATH`. `bash` is never looked up on `PATH`, where
+   `System32\bash.exe` is the WSL launcher.
+4. **The argv goes through the environment.** The MSYS2 runtime splits a
+   command line from a Windows parent with its own quoting and globbing rules.
+   The command line therefore carries one fixed script with no quote and no
+   backslash, `IFS=;set -f;eval $KGRAF_SHELL_COMMAND`, and the argv travels in
+   `KGRAF_SHELL_COMMAND`, single-quoted, as an `exec` of `/usr/bin/sh` or
+   `/usr/bin/bash`. This sits in the backend's spawn, so the gates' and the
+   contract checks' `sh -c` use it too.
+5. **`CARGO_NET_OFFLINE=true` stays on Windows.** It keeps a build to the
+   dependencies the user fetched, as on every other platform, and the sandbox
+   cannot write the user's cargo home there anyway.
+
+**Behavior.** The same contract as on Unix: environment, working directory,
+output caps, the timeout marker, cancel, git's safety settings and the
+permission checks. The job object ends every process of the command at a
+timeout, a cancel and a normal exit.
+
+**Known gaps.** A `.cmd` or `.bat` program or an extensionless script runs only
+through `["sh", "-c", ...]`, and the error says so. The `cmd /c` script reader
+judges the argv's text, while cmd.exe parses the raw command line; the two can
+differ for a script with embedded quotes.
+
+**Status.** Built and compile-checked for Windows; the decision logic and the
+argument transport are tested on macOS. Nothing ran on Windows. Test steps:
+`docs/WINDOWS-TESTING.md`.

@@ -681,7 +681,12 @@ impl SandboxRunner {
         // already; a cargo file above the tree makes cargo fail loud instead.
         let mut policy = SandboxPolicy::new(vec![run_dir.to_path_buf()], self.network.network())
             .with_tmp_dir(run_dir.join("tmp"))
-            .accept_partial_isolation(self.accept_partial);
+            // The Windows backend is always partial; a check runs there under
+            // the same decision that opens its network, and says so
+            // (`CheckNetwork::accepts_partial_isolation`, decision 0011).
+            .accept_partial_isolation(
+                self.accept_partial || self.network.accepts_partial_isolation(),
+            );
         // Every process of the check holds this file shared until it exits,
         // so its absence of holders proves the tree is gone. It lies
         // outside the check's only writable root, beside `.out` and `.err`, as
@@ -907,6 +912,11 @@ impl SandboxRunner {
             &run_dir.join("tree"),
         )
         .map_err(|e| CheckError::Sandbox(e.to_string()))?;
+        // `CARGO_NET_OFFLINE` stays with the network open: the check judges
+        // the code against the dependencies the user already fetched, as on
+        // every other platform, and the sandbox cannot write the user's cargo
+        // home here either (a Low integrity process cannot write the user's
+        // files), so a fetch could only fail after its download.
         cmd.args(args)
             .env("CARGO_TARGET_DIR", run_dir.join("target"))
             .env("CARGO_NET_OFFLINE", "true")

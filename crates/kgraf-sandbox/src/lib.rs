@@ -53,8 +53,8 @@ pub use sandbox::SandboxedChild;
 pub use sandbox::SetupProbe;
 pub use sandbox::{
     Backend, CheckNetwork, FROZEN_GIT_FILES, FrozenGit, IsolationStrength, NETWORK_OPEN_NOTICE,
-    Network, ReadConfinement, Redirect, SandboxPolicy, SandboxedCommand, platform_isolation,
-    sandboxed_command, workspace_command,
+    Network, ReadConfinement, Redirect, SHELL_NETWORK_OPEN_NOTICE, SandboxPolicy, SandboxedCommand,
+    platform_isolation, sandboxed_command, workspace_command,
 };
 #[cfg(target_os = "linux")]
 pub use sandbox::{LinuxConfinement, linux_confinement};

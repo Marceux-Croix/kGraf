@@ -159,8 +159,14 @@ pub enum Notice {
     /// with the network open, because this platform's sandbox cannot deny it
     /// (Windows; decision 0011, amended 2026-10-06). The sentence is the
     /// whole notice; it is also traced and in the run report. The worker's
-    /// shell is not part of this.
+    /// shell has its own notice ([`Notice::ShellNetworkOpen`]).
     ChecksNetworkOpen(String),
+    /// The workers' shell commands run with the network open, because this
+    /// platform's sandbox cannot deny it (Windows; decision 0011, amended
+    /// 2026-10-07). The sentence is the whole notice; it is also traced when
+    /// the run opens, and each worker's shell says it in its first result
+    /// and in its description.
+    ShellNetworkOpen(String),
 }
 
 /// Say, once per run, that checks run with the network open: the notice for
@@ -172,6 +178,18 @@ pub(crate) fn announce_open_network(
 ) -> Option<String> {
     let sentence = network.notice()?.to_owned();
     notices(Notice::ChecksNetworkOpen(sentence.clone()));
+    Some(sentence)
+}
+
+/// Say, once per run, that the workers' shell commands run with the network
+/// open: the notice for the printed list, and the sentence to trace when the
+/// run opens. Nothing for a backend that denies the network.
+pub(crate) fn announce_open_shell_network(
+    network: kgraf_sandbox::CheckNetwork,
+    notices: &mut (dyn FnMut(Notice) + Send),
+) -> Option<String> {
+    let sentence = network.shell_notice()?.to_owned();
+    notices(Notice::ShellNetworkOpen(sentence.clone()));
     Some(sentence)
 }
 
@@ -1945,6 +1963,13 @@ impl Host {
                 notices(Notice::RuleConflict(conflict));
             }
         }
+        // Decision 0011, amended 2026-10-07: traced once with the run's other
+        // start notices; each worker's shell decides from the same platform
+        // capability (`ShellTool`'s default `CheckNetwork::current`).
+        start_notices.extend(announce_open_shell_network(
+            kgraf_sandbox::CheckNetwork::current(),
+            notices,
+        ));
         let orchestrator = orchestrator.with_start_notices(start_notices);
         let orchestrator = orchestrator.with_check_network_notice(announce_open_network(
             kgraf_sandbox::CheckNetwork::current(),

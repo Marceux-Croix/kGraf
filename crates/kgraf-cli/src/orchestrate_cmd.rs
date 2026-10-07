@@ -236,7 +236,9 @@ fn notice_line(n: &Notice) -> String {
         }
         Notice::RuleConflict(conflict) => format!("notice     {}", conflict.sentence()),
         Notice::RuleMatchesNoTool(sentence) => format!("notice     {sentence}"),
-        Notice::ChecksNetworkOpen(sentence) => format!("sandbox    {sentence}"),
+        Notice::ChecksNetworkOpen(sentence) | Notice::ShellNetworkOpen(sentence) => {
+            format!("sandbox    {sentence}")
+        }
         Notice::GraphEmpty { root, files_seen } => format!(
             "graph      empty after indexing {} ({files_seen} file(s) seen): no graph slices \
              for this run, likely no supported language in the tree",
