@@ -17,6 +17,7 @@ mod confined;
 pub mod dependencies;
 mod error;
 pub mod git;
+pub mod git_for_windows;
 pub mod gradle_wrapper;
 pub mod lifecycle;
 pub mod merge;

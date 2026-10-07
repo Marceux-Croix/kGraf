@@ -133,6 +133,13 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // The worker shell needs Git Bash on Windows. A diagnostic run (--measure,
+    // --screenshot) is unattended and cannot answer a question, so it skips the check.
+    #[cfg(windows)]
+    if args.measure.is_none() && args.screenshot.is_none() {
+        git_for_windows::ensure_or_explain()?;
+    }
+
     let settings_path = match args.config {
         Some(p) => p,
         None => default_settings_path()?,
@@ -243,4 +250,41 @@ fn diag_code_for(err: &anyhow::Error) -> (&'static str, &'static str) {
     }
     let spec = kgraf_diag::catch_all_for("kgraf-shell");
     (spec.code, spec.crate_name)
+}
+
+/// The Git for Windows check, with native message boxes because this binary
+/// has no console. A yes runs `winget`; every other end shows the fix and
+/// stops the launch.
+#[cfg(windows)]
+mod git_for_windows {
+    use anyhow::{Result, anyhow};
+    use kgraf_sandbox::git_for_windows::{SystemProbe, ensure};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        IDYES, MB_ICONERROR, MB_ICONQUESTION, MB_OK, MB_YESNO, MessageBoxW,
+    };
+
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    fn show(text: &str, flags: u32) -> i32 {
+        let text = wide(text);
+        let title = wide("kGraf");
+        // SAFETY: both strings are NUL-terminated and outlive the call; a null
+        // owner window is allowed.
+        unsafe { MessageBoxW(std::ptr::null_mut(), text.as_ptr(), title.as_ptr(), flags) }
+    }
+
+    pub fn ensure_or_explain() -> Result<()> {
+        let outcome = ensure(&SystemProbe, |question| {
+            show(question, MB_YESNO | MB_ICONQUESTION) == IDYES
+        });
+        match outcome.into_result() {
+            Ok(_) => Ok(()),
+            Err(text) => {
+                show(&text, MB_OK | MB_ICONERROR);
+                Err(anyhow!(text))
+            }
+        }
+    }
 }

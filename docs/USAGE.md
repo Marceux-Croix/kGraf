@@ -2152,6 +2152,29 @@ and SmartScreen warnings. `scripts/release-all.sh` builds every installer from o
 tag. A `cargo-dist` workflow in `.github/workflows/release.yml` builds draft releases from a
 version tag.
 
+### Windows: Git for Windows
+
+kGraf needs git on every platform. On Windows it also runs `sh` and `bash` with Git Bash,
+which comes with [Git for Windows](https://gitforwindows.org/). The `.msi` and `.zip` do not
+carry Git for Windows: it is a separate package under its own license.
+
+At each start, `kgraf-app.exe` and `kgraf.exe` look for Git Bash. They check, in this
+order: `KGRAF_GIT_BASH_PATH`, the `InstallPath` of the `SOFTWARE\GitForWindows` registry key
+(`HKLM`, then `HKCU`), each `PATH` folder that holds `git.exe`, and the usual install
+folders. When Git Bash is missing:
+
+- If `winget` is available, kGraf asks once whether to install Git for Windows for your
+  user account. On yes it runs `winget install --id Git.Git -e --scope user --silent
+  --accept-package-agreements --accept-source-agreements --disable-interactivity` and
+  looks again. The install needs no administrator rights. A start with no terminal (a
+  script, a pipe) cannot ask, so it stops with the same text and command.
+- If you answer no, `winget` fails, or `winget` is not there, kGraf stops and shows the
+  download link, the `winget` command, and `KGRAF_GIT_BASH_PATH`. It checks again at the next
+  start.
+
+`kgraf diag` and `--help` run without the check, and so do `kgraf-app --measure` and
+`--screenshot`.
+
 ## Diagnostics
 
 kGraf keeps one small, local, per-user file of basic usage counts (launches,

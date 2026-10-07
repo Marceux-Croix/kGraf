@@ -247,9 +247,6 @@ pub(super) fn env_block(
 /// not see it.
 pub(super) const SHELL_COMMAND_VAR: &str = "KGRAF_SHELL_COMMAND";
 
-/// Names the Git Bash to run (its `bin\bash.exe`), in place of the search.
-pub(super) const GIT_BASH_PATH_VAR: &str = "KGRAF_GIT_BASH_PATH";
-
 /// The script Git Bash gets on its command line: evaluate
 /// [`SHELL_COMMAND_VAR`] as one word. `IFS=` stops field splitting and
 /// `set -f` stops globbing of the expansion, so the text reaches `eval`
@@ -347,66 +344,6 @@ pub(super) fn shell_launch(
     })
 }
 
-/// Find Git Bash, the `bin\bash.exe` of Git for Windows.
-///
-/// - `override_path` ([`GIT_BASH_PATH_VAR`]): used when set, and an error
-///   when it is not a file; the search does not run.
-/// - Each `PATH` directory holding `git.exe` (Git's `cmd` or `mingw64\bin`):
-///   `..\bin\bash.exe` and `..\..\bin\bash.exe` beside it.
-/// - Each install root (`%ProgramFiles%`, `%ProgramW6432%`,
-///   `%ProgramFiles(x86)%`, `%LOCALAPPDATA%\Programs`): `Git\bin\bash.exe`.
-///
-/// `bin\bash.exe` is Git's launcher: it puts `usr\bin` and `mingw64\bin` on
-/// `PATH` and passes its command line on unchanged (Git for Windows
-/// `git-wrapper.c`). `usr\bin\bash.exe` alone would not find `ls` or `grep`.
-pub(super) fn find_git_bash(
-    override_path: Option<&std::path::Path>,
-    path_dirs: &[std::path::PathBuf],
-    install_roots: &[std::path::PathBuf],
-    is_file: impl Fn(&std::path::Path) -> bool,
-) -> Result<std::path::PathBuf, String> {
-    if let Some(path) = override_path {
-        return if is_file(path) {
-            Ok(path.to_path_buf())
-        } else {
-            Err(format!(
-                "{GIT_BASH_PATH_VAR} names {}, which is not a file; set it to the bin\\bash.exe \
-                 of Git for Windows",
-                path.display()
-            ))
-        };
-    }
-    let mut looked = Vec::new();
-    let beside_git = path_dirs
-        .iter()
-        .filter(|dir| is_file(&dir.join("git.exe")))
-        .flat_map(|dir| {
-            [
-                dir.join("..").join("bin").join("bash.exe"),
-                dir.join("..").join("..").join("bin").join("bash.exe"),
-            ]
-        });
-    let installed = install_roots
-        .iter()
-        .map(|root| root.join("Git").join("bin").join("bash.exe"));
-    for candidate in beside_git.chain(installed) {
-        if is_file(&candidate) {
-            return Ok(candidate);
-        }
-        looked.push(candidate.display().to_string());
-    }
-    Err(format!(
-        "on Windows, kGraf runs `sh` and `bash` with Git Bash from Git for Windows \
-         (https://gitforwindows.org/), and none was found; install Git for Windows, or set \
-         {GIT_BASH_PATH_VAR} to its bin\\bash.exe. Looked in: {}",
-        if looked.is_empty() {
-            "no candidate (no git.exe on PATH and no install folder set)".to_owned()
-        } else {
-            looked.join(", ")
-        }
-    ))
-}
-
 #[cfg(windows)]
 pub use imp::SandboxedChild;
 #[cfg(windows)]
@@ -486,8 +423,8 @@ mod imp {
 
     use super::super::{Network, Redirect, Resolved};
     use super::{
-        BACKEND_NAME, GIT_BASH_PATH_VAR, SHELL_COMMAND_VAR, ShellLaunch, capability_sid_string,
-        env_block, find_git_bash, is_batch_file, posix_shell, shell_launch,
+        BACKEND_NAME, SHELL_COMMAND_VAR, ShellLaunch, capability_sid_string, env_block,
+        is_batch_file, posix_shell, shell_launch,
     };
     use crate::error::SandboxError;
     // Shared with the command policy's check of a `cmd /c` or PowerShell
@@ -1838,24 +1775,10 @@ mod imp {
     /// found (fail loud: no other shell is tried).
     fn git_bash_launch(shell: &str, cmd: &Command) -> Result<ShellLaunch, SandboxError> {
         let not_run = |kind, why: String| SandboxError::Spawn(io::Error::new(kind, why));
-        let override_path = std::env::var_os(GIT_BASH_PATH_VAR)
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from);
-        let path_dirs: Vec<PathBuf> = std::env::var_os("PATH")
-            .map(|p| std::env::split_paths(&p).collect())
-            .unwrap_or_default();
-        let install_roots: Vec<PathBuf> = ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"]
-            .iter()
-            .filter_map(|v| std::env::var_os(v).map(PathBuf::from))
-            .chain(std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("Programs")))
-            .collect();
-        let bash = find_git_bash(
-            override_path.as_deref(),
-            &path_dirs,
-            &install_roots,
-            Path::is_file,
-        )
-        .map_err(|why| not_run(io::ErrorKind::NotFound, why))?;
+        use crate::git_for_windows::{Probe as _, SystemProbe};
+        let bash = SystemProbe
+            .find()
+            .map_err(|why| not_run(io::ErrorKind::NotFound, why))?;
         let args: Vec<&OsStr> = cmd.get_args().collect();
         shell_launch(shell, &args, bash).map_err(|why| not_run(io::ErrorKind::InvalidInput, why))
     }
@@ -2442,84 +2365,5 @@ mod tests {
             "<zero>[a b][it's][*.rs][C:\\\\dir\\\\][\"q\"][{x,y}][~][@file][new\nline][]{unset}\n\
              a.rs b.rs\n"
         );
-    }
-
-    #[test]
-    fn the_override_names_git_bash_and_a_missing_one_is_an_error() {
-        let named = std::path::Path::new("D:/tools/Git/bin/bash.exe");
-        let found = find_git_bash(Some(named), &[], &[], |p| p == named).unwrap();
-        assert_eq!(found, named);
-        let err = find_git_bash(Some(named), &[], &[], |_| false).unwrap_err();
-        assert!(
-            err.contains(GIT_BASH_PATH_VAR) && err.contains("not a file"),
-            "{err}"
-        );
-    }
-
-    /// Git Bash is found beside the `git.exe` on `PATH`, then in the install
-    /// folders; the WSL launcher in System32 is never taken, and a search
-    /// that finds nothing says where it looked and how to fix it.
-    #[test]
-    fn git_bash_is_found_beside_git_then_in_the_install_folders_never_wsl() {
-        use std::path::{Path, PathBuf};
-        fn exists(files: &'static [&'static str]) -> impl Fn(&Path) -> bool {
-            move |p: &Path| files.iter().any(|f| Path::new(f) == p)
-        }
-        let system32 = PathBuf::from("C:/Windows/System32");
-        let found = find_git_bash(
-            None,
-            &[system32.clone(), PathBuf::from("E:/Git/cmd")],
-            &[PathBuf::from("C:/Program Files")],
-            exists(&[
-                "C:/Windows/System32/bash.exe",
-                "E:/Git/cmd/git.exe",
-                "E:/Git/cmd/../bin/bash.exe",
-                "C:/Program Files/Git/bin/bash.exe",
-            ]),
-        )
-        .unwrap();
-        assert_eq!(found, PathBuf::from("E:/Git/cmd/../bin/bash.exe"));
-        let found = find_git_bash(
-            None,
-            &[PathBuf::from("E:/Git/mingw64/bin")],
-            &[],
-            exists(&[
-                "E:/Git/mingw64/bin/git.exe",
-                "E:/Git/mingw64/bin/../../bin/bash.exe",
-            ]),
-        )
-        .unwrap();
-        assert_eq!(
-            found,
-            PathBuf::from("E:/Git/mingw64/bin/../../bin/bash.exe")
-        );
-        let found = find_git_bash(
-            None,
-            std::slice::from_ref(&system32),
-            &[
-                PathBuf::from("C:/Program Files"),
-                PathBuf::from("L:/AppData/Local/Programs"),
-            ],
-            exists(&[
-                "C:/Windows/System32/bash.exe",
-                "L:/AppData/Local/Programs/Git/bin/bash.exe",
-            ]),
-        )
-        .unwrap();
-        assert_eq!(
-            found,
-            PathBuf::from("L:/AppData/Local/Programs/Git/bin/bash.exe")
-        );
-        let err = find_git_bash(
-            None,
-            &[system32],
-            &[PathBuf::from("C:/Program Files")],
-            exists(&["C:/Windows/System32/bash.exe"]),
-        )
-        .unwrap_err();
-        assert!(err.contains("gitforwindows.org"), "{err}");
-        assert!(err.contains(GIT_BASH_PATH_VAR), "{err}");
-        assert!(err.contains("C:/Program Files/Git/bin/bash.exe"), "{err}");
-        assert!(!err.contains("System32/bash.exe"), "{err}");
     }
 }

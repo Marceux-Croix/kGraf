@@ -912,6 +912,28 @@ fn main() -> std::process::ExitCode {
     }
 }
 
+/// Finds Git Bash, or offers `winget` on a terminal. Without a terminal there
+/// is nobody to ask, so the fix is the error.
+#[cfg(windows)]
+fn ensure_git_for_windows() -> Result<()> {
+    use kgraf_sandbox::git_for_windows::{SystemProbe, ensure};
+    use std::io::{BufRead, IsTerminal, Write};
+    let outcome = ensure(&SystemProbe, |question| {
+        if !std::io::stdin().is_terminal() {
+            return false;
+        }
+        eprint!("{question}\n[y/N] ");
+        let _ = std::io::stderr().flush();
+        let mut line = String::new();
+        std::io::stdin().lock().read_line(&mut line).is_ok()
+            && matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+    });
+    outcome
+        .into_result()
+        .map(|_| ())
+        .map_err(|text| anyhow::anyhow!(text))
+}
+
 fn run_cli() -> Result<()> {
     // First, so every later line (including `rmcp`'s) goes through the filter.
     kgraf_cli::logging::init()?;
@@ -924,6 +946,12 @@ fn run_cli() -> Result<()> {
     // has its own sink that shows the same notices in its UI instead.
     kgraf_provider::set_notice_sink(Box::new(|notice| eprintln!("warning: {notice}")));
     let cli = Cli::parse();
+    // The worker shell and git need Git for Windows. `diag` is how a problem
+    // gets reported, so it runs without the check.
+    #[cfg(windows)]
+    if !matches!(cli.command, Command::Diag { .. }) {
+        ensure_git_for_windows()?;
+    }
     let root = match cli.root {
         Some(root) => root,
         None => std::env::current_dir().context("cannot determine the working directory")?,

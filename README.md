@@ -144,6 +144,10 @@ Prebuilt packages are not published yet. Local packaging scripts build them from
 | Linux | `scripts/package-linux.sh` | Tarball and `.deb` |
 | Windows | `scripts/package-windows.sh` | x64 `.msi` and `.zip` |
 
+On Windows, kGraf needs Git for Windows (git and Git Bash). It is not bundled; kGraf offers
+to install it with `winget` at first start, and says how to install it by hand when it
+cannot (see the Installers section of `docs/USAGE.md`).
+
 The packages are not yet signed with a developer certificate, so expect Gatekeeper and
 SmartScreen warnings. `scripts/release-all.sh` builds all three from one git tag.
 

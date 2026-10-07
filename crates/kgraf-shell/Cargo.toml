@@ -30,6 +30,8 @@ kgraf-provider.workspace = true
 kgraf-orchestrator.workspace = true
 # Builds each scheduled run: the construction `kgraf orchestrate` uses.
 kgraf-host.workspace = true
+# The Git for Windows check at startup (Windows only use; the logic is pure).
+kgraf-sandbox.workspace = true
 # The box desk's allow-rule subjects come from the shell tool's.
 kgraf-tools.workspace = true
 kgraf-core.workspace = true
@@ -128,6 +130,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_Console",
     "Win32_System_IO",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [build-dependencies]

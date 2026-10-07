@@ -250,6 +250,40 @@ Answer "deny" to every question. What to expect:
 - If the model changes an argv (for example it splits command 5 into separate words), the
   result does not test that case; note which ones.
 
+## 6a. The Git for Windows check and install offer
+
+Test this on a machine (or a fresh Windows 11 virtual machine) with the built `.msi` or
+`.zip`, as a normal user. Each case below starts kGraf and writes what it saw into
+`$r\6a-git-check.txt`. `winget` needs Windows 10 1809 or later with App Installer.
+
+1. **Fresh Windows, no Git, winget present.** Confirm: `git --version` and
+   `reg query HKLM\SOFTWARE\GitForWindows` both fail. Start `kgraf-app.exe` from the Start
+   menu. Expected: one window asks to install Git for Windows with winget and shows the full
+   `winget install --id Git.Git ... --scope user ...` line. Answer Yes. Expected: no
+   administrator prompt; the install ends; kGraf opens without a restart. Then
+   `reg query HKCU\SOFTWARE\GitForWindows /v InstallPath` shows a folder with
+   `bin\bash.exe` in it.
+2. **Same, answer No.** Reset first: `winget uninstall --id Git.Git`. Start kGraf, answer
+   No. Expected: an error window with the download link, the winget command and
+   `KGRAF_GIT_BASH_PATH`, and kGraf exits. Nothing was installed.
+3. **Same, command line, with a terminal.** Reset. Run `kgraf.exe index` in PowerShell.
+   Expected: the same question on the terminal with `[y/N]`; `y` installs and the command
+   runs. Run it again with input redirected (`echo | kgraf.exe index`): it must not ask, and
+   must stop with the same fix text.
+4. **With Git.** Install Git for Windows by hand. Start kGraf. Expected: no question and
+   no delay. Repeat with Git installed for all users (`HKLM` key) and with a per-user
+   install (`HKCU` key). Repeat with Git installed on a drive other than `C:` and not on
+   `PATH`: the registry entry must be enough.
+5. **Without winget.** Rename the winget stub for the test:
+   `Rename-Item "$env:LOCALAPPDATA\Microsoft\WindowsApps\winget.exe" winget.off`, with Git
+   not installed. Start kGraf. Expected: an error window that says winget is not available
+   and gives the download link and `KGRAF_GIT_BASH_PATH`; no question. Rename it back.
+   Then install Git from the link and start kGraf again: it starts.
+6. **Bad override.** Set `KGRAF_GIT_BASH_PATH` to a file that does not exist. Expected: an
+   error that names the variable and the file, and no offer to install.
+
+Report, for each case, what the window or terminal said and whether kGraf started.
+
 ## 7. What to send back
 
 Collect the machine facts into the results folder, then zip it:
