@@ -42,6 +42,10 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 120
     steps:
+      # Some tracked benchmark logs have paths longer than 260 characters;
+      # without long paths, Git cannot check them out on Windows.
+      - name: Allow long paths in Git
+        run: git config --system core.longpaths true
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       # The same moving `stable` alias that ci.yml uses; see the comment there.
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, as of 2026-09-26
@@ -53,6 +57,7 @@ jobs:
           workspaces: ". -> target/wintest"
 
       - name: Build the self-test bundle
+        id: build
         shell: bash
         env:
           KGRAF_WINTEST_NATIVE: "1"
@@ -78,7 +83,8 @@ jobs:
           ls -la "$report_dir"
 
       - name: Run the firewall network test
-        if: ${{ !cancelled() }}
+        # It runs the sandbox from the bundle, so it needs the build.
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         shell: pwsh
         run: |
           $stage = (Get-ChildItem target/wintest/bundle -Directory -Filter 'kgraf-wintest-*' | Select-Object -First 1).FullName
