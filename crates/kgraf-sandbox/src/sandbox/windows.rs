@@ -56,7 +56,10 @@
 //! profiles and the Credential Manager API stay readable, and a Low process
 //! can open the Medium harness process for `PROCESS_VM_READ`. Network egress
 //! is not blocked (only AppContainer or administrator-installed filtering
-//! rules can do that). [`STRENGTH`] reports all of this, and the runner
+//! rules can do that), so [`Network::Deny`] is refused here. Checks and gates
+//! ask through [`super::CheckNetwork`] instead, which runs them with the
+//! network open and a notice (decision 0011, amended 2026-10-06); the worker's
+//! shell does not. [`STRENGTH`] reports all of this, and the runner
 //! refuses unless the policy opts in to partial isolation (fail loud).
 //!
 //! **Provenance.** The token construction (restricting-SID order, flags,

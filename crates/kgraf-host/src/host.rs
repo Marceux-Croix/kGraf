@@ -155,6 +155,24 @@ pub enum Notice {
     /// uses instead and which rule to write (amended 2026-10-05). The
     /// sentence is the whole notice; it is also traced.
     RuleMatchesNoTool(String),
+    /// The verifier's checks, the quality gates and the contract checks run
+    /// with the network open, because this platform's sandbox cannot deny it
+    /// (Windows; decision 0011, amended 2026-10-06). The sentence is the
+    /// whole notice; it is also traced and in the run report. The worker's
+    /// shell is not part of this.
+    ChecksNetworkOpen(String),
+}
+
+/// Say, once per run, that checks run with the network open: the notice for
+/// the printed list, and the sentence the orchestrator traces and reports.
+/// Nothing for a backend that denies the network.
+pub(crate) fn announce_open_network(
+    network: kgraf_sandbox::CheckNetwork,
+    notices: &mut (dyn FnMut(Notice) + Send),
+) -> Option<String> {
+    let sentence = network.notice()?.to_owned();
+    notices(Notice::ChecksNetworkOpen(sentence.clone()));
+    Some(sentence)
 }
 
 /// The output caps of a run, lowered to the models' supported limits: the
@@ -1897,6 +1915,10 @@ impl Host {
             }
         }
         let orchestrator = orchestrator.with_start_notices(start_notices);
+        let orchestrator = orchestrator.with_check_network_notice(announce_open_network(
+            kgraf_sandbox::CheckNetwork::current(),
+            notices,
+        ));
         let orchestrator = orchestrator.with_gate_runner(Arc::new(CommandGateRunner {
             commands: gate_commands.clone(),
             manager: manager.clone(),

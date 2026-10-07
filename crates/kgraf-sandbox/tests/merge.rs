@@ -1841,3 +1841,116 @@ fn a_merge_and_a_worktree_add_wait_for_an_open_git_window() {
     out.unwrap();
     assert!(waited >= Duration::from_millis(350), "{waited:?}");
 }
+
+/// `commit_is_on_branch` reads git's ancestry, not the merge's own record: a
+/// merged commit is on the branch, a committed but unmerged one is not, a
+/// merge moved off the branch by hand is not, and a commit git does not know
+/// is an error rather than either answer.
+#[test]
+fn commit_is_on_branch_answers_from_git_ancestry() {
+    let e = env();
+    let mb = merger(&e);
+    let mut merged = attempt(&e, "landed");
+    write(&merged, "a.txt", "a\n");
+    let FinishOutcome::Merged { merge_commit, .. } =
+        mb.finish(&mut merged, "landed: add a", &["a.txt"]).unwrap()
+    else {
+        panic!("not merged")
+    };
+    assert!(mb.commit_is_on_branch(&merge_commit).unwrap());
+
+    let mut pending = attempt(&e, "pending");
+    write(&pending, "b.txt", "b\n");
+    let CommitOutcome::Committed { .. } = mb
+        .commit_declared(&mut pending, "pending: add b", &["b.txt"])
+        .unwrap()
+    else {
+        panic!("not committed")
+    };
+    let pending_commit = git(&e.f.repo, &["rev-parse", &pending.attempt_ref()]);
+    assert!(
+        !mb.commit_is_on_branch(&pending_commit).unwrap(),
+        "committed on an attempt ref, not on the branch"
+    );
+
+    let unknown = "0123456789abcdef0123456789abcdef01234567";
+    assert!(
+        mb.commit_is_on_branch(unknown).is_err(),
+        "an unknown commit is neither on the branch nor off it"
+    );
+
+    // Move the branch back off the merge by hand.
+    let parent = git(&e.f.repo, &["rev-parse", &format!("{merge_commit}^1")]);
+    git(
+        &e.f.repo,
+        &[
+            "update-ref",
+            "refs/heads/integration",
+            &parent,
+            &merge_commit,
+        ],
+    );
+    assert!(!mb.commit_is_on_branch(&merge_commit).unwrap());
+}
+
+/// When git refuses the branch update and the tip has not moved, the failure
+/// is git's own, not "contended": a retry against an unchanged tip would
+/// fail the same way. A ref lock held by another process is such a refusal.
+#[test]
+fn a_refused_branch_update_on_an_unmoved_tip_is_git_failure_not_contention() {
+    let e = env();
+    let mb = merger(&e);
+    let mut w = attempt(&e, "locked");
+    write(&w, "a.txt", "a\n");
+    let CommitOutcome::Committed { .. } = mb
+        .commit_declared(&mut w, "locked: add a", &["a.txt"])
+        .unwrap()
+    else {
+        panic!("not committed")
+    };
+    let before = tip(&e.f.repo);
+    let lock =
+        e.f.repo
+            .join(".git/refs/heads")
+            .join(format!("{BRANCH}.lock"));
+    std::fs::write(&lock, "").unwrap();
+    let err = mb.merge(&mut w).unwrap_err();
+    assert!(
+        matches!(err, MergeError::Workspace(_)),
+        "git's refusal, not contention: {err:?}"
+    );
+    assert_eq!(tip(&e.f.repo), before, "the branch did not move");
+    std::fs::remove_file(&lock).unwrap();
+    assert!(matches!(
+        mb.merge(&mut w).unwrap(),
+        MergeOutcome::Merged { .. }
+    ));
+}
+
+/// The end-of-run sweep deletes the refs of the names it is given, numbered
+/// or not, and no other: a ref of another attempt stays, even when its name
+/// starts with a swept name.
+#[test]
+fn sweep_attempt_refs_deletes_only_the_named_attempts() {
+    let e = env();
+    let mb = merger(&e);
+    let mut refs = Vec::new();
+    for name in ["s1", "s10", "s2"] {
+        let mut a = attempt(&e, name);
+        let file = format!("{name}.txt");
+        write(&a, &file, "x\n");
+        let CommitOutcome::Committed { .. } =
+            mb.commit_declared(&mut a, "m", &[file.as_str()]).unwrap()
+        else {
+            panic!("not committed")
+        };
+        refs.push(a.attempt_ref());
+    }
+    let swept = mb.sweep_attempt_refs(&["s1".to_owned()]).unwrap();
+    assert_eq!(swept, [refs[0].clone()]);
+    assert!(!ref_exists(&e.f.repo, &refs[0]));
+    assert!(ref_exists(&e.f.repo, &refs[1]), "s10 is not s1");
+    assert!(ref_exists(&e.f.repo, &refs[2]), "s2 is not named");
+    assert!(mb.sweep_attempt_refs(&[]).unwrap().is_empty());
+    assert!(ref_exists(&e.f.repo, &refs[1]));
+}

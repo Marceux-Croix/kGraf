@@ -160,3 +160,31 @@ achievable without admin on all three platforms and is worth having on its
 own.
 
 **Per-platform native primitives, honestly labeled.** Chosen.
+
+## Amendment (2026-10-06): on Windows, checks and gates run with the network open, and say so
+
+**Problem.** The Windows backend cannot deny the network, so it refuses
+`Network::Deny`. The verifier's check, the quality gates and the contract
+checks all ask for it, so on Windows no check or gate ran at all.
+
+**Decision.** For those three only, `kgraf_sandbox::CheckNetwork` decides from
+the backend's own capability: on the Windows restricted-token backend, which
+cannot deny the network, a check runs with the network open and a notice; every
+other backend keeps `Network::Deny`, so macOS and Linux do not change. The notice
+reads "network not blocked: the Windows sandbox cannot deny network access
+without administrator rights (decision 0011); this check ran with the network
+open". It is in the output of every such check and gate (a pass included), in
+the contract check's result, once in the run's trace, in the run report's
+notices, and in the list the run command prints when a run opens.
+
+**Not changed.** The worker's shell is not part of this. On Windows it is
+already refused whole, and it asks for `Network::Deny`.
+
+**Trade-off.** A check runs the project's own code with the network open, so
+that code can send what it can read to any host. On Windows reads are already
+not confined, so the open network makes a local read a possible exfiltration,
+and the notice says so. A check that passes there proves less than one that
+passes where the network is denied.
+
+**Status.** Built and compile-checked for Windows; the decision logic is tested
+on macOS with a stand-in capability. Nothing ran on Windows.

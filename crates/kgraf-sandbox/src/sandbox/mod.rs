@@ -708,6 +708,69 @@ pub struct IsolationStrength {
     pub gaps: &'static str,
 }
 
+/// The sentence a check or gate carries when it ran with the network open
+/// because the backend cannot deny it ([`CheckNetwork`]).
+pub const NETWORK_OPEN_NOTICE: &str = "network not blocked: the Windows sandbox cannot deny \
+    network access without administrator rights (decision 0011); this check ran with the \
+    network open";
+
+/// The network a verifier check, a quality gate or a contract check asks for
+/// (decision 0011, amended 2026-10-06). One decision, made from the backend's
+/// own capability: it is [`Network::Deny`] wherever the backend can deny it
+/// or refuse to run (macOS, Linux), and [`Network::Allow`] with a notice only
+/// on the Windows restricted-token backend, which cannot deny it and would
+/// otherwise run no check at all. It never applies to the worker's shell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckNetwork {
+    network: Network,
+    notice: Option<&'static str>,
+}
+
+impl CheckNetwork {
+    /// The decision for one backend's strength. Pure, so it is tested with a
+    /// strength value on every platform.
+    pub fn for_strength(strength: &IsolationStrength) -> Self {
+        if strength.backend == Backend::WindowsRestrictedToken && !strength.network_deniable {
+            Self::open_with_notice()
+        } else {
+            Self::deny()
+        }
+    }
+
+    /// The decision for this platform. A platform with no backend keeps
+    /// [`Network::Deny`], so the sandbox refuses as before.
+    pub fn current() -> Self {
+        platform_isolation().map_or_else(|_| Self::deny(), |s| Self::for_strength(&s))
+    }
+
+    /// What a backend that cannot deny the network gets: the network open and
+    /// the notice. Public so a test of a caller can stand in for that backend.
+    pub fn open_with_notice() -> Self {
+        Self {
+            network: Network::Allow,
+            notice: Some(NETWORK_OPEN_NOTICE),
+        }
+    }
+
+    /// What every other backend gets: the network denied, no notice.
+    pub fn deny() -> Self {
+        Self {
+            network: Network::Deny,
+            notice: None,
+        }
+    }
+
+    /// The network to put in the check's [`SandboxPolicy`].
+    pub fn network(&self) -> Network {
+        self.network
+    }
+
+    /// Set where the network is open: the sentence every such run carries.
+    pub fn notice(&self) -> Option<&'static str> {
+        self.notice
+    }
+}
+
 /// The strength of this platform's backend, or the reason there is none.
 pub fn platform_isolation() -> Result<IsolationStrength, SandboxError> {
     #[cfg(target_os = "macos")]
@@ -1281,6 +1344,43 @@ pub fn workspace_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only the Windows backend, which cannot deny the network, gets it open
+    /// and a notice; every backend that can deny keeps `Deny` and says nothing.
+    #[test]
+    fn checks_get_the_network_open_only_on_a_backend_that_cannot_deny_it() {
+        let windows = windows::STRENGTH;
+        assert!(!windows.network_deniable);
+        let open = CheckNetwork::for_strength(&windows);
+        assert_eq!(open.network(), Network::Allow);
+        assert_eq!(open.notice(), Some(NETWORK_OPEN_NOTICE));
+        assert!(NETWORK_OPEN_NOTICE.contains("network not blocked"));
+        assert!(NETWORK_OPEN_NOTICE.contains("decision 0011"));
+        // The same backend, were it able to deny: nothing changes.
+        let deniable = IsolationStrength {
+            network_deniable: true,
+            ..windows
+        };
+        assert_eq!(CheckNetwork::for_strength(&deniable), CheckNetwork::deny());
+        // Another backend that cannot deny stays refused, as before: Linux
+        // without its network namespace is not changed by this.
+        let linux = IsolationStrength {
+            backend: Backend::LinuxLandlock,
+            network_deniable: false,
+            ..windows
+        };
+        let decided = CheckNetwork::for_strength(&linux);
+        assert_eq!(decided.network(), Network::Deny);
+        assert_eq!(decided.notice(), None);
+    }
+
+    /// On this host the decision is the platform's: macOS and Linux keep
+    /// the network denied for checks.
+    #[cfg(unix)]
+    #[test]
+    fn checks_keep_the_network_denied_on_unix() {
+        assert_eq!(CheckNetwork::current(), CheckNetwork::deny());
+    }
 
     /// With `HOME` unset the home comes from the password
     /// database, so the rules that hang off it do not silently vanish.

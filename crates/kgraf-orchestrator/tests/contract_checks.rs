@@ -1577,6 +1577,38 @@ async fn the_delivery_is_every_declared_file_the_workspace_holds() {
     assert_eq!(got[1].content, "pub fn bonus() {}\n");
 }
 
+/// A declared path listed twice is one file in the delivery. A declared path
+/// that leaves the repository or names protected state is never read, even
+/// when a file is there: the delivery lays files over the check base, so a
+/// read of `../x` would pull a file from outside the workspace into it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_delivery_lists_a_path_once_and_never_reads_an_invalid_one() {
+    let dir = tempfile::tempdir().expect("dir");
+    let ws = dir.path().join("worktree");
+    std::fs::create_dir_all(ws.join("prod/src")).expect("mkdir");
+    std::fs::create_dir_all(ws.join(".git")).expect("mkdir");
+    std::fs::write(ws.join("prod/src/lib.rs"), "pub fn one() {}\n").expect("write");
+    std::fs::write(ws.join(".git/config"), "[core]\n").expect("write");
+    std::fs::write(dir.path().join("outside.txt"), "outside\n").expect("write");
+    let w = |p: &str| WriteTarget {
+        path: p.into(),
+        node: None,
+    };
+    let got = delivered_files(
+        &ws,
+        &[
+            w("../outside.txt"),
+            w(".git/config"),
+            w("prod/src/lib.rs"),
+            w("prod/src/lib.rs"),
+            w("  "),
+        ],
+    )
+    .await;
+    let paths: Vec<&str> = got.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(paths, ["prod/src/lib.rs"]);
+}
+
 const SHOP_PROD: &str = "def price(qty):\n    return qty * 100\n";
 const SHOP_APP: &str = "from shop.prod import price\n\n\ndef total(q):\n    return price(q)\n";
 

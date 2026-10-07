@@ -1247,7 +1247,11 @@ Sandboxing uses native primitives per platform with no administrator
 requirement. Strength differs materially: Linux gets Landlock with seccomp
 and namespaces, macOS gets Seatbelt, and **Windows gets materially less, with
 no non-admin way to block network egress at all.** Each backend reports its
-own strength and gaps. **Not built yet:** a per-platform strength indicator in
+own strength and gaps. Because Windows cannot deny the network, the
+verifier's check, the gates and the contract checks run there with the network
+open and a notice in their output, the run's trace, the run report and the
+run-start list (decision 0011, amended 2026-10-06); macOS and Linux keep it
+denied. **Not built yet:** a per-platform strength indicator in
 the interface rather than one shared badge.
 
 `kgraf-sandbox` holds worktrees through the git CLI; macOS Seatbelt; on

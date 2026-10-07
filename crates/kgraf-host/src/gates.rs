@@ -5,8 +5,8 @@ use crate::error::{Result, ResultExt};
 use crate::workspaces::now_nanos;
 use kgraf_orchestrator::{GateRequest, GateRunner, GateVerdict, UntrustedText};
 use kgraf_sandbox::{
-    CheckFolder, MergeBack, Network, Redirect, SandboxPolicy, Workspace, WorkspaceManager,
-    WorkspaceSpec, sandboxed_command,
+    CheckFolder, MergeBack, Redirect, SandboxPolicy, Workspace, WorkspaceManager, WorkspaceSpec,
+    sandboxed_command,
 };
 // The process lifecycle (WNOWAIT, group kill until the hold is free, then
 // reap) lives in the sandbox crate so the contract-check runner shares it.
@@ -514,7 +514,37 @@ fn tail(text: &str, cap: usize) -> String {
 /// crates; without it,
 /// or where no clone can be made, the check builds cold, and a failing
 /// check's output says so.
+///
+/// **The network.** Denied wherever the backend can deny it. On the Windows
+/// backend, which cannot, the check runs with the network open and its output
+/// ends with the notice that says so ([`kgraf_sandbox::CheckNetwork`],
+/// decision 0011, amended 2026-10-06).
 pub(crate) fn run_confined(
+    ws: &Workspace,
+    checkout: &Path,
+    denies: &[PathBuf],
+    command: &str,
+    timeout: Duration,
+    cap: usize,
+    warm: Option<&Path>,
+) -> std::result::Result<(bool, String), String> {
+    run_confined_on(
+        kgraf_sandbox::CheckNetwork::current(),
+        ws,
+        checkout,
+        denies,
+        command,
+        timeout,
+        cap,
+        warm,
+    )
+}
+
+/// [`run_confined`] with the network decision given, so a test can stand in
+/// for a backend that cannot deny it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_confined_on(
+    network: kgraf_sandbox::CheckNetwork,
     ws: &Workspace,
     checkout: &Path,
     denies: &[PathBuf],
@@ -540,7 +570,7 @@ pub(crate) fn run_confined(
         );
     }
     let tmp = check.tmp();
-    let mut policy = SandboxPolicy::for_workspace(ws, Network::Deny)
+    let mut policy = SandboxPolicy::for_workspace(ws, network.network())
         .with_writable_root(check.path().to_path_buf())
         .with_tmp_dir(tmp.clone())
         .with_ancestor_reads(checkout.to_path_buf())
@@ -640,6 +670,9 @@ pub(crate) fn run_confined(
     }
     let mut text = read_log(&log, cap);
     let _ = std::fs::remove_file(&log);
+    // Said on every outcome, a pass included: a pass with the network open
+    // proves less than one with it denied.
+    let open = network.notice().map_or_else(String::new, open_network_note);
     match status {
         Some(s) => {
             text = format!("$ {command}\n{text}\n[{s}]");
@@ -648,16 +681,22 @@ pub(crate) fn run_confined(
                 text.push_str(&build_note);
                 text.push_str(&missing_installs_note(checkout));
             }
+            text.push_str(&open);
             Ok((s.success(), text))
         }
         None => Ok((
             false,
             format!(
-                "$ {command}\n{text}\n[killed after {}s]{refused}{build_note}",
+                "$ {command}\n{text}\n[killed after {}s]{refused}{build_note}{open}",
                 timeout.as_secs()
             ),
         )),
     }
+}
+
+/// The line a check that ran with the network open ends with.
+fn open_network_note(notice: &str) -> String {
+    format!("\n[sandbox] {notice}")
 }
 
 /// Each install the checkout needs and lacks, as lines to append to a

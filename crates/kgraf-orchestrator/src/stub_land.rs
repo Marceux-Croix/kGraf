@@ -1492,6 +1492,77 @@ mod tests {
             "pub fn shared() -> u16 { 2 }",
             "the racer's content stands; none of the stub's bytes were written to the branch"
         );
+
+        // A conflicted attempt is kept for inspection, like a refused one,
+        // until the end-of-run sweep removes it, its worktree and its ref.
+        let kept = f.manager.base().join("stub-shared-v1");
+        assert!(kept.exists(), "the conflicted worktree is kept");
+        assert!(
+            !git_out(&f.root, &["for-each-ref", "refs/kgraf/attempts/"]).is_empty(),
+            "the conflicted attempt keeps its ref"
+        );
+        let swept = lander.sweep().expect("sweep");
+        assert!(!kept.exists(), "removed at the end of the run");
+        assert!(
+            swept.iter().any(|s| s.contains("stub-shared-v1")),
+            "{swept:?}"
+        );
+        assert_eq!(
+            git_out(&f.root, &["for-each-ref", "refs/kgraf/attempts/"]),
+            "",
+            "no attempt ref remains"
+        );
+    }
+
+    /// A merge-back failure (not a conflict or a refusal) is reported with
+    /// the interface it was for and the cause. A ref lock held by another
+    /// process makes the branch update fail on an unmoved tip.
+    #[tokio::test]
+    async fn a_merge_back_failure_names_the_interface_and_the_cause() {
+        let f = fixture();
+        let lander = GitStubLander::new(f.manager.clone(), f.merge_back.clone());
+        let contract = ic(
+            "locked",
+            1,
+            vec![FileOverlay::new(
+                "src/config.rs",
+                "pub fn parse() -> u16 { 0 }\n",
+            )],
+        );
+        let lock = f.root.join(".git/refs/heads/kgraf/r-1.lock");
+        std::fs::write(&lock, "").expect("lock");
+        let err = lander
+            .land(&contract, &scope(&contract))
+            .await
+            .expect_err("the branch update is refused");
+        let lead = format!("cannot land the stub of {}: ", contract.label());
+        assert!(err.starts_with(&lead), "{err}");
+        assert!(err.len() > lead.len(), "the cause follows: {err}");
+        assert_eq!(tip(&f), base(&f), "nothing reached the branch");
+        std::fs::remove_file(&lock).expect("unlock");
+        lander.sweep().expect("sweep");
+    }
+
+    /// A stub path that cannot be inspected for a reason other than "not
+    /// there" is refused as uninspectable, not treated as absent and written
+    /// later. A NUL byte in a component fails the inspection with an error
+    /// that is not `NotFound` (`InvalidInput`).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stub_path_that_cannot_be_inspected_is_refused_not_treated_as_absent() {
+        let f = fixture();
+        let lander = GitStubLander::new(f.manager.clone(), f.merge_back.clone());
+        let contract = ic(
+            "nulname",
+            1,
+            vec![FileOverlay::new("a\0b.rs", "pub fn parse() -> u16 { 0 }\n")],
+        );
+        let err = lander
+            .land(&contract, &scope(&contract))
+            .await
+            .expect_err("refused");
+        assert!(err.contains("cannot inspect"), "{err}");
+        lander.sweep().expect("sweep");
     }
 
     /// Revision: a revised version whose stub bytes did not change is

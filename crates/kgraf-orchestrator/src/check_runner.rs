@@ -57,7 +57,7 @@
 //! them.
 
 use crate::checks::{CheckError, FileOverlay};
-use kgraf_sandbox::{Network, SandboxPolicy, sandboxed_command};
+use kgraf_sandbox::{CheckNetwork, SandboxPolicy, sandboxed_command};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -186,6 +186,10 @@ pub struct SandboxRunner {
     scratch: PathBuf,
     read_denies: Vec<PathBuf>,
     accept_partial: bool,
+    /// The network checks run with: denied, except where the backend cannot
+    /// deny it (Windows), where it is open and every result says so
+    /// ([`CheckNetwork`], decision 0011 amended 2026-10-06).
+    network: CheckNetwork,
     timeout: Duration,
     /// The bound on a compile (stub-compile and canary) run, separate from the
     /// test runs' bound: a cold compile on a loaded machine is slow for reasons
@@ -272,6 +276,7 @@ impl SandboxRunner {
             scratch,
             read_denies,
             accept_partial: false,
+            network: CheckNetwork::current(),
             timeout: Duration::from_secs(600),
             compile_timeout: Duration::from_secs(600),
             limits: ResourceLimits::default(),
@@ -283,6 +288,15 @@ impl SandboxRunner {
     /// without this, as the sandbox refuses.
     pub fn accept_partial_isolation(mut self, accept: bool) -> Self {
         self.accept_partial = accept;
+        self
+    }
+
+    /// Decide the network checks run with. The default is the platform's
+    /// ([`CheckNetwork::current`]); a test passes
+    /// [`CheckNetwork::open_with_notice`] to stand in for a backend that
+    /// cannot deny it.
+    pub fn with_check_network(mut self, network: CheckNetwork) -> Self {
+        self.network = network;
         self
     }
 
@@ -581,6 +595,15 @@ impl SandboxRunner {
         }
         let mut result = self.exec(&name, &run_dir, argv, timeout).await?;
         result.queued = queued;
+        // Said in every result, a pass included: a check that passed with the
+        // network open proves less than one that passed with it denied.
+        if let Some(notice) = self.network.notice() {
+            if !result.tail.is_empty() {
+                result.tail.push('\n');
+            }
+            result.tail.push_str("[sandbox] ");
+            result.tail.push_str(notice);
+        }
         Ok(result)
     }
 
@@ -656,7 +679,7 @@ impl SandboxRunner {
         // and another user could plant a `.cargo/config.toml` there whose
         // `runner` would run as the owner and forge a pass. A `.cargo/config.toml` the repository tracks is in the copy
         // already; a cargo file above the tree makes cargo fail loud instead.
-        let mut policy = SandboxPolicy::new(vec![run_dir.to_path_buf()], Network::Deny)
+        let mut policy = SandboxPolicy::new(vec![run_dir.to_path_buf()], self.network.network())
             .with_tmp_dir(run_dir.join("tmp"))
             .accept_partial_isolation(self.accept_partial);
         // Every process of the check holds this file shared until it exits,

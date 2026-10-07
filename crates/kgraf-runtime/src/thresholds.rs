@@ -294,6 +294,19 @@ mod tests {
     }
 
     #[test]
+    fn a_context_past_the_point_has_reached_it() {
+        // Past the point counts as reached, not only exactly at it; a zero
+        // context has not reached any point.
+        let c = ContextConfig::for_model(200_000).expect("valid");
+        assert_eq!(c.compaction_point_tokens(), 80_000);
+        assert!(!c.reached_point(0));
+        assert!(!c.reached_point(79_999));
+        assert!(c.reached_point(80_000));
+        assert!(c.reached_point(80_001));
+        assert!(c.reached_point(u64::MAX));
+    }
+
+    #[test]
     fn the_bounds_are_inclusive_and_outside_them_is_an_error() {
         let base = ContextConfig::for_model(100_000).expect("valid");
         assert!(base.clone().with_point(5, PointSource::User).is_ok());

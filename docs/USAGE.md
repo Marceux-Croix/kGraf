@@ -1508,6 +1508,23 @@ an inventory is there.
 
 The orchestrator's own planning calls use no tools, so skills apply to workers only.
 
+## Windows sandbox: checks run with the network open
+
+The Windows sandbox cannot deny network access without administrator rights (decision
+0011). The verifier's check, the quality gates and the contract checks therefore run there
+with the network open, and say so:
+
+- Each such check and gate ends its output with `[sandbox] network not blocked: the Windows
+  sandbox cannot deny network access without administrator rights (decision 0011); this
+  check ran with the network open`, a passing one included.
+- The run command prints the same sentence as a `sandbox` line when a run opens. The run's
+  trace holds it once, and the run report lists it among its notices.
+- The code a check runs can reach any host, and on Windows it can also read every file you
+  can read. A check that passes there proves less than one that passes on macOS or Linux,
+  where the network is denied.
+- macOS and Linux are not changed: the network stays denied for checks and gates.
+- The worker's own shell tool does not run on Windows yet, so this does not apply to it.
+
 ## Linux sandbox: cargo files above a worktree
 
 A worktree lies inside your checkout (`<checkout>/.kgraf/worktrees/<name>`). Cargo run

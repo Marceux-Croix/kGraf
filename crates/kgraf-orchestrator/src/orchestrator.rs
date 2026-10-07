@@ -2022,6 +2022,9 @@ pub struct Orchestrator {
     /// Plain-sentence notices the host built for this run's start, traced once
     /// the run opens ([`Self::with_start_notices`]).
     start_notices: Vec<String>,
+    /// Set when the run's checks and gates ran with the network open
+    /// ([`Self::with_check_network_notice`]).
+    check_network_notice: Option<String>,
     /// The user's live permission mode, the desk the box reads, and whether
     /// a person attends (decision 0094).
     pub(crate) perms: permission_hooks::PermissionParts,
@@ -2060,6 +2063,7 @@ impl Orchestrator {
             session_notices: None,
             index_extractor_changes: Vec::new(),
             start_notices: Vec::new(),
+            check_network_notice: None,
             perms: permission_hooks::PermissionParts::default(),
         })
     }
@@ -2172,6 +2176,14 @@ impl Orchestrator {
     /// when the run opens. They change nothing about the run.
     pub fn with_start_notices(mut self, notices: Vec<String>) -> Self {
         self.start_notices = notices;
+        self
+    }
+
+    /// The sentence saying this run's checks and gates run with the network
+    /// open (the sandbox cannot deny it). Traced once when a fresh run opens,
+    /// and in every report of the run, a resumed one included.
+    pub fn with_check_network_notice(mut self, notice: Option<String>) -> Self {
+        self.check_network_notice = notice;
         self
     }
 
@@ -2560,6 +2572,7 @@ impl RunLoop {
             session_notices,
             index_extractor_changes,
             start_notices,
+            check_network_notice,
             perms,
         } = o;
         // The check setting is the run's: kept in the record, and a resume with
@@ -2748,6 +2761,15 @@ impl RunLoop {
             .await?;
         }
         // A fresh run only: a resumed run already traced them when it began.
+        // The report names the open network either way: every check of the
+        // run ran that way.
+        let start_notices: Vec<String> = start_notices
+            .into_iter()
+            .chain(check_network_notice.iter().cloned())
+            .collect();
+        if let Some(n) = check_network_notice {
+            me.notices.insert(n);
+        }
         if !resumed {
             for detail in start_notices {
                 let at_ms = me.now();
