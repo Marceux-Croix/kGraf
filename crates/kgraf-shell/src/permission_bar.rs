@@ -571,14 +571,14 @@ impl Raised for PermissionItem {
 pub fn groups(asks: &[PendingAsk], requests: &[PermissionRequestView]) -> Vec<Vec<PermissionItem>> {
     let mut items: Vec<PermissionItem> = asks
         .iter()
-        .filter(|a| a.tool != crate::dependency_prompt::FETCH_PROMPT_TOOL)
+        .filter(|a| !crate::dependency_prompt::is_dependency_prompt(&a.tool))
         .cloned()
         .map(PermissionItem::Ask)
         .collect();
     items.extend(requests.iter().cloned().map(PermissionItem::Request));
     let mut out: Vec<Vec<PermissionItem>> = asks
         .iter()
-        .filter(|a| a.tool == crate::dependency_prompt::FETCH_PROMPT_TOOL)
+        .filter(|a| crate::dependency_prompt::is_dependency_prompt(&a.tool))
         .cloned()
         .map(|a| vec![PermissionItem::Ask(a)])
         .collect();

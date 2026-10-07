@@ -245,3 +245,43 @@ differ for a script with embedded quotes.
 **Status.** Built and compile-checked for Windows; the decision logic and the
 argument transport are tested on macOS. Nothing ran on Windows. Test steps:
 `docs/WINDOWS-TESTING.md`.
+
+## Amendment (2026-10-07): a network limited to kGraf's egress proxy, and a hidden folder inside a writable root
+
+Decision 0087, amended 2026-10-07, runs a project's dependency install in the sandbox with the
+network limited to the package registries. Two policy options are new, each enforced per
+backend or refused.
+
+1. **`Network::Proxy { port }`: TCP to one loopback port only**, where kGraf's egress proxy
+   (`kgraf_sandbox::egress`) listens and decides by host name.
+   - **macOS**: Seatbelt allows `connect()` to `localhost:PORT` and no other IP destination
+     (the rule form Anthropic's sandbox-runtime uses for its proxy). The DNS resolver socket is
+     not allowed; the network policy's mach services stay, for TLS certificate checks.
+   - **Linux**: the command gets a network namespace of its own. Its first process, between
+     fork and exec and before Landlock and seccomp, brings the namespace's loopback up, listens
+     on `127.0.0.1:3128` there, and passes the listening socket to kGraf over a socket pair
+     (`SCM_RIGHTS`); kGraf accepts on it from outside
+     (`SandboxedCommand::take_loopback_listener`, `EgressProxy::spawn`). seccomp allows IP
+     sockets as with `Network::Allow`; the namespace has nothing else to reach. Needs user
+     namespaces, else `PolicyNotEnforceable`. Landlock's TCP port rules were rejected: they
+     limit ports, not hosts.
+   - **Windows**: refused (`PolicyNotEnforceable`): nothing would keep a command on the proxy.
+     kGraf's Windows install runs with the network open and says so (0087).
+2. **`SandboxPolicy::hide(dir)`: a folder beneath a writable root that a command can neither
+   read nor write**, apart from writable roots beneath it. Used for the checkout's `.kgraf`
+   while an install runs with the checkout writable.
+   - **macOS**: after the root allows, `deny file-read*` and `deny file-write*` of the folder,
+     then the roots beneath it allowed again, and the metadata (never the listing) of the
+     folders between it and them, which realpath(3) needs. Renaming or replacing the folder is
+     a write in it and is denied.
+   - **Linux**: in the command's mount namespace, each root beneath the folder is cloned
+     (`open_tree`), an empty tmpfs is mounted on the folder, each clone is moved back onto its
+     path, and the tmpfs is made read-only. A mount point cannot be renamed. Needs user
+     namespaces, else `PolicyNotEnforceable`.
+   - **Windows**: a deny-write access entry for the capability of each writable root that holds
+     the folder, inherited by what is in it; a root beneath it keeps its own capability and its
+     explicit grant, which Windows orders before the inherited deny. Reads are not confined on
+     this backend. Unverified on Windows, like the rest of the backend.
+
+Tests: `kgraf-sandbox` `tests/egress.rs` (macOS and Linux, real backends), `windows.rs`
+`a_hidden_folder_denies_the_roots_above_it_only` (the Windows plan, on every platform).

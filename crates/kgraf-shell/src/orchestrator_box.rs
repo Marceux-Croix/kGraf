@@ -541,7 +541,7 @@ impl BoxModel {
 /// The allow-always button's words: for an `mcp__` tool the rule covers every
 /// call to the tool (an any-call rule), and the button says so.
 pub fn always_label(tool: &str) -> String {
-    if tool == crate::dependency_prompt::FETCH_PROMPT_TOOL {
+    if crate::dependency_prompt::is_dependency_prompt(tool) {
         "Always for this project".to_owned()
     } else if tool.starts_with("mcp__") {
         format!("Allow every call to {tool}")
@@ -553,7 +553,7 @@ pub fn always_label(tool: &str) -> String {
 /// The deny button's words: "Not now" for the dependency question, which
 /// stores nothing (decision 0087).
 pub fn deny_label(tool: &str) -> &'static str {
-    if tool == crate::dependency_prompt::FETCH_PROMPT_TOOL {
+    if crate::dependency_prompt::is_dependency_prompt(tool) {
         "Not now"
     } else {
         "Deny"
@@ -572,6 +572,21 @@ pub fn consequence(tool: &str, answer: &AskAnswer) -> String {
                 .to_owned(),
             AskAnswer::Deny { .. } => {
                 "Nothing is fetched and the run does not start; you will be asked again.".to_owned()
+            }
+        };
+    }
+    if tool == crate::dependency_prompt::INSTALL_PROMPT_TOOL {
+        return match answer {
+            AskAnswer::AllowOnce => "kGraf runs these install commands in its sandbox for this \
+                                     run only; the next run asks again."
+                .to_owned(),
+            AskAnswer::AllowAlways => "Saves the answer for these exact commands: kGraf runs \
+                                       them in its sandbox whenever a run needs them. A changed \
+                                       command asks again."
+                .to_owned(),
+            AskAnswer::Deny { .. } => {
+                "Nothing is installed and the run does not start; you will be asked again."
+                    .to_owned()
             }
         };
     }

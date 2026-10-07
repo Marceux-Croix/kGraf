@@ -312,6 +312,135 @@ use super::ANCESTOR_READS;
 /// Device files every build tool writes to.
 const DEVICE_WRITES: &[&str] = &["/dev/null", "/dev/zero", "/dev/full", "/dev/tty"];
 
+/// A built command: the command, its child step, the refused ancestor reads,
+/// and the proxy listener's handoff socket for [`Network::Proxy`].
+pub(super) type Built = (Command, Option<ChildStep>, Vec<String>, Option<Handoff>);
+
+/// The socket pair a [`Network::Proxy`] command's first process sends its
+/// loopback listener over (`namespaces::hand_off_loopback_listener`). Both
+/// ends are close-on-exec: the child uses its end between fork and exec.
+#[derive(Debug)]
+pub(super) struct Handoff {
+    parent: std::os::fd::OwnedFd,
+    child: Option<std::os::fd::OwnedFd>,
+}
+
+impl Handoff {
+    fn new() -> Result<Self, SandboxError> {
+        use std::os::fd::FromRawFd;
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: socketpair writes two descriptors into `fds`.
+        let rc = unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+                0,
+                fds.as_mut_ptr(),
+            )
+        };
+        if rc != 0 {
+            return Err(SandboxError::Spawn(std::io::Error::last_os_error()));
+        }
+        // SAFETY: both descriptors were just created and are owned here only.
+        Ok(unsafe {
+            Self {
+                parent: std::os::fd::OwnedFd::from_raw_fd(fds[0]),
+                child: Some(std::os::fd::OwnedFd::from_raw_fd(fds[1])),
+            }
+        })
+    }
+
+    fn child_fd(&self) -> libc::c_int {
+        use std::os::fd::AsRawFd;
+        self.child.as_ref().map_or(-1, |c| c.as_raw_fd())
+    }
+
+    /// After the spawn: the listener the command's first process sent.
+    /// Waits up to `wait`; the child's end is closed first, so a child that
+    /// died before sending reads as the end of the stream, not a hang.
+    pub(super) fn receive(
+        &mut self,
+        wait: std::time::Duration,
+    ) -> Result<std::net::TcpListener, SandboxError> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        self.child = None;
+        let fd = self.parent.as_raw_fd();
+        let failed = |what: &str, e: std::io::Error| {
+            SandboxError::Spawn(std::io::Error::new(
+                e.kind(),
+                format!("the sandboxed command's proxy listener {what}: {e}"),
+            ))
+        };
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ms = libc::c_int::try_from(wait.as_millis()).unwrap_or(libc::c_int::MAX);
+        // SAFETY: polls one descriptor owned by `self`.
+        let ready = unsafe { libc::poll(&mut pfd, 1, ms) };
+        if ready <= 0 {
+            return Err(failed(
+                "did not arrive",
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out"),
+            ));
+        }
+        #[repr(C, align(8))]
+        struct Control([u8; 64]);
+        let mut control = Control([0; 64]);
+        let mut byte = [0u8; 1];
+        let mut iov = libc::iovec {
+            iov_base: byte.as_mut_ptr().cast(),
+            iov_len: 1,
+        };
+        // SAFETY: a zeroed msghdr is valid; every pointer set below lives
+        // for the call.
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control.0.as_mut_ptr().cast();
+        msg.msg_controllen = 64;
+        // SAFETY: receives into the buffers above.
+        let n = unsafe { libc::recvmsg(fd, &mut msg, libc::MSG_CMSG_CLOEXEC) };
+        if n != 1 {
+            return Err(failed(
+                "was not sent",
+                if n < 0 {
+                    std::io::Error::last_os_error()
+                } else {
+                    std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "the child ended first")
+                },
+            ));
+        }
+        // SAFETY: reads the control message recvmsg filled.
+        unsafe {
+            let cmsg = libc::CMSG_FIRSTHDR(&msg);
+            if cmsg.is_null()
+                || (*cmsg).cmsg_level != libc::SOL_SOCKET
+                || (*cmsg).cmsg_type != libc::SCM_RIGHTS
+            {
+                return Err(failed(
+                    "came without a descriptor",
+                    std::io::Error::from(std::io::ErrorKind::InvalidData),
+                ));
+            }
+            let mut raw: libc::c_int = -1;
+            std::ptr::copy_nonoverlapping(
+                libc::CMSG_DATA(cmsg),
+                (&mut raw as *mut libc::c_int).cast::<u8>(),
+                std::mem::size_of::<libc::c_int>(),
+            );
+            if raw < 0 {
+                return Err(failed(
+                    "came without a descriptor",
+                    std::io::Error::from(std::io::ErrorKind::InvalidData),
+                ));
+            }
+            Ok(std::net::TcpListener::from_raw_fd(raw))
+        }
+    }
+}
+
 /// The child-side state, built in the parent and consumed by one spawn.
 struct Prepared {
     ruleset: RulesetCreated,
@@ -324,17 +453,14 @@ pub(super) fn command(
     policy: &Resolved,
     program: &OsStr,
 ) -> Result<(Command, Option<ChildStep>), SandboxError> {
-    command_with(policy, program, confinement()).map(|(cmd, step, _)| (cmd, step))
+    command_with(policy, program, confinement()).map(|(cmd, step, _, _)| (cmd, step))
 }
 
 /// The command, its child step, and the cargo files above a writable root the
 /// policy opted in to but could not grant, each with its cause
 /// ([`AncestorReads::refused`]): the caller shows them beside the command's
 /// own error, so a refusal is never silent.
-pub(super) fn command_noting(
-    policy: &Resolved,
-    program: &OsStr,
-) -> Result<(Command, Option<ChildStep>, Vec<String>), SandboxError> {
+pub(super) fn command_noting(policy: &Resolved, program: &OsStr) -> Result<Built, SandboxError> {
     command_with(policy, program, confinement())
 }
 
@@ -347,7 +473,7 @@ fn command_with(
     policy: &Resolved,
     program: &OsStr,
     kernel: LinuxConfinement,
-) -> Result<(Command, Option<ChildStep>, Vec<String>), SandboxError> {
+) -> Result<Built, SandboxError> {
     if !kernel.seccomp && policy.network == Network::Deny {
         return Err(SandboxError::PolicyNotEnforceable {
             backend: BACKEND_NAME,
@@ -362,6 +488,24 @@ fn command_with(
                    tell one path from another)",
         });
     }
+    if matches!(policy.network, Network::Proxy { .. }) && !kernel.namespaces {
+        return Err(SandboxError::PolicyNotEnforceable {
+            backend: BACKEND_NAME,
+            what: "network through the egress proxy only (it needs a network namespace of the \
+                   command's own, and user namespaces are not available)",
+        });
+    }
+    if !policy.hidden.is_empty() && !kernel.namespaces {
+        return Err(SandboxError::PolicyNotEnforceable {
+            backend: BACKEND_NAME,
+            what: "a hidden folder beneath a writable root (Landlock cannot deny a folder \
+                   inside a granted one, and user namespaces are not available to cover it)",
+        });
+    }
+    let handoff = match policy.network {
+        Network::Proxy { .. } => Some(Handoff::new()?),
+        _ => None,
+    };
     let (ruleset, refused) = build_ruleset(policy, kernel.landlock_abi >= LANDLOCK_SCOPES)?;
     let mut slot = Some(Prepared {
         ruleset,
@@ -375,6 +519,8 @@ fn command_with(
                 policy.network,
                 &policy.writable,
                 kernel.fresh_proc,
+                handoff.as_ref().map(Handoff::child_fd),
+                &policy.hidden,
             )?)
         } else {
             None
@@ -423,7 +569,7 @@ fn command_with(
         }
         Ok(())
     });
-    Ok((Command::new(program), Some(step), refused))
+    Ok((Command::new(program), Some(step), refused, handoff))
 }
 
 /// Readable rule for the procfs just mounted on `/proc`. The parent's rule
@@ -857,6 +1003,7 @@ mod tests {
             cargo_homes: home.map(|h| vec![std::fs::canonicalize(h).unwrap().join(".cargo")]),
             frozen_git: vec![],
             dependency_reads: vec![],
+            hidden: vec![],
         }
     }
 
@@ -1442,7 +1589,7 @@ mod tests {
             namespaces: false,
             ..k
         };
-        let (mut cmd, step, _) = command_with(&policy, OsStr::new("/bin/sh"), no_ns).unwrap();
+        let (mut cmd, step, _, _) = command_with(&policy, OsStr::new("/bin/sh"), no_ns).unwrap();
         let _probe = super::super::child::install(&mut cmd, None, step).unwrap();
         let script = format!(
             "cat /proc/self/status; echo x > '{}' && echo WROTE",

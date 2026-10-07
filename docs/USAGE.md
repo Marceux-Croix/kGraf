@@ -63,11 +63,85 @@ kgraf deps reset     # forget the answer; the next run that needs a fetch asks
   are ordinary files (0084).
 - Each fetch is a network event with no tokens; `kgraf diag show` counts them.
 
-For the other languages, install the dependencies in the checkout yourself, as you would to
+For the other languages, the dependencies must be installed in the checkout, as you would to
 run the tests by hand (`npm ci`, `pnpm install`, `yarn install`, a `.venv` with
-`pip install -r requirements.txt`, `go mod download`, `mvn test` once, `dotnet restore`).
-kGraf does not fetch for them: their install commands run package code on this machine,
-outside the sandbox (decision 0087, amended 2026-10-06).
+`pip install -r requirements.txt`, `go mod download`, `mvn test` once, `dotnet restore`,
+`composer install`, `bundle install`). Install them yourself, or let kGraf run the install
+command in its sandbox, with your consent, once per project (decision 0087, amended
+2026-10-07):
+
+```
+kgraf deps status          # each missing install, its exact command and the stored answer
+kgraf deps allow npm       # run npm's missing install in the sandbox whenever a run needs it
+kgraf deps install         # run every missing install now, once (or: kgraf deps install npm)
+kgraf deps refuse npm      # never run it; runs go on without it and say so
+kgraf deps reset npm       # forget the answer; the next run that needs it asks
+```
+
+The package managers are `npm` (also pnpm, Yarn and Bun), `python`, `go`, `maven`, `gradle`,
+`dotnet`, `composer` and `bundler`.
+
+- **One answer per command.** The answer is kept for the exact command, per package and
+  folder (`npm ci` in the project root). If the command changes (a lockfile is added, another
+  package manager is used), the next run asks again. A changed lockfile or package script
+  does not change the command: what it runs, it runs in the sandbox. The answer is sealed
+  with a key kept in kGraf's own data folder (`install-consent.key`), so an answer a
+  repository brings in its `.kgraf` folder counts for nothing, and the run asks.
+- **"Allow once"** answers the question it is on only. A run that needs cargo's fetch and an
+  install asks both in turn; allowing the fetch once does not run the install.
+- **At run start**, after cargo's check: with an answer, kGraf runs the command and says so
+  (`installed  npm dependencies ...: ran `npm ci` in the project root in kGraf's sandbox ...
+  reached registry.npmjs.org:443`). With no answer, `kgraf orchestrate` at a terminal
+  asks once (once, always, not now, never) and the desktop app shows a card (Allow once,
+  Always for this project, Not now); with nobody there to answer, the run stops before it
+  starts and names the command and how to allow it. A refusal (stored, or `--no-fetch-deps`)
+  lets the run go on without the install, with a notice. `--fetch-deps` allows it for one
+  run. kGraf never installs unasked.
+- **The sandbox.** The install runs in the project's folder, in kGraf's sandbox: it can write
+  only the project (never its `.git` or `.kgraf` folder, which it cannot read either) and
+  kGraf's package cache for the project (`.kgraf/package-stores/`). Install scripts (npm's
+  `postinstall`, a `setup.py` build, Maven and Gradle build logic) run inside the same
+  sandbox. The install and its scripts can still change the project's own files, as when you
+  run the install yourself. No process the install starts outlives it: one that leaves the
+  install's process group is stopped, and the install fails and says so. Gradle's daemon and
+  MSBuild's reused nodes are turned off for the install.
+- **The network.** On macOS and Linux the install reaches only the package registries of its
+  package manager, through kGraf's proxy: `registry.npmjs.org` and `registry.yarnpkg.com`;
+  `pypi.org` and `files.pythonhosted.org`; `proxy.golang.org` and `sum.golang.org`;
+  `repo.maven.apache.org`; for Gradle `plugins.gradle.org`, `plugins-artifacts.gradle.org`,
+  `services.gradle.org`, `repo.maven.apache.org`, `github.com` and
+  `release-assets.githubusercontent.com` (the wrapper's download); `api.nuget.org`; for
+  Composer `repo.packagist.org`, `api.github.com` and `codeload.github.com` (package
+  downloads); `rubygems.org` and `index.rubygems.org`. Change a list in the desktop app under
+  Settings, Permissions, Install registries (one host per line; `*.example.com` for every name
+  under a domain; `host:port` for a port other than 443 and 80), or in the user-level
+  `settings.toml`:
+
+  ```toml
+  [install_registries]
+  npm = ["registry.npmjs.org", "npm.example.com", "127.0.0.1:4873"]
+  ```
+
+  A list you name replaces its default; the others keep theirs. On Linux this needs user
+  namespaces; without them the install stops and says so. **On Windows** the sandbox cannot
+  limit the network or reads (decision 0011): the install runs with the network open, and it
+  and its scripts can read any file you can, your credential files included, and send it
+  anywhere. Its writes are still confined. The question and the notice say so.
+- **Fail loud.** A failed install stops the run with the end of its output. A host the proxy
+  blocked is named, with how to allow it (`kGraf blocked npm.example.com:443: ...`).
+- **No credentials.** The install runs with a home folder of its own, so it never reads your
+  `~/.npmrc`, `~/.pypirc`, `~/.netrc`, Maven `settings.xml` or other login files (on macOS
+  and Linux the sandbox also denies them), and pip reads no configuration file. Package
+  manager settings in your environment (`PIP_INDEX_URL`, `npm_config_*`, `BUNDLE_*`,
+  `GOPROXY` and the like, which can hold a login) are not passed to it. A project that needs a private registry with a login fails
+  with the blocked host named: allow the host and run the install yourself. A way to give
+  kGraf a registry token of its own is not built yet.
+- **Package stores.** Go, Maven, Gradle and NuGet install into a store, not the project.
+  kGraf's install fills a store of the project's own in `.kgraf/package-stores/` and never
+  writes your `~/go/pkg/mod`, `~/.m2`, `~/.gradle` or `~/.nuget`; workers, checks and gates
+  of the project read that store, read-only.
+- Each install is a network event with no tokens; `kgraf diag show` counts it with the
+  registry fetches.
 
 - Workers, the verifier's check, the gates and the contract checks read what you installed,
   and never write it. Each installed tree beside its project's manifest is linked into the
@@ -130,10 +204,11 @@ outside the sandbox (decision 0087, amended 2026-10-06).
   `.gradle/`, .NET `obj/` and `bin/`, a `*.tsbuildinfo`, a worker's own install): each
   build tool takes such files as work already done. The links to your installs are made
   again. A check therefore needs what the merged tree needs, as the gate does.
-- When the project declares dependencies that are not installed, the run start says which,
-  and the command to run; so does a failing check or gate, after its own output
-  (`[dependencies] npm dependencies are not installed: node_modules has no jest. Run
-  `npm ci` in the project root ...`).
+- When the project declares dependencies that are not installed, the run start asks to run
+  the install (above), or says which are missing when you refused; so does a failing check or
+  gate, after its own output (`[dependencies] npm dependencies are not installed:
+  node_modules has no jest. Run `npm ci` in the project root, or let kGraf run it in its
+  sandbox (`kgraf deps allow npm`) ...`).
 - Not covered: a link inside `node_modules` to a folder of the checkout that the worktree
   does not have (an untracked package) stays unreadable.
 

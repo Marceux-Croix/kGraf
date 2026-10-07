@@ -176,6 +176,13 @@ pub struct RunConfig {
     /// scheduled or desktop run goes by the project's stored consent.
     #[serde(skip)]
     pub dependency_fetch: crate::deps::RunFetch,
+    /// The hosts each ecosystem's sandboxed install may reach (decision 0087,
+    /// amended 2026-10-07). `None` reads the user's `install_registries`
+    /// setting when an install is about to run, so the latest Settings
+    /// apply; a test sets it. Not in `run.json`: a user setting, never a
+    /// project file a worker could write.
+    #[serde(skip)]
+    pub install_hosts: Option<crate::deps::InstallHosts>,
     /// What happens to a worker's worktree, and the build output in it, once
     /// nothing needs it (decision 0088): `Delete` (the default) or `Keep`.
     /// One source per surface: the command's `--keep-worktrees`, and in the
@@ -370,6 +377,7 @@ impl RunConfig {
             routing: kgraf_orchestrator::RoutingPolicy::default(),
             tbench_bridge_socket: None,
             dependency_fetch: crate::deps::RunFetch::Stored,
+            install_hosts: None,
             worktrees: WorktreeRetention::default(),
             approve_plan: false,
         }

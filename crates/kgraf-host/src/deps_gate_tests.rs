@@ -155,7 +155,10 @@ async fn unset_and_unattended_fails_loud_before_anything_is_built() {
         Err(e) => e,
     };
     let q = err.dependency_question().expect("a question to ask");
-    assert_eq!(q.registry, Registry::CratesIo);
+    assert_eq!(
+        q.subject,
+        crate::deps::ConsentSubject::Fetch(Registry::CratesIo)
+    );
     assert!(q.text().contains("crates.io"), "{}", q.text());
     let text = format!("{err:#}");
     for needle in ["kgraf deps allow", "--fetch-deps", "cargo fetch"] {
@@ -294,6 +297,24 @@ async fn a_grant_covers_its_own_run_only_until_it_finishes() {
     assert!(again.dependency_question().is_some());
 }
 
+/// The other way: "Allow once" on the install question is no answer about
+/// cargo's fetch on the host.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn allowing_the_install_once_does_not_allow_the_fetch() {
+    let (_dir, config) = project();
+    let root = config.root.clone();
+    let fake = Fake::missing(&root);
+    let host = host_with(config, &fake);
+    host.grant_dependency_install(&RunId::new("d7"));
+    let err = match host.prepare(RunId::new("d7"), None, &mut |_| {}).await {
+        Ok(_) => panic!("fetched on the install's grant"),
+        Err(e) => e,
+    };
+    let q = err.dependency_question().expect("a question");
+    assert!(matches!(q.subject, crate::deps::ConsentSubject::Fetch(_)));
+    assert!(!fake.fetched());
+}
+
 /// A refusal stored after the run's start gate stops a worker's fetch even
 /// when that worker's refetcher is made later: the consent it compares against
 /// is the one the start gate read, not the file as it is when the first worker
@@ -397,4 +418,151 @@ async fn ready_dependencies_pass_without_asking() {
         .expect("prepared");
     assert_eq!(fake.log(), ["check"]);
     assert!(!host.dependency_consents().path().exists());
+}
+
+// ---- installs of the other package managers (amended 2026-10-07) ---------
+
+/// An install runner that records each command and makes the install.
+#[derive(Default)]
+struct FakeInstall {
+    ran: Mutex<Vec<String>>,
+}
+
+impl crate::deps::InstallRunner for FakeInstall {
+    fn run(
+        &self,
+        install: &crate::deps::MissingInstall,
+        checkout: &Path,
+        _hosts: &[kgraf_sandbox::egress::HostRule],
+        _stop: &crate::deps::Stop,
+    ) -> Result<crate::deps::InstallReport, DepsError> {
+        self.ran.lock().unwrap().push(install.command.clone());
+        std::fs::create_dir_all(checkout.join("node_modules/left-pad")).unwrap();
+        Ok(crate::deps::InstallReport {
+            install: install.clone(),
+            elapsed: Duration::from_millis(1),
+            contacted: vec!["registry.npmjs.org:443".into()],
+            blocked: Vec::new(),
+            network_open: false,
+        })
+    }
+}
+
+/// A project whose cargo dependencies are ready and whose npm install is
+/// missing, served by `install`, with this run's answer `run`.
+fn npm_project(install: &Arc<FakeInstall>, run: RunFetch) -> (tempfile::TempDir, Host, PathBuf) {
+    let (dir, config) = project();
+    let root = config.root.clone();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"dependencies":{"left-pad":"1"}}"#,
+    )
+    .expect("write");
+    let config = RunConfig {
+        dependency_fetch: run,
+        ..config
+    };
+    let fake = Fake::missing(&root);
+    *fake.ready.lock().unwrap() = true;
+    let host = host_with(config, &fake).with_install_runner(install.clone());
+    (dir, host, root)
+}
+
+/// Unattended (a scheduled run, a pipe), with no stored answer: the run
+/// fails loud before anything of it is built, naming the command, and the
+/// question is kept for a caller that can ask.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unanswered_install_stops_an_unattended_start_with_the_command() {
+    let install = Arc::new(FakeInstall::default());
+    let (_dir, host, root) = npm_project(&install, RunFetch::Stored);
+    let err = match host.prepare(RunId::new("i1"), None, &mut |_| {}).await {
+        Ok(_) => panic!("the run was built"),
+        Err(e) => e,
+    };
+    let text = format!("{err:#}");
+    for needle in ["`npm install`", "kgraf deps allow npm", "--fetch-deps"] {
+        assert!(text.contains(needle), "`{needle}` missing: {text}");
+    }
+    assert!(
+        !err.is_transient(),
+        "a settings failure, not a transient one"
+    );
+    let q = err.dependency_question().expect("a question");
+    assert!(matches!(q.subject, crate::deps::ConsentSubject::Install(_)));
+    assert!(install.ran.lock().unwrap().is_empty(), "nothing ran");
+    assert!(!branch_exists(&root, "i1"), "nothing of the run was built");
+    assert!(host.take_dependency_question(&RunId::new("i1")).is_some());
+}
+
+/// Answered once for the project: the install runs before the run is built,
+/// is said, and the next start neither asks nor runs it again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stored_install_consent_runs_it_before_the_run_and_says_so() {
+    let install = Arc::new(FakeInstall::default());
+    let (_dir, host, root) = npm_project(&install, RunFetch::Stored);
+    let missing =
+        crate::deps::missing_installs(&root, &crate::deps::InstallEnv::default(), &|| true);
+    host.set_install_consent(&missing[0], Consent::Allowed)
+        .expect("store");
+    let mut notices = Vec::new();
+    let prepared = host
+        .prepare(RunId::new("i2"), None, &mut |n| notices.push(n))
+        .await
+        .expect("prepared");
+    assert_eq!(*install.ran.lock().unwrap(), vec!["npm install".to_owned()]);
+    assert!(
+        notices.iter().any(|n| matches!(n,
+            Notice::DependenciesInstalled { ecosystem, summary }
+                if ecosystem == "npm" && summary.contains("registry.npmjs.org"))),
+        "{notices:?}"
+    );
+    assert!(branch_exists(&root, "i2"));
+    drop(prepared);
+    host.prepare(RunId::new("i3"), None, &mut |_| {})
+        .await
+        .expect("prepared again");
+    assert_eq!(
+        install.ran.lock().unwrap().len(),
+        1,
+        "installed: not run again"
+    );
+}
+
+/// "Allow once" answers one question. A person who allowed cargo's fetch on
+/// the host for this run (the first question a start can stop on) has not
+/// allowed the project's install scripts to run: the install question is
+/// still asked, and nothing runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn allowing_the_fetch_once_does_not_allow_the_install() {
+    let install = Arc::new(FakeInstall::default());
+    let (_dir, host, root) = npm_project(&install, RunFetch::Stored);
+    host.grant_dependency_fetch(&RunId::new("i5"));
+    let err = match host.prepare(RunId::new("i5"), None, &mut |_| {}).await {
+        Ok(_) => panic!("the install ran on the fetch's grant"),
+        Err(e) => e,
+    };
+    let q = err.dependency_question().expect("a question");
+    assert!(matches!(q.subject, crate::deps::ConsentSubject::Install(_)));
+    assert!(install.ran.lock().unwrap().is_empty(), "nothing ran");
+    assert!(!branch_exists(&root, "i5"));
+}
+
+/// `--no-fetch-deps`: the run goes on without the install and says what to
+/// run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_that_refuses_goes_on_without_the_install_and_says_so() {
+    let install = Arc::new(FakeInstall::default());
+    let (_dir, host, _root) = npm_project(&install, RunFetch::Refuse);
+    let mut notices = Vec::new();
+    let prepared = host
+        .prepare(RunId::new("i4"), None, &mut |n| notices.push(n))
+        .await
+        .expect("prepared");
+    assert!(install.ran.lock().unwrap().is_empty());
+    assert!(
+        notices.iter().any(|n| matches!(n,
+            Notice::DependenciesNotInstalled(lines) if lines[0].contains("Run `npm install`"))),
+        "{notices:?}"
+    );
+    drop(prepared);
 }

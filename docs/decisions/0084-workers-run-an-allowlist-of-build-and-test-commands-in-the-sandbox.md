@@ -938,3 +938,31 @@ overlayfs): `pnpm_workspace_links_inside_the_store_resolve_to_the_tree_s_package
 `a_stamp_read_right_after_a_change_is_racy`,
 `an_entry_added_in_the_same_time_step_is_linked_on_the_next_call`;
 `a_current_mirror_is_not_walked_again` now ages the install first.
+
+## Amendment (2026-10-07): a command reads the package stores kGraf's install filled, read-only
+
+Decision 0087, amended 2026-10-07, has kGraf run a project's missing install in its sandbox
+with the user's consent. Four package managers install into a store outside the project, not
+into it: Go's module cache, Maven's local repository, Gradle's dependency cache and NuGet's
+packages folder. kGraf's install fills a store of the project's own under
+`.kgraf/package-stores/` instead of the user's (`kgraf_sandbox::PackageStores`), so the later
+commands of the project must find it.
+
+- **Found with the dependency links.** `link_dependency_trees` also returns the stores that
+  exist for the checkout (`DependencyLinks::package_stores`); each must be marked filled by a
+  successful install (`.kgraf-store-complete`) and be a real folder whose
+  path resolves to itself (a link, or a folder below one, is not used). Every place that grants
+  the links (the worker's shell, the verifier's checks, the gates, the contract checks) grants
+  the stores with them.
+- **Read, never written.** Each store is a readable root: on macOS it is allowed again after the
+  state directory's deny, like a worktree under it; on Linux it is granted read and execute. No
+  write rule names it. A store that now resolves elsewhere refuses the command
+  (`InvalidPolicy`).
+- **Named to its package manager**, after the user's own stores, so the project's wins:
+  `GOMODCACHE`, `-Dmaven.repo.local` appended to `MAVEN_OPTS`, `GRADLE_RO_DEP_CACHE` (the store's
+  `caches`), `NUGET_PACKAGES`. The Gradle wrapper's distribution is taken from the store's
+  `wrapper` folder when the store exists.
+- **Not verified live**: Go, Maven, Gradle and .NET were not installed on the machine where
+  this was built. That each tool reads its store read-only and offline (Maven may try to write
+  its tracking files) is taken from their documentation and untested; the grants and the
+  variables are unit-tested (`package_stores.rs`, `sandbox/mod.rs`).

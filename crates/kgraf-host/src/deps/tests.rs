@@ -261,7 +261,7 @@ fn a_check_that_cannot_decide_after_a_fetch_is_a_failure_to_confirm() {
 #[test]
 fn the_consent_text_says_workers_may_fetch_what_they_add() {
     let q = ConsentQuestion {
-        registry: Registry::CratesIo,
+        subject: crate::deps::ConsentSubject::Fetch(Registry::CratesIo),
         project: PathBuf::from("/p"),
         detail: "no matching package named `itoa`".into(),
     };
@@ -308,7 +308,7 @@ fn a_damaged_or_foreign_consent_file_is_an_error_never_unset() {
         store.get(Registry::CratesIo),
         Err(DepsError::Store { .. })
     ));
-    std::fs::write(store.path(), "{\"version\":2,\"registries\":{}}").unwrap();
+    std::fs::write(store.path(), "{\"version\":3,\"registries\":{}}").unwrap();
     assert!(matches!(
         store.get(Registry::CratesIo),
         Err(DepsError::Store { .. })

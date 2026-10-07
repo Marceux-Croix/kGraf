@@ -43,7 +43,7 @@ fn python_program() -> &'static str {
 }
 
 /// Whether the interpreter can import pytest.
-pub(crate) fn pytest_importable() -> bool {
+pub fn pytest_importable() -> bool {
     std::process::Command::new(python_program())
         .args(["-c", "import pytest"])
         .stdin(std::process::Stdio::null())
@@ -107,7 +107,7 @@ pub(crate) fn discover_with(
         &GateProbes {
             pytest_importable,
             on_path: &on_path,
-            env: crate::deps::InstallEnv::current(),
+            env: crate::deps::InstallEnv::for_checkout(root),
         },
     )
 }
@@ -708,7 +708,7 @@ fn open_network_note(notice: &str) -> String {
 fn missing_installs_note(checkout: &Path) -> String {
     let missing = crate::deps::missing_installs(
         checkout,
-        &crate::deps::InstallEnv::current(),
+        &crate::deps::InstallEnv::for_checkout(checkout),
         &pytest_importable,
     );
     missing

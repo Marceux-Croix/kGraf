@@ -466,14 +466,20 @@ enum Command {
         /// default.
         #[arg(long)]
         tbench_bridge_socket: Option<PathBuf>,
-        /// Fetch the project's dependencies from crates.io for this run, if
-        /// they are not in the local cache, without asking (decision 0087).
-        /// Runs `cargo fetch` on this machine, outside the workers' sandbox.
-        /// Stores nothing; `kgraf deps allow` makes it the project's default.
+        /// Fetch the project's dependencies for this run, without asking
+        /// (decision 0087): cargo's from crates.io when they are not in the
+        /// local cache (`cargo fetch` on this machine, outside the workers'
+        /// sandbox), and each missing install of the other package managers
+        /// (`npm ci`, `pip install`, ...), run with its install scripts in
+        /// kGraf's sandbox, the network limited to their registries (open on
+        /// Windows). Stores nothing; `kgraf deps allow [package-manager]`
+        /// makes it the project's default.
         #[arg(long, conflicts_with = "no_fetch_deps")]
         fetch_deps: bool,
-        /// Never fetch dependencies for this run: a run whose dependencies
-        /// are not in the local cache stops before it starts.
+        /// Never fetch dependencies for this run: a run whose cargo
+        /// dependencies are not in the local cache stops before it starts;
+        /// a missing install of another package manager is not run, and the
+        /// run goes on without it and says so.
         #[arg(long)]
         no_fetch_deps: bool,
         /// Warn at the start of the run when your verify or gate command runs
@@ -704,14 +710,20 @@ enum ScheduleAction {
         /// configuration's `shell_timeout_secs`; without either, 600.
         #[arg(long)]
         shell_timeout: Option<u64>,
-        /// Fetch the project's dependencies from crates.io for this run, if
-        /// they are not in the local cache, without asking (decision 0087).
-        /// Runs `cargo fetch` on this machine, outside the workers' sandbox.
-        /// Stores nothing; `kgraf deps allow` makes it the project's default.
+        /// Fetch the project's dependencies for this run, without asking
+        /// (decision 0087): cargo's from crates.io when they are not in the
+        /// local cache (`cargo fetch` on this machine, outside the workers'
+        /// sandbox), and each missing install of the other package managers
+        /// (`npm ci`, `pip install`, ...), run with its install scripts in
+        /// kGraf's sandbox, the network limited to their registries (open on
+        /// Windows). Stores nothing; `kgraf deps allow [package-manager]`
+        /// makes it the project's default.
         #[arg(long, conflicts_with = "no_fetch_deps")]
         fetch_deps: bool,
-        /// Never fetch dependencies for this run: a run whose dependencies
-        /// are not in the local cache stops before it starts.
+        /// Never fetch dependencies for this run: a run whose cargo
+        /// dependencies are not in the local cache stops before it starts;
+        /// a missing install of another package manager is not run, and the
+        /// run goes on without it and says so.
         #[arg(long)]
         no_fetch_deps: bool,
         /// Warn at the start of the run when your verify or gate command runs
@@ -731,21 +743,30 @@ enum ScheduleAction {
     },
 }
 
-/// `kgraf deps`: whether kGraf may fetch this project's dependencies
-/// (decision 0087).
+/// `kgraf deps`: whether kGraf may fetch this project's dependencies, or run
+/// its install commands in its sandbox (decision 0087).
 #[derive(Subcommand)]
 enum DepsAction {
-    /// Show the stored answer and whether the dependencies are ready offline.
+    /// Show the stored answers, whether the dependencies are ready offline,
+    /// and each missing install with its command.
     Status,
-    /// Let kGraf fetch this project's dependencies from crates.io whenever a
-    /// run needs them, without asking again. The one-time setup step.
-    Allow,
-    /// Never fetch; a run that needs a fetch stops before it starts.
-    Refuse,
-    /// Forget the answer: the next run that needs a fetch asks again.
-    Reset,
+    /// Without a package manager: let kGraf fetch this project's crates.io
+    /// dependencies whenever a run needs them. With one (npm, python, go,
+    /// maven, gradle, dotnet, composer, bundler): let kGraf run that
+    /// package manager's missing install, the exact command `kgraf deps
+    /// status` shows, in its sandbox whenever a run needs it. The one-time
+    /// setup step; a changed command asks again.
+    Allow { package_manager: Option<String> },
+    /// Never fetch (cargo: a run that needs a fetch stops before it starts),
+    /// or never run the install (a run goes on without it and says so).
+    Refuse { package_manager: Option<String> },
+    /// Forget the answer: the next run that needs it asks again.
+    Reset { package_manager: Option<String> },
     /// Fetch now, once (`cargo fetch` outside the workers' sandbox).
     Fetch,
+    /// Run each missing install now, once, in kGraf's sandbox (all, or one
+    /// package manager's). Stores nothing.
+    Install { package_manager: Option<String> },
 }
 
 #[derive(Subcommand)]
@@ -1408,10 +1429,26 @@ fn run_cli() -> Result<()> {
         },
         Command::Deps { action } => match action {
             DepsAction::Status => deps_cmd::status(&root),
-            DepsAction::Allow => deps_cmd::set(&root, deps_cmd::Consent::Allowed),
-            DepsAction::Refuse => deps_cmd::set(&root, deps_cmd::Consent::Refused),
-            DepsAction::Reset => deps_cmd::set(&root, deps_cmd::Consent::Unset),
+            DepsAction::Allow { package_manager } => deps_cmd::set(
+                &root,
+                deps_cmd::Consent::Allowed,
+                deps_cmd::parse_ecosystem(package_manager.as_deref())?,
+            ),
+            DepsAction::Refuse { package_manager } => deps_cmd::set(
+                &root,
+                deps_cmd::Consent::Refused,
+                deps_cmd::parse_ecosystem(package_manager.as_deref())?,
+            ),
+            DepsAction::Reset { package_manager } => deps_cmd::set(
+                &root,
+                deps_cmd::Consent::Unset,
+                deps_cmd::parse_ecosystem(package_manager.as_deref())?,
+            ),
             DepsAction::Fetch => deps_cmd::fetch(&root),
+            DepsAction::Install { package_manager } => deps_cmd::install(
+                &root,
+                deps_cmd::parse_ecosystem(package_manager.as_deref())?,
+            ),
         },
     };
 

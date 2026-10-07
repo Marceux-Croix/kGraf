@@ -116,11 +116,14 @@ pub enum Notice {
     /// cannot read, say); the run goes on, and workers' builds will show the
     /// same error.
     DependenciesUnchecked(String),
-    /// Installs the project needs and lacks for a package manager kGraf
-    /// does not fetch for (decision 0087, amended 2026-10-06): each names
-    /// the command that makes it. The run goes on; tests that need them
-    /// fail, and their failure says the same.
+    /// Installs the project needs and lacks, which the user declined to let
+    /// kGraf run (decision 0087, amended 2026-10-06 and 2026-10-07): each
+    /// names the command that makes it. The run goes on; tests that need
+    /// them fail, and their failure says the same.
     DependenciesNotInstalled(Vec<String>),
+    /// kGraf ran an install command in its sandbox, with the user's consent
+    /// (decision 0087, amended 2026-10-07): which, and the hosts it reached.
+    DependenciesInstalled { ecosystem: String, summary: String },
     /// The quality-gate commands this run uses (discovered, configured, or
     /// the approved plan's), or none: a run that passes its gates says which
     /// commands passed them.
@@ -340,9 +343,20 @@ pub struct Host {
     /// The package manager the dependency gate checks and fetches with
     /// (decision 0087); cargo unless a test gives a fake.
     deps_tool: Arc<dyn crate::deps::DependencyTool>,
+    /// Runs the installs of the other package managers, in the sandbox, with
+    /// consent (decision 0087, amended 2026-10-07); a fake in tests.
+    install_runner: Arc<dyn crate::deps::InstallRunner>,
+    /// The key install answers are sealed with, instead of the per-user one
+    /// ([`Host::with_consent_key`]).
+    consent_key: Option<[u8; 32]>,
     /// Runs a person allowed to fetch for (the desktop's "Allow once"),
     /// until [`Host::finish_run`].
     fetch_grants: Mutex<std::collections::BTreeSet<RunId>>,
+    /// Runs a person allowed the sandboxed installs for ("Allow once" on the
+    /// install question), until [`Host::finish_run`]. Apart from
+    /// [`Self::fetch_grants`]: an answer to one question is never an answer
+    /// to the other.
+    install_grants: Mutex<std::collections::BTreeSet<RunId>>,
     /// Each run's refetcher, until [`Host::finish_run`] stops it (a worker's
     /// fetch still running then is killed).
     refetchers: Mutex<BTreeMap<RunId, crate::deps::HostRefetch>>,
@@ -367,6 +381,7 @@ pub struct Retained {
     pub start_consents: usize,
     pub dependency_questions: usize,
     pub fetch_grants: usize,
+    pub install_grants: usize,
     pub notices: usize,
 }
 
@@ -587,7 +602,10 @@ impl Host {
             build_timeout: DEFAULT_BUILD_TIMEOUT,
             profiles,
             deps_tool: Arc::new(crate::deps::CargoDeps::default()),
+            install_runner: Arc::new(crate::deps::SandboxedInstall::default()),
+            consent_key: None,
             fetch_grants: Mutex::new(std::collections::BTreeSet::new()),
+            install_grants: Mutex::new(std::collections::BTreeSet::new()),
             refetchers: Mutex::new(BTreeMap::new()),
             start_consents: Mutex::new(BTreeMap::new()),
             dependency_questions: Mutex::new(BTreeMap::new()),
@@ -642,7 +660,18 @@ impl Host {
 
     /// This project's consent store (decision 0087).
     pub fn dependency_consents(&self) -> crate::deps::ConsentStore {
-        crate::deps::ConsentStore::in_state_dir(&self.state)
+        let store = crate::deps::ConsentStore::in_state_dir(&self.state);
+        match self.consent_key {
+            Some(key) => store.with_key(key),
+            None => store,
+        }
+    }
+
+    /// Seal and check install answers with `key` instead of the per-user key
+    /// (another crate's tests, which must not touch the user's data folder).
+    pub fn with_consent_key(mut self, key: [u8; 32]) -> Self {
+        self.consent_key = Some(key);
+        self
     }
 
     /// Store the project's answer about fetching from `registry` ("Always
@@ -656,13 +685,31 @@ impl Host {
     }
 
     /// Allow fetching for `run` only, storing nothing: the desktop's "Allow
-    /// once". Covers the run's start and its workers, until
-    /// [`Host::finish_run`].
+    /// once" on the fetch question. Covers the run's start and its workers,
+    /// until [`Host::finish_run`]. Never the sandboxed installs
+    /// ([`Host::grant_dependency_install`]).
     pub fn grant_dependency_fetch(&self, run: &RunId) {
         self.fetch_grants
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .insert(run.clone());
+    }
+
+    /// Allow the sandboxed installs for `run` only, storing nothing: "Allow
+    /// once" on the install question. Never cargo's fetch on the host.
+    pub fn grant_dependency_install(&self, run: &RunId) {
+        self.install_grants
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(run.clone());
+    }
+
+    /// "Allow once" for the question `subject` is about, and for nothing else.
+    pub fn grant_dependency_once(&self, run: &RunId, subject: &crate::deps::ConsentSubject) {
+        match subject {
+            crate::deps::ConsentSubject::Fetch(_) => self.grant_dependency_fetch(run),
+            crate::deps::ConsentSubject::Install(_) => self.grant_dependency_install(run),
+        }
     }
 
     /// The question `run` stopped on for want of an answer about fetching
@@ -684,6 +731,24 @@ impl Host {
             RunFetch::Stored
                 if self
                     .fetch_grants
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .contains(run) =>
+            {
+                RunFetch::Allow
+            }
+            other => other,
+        }
+    }
+
+    /// This run's own answer about the sandboxed installs: the configured
+    /// flag (which covers both), else an install grant, else none.
+    fn run_install(&self, run: &RunId) -> crate::deps::RunFetch {
+        use crate::deps::RunFetch;
+        match self.config.dependency_fetch {
+            RunFetch::Stored
+                if self
+                    .install_grants
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .contains(run) =>
@@ -734,21 +799,7 @@ impl Host {
             self.run_fetch(run),
             Trigger::RunStart,
         )
-        .inspect_err(|e| {
-            if let Some(q) = e.consent_question() {
-                let mut questions = self
-                    .dependency_questions
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner());
-                // Only the desktop takes these; a scheduled run's question is
-                // never taken, so keep a bounded few, dropping the lowest run
-                // id first. A dropped question is asked again at the next start.
-                while questions.len() >= MAX_KEPT_QUESTIONS {
-                    questions.pop_first();
-                }
-                questions.insert(run.clone(), q);
-            }
-        })?;
+        .inspect_err(|e| self.keep_question(run, e))?;
         match outcome {
             GateOutcome::NotApplicable | GateOutcome::Ready => {}
             GateOutcome::Fetched(report) => notices(Notice::DependenciesFetched {
@@ -757,17 +808,77 @@ impl Host {
             }),
             GateOutcome::Unchecked(why) => notices(Notice::DependenciesUnchecked(why)),
         }
-        let missing = crate::deps::missing_installs(
+        // The other package managers' installs: run in the sandbox with
+        // consent, asked for first when unanswered (amended 2026-10-07).
+        let installs = crate::deps::ensure_installs(
             &self.config.root,
-            &crate::deps::InstallEnv::current(),
+            &crate::deps::InstallEnv::for_checkout(&self.config.root),
             &crate::gates::pytest_importable,
-        );
-        if !missing.is_empty() {
+            &self.dependency_consents(),
+            self.run_install(run),
+            self.install_runner.as_ref(),
+            &|| self.install_hosts(),
+            &crate::deps::Stop::default(),
+        )
+        .inspect_err(|e| self.keep_question(run, e))?;
+        for report in &installs.installed {
+            notices(Notice::DependenciesInstalled {
+                ecosystem: report.install.ecosystem.name().to_owned(),
+                summary: report.summary(),
+            });
+        }
+        if !installs.declined.is_empty() {
             notices(Notice::DependenciesNotInstalled(
-                missing.iter().map(|m| m.sentence()).collect(),
+                installs.declined.iter().map(|m| m.sentence()).collect(),
             ));
         }
         Ok(())
+    }
+
+    /// The hosts a sandboxed install may reach: the run's own, else the
+    /// user's `install_registries` setting read now (decision 0087, amended
+    /// 2026-10-07). Unit tests never read the user's file.
+    fn install_hosts(&self) -> std::result::Result<crate::deps::InstallHosts, String> {
+        match &self.config.install_hosts {
+            Some(hosts) => Ok(hosts.clone()),
+            None if cfg!(test) => Ok(crate::deps::InstallHosts::defaults()),
+            None => crate::deps::InstallHosts::load_default(),
+        }
+    }
+
+    /// Keep the question a start stopped on, for a caller that asks through
+    /// a seam that keeps only the error's words ([`Host::take_dependency_question`]).
+    fn keep_question(&self, run: &RunId, e: &crate::deps::DepsError) {
+        if let Some(q) = e.consent_question() {
+            let mut questions = self
+                .dependency_questions
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            // Only the desktop takes these; a scheduled run's question is
+            // never taken, so keep a bounded few, dropping the lowest run
+            // id first. A dropped question is asked again at the next start.
+            while questions.len() >= MAX_KEPT_QUESTIONS {
+                questions.pop_first();
+            }
+            questions.insert(run.clone(), q);
+        }
+    }
+
+    /// Run the other package managers' installs with `runner` instead of the
+    /// sandbox (decision 0087, amended 2026-10-07). For tests.
+    pub fn with_install_runner(mut self, runner: Arc<dyn crate::deps::InstallRunner>) -> Self {
+        self.install_runner = runner;
+        self
+    }
+
+    /// Store the project's answer about running `install`'s exact command
+    /// ("Always for this project" stores [`crate::deps::Consent::Allowed`]).
+    pub fn set_install_consent(
+        &self,
+        install: &crate::deps::MissingInstall,
+        consent: crate::deps::Consent,
+    ) -> Result<()> {
+        Ok(self.dependency_consents().set_install(install, consent)?)
     }
 
     /// `run`'s refetcher, while the run is not finished.
@@ -854,6 +965,11 @@ impl Host {
             dependency_questions: len(&self.dependency_questions),
             fetch_grants: self
                 .fetch_grants
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .len(),
+            install_grants: self
+                .install_grants
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .len(),
@@ -2341,6 +2457,10 @@ impl Host {
     /// for a run this host did not hand out (or already finished).
     pub fn finish_run(&self, run: &RunId) -> Option<Housekeeping> {
         self.fetch_grants
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(run);
+        self.install_grants
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(run);

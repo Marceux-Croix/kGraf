@@ -344,6 +344,35 @@ pub(super) fn shell_launch(
     })
 }
 
+/// For each hidden folder (`SandboxPolicy::hide`), the capabilities whose
+/// writes in it are denied: those of the writable roots that hold it. A
+/// writable root beneath the folder (a package store inside `.kgraf`) keeps
+/// its own capability undenied, and the explicit grant on that root comes
+/// before the deny it inherits from the folder (Windows orders explicit
+/// entries, then inherited ones nearest first), so writes there still pass.
+/// `roots` and `caps` are parallel; paths compare as given, after the
+/// caller has stripped verbatim prefixes from all of them.
+pub(super) fn hidden_denials<'a, S>(
+    hidden: &[super::Hidden],
+    roots: &[std::path::PathBuf],
+    caps: &'a [S],
+    normalize: impl Fn(&std::path::Path) -> std::path::PathBuf,
+) -> Vec<(std::path::PathBuf, Vec<&'a S>)> {
+    hidden
+        .iter()
+        .map(|h| {
+            let dir = normalize(&h.dir);
+            let sids = roots
+                .iter()
+                .zip(caps)
+                .filter(|(root, _)| dir.starts_with(root) && **root != dir)
+                .map(|(_, sid)| sid)
+                .collect();
+            (dir, sids)
+        })
+        .collect()
+}
+
 #[cfg(windows)]
 pub use imp::SandboxedChild;
 #[cfg(windows)]
@@ -867,6 +896,13 @@ mod imp {
                        sockets, and AppContainer breaks the toolchains)",
             });
         }
+        if matches!(policy.network, Network::Proxy { .. }) {
+            return Err(SandboxError::PolicyNotEnforceable {
+                backend: BACKEND_NAME,
+                what: "network through the egress proxy only (without administrator rights no \
+                       destination can be denied, so a command could pass the proxy by)",
+            });
+        }
         if !policy.unix_sockets.is_empty() {
             return Err(SandboxError::PolicyNotEnforceable {
                 backend: BACKEND_NAME,
@@ -911,6 +947,17 @@ mod imp {
             refuse_reparse(&gitlink)?;
             for sid in &caps {
                 deny_writes(&gitlink, sid)?;
+            }
+        }
+        // A hidden folder (`SandboxPolicy::hide`): a deny ACE for the
+        // capability of every writable root above it, inherited by what is in
+        // it. A writable root beneath it has its own capability, which is not
+        // denied, and its own explicit grant, which precedes the inherited
+        // deny (`hidden_denials`). Reads are not confined on this backend.
+        for (dir, sids) in super::hidden_denials(&policy.hidden, &roots, &caps, strip_verbatim) {
+            refuse_reparse(&dir)?;
+            for sid in sids {
+                deny_writes(&dir, sid)?;
             }
         }
         // The first writable root (the worktree root under the standard policy)
@@ -2157,6 +2204,36 @@ mod tests {
             crate::win_command_line::append_arg(&mut out, &a.encode_utf16().collect::<Vec<_>>());
         }
         String::from_utf16(&out).unwrap()
+    }
+
+    /// A hidden folder's writes are denied to the capability of each root
+    /// that holds it, never to a root beneath it (the package store inside
+    /// `.kgraf`), and not to an unrelated root.
+    #[test]
+    fn a_hidden_folder_denies_the_roots_above_it_only() {
+        use std::path::PathBuf;
+        // Built with joins, so the test reads the same on every platform.
+        let base = PathBuf::from("/w");
+        let project = base.join("p");
+        let state = project.join(".kgraf");
+        let store = state.join("package-stores");
+        let roots = vec![project.clone(), store.clone(), base.join("other")];
+        let caps = ["cap-p", "cap-store", "cap-other"];
+        let hidden = [crate::sandbox::Hidden {
+            dir: base.join("verbatim").join("p").join(".kgraf"),
+            keep: vec![store.clone()],
+        }];
+        // Stands in for stripping a verbatim prefix: the given folder is
+        // compared after it is normalized.
+        let strip = |p: &std::path::Path| {
+            p.strip_prefix(base.join("verbatim"))
+                .map(|rest| base.join(rest))
+                .unwrap_or_else(|_| p.to_path_buf())
+        };
+        let plan = hidden_denials(&hidden, &roots, &caps, strip);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].0, state);
+        assert_eq!(plan[0].1, vec![&"cap-p"]);
     }
 
     /// Only the ACL check's own probe names are swept, and the process id

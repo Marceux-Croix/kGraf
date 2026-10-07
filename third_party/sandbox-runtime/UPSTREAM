@@ -1,0 +1,30 @@
+repository: https://github.com/anthropics/sandbox-runtime
+commit: 12a2be92c110cbc3c19584c4c8387e7e754c8179
+paths: src/sandbox/http-proxy.ts, src/sandbox/domain-pattern.ts, src/sandbox/resolved-address-guard.ts, src/sandbox/macos-sandbox-utils.ts, src/sandbox/linux-sandbox-utils.ts, src/sandbox/sandbox-utils.ts
+license: Apache-2.0
+date verified: 2026-10-07
+
+Ported (behavior re-written in Rust, no code copied) to
+crates/kgraf-sandbox/src/egress.rs and the Network::Proxy rule of
+crates/kgraf-sandbox/src/sandbox/macos.rs (decision 0087, amended 2026-10-07).
+
+What was taken:
+- The design: a host-side HTTP proxy that decides by host name, with the
+  sandbox limited to the proxy's loopback port.
+- The Seatbelt rule form for that port: `(allow network-outbound (remote ip
+  "localhost:PORT"))`.
+- The host pattern rules: an exact name, or `*.domain` for every name below
+  the domain (never the domain itself, never an IP address), with an optional
+  port.
+- The address classes an allowed name may not resolve to unless an address
+  entry names the address: loopback, unspecified, link-local, multicast,
+  broadcast, and the cloud metadata endpoints outside link-local.
+- The proxy variables a command gets, with NO_PROXY emptied.
+
+Deliberately different from upstream:
+- Linux: upstream bridges the command's network namespace with socat relays
+  over a unix socket bound into it. kGraf's seccomp filter refuses unix
+  sockets, so the command's first process opens the listener inside its own
+  namespace and passes it to kGraf (SCM_RIGHTS); no helper program.
+- No SOCKS proxy, no TLS termination, no request filtering beyond the host;
+  an entry without a port allows 443 and 80 only.

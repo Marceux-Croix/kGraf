@@ -180,6 +180,9 @@ pub struct DependencyLinks {
     /// A tree found but not linked, and why; a search cut short. Shown with
     /// a failing command's output.
     pub notes: Vec<String>,
+    /// The package stores kGraf filled for the checkout when it ran an
+    /// install itself, read-only to a command ([`crate::PackageStores`]).
+    pub package_stores: crate::PackageStores,
 }
 
 /// A virtual environment linked into a tree.
@@ -411,6 +414,7 @@ pub fn link_dependency_trees(tree: &Path, checkout: &Path) -> DependencyLinks {
     let (trees, notes) = recent_trees(checkout);
     let mut out = DependencyLinks {
         notes,
+        package_stores: crate::PackageStores::find(checkout),
         ..DependencyLinks::default()
     };
     if cfg!(not(any(unix, windows))) {

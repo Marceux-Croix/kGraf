@@ -1,5 +1,6 @@
-//! The window's question when a run's dependencies need fetching and the
-//! project has no answer yet (decision 0087).
+//! The window's question when a run's dependencies need fetching, or its
+//! install commands need running in the sandbox, and the project has no
+//! answer yet (decision 0087, amended 2026-10-07).
 //!
 //! The run's start fails at the host's dependency gate, before anything of it
 //! is built. The box then shows the question as a pinned approval card (the
@@ -17,11 +18,20 @@
 
 use kgraf_core::RunId;
 use kgraf_host::Host;
-use kgraf_host::deps::{Consent, ConsentQuestion};
+use kgraf_host::deps::{Consent, ConsentQuestion, ConsentSubject};
 use kgraf_orchestrator::{AskAnswer, PendingAsk};
 
 /// The card's tool name: the box words its buttons for this prompt by it.
 pub const FETCH_PROMPT_TOOL: &str = "dependency fetch";
+
+/// The card's tool name when the question is about running install
+/// commands in the sandbox (decision 0087, amended 2026-10-07).
+pub const INSTALL_PROMPT_TOOL: &str = "dependency install";
+
+/// Whether `tool` names one of the dependency cards (not a worker's ask).
+pub fn is_dependency_prompt(tool: &str) -> bool {
+    tool == FETCH_PROMPT_TOOL || tool == INSTALL_PROMPT_TOOL
+}
 
 /// The card's id, outside the desk's own ids (which count up from zero).
 pub const FETCH_PROMPT_ID: u64 = u64::MAX;
@@ -53,12 +63,23 @@ pub fn apply(
 ) -> Result<bool, String> {
     match choice {
         FetchChoice::AllowOnce => {
-            host.grant_dependency_fetch(run);
+            host.grant_dependency_once(run, &question.subject);
             Ok(true)
         }
         FetchChoice::AlwaysForProject => {
-            host.set_dependency_consent(question.registry, Consent::Allowed)
-                .map_err(|e| format!("the answer was not stored: {e}"))?;
+            match &question.subject {
+                ConsentSubject::Fetch(registry) => {
+                    host.set_dependency_consent(*registry, Consent::Allowed)
+                        .map_err(|e| format!("the answer was not stored: {e}"))?;
+                }
+                // Each install's exact command: a changed one asks again.
+                ConsentSubject::Install(installs) => {
+                    for install in installs {
+                        host.set_install_consent(install, Consent::Allowed)
+                            .map_err(|e| format!("the answer was not stored: {e}"))?;
+                    }
+                }
+            }
             Ok(true)
         }
         FetchChoice::NotNow => Ok(false),
@@ -71,7 +92,11 @@ pub fn pending_ask(question: &ConsentQuestion) -> PendingAsk {
         id: FETCH_PROMPT_ID,
         worker: "kGraf".to_owned(),
         task: "run start".to_owned(),
-        tool: FETCH_PROMPT_TOOL.to_owned(),
+        tool: match question.subject {
+            ConsentSubject::Fetch(_) => FETCH_PROMPT_TOOL,
+            ConsentSubject::Install(_) => INSTALL_PROMPT_TOOL,
+        }
+        .to_owned(),
         question: question.text(),
         asked_by: "the dependency check".to_owned(),
         input: format!(
@@ -85,11 +110,20 @@ pub fn pending_ask(question: &ConsentQuestion) -> PendingAsk {
 
 /// What "Not now" leaves the user to do.
 pub fn not_now_line(question: &ConsentQuestion) -> String {
-    format!(
-        "not started: the dependencies are not in the local cache. Run `{}` in the project, \
-         or `kgraf deps allow`, then start again",
-        question.registry.manual_command()
-    )
+    match &question.subject {
+        ConsentSubject::Fetch(_) => format!(
+            "not started: the dependencies are not in the local cache. Run {} in the project, \
+             or `{}`, then start again",
+            question.manual_commands(),
+            question.allow_command()
+        ),
+        ConsentSubject::Install(_) => format!(
+            "not started: the project's dependencies are not installed. Run {} yourself, or \
+             `{}`, then start again",
+            question.manual_commands(),
+            question.allow_command()
+        ),
+    }
 }
 
 /// How to start the run again once allowed.
@@ -104,6 +138,11 @@ pub(crate) enum Restart {
 pub(crate) struct FetchPrompt {
     pub(crate) question: ConsentQuestion,
     pub(crate) restart: Restart,
+    /// The questions already answered "Allow once" for this start. A start
+    /// can stop on two questions in turn (cargo's fetch, then the installs),
+    /// and a start begins again under a new run id: each grant is given
+    /// again to that id, so the first answer is not asked a second time.
+    pub(crate) once: Vec<ConsentSubject>,
 }
 
 #[cfg(test)]
@@ -126,7 +165,7 @@ mod tests {
     #[test]
     fn the_card_says_what_a_fetch_does_and_what_is_missing() {
         let q = ConsentQuestion {
-            registry: kgraf_host::deps::Registry::CratesIo,
+            subject: ConsentSubject::Fetch(kgraf_host::deps::Registry::CratesIo),
             project: "/p".into(),
             detail: "no matching package named `itoa`".into(),
         };
@@ -239,6 +278,14 @@ mod tests {
         }
 
         fn window() -> (tempfile::TempDir, Arc<Host>, Arc<Fake>, OrchestratorHost) {
+            window_with(|_| {}, |h| h)
+        }
+
+        /// [`window`] with the project's files and the host changed first.
+        fn window_with(
+            files: impl FnOnce(&Path),
+            change: impl FnOnce(Host) -> Host,
+        ) -> (tempfile::TempDir, Arc<Host>, Arc<Fake>, OrchestratorHost) {
             let dir = tempfile::tempdir().expect("dir");
             let root = dir.path().join("repo");
             std::fs::create_dir_all(&root).expect("mkdir");
@@ -255,14 +302,17 @@ mod tests {
                 r#"{"m": {"uncached_input": 1, "cache_read": 1, "cache_write": 1, "output": 1, "reasoning": 1}}"#,
             )
             .expect("prices");
+            files(&root);
             let fake = Arc::new(Fake::default());
-            let host = Arc::new(
+            let host = Arc::new(change(
                 Host::open(RunConfig::new(&root, vec!["fake:m".into()], &prices))
                     .expect("open")
                     .with_route_provider("fake", Arc::new(NoModel))
                     .expect("route")
-                    .with_dependency_tool(fake.clone()),
-            );
+                    .with_dependency_tool(fake.clone())
+                    // Never the user's own install answer key.
+                    .with_consent_key(*b"kgraf-shell-test-consent-key-32!"),
+            ));
             let factory = Arc::new(ProjectFactory::with_host(host.clone()));
             let parts = HostParts {
                 factory: factory.clone(),
@@ -368,5 +418,140 @@ mod tests {
                 "no run started"
             );
         }
+
+        /// Records each install command and makes the install.
+        #[derive(Default)]
+        struct FakeInstall {
+            ran: Mutex<Vec<String>>,
+        }
+
+        impl kgraf_host::deps::InstallRunner for FakeInstall {
+            fn run(
+                &self,
+                install: &kgraf_host::deps::MissingInstall,
+                checkout: &Path,
+                _hosts: &[kgraf_host::deps::HostRule],
+                _stop: &kgraf_host::deps::Stop,
+            ) -> Result<kgraf_host::deps::InstallReport, DepsError> {
+                self.ran.lock().unwrap().push(install.command.clone());
+                std::fs::create_dir_all(checkout.join("node_modules/left-pad")).unwrap();
+                Ok(kgraf_host::deps::InstallReport {
+                    install: install.clone(),
+                    elapsed: Duration::from_millis(1),
+                    contacted: Vec::new(),
+                    blocked: Vec::new(),
+                    network_open: false,
+                })
+            }
+        }
+
+        /// A start that needs cargo's fetch and an install asks both, in
+        /// turn: "Allow once" on the fetch card fetches and asks about the
+        /// install (it does not run it); "Allow once" there runs it. Nothing
+        /// is stored.
+        #[test]
+        fn allow_once_on_the_fetch_card_does_not_run_the_install() {
+            let install = Arc::new(FakeInstall::default());
+            let runner = install.clone();
+            let (_dir, host, fake, mut w) = window_with(
+                |root| {
+                    std::fs::write(
+                        root.join("package.json"),
+                        r#"{"dependencies":{"left-pad":"1"}}"#,
+                    )
+                    .expect("write")
+                },
+                move |h| h.with_install_runner(runner),
+            );
+            let mut events = Vec::new();
+            w.start("make x").expect("start");
+            until(&mut w, &mut events, "the fetch question", |w, _| asked(w));
+            w.answer(FETCH_PROMPT_ID, AskAnswer::AllowOnce)
+                .expect("answered");
+            until(&mut w, &mut events, "the install question", |w, _| {
+                w.pending_asks()
+                    .iter()
+                    .any(|a| a.id == FETCH_PROMPT_ID && a.tool == INSTALL_PROMPT_TOOL)
+            });
+            assert_eq!(*fake.fetches.lock().unwrap(), 1);
+            assert!(
+                install.ran.lock().unwrap().is_empty(),
+                "the fetch's answer ran the install"
+            );
+            w.answer(FETCH_PROMPT_ID, AskAnswer::AllowOnce)
+                .expect("answered");
+            until(&mut w, &mut events, "the install", |_, _| {
+                install.ran.lock().unwrap().len() == 1
+            });
+            assert!(
+                host.dependency_consents()
+                    .installs()
+                    .expect("read")
+                    .is_empty()
+            );
+        }
+
+        /// The install question through the window: the card, "Always for
+        /// this project" stores the exact command, and the install runs.
+        #[test]
+        fn an_install_question_is_a_card_and_always_stores_the_command() {
+            let install = Arc::new(FakeInstall::default());
+            let runner = install.clone();
+            let (_dir, host, fake, mut w) = window_with(
+                |root| {
+                    std::fs::write(
+                        root.join("package.json"),
+                        r#"{"dependencies":{"left-pad":"1"}}"#,
+                    )
+                    .expect("write")
+                },
+                move |h| h.with_install_runner(runner),
+            );
+            *fake.ready.lock().unwrap() = true;
+            let mut events = Vec::new();
+            w.start("make x").expect("start");
+            until(&mut w, &mut events, "the install question", |w, _| asked(w));
+            let card = w
+                .pending_asks()
+                .into_iter()
+                .find(|a| a.id == FETCH_PROMPT_ID)
+                .expect("card");
+            assert_eq!(card.tool, INSTALL_PROMPT_TOOL);
+            assert!(card.question.contains("`npm install`"), "{}", card.question);
+            assert!(install.ran.lock().unwrap().is_empty(), "asked first");
+            w.answer(FETCH_PROMPT_ID, AskAnswer::AllowAlways)
+                .expect("answered");
+            let stored = host.dependency_consents().installs().expect("read");
+            assert_eq!(stored["npm:"].command, "npm install");
+            assert_eq!(stored["npm:"].consent, Consent::Allowed);
+            until(&mut w, &mut events, "the install", |_, _| {
+                install.ran.lock().unwrap().len() == 1
+            });
+        }
+    }
+
+    #[test]
+    fn the_install_card_names_the_command_and_not_now_says_how_to_allow() {
+        let q = ConsentQuestion {
+            subject: ConsentSubject::Install(vec![kgraf_host::deps::MissingInstall {
+                ecosystem: kgraf_host::deps::Ecosystem::Python,
+                dir: "svc".into(),
+                what: "no venv".into(),
+                command: "python3 -m venv .venv".into(),
+            }]),
+            project: "/p".into(),
+            detail: "svc (Python): no venv".into(),
+        };
+        let card = pending_ask(&q);
+        assert_eq!(card.tool, INSTALL_PROMPT_TOOL);
+        assert!(is_dependency_prompt(&card.tool));
+        assert!(
+            card.question.contains("`python3 -m venv .venv` in svc"),
+            "{}",
+            card.question
+        );
+        assert!(card.question.contains("never its .git or .kgraf"));
+        let line = not_now_line(&q);
+        assert!(line.contains("kgraf deps allow python"), "{line}");
     }
 }

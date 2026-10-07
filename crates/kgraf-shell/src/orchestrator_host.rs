@@ -246,6 +246,10 @@ pub struct OrchestratorHost {
     /// How to start the run in `Slot::Starting` again, should its start stop
     /// on the dependency question (decision 0087).
     starting_restart: Option<crate::dependency_prompt::Restart>,
+    /// The dependency questions answered "Allow once" for the start in
+    /// `Slot::Starting` (`FetchPrompt::once`); empty for a start the person
+    /// began.
+    starting_once: Vec<kgraf_host::deps::ConsentSubject>,
     /// The dependency question the box shows, until answered.
     fetch_prompt: Option<crate::dependency_prompt::FetchPrompt>,
 }
@@ -335,6 +339,7 @@ impl OrchestratorHost {
             offers: Vec::new(),
             next_offer_id: 0,
             starting_restart: None,
+            starting_once: Vec::new(),
             fetch_prompt: None,
         }
     }
@@ -363,6 +368,7 @@ impl OrchestratorHost {
             offers: Vec::new(),
             next_offer_id: 0,
             starting_restart: None,
+            starting_once: Vec::new(),
             fetch_prompt: None,
         })
     }
@@ -440,6 +446,7 @@ impl OrchestratorHost {
         // A question left open for another start is stale now.
         self.fetch_prompt = None;
         self.starting_restart = Some(restart);
+        self.starting_once = Vec::new();
         Ok(())
     }
 
@@ -455,6 +462,7 @@ impl OrchestratorHost {
         // A question left open for another start is stale now.
         self.fetch_prompt = None;
         self.starting_restart = Some(restart);
+        self.starting_once = Vec::new();
         Ok(())
     }
 
@@ -495,12 +503,22 @@ impl OrchestratorHost {
                 .push(BackendEvent::Notice(not_now_line(&prompt.question)));
             return Ok(());
         }
+        // The earlier "Allow once" answers of this start, given again to the
+        // run id it starts under now, and this one with them.
+        let mut once = prompt.once.clone();
+        for subject in &once {
+            host.grant_dependency_once(&run, subject);
+        }
+        if choice == FetchChoice::AllowOnce {
+            once.push(prompt.question.subject.clone());
+        }
         let started = match &prompt.restart {
             Restart::Start(instruction) => self.start_as(run, instruction),
             Restart::Resume(run) => self.resume(run.clone()),
         };
-        if started.is_err() {
-            self.fetch_prompt = Some(prompt);
+        match started {
+            Ok(()) => self.starting_once = once,
+            Err(_) => self.fetch_prompt = Some(prompt),
         }
         started
     }
@@ -832,8 +850,11 @@ impl BoxBackend for OrchestratorHost {
                                  the local cache"
                                     .to_owned(),
                             ));
-                            self.fetch_prompt =
-                                Some(crate::dependency_prompt::FetchPrompt { question, restart });
+                            self.fetch_prompt = Some(crate::dependency_prompt::FetchPrompt {
+                                question,
+                                restart,
+                                once: std::mem::take(&mut self.starting_once),
+                            });
                         }
                         _ => {
                             self.fail(format!("the run did not start: {e}"));
@@ -1336,11 +1357,12 @@ mod tests {
         fn prompt(restart: Restart) -> FetchPrompt {
             FetchPrompt {
                 question: ConsentQuestion {
-                    registry: Registry::CratesIo,
+                    subject: kgraf_host::deps::ConsentSubject::Fetch(Registry::CratesIo),
                     project: "/p".into(),
                     detail: "no matching package named `itoa`".into(),
                 },
                 restart,
+                once: Vec::new(),
             }
         }
 
@@ -1377,6 +1399,28 @@ mod tests {
                 kgraf_host::deps::Consent::Unset,
                 "the answer was stored though nothing started"
             );
+        }
+
+        /// A start can stop on two questions in turn, and each answer starts
+        /// it again under a new run id. An "Allow once" given to the first
+        /// question is given again to that id with the second, or the start
+        /// would ask the first again, and again.
+        #[test]
+        fn an_earlier_allow_once_is_given_again_to_the_run_that_starts() {
+            let (_dir, host, mut w) = window();
+            let mut p = prompt(Restart::Start("x".into()));
+            p.question.subject = kgraf_host::deps::ConsentSubject::Install(Vec::new());
+            p.once = vec![kgraf_host::deps::ConsentSubject::Fetch(Registry::CratesIo)];
+            w.fetch_prompt = Some(p);
+            w.answer(FETCH_PROMPT_ID, AskAnswer::AllowOnce)
+                .expect("starts again");
+            let held = host.retained();
+            assert_eq!(
+                (held.fetch_grants, held.install_grants),
+                (1, 1),
+                "each question's own grant, for the run that starts: {held:?}"
+            );
+            assert_eq!(w.starting_once.len(), 2);
         }
 
         /// Starting or resuming another run drops a question left open.

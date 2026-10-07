@@ -1418,9 +1418,21 @@ ignored files are removed from the tree first (`kgraf_sandbox::CheckFolder`,
 `MergeBack::remove_ignored`): build records the worker left never decide a check. The package stores in the home folder (`~/.m2/repository`,
 `~/.gradle/caches`, `~/.nuget/packages`, `~/go/pkg/mod`, `~/.npm`,
 `~/.cargo/registry`, ...) are readable and their configuration and credential
-files are not. Other package managers are not fetched for: a missing install is
-named, with its command, at run start and after a failing check or gate
-(`kgraf_host::deps::installs`; decisions 0084 and 0087, amended 2026-10-06).
+files are not. A missing install of another package manager is named, with
+its exact command, at run start and after a failing check or gate
+(`kgraf_host::deps::installs`); with the user's consent for that command, once per
+project, kGraf runs it at run start in its sandbox (`kgraf_host::deps::install`):
+writes only in the checkout and the project's package stores under
+`.kgraf/package-stores/` (`kgraf_sandbox::PackageStores`), `.kgraf` itself hidden
+(`SandboxPolicy::hide`), `.git` read-only, no login file of the user's read, and on
+macOS and Linux the network limited to the ecosystem's registry hosts through kGraf's
+egress proxy (`kgraf_sandbox::egress`, `Network::Proxy`: Seatbelt allows only the
+proxy's loopback port; on Linux the command's own network namespace hands its loopback
+listener to the proxy). Windows runs it with the network and reads open and says so. The
+consent is sealed with a per-user key, so a consent file a repository brings counts for
+nothing; no process the install starts outlives it. Later
+commands read the project's stores read-only (decisions 0084, 0087 and 0011, amended
+2026-10-06 and 2026-10-07).
 
 A worker builds and tests its own work. A declared allowlist of build and
 test commands (cargo's, and each other language's test and build commands,

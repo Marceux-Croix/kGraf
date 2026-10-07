@@ -1,5 +1,5 @@
-//! Installs a project needs and does not have, for the package managers kGraf
-//! does not fetch for (decision 0087, amended 2026-10-06).
+//! Installs a project needs and does not have, for the package managers
+//! other than cargo (decision 0087, amended 2026-10-06 and 2026-10-07).
 //!
 //! Workers, gates and the verifier run with the network off and read the
 //! checkout's installed dependencies through links (`kgraf_sandbox::
@@ -8,15 +8,14 @@
 //! error ("Cannot find module", "No module named pytest"), which reads like a
 //! fault in the work. This module names the missing install and the command
 //! that makes it, so the failure, the gate note and the run-start notice say
-//! that instead.
+//! that instead; with the user's consent kGraf runs that command itself, in
+//! its sandbox ([`super::install`]).
 //!
-//! **Why no fetch for these.** Cargo's fetch downloads and unpacks and runs no
-//! package code. The install commands of the other ecosystems run package
-//! code on the host, outside the sandbox: npm, pnpm and yarn run install
+//! **Why the install runs sandboxed, unlike cargo's fetch.** Cargo's fetch
+//! downloads and unpacks and runs no package code. The install commands of
+//! the other ecosystems run package code: npm, pnpm and yarn run install
 //! scripts, pip builds a source distribution by running its `setup.py`,
-//! Bundler and Composer run plugins. The user's own install, which the
-//! sandbox now reads, is what makes the tree runnable; kGraf names the
-//! command and the user runs it.
+//! Bundler and Composer run plugins, Maven and Gradle run build logic.
 //!
 //! Every check here reads files only. None runs a package manager, an
 //! interpreter or a project file.
@@ -24,17 +23,33 @@
 use std::path::{Path, PathBuf};
 
 /// A package manager whose installs this module checks.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Ecosystem {
+    /// npm, pnpm, Yarn and Bun: one registry protocol.
     Npm,
     Python,
     Go,
     Maven,
     Gradle,
     Dotnet,
+    /// PHP's Composer.
+    Composer,
+    /// Ruby's Bundler.
+    Bundler,
 }
 
 impl Ecosystem {
+    pub const ALL: [Ecosystem; 8] = [
+        Ecosystem::Npm,
+        Ecosystem::Python,
+        Ecosystem::Go,
+        Ecosystem::Maven,
+        Ecosystem::Gradle,
+        Ecosystem::Dotnet,
+        Ecosystem::Composer,
+        Ecosystem::Bundler,
+    ];
+
     pub fn name(self) -> &'static str {
         match self {
             Ecosystem::Npm => "npm",
@@ -43,6 +58,39 @@ impl Ecosystem {
             Ecosystem::Maven => "Maven",
             Ecosystem::Gradle => "Gradle",
             Ecosystem::Dotnet => ".NET",
+            Ecosystem::Composer => "Composer",
+            Ecosystem::Bundler => "Bundler",
+        }
+    }
+
+    /// The word `kgraf deps allow`, the consent file and the
+    /// `install_registries` settings table use.
+    pub fn key(self) -> &'static str {
+        match self {
+            Ecosystem::Npm => "npm",
+            Ecosystem::Python => "python",
+            Ecosystem::Go => "go",
+            Ecosystem::Maven => "maven",
+            Ecosystem::Gradle => "gradle",
+            Ecosystem::Dotnet => "dotnet",
+            Ecosystem::Composer => "composer",
+            Ecosystem::Bundler => "bundler",
+        }
+    }
+
+    /// The ecosystem a word names: its [`Self::key`], or a package manager's
+    /// own name (`pnpm`, `pip`, `nuget`, `gem`).
+    pub fn parse(word: &str) -> Option<Self> {
+        match word.trim().to_ascii_lowercase().as_str() {
+            "npm" | "pnpm" | "yarn" | "bun" | "node" => Some(Ecosystem::Npm),
+            "python" | "pip" | "pypi" => Some(Ecosystem::Python),
+            "go" => Some(Ecosystem::Go),
+            "maven" | "mvn" => Some(Ecosystem::Maven),
+            "gradle" => Some(Ecosystem::Gradle),
+            "dotnet" | ".net" | "nuget" => Some(Ecosystem::Dotnet),
+            "composer" | "php" => Some(Ecosystem::Composer),
+            "bundler" | "bundle" | "ruby" | "gem" => Some(Ecosystem::Bundler),
+            _ => None,
         }
     }
 }
@@ -62,19 +110,48 @@ pub struct MissingInstall {
 impl MissingInstall {
     /// One sentence for a failure, a gate note or a notice.
     pub fn sentence(&self) -> String {
-        let place = if self.dir.as_os_str().is_empty() {
-            "the project root".to_owned()
-        } else {
-            self.dir.display().to_string()
-        };
+        let place = self.place();
         format!(
-            "{} dependencies are not installed: {}. Run `{}` in {place}; workers run with the \
-             network off and kGraf does not install {} packages",
+            "{} dependencies are not installed: {}. Run `{}` in {place}, or let kGraf run it \
+             in its sandbox (`kgraf deps allow {}`); workers run with the network off",
             self.ecosystem.name(),
             self.what,
             self.command,
-            self.ecosystem.name()
+            self.ecosystem.key()
         )
+    }
+
+    /// The consent file's key for this install: the ecosystem and the
+    /// folder, so each package of a monorepo is answered for on its own.
+    pub fn consent_key(&self) -> String {
+        format!(
+            "{}:{}",
+            self.ecosystem.key(),
+            self.dir.to_string_lossy().replace('\\', "/")
+        )
+    }
+
+    /// Where it runs, for a person: "the project root" or the folder. The
+    /// folder's name comes from the repository, and the question a person
+    /// answers shows it on a terminal: a control character in it (an escape
+    /// sequence that clears the line) is shown escaped, never sent as it is.
+    pub fn place(&self) -> String {
+        if self.dir.as_os_str().is_empty() {
+            "the project root".to_owned()
+        } else {
+            self.dir
+                .display()
+                .to_string()
+                .chars()
+                .map(|c| {
+                    if c.is_control() {
+                        c.escape_unicode().to_string()
+                    } else {
+                        c.to_string()
+                    }
+                })
+                .collect()
+        }
     }
 }
 
@@ -85,9 +162,20 @@ pub struct InstallEnv {
     /// Go's module cache: `GOMODCACHE`, else the first `GOPATH` entry's
     /// `pkg/mod`, else `~/go/pkg/mod`.
     pub go_mod_cache: Option<PathBuf>,
+    /// The project's own stores, filled by an install kGraf ran
+    /// (`kgraf_sandbox::PackageStores`): an install found there counts.
+    pub stores: kgraf_sandbox::PackageStores,
 }
 
 impl InstallEnv {
+    /// [`Self::current`] with the stores kGraf filled for `checkout`.
+    pub fn for_checkout(checkout: &Path) -> Self {
+        Self {
+            stores: kgraf_sandbox::PackageStores::find(checkout),
+            ..Self::current()
+        }
+    }
+
     pub fn current() -> Self {
         let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
             .filter(|h| !h.is_empty())
@@ -102,7 +190,11 @@ impl InstallEnv {
                     .map(|p| p.join("pkg/mod"))
             })
             .or_else(|| home.as_ref().map(|h| h.join("go/pkg/mod")));
-        Self { home, go_mod_cache }
+        Self {
+            home,
+            go_mod_cache,
+            stores: kgraf_sandbox::PackageStores::default(),
+        }
     }
 }
 
@@ -125,8 +217,12 @@ pub fn missing_installs(
         if names.contains("package.json") {
             out.extend(npm(&root, dir, rel));
         }
+        if names.contains("composer.json") {
+            out.extend(composer(dir, rel));
+        }
         out.extend(dotnet(dir, rel, names));
     });
+    out.extend(bundler(&root));
     out.extend(python(&root, python_ready));
     out.extend(go(&root, env));
     out.extend(maven(&root, env));
@@ -401,12 +497,19 @@ fn go(root: &Path, env: &InstallEnv) -> Option<MissingInstall> {
     if requires.is_empty() {
         return None;
     }
-    let cache = env.go_mod_cache.as_ref();
+    // The user's module cache, or the project's own store when kGraf's
+    // install filled it (a later command reads that one instead).
+    let caches: Vec<&PathBuf> = env
+        .stores
+        .go
+        .iter()
+        .chain(env.go_mod_cache.iter())
+        .collect();
     let missing: Vec<&str> = requires
         .iter()
         .filter(|(m, v)| {
-            cache.is_none_or(|c| {
-                !c.join("cache/download")
+            !caches.iter().any(|c| {
+                c.join("cache/download")
                     .join(go_escape(m))
                     .join("@v")
                     .join(format!("{v}.mod"))
@@ -445,9 +548,17 @@ fn maven(root: &Path, env: &InstallEnv) -> Option<MissingInstall> {
     if !root.join("pom.xml").is_file() {
         return None;
     }
+    let surefire = "org/apache/maven/plugins/maven-surefire-plugin";
+    if env
+        .stores
+        .maven
+        .as_ref()
+        .is_some_and(|store| store.join(surefire).is_dir())
+    {
+        return None;
+    }
     let repo = env.home.as_ref()?.join(".m2/repository");
-    let surefire = repo.join("org/apache/maven/plugins/maven-surefire-plugin");
-    if surefire.is_dir() {
+    if repo.join(surefire).is_dir() {
         return None;
     }
     Some(MissingInstall {
@@ -478,6 +589,14 @@ fn gradle(root: &Path, env: &InstallEnv) -> Option<MissingInstall> {
     if !GRADLE_FILES.iter().any(|f| root.join(f).is_file()) {
         return None;
     }
+    if env
+        .stores
+        .gradle_home
+        .as_ref()
+        .is_some_and(|store| store.join("caches/modules-2").is_dir())
+    {
+        return None;
+    }
     let cache = env.home.as_ref()?.join(".gradle/caches/modules-2");
     if cache.is_dir() {
         return None;
@@ -492,6 +611,67 @@ fn gradle(root: &Path, env: &InstallEnv) -> Option<MissingInstall> {
         dir: PathBuf::new(),
         what: "there is no Gradle dependency cache (~/.gradle/caches/modules-2)".to_owned(),
         command: command.into(),
+    })
+}
+
+/// A Composer package is installed when its `vendor/autoload.php` exists,
+/// once its `composer.json` requires anything but PHP itself and its
+/// extensions (`php`, `ext-*`, `lib-*`, which no install provides).
+fn composer(dir: &Path, rel: &Path) -> Option<MissingInstall> {
+    let text = std::fs::read_to_string(dir.join("composer.json")).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let mut packages: Vec<&str> = ["require", "require-dev"]
+        .iter()
+        .filter_map(|k| json[*k].as_object())
+        .flat_map(|m| m.keys().map(String::as_str))
+        .filter(|name| {
+            *name != "php"
+                && !name.starts_with("ext-")
+                && !name.starts_with("lib-")
+                && name.contains('/')
+        })
+        .collect();
+    packages.sort_unstable();
+    packages.dedup();
+    if packages.is_empty() || dir.join("vendor/autoload.php").is_file() {
+        return None;
+    }
+    Some(MissingInstall {
+        ecosystem: Ecosystem::Composer,
+        dir: rel.to_path_buf(),
+        what: format!(
+            "composer.json requires {} package(s) and there is no vendor/autoload.php",
+            packages.len()
+        ),
+        command: "composer install".into(),
+    })
+}
+
+/// A Bundler project installs into the project only when its own
+/// `.bundle/config` sets a path (`BUNDLE_PATH: "vendor/bundle"`); then the
+/// install is missing while that folder is. Without a path Bundler installs
+/// into the Ruby installation's gems, outside the project, which this check
+/// does not read.
+fn bundler(root: &Path) -> Option<MissingInstall> {
+    if !root.join("Gemfile").is_file() {
+        return None;
+    }
+    let config = std::fs::read_to_string(root.join(".bundle/config")).ok()?;
+    let path = config.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        (key.trim() == "BUNDLE_PATH").then(|| value.trim().trim_matches(['"', '\'']).to_owned())
+    })?;
+    if path.is_empty() || Path::new(&path).is_absolute() || path.contains("..") {
+        return None;
+    }
+    if root.join(&path).is_dir() {
+        return None;
+    }
+    Some(MissingInstall {
+        ecosystem: Ecosystem::Bundler,
+        dir: PathBuf::new(),
+        what: format!("the Bundler path {path} (from .bundle/config) does not exist"),
+        command: "bundle install".into(),
     })
 }
 
@@ -531,6 +711,7 @@ mod tests {
         InstallEnv {
             home: Some(home.to_path_buf()),
             go_mod_cache: Some(home.join("go/pkg/mod")),
+            stores: Default::default(),
         }
     }
 

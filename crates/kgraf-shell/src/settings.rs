@@ -606,6 +606,11 @@ pub struct Settings {
     /// every worktree and its builds for the user to inspect or reuse. A worktree a
     /// live worker, a stopped run or a pending merge needs is kept either way.
     pub delete_worker_worktrees: bool,
+    /// The hosts each package manager's sandboxed install may reach
+    /// (decision 0087, amended 2026-10-07): the built-in lists unless the
+    /// user changed one. Only a changed list is written to the file; the
+    /// host reads the file when an install is about to run.
+    pub install_registries: kgraf_host::deps::InstallHosts,
 }
 
 impl Settings {
@@ -643,6 +648,7 @@ impl Default for Settings {
             check_for_updates: false,
             allow_prerelease_updates: false,
             delete_worker_worktrees: true,
+            install_registries: kgraf_host::deps::InstallHosts::defaults(),
         }
     }
 }
@@ -712,6 +718,11 @@ struct SettingsFile {
     allow_prerelease_updates: Option<bool>,
     /// Absent (an older settings file) means on, the default (decision 0088).
     delete_worker_worktrees: Option<bool>,
+    /// The changed install host lists, by package manager; one left out is
+    /// the built-in list. Read with the host's own reader
+    /// (`kgraf_host::deps::InstallHosts::from_toml_str`).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    install_registries: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 impl Settings {
@@ -807,6 +818,10 @@ impl Settings {
         if let Some(b) = file.delete_worker_worktrees {
             settings.delete_worker_worktrees = b;
         }
+        // The same reader the host uses at install time, so a bad entry is
+        // refused in both places with the same words.
+        settings.install_registries =
+            kgraf_host::deps::InstallHosts::from_toml_str(text).map_err(ShellError::Config)?;
         Ok(settings)
     }
 
@@ -840,6 +855,20 @@ impl Settings {
             check_for_updates: Some(self.check_for_updates),
             allow_prerelease_updates: Some(self.allow_prerelease_updates),
             delete_worker_worktrees: Some(self.delete_worker_worktrees),
+            install_registries: kgraf_host::deps::Ecosystem::ALL
+                .iter()
+                .filter(|e| !self.install_registries.is_default(**e))
+                .map(|e| {
+                    (
+                        e.key().to_owned(),
+                        self.install_registries
+                            .for_ecosystem(*e)
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect(),
+                    )
+                })
+                .collect(),
         };
         toml::to_string(&file).map_err(|e| ShellError::Config(e.to_string()))
     }
@@ -1261,6 +1290,41 @@ mod tests {
         let loaded = Settings::load(&path).expect("load");
         assert!(loaded.check_for_updates);
         assert!(loaded.allow_prerelease_updates);
+    }
+
+    /// The install host lists (decision 0087, amended 2026-10-07): built-in
+    /// unless changed; only a changed list is written, and the host's own
+    /// reader reads what the window wrote.
+    #[test]
+    fn install_registries_round_trip_and_only_a_changed_list_is_written() {
+        use kgraf_host::deps::{Ecosystem, InstallHosts};
+        let s = Settings::from_toml_str("").expect("valid");
+        assert_eq!(s.install_registries, InstallHosts::defaults());
+        let text = Settings::default().to_toml_string().expect("toml");
+        assert!(!text.contains("install_registries"), "{text}");
+        let mut s = Settings::default();
+        s.install_registries.set(
+            Ecosystem::Npm,
+            InstallHosts::parse_list(&["npm.example.com".into(), "127.0.0.1:4873".into()])
+                .expect("parse"),
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.toml");
+        s.save(&path).expect("save");
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(text.contains("[install_registries]"), "{text}");
+        assert!(
+            !text.contains("pypi.org"),
+            "unchanged lists are not written: {text}"
+        );
+        let loaded = Settings::load(&path).expect("load");
+        assert_eq!(loaded.install_registries, s.install_registries);
+        let host_view = InstallHosts::load(&path).expect("the host reads it");
+        assert_eq!(host_view, s.install_registries);
+        assert!(
+            Settings::from_toml_str("[install_registries]\nnpm = [\"https://x/\"]\n").is_err(),
+            "a bad entry is refused, not dropped"
+        );
     }
 
     /// Decision 0088: on by default (a fresh file, and an older one written

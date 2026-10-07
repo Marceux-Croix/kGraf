@@ -153,6 +153,8 @@ fn run_config(root: &Path, args: &OrchestrateArgs) -> RunConfig {
         routing: args.routing,
         tbench_bridge_socket: args.tbench_bridge_socket.clone(),
         dependency_fetch: args.fetch_deps,
+        // Read from the user's settings when an install is about to run.
+        install_hosts: None,
         approve_plan: args.approve_plan,
     }
 }
@@ -207,6 +209,9 @@ fn notice_line(n: &Notice) -> String {
         ),
         Notice::DependenciesNotInstalled(missing) => {
             format!("deps       not installed: {}", missing.join("; "))
+        }
+        Notice::DependenciesInstalled { ecosystem, summary } => {
+            format!("installed  {ecosystem} dependencies (decision 0087): {summary}")
         }
         Notice::GateCommands(commands) if commands.is_empty() => {
             "gates      none: no test command was configured or found, so the run has no quality \
@@ -537,44 +542,50 @@ pub fn run(root: &Path, args: OrchestrateArgs) -> Result<()> {
     // person at the terminal is asked once; nobody there, and the error
     // (with the instruction) stands. The gate runs before anything of the
     // run is built, so building again is safe.
-    let prepared = match build(&host) {
-        Ok(prepared) => prepared,
-        Err(e) => match e.dependency_question() {
-            Some(q) if crate::deps_cmd::attended() => {
-                use crate::deps_cmd::Answer;
-                use kgraf_host::deps::Consent;
-                // The prompt blocks on the terminal, so it runs off the
-                // runtime and an interrupt ends the process at once.
-                let registry = q.registry;
-                let asked = runtime.block_on(async {
-                    let prompt = tokio::task::spawn_blocking(move || crate::deps_cmd::ask(&q));
-                    tokio::select! {
-                        answer = prompt => Ok(answer),
-                        signal = interrupts.next() => Err(signal),
-                    }
-                });
-                let answer = match asked {
-                    Ok(answer) => answer.context("the dependency question ended abnormally")??,
-                    Err(signal) => {
-                        println!(
-                            "stopped    {}: no dependency answer given",
-                            signal_name(signal)
-                        );
-                        std::process::exit(128 + signal)
-                    }
-                };
-                match answer {
-                    Answer::Once => host.grant_dependency_fetch(&run_id),
-                    Answer::Always => host.set_dependency_consent(registry, Consent::Allowed)?,
-                    Answer::NotNow => return Err(e.into()),
-                    // Stored, then built again: the refusal's own error (with
-                    // how to undo it) is what the user reads.
-                    Answer::Never => host.set_dependency_consent(registry, Consent::Refused)?,
-                }
-                build(&host)?
+    //
+    // A start can stop on two questions in turn (cargo's fetch, then the
+    // other package managers' installs, amended 2026-10-07): each is asked,
+    // then the run is built again. A third stop is not asked again.
+    let mut asked_questions = 0;
+    let prepared = loop {
+        let e = match build(&host) {
+            Ok(prepared) => break prepared,
+            Err(e) => e,
+        };
+        let Some(q) = e.dependency_question() else {
+            return Err(e.into());
+        };
+        if !crate::deps_cmd::attended() || asked_questions >= 2 {
+            return Err(e.into());
+        }
+        asked_questions += 1;
+        // The prompt blocks on the terminal, so it runs off the runtime and
+        // an interrupt ends the process at once.
+        let question = q.clone();
+        let asked = runtime.block_on(async {
+            let prompt = tokio::task::spawn_blocking(move || crate::deps_cmd::ask(&question));
+            tokio::select! {
+                answer = prompt => Ok(answer),
+                signal = interrupts.next() => Err(signal),
             }
-            _ => return Err(e.into()),
-        },
+        });
+        let answer = match asked {
+            Ok(answer) => answer.context("the dependency question ended abnormally")??,
+            Err(signal) => {
+                println!(
+                    "stopped    {}: no dependency answer given",
+                    signal_name(signal)
+                );
+                std::process::exit(128 + signal)
+            }
+        };
+        // "Not now" stops here with the error and its instruction; any other
+        // answer is stored (or granted for this run) and the run built
+        // again. After a stored refusal, the refusal's own outcome is what
+        // the user reads.
+        if !crate::deps_cmd::apply_answer(&host, &run_id, &q, answer)? {
+            return Err(e.into());
+        }
     };
 
     // An interrupt that came during setup: nothing has started, so say so.

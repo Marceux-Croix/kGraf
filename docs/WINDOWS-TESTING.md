@@ -56,7 +56,8 @@ What stays manual: installing the prerequisites and building from source (sectio
 3), the winget install itself and its question in the app and on a terminal (section 6a
 cases 1 to 3; the runner simulates a missing Git Bash with `KGRAF_GIT_BASH_PATH` naming a
 missing file and with `winget` taken off `PATH`, and marks those checks SIMULATED), the
-different Git install locations (case 4), the desktop app window and installer, and the
+different Git install locations (case 4), the sandboxed dependency install (section 7, which
+needs npm and the internet), the desktop app window and installer, and the
 Windows Firewall test in `MANUAL-NETWORK-TEST.txt` in the zip. For manual tests,
 `kgraf-wintest.exe sandbox-run -- <program> [args...]` runs one program inside kGraf's
 sandbox in a temporary folder and prints its exit code.
@@ -352,7 +353,61 @@ Test this on a machine (or a fresh Windows 11 virtual machine) with the built `.
 
 Report, for each case, what the window or terminal said and whether kGraf started.
 
-## 7. What to send back
+## 7. A dependency install in the sandbox
+
+This checks that kGraf runs a project's missing install in its sandbox with the network
+open and says so, that the install's own script cannot write outside the project or into
+its `.kgraf` folder, and that the consent is asked for. It needs Node.js with npm on `PATH`
+(`winget install OpenJS.NodeJS.LTS`) and the network; no model route.
+
+Make a project with one public package and one local package whose install script tries
+to write where it may not:
+
+```powershell
+cd C:\src
+mkdir kgraf-install-check; cd kgraf-install-check
+git init -q
+mkdir probe
+@'
+{"name":"probe","version":"1.0.0","scripts":{"postinstall":"node probe.js"}}
+'@ | Set-Content probe\package.json
+@'
+const fs = require('fs');
+const out = {};
+for (const [k, p] of [['outside', 'C:\\src\\kgraf-escape.txt'], ['state', '..\\..\\.kgraf\\planted.txt']]) {
+  try { fs.writeFileSync(p, 'x'); out[k] = 'written'; } catch (e) { out[k] = 'denied ' + e.code; }
+}
+fs.writeFileSync('probe-result.json', JSON.stringify(out));
+'@ | Set-Content probe\probe.js
+@'
+{"name":"app","version":"1.0.0","dependencies":{"left-pad":"1.3.0","probe":"file:probe"}}
+'@ | Set-Content package.json
+# Install the local package as a copy, not a link, so its script runs in node_modules\probe.
+"install-links=true" | Set-Content .npmrc
+& $kgraf deps status 2>&1 | Tee-Object "$r\9-deps-status.txt"
+& $kgraf deps install npm 2>&1 | Tee-Object "$r\10-deps-install.txt"
+Get-Content node_modules\probe\probe-result.json | Tee-Object "$r\11-probe-result.txt"
+Test-Path C:\src\kgraf-escape.txt | Tee-Object -Append "$r\11-probe-result.txt"
+Test-Path .kgraf\planted.txt | Tee-Object -Append "$r\11-probe-result.txt"
+```
+
+What to expect:
+
+- `deps status` lists `install: npm install in the project root (npm)` with the stored
+  answer `unset`.
+- `deps install npm` prints `installing `npm install` ...`, then `installed  ran `npm
+  install` in the project root in kGraf's sandbox ...; network not limited: the Windows
+  sandbox cannot limit network access without administrator rights (decision 0011), so the
+  install ran with the network open, and its reads were not confined either; its writes
+  were still confined`.
+- `node_modules\left-pad` exists. `probe-result.json` shows `outside` and `state` as
+  `denied` with an error code (`EPERM` or `EACCES`), and both `Test-Path` lines print
+  `False`. A `written` or a `True` is a finding: send it.
+- Then check the question: delete `node_modules`, run `& $kgraf deps allow npm` and look
+  for `npm: allowed `npm install` in the project root`. `& $kgraf deps reset npm` forgets
+  it.
+
+## 8. What to send back
 
 Collect the machine facts into the results folder, then zip it:
 

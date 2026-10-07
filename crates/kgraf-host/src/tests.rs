@@ -3643,6 +3643,7 @@ fn discover_probed(
             env: crate::deps::InstallEnv {
                 home: Some(home.to_path_buf()),
                 go_mod_cache: Some(home.join("go/pkg/mod")),
+                stores: Default::default(),
             },
         },
     )

@@ -57,6 +57,20 @@ pub enum Network {
     /// Deny all network. A backend that cannot enforce this returns
     /// [`SandboxError::PolicyNotEnforceable`] instead of running with network.
     Deny,
+    /// Only TCP to one loopback port, where kGraf's egress proxy listens
+    /// ([`crate::egress::EgressProxy`]); every other address, UDP, and DNS
+    /// are denied. The proxy decides which hosts are reached.
+    ///
+    /// **macOS**: Seatbelt allows `connect()` to `localhost:port` and no
+    /// other IP destination; the proxy listens on the host's loopback.
+    /// **Linux**: the command gets a network namespace of its own, whose only
+    /// interface is its loopback. Before the command starts, its first process
+    /// opens a listening socket on `127.0.0.1:port` inside that namespace and
+    /// hands it to kGraf, which serves the proxy on it from outside
+    /// ([`SandboxedCommand::take_loopback_listener`]). Needs user namespaces;
+    /// without them the policy is refused. **Windows** cannot confine the
+    /// network and refuses it.
+    Proxy { port: u16 },
 }
 
 /// What a sandboxed command may touch.
@@ -94,6 +108,12 @@ pub struct SandboxPolicy {
     /// The folder that chooses the virtual environment, when it is not the
     /// command's working directory ([`Self::with_command_dir`]).
     command_dir: Option<PathBuf>,
+    /// Folders beneath a writable root the command can neither read nor
+    /// write, apart from writable roots beneath them ([`Self::hide`]).
+    hidden: Vec<PathBuf>,
+    /// Package stores kGraf filled for this project, read-only
+    /// ([`Self::with_dependency_links`]).
+    package_stores: crate::PackageStores,
 }
 
 /// A writable git directory whose configuration files stay read-only
@@ -149,6 +169,8 @@ impl SandboxPolicy {
             dependency_reads: Vec::new(),
             virtual_envs: Vec::new(),
             command_dir: None,
+            hidden: Vec::new(),
+            package_stores: crate::PackageStores::default(),
         }
     }
 
@@ -253,6 +275,41 @@ impl SandboxPolicy {
                 self.virtual_envs.push(venv.clone());
             }
         }
+        // The stores kGraf filled for this project (`crate::PackageStores`):
+        // readable roots (each stays readable beneath the denied state
+        // directory), never writable, and named to their package manager.
+        let stores = &links.package_stores;
+        let pick = |mine: &mut Option<PathBuf>, found: &Option<PathBuf>| {
+            if found.is_some() {
+                mine.clone_from(found);
+            }
+        };
+        pick(&mut self.package_stores.go, &stores.go);
+        pick(&mut self.package_stores.maven, &stores.maven);
+        pick(&mut self.package_stores.gradle_home, &stores.gradle_home);
+        pick(&mut self.package_stores.nuget, &stores.nuget);
+        self
+    }
+
+    /// Hide `dir`, a folder beneath a writable root, from the command: it can
+    /// neither read nor write anything in it, apart from writable roots that
+    /// lie beneath it. kGraf's own install of a project's dependencies runs
+    /// with the checkout writable and its state directory (`.kgraf`: consents,
+    /// permission rules, transcripts) hidden this way, except the package
+    /// stores inside it ([`crate::PackageStores`]).
+    ///
+    /// **macOS**: reads and writes of `dir` are denied, and the writable roots
+    /// beneath it allowed again after that. **Linux**: an empty, read-only
+    /// file system is mounted on `dir` in the command's mount namespace, and
+    /// each writable root beneath it is mounted again on top (needs user
+    /// namespaces; refused without). **Windows**: writes are denied by an
+    /// access entry for the capability of each writable root above `dir`;
+    /// reads are not confined there.
+    ///
+    /// `dir` must exist and lie beneath a writable root (checked when the
+    /// command is built).
+    pub fn hide(mut self, dir: PathBuf) -> Self {
+        self.hidden.push(dir);
         self
     }
 
@@ -441,9 +498,41 @@ impl SandboxPolicy {
                 tree.display()
             )));
         }
+        let mut hidden = Vec::new();
+        for dir in &self.hidden {
+            let dir = resolve(dir)?;
+            if !writable.iter().any(|r| dir.starts_with(r) && *r != dir) {
+                return Err(SandboxError::InvalidPolicy(format!(
+                    "hidden folder {} is not beneath a writable root",
+                    dir.display()
+                )));
+            }
+            let keep: Vec<PathBuf> = writable
+                .iter()
+                .filter(|r| r.starts_with(&dir) && **r != dir)
+                .cloned()
+                .collect();
+            hidden.push(Hidden { dir, keep });
+        }
+        // Each store is a canonical folder `PackageStores::find` checked; one
+        // that now resolves elsewhere is refused, as a dependency tree is.
+        let mut readable = resolve_all(&self.readable_roots)?;
+        for store in self.package_stores.all() {
+            let now = resolve(store)?;
+            if now != store {
+                return Err(SandboxError::InvalidPolicy(format!(
+                    "package store {} now resolves to {}; it is not granted",
+                    store.display(),
+                    now.display()
+                )));
+            }
+            if !readable.contains(&now) {
+                readable.push(now);
+            }
+        }
         Ok(Resolved {
             writable,
-            readable: resolve_all(&self.readable_roots)?,
+            readable,
             read_denied,
             dependency_reads,
             // Sockets may not exist yet; resolve the parent directory.
@@ -456,6 +545,7 @@ impl SandboxPolicy {
             home: home_dir(),
             ancestor_limit: self.ancestor_limit.as_deref().map(resolve).transpose()?,
             cargo_homes: cargo_homes(),
+            hidden,
             frozen_git: self
                 .frozen_git
                 .iter()
@@ -529,6 +619,20 @@ struct Resolved {
     /// folder or file in the checkout. Granted on macOS and Linux.
     #[cfg_attr(windows, allow(dead_code))]
     dependency_reads: Vec<PathBuf>,
+    /// See [`SandboxPolicy::hide`]: canonical, each beneath a writable root.
+    hidden: Vec<Hidden>,
+}
+
+/// A folder hidden from the command ([`SandboxPolicy::hide`]), and the
+/// writable roots beneath it that stay usable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux", windows)),
+    allow(dead_code)
+)]
+struct Hidden {
+    dir: PathBuf,
+    keep: Vec<PathBuf>,
 }
 
 /// `path` with its deepest existing ancestor canonical and the rest
@@ -938,6 +1042,33 @@ fn package_store_env(cmd: &mut Command, tmp: &Path, home: Option<&Path>, network
     }
 }
 
+/// Point each package manager at the store kGraf filled for this project
+/// (`crate::PackageStores`), read-only: Go's module cache, the Maven local
+/// repository (appended to `MAVEN_OPTS`), Gradle's read-only dependency
+/// cache, and NuGet's packages folder. Set after [`package_store_env`], so a
+/// store of this project wins over the user's own.
+fn package_stores_env(cmd: &mut Command, stores: &crate::PackageStores) {
+    if let Some(go) = &stores.go {
+        cmd.env("GOMODCACHE", go);
+    }
+    if let Some(maven) = &stores.maven {
+        let mut opts = std::env::var_os("MAVEN_OPTS").unwrap_or_default();
+        if !opts.is_empty() {
+            opts.push(" ");
+        }
+        opts.push("-Dmaven.repo.local=");
+        // `mvn` splits MAVEN_OPTS on white space.
+        opts.push(crate::jvm_path(maven));
+        cmd.env("MAVEN_OPTS", opts);
+    }
+    if let Some(gradle) = &stores.gradle_home {
+        cmd.env("GRADLE_RO_DEP_CACHE", gradle.join("caches"));
+    }
+    if let Some(nuget) = &stores.nuget {
+        cmd.env("NUGET_PACKAGES", nuget);
+    }
+}
+
 /// Where a standard stream of a sandboxed command goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Redirect {
@@ -979,6 +1110,10 @@ pub struct SandboxedCommand {
     cmd: Command,
     /// See [`Self::refused_reads`].
     refused_reads: Vec<String>,
+    /// [`Network::Proxy`] on Linux: where the loopback listener arrives
+    /// ([`Self::take_loopback_listener`]).
+    #[cfg(target_os = "linux")]
+    handoff: Option<linux::Handoff>,
     #[cfg(unix)]
     probe: child::SetupProbe,
     #[cfg(windows)]
@@ -1109,6 +1244,27 @@ impl SandboxedCommand {
         }
     }
 
+    /// [`Network::Proxy`] on Linux, after [`Self::spawn`]: the listening
+    /// socket the command's first process opened on its own namespace's
+    /// loopback, for kGraf's egress proxy to accept on
+    /// ([`crate::egress::EgressProxy::serve`]). `None` for any other network
+    /// and on other platforms, where the proxy listens on the host's
+    /// loopback itself. Taken once; waits up to `wait` for the listener.
+    pub fn take_loopback_listener(
+        &mut self,
+        wait: std::time::Duration,
+    ) -> Option<Result<std::net::TcpListener, SandboxError>> {
+        #[cfg(target_os = "linux")]
+        {
+            self.handoff.take().map(|mut h| h.receive(wait))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = wait;
+            None
+        }
+    }
+
     /// For async callers (`tokio::process::Command::from`): the command plus
     /// a probe that recovers the child's setup-failure reason after a failed
     /// spawn.
@@ -1175,7 +1331,7 @@ pub fn sandboxed_command(
         #[cfg(target_os = "macos")]
         let (mut cmd, setup) = macos::command(&resolved, program.as_ref())?;
         #[cfg(target_os = "linux")]
-        let (mut cmd, setup, mut refused_reads) = {
+        let (mut cmd, setup, mut refused_reads, handoff) = {
             if !policy.accept_partial && linux::is_partial() {
                 return Err(SandboxError::PartialIsolation {
                     backend: linux::BACKEND_NAME,
@@ -1282,13 +1438,20 @@ pub fn sandboxed_command(
         #[cfg(any(unix, windows))]
         if let (Some(tmp), Some(home)) = (&policy.tmp_dir, resolved.home.as_deref()) {
             let tmp = resolve(tmp)?;
+            // The project's own Gradle store, when kGraf's install filled it,
+            // holds the distribution that install downloaded.
+            let gradle_dir = policy
+                .package_stores
+                .gradle_home
+                .clone()
+                .unwrap_or_else(|| home.join(".gradle"));
             if let Some(root) = resolved
                 .writable
                 .iter()
                 .filter(|r| tmp.starts_with(r))
                 .max_by_key(|r| r.components().count())
                 && let Err(e) =
-                    crate::gradle_wrapper::prepare(&home.join(".gradle"), root, &tmp, &command_dir)
+                    crate::gradle_wrapper::prepare(&gradle_dir, root, &tmp, &command_dir)
             {
                 refused_reads.push(format!(
                     "the Gradle wrapper's distribution could not be made reachable in the \
@@ -1364,9 +1527,14 @@ pub fn sandboxed_command(
                 }
             }
         }
+        // The stores kGraf filled for this project, read-only, used in place
+        // of the user's own (`crate::PackageStores`).
+        package_stores_env(&mut cmd, &policy.package_stores);
         Ok(SandboxedCommand {
             cmd,
             refused_reads,
+            #[cfg(target_os = "linux")]
+            handoff,
             #[cfg(unix)]
             probe,
             #[cfg(windows)]
@@ -1641,6 +1809,53 @@ mod tests {
     /// The package managers' stores: Go goes offline when the network is
     /// denied; Gradle and .NET homes are in the command's temporary folder;
     /// the user's caches are named only when they exist.
+    #[test]
+    fn the_projects_own_stores_are_named_and_readable_never_writable() {
+        let checkout = tempfile::tempdir().unwrap();
+        let c = std::fs::canonicalize(checkout.path()).unwrap();
+        for rel in ["go", "maven", "gradle", "nuget"] {
+            crate::mark_store_complete(&c, rel).unwrap();
+        }
+        let links = crate::DependencyLinks {
+            package_stores: crate::PackageStores::find(&c),
+            ..Default::default()
+        };
+        let tree = tempfile::tempdir().unwrap();
+        let policy = SandboxPolicy::new(vec![tree.path().to_path_buf()], Network::Deny)
+            .with_dependency_links(&links);
+        let resolved = policy.resolved().unwrap();
+        let root = crate::package_stores_root(&c);
+        for rel in ["go", "maven", "gradle", "nuget"] {
+            assert!(resolved.readable.contains(&root.join(rel)), "{rel}");
+            assert!(!resolved.writable.iter().any(|w| w.starts_with(&root)));
+        }
+        let mut cmd = Command::new("true");
+        package_stores_env(&mut cmd, &policy.package_stores);
+        let env: std::collections::BTreeMap<String, String> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| {
+                Some((
+                    k.to_string_lossy().into_owned(),
+                    v?.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect();
+        assert_eq!(env["GOMODCACHE"], root.join("go").to_string_lossy());
+        assert_eq!(
+            env["GRADLE_RO_DEP_CACHE"],
+            root.join("gradle/caches").to_string_lossy()
+        );
+        assert_eq!(env["NUGET_PACKAGES"], root.join("nuget").to_string_lossy());
+        assert!(
+            env["MAVEN_OPTS"].ends_with(&format!(
+                "-Dmaven.repo.local={}",
+                crate::jvm_path(&root.join("maven")).display()
+            )),
+            "{}",
+            env["MAVEN_OPTS"]
+        );
+    }
+
     #[test]
     fn package_store_variables_follow_the_network_and_the_home() {
         let env_of = |network: Network, home: Option<&Path>| {

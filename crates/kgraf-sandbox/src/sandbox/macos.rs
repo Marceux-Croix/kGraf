@@ -292,6 +292,41 @@ pub(super) fn profile(policy: &Resolved, home: &Path) -> (String, Vec<(String, P
         extra_denies.push(format!("(subpath (param \"{key}\"))"));
         params.push((key, dir.to_path_buf()));
     }
+    // A hidden folder (SandboxPolicy::hide) lies beneath a writable root,
+    // whose own allows come first; its denies follow them, and the roots
+    // beneath it are allowed again after its denies. The folders between it
+    // and such a root keep their metadata readable (realpath(3) needs it),
+    // never their listing or contents.
+    let mut hidden_writes = Vec::new();
+    let mut hidden_reads = Vec::new();
+    for (i, hidden) in policy.hidden.iter().enumerate() {
+        let key = format!("HIDDEN_{i}");
+        hidden_reads.push(format!("(deny file-read* (subpath (param \"{key}\")))"));
+        hidden_writes.push(format!("(deny file-write* (subpath (param \"{key}\")))"));
+        params.push((key, hidden.dir.clone()));
+        let mut between = Vec::new();
+        for (j, keep) in hidden.keep.iter().enumerate() {
+            let key = format!("HIDDEN_{i}_KEEP_{j}");
+            hidden_reads.push(format!("(allow file-read* (subpath (param \"{key}\")))"));
+            hidden_writes.push(format!("(allow file-write* (subpath (param \"{key}\")))"));
+            params.push((key, keep.clone()));
+            for dir in keep.ancestors().skip(1) {
+                if !dir.starts_with(&hidden.dir) {
+                    break;
+                }
+                if !between.contains(&dir) {
+                    between.push(dir);
+                }
+            }
+        }
+        for (j, dir) in between.into_iter().enumerate() {
+            let key = format!("HIDDEN_{i}_ABOVE_{j}");
+            hidden_reads.push(format!(
+                "(allow file-read-metadata (literal (param \"{key}\")))"
+            ));
+            params.push((key, dir.to_path_buf()));
+        }
+    }
     let checkout = policy.ancestor_limit.as_deref();
     if let Some(limit) = checkout {
         denied.push(limit);
@@ -459,6 +494,14 @@ pub(super) fn profile(policy: &Resolved, home: &Path) -> (String, Vec<(String, P
             dependency_reads.join("\n  ")
         ));
     }
+    // After every allow above (the writable root around a hidden folder is
+    // re-allowed there), before the credential deny.
+    if !hidden_reads.is_empty() {
+        sections.push(format!(
+            "; hidden folders, and the roots beneath them\n{}",
+            hidden_reads.join("\n")
+        ));
+    }
     // After the re-allow, so no root reopens a credential store.
     sections.extend([format!(
         "; credential stores, browser profiles, histories\n(deny file-read*\n  {}\n)",
@@ -481,22 +524,48 @@ pub(super) fn profile(policy: &Resolved, home: &Path) -> (String, Vec<(String, P
             inner_metadata.join("\n  ")
         ));
     }
-    sections.extend([
-        format!("(allow file-write*\n  {}\n)", write_allows.join("\n  ")),
-        socket_rules.join("\n"),
-    ]);
-    if policy.network == Network::Allow {
-        // IP only: a bare (allow network-outbound) also admits unix sockets.
-        sections.push(
-            "(allow network-outbound (remote ip \"*:*\"))\n\
-             (allow network-inbound (local ip \"*:*\"))\n\
-             (allow network-bind (local ip \"*:*\"))"
-                .to_string(),
-        );
-        sections.push(NETWORK_POLICY.to_string());
+    sections.push(format!(
+        "(allow file-write*\n  {}\n)",
+        write_allows.join("\n  ")
+    ));
+    // After the root allows, so the hidden folder's deny wins over the root
+    // above it, and its own roots are allowed again after the deny; before
+    // the anchor and repository-link denies, which still win over both.
+    if !hidden_writes.is_empty() {
         sections.push(format!(
-            "(allow network-outbound (remote unix-socket (literal \"{MDNS_SOCKET}\")))"
+            "; hidden folders and the roots beneath them\n{}",
+            hidden_writes.join("\n")
         ));
+    }
+    sections.push(socket_rules.join("\n"));
+    match policy.network {
+        Network::Allow => {
+            // IP only: a bare (allow network-outbound) also admits unix sockets.
+            sections.push(
+                "(allow network-outbound (remote ip \"*:*\"))\n\
+                 (allow network-inbound (local ip \"*:*\"))\n\
+                 (allow network-bind (local ip \"*:*\"))"
+                    .to_string(),
+            );
+            sections.push(NETWORK_POLICY.to_string());
+            sections.push(format!(
+                "(allow network-outbound (remote unix-socket (literal \"{MDNS_SOCKET}\")))"
+            ));
+        }
+        Network::Proxy { port } => {
+            // One loopback port, kGraf's egress proxy, and nothing else: no
+            // other IP destination, no bind, and no DNS resolver socket (a
+            // name lookup is a way out too; the proxy resolves names). The
+            // form is the one Anthropic's sandbox-runtime uses for its proxy
+            // (`(remote ip "localhost:PORT")`, which matches 127.0.0.1 and
+            // ::1). The mach services of the network policy stay: TLS
+            // certificate checks of the tunneled connection need trustd.
+            sections.push(format!(
+                "(allow network-outbound (remote ip \"localhost:{port}\"))"
+            ));
+            sections.push(NETWORK_POLICY.to_string());
+        }
+        Network::Deny => {}
     }
     sections.push(PREFERENCES_POLICY.to_string());
     sections.push("(deny mach-lookup (xpc-service-name-prefix \"\"))".to_string());
@@ -617,6 +686,7 @@ mod tests {
             cargo_homes: None,
             frozen_git: vec![],
             dependency_reads: vec![],
+            hidden: vec![],
         }
     }
 

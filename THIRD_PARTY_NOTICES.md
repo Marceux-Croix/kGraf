@@ -20280,6 +20280,16 @@ CC-BY-4.0. See https://creativecommons.org/licenses/by/4.0/legalcode for
 the full license text.
 ```
 
+### sandbox-runtime
+
+```
+repository: https://github.com/anthropics/sandbox-runtime
+commit: 12a2be92c110cbc3c19584c4c8387e7e754c8179
+paths: src/sandbox/http-proxy.ts, src/sandbox/domain-pattern.ts, src/sandbox/resolved-address-guard.ts, src/sandbox/macos-sandbox-utils.ts, src/sandbox/linux-sandbox-utils.ts, src/sandbox/sandbox-utils.ts
+license: Apache-2.0
+date verified: 2026-10-07
+```
+
 ### sweagent
 
 ```

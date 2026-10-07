@@ -136,7 +136,9 @@ pub(super) fn build(network: Network) -> Result<BpfProgram, SandboxError> {
         Network::Deny => Vec::new(),
         // Deny when the domain is neither AF_INET nor AF_INET6 (the
         // conditions of one rule are ANDed).
-        Network::Allow => vec![rule(vec![
+        // With the proxy, the command's network namespace has only its own
+        // loopback (`namespaces`), so an IP socket reaches nothing else.
+        Network::Allow | Network::Proxy { .. } => vec![rule(vec![
             cond(0, SeccompCmpOp::Ne, af(libc::AF_INET))?,
             cond(0, SeccompCmpOp::Ne, af(libc::AF_INET6))?,
         ])?],

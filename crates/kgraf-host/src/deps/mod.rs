@@ -35,11 +35,17 @@
 mod cargo;
 #[cfg(unix)]
 mod group;
+pub mod install;
 pub mod installs;
 mod refetch;
 
 pub use cargo::{CargoDeps, FetchSite};
+pub use install::{
+    InstallHosts, InstallOutcome, InstallReport, InstallRunner, SandboxedInstall, ensure_installs,
+};
 pub use installs::{Ecosystem, InstallEnv, MissingInstall, missing_installs};
+/// An allowed-host entry of an install (`kgraf_sandbox::egress`).
+pub use kgraf_sandbox::egress::HostRule;
 pub use refetch::{HostRefetch, MAX_WORKER_CHECKS, MAX_WORKER_FETCHES};
 
 use serde::{Deserialize, Serialize};
@@ -165,6 +171,98 @@ pub enum RunFetch {
 #[derive(Clone, Debug)]
 pub struct ConsentStore {
     path: PathBuf,
+    /// The key that seals each install answer ([`InstallConsent::seal`]).
+    key: ConsentKey,
+}
+
+/// `KGRAF_CONSENT_KEY_PATH`: the file holding the key that seals install
+/// answers, instead of the per-user one ([`ConsentKey::user_path`]).
+pub const CONSENT_KEY_PATH_ENV: &str = "KGRAF_CONSENT_KEY_PATH";
+
+/// Where the key that seals install answers comes from.
+///
+/// **Why a seal.** The consent file lives in the project's `.kgraf`, and a
+/// project's own files are not the user's word: a repository can commit
+/// `.kgraf/dependency-fetch.json`, and an archive can unpack one, with an
+/// install "allowed" for the very command kGraf would run. An install answer
+/// therefore counts only with a seal kGraf made: a keyed BLAKE3 hash of the
+/// answer under a random key kept per user, outside every project, in
+/// kGraf's own data folder (which the sandbox denies to every command on
+/// macOS and never grants on Linux). An answer without a valid seal reads as
+/// unset, and the run asks.
+#[derive(Clone, Debug)]
+enum ConsentKey {
+    /// The per-user key file, made on first use.
+    User,
+    /// A given key (tests; a caller with its own key).
+    Fixed([u8; kgraf_diag::key::KEY_LEN]),
+}
+
+impl Default for ConsentKey {
+    fn default() -> Self {
+        // This crate's unit tests never touch the user's data folder.
+        if cfg!(test) {
+            ConsentKey::Fixed(*b"kgraf-host-test-consent-key-32b!")
+        } else {
+            ConsentKey::User
+        }
+    }
+}
+
+impl ConsentKey {
+    /// The per-user key file: [`CONSENT_KEY_PATH_ENV`], else
+    /// `install-consent.key` in kGraf's data folder.
+    fn user_path() -> Option<PathBuf> {
+        match std::env::var_os(CONSENT_KEY_PATH_ENV) {
+            Some(p) if !p.is_empty() => Some(PathBuf::from(p)),
+            _ => directories::ProjectDirs::from("", "", "kGraf")
+                .map(|d| d.data_dir().join("install-consent.key")),
+        }
+    }
+
+    fn load(&self) -> Result<[u8; kgraf_diag::key::KEY_LEN], DepsError> {
+        match self {
+            ConsentKey::Fixed(k) => Ok(*k),
+            ConsentKey::User => {
+                let path = Self::user_path().ok_or_else(|| DepsError::Store {
+                    path: PathBuf::from("install-consent.key"),
+                    detail: "no per-user data folder is known for the key that seals install \
+                             answers"
+                        .into(),
+                })?;
+                kgraf_diag::key::load_or_create(&path).map_err(|e| {
+                    DepsError::io(
+                        format!(
+                            "cannot read or make the install answer key {}",
+                            path.display()
+                        ),
+                        e,
+                    )
+                })
+            }
+        }
+    }
+}
+
+/// The seal of an install answer: the keyed hash of its key, command and
+/// answer, so a seal made for one cannot be moved to another.
+fn install_seal(
+    key: &[u8; kgraf_diag::key::KEY_LEN],
+    consent_key: &str,
+    command: &str,
+    consent: Consent,
+) -> blake3::Hash {
+    let mut h = blake3::Hasher::new_keyed(key);
+    for part in [
+        "kgraf install answer 1",
+        consent_key,
+        command,
+        consent.name(),
+    ] {
+        h.update(&(part.len() as u64).to_le_bytes());
+        h.update(part.as_bytes());
+    }
+    h.finalize()
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -173,16 +271,49 @@ struct ConsentFile {
     version: u32,
     #[serde(default)]
     registries: BTreeMap<Registry, Consent>,
+    /// Version 2: the answer about each install command kGraf may run in its
+    /// sandbox, keyed by [`MissingInstall::consent_key`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    installs: BTreeMap<String, InstallConsent>,
 }
 
+/// The stored answer about one install command. It holds for that exact
+/// command only: when the project's install command changes (a lockfile
+/// added, a different package manager), the answer no longer applies and a
+/// run asks again. A changed lockfile or package script does not change the
+/// command: what it runs, it runs in the sandbox.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstallConsent {
+    pub command: String,
+    pub consent: Consent,
+    /// kGraf's seal of this answer, hex ([`ConsentKey`]); an answer without
+    /// a valid one reads as unset.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub seal: String,
+}
+
+/// The version a file with no install answers is written as, so an older
+/// kGraf still reads it.
 const CONSENT_VERSION: u32 = 1;
+/// The version a file with install answers is written as.
+const CONSENT_VERSION_INSTALLS: u32 = 2;
 
 impl ConsentStore {
     /// The store in the state directory `state` (`<project>/.kgraf`).
     pub fn in_state_dir(state: &Path) -> Self {
         Self {
             path: state.join(CONSENT_FILE),
+            key: ConsentKey::default(),
         }
+    }
+
+    /// This store, sealing and checking install answers with `key` instead
+    /// of the per-user key (another crate's tests, which must not touch the
+    /// user's data folder).
+    pub fn with_key(mut self, key: [u8; kgraf_diag::key::KEY_LEN]) -> Self {
+        self.key = ConsentKey::Fixed(key);
+        self
     }
 
     pub fn path(&self) -> &Path {
@@ -206,16 +337,83 @@ impl ConsentStore {
             path: self.path.clone(),
             detail: e.to_string(),
         })?;
-        if file.version != CONSENT_VERSION {
+        if file.version != CONSENT_VERSION && file.version != CONSENT_VERSION_INSTALLS {
             return Err(DepsError::Store {
                 path: self.path.clone(),
                 detail: format!(
-                    "version {} is not {CONSENT_VERSION}, the one this kGraf reads",
+                    "version {} is not {CONSENT_VERSION} or {CONSENT_VERSION_INSTALLS}, the ones \
+                     this kGraf reads",
                     file.version
                 ),
             });
         }
         Ok(file)
+    }
+
+    /// The stored answer about running `install`: [`Consent::Unset`] when
+    /// none is stored, when the stored one was given for another command, or
+    /// when kGraf did not seal it (a file a repository or an archive brought,
+    /// [`ConsentKey`]).
+    pub fn install_consent(&self, install: &MissingInstall) -> Result<Consent, DepsError> {
+        let file = self.read()?;
+        let key = install.consent_key();
+        let Some(answer) = file
+            .installs
+            .get(&key)
+            .filter(|c| c.command == install.command && c.consent != Consent::Unset)
+        else {
+            return Ok(Consent::Unset);
+        };
+        let Ok(stored) = blake3::Hash::from_hex(&answer.seal) else {
+            return Ok(Consent::Unset);
+        };
+        // `blake3::Hash` compares in constant time.
+        let expected = install_seal(&self.key.load()?, &key, &answer.command, answer.consent);
+        Ok(if stored == expected {
+            answer.consent
+        } else {
+            Consent::Unset
+        })
+    }
+
+    /// Store `consent` for running `install` (its exact command); `Unset`
+    /// removes the entry.
+    pub fn set_install(&self, install: &MissingInstall, consent: Consent) -> Result<(), DepsError> {
+        let mut file = self.read()?;
+        match consent {
+            Consent::Unset => {
+                file.installs.remove(&install.consent_key());
+            }
+            c => {
+                let key = install.consent_key();
+                let seal = install_seal(&self.key.load()?, &key, &install.command, c);
+                file.installs.insert(
+                    key,
+                    InstallConsent {
+                        command: install.command.clone(),
+                        consent: c,
+                        seal: seal.to_hex().to_string(),
+                    },
+                );
+            }
+        }
+        self.write(file)
+    }
+
+    /// Remove every stored install answer of `ecosystem`.
+    pub fn reset_installs(&self, ecosystem: Ecosystem) -> Result<usize, DepsError> {
+        let mut file = self.read()?;
+        let prefix = format!("{}:", ecosystem.key());
+        let before = file.installs.len();
+        file.installs.retain(|k, _| !k.starts_with(&prefix));
+        let removed = before - file.installs.len();
+        self.write(file)?;
+        Ok(removed)
+    }
+
+    /// Every stored install answer, by key.
+    pub fn installs(&self) -> Result<BTreeMap<String, InstallConsent>, DepsError> {
+        Ok(self.read()?.installs)
     }
 
     /// The stored consent for `registry`; [`Consent::Unset`] when none is stored.
@@ -233,10 +431,18 @@ impl ConsentStore {
     /// old file or the new one, never half of one.
     pub fn set(&self, registry: Registry, consent: Consent) -> Result<(), DepsError> {
         let mut file = self.read()?;
-        file.version = CONSENT_VERSION;
         match consent {
             Consent::Unset => file.registries.remove(&registry),
             c => file.registries.insert(registry, c),
+        };
+        self.write(file)
+    }
+
+    fn write(&self, mut file: ConsentFile) -> Result<(), DepsError> {
+        file.version = if file.installs.is_empty() {
+            CONSENT_VERSION
+        } else {
+            CONSENT_VERSION_INSTALLS
         };
         let dir = self.path.parent().ok_or_else(|| DepsError::Store {
             path: self.path.clone(),
@@ -383,6 +589,49 @@ pub enum DepsError {
     /// `Cargo.toml`). The same run fails the same way each time.
     #[error("the project cannot be fetched for: {detail}")]
     Project { detail: String },
+    /// Installs are missing and nobody has answered whether kGraf may run
+    /// their install commands in its sandbox. A caller that can ask asks,
+    /// then starts again; an unattended one shows this.
+    #[error(
+        "{} needs installs that are missing, and kGraf has no answer about running them: {}. \
+         Workers run with the network off, so the run cannot start without them. Run each \
+         command yourself, or let kGraf run it in its sandbox (writes only in the project, never \
+         its .git or .kgraf; network only to the package registries): `kgraf deps allow {}` \
+         (always, for these exact commands), or `--fetch-deps` (this run only; \
+         `--no-fetch-deps` goes on without them)",
+        project.display(),
+        install_list(installs),
+        install_keys(installs)
+    )]
+    InstallConsentNeeded {
+        project: PathBuf,
+        installs: Vec<MissingInstall>,
+    },
+    /// kGraf ran an install command in its sandbox and it failed.
+    #[error(
+        "kGraf ran `{}` in {} ({}) in its sandbox, and it failed: {detail}",
+        install.command,
+        install.place(),
+        install.ecosystem.name()
+    )]
+    InstallFailed {
+        install: MissingInstall,
+        detail: String,
+    },
+    /// kGraf ran an install command and its install is still missing.
+    #[error(
+        "kGraf ran `{}` in {} and it succeeded, but the install is still missing: {what}. \
+         Run it yourself to see why",
+        install.command,
+        install.place()
+    )]
+    InstallIncomplete {
+        install: MissingInstall,
+        what: String,
+    },
+    /// The `install_registries` setting cannot be used.
+    #[error("the install registries setting is not usable, so no install was run: {detail}")]
+    Settings { detail: String },
     /// The consent file is damaged.
     #[error("{} is not a dependency-fetch consent file: {detail}", path.display())]
     Store { path: PathBuf, detail: String },
@@ -406,17 +655,47 @@ impl DepsError {
     /// network) could; a missing answer, a refusal, a damaged file or a
     /// project that cannot be mirrored cannot.
     pub fn is_transient(&self) -> bool {
-        matches!(self, DepsError::Fetch { .. } | DepsError::Io { .. })
+        matches!(
+            self,
+            DepsError::Fetch { .. } | DepsError::Io { .. } | DepsError::InstallFailed { .. }
+        )
     }
 }
 
-/// The question a person answers when [`DepsError::ConsentNeeded`] stops a
-/// run: the desktop's prompt, the terminal's.
+/// "`npm ci` in the project root (npm); ..." for a message.
+fn install_list(installs: &[MissingInstall]) -> String {
+    installs
+        .iter()
+        .map(|i| format!("`{}` in {} ({})", i.command, i.place(), i.ecosystem.name()))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// The distinct ecosystem words of `installs`, for `kgraf deps allow`.
+fn install_keys(installs: &[MissingInstall]) -> String {
+    let mut keys: Vec<&str> = installs.iter().map(|i| i.ecosystem.key()).collect();
+    keys.sort_unstable();
+    keys.dedup();
+    keys.join(" ")
+}
+
+/// What a person is asked to allow.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConsentSubject {
+    /// A fetch from a registry, on the host (cargo).
+    Fetch(Registry),
+    /// These install commands, run in kGraf's sandbox.
+    Install(Vec<MissingInstall>),
+}
+
+/// The question a person answers when [`DepsError::ConsentNeeded`] or
+/// [`DepsError::InstallConsentNeeded`] stops a run: the desktop's prompt,
+/// the terminal's.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConsentQuestion {
-    pub registry: Registry,
+    pub subject: ConsentSubject,
     pub project: PathBuf,
-    /// The package manager's words about what is missing.
+    /// What is missing, in the package manager's words or kGraf's.
     pub detail: String,
 }
 
@@ -434,14 +713,35 @@ pub fn worker_fetch_scope(registry: Registry) -> String {
 
 impl ConsentQuestion {
     pub fn text(&self) -> String {
-        format!(
-            "Fetch this project's dependencies from {}? They are not in the local cache, and \
-             workers build with the network off. kGraf would run `{}` on this machine, outside \
-             the workers' sandbox; it downloads and unpacks, and runs no build script. {}",
-            self.registry,
-            self.registry.manual_command(),
-            worker_fetch_scope(self.registry)
-        )
+        match &self.subject {
+            ConsentSubject::Fetch(registry) => format!(
+                "Fetch this project's dependencies from {registry}? They are not in the local \
+                 cache, and workers build with the network off. kGraf would run `{}` on this \
+                 machine, outside the workers' sandbox; it downloads and unpacks, and runs no \
+                 build script. {}",
+                registry.manual_command(),
+                worker_fetch_scope(*registry)
+            ),
+            ConsentSubject::Install(installs) => install::question_text(installs),
+        }
+    }
+
+    /// The command a person runs by hand instead, for "not now".
+    pub fn manual_commands(&self) -> String {
+        match &self.subject {
+            ConsentSubject::Fetch(registry) => format!("`{}`", registry.manual_command()),
+            ConsentSubject::Install(installs) => install_list(installs),
+        }
+    }
+
+    /// The words `kgraf deps allow` takes for this question.
+    pub fn allow_command(&self) -> String {
+        match &self.subject {
+            ConsentSubject::Fetch(_) => "kgraf deps allow".to_owned(),
+            ConsentSubject::Install(installs) => {
+                format!("kgraf deps allow {}", install_keys(installs))
+            }
+        }
     }
 }
 
@@ -454,9 +754,18 @@ impl DepsError {
                 project,
                 detail,
             } => Some(ConsentQuestion {
-                registry: *registry,
+                subject: ConsentSubject::Fetch(*registry),
                 project: project.clone(),
                 detail: detail.clone(),
+            }),
+            DepsError::InstallConsentNeeded { project, installs } => Some(ConsentQuestion {
+                subject: ConsentSubject::Install(installs.clone()),
+                project: project.clone(),
+                detail: installs
+                    .iter()
+                    .map(|i| format!("{} ({}): {}", i.place(), i.ecosystem.name(), i.what))
+                    .collect::<Vec<_>>()
+                    .join("; "),
             }),
             _ => None,
         }

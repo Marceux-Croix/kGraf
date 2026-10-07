@@ -202,6 +202,11 @@ pub struct ChromeState {
     animating: Option<Duration>,
     /// The color vision the open project views were last given ([`sync_stage_vision`]).
     stage_vision: Option<kgraf_core::palette::Vision>,
+    /// Settings, install registries: each package manager's host list as it
+    /// is being edited, one host per line, with the reason it is refused, if
+    /// it is. Filled from the settings when first drawn.
+    install_registry_text:
+        std::collections::BTreeMap<kgraf_host::deps::Ecosystem, (String, Option<String>)>,
 }
 
 impl ChromeState {
@@ -236,6 +241,7 @@ impl Default for ChromeState {
             run_json: FileCache::new(FILE_RECHECK),
             animating: None,
             stage_vision: None,
+            install_registry_text: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -3224,6 +3230,8 @@ impl ShellApp {
             settings_rows::helper(ui, p, "No permission settings were loaded in this window.");
             settings_rows::divider(ui, p);
             self.settings_rule_conflicts(ui, p);
+            settings_rows::divider(ui, p);
+            self.settings_install_registries(ui, p);
             return;
         };
         crate::permission_bar::draw_load_result(ui, &perm, p);
@@ -3276,6 +3284,75 @@ impl ShellApp {
         }
         settings_rows::divider(ui, p);
         self.settings_rule_conflicts(ui, p);
+        settings_rows::divider(ui, p);
+        self.settings_install_registries(ui, p);
+    }
+
+    /// The hosts each package manager's install may reach when kGraf runs it
+    /// in its sandbox (decision 0087, amended 2026-10-07): one host per line,
+    /// `*.domain` for every name under a domain, `host:port` for another
+    /// port than 443 and 80. A list that does not parse is shown with the
+    /// reason and not applied (CMP-FLD-4); "Default" puts the built-in list
+    /// back. Kept in settings.toml, read when an install is about to run.
+    fn settings_install_registries(&mut self, ui: &mut Ui, p: &Palette) {
+        use kgraf_host::deps::{Ecosystem, InstallHosts};
+        settings_rows::heading(ui, p, "Install registries");
+        settings_rows::description(
+            ui,
+            p,
+            "When you allow it, kGraf runs a project's missing install (npm, pip, Go, Maven, \
+             Gradle, .NET, Composer, Bundler) in its sandbox. On macOS and Linux the install \
+             reaches only these hosts, one per line, and cannot read your registry logins, so \
+             a private registry that needs one stays unreachable. On Windows the sandbox \
+             confines neither the network nor reads: the install runs with the network open, \
+             and its scripts can read any file you can.",
+        );
+        for eco in Ecosystem::ALL {
+            let current = || {
+                self.settings
+                    .install_registries
+                    .for_ecosystem(eco)
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            let initial = current();
+            let (text, error) = self
+                .chrome
+                .install_registry_text
+                .entry(eco)
+                .or_insert_with(|| (initial, None));
+            ui.add_space(6.0);
+            settings_rows::label(ui, p, eco.name());
+            let edited = ui
+                .add(
+                    egui::TextEdit::multiline(text)
+                        .desired_rows(2)
+                        .desired_width(f32::INFINITY),
+                )
+                .changed();
+            let mut reset = false;
+            ui.horizontal(|ui| {
+                reset = chrome::text_button(ui, p.primary, "Default").clicked();
+            });
+            if reset {
+                *text = InstallHosts::default_hosts(eco).join("\n");
+            }
+            if edited || reset {
+                let entries: Vec<String> = text.lines().map(str::to_owned).collect();
+                match InstallHosts::parse_list(&entries) {
+                    Ok(rules) => {
+                        *error = None;
+                        self.settings.install_registries.set(eco, rules);
+                    }
+                    Err(e) => *error = Some(e),
+                }
+            }
+            if let Some(e) = error {
+                settings_rows::error(ui, p, e);
+            }
+        }
     }
 
     /// The rule-conflict warning: a run setting kept in settings.toml with the

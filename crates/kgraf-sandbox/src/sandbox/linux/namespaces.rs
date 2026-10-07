@@ -52,6 +52,25 @@ pub(super) struct Plan {
     read_only: Vec<CString>,
     /// Mount a fresh procfs on `/proc` in the PID namespace.
     pub(super) fresh_proc: bool,
+    /// [`Network::Proxy`]: the socket the loopback listener is handed to
+    /// kGraf through, and the port it listens on.
+    proxy: Option<(libc::c_int, u16)>,
+    /// Folders hidden under an empty file system ([`super::super::SandboxPolicy::hide`]).
+    hidden: Vec<HiddenPlan>,
+}
+
+/// Most writable roots one hidden folder may hold: the descriptors of their
+/// clones live on the child's stack.
+pub(super) const MAX_KEPT: usize = 8;
+
+/// One hidden folder, prepared in the parent.
+#[derive(Debug)]
+struct HiddenPlan {
+    dir: CString,
+    /// Each writable root beneath `dir`, with the folders to make on the
+    /// empty file system on the way to it, outermost first (each absolute;
+    /// the last is the root itself).
+    keep: Vec<(CString, Vec<CString>)>,
 }
 
 impl Plan {
@@ -62,9 +81,46 @@ impl Plan {
         network: Network,
         writable: &[std::path::PathBuf],
         fresh_proc: bool,
+        handoff: Option<libc::c_int>,
+        hidden: &[super::super::Hidden],
     ) -> Result<Self, SandboxError> {
         let mut plan = Self::bare(network);
         plan.fresh_proc = fresh_proc;
+        if let Network::Proxy { port } = network {
+            let fd = handoff.ok_or_else(|| {
+                SandboxError::InvalidPolicy("a proxy network needs its handoff socket".into())
+            })?;
+            plan.proxy = Some((fd, port));
+        }
+        for h in hidden {
+            if h.keep.len() > MAX_KEPT {
+                return Err(SandboxError::InvalidPolicy(format!(
+                    "hidden folder {} holds more than {MAX_KEPT} writable roots",
+                    h.dir.display()
+                )));
+            }
+            let mut keep = Vec::new();
+            for root in &h.keep {
+                let rel = root.strip_prefix(&h.dir).map_err(|_| {
+                    SandboxError::InvalidPolicy(format!(
+                        "{} is not beneath {}",
+                        root.display(),
+                        h.dir.display()
+                    ))
+                })?;
+                let mut dirs = Vec::new();
+                let mut at = h.dir.clone();
+                for part in rel.components() {
+                    at.push(part);
+                    dirs.push(c_path(&at)?);
+                }
+                keep.push((c_path(root)?, dirs));
+            }
+            plan.hidden.push(HiddenPlan {
+                dir: c_path(&h.dir)?,
+                keep,
+            });
+        }
         for root in writable {
             let gitlink = root.join(".git");
             if std::fs::symlink_metadata(&gitlink).is_ok() {
@@ -82,7 +138,7 @@ impl Plan {
         let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
         let mut flags =
             libc::CLONE_NEWUSER | libc::CLONE_NEWNS | libc::CLONE_NEWIPC | libc::CLONE_NEWPID;
-        if network == Network::Deny {
+        if matches!(network, Network::Deny | Network::Proxy { .. }) {
             flags |= libc::CLONE_NEWNET;
         }
         Self {
@@ -91,6 +147,8 @@ impl Plan {
             gid_map: format!("{gid} {gid} 1\n").into_bytes(),
             read_only: Vec::new(),
             fresh_proc: false,
+            proxy: None,
+            hidden: Vec::new(),
         }
     }
 }
@@ -246,6 +304,195 @@ pub(super) fn enter(plan: &Plan) -> Result<(), StepError> {
     }
     for path in &plan.read_only {
         bind_read_only(path)?;
+    }
+    for hidden in &plan.hidden {
+        hide(hidden)?;
+    }
+    if let Some((fd, port)) = plan.proxy {
+        hand_off_loopback_listener(fd, port)?;
+    }
+    Ok(())
+}
+
+/// Cover `plan.dir` with an empty, read-only tmpfs, then mount each kept
+/// writable root again at its own path on top. The roots are cloned (as
+/// detached bind mounts, from their descriptors) before the cover goes on,
+/// since their paths lead into the covered folder afterwards. Child only.
+fn hide(plan: &HiddenPlan) -> Result<(), StepError> {
+    let mut trees = [-1 as libc::c_int; MAX_KEPT];
+    let close_all = |trees: &[libc::c_int; MAX_KEPT]| {
+        for fd in trees.iter().filter(|fd| **fd >= 0) {
+            // SAFETY: closes a descriptor opened below.
+            unsafe { libc::close(*fd) };
+        }
+    };
+    for (i, (root, _)) in plan.keep.iter().enumerate() {
+        let flags = OPEN_TREE_CLONE | libc::O_CLOEXEC.cast_unsigned();
+        // SAFETY: open_tree on a NUL-terminated path from the parent.
+        let tree =
+            unsafe { libc::syscall(libc::SYS_open_tree, libc::AT_FDCWD, root.as_ptr(), flags) };
+        match libc::c_int::try_from(tree) {
+            Ok(t) if t >= 0 => trees[i] = t,
+            _ => {
+                let e = errno();
+                close_all(&trees);
+                return Err(("cannot clone a writable root beneath a hidden folder", e));
+            }
+        }
+    }
+    let flags = libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC;
+    // SAFETY: mount with NUL-terminated strings from the parent or static.
+    let rc = unsafe {
+        libc::mount(
+            c"tmpfs".as_ptr(),
+            plan.dir.as_ptr(),
+            c"tmpfs".as_ptr(),
+            flags,
+            c"size=64k,mode=0755".as_ptr().cast(),
+        )
+    };
+    if rc != 0 {
+        let e = errno();
+        close_all(&trees);
+        return Err(("cannot cover a hidden folder", e));
+    }
+    for (i, (root, dirs)) in plan.keep.iter().enumerate() {
+        for dir in dirs {
+            // SAFETY: mkdir on a NUL-terminated path from the parent.
+            if unsafe { libc::mkdir(dir.as_ptr(), 0o755) } != 0 && errno() != libc::EEXIST {
+                let e = errno();
+                close_all(&trees);
+                return Err(("cannot make a folder on a hidden folder's cover", e));
+            }
+        }
+        // SAFETY: moves the detached clone opened above onto a path from the
+        // parent; the clone's descriptor is closed below.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_move_mount,
+                trees[i],
+                c"".as_ptr(),
+                libc::AT_FDCWD,
+                root.as_ptr(),
+                MOVE_MOUNT_F_EMPTY_PATH,
+            )
+        };
+        if rc != 0 {
+            let e = errno();
+            close_all(&trees);
+            return Err(("cannot mount a writable root beneath a hidden folder", e));
+        }
+    }
+    close_all(&trees);
+    // SAFETY: remount with a NUL-terminated path from the parent, no data.
+    let rc = unsafe {
+        libc::mount(
+            std::ptr::null(),
+            plan.dir.as_ptr(),
+            std::ptr::null(),
+            libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY | flags,
+            std::ptr::null(),
+        )
+    };
+    if rc != 0 {
+        return Err(("cannot make a hidden folder's cover read-only", errno()));
+    }
+    Ok(())
+}
+
+/// [`Network::Proxy`]: bring the new network namespace's loopback up, open a
+/// listening TCP socket on `127.0.0.1:port` in it, and send that socket to
+/// kGraf over `handoff` (`SCM_RIGHTS`). kGraf accepts on it from outside
+/// the namespace and serves the egress proxy there; the command's own
+/// connections to that port are the only ones that leave the namespace. A
+/// socket keeps the namespace it was made in, so the listener stays inside
+/// it after it is passed. Child only, before Landlock and seccomp.
+///
+/// Written new. Anthropic's sandbox-runtime bridges the same gap with socat
+/// relays over a unix socket bound into the namespace; here the seccomp
+/// filter refuses unix sockets, and a passed listener needs no helper
+/// process.
+fn hand_off_loopback_listener(handoff: libc::c_int, port: u16) -> Result<(), StepError> {
+    // SAFETY: raw syscalls on stack structs and descriptors opened here;
+    // every descriptor is closed before return.
+    unsafe {
+        let s = libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0);
+        if s < 0 {
+            return Err(("cannot open a socket to bring the loopback up", errno()));
+        }
+        let mut ifr: libc::ifreq = std::mem::zeroed();
+        for (dst, src) in ifr.ifr_name.iter_mut().zip(b"lo\0") {
+            *dst = *src as libc::c_char;
+        }
+        if libc::ioctl(s, libc::SIOCGIFFLAGS as _, &mut ifr) != 0 {
+            let e = errno();
+            libc::close(s);
+            return Err(("cannot read the loopback's flags", e));
+        }
+        ifr.ifr_ifru.ifru_flags |= (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
+        if libc::ioctl(s, libc::SIOCSIFFLAGS as _, &ifr) != 0 {
+            let e = errno();
+            libc::close(s);
+            return Err(("cannot bring the loopback up", e));
+        }
+        libc::close(s);
+        let l = libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+        if l < 0 {
+            return Err(("cannot open the proxy listener", errno()));
+        }
+        let addr = libc::sockaddr_in {
+            sin_family: libc::AF_INET as libc::sa_family_t,
+            sin_port: port.to_be(),
+            sin_addr: libc::in_addr {
+                s_addr: u32::from_be_bytes([127, 0, 0, 1]).to_be(),
+            },
+            sin_zero: [0; 8],
+        };
+        if libc::bind(
+            l,
+            (&addr as *const libc::sockaddr_in).cast(),
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        ) != 0
+            || libc::listen(l, 128) != 0
+        {
+            let e = errno();
+            libc::close(l);
+            return Err(("cannot listen on the namespace's loopback", e));
+        }
+        // One byte of data carries the descriptor.
+        #[repr(C, align(8))]
+        struct Control([u8; 64]);
+        let mut control = Control([0; 64]);
+        let mut byte = [b'L'];
+        let mut iov = libc::iovec {
+            iov_base: byte.as_mut_ptr().cast(),
+            iov_len: 1,
+        };
+        let mut msg: libc::msghdr = std::mem::zeroed();
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control.0.as_mut_ptr().cast();
+        msg.msg_controllen = libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as u32) as _;
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        if cmsg.is_null() {
+            libc::close(l);
+            return Err(("cannot build the listener handoff", libc::EINVAL));
+        }
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as u32) as _;
+        std::ptr::copy_nonoverlapping(
+            (&l as *const libc::c_int).cast::<u8>(),
+            libc::CMSG_DATA(cmsg),
+            std::mem::size_of::<libc::c_int>(),
+        );
+        let sent = libc::sendmsg(handoff, &msg, libc::MSG_NOSIGNAL);
+        let e = errno();
+        libc::close(l);
+        libc::close(handoff);
+        if sent != 1 {
+            return Err(("cannot hand the proxy listener to kGraf", e));
+        }
     }
     Ok(())
 }

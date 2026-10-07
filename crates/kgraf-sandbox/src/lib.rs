@@ -15,12 +15,14 @@
 mod build_dir;
 mod confined;
 pub mod dependencies;
+pub mod egress;
 mod error;
 pub mod git;
 pub mod git_for_windows;
 pub mod gradle_wrapper;
 pub mod lifecycle;
 pub mod merge;
+mod package_stores;
 /// The repository lock lives in `kgraf-core` so every crate that runs git on
 /// a repository (the worker's status read, the co-change history read) takes
 /// it without depending on this crate; re-exported under its old path.
@@ -48,6 +50,10 @@ pub use merge::{
     MergedWorktree, Refusal, RefusalReason, SelectFailure, TreeManifests, TrialMerge, file_head,
     generated_kind, is_compiled_binary, is_dependency_link, is_python_bytecode, lockfile_manifests,
     manifest_matches, manifests_beside,
+};
+pub use package_stores::{
+    PACKAGE_STORES_DIR, PackageStores, STORE_COMPLETE, jvm_path, layout as store_layout,
+    mark_store_complete, package_stores_root,
 };
 #[cfg(windows)]
 pub use sandbox::SandboxedChild;

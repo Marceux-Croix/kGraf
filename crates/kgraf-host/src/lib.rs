@@ -153,7 +153,7 @@ mod workspaces;
 
 pub use config::{ModelRouteSpec, RouteSpec, RunConfig, WorktreeRetention};
 pub use error::{Error, NotReady, Result};
-pub use gates::discover_validation_commands;
+pub use gates::{discover_validation_commands, pytest_importable};
 pub use host::{
     CorpusRequest, Host, HostFactory, Housekeeping, Notice, PreparedRun, Retained,
     RouteCapacityInput, RouteShape, RunHandle, RunOutcome, RunShape, RunStart, RunSummary, Startup,
