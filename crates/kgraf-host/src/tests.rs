@@ -4259,6 +4259,38 @@ fn open_offline(mut config: RunConfig) -> Host {
         .expect("in-process route")
 }
 
+/// `Host::with_local_endpoint` moves the readiness dial of a local route to
+/// a listener the test owns (so no server on this machine is needed), and
+/// refuses a route that is not a credential-free catalog route and a URL that
+/// names no http endpoint.
+#[test]
+fn a_local_endpoint_moves_the_readiness_dial_and_refuses_what_is_not_local() {
+    let listening = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let url = format!("http://{}/v1", listening.local_addr().expect("addr"));
+    let host = Host::open(project().1)
+        .expect("open")
+        .with_local_endpoint("ollama", &url)
+        .expect("a local route");
+    assert_eq!(host.check_reachable(), Ok(()));
+    let closed = Host::open(project().1)
+        .expect("open")
+        .with_local_endpoint("ollama", "http://127.0.0.1:0/v1")
+        .expect("a local route");
+    assert!(matches!(
+        closed.check_reachable(),
+        Err(NotReady::Unreachable { .. })
+    ));
+    let refused = |route: &str, url: &str| {
+        Host::open(project().1)
+            .expect("open")
+            .with_local_endpoint(route, url)
+            .err()
+    };
+    assert!(refused("openai", &url).is_some(), "a hosted route");
+    assert!(refused("nowhere", &url).is_some(), "not in the catalog");
+    assert!(refused("ollama", "unix:///tmp/s").is_some(), "not http");
+}
+
 fn spec(s: &str) -> RouteSpec {
     RouteSpec::parse(s).expect("spec")
 }

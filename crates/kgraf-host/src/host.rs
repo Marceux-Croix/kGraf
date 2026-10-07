@@ -285,6 +285,10 @@ pub struct Host {
     /// Routes served by a provider the embedding process gave
     /// ([`Host::with_route_provider`]) instead of `kgraf_fleet`.
     in_process: BTreeMap<String, Arc<dyn Provider>>,
+    /// Route to base URL: where [`Host::check_reachable`] dials a local route
+    /// instead of the catalog address. Set only by tests, so they need no
+    /// server on this machine.
+    local_endpoints: BTreeMap<String, String>,
     /// Runs handed out by [`PreparedRun::into_orchestrator`], waiting for
     /// [`Host::finish_run`].
     ended: Mutex<BTreeMap<RunId, RunEnd>>,
@@ -554,6 +558,7 @@ impl Host {
             asks: None,
             permissions: Arc::new(kgraf_tools::PermissionControl::manual()),
             in_process: BTreeMap::new(),
+            local_endpoints: BTreeMap::new(),
             ended: Mutex::new(BTreeMap::new()),
             notices: Mutex::new(Vec::new()),
             worker_cap,
@@ -884,6 +889,31 @@ impl Host {
         Ok(self)
     }
 
+    /// Dial `route`'s local endpoint at `base_url` in [`Host::check_reachable`]
+    /// instead of the catalog address, so a test points a build at a listener
+    /// it owns and depends on no server on this machine. Only the readiness
+    /// dial moves; calls to the route still use the catalog address. Refused
+    /// for a route that is not a credential-free catalog route.
+    #[cfg(any(test, feature = "in-process-provider", feature = "test-support"))]
+    pub fn with_local_endpoint(mut self, route: &str, base_url: &str) -> Result<Self> {
+        match kgraf_fleet::entry(route) {
+            Ok(entry) if !entry.requires_credential => {}
+            _ => {
+                return Err(Error::Invalid(format!(
+                    "route `{route}` is not a local route of the provider catalog"
+                )));
+            }
+        }
+        if endpoint_of(base_url).is_none() {
+            return Err(Error::Invalid(format!(
+                "`{base_url}` names no http endpoint"
+            )));
+        }
+        self.local_endpoints
+            .insert(route.to_owned(), base_url.to_owned());
+        Ok(self)
+    }
+
     /// The route's provider behind its limiter: the in-process one, or one from
     /// `kgraf_fleet` (which needs the route's credential).
     fn provider(&self, route: &str, model: &str) -> Result<Arc<dyn Provider>> {
@@ -1156,6 +1186,7 @@ impl Host {
         check_reachable(
             &routes,
             &|r| self.in_process.contains_key(r),
+            &|r| self.local_endpoints.get(r).cloned(),
             REACHABLE_TIMEOUT,
         )
     }
@@ -2514,6 +2545,7 @@ fn probe_endpoints(
 pub(crate) fn check_reachable(
     routes: &[RouteSpec],
     in_process: &dyn Fn(&str) -> bool,
+    moved: &dyn Fn(&str) -> Option<String>,
     timeout: Duration,
 ) -> Result<(), NotReady> {
     let mut seen = std::collections::BTreeSet::new();
@@ -2529,8 +2561,12 @@ pub(crate) fn check_reachable(
         if entry.requires_credential {
             continue;
         }
-        let endpoint =
-            kgraf_fleet::local_endpoint(entry).map_err(|e| NotReady::Invalid(e.to_string()))?;
+        let endpoint = match moved(&r.route) {
+            Some(url) => url,
+            None => {
+                kgraf_fleet::local_endpoint(entry).map_err(|e| NotReady::Invalid(e.to_string()))?
+            }
+        };
         endpoints.push((r.route.clone(), endpoint));
     }
     probe_endpoints(&endpoints, timeout, tcp_connect)
@@ -3217,6 +3253,42 @@ mod reachable_tests {
         assert!(err.to_string().contains("start its server"), "{err}");
     }
 
+    /// A route's endpoint set on the host replaces the catalog address in the
+    /// dial: a listener the test owns passes, port 0 (nothing can listen
+    /// there) is reported with that endpoint, and a credential route or a
+    /// non-http URL is refused.
+    #[test]
+    fn a_moved_local_endpoint_is_the_one_dialed() {
+        let spec = RouteSpec {
+            route: "ollama".to_owned(),
+            model: "m".to_owned(),
+        };
+        let listening = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let open = format!("http://{}/v1", listening.local_addr().expect("addr"));
+        let timeout = Duration::from_secs(2);
+        let moved_to = |url: &'static str| move |r: &str| (r == "ollama").then(|| url.to_owned());
+        assert_eq!(
+            check_reachable(
+                std::slice::from_ref(&spec),
+                &|_| false,
+                &|r| (r == "ollama").then(|| open.clone()),
+                timeout
+            ),
+            Ok(())
+        );
+        let err = check_reachable(
+            std::slice::from_ref(&spec),
+            &|_| false,
+            &moved_to("http://127.0.0.1:0/v1"),
+            timeout,
+        )
+        .expect_err("nothing listens at port 0");
+        assert!(
+            matches!(&err, NotReady::Unreachable { endpoint, .. } if endpoint == "http://127.0.0.1:0/v1"),
+            "{err:?}"
+        );
+    }
+
     /// A connect that takes 300 ms and fails, for every address.
     fn slow_refusal(_: &std::net::SocketAddr, _: Duration) -> std::io::Result<()> {
         std::thread::sleep(Duration::from_millis(300));
@@ -3263,6 +3335,7 @@ mod reachable_tests {
             check_reachable(
                 &[spec("kimi"), spec("openai")],
                 &|_| false,
+                &|_| None,
                 Duration::from_millis(1)
             ),
             Ok(())
@@ -3273,6 +3346,7 @@ mod reachable_tests {
             check_reachable(
                 &[spec("ollama")],
                 &|r| r == "ollama",
+                &|_| None,
                 Duration::from_millis(1)
             ),
             Ok(())

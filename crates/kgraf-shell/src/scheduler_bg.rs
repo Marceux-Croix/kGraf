@@ -116,6 +116,10 @@ pub struct ProjectFactory {
     /// The user's live permission control (decision 0094): every host this
     /// factory opens runs under it, box and scheduled runs alike.
     permissions: Option<crate::permission_bar::PermissionUi>,
+    /// Route to base URL for the readiness dial of each host this factory
+    /// opens. Tests only: they point the `ollama` route at a listener they own.
+    #[cfg(test)]
+    local_endpoints: BTreeMap<String, String>,
 }
 
 /// The file a host was opened from: its content hash only. A touch that
@@ -152,7 +156,32 @@ impl ProjectFactory {
             worktrees: Mutex::new(None),
             limits: kgraf_host::limits::SharedLimits::default(),
             permissions: None,
+            #[cfg(test)]
+            local_endpoints: BTreeMap::new(),
         }
+    }
+
+    /// Moves the readiness dial of a host this factory opened, in a test.
+    #[cfg(test)]
+    fn with_test_endpoints(&self, host: Host) -> kgraf_host::Result<Host> {
+        self.local_endpoints
+            .iter()
+            .try_fold(host, |h, (r, u)| h.with_local_endpoint(r, u))
+    }
+
+    /// Outside tests the host is used as opened.
+    #[cfg(not(test))]
+    fn with_test_endpoints(&self, host: Host) -> kgraf_host::Result<Host> {
+        Ok(host)
+    }
+
+    /// Test only: every host this factory opens dials `route` at `base_url`
+    /// before a build, so a test needs no server on this machine.
+    #[cfg(test)]
+    fn with_local_endpoint(mut self, route: &str, base_url: &str) -> Self {
+        self.local_endpoints
+            .insert(route.to_owned(), base_url.to_owned());
+        self
     }
 
     /// Every host this factory opens takes the run limits the user set from
@@ -294,6 +323,8 @@ impl ProjectFactory {
             worktrees: Mutex::new(None),
             limits: kgraf_host::limits::SharedLimits::default(),
             permissions: None,
+            #[cfg(test)]
+            local_endpoints: BTreeMap::new(),
         }
     }
 
@@ -378,6 +409,7 @@ impl ProjectFactory {
                 config.check_configured()?;
                 Host::open(config)
             })
+            .and_then(|host| self.with_test_endpoints(host))
             .map(|host| match &self.asks {
                 Some(asks) => host.with_ask_resolver(asks.clone()),
                 None => host,
@@ -2140,6 +2172,16 @@ mod tests {
         }
     }
 
+    /// A listener this test owns, and the `ollama` base URL that reaches it. A
+    /// build dials each local route first; the listener never answers, and a
+    /// connection is all the dial needs. Keep the listener alive while the
+    /// factory builds.
+    fn stub_ollama() -> (std::net::TcpListener, String) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("stub listener");
+        let url = format!("http://{}/v1", listener.local_addr().expect("stub address"));
+        (listener, url)
+    }
+
     fn multi_thread() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -2153,7 +2195,9 @@ mod tests {
     #[test]
     fn a_valid_run_json_builds_through_the_project_factory() {
         let dir = configured_project(1.0);
-        let factory = ProjectFactory::for_project(dir.path());
+        let (_stub, stub_url) = stub_ollama();
+        let factory =
+            ProjectFactory::for_project(dir.path()).with_local_endpoint("ollama", &stub_url);
         multi_thread().block_on(async {
             factory.configured().await.expect("configured");
             factory.ready("nightly").await.expect("ready");
@@ -2292,7 +2336,10 @@ mod tests {
             r#"{"mcp_servers": [{"name": "gone", "transport": {"type": "streamable_http", "url": "http://127.0.0.1:1/mcp"}}]}"#,
         )
         .expect("worker.json");
-        let factory = Arc::new(ProjectFactory::for_project(dir.path()));
+        let (_stub, stub_url) = stub_ollama();
+        let factory = Arc::new(
+            ProjectFactory::for_project(dir.path()).with_local_endpoint("ollama", &stub_url),
+        );
         let mut instructions = BTreeMap::new();
         instructions.insert("nightly".to_owned(), "do it".to_owned());
         let starter = ScheduledRuns::new(factory.clone(), instructions, 1);

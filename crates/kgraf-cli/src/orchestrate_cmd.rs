@@ -1583,9 +1583,17 @@ mod tests {
         // rate-limit store, so it must point at its own tempdir, never
         // `Host::open`'s real per-user default.
         let store_path = dir.path().join("rate-limits.sqlite3");
+        // A build dials each local route first. The dial goes to a listener
+        // this test owns, so the result does not depend on a server on this
+        // machine. The listener never answers; a connection is all the dial needs.
+        let stub = std::net::TcpListener::bind("127.0.0.1:0").expect("stub listener");
+        let stub_url = format!("http://{}/v1", stub.local_addr().expect("stub address"));
         let mut shapes = Vec::new();
         for config in [from_flags, from_file] {
-            let host = Host::open_with_rate_limit_store(config, Some(&store_path)).expect("open");
+            let host = Host::open_with_rate_limit_store(config, Some(&store_path))
+                .expect("open")
+                .with_local_endpoint("ollama", &stub_url)
+                .expect("local endpoint");
             let prepared = host
                 .prepare(RunId::new("same"), None, &mut |_| {})
                 .await

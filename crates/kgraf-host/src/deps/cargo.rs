@@ -1398,10 +1398,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_sigint_kills_the_command_in_flight() {
-        use std::os::unix::process::ExitStatusExt;
+        use std::os::unix::process::{CommandExt, ExitStatusExt};
         let dir = tempfile::tempdir().unwrap();
         let pid_file = dir.path().join("pid");
-        let mut helper = Command::new(std::env::current_exe().unwrap())
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
             .args([
                 "--exact",
                 "deps::cargo::tests::signal_helper",
@@ -1410,9 +1411,26 @@ mod tests {
             ])
             .env("KGRAF_TEST_PID_FILE", &pid_file)
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::null());
+        // A process started in the background of a non-interactive shell (a
+        // gate run by a script, `nohup`) has `SIGINT` ignored, and `exec`
+        // keeps an ignored signal ignored. The helper would then never see
+        // the interrupt, wait out its 30 s command and exit 0. The helper
+        // must start with the default dispositions and an empty mask,
+        // whatever this process inherited.
+        // SAFETY: the closure calls only signal and sigprocmask-family
+        // functions, which are async-signal-safe, and allocates nothing.
+        unsafe {
+            command.pre_exec(|| {
+                libc::signal(libc::SIGINT, libc::SIG_DFL);
+                libc::signal(libc::SIGTERM, libc::SIG_DFL);
+                let mut set: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut set);
+                libc::sigprocmask(libc::SIG_SETMASK, &set, std::ptr::null_mut());
+                Ok(())
+            });
+        }
+        let mut helper = command.spawn().unwrap();
         let sleeper = pid_written(&pid_file);
         // SAFETY: signals the helper this test started.
         unsafe { libc::kill(helper.id() as libc::pid_t, libc::SIGINT) };
