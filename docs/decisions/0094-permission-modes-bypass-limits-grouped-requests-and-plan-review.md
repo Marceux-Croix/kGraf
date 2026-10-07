@@ -1616,3 +1616,37 @@ file-watcher wrappers (`gdb --args`, `perf stat`, `entr`) are opaque and ask in 
 mode; environment variables that name a command (`EDITOR`, `PAGER`, `MANPAGER`, `LESSOPEN`)
 are read only for git; bash's `/dev/tcp` redirection is network egress no `shell(curl*)` rule
 names.
+
+## Amendment (2026-10-07): a cmd or PowerShell script is read only when its text is the text the interpreter runs
+
+The Windows backend builds the process command line itself, with MSVC quoting that adds
+quotes only around an argument with a space or a tab. cmd.exe and PowerShell do not split
+their command line by those rules: cmd takes the text after `/c` and applies its own quote
+rule (`cmd /?`: it keeps a lone pair of quotes that names an existing executable), then its
+escapes, variables and command-name delimiters; PowerShell's parser handles quotes, escapes,
+variables, script blocks and expressions the reader only approximates. So a script is read as
+text only when the text checked is certainly the text run. Otherwise it is unreadable (asked
+about while a shell deny or ask rule with a pattern exists, never granted by a program grant,
+otherwise the mode decides), and the best-effort reading is kept beside the reason, so a deny
+rule and the `forbid` rules still see what it would most likely run.
+
+- cmd: a double quote in any argument, `^`, `%`, `!`, a parenthesis, a line break or other
+  control character, a character outside ASCII, a switch before `/c` that is not `/X` or
+  `/X:VALUE`, an argument with a space beside other arguments, a lone quoted script with no
+  operator among `&<>()@^|` and no `/s`, a lone quoted script ending in `\`, and a program
+  word cmd ends at `,;=/` or reads as a built-in before `.\:+[]` (`rd\x`, `echo.`).
+- PowerShell (`-Command`, `-c`, plain arguments, and the decoded text of `-EncodedCommand`):
+  a quote (ASCII or typographic), a backtick, `$`, `@`, braces, parentheses, `#`, `<`, a
+  control character other than a tab or a line break, a character outside ASCII, `&` joined
+  to other text, and an argument with a space ending in `\`.
+- Plain scripts of words, spaces, the operators the readers split on and cmd redirections
+  read as before. A PowerShell statement starting with a relative path (`.\tool.exe`) is now
+  read as the program it runs.
+
+The quoting lives in `kgraf-sandbox`'s `win_command_line`, built on every platform and called
+by the backend. A test builds the backend's command line for every accepted call, from a table
+and from 40,000 generated argument lists, and checks that cmd's documented quote rule (with
+the worst case for the executable-name condition) yields the checked text, and that the argv
+PowerShell's host parses back, by the MSVC rules or by a plain quote-toggle rule, is the argv
+given. `["cmd", "/c", "dir /b"]` is now unreadable; `["cmd", "/c", "dir", "/b"]` and
+`["cmd", "/s", "/c", "dir /b"]` read as before.

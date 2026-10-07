@@ -150,41 +150,6 @@ fn fnv1a64(seed: u64, bytes: &[u8]) -> u64 {
         })
 }
 
-/// Append one argument to a UTF-16 command line under the MSVC runtime
-/// parsing rules (the rules `CommandLineToArgvW` and Rust's std follow).
-pub(super) fn append_arg(out: &mut Vec<u16>, arg: &[u16]) {
-    const QUOTE: u16 = b'"' as u16;
-    const SLASH: u16 = b'\\' as u16;
-    if !out.is_empty() {
-        out.push(u16::from(b' '));
-    }
-    let quote = arg.is_empty()
-        || arg
-            .iter()
-            .any(|c| *c == u16::from(b' ') || *c == u16::from(b'\t'));
-    if quote {
-        out.push(QUOTE);
-    }
-    let mut slashes = 0usize;
-    for &c in arg {
-        if c == SLASH {
-            slashes += 1;
-        } else {
-            if c == QUOTE {
-                // Double the run of backslashes before a quote, then escape it.
-                out.extend(std::iter::repeat_n(SLASH, slashes + 1));
-            }
-            slashes = 0;
-        }
-        out.push(c);
-    }
-    if quote {
-        // Backslashes before the closing quote must be doubled.
-        out.extend(std::iter::repeat_n(SLASH, slashes));
-        out.push(QUOTE);
-    }
-}
-
 /// `true` if the program is a batch file. `CreateProcess` runs those through
 /// `cmd.exe`, whose argument parsing differs from the MSVC rules (the
 /// BatBadBut class of injection); callers must invoke `cmd.exe` themselves.
@@ -263,8 +228,9 @@ pub(super) fn env_block(
 //
 // **Why the arguments go through the environment.** Git Bash is an MSYS2
 // program, and the MSYS2 runtime splits a command line from a Windows parent
-// with its own rules, not the MSVC rules `append_arg` writes for (msys2-runtime
-// `winsup/cygwin/dcrt0.cc`, `build_argv`, `quoted`, `globify`): single quotes
+// with its own rules, not the MSVC rules `win_command_line::append_arg` writes
+// for (msys2-runtime `winsup/cygwin/dcrt0.cc`, `build_argv`, `quoted`,
+// `globify`): single quotes
 // quote, `\\` inside quotes becomes `\`, a quote escaped as `\"` can end a
 // quoted run early and split the word, unquoted words are globbed with braces
 // and `~`, and a word starting with `@` names a file of more arguments. A
@@ -520,10 +486,13 @@ mod imp {
 
     use super::super::{Network, Redirect, Resolved};
     use super::{
-        BACKEND_NAME, GIT_BASH_PATH_VAR, SHELL_COMMAND_VAR, ShellLaunch, append_arg,
-        capability_sid_string, env_block, find_git_bash, is_batch_file, posix_shell, shell_launch,
+        BACKEND_NAME, GIT_BASH_PATH_VAR, SHELL_COMMAND_VAR, ShellLaunch, capability_sid_string,
+        env_block, find_git_bash, is_batch_file, posix_shell, shell_launch,
     };
     use crate::error::SandboxError;
+    // Shared with the command policy's check of a `cmd /c` or PowerShell
+    // script, so it is built on every platform.
+    use crate::win_command_line::command_line;
 
     // ---- errors -------------------------------------------------------------
 
@@ -2100,26 +2069,17 @@ mod imp {
                 "program path contains a quote",
             )));
         }
-        let mut line: Vec<u16> = Vec::new();
         // argv[0] is always quoted and never escaped, as std does.
-        line.push(u16::from(b'"'));
-        match &launch {
-            Some(l) => line.extend(l.program.as_os_str().encode_wide()),
-            None => line.extend(cmd.get_program().encode_wide()),
-        }
-        line.push(u16::from(b'"'));
-        match &launch {
-            Some(l) => {
-                for arg in l.args {
-                    append_arg(&mut line, &arg.encode_utf16().collect::<Vec<_>>());
-                }
-            }
-            None => {
-                for arg in cmd.get_args() {
-                    append_arg(&mut line, &arg.encode_wide().collect::<Vec<_>>());
-                }
-            }
-        }
+        let mut line = match &launch {
+            Some(l) => command_line(
+                &l.program.as_os_str().encode_wide().collect::<Vec<_>>(),
+                l.args.iter().map(|a| a.encode_utf16().collect::<Vec<_>>()),
+            ),
+            None => command_line(
+                &cmd.get_program().encode_wide().collect::<Vec<_>>(),
+                cmd.get_args().map(|a| a.encode_wide().collect::<Vec<_>>()),
+            ),
+        };
         line.push(0);
 
         let (token, _logon, user) = build_sandbox_token(&prepared.caps)?;
@@ -2271,7 +2231,7 @@ mod tests {
     fn line(args: &[&str]) -> String {
         let mut out = Vec::new();
         for a in args {
-            append_arg(&mut out, &a.encode_utf16().collect::<Vec<_>>());
+            crate::win_command_line::append_arg(&mut out, &a.encode_utf16().collect::<Vec<_>>());
         }
         String::from_utf16(&out).unwrap()
     }

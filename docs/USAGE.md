@@ -1033,7 +1033,8 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   Some of these cannot be read, and are treated like `source FILE` above: a runner whose
   command kGraf cannot name (`docker run IMAGE` with no command, a package given by a URL,
   `kubectl exec` without `--`), a Windows script with a variable as a program or a construct
-  kGraf does not read (`iex`, `[...]::`, `-File`), a git value it cannot see (`--config-env`,
+  kGraf does not read (`iex`, `[...]::`, `-File`), a cmd or PowerShell script that is not
+  plain text (see "Windows: the worker shell" below), a git value it cannot see (`--config-env`,
   `core.hooksPath`, an included configuration file), a command named by a variable or a
   substitution (`$CMD x`, `"$@"`, `${X}`, `$(which curl) x`, `eval "$X"`), a command that sets
   `PATH` (`PATH=./bin ls`) or a variable that makes a program load code first (`LD_PRELOAD`,
@@ -1552,6 +1553,32 @@ object.
   to PowerShell or cmd: they would run a different language than the one that was checked.
   A model can still run `powershell -Command ...` or `cmd /c ...` as a program; the
   permission rules read those scripts too.
+- **A cmd or PowerShell script is read only when its text is plain** (decision 0094). cmd
+  and PowerShell read their command line by their own rules, not the rules kGraf quotes it
+  for, so kGraf reads a script as text only when the text it checks is certainly the text
+  the interpreter runs. A plain script of words, spaces and the operators kGraf splits on
+  reads as before: `["cmd", "/c", "dir"]`, `["cmd", "/c", "cargo", "test", "&&", "echo",
+  "done"]`, `["cmd", "/c", "cargo test && echo done"]`, `["powershell", "-Command",
+  "Get-Item x; cargo test | Out-Null"]`, and cmd redirections such as `2>&1` and `> out.txt`.
+  Any other script is unreadable: like `source FILE`, it asks while you have a shell deny or
+  ask rule with a pattern, no program grant covers it, and with no such rule the mode
+  decides. kGraf still reads what it can of it, so a deny rule and the command policy still
+  refuse a program they name there.
+  - cmd: a double quote in any argument, `^`, `%`, `!`, a parenthesis, a line break or other
+    control character, a character outside ASCII, a switch before `/c` other than `/X` or
+    `/X:VALUE`, an argument with a space next to other arguments, a script given as one
+    argument with a space and no operator (cmd runs it as a program name when a file of that
+    name exists; give the words as separate arguments or add `/s` before `/c`), a script
+    given as one argument that ends in `\`, and a program word that cmd ends at `,`, `;`,
+    `=` or `/` or reads as a built-in (`rd\x`, `echo.`).
+  - PowerShell (`-Command`, `-c`, a script as plain arguments, and the decoded text of
+    `-EncodedCommand`): a quote (straight or typographic), a backtick, `$`, `@`, braces,
+    parentheses, `#`, `<`, a control character other than a tab or a line break, a
+    character outside ASCII, `&` joined to other text, and an argument with a space that
+    ends in `\`.
+
+  To give a script with these, use `["sh", "-c", "<line>"]`, which runs in Git Bash with
+  the exact text kGraf checked.
 - **Programs that are not `.exe` files** (a `.cmd` or `.bat` file, or a shell script such
   as Node's `npm`) do not run as a plain argv. The error says to run them through Git Bash:
   `["sh", "-c", "npm test"]`.

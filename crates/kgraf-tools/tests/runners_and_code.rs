@@ -483,6 +483,27 @@ fn opaque_cases() -> Vec<(&'static str, &'static str, Vec<String>, Vec<&'static 
             vec!["powershell"],
         ),
         ("2", "cmd (no /c)", argv(&["cmd"]), vec!["cmd"]),
+        // Scripts the interpreter may read differently from kGraf: a quote
+        // on the command line. Granting the program they seem to run does
+        // not cover them.
+        (
+            "2",
+            "cmd /c with a quote",
+            argv(&["cmd", "/c", "dir", "\"a\""]),
+            vec!["cmd", "dir"],
+        ),
+        (
+            "2",
+            "cmd /c one quoted string",
+            argv(&["cmd", "/c", "dir /b"]),
+            vec!["cmd", "dir"],
+        ),
+        (
+            "2",
+            "powershell -c with a quote",
+            argv(&["powershell", "-c", "Get-Item 'a'"]),
+            vec!["powershell", "Get-Item"],
+        ),
         (
             "3",
             "git -c core.hooksPath",
@@ -650,7 +671,9 @@ async fn a_rule_does_not_refuse_what_runs_another_program() {
             argv(&["python3", "clean.py"]),
             argv(&["python3", "-c", "print('curl')"]),
             argv(&["docker", "exec", "web", "ls"]),
-            argv(&["cmd", "/c", "echo curl"]),
+            // Separate words: one quoted string is unreadable (cmd may run
+            // it as a program name).
+            argv(&["cmd", "/c", "echo", "curl"]),
             argv(&["git", "-c", "core.pager=less", "log"]),
             argv(&["git", "st"]),
             argv(&["sh", "-c", "echo $X"]),

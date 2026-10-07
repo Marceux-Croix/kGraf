@@ -206,7 +206,51 @@ If Git Bash is missing, command 2 fails with a message that names Git for Window
 `KGRAF_GIT_BASH_PATH`; that is the intended behavior, but report it if Git for Windows is
 installed.
 
-## 6. What to send back
+## 6. cmd and PowerShell scripts under a rule
+
+This checks that a cmd or PowerShell script kGraf cannot read as plain text asks, and that
+a plain one runs on its grants. The pure parts (which scripts are unreadable, and that the
+text kGraf checks is the text the interpreter gets from the command line) are already in
+step 4 of section 4. This step runs the real `cmd.exe` and `powershell.exe`. It needs the
+model route and the `kgraf-smoke` project of section 5.
+
+Make a permissions file outside the project for this run only, in Auto with an ask rule:
+
+```powershell
+cd C:\src\kgraf-smoke
+@'
+mode = "auto"
+ask = ["shell(curl*)"]
+[allow]
+programs = ["cmd", "powershell", "echo", "Get-Location", "Write-Output"]
+'@ | Set-Content "$r\permissions.toml"
+$env:KGRAF_PERMISSIONS_PATH = "$r\permissions.toml"
+@'
+Use the shell tool for each of these argv lists exactly, one call each, then stop and
+report each output or refusal:
+1. ["cmd", "/d", "/c", "echo", "plain-cmd"]
+2. ["cmd", "/d", "/c", "echo plain-cmd && echo second"]
+3. ["powershell", "-NoProfile", "-Command", "Get-Location"]
+4. ["cmd", "/d", "/c", "echo", "\"quoted\""]
+5. ["cmd", "/d", "/c", "echo two words"]
+6. ["powershell", "-NoProfile", "-Command", "Write-Output 'quoted'"]
+Do not change any file.
+'@ | Set-Content brief-windows-shells.txt
+& $kgraf worker --provider <provider> --model <model-id> --brief brief-windows-shells.txt --events "$r\shells-events.jsonl" 2>&1 | Tee-Object "$r\8-windows-shells.txt"
+Remove-Item Env:KGRAF_PERMISSIONS_PATH
+```
+
+Answer "deny" to every question. What to expect:
+
+- Commands 1, 2 and 3 run without a question: they print `plain-cmd`, then `plain-cmd` and
+  `second`, then the folder.
+- Commands 4, 5 and 6 each ask, even though every program they name is granted. The
+  question says the command cannot be checked against your ask rule `shell(curl*)` and
+  why: 4 holds `"`; 5 is one quoted string with no operator; 6 holds `'`.
+- If the model changes an argv (for example it splits command 5 into separate words), the
+  result does not test that case; note which ones.
+
+## 7. What to send back
 
 Collect the machine facts into the results folder, then zip it:
 

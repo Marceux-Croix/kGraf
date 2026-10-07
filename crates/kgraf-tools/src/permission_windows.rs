@@ -24,6 +24,30 @@
 //!   variable or an expression, dot-sourcing, backtick escapes, a program
 //!   word holding `$`, `-File`, `-Command -` (standard input), `-NoExit`, and
 //!   a text that does not decode.
+//!
+//! Both interpreters read their command line by their own rules, not the
+//! MSVC rules the Windows backend quotes it for, and their parsers do more
+//! than these readers model (decision 0094, amended 2026-10-07). So a script
+//! is read as text only when the text checked is certainly the text the
+//! interpreter runs; otherwise it is unreadable, with the best-effort reading
+//! kept beside the reason so a deny rule and the `forbid` rules still see
+//! it:
+//!
+//! - cmd: a double quote in any argument, `^`, `%`, `!`, a parenthesis, a
+//!   line break or control character, a character outside ASCII, a switch
+//!   before `/c` that is not `/X` or `/X:VALUE`, an argument with a space
+//!   beside other arguments, a lone quoted script with no operator and no
+//!   `/s` (cmd keeps its quotes when a file of that name exists), a quoted
+//!   script ending in `\`, and a program word cmd would end at `,;=/` or
+//!   read as a built-in (`rd\x`, `echo.`).
+//! - PowerShell: a quote (ASCII or typographic), a backtick, `$`, `@`,
+//!   braces, parentheses, `#`, `<`, a control character other than a tab or
+//!   a line break, a character outside ASCII, `&` joined to other text, and
+//!   an argument with a space that ends in `\`; for `-EncodedCommand`, the
+//!   same rules on the decoded text.
+//!
+//! Plain scripts of words, spaces, the operators the readers split on and
+//! cmd redirections read as before.
 
 use super::Embedded;
 
@@ -31,47 +55,214 @@ fn unreadable(program: &str, why: &str) -> Vec<Embedded> {
     vec![Embedded::Unreadable(format!("`{program}` {why}"))]
 }
 
+/// Combine a reading with the reason the interpreter may read the script
+/// differently from kGraf: the unreadable reason first, then the best-effort
+/// reading, so a deny rule and the `forbid` rules still see what the script
+/// would most likely run while the call stays unreadable (asked under a
+/// shell rule, never granted).
+fn with_unmodeled(program: &str, unmodeled: Option<String>, read: Vec<Embedded>) -> Vec<Embedded> {
+    match unmodeled {
+        None => read,
+        Some(why) => {
+            let mut out = unreadable(program, &why);
+            out.extend(read);
+            out
+        }
+    }
+}
+
 /// `cmd [/q] [/d] [/s] [/v:on] [/c | /k] STRING`.
 pub(super) fn cmd(args: &[String]) -> Vec<Embedded> {
+    let script = match cmd_script_text(args) {
+        Ok(script) => script,
+        Err(found) => return found,
+    };
+    // The best-effort reading of an unmodeled script. `/s` strips one pair
+    // of outer quotes; reading without it treats the quoted text as one
+    // command, which is how cmd reads most such lines too.
+    let text = script.text.trim();
+    let text = text
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .filter(|inner| !inner.contains('"') || script.strip)
+        .unwrap_or(text);
+    with_unmodeled("cmd", script.unmodeled, cmd_script(text, script.delayed))
+}
+
+/// A `cmd` script as the reader checks it.
+struct CmdScript {
+    /// The arguments after `/c` joined with spaces, untrimmed: the text
+    /// cmd runs when [`CmdScript::unmodeled`] is `None`.
+    text: String,
+    /// `/v:on`: `!NAME!` expands.
+    delayed: bool,
+    /// `/s`: cmd always strips one pair of outer quotes.
+    strip: bool,
+    /// Why cmd may read its command line differently from `text`.
+    unmodeled: Option<String>,
+}
+
+/// The script of `cmd ... /c SCRIPT`, or the reading when there is none.
+///
+/// cmd does not split its command line by the MSVC rules the Windows
+/// backend quotes it for: it takes the text after `/c`, applies its own
+/// quote rule (`cmd /?`), then its own escapes, variables and delimiters.
+/// So a script is checked as text only where that text is certainly what
+/// cmd runs: no character cmd treats specially beyond the operators the
+/// reader splits on and the redirections it strips, and no quote on the
+/// command line except one pair cmd is certain to strip. Anything else is
+/// unmodeled.
+fn cmd_script_text(args: &[String]) -> Result<CmdScript, Vec<Embedded>> {
     let mut delayed = false;
+    let mut strip = false;
+    let mut unmodeled = args.iter().find_map(|a| cmd_unmodeled_char(a));
     for (i, a) in args.iter().enumerate() {
         let lower = a.to_ascii_lowercase();
         if lower == "/c" || lower == "/k" || lower == "/r" {
-            let script = args[i + 1..].join(" ");
-            if script.trim().is_empty() {
-                return unreadable(
+            let tail = &args[i + 1..];
+            let text = tail.join(" ");
+            if text.trim().is_empty() {
+                return Err(unreadable(
                     "cmd",
                     "with an empty `/c` command runs nothing kGraf can read",
-                );
+                ));
             }
-            // `/s` strips one pair of outer quotes; reading without it
-            // treats the quoted text as one command, which is how cmd reads
-            // most such lines too.
-            let script = script.trim();
-            let script = script
-                .strip_prefix('"')
-                .and_then(|s| s.strip_suffix('"'))
-                .filter(|inner| {
-                    !inner.contains('"') || args.iter().any(|a| a.eq_ignore_ascii_case("/s"))
-                })
-                .unwrap_or(script);
-            return cmd_script(script, delayed);
-        }
-        if lower.starts_with("/v:on") {
-            delayed = true;
-            continue;
+            unmodeled = unmodeled.or_else(|| cmd_unmodeled_quoting(tail, strip));
+            return Ok(CmdScript {
+                text,
+                delayed,
+                strip,
+                unmodeled,
+            });
         }
         if lower.starts_with('/') {
+            if lower.starts_with("/v:on") {
+                delayed = true;
+            }
+            if lower == "/s" {
+                strip = true;
+            }
+            if !is_plain_cmd_switch(&lower) {
+                unmodeled = unmodeled.or_else(|| {
+                    Some(format!(
+                        "has the switch `{}`, and kGraf does not model how cmd reads it",
+                        a.escape_debug()
+                    ))
+                });
+            }
             continue;
         }
         // A word that is not an option before `/c`: cmd runs it as a
         // command line.
         break;
     }
-    unreadable(
+    Err(unreadable(
         "cmd",
         "with no `/c` or `/k` command reads its commands from its input",
-    )
+    ))
+}
+
+/// A switch of the form `/X` or `/X:VALUE` (one letter, a value of letters
+/// and digits): `/q`, `/d`, `/s`, `/v:on`, `/e:off`, `/t:0a`. These hold no
+/// second `/` that cmd could read as `/c`.
+fn is_plain_cmd_switch(lower: &str) -> bool {
+    let Some(rest) = lower.strip_prefix('/') else {
+        return false;
+    };
+    let mut chars = rest.chars();
+    let letter = chars.next().is_some_and(|c| c.is_ascii_alphabetic());
+    let value = chars.as_str();
+    letter
+        && (value.is_empty()
+            || value
+                .strip_prefix(':')
+                .is_some_and(|v| !v.is_empty() && v.chars().all(|c| c.is_ascii_alphanumeric())))
+}
+
+/// Why cmd may read an argument holding this character differently from
+/// the reader: a quote (cmd's own quote rule, and the quotes the backend's
+/// MSVC quoting adds), `^` (escape), `%` and `!` (variables), parentheses
+/// (groups and `if`/`for` clauses), a line break or another control
+/// character, and any character outside ASCII (cmd's code page and its
+/// own delimiters).
+fn cmd_unmodeled_char(arg: &str) -> Option<String> {
+    let c = arg.chars().find(|&c| {
+        matches!(c, '"' | '^' | '%' | '!' | '(' | ')')
+            || (c.is_control() && c != '\t')
+            || !c.is_ascii()
+    })?;
+    Some(if c.is_control() {
+        "holds a line break or a control character, which cmd reads by rules kGraf does not model"
+            .to_owned()
+    } else if c.is_ascii() {
+        format!("holds `{c}`, which cmd reads by rules kGraf does not model")
+    } else {
+        "holds a character outside ASCII, which cmd reads by rules kGraf does not model".to_owned()
+    })
+}
+
+/// Why the quotes the backend adds around an argument with a space would
+/// change the text cmd runs. cmd strips the first and the last quote of the
+/// text after `/c`, except that it keeps both when (with no `/s`) they are
+/// the only two, enclose a space and no `&<>()@^|`, and name an existing
+/// executable file: a state of the disk the reader cannot see.
+fn cmd_unmodeled_quoting(tail: &[String], strip: bool) -> Option<String> {
+    let quoted = |a: &String| a.is_empty() || a.contains([' ', '\t']);
+    if !tail.iter().any(quoted) {
+        return None;
+    }
+    if tail.len() > 1 {
+        return Some(
+            "has an argument with a space beside other arguments, so cmd sees the quotes \
+             around it and runs a different text than kGraf reads"
+                .to_owned(),
+        );
+    }
+    let only = &tail[0];
+    if only.ends_with('\\') {
+        return Some(
+            "ends with a backslash inside quotes, which the command line doubles and cmd keeps"
+                .to_owned(),
+        );
+    }
+    if !strip && !only.contains(['&', '<', '>', '(', ')', '@', '^', '|']) {
+        return Some(
+            "is one quoted string with no operator, which cmd runs as a program name when a \
+             file of that name exists; give the words as separate arguments or add `/s`"
+                .to_owned(),
+        );
+    }
+    None
+}
+
+/// cmd's built-in commands. cmd recognizes one when its name is followed
+/// by any of `.\:+[]` as well as by a space (`cd\`, `echo.`), so a word
+/// such as `rd\x` runs `rd`.
+const CMD_BUILTINS: &[&str] = &[
+    "assoc", "break", "call", "cd", "chdir", "cls", "color", "copy", "date", "del", "dir", "dpath",
+    "echo", "endlocal", "erase", "exit", "for", "ftype", "goto", "if", "keys", "md", "mkdir",
+    "mklink", "move", "path", "pause", "popd", "prompt", "pushd", "rd", "rem", "ren", "rename",
+    "rmdir", "set", "setlocal", "shift", "start", "time", "title", "type", "ver", "verify", "vol",
+];
+
+/// Why cmd may run a different program than the word the reader names:
+/// cmd also ends a command name at `,`, `;`, `=` and `/`, and finds a
+/// built-in before `.\:+[]`.
+fn cmd_program_unmodeled(program: &str) -> Option<String> {
+    if program.contains([',', ';', '=', '/']) {
+        return Some(format!(
+            "runs `{}`, a name cmd ends at `,`, `;`, `=` or `/`",
+            program.escape_debug()
+        ));
+    }
+    let at = program.find(['.', '\\', ':', '+', '[', ']'])?;
+    let prefix = program[..at].to_ascii_lowercase();
+    (at > 0 && CMD_BUILTINS.contains(&prefix.as_str())).then(|| {
+        format!(
+            "runs `{}`, which cmd reads as its built-in `{prefix}`",
+            program.escape_debug()
+        )
+    })
 }
 
 /// The commands of a cmd script, or why it cannot be read.
@@ -138,6 +329,9 @@ fn cmd_script(script: &str, delayed: bool) -> Vec<Embedded> {
                 "cmd",
                 "runs a command named by a variable, so kGraf cannot tell what it runs",
             );
+        }
+        if let Some(why) = cmd_program_unmodeled(&program) {
+            out.push(Embedded::Unreadable(format!("`cmd` {why}")));
         }
         let mut argv = vec![program];
         argv.extend(words[1..].iter().cloned());
@@ -315,6 +509,36 @@ fn ps_option(name: &str) -> Option<PsOption> {
 /// `powershell [OPTIONS] -Command TEXT...`, `-EncodedCommand B64`, or (for
 /// `powershell`, not `pwsh`) the script as plain arguments.
 pub(super) fn powershell(program: &str, args: &[String]) -> Vec<Embedded> {
+    match ps_script_text(program, args) {
+        Ok(script) => with_unmodeled(program, script.unmodeled, ps_script(program, &script.text)),
+        Err(found) => found,
+    }
+}
+
+/// A PowerShell script as the reader checks it.
+struct PsScript {
+    /// The arguments after `-Command` (or the plain arguments) joined with
+    /// spaces, as PowerShell joins them, or the decoded `-EncodedCommand`.
+    text: String,
+    /// Why PowerShell may read the script differently from `text`.
+    unmodeled: Option<String>,
+}
+
+/// The script of a `powershell` or `pwsh` call, or the reading when there
+/// is none.
+///
+/// PowerShell's own parser handles quotes, escapes, variables, script
+/// blocks and expressions that the reader only approximates, and its host
+/// splits the command line with its own runtime. So a script is checked as
+/// text only where it holds none of those (see [`ps_unmodeled_text`]) and
+/// every argument survives the backend's quoting unchanged (no quote, no
+/// backslash before an added closing quote). Anything else is unmodeled.
+fn ps_script_text(program: &str, args: &[String]) -> Result<PsScript, Vec<Embedded>> {
+    let args_unmodeled = args.iter().find_map(|a| ps_unmodeled_arg(a));
+    let script = |text: String| {
+        let unmodeled = args_unmodeled.clone().or_else(|| ps_unmodeled_text(&text));
+        PsScript { text, unmodeled }
+    };
     let mut i = 0;
     while let Some(a) = args.get(i) {
         if !(a.starts_with('-') || (a.starts_with('/') && a.len() > 1)) {
@@ -324,49 +548,120 @@ pub(super) fn powershell(program: &str, args: &[String]) -> Vec<Embedded> {
             Some(PsOption::Command) => {
                 let text = args[i + 1..].join(" ");
                 if text.trim() == "-" {
-                    return unreadable(program, "reads its commands from its input");
+                    return Err(unreadable(program, "reads its commands from its input"));
                 }
                 if text.trim().is_empty() {
-                    return Vec::new();
+                    return Err(Vec::new());
                 }
-                return ps_script(program, &text);
+                return Ok(script(text));
             }
             Some(PsOption::Encoded) => {
                 let Some(b64) = args.get(i + 1) else {
-                    return unreadable(program, "names no encoded command");
+                    return Err(unreadable(program, "names no encoded command"));
                 };
                 return match decode_utf16le_base64(b64) {
-                    Some(text) => ps_script(program, &text),
-                    None => unreadable(program, "has an encoded command that does not decode"),
+                    Some(text) => Ok(script(text)),
+                    None => Err(unreadable(
+                        program,
+                        "has an encoded command that does not decode",
+                    )),
                 };
             }
             Some(PsOption::File) => {
-                return unreadable(program, "runs a script file, which kGraf does not read");
+                return Err(unreadable(
+                    program,
+                    "runs a script file, which kGraf does not read",
+                ));
             }
             Some(PsOption::Interactive) => {
-                return unreadable(program, "stays open reading commands from its input");
+                return Err(unreadable(
+                    program,
+                    "stays open reading commands from its input",
+                ));
             }
             Some(PsOption::Valued) => i += 2,
             Some(PsOption::Flag) => i += 1,
             None => {
-                return unreadable(
+                return Err(unreadable(
                     program,
                     &format!(
                         "has the option `{}`, which kGraf cannot place",
                         a.escape_debug()
                     ),
-                );
+                ));
             }
         }
     }
     match args.get(i..) {
         // `pwsh FILE`: the first plain argument is a script file.
-        Some(rest) if !rest.is_empty() && program == "pwsh" => {
-            unreadable(program, "runs a script file, which kGraf does not read")
-        }
-        Some(rest) if !rest.is_empty() => ps_script(program, &rest.join(" ")),
-        _ => unreadable(program, "with no command reads its commands from its input"),
+        Some(rest) if !rest.is_empty() && program == "pwsh" => Err(unreadable(
+            program,
+            "runs a script file, which kGraf does not read",
+        )),
+        Some(rest) if !rest.is_empty() => Ok(script(rest.join(" "))),
+        _ => Err(unreadable(
+            program,
+            "with no command reads its commands from its input",
+        )),
     }
+}
+
+/// The character in `text` PowerShell reads by rules the reader does not
+/// model: a quote (ASCII or the typographic quotes PowerShell also
+/// accepts), a backtick (escape), `$` (variables, subexpressions), `@`
+/// (splatting, arrays, here-strings), braces (script blocks), parentheses
+/// (expressions), `#` (comments), `<` (reserved), a control character
+/// other than a tab or a line break, and any character outside ASCII
+/// (PowerShell reads typographic dashes as `-` and more spaces than the
+/// reader splits on).
+fn ps_unmodeled_char(text: &str) -> Option<String> {
+    let c = text.chars().find(|&c| {
+        matches!(
+            c,
+            '\'' | '"' | '`' | '$' | '@' | '{' | '}' | '(' | ')' | '#' | '<'
+        ) || (c.is_control() && !matches!(c, '\t' | '\n' | '\r'))
+            || !c.is_ascii()
+    })?;
+    Some(if c.is_control() {
+        "holds a control character, which PowerShell reads by rules kGraf does not model".to_owned()
+    } else if c.is_ascii() {
+        format!("holds `{c}`, which PowerShell reads by rules kGraf does not model")
+    } else {
+        "holds a character outside ASCII, which PowerShell reads by rules kGraf does not model"
+            .to_owned()
+    })
+}
+
+/// Why PowerShell may receive an argument differently from how it was
+/// given: an unmodeled character, or a backslash before the closing quote
+/// the backend adds around an argument with a space (written doubled for
+/// the MSVC rules, which a host's runtime may not share).
+fn ps_unmodeled_arg(arg: &str) -> Option<String> {
+    if let Some(why) = ps_unmodeled_char(arg) {
+        return Some(why);
+    }
+    (arg.contains([' ', '\t']) && arg.ends_with('\\')).then(|| {
+        "has an argument that ends with a backslash inside quotes, which PowerShell's host \
+         may read differently"
+            .to_owned()
+    })
+}
+
+/// Why PowerShell may read a script text differently from the reader: an
+/// unmodeled character ([`ps_unmodeled_char`]), or `&` that is neither a
+/// word of its own (the call operator) nor part of `&&`: `&curl` calls
+/// `curl`, where the reader would name a program `&curl`.
+fn ps_unmodeled_text(text: &str) -> Option<String> {
+    if let Some(why) = ps_unmodeled_char(text) {
+        return Some(why);
+    }
+    text.split_whitespace()
+        .any(|w| w != "&" && w.replace("&&", "").contains('&'))
+        .then(|| {
+            "holds `&` joined to other text, which PowerShell reads by rules kGraf does not \
+             model"
+                .to_owned()
+        })
 }
 
 /// Base64 of UTF-16LE text, as `-EncodedCommand` takes it.
@@ -596,7 +891,15 @@ fn ps_command(words: &[PsWord]) -> Result<Option<Vec<String>>, String> {
         }
         return Ok(None);
     }
-    if first.quoted || text.parse::<f64>().is_ok() || text.starts_with('.') || text.starts_with('-')
+    // A word that starts with `.` is a member access or a number, except a
+    // relative path (`.\tool.exe`, `../bin/tool`), which runs a program.
+    let relative_path = ["./", ".\\", "../", "..\\"]
+        .iter()
+        .any(|p| text.starts_with(p));
+    if first.quoted
+        || text.parse::<f64>().is_ok()
+        || (text.starts_with('.') && !relative_path)
+        || text.starts_with('-')
     {
         return Ok(None);
     }
@@ -790,5 +1093,423 @@ mod tests {
         assert!(unreadable_found(&ps(&["-Command", "-"])));
         assert!(unreadable_found(&ps(&[])));
         assert!(unreadable_found(&powershell("pwsh", &argv(&["x.ps1"]))));
+    }
+
+    fn encoded(script: &str) -> String {
+        use base64::Engine as _;
+        let bytes: Vec<u8> = script
+            .encode_utf16()
+            .flat_map(|u| u.to_le_bytes())
+            .collect();
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    /// One case per cmd rule: each script is unreadable, and the reason
+    /// comes first.
+    #[test]
+    fn cmd_scripts_cmd_may_read_differently_are_unreadable() {
+        // (the reason's own words, the call)
+        let cases: &[(&str, &[&str])] = &[
+            ("holds `\"`", &["/c", "echo", "\"a\""]),
+            ("holds `^`", &["/c", "dir", "a^b"]),
+            ("holds `%`", &["/c", "echo", "x%y"]),
+            ("holds `!`", &["/c", "echo", "a!b"]),
+            ("holds `(`", &["/c", "echo", "a(b"]),
+            ("holds `)`", &["/c", "echo", "a)b"]),
+            ("line break", &["/c", "dir\necho a"]),
+            ("line break", &["/c", "dir\recho a"]),
+            ("control character", &["/c", "dir\u{b}a"]),
+            ("outside ASCII", &["/c", "echo", "caf\u{e9}"]),
+            ("has the switch `/q/d`", &["/q/d", "/c", "dir"]),
+            ("beside other arguments", &["/c", "dir", "a b"]),
+            ("one quoted string with no operator", &["/c", "dir /b"]),
+            ("ends with a backslash", &["/c", "dir C:\\a & dir b\\"]),
+            ("a name cmd ends at", &["/c", "dir,a"]),
+            ("a name cmd ends at", &["/c", "dir;a"]),
+            ("a name cmd ends at", &["/c", "dir=a"]),
+            ("a name cmd ends at", &["/c", "tools/x.exe"]),
+            ("its built-in `rd`", &["/c", "rd\\a"]),
+            ("its built-in `echo`", &["/c", "echo.a"]),
+        ];
+        for (reason, words) in cases {
+            let found = cmd(&argv(words));
+            assert!(
+                matches!(found.first(), Some(Embedded::Unreadable(why)) if why.contains(reason)),
+                "{reason}: {words:?}: {found:?}"
+            );
+        }
+    }
+
+    /// Ordinary cmd scripts read as before: no unreadable entry and the same
+    /// commands.
+    #[test]
+    fn plain_cmd_scripts_stay_readable_with_the_same_split() {
+        for (words, want) in plain_cmd_cases() {
+            let found = cmd(&argv(words));
+            assert!(!unreadable_found(&found), "{words:?}: {found:?}");
+            let want: Vec<Vec<String>> = want.iter().map(|c| argv(c)).collect();
+            assert_eq!(argvs(&found), want, "{words:?}");
+        }
+    }
+
+    type Case = (&'static [&'static str], &'static [&'static [&'static str]]);
+
+    fn plain_cmd_cases() -> Vec<Case> {
+        vec![
+            (&["/c", "dir"], &[&["dir"]]),
+            (
+                &["/c", "cargo", "test", "&&", "echo", "done"],
+                &[&["cargo", "test"], &["echo", "done"]],
+            ),
+            (
+                &["/c", "cargo test && echo done"],
+                &[&["cargo", "test"], &["echo", "done"]],
+            ),
+            (&["/c", "dir & curl x"], &[&["dir"], &["curl", "x"]]),
+            (
+                &["/k", "dir || echo none | findstr n"],
+                &[&["dir"], &["echo", "none"], &["findstr", "n"]],
+            ),
+            (
+                &["/c", "echo a 2>&1 | findstr a"],
+                &[&["echo", "a"], &["findstr", "a"]],
+            ),
+            (&["/c", "dir > out.txt"], &[&["dir"]]),
+            (&["/s", "/c", "dir /b"], &[&["dir", "/b"]]),
+            (
+                &["/d", "/q", "/v:off", "/c", "cargo", "build"],
+                &[&["cargo", "build"]],
+            ),
+            (
+                &["/c", "C:\\tools\\curl.exe", "x"],
+                &[&["C:\\tools\\curl.exe", "x"]],
+            ),
+            (&["/c", "@echo", "off"], &[&["echo", "off"]]),
+        ]
+    }
+
+    /// One case per PowerShell rule: each script is unreadable, and the
+    /// reason comes first.
+    #[test]
+    fn powershell_scripts_powershell_may_read_differently_are_unreadable() {
+        let enc_dollar = encoded("$x = curl x");
+        let enc_quote = encoded("Write-Output 'a; b'");
+        // (the reason's own words, the call)
+        let cases: Vec<(&str, Vec<&str>)> = vec![
+            ("holds `'`", vec!["-c", "Get-Item 'a'"]),
+            ("holds `\"`", vec!["-c", "Get-Item", "\"a\""]),
+            // A semicolon inside quotes: the quote is the reason.
+            ("holds `'`", vec!["-c", "Write-Output 'a; b'"]),
+            // Typographic quotes and dashes.
+            ("outside ASCII", vec!["-c", "Get-Item \u{2018}a\u{2019}"]),
+            ("outside ASCII", vec!["-c", "Get-Item \u{2013}Force"]),
+            ("holds ```", vec!["-c", "Get-Item a`b"]),
+            ("holds `$`", vec!["-c", "Get-Item", "$x"]),
+            ("holds `@`", vec!["-c", "Get-Item @a"]),
+            ("holds `{`", vec!["-c", "Get-Item a{"]),
+            ("holds `}`", vec!["-c", "Get-Item a}"]),
+            ("holds `(`", vec!["-c", "Get-Item a("]),
+            ("holds `)`", vec!["-c", "Get-Item a)"]),
+            ("holds `#`", vec!["-c", "Get-Item a # b"]),
+            ("holds `<`", vec!["-c", "Get-Item < a"]),
+            ("control character", vec!["-c", "Get-Item\u{b}a"]),
+            ("`&` joined to other text", vec!["-c", "&tool x"]),
+            ("ends with a backslash", vec!["-c", "dir C:\\a b\\"]),
+            // An option value is an argument too.
+            ("holds `'`", vec!["-ExecutionPolicy", "'x'", "-c", "dir"]),
+            // The script as plain arguments.
+            ("holds `'`", vec!["Get-Item", "'a'"]),
+            // The decoded text of `-EncodedCommand`.
+            ("holds `$`", vec!["-EncodedCommand", &enc_dollar]),
+            ("holds `'`", vec!["-enc", &enc_quote]),
+        ];
+        for (reason, words) in &cases {
+            let found = powershell("powershell", &argv(words));
+            assert!(
+                matches!(found.first(), Some(Embedded::Unreadable(why)) if why.contains(reason)),
+                "{reason}: {words:?}: {found:?}"
+            );
+        }
+    }
+
+    fn plain_ps_cases() -> Vec<(Vec<String>, Vec<Vec<String>>)> {
+        let to = |c: &[&[&str]]| c.iter().map(|w| argv(w)).collect::<Vec<_>>();
+        vec![
+            (
+                argv(&["-c", "Get-Item x; curl.exe x | Out-Null"]),
+                to(&[&["Get-Item", "x"], &["curl.exe", "x"], &["Out-Null"]]),
+            ),
+            (
+                argv(&[
+                    "-NoProfile",
+                    "-Command",
+                    "Get-ChildItem",
+                    "|",
+                    "Select-Object",
+                    "-First",
+                    "1",
+                ]),
+                to(&[&["Get-ChildItem"], &["Select-Object", "-First", "1"]]),
+            ),
+            (
+                argv(&["-c", "cargo test && echo done"]),
+                to(&[&["cargo", "test"], &["echo", "done"]]),
+            ),
+            (
+                argv(&["-c", "& C:\\tools\\curl.exe x"]),
+                to(&[&["C:\\tools\\curl.exe", "x"]]),
+            ),
+            (argv(&["Get-Item", "x"]), to(&[&["Get-Item", "x"]])),
+            (
+                argv(&["-EncodedCommand", &encoded("curl x")]),
+                to(&[&["curl", "x"]]),
+            ),
+            (
+                argv(&["-enc", &encoded("Get-Item a\r\ncurl x")]),
+                to(&[&["Get-Item", "a"], &["curl", "x"]]),
+            ),
+        ]
+    }
+
+    /// Ordinary PowerShell scripts read as before: no unreadable entry and
+    /// the same commands.
+    #[test]
+    fn plain_powershell_scripts_stay_readable_with_the_same_split() {
+        for (words, want) in plain_ps_cases() {
+            let found = powershell("powershell", &words);
+            assert!(!unreadable_found(&found), "{words:?}: {found:?}");
+            assert_eq!(argvs(&found), want, "{words:?}");
+        }
+    }
+
+    /// A PowerShell statement that starts with a relative path runs that
+    /// program; it is not a member access.
+    #[test]
+    fn a_powershell_relative_path_is_read_as_a_program() {
+        for path in [".\\tool.exe", "./tool", "..\\bin\\tool.exe"] {
+            let found = powershell("powershell", &argv(&["-c", &format!("{path} x")]));
+            assert_eq!(argvs(&found), vec![argv(&[path, "x"])], "{path}");
+        }
+    }
+
+    // ---- the text checked is the text run ---------------------------------
+
+    /// The text after `/c` that cmd runs from `line`, by the rule `cmd /?`
+    /// documents: it keeps the quotes when (with no `/s`) they are the only
+    /// two, enclose whitespace and no `&<>()@^|`, and name an executable
+    /// (assumed here, the worst case); otherwise it strips a leading quote
+    /// and the last quote. `None` when the line has no `/c`.
+    fn cmd_visible(line: &str) -> Option<String> {
+        let rest = line.strip_prefix('"')?;
+        let mut rest = &rest[rest.find('"')? + 1..];
+        let mut strip = false;
+        loop {
+            rest = rest.trim_start_matches([' ', '\t']);
+            let end = rest.find([' ', '\t']).unwrap_or(rest.len());
+            let token = rest[..end].to_ascii_lowercase();
+            if token.is_empty() {
+                return None;
+            }
+            rest = &rest[end..];
+            if matches!(token.as_str(), "/c" | "/k" | "/r") {
+                break;
+            }
+            strip |= token == "/s";
+        }
+        let script = rest.trim_start_matches([' ', '\t']);
+        let kept = !strip
+            && script.matches('"').count() == 2
+            && script.starts_with('"')
+            && script[1..].split('"').next().is_some_and(|inner| {
+                !inner.contains(['&', '<', '>', '(', ')', '@', '^', '|'])
+                    && inner.contains([' ', '\t'])
+            });
+        if kept || !script.starts_with('"') {
+            return Some(script.to_owned());
+        }
+        let inner = &script[1..];
+        Some(match inner.rfind('"') {
+            Some(last) => format!("{}{}", &inner[..last], &inner[last + 1..]),
+            None => inner.to_owned(),
+        })
+    }
+
+    /// `line` split by the MSVC runtime rules (2008 and later), the
+    /// program word read up to its closing quote.
+    fn msvc_split(line: &str) -> Vec<String> {
+        let c: Vec<char> = line.chars().collect();
+        let mut out = Vec::new();
+        let mut i = 0;
+        if c.first() == Some(&'"') {
+            let end = c[1..]
+                .iter()
+                .position(|&x| x == '"')
+                .map_or(c.len(), |p| p + 1);
+            out.push(c[1..end].iter().collect());
+            i = end + 1;
+        }
+        loop {
+            while i < c.len() && matches!(c[i], ' ' | '\t') {
+                i += 1;
+            }
+            if i >= c.len() {
+                return out;
+            }
+            let (mut cur, mut quoted) = (String::new(), false);
+            while i < c.len() {
+                match c[i] {
+                    '\\' => {
+                        let run = c[i..].iter().take_while(|&&x| x == '\\').count();
+                        i += run;
+                        if c.get(i) == Some(&'"') {
+                            cur.extend(std::iter::repeat_n('\\', run / 2));
+                            if run % 2 == 1 {
+                                cur.push('"');
+                                i += 1;
+                            }
+                        } else {
+                            cur.extend(std::iter::repeat_n('\\', run));
+                        }
+                    }
+                    '"' if quoted && c.get(i + 1) == Some(&'"') => {
+                        cur.push('"');
+                        i += 2;
+                    }
+                    '"' => {
+                        quoted = !quoted;
+                        i += 1;
+                    }
+                    ' ' | '\t' if !quoted => break,
+                    x => {
+                        cur.push(x);
+                        i += 1;
+                    }
+                }
+            }
+            out.push(cur);
+        }
+    }
+
+    /// `line` split by the plainest rule a host could use: a quote toggles
+    /// grouping and a space or a tab ends a word outside it; a backslash is
+    /// literal.
+    fn toggle_split(line: &str) -> Vec<String> {
+        let (mut out, mut cur, mut quoted, mut started) = (Vec::new(), String::new(), false, false);
+        for ch in line.chars() {
+            match ch {
+                '"' => {
+                    quoted = !quoted;
+                    started = true;
+                }
+                ' ' | '\t' if !quoted => {
+                    if started {
+                        out.push(std::mem::take(&mut cur));
+                        started = false;
+                    }
+                }
+                x => {
+                    cur.push(x);
+                    started = true;
+                }
+            }
+        }
+        if started {
+            out.push(cur);
+        }
+        out
+    }
+
+    /// Check that an accepted cmd call's checked text is the text cmd runs
+    /// from the backend's command line. `Some(false)` on a mismatch, `None`
+    /// when the reader does not accept the call.
+    fn cmd_text_matches(words: &[String]) -> Option<bool> {
+        let script = cmd_script_text(words).ok()?;
+        if script.unmodeled.is_some() || unreadable_found(&cmd(words)) {
+            return None;
+        }
+        let line = kgraf_sandbox::windows_command_line(r"C:\Windows\System32\cmd.exe", words);
+        let visible = cmd_visible(&line)?;
+        Some(visible.trim_start() == script.text.trim_start())
+    }
+
+    /// Check that an accepted PowerShell call's arguments reach PowerShell
+    /// unchanged from the backend's command line under both the MSVC rules
+    /// and the plain toggle rule, so the joined text PowerShell runs is the
+    /// text checked whatever runtime its host uses.
+    fn ps_text_matches(words: &[String]) -> Option<bool> {
+        let script = ps_script_text("powershell", words).ok()?;
+        if script.unmodeled.is_some() || unreadable_found(&powershell("powershell", words)) {
+            return None;
+        }
+        let line = kgraf_sandbox::windows_command_line(
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+            words,
+        );
+        let msvc = msvc_split(&line);
+        let toggle = toggle_split(&line);
+        Some(msvc[1..] == *words && toggle[1..] == *words)
+    }
+
+    #[test]
+    fn every_accepted_plain_script_is_the_text_the_interpreter_runs() {
+        for (words, _) in plain_cmd_cases() {
+            assert_eq!(cmd_text_matches(&argv(words)), Some(true), "{words:?}");
+        }
+        for (words, _) in plain_ps_cases() {
+            assert_eq!(ps_text_matches(&words), Some(true), "{words:?}");
+        }
+    }
+
+    /// The same property over generated argument lists: every call the
+    /// reader accepts, drawn from the characters each interpreter treats
+    /// specially, runs the text checked. A fixed seed keeps it repeatable.
+    #[test]
+    fn generated_accepted_scripts_are_the_text_the_interpreter_runs() {
+        const ALPHABET: &[char] = &[
+            'a', 'b', 'x', ' ', ' ', '\t', '"', '\\', '&', '|', '^', '%', '!', '(', ')', '<', '>',
+            '@', ';', ',', '=', '/', '$', '\'', '`', '{', '}', '#', '-', '.', ':', '\n',
+        ];
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = |n: usize| {
+            // xorshift64: deterministic, no dependency.
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % n as u64) as usize
+        };
+        let (mut cmd_accepted, mut ps_accepted) = (0, 0);
+        for _ in 0..40_000 {
+            let mut script: Vec<String> = (0..1 + next(3))
+                .map(|_| {
+                    (0..next(7))
+                        .map(|_| ALPHABET[next(ALPHABET.len())])
+                        .collect()
+                })
+                .collect();
+            if script.iter().all(|w| w.trim().is_empty()) {
+                script.insert(0, "dir".to_owned());
+            }
+            let mut words: Vec<String> = [&[][..], &["/s"], &["/d", "/q"], &["/v:on/s"]][next(4)]
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect();
+            words.push("/c".to_owned());
+            words.extend(script.iter().cloned());
+            if let Some(ok) = cmd_text_matches(&words) {
+                assert!(ok, "cmd {words:?}");
+                cmd_accepted += 1;
+            }
+            let mut words = argv(&["-NoProfile", "-c"]);
+            words.extend(script);
+            if let Some(ok) = ps_text_matches(&words) {
+                assert!(ok, "powershell {words:?}");
+                ps_accepted += 1;
+            }
+        }
+        // The generator reaches the accepted forms, not only refusals.
+        assert!(
+            cmd_accepted > 1_000 && ps_accepted > 1_000,
+            "{cmd_accepted} {ps_accepted}"
+        );
     }
 }

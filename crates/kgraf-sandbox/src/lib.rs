@@ -27,6 +27,7 @@ pub use kgraf_core::repo_lock;
 mod sandbox;
 #[cfg(unix)]
 pub mod trust;
+mod win_command_line;
 mod workspace;
 
 pub use build_dir::{
@@ -58,6 +59,7 @@ pub use sandbox::{
 };
 #[cfg(target_os = "linux")]
 pub use sandbox::{LinuxConfinement, linux_confinement};
+pub use win_command_line::windows_command_line;
 pub use workspace::{
     CheckFolder, HostId, LEGACY_LOCK_TAG, LOCK_TAG, Liveness, OrphanCause, OrphanRemoval,
     ProcessIdentity, QuietGuard, ReopenSpec, Workspace, WorkspaceManager, WorkspaceSpec,
