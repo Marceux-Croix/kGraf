@@ -6,9 +6,11 @@ pub mod accounts;
 pub mod dpapi;
 pub mod elevate;
 pub mod firewall;
+pub(crate) mod launch;
 pub mod pipe;
 pub mod runner;
 pub mod setup;
+pub(crate) mod state;
 
 use std::ffi::OsStr;
 use std::io;

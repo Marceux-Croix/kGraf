@@ -276,9 +276,9 @@ pub fn install_network(backend: kgraf_sandbox::Backend) -> InstallNetwork {
         kgraf_sandbox::Backend::WindowsRestrictedToken => {
             InstallNetwork::OpenWithNotice(WINDOWS_NETWORK_OPEN)
         }
-        kgraf_sandbox::Backend::MacosSeatbelt | kgraf_sandbox::Backend::LinuxLandlock => {
-            InstallNetwork::ThroughProxy
-        }
+        kgraf_sandbox::Backend::MacosSeatbelt
+        | kgraf_sandbox::Backend::LinuxLandlock
+        | kgraf_sandbox::Backend::WindowsSandboxUser => InstallNetwork::ThroughProxy,
     }
 }
 
@@ -294,7 +294,8 @@ fn this_install_network() -> InstallNetwork {
 /// What a Windows install says: decision 0011, no network limit there.
 pub const WINDOWS_NETWORK_OPEN: &str = "network not limited: the Windows sandbox cannot limit \
     network access without administrator rights (decision 0011), so the install ran with the \
-    network open, and its reads were not confined either; its writes were still confined";
+    network open, and its reads were not confined either; its writes were still confined; \
+    run `kgraf sandbox setup` once, with administrator rights, to block it (decision 0097)";
 
 /// Runs one install. [`SandboxedInstall`] is the real one; tests pass a fake.
 pub trait InstallRunner: Send + Sync {

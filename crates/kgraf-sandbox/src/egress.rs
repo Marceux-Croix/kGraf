@@ -372,7 +372,7 @@ impl EgressProxy {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+            let listener = bind_for_sandbox()?;
             let port = listener.local_addr()?.port();
             let proxy = Self { shared, port };
             proxy.serve(listener)?;
@@ -549,6 +549,40 @@ fn max_connections() -> usize {
     #[cfg(not(unix))]
     {
         MAX_CONNECTIONS
+    }
+}
+
+/// The loopback listener a sandboxed command's proxy uses. On Windows, the
+/// first free port of [`crate::sandbox_user::PROXY_PORTS`]: the offline
+/// sandbox user's firewall rules leave only those loopback ports open
+/// (decision 0097). Elsewhere, a port the system picks.
+#[cfg(not(target_os = "linux"))]
+fn bind_for_sandbox() -> io::Result<TcpListener> {
+    #[cfg(windows)]
+    {
+        let range = crate::sandbox_user::PROXY_PORTS;
+        for port in range.clone() {
+            match TcpListener::bind((Ipv4Addr::LOCALHOST, port)) {
+                Ok(listener) => return Ok(listener),
+                Err(e) if e.kind() == io::ErrorKind::AddrInUse => continue,
+                // Windows reports a port another program holds exclusively
+                // as access denied.
+                Err(e) if e.kind() == io::ErrorKind::PermissionDenied => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!(
+                "every egress proxy port from {} to {} is in use",
+                range.start(),
+                range.end()
+            ),
+        ))
+    }
+    #[cfg(not(windows))]
+    {
+        TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
     }
 }
 

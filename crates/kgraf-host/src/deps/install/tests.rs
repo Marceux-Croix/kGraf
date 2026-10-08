@@ -661,9 +661,9 @@ fn a_link_an_install_left_in_the_stores_is_never_followed_by_kgraf() {
 
 // ---- the Windows rule, tested on every platform ---------------------------
 
-/// Windows' backend cannot deny the network: an install there runs with it
-/// open and says so (decision 0011); every other backend goes through the
-/// proxy.
+/// Windows' token backend cannot deny the network: an install there runs
+/// with it open and says so (decision 0011); every other backend, the
+/// Windows sandbox user included (decision 0097), goes through the proxy.
 #[test]
 fn only_the_windows_backend_runs_an_install_with_the_network_open() {
     use kgraf_sandbox::Backend;
@@ -679,7 +679,12 @@ fn only_the_windows_backend_runs_an_install_with_the_network_open() {
         install_network(Backend::LinuxLandlock),
         InstallNetwork::ThroughProxy
     );
+    assert_eq!(
+        install_network(Backend::WindowsSandboxUser),
+        InstallNetwork::ThroughProxy
+    );
     assert!(WINDOWS_NETWORK_OPEN.contains("decision 0011"));
+    assert!(WINDOWS_NETWORK_OPEN.contains("kgraf sandbox setup"));
     assert!(WINDOWS_NETWORK_OPEN.contains("writes were still confined"));
 }
 

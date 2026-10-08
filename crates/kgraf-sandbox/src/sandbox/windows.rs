@@ -205,6 +205,31 @@ pub(super) const STRENGTH: IsolationStrength = IsolationStrength {
            cross-sandbox write denial are unverified on Windows",
 };
 
+/// The backend name once `kgraf sandbox setup` has run: commands run as a
+/// dedicated local sandbox user (decision 0097).
+pub(super) const USER_BACKEND_NAME: &str = "Windows sandbox user";
+
+/// What the sandbox user mode enforces. The user's own token has no
+/// restricting SIDs, so Schannel TLS and the MSYS2 runtime work; writes are
+/// confined by ACL entries for the sandbox user on the writable roots; the
+/// owner's profile admits only the owner, SYSTEM and Administrators, so the
+/// sandbox user cannot read it; the offline user's network is blocked by
+/// firewall rules scoped to its SID. The flags stay false where Windows has
+/// not yet confirmed them (the escape tests in `tests/escape_windows.rs`).
+pub(super) const USER_STRENGTH: IsolationStrength = IsolationStrength {
+    backend: Backend::WindowsSandboxUser,
+    // Unverified on Windows.
+    writes_confined: false,
+    reads: ReadConfinement::CredentialDenyList,
+    unix_sockets_confined: false,
+    network_deniable: true,
+    // The deny ACE on the top-level `.git` entry is written for the sandbox
+    // user, but not yet verified on Windows.
+    gitlink_protected: false,
+    git_config_freezable: false,
+    gaps: "the sandbox user can read whatever every local user can read (other drives,            Program Files, world-readable folders), though not the owner's profile; DNS            lookups go through the system's DNS client service, which the firewall rules do            not scope to the sandbox user, so a name lookup can leave the machine; commands            that run at the same time run as the same user and can write each other's            writable folders while both run; unix-domain sockets are confined only by their            own ACLs; write confinement, the gitlink deny and the network block are            unverified on Windows",
+};
+
 /// The TLS library tools are steered to inside this sandbox. The Windows
 /// stack (Schannel) cannot run under the sandbox token (see the module
 /// header); Git for Windows ships OpenSSL beside it.
@@ -545,11 +570,13 @@ pub(super) fn hidden_denials<'a, S>(
 }
 
 #[cfg(windows)]
-pub(crate) use imp::AttributeList;
-#[cfg(windows)]
 pub use imp::SandboxedChild;
 #[cfg(windows)]
-pub(super) use imp::{Prepared, default_stdio, output, prepare, prepare_root, spawn, status};
+pub(crate) use imp::{AttributeList, revoke};
+#[cfg(windows)]
+pub(super) use imp::{
+    Prepared, default_stdio, is_partial, output, prepare, prepare_root, spawn, status, strength,
+};
 
 #[cfg(windows)]
 mod imp {
@@ -569,7 +596,7 @@ mod imp {
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertStringSidToSidW, DENY_ACCESS, EXPLICIT_ACCESS_W, GRANT_ACCESS,
-        GetNamedSecurityInfoW, SE_FILE_OBJECT, SE_WINDOW_OBJECT, SetEntriesInAclW,
+        GetNamedSecurityInfoW, REVOKE_ACCESS, SE_FILE_OBJECT, SE_WINDOW_OBJECT, SetEntriesInAclW,
         SetNamedSecurityInfoW, SetSecurityInfo, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
     };
     use windows_sys::Win32::Security::{
@@ -629,12 +656,17 @@ mod imp {
         UpdateProcThreadAttribute, WaitForSingleObject,
     };
 
-    use super::super::{Network, Redirect, Resolved};
+    use super::super::{IsolationStrength, Network, Redirect, Resolved};
     use super::{
-        BACKEND_NAME, SHELL_COMMAND_VAR, ShellLaunch, capability_sid_string, env_block,
-        inherited_vars, is_batch_file, posix_shell, shell_launch,
+        BACKEND_NAME, SHELL_COMMAND_VAR, STRENGTH, ShellLaunch, USER_BACKEND_NAME, USER_STRENGTH,
+        capability_sid_string, env_block, inherited_vars, is_batch_file, posix_shell, shell_launch,
     };
     use crate::error::SandboxError;
+    use crate::sandbox_user::PROXY_PORTS;
+    use crate::sandbox_user::names::Role;
+    use crate::sandbox_user::runner::Request;
+    use crate::sandbox_user::windows::launch;
+    use crate::sandbox_user::windows::state::{self, LoadedUser, Users};
     // Shared with the command policy's check of a `cmd /c` or PowerShell
     // script, so it is built on every platform.
     use crate::win_command_line::command_line;
@@ -908,6 +940,153 @@ mod imp {
         Ok(())
     }
 
+    // ---- ACLs for the sandbox user (decision 0097) ---------------------------
+
+    /// Read and run: what the sandbox user gets on the folders it reads.
+    const READ_MASK: u32 = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
+    /// What a hidden folder denies the sandbox user: reads and writes. Deny
+    /// on read takes effect here, unlike under the write-restricted token,
+    /// whose restricting SIDs are consulted for writes only.
+    const DENY_ALL_MASK: u32 = READ_MASK | DENY_WRITE_MASK;
+
+    /// Admit `sid` to read and run `path` and, for a folder, everything
+    /// below it. Written only while absent, as [`grant_writable_root`] is.
+    /// True when it was written now. A reparse point is refused first, so
+    /// the entry never lands on a link's target (decision 0083).
+    fn grant_read(path: &Path, sid: &Sid) -> Result<bool, SandboxError> {
+        refuse_reparse(path)?;
+        let flags = if path.is_dir() {
+            OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
+        } else {
+            NO_INHERITANCE
+        };
+        let dacl = read_dacl(path)?;
+        if has_ace(&dacl, ACCESS_ALLOWED_ACE_TYPE, sid, READ_MASK, flags) {
+            return Ok(false);
+        }
+        apply(
+            path,
+            &dacl,
+            &[explicit(sid, READ_MASK, GRANT_ACCESS, flags)],
+        )?;
+        if !has_ace(
+            &read_dacl(path)?,
+            ACCESS_ALLOWED_ACE_TYPE,
+            sid,
+            READ_MASK,
+            flags,
+        ) {
+            return Err(SandboxError::PlatformSetup {
+                step: "verify a read grant for the sandbox user",
+                source: io::Error::other(format!(
+                    "the read entry for {} is missing after SetNamedSecurityInfoW",
+                    path.display()
+                )),
+            });
+        }
+        Ok(true)
+    }
+
+    /// Deny `sid` every read and write beneath the hidden folder `dir`. A
+    /// writable root beneath it keeps its own explicit grant, which precedes
+    /// the inherited deny.
+    fn deny_all(dir: &Path, sid: &Sid) -> Result<(), SandboxError> {
+        refuse_reparse(dir)?;
+        let flags = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE;
+        let dacl = read_dacl(dir)?;
+        if has_ace(&dacl, ACCESS_DENIED_ACE_TYPE, sid, DENY_ALL_MASK, flags) {
+            return Ok(());
+        }
+        apply(
+            dir,
+            &dacl,
+            &[explicit(sid, DENY_ALL_MASK, DENY_ACCESS, flags)],
+        )
+    }
+
+    /// Remove every explicit entry for the SIDs `sids` from `path`
+    /// (`kgraf sandbox remove`). A path that no longer exists is skipped; a
+    /// reparse point is refused, never followed (decision 0083).
+    pub(crate) fn revoke(path: &Path, sids: &[&str]) -> Result<(), SandboxError> {
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => {
+                return Err(SandboxError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
+        }
+        refuse_reparse(path)?;
+        let sids = sids
+            .iter()
+            .map(|s| Sid::from_string(s))
+            .collect::<Result<Vec<_>, _>>()?;
+        let entries: Vec<EXPLICIT_ACCESS_W> = sids
+            .iter()
+            .map(|sid| explicit(sid, 0, REVOKE_ACCESS, NO_INHERITANCE))
+            .collect();
+        let dacl = read_dacl(path)?;
+        apply(path, &dacl, &entries)
+    }
+
+    /// The folders the sandbox user reads beyond its writable roots: the
+    /// policy's read roots (the git common directory, package stores), the
+    /// dependency trees, the toolchain, and the folders on `PATH` inside the
+    /// owner's profile. The profile itself admits only the owner, SYSTEM and
+    /// Administrators, so a tool installed there would not start otherwise.
+    /// The toolchain follows `toolchain_reads_from` with rustup's own
+    /// defaults (`%USERPROFILE%\.cargo`, `%USERPROFILE%\.rustup`), so the cargo
+    /// home's `credentials.toml` is never granted: only its `bin`,
+    /// `registry` and `git` folders are.
+    fn user_reads(
+        policy: &Resolved,
+        profile: Option<&Path>,
+    ) -> (Vec<PathBuf>, Vec<(String, OsString)>) {
+        let mut reads: Vec<PathBuf> = Vec::new();
+        let mut push = |p: PathBuf| {
+            let p = strip_verbatim(&p);
+            if !reads.contains(&p) {
+                reads.push(p);
+            }
+        };
+        policy.readable.iter().cloned().for_each(&mut push);
+        policy.dependency_reads.iter().cloned().for_each(&mut push);
+        let mut env = Vec::new();
+        let var = |name: &str, default: &str| -> Option<OsString> {
+            std::env::var_os(name)
+                .filter(|v| !v.is_empty())
+                .or_else(|| profile.map(|p| p.join(default).into_os_string()))
+        };
+        let cargo = var("CARGO_HOME", ".cargo");
+        let rustup = var("RUSTUP_HOME", ".rustup");
+        // A command that runs as another user would look for the toolchain in
+        // that user's profile; it is told where the owner's is, also after
+        // an environment clear.
+        for (name, value) in [("CARGO_HOME", &cargo), ("RUSTUP_HOME", &rustup)] {
+            if let Some(v) = value
+                && Path::new(v).is_dir()
+            {
+                env.push((name.to_owned(), v.clone()));
+            }
+        }
+        let toolchain = super::super::toolchain_reads_from(rustup, cargo, profile);
+        toolchain.reads.into_iter().for_each(&mut push);
+        if let (Some(profile), Some(path)) = (profile, std::env::var_os("PATH")) {
+            for dir in std::env::split_paths(&path) {
+                if let Ok(real) = kgraf_core::plain_path::canonicalize(&dir)
+                    && real.is_dir()
+                    && real.starts_with(profile)
+                    && real != profile
+                {
+                    push(real);
+                }
+            }
+        }
+        (reads, env)
+    }
+
     /// Deny writes to `path` for `sid` (the top-level `.git` entry). Deny ACEs
     /// are ordered before allows by `SetEntriesInAclW`.
     fn deny_writes(path: &Path, sid: &Sid) -> Result<(), SandboxError> {
@@ -1064,11 +1243,43 @@ mod imp {
         caps: Vec<Sid>,
         /// Identifies the workspace, so its private desktop is reused.
         desktop_key: String,
+        /// When set, the command starts as this sandbox user through the
+        /// runner (decision 0097) instead of under the restricted token.
+        user: Option<SandboxUser>,
+    }
+
+    /// The sandbox user a command starts as, and the runner that starts it.
+    #[derive(Debug)]
+    pub(in crate::sandbox) struct SandboxUser {
+        user: &'static LoadedUser,
+        runner: &'static Path,
+        /// Variables the command gets unless it sets them itself: where the
+        /// owner's toolchain is (`user_reads`).
+        env: Vec<(String, OsString)>,
+    }
+
+    /// The strength of the mode this process uses: the sandbox user once
+    /// setup has run, the restricted token otherwise. An error when setup
+    /// ran but its users cannot be used (`state`).
+    pub(in crate::sandbox) fn strength() -> Result<IsolationStrength, SandboxError> {
+        Ok(match state::users()? {
+            Some(_) => USER_STRENGTH,
+            None => STRENGTH,
+        })
+    }
+
+    /// Whether this process uses the restricted token, whose isolation is
+    /// partial and needs the policy's opt-in.
+    pub(in crate::sandbox) fn is_partial() -> Result<bool, SandboxError> {
+        Ok(state::users()?.is_none())
     }
 
     /// Check what the backend can enforce and set the root ACLs. Runs when the
     /// command is built, so a failure surfaces before anything starts.
     pub(in crate::sandbox) fn prepare(policy: &Resolved) -> Result<Prepared, SandboxError> {
+        if let Some(users) = state::users()? {
+            return prepare_for_user(policy, users);
+        }
         if policy.network == Network::Deny {
             return Err(SandboxError::PolicyNotEnforceable {
                 backend: BACKEND_NAME,
@@ -1146,7 +1357,99 @@ mod imp {
             .first()
             .map(|r| r.to_string_lossy().to_lowercase())
             .unwrap_or_default();
-        Ok(Prepared { caps, desktop_key })
+        Ok(Prepared {
+            caps,
+            desktop_key,
+            user: None,
+        })
+    }
+
+    /// [`prepare`] once setup has run: pick the sandbox user for the policy's
+    /// network and grant it write on the writable roots. The offline user
+    /// runs a command with the network denied or through the egress proxy
+    /// (its firewall rules leave only the proxy's ports open); the online
+    /// user runs one with the network open.
+    fn prepare_for_user(
+        policy: &Resolved,
+        users: &'static Users,
+    ) -> Result<Prepared, SandboxError> {
+        if !policy.unix_sockets.is_empty() {
+            return Err(SandboxError::PolicyNotEnforceable {
+                backend: USER_BACKEND_NAME,
+                what: "a unix-socket allowlist (a socket is confined only by its own ACL)",
+            });
+        }
+        let role = match policy.network {
+            Network::Allow => Role::Online,
+            Network::Deny => Role::Offline,
+            Network::Proxy { port } if PROXY_PORTS.contains(&port) => Role::Offline,
+            Network::Proxy { .. } => {
+                return Err(SandboxError::PolicyNotEnforceable {
+                    backend: USER_BACKEND_NAME,
+                    what: "an egress proxy port outside 47100 to 47131, the only loopback \
+                           ports the offline sandbox user's firewall rules leave open",
+                });
+            }
+        };
+        let user = users.user(role);
+        let sid = Sid::from_string(&user.sid)?;
+        let roots: Vec<PathBuf> = policy.writable.iter().map(|r| strip_verbatim(r)).collect();
+        for root in &roots {
+            // As in `prepare`: refuse a junction and a non-ACL volume before
+            // any security call.
+            refuse_reparse(root)?;
+            require_acl_volume(root)?;
+            grant_writable_root(root, &sid)?;
+        }
+        for root in &roots {
+            let gitlink = root.join(".git");
+            match std::fs::symlink_metadata(&gitlink) {
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(source) => {
+                    return Err(SandboxError::Io {
+                        path: gitlink,
+                        source,
+                    });
+                }
+            }
+            refuse_reparse(&gitlink)?;
+            deny_writes(&gitlink, &sid)?;
+        }
+        // A hidden folder always lies beneath a writable root (the policy
+        // checks it), so the sandbox user is denied there.
+        for hidden in &policy.hidden {
+            deny_all(&strip_verbatim(&hidden.dir), &sid)?;
+        }
+        let profile = std::env::var_os("USERPROFILE")
+            .filter(|p| !p.is_empty())
+            .and_then(|p| kgraf_core::plain_path::canonicalize(PathBuf::from(p)).ok());
+        let (reads, env) = user_reads(policy, profile.as_deref());
+        for dir in &reads {
+            // A read root inside a writable root is already granted there.
+            if roots.iter().any(|r| dir.starts_with(r)) {
+                continue;
+            }
+            if grant_read(dir, &sid)? {
+                users.record_grant(dir)?;
+            }
+        }
+        // The runner must be readable and runnable by both users wherever
+        // kGraf is installed.
+        for u in [&users.offline, &users.online] {
+            if grant_read(&users.runner, &Sid::from_string(&u.sid)?)? {
+                users.record_grant(&users.runner)?;
+            }
+        }
+        Ok(Prepared {
+            caps: Vec::new(),
+            desktop_key: String::new(),
+            user: Some(SandboxUser {
+                user,
+                runner: &users.runner,
+                env,
+            }),
+        })
     }
 
     /// Confirm the restricted token is actually granted write on `root` and on
@@ -1162,6 +1465,17 @@ mod imp {
     /// written again on each command (see `gaps`).
     pub(in crate::sandbox) fn prepare_root(root: &Path) -> Result<(), SandboxError> {
         let root = strip_verbatim(root);
+        if let Some(users) = state::users()? {
+            // Either sandbox user may run a command here, so both get the
+            // grant ([`prepare_for_user`] writes the one it uses again, a
+            // no-op while it is present).
+            refuse_reparse(&root)?;
+            require_acl_volume(&root)?;
+            for user in [&users.offline, &users.online] {
+                grant_writable_root(&root, &Sid::from_string(&user.sid)?)?;
+            }
+            return Ok(());
+        }
         let sid = Sid::from_string(&capability_sid_string(&root.to_string_lossy()))?;
         refuse_reparse(&root)?;
         require_acl_volume(&root)?;
@@ -2069,6 +2383,7 @@ mod imp {
     fn final_env(
         cmd: &Command,
         extra: Option<(&str, &str)>,
+        defaults: &[(String, OsString)],
         inherit_all: bool,
     ) -> (Vec<u16>, Option<OsString>) {
         let inherited: Vec<_> = inherited_vars(std::env::vars_os(), inherit_all)
@@ -2089,6 +2404,19 @@ mod imp {
                 name.encode_utf16().collect(),
                 Some(value.encode_utf16().collect()),
             ));
+        }
+        // A default applies only where the command did not set or remove the
+        // variable itself.
+        for (name, value) in defaults {
+            if !cmd
+                .get_envs()
+                .any(|(k, _)| k.eq_ignore_ascii_case(OsStr::new(name)))
+            {
+                overrides.push((
+                    name.encode_utf16().collect(),
+                    Some(value.encode_wide().collect()),
+                ));
+            }
         }
         let block = env_block(inherited, overrides);
         // PATH as the child will see it, for program lookup.
@@ -2165,8 +2493,10 @@ mod imp {
         process: OwnedHandle,
         pid: u32,
         job: OwnedHandle,
-        /// Keeps the (shared, per-workspace) desktop alive while the child runs.
-        _desktop: DesktopGuard,
+        /// Keeps the (shared, per-workspace) desktop alive while the child
+        /// runs. `None` for a command that runs as the sandbox user: its
+        /// runner holds the command's own window station.
+        _desktop: Option<DesktopGuard>,
     }
 
     /// Debug-printable wrapper so `SandboxedChild` can derive Debug.
@@ -2385,6 +2715,7 @@ mod imp {
             launch
                 .as_ref()
                 .map(|l| (SHELL_COMMAND_VAR, l.command.as_str())),
+            prepared.user.as_ref().map_or(&[][..], |u| &u.env[..]),
             inherit_env,
         );
         let program = match &launch {
@@ -2416,6 +2747,9 @@ mod imp {
                 cmd.get_args().map(|a| a.encode_wide().collect::<Vec<_>>()),
             ),
         };
+        if let Some(user) = &prepared.user {
+            return spawn_as_user(user, &program, line, cwd, env, stdio);
+        }
         line.push(0);
 
         // The desktop first: its SID is one of the token's restricting SIDs.
@@ -2520,7 +2854,58 @@ mod imp {
             process,
             pid: pi.dwProcessId,
             job,
-            _desktop: DesktopGuard(desktop),
+            _desktop: Some(DesktopGuard(desktop)),
+        })
+    }
+
+    /// Start a command as the sandbox user: the runner starts as that user
+    /// in a new job and starts the command (see `sandbox_user::windows::launch`).
+    /// `line` is the command line without its terminating NUL; `env` is a
+    /// complete environment block.
+    fn spawn_as_user(
+        user: &SandboxUser,
+        program: &Path,
+        line: Vec<u16>,
+        cwd: &Path,
+        env: Vec<u16>,
+        stdio: [Redirect; 3],
+    ) -> Result<SandboxedChild, SandboxError> {
+        let request = Request {
+            application: program.as_os_str().encode_wide().collect(),
+            command_line: line,
+            directory: strip_verbatim(cwd).as_os_str().encode_wide().collect(),
+            environment: env,
+        };
+        let job = create_job()?;
+        let [stdin, stdout, stderr] = [
+            stream(STD_INPUT_HANDLE, stdio[0])?,
+            stream(STD_OUTPUT_HANDLE, stdio[1])?,
+            stream(STD_ERROR_HANDLE, stdio[2])?,
+        ];
+        let raw = |s: &Stream| {
+            s.child
+                .as_ref()
+                .map_or(ptr::null_mut(), |h| h.as_raw_handle())
+        };
+        let started = launch::start(
+            &launch::Credential {
+                name: &user.user.name,
+                sid: &user.user.sid,
+                password: &user.user.password,
+            },
+            user.runner,
+            [raw(&stdin), raw(&stdout), raw(&stderr)],
+            &job,
+            &request,
+        )?;
+        Ok(SandboxedChild {
+            stdin: stdin.parent.map(ChildStdin::from),
+            stdout: stdout.parent.map(ChildStdout::from),
+            stderr: stderr.parent.map(ChildStderr::from),
+            process: started.runner,
+            pid: started.command_pid,
+            job,
+            _desktop: None,
         })
     }
 

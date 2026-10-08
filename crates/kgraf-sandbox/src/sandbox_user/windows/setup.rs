@@ -18,7 +18,7 @@ use super::super::plan::{
     plan_remove, plan_setup, status_report,
 };
 use super::super::record::{DENIED_LOGON_RIGHTS, Record, UndoEntry};
-use super::super::store::load_user;
+use super::super::store::{grants_path, load_user, parse_grants};
 use super::{accounts, dpapi::Dpapi, elevate, firewall, pipe};
 use crate::error::SandboxError;
 
@@ -385,6 +385,7 @@ pub fn remove(
     store: &Path,
     on_event: &mut dyn FnMut(&Event),
 ) -> Result<(), SandboxError> {
+    revoke_grants(store)?;
     drive(names, launch, ElevatedAction::Remove, on_event)?;
     match std::fs::remove_file(store) {
         Ok(()) => Ok(()),
@@ -445,4 +446,27 @@ pub fn stored_user(
     load_user(&bytes, role, &Dpapi)
         .map(Some)
         .map_err(|e| setup_error("open the stored sandbox password", e))
+}
+
+/// Remove the sandbox users' entries from every folder of the owner's that
+/// the grants list beside `store` names, then delete the list. Runs before
+/// the users are removed, as the owner, who may rewrite the DACLs of the
+/// owner's own folders. The first failure stops it and keeps the list, so
+/// `remove` can run again.
+fn revoke_grants(store: &Path) -> Result<(), SandboxError> {
+    let list = grants_path(store);
+    let text = match std::fs::read_to_string(&list) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(setup_error("read the sandbox grants list", e)),
+    };
+    let bytes =
+        std::fs::read(store).map_err(|e| setup_error("read the stored sandbox users", e))?;
+    let users =
+        decode_users(&bytes).map_err(|e| setup_error("read the stored sandbox users", e))?;
+    let sids: Vec<&str> = users.iter().map(|(u, _)| u.sid.as_str()).collect();
+    for path in parse_grants(&text) {
+        crate::sandbox::revoke_sandbox_grant(&path, &sids)?;
+    }
+    std::fs::remove_file(&list).map_err(|e| setup_error("delete the sandbox grants list", e))
 }

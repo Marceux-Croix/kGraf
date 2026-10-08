@@ -8,7 +8,7 @@
 //! error: running with less confinement than setup promised would be silent
 //! degradation.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::blob::{BlobError, Protector, StoredUser, decode_users};
 use super::names::Role;
@@ -27,6 +27,29 @@ pub fn credentials_file_name(tag: Option<&str>) -> String {
 pub fn credentials_path(tag: Option<&str>) -> Option<PathBuf> {
     directories::ProjectDirs::from("", "", kgraf_diag::paths::APP_NAME)
         .map(|dirs| dirs.config_dir().join(credentials_file_name(tag)))
+}
+
+/// The list of the owner's folders that hold an entry for the sandbox users,
+/// beside the store at `store`. Grants on the owner's toolchain, `PATH`
+/// folders, git directory and package stores stay in place between
+/// commands, because writing a folder's DACL rewrites the inherited entries
+/// of every file below it; `kgraf sandbox remove` removes each one listed.
+pub fn grants_path(store: &Path) -> PathBuf {
+    store.with_extension("grants")
+}
+
+/// The folders a grants list names: one absolute path per line, each once,
+/// in the order first written. Blank and relative lines are skipped, so a
+/// damaged line never names a folder relative to where `remove` runs.
+pub fn parse_grants(text: &str) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for line in text.lines() {
+        let path = PathBuf::from(line.trim_end_matches('\r'));
+        if path.is_absolute() && !out.contains(&path) {
+            out.push(path);
+        }
+    }
+    out
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -105,6 +128,30 @@ mod tests {
             ),
             sid: format!("S-1-5-21-1-2-3-{rid}"),
         }
+    }
+
+    #[test]
+    fn the_grants_list_sits_beside_the_store_and_parses_absolute_paths_once() {
+        let store = Path::new("/cfg/sandbox-credentials-t1.bin");
+        assert_eq!(
+            grants_path(store),
+            Path::new("/cfg/sandbox-credentials-t1.grants")
+        );
+        let abs = if cfg!(windows) {
+            r"C:\Users\o\.cargo\bin"
+        } else {
+            "/home/o/.cargo/bin"
+        };
+        let other = if cfg!(windows) {
+            r"C:\Users\o\.rustup"
+        } else {
+            "/home/o/.rustup"
+        };
+        let text = format!("{abs}\r\n\nrelative\\x\n{other}\n{abs}\n");
+        assert_eq!(
+            parse_grants(&text),
+            vec![PathBuf::from(abs), PathBuf::from(other)]
+        );
     }
 
     #[test]

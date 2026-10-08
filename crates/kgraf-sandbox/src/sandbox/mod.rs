@@ -904,6 +904,9 @@ pub enum Backend {
     /// name predates those layers.
     LinuxLandlock,
     WindowsRestrictedToken,
+    /// Windows after `kgraf sandbox setup`: commands run as a dedicated local
+    /// sandbox user (decision 0097).
+    WindowsSandboxUser,
 }
 
 /// How reads outside the workspace are limited.
@@ -952,13 +955,15 @@ pub struct IsolationStrength {
 /// because the backend cannot deny it ([`CheckNetwork`]).
 pub const NETWORK_OPEN_NOTICE: &str = "network not blocked: the Windows sandbox cannot deny \
     network access without administrator rights (decision 0011); this check ran with the \
-    network open";
+    network open; \
+    run `kgraf sandbox setup` once, with administrator rights, to block it (decision 0097)";
 
 /// The sentence the worker's shell carries when its commands run with the
 /// network open because the backend cannot deny it ([`CheckNetwork`]).
 pub const SHELL_NETWORK_OPEN_NOTICE: &str = "network not blocked: the Windows sandbox cannot \
     deny network access without administrator rights (decision 0011); shell commands run with \
-    the network open";
+    the network open; \
+    run `kgraf sandbox setup` once, with administrator rights, to block it (decision 0097)";
 
 /// The line a shell result carries on Windows when a command's output shows
 /// the Windows TLS stack (Schannel) refused to start: that stack cannot run
@@ -1063,7 +1068,7 @@ pub fn platform_isolation() -> Result<IsolationStrength, SandboxError> {
     }
     #[cfg(windows)]
     {
-        Ok(windows::STRENGTH)
+        windows::strength()
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
@@ -1309,6 +1314,10 @@ pub(crate) use windows::AttributeList;
 /// (std cannot spawn under another token).
 #[cfg(windows)]
 pub use windows::SandboxedChild;
+/// Remove the sandbox users' entries from one of the owner's folders
+/// (`kgraf sandbox remove`).
+#[cfg(windows)]
+pub(crate) use windows::revoke as revoke_sandbox_grant;
 
 /// Set the write ACL and Low label of the writable root `root` before a
 /// dependency junction is made in it (`crate::dependencies`).
@@ -1582,7 +1591,7 @@ pub fn sandboxed_command(
         }
         #[cfg(windows)]
         let prepared = {
-            if !policy.accept_partial {
+            if !policy.accept_partial && windows::is_partial()? {
                 return Err(SandboxError::PartialIsolation {
                     backend: windows::BACKEND_NAME,
                     gaps: windows::STRENGTH.gaps,

@@ -78,7 +78,8 @@ junction = { version = "2.1.0", default-features = false }
 # handle with `NtCreateFile` (`confined.rs`), never following a reparse point.
 # `Win32_System_Threading` and `Win32_System_Registry` also serve owner liveness
 # (`win_process.rs`): `OpenProcess`, `GetProcessTimes`, `WaitForSingleObject`,
-# and `MachineGuid` through `RegGetValueW`.
+# and `MachineGuid` through `RegGetValueW`. `Win32_System_SystemInformation`:
+# the sandbox user's runner starts in the system folder (`GetSystemDirectoryW`).
 windows-sys = { version = "0.61.2", features = [
     "Wdk_Foundation",
     "Wdk_Storage_FileSystem",
@@ -97,6 +98,7 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_Pipes",
     "Win32_System_Registry",
     "Win32_System_StationsAndDesktops",
+    "Win32_System_SystemInformation",
     "Win32_System_SystemServices",
     "Win32_System_Threading",
     "Win32_UI_Shell",

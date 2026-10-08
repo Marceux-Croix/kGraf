@@ -60,7 +60,9 @@ pub use plan::{
     plan_setup, status_report,
 };
 pub use record::{DENIED_LOGON_RIGHTS, Record, RecordError, UndoEntry};
-pub use store::{LoadError, credentials_file_name, credentials_path, load_user};
+pub use store::{
+    LoadError, credentials_file_name, credentials_path, grants_path, load_user, parse_grants,
+};
 
 /// What `kgraf sandbox setup` prints on a platform that needs no setup.
 pub fn no_setup_needed_notice() -> String {

@@ -100,58 +100,14 @@ impl Server {
         child: &OwnedHandle,
         child_pid: u32,
     ) -> Result<mpsc::Receiver<Result<String, String>>, SandboxError> {
-        let raw = self.handle.as_raw_handle() as usize;
-        let (connected_tx, connected_rx) = mpsc::channel::<Result<(), u32>>();
-        std::thread::spawn(move || {
-            // SAFETY: a blocking connect on the server handle, which outlives
-            // this thread's use of it (the caller waits for the result).
-            let ok = unsafe { ConnectNamedPipe(raw as HANDLE, ptr::null_mut()) };
-            // SAFETY: reads the thread's last error.
-            let err = unsafe { GetLastError() };
-            let _ = connected_tx.send(if ok != 0 || err == ERROR_PIPE_CONNECTED {
-                Ok(())
-            } else {
-                Err(err)
-            });
-        });
-        loop {
-            match connected_rx.recv_timeout(Duration::from_millis(200)) {
-                Ok(Ok(())) => break,
-                Ok(Err(code)) => return Err(win32("wait for the elevated step", code)),
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    // SAFETY: a zero-timeout check of the child's handle.
-                    if unsafe { WaitForSingleObject(child.as_raw_handle(), 0) } == WAIT_OBJECT_0 {
-                        // Unblock the connect thread by connecting to our own
-                        // pipe, then report the child's early end.
-                        let _ = connect_client(&self.name);
-                        return Err(SandboxError::PlatformSetup {
-                            step: "wait for the elevated step",
-                            source: std::io::Error::other(
-                                "the elevated step ended before it connected (UAC refused or it \
-                                 failed to start)",
-                            ),
-                        });
-                    }
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err(win32("wait for the elevated step", 0));
-                }
-            }
-        }
-        let mut client_pid = 0u32;
-        // SAFETY: reads the connected client's process ID.
-        if unsafe { GetNamedPipeClientProcessId(self.handle.as_raw_handle(), &mut client_pid) } == 0
-        {
-            return Err(last_error("identify the setup pipe's client"));
-        }
-        if client_pid != child_pid {
-            return Err(SandboxError::PlatformSetup {
-                step: "identify the setup pipe's client",
-                source: std::io::Error::other(format!(
-                    "process {client_pid} connected, not the elevated step {child_pid}"
-                )),
-            });
-        }
+        wait_for_client(
+            &self.handle,
+            &self.name,
+            child,
+            child_pid,
+            "wait for the elevated step",
+            "the elevated step ended before it connected (UAC refused or it failed to start)",
+        )?;
         let file = File::from(self.handle);
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
@@ -165,6 +121,67 @@ impl Server {
         });
         Ok(rx)
     }
+}
+
+/// Wait until a client connects to the server end `server` of pipe `name`,
+/// then check that it is process `child_pid`. Fails with `early_end` if
+/// `child` ends first, and when another process connected. Shared by the
+/// setup pipe and the runner pipe.
+pub(super) fn wait_for_client(
+    server: &OwnedHandle,
+    name: &str,
+    child: &OwnedHandle,
+    child_pid: u32,
+    step: &'static str,
+    early_end: &'static str,
+) -> Result<(), SandboxError> {
+    let raw = server.as_raw_handle() as usize;
+    let (connected_tx, connected_rx) = mpsc::channel::<Result<(), u32>>();
+    std::thread::spawn(move || {
+        // SAFETY: a blocking connect on the server handle, which outlives
+        // this thread's use of it (the caller waits for the result).
+        let ok = unsafe { ConnectNamedPipe(raw as HANDLE, ptr::null_mut()) };
+        // SAFETY: reads the thread's last error.
+        let err = unsafe { GetLastError() };
+        let _ = connected_tx.send(if ok != 0 || err == ERROR_PIPE_CONNECTED {
+            Ok(())
+        } else {
+            Err(err)
+        });
+    });
+    loop {
+        match connected_rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(Ok(())) => break,
+            Ok(Err(code)) => return Err(win32(step, code)),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // SAFETY: a zero-timeout check of the child's handle.
+                if unsafe { WaitForSingleObject(child.as_raw_handle(), 0) } == WAIT_OBJECT_0 {
+                    // Unblock the connect thread by connecting to our own
+                    // pipe, then report the child's early end.
+                    let _ = connect_client(name);
+                    return Err(SandboxError::PlatformSetup {
+                        step,
+                        source: std::io::Error::other(early_end),
+                    });
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Err(win32(step, 0)),
+        }
+    }
+    let mut client_pid = 0u32;
+    // SAFETY: reads the connected client's process ID.
+    if unsafe { GetNamedPipeClientProcessId(server.as_raw_handle(), &mut client_pid) } == 0 {
+        return Err(last_error(step));
+    }
+    if client_pid != child_pid {
+        return Err(SandboxError::PlatformSetup {
+            step,
+            source: std::io::Error::other(format!(
+                "process {client_pid} connected, not the expected process {child_pid}"
+            )),
+        });
+    }
+    Ok(())
 }
 
 fn connect_client(name: &str) -> Result<File, SandboxError> {
