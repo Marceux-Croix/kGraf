@@ -2314,7 +2314,7 @@ place, `[workspace.package].version` in the root `Cargo.toml`, and
 number. The packages are not signed with a developer certificate yet, so expect Gatekeeper
 and SmartScreen warnings. `scripts/release-all.sh` builds every installer from one git
 tag. A `cargo-dist` workflow in `.github/workflows/release.yml` builds draft releases from a
-version tag.
+version tag when started by hand; pushing a tag does not start it.
 
 ### Windows: Git for Windows
 

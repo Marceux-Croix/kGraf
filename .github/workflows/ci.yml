@@ -2,13 +2,13 @@
 # Ubuntu-only by design: Actions minutes are limited, and macOS and Windows
 # runners bill at a higher per-minute rate than Linux. Cross-platform build
 # correctness is instead exercised by the release workflow's per-platform
-# matrix (.github/workflows/release.yml), which only runs on a version tag,
-# not on every push/PR. See scripts/release-local.md for a local Linux/macOS/
+# matrix (.github/workflows/release.yml), which runs only when started by hand
+# from a version tag. See scripts/release-local.md for a local Linux/macOS/
 # Windows build path that costs no Actions minutes at all.
 name: CI
 
-# Push-triggered runs are paused. The same gates run locally before every
-# push. Restore the push trigger below once re-enabled.
+# Manual runs only (workflow_dispatch): no push or pull request starts this
+# workflow. The same gates run locally before every push.
 on:
   workflow_dispatch:
   # push:
@@ -16,10 +16,6 @@ on:
   #   paths-ignore:
   #     - '**.md'
   #     - 'docs/**'
-  pull_request:
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
 
 # No job here writes to the repository; read is enough for checkout.
 permissions:
