@@ -4174,7 +4174,7 @@ name = "kgraf-tbench-bridge"
 version = "0.7.8"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "kgraf-tools",
  "serde",
  "serde_json",
