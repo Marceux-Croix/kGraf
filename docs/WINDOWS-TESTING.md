@@ -120,9 +120,10 @@ baseline, and it stays comparable with earlier runs. Then the phase runs these s
 
 | Step | Command | What it checks |
 |---|---|---|
-| (b) | `kgraf sandbox setup` | Creates the two sandbox users, the group and the firewall rules, with no tag. |
+| (b0) | `kgraf sandbox selfcheck` | Before setup, for comparison only. On the token sandbox it passes with a network line that is not a pass. |
+| (b) | `kgraf sandbox setup` | Creates the sandbox users (one per worker slot, plus the online user), the group and the firewall rules, with no tag. |
 | (c) | `kgraf sandbox status` | Every kGraf line is present. Both stored passwords log on. |
-| (d) | `kgraf sandbox selfcheck` | The gate. If it fails, step (e) does not run. |
+| (d) | `kgraf sandbox selfcheck` | The gate. It passes only if selfcheck exits 0, prints `sandbox selfcheck: ok` and names the backend `Windows sandbox user`. A pass on the token sandbox means setup did not take effect, so it stops the phase too. If the gate fails, step (e) does not run. |
 | (e) | re-run | The sandbox test binaries, the baseline binaries that failed for the cargo jobserver, Git Bash or Schannel, and the end-to-end checks, with the sandbox user active. |
 | (f) | `kgraf sandbox remove`, then `kgraf sandbox status` | Always runs, also after a failure or Ctrl+C. Every kGraf line must be MISSING. |
 

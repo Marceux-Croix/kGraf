@@ -29,6 +29,25 @@ use crate::report::BinaryResult;
 pub const SETUP_LIMIT: Duration = Duration::from_secs(300);
 pub const STATUS_LIMIT: Duration = Duration::from_secs(120);
 pub const SELFCHECK_LIMIT: Duration = Duration::from_secs(300);
+
+/// The lines `kgraf sandbox selfcheck` prints for a pass that proved network
+/// confinement, and the backend line of the Windows sandbox user
+/// (crates/kgraf-cli/src/sandbox_cmd.rs, `backend_name`).
+const SELFCHECK_OK: &str = "sandbox selfcheck: ok";
+const SELFCHECK_SANDBOX_USER: &str = "  backend: Windows sandbox user";
+
+/// The gate passes only when selfcheck exited 0, proved confinement, and ran
+/// on the sandbox user. Under the token sandbox selfcheck also exits 0, with a
+/// network line that is not a pass; a setup that did not take effect must
+/// stop the phase, not re-run the tests on the old backend.
+fn gate_passed(step: &StepRun) -> bool {
+    step.ok()
+        && step.output.lines().any(|l| l.trim_end() == SELFCHECK_OK)
+        && step
+            .output
+            .lines()
+            .any(|l| l.trim_end() == SELFCHECK_SANDBOX_USER)
+}
 pub const REMOVE_LIMIT: Duration = Duration::from_secs(300);
 
 /// Test binaries that always re-run with the sandbox user active (ids without
@@ -267,6 +286,9 @@ pub struct Rerun {
 pub struct SandboxPhase {
     /// Why the phase did not start (nothing was changed), if so.
     pub skipped: Option<String>,
+    /// selfcheck before setup, for comparison: on the token sandbox it passes
+    /// with a network line that is not a pass. Not a gate.
+    pub selfcheck_before: Option<StepRun>,
     pub setup: Option<StepRun>,
     pub status: Option<StepRun>,
     pub status_check: Option<StatusCheck>,
@@ -326,6 +348,12 @@ pub fn run_phase(
     }
 
     // From here on, (f) always runs.
+    p.selfcheck_before = Some(ex.cli(
+        "(b0) selfcheck before setup",
+        &["sandbox", "selfcheck"],
+        SELFCHECK_LIMIT,
+        true,
+    ));
     let setup = ex.cli("(b) setup", &["sandbox", "setup"], SETUP_LIMIT, true);
     if !setup.ok() {
         p.notes.push(format!("Setup {}.", setup.how()));
@@ -345,7 +373,7 @@ pub fn run_phase(
         SELFCHECK_LIMIT,
         true,
     );
-    let passed = gate.ok();
+    let passed = gate_passed(&gate);
     p.selfcheck = Some(gate);
     if !passed {
         p.stopped_at_gate = true;
@@ -475,6 +503,8 @@ pub fn render(first: &[BinaryResult], first_e2e: &[Check], p: &SandboxPhase) -> 
         return md;
     }
 
+    md.push_str("### (b0) selfcheck before setup (not a gate)\n\n");
+    md.push_str(&step_block(&p.selfcheck_before));
     md.push_str("### (b) setup\n\n");
     md.push_str(&step_block(&p.setup));
     md.push_str("### (c) status\n\n");
@@ -633,6 +663,10 @@ mod tests {
         }
     }
 
+    const SELFCHECK_PASS: &str =
+        "sandbox selfcheck: ok\n  backend: Windows sandbox user\n  network: confined";
+    const SELFCHECK_TOKEN: &str = "sandbox selfcheck: network not confined\n  backend: Windows restricted token (token sandbox)";
+
     const STATUS_OK: &str = "  present  Windows Firewall on for every profile\n  present  local firewall rules take effect\n  present  offline sandbox user kgraf-a\n  present  online sandbox user kgraf-b\n  present  stored password of kgraf-a\n  present  stored password of kgraf-b\nThe Windows sandbox user is set up.";
     const STATUS_GONE: &str = "  present  Windows Firewall on for every profile\n  present  local firewall rules take effect\n  MISSING  offline sandbox user kgraf-a\n  MISSING  online sandbox user kgraf-b\n  MISSING  stored passwords\nThe Windows sandbox user is not fully set up: run `kgraf sandbox setup`.";
 
@@ -641,6 +675,8 @@ mod tests {
     struct Fake {
         calls: Vec<String>,
         selfcheck_code: i32,
+        /// What selfcheck prints; `None`: a pass on the sandbox user.
+        selfcheck_out: Option<&'static str>,
         setup_code: i32,
         removed: bool,
         preflight: Option<String>,
@@ -664,7 +700,10 @@ mod tests {
                 }
                 "status" if self.removed => (1, STATUS_GONE),
                 "status" => (0, STATUS_OK),
-                _ => (self.selfcheck_code, "selfcheck output line"),
+                _ => (
+                    self.selfcheck_code,
+                    self.selfcheck_out.unwrap_or(SELFCHECK_PASS),
+                ),
             };
             StepRun {
                 label: label.into(),
@@ -712,6 +751,7 @@ mod tests {
     fn the_gate_stops_the_rerun_and_the_removal_still_runs() {
         let mut ex = Fake {
             selfcheck_code: 1,
+            selfcheck_out: Some("selfcheck output line"),
             ..Fake::default()
         };
         let p = run_phase(&mut ex, &baseline(), Some(true), &|| false);
@@ -728,6 +768,24 @@ mod tests {
         let md = render(&baseline(), &[], &p);
         assert!(md.contains("stopped at the gate"), "{md}");
         assert!(md.contains("selfcheck output line"));
+    }
+
+    /// Under the token sandbox selfcheck exits 0 with a network line that is
+    /// not a pass. A setup that did not take effect must stop the phase.
+    #[test]
+    fn a_selfcheck_pass_on_the_token_sandbox_does_not_open_the_gate() {
+        let mut ex = Fake {
+            selfcheck_out: Some(SELFCHECK_TOKEN),
+            ..Fake::default()
+        };
+        let p = run_phase(&mut ex, &baseline(), Some(true), &|| false);
+        assert!(p.stopped_at_gate);
+        assert!(
+            !ex.calls
+                .iter()
+                .any(|c| c.starts_with("rerun") || c == "e2e")
+        );
+        assert!(ex.calls.contains(&"sandbox remove cancel=false".to_owned()));
     }
 
     #[test]
@@ -904,6 +962,7 @@ mod tests {
         let md = render(&first, &[], &p);
         for want in [
             "## Sandbox user phase",
+            "### (b0) selfcheck before setup (not a gate)",
             "### (b) setup",
             "### (c) status",
             "### (d) selfcheck (gate)",
