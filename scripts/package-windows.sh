@@ -148,10 +148,15 @@ export PATH="$LLVM_BIN:$PATH"
 echo "==> Building kgraf (CLI) and kgraf-app (shell) for $TARGET (release)"
 cargo xwin build --release --target "$TARGET" -p kgraf-cli --bin kgraf
 cargo xwin build --release --target "$TARGET" -p kgraf-shell --bin kgraf-app
+# The sandbox runner (decision 0097): kGraf starts it to run a worker command as
+# the dedicated sandbox user. It must sit beside kgraf.exe, or, once
+# `kgraf sandbox setup` has run, every sandboxed command stops with an error.
+cargo xwin build --release --target "$TARGET" -p kgraf-sandbox --bin kgraf-sandbox-runner
 
 BIN_DIR="$ROOT/target/$TARGET/release"
 CLI_EXE="$BIN_DIR/kgraf.exe"
 APP_EXE="$BIN_DIR/kgraf-app.exe"
+RUNNER_EXE="$BIN_DIR/kgraf-sandbox-runner.exe"
 for exe in "$CLI_EXE" "$APP_EXE"; do
   [[ -f "$exe" ]] || {
     echo "expected build output missing: $exe" >&2
@@ -170,8 +175,8 @@ done
 # despite the fix (reattaching the launching console for a diagnostic invocation only,
 # or a rotated, size-capped log file otherwise -- see its module doc). kgraf.exe
 # is the CLI and MUST stay "(console)": that IS its UI.
-echo "==> file(1) on both executables (expect PE32+ x86-64, MS Windows; kgraf.exe console, kgraf-app.exe GUI)"
-for exe in "$CLI_EXE" "$APP_EXE"; do
+echo "==> file(1) on each executable (expect PE32+ x86-64, MS Windows; kgraf.exe and kgraf-sandbox-runner.exe console, kgraf-app.exe GUI)"
+for exe in "$CLI_EXE" "$APP_EXE" "$RUNNER_EXE"; do
   desc="$(file -b "$exe")"
   echo "  $(basename "$exe"): $desc"
   case "$desc" in
@@ -189,6 +194,14 @@ case "$(file -b "$CLI_EXE")" in
     exit 1
     ;;
 esac
+# The runner relays a command's standard streams, so it is a console binary too.
+case "$(file -b "$RUNNER_EXE")" in
+  *"(console)"*) ;;
+  *)
+    echo "kgraf-sandbox-runner.exe is not a console-subsystem binary: $(file -b "$RUNNER_EXE")" >&2
+    exit 1
+    ;;
+esac
 case "$(file -b "$APP_EXE")" in
   *"(GUI)"*) ;;
   *)
@@ -203,8 +216,8 @@ esac
 # so a dynamic import of either would mean the packaged .exe fails to launch on a bare
 # Windows machine with a "the program can't start because VCRUNTIME140.dll is missing"
 # dialog -- exactly the defect this check catches before it reaches a user.
-echo "==> Verifying neither executable imports the dynamic MSVC CRT (llvm-objdump -p)"
-for exe in "$CLI_EXE" "$APP_EXE"; do
+echo "==> Verifying no executable imports the dynamic MSVC CRT (llvm-objdump -p)"
+for exe in "$CLI_EXE" "$APP_EXE" "$RUNNER_EXE"; do
   imports="$("$LLVM_BIN/llvm-objdump" -p "$exe" | grep -i "DLL Name" || true)"
   bad="$(echo "$imports" | grep -iE "vcruntime|msvcp|concrt|ucrtbase\.dll" || true)"
   if [[ -n "$bad" ]]; then
@@ -237,7 +250,8 @@ done
 echo "==> Sizes"
 CLI_SIZE="$(du -h "$CLI_EXE" | cut -f1)"
 APP_SIZE="$(du -h "$APP_EXE" | cut -f1)"
-echo "kgraf.exe: $CLI_SIZE   kgraf-app.exe: $APP_SIZE"
+RUNNER_SIZE="$(du -h "$RUNNER_EXE" | cut -f1)"
+echo "kgraf.exe: $CLI_SIZE   kgraf-app.exe: $APP_SIZE   kgraf-sandbox-runner.exe: $RUNNER_SIZE"
 
 # --- shared payload: staged copies, generated icon, LICENSE, THIRD_PARTY_NOTICES.md
 # --------------------------------------------------------------------------------------
@@ -252,6 +266,7 @@ echo "kgraf.exe: $CLI_SIZE   kgraf-app.exe: $APP_SIZE"
 # exists, is newer than a staleness sentinel is not tracked here, and ships it.
 cp "$CLI_EXE" "$STAGE_DIR/kgraf.exe"
 cp "$APP_EXE" "$STAGE_DIR/kgraf-app.exe"
+cp "$RUNNER_EXE" "$STAGE_DIR/kgraf-sandbox-runner.exe"
 
 if [[ ! -f "$ROOT/LICENSE" ]]; then
   echo "LICENSE is missing from the repository root" >&2
@@ -404,6 +419,9 @@ if [[ "$HAVE_WIXL" -eq 1 ]]; then
           <Component Id="AppExe" Guid="27fc8a36-87b9-4e64-b43a-cbec00041ea8" Win64="yes">
             <File Id="kGrafAppExe" Source="kgraf-app.exe" KeyPath="yes" />
           </Component>
+          <Component Id="SandboxRunnerExe" Guid="d61487cc-5b8a-4f09-a007-2bb579cde770" Win64="yes">
+            <File Id="kGrafSandboxRunnerExe" Source="kgraf-sandbox-runner.exe" KeyPath="yes" />
+          </Component>
           <Component Id="LicenseFile" Guid="833ada7a-88cc-466e-9b10-58657c465ec1" Win64="yes">
             <File Id="LicenseTxt" Source="LICENSE.txt" KeyPath="yes" />
           </Component>
@@ -427,6 +445,7 @@ if [[ "$HAVE_WIXL" -eq 1 ]]; then
     <Feature Id="MainFeature" Title="$APP_NAME" Level="1">
       <ComponentRef Id="CliExe" />
       <ComponentRef Id="AppExe" />
+      <ComponentRef Id="SandboxRunnerExe" />
       <ComponentRef Id="LicenseFile" />
       <ComponentRef Id="NoticesFile" />
       <ComponentRef Id="ShortcutComponent" />
@@ -454,10 +473,10 @@ WXSEOF
     exit 1
   fi
 
-  echo "-- File table (expect kgraf.exe/kgraf-app.exe/LICENSE.txt/THIRD_PARTY_NOTICES.md, real byte sizes) --"
+  echo "-- File table (expect kgraf.exe/kgraf-app.exe/kgraf-sandbox-runner.exe/LICENSE.txt/THIRD_PARTY_NOTICES.md, real byte sizes) --"
   FILE_TABLE="$(msiinfo export "$MSI_PATH" File)"
   echo "$FILE_TABLE"
-  for f in kGrafExe kGrafAppExe LicenseTxt ThirdPartyNotices; do
+  for f in kGrafExe kGrafAppExe kGrafSandboxRunnerExe LicenseTxt ThirdPartyNotices; do
     echo "$FILE_TABLE" | grep -q "^$f	" || {
       echo "MSI File table is missing the $f row" >&2
       exit 1

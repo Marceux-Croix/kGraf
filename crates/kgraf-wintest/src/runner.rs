@@ -27,6 +27,7 @@ use crate::platform::{self, CANCEL, FINISHED};
 use crate::progress::Progress;
 use crate::redact::Redactor;
 use crate::report::{self, BinaryResult, Failure, Report, StepTime};
+use crate::sandbox_phase::{self, Exec, StepRun};
 use crate::workdir::{self, Layout, Made, Traces};
 
 /// Steps of docs/WINDOWS-TESTING.md that stay manual.
@@ -45,6 +46,8 @@ const SECS_FACTS: f64 = 20.0;
 const SECS_MIRROR: f64 = 20.0;
 const SECS_E2E: f64 = 90.0;
 const SECS_CLEANUP: f64 = 15.0;
+/// Setup, status, selfcheck, the re-runs and the removal take a few minutes.
+const SECS_SANDBOX_USER: f64 = 600.0;
 /// Per binary: start-up and listing.
 const SECS_BINARY_BASE: f64 = 2.0;
 const SECS_LIST_EACH: f64 = 0.5;
@@ -328,6 +331,15 @@ fn copy_tree(from: &Path, to: &Path) -> std::io::Result<u64> {
 pub fn mirrored(mirror_root: &Path, build_root: &str) -> PathBuf {
     let mut p = mirror_root.to_path_buf();
     for part in build_root.split(['/', '\\']).filter(|s| !s.is_empty()) {
+        p.push(part);
+    }
+    p
+}
+
+/// The working folder of a test binary: its package folder under `root`.
+fn package_cwd(root: &Path, r: &TestRun) -> PathBuf {
+    let mut p = root.to_path_buf();
+    for part in r.package_dir.split(['/', '\\']).filter(|s| !s.is_empty()) {
         p.push(part);
     }
     p
@@ -788,13 +800,7 @@ pub fn run(o: RunOptions) -> i32 {
     console.with(|p, now| p.finish(1, now));
     let cwd_root = cwd_root.unwrap_or_else(|| mirror_build_root.clone());
     let env = base_env(&layout);
-    let cwd_for = |r: &TestRun| {
-        let mut p = cwd_root.clone();
-        for part in r.package_dir.split(['/', '\\']).filter(|s| !s.is_empty()) {
-            p.push(part);
-        }
-        p
-    };
+    let cwd_for = |r: &TestRun| package_cwd(&cwd_root, r);
 
     // Step 2: count every binary's tests, so the question about the
     // extended set and the estimate rest on real counts.
@@ -848,18 +854,27 @@ pub fn run(o: RunOptions) -> i32 {
             }
         });
     }
+    if o.sandbox_user {
+        console.with(|p, _| p.push("sandbox user".into(), SECS_SANDBOX_USER));
+    }
     console.with(|p, _| p.push("cleanup".into(), SECS_CLEANUP));
     let step_e2e = 3 + core.len();
     let first_ext = step_e2e + 1;
-    let step_cleanup = if run_extended {
+    let step_sandbox = if run_extended {
         first_ext + extended.len()
     } else {
         first_ext
     };
+    let step_cleanup = step_sandbox + usize::from(o.sandbox_user);
     let chosen: Vec<&TestRun> = core
         .iter()
         .copied()
         .chain(extended.iter().copied().filter(|_| run_extended))
+        .collect();
+    let expected_all: Vec<f64> = all
+        .iter()
+        .enumerate()
+        .map(|(i, r)| expected_of(i, r))
         .collect();
     let listed = listed_all;
 
@@ -907,6 +922,40 @@ pub fn run(o: RunOptions) -> i32 {
     if chosen.len() <= core.len() && !CANCEL.load(Ordering::Relaxed) {
         e2e_checks = run_e2e_step(&console, step_e2e, &bundle, &layout, &env, &machine);
     }
+
+    // The sandbox user phase: after the baseline, before the cleanup.
+    let sandbox_user = if o.sandbox_user {
+        console.with(|p, now| p.start(step_sandbox, now));
+        let by_id: std::collections::HashMap<&str, (f64, Option<u64>)> = all
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                (
+                    r.id.as_str(),
+                    (expected_all[i], listed.get(i).copied().flatten()),
+                )
+            })
+            .collect();
+        let mut ex = PhaseExec {
+            console: &console,
+            bundle: &bundle,
+            layout: &layout,
+            env: &env,
+            machine: &machine,
+            runs: &all,
+            by_id,
+            cwd_root: &cwd_root,
+            placed: None,
+        };
+        let phase = sandbox_phase::run_phase(&mut ex, &binaries, machine.elevated, &|| {
+            CANCEL.load(Ordering::Relaxed)
+        });
+        console.log(&format!("Sandbox user phase: {}", phase.summary()));
+        console.with(|p, now| p.finish(step_sandbox, now));
+        Some(phase)
+    } else {
+        None
+    };
 
     // Cleanup.
     let interrupted = CANCEL.load(Ordering::Relaxed);
@@ -973,6 +1022,7 @@ pub fn run(o: RunOptions) -> i32 {
         step_times,
         total_secs: t0.elapsed().as_secs_f64(),
         notes,
+        sandbox_user,
     };
     if !run_extended {
         r.notes.push(format!(
@@ -1054,7 +1104,8 @@ pub fn run(o: RunOptions) -> i32 {
     if !o.no_wait {
         wait_for_key();
     }
-    i32::from(!(t.failed == 0 && t.hung_or_crashed == 0 && t.e2e_fail == 0))
+    let left = r.sandbox_user.as_ref().is_some_and(|p| p.left_behind());
+    i32::from(!(t.failed == 0 && t.hung_or_crashed == 0 && t.e2e_fail == 0) || left)
 }
 
 fn run_e2e_step(
@@ -1081,6 +1132,149 @@ fn run_e2e_step(
     }
     console.with(|p, now| p.finish(step, now));
     checks
+}
+
+/// The real [`Exec`] of the sandbox user phase. Every process goes through
+/// `proc::run`, and the re-runs through `run_binary` and the end-to-end
+/// runner: the baseline's own paths.
+struct PhaseExec<'a> {
+    console: &'a Console,
+    bundle: &'a Path,
+    layout: &'a Layout,
+    env: &'a Env,
+    machine: &'a MachineFacts,
+    runs: &'a [&'a TestRun],
+    /// Expected seconds and listed test count by run id.
+    by_id: std::collections::HashMap<&'a str, (f64, Option<u64>)>,
+    cwd_root: &'a Path,
+    /// The runner copy placed beside the test binaries, removed at the end.
+    placed: Option<PathBuf>,
+}
+
+impl PhaseExec<'_> {
+    fn kgraf(&self) -> PathBuf {
+        self.bundle.join("programs").join("kgraf.exe")
+    }
+}
+
+impl Exec for PhaseExec<'_> {
+    fn preflight(&mut self) -> Result<(), String> {
+        if !cfg!(windows) {
+            return Err("the sandbox user exists only on Windows".into());
+        }
+        // The phase ends with `remove`: it must not remove a setup the person
+        // made before the run.
+        if let Some(store) = kgraf_sandbox::sandbox_user::credentials_path(None)
+            && store.exists()
+        {
+            return Err(format!(
+                "this Windows user already has a sandbox user set up (stored passwords at {}); \
+                 the phase would remove it. Run `kgraf sandbox remove` first to let the phase run",
+                store.display()
+            ));
+        }
+        let runner = format!("{}.exe", kgraf_sandbox::sandbox_user::runner::RUNNER_NAME);
+        let built = self.bundle.join("programs").join(&runner);
+        if !self.kgraf().is_file() || !built.is_file() {
+            return Err(format!(
+                "the bundle has no programs/kgraf.exe and programs/{runner} side by side"
+            ));
+        }
+        // kGraf looks for the runner beside the running executable. The test
+        // binaries are in `tests/`, so the runner needs a copy there.
+        let copy = self.bundle.join("tests").join(&runner);
+        if !copy.is_file() {
+            std::fs::copy(&built, &copy)
+                .map_err(|e| format!("cannot place {runner} beside the test binaries: {e}"))?;
+            self.placed = Some(copy);
+        }
+        Ok(())
+    }
+
+    fn cli(&mut self, label: &str, args: &[&str], limit: Duration, honor_cancel: bool) -> StepRun {
+        self.console.log(&format!("  sandbox user {label}"));
+        let mut cmd = Command::new(self.kgraf());
+        cmd.args(args)
+            .current_dir(&self.layout.e2e)
+            .env_clear()
+            .envs(e2e::child_env(std::env::vars(), &self.env.vars));
+        let never = std::sync::atomic::AtomicBool::new(false);
+        let cancel = if honor_cancel { &CANCEL } else { &never };
+        let f = crate::proc::run(cmd, limit, cancel, |_| {});
+        StepRun {
+            label: label.to_owned(),
+            command: format!("kgraf {}", args.join(" ")),
+            code: f.code,
+            timed_out: f.timed_out,
+            cancelled: f.cancelled,
+            start_error: f.start_error.clone(),
+            secs: f.secs,
+            output: f.tail.join("\n"),
+        }
+    }
+
+    fn rerun(&mut self, id: &str) -> BinaryResult {
+        self.console
+            .log(&format!("  sandbox user: running {id} again"));
+        let Some(run) = self.runs.iter().find(|r| r.id == id) else {
+            return BinaryResult {
+                id: id.to_owned(),
+                set: Set::Core,
+                exit_code: None,
+                timed_out: false,
+                cancelled: false,
+                start_error: Some("not in the manifest".into()),
+                secs: 0.0,
+                expected_secs: 0.0,
+                listed: None,
+                passed: 0,
+                failed: 0,
+                ignored: 0,
+                tests: Vec::new(),
+                failures: Vec::new(),
+                open_test: None,
+                open_test_solo: None,
+                rerun_skipped: Vec::new(),
+                tail: None,
+                skipped: Vec::new(),
+            };
+        };
+        let (expected, listed) = self.by_id.get(id).copied().unwrap_or((30.0, None));
+        run_binary(
+            self.console,
+            run,
+            self.bundle,
+            &package_cwd(self.cwd_root, run),
+            self.env,
+            expected,
+            listed,
+        )
+    }
+
+    fn e2e(&mut self) -> Vec<e2e::Check> {
+        let dir = self.layout.e2e.join("sandbox-user");
+        let _ = std::fs::create_dir_all(&dir);
+        let ctx = e2e::Ctx {
+            kgraf: self.kgraf(),
+            dir,
+            env: self.env.vars.clone(),
+            git_bash_found: self.machine.git_bash_path.is_some(),
+            cancel: &CANCEL,
+        };
+        e2e::run_all(&ctx, cfg!(windows))
+    }
+
+    fn teardown(&mut self) -> Vec<String> {
+        match self.placed.take() {
+            Some(p) => {
+                let ok = std::fs::remove_file(&p).is_ok();
+                vec![format!(
+                    "runner copy placed beside the test binaries: removed {ok}"
+                )]
+            }
+            None => Vec::new(),
+        }
+    }
 }
 
 #[cfg(test)]

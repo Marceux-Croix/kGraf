@@ -94,6 +94,8 @@ pub struct Report {
     pub step_times: Vec<StepTime>,
     pub total_secs: f64,
     pub notes: Vec<String>,
+    /// The sandbox user phase, when the run asked for it.
+    pub sandbox_user: Option<crate::sandbox_phase::SandboxPhase>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
@@ -200,7 +202,7 @@ pub fn verdict(t: &Totals, r: &Report) -> String {
     }
 }
 
-fn md_escape(s: &str) -> String {
+pub(crate) fn md_escape(s: &str) -> String {
     s.replace('|', "\\|").replace('\n', " ")
 }
 
@@ -209,7 +211,7 @@ fn opt(s: &Option<String>) -> String {
 }
 
 /// A fenced block that cannot be closed early by its own content.
-fn fence(lang: &str, body: &str) -> String {
+pub(crate) fn fence(lang: &str, body: &str) -> String {
     let mut ticks = "```".to_owned();
     while body.contains(&ticks) {
         ticks.push('`');
@@ -280,6 +282,10 @@ pub fn render(r: &Report) -> String {
         ),
         ("Total time", crate::progress::clock(r.total_secs)),
     ];
+    let mut rows = rows.to_vec();
+    if let Some(p) = &r.sandbox_user {
+        rows.insert(7, ("Sandbox user phase", p.summary()));
+    }
     for (k, v) in rows {
         md.push_str(&format!("| {k} | {} |\n", md_escape(&v)));
     }
@@ -377,6 +383,10 @@ pub fn render(r: &Report) -> String {
             if c.simulated { "SIMULATED" } else { "live" },
             md_escape(&c.detail)
         ));
+    }
+
+    if let Some(p) = &r.sandbox_user {
+        md.push_str(&crate::sandbox_phase::render(&r.binaries, &r.e2e, p));
     }
 
     md.push_str("\n## Machine\n\n");

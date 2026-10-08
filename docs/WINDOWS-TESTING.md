@@ -93,7 +93,7 @@ so. The steps below remain the fallback, and the way to test a native ARM64 buil
 
 The `wintest.yml` workflow builds the bundle natively on a GitHub-hosted Windows runner
 (`KGRAF_WINTEST_NATIVE=1 scripts/package-wintest.sh`), runs `kgraf-wintest.exe --all
---no-wait`, and runs the Windows Firewall test (`scripts/wintest-firewall.ps1`). It has a
+--no-wait` (with `--sandbox-user` by default, see below), and runs the Windows Firewall test (`scripts/wintest-firewall.ps1`). It has a
 manual trigger only:
 
 ```
@@ -108,6 +108,52 @@ job; a missing report file does. Two things differ from a standard user's machin
 runner account is an administrator, so the sandbox and firewall checks run elevated, and
 the runner has Git for Windows, so the worker shell finds `sh`. A result from the runner
 does not replace a run on a standard-user machine without Git for Windows.
+
+#### The sandbox user phase
+
+The workflow has one input, `sandbox_user`, on by default. It adds `--sandbox-user` to the
+runner. Turn it off with `gh workflow run wintest.yml -f sandbox_user=false`. A person can
+add the same flag on any Windows machine: `kgraf-wintest.exe --all --sandbox-user`.
+
+The suite runs first, exactly as without the flag, with no sandbox user set up. That is the
+baseline, and it stays comparable with earlier runs. Then the phase runs these steps:
+
+| Step | Command | What it checks |
+|---|---|---|
+| (b) | `kgraf sandbox setup` | Creates the two sandbox users, the group and the firewall rules, with no tag. |
+| (c) | `kgraf sandbox status` | Every kGraf line is present. Both stored passwords log on. |
+| (d) | `kgraf sandbox selfcheck` | The gate. If it fails, step (e) does not run. |
+| (e) | re-run | The sandbox test binaries, the baseline binaries that failed for the cargo jobserver, Git Bash or Schannel, and the end-to-end checks, with the sandbox user active. |
+| (f) | `kgraf sandbox remove`, then `kgraf sandbox status` | Always runs, also after a failure or Ctrl+C. Every kGraf line must be MISSING. |
+
+Rules of the phase:
+
+- It uses the sandbox user of the Windows user who runs it (no tag). If that user already has
+  a stored sandbox user, the phase does not start, because step (f) would remove it. Run
+  `kgraf sandbox remove` first.
+- Setup needs administrator rights. The hosted runner is elevated. On another machine, start
+  the runner from an elevated prompt, or accept the UAC prompt. The report says so when the
+  window is not elevated and a step fails.
+- `kgraf-sandbox-runner.exe` must be in `programs\` of the bundle. The phase puts a copy in
+  `tests\` for the test binaries, and removes it at the end.
+- `KGRAF_SANDBOX_SETUP_TEST=1` stays only for the tagged setup test in the baseline. The
+  phase does not use a tag.
+- The status command prints no words "logon works". A stored password line that is
+  `present` means that a real logon with that password worked, and the report counts them.
+
+What the report part "Sandbox user phase" shows:
+
+- A summary line in the first table: it ran to the end, or it stopped at the gate, and
+  whether the sandbox user is gone.
+- The commands of (b), (c), (d) and (f) with their full output. If the gate fails, the full
+  selfcheck output is there and the report says that the phase stopped at the gate.
+- A table with the baseline and the sandbox user side by side for each re-run binary. A
+  second table lists each test that failed in the baseline and ran again: `passed`,
+  `failed`, `hung` or `not reached`. The tail of each is below the table.
+- The end-to-end checks with the baseline status and the sandbox user status.
+- The confirmation after (f). If anything is left, the runner exits with a non-zero code.
+
+The totals and the verdict at the top of the report count the baseline only.
 
 ## 1. Find out which machine you have
 

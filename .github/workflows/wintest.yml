@@ -6,7 +6,10 @@
 # What it runs:
 #   1. Builds the self-test bundle natively with scripts/package-wintest.sh
 #      (every workspace test binary, kgraf.exe, the kgraf-wintest runner).
-#   2. Runs the bundle with `kgraf-wintest.exe --all --no-wait`.
+#   2. Runs the bundle with `kgraf-wintest.exe --all --no-wait`, and with the
+#      sandbox_user input on (the default) also `--sandbox-user`: after the
+#      suite, which runs with no sandbox user as the baseline, the runner sets
+#      the Windows sandbox user up, re-runs the parts it changes and removes it.
 #   3. Runs the Windows Firewall network test (scripts/wintest-firewall.ps1).
 #   4. Uploads the report and the firewall output as one artifact.
 #
@@ -25,6 +28,11 @@ name: Windows self-test
 
 on:
   workflow_dispatch:
+    inputs:
+      sandbox_user:
+        description: "Also run the sandbox user phase (setup, status, selfcheck, re-run, remove) after the suite"
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -70,6 +78,7 @@ jobs:
           # The runner is elevated and throwaway, so the sandbox user setup
           # test may create its tagged test users and firewall rules.
           KGRAF_SANDBOX_SETUP_TEST: "1"
+          SANDBOX_USER: ${{ inputs.sandbox_user }}
         run: |
           set -u
           stage="$(ls -d target/wintest/bundle/kgraf-wintest-*/ | head -1)"
@@ -77,7 +86,9 @@ jobs:
           mkdir -p "$report_dir"
           cd "$stage"
           # A failed test is a result, not a job failure.
-          ./kgraf-wintest.exe --all --no-wait --report-dir "$(cygpath -w "$report_dir")" || echo "kgraf-wintest.exe exited with $?"
+          extra=()
+          if [[ "$SANDBOX_USER" == "true" ]]; then extra+=(--sandbox-user); fi
+          ./kgraf-wintest.exe --all --no-wait "${extra[@]}" --report-dir "$(cygpath -w "$report_dir")" || echo "kgraf-wintest.exe exited with $?"
           # The report file is the result: no file, no result.
           if ! ls "$report_dir"/kgraf-wintest-report-*.md >/dev/null 2>&1; then
             echo "no report file in $report_dir" >&2

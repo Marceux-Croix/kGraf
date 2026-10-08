@@ -56,6 +56,14 @@ runs one program inside kGraf's sandbox (network allowed) in a temporary
 folder, prints its output and exit code, and removes the folder. See
 MANUAL-NETWORK-TEST.txt for the one manual test that uses it.
 
+Sandbox user phase (optional, needs administrator rights)
+---------------------------------------------------------
+  kgraf-wintest.exe --all --sandbox-user
+runs the suite as usual, then sets kGraf's Windows sandbox user up, re-runs
+the parts it changes, and removes it again. Start it from an elevated prompt,
+or accept the UAC prompt. It does not start if this Windows user already has
+a sandbox user set up. The report shows both results side by side.
+
 Other options: kgraf-wintest.exe --help
 
 Folder layout

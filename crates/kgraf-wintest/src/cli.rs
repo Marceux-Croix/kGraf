@@ -13,6 +13,9 @@ pub struct RunOptions {
     pub no_wait: bool,
     /// Write the report here instead of the Desktop.
     pub report_dir: Option<PathBuf>,
+    /// After the suite, set the Windows sandbox user up, re-run the parts it
+    /// changes, and remove it again (needs administrator rights).
+    pub sandbox_user: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -53,6 +56,8 @@ kgraf-wintest: runs kGraf's Windows tests and writes one report to the Desktop.
       --keep-bundle                  do not offer to delete this folder at the end
       --no-wait                      do not wait for a key at the end
       --report-dir <folder>          write the report there instead of the Desktop
+      --sandbox-user                 after the suite: set the Windows sandbox user up, re-run the
+                                     parts it changes, remove it (needs administrator rights)
   kgraf-wintest sandbox-run -- <program> [args...]
                                      run one program inside kGraf's sandbox (for manual tests)
 ";
@@ -132,6 +137,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                     "--all" => o.extended = Some(true),
                     "--keep-bundle" => o.keep_bundle = true,
                     "--no-wait" => o.no_wait = true,
+                    "--sandbox-user" => o.sandbox_user = true,
                     "--report-dir" => o.report_dir = Some(PathBuf::from(value(&mut it, a)?)),
                     "-h" | "--help" | "/?" => return Ok(Command::Help),
                     other => return Err(format!("unknown argument {other}\n\n{USAGE}")),
@@ -206,12 +212,20 @@ mod tests {
     #[test]
     fn no_arguments_is_the_full_run_and_flags_set_options() {
         assert_eq!(p(&[]).expect("parses"), Command::Run(RunOptions::default()));
-        let Command::Run(o) = p(&["--core", "--no-wait", "--report-dir", "D:\\r"]).expect("parses")
-        else {
+        let Command::Run(o) = p(&[
+            "--core",
+            "--no-wait",
+            "--sandbox-user",
+            "--report-dir",
+            "D:\\r",
+        ])
+        .expect("parses") else {
             panic!("a run");
         };
         assert_eq!(o.extended, Some(false));
         assert!(o.no_wait);
+        assert!(o.sandbox_user);
+        assert!(!RunOptions::default().sandbox_user);
         assert_eq!(o.report_dir, Some(PathBuf::from("D:\\r")));
         assert!(p(&["--bogus"]).is_err());
     }
