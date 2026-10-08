@@ -16,7 +16,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["net", "fs", "time", "io-util"] }
-base64 = "0.22"
+base64 = "0.23"
 sha2 = { workspace = true }
 
 [dev-dependencies]
