@@ -144,7 +144,9 @@ fn valid_component(name: &str) -> bool {
 
 /// Whether `name` is a device name: the part before the first dot, without
 /// trailing spaces, matched without case (`con`, `NUL.txt`, `Aux .rs`).
-fn is_reserved(name: &str) -> bool {
+/// Win32 opens the device for such a name in any folder, so it never names a
+/// file there.
+pub fn is_reserved(name: &str) -> bool {
     let stem = name.split('.').next().unwrap_or(name).trim_end_matches(' ');
     RESERVED
         .iter()

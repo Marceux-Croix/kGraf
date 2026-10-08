@@ -306,7 +306,7 @@ fn local_module(
     }
     // A relative import (`./x`, `.x`) names a local module that must be
     // there; a bare name is an installed package.
-    let relative = import.starts_with('.') || import.starts_with('/');
+    let relative = names_a_file(import);
     if relative || matches!(lang, Lang::Php | Lang::PhpOnly) {
         return Err(format!(
             "imports the local module `{}`, which kGraf cannot find",
@@ -340,6 +340,13 @@ fn read_script_file(program: &str, lang: Lang, file: &str, ctx: &ReadContext) ->
 /// `bun run FILE` and `bun FILE`: the file read as code of its kind.
 pub(super) fn script_file_call(program: &str, file: &str, ctx: &ReadContext) -> Vec<Embedded> {
     read_script_file(program, Lang::of_js_file(file), file, ctx)
+}
+
+/// Whether a module or library an interpreter is told to load names a file
+/// (`./x`, `/x`, and on Windows `.\x`, `C:\x`, `\x`) rather than an installed
+/// package, under the host's path rules.
+fn names_a_file(spec: &str) -> bool {
+    super::paths::names_a_file(super::paths::Flavor::HOST, spec)
 }
 
 fn inline(program: &str, lang: Lang, code: &str, ctx: &ReadContext) -> Vec<Embedded> {
@@ -506,7 +513,7 @@ fn node_call(program: &str, args: &[String], ctx: &ReadContext) -> Option<Vec<Em
             "-c" | "--check" => return None,
             "-r" | "--require" | "--import" => {
                 if let Some(m) = next
-                    && (m.starts_with('.') || m.starts_with('/'))
+                    && names_a_file(m)
                 {
                     out.extend(read_script_file(program, Lang::of_js_file(m), m, ctx));
                 }
@@ -541,7 +548,7 @@ fn node_call(program: &str, args: &[String], ctx: &ReadContext) -> Option<Vec<Em
             }
             _ if a.starts_with("--require=") || a.starts_with("--import=") => {
                 let m = a.split_once('=').map(|(_, m)| m).unwrap_or_default();
-                if m.starts_with('.') || m.starts_with('/') {
+                if names_a_file(m) {
                     out.extend(read_script_file(program, Lang::of_js_file(m), m, ctx));
                 }
                 i += 1;
@@ -783,7 +790,7 @@ fn ruby_call(program: &str, args: &[String], ctx: &ReadContext) -> Option<Vec<Em
                     };
                     match c {
                         'e' => code.push(value),
-                        'r' if value.starts_with('.') || value.starts_with('/') => {
+                        'r' if names_a_file(&value) => {
                             out.extend(read_script_file(program, Lang::Ruby, &value, ctx));
                         }
                         'C' | 'x' => {
@@ -1988,7 +1995,7 @@ mod js {
                         continue;
                     };
                     check(&source)?;
-                    if source.starts_with('.') || source.starts_with('/') {
+                    if names_a_file(&source) {
                         imports.push(source.clone());
                     }
                     for clause in named_children(*n)
@@ -2035,7 +2042,7 @@ mod js {
                             return Err("loads a module named by a value kGraf cannot see".into());
                         };
                         check(&m)?;
-                        if m.starts_with('.') || m.starts_with('/') {
+                        if names_a_file(&m) {
                             imports.push(m.clone());
                         }
                         // `const cp = require('child_process')`, `const {
@@ -2453,7 +2460,7 @@ mod ruby {
                             Some(t) if method == "require_relative" => {
                                 imports.push(format!("./{t}"))
                             }
-                            Some(t) if t.starts_with('.') || t.starts_with('/') => imports.push(t),
+                            Some(t) if names_a_file(&t) => imports.push(t),
                             Some(_) => {}
                             None => {
                                 return Err("loads code named by a value kGraf cannot see".into());

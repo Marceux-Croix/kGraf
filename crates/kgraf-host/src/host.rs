@@ -2941,40 +2941,56 @@ fn check_scratch(run: &RunId) -> Result<tempfile::TempDir> {
 /// Remove the check scratch directories whose owner process is gone (a
 /// crash, a kill): their name carries the owner's PID. A live PID, even one
 /// reused by another program, keeps its directory: removing a live run's
-/// trees would be worse than leaving a dead one's. Unix only; elsewhere a dead
-/// run's directory stays in the temporary directory.
+/// trees would be worse than leaving a dead one's.
 pub(crate) fn sweep_check_scratch() -> Vec<PathBuf> {
-    // Only the unix branch below pushes to it.
-    #[cfg_attr(not(unix), allow(unused_mut))]
+    // Only a safe root is swept: an unsafe one is never read from.
+    let Ok(root) = check_scratch_root() else {
+        return Vec::new();
+    };
+    sweep_scratch_in(&root, &scratch_owner_gone)
+}
+
+/// [`sweep_check_scratch`] over `root`, with `gone` judging each PID, so the
+/// name parsing is testable with any judge.
+fn sweep_scratch_in(root: &Path, gone: &dyn Fn(u32) -> bool) -> Vec<PathBuf> {
     let mut removed = Vec::new();
-    #[cfg(unix)]
-    {
-        // Only a safe root is swept: an unsafe one is never read from.
-        let Ok(root) = check_scratch_root() else {
-            return removed;
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return removed;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let mut parts = name.rsplitn(3, '-');
+        let (_random, pid) = (parts.next(), parts.next());
+        let Some(pid) = pid.and_then(|p| p.parse::<u32>().ok()) else {
+            continue;
         };
-        let Ok(entries) = std::fs::read_dir(root) else {
-            return removed;
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let mut parts = name.rsplitn(3, '-');
-            let (_random, pid) = (parts.next(), parts.next());
-            let Some(pid) = pid.and_then(|p| p.parse::<libc::pid_t>().ok()) else {
-                continue;
-            };
-            if pid <= 0 || pid == std::process::id() as libc::pid_t {
-                continue;
-            }
-            // SAFETY: signal 0 only probes whether the process exists.
-            let gone = unsafe { libc::kill(pid, 0) } != 0
-                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
-            if gone && std::fs::remove_dir_all(entry.path()).is_ok() {
-                removed.push(entry.path());
-            }
+        if pid == 0 || pid == std::process::id() {
+            continue;
+        }
+        if gone(pid) && std::fs::remove_dir_all(entry.path()).is_ok() {
+            removed.push(entry.path());
         }
     }
     removed
+}
+
+/// Whether no process has `pid`: `kill(pid, 0)` fails with `ESRCH`. A zombie
+/// still counts as present.
+#[cfg(unix)]
+fn scratch_owner_gone(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: signal 0 only probes whether the process exists.
+    let rc = unsafe { libc::kill(pid, 0) };
+    rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+/// Whether no running process has `pid` (`kgraf_sandbox::pid_is_gone`): a
+/// process this user cannot open counts as present.
+#[cfg(not(unix))]
+fn scratch_owner_gone(pid: u32) -> bool {
+    kgraf_sandbox::pid_is_gone(pid)
 }
 
 /// What a run was built with, for a caller to show and for the test that holds
@@ -3517,5 +3533,53 @@ mod base_build_claim_tests {
         drop(first);
         let again = BaseBuildClaim::take(&set, "r1").expect("free after the first ended");
         drop((other, again));
+    }
+}
+
+#[cfg(test)]
+mod scratch_sweep_tests {
+    use super::*;
+
+    /// A directory named `<run>-<pid>-<random>` goes when its PID is judged
+    /// gone; a live PID, this process's own, PID 0 and a name without a PID
+    /// stay.
+    #[test]
+    fn only_a_gone_owners_scratch_is_swept() {
+        let root = tempfile::tempdir().expect("root");
+        let me = std::process::id();
+        let names = [
+            "r1-40-abc".to_owned(),
+            "r1-41-abc".to_owned(),
+            format!("r1-{me}-abc"),
+            "r1-0-abc".to_owned(),
+            "no-pid".to_owned(),
+        ];
+        for name in &names {
+            std::fs::create_dir(root.path().join(name)).expect("mkdir");
+        }
+        let removed = sweep_scratch_in(root.path(), &|pid| pid != 41);
+        assert_eq!(removed, vec![root.path().join("r1-40-abc")]);
+        for kept in &names[1..] {
+            assert!(root.path().join(kept).is_dir(), "{kept} stays");
+        }
+    }
+
+    /// The probe each platform uses: a reaped child is gone, this process is
+    /// not.
+    #[test]
+    fn a_reaped_child_is_gone_and_this_process_is_not() {
+        let mut cmd = if cfg!(windows) {
+            let mut c = std::process::Command::new("cmd");
+            c.args(["/D", "/C", "exit 0"]);
+            c
+        } else {
+            std::process::Command::new("true")
+        };
+        let mut child = cmd.spawn().expect("spawn");
+        let pid = child.id();
+        child.wait().expect("wait");
+        drop(child);
+        assert!(scratch_owner_gone(pid));
+        assert!(!scratch_owner_gone(std::process::id()));
     }
 }

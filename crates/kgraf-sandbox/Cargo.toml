@@ -65,6 +65,9 @@ junction = { version = "2.1.0", default-features = false }
 # `Wdk_Foundation`, `Wdk_Storage_FileSystem` and `Win32_System_IO`: host writes
 # and removals in a worker's tree open each name relative to its folder's
 # handle with `NtCreateFile` (`confined.rs`), never following a reparse point.
+# `Win32_System_Threading` and `Win32_System_Registry` also serve owner liveness
+# (`win_process.rs`): `OpenProcess`, `GetProcessTimes`, `WaitForSingleObject`,
+# and `MachineGuid` through `RegGetValueW`.
 windows-sys = { version = "0.61.2", features = [
     "Wdk_Foundation",
     "Wdk_Storage_FileSystem",
@@ -93,7 +96,8 @@ criterion = { version = "0.8.2", default-features = false, features = ["cargo_be
 # OpenProcess, registry, hard links, SendInput, waiting on a process handle).
 # The Schannel tests ask for a TLS client credential under each token
 # (`Authentication_Identity`, `Credentials`, and `Cryptography` for
-# `SCHANNEL_CRED`).
+# `SCHANNEL_CRED`). `Win32_System_Ioctl`: a confined-walk test turns a folder
+# into a junction in place (`FSCTL_SET_REPARSE_POINT`).
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Security",
@@ -102,6 +106,7 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
     "Win32_System_Console",
+    "Win32_System_Ioctl",
     "Win32_System_Registry",
     "Win32_System_StationsAndDesktops",
     "Win32_System_Threading",

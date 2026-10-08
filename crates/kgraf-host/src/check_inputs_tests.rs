@@ -217,8 +217,5 @@ async fn the_check_starts_from_the_checkout_s_build_folder_and_leaves_it_as_it_w
         "the checkout's build folder changed"
     );
     let live = r.workspaces.get(&ws).expect("live");
-    let left: Vec<_> = std::fs::read_dir(live.checks_dir())
-        .map(|d| d.flatten().map(|e| e.file_name()).collect())
-        .unwrap_or_default();
-    assert!(left.is_empty(), "{left:?}");
+    assert!(!live.checks_dir().exists(), "a check folder is left");
 }

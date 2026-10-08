@@ -31,6 +31,15 @@ tokio = { version = "1.53", features = ["fs", "io-util", "rt"] }
 # writing new code.
 libc = "0.2.189"
 
+[target.'cfg(windows)'.dependencies]
+# `LockFileEx`: the transcript's exclusive writer lock on Windows (see
+# `transcript.rs`). The windows-sys release kgraf-sandbox already pins.
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+] }
+
 [dev-dependencies]
 # `flock::Forkers`: fork pressure for the transcript's lock-release test.
 kgraf-core = { path = "../kgraf-core", features = ["test-support"] }

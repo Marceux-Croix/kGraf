@@ -199,6 +199,9 @@ pub const CORE: &[(&str, &[&str], f64)] = &[
     ("kgraf-sandbox/lib/kgraf_sandbox", &[], 0.05),
     // sh and bash through Git Bash inside the sandbox.
     ("kgraf-sandbox/test/shell_windows", &[], 2.0),
+    // Programs that load user32.dll, cmd, sh and bash start in the sandbox;
+    // a cleared environment passes only what a program needs.
+    ("kgraf-sandbox/test/startup_windows", &[], 1.0),
     // Writes outside, the profile, the registry, junctions, other sandboxes.
     ("kgraf-sandbox/test/escape_windows", &[], 2.0),
     // HTTPS inside the sandbox: the curl of Git for Windows (OpenSSL) works,

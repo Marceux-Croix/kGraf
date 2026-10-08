@@ -10,9 +10,10 @@
 //!
 //! - **Token.** `CreateRestrictedToken` with `WRITE_RESTRICTED | LUA_TOKEN |
 //!   DISABLE_MAX_PRIVILEGE`. The restricting SIDs are one capability SID per
-//!   writable root, a fresh per-spawn SID, and Everyone. A write succeeds only
-//!   if both the normal access check and the check against the restricting SIDs
-//!   pass. The token integrity level is then dropped to Low.
+//!   writable root, a fresh per-spawn SID, the SID of the private desktop the
+//!   command runs on, and Everyone. A write succeeds only if both the normal
+//!   access check and the check against the restricting SIDs pass. The token
+//!   integrity level is then dropped to Low.
 //! - **Cross-sandbox isolation.** The token's default DACL grants the user SID
 //!   and the per-spawn SID, never the logon SID. Because the per-spawn SID is
 //!   unique and is a restricting SID, only the processes of one spawn pass the
@@ -48,7 +49,50 @@
 //! - **Private desktop.** Reused per workspace, labeled Low, on the process's
 //!   own window station (queried, not hard-coded, so scheduled or service runs
 //!   work). Restricted processes must run on a non-default desktop so they
-//!   cannot send window messages to unrestricted applications.
+//!   cannot send window messages to unrestricted applications. Its DACL admits
+//!   the user SID (the normal access check) and a fresh SID made with the
+//!   desktop (the restricting check), and every command that runs on it gets
+//!   that SID as a restricting SID. The desktop rights `user32.dll` needs when
+//!   it loads (`DESKTOP_CREATEWINDOW`, `DESKTOP_WRITEOBJECTS` and the others in
+//!   the desktop's generic write mapping) are write rights, so a desktop that
+//!   admits only the user SID fails the restricting check, and every program
+//!   that loads `user32.dll` at start (`where`, `whoami`, PowerShell, Node,
+//!   the `bin\bash.exe` launcher of Git for Windows through `shell32.dll`)
+//!   exits with STATUS_DLL_INIT_FAILED (0xC0000142) before its first
+//!   instruction; `cmd.exe` does not load it and runs (the same split is
+//!   measured in openai/codex issue 46412; the `desktop_access` tests below
+//!   measure the desktop open itself). The desktop SID is
+//!   granted on nothing else, so it adds no write anywhere but on that desktop
+//!   (decision 0011, amendment "Desktop and environment"). codex grants its
+//!   desktop to the logon SID, a restricting SID there; this backend leaves
+//!   the logon SID out (see cross-sandbox isolation above).
+//!
+//! **MSYS2 and Cygwin programs do not start in this sandbox.** The runtime
+//! (`msys-2.0.dll`, `cygwin1.dll`) creates its signal pipe while it loads
+//! (`sigproc_init`, called from `dll_crt0_0`), with an ACL that grants only
+//! the user SID, Administrators and SYSTEM (`sec_user_nih` in
+//! `winsup/cygwin/sec/helper.cc`), and then opens it with `GENERIC_WRITE`
+//! (`fhandler_pipe::create`). None of those SIDs is a restricting SID here,
+//! so the open is refused (`ERROR_ACCESS_DENIED`), the runtime stops with
+//! "couldn't create signal pipe, Win32 error 5", and the process exits with
+//! STATUS_DLL_INIT_FAILED. The same refusal is reported for codex's
+//! unelevated sandbox (openai/codex issues 7031 and 15016). Every fix inside
+//! the token makes the user SID (or a group that is granted wherever the
+//! user is) a restricting SID, which removes the per-root write confinement;
+//! decision 0011 records the options. The `msys_pipe` tests below pin the
+//! cause.
+//!
+//! **Environment.** A command inherits kGraf's environment, minus the
+//! credential-shaped names the scrub removes, unless the caller calls
+//! `SandboxedCommand::env_clear`. Then it inherits only
+//! [`super::WINDOWS_BASE_VARS`], the variables a Windows program needs to start
+//! (`SystemRoot`, `PATH`, the profile folders and the others listed there),
+//! and the sandbox sets its own again: `TMP` and `TEMP` (the policy's tmp
+//! folder) and the git and curl settings (see `git_config_entries`),
+//! numbered from zero because the host's `GIT_CONFIG_*` entries are gone.
+//! The profile variables keep their real values: reads are not confined
+//! here, writes there are refused by the token, and a tool that cannot find
+//! its configuration would fail for no gain.
 //!
 //! **Partial isolation.** `WRITE_RESTRICTED` makes Windows consult the
 //! restricting SIDs for writes only, and Low integrity blocks writes up, not
@@ -145,9 +189,13 @@ pub(super) const STRENGTH: IsolationStrength = IsolationStrength {
            through the Windows TLS stack (Schannel: curl.exe from System32, PowerShell, \
            .NET, WinHTTP) fails with SEC_E_NO_CREDENTIALS, because Schannel refuses a client \
            credential to a token with restricting SIDs (git and the curl of Git for Windows \
-           are set to OpenSSL, and tools with their own TLS library work); the gitlink \
-           deny, the Low label on the writable roots, and cross-sandbox write denial are \
-           unverified on Windows",
+           are set to OpenSSL, and tools with their own TLS library work); MSYS2 and \
+           Cygwin programs (the `sh`, `bash`, `ls` and `grep` of Git Bash) stop at start \
+           with STATUS_DLL_INIT_FAILED (0xC0000142), because their runtime opens its own \
+           signal pipe for write with an ACL that names only the user, Administrators and \
+           SYSTEM, and a write-restricted token passes a write only where a restricting \
+           SID is granted; the gitlink deny, the Low label on the writable roots, and \
+           cross-sandbox write denial are unverified on Windows",
 };
 
 /// The TLS library tools are steered to inside this sandbox. The Windows
@@ -180,6 +228,39 @@ pub(super) fn git_config_entries(start: u32, network_open: bool) -> (Vec<(String
     }
     let count = start + pairs.len() as u32;
     (entries, count)
+}
+
+/// Every variable the sandbox sets for the tools on Windows: the
+/// [`git_config_entries`] from index `start` and the new `GIT_CONFIG_COUNT`,
+/// and, with the network open, [`CURL_SSL_BACKEND_VAR`].
+pub(super) fn tool_env(start: u32, network_open: bool) -> Vec<(String, String)> {
+    let (mut vars, count) = git_config_entries(start, network_open);
+    vars.push(("GIT_CONFIG_COUNT".to_owned(), count.to_string()));
+    if network_open {
+        vars.push((CURL_SSL_BACKEND_VAR.to_owned(), TLS_BACKEND.to_owned()));
+    }
+    vars
+}
+
+/// What `SandboxedCommand::env_clear` sets again on Windows: [`tool_env`]
+/// numbered from zero (the host's `GIT_CONFIG_*` entries are not inherited
+/// any more, so a count that went on from them would name entries that are
+/// gone, and git stops on a missing `GIT_CONFIG_KEY_0`), and `TMP` and
+/// `TEMP` set to the policy's tmp folder: without them Windows programs
+/// fall back to folders the token cannot write.
+pub(super) fn kept_on_clear(
+    network_open: bool,
+    tmp: Option<&std::path::Path>,
+) -> Vec<(String, std::ffi::OsString)> {
+    let mut kept: Vec<(String, std::ffi::OsString)> = tool_env(0, network_open)
+        .into_iter()
+        .map(|(k, v)| (k, v.into()))
+        .collect();
+    if let Some(tmp) = tmp {
+        kept.push(("TMP".to_owned(), tmp.as_os_str().to_owned()));
+        kept.push(("TEMP".to_owned(), tmp.as_os_str().to_owned()));
+    }
+    kept
 }
 
 /// The capability SID for one writable root. Deterministic, so repeated runs
@@ -233,6 +314,34 @@ fn acl_probe_pid(name: &str) -> Option<u32> {
 pub(super) fn is_batch_file(program: &str) -> bool {
     let lower = program.to_ascii_lowercase();
     lower.ends_with(".bat") || lower.ends_with(".cmd")
+}
+
+/// Whether `name` is one of [`super::WINDOWS_BASE_VARS`], compared without case
+/// as Windows compares variable names.
+pub(super) fn is_base_var(name: &std::ffi::OsStr) -> bool {
+    name.to_str().is_some_and(|n| {
+        super::WINDOWS_BASE_VARS
+            .iter()
+            .any(|b| b.eq_ignore_ascii_case(n))
+    })
+}
+
+/// What a command inherits from `parent` (this process's environment): all
+/// of it, or, once its environment was cleared, only
+/// [`super::WINDOWS_BASE_VARS`].
+/// Variables the sandbox or the caller set on the command are applied over
+/// this ([`env_block`]).
+pub(super) fn inherited_vars<I>(
+    parent: I,
+    inherit_all: bool,
+) -> Vec<(std::ffi::OsString, std::ffi::OsString)>
+where
+    I: IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+{
+    parent
+        .into_iter()
+        .filter(|(name, _)| inherit_all || is_base_var(name))
+        .collect()
 }
 
 /// An environment variable as UTF-16 name and value.
@@ -516,7 +625,7 @@ mod imp {
     use super::super::{Network, Redirect, Resolved};
     use super::{
         BACKEND_NAME, SHELL_COMMAND_VAR, ShellLaunch, capability_sid_string, env_block,
-        is_batch_file, posix_shell, shell_launch,
+        inherited_vars, is_batch_file, posix_shell, shell_launch,
     };
     use crate::error::SandboxError;
     // Shared with the command policy's check of a `cmd /c` or PowerShell
@@ -1280,7 +1389,8 @@ mod imp {
     /// A fresh, unique SID for one spawn. Granted in the default DACL and added
     /// to the restricting set, it isolates one spawn's process tree from every
     /// other sandbox's: only this spawn's processes pass the restricting
-    /// write check on each other. Shape follows `capability_sid_string`.
+    /// write check on each other. Shape follows `capability_sid_string`. A
+    /// private desktop's SID is made the same way ([`Desktop::create`]).
     fn per_spawn_sid() -> Result<Sid, SandboxError> {
         let (a, b) = (random_u64(), random_u64());
         Sid::from_string(&format!(
@@ -1457,20 +1567,35 @@ mod imp {
     }
 
     /// The primary token for a spawn: restricted by the capability SIDs, a
-    /// fresh per-spawn SID and Everyone; default DACL scoped to the user and
-    /// the per-spawn SID; integrity dropped to Low. Returns the token, the
-    /// logon SID and the user SID (both for the desktop DACL).
-    fn build_sandbox_token(caps: &[Sid]) -> Result<(OwnedHandle, Sid, Sid), SandboxError> {
+    /// fresh per-spawn SID, the SID of the private desktop it runs on (see
+    /// [`Desktop`]) and Everyone; default DACL scoped to the user and the
+    /// per-spawn SID; integrity dropped to Low.
+    fn build_sandbox_token(
+        caps: &[Sid],
+        desktop: Option<&Sid>,
+    ) -> Result<OwnedHandle, SandboxError> {
         let per_spawn = per_spawn_sid()?;
         let everyone = Sid::from_string("S-1-1-0")?;
-        let mut restricting: Vec<Sid> = Vec::with_capacity(caps.len() + 2);
+        let mut restricting: Vec<Sid> = Vec::with_capacity(caps.len() + 3);
         restricting.extend(caps.iter().cloned());
         restricting.push(per_spawn.clone());
+        restricting.extend(desktop.cloned());
         restricting.push(everyone);
-        let (token, user, logon) = restricted_token_for(&restricting)?;
+        let (token, user, _logon) = restricted_token_for(&restricting)?;
         set_default_dacl(&token, &user, &per_spawn)?;
         set_integrity_low(&token)?;
-        Ok((token, logon, user))
+        Ok(token)
+    }
+
+    /// The user SID of this process's token: the SID a sandboxed process
+    /// passes the normal access check with.
+    fn process_user_sid() -> Result<Sid, SandboxError> {
+        let mut raw: HANDLE = ptr::null_mut();
+        // SAFETY: pseudo-handle of this process; output written on success.
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw) } == 0 {
+            return Err(last_error("OpenProcessToken(TOKEN_QUERY)"));
+        }
+        user_sid(&owned(raw, "OpenProcessToken(TOKEN_QUERY)")?)
     }
 
     // ---- job and desktop --------------------------------------------------------
@@ -1533,11 +1658,17 @@ mod imp {
         /// `<WindowStation>\<name>`, NUL-terminated, for
         /// `STARTUPINFOW::lpDesktop`.
         startup_name: Vec<u16>,
+        /// A fresh SID granted on this desktop and on nothing else. Every
+        /// command that runs here carries it as a restricting SID, so the
+        /// desktop's write rights pass the restricting check; without it they
+        /// fail and `user32.dll` cannot load (see the module header).
+        sid: Sid,
     }
 
     // SAFETY: a desktop handle is a kernel handle usable from any thread.
     unsafe impl Send for Desktop {}
-    // SAFETY: no interior state beyond the handle and an immutable name.
+    // SAFETY: no interior state beyond the handle, an immutable name and an
+    // immutable SID.
     unsafe impl Sync for Desktop {}
 
     /// The current process's window station name (`WinSta0` interactively, but
@@ -1572,6 +1703,10 @@ mod imp {
         fn create(user: &Sid) -> Result<Self, SandboxError> {
             let name = format!("kGrafSandbox-{:016x}", random_u64());
             let wname = wide(OsStr::new(&name));
+            // Everything that can fail without a handle comes first, so no
+            // early return leaves the desktop handle open.
+            let station = window_station_name()?;
+            let sid = per_spawn_sid()?;
             // SAFETY: NUL-terminated name, no device or mode, default security;
             // the handle is closed by Drop. Full rights for this process.
             let handle = unsafe {
@@ -1587,22 +1722,36 @@ mod imp {
             if handle.is_null() {
                 return Err(last_error("CreateDesktopW"));
             }
-            let station = window_station_name()?;
             let desktop = Self {
                 handle,
                 startup_name: wide(OsStr::new(&format!("{station}\\{name}"))),
+                sid,
             };
-            // Replace the DACL: the sandbox (its token carries the user SID as
-            // a normal group) participates; nobody else is admitted.
-            let entries = [explicit(
-                user,
-                DESKTOP_PARTICIPANT,
-                GRANT_ACCESS,
-                NO_INHERITANCE,
-            )];
+            // Replace the DACL: the sandbox participates; nobody else is
+            // admitted. Two entries, because a write-restricted token is
+            // checked twice: the user SID passes the normal check, and the
+            // desktop's own SID, a restricting SID of every command here,
+            // passes the restricting check for the desktop's write rights.
+            // Another sandbox runs on its own desktop with another SID.
+            let entries = [
+                explicit(user, DESKTOP_PARTICIPANT, GRANT_ACCESS, NO_INHERITANCE),
+                explicit(
+                    &desktop.sid,
+                    DESKTOP_PARTICIPANT,
+                    GRANT_ACCESS,
+                    NO_INHERITANCE,
+                ),
+            ];
             let mut acl: *mut ACL = ptr::null_mut();
             // SAFETY: valid entries, no old ACL.
-            let code = unsafe { SetEntriesInAclW(1, entries.as_ptr(), ptr::null(), &mut acl) };
+            let code = unsafe {
+                SetEntriesInAclW(
+                    entries.len() as u32,
+                    entries.as_ptr(),
+                    ptr::null(),
+                    &mut acl,
+                )
+            };
             if code != ERROR_SUCCESS {
                 return Err(win32("SetEntriesInAclW(desktop)", code));
             }
@@ -1678,7 +1827,7 @@ mod imp {
 
     /// One private desktop per workspace, reused across spawns. Held for
     /// the process lifetime; a worktree is short-lived and few run at once.
-    fn desktop_for(key: &str, user: &Sid) -> Result<std::sync::Arc<Desktop>, SandboxError> {
+    fn desktop_for(key: &str) -> Result<std::sync::Arc<Desktop>, SandboxError> {
         use std::sync::{Arc, Mutex, OnceLock};
         static DESKTOPS: OnceLock<Mutex<std::collections::HashMap<String, Arc<Desktop>>>> =
             OnceLock::new();
@@ -1690,7 +1839,7 @@ mod imp {
         if let Some(desktop) = map.get(key) {
             return Ok(Arc::clone(desktop));
         }
-        let desktop = Arc::new(Desktop::create(user)?);
+        let desktop = Arc::new(Desktop::create(&process_user_sid()?)?);
         map.insert(key.to_string(), Arc::clone(&desktop));
         Ok(desktop)
     }
@@ -1812,9 +1961,17 @@ mod imp {
     // ---- program and command line --------------------------------------------
 
     /// The child's environment block and its `PATH`. `extra` is set last,
-    /// over everything else (a POSIX shell's [`SHELL_COMMAND_VAR`]).
-    fn final_env(cmd: &Command, extra: Option<(&str, &str)>) -> (Vec<u16>, Option<OsString>) {
-        let inherited: Vec<_> = std::env::vars_os()
+    /// over everything else (a POSIX shell's [`SHELL_COMMAND_VAR`]). With
+    /// `inherit_all` false (the command's environment was cleared) only
+    /// [`super::super::WINDOWS_BASE_VARS`] come from this process; `PATH` is one of
+    /// them, so the lookup below stays right.
+    fn final_env(
+        cmd: &Command,
+        extra: Option<(&str, &str)>,
+        inherit_all: bool,
+    ) -> (Vec<u16>, Option<OsString>) {
+        let inherited: Vec<_> = inherited_vars(std::env::vars_os(), inherit_all)
+            .into_iter()
             .map(|(k, v)| (k.encode_wide().collect(), v.encode_wide().collect()))
             .collect();
         let mut overrides: Vec<_> = cmd
@@ -2070,6 +2227,7 @@ mod imp {
         cmd: &Command,
         prepared: &Prepared,
         stdio: [Redirect; 3],
+        inherit_env: bool,
     ) -> Result<SandboxedChild, SandboxError> {
         let cwd = cmd.get_current_dir().ok_or_else(|| {
             SandboxError::InvalidPolicy("sandboxed command has no working directory".into())
@@ -2084,6 +2242,7 @@ mod imp {
             launch
                 .as_ref()
                 .map(|l| (SHELL_COMMAND_VAR, l.command.as_str())),
+            inherit_env,
         );
         let program = match &launch {
             Some(l) => l.program.clone(),
@@ -2116,8 +2275,9 @@ mod imp {
         };
         line.push(0);
 
-        let (token, _logon, user) = build_sandbox_token(&prepared.caps)?;
-        let desktop = desktop_for(&prepared.desktop_key, &user)?;
+        // The desktop first: its SID is one of the token's restricting SIDs.
+        let desktop = desktop_for(&prepared.desktop_key)?;
+        let token = build_sandbox_token(&prepared.caps, Some(&desktop.sid))?;
         let job = create_job()?;
         let [stdin, stdout, stderr] = [
             stream(STD_INPUT_HANDLE, stdio[0])?,
@@ -2225,6 +2385,7 @@ mod imp {
         cmd: &Command,
         prepared: &Prepared,
         stdio: [Option<Redirect>; 3],
+        inherit_env: bool,
     ) -> Result<Output, SandboxError> {
         let child = spawn(
             cmd,
@@ -2234,6 +2395,7 @@ mod imp {
                 stdio[1].unwrap_or(Redirect::Piped),
                 stdio[2].unwrap_or(Redirect::Piped),
             ],
+            inherit_env,
         )?;
         child.wait_with_output().map_err(SandboxError::Spawn)
     }
@@ -2242,8 +2404,9 @@ mod imp {
         cmd: &Command,
         prepared: &Prepared,
         stdio: [Option<Redirect>; 3],
+        inherit_env: bool,
     ) -> Result<ExitStatus, SandboxError> {
-        let mut child = spawn(cmd, prepared, default_stdio(stdio))?;
+        let mut child = spawn(cmd, prepared, default_stdio(stdio), inherit_env)?;
         child.wait().map_err(SandboxError::Spawn)
     }
 
@@ -2347,7 +2510,7 @@ mod imp {
 
         /// A primary copy of this process's token, which can be changed
         /// without changing the process.
-        fn own_token_copy() -> OwnedHandle {
+        pub(super) fn own_token_copy() -> OwnedHandle {
             let mut raw: HANDLE = ptr::null_mut();
             // SAFETY: pseudo-handle of this process; output written on success.
             let ok = unsafe {
@@ -2391,7 +2554,7 @@ mod imp {
         /// assert `SEC_E_OK`.
         #[test]
         fn schannel_refuses_the_sandbox_token_a_client_credential() {
-            let (token, _, _) = build_sandbox_token(&[]).unwrap();
+            let token = build_sandbox_token(&[], None).unwrap();
             let status = client_credential_status(&token);
             assert_eq!(status, SEC_E_NO_CREDENTIALS, "got {}", hex(status));
         }
@@ -2416,6 +2579,244 @@ mod imp {
             set_integrity_low(&token).unwrap();
             let status = client_credential_status(&token);
             assert_eq!(status, SEC_E_OK, "got {}", hex(status));
+        }
+    }
+
+    /// Runs `f` on a new thread that impersonates `token`, and returns what
+    /// it returns. Objects the thread creates get the token's default DACL
+    /// and integrity label, and its access checks are the token's, as in a
+    /// process running with that token.
+    #[cfg(test)]
+    fn impersonating<T: Send + 'static>(
+        token: &OwnedHandle,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        use windows_sys::Win32::Security::RevertToSelf;
+        use windows_sys::Win32::System::Threading::SetThreadToken;
+        // A HANDLE is a pointer and not `Send`; the thread is joined before
+        // `token` can close.
+        let raw = token.as_raw_handle() as usize;
+        std::thread::spawn(move || {
+            let mut imp: HANDLE = ptr::null_mut();
+            // SAFETY: `raw` is a token handle that stays open until this
+            // thread is joined; the output is written on success.
+            let ok = unsafe {
+                DuplicateTokenEx(
+                    raw as HANDLE,
+                    TOKEN_QUERY | TOKEN_IMPERSONATE,
+                    ptr::null(),
+                    SecurityImpersonation,
+                    TokenImpersonation,
+                    &mut imp,
+                )
+            };
+            assert_ne!(ok, 0, "DuplicateTokenEx: {}", io::Error::last_os_error());
+            let imp = owned(imp, "DuplicateTokenEx").unwrap();
+            // SAFETY: a null thread pointer means the calling thread; `imp`
+            // is a valid impersonation token.
+            let ok = unsafe { SetThreadToken(ptr::null(), imp.as_raw_handle()) };
+            assert_ne!(ok, 0, "SetThreadToken: {}", io::Error::last_os_error());
+            let out = f();
+            // SAFETY: ends this thread's impersonation; no arguments.
+            unsafe { RevertToSelf() };
+            out
+        })
+        .join()
+        .unwrap()
+    }
+
+    /// Why MSYS2 and Cygwin programs (Git Bash's `sh`, `bash` and tools) stop
+    /// with STATUS_DLL_INIT_FAILED in this sandbox. While the runtime loads it
+    /// creates its signal pipe with an ACL that grants `GENERIC_ALL` to the
+    /// user SID, Administrators and SYSTEM only, then opens the pipe for
+    /// `GENERIC_WRITE | FILE_READ_ATTRIBUTES` (msys2-runtime
+    /// `winsup/cygwin/sigproc.cc` `sigproc_init`, `sec/helper.cc` `sec_acl`,
+    /// `fhandler/pipe.cc` `fhandler_pipe::create`). Each test makes that pipe
+    /// and that open on a thread impersonating one token, so the result is
+    /// the one the runtime gets, with no Git for Windows needed.
+    #[cfg(test)]
+    mod msys_pipe {
+        use super::*;
+        use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
+        use windows_sys::Win32::Security::{
+            InitializeSecurityDescriptor, SECURITY_DESCRIPTOR, SetSecurityDescriptorDacl,
+        };
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_READ_ATTRIBUTES, PIPE_ACCESS_INBOUND,
+        };
+        use windows_sys::Win32::System::Pipes::{
+            CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_MESSAGE,
+        };
+        use windows_sys::Win32::System::SystemServices::SECURITY_DESCRIPTOR_REVISION;
+
+        /// The runtime's two steps under `token`: `Ok(())` when the write
+        /// open succeeds, `Err(code)` with the Win32 error of the open. A
+        /// failure to create the pipe at all panics, naming that step.
+        fn signal_pipe_open(token: &OwnedHandle) -> Result<(), u32> {
+            let user = process_user_sid().unwrap();
+            impersonating(token, move || {
+                let admins = Sid::from_string("S-1-5-32-544").unwrap();
+                let system = Sid::from_string("S-1-5-18").unwrap();
+                let entries = [
+                    explicit(&user, GENERIC_ALL, GRANT_ACCESS, NO_INHERITANCE),
+                    explicit(&admins, GENERIC_ALL, GRANT_ACCESS, NO_INHERITANCE),
+                    explicit(&system, GENERIC_ALL, GRANT_ACCESS, NO_INHERITANCE),
+                ];
+                let mut acl: *mut ACL = ptr::null_mut();
+                // SAFETY: valid entries, no old ACL; freed by `Local`.
+                let code = unsafe {
+                    SetEntriesInAclW(
+                        entries.len() as u32,
+                        entries.as_ptr(),
+                        ptr::null(),
+                        &mut acl,
+                    )
+                };
+                assert_eq!(code, ERROR_SUCCESS, "SetEntriesInAclW");
+                let _acl = Local(acl.cast());
+                // SAFETY: zeroed is a valid value to initialize.
+                let mut sd: SECURITY_DESCRIPTOR = unsafe { std::mem::zeroed() };
+                let psd: PSECURITY_DESCRIPTOR = ptr::addr_of_mut!(sd).cast();
+                // SAFETY: `psd` points at a SECURITY_DESCRIPTOR-sized buffer.
+                let ok = unsafe { InitializeSecurityDescriptor(psd, SECURITY_DESCRIPTOR_REVISION) };
+                assert_ne!(ok, 0, "InitializeSecurityDescriptor");
+                // SAFETY: an initialized descriptor and an ACL that outlives it.
+                let ok = unsafe { SetSecurityDescriptorDacl(psd, 1, acl, 0) };
+                assert_ne!(ok, 0, "SetSecurityDescriptorDacl");
+                let sa = SECURITY_ATTRIBUTES {
+                    nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                    lpSecurityDescriptor: psd,
+                    bInheritHandle: 0,
+                };
+                let name = wide(OsStr::new(&format!(
+                    r"\\.\pipe\kgraf-msys-probe-{:016x}-sigwait",
+                    random_u64()
+                )));
+                // SAFETY: NUL-terminated name and valid attributes.
+                let server = unsafe {
+                    CreateNamedPipeW(
+                        name.as_ptr(),
+                        PIPE_ACCESS_INBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                        PIPE_TYPE_MESSAGE | PIPE_READMODE_BYTE | PIPE_REJECT_REMOTE_CLIENTS,
+                        1,
+                        4096,
+                        4096,
+                        0,
+                        &sa,
+                    )
+                };
+                let _server = owned(server, "CreateNamedPipeW").unwrap_or_else(|e| {
+                    panic!("creating the pipe failed, before the write open: {e}")
+                });
+                // SAFETY: NUL-terminated name; no template, no attributes.
+                let client = unsafe {
+                    CreateFileW(
+                        name.as_ptr(),
+                        GENERIC_WRITE | FILE_READ_ATTRIBUTES,
+                        0,
+                        ptr::null(),
+                        OPEN_EXISTING,
+                        0,
+                        ptr::null_mut(),
+                    )
+                };
+                if client == INVALID_HANDLE_VALUE {
+                    // SAFETY: plain call.
+                    return Err(unsafe { GetLastError() });
+                }
+                drop(owned(client, "CreateFileW(pipe)"));
+                Ok(())
+            })
+        }
+
+        /// The control: the user's own token, lowered to Low as the sandbox
+        /// token is, opens the pipe. Without it a refusal below could be the
+        /// integrity level or a broken probe.
+        #[test]
+        fn a_low_copy_of_the_users_token_opens_the_msys_signal_pipe() {
+            let token = super::schannel::own_token_copy();
+            set_integrity_low(&token).unwrap();
+            assert_eq!(signal_pipe_open(&token), Ok(()));
+        }
+
+        /// The cause, pinned: the token every sandboxed command runs with is
+        /// refused the write open, because no restricting SID is in the
+        /// pipe's ACL. A change that makes MSYS2 start in the sandbox makes
+        /// this test fail; it must then assert `Ok(())`.
+        #[test]
+        fn the_sandbox_token_is_refused_the_msys_signal_pipe() {
+            let token = build_sandbox_token(&[], None).unwrap();
+            assert_eq!(signal_pipe_open(&token), Err(ERROR_ACCESS_DENIED));
+        }
+
+        /// The only change inside the token that opens it: the user SID as a
+        /// restricting SID. The same SID then passes the restricting check on
+        /// every object the user can write, which is why it is not done here
+        /// (decision 0011, amendment "Desktop and environment").
+        #[test]
+        fn only_the_user_sid_as_a_restricting_sid_opens_the_msys_signal_pipe() {
+            let user = process_user_sid().unwrap();
+            let everyone = Sid::from_string("S-1-1-0").unwrap();
+            let (token, _, _) = restricted_token_for(&[user, everyone]).unwrap();
+            set_integrity_low(&token).unwrap();
+            assert_eq!(signal_pipe_open(&token), Ok(()));
+        }
+    }
+
+    /// Why programs that load `user32.dll` at start stopped with
+    /// STATUS_DLL_INIT_FAILED, and that the desktop SID fixes it: the open of
+    /// the private desktop with the rights `user32.dll` takes, on a thread
+    /// impersonating the token a command on that desktop runs with.
+    #[cfg(test)]
+    mod desktop_access {
+        use super::*;
+        use windows_sys::Win32::System::StationsAndDesktops::OpenDesktopW;
+
+        /// Whether a thread with `token` opens the desktop named `name` (on
+        /// this process's window station) with [`DESKTOP_PARTICIPANT`].
+        fn opens(token: &OwnedHandle, name: Vec<u16>) -> bool {
+            impersonating(token, move || {
+                // SAFETY: NUL-terminated name; the handle is closed below.
+                let h = unsafe { OpenDesktopW(name.as_ptr(), 0, 0, DESKTOP_PARTICIPANT) };
+                if h.is_null() {
+                    return false;
+                }
+                // SAFETY: a desktop handle opened above, closed once.
+                unsafe { CloseDesktop(h) };
+                true
+            })
+        }
+
+        /// The bare desktop name, without the window station prefix.
+        fn bare_name(desktop: &Desktop) -> Vec<u16> {
+            let full = &desktop.startup_name;
+            let start = full
+                .iter()
+                .rposition(|c| *c == u16::from(b'\\'))
+                .map_or(0, |i| i + 1);
+            full[start..].to_vec()
+        }
+
+        /// A command's token, with the desktop's SID, opens the desktop with
+        /// the participant rights; the same token without that SID (the
+        /// backend before the fix) is refused, so the SID is what admits it.
+        #[test]
+        fn the_desktop_sid_admits_a_command_and_its_absence_refuses_it() {
+            let desktop = desktop_for("desktop-access-test").unwrap();
+            let with = build_sandbox_token(&[], Some(&desktop.sid)).unwrap();
+            assert!(opens(&with, bare_name(&desktop)));
+            let without = build_sandbox_token(&[], None).unwrap();
+            assert!(!opens(&without, bare_name(&desktop)));
+        }
+
+        /// Another workspace's desktop does not admit this command: its SID
+        /// is a different one.
+        #[test]
+        fn a_desktop_does_not_admit_another_desktops_command() {
+            let mine = desktop_for("desktop-access-mine").unwrap();
+            let other = desktop_for("desktop-access-other").unwrap();
+            let token = build_sandbox_token(&[], Some(&mine.sid)).unwrap();
+            assert!(!opens(&token, bare_name(&other)));
         }
     }
 }
@@ -2719,5 +3120,80 @@ mod tests {
         assert!(entries.iter().all(|(k, _)| {
             k.starts_with("GIT_CONFIG_KEY_") || k.starts_with("GIT_CONFIG_VALUE_")
         }));
+    }
+
+    fn os(pairs: &[(&str, &str)]) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).into(), (*v).into()))
+            .collect()
+    }
+
+    /// A command whose environment was cleared inherits the base variables
+    /// only, matched without case as Windows matches names; an API key and a
+    /// plain variable stay behind. A command that was not cleared inherits
+    /// everything, as before (the scrub then removes credential names).
+    #[test]
+    fn a_cleared_environment_inherits_only_the_base_variables() {
+        let parent = os(&[
+            ("SystemRoot", r"C:\Windows"),
+            ("Path", r"C:\Windows\System32"),
+            ("userprofile", r"C:\Users\u"),
+            ("ANTHROPIC_API_KEY", "sk-should-not-leak"),
+            ("KGRAF_PLAIN", "visible"),
+            ("TEMP", r"C:\Users\u\AppData\Local\Temp"),
+        ]);
+        let kept = inherited_vars(parent.clone(), false);
+        assert_eq!(
+            kept,
+            os(&[
+                ("SystemRoot", r"C:\Windows"),
+                ("Path", r"C:\Windows\System32"),
+                ("userprofile", r"C:\Users\u"),
+            ])
+        );
+        assert_eq!(inherited_vars(parent.clone(), true), parent);
+    }
+
+    /// The variables the sandbox sets for the tools: the git entries from the
+    /// given index, the count after them, and the curl backend only with the
+    /// network open.
+    #[test]
+    fn tool_env_is_the_git_entries_the_count_and_the_curl_backend() {
+        let open = tool_env(3, true);
+        assert_eq!(lookup(&open, "GIT_CONFIG_KEY_3"), Some("credential.helper"));
+        assert_eq!(lookup(&open, "GIT_CONFIG_KEY_4"), Some("http.sslBackend"));
+        assert_eq!(lookup(&open, "GIT_CONFIG_COUNT"), Some("5"));
+        assert_eq!(lookup(&open, CURL_SSL_BACKEND_VAR), Some(TLS_BACKEND));
+        let closed = tool_env(0, false);
+        assert_eq!(lookup(&closed, "GIT_CONFIG_COUNT"), Some("1"));
+        assert_eq!(lookup(&closed, CURL_SSL_BACKEND_VAR), None);
+    }
+
+    /// After a clear the git entries start at zero (the host's entries are
+    /// gone, so a count that went on from them would name missing keys), the
+    /// TLS settings survive, and `TMP` and `TEMP` are the policy's folder.
+    #[test]
+    fn a_clear_keeps_the_sandbox_settings_numbered_from_zero() {
+        let tmp = std::path::Path::new(r"C:\ws\scratch");
+        let kept: Vec<(String, String)> = kept_on_clear(true, Some(tmp))
+            .into_iter()
+            .map(|(k, v)| (k, v.to_string_lossy().into_owned()))
+            .collect();
+        assert_eq!(lookup(&kept, "GIT_CONFIG_KEY_0"), Some("credential.helper"));
+        assert_eq!(lookup(&kept, "GIT_CONFIG_VALUE_0"), Some(""));
+        assert_eq!(lookup(&kept, "GIT_CONFIG_KEY_1"), Some("http.sslBackend"));
+        assert_eq!(lookup(&kept, "GIT_CONFIG_COUNT"), Some("2"));
+        assert_eq!(lookup(&kept, CURL_SSL_BACKEND_VAR), Some("openssl"));
+        assert_eq!(lookup(&kept, "TMP"), Some(r"C:\ws\scratch"));
+        assert_eq!(lookup(&kept, "TEMP"), Some(r"C:\ws\scratch"));
+        let bare: Vec<String> = kept_on_clear(false, None)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(
+            bare,
+            ["GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0", "GIT_CONFIG_COUNT"]
+        );
     }
 }

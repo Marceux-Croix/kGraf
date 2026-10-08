@@ -36,12 +36,32 @@ pub(super) fn embedded_by_reader(
     // directory kGraf cannot tell whether a relative path names such a
     // file; an absolute path is taken as the program it names, as an allow
     // set lists it (a worker's worktree path changes with every attempt).
-    if program.contains('/') {
-        if ctx.cwd.is_none() && !program.starts_with('/') {
+    // On Windows a path rooted with one `/` names a file of Git Bash's own
+    // tree (`/usr/bin/env` from a `#!` line), which is taken as the program
+    // it names, as before; a Git Bash drive path (`/c/...`) may name the
+    // worktree and is not ([`super::paths::git_bash_tree_path`]).
+    let flavor = super::paths::Flavor::HOST;
+    if super::paths::has_separator(flavor, program)
+        && !super::paths::git_bash_tree_path(flavor, program)
+    {
+        if ctx.cwd.is_none()
+            && super::paths::shape(flavor, program) != super::paths::Shape::Absolute
+        {
             return Some(unreadable(
                 program,
                 "is named by a path, and kGraf cannot tell which directory it is taken from, \
                  so it may be a script of the worktree",
+            ));
+        }
+        // A form kGraf cannot place (a device path, a stream, a Git Bash
+        // drive path, another drive's directory) may be a file of the
+        // worktree under another spelling.
+        if let (Some(root), Some(cwd)) = (&ctx.root, &ctx.cwd)
+            && let Err(super::Unplaced::Unknown(why)) = super::locate(flavor, root, cwd, program)
+        {
+            return Some(unreadable(
+                program,
+                &format!("is named by {why}, which may be a script of the worktree"),
             ));
         }
         if super::worktree_file_exists(ctx, program) {

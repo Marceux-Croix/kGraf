@@ -765,6 +765,8 @@ impl InstallRunner for SandboxedInstall {
         }
         let started = Instant::now();
         #[cfg(unix)]
+        let spawned = std::time::SystemTime::now();
+        #[cfg(unix)]
         let child = proxy
             .spawn(&mut cmd)
             .map_err(|e| failed(format!("it did not start: {e}")))?;
@@ -773,7 +775,7 @@ impl InstallRunner for SandboxedInstall {
             .spawn()
             .map_err(|e| failed(format!("it did not start: {e}")))?;
         #[cfg(unix)]
-        let (status, tail) = wait_bounded(child, self.timeout, stop, &hold.path);
+        let (status, tail) = wait_bounded(child, self.timeout, stop, &hold.path, spawned);
         #[cfg(not(unix))]
         let (status, tail) = wait_bounded(child, self.timeout, stop);
         let elapsed = started.elapsed();
@@ -951,30 +953,152 @@ impl Drop for HoldFile {
 
 /// After the install's group is gone: if a process it started still holds
 /// `hold`, it left the group (its own `setsid`) and would go on writing the
-/// checkout. On macOS it is killed by name ([`stop_holders`]); either way the
-/// install fails. `None` when nothing was left behind. Linux needs no names:
-/// the install is PID 1 of its own PID namespace, and the kernel ends every
-/// process left in it when the install's first process exits.
+/// checkout. On macOS it is killed by name ([`stop_holders`]), as was every
+/// one the watch found while the install ran ([`EscapeWatch`]); either way
+/// the install fails. `None` when nothing was left behind. Linux needs no
+/// names: the install is PID 1 of its own PID namespace, and the kernel ends
+/// every process left in it when the install's first process exits.
 ///
 /// What escapes this too: a process that closes the descriptors it inherited
 /// and leaves the group (decision 0084's known gap on macOS); a build
 /// daemon is kept from starting by [`install_env`].
 #[cfg(unix)]
-fn left_behind(hold: &Path) -> Option<String> {
+fn left_behind(hold: &Path, watched: Watched) -> Option<String> {
     #[cfg(target_os = "macos")]
     {
-        stop_holders(
+        let found = stop_holders(
             hold,
             kgraf_sandbox::lifecycle::holders,
             kgraf_sandbox::lifecycle::GROUP_EXIT_GRACE,
-        )
+            watched.killed,
+        );
+        match watched.failed {
+            None => found,
+            Some(e) => Some(format!(
+                "{}kGraf could not watch for processes that leave the install's group while \
+                 it ran ({e}), so one may have changed files in the project unseen. An install \
+                 kGraf could not watch is not taken as done",
+                found.map(|f| format!("{f}. ")).unwrap_or_default()
+            )),
+        }
     }
     #[cfg(not(target_os = "macos"))]
     {
+        let Watched {} = watched;
         if kgraf_sandbox::lifecycle::hold_free(hold) {
             return None;
         }
         Some(STILL_RUNNING.to_owned())
+    }
+}
+
+/// What the watch for processes that leave the install's group found
+/// ([`EscapeWatch`]); nothing on Linux, which needs no watch.
+#[cfg(unix)]
+#[derive(Default)]
+struct Watched {
+    /// Every process the watch killed.
+    #[cfg(target_os = "macos")]
+    killed: std::collections::BTreeSet<libc::pid_t>,
+    /// The first error of a scan, when one failed.
+    #[cfg(target_os = "macos")]
+    failed: Option<String>,
+}
+
+/// macOS: while the install runs, a helper thread names the processes that
+/// hold its hold file and left its process group, and kills each at once.
+///
+/// A scan after the install's first process exits is too late: a process
+/// that left the group goes on with its work while kGraf looks for it, and
+/// at a load average of about 120 the scan and kill after the exit took
+/// over 1 s. A process that leaves the group holds the hold file from its
+/// fork (it inherits the descriptor), so the watch sees it as soon as it
+/// has left.
+///
+/// Who is an escapee: a holder whose process group is not the install's.
+/// The install's first process leads its own session and group (the sandbox
+/// calls `setsid`), and every process it starts stays in that group unless
+/// it calls `setsid` or `setpgid` itself, which a group kill then cannot
+/// reach. The install's own processes, in its group, are never named; nor
+/// is kGraf or a child of kGraf. Only processes started since the install
+/// began are read (`kgraf_sandbox::lifecycle::holders_started_since`), so a
+/// scan takes milliseconds. One the clock leaves out (a clock stepped back)
+/// is still found by the final scan after the exit, which reads every
+/// process and waits for the hold to be free ([`stop_holders`]).
+///
+/// Between the scan that names a process and its kill, its PID could only
+/// pass to another program if it ended, was reaped, and the PID counter
+/// wrapped round to it: macOS hands out PIDs in increasing order up to
+/// 99,999.
+#[cfg(target_os = "macos")]
+struct EscapeWatch {
+    done: Arc<std::sync::atomic::AtomicBool>,
+    found: Arc<std::sync::atomic::AtomicBool>,
+    thread: std::thread::JoinHandle<Watched>,
+}
+
+#[cfg(target_os = "macos")]
+impl EscapeWatch {
+    /// Time between two scans. A scan of new processes takes milliseconds,
+    /// so the watch costs little CPU, and a process that left the group is
+    /// killed within about this time plus one scan.
+    const EVERY: Duration = Duration::from_millis(50);
+
+    /// Watch the holders of `hold` started at or after `since` whose group is
+    /// not `group`, the install's.
+    fn start(hold: PathBuf, group: libc::pid_t, since: std::time::SystemTime) -> Self {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let done = Arc::new(AtomicBool::new(false));
+        let found = Arc::new(AtomicBool::new(false));
+        let thread = {
+            let (done, found) = (done.clone(), found.clone());
+            std::thread::spawn(move || {
+                let mut watched = Watched::default();
+                while !done.load(Ordering::SeqCst) {
+                    match kgraf_sandbox::lifecycle::holders_started_since(&hold, since) {
+                        Ok(holders) => {
+                            for h in holders.into_iter().filter(|h| h.group != group) {
+                                // SAFETY: signals a process that holds the
+                                // install's own hold file, which only the
+                                // install's processes ever open, that left
+                                // the install's group, and that is not a
+                                // child of this process.
+                                unsafe {
+                                    libc::kill(h.pid, libc::SIGKILL);
+                                }
+                                watched.killed.insert(h.pid);
+                                found.store(true, Ordering::SeqCst);
+                            }
+                        }
+                        Err(e) => {
+                            watched.failed.get_or_insert_with(|| e.to_string());
+                        }
+                    }
+                    std::thread::sleep(Self::EVERY);
+                }
+                watched
+            })
+        };
+        Self {
+            done,
+            found,
+            thread,
+        }
+    }
+
+    /// Whether the watch has killed a process.
+    fn found(&self) -> bool {
+        self.found.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Stop the watch and say what it found. A watch thread that panicked
+    /// is reported as a failed scan.
+    fn finish(self) -> Watched {
+        self.done.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.thread.join().unwrap_or_else(|_| Watched {
+            failed: Some("the watch thread ended abnormally".to_owned()),
+            ..Watched::default()
+        })
     }
 }
 
@@ -985,8 +1109,10 @@ const STILL_RUNNING: &str = "a process it started left its process group and is 
      and stop it before you start again";
 
 /// macOS: kill every process `list` names as a holder of `hold`, again and
-/// again until the hold is free or `grace` runs out, and say what happened.
-/// `None` when the hold is free at once.
+/// again until the hold is free or `grace` runs out, and say what happened,
+/// naming every process killed here and in `killed` (those the watch killed
+/// while the install ran, [`EscapeWatch`]). `None` when the hold is free at
+/// once and `killed` is empty.
 ///
 /// Each holder is killed the moment it is named, and the lister reads the
 /// process table in this process
@@ -1001,13 +1127,13 @@ fn stop_holders(
     hold: &Path,
     mut list: impl FnMut(&Path) -> std::io::Result<Vec<libc::pid_t>>,
     grace: Duration,
+    mut killed: std::collections::BTreeSet<libc::pid_t>,
 ) -> Option<String> {
     use kgraf_sandbox::lifecycle::hold_free;
-    if hold_free(hold) {
+    if hold_free(hold) && killed.is_empty() {
         return None;
     }
     let deadline = Instant::now() + grace;
-    let mut killed = std::collections::BTreeSet::new();
     let mut list_failed = None;
     while !hold_free(hold) && Instant::now() < deadline {
         match list(hold) {
@@ -1030,7 +1156,15 @@ fn stop_holders(
         let why = list_failed
             .map(|e| format!(" (the process list could not be read: {e})"))
             .unwrap_or_default();
-        return Some(format!("{STILL_RUNNING}{why}"));
+        let stopped = if killed.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "kGraf stopped {} that left the install's process group, but ",
+                pids_text(&killed)
+            )
+        };
+        return Some(format!("{stopped}{STILL_RUNNING}{why}"));
     }
     if killed.is_empty() {
         return Some(
@@ -1040,29 +1174,43 @@ fn stop_holders(
                 .to_owned(),
         );
     }
-    let named = killed
+    Some(format!(
+        "a process it started left its process group and kept running; kGraf stopped it \
+         ({}). An install that leaves a process behind is not taken as done",
+        pids_text(&killed)
+    ))
+}
+
+/// "process 12" or "processes 12, 34".
+#[cfg(target_os = "macos")]
+fn pids_text(pids: &std::collections::BTreeSet<libc::pid_t>) -> String {
+    let named = pids
         .iter()
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(", ");
-    Some(format!(
-        "a process it started left its process group and kept running; kGraf stopped it \
-         (process {named}). An install that leaves a process behind is not taken as done"
-    ))
+    if pids.len() == 1 {
+        format!("process {named}")
+    } else {
+        format!("processes {named}")
+    }
 }
 
 /// Wait for the install to end, its timeout, or `stop`; killed at either of
 /// the last two, with its whole process group, until every process holding
 /// `hold` is gone or the grace runs out. A process that left the group is
-/// then handled by [`left_behind`]. Returns whether it succeeded (or why it
-/// was stopped) and its output, stdout and stderr interleaved by line, in
-/// both cases.
+/// then handled by [`left_behind`]; on macOS one is killed while the install
+/// runs, and the install stopped at once ([`EscapeWatch`]). `spawned` is a
+/// time no later than the child's start. Returns whether it succeeded (or
+/// why it was stopped) and its output, stdout and stderr interleaved by
+/// line, in both cases.
 #[cfg(unix)]
 fn wait_bounded(
     mut child: std::process::Child,
     timeout: Duration,
     stop: &Stop,
     hold: &Path,
+    spawned: std::time::SystemTime,
 ) -> (Result<bool, String>, String) {
     let streams: Vec<Box<dyn std::io::Read + Send>> = [
         child
@@ -1095,6 +1243,18 @@ fn wait_bounded(
             );
         }
     };
+    // A second of margin: a clock stepped back by less still sees every
+    // process the install started.
+    #[cfg(target_os = "macos")]
+    let watch = EscapeWatch::start(
+        hold.to_path_buf(),
+        child.id() as libc::pid_t,
+        spawned
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or(std::time::UNIX_EPOCH),
+    );
+    #[cfg(not(target_os = "macos"))]
+    let _ = spawned;
     let deadline = Instant::now() + timeout;
     // Kill the group, again and again, until the hold is free or a short
     // grace passes: a killed member is gone within milliseconds, and one
@@ -1148,10 +1308,21 @@ fn wait_bounded(
             kill(&mut child);
             break Err("it was stopped: the run ended or was cancelled".to_owned());
         }
+        // The install fails anyway ([`left_behind`] says why): it is not let
+        // go on changing the project.
+        #[cfg(target_os = "macos")]
+        if watch.found() {
+            kill(&mut child);
+            break Err("a process it started left its process group".to_owned());
+        }
         std::thread::sleep(Duration::from_millis(50));
     };
+    #[cfg(target_os = "macos")]
+    let watched = watch.finish();
+    #[cfg(not(target_os = "macos"))]
+    let watched = Watched::default();
     // Before the output is read: a process left behind holds the pipes.
-    let result = match left_behind(hold) {
+    let result = match left_behind(hold, watched) {
         Some(why) => Err(why),
         None => result,
     };

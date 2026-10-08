@@ -4,6 +4,8 @@
 
 use super::*;
 use crate::deps::ConsentStore;
+#[cfg(target_os = "macos")]
+use std::collections::BTreeSet;
 // The real install's registry stub (macOS and Linux only).
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::io::{Read, Write};
@@ -885,7 +887,8 @@ fn a_holder_that_ends_unnamed_is_not_reported_as_stopped() {
         go.take();
         Ok(Vec::new())
     };
-    let why = stop_holders(&hold, unnamed, Duration::from_secs(5)).expect("a holder was left");
+    let why = stop_holders(&hold, unnamed, Duration::from_secs(5), BTreeSet::new())
+        .expect("a holder was left");
     assert!(gone_soon(pid), "the holder still runs");
     assert!(!why.contains("kGraf stopped"), "{why}");
     assert!(why.contains("ended by itself"), "{why}");
@@ -909,6 +912,7 @@ fn a_listing_that_fails_leaves_the_holder_reported_as_running() {
         &hold,
         |_| Err(std::io::Error::other("listing refused")),
         Duration::from_millis(300),
+        BTreeSet::new(),
     )
     .expect("a holder was left");
     // SAFETY: kills the holder this test started.
@@ -919,11 +923,14 @@ fn a_listing_that_fails_leaves_the_holder_reported_as_running() {
     assert!(why.contains("listing refused"), "{why}");
 }
 
-/// A holder that left the group and does its work 1 s later is killed
-/// before that work: the real listing names it in time (0.1 to 0.25 s).
-/// Before, two `lsof` runs 100 ms apart took 0.45 to 1 s on an idle machine
-/// and 1.4 to 2.4 s with four CPU-bound processes per core, and under that
-/// load the holder wrote first in half the runs.
+/// A process that leaves the install's group while the install's first
+/// process still runs, and does its work 300 ms later, is killed before
+/// that work, and the install is stopped at once and fails naming it. Only
+/// a watch while the install runs can meet this: a scan after the first
+/// process exits (here 30 s on) comes after the work, when the process has
+/// ended and the hold is free, and the install would pass. Before the
+/// watch, a scan after the exit took over 1 s at a load average of about
+/// 120, and a process that worked 1 s after it left wrote first.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_holder_that_left_the_group_is_killed_before_its_work() {
@@ -931,37 +938,140 @@ fn a_holder_that_left_the_group_is_killed_before_its_work() {
         eprintln!("skipped: no perl on PATH");
         return;
     }
-    let dir = tempfile::tempdir().expect("dir");
-    let hold = hold_in(&dir);
-    let marker = dir.path().join("worked");
-    let (pid, go) = detached_holder(
-        &hold,
-        &format!(
-            "select(undef, undef, undef, 1.0); open(my $w, '>', '{}'); close($w);",
-            marker.display()
-        ),
-    );
-    // The holder's second starts now, as a process's work goes on from the
-    // moment its group is killed.
-    drop(go);
+    let dir = tempfile::tempdir().expect("project");
+    let root = kgraf_core::plain_path::canonicalize(dir.path()).expect("canonical");
+    std::fs::create_dir_all(root.join(".kgraf")).expect("state");
+    let install = MissingInstall {
+        ecosystem: Ecosystem::Npm,
+        dir: PathBuf::new(),
+        what: "no node_modules".into(),
+        command: "perl -e 'use POSIX; if (fork()) { sleep 30; exit 0 } \
+                  POSIX::setsid(); select(undef, undef, undef, 0.3); \
+                  open(my $f, \">\", \"worked\"); close($f);'"
+            .into(),
+    };
     let started = Instant::now();
-    let why = stop_holders(
-        &hold,
-        kgraf_sandbox::lifecycle::holders,
-        kgraf_sandbox::lifecycle::GROUP_EXIT_GRACE,
-    )
-    .expect("a holder was left");
+    let result = SandboxedInstall::default().run(&install, &root, &[], &Stop::default());
     let took = started.elapsed();
     std::thread::sleep(Duration::from_secs(1));
     assert!(
-        !marker.exists(),
-        "the holder did its work first; the stop took {took:?} ({why})"
+        !root.join("worked").exists(),
+        "the process that left the group did its work first ({took:?}, {result:?})"
     );
-    assert!(gone_soon(pid), "the holder still runs");
+    let text = result
+        .expect_err("an install that left a process behind fails")
+        .to_string();
+    let pid: libc::pid_t = text
+        .split_once("kGraf stopped it (process ")
+        .and_then(|(_, rest)| rest.split_once(')'))
+        .and_then(|(pid, _)| pid.parse().ok())
+        .unwrap_or_else(|| panic!("no process named: {text}"));
+    assert!(gone_soon(pid), "the process {pid} still runs");
+    // Stopped when the process was found, not at the first process's exit.
+    assert!(took < Duration::from_secs(20), "{took:?}: {text}");
+}
+
+/// A process the watch killed while the install ran is named in the
+/// failure, though the hold is free by the final scan.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_process_killed_while_the_install_ran_is_named() {
+    let dir = tempfile::tempdir().expect("dir");
+    let hold = hold_in(&dir);
+    let unused =
+        |_: &Path| -> std::io::Result<Vec<libc::pid_t>> { panic!("a free hold needs no listing") };
+    assert_eq!(
+        stop_holders(&hold, unused, Duration::from_secs(1), BTreeSet::new()),
+        None
+    );
+    let why = stop_holders(
+        &hold,
+        unused,
+        Duration::from_secs(1),
+        BTreeSet::from([41, 42]),
+    )
+    .expect("a process was killed");
+    assert!(why.contains("kGraf stopped it (processes 41, 42)"), "{why}");
+}
+
+/// When a holder still runs after the watch killed another, the failure
+/// says both: the one stopped and the one still running.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_holder_still_running_after_a_kill_is_reported_with_the_kill() {
+    if !on_path("perl") {
+        eprintln!("skipped: no perl on PATH");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("dir");
+    let hold = hold_in(&dir);
+    let (pid, _go) = detached_holder(&hold, "");
+    let why = stop_holders(
+        &hold,
+        |_| Ok(Vec::new()),
+        Duration::from_millis(300),
+        BTreeSet::from([41]),
+    )
+    .expect("a holder was left");
+    // SAFETY: kills the holder this test started.
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
+    assert!(why.contains("kGraf stopped process 41"), "{why}");
+    assert!(why.contains("is still running"), "{why}");
+}
+
+/// A scan that fails while the install runs fails the install, with the
+/// scan's error, even when nothing was left behind.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_failed_watch_fails_the_install() {
+    let dir = tempfile::tempdir().expect("dir");
+    let hold = hold_in(&dir);
+    let why = left_behind(
+        &hold,
+        Watched {
+            killed: BTreeSet::new(),
+            failed: Some("process list refused".into()),
+        },
+    )
+    .expect("a failed watch is no pass");
+    assert!(why.contains("could not watch"), "{why}");
+    assert!(why.contains("process list refused"), "{why}");
+}
+
+/// The watch kills a holder that left the group, never one in the group,
+/// and stops when told.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_watch_kills_only_a_holder_outside_the_group() {
+    if !on_path("perl") {
+        eprintln!("skipped: no perl on PATH");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("dir");
+    let hold = hold_in(&dir);
+    let since = std::time::SystemTime::now() - Duration::from_secs(1);
+    let (outside, _go) = detached_holder(&hold, "");
+    let (inside, _go2) = detached_holder(&hold, "");
+    // Told the second holder's own group is the install's.
+    // SAFETY: getpgid only reads the group of a process this test started.
+    let group = unsafe { libc::getpgid(inside) };
+    let watch = EscapeWatch::start(hold.clone(), group, since);
     assert!(
-        why.contains(&format!("kGraf stopped it (process {pid})")),
-        "{why}"
+        gone_soon(outside),
+        "the holder outside the group still runs"
     );
+    let watched = watch.finish();
+    // SAFETY: signal 0 only probes whether the process exists.
+    let inside_ran = unsafe { libc::kill(inside, 0) == 0 };
+    // SAFETY: kills the holder this test started.
+    unsafe {
+        libc::kill(inside, libc::SIGKILL);
+    }
+    assert!(inside_ran, "the holder in the group was killed");
+    assert_eq!(watched.killed, BTreeSet::from([outside]));
+    assert_eq!(watched.failed, None);
 }
 
 /// The package managers read their configuration from the environment as

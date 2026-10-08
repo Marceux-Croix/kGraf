@@ -64,3 +64,17 @@ step is refused, naming it; a file with more than one hard link is refused; a na
 programs could not open by path (a reserved device name, a trailing dot or space, a stream
 suffix) is refused. A removal deletes through the handle it opened, so a link or junction is
 only ever removed itself, never what it points to.
+
+**Note (2026-10-07).** On Windows the guarantee is that no host write or removal lands outside
+what the worker can already write, not that it never leaves the tree. A worker may delete in
+its own tree, so it can move a folder the host holds open into a place it can write (its own
+temporary folder); a write through that open folder then lands there, which the worker could
+have written itself. It never lands where the worker cannot write.
+
+The walk also sets `OBJ_DONT_REPARSE` on every open, so a held folder turned into a junction in
+place is never resolved through; a Windows release that rejects the flag gets an error naming
+it, never an open without it. Each name opened must be the long name of what it reached, other
+than by case, so a short (8.3) name of a protected file is refused. Folders on the way to a
+removal are opened to list and enter only, so another process's current folder on the path does
+not fail the removal; the empty-parent clean-up checks it deletes the same folder it walked
+through. A read-only file with more than one hard link is never changed to delete it.

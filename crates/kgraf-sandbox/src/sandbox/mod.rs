@@ -968,6 +968,45 @@ fn unsupported() -> SandboxError {
     }
 }
 
+/// The variables a command with a cleared environment
+/// (`SandboxedCommand::env_clear`) still inherits on Windows: what a Windows
+/// program needs to start and find its files. Without `SystemRoot`, Winsock
+/// and the crypto providers fail to load; without `PATH` and `PATHEXT`,
+/// programs and their DLLs are not found; without the profile folders, git,
+/// cargo and npm do not find their configuration. None holds a credential
+/// (a unit test checks each name against the credential test the scrub
+/// uses). `TMP` and `TEMP` are not here: the sandbox sets its own.
+pub const WINDOWS_BASE_VARS: &[&str] = &[
+    "ALLUSERSPROFILE",
+    "APPDATA",
+    "CommonProgramFiles",
+    "CommonProgramFiles(x86)",
+    "CommonProgramW6432",
+    "ComSpec",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "LOCALAPPDATA",
+    "NUMBER_OF_PROCESSORS",
+    "OS",
+    "PATH",
+    "PATHEXT",
+    "PROCESSOR_ARCHITECTURE",
+    "PROCESSOR_ARCHITEW6432",
+    "PROCESSOR_IDENTIFIER",
+    "PROCESSOR_LEVEL",
+    "PROCESSOR_REVISION",
+    "ProgramData",
+    "ProgramFiles",
+    "ProgramFiles(x86)",
+    "ProgramW6432",
+    "PUBLIC",
+    "SystemDrive",
+    "SystemRoot",
+    "USERNAME",
+    "USERPROFILE",
+    "windir",
+];
+
 /// Inherited variables naming an agent or daemon socket. Removing them does
 /// not stop a process that already knows the path; the socket rules do that.
 /// It stops tools from finding the agent by default.
@@ -1137,6 +1176,14 @@ pub struct SandboxedCommand {
     /// Explicit stdin, stdout, stderr; `None` takes the per-method default.
     #[cfg(windows)]
     stdio: [Option<Redirect>; 3],
+    /// False after [`Self::env_clear`]: the command then inherits only
+    /// [`WINDOWS_BASE_VARS`] from this process.
+    #[cfg(windows)]
+    inherit_env: bool,
+    /// What [`Self::env_clear`] sets again on Windows: the sandbox's `TMP`
+    /// and `TEMP`, and its git and curl settings numbered from zero.
+    #[cfg(windows)]
+    kept_on_clear: Vec<(String, OsString)>,
 }
 
 impl SandboxedCommand {
@@ -1167,6 +1214,30 @@ impl SandboxedCommand {
 
     pub fn env_remove(&mut self, key: impl AsRef<OsStr>) -> &mut Self {
         self.cmd.env_remove(key);
+        self
+    }
+
+    /// Inherit nothing from this process's environment and drop every
+    /// variable set on the command so far, as `Command::env_clear` does; set
+    /// what the command needs afterwards with [`Self::env`]. For a command
+    /// that must see no credential and no name it was not given.
+    ///
+    /// On Windows a program cannot start without some variables, so the
+    /// command still inherits [`WINDOWS_BASE_VARS`] (none holds a
+    /// credential), and the sandbox sets its own `TMP` and `TEMP` and its git
+    /// and curl settings again: the reset of git's credential helper keeps
+    /// git from asking the Credential Manager, which this backend cannot
+    /// make unreadable. They are numbered from zero, because the host's own
+    /// `GIT_CONFIG_*` entries are no longer inherited.
+    pub fn env_clear(&mut self) -> &mut Self {
+        self.cmd.env_clear();
+        #[cfg(windows)]
+        {
+            self.inherit_env = false;
+            for (key, value) in &self.kept_on_clear {
+                self.cmd.env(key, value);
+            }
+        }
         self
     }
 
@@ -1233,13 +1304,14 @@ impl SandboxedCommand {
             &self.cmd,
             &self.prepared,
             windows::default_stdio(self.stdio),
+            self.inherit_env,
         )
     }
 
     pub fn output(&mut self) -> Result<Output, SandboxError> {
         #[cfg(windows)]
         {
-            windows::output(&self.cmd, &self.prepared, self.stdio)
+            windows::output(&self.cmd, &self.prepared, self.stdio, self.inherit_env)
         }
         #[cfg(not(windows))]
         {
@@ -1251,7 +1323,7 @@ impl SandboxedCommand {
     pub fn status(&mut self) -> Result<ExitStatus, SandboxError> {
         #[cfg(windows)]
         {
-            windows::status(&self.cmd, &self.prepared, self.stdio)
+            windows::status(&self.cmd, &self.prepared, self.stdio, self.inherit_env)
         }
         #[cfg(not(windows))]
         {
@@ -1543,14 +1615,8 @@ pub fn sandboxed_command(
                     "GIT_CONFIG_COUNT is set to a value that is not a number".into(),
                 ));
             };
-            let network_open = matches!(policy.network, Network::Allow);
-            let (entries, count) = windows::git_config_entries(n, network_open);
-            for (key, value) in entries {
+            for (key, value) in windows::tool_env(n, network_open(policy.network)) {
                 cmd.env(key, value);
-            }
-            cmd.env("GIT_CONFIG_COUNT", count.to_string());
-            if network_open {
-                cmd.env(windows::CURL_SSL_BACKEND_VAR, windows::TLS_BACKEND);
             }
         }
         // The stores kGraf filled for this project, read-only, used in place
@@ -1567,8 +1633,22 @@ pub fn sandboxed_command(
             prepared,
             #[cfg(windows)]
             stdio: [None; 3],
+            #[cfg(windows)]
+            inherit_env: true,
+            #[cfg(windows)]
+            kept_on_clear: windows::kept_on_clear(
+                network_open(policy.network),
+                policy.tmp_dir.as_deref(),
+            ),
         })
     }
+}
+
+/// Whether the command runs with the network open: the condition for the
+/// sandbox's TLS settings on Windows.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn network_open(network: Network) -> bool {
+    matches!(network, Network::Allow)
 }
 
 /// Convenience: a confined command in `ws` under the standard worker policy.
@@ -2174,5 +2254,26 @@ mod tests {
             .map(|(k, _)| k.to_owned())
             .collect();
         assert_eq!(removed, vec![OsString::from("GITHUB_TOKEN")]);
+    }
+
+    /// What a cleared Windows environment still inherits holds no
+    /// credential and no agent socket by the scrub's own test, and leaves out
+    /// the temp folders, which the sandbox sets to its own.
+    #[test]
+    fn the_windows_base_variables_are_not_credentials() {
+        for name in WINDOWS_BASE_VARS {
+            assert!(!is_scrubbed(OsStr::new(name)), "{name}");
+        }
+        for name in ["TMP", "TEMP", "TMPDIR"] {
+            assert!(
+                !WINDOWS_BASE_VARS
+                    .iter()
+                    .any(|b| b.eq_ignore_ascii_case(name)),
+                "{name}"
+            );
+        }
+        for name in ["SystemRoot", "PATH", "USERPROFILE", "ComSpec"] {
+            assert!(WINDOWS_BASE_VARS.contains(&name), "{name}");
+        }
     }
 }

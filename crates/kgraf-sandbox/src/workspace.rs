@@ -72,7 +72,8 @@ const CHECKS: &str = ".checks";
 /// place no worker's sandbox can write (a worker's writable roots are its
 /// worktree and its scratch folder), so nothing a worker left, and no
 /// process of the worker that escaped the hold check, can change what the
-/// check reads there. Removed on drop (never through a link); a folder left
+/// check reads there. Removed on drop (never through a link), with `.checks`
+/// when it is then empty; a folder left
 /// by a process that has ended is removed by the next startup cleanup.
 #[derive(Debug)]
 pub struct CheckFolder {
@@ -84,15 +85,24 @@ impl CheckFolder {
     pub fn create(ws: &Workspace) -> Result<Self, WorkspaceError> {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let parent = ws.checks_dir();
-        std::fs::create_dir_all(&parent).map_err(|e| WorkspaceError::io(&parent, e))?;
         let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let me = ProcessIdentity::current();
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
         let path = parent.join(format!("{}-{}-{nanos}-{n}", me.pid, me.start.unwrap_or(0)));
-        // `create_dir`, not `create_dir_all`: anything already there fails.
-        std::fs::create_dir(&path).map_err(|e| WorkspaceError::io(&path, e))?;
+        // The last check to end removes `parent` when it is empty (see
+        // `Drop`), so it can go between the two calls below; make it again.
+        let mut tries = 0;
+        loop {
+            std::fs::create_dir_all(&parent).map_err(|e| WorkspaceError::io(&parent, e))?;
+            // `create_dir`, not `create_dir_all`: anything already there fails.
+            match std::fs::create_dir(&path) {
+                Ok(()) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && tries < 16 => tries += 1,
+                Err(e) => return Err(WorkspaceError::io(&path, e)),
+            }
+        }
         let folder = Self { path };
         let tmp = folder.tmp();
         std::fs::create_dir(&tmp).map_err(|e| WorkspaceError::io(&tmp, e))?;
@@ -132,6 +142,13 @@ impl Drop for CheckFolder {
     fn drop(&mut self) {
         // `remove_dir_all` removes a link inside, never what it points at.
         let _ = std::fs::remove_dir_all(&self.path);
+        // `.checks` is kGraf's own folder, not a worktree: it does not stay
+        // in the worktree list once its last check folder is gone. Only an
+        // empty folder goes (another check's folder, or a leftover, keeps it),
+        // and a check starting now makes it again (`create` retries).
+        if let Some(parent) = self.path.parent() {
+            let _ = std::fs::remove_dir(parent);
+        }
     }
 }
 
@@ -563,7 +580,8 @@ impl WorkspaceManager {
 
     /// kGraf worktrees under this base whose owner cannot be judged from
     /// here ([`Liveness::Unknowable`]: another machine or PID namespace, an
-    /// unreadable boot, or another boot of an unknown machine), and those
+    /// unreadable boot, another boot of an unknown machine, or a PID that now
+    /// runs a process whose start time cannot be read), and those
     /// whose kGraf lock cannot be read at all ([`is_unreadable_own_lock`]).
     /// Nothing removes them on its own; they are listed so a person can, with
     /// [`Self::clean`].
@@ -926,7 +944,9 @@ impl WorkspaceManager {
                 return Err(refuse(
                     "its owner ran on another machine or in another PID namespace (or its \
                      boot is unreadable, or it ran in another boot of a machine not known \
-                     to be this one), so nothing here can tell whether it still runs"
+                     to be this one, or its PID now names a process whose start time \
+                     cannot be read), so nothing here can tell whether it still runs; \
+                     check, then run `kgraf clean`"
                         .into(),
                 ));
             }
@@ -1563,7 +1583,18 @@ fn lock_reason(name: &str) -> Result<String, WorkspaceError> {
 ///   container's worktrees are thus stranded after a host reboot, listed by
 ///   `WorkspaceManager::stranded`, until removed with `kgraf clean`.
 ///
-/// **Known limits** (both come from copying a machine, not from kGraf):
+/// Within one PID table, the PID and start time decide ([`judge`]); a live
+/// PID whose start time cannot be read (on Windows, another user's or a
+/// protected process) is unknowable.
+///
+/// **Windows.** The boot id is the boot sequence number, a counter, not a
+/// random id, so it is recorded only together with the machine id
+/// ([`windows_host_id`]). Windows has no PID or time namespaces. The start
+/// time is the absolute creation time, so a PID reused after a fast startup
+/// (which keeps the boot sequence) still shows another start time. See
+/// `win_process` for the sources and the ids that were rejected.
+///
+/// **Known limits** (all come from copying a machine, not from kGraf):
 /// - a VM or disk image cloned without regenerating `/etc/machine-id` gives
 ///   two machines one machine id. Each boots with its own boot id, so a lock
 ///   one wrote looks, from the other, like this machine before a reboot: a
@@ -1574,14 +1605,21 @@ fn lock_reason(name: &str) -> Result<String, WorkspaceError> {
 ///   restores of one snapshot running at once therefore look like one PID
 ///   table, and each judges the other's owners by PID. Do not run two
 ///   restores of one snapshot against one repository.
+/// - two Windows machines cloned from one image that kept its `MachineGuid`
+///   share a machine id, and can share a boot sequence number. A lock one
+///   wrote is then judged by PID on the other, where its owner's PID and
+///   creation time name no process: **dead**. Do not share one repository
+///   between clones that keep one `MachineGuid`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HostId {
     /// macOS: the hardware UUID (`gethostuuid`). Linux: `/etc/machine-id`,
     /// else `/var/lib/dbus/machine-id`, else unknown (a slim container often
-    /// has neither). Needed only to tell a reboot of this machine from
-    /// another machine; within one boot the boot id suffices.
+    /// has neither). Windows: `MachineGuid` from the registry. Needed only to
+    /// tell a reboot of this machine from another machine; within one boot
+    /// the boot id suffices (on Linux and macOS).
     pub machine: Option<String>,
-    /// macOS `kern.bootsessionuuid`; Linux `/proc/sys/kernel/random/boot_id`.
+    /// macOS `kern.bootsessionuuid`; Linux `/proc/sys/kernel/random/boot_id`;
+    /// Windows `KUSER_SHARED_DATA.BootId`, only with a machine id.
     pub boot: Option<String>,
     /// Linux: the inode of `/proc/self/ns/pid`. macOS has no PID namespaces:
     /// `None` on both sides compares equal there. On Linux an unreadable
@@ -1664,14 +1702,16 @@ pub enum Liveness {
     Dead,
     /// Recorded on another machine or in another PID namespace, with the boot
     /// (or on Linux the namespace) unreadable, or in another boot of a machine
-    /// not known to be this one: nothing here can tell. Its work is
+    /// not known to be this one; or its PID runs a process whose start time
+    /// cannot be read (on Windows, another user's or a protected process):
+    /// nothing here can tell. Its work is
     /// **stranded** until a person removes it (`kgraf clean <worktree>`);
     /// a container restarted with a new PID namespace strands its worktrees
     /// this way.
     Unknowable,
 }
 
-fn owner_liveness(pid: u32, start: Option<u64>, host: Option<&HostId>) -> Liveness {
+pub(crate) fn owner_liveness(pid: u32, start: Option<u64>, host: Option<&HostId>) -> Liveness {
     let here = HostId::current();
     if let Some(recorded) = host {
         match host_verdict(recorded, &here, PID_NAMESPACES_EXIST) {
@@ -1680,16 +1720,104 @@ fn owner_liveness(pid: u32, start: Option<u64>, host: Option<&HostId>) -> Livene
             HostVerdict::Unknowable => return Liveness::Unknowable,
         }
     }
+    // Start times from another time namespace are offset: not comparable.
+    let comparable = host.is_none_or(|h| h.time_ns == here.time_ns);
+    judge(start, probe(pid), comparable)
+}
+
+/// What the process table says about a PID now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Probe {
+    /// No process runs under it: none has it, or the one that has it has
+    /// exited and waits only to be reaped (a zombie; on Windows, a process
+    /// object kept by an open handle).
+    Gone,
+    /// A process runs under it. `start` is its start time as
+    /// [`process_start_time`] reports it, `None` when it cannot be read (on
+    /// Windows, another user's or a protected process).
+    Running { start: Option<u64> },
+}
+
+/// The verdict on an owner recorded with the start time `recorded`, in the
+/// same PID table, given what its PID shows now. `comparable`: both start
+/// times were read in one time namespace. Pure, so every case is testable on
+/// any platform.
+///
+/// | now                       | recorded start          | verdict             |
+/// |---------------------------|-------------------------|---------------------|
+/// | gone                      | any                     | dead                |
+/// | running, start `t`        | `t`                     | alive               |
+/// | running, start `t`        | another value           | dead (a reused PID) |
+/// | running, start unreadable | a value                 | unknowable          |
+/// | running                   | none recorded           | alive               |
+/// | running                   | a value, not comparable | alive               |
+///
+/// A running process whose start time cannot be read is not known to be the
+/// owner, and not known to be another process: unknowable, so its work is
+/// never taken over, and a person can still remove it (`kgraf clean`).
+fn judge(recorded: Option<u64>, now: Probe, comparable: bool) -> Liveness {
+    match (now, recorded) {
+        (Probe::Gone, _) => Liveness::Dead,
+        (Probe::Running { .. }, Some(_)) if !comparable => Liveness::Alive,
+        (
+            Probe::Running {
+                start: Some(current),
+            },
+            Some(recorded),
+        ) if current != recorded => Liveness::Dead,
+        (Probe::Running { start: None }, Some(_)) => Liveness::Unknowable,
+        (Probe::Running { .. }, _) => Liveness::Alive,
+    }
+}
+
+/// `kill(pid, 0)`, the zombie check, then the start time.
+#[cfg(not(windows))]
+fn probe(pid: u32) -> Probe {
     // A zombie has exited; only its parent has not reaped it (see
     // `is_zombie`). `kill(pid, 0)` still succeeds for it.
     if !pid_alive(pid) || is_zombie(pid) {
-        return Liveness::Dead;
+        return Probe::Gone;
     }
-    // Start times from another time namespace are offset: not comparable.
-    let comparable = host.is_none_or(|h| h.time_ns == here.time_ns);
-    match (start, process_start_time(pid)) {
-        (Some(recorded), Some(current)) if comparable && recorded != current => Liveness::Dead,
-        _ => Liveness::Alive,
+    Probe::Running {
+        start: process_start_time(pid),
+    }
+}
+
+/// One `OpenProcess` answers both questions (see `win_process`).
+#[cfg(windows)]
+fn probe(pid: u32) -> Probe {
+    crate::win_process::probe(pid)
+}
+
+/// Whether no running process has `pid` in this PID table: none has it, or
+/// the one that has it has exited and waits only to be reaped. A process that
+/// cannot be queried (another user's) counts as running. For a record that
+/// names its owner by PID alone; [`ProcessIdentity`] also catches a reused
+/// PID.
+pub fn pid_is_gone(pid: u32) -> bool {
+    probe(pid) == Probe::Gone
+}
+
+/// A Windows `FILETIME` (two 32-bit halves) as the one `u64` a lock records.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn filetime_to_u64(low: u32, high: u32) -> u64 {
+    (u64::from(high) << 32) | u64::from(low)
+}
+
+/// The host a Windows process records, from its machine id and boot
+/// sequence (`win_process`). The boot sequence is a small counter, equal on
+/// many machines, unlike the random boot ids of Linux and macOS: with the
+/// machine id unreadable, an equal counter would let a lock written on
+/// another machine be judged by PID here. So the boot is recorded only with
+/// a machine id; without one the host is unknowable ([`host_verdict`]).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_host_id(machine: Option<String>, boot_sequence: Option<u32>) -> HostId {
+    let boot = machine.as_ref().and(boot_sequence).map(|b| b.to_string());
+    HostId {
+        machine,
+        boot,
+        ns: None,
+        time_ns: None,
     }
 }
 
@@ -1914,7 +2042,15 @@ fn host_probe() -> HostId {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(windows)]
+fn host_probe() -> HostId {
+    windows_host_id(
+        crate::win_process::machine_guid(),
+        crate::win_process::boot_sequence(),
+    )
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn host_probe() -> HostId {
     HostId::default()
 }
@@ -2078,10 +2214,14 @@ fn is_zombie(_pid: u32) -> bool {
 
 fn own_start_time() -> Result<u64, WorkspaceError> {
     let pid = std::process::id();
-    if cfg!(any(target_os = "macos", target_os = "linux")) {
+    if cfg!(any(target_os = "macos", target_os = "linux", windows)) {
         process_start_time(pid).ok_or_else(|| {
             WorkspaceError::io(
-                format!("/proc/{pid}"),
+                if cfg!(target_os = "linux") {
+                    format!("/proc/{pid}")
+                } else {
+                    format!("process {pid}")
+                },
                 std::io::Error::other("cannot read this process's start time"),
             )
         })
@@ -2176,7 +2316,16 @@ fn process_start_time(pid: u32) -> Option<u64> {
     after.split_whitespace().nth(19)?.parse().ok()
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+/// Process creation time, a `FILETIME`: 100 ns intervals since 1601 UTC.
+#[cfg(windows)]
+fn process_start_time(pid: u32) -> Option<u64> {
+    match probe(pid) {
+        Probe::Running { start } => start,
+        Probe::Gone => None,
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 fn process_start_time(_pid: u32) -> Option<u64> {
     None
 }
@@ -2194,9 +2343,16 @@ fn pid_alive(pid: u32) -> bool {
     rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-/// No liveness probe off Unix yet: every owner counts as alive, so cleanup
-/// removes only entries whose directory is gone. Conservative, never destructive.
-#[cfg(not(unix))]
+/// Whether `pid` names a running process (see `win_process`). A process that
+/// cannot be opened (another user's, a protected one) counts as alive.
+#[cfg(windows)]
+fn pid_alive(pid: u32) -> bool {
+    probe(pid) != Probe::Gone
+}
+
+/// No liveness probe on this platform: every owner counts as alive, so
+/// cleanup removes only entries whose directory is gone.
+#[cfg(not(any(unix, windows)))]
 fn pid_alive(_pid: u32) -> bool {
     true
 }
@@ -2488,7 +2644,7 @@ mod tests {
     /// time namespace, so a start time recorded in another one is not
     /// comparable. The owner is then judged by PID alone (errs toward alive);
     /// within one time namespace a different start time is still a reused PID.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn start_times_compare_only_within_one_time_namespace() {
         let me = std::process::id();
@@ -2526,7 +2682,7 @@ mod tests {
         let hold = dir.path().join("hold");
         let here = HostId::current();
         let Some(boot) = here.boot.clone() else {
-            // No boot id (not macOS or Linux): every line is another boot's.
+            // No boot id readable here: every line is another boot's.
             return;
         };
         let dead = {
@@ -2616,7 +2772,7 @@ mod tests {
         child.wait().unwrap();
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn own_process_is_alive_and_a_reused_pid_is_not() {
         let me = std::process::id();
@@ -2638,5 +2794,95 @@ mod tests {
             }
             .alive()
         );
+    }
+
+    /// Every row of the table on [`judge`].
+    #[test]
+    fn the_pid_and_start_time_rule_covers_every_case() {
+        use Liveness::{Alive, Dead, Unknowable};
+        let running = |start| Probe::Running { start };
+        let cases = [
+            // (recorded start, now, comparable, verdict)
+            (None, Probe::Gone, true, Dead),
+            (Some(7), Probe::Gone, true, Dead),
+            (Some(7), Probe::Gone, false, Dead),
+            (Some(7), running(Some(7)), true, Alive),
+            (Some(7), running(Some(8)), true, Dead),
+            // The start time of a live PID unreadable (on Windows, another
+            // user's or a protected process): not known to be the owner.
+            (Some(7), running(None), true, Unknowable),
+            (None, running(Some(8)), true, Alive),
+            (None, running(None), true, Alive),
+            // Another time namespace: start times are not comparable.
+            (Some(7), running(Some(8)), false, Alive),
+            (Some(7), running(None), false, Alive),
+        ];
+        for (recorded, now, comparable, want) in cases {
+            assert_eq!(
+                judge(recorded, now, comparable),
+                want,
+                "recorded {recorded:?}, now {now:?}, comparable {comparable}"
+            );
+        }
+    }
+
+    /// A Windows creation time is a 64-bit count of 100 ns intervals; the lock
+    /// reason and the run lease record it in decimal and read it back exactly.
+    #[test]
+    fn a_windows_creation_time_round_trips_through_the_lock_reason() {
+        // A FILETIME in 2026 is about 1.34e17, far above u32::MAX: both
+        // halves must reach the record, in the right order.
+        let start = filetime_to_u64(0x89AB_CDEF, 0x01DC_3F12);
+        assert_eq!(start, 0x01DC_3F12_89AB_CDEF);
+        assert_eq!(filetime_to_u64(u32::MAX, 0), u64::from(u32::MAX));
+        assert_eq!(filetime_to_u64(0, 1), 1 << 32);
+        let host = windows_host_id(
+            Some("6f1e1c0a-2b3d-4e5f-8a9b-0c1d2e3f4a5b".into()),
+            Some(412),
+        );
+        let reason = format!(
+            "{LOCK_TAG}:pid=4321:start={start}:{}:name=w1",
+            host.fields()
+        );
+        assert_eq!(
+            parse_owner(&reason),
+            Some(Owner {
+                pid: 4321,
+                start: Some(start),
+                host: Some(host),
+            })
+        );
+    }
+
+    /// The Windows boot sequence is a counter, equal on many machines: it is
+    /// recorded only with a machine id, so two machines with unreadable ids
+    /// are never one PID table.
+    #[test]
+    fn a_windows_boot_sequence_counts_only_with_a_machine_id() {
+        use HostVerdict::{Rebooted, SamePidTable, Unknowable};
+        let guid = || Some("6f1e1c0a-2b3d-4e5f-8a9b-0c1d2e3f4a5b".to_owned());
+        let here = windows_host_id(guid(), Some(412));
+        assert_eq!(here.boot.as_deref(), Some("412"));
+        assert_eq!((here.ns.as_deref(), here.time_ns.as_deref()), (None, None));
+        let no_machine = windows_host_id(None, Some(412));
+        assert_eq!(no_machine, HostId::default());
+        assert_eq!(windows_host_id(guid(), None).boot, None);
+
+        let cases = [
+            (here.clone(), SamePidTable),
+            // A restart of this machine: every owner is gone.
+            (windows_host_id(guid(), Some(411)), Rebooted),
+            // Another machine at the same boot count.
+            (
+                windows_host_id(Some("another-guid".into()), Some(412)),
+                Unknowable,
+            ),
+            (no_machine.clone(), Unknowable),
+            (windows_host_id(guid(), None), Unknowable),
+        ];
+        for (recorded, want) in cases {
+            assert_eq!(host_verdict(&recorded, &here, false), want, "{recorded:?}");
+        }
+        assert_eq!(host_verdict(&here, &no_machine, false), Unknowable);
     }
 }

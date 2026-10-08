@@ -42,7 +42,7 @@
 use crate::approval::{ApprovalHook, HookDecision, PendingCall};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 #[path = "permission_names.rs"]
@@ -54,6 +54,8 @@ pub mod permission_names;
 mod code;
 #[path = "permission_git.rs"]
 mod git;
+#[path = "permission_paths.rs"]
+pub(crate) mod paths;
 #[path = "permission_readers.rs"]
 mod readers;
 #[path = "permission_recipes.rs"]
@@ -1978,7 +1980,9 @@ impl ReadContext {
                     && !dir.contains(['$', '`', '~', '*', '?', '['])
                     && dir != "-" =>
             {
-                lexical_normalize(&cwd.join(dir)).filter(|p| p.starts_with(root))
+                locate(paths::Flavor::HOST, root, cwd, dir)
+                    .ok()
+                    .map(|rel| root.join(rel))
             }
             _ => None,
         };
@@ -2665,10 +2669,8 @@ fn read_worktree_file(ctx: &ReadContext, name: &str) -> Result<ReadFile, String>
             name.escape_debug()
         ));
     }
-    let path = lexical_normalize(&cwd.join(name))
-        .filter(|p| p.starts_with(root))
-        .ok_or_else(|| format!("`{}` is outside the worktree", name.escape_debug()))?;
-    let rel = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
+    let rel = locate(paths::Flavor::HOST, root, cwd, name).map_err(|why| why.message(name))?;
+    let path = root.join(&rel);
     let version = std::fs::metadata(&path).ok().map(|m| FileVersion::of(&m));
     let cached = version.filter(|v| !v.recent()).and_then(|v| {
         FILE_TEXTS
@@ -2708,10 +2710,50 @@ fn worktree_file_exists(ctx: &ReadContext, name: &str) -> bool {
     let (Some(root), Some(cwd)) = (&ctx.root, &ctx.cwd) else {
         return false;
     };
-    lexical_normalize(&cwd.join(name))
-        .filter(|p| p.starts_with(root))
-        .and_then(|p| std::fs::metadata(p).ok())
+    locate(paths::Flavor::HOST, root, cwd, name)
+        .ok()
+        .and_then(|rel| std::fs::metadata(root.join(rel)).ok())
         .is_some_and(|m| m.is_file())
+}
+
+/// Why a name a command reads is not a file of the worktree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Unplaced {
+    /// Outside the worktree, or above the file system root.
+    Outside,
+    /// A form kGraf cannot place ([`paths::Resolved::Unknown`]).
+    Unknown(&'static str),
+}
+
+impl Unplaced {
+    fn message(&self, name: &str) -> String {
+        match self {
+            Self::Outside => format!("`{}` is outside the worktree", name.escape_debug()),
+            Self::Unknown(why) => format!(
+                "`{}` is {why}, so kGraf cannot tell whether it is inside the worktree",
+                name.escape_debug()
+            ),
+        }
+    }
+}
+
+/// The worktree-relative path of `name`, read from directory `cwd` under
+/// `flavor`'s path rules ([`paths`]), when it lies inside `root`. The one
+/// containment test of the readers: a caller joins the result to `root`,
+/// so the file it opens is spelled as the worktree is.
+fn locate(flavor: paths::Flavor, root: &Path, cwd: &Path, name: &str) -> Result<PathBuf, Unplaced> {
+    let (Some(root_l), Some(cwd_l)) = (paths::full(flavor, root), paths::full(flavor, cwd)) else {
+        return Err(Unplaced::Unknown(
+            "read from a directory kGraf cannot place",
+        ));
+    };
+    match paths::resolve(flavor, Some(&cwd_l), name) {
+        paths::Resolved::Path(l) => paths::within(flavor, &l, &root_l)
+            .map(|rel| rel.iter().collect())
+            .ok_or(Unplaced::Outside),
+        paths::Resolved::AboveRoot(_) => Err(Unplaced::Outside),
+        paths::Resolved::Unknown(why) => Err(Unplaced::Unknown(why)),
+    }
 }
 
 /// A memo of what the permission check parsed out of a file or a piece of
@@ -5277,21 +5319,35 @@ pub fn critical_deletion(
     home: Option<&Path>,
     workspace: Option<&Path>,
 ) -> Option<HardLimit> {
+    critical_deletion_in(paths::Flavor::HOST, argv, home, workspace)
+}
+
+/// [`critical_deletion`] with operands read under `flavor`'s path rules.
+pub(crate) fn critical_deletion_in(
+    flavor: paths::Flavor,
+    argv: &[String],
+    home: Option<&Path>,
+    workspace: Option<&Path>,
+) -> Option<HardLimit> {
     // The commands a file in the workspace makes a program run (a recipe, a
     // script's literal calls) are read too (decision 0094, amended
     // 2026-10-06).
     let ctx = workspace
         .map(|ws| ReadContext::in_worktree(ws, home))
         .unwrap_or_default();
-    critical_deletion_of(&read_call_in(argv, &ctx), home, workspace)
+    critical_deletion_of(flavor, &read_call_in(argv, &ctx), home, workspace)
 }
 
-/// [`critical_deletion`] over a call already read.
+/// [`critical_deletion`] over a call already read, its operands read under
+/// `flavor`'s path rules.
 fn critical_deletion_of(
+    flavor: paths::Flavor,
     reading: &CallReading,
     home: Option<&Path>,
     workspace: Option<&Path>,
 ) -> Option<HardLimit> {
+    let places = Places::new(flavor, home, workspace);
+    let places = &places;
     let mut ask: Option<HardLimit> = None;
     // Where a relative operand may point. The first entry is the workspace,
     // moved by each plain `cd` (the first word of a script's own command), as
@@ -5301,9 +5357,10 @@ fn critical_deletion_of(
     // where it may lead instead of replacing anything, and an operand is
     // judged by the strictest result over every entry. So a directory change
     // can only make the limit stricter.
-    let mut cwds = vec![match workspace {
-        Some(ws) => Cwd::Known(ws.to_path_buf()),
-        None => Cwd::NoWorkspace,
+    let mut cwds = vec![match &places.workspace {
+        Workspace::Known(ws) => Cwd::Known(ws.clone()),
+        Workspace::Unplaced => Cwd::Unknown,
+        Workspace::Absent => Cwd::NoWorkspace,
     }];
     for Nested {
         depth,
@@ -5321,12 +5378,12 @@ fn critical_deletion_of(
         {
             let moved: Vec<Cwd> = cwds
                 .iter()
-                .map(|c| change_directory(c, &words[at..], home))
+                .map(|c| change_directory(places, c, &words[at..]))
                 .collect();
             let plain = depth <= 1 && same_shell && at == 0 && base_name(words[0]) == "cd";
             if plain {
                 for c in cwds.iter_mut() {
-                    *c = cd(c, words.get(1).copied(), home);
+                    *c = cd(places, c, words.get(1).copied());
                 }
             }
             for m in moved {
@@ -5351,7 +5408,7 @@ fn critical_deletion_of(
         // there.
         let mut judged = cwds.clone();
         if let Some(d) = &dir {
-            let d = Cwd::Known(d.clone());
+            let d = places.dir(d);
             if !judged.contains(&d) {
                 judged.push(d);
             }
@@ -5368,7 +5425,7 @@ fn critical_deletion_of(
                 .take_while(|w| !w.starts_with('-') && **w != "(" && **w != "!")
             {
                 for cwd in &judged {
-                    if let Target::System(p) = classify(w, home, cwd, workspace) {
+                    if let Target::System(p) = classify(places, w, cwd) {
                         return Some(system_refusal(&p));
                     }
                 }
@@ -5409,7 +5466,7 @@ fn critical_deletion_of(
                 continue;
             }
             for cwd in &judged {
-                match classify(w, home, cwd, workspace) {
+                match classify(places, w, cwd) {
                     Target::System(p) => return Some(system_refusal(&p)),
                     Target::Critical(p) => {
                         ask.get_or_insert(HardLimit::Ask(format!(
@@ -5439,7 +5496,7 @@ const MAX_CWDS: usize = 16;
 /// and its arguments) moves from `cwd`: `cd` and `pushd` to their first
 /// operand after options (`cd -P /` goes to `/`), `pushd` with no directory
 /// or a stack index and `popd` to a place kGraf cannot tell.
-fn change_directory(cwd: &Cwd, words: &[&str], home: Option<&Path>) -> Cwd {
+fn change_directory(places: &Places<'_>, cwd: &Cwd, words: &[&str]) -> Cwd {
     let changer = base_name(words[0]);
     if changer == "popd" {
         return Cwd::Unknown;
@@ -5455,7 +5512,7 @@ fn change_directory(cwd: &Cwd, words: &[&str], home: Option<&Path>) -> Cwd {
     match target {
         None if changer == "pushd" => Cwd::Unknown,
         Some(t) if changer == "pushd" && t.starts_with('+') => Cwd::Unknown,
-        t => cd(cwd, t, home),
+        t => cd(places, cwd, t),
     }
 }
 
@@ -5486,11 +5543,49 @@ enum Target {
 /// The directory a script's relative operands resolve against.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Cwd {
-    Known(PathBuf),
+    Known(paths::Lexical),
     /// After `cd $X`, `cd -` or another target that cannot be resolved.
     Unknown,
     /// No workspace was given: relative operands are judged by their shape.
     NoWorkspace,
+}
+
+/// The worktree as the deletion check sees it.
+enum Workspace {
+    Absent,
+    Known(paths::Lexical),
+    /// Given, but not a full path kGraf can read (not Unicode): nothing can
+    /// be compared with it, so every operand that is not a system path is
+    /// unresolved.
+    Unplaced,
+}
+
+/// What the deletion check judges an operand against: the path rules, the
+/// home directory and the worktree, each read once per call.
+struct Places<'a> {
+    flavor: paths::Flavor,
+    home: Option<&'a Path>,
+    home_l: Option<paths::Lexical>,
+    workspace: Workspace,
+}
+
+impl<'a> Places<'a> {
+    fn new(flavor: paths::Flavor, home: Option<&'a Path>, workspace: Option<&Path>) -> Self {
+        Self {
+            flavor,
+            home,
+            home_l: home.and_then(|h| paths::full(flavor, h)),
+            workspace: match workspace {
+                None => Workspace::Absent,
+                Some(ws) => paths::full(flavor, ws).map_or(Workspace::Unplaced, Workspace::Known),
+            },
+        }
+    }
+
+    /// A directory a reader found a command starting in.
+    fn dir(&self, d: &Path) -> Cwd {
+        paths::full(self.flavor, d).map_or(Cwd::Unknown, Cwd::Known)
+    }
 }
 
 /// `~`, `~/x`, `$HOME` and `${HOME}/x` with the home directory put in.
@@ -5509,134 +5604,170 @@ fn expand_home(word: &str, home: Option<&Path>) -> Option<String> {
 }
 
 /// Where `cd target` moves from `cwd`.
-fn cd(cwd: &Cwd, target: Option<&str>, home: Option<&Path>) -> Cwd {
+fn cd(places: &Places<'_>, cwd: &Cwd, target: Option<&str>) -> Cwd {
     let target = match target {
-        None | Some("~") => return home.map_or(Cwd::Unknown, |h| Cwd::Known(h.to_path_buf())),
+        None | Some("~") => return places.home_l.clone().map_or(Cwd::Unknown, Cwd::Known),
         Some(t) => t,
     };
-    let t = expand_home(target, home).unwrap_or_else(|| target.to_owned());
+    let t = expand_home(target, places.home).unwrap_or_else(|| target.to_owned());
     if t == "-" || t.contains('$') || t.contains('`') {
         return Cwd::Unknown;
     }
-    let path = PathBuf::from(&t);
-    let joined = if path.is_absolute() {
-        path
-    } else {
-        match cwd {
-            Cwd::Known(c) => c.join(path),
-            Cwd::Unknown | Cwd::NoWorkspace => return Cwd::Unknown,
-        }
+    let base = match cwd {
+        Cwd::Known(c) => Some(c),
+        Cwd::Unknown | Cwd::NoWorkspace => None,
     };
-    lexical_normalize(&joined).map_or(Cwd::Known(PathBuf::from("/")), Cwd::Known)
+    match paths::resolve(places.flavor, base, &t) {
+        paths::Resolved::Path(l) => Cwd::Known(l),
+        // `cd ..` above the root stays at the root.
+        paths::Resolved::AboveRoot(anchor) => Cwd::Known(paths::Lexical {
+            anchor,
+            names: Vec::new(),
+        }),
+        paths::Resolved::Unknown(_) => Cwd::Unknown,
+    }
 }
 
-fn classify(word: &str, home: Option<&Path>, cwd: &Cwd, workspace: Option<&Path>) -> Target {
+/// Private-use characters that stand for `*` and `?` while [`classify`]
+/// resolves a word.
+const GLOB_STAR: &str = "\u{E000}";
+const GLOB_ONE: &str = "\u{E001}";
+
+fn classify(places: &Places<'_>, word: &str, cwd: &Cwd) -> Target {
     if matches!(word, "~" | "$HOME" | "${HOME}") {
         return Target::System(word.to_owned());
     }
     // `~` and `$HOME` name the home directory.
-    let w = expand_home(word, home).unwrap_or_else(|| word.to_owned());
+    let w = expand_home(word, places.home).unwrap_or_else(|| word.to_owned());
     // A variable, a substitution, or a placeholder another program fills in
     // (`find -exec rm -rf {} ;`, `parallel rm -rf {} :::`, a brace
     // expansion) names what kGraf cannot see.
     if w.contains('$') || w.contains('`') || (w.contains('{') && w.contains('}')) {
         return Target::Unresolved(word.to_owned());
     }
-    let path = PathBuf::from(&w);
-    let absolute = path.is_absolute();
-    let joined = if absolute {
-        path.clone()
-    } else {
-        match cwd {
-            Cwd::Known(c) => c.join(&path),
-            Cwd::Unknown => return Target::Unresolved(word.to_owned()),
-            Cwd::NoWorkspace => return relative_target(&path, word),
-        }
+    let flavor = places.flavor;
+    let shape = paths::shape(flavor, &w);
+    let base = match (shape, cwd) {
+        (paths::Shape::Absolute, _) => None,
+        (paths::Shape::Unplaced, _) => return unplaced_target(&w, word),
+        (_, Cwd::Known(c)) => Some(c),
+        (_, Cwd::Unknown) => return Target::Unresolved(word.to_owned()),
+        (paths::Shape::Relative, Cwd::NoWorkspace) => return relative_target(flavor, &w, word),
+        (paths::Shape::Rooted, Cwd::NoWorkspace) => None,
     };
-    let Some(norm) = lexical_normalize(&joined) else {
+    // A path that does not start from the directory (`/x`, `C:\x`, `\x`)
+    // cannot climb out of the workspace by accident.
+    let absolute = shape != paths::Shape::Relative;
+    // A glob character is a pattern the shell expands, not part of a name;
+    // it is marked so the Windows name rules, which refuse `*` and `?` in a
+    // name, still read the rest of the path.
+    let marked = w.replace('*', GLOB_STAR).replace('?', GLOB_ONE);
+    let norm = match paths::resolve(flavor, base, &marked) {
+        paths::Resolved::Path(l) => l,
         // Climbed above the filesystem root.
-        return Target::System(word.to_owned());
+        paths::Resolved::AboveRoot(_) => return Target::System(word.to_owned()),
+        // A device, a stream, a drive whose directory kGraf cannot see.
+        paths::Resolved::Unknown(_) => return Target::Unresolved(word.to_owned()),
     };
     // A glob over a component makes it as wide as its parent.
-    let comps: Vec<String> = norm
-        .components()
-        .filter_map(|c| match c {
-            Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
-            _ => None,
-        })
-        .collect();
-    let glob_at = comps
+    let depth = norm
+        .names
         .iter()
-        .position(|c| c.contains('*') || c.contains('?') || c.contains('['));
-    let depth = glob_at.unwrap_or(comps.len());
-    let effective: PathBuf = std::iter::once("/".to_owned())
-        .chain(comps.iter().take(depth).cloned())
-        .collect();
+        .position(|c| c.contains(GLOB_STAR) || c.contains(GLOB_ONE) || c.contains('['))
+        .unwrap_or(norm.names.len());
     if depth <= 1 {
         return Target::System(word.to_owned());
     }
-    if let Some(h) = home
-        && let Some(hn) = lexical_normalize(h)
-        && (effective == hn || hn.starts_with(&effective))
+    let effective = paths::Lexical {
+        anchor: norm.anchor,
+        names: norm.names[..depth].to_vec(),
+    };
+    // The home directory or a directory above it.
+    if let Some(hn) = &places.home_l
+        && paths::within(flavor, hn, &effective).is_some()
     {
         return Target::System(word.to_owned());
     }
-    if let Some(ws) = workspace
-        && let Some(wn) = lexical_normalize(ws)
-    {
-        if effective == wn || wn.starts_with(&effective) || effective == wn.join(".git") {
-            return Target::Critical(word.to_owned());
-        }
-        if effective.starts_with(wn.join(".git")) {
-            return Target::Critical(word.to_owned());
-        }
-        if !absolute && !effective.starts_with(&wn) {
-            return Target::Critical(word.to_owned());
-        }
-    }
-    Target::Plain
-}
-
-fn relative_target(path: &Path, word: &str) -> Target {
-    let mut depth: i64 = 0;
-    for c in path.components() {
-        match c {
-            Component::ParentDir => depth -= 1,
-            Component::Normal(_) => depth += 1,
-            _ => {}
-        }
-        if depth < 0 {
-            return Target::Critical(word.to_owned());
-        }
-    }
-    if depth == 0 || path.starts_with(".git") {
-        return Target::Critical(word.to_owned());
-    }
-    Target::Plain
-}
-
-/// `.` and `..` removed without touching the filesystem; `None` when `..`
-/// climbs above the root.
-fn lexical_normalize(p: &Path) -> Option<PathBuf> {
-    let mut out = PathBuf::new();
-    for c in p.components() {
-        match c {
-            Component::RootDir | Component::Prefix(_) => out.push(c.as_os_str()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !out.pop() || out.as_os_str().is_empty() {
-                    return None;
-                }
+    match &places.workspace {
+        Workspace::Absent => Target::Plain,
+        Workspace::Unplaced => Target::Unresolved(word.to_owned()),
+        Workspace::Known(wn) => {
+            // The workspace itself or a directory above it.
+            if paths::within(flavor, wn, &effective).is_some() {
+                return Target::Critical(word.to_owned());
             }
-            Component::Normal(s) => out.push(s),
+            match paths::within(flavor, &effective, wn) {
+                Some(rel) if rel.first().is_some_and(|n| is_git_dir_name(n)) => {
+                    Target::Critical(word.to_owned())
+                }
+                Some(_) => Target::Plain,
+                None if !absolute => Target::Critical(word.to_owned()),
+                None => Target::Plain,
+            }
         }
     }
-    Some(out)
+}
+
+/// Whether a name in the workspace root is its `.git` (or kGraf's state) as
+/// some volume reads it: `.GIT`, `.git.`, `GIT~1` ([`kgraf_core::paths`]).
+fn is_git_dir_name(name: &str) -> bool {
+    kgraf_core::paths::is_unreadable_name(name)
+}
+
+/// A relative operand with no workspace, judged by its shape: one that
+/// climbs above where it starts, names that place itself, or names `.git`.
+fn relative_target(flavor: paths::Flavor, w: &str, word: &str) -> Target {
+    let start = paths::Lexical {
+        anchor: paths::Anchor::Root,
+        names: Vec::new(),
+    };
+    match paths::resolve(flavor, Some(&start), w) {
+        paths::Resolved::Path(l) if l.names.first().is_some_and(|n| !is_git_dir_name(n)) => {
+            Target::Plain
+        }
+        paths::Resolved::Path(_) | paths::Resolved::AboveRoot(_) => {
+            Target::Critical(word.to_owned())
+        }
+        paths::Resolved::Unknown(_) => Target::Unresolved(word.to_owned()),
+    }
+}
+
+/// A Windows operand whose place kGraf cannot tell (`/tmp/x` under Git
+/// Bash, a device path): its depth still marks a system path (`/`, `/c`,
+/// `\\.\C:`), and anything deeper is unresolved.
+fn unplaced_target(w: &str, word: &str) -> Target {
+    let start = paths::Lexical {
+        anchor: paths::Anchor::Root,
+        names: Vec::new(),
+    };
+    match paths::resolve(paths::Flavor::Unix, Some(&start), &w.replace('\\', "/")) {
+        paths::Resolved::Path(l)
+            if l.names
+                .iter()
+                .position(|c| c.contains('*') || c.contains('?') || c.contains('['))
+                .unwrap_or(l.names.len())
+                > 1 =>
+        {
+            Target::Unresolved(word.to_owned())
+        }
+        _ => Target::System(word.to_owned()),
+    }
 }
 
 /// The limits no mode lifts, for one call: the user's deny rules, then the
 /// critical-path deletion limit, then the user's ask rules.
 pub fn hard_limit(
+    rules: &UserRules,
+    call: &PendingCall,
+    home: Option<&Path>,
+    workspace: Option<&Path>,
+) -> Option<HardLimit> {
+    hard_limit_in(paths::Flavor::HOST, rules, call, home, workspace)
+}
+
+/// [`hard_limit`] with deletion operands read under `flavor`'s path rules.
+pub(crate) fn hard_limit_in(
+    flavor: paths::Flavor,
     rules: &UserRules,
     call: &PendingCall,
     home: Option<&Path>,
@@ -5662,7 +5793,7 @@ pub fn hard_limit(
     }
     let deletion = reading
         .as_ref()
-        .and_then(|r| critical_deletion_of(r, home, workspace));
+        .and_then(|r| critical_deletion_of(flavor, r, home, workspace));
     if let Some(HardLimit::Deny(reason)) = &deletion {
         return Some(HardLimit::Deny(reason.clone()));
     }
@@ -5893,7 +6024,12 @@ mod tests {
     }
 
     fn limit(words: &[&str]) -> Option<HardLimit> {
-        critical_deletion(&argv(words), Some(&home()), Some(&ws()))
+        critical_deletion_in(
+            paths::Flavor::Unix,
+            &argv(words),
+            Some(&home()),
+            Some(&ws()),
+        )
     }
 
     #[test]
@@ -6046,7 +6182,8 @@ mod tests {
         };
         let h = home();
         let w = ws();
-        let lim = |c: &PendingCall| hard_limit(&rules, c, Some(&h), Some(&w));
+        let lim =
+            |c: &PendingCall| hard_limit_in(paths::Flavor::Unix, &rules, c, Some(&h), Some(&w));
         assert!(matches!(
             lim(&shell(&["curl", "x"])),
             Some(HardLimit::Deny(_))
@@ -6084,7 +6221,13 @@ mod tests {
             deny: vec![Rule::parse("shell(python3*)").expect("rule")],
             ask: vec![Rule::parse("shell(git push*)").expect("rule")],
         };
-        let reason_of = |c: &PendingCall| match hard_limit(&rules, c, Some(&home()), Some(&ws())) {
+        let reason_of = |c: &PendingCall| match hard_limit_in(
+            paths::Flavor::Unix,
+            &rules,
+            c,
+            Some(&home()),
+            Some(&ws()),
+        ) {
             Some(HardLimit::Deny(r) | HardLimit::Ask(r)) => r,
             None => panic!("expected a limit"),
         };
@@ -6115,8 +6258,13 @@ mod tests {
             ask: vec![],
         };
         let sh = shell(&["sh", "-c", "mkdir x"]);
-        let Some(HardLimit::Deny(reason)) = hard_limit(&sh_rules, &sh, Some(&home()), Some(&ws()))
-        else {
+        let Some(HardLimit::Deny(reason)) = hard_limit_in(
+            paths::Flavor::Unix,
+            &sh_rules,
+            &sh,
+            Some(&home()),
+            Some(&ws()),
+        ) else {
             panic!("expected a deny");
         };
         assert_eq!(
@@ -6125,9 +6273,13 @@ mod tests {
         );
         // A deletion limit names the deleting command, not its shell.
         let rm = shell(&["sh", "-c", "mkdir x && rm -rf /usr"]);
-        let Some(HardLimit::Deny(reason)) =
-            hard_limit(&UserRules::default(), &rm, Some(&home()), Some(&ws()))
-        else {
+        let Some(HardLimit::Deny(reason)) = hard_limit_in(
+            paths::Flavor::Unix,
+            &UserRules::default(),
+            &rm,
+            Some(&home()),
+            Some(&ws()),
+        ) else {
             panic!("expected a deny");
         };
         assert_eq!(
@@ -6180,9 +6332,13 @@ mod tests {
                 deny: vec![Rule::parse(text).expect("rule")],
                 ask: vec![],
             };
-            let Some(HardLimit::Deny(reason)) =
-                hard_limit(&rules, &wrapped, Some(&home()), Some(&ws()))
-            else {
+            let Some(HardLimit::Deny(reason)) = hard_limit_in(
+                paths::Flavor::Unix,
+                &rules,
+                &wrapped,
+                Some(&home()),
+                Some(&ws()),
+            ) else {
                 panic!("expected a deny for {text}");
             };
             assert_eq!(
@@ -6201,8 +6357,13 @@ mod tests {
             input: json!({"patch": "*** Begin Patch\n*** Add File: notes.md\n+a\n*** Add File: secrets/key.txt\n+b\n*** End Patch"}),
             ..shell(&["x"])
         };
-        let Some(HardLimit::Deny(reason)) = hard_limit(&rules, &patch, Some(&home()), Some(&ws()))
-        else {
+        let Some(HardLimit::Deny(reason)) = hard_limit_in(
+            paths::Flavor::Unix,
+            &rules,
+            &patch,
+            Some(&home()),
+            Some(&ws()),
+        ) else {
             panic!("expected a deny");
         };
         assert_eq!(

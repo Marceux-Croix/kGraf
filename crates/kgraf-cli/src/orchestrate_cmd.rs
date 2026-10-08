@@ -169,7 +169,7 @@ fn notice_line(n: &Notice) -> String {
         ),
         Notice::Stranded { path, name } => format!(
             "stranded   {}: its owner ran on another machine or in another PID namespace \
-             (or its host is unreadable); check, then run `kgraf clean {name}`",
+             (or its host or process cannot be read); check, then run `kgraf clean {name}`",
             path.display()
         ),
         Notice::CleanedMcpHome(path) => {
@@ -1713,7 +1713,7 @@ mod tests {
                 name: "w".into()
             }),
             "stranded   /b/w: its owner ran on another machine or in another PID namespace \
-             (or its host is unreadable); check, then run `kgraf clean w`"
+             (or its host or process cannot be read); check, then run `kgraf clean w`"
         );
         let report = kgraf_mcp::RegistrationReport::default();
         assert_eq!(

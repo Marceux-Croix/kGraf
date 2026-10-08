@@ -178,6 +178,10 @@ pub struct JsonlTranscript<E> {
 /// (a cancelled `append`, `pending` set) the lock is left to the close, which
 /// tokio performs only after that operation ends: releasing early would let a
 /// new handle read the tail while the orphaned write lands.
+///
+/// Windows: the same rule. Windows releases a closed handle's byte-range
+/// locks only after a delay that "depends upon available system resources"
+/// (Microsoft Learn, "LockFileEx function"), so an idle handle unlocks first.
 impl<E> Drop for JsonlTranscript<E> {
     fn drop(&mut self) {
         #[cfg(unix)]
@@ -188,6 +192,93 @@ impl<E> Drop for JsonlTranscript<E> {
             unsafe {
                 libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
             }
+        }
+        #[cfg(windows)]
+        if self.pending.is_none() && self.settled {
+            win_lock::unlock(&self.file);
+        }
+    }
+}
+
+/// The writer lock on Windows: an exclusive byte-range lock (`LockFileEx`)
+/// on one byte at [`win_lock::OFFSET`], far past any real end of a
+/// transcript. Taken without waiting, so a second writer is refused at once.
+///
+/// Not the whole file, as `std::fs::File::try_lock` locks it: Windows
+/// byte-range locks are mandatory, and a lock over the content would refuse
+/// every other handle to it, this process's own included ("If the locking
+/// process opens the file a second time, it cannot access the specified
+/// region through this second handle": Microsoft Learn, "LockFileEx
+/// function"). The transcript reads its file through another handle
+/// (`read_jsonl`), and changes its length through a second one, because the
+/// append handle lacks the right to (`set_len_to`). A byte past the end is
+/// touched by none of them, and "locking a region that goes beyond the
+/// current end-of-file position is not an error" (the same page). SQLite
+/// locks a byte range away from the data on Windows for the same reason
+/// (`PENDING_BYTE`, `os_win.c`).
+#[cfg(windows)]
+mod win_lock {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{ERROR_IO_PENDING, ERROR_LOCK_VIOLATION};
+    use windows_sys::Win32::Storage::FileSystem::{
+        LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, UnlockFileEx,
+    };
+    use windows_sys::Win32::System::IO::{OVERLAPPED, OVERLAPPED_0, OVERLAPPED_0_0};
+
+    /// 2^62: no transcript grows that long, and the offset stays below 2^63
+    /// for file servers that store lock offsets as signed 64-bit values.
+    pub(super) const OFFSET: u64 = 1 << 62;
+
+    fn at_offset() -> OVERLAPPED {
+        OVERLAPPED {
+            Anonymous: OVERLAPPED_0 {
+                Anonymous: OVERLAPPED_0_0 {
+                    // The low and high halves of OFFSET: truncation intended.
+                    Offset: OFFSET as u32,
+                    OffsetHigh: (OFFSET >> 32) as u32,
+                },
+            },
+            ..OVERLAPPED::default()
+        }
+    }
+
+    /// `Ok(true)`: taken. `Ok(false)`: another handle holds it. `Err`: the
+    /// lock could not be asked for at all (a file system without byte-range
+    /// locks); never read as "free".
+    pub(super) fn try_lock(file: &tokio::fs::File) -> std::io::Result<bool> {
+        let mut overlapped = at_offset();
+        // SAFETY: the handle is open (opened for reading, which LockFileEx
+        // requires) for the whole call; `overlapped` is valid and lives past
+        // it. The handle is synchronous, so the call does not return pending
+        // and keep the pointer.
+        let ok = unsafe {
+            LockFileEx(
+                file.as_raw_handle(),
+                LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                0,
+                1,
+                0,
+                &mut overlapped,
+            )
+        };
+        if ok != 0 {
+            return Ok(true);
+        }
+        let err = std::io::Error::last_os_error();
+        // The codes `std::fs::File::try_lock` also reads as "held elsewhere".
+        match err.raw_os_error().and_then(|c| u32::try_from(c).ok()) {
+            Some(ERROR_LOCK_VIOLATION | ERROR_IO_PENDING) => Ok(false),
+            _ => Err(err),
+        }
+    }
+
+    /// Release the lock [`try_lock`] took through this handle.
+    pub(super) fn unlock(file: &tokio::fs::File) {
+        let mut overlapped = at_offset();
+        // SAFETY: as in `try_lock`; unlocking a range this handle locked.
+        // A failure leaves the lock to the close of the handle.
+        unsafe {
+            UnlockFileEx(file.as_raw_handle(), 0, 1, 0, &mut overlapped);
         }
     }
 }
@@ -308,6 +399,14 @@ where
             if rc != 0 {
                 return Err(SessionError::TranscriptLocked { path });
             }
+        }
+        // The same refusal on Windows (see `win_lock`). Any other failure is
+        // an I/O error: a lock that could not be asked for is not a free one.
+        #[cfg(windows)]
+        match win_lock::try_lock(&file) {
+            Ok(true) => {}
+            Ok(false) => return Err(SessionError::TranscriptLocked { path }),
+            Err(source) => return Err(io_err(&path, source)),
         }
         let t = Self {
             path,
@@ -937,7 +1036,35 @@ mod tests {
         assert_eq!(mode, 0o600, "{mode:o}");
     }
 
-    #[cfg(unix)]
+    /// The writer lock must not lock the content: on Windows a byte-range
+    /// lock is mandatory, and the transcript reads its file and changes its
+    /// length through other handles while the lock is held.
+    #[tokio::test]
+    async fn the_writer_lock_leaves_the_content_open_to_other_handles() {
+        let (_dir, path) = temp_path();
+        let mut t: JsonlTranscript<String> = JsonlTranscript::open(&path).await.expect("open");
+        t.append("a".to_owned()).await.expect("append");
+        let text = std::fs::read_to_string(&path).expect("another handle reads the content");
+        assert!(text.contains("\"a\""), "{text}");
+        assert_eq!(t.load().await.expect("load").len(), 1);
+        // A torn tail, repaired through a second handle while the lock is held.
+        drop(t);
+        std::fs::write(&path, format!("{text}{{\"seq\":1")).expect("tear");
+        let (mut repaired, torn) = JsonlTranscript::<String>::open_repairing_torn_tail(&path)
+            .await
+            .expect("repair under the lock");
+        assert!(torn.is_some());
+        assert_eq!(repaired.append("b".to_owned()).await.expect("append"), 1);
+        assert_eq!(
+            std::fs::read_to_string(&path)
+                .expect("read")
+                .lines()
+                .count(),
+            2
+        );
+    }
+
+    #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn a_second_writer_is_refused_not_silently_interleaved() {
         // Two writers: disjoint writes say this should not arise, but
@@ -955,6 +1082,29 @@ mod tests {
         let _third: JsonlTranscript<String> = JsonlTranscript::open(&path)
             .await
             .expect("a resume after the prior handle is dropped must succeed");
+    }
+
+    /// A dropped handle's lock is free for a resume at once, and a refused
+    /// open (a torn tail) leaves none behind. On Windows the close alone frees
+    /// a byte-range lock only after a delay; the drop unlocks first.
+    #[tokio::test]
+    async fn a_resume_right_after_a_drop_is_never_refused() {
+        let (_dir, path) = temp_path();
+        for i in 0..300u64 {
+            let mut t = JsonlTranscript::<String>::open(&path)
+                .await
+                .expect("a resume right after a drop");
+            assert_eq!(t.append(format!("e{i}")).await.expect("append"), i);
+        }
+        let torn = path.with_extension("torn");
+        std::fs::write(&torn, "{\"seq\":0").expect("torn");
+        for _ in 0..300 {
+            let refused = JsonlTranscript::<String>::open(&torn).await;
+            assert!(
+                matches!(refused, Err(SessionError::TornTranscriptLine { .. })),
+                "{refused:?}"
+            );
+        }
     }
 
     /// A dropped handle's lock is free for a resume at once, while other

@@ -1408,8 +1408,12 @@ cargo run -p kgraf-cli -- schedule run-now nightly --route kimi:<model-id> --pri
   unattended worker is denied an MCP tool until `allow` records a rule in
   `.kgraf/allow-rules.json`.
 - `clean` removes a worktree whose owner was on another machine or in another PID
-  namespace. It refuses while the owner or any process started in it runs; `--force` is
-  needed when a run record still names it.
+  namespace, or whose owner's PID now names a process kGraf cannot read (on Windows,
+  another user's or a protected process). It refuses while the owner or any process
+  started in it runs; `--force` is needed when a run record still names it.
+- kGraf names each owner by PID, start time, machine and boot. On Windows these are the
+  process creation time, `MachineGuid` and the boot sequence number, so a dead owner's
+  worktree and run lease are taken over there as on Linux and macOS.
 - `schedule` also has `remove` and `enable`. `--zone` is required and an unknown zone is
   refused; give exactly one of `--cron` (seconds first) or `--at` (RFC 3339).
 - A schedule is a property of a work node. `schedule add --node <id>`

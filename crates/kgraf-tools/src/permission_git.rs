@@ -273,9 +273,17 @@ fn value_runs(key: &str, kind: KeyRuns, value: &str) -> Vec<Embedded> {
         )],
         KeyRuns::Helper => match value.strip_prefix('!') {
             Some(cmd) => vec![Embedded::Script(cmd.to_owned())],
-            None if value.starts_with('/') || value.contains('\\') => vec![Embedded::Argv(
-                value.split_whitespace().map(str::to_owned).collect(),
-            )],
+            // Git runs an absolute path as written: on Windows also
+            // `C:/tools/helper.exe`, the form Git for Windows writes.
+            None if value.starts_with('/')
+                || value.contains('\\')
+                || super::paths::shape(super::paths::Flavor::HOST, value)
+                    == super::paths::Shape::Absolute =>
+            {
+                vec![Embedded::Argv(
+                    value.split_whitespace().map(str::to_owned).collect(),
+                )]
+            }
             None => {
                 let mut words = value.split_whitespace();
                 let first = words.next().unwrap_or_default();
@@ -1036,6 +1044,16 @@ mod tests {
             let found = read(&["git", "-c", &setting, "fetch"], &none);
             assert_eq!(scripts(&found), vec![want], "{value}");
         }
+        // A drive path with forward slashes, as Git for Windows writes it,
+        // is a path only where it is one.
+        let setting = "credential.helper=C:/tools/helper.exe x";
+        let found = read(&["git", "-c", setting, "fetch"], &none);
+        let want = if cfg!(windows) {
+            "C:/tools/helper.exe x"
+        } else {
+            "git-credential-C:/tools/helper.exe x"
+        };
+        assert_eq!(scripts(&found), vec![want]);
     }
 
     /// The program variables run what they hold, and the variables that

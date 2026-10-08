@@ -105,26 +105,70 @@ pub fn kill_group_until_hold_free(pid: u32, hold: &Path) {
 /// took 0.1 s, and 0.23 s with four CPU-bound processes per core, where one
 /// `lsof` run took 0.4 s and 0.5 to 1.1 s. A caller that kills what this
 /// names (a process that left its group) must find it before it does its
-/// work.
+/// work; [`holders_started_since`] is faster still.
 ///
 /// An error when the process list cannot be read. A process that ends
 /// during the scan is skipped.
 #[cfg(target_os = "macos")]
 pub fn holders(file: &Path) -> std::io::Result<Vec<libc::pid_t>> {
+    Ok(holders_started_since(file, std::time::UNIX_EPOCH)?
+        .into_iter()
+        .map(|h| h.pid)
+        .collect())
+}
+
+/// A process that has a file open ([`holders_started_since`]), with its
+/// process group.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Holder {
+    pub pid: libc::pid_t,
+    pub group: libc::pid_t,
+}
+
+/// As [`holders`], but only processes started at or after `since` (the
+/// kernel's start time, on the wall clock). Each process costs one cheap
+/// read of its table entry (parent, group, start time); only one started
+/// since `since` has its descriptors read, the costly part. With about 520
+/// processes and 16 CPU-bound processes on 16 cores (a debug build), a scan
+/// of only new processes took 0.5 to 42 ms where the full scan took 0.21 to
+/// 0.63 s.
+///
+/// A process that started before `since` by the clock is not named: a
+/// caller that needs every holder (a clock stepped back while it ran) checks
+/// the file's lock as well ([`hold_free`]) and falls back to [`holders`].
+#[cfg(target_os = "macos")]
+pub fn holders_started_since(
+    file: &Path,
+    since: std::time::SystemTime,
+) -> std::io::Result<Vec<Holder>> {
     use std::os::unix::fs::MetadataExt;
     let meta = std::fs::metadata(file)?;
     // `vinfo_stat` keeps the device as 32 bits, as `stat` does on macOS.
     let (dev, ino) = (meta.dev() as u32, meta.ino());
+    let since = since
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
     let me = std::process::id() as libc::pid_t;
     let mut found = Vec::new();
     for pid in all_pids()? {
-        if pid <= 1 || pid == me || !has_open(pid, dev, ino) {
+        if pid <= 1 || pid == me {
             continue;
         }
-        if parent_of(pid) == Some(me) {
+        // Unreadable: it ended, or it is another user's process, whose
+        // descriptors cannot be read either.
+        let Some(info) = bsd_info(pid) else {
+            continue;
+        };
+        let started =
+            Duration::new(info.pbi_start_tvsec, 0) + Duration::from_micros(info.pbi_start_tvusec);
+        if info.pbi_ppid as libc::pid_t == me || started < since || !has_open(pid, dev, ino) {
             continue;
         }
-        found.push(pid);
+        found.push(Holder {
+            pid,
+            group: info.pbi_pgid as libc::pid_t,
+        });
     }
     Ok(found)
 }
@@ -150,9 +194,10 @@ fn all_pids() -> std::io::Result<Vec<libc::pid_t>> {
     Ok(pids)
 }
 
-/// The parent of `pid`, or `None` when it cannot be read (it ended).
+/// The kernel's table entry for `pid` (parent, group, start time), or `None`
+/// when it cannot be read (it ended).
 #[cfg(target_os = "macos")]
-fn parent_of(pid: libc::pid_t) -> Option<libc::pid_t> {
+fn bsd_info(pid: libc::pid_t) -> Option<libc::proc_bsdinfo> {
     let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
     // SAFETY: zeroed proc_bsdinfo is a valid out-parameter.
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
@@ -166,7 +211,7 @@ fn parent_of(pid: libc::pid_t) -> Option<libc::pid_t> {
             size,
         )
     };
-    (got == size).then_some(info.pbi_ppid as libc::pid_t)
+    (got == size).then_some(info)
 }
 
 /// `struct proc_fileinfo` of `<sys/proc_info.h>` (not in the libc crate).
@@ -381,5 +426,64 @@ mod tests {
         let found = found.expect("list");
         assert_eq!(found, vec![detached], "child {}", child.id());
         assert_eq!(none.expect("list"), Vec::<libc::pid_t>::new());
+    }
+
+    /// The faster lister names a holder started at or after `since`, with
+    /// its process group, and leaves out one started before it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn holders_started_since_names_new_holders_with_their_group() {
+        use std::io::BufRead;
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, SystemTime};
+        let dir = tempfile::tempdir().expect("dir");
+        let hold = dir.path().join("hold");
+        std::fs::File::create(&hold).expect("hold");
+        let detached = || -> libc::pid_t {
+            let mut spawner = Command::new("perl")
+                .arg("-e")
+                .arg(
+                    // The child prints its own PID only after `setsid`, so a
+                    // scan never sees it in the old group.
+                    "use POSIX; open(my $f, '<', $ARGV[0]) or die; my $p = fork(); \
+                     if ($p) { exit 0 } POSIX::setsid(); $| = 1; print \"$$\\n\"; \
+                     close(STDOUT); sleep 30;",
+                )
+                .arg(&hold)
+                .stdout(Stdio::piped())
+                .spawn()
+                .expect("perl");
+            let mut line = String::new();
+            std::io::BufReader::new(spawner.stdout.take().expect("stdout"))
+                .read_line(&mut line)
+                .expect("read");
+            spawner.wait().expect("wait");
+            line.trim().parse().expect("pid")
+        };
+        let old = detached();
+        // The kernel keeps start times to the microsecond; well past it.
+        std::thread::sleep(Duration::from_millis(50));
+        let since = SystemTime::now();
+        let new = detached();
+        let found = super::holders_started_since(&hold, since);
+        let all = super::holders(&hold);
+        // SAFETY: kills the two processes this test started.
+        unsafe {
+            libc::kill(old, libc::SIGKILL);
+            libc::kill(new, libc::SIGKILL);
+        }
+        // Each called `setsid`, so leads its own group.
+        assert_eq!(
+            found.expect("list"),
+            vec![super::Holder {
+                pid: new,
+                group: new
+            }]
+        );
+        let mut all = all.expect("list");
+        all.sort();
+        let mut both = vec![old, new];
+        both.sort();
+        assert_eq!(all, both);
     }
 }

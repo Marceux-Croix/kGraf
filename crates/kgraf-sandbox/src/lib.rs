@@ -31,6 +31,8 @@ mod sandbox;
 #[cfg(unix)]
 pub mod trust;
 mod win_command_line;
+#[cfg(windows)]
+mod win_process;
 mod workspace;
 
 /// The name of the Python interpreter the platform installs: Windows installs
@@ -69,8 +71,8 @@ pub use sandbox::SetupProbe;
 pub use sandbox::{
     Backend, CheckNetwork, FROZEN_GIT_FILES, FrozenGit, IsolationStrength, NETWORK_OPEN_NOTICE,
     Network, ReadConfinement, Redirect, SHELL_NETWORK_OPEN_NOTICE, SandboxPolicy, SandboxedCommand,
-    TLS_UNAVAILABLE_HINT, platform_isolation, sandboxed_command, tls_unavailable_hint,
-    workspace_command,
+    TLS_UNAVAILABLE_HINT, WINDOWS_BASE_VARS, platform_isolation, sandboxed_command,
+    tls_unavailable_hint, workspace_command,
 };
 #[cfg(target_os = "linux")]
 pub use sandbox::{LinuxConfinement, linux_confinement};
@@ -78,5 +80,5 @@ pub use win_command_line::windows_command_line;
 pub use workspace::{
     CheckFolder, HostId, LEGACY_LOCK_TAG, LOCK_TAG, Liveness, OrphanCause, OrphanRemoval,
     ProcessIdentity, QuietGuard, ReopenSpec, Workspace, WorkspaceManager, WorkspaceSpec,
-    lock_owner_may_be_running,
+    lock_owner_may_be_running, pid_is_gone,
 };

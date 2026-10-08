@@ -359,3 +359,57 @@ System32 `curl.exe` control passes outside the sandbox; the curl of Git for Wind
 with `SEC_E_NO_CREDENTIALS` inside it. Still fails inside the sandbox: any tool whose only TLS
 stack is Schannel (System32 `curl.exe`, PowerShell, .NET, WinHTTP installers). Options 2 to 4
 are not built. Compile-checked for Windows; nothing here ran on Windows.
+
+## Amendment (2026-10-07): Desktop and environment; MSYS2 programs cannot start under the write-restricted token
+
+**Found.** On Windows 11 and Windows Server 2025, every `sh` and `bash` command in the
+sandbox exited with 0xC0000142 (STATUS_DLL_INIT_FAILED) and printed nothing, while
+`cmd /d /c echo` ran. On Windows the benchmark-brief check's environment was also not
+cleared.
+
+**Cause, two layers.**
+
+1. **The private desktop admitted the user SID only.** The `bin\bash.exe` launcher of Git for
+   Windows links `shell32`, which loads `user32.dll`; `user32.dll` connects to the desktop
+   while it loads, with rights from the desktop's generic write mapping. A `WRITE_RESTRICTED`
+   token must also pass the check with its restricting SIDs for a write right, and the user
+   SID is not one, so every program that loads `user32.dll` at start failed with 0xC0000142.
+   `cmd.exe` does not load it. openai/codex issue 46412 measures the same split; codex grants
+   its desktop to the logon SID, one of its restricting SIDs, which this backend leaves out.
+2. **The MSYS2 runtime's signal pipe.** `msys-2.0.dll` creates its signal pipe while it loads,
+   with an ACL that grants only the user SID, Administrators and SYSTEM, and opens it for
+   `GENERIC_WRITE` (msys2-runtime `sigproc.cc`, `sec/helper.cc`, `fhandler/pipe.cc`). No
+   restricting SID is in that ACL, so the open is refused and the runtime stops with
+   "couldn't create signal pipe, Win32 error 5" (also reported for codex's unelevated
+   sandbox, openai/codex issues 7031 and 15016).
+
+**Built.**
+
+1. Each private desktop has its own fresh SID, granted on that desktop only, and every command
+   on it carries the SID as a restricting SID. No write is added anywhere else. Whether
+   `user32.dll` also needs a write right on the window station is not yet measured.
+2. `SandboxedCommand::env_clear` works on every platform. On Windows a cleared command still
+   inherits `WINDOWS_BASE_VARS` (`SystemRoot`, `PATH`, `PATHEXT`, `ComSpec`, the profile and
+   program folders, the processor variables, `USERNAME`), and the sandbox sets its `TMP`,
+   `TEMP`, git `credential.helper` reset and TLS settings again, numbered from
+   `GIT_CONFIG_KEY_0`. The profile variables keep their real values. No base variable is
+   credential-shaped.
+
+**MSYS2 layer: options, not yet chosen.** Every fix inside the token makes the user SID (or a
+group granted wherever the user is) a restricting SID, which removes the per-root write
+confinement and leaves the Low integrity level as the only write boundary.
+
+1. The user SID as a restricting SID: other workspaces' Low-labeled roots, `LocalLow` and
+   other sandboxes' processes become writable.
+2. A Low-only token for shell commands: the same costs; also fixes Schannel; MSYS2 may still
+   fail on shared objects a Medium process created.
+3. A dedicated sandbox user set up once with administrator rights: keeps confinement and fixes
+   Schannel; needs administrator rights once.
+4. A POSIX shell without the Cygwin runtime (busybox-w32): keeps confinement; the MSYS2 tools
+   of Git for Windows, and what git runs through its own `sh`, still fail.
+5. Keep it: `sh` and `bash` do not run on Windows; the failure shows the runtime's message.
+
+**Tests.** Unit tests for the environment filter and the kept settings run on every platform.
+Windows-only tests pin the pipe refusal and the desktop admission by impersonation, and run
+`whoami.exe`, `where.exe`, PowerShell, `cmd`, `sh` and `bash` in the sandbox, with and
+without a cleared environment. Compile-checked for Windows; nothing here ran on Windows.

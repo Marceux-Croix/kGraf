@@ -409,13 +409,16 @@ fn node_takes_its_options_and_finds_the_script() {
         );
         runs(&ctx, "node", &[flag, "pkg", "main.js"], &["curl x"]);
     }
-    let absolute = ctx
-        .root
-        .as_ref()
-        .expect("root")
-        .join("pre.js")
-        .display()
-        .to_string();
+    // The worktree path and the file name joined by `/`: on Windows a path
+    // with both separators, which node reads as one file.
+    let absolute = format!("{}/pre.js", ctx.root.as_ref().expect("root").display());
+    let native = ctx.root.as_ref().expect("root").join("pre.js");
+    runs(
+        &ctx,
+        "node",
+        &["-r", &native.display().to_string(), "main.js"],
+        &["curl pre", "curl x"],
+    );
     runs(
         &ctx,
         "node",
@@ -668,13 +671,15 @@ fn ruby_takes_its_options_and_finds_the_code() {
         &["-r./lib.rb", "x.rb"],
         &["curl lib", "curl x"],
     );
-    let absolute = ctx
-        .root
-        .as_ref()
-        .expect("root")
-        .join("lib.rb")
-        .display()
-        .to_string();
+    // Both separators on Windows, as for node.
+    let absolute = format!("{}/lib.rb", ctx.root.as_ref().expect("root").display());
+    let native = ctx.root.as_ref().expect("root").join("lib.rb");
+    runs(
+        &ctx,
+        "ruby",
+        &["-r", &native.display().to_string(), "x.rb"],
+        &["curl lib", "curl x"],
+    );
     runs(
         &ctx,
         "ruby",

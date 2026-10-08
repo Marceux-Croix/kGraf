@@ -401,10 +401,13 @@ fn process_identity_is_pid_reuse_safe() {
     let me = ProcessIdentity::current();
     assert!(me.is_alive());
     let here = HostId::current();
-    // The boot id is readable on both Unix platforms; the machine id is not
-    // on a slim Linux container (no /etc/machine-id), and need not be.
-    #[cfg(unix)]
+    // The boot id is readable on Linux, macOS and Windows; the machine id is
+    // not on a slim Linux container (no /etc/machine-id), and need not be.
+    // Windows records its boot (a counter) only with its machine id.
+    #[cfg(any(unix, windows))]
     assert!(here.boot.is_some(), "the boot is readable here: {here:?}");
+    #[cfg(windows)]
+    assert!(here.machine.is_some(), "MachineGuid is readable: {here:?}");
     let host = Some(here.clone());
     assert!(
         !ProcessIdentity {

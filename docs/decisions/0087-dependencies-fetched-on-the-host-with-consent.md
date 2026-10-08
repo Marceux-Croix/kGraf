@@ -482,3 +482,42 @@ Changes item 3 of the amendment above, on macOS.
 leaves the group before its parent exits (else the group kill can end it first and nothing
 escapes) and which checks that the stop names a process. `kgraf-sandbox` `lifecycle.rs`:
 `holders_names_a_detached_holder_and_not_a_child_or_this_process`.
+
+## Amendment (2026-10-07, fourth): a process that leaves the install's group is found while the install runs
+
+Changes items 1 and 2 of the amendment above, on macOS.
+
+1. **A scan after the install's first process exits came too late under heavy load.** With
+   16 CPU-bound processes on 16 cores and the host test suite running in the same process
+   (load average about 120), the scan and kill after the exit took 1.26 s, and a process that
+   left the group and wrote 1 s later wrote first. Any scan that starts at the exit races the
+   escaped process's own work.
+2. **A watch runs while the install runs.** A helper thread scans every 50 ms for processes
+   that hold the install's hold file and are not in the install's process group, and kills
+   each at once; the install is then stopped and fails. The install's first process leads its
+   own session and group (the sandbox calls `setsid`), and every process it starts stays in
+   that group unless it calls `setsid` or `setpgid` itself. So a holder in the group is one of
+   the install's own processes and is never killed; a holder in another group is one a group
+   kill cannot reach. kGraf and its children are never named. A process that leaves the group
+   holds the hold file from its fork (it inherits the descriptor), so the watch sees it as
+   soon as it has left.
+3. **The watch reads only processes started since the install began**
+   (`kgraf_sandbox::lifecycle::holders_started_since`): one cheap read of each process's table
+   entry, and the descriptor list only of a new process. With about 520 processes and 16
+   CPU-bound processes on 16 cores, a scan took 0.5 to 42 ms where the full scan took 0.21 to
+   0.63 s. A process that the clock leaves out (a clock stepped back by more than the 1 s
+   margin) is still found by the full scan after the exit, which stays as the final sweep and
+   waits for the hold to be free.
+4. **The failure names every process killed**, during the run and after it. A scan that fails
+   during the run fails the install, with the scan's error: kGraf could not watch, so a
+   process may have changed files unseen.
+
+**Tests.** `kgraf-host` `deps/install/tests.rs`:
+`a_holder_that_left_the_group_is_killed_before_its_work` now runs a real install whose first
+process sleeps 30 s while a process that left the group writes 300 ms after it left; it fails
+with the watch disabled (the install passed and the file was written).
+`the_watch_kills_only_a_holder_outside_the_group`,
+`a_process_killed_while_the_install_ran_is_named`,
+`a_holder_still_running_after_a_kill_is_reported_with_the_kill`,
+`a_failed_watch_fails_the_install`. `kgraf-sandbox` `lifecycle.rs`:
+`holders_started_since_names_new_holders_with_their_group`.

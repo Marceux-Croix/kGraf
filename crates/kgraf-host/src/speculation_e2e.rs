@@ -38,6 +38,14 @@ fn now_ms() -> i64 {
         .unwrap_or_default()
 }
 
+/// How long the test holds both workers in flight at most: the release
+/// watcher gives up after this, and a worker's step budget lasts longer, so
+/// only the release (or this limit, which fails the test loudly) ends a hold.
+const HOLD_LIMIT: Duration = Duration::from_secs(30);
+const NAP: Duration = Duration::from_millis(250);
+/// Idle rounds that outlast `HOLD_LIMIT`, with room to spare.
+const HOLD_ROUNDS: usize = 200;
+
 /// A worker's idle round while the test holds both contracts in flight.
 struct Nap;
 
@@ -62,7 +70,7 @@ impl Tool for Nap {
         _ctx: &ToolContext,
         _permit: &CallPermit,
     ) -> Result<ToolOutput, ToolError> {
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(NAP).await;
         Ok(ToolOutput::text("rested"))
     }
 }
@@ -109,6 +117,11 @@ struct Outcome {
     _dir: tempfile::TempDir,
 }
 
+/// Speculation never delays a landing (decision 0074), so a pair is reported
+/// before it lands only while the workers are still in flight. The hold must
+/// therefore have no limit of its own: a worker that finishes by itself lands
+/// while a slow round is still validating, and the round reports afterwards.
+///
 /// Run contracts `a` (writes `a.flag`) and `b` (writes `b.flag`) at once.
 /// Each worker writes its file, then idles until `release` says both have
 /// been in flight long enough, then finishes.
@@ -173,7 +186,7 @@ async fn run_pair(
                     json!({"path": file, "content": file}),
                 )];
             }
-            if !hold.load(Ordering::SeqCst) && round < 55 {
+            if !hold.load(Ordering::SeqCst) && round < HOLD_ROUNDS {
                 return vec![call(&format!("nap{round}"), "nap", json!({"r": round}))];
             }
             vec![Content::text("done")]
@@ -293,7 +306,7 @@ async fn run_pair(
     });
     let config = OrchestratorConfig {
         tick: Duration::from_millis(10),
-        step_budget: 60,
+        step_budget: (HOLD_ROUNDS + 20) as u32,
         speculate_every: Some(Duration::from_millis(20)),
         ..OrchestratorConfig::default()
     };
@@ -305,7 +318,7 @@ async fn run_pair(
         let probe = probe.clone();
         let store = RunStore::new(graph.clone());
         tokio::spawn(async move {
-            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            let deadline = std::time::Instant::now() + HOLD_LIMIT;
             while !release(&probe, &store) && std::time::Instant::now() < deadline {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
@@ -362,7 +375,9 @@ async fn a_semantic_conflict_between_two_in_flight_workers_is_reported_before_ei
     // carries the finding, so it can only have come from in-flight trees.
     let out = run_pair(
         "test ! -f a.flag || test ! -f b.flag",
-        Duration::ZERO,
+        // Each validation is held, so a round takes longer than a worker's
+        // few idle rounds, as it does on a loaded machine.
+        Duration::from_secs(2),
         |_, store| {
             store
                 .load(&RunId::new("r1"))
@@ -373,7 +388,7 @@ async fn a_semantic_conflict_between_two_in_flight_workers_is_reported_before_ei
     )
     .await;
     let found = &out.record.coordination.speculative_conflicts;
-    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found.len(), 1, "{found:?} {:#?}", out.trace);
     assert_eq!(found[0].contracts, ["a".to_owned(), "b".to_owned()]);
     assert_eq!(found[0].kind, ConflictKind::Semantic);
     // The pair and each member alone were validated, and the run says so.
@@ -392,7 +407,8 @@ async fn a_semantic_conflict_between_two_in_flight_workers_is_reported_before_ei
     );
     assert!(
         landed.iter().all(|(i, _, _)| reported < *i),
-        "reported before either landed"
+        "reported before either landed: {:#?}",
+        out.trace
     );
     assert!(
         !out.branch_log.contains("speculative"),

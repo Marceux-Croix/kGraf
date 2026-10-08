@@ -465,8 +465,11 @@ fn sandboxed_with(
     }
     let mut cmd = sandboxed_command(&policy, program, dir)
         .with_context(|| format!("cannot sandbox `{program}` in {}", dir.display()))?;
-    #[cfg(unix)]
-    cmd.command_mut().env_clear();
+    // Nothing from kGraf's own environment (provider API keys among it)
+    // reaches a check; on Windows the sandbox keeps the few variables a
+    // program needs to start (`WINDOWS_BASE_VARS`) and its own git and TLS
+    // settings.
+    cmd.env_clear();
     for (k, v) in &vars {
         cmd.env(k, v);
     }
@@ -1454,17 +1457,31 @@ mod tests {
         assert!(saw_nothing, "the check process inherited a credential");
     }
 
+    /// The check process sees the build variables and nothing else from this
+    /// process. On Windows the environment is listed by `cmd /d /c set`, which
+    /// shows the process environment as given, with no shell runtime adding
+    /// its own names, and the allowance also holds the variables a Windows
+    /// program needs to start (`WINDOWS_BASE_VARS`), the sandbox's git and
+    /// TLS settings, and the `PROMPT` that `cmd.exe` sets for itself.
     #[test]
     fn only_the_build_variables_are_passed() {
+        // A plain name no scrub would match: only clearing hides it.
+        // SAFETY: a variable with a name nothing else in this test binary reads.
+        unsafe { std::env::set_var("KGRAF_BENCH_TEST_ENV_PROBE", "visible") };
         let dir = tempfile::tempdir().expect("dir");
         let scratch = tempfile::tempdir().expect("scratch");
         std::fs::write(dir.path().join("r.sh"), "#!/bin/sh\nenv\n").expect("write");
         let env = env_in(scratch.path(), 30);
-        let ran = sandboxed(dir.path(), "sh", &["r.sh"], &env, "target").expect("run");
+        let (program, args): (&str, &[&str]) = if cfg!(windows) {
+            ("cmd", &["/d", "/c", "set"])
+        } else {
+            ("sh", &["r.sh"])
+        };
+        let ran = sandboxed(dir.path(), program, args, &env, "target").expect("run");
         let names: Vec<&str> = ran
             .stdout
             .lines()
-            .filter_map(|l| l.split_once('=').map(|(k, _)| k))
+            .filter_map(|l| l.split_once('=').map(|(k, _)| k.trim()))
             .collect();
         let allowed = [
             "PATH",
@@ -1484,11 +1501,46 @@ mod tests {
             "NPM_CONFIG_CACHE",
             "GOCACHE",
         ];
+        // Windows compares variable names without case.
+        let same = |a: &str, b: &str| {
+            if cfg!(windows) {
+                a.eq_ignore_ascii_case(b)
+            } else {
+                a == b
+            }
+        };
+        let windows_only = |n: &str| {
+            cfg!(windows)
+                && (kgraf_sandbox::WINDOWS_BASE_VARS
+                    .iter()
+                    .any(|b| b.eq_ignore_ascii_case(n))
+                    || ["GIT_CONFIG_COUNT", "CURL_SSL_BACKEND", "PROMPT"]
+                        .iter()
+                        .any(|b| b.eq_ignore_ascii_case(n))
+                    || ["GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"].iter().any(|p| {
+                        n.get(..p.len()).is_some_and(|h| h.eq_ignore_ascii_case(p))
+                            && n.len() > p.len()
+                            && n[p.len()..].bytes().all(|b| b.is_ascii_digit())
+                    }))
+        };
         for n in &names {
-            assert!(allowed.contains(n), "unexpected variable {n} in {names:?}");
+            assert!(
+                allowed.iter().any(|a| same(a, n)) || windows_only(n),
+                "unexpected variable {n} in {names:?}"
+            );
         }
-        assert!(names.contains(&"CARGO_NET_OFFLINE"), "{names:?}");
-        assert!(names.contains(&"CARGO_TARGET_DIR"), "{names:?}");
+        assert!(
+            !names.iter().any(|n| same(n, "KGRAF_BENCH_TEST_ENV_PROBE")),
+            "{names:?}"
+        );
+        assert!(
+            names.iter().any(|n| same(n, "CARGO_NET_OFFLINE")),
+            "{names:?}"
+        );
+        assert!(
+            names.iter().any(|n| same(n, "CARGO_TARGET_DIR")),
+            "{names:?}"
+        );
     }
 
     #[test]

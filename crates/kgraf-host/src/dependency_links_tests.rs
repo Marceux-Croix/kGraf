@@ -219,13 +219,8 @@ async fn tool_settings_the_worker_leaves_in_its_scratch_folder_never_reach_the_c
     )
     .expect("ran");
     assert!(ok, "{out}");
-    // The check's own folder is gone once it ends.
-    let left: Vec<_> = std::fs::read_dir(live.checks_dir())
-        .expect("checks")
-        .flatten()
-        .map(|e| e.file_name())
-        .collect();
-    assert!(left.is_empty(), "{left:?}");
+    // The check's own folder is gone once it ends, and `.checks` with it.
+    assert!(!live.checks_dir().exists(), "a check folder is left");
 }
 
 /// Dependencies the project declares and the checkout lacks: the failure

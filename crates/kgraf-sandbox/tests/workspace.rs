@@ -609,6 +609,7 @@ fn a_removed_workspace_leaves_no_hold_and_tidy_leaves_no_internal_directory() {
     let mgr = WorkspaceManager::open(&f.repo, &f.base).unwrap();
     let ws = mgr.create(&spec("w1")).unwrap();
     let hold = ws.hold_file().to_path_buf();
+    drop(kgraf_sandbox::CheckFolder::create(&ws).unwrap());
     // What a sandboxed command does before it runs.
     std::fs::create_dir_all(hold.parent().unwrap()).unwrap();
     std::fs::File::create(&hold).unwrap();
@@ -771,4 +772,46 @@ fn startup_reads_the_owner_of_a_check_folder_from_its_name() {
         assert!(!reused.exists(), "a reused process id is removed");
         assert!(live.path().is_dir());
     }
+}
+
+/// `.checks` is kGraf's own folder: it is not left in the worktree list when
+/// the last check ends, even while a worktree is registered (so `tidy` does
+/// not remove it). Another check's folder, or a leftover, keeps it; checks
+/// that start and end at the same time never fail on it.
+#[test]
+fn the_checks_folder_goes_with_its_last_check_folder() {
+    let f = fixture();
+    let mgr = WorkspaceManager::open(&f.repo, &f.base).unwrap();
+    mgr.startup().unwrap();
+    let ws = mgr.create(&spec("w1")).unwrap();
+    let checks = ws.checks_dir();
+
+    let one = kgraf_sandbox::CheckFolder::create(&ws).unwrap();
+    let two = kgraf_sandbox::CheckFolder::create(&ws).unwrap();
+    drop(one);
+    assert!(two.path().is_dir(), "a running check's folder stays");
+    drop(two);
+    assert!(!checks.exists(), "no internal folder is left in the base");
+
+    let left = checks.join("not-a-check-folder");
+    std::fs::create_dir_all(&left).unwrap();
+    drop(kgraf_sandbox::CheckFolder::create(&ws).unwrap());
+    assert!(
+        left.is_dir(),
+        "a leftover keeps the folder and is not touched"
+    );
+    std::fs::remove_dir_all(&checks).unwrap();
+
+    std::thread::scope(|s| {
+        for _ in 0..8 {
+            s.spawn(|| {
+                for _ in 0..50 {
+                    let c = kgraf_sandbox::CheckFolder::create(&ws).unwrap();
+                    assert!(c.tmp().is_dir());
+                }
+            });
+        }
+    });
+    assert!(!checks.exists());
+    mgr.remove(ws).unwrap();
 }

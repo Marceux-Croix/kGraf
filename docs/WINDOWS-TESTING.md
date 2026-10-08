@@ -212,6 +212,22 @@ process environment.
    cargo test -p kgraf-sandbox --test shell_windows -- --test-threads=1 2>&1 | Tee-Object "$r\2-shell-windows.txt"
    ```
 
+   **2a.** Programs that load `user32.dll` (`whoami.exe`, `where.exe`, PowerShell), `cmd`,
+   `sh` and `bash`, and a cleared environment, inside the sandbox:
+
+   ```powershell
+   cargo test -p kgraf-sandbox --test startup_windows -- --test-threads=1 2>&1 | Tee-Object "$r\2a-startup-windows.txt"
+   ```
+
+   Expected: every test passes except `sh_dash_c_echo_ok_prints_ok` and
+   `bash_dash_c_exit_3_returns_3`, and the `sh` and `bash` tests of step 2. Those fail until
+   decision 0011 (amendment "Desktop and environment") settles how MSYS2 programs run: their
+   output should show `couldn't create signal pipe, Win32 error 5`. If they still show only
+   exit `-1073741502` with no message, the desktop fix is not enough: report it, with the
+   output of `dumpbin /imports "C:\Program Files\Git\bin\bash.exe"` if Visual Studio is
+   installed. The `msys_pipe` and `desktop_access` tests in step 1 measure both causes, so keep
+   the step 1 output too.
+
 3. The sandbox escape tests (writes outside the worktree, the user profile, another
    sandbox's process, the registry, a junction, and a real cargo build inside the sandbox):
 

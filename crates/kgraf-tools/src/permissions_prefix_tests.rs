@@ -323,7 +323,14 @@ fn a_redirect_after_a_hidden_directory_change_is_never_granted_by_a_script_grant
 /// directory change behind a prefix word, `pushd` and `cd -P`.
 #[test]
 fn the_deletion_limit_sees_a_deleter_and_a_directory_change_behind_prefix_words() {
-    let limit = |words: &[&str]| critical_deletion(&argv(words), Some(&home()), Some(&ws()));
+    let limit = |words: &[&str]| {
+        critical_deletion_in(
+            paths::Flavor::Unix,
+            &argv(words),
+            Some(&home()),
+            Some(&ws()),
+        )
+    };
     for words in [
         &["sh", "-c", "if rm -rf /; then :; fi"][..],
         &["sh", "-c", "while rm -rf /; do :; done"],
@@ -451,14 +458,17 @@ fn legacy_critical_deletion(
     workspace: Option<&Path>,
 ) -> Option<HardLimit> {
     let mut ask: Option<HardLimit> = None;
-    let mut cwd = match workspace {
-        Some(ws) => Cwd::Known(ws.to_path_buf()),
-        None => Cwd::NoWorkspace,
+    let places = Places::new(paths::Flavor::Unix, home, workspace);
+    let places = &places;
+    let mut cwd = match &places.workspace {
+        Workspace::Known(ws) => Cwd::Known(ws.clone()),
+        Workspace::Unplaced => Cwd::Unknown,
+        Workspace::Absent => Cwd::NoWorkspace,
     };
     for command in legacy_simple_commands(argv) {
         let words: Vec<&str> = command.iter().map(String::as_str).collect();
         if words.first().map(|w| base_name(w)) == Some("cd") {
-            cwd = cd(&cwd, words.get(1).copied(), home);
+            cwd = cd(places, &cwd, words.get(1).copied());
             continue;
         }
         let Some(at) = legacy_program_index(&words) else {
@@ -474,7 +484,7 @@ fn legacy_critical_deletion(
                 .iter()
                 .take_while(|w| !w.starts_with('-') && **w != "(" && **w != "!")
             {
-                if let Target::System(p) = classify(w, home, &cwd, workspace) {
+                if let Target::System(p) = classify(places, w, &cwd) {
                     return Some(system_refusal(&p));
                 }
             }
@@ -496,7 +506,7 @@ fn legacy_critical_deletion(
             if !operands_only && w.starts_with('-') {
                 continue;
             }
-            match classify(w, home, &cwd, workspace) {
+            match classify(places, w, &cwd) {
                 Target::System(p) => return Some(system_refusal(&p)),
                 Target::Critical(_) => {
                     ask.get_or_insert(HardLimit::Ask(String::new()));
@@ -615,7 +625,12 @@ async fn no_previously_refused_command_of_the_corpus_is_now_allowed() {
             Some(&home()),
             Some(&ws()),
         ));
-        let new_deletion = limit_strictness(&critical_deletion(&words, Some(&home()), Some(&ws())));
+        let new_deletion = limit_strictness(&critical_deletion_in(
+            paths::Flavor::Unix,
+            &words,
+            Some(&home()),
+            Some(&ws()),
+        ));
         assert!(
             new_deletion >= old_deletion,
             "{words:?}: deletion {new_deletion} < old {old_deletion}"
@@ -824,7 +839,14 @@ fn a_numeric_operand_is_the_wrappers_operand() {
 /// a `cd` outside the call's own shell moves nothing.
 #[test]
 fn the_deletion_limit_sees_a_deleter_given_as_an_argument() {
-    let limit = |words: &[&str]| critical_deletion(&argv(words), Some(&home()), Some(&ws()));
+    let limit = |words: &[&str]| {
+        critical_deletion_in(
+            paths::Flavor::Unix,
+            &argv(words),
+            Some(&home()),
+            Some(&ws()),
+        )
+    };
     for words in [
         &["find", ".", "-exec", "rm", "-rf", "/", ";"][..],
         &["su", "-c", "rm -rf /"],

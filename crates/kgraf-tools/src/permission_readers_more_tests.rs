@@ -316,6 +316,7 @@ fn a_script_path_is_read_as_its_interpreter_given_the_file() {
     w("sh.sh", b"#!/bin/sh -e\nls\n");
     w("bare.sh", b"#!/bin/bash\nls\n");
     w("plain.txt", b"just text\n");
+    // Not `nul.bin`: on Windows `NUL` with any extension is a device.
     w("zero.bin", b"\0\x01\x02 binary");
     w("utf.bin", &[0xff, 0xfe, 0x00, 0x01]);
     w("space.sh", b"#!  /bin/sh   -x  \nls\n");
@@ -351,6 +352,33 @@ fn a_script_path_is_read_as_its_interpreter_given_the_file() {
     assert_eq!(p("zero.bin", &[]), None);
     assert_eq!(p("utf.bin", &[]), None);
     assert_eq!(p("missing", &[]), None);
+}
+
+/// On Windows a device name, a stream or a device path is never placed in
+/// the worktree, so a program named by one is unreadable (asked about)
+/// rather than taken as a program by its name.
+#[cfg(windows)]
+#[test]
+fn a_program_named_by_a_windows_form_kgraf_cannot_place_is_unreadable() {
+    let (_dir, ctx) = tree();
+    for program in [
+        r".\nul.bin",
+        "./CON",
+        r".\x.sh:s",
+        "/c/x/make",
+        r"\\.\C:\x\make",
+    ] {
+        let found = read(&ctx, &[program]).expect("read");
+        assert!(
+            why(&found).contains("which may be a script of the worktree"),
+            "{program}: {}",
+            why(&found)
+        );
+    }
+    // A path in Git Bash's own tree is the program it names, as before.
+    assert!(!opaque(
+        &read(&ctx, &["/usr/bin/env", "ls"]).unwrap_or_default()
+    ));
 }
 
 #[cfg(unix)]
