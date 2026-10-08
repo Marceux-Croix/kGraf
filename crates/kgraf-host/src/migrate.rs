@@ -794,7 +794,10 @@ fn repair_worktrees(
     if !moved.is_empty() {
         let mut args: Vec<std::ffi::OsString> = vec!["worktree".into(), "repair".into()];
         args.extend(moved.iter().map(|p| p.as_os_str().to_owned()));
-        git.run(root, args)
+        let common = git
+            .common_dir(root)
+            .step("cannot find the git directory to repair worktrees in")?;
+        kgraf_sandbox::git::with_worktree_admin_lock(&common, || git.run(root, &args))
             .step("git worktree repair failed after moving the state directory")?;
     }
     // Verify: every moved worktree's link and its registration agree, and no

@@ -59,9 +59,6 @@ const MARKER: &str = ".kgraf-workspaces";
 /// [`MARKER`] under the former name. A base that has only this one (a state
 /// directory moved from `.haustoria`) has it renamed on open.
 const LEGACY_MARKER: &str = ".haustoria-workspaces";
-/// Lock file in the common git directory that serializes worktree-entry git
-/// calls ([`WorkspaceManager::admin_locked`]).
-const ADMIN_LOCK: &str = "kgraf-worktree-admin.lock";
 const MARKER_HEADER: &str = "kgraf-workspaces v1";
 const SCRATCH: &str = ".scratch";
 /// Hold files, one per workspace, outside every writable root (a worker cannot
@@ -624,7 +621,7 @@ impl WorkspaceManager {
 
     /// Registered worktrees of the repository, including the main one.
     pub fn list(&self) -> Result<Vec<WorktreeEntry>, WorkspaceError> {
-        self.admin_locked(|| self.git.worktree_list(&self.repo))
+        self.admin_locked(|| self.git.worktree_list_held(&self.repo))
     }
 
     /// kGraf worktrees under this base whose owner cannot be judged from
@@ -1446,30 +1443,14 @@ impl WorkspaceManager {
         }
     }
 
-    /// Run `f` while holding the repository's worktree-admin lock.
-    ///
-    /// Git writes `worktrees/<id>/` in steps (`gitdir`, `commondir`, `HEAD`)
-    /// and `git worktree list` fails on an entry caught between them. Every
-    /// git call of this manager that adds, changes, removes or lists worktree
-    /// entries runs under this one lock, so none sees another's half-made
-    /// entry. It is an `flock` on a file in the common git directory: it
-    /// excludes other threads (each call opens its own file description) and
-    /// other kGraf processes on the same repository, whatever their base. It is
-    /// held for the git call only, and never taken while it is already held.
+    /// Run `f` while holding the repository's worktree-admin lock
+    /// ([`crate::git::with_worktree_admin_lock`]). Held for the git call only,
+    /// and never taken while it is already held.
     fn admin_locked<T>(
         &self,
         f: impl FnOnce() -> Result<T, WorkspaceError>,
     ) -> Result<T, WorkspaceError> {
-        let path = self.common_dir.join(ADMIN_LOCK);
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&path)
-            .map_err(|e| WorkspaceError::io(&path, e))?;
-        file.lock().map_err(|e| WorkspaceError::io(&path, e))?;
-        let _held = HeldLock::new(file);
-        f()
+        crate::git::with_worktree_admin_lock(&self.common_dir, f)
     }
 
     /// A git call that changes or reads worktree entries, under the

@@ -2002,3 +2002,64 @@ fn remove_ignored_removes_what_git_ignores_and_nothing_else() {
     // A second call finds nothing.
     assert!(mb.remove_ignored(&w).unwrap().is_empty());
 }
+
+/// The merge's check that the integration branch is not checked out runs
+/// `git worktree list`, which fails on an admin entry another process has
+/// half made. A git wrapper plants such an entry for the time a `worktree add`
+/// of a second manager (another base, as another process would have) runs.
+/// The merge must wait for the add, not fail on the entry.
+#[cfg(unix)]
+#[test]
+fn the_checked_out_check_waits_for_a_worktree_add_with_a_half_made_entry() {
+    use std::os::unix::fs::PermissionsExt;
+    let e = env();
+    let mb = merger(&e);
+    let mut w = attempt(&e, "w");
+    write(&w, "x", "x\n");
+    mb.commit_declared(&mut w, "x", &["x"]).unwrap();
+
+    let real = Git::discover().unwrap();
+    let planted = e.f.repo.join(".git/worktrees/half-made");
+    let wrapper = e.f.tmp.path().join("slow-add-git");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\n\
+             case \" $* \" in *' worktree add '*)\n  \
+             mkdir -p '{p}'\n  \
+             echo x > '{p}/gitdir'; : > '{p}/commondir'\n  \
+             sleep 1\n  \
+             rm -rf '{p}'\n;;\nesac\n\
+             exec '{g}' \"$@\"\n",
+            p = planted.display(),
+            g = real.exe().display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let slow =
+        WorkspaceManager::open_with_git(&e.f.repo, &e.f.tmp.path().join("ws2"), Git::at(wrapper))
+            .unwrap();
+    slow.startup().unwrap();
+
+    std::thread::scope(|s| {
+        let adding = s.spawn(|| {
+            slow.create(&WorkspaceSpec {
+                name: "other",
+                base: BRANCH,
+                branch: None,
+            })
+            .unwrap()
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !planted.exists() {
+            assert!(std::time::Instant::now() < deadline, "add never started");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let out = mb
+            .merge(&mut w)
+            .expect("the merge waits for the add instead of failing on its entry");
+        assert!(matches!(out, MergeOutcome::Merged { .. }), "{out:?}");
+        adding.join().unwrap();
+    });
+}

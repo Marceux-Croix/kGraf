@@ -165,8 +165,26 @@ impl Git {
             })
     }
 
-    /// `git worktree list --porcelain -z` for the repository at `repo`.
+    /// The absolute common git directory of the repository at `repo`.
+    pub fn common_dir(&self, repo: &Path) -> Result<PathBuf, WorkspaceError> {
+        self.run_str(
+            repo,
+            ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )
+        .map(PathBuf::from)
+    }
+
+    /// `git worktree list --porcelain -z` for the repository at `repo`, under
+    /// the worktree-admin lock ([`with_worktree_admin_lock`]). Do not call it
+    /// while holding that lock; use [`Self::worktree_list_held`] there.
     pub fn worktree_list(&self, repo: &Path) -> Result<Vec<WorktreeEntry>, WorkspaceError> {
+        let common = self.common_dir(repo)?;
+        with_worktree_admin_lock(&common, || self.worktree_list_held(repo))
+    }
+
+    /// [`Self::worktree_list`] for a caller that already holds the
+    /// worktree-admin lock.
+    pub fn worktree_list_held(&self, repo: &Path) -> Result<Vec<WorktreeEntry>, WorkspaceError> {
         let args = ["worktree", "list", "--porcelain", "-z"];
         let out = self.run(repo, args)?;
         parse_porcelain_z(&out).map_err(|detail| WorkspaceError::GitOutput {
@@ -174,6 +192,40 @@ impl Git {
             detail,
         })
     }
+}
+
+/// Lock file in the common git directory that serializes worktree-entry git
+/// calls.
+const ADMIN_LOCK: &str = "kgraf-worktree-admin.lock";
+
+/// Run `f` while holding the repository's worktree-admin lock.
+///
+/// Git writes `worktrees/<id>/` in steps (`gitdir`, `commondir`, `HEAD`) and
+/// `git worktree list` fails on an entry caught between them, or on a
+/// `worktrees` directory a prune has just removed. Every `git worktree`
+/// call that adds, changes, removes, repairs or lists entries runs inside this
+/// one lock, so none sees another's half-made state. It is an `flock` on a file
+/// in the common git directory: it excludes other threads (each call opens its
+/// own file description) and other kGraf processes on the same repository,
+/// whatever their base. Hold it for the git call only. It is not reentrant: a
+/// nested call on the same directory waits for itself forever.
+pub fn with_worktree_admin_lock<T, E>(
+    common_dir: &Path,
+    f: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E>
+where
+    E: From<WorkspaceError>,
+{
+    let path = common_dir.join(ADMIN_LOCK);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(|e| WorkspaceError::io(&path, e))?;
+    file.lock().map_err(|e| WorkspaceError::io(&path, e))?;
+    let _held = kgraf_core::flock::HeldLock::new(file);
+    f()
 }
 
 fn display_args(args: &[OsString]) -> String {

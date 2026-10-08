@@ -819,7 +819,8 @@ fn an_install_process_that_leaves_its_group_is_stopped_and_fails_the_install() {
 
 /// A process with a shared lock on `hold` that left this process's tree
 /// (its parent exits at once, then it calls `setsid`), as an install process
-/// that left its group is. It runs the Perl `then` once the returned pipe is
+/// that left its group is. The PID is reported only after `setsid`, so the
+/// test never reads its old group. It runs the Perl `then` once the returned pipe is
 /// dropped, and exits: its timing starts when the test says, not when a
 /// loaded machine gets round to it. Its PID and that pipe.
 #[cfg(target_os = "macos")]
@@ -830,7 +831,7 @@ fn detached_holder(hold: &Path, then: &str) -> (libc::pid_t, std::process::Child
         .arg(format!(
             "use POSIX; use Fcntl ':flock'; open(my $f, '<', $ARGV[0]) or die; \
              flock($f, LOCK_SH) or die; my $p = fork(); \
-             if ($p) {{ print \"$p\\n\"; exit 0 }} POSIX::setsid(); close(STDOUT); \
+             if ($p) {{ exit 0 }} POSIX::setsid(); $| = 1; print \"$$\\n\"; close(STDOUT); \
              my @go = <STDIN>; {then}"
         ))
         .arg(hold)

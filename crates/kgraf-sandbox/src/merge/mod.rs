@@ -74,7 +74,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::error::WorkspaceError;
-use crate::git::{Git, parse_porcelain_z};
+use crate::git::{Git, parse_porcelain_z, with_worktree_admin_lock};
 use crate::workspace::{Workspace, WorkspaceManager};
 
 pub use generated::{
@@ -1505,7 +1505,11 @@ impl MergeBack {
 
     fn refuse_checked_out(&self) -> Result<(), MergeError> {
         let args = ["worktree", "list", "--porcelain", "-z"];
-        let out = self.git.ok_bytes(&Target::Repo, &[], args, None)?;
+        // A list run between the steps of another process's `worktree add`
+        // fails on its half-made entry, so it waits on the same lock.
+        let out = with_worktree_admin_lock(&self.git.common_dir, || {
+            self.git.ok_bytes(&Target::Repo, &[], args, None)
+        })?;
         let entries = parse_porcelain_z(&out).map_err(|detail| WorkspaceError::GitOutput {
             args: args.join(" "),
             detail,
