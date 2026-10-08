@@ -187,6 +187,12 @@ The package managers are `npm` (also pnpm, Yarn and Bun), `python`, `go`, `maven
   read-only; the .NET CLI's telemetry is off. A Gradle wrapper finds its distribution, when
   you have unpacked it once (`./gradlew --version`), through that home, read-only (on
   Windows through a junction; not yet run there).
+- On Linux, a Rust toolchain outside your home folder is readable too, when `RUSTUP_HOME`
+  or `CARGO_HOME` names it with an absolute path: the whole `RUSTUP_HOME`, and the `bin`,
+  `registry` and `git` folders of `CARGO_HOME`, never `CARGO_HOME` itself, which holds
+  `credentials.toml`. A value that is relative, missing, the root, your home folder or a
+  folder above it is ignored, and the failing command's output says so. On macOS a
+  `CARGO_HOME` outside your home folder keeps its `credentials` and `config` files unreadable.
 - The verifier's check, the gates and the contract checks each get a new temporary folder,
   removed when they end: tool settings a worker left in its own scratch directory (an
   `.npmrc`, a Gradle init script, a Go build cache, Python bytecode) never reach a check.

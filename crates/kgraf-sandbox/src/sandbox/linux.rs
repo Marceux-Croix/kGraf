@@ -667,6 +667,8 @@ fn build_ruleset(
     if let Some(home) = &policy.home {
         optional.extend(HOME_READS.iter().map(|rel| home.join(rel)));
     }
+    // `$RUSTUP_HOME` and `$CARGO_HOME` when the toolchain lives elsewhere.
+    optional.extend(policy.toolchain.reads.iter().cloned());
     // Optional: a path this machine lacks, or cannot reach (a regular file
     // `~/.config` makes `~/.config/git` "not a directory"), grants nothing.
     for path in &optional {
@@ -704,7 +706,9 @@ fn build_ruleset(
             ruleset = ruleset.add_rule(r).map_err(kernel)?;
         }
     }
-    Ok((ruleset, ancestors.refused))
+    let mut refused = ancestors.refused;
+    refused.extend(policy.toolchain.notes.iter().cloned());
+    Ok((ruleset, refused))
 }
 
 fn gone(path: &Path) -> SandboxError {
@@ -1043,6 +1047,7 @@ mod tests {
             frozen_git: vec![],
             dependency_reads: vec![],
             hidden: vec![],
+            toolchain: super::super::ToolchainReads::default(),
         }
     }
 

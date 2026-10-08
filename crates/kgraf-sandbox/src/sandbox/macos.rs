@@ -63,6 +63,11 @@ const PREFERENCES_POLICY: &str = include_str!("seatbelt_preferences_policy.sbpl"
 /// The system DNS resolver socket. Needed for name resolution with network on.
 const MDNS_SOCKET: &str = "/private/var/run/mDNSResponder";
 
+/// Files in a cargo home outside `$HOME` whose reads are denied: the
+/// credentials and the config, which can carry a token or a proxy login.
+const CARGO_HOME_SECRET_FILES: &[&str] =
+    &["credentials", "credentials.toml", "config", "config.toml"];
+
 /// Paths under `$HOME` whose reads are denied: keys, cloud and registry
 /// credentials, keychains, browser profiles, mail and messages, histories.
 pub(super) const DENIED_HOME_READS: &[&str] = &[
@@ -428,6 +433,22 @@ pub(super) fn profile(policy: &Resolved, home: &Path) -> (String, Vec<(String, P
         inner_metadata.push(format!("(literal (param \"{key}\"))"));
         params.push((key, dir));
     }
+    // A cargo home outside the home folder (`$CARGO_HOME`) holds the same
+    // registry token and proxy login as `~/.cargo`, which the list above
+    // denies by name. Reads are open here, so its files are denied by name.
+    for (i, cargo_home) in policy
+        .cargo_homes
+        .iter()
+        .flatten()
+        .filter(|c| !c.starts_with(home))
+        .enumerate()
+    {
+        for (j, file) in CARGO_HOME_SECRET_FILES.iter().enumerate() {
+            let key = format!("DENY_READ_CARGO_HOME_{i}_{j}");
+            read_denies.push(format!("(literal (param \"{key}\"))"));
+            params.push((key, cargo_home.join(file)));
+        }
+    }
     // Another coding agent's configuration file, plus every sibling path
     // that starts with its name: `.claude.json.backup`, `.claude.json.tmp.*`
     // and any other copy an editor or the agent itself leaves next to it.
@@ -687,6 +708,7 @@ mod tests {
             frozen_git: vec![],
             dependency_reads: vec![],
             hidden: vec![],
+            toolchain: super::super::ToolchainReads::default(),
         }
     }
 
@@ -985,6 +1007,31 @@ mod tests {
         let (text, params) = profile(&resolved("/x/w", Network::Deny), Path::new("/h"));
         assert!(!text.contains("; the checkout"));
         assert!(!params.iter().any(|(k, _)| k.starts_with("ANCESTOR_FILE_")));
+    }
+
+    /// A cargo home outside the home folder has its credentials and config
+    /// denied by name; one under the home folder is covered by the home list
+    /// and adds nothing.
+    #[test]
+    fn a_cargo_home_outside_the_home_folder_has_its_secret_files_denied() {
+        let mut policy = resolved("/x/w", Network::Deny);
+        policy.cargo_homes = Some(vec![
+            PathBuf::from("/home/u/.cargo"),
+            PathBuf::from("/data/cargo"),
+        ]);
+        let (text, params) = profile(&policy, Path::new("/home/u"));
+        let denied: Vec<PathBuf> = params
+            .iter()
+            .filter(|(k, _)| k.starts_with("DENY_READ_CARGO_HOME_"))
+            .map(|(_, v)| v.clone())
+            .collect();
+        let want: Vec<PathBuf> = CARGO_HOME_SECRET_FILES
+            .iter()
+            .map(|f| PathBuf::from("/data/cargo").join(f))
+            .collect();
+        assert_eq!(denied, want);
+        let credentials = text.find("; credential stores, browser").unwrap();
+        assert!(text[credentials..].contains("DENY_READ_CARGO_HOME_0_0"));
     }
 
     /// The IP network rules appear for `Network::Allow` and for no other

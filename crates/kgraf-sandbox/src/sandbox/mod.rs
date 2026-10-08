@@ -532,6 +532,7 @@ impl SandboxPolicy {
                 readable.push(now);
             }
         }
+        let home = home_dir();
         Ok(Resolved {
             writable,
             readable,
@@ -544,7 +545,8 @@ impl SandboxPolicy {
                 .map(|p| resolve_socket(p))
                 .collect::<Result<_, _>>()?,
             network: self.network,
-            home: home_dir(),
+            toolchain: toolchain_reads(home.as_deref()),
+            home,
             ancestor_limit: self.ancestor_limit.as_deref().map(resolve).transpose()?,
             cargo_homes: cargo_homes(),
             hidden,
@@ -604,6 +606,9 @@ struct Resolved {
     /// The credential deny list (macOS) and toolchain reads (Linux) hang off it.
     #[cfg_attr(windows, allow(dead_code))]
     home: Option<PathBuf>,
+    /// Toolchain folders named by `$RUSTUP_HOME` and `$CARGO_HOME` (Linux).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    toolchain: ToolchainReads,
     /// See [`SandboxPolicy::with_ancestor_reads`] (Linux and macOS).
     #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
     ancestor_limit: Option<PathBuf>,
@@ -748,6 +753,110 @@ fn cargo_homes_from(
         out.push(canonical(PathBuf::from(cargo_home)));
     }
     Some(out)
+}
+
+/// Toolchain folders outside the home folder that a command may read, from
+/// `$RUSTUP_HOME` and `$CARGO_HOME` (decision 0084).
+///
+/// Where reads are an allowlist (Linux), the defaults under `$HOME`
+/// (`~/.rustup`, `~/.cargo/{bin,registry,git}`) miss a toolchain installed
+/// elsewhere (a CI image, a shared machine), and `cargo` fails with
+/// "Permission denied". A set variable adds:
+///
+/// - `$RUSTUP_HOME`, whole. Rustup keeps toolchains, `settings.toml`, the
+///   download cache and update hashes there, and no login.
+/// - `$CARGO_HOME/bin`, `registry` and `git`, never the folder itself:
+///   `credentials.toml` and `config.toml` live in it.
+///
+/// A value that is not usable is ignored and named in `notes`, which the
+/// caller shows beside the command's own error: a relative path, one that
+/// does not exist or is not a folder, and one that would grant too much
+/// (the root, the home folder or a folder above it, or a rustup home that
+/// holds the cargo home). The command then runs with the defaults only.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct ToolchainReads {
+    reads: Vec<PathBuf>,
+    notes: Vec<String>,
+}
+
+/// [`toolchain_reads_from`] with the host environment.
+fn toolchain_reads(home: Option<&Path>) -> ToolchainReads {
+    toolchain_reads_from(
+        std::env::var_os("RUSTUP_HOME"),
+        std::env::var_os("CARGO_HOME"),
+        home,
+    )
+}
+
+/// [`ToolchainReads`] for the two variables given, so a test needs no
+/// environment change. An empty value counts as unset.
+fn toolchain_reads_from(
+    rustup_home: Option<OsString>,
+    cargo_home: Option<OsString>,
+    home: Option<&Path>,
+) -> ToolchainReads {
+    let mut out = ToolchainReads::default();
+    // A folder is too broad when granting it would expose the home folder
+    // (equal to it or above it) or everything (the root).
+    let too_broad = |dir: &Path| dir.parent().is_none() || home.is_some_and(|h| h.starts_with(dir));
+    let folder = |name: &str, value: OsString, notes: &mut Vec<String>| -> Option<PathBuf> {
+        let path = PathBuf::from(value);
+        if !path.is_absolute() {
+            notes.push(format!(
+                "${name} is {}, not an absolute path; the toolchain folders it names are not readable",
+                path.display()
+            ));
+            return None;
+        }
+        match kgraf_core::plain_path::canonicalize(&path) {
+            Ok(real) if real.is_dir() && too_broad(&real) => {
+                notes.push(format!(
+                    "${name} is {}, which holds the root or the home folder; it is not readable",
+                    real.display()
+                ));
+                None
+            }
+            Ok(real) if real.is_dir() => Some(real),
+            _ => {
+                notes.push(format!(
+                    "${name} is {}, which is not a folder this user can resolve; it is not readable",
+                    path.display()
+                ));
+                None
+            }
+        }
+    };
+    let mut cargo_real = None;
+    if let Some(value) = cargo_home.filter(|v| !v.is_empty())
+        && let Some(real) = folder("CARGO_HOME", value, &mut out.notes)
+    {
+        for sub in ["bin", "registry", "git"] {
+            // A link such as `registry` -> elsewhere is judged at its target.
+            if let Ok(target) = kgraf_core::plain_path::canonicalize(real.join(sub))
+                && target.is_dir()
+                && !too_broad(&target)
+            {
+                out.reads.push(target);
+            }
+        }
+        cargo_real = Some(real);
+    }
+    if let Some(value) = rustup_home.filter(|v| !v.is_empty())
+        && let Some(real) = folder("RUSTUP_HOME", value, &mut out.notes)
+    {
+        // Granting a rustup home that holds the cargo home would expose
+        // `credentials.toml`.
+        if cargo_real.as_ref().is_some_and(|c| c.starts_with(&real)) {
+            out.notes.push(format!(
+                "$RUSTUP_HOME is {}, which holds $CARGO_HOME; it is not readable",
+                real.display()
+            ));
+        } else {
+            out.reads.push(real);
+        }
+    }
+    out
 }
 
 /// This user's home directory from the password database (getpwuid_r(3)).
@@ -1892,6 +2001,109 @@ mod tests {
         );
         let gone = env_home.join("missing");
         assert_eq!(home_dir_from(Some(gone.into_os_string()), || None), None);
+    }
+
+    /// `$RUSTUP_HOME` is granted whole, and `$CARGO_HOME` by its `bin`,
+    /// `registry` and `git` only, never as a folder (`credentials.toml`).
+    #[cfg(unix)]
+    #[test]
+    fn the_toolchain_variables_grant_rustup_whole_and_cargo_by_subfolder() {
+        let base = tempfile::tempdir().unwrap();
+        let real = kgraf_core::plain_path::canonicalize(base.path()).unwrap();
+        let (home, rustup, cargo) = (real.join("h"), real.join("r"), real.join("c"));
+        for d in [
+            &home,
+            &rustup,
+            &cargo.join("bin"),
+            &cargo.join("registry"),
+            &cargo.join("git"),
+            &cargo.join("other"),
+        ] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let got = toolchain_reads_from(
+            Some(rustup.clone().into_os_string()),
+            Some(cargo.clone().into_os_string()),
+            Some(&home),
+        );
+        assert_eq!(got.notes, Vec::<String>::new());
+        assert_eq!(
+            got.reads,
+            vec![
+                cargo.join("bin"),
+                cargo.join("registry"),
+                cargo.join("git"),
+                rustup.clone()
+            ]
+        );
+        assert!(!got.reads.contains(&cargo));
+        // A missing `git` folder is skipped without a note; unset and empty
+        // variables grant nothing.
+        std::fs::remove_dir(cargo.join("git")).unwrap();
+        let some = toolchain_reads_from(None, Some(cargo.clone().into_os_string()), Some(&home));
+        assert_eq!(some.reads, vec![cargo.join("bin"), cargo.join("registry")]);
+        assert!(some.notes.is_empty());
+        let none = toolchain_reads_from(Some(OsString::new()), Some(OsString::new()), Some(&home));
+        assert_eq!(none, ToolchainReads::default());
+        assert_eq!(
+            toolchain_reads_from(None, None, None),
+            ToolchainReads::default()
+        );
+    }
+
+    /// A value that is relative, missing, a file, the root, the home folder,
+    /// a folder above it, or a rustup home holding the cargo home grants
+    /// nothing and is named.
+    #[cfg(unix)]
+    #[test]
+    fn an_unusable_toolchain_variable_grants_nothing_and_says_why() {
+        let base = tempfile::tempdir().unwrap();
+        let real = kgraf_core::plain_path::canonicalize(base.path()).unwrap();
+        let home = real.join("top/home");
+        let cargo = real.join("top/rustup/cargo");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(cargo.join("bin")).unwrap();
+        let file = real.join("file");
+        std::fs::write(&file, "x").unwrap();
+        let rustup_cases: Vec<(PathBuf, &str)> = vec![
+            (PathBuf::from("rel/rustup"), "absolute"),
+            (real.join("missing"), "not a folder"),
+            (file.clone(), "not a folder"),
+            (PathBuf::from("/"), "root or the home"),
+            (home.clone(), "root or the home"),
+            (real.join("top"), "root or the home"),
+        ];
+        for (value, why) in rustup_cases {
+            let got = toolchain_reads_from(Some(value.clone().into_os_string()), None, Some(&home));
+            assert!(got.reads.is_empty(), "{value:?}: {got:?}");
+            assert_eq!(got.notes.len(), 1, "{value:?}: {got:?}");
+            assert!(got.notes[0].contains("$RUSTUP_HOME"), "{got:?}");
+            assert!(got.notes[0].contains(why), "{value:?}: {got:?}");
+        }
+        let got = toolchain_reads_from(None, Some(OsString::from("/")), Some(&home));
+        assert!(got.reads.is_empty(), "{got:?}");
+        assert!(got.notes[0].contains("$CARGO_HOME"), "{got:?}");
+        // A rustup home above the cargo home would expose its credentials;
+        // the cargo subfolders stay granted.
+        let got = toolchain_reads_from(
+            Some(real.join("top/rustup").into_os_string()),
+            Some(cargo.clone().into_os_string()),
+            Some(&home),
+        );
+        assert_eq!(got.reads, vec![cargo.join("bin")]);
+        assert!(got.notes[0].contains("holds $CARGO_HOME"), "{got:?}");
+        // A `registry` link that leads to the home folder is not followed
+        // into a grant.
+        std::os::unix::fs::symlink(&home, cargo.join("registry")).unwrap();
+        let got = toolchain_reads_from(None, Some(cargo.clone().into_os_string()), Some(&home));
+        assert_eq!(got.reads, vec![cargo.join("bin")]);
+    }
+
+    /// The toolchain variables reach the command: neither name is scrubbed.
+    #[test]
+    fn the_toolchain_variables_are_not_scrubbed() {
+        assert!(!is_scrubbed(OsStr::new("RUSTUP_HOME")));
+        assert!(!is_scrubbed(OsStr::new("CARGO_HOME")));
     }
 
     /// Every cargo home an ancestor read must never enter: `$HOME/.cargo`,

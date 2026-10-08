@@ -60,6 +60,8 @@ run_as_user() {
   sudo -u "$TEST_USER" env -i \
     HOME="$USERSPACE" TMPDIR="$USERSPACE/tmp" \
     PATH="$USERSPACE_PATH_EXTRA/usr/local/bin:/usr/bin:/bin" \
+    RUSTUP_HOME="$(rustup show home 2>/dev/null || echo "$HOME/.rustup")" \
+    CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
     LANG=C.UTF-8 RUST_BACKTRACE=0 \
     bash -c 'cd "$1" && shift && exec "$@"' _ "$dir" "$@" >"$log" 2>&1
 }

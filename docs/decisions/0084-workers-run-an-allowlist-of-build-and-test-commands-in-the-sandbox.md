@@ -987,3 +987,36 @@ mode that grants no program by name, add nothing. The program the refusal names 
 uncovered one.
 
 Tests: `a_shell_question_names_the_programs_the_mode_grants` (fails without the sentence).
+
+## Amendment (2026-10-08): a toolchain outside the home folder is readable on Linux
+
+The Linux sandbox granted toolchain reads only under `$HOME` (`~/.rustup`,
+`~/.cargo/{bin,registry,git}`). A toolchain kept elsewhere (`RUSTUP_HOME=/data/rustup`, a CI
+image, a shared machine) made `cargo` fail with "Permission denied" for correct work. The
+policy now also reads `RUSTUP_HOME` and `CARGO_HOME` from the host environment:
+
+- `$RUSTUP_HOME` is granted whole. Rustup stores toolchains, `settings.toml`, downloads and
+  update hashes there, and no login.
+- `$CARGO_HOME` is granted by `bin`, `registry` and `git` only, never as a folder:
+  `credentials.toml` and `config.toml` are in it, and the config's safe keys still reach the
+  command through its own cargo home.
+- A value is ignored, with a line in the command's refused reads, when it is relative, does not
+  exist, is not a folder, or would grant too much: the root, the home folder or a folder above
+  it, or a rustup home that holds the cargo home. Each granted folder is judged at its resolved
+  path, so a `registry` link to the home folder grants nothing. The command still runs with the
+  defaults under `$HOME`. Ignoring with a notice was chosen over refusing to start, so a
+  mistyped variable does not block work that the defaults can run.
+
+macOS reads are open apart from a deny list, so no grant is needed there; but the list named
+only `~/.cargo`. A `CARGO_HOME` outside the home folder now has `credentials`,
+`credentials.toml`, `config` and `config.toml` denied by name. On Windows reads are not
+confined, so the variables need no grant. A command that clears its environment must set the
+two variables itself, as the bench check runner does; the orchestrator's check runner does not
+clear it, and neither variable is scrubbed.
+
+Tests: `the_toolchain_variables_grant_rustup_whole_and_cargo_by_subfolder`,
+`an_unusable_toolchain_variable_grants_nothing_and_says_why`,
+`the_toolchain_variables_are_not_scrubbed`, `toolchain_env_linux` (a program under a
+`RUSTUP_HOME` and a `CARGO_HOME` outside the home runs in the sandbox; the credentials file does
+not read; fails without the grant), and on macOS
+`a_cargo_home_outside_the_home_folder_has_its_secret_files_denied` and `cargo_home_reads_macos`.
