@@ -532,6 +532,12 @@ fn sandboxed_with(
             Err(e) => bail!("waiting for `{program}`: {e}"),
         }
     };
+    // The job stands in for the process group on Windows: ending it once the
+    // leader has exited ends every process the command left behind. A build
+    // tool's background server holds the output pipes open, and the readers
+    // below would wait out their grace and return nothing.
+    #[cfg(windows)]
+    let _ = child.kill();
     #[cfg(unix)]
     {
         // SIGKILL lands asynchronously: give the group a bounded time to go.
@@ -574,6 +580,18 @@ fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> mpsc::Receiver<String> {
         let _ = tx.send(String::from_utf8_lossy(&kept).into_owned());
     });
     rx
+}
+
+/// How a process ended, for a reason: the exit code, in hex too when it is a
+/// Windows status (`0xC0000142` is a program that could not start).
+fn exit_note(status: ExitStatus) -> String {
+    match status.code() {
+        Some(code) if !(0..=255).contains(&code) => {
+            format!("exit code {code} = {:#010x}", code as u32)
+        }
+        Some(code) => format!("exit code {code}"),
+        None => "no exit code".to_owned(),
+    }
 }
 
 /// The last few lines of a process's standard error, for a reason.
@@ -707,7 +725,11 @@ fn cargo_test(
         return unmet(timed_out());
     };
     if !status.success() {
-        return unmet(format!("the build failed: {}", stderr_tail(&built.stderr)));
+        return unmet(format!(
+            "the build failed ({}): {}",
+            exit_note(status),
+            stderr_tail(&built.stderr)
+        ));
     }
     if !guard.intact(dir) || untrusted_build_input(dir).is_some() {
         return unmet("the build changed a protected file or added a build input");

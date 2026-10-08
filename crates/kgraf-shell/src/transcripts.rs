@@ -172,7 +172,7 @@ fn event_turn(event: WorkerEvent, turns: &mut Vec<Turn>) {
             usage.cache_read,
             usage.cache_write,
             usage.text_output,
-            usage.reasoning_output
+            usage.reasoning_label()
         ))),
         WorkerEvent::Stop { reason, .. } => turns.push(Turn::Event(format!("{STOP}{reason:?}"))),
         WorkerEvent::Cancelled { phase } => {

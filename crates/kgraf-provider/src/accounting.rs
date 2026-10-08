@@ -1946,7 +1946,8 @@ impl Ledger {
             let mut stmt = conn.prepare(
                 "SELECT model,
                         SUM(uncached_input), SUM(cache_read), SUM(cache_write),
-                        SUM(text_output), SUM(reasoning_output)
+                        SUM(text_output), SUM(reasoning_output),
+                        SUM(unsplit_reasoning_chars)
                  FROM calls WHERE settlement IN ('counted', 'cancelled')
                  GROUP BY model ORDER BY model",
             )?;
@@ -2038,7 +2039,8 @@ impl Ledger {
         self.read(|conn| {
             let mut stmt = conn.prepare(&format!(
                 "SELECT {key_sql}, model, route,
-                        uncached_input, cache_read, cache_write, text_output, reasoning_output
+                        uncached_input, cache_read, cache_write, text_output, reasoning_output,
+                        unsplit_reasoning_chars
                  FROM calls
                  WHERE settlement IN ('counted', 'cancelled') AND (?1 IS NULL OR agent_id = ?1)"
             ))?;
@@ -2073,7 +2075,7 @@ impl Ledger {
             let mut stmt = conn.prepare(
                 "WITH w AS (
                     SELECT model, task_id, uncached_input, cache_read, cache_write,
-                           text_output, reasoning_output,
+                           text_output, reasoning_output, unsplit_reasoning_chars,
                            uncached_input + cache_read + cache_write AS input,
                            ROW_NUMBER() OVER (
                                PARTITION BY model, task_id ORDER BY started_ms, rowid
@@ -2084,7 +2086,8 @@ impl Ledger {
                  SELECT model, task_id, COUNT(*),
                         MAX(CASE WHEN rn = 1 THEN input END), MAX(input),
                         SUM(uncached_input), SUM(cache_read), SUM(cache_write),
-                        SUM(text_output), SUM(reasoning_output)
+                        SUM(text_output), SUM(reasoning_output),
+                        SUM(unsplit_reasoning_chars)
                  FROM w GROUP BY model, task_id ORDER BY model, task_id",
             )?;
             let rows = stmt.query_map(params![exclude_agent_prefix], |row| {
@@ -2113,7 +2116,8 @@ impl Ledger {
         let rows: BTreeMap<String, Row> = self.read(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, settlement, model, route,
-                        uncached_input, cache_read, cache_write, text_output, reasoning_output
+                        uncached_input, cache_read, cache_write, text_output, reasoning_output,
+                        unsplit_reasoning_chars
                  FROM calls WHERE id IN (SELECT value FROM json_each(?1))",
             )?;
             let rows = stmt.query_map(params![wanted], |row| {
@@ -2673,6 +2677,7 @@ fn apply_begin(
         given_slice_ids: slice_ids,
         given_prefix_hash: trace.given_prefix_hash.clone(),
         redacted: 0,
+        unsplit_reasoning_chars: None,
     };
     append_chain(conn, tip, "begin", &id, &content_digest(&fields), None)?;
     Ok(id)
@@ -2799,7 +2804,8 @@ fn apply_settlement(
                           text_output = ?6, reasoning_output = ?7,
                           raw_usage = ?8, raw_hash = ?9,
                           request_id = COALESCE(?10, request_id),
-                          finished_ms = ?11
+                          finished_ms = ?11,
+                          unsplit_reasoning_chars = ?14
          WHERE id = ?1 AND settlement IN (?12, ?13)",
         )?
         .execute(params![
@@ -2819,6 +2825,7 @@ fn apply_settlement(
                 SettleFrom::InFlight => "in_flight",
                 SettleFrom::Open => "unreconciled",
             },
+            usage.unsplit_reasoning_chars.map(|n| n as i64),
         ])?;
     if changed == 0 {
         let state = raw_row(conn, id)?.map(|r| r.settlement);
@@ -3025,8 +3032,9 @@ fn open_reader(path: &Path) -> Result<Connection, LedgerError> {
     Ok(conn)
 }
 
-/// Six summed usage columns starting at `first`, as a `TokenUsage`. A `SUM`
-/// over no rows is `NULL`, read as zero.
+/// Six summed usage columns starting at `first`, as a `TokenUsage`. The sixth
+/// is the unsplit reasoning characters. A `SUM` over no rows is `NULL`, read as
+/// zero; the sixth stays `None` when no row had a mark.
 fn usage_from_sums(row: &rusqlite::Row<'_>, first: usize) -> rusqlite::Result<TokenUsage> {
     let at = |i: usize| -> rusqlite::Result<u64> {
         Ok(row.get::<_, Option<i64>>(first + i)?.unwrap_or(0) as u64)
@@ -3037,6 +3045,7 @@ fn usage_from_sums(row: &rusqlite::Row<'_>, first: usize) -> rusqlite::Result<To
         cache_write: at(2)?,
         text_output: at(3)?,
         reasoning_output: at(4)?,
+        unsplit_reasoning_chars: row.get::<_, Option<i64>>(first + 5)?.map(|n| n as u64),
         raw: None,
     })
 }
@@ -3385,7 +3394,7 @@ const CALL_COLUMNS: &str = "id, adapter, protocol, model, agent_id, task_id, set
      uncached_input, cache_read, cache_write, text_output, reasoning_output,
      raw_usage, request_id, started_ms, finished_ms,
      parent_call, call_kind, call_role, ttft_ms, tool_rounds,
-     given_slice_ids, given_prefix_hash, redacted, route";
+     given_slice_ids, given_prefix_hash, redacted, route, unsplit_reasoning_chars";
 
 fn record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CallRecord> {
     let protocol: String = row.get(2)?;
@@ -3413,6 +3422,7 @@ fn record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CallRecord> {
             cache_write: row.get::<_, i64>(9)? as u64,
             text_output: row.get::<_, i64>(10)? as u64,
             reasoning_output: row.get::<_, i64>(11)? as u64,
+            unsplit_reasoning_chars: row.get::<_, Option<i64>>(25)?.map(|n| n as u64),
             raw: raw.and_then(|r| serde_json::from_str(&r).ok()),
         },
         request_id: row.get(13)?,
@@ -3463,13 +3473,14 @@ struct RawFields {
     given_slice_ids: String,
     given_prefix_hash: Option<String>,
     redacted: i64,
+    unsplit_reasoning_chars: Option<i64>,
 }
 
 const RAW_COLUMNS: &str = "id, adapter, protocol, model, agent_id, task_id, settlement,
      uncached_input, cache_read, cache_write, text_output, reasoning_output,
      raw_usage, raw_hash, request_id, started_ms, finished_ms,
      parent_call, call_kind, call_role, ttft_ms, tool_rounds,
-     given_slice_ids, given_prefix_hash, redacted";
+     given_slice_ids, given_prefix_hash, redacted, unsplit_reasoning_chars";
 
 fn raw_fields_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawFields> {
     Ok(RawFields {
@@ -3498,6 +3509,7 @@ fn raw_fields_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawFields> {
         given_slice_ids: row.get(22)?,
         given_prefix_hash: row.get(23)?,
         redacted: row.get(24)?,
+        unsplit_reasoning_chars: row.get(25)?,
     })
 }
 
@@ -3546,6 +3558,12 @@ fn content_digest(f: &RawFields) -> String {
     hash_str(&mut h, &f.tool_rounds);
     hash_str(&mut h, &f.given_slice_ids);
     hash_opt_str(&mut h, f.given_prefix_hash.as_deref());
+    // Hashed only when set, so every digest written before the column existed
+    // still verifies.
+    if let Some(chars) = f.unsplit_reasoning_chars {
+        hash_str(&mut h, "unsplit_reasoning_chars");
+        hash_i64(&mut h, chars);
+    }
     h.finalize().to_hex().to_string()
 }
 
@@ -3674,6 +3692,11 @@ const MIGRATION_COLUMNS: &[(&str, &str)] = &[
     // column into the content hash would make an ordinary, expected
     // `route = NULL` on an unwrapped call indistinguishable from tampering.
     ("route", "TEXT"),
+    // Characters of reasoning text in a response whose usage gave no reasoning
+    // token count. Set means those tokens are inside `text_output` and the
+    // split is unknown. NULL means the split is as reported. Part of
+    // `content_digest` when set.
+    ("unsplit_reasoning_chars", "INTEGER"),
 ];
 
 /// The hash chain, append-only. One row per mutating event: `begin`, `settle`,
@@ -3910,6 +3933,7 @@ mod tests {
             cache_write: 50,
             text_output: 20,
             reasoning_output: 5,
+            unsplit_reasoning_chars: None,
             raw: Some(json!({"input_tokens": 100})),
         }
     }
@@ -4025,6 +4049,7 @@ mod tests {
             cache_write: 0,
             text_output: 40,
             reasoning_output: 0,
+            unsplit_reasoning_chars: None,
             raw: None,
         };
         let id = {
@@ -4082,6 +4107,7 @@ mod tests {
             cache_write: 0,
             text_output: 87,
             reasoning_output: 0,
+            unsplit_reasoning_chars: None,
             raw: None,
         };
         ledger.reconcile(&id, &final_usage).expect("reconcile");
@@ -5209,6 +5235,7 @@ mod tests {
                         cache_write: 13,
                         text_output: 3 + i,
                         reasoning_output: 5,
+                        unsplit_reasoning_chars: None,
                         raw: None,
                     },
                 )

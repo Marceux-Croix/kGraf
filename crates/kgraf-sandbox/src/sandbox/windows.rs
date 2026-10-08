@@ -88,8 +88,10 @@
 //! [`super::WINDOWS_BASE_VARS`], the variables a Windows program needs to start
 //! (`SystemRoot`, `PATH`, the profile folders and the others listed there),
 //! and the sandbox sets its own again: `TMP` and `TEMP` (the policy's tmp
-//! folder) and the git and curl settings (see `git_config_entries`),
-//! numbered from zero because the host's `GIT_CONFIG_*` entries are gone.
+//! folder) and the git and curl settings (see `git_config_pairs`). With or
+//! without a clear, the git entries are numbered from zero and the host's
+//! own `GIT_CONFIG_*` entries never reach the command: their values can
+//! carry a credential.
 //! The profile variables keep their real values: reads are not confined
 //! here, writes there are refused by the token, and a tool that cannot find
 //! its configuration would fail for no gain.
@@ -131,7 +133,7 @@
 //! "Schannel"). With the network open, the command's environment steers the
 //! tools that can switch: `CURL_SSL_BACKEND=openssl` for the curl of Git for
 //! Windows, and `http.sslBackend=openssl` through `GIT_CONFIG_COUNT` for git
-//! (see `git_config_entries`). A tool whose only TLS stack is Schannel
+//! (see `git_config_pairs`). A tool whose only TLS stack is Schannel
 //! (curl.exe from System32, PowerShell, .NET) still fails.
 //!
 //! **POSIX shells.** A command whose program is `sh` or `bash` runs through
@@ -207,30 +209,29 @@ pub(super) const TLS_BACKEND: &str = "openssl";
 /// libcurl) reads to pick its TLS backend.
 pub(super) const CURL_SSL_BACKEND_VAR: &str = "CURL_SSL_BACKEND";
 
-/// The `GIT_CONFIG_KEY_n` / `GIT_CONFIG_VALUE_n` pairs the sandbox adds from
-/// index `start` (the host's own `GIT_CONFIG_COUNT`, or 0), and the new
-/// count. The first entry resets the credential helper list, so git does not
-/// ask the Credential Manager. With the network open, a second selects
-/// OpenSSL for git's HTTPS (`http.sslBackend`), because Schannel cannot run
-/// under the sandbox token. Then come the line-ending settings kGraf's own
-/// git uses (`kgraf_core::host_git::LINE_ENDINGS`). The entries are appended
-/// after the host's, never replacing them; none touches `GIT_CONFIG_NOSYSTEM`
-/// or `GIT_CONFIG_GLOBAL`, which keep their effect.
-pub(super) fn git_config_entries(start: u32, network_open: bool) -> (Vec<(String, String)>, u32) {
+/// The `GIT_CONFIG_KEY_n` / `GIT_CONFIG_VALUE_n` pairs the sandbox gives a
+/// command, numbered from zero, and their count. The host's own entries are
+/// not inherited (`super::is_git_config_entry_var`). The first entry resets
+/// the credential helper list, so git does not ask the Credential Manager.
+/// With the network open, a second selects OpenSSL for git's HTTPS
+/// (`http.sslBackend`), because Schannel cannot run under the sandbox token.
+/// Then come the line-ending settings kGraf's own git uses
+/// (`kgraf_core::host_git::LINE_ENDINGS`). None touches
+/// `GIT_CONFIG_NOSYSTEM` or `GIT_CONFIG_GLOBAL`, which keep their effect.
+pub(super) fn git_config_pairs(network_open: bool) -> Vec<(&'static str, &'static str)> {
     let mut pairs: Vec<(&str, &str)> = vec![("credential.helper", "")];
     if network_open {
         pairs.push(("http.sslBackend", TLS_BACKEND));
     }
     pairs.extend_from_slice(kgraf_core::host_git::LINE_ENDINGS);
-    super::git_config_entries(start, &pairs)
+    pairs
 }
 
 /// Every variable the sandbox sets for the tools on Windows: the
-/// [`git_config_entries`] from index `start` and the new `GIT_CONFIG_COUNT`,
-/// and, with the network open, [`CURL_SSL_BACKEND_VAR`].
-pub(super) fn tool_env(start: u32, network_open: bool) -> Vec<(String, String)> {
-    let (mut vars, count) = git_config_entries(start, network_open);
-    vars.push(("GIT_CONFIG_COUNT".to_owned(), count.to_string()));
+/// [`git_config_pairs`] as `GIT_CONFIG_*` entries from index zero and their
+/// `GIT_CONFIG_COUNT`, and, with the network open, [`CURL_SSL_BACKEND_VAR`].
+pub(super) fn tool_env(network_open: bool) -> Vec<(String, String)> {
+    let mut vars = super::git_config_vars(&git_config_pairs(network_open));
     if network_open {
         vars.push((CURL_SSL_BACKEND_VAR.to_owned(), TLS_BACKEND.to_owned()));
     }
@@ -238,16 +239,14 @@ pub(super) fn tool_env(start: u32, network_open: bool) -> Vec<(String, String)> 
 }
 
 /// What `SandboxedCommand::env_clear` sets again on Windows: [`tool_env`]
-/// numbered from zero (the host's `GIT_CONFIG_*` entries are not inherited
-/// any more, so a count that went on from them would name entries that are
-/// gone, and git stops on a missing `GIT_CONFIG_KEY_0`), and `TMP` and
+/// (numbered from zero, as without a clear), and `TMP` and
 /// `TEMP` set to the policy's tmp folder: without them Windows programs
 /// fall back to folders the token cannot write.
 pub(super) fn kept_on_clear(
     network_open: bool,
     tmp: Option<&std::path::Path>,
 ) -> Vec<(String, std::ffi::OsString)> {
-    let mut kept: Vec<(String, std::ffi::OsString)> = tool_env(0, network_open)
+    let mut kept: Vec<(String, std::ffi::OsString)> = tool_env(network_open)
         .into_iter()
         .map(|(k, v)| (k, v.into()))
         .collect();
@@ -3073,39 +3072,92 @@ mod tests {
             .map(|(_, v)| v.as_str())
     }
 
-    /// With the network open the sandbox adds the credential-helper reset,
-    /// the OpenSSL selection and the line-ending settings, after the host's
-    /// own entries.
+    /// With the network open the sandbox gives the credential-helper reset,
+    /// the OpenSSL selection and the line-ending settings, from index zero.
     #[test]
-    fn git_config_entries_append_after_the_hosts_with_the_network_open() {
-        let (entries, count) = git_config_entries(2, true);
-        assert_eq!(count, 7);
+    fn git_config_entries_start_at_zero_with_the_network_open() {
+        let (entries, count) = super::super::git_config_entries(&git_config_pairs(true));
+        assert_eq!(count, 5);
         assert_eq!(
-            lookup(&entries, "GIT_CONFIG_KEY_2"),
+            lookup(&entries, "GIT_CONFIG_KEY_0"),
             Some("credential.helper")
         );
-        assert_eq!(lookup(&entries, "GIT_CONFIG_VALUE_2"), Some(""));
+        assert_eq!(lookup(&entries, "GIT_CONFIG_VALUE_0"), Some(""));
         assert_eq!(
-            lookup(&entries, "GIT_CONFIG_KEY_3"),
+            lookup(&entries, "GIT_CONFIG_KEY_1"),
             Some("http.sslBackend")
         );
-        assert_eq!(lookup(&entries, "GIT_CONFIG_VALUE_3"), Some("openssl"));
-        assert_eq!(lookup(&entries, "GIT_CONFIG_KEY_4"), Some("core.autocrlf"));
-        assert_eq!(lookup(&entries, "GIT_CONFIG_VALUE_4"), Some("false"));
-        assert_eq!(lookup(&entries, "GIT_CONFIG_KEY_5"), Some("core.eol"));
-        assert_eq!(lookup(&entries, "GIT_CONFIG_VALUE_5"), Some("lf"));
-        assert_eq!(lookup(&entries, "GIT_CONFIG_KEY_6"), Some("core.safecrlf"));
+        assert_eq!(lookup(&entries, "GIT_CONFIG_VALUE_1"), Some("openssl"));
+        assert_eq!(lookup(&entries, "GIT_CONFIG_KEY_2"), Some("core.autocrlf"));
+        assert_eq!(lookup(&entries, "GIT_CONFIG_VALUE_2"), Some("false"));
+        assert_eq!(lookup(&entries, "GIT_CONFIG_KEY_3"), Some("core.eol"));
+        assert_eq!(lookup(&entries, "GIT_CONFIG_VALUE_3"), Some("lf"));
+        assert_eq!(lookup(&entries, "GIT_CONFIG_KEY_4"), Some("core.safecrlf"));
         assert_eq!(entries.len(), 10);
-        // Nothing below the host's count is written.
-        assert!(lookup(&entries, "GIT_CONFIG_KEY_0").is_none());
-        assert!(lookup(&entries, "GIT_CONFIG_KEY_1").is_none());
+    }
+
+    /// The Windows tool settings applied over a host that hands git a
+    /// credential through `GIT_CONFIG_COUNT`, through the same environment
+    /// block a Windows spawn builds: every host entry name is removed,
+    /// whatever its case, and the command's entries are the sandbox's own
+    /// from index zero, with a count that matches them. The value is a fake.
+    #[test]
+    fn the_windows_tool_env_drops_the_hosts_git_config_entries() {
+        let host = [
+            ("GIT_CONFIG_COUNT", "2"),
+            ("GIT_CONFIG_KEY_0", "http.https://example.com/.extraheader"),
+            (
+                "GIT_CONFIG_VALUE_0",
+                "AUTHORIZATION: bearer fake-test-value",
+            ),
+            ("Git_Config_Key_1", "user.name"),
+            ("git_config_value_1", "Preset"),
+            (
+                "GIT_CONFIG_PARAMETERS",
+                "'http.extraheader'='fake-test-value'",
+            ),
+            ("Path", r"C:\Windows"),
+        ];
+        let changes = super::super::worker_git_config_env(
+            host.iter().map(|(k, _)| std::ffi::OsString::from(k)),
+            tool_env(true),
+        );
+        let wide = |s: &str| -> Vec<u16> { s.encode_utf16().collect() };
+        let inherited = host.iter().map(|(k, v)| (wide(k), wide(v))).collect();
+        let overrides = changes
+            .iter()
+            .map(|(k, v)| {
+                (
+                    wide(&k.to_string_lossy()),
+                    v.as_ref().map(|v| wide(&v.to_string_lossy())),
+                )
+            })
+            .collect();
+        let block = String::from_utf16_lossy(&env_block(inherited, overrides));
+        let vars: Vec<(String, String)> = block
+            .split('\0')
+            .filter_map(|e| e.split_once('='))
+            .map(|(k, v)| (k.to_uppercase(), v.to_owned()))
+            .collect();
+        assert!(!block.to_lowercase().contains("extraheader"), "{block}");
+        assert!(!block.contains("fake-test-value"), "{block}");
+        assert!(!block.contains("Preset"), "{block}");
+        assert_eq!(lookup(&vars, "GIT_CONFIG_PARAMETERS"), None, "{block}");
+        assert_eq!(lookup(&vars, "GIT_CONFIG_COUNT"), Some("5"), "{block}");
+        assert_eq!(lookup(&vars, "GIT_CONFIG_KEY_0"), Some("credential.helper"));
+        assert_eq!(lookup(&vars, "GIT_CONFIG_KEY_2"), Some("core.autocrlf"));
+        assert_eq!(lookup(&vars, "GIT_CONFIG_VALUE_2"), Some("false"));
+        let count = |prefix: &str| vars.iter().filter(|(k, _)| k.starts_with(prefix)).count();
+        assert_eq!(count("GIT_CONFIG_KEY_"), 5, "{block}");
+        assert_eq!(count("GIT_CONFIG_VALUE_"), 5, "{block}");
+        assert_eq!(lookup(&vars, "PATH"), Some(r"C:\Windows"));
     }
 
     /// Without an open network the credential-helper reset and the
-    /// line-ending settings are added, and no TLS backend.
+    /// line-ending settings are given, and no TLS backend.
     #[test]
     fn git_config_entries_keep_the_tls_backend_out_without_open_network() {
-        let (entries, count) = git_config_entries(0, false);
+        let (entries, count) = super::super::git_config_entries(&git_config_pairs(false));
         assert_eq!(count, 4);
         assert_eq!(lookup(&entries, "GIT_CONFIG_KEY_1"), Some("core.autocrlf"));
         assert_eq!(
@@ -3119,7 +3171,7 @@ mod tests {
     /// configuration, so their effect is intact.
     #[test]
     fn git_config_entries_leave_the_frozen_config_variables_alone() {
-        let (entries, _) = git_config_entries(0, true);
+        let (entries, _) = super::super::git_config_entries(&git_config_pairs(true));
         assert!(entries.iter().all(|(k, _)| {
             k.starts_with("GIT_CONFIG_KEY_") || k.starts_with("GIT_CONFIG_VALUE_")
         }));
@@ -3158,23 +3210,22 @@ mod tests {
         assert_eq!(inherited_vars(parent.clone(), true), parent);
     }
 
-    /// The variables the sandbox sets for the tools: the git entries from the
-    /// given index, the count after them, and the curl backend only with the
+    /// The variables the sandbox sets for the tools: the git entries from
+    /// zero, the count after them, and the curl backend only with the
     /// network open.
     #[test]
     fn tool_env_is_the_git_entries_the_count_and_the_curl_backend() {
-        let open = tool_env(3, true);
-        assert_eq!(lookup(&open, "GIT_CONFIG_KEY_3"), Some("credential.helper"));
-        assert_eq!(lookup(&open, "GIT_CONFIG_KEY_4"), Some("http.sslBackend"));
-        assert_eq!(lookup(&open, "GIT_CONFIG_COUNT"), Some("8"));
+        let open = tool_env(true);
+        assert_eq!(lookup(&open, "GIT_CONFIG_KEY_0"), Some("credential.helper"));
+        assert_eq!(lookup(&open, "GIT_CONFIG_KEY_1"), Some("http.sslBackend"));
+        assert_eq!(lookup(&open, "GIT_CONFIG_COUNT"), Some("5"));
         assert_eq!(lookup(&open, CURL_SSL_BACKEND_VAR), Some(TLS_BACKEND));
-        let closed = tool_env(0, false);
+        let closed = tool_env(false);
         assert_eq!(lookup(&closed, "GIT_CONFIG_COUNT"), Some("4"));
         assert_eq!(lookup(&closed, CURL_SSL_BACKEND_VAR), None);
     }
 
-    /// After a clear the git entries start at zero (the host's entries are
-    /// gone, so a count that went on from them would name missing keys), the
+    /// After a clear the git entries start at zero, as without one, the
     /// TLS settings survive, and `TMP` and `TEMP` are the policy's folder.
     #[test]
     fn a_clear_keeps_the_sandbox_settings_numbered_from_zero() {

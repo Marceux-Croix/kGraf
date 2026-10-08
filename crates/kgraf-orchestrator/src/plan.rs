@@ -35,7 +35,9 @@ pub struct ContractSpec {
     /// list of criteria instead of one string ([`text_or_list`]).
     #[serde(deserialize_with = "text_or_list")]
     pub acceptance: String,
-    #[serde(default, deserialize_with = "null_as_default")]
+    /// Files the contract writes. A model may write a bare path string for
+    /// `{"path": ...}` ([`write_targets`]).
+    #[serde(default, deserialize_with = "write_targets")]
     pub writes: Vec<WriteTarget>,
     #[serde(default, deserialize_with = "null_as_default")]
     pub depends_on: Vec<String>,
@@ -70,6 +72,48 @@ where
     T: Deserialize<'de> + Default,
 {
     Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+}
+
+/// The contract's `writes`: a list whose entries are objects
+/// `{"path": ...}` or bare path strings. A bare string is the same declaration
+/// as the object holding only that path, so it reads as one (seen live: a
+/// planner wrote `["src/lib.rs"]` and lost the whole plan). The path is still
+/// validated like any other (`valid_write_path`, in `validate_plan`). A lone
+/// string reads as a list of one; `null` and an absent field read as empty.
+/// Any other entry is refused, and [`from_answer`] names where.
+fn write_targets<'de, D>(d: D) -> Result<Vec<WriteTarget>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Entry {
+        Path(String),
+        Target(WriteTarget),
+    }
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Field {
+        One(String),
+        Many(Vec<serde_json::Value>),
+    }
+    use serde::de::Error;
+    match Option::<Field>::deserialize(d)? {
+        None => Ok(Vec::new()),
+        Some(Field::One(path)) => Ok(vec![WriteTarget { path, node: None }]),
+        Some(Field::Many(items)) => items
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| match serde_json::from_value::<Entry>(v.clone()) {
+                Ok(Entry::Path(path)) => Ok(WriteTarget { path, node: None }),
+                Ok(Entry::Target(t)) => Ok(t),
+                Err(_) => Err(D::Error::custom(format!(
+                    "item {i} is {}, expected an object {{\"path\":\"...\"}} or a path string",
+                    describe_value(&v)
+                ))),
+            })
+            .collect(),
+    }
 }
 
 /// A text field a model may also write as a list of strings: the contract's
@@ -1377,7 +1421,8 @@ that exact route name; a kind word is never a route. A contract's \
 \"tools\" may name only tools on the request's Tools line, spelled exactly as listed; a \
 contract that names a tool its route does not offer is refused before it starts. A \
 contract's \"depends_on\" lists the ids of other contracts in this answer that must land \
-first; it never holds an interface id. A contract's \"slices\" lists the functions, types \
+first; it never holds an interface id. A contract's \"writes\" is a list of objects, one per \
+file: {\"path\":\"src/x.rs\"}. A contract's \"slices\" lists the functions, types \
 and modules its worker must read, spelled as they are in the code (a symbol the instruction \
 names, or one defined in a file the contract writes); kGraf gives the worker their source \
 from the code graph. The existing public items of the repository (type names and shapes, \
@@ -2115,6 +2160,37 @@ mod tests {
         assert!(reason.contains("contracts"), "{reason}");
     }
 
+    /// A bare path string in `writes` is the object holding only that path
+    /// (seen live: a planner wrote `"writes":["discount_flat/src/lib.rs"]` and
+    /// the whole plan failed). Both forms and a mix parse to the same plan, and
+    /// the path is validated as before.
+    #[test]
+    fn a_bare_path_string_in_writes_is_the_path_object() {
+        let plan_with = |writes: &str| {
+            parse_plan(&format!(
+                "{{\"contracts\":[{{\"id\":\"c1\",\"instruction\":\"x\",\
+                 \"acceptance\":\"y\",\"writes\":{writes}}}]}}"
+            ))
+            .expect("parses")
+        };
+        let objects = plan_with("[{\"path\":\"a/src/lib.rs\"},{\"path\":\"b.rs\"}]");
+        assert_eq!(plan_with("[\"a/src/lib.rs\",\"b.rs\"]"), objects);
+        assert_eq!(plan_with("[\"a/src/lib.rs\",{\"path\":\"b.rs\"}]"), objects);
+        assert_eq!(plan_with("\"b.rs\""), plan_with("[{\"path\":\"b.rs\"}]"));
+        // The path is still checked after it is read.
+        let bad = plan_with("[\"../etc/passwd\"]");
+        let none = BTreeSet::new();
+        assert!(validate_plan(&bad, &none, &["kimi".to_owned()], &[], 32).is_err());
+        // Other entries are refused, with the item named.
+        let Err(PlanError::BadOutput { reason, .. }) = parse_plan(
+            "{\"contracts\":[{\"id\":\"c1\",\"instruction\":\"x\",\"acceptance\":\"y\",\
+             \"writes\":[\"a.rs\",7]}]}",
+        ) else {
+            panic!("a number in writes is refused");
+        };
+        assert!(reason.contains("contracts[0].writes") && reason.contains("item 1"));
+    }
+
     #[test]
     fn null_optional_interface_fields_read_as_absent() {
         let none = parse_interfaces(&answer_with(",\"interfaces\":null")).expect("null is none");
@@ -2402,7 +2478,7 @@ mod tests {
         let mut d = spec("d", &[]);
         d.writes[0].path = inside.to_string_lossy().into_owned();
         let (out, notices) = normalize_plan(vec![d], None, &[]);
-        assert!(out[0].writes[0].path.starts_with('/'));
+        assert!(std::path::Path::new(&out[0].writes[0].path).is_absolute());
         assert!(notices.is_empty());
     }
 

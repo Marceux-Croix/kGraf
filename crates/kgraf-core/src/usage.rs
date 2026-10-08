@@ -91,6 +91,15 @@ pub struct TokenUsage {
     pub text_output: u64,
     /// Output tokens spent on reasoning, where the protocol distinguishes them.
     pub reasoning_output: u64,
+    /// Set when the response carried reasoning text but its usage object gave
+    /// no reasoning token count. The value is the length of that reasoning text
+    /// in characters.
+    ///
+    /// The reasoning tokens are then inside `text_output` and the split is
+    /// unknown: `reasoning_output` of zero means "not reported", not "none".
+    /// Reports must say so. No token count is estimated from the characters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unsplit_reasoning_chars: Option<u64>,
     /// The provider's usage object exactly as it arrived on the wire.
     ///
     /// `None` only for usage synthesized locally, such as a reconciliation
@@ -130,6 +139,7 @@ impl TokenUsage {
             cache_write,
             text_output,
             reasoning_output,
+            unsplit_reasoning_chars: None,
             raw,
         })
     }
@@ -141,6 +151,23 @@ impl TokenUsage {
     /// counts, and failing to add them on an additive one undercounts.
     pub fn total_input(&self) -> u64 {
         self.uncached_input + self.cache_read + self.cache_write
+    }
+
+    /// The reasoning share of output as a report line states it.
+    ///
+    /// A plain count when the provider reported one. When reasoning text came
+    /// back without a count, the tokens are inside text output and the split is
+    /// unknown, so this says that and gives the text length instead of a zero.
+    pub fn reasoning_label(&self) -> String {
+        match (self.reasoning_output, self.unsplit_reasoning_chars) {
+            (reported, None) => reported.to_string(),
+            (0, Some(chars)) => {
+                format!("not reported, {chars} chars of reasoning text are inside out")
+            }
+            (reported, Some(chars)) => {
+                format!("{reported}, and {chars} more chars of reasoning text are inside out")
+            }
+        }
     }
 
     /// Every output token the call produced.
@@ -198,6 +225,9 @@ impl TokenUsage {
             delta.reasoning_output,
             reported.reasoning_output,
         );
+        if delta.unsplit_reasoning_chars.is_some() {
+            self.unsplit_reasoning_chars = delta.unsplit_reasoning_chars;
+        }
         if delta.raw.is_some() {
             self.raw = delta.raw.clone();
         }
@@ -219,6 +249,31 @@ pub struct ReportedFields {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn the_reasoning_label_never_reads_an_unsplit_total_as_zero() {
+        let mut usage = TokenUsage::default();
+        assert_eq!(usage.reasoning_label(), "0");
+        usage.reasoning_output = 7;
+        assert_eq!(usage.reasoning_label(), "7");
+        usage.reasoning_output = 0;
+        usage.unsplit_reasoning_chars = Some(120);
+        assert_eq!(
+            usage.reasoning_label(),
+            "not reported, 120 chars of reasoning text are inside out"
+        );
+        usage.reasoning_output = 7;
+        assert!(usage.reasoning_label().starts_with("7, and 120 more chars"));
+    }
+
+    #[test]
+    fn an_old_usage_record_without_the_mark_still_reads() {
+        let old = r#"{"uncached_input":1,"cache_read":0,"cache_write":0,"text_output":2,"reasoning_output":0,"raw":null}"#;
+        let usage: TokenUsage = serde_json::from_str(old).expect("old record");
+        assert_eq!(usage.unsplit_reasoning_chars, None);
+        let written = serde_json::to_string(&usage).expect("write");
+        assert!(!written.contains("unsplit"), "{written}");
+    }
 
     #[test]
     fn additive_protocol_sums_the_cache_fields() {

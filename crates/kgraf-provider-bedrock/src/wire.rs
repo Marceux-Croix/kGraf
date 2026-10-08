@@ -351,6 +351,7 @@ pub fn lower_bound_usage(raw: &Value) -> Option<TokenUsage> {
         cache_write: take(field("cacheWriteInputTokens").unwrap_or(0)),
         text_output: take(output.unwrap_or(0)),
         reasoning_output: 0,
+        unsplit_reasoning_chars: None,
         raw: Some(raw.clone()),
     })
 }

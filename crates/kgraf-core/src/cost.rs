@@ -684,6 +684,7 @@ mod tests {
                 cache_write: field("cache_write"),
                 text_output: field("text_output"),
                 reasoning_output: field("reasoning_output"),
+                unsplit_reasoning_chars: None,
                 raw: Some(usage["raw"].clone()),
             },
         )

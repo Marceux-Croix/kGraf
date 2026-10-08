@@ -97,6 +97,9 @@ struct Fake {
     streams: bool,
     /// What `Provider::resends_reasoning` answers.
     resends_reasoning: bool,
+    /// Whether `Provider::undelivered_output_tokens` measures the reply, as a
+    /// Chat Completions adapter does, or answers `None`.
+    counts_delivery: bool,
 }
 
 impl Fake {
@@ -106,6 +109,19 @@ impl Fake {
             requests: Mutex::new(Vec::new()),
             streams,
             resends_reasoning: false,
+            counts_delivery: false,
+        })
+    }
+
+    /// A provider whose replies carry all the output they count, so a reply
+    /// that carries less is measured (`Response::undelivered_output_floor`).
+    fn counting(script: impl Fn(&Request) -> Round + Send + Sync + 'static) -> Arc<Self> {
+        Arc::new(Self {
+            script: Box::new(script),
+            requests: Mutex::new(Vec::new()),
+            streams: false,
+            resends_reasoning: false,
+            counts_delivery: true,
         })
     }
 
@@ -116,6 +132,7 @@ impl Fake {
             requests: Mutex::new(Vec::new()),
             streams: false,
             resends_reasoning: true,
+            counts_delivery: false,
         })
     }
 
@@ -171,6 +188,11 @@ impl Provider for Fake {
 
     fn resends_reasoning(&self) -> bool {
         self.resends_reasoning
+    }
+
+    fn undelivered_output_tokens(&self, response: &Response) -> Option<u64> {
+        self.counts_delivery
+            .then(|| response.undelivered_output_floor())
     }
 
     async fn complete(
@@ -1960,13 +1982,14 @@ async fn a_denied_call_is_not_run_and_the_model_is_told_why() {
     assert_eq!(result.outcome, WorkerOutcome::Completed);
     assert!(!dir.path().join("x.txt").exists());
     assert!(result.changed_paths.is_empty());
-    // Decision 0093: the denial is followed by how to report a shortfall, and
-    // the result lists it.
+    // Decision 0093: the denial says how to report a shortfall, ahead of the
+    // policy's own text, and the result lists it.
     assert!(events.iter().any(|e| matches!(
         e,
         WorkerEvent::ToolCallFinished { output, is_error: true, .. }
-            if output.starts_with("ERROR: denied by deny-writes: read-only run.")
+            if output.starts_with("ERROR: denied by deny-writes: If your instruction")
                 && output.contains("do not work around it")
+                && output.ends_with("The refusal: read-only run.")
     )));
     assert_eq!(result.refused.len(), 1, "{:?}", result.refused);
     assert_eq!(result.refused[0].capability, "write_file");
@@ -3253,6 +3276,139 @@ async fn an_empty_turn_gets_one_notice_round_and_is_not_completed() {
             ..
         }
     )));
+}
+
+/// A reply whose tool call the server dropped: no tool call, a short
+/// announcement, and 1,500 output tokens counted for it.
+fn lost_reply() -> Round {
+    Round {
+        usage: usage(100, 1500),
+        ..Round::answer("I have the full picture now. Let me write the file.")
+    }
+}
+
+fn lost_output_notices(events: &[WorkerEvent]) -> usize {
+    events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                WorkerEvent::Notice {
+                    kind: NoticeKind::LostOutput,
+                    ..
+                }
+            )
+        })
+        .count()
+}
+
+/// A local server that cannot parse the model's tool call can drop it and
+/// answer 200 with a plain stop. Taken as it arrived, the announcement would
+/// end the attempt as completed with the file never written. The provider's
+/// count shows the reply is short: the round is dropped, the model is told
+/// its call did not arrive, and it sends the call again.
+#[tokio::test]
+async fn a_reply_the_server_cut_down_is_sent_again_not_taken_as_the_answer() {
+    let dir = tempfile::tempdir().expect("dir");
+    let sent = AtomicUsize::new(0);
+    let provider = Fake::counting(move |_| match sent.fetch_add(1, Ordering::SeqCst) {
+        0 => lost_reply(),
+        1 => Round::tool(vec![(
+            "t1",
+            "write_file",
+            json!({"path": "out.txt", "content": "written"}),
+        )]),
+        _ => Round::answer("done"),
+    });
+    let env = Arc::new(env_with(
+        provider.clone(),
+        vec![Arc::new(WriteFile)],
+        CallMode::Complete,
+    ));
+    let handle = spawn_worker(
+        env,
+        brief("w1", "write out.txt", dir.path(), 6),
+        SpawnOptions::default(),
+    )
+    .await
+    .expect("spawn");
+    let (events, result) = with_timeout(drain(handle)).await.expect("in time");
+    assert_eq!(result.outcome, WorkerOutcome::Completed);
+    assert_eq!(result.answer, "done");
+    assert!(dir.path().join("out.txt").exists(), "the resent call ran");
+    assert_eq!(lost_output_notices(&events), 1);
+    assert!(events.iter().any(|e| matches!(
+        e,
+        WorkerEvent::RoundAbandoned { reason, .. }
+            if reason == kgraf_runtime::LOST_OUTPUT_ABANDON_REASON
+    )));
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 3);
+    let told = requests[1].messages.last().expect("last message");
+    assert!(
+        told.content.iter().any(|c| c.as_text().is_some_and(|t| {
+            t.contains("did not arrive complete") && t.contains("counted 1500 output tokens")
+        })),
+        "{told:?}"
+    );
+}
+
+/// The retry is bounded per attempt: after `MAX_LOST_OUTPUT_RETRIES` notices a
+/// short reply is judged as it arrived. A provider that cannot measure its
+/// replies (the default) never triggers it.
+#[tokio::test]
+async fn lost_output_retries_are_bounded_and_need_a_measuring_provider() {
+    let dir = tempfile::tempdir().expect("dir");
+    let provider = Fake::counting(|_| lost_reply());
+    let env = Arc::new(env_with(provider.clone(), vec![], CallMode::Complete));
+    let handle = spawn_worker(
+        env,
+        brief("w1", "task", dir.path(), 8),
+        SpawnOptions::default(),
+    )
+    .await
+    .expect("spawn");
+    let (events, result) = with_timeout(drain(handle)).await.expect("in time");
+    let bound = usize::try_from(kgraf_runtime::MAX_LOST_OUTPUT_RETRIES).expect("small");
+    assert_eq!(lost_output_notices(&events), bound);
+    assert_eq!(provider.requests().len(), bound + 1);
+    assert_eq!(result.outcome, WorkerOutcome::Completed);
+
+    let dir = tempfile::tempdir().expect("dir");
+    let provider = Fake::new(false, |_| lost_reply());
+    let env = Arc::new(env_with(provider.clone(), vec![], CallMode::Complete));
+    let handle = spawn_worker(
+        env,
+        brief("w1", "task", dir.path(), 8),
+        SpawnOptions::default(),
+    )
+    .await
+    .expect("spawn");
+    let (events, _) = with_timeout(drain(handle)).await.expect("in time");
+    assert_eq!(lost_output_notices(&events), 0);
+    assert_eq!(provider.requests().len(), 1);
+}
+
+/// A reply that carries what it counts is an ordinary end of turn.
+#[tokio::test]
+async fn a_reply_that_carries_its_count_is_not_lost_output() {
+    let dir = tempfile::tempdir().expect("dir");
+    let provider = Fake::counting(|_| Round {
+        usage: usage(100, 200),
+        ..Round::answer(&"x".repeat(800))
+    });
+    let env = Arc::new(env_with(provider.clone(), vec![], CallMode::Complete));
+    let handle = spawn_worker(
+        env,
+        brief("w1", "task", dir.path(), 6),
+        SpawnOptions::default(),
+    )
+    .await
+    .expect("spawn");
+    let (events, result) = with_timeout(drain(handle)).await.expect("in time");
+    assert_eq!(result.outcome, WorkerOutcome::Completed);
+    assert_eq!(lost_output_notices(&events), 0);
+    assert_eq!(provider.requests().len(), 1);
 }
 
 /// A second empty turn in a row ends the attempt as failed, naming the cause.

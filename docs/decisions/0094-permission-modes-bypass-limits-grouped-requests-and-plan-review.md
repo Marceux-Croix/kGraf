@@ -1694,3 +1694,11 @@ a host entry that reaches it intact. Five fail with the settings removed (one mo
 test's own setup), and the host-entry test fails with the scrub exemption removed.
 `kgraf-core` `host_git` tests: a repository with `core.autocrlf=true` gets LF from kGraf's
 checkout and nothing staged, while plain git writes CRLF.
+
+## Amendment (2026-10-08): a worker's git entries no longer follow the host's
+
+The sandbox no longer appends its line-ending entries after the host's own `GIT_CONFIG_COUNT`
+entries: the host's entries do not reach a sandboxed command at all, and the sandbox's own are
+numbered from zero (decision 0011, amendment of 2026-10-08). Their values can carry a
+credential. The line-ending rule above is unchanged. The scrub exemption for
+`GIT_CONFIG_KEY_<n>` stays in the shared classifier, where other callers judge names.

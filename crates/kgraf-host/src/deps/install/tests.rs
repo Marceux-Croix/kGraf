@@ -1079,7 +1079,7 @@ fn the_watch_kills_only_a_holder_outside_the_group() {
 /// with a password (`PIP_INDEX_URL`, `UV_INDEX_URL`), Bundler's per-host
 /// credentials (`BUNDLE_GEMS__EXAMPLE__COM=user:pass`), NuGet's feed
 /// endpoints with their tokens, a Go proxy URL, Gradle project properties,
-/// git's command-line configuration (an `http.extraHeader` with a token).
+/// git's config file locations (the sandbox removes git's environment entries).
 /// None of these names looks like a credential, so the sandbox's own scrub
 /// keeps them; the install removes them. Toolchain variables stay.
 #[test]
@@ -1106,11 +1106,8 @@ fn package_manager_configuration_from_the_environment_is_removed() {
         "PNPM_HOME_REGISTRY",
         "GIT_ASKPASS",
         "SSH_ASKPASS",
-        "GIT_CONFIG_PARAMETERS",
-        "GIT_CONFIG_COUNT",
-        "GIT_CONFIG_KEY_0",
-        "GIT_CONFIG_VALUE_0",
         "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
         "NETRC",
         "_JAVA_OPTIONS",
         "JDK_JAVA_OPTIONS",
@@ -1151,6 +1148,27 @@ fn package_manager_configuration_from_the_environment_is_removed() {
     for name in kept {
         assert!(!removed.iter().any(|r| r == name), "{name} was removed");
     }
+}
+
+/// git's configuration entries from the environment (an `http.extraHeader`
+/// with a token) are the sandbox's to remove: it drops the host's and sets
+/// its own under the same names. The install leaves the names alone, so the
+/// sandbox's own entries (its line-ending settings, and on Windows the
+/// credential-helper reset) are not removed with the host's.
+#[test]
+fn git_config_entries_are_left_to_the_sandbox() {
+    let names = [
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_KEY_0",
+        "GIT_CONFIG_VALUE_0",
+        "git_config_value_1",
+    ];
+    for name in names {
+        assert!(kgraf_sandbox::is_git_config_entry_var(name), "{name}");
+    }
+    let removed = inherited_configuration(names.iter().map(std::ffi::OsString::from));
+    assert!(removed.is_empty(), "{removed:?}");
 }
 
 /// On Windows the sandbox confines neither reads nor the network (decision

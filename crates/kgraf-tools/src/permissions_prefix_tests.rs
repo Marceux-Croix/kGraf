@@ -392,6 +392,7 @@ fn a_forbid_rule_refuses_its_shape_behind_a_prefix_word() {
 
 /// The old split: the whole argv and, only when its first word is a shell,
 /// each command of its `-c` script.
+#[cfg(unix)]
 fn legacy_simple_commands(words: &[String]) -> Vec<Vec<String>> {
     let mut out = vec![words.to_vec()];
     let Some(program) = words.first() else {
@@ -419,6 +420,7 @@ fn legacy_simple_commands(words: &[String]) -> Vec<Vec<String>> {
 }
 
 /// The old rule subjects: each old command joined with single spaces.
+#[cfg(unix)]
 fn legacy_subjects(words: &[String]) -> Vec<String> {
     legacy_simple_commands(words)
         .iter()
@@ -427,6 +429,7 @@ fn legacy_subjects(words: &[String]) -> Vec<String> {
 }
 
 /// The old deleter scan.
+#[cfg(unix)]
 fn legacy_program_index(words: &[&str]) -> Option<usize> {
     const OLD_WRAPPERS: &[&str] = &[
         "sudo", "doas", "env", "command", "nice", "nohup", "time", "exec", "busybox", "xargs",
@@ -452,6 +455,7 @@ fn legacy_program_index(words: &[&str]) -> Option<usize> {
 
 /// The old deletion limit: one working directory, moved only by a command
 /// whose first word is `cd`.
+#[cfg(unix)]
 fn legacy_critical_deletion(
     argv: &[String],
     home: Option<&Path>,
@@ -521,6 +525,7 @@ fn legacy_critical_deletion(
     ask
 }
 
+#[cfg(unix)]
 fn limit_strictness(l: &Option<HardLimit>) -> u8 {
     match l {
         Some(HardLimit::Deny(_)) => 2,
@@ -532,6 +537,7 @@ fn limit_strictness(l: &Option<HardLimit>) -> u8 {
 /// The commands the existing tests refuse or ask about, gathered as one
 /// corpus, with directory-change, group and wrapper shapes around them and
 /// every hidden shape above.
+#[cfg(unix)]
 fn refusal_corpus() -> Vec<Vec<String>> {
     let base: &[&[&str]] = &[
         &["rm", "-rf", "/"],
@@ -592,6 +598,11 @@ fn refusal_corpus() -> Vec<Vec<String>> {
 /// No loosening. For every command of the corpus: the old rule subjects are
 /// all still subjects, and the rules hook is, in every mode, at least as
 /// strict as the old rules and the old deletion limit together were.
+///
+/// Unix only: the old rules read the corpus under the Unix path rules and the
+/// hook reads it under the host's, so on Windows the same Unix paths (`/home/...`)
+/// are not full paths to the hook and it can only ask where the old rules refuse.
+#[cfg(unix)]
 #[tokio::test]
 async fn no_previously_refused_command_of_the_corpus_is_now_allowed() {
     let user = rules(

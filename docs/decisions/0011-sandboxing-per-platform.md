@@ -413,3 +413,45 @@ confinement and leaves the Low integrity level as the only write boundary.
 Windows-only tests pin the pipe refusal and the desktop admission by impersonation, and run
 `whoami.exe`, `where.exe`, PowerShell, `cmd`, `sh` and `bash` in the sandbox, with and
 without a cleared environment. Compile-checked for Windows; nothing here ran on Windows.
+
+## Amendment (2026-10-08): the host's git configuration entries do not reach a sandboxed command
+
+**Why.** git takes configuration from the environment: `GIT_CONFIG_COUNT` with
+`GIT_CONFIG_KEY_<n>` and `GIT_CONFIG_VALUE_<n>`, and `GIT_CONFIG_PARAMETERS`, which `git -c`
+hands to the git processes it starts. The scrub removes a variable by its name, and these
+names hold no credential, so the host's entries reached the command with their values. A
+value can carry a credential: `http.<url>.extraHeader` with a bearer token (CI checkouts give
+git their token this way), `url.<base>.insteadOf` or `remote.<name>.url` with a login,
+`http.proxy` with a password, `credential.helper` with an inline secret. A worker gets no
+credential.
+
+**Rule.** On every platform, with or without `env_clear`, a sandboxed command gets none of the
+host's git configuration entries: every inherited `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_*`,
+`GIT_CONFIG_VALUE_*` and `GIT_CONFIG_PARAMETERS`, in any case, is removed. The sandbox then
+sets its own entries from `GIT_CONFIG_KEY_0` with a `GIT_CONFIG_COUNT` that matches them: the
+line-ending settings, and on Windows the `credential.helper` reset and, with the network open,
+`http.sslBackend=openssl`. Only the names of the host's variables are read, never their
+values. A policy that asks to pass one of these names is refused. A caller can still set its
+own entries after the sandbox. The dependency install leaves these names to the sandbox.
+kGraf's own host git already removes every inherited `GIT_*` variable but the commit identity
+and the config file locations.
+
+**Options considered.** (1) Drop only host entries whose key is credential-bearing (a list of
+`http.*.extraheader`, `credential.*`, `url.*.insteadof`, `remote.*.url`, `http.proxy`,
+`core.sshcommand`, `core.askpass`, `*.password`, `*.token`). Rejected: a deny list misses each
+key it does not name and each key git adds, a key can be spelled in many forms, and keys that
+are not credentials can still run programs (`core.fsmonitor`, `core.hooksPath`,
+`include.path`). (2) Drop all host entries and keep only kGraf's own. Chosen: simpler, and
+nothing a worker needs comes from the host's entries.
+
+**Cost.** Harmless settings given to git through `GIT_CONFIG_COUNT` (`user.name`,
+`safe.directory`) do not reach a worker's git. The global and system config files are not
+affected by this rule.
+
+**Tests.** An end-to-end test gives the host an `extraheader` entry with a fake value, a
+harmless entry and `GIT_CONFIG_PARAMETERS`: the worker's environment holds no host key or
+value, exactly the sandbox's entries from index zero, git reads `core.autocrlf=false`, and the
+count matches. It fails without the removal. Platform-neutral unit tests cover the names, the
+order of removal and setting, the refused pass, the Windows settings through the Windows
+environment block, and the install. A Windows-only test checks the same through git on
+Windows.

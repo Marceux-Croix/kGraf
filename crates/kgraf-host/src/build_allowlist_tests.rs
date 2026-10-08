@@ -342,6 +342,13 @@ async fn a_granted_program_runs_under_a_scope_and_another_is_still_refused() {
     .await;
     assert!(is_error, "{out}");
     assert!(out.contains("do not work around it"), "{out}");
+    // The unattended refusal quotes the whole allowlist; the next step comes
+    // before it, where a model reads it first.
+    let step = out.find("do not work around it").expect("step");
+    let allowlist = out
+        .find("build and test allowlist")
+        .expect("allowlist quoted");
+    assert!(step < allowlist, "{out}");
 }
 
 /// A fake vendor key for a throwaway checkout's `.env`; never a real one.

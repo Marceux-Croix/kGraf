@@ -335,3 +335,22 @@ Tests: `kgraf-host` `shortfall_tests.rs` `a_wrapped_command_is_granted_with_ever
 (a hosted run: a worker refused `env cp ...` reports `cp`, the orchestrator grants `cp` and
 `env`, and the fresh attempt runs the command); with the change reverted, the worker is
 answered that nothing refused `cp` and the run is blocked.
+
+## Amendment (2026-10-08): the next step comes before the policy's text
+
+Point 1 put the next step at the end of the refusal. A shell refusal under the Manual mode
+quotes the whole build and test allowlist (about 2,400 characters once the npm, Go, Maven,
+Gradle and .NET entries were added), so the step came after it. In a recorded run a worker was
+refused six times, tried one listed-looking command after another, and never called
+`report_shortfall`; in three earlier runs with a refusal half as long, the worker asked after
+two to five refusals.
+
+A refusal a worker sees is now: the header as before (`ERROR: denied by <policy>: ` or
+`ERROR: refused: `), then the next step, then `The refusal: ` and the policy's own text, whole.
+Every reader that matches the header still does, and the record `report_shortfall` reads holds
+the policy's text as it was. Mechanism: `kgraf_runtime::shortfall::with_refusal_hint`.
+
+Tests: `kgraf-runtime` `shortfall.rs` `the_next_step_comes_before_a_long_refusal_text` and
+`the_header_and_the_policy_name_are_kept`; `kgraf-host` `build_allowlist_tests.rs`
+`a_granted_program_runs_under_a_scope_and_another_is_still_refused` (a real unattended shell
+refusal: the step comes before the quoted allowlist).

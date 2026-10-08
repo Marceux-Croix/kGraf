@@ -18,6 +18,8 @@
 //! <base>/.scratch/<name>/        per-workspace TMPDIR (writable, outside git)
 //! <base>/.checks/<owner>-<n>/    one check's own folder ([`CheckFolder`]),
 //!                                outside every worker's writable roots
+//! <base>/.checks.lock            orders making a check folder against
+//!                                removing an empty `.checks`
 //! ```
 //!
 //! Concurrency: `create` and `remove` hold a shared lock, orphan cleanup an
@@ -57,6 +59,9 @@ const MARKER: &str = ".kgraf-workspaces";
 /// [`MARKER`] under the former name. A base that has only this one (a state
 /// directory moved from `.haustoria`) has it renamed on open.
 const LEGACY_MARKER: &str = ".haustoria-workspaces";
+/// Lock file in the common git directory that serializes worktree-entry git
+/// calls ([`WorkspaceManager::admin_locked`]).
+const ADMIN_LOCK: &str = "kgraf-worktree-admin.lock";
 const MARKER_HEADER: &str = "kgraf-workspaces v1";
 const SCRATCH: &str = ".scratch";
 /// Hold files, one per workspace, outside every writable root (a worker cannot
@@ -65,6 +70,37 @@ const HOLDS: &str = ".holds";
 /// One folder per running check ([`CheckFolder`]), outside every writable
 /// root a worker's shell has.
 const CHECKS: &str = ".checks";
+/// Lock file that orders making a check folder against removing an empty
+/// `.checks`. It stays in the base, like the marker.
+const CHECKS_LOCK: &str = ".checks.lock";
+
+/// Exclusive `flock` on `<base>/.checks.lock`, across threads and processes
+/// (each opener has its own open file description, so two threads of one
+/// process also exclude each other). Without it, a create that races the
+/// removal of the empty parent can fail with `ENOENT` or, on macOS,
+/// `EINVAL`, and no retry list covers every error a vanishing directory gives.
+/// Not re-entrant: a holder must not take it again.
+///
+/// `tidy` deletes the file when no worktree is registered, and only then, so
+/// that nothing but the marker is left in the base. No check folder can be
+/// made then (making one needs a registered [`Workspace`]), so nobody waits on
+/// the deleted file. `create` makes the file; with `create` false, a missing
+/// file gives `Ok(None)`: the workspace is gone and nothing else can race.
+fn lock_checks(base: &Path, create: bool) -> Result<Option<HeldLock>, WorkspaceError> {
+    let path = base.join(CHECKS_LOCK);
+    let opened = std::fs::OpenOptions::new()
+        .create(create)
+        .truncate(false)
+        .write(true)
+        .open(&path);
+    let file = match opened {
+        Ok(file) => file,
+        Err(e) if !create && e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(WorkspaceError::io(&path, e)),
+    };
+    file.lock().map_err(|e| WorkspaceError::io(&path, e))?;
+    Ok(Some(HeldLock::new(file)))
+}
 
 /// A folder of one check's own, `<base>/.checks/<pid>-<start>-<nanos>-<n>`:
 /// its temporary folder, tool homes and cargo target folder. Made by the
@@ -92,21 +128,20 @@ impl CheckFolder {
             .map_or(0, |d| d.as_nanos());
         let path = parent.join(format!("{}-{}-{nanos}-{n}", me.pid, me.start.unwrap_or(0)));
         // The last check to end removes `parent` when it is empty (see
-        // `Drop`), so it can go between the two calls below; make it again.
-        let mut tries = 0;
-        loop {
-            std::fs::create_dir_all(&parent).map_err(|e| WorkspaceError::io(&parent, e))?;
-            // `create_dir`, not `create_dir_all`: anything already there fails.
-            match std::fs::create_dir(&path) {
-                Ok(()) => break,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound && tries < 16 => tries += 1,
-                Err(e) => return Err(WorkspaceError::io(&path, e)),
-            }
+        // `Drop`); the lock keeps that from happening between the calls below.
+        let base = parent.parent().unwrap_or(&parent);
+        let _lock = lock_checks(base, true)?;
+        std::fs::create_dir_all(&parent).map_err(|e| WorkspaceError::io(&parent, e))?;
+        // `create_dir`, not `create_dir_all`: anything already there fails.
+        std::fs::create_dir(&path).map_err(|e| WorkspaceError::io(&path, e))?;
+        let tmp = path.join("tmp");
+        if let Err(e) = std::fs::create_dir(&tmp) {
+            // Not a `CheckFolder` yet, so `Drop` (which takes the lock) must
+            // not run here.
+            let _ = std::fs::remove_dir_all(&path);
+            return Err(WorkspaceError::io(&tmp, e));
         }
-        let folder = Self { path };
-        let tmp = folder.tmp();
-        std::fs::create_dir(&tmp).map_err(|e| WorkspaceError::io(&tmp, e))?;
-        Ok(folder)
+        Ok(Self { path })
     }
 
     /// The folder itself: the check's writable root.
@@ -140,13 +175,20 @@ impl CheckFolder {
 
 impl Drop for CheckFolder {
     fn drop(&mut self) {
+        let Some(parent) = self.path.parent() else {
+            let _ = std::fs::remove_dir_all(&self.path);
+            return;
+        };
+        // If the lock cannot be taken the parent stays: `tidy` removes an
+        // empty one. No lock file means no workspace, so nothing can race.
+        let lock = lock_checks(parent.parent().unwrap_or(parent), false);
         // `remove_dir_all` removes a link inside, never what it points at.
         let _ = std::fs::remove_dir_all(&self.path);
         // `.checks` is kGraf's own folder, not a worktree: it does not stay
         // in the worktree list once its last check folder is gone. Only an
         // empty folder goes (another check's folder, or a leftover, keeps it),
-        // and a check starting now makes it again (`create` retries).
-        if let Some(parent) = self.path.parent() {
+        // and a check starting now waits for the lock, then makes it again.
+        if lock.is_ok() {
             let _ = std::fs::remove_dir(parent);
         }
     }
@@ -509,7 +551,7 @@ impl WorkspaceManager {
         referenced: &dyn Fn(&str) -> bool,
     ) -> Result<Vec<OrphanRemoval>, WorkspaceError> {
         let _lock = self.exclusive()?;
-        self.git.run(&self.repo, ["worktree", "prune"])?;
+        self.worktree_git(["worktree", "prune"])?;
         self.clean_orphans_locked(referenced)
     }
 
@@ -531,7 +573,14 @@ impl WorkspaceManager {
         if !any_registered {
             remove_dir_if_empty(&self.base.join(HOLDS))?;
             remove_dir_if_empty(&self.base.join(SCRATCH))?;
+            let _checks = lock_checks(&self.base, false)?;
             remove_dir_if_empty(&self.base.join(CHECKS))?;
+            // Held while it goes; see `lock_checks`.
+            match std::fs::remove_file(self.base.join(CHECKS_LOCK)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(WorkspaceError::io(self.base.join(CHECKS_LOCK), e)),
+            }
         }
         Ok(())
     }
@@ -575,7 +624,7 @@ impl WorkspaceManager {
 
     /// Registered worktrees of the repository, including the main one.
     pub fn list(&self) -> Result<Vec<WorktreeEntry>, WorkspaceError> {
-        self.git.worktree_list(&self.repo)
+        self.admin_locked(|| self.git.worktree_list(&self.repo))
     }
 
     /// kGraf worktrees under this base whose owner cannot be judged from
@@ -839,24 +888,22 @@ impl WorkspaceManager {
 
         // Upstream retries once after clearing stale metadata: a crashed
         // earlier add can leave an admin entry that blocks this one.
-        if let Err(first) = self.git.run(&self.repo, &args) {
+        if let Err(first) = self.worktree_git(&args) {
             self.purge(&path)?;
-            self.git
-                .run(&self.repo, &args)
-                .map_err(|second| match second {
-                    WorkspaceError::GitFailed {
-                        args,
-                        cwd,
-                        code,
-                        stderr,
-                    } => WorkspaceError::GitFailed {
-                        args,
-                        cwd,
-                        code,
-                        stderr: format!("{stderr} (first attempt: {first})"),
-                    },
-                    other => other,
-                })?;
+            self.worktree_git(&args).map_err(|second| match second {
+                WorkspaceError::GitFailed {
+                    args,
+                    cwd,
+                    code,
+                    stderr,
+                } => WorkspaceError::GitFailed {
+                    args,
+                    cwd,
+                    code,
+                    stderr: format!("{stderr} (first attempt: {first})"),
+                },
+                other => other,
+            })?;
         }
         if !path.is_dir() {
             return Err(WorkspaceError::MissingAfterCreate(path));
@@ -1098,21 +1145,15 @@ impl WorkspaceManager {
         }
 
         // This process owns it now.
-        self.git.run(
-            &self.repo,
-            ["worktree".as_ref(), "unlock".as_ref(), path.as_os_str()],
-        )?;
+        self.worktree_git(["worktree".as_ref(), "unlock".as_ref(), path.as_os_str()])?;
         let reason = lock_reason(spec.name)?;
-        self.git.run(
-            &self.repo,
-            [
-                "worktree".as_ref(),
-                "lock".as_ref(),
-                "--reason".as_ref(),
-                std::ffi::OsStr::new(&reason),
-                path.as_os_str(),
-            ],
-        )?;
+        self.worktree_git([
+            "worktree".as_ref(),
+            "lock".as_ref(),
+            "--reason".as_ref(),
+            std::ffi::OsStr::new(&reason),
+            path.as_os_str(),
+        ])?;
         std::fs::create_dir_all(&ws.scratch).map_err(|e| WorkspaceError::io(&ws.scratch, e))?;
         // Every logged session has ended: start the log afresh.
         remove_file_if_exists(&session_log(&ws.hold))?;
@@ -1178,10 +1219,7 @@ impl WorkspaceManager {
         let mut remove_err = None;
         if let Some(entry) = &entry {
             if entry.locked.is_some() {
-                self.git.run(
-                    &self.repo,
-                    ["worktree".as_ref(), "unlock".as_ref(), path.as_os_str()],
-                )?;
+                self.worktree_git(["worktree".as_ref(), "unlock".as_ref(), path.as_os_str()])?;
             }
             if path.exists() {
                 // Double --force also removes a locked worktree; unlock ran
@@ -1193,11 +1231,11 @@ impl WorkspaceManager {
                     "--force".as_ref(),
                     path.as_os_str(),
                 ];
-                remove_err = self.git.run(&self.repo, args).err();
+                remove_err = self.worktree_git(args).err();
             }
         }
         remove_dir_if_exists(path)?;
-        self.git.run(&self.repo, ["worktree", "prune"])?;
+        self.worktree_git(["worktree", "prune"])?;
 
         let still_registered = self.list()?.iter().any(|e| e.path == path);
         if still_registered || path.exists() {
@@ -1406,6 +1444,42 @@ impl WorkspaceManager {
             Err(std::fs::TryLockError::WouldBlock) => Err(None),
             Err(std::fs::TryLockError::Error(e)) => Err(Some(WorkspaceError::io(hold, e))),
         }
+    }
+
+    /// Run `f` while holding the repository's worktree-admin lock.
+    ///
+    /// Git writes `worktrees/<id>/` in steps (`gitdir`, `commondir`, `HEAD`)
+    /// and `git worktree list` fails on an entry caught between them. Every
+    /// git call of this manager that adds, changes, removes or lists worktree
+    /// entries runs under this one lock, so none sees another's half-made
+    /// entry. It is an `flock` on a file in the common git directory: it
+    /// excludes other threads (each call opens its own file description) and
+    /// other kGraf processes on the same repository, whatever their base. It is
+    /// held for the git call only, and never taken while it is already held.
+    fn admin_locked<T>(
+        &self,
+        f: impl FnOnce() -> Result<T, WorkspaceError>,
+    ) -> Result<T, WorkspaceError> {
+        let path = self.common_dir.join(ADMIN_LOCK);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .map_err(|e| WorkspaceError::io(&path, e))?;
+        file.lock().map_err(|e| WorkspaceError::io(&path, e))?;
+        let _held = HeldLock::new(file);
+        f()
+    }
+
+    /// A git call that changes or reads worktree entries, under the
+    /// worktree-admin lock ([`Self::admin_locked`]).
+    fn worktree_git<I, S>(&self, args: I) -> Result<Vec<u8>, WorkspaceError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        self.admin_locked(|| self.git.run(&self.repo, args))
     }
 
     fn marker_file(&self) -> Result<File, WorkspaceError> {

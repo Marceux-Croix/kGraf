@@ -550,6 +550,10 @@ impl Provider for RouteRecorded {
         self.inner.resends_reasoning()
     }
 
+    fn undelivered_output_tokens(&self, response: &Response) -> Option<u64> {
+        self.inner.undelivered_output_tokens(response)
+    }
+
     async fn complete(
         &self,
         request: &Request,
@@ -693,6 +697,10 @@ impl Provider for RateLimited {
         self.inner.resends_reasoning()
     }
 
+    fn undelivered_output_tokens(&self, response: &Response) -> Option<u64> {
+        self.inner.undelivered_output_tokens(response)
+    }
+
     async fn complete(
         &self,
         request: &Request,
@@ -771,6 +779,49 @@ mod tests {
                 request_id: None,
             })
         }
+    }
+
+    /// A provider that reports a fixed undelivered count, to see the wrappers
+    /// pass the question through.
+    struct Counts;
+
+    #[async_trait::async_trait]
+    impl Provider for Counts {
+        fn adapter(&self) -> &'static str {
+            "counts"
+        }
+        fn protocol(&self) -> Protocol {
+            Protocol::Additive
+        }
+        fn undelivered_output_tokens(&self, _response: &Response) -> Option<u64> {
+            Some(900)
+        }
+        async fn complete(
+            &self,
+            request: &Request,
+            token: &CallToken,
+        ) -> Result<Response, ProviderError> {
+            Instant0.complete(request, token).await
+        }
+    }
+
+    /// A wrapper that kept the default would hide a reply the server cut down.
+    #[test]
+    fn both_wrappers_pass_the_undelivered_output_question_to_the_adapter() {
+        let response = Response {
+            finish_reason: None,
+            model: "m".into(),
+            content: Vec::new(),
+            stop_reason: StopReason::EndTurn,
+            usage: TokenUsage::default(),
+            request_id: None,
+        };
+        let limiter = RouteLimiter::new("r", RateLimit::parse("60/5").expect("spec")).expect("lim");
+        let limited = RateLimited::new(Arc::new(Counts), limiter);
+        assert_eq!(limited.undelivered_output_tokens(&response), Some(900));
+        let recorded = RouteRecorded::new(Arc::new(Counts), "r");
+        assert_eq!(recorded.undelivered_output_tokens(&response), Some(900));
+        assert_eq!(Instant0.undelivered_output_tokens(&response), None);
     }
 
     fn limited(spec: &str) -> RateLimited {

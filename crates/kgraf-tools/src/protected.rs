@@ -549,16 +549,21 @@ impl ProtectedWrites {
         {
             return Err("a protected name inside `.git` is refused".into());
         }
+        // The path in the repository's own spelling: git decides which names
+        // are shared with the main repository by matching `info/exclude` or
+        // `refs/...` with `/`, so a name spelled with a backslash on Windows
+        // would be read as a name inside this worktree's own directory.
+        let rest_arg = std::ffi::OsString::from(slashed(rest));
         let out = self
             .git(
                 &self.admin_dir,
                 [
                     OsStr::new("rev-parse"),
                     OsStr::new("--git-path"),
-                    rest.as_os_str(),
+                    rest_arg.as_os_str(),
                 ],
             )
-            .map_err(|e| format!("cannot resolve `.git/{}`: {e}", rest.display()))?;
+            .map_err(|e| format!("cannot resolve `.git/{}`: {e}", slashed(rest)))?;
         let resolved = PathBuf::from(out.trim());
         let resolved = if resolved.is_absolute() {
             resolved
@@ -579,7 +584,7 @@ impl ProtectedWrites {
         }
         Err(format!(
             "`.git/{}` resolves to {}, outside the repository's git directory",
-            rest.display(),
+            slashed(rest),
             resolved.display()
         ))
     }
@@ -1271,7 +1276,7 @@ impl ProtectedWrites {
     fn shown_git_path(&self, abs: &Path) -> String {
         for root in [&self.admin_dir, &self.common_dir] {
             if let Ok(rel) = abs.strip_prefix(root) {
-                return format!(".git/{}", rel.display());
+                return format!(".git/{}", slashed(rel));
             }
         }
         abs.display().to_string()
@@ -1773,6 +1778,16 @@ fn walk_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// `path` with `/` between its components on every platform: a path shown to
+/// a worker or a person is spelled as the repository spells it
+/// (`.git/refs/heads/x`), not in the host's separator.
+fn slashed(path: &Path) -> String {
+    path.components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// A file's bytes, `None` when it does not exist; refused over `limit`.

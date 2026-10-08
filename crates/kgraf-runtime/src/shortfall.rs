@@ -345,6 +345,38 @@ pub fn refusal_hint(can_report: bool) -> &'static str {
     }
 }
 
+/// What follows the next step in a refusal a worker sees: the refusal's own
+/// text, as the policy wrote it.
+pub const REFUSAL_TEXT_LEAD: &str = "The refusal: ";
+
+/// A policy refusal as the worker sees it: its header (`ERROR: denied by
+/// <policy>: ` or `ERROR: refused: `), then [`refusal_hint`], then the
+/// policy's text after [`REFUSAL_TEXT_LEAD`].
+///
+/// The next step comes before the policy's text because that text can be
+/// long: a shell refusal quotes the whole build and test allowlist, over
+/// 2,000 characters. With the step at the end, a model read the allowlist,
+/// tried one listed-looking command after another, and never asked. The
+/// header is kept as it was, so every reader that matches it still does.
+pub(crate) fn with_refusal_hint(output: &str, can_report: bool) -> String {
+    let header = match output.strip_prefix(crate::worker::DENIED_PREFIX) {
+        Some(rest) => {
+            crate::worker::DENIED_PREFIX.len() + rest.find(": ").map_or(rest.len(), |i| i + 2)
+        }
+        None if output.starts_with(crate::worker::REFUSED_PREFIX) => {
+            crate::worker::REFUSED_PREFIX.len()
+        }
+        None => 0,
+    };
+    let (head, text) = output.split_at(header);
+    let text = text.trim_end();
+    let stop = if text.ends_with('.') { "" } else { "." };
+    format!(
+        "{head}{} {REFUSAL_TEXT_LEAD}{text}{stop}",
+        refusal_hint(can_report).trim_start()
+    )
+}
+
 /// What one running worker's policies refused so far, as `report_shortfall`
 /// reads it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -490,6 +522,73 @@ impl RefusedCalls {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shape of an unattended shell refusal: the question quotes the
+    /// whole build and test allowlist before the unattended text.
+    fn long_shell_refusal() -> String {
+        format!(
+            "ERROR: denied by user: Run `mkdir -p out`? It is not on the build and test \
+             allowlist, which runs without approval: {}; exactly [\"python3\", \"check.py\"]. \
+             Nobody is attached to answer, and no persisted allow rule for this project \
+             covers it; run attached to a terminal and answer `a` to record one for this \
+             exact call.",
+            "cargo build, cargo test with their usual options; ".repeat(50)
+        )
+    }
+
+    #[test]
+    fn the_next_step_comes_before_a_long_refusal_text() {
+        let raw = long_shell_refusal();
+        for can_report in [true, false] {
+            let seen = with_refusal_hint(&raw, can_report);
+            assert!(
+                seen.starts_with("ERROR: denied by user: If your instruction"),
+                "{seen}"
+            );
+            let step = seen
+                .find(if can_report {
+                    "call report_shortfall"
+                } else {
+                    "stop, and say"
+                })
+                .expect("the step");
+            let allowlist = seen
+                .find("build and test allowlist")
+                .expect("allowlist kept");
+            assert!(step < 400, "the step is near the top: at {step}");
+            assert!(step < allowlist);
+            // The policy's text is kept whole, after the lead.
+            let rest = raw.strip_prefix("ERROR: denied by user: ").expect("prefix");
+            assert!(
+                seen.ends_with(&format!("{REFUSAL_TEXT_LEAD}{rest}")),
+                "{seen}"
+            );
+        }
+    }
+
+    /// Every reader matches the header, and the policy name stays readable
+    /// from it as before (`by` up to the first `: `).
+    #[test]
+    fn the_header_and_the_policy_name_are_kept() {
+        let seen = with_refusal_hint("ERROR: denied by skills:allowed-tools: no shell", true);
+        let rest = seen
+            .strip_prefix(crate::worker::DENIED_PREFIX)
+            .expect("header");
+        assert_eq!(
+            rest.split_once(": ").map(|(by, _)| by),
+            Some("skills:allowed-tools")
+        );
+        assert!(seen.ends_with("The refusal: no shell."), "{seen}");
+        let seen = with_refusal_hint("ERROR: refused: outside the write scope", false);
+        assert!(
+            seen.starts_with("ERROR: refused: If your instruction"),
+            "{seen}"
+        );
+        assert!(
+            seen.ends_with("The refusal: outside the write scope."),
+            "{seen}"
+        );
+    }
 
     fn refusal(capability: &str) -> RefusedCall {
         RefusedCall {

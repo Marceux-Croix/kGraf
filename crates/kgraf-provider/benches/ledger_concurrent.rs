@@ -39,6 +39,7 @@ fn usage() -> TokenUsage {
         cache_write: 0,
         text_output: 420,
         reasoning_output: 180,
+        unsplit_reasoning_chars: None,
         raw: Some(serde_json::json!({"input_tokens": 1200, "output_tokens": 600})),
     }
 }

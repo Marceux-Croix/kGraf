@@ -261,6 +261,11 @@ fn repo() -> Repo {
     git(&root, &["init", "-q", "-b", "main"]);
     git(&root, &["config", "user.name", "Test"]);
     git(&root, &["config", "user.email", "test@example.com"]);
+    // The tests compare the bytes a worker wrote with the bytes a later
+    // checkout holds. Git for Windows converts line endings on checkout by
+    // default (`core.autocrlf=true`), which would make every such comparison
+    // depend on the machine's setting, not on the worker.
+    git(&root, &["config", "core.autocrlf", "false"]);
     std::fs::write(root.join("src/lib.rs"), LIB_RS).expect("lib.rs");
     // `target/` deliberately NOT ignored: the seeded build
     // directory (0060) must stay out of the attempt anyway.
@@ -1573,7 +1578,9 @@ async fn a_kill_between_the_end_record_and_the_removal_resumes_past_the_leftover
 /// a clean directory under the state directory and learns the worktree from
 /// `KGRAF_WORKTREE`. The server here is a real process: a shell that
 /// records its working directory, would run a planted script if it found one
-/// in its working directory, then execs the real echo server.
+/// in its working directory, then execs the real echo server. Unix only: the
+/// server is a POSIX shell script run by `/bin/sh`.
+#[cfg(unix)]
 #[tokio::test]
 async fn a_stdio_mcp_server_starts_outside_the_worktree_and_never_runs_a_planted_module() {
     let repo = repo();

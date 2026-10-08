@@ -155,6 +155,7 @@ fn lower_bound_usage(protocol: Protocol, raw: &serde_json::Value) -> Option<Toke
         cache_write: write,
         text_output: output - reasoning,
         reasoning_output: reasoning,
+        unsplit_reasoning_chars: None,
         raw: Some(raw.clone()),
     })
 }

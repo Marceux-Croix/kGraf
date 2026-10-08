@@ -222,6 +222,25 @@ otherwise.
   (decision [0039](decisions/0039-accounting-is-enforced-by-an-unforgeable-call-token.md)).
   No live server has been seen sending such an error mid-stream; the tests use written
   replies, so no route status changes.
+- **A server can drop a tool call it cannot parse and answer 200** (`ollama`, a VERIFIED
+  route; seen with Ollama 0.34.4 and `qwen3.6:35b` on 2026-10-07). The reply has no tool
+  call and `finish_reason: "stop"`, but `completion_tokens` still counts the dropped call:
+  1,659 tokens were counted for 718 bytes of reasoning. A byte-level tokenizer writes at
+  least one byte per token, so the Chat Completions adapter reports the counted text output
+  above the delivered bytes as a floor of lost tokens (reasoning counted apart, as a server
+  that hides it reports it, is left out). A worker reply with no tool call and at least 256
+  lost tokens is dropped, and the model is told that its reply did not arrive complete; at
+  most two such replies an attempt. A server that hides reasoning without counting it apart
+  can cause a false notice, which costs one round. The other adapters do not measure this:
+  their protocols count hidden or summarized reasoning inside the output.
+- **Reasoning tokens are not split out on `ollama`.** A reasoning model on Ollama (checked
+  with `qwen3.6:35b`) sends its thinking as `message.reasoning` and reports one
+  `completion_tokens` total with no `reasoning_tokens`. The thinking tokens are inside that
+  total. The ledger keeps them in text output and sets `unsplit_reasoning_chars` to the
+  length of the thinking text. A report shows "not reported" with that length, never a
+  reasoning count of zero. No token count is derived from the characters, because kGraf has
+  no tokenizer for the served model. The `llama-cpp` route uses the same adapter and the
+  same rule; its usage shape has not been recorded.
 - **A model name is not a verified model.** A VERIFIED row covers the models named in its
   record. A different model on the same route can behave differently. DeepSeek is known to
   replace an unsupported model name with a cheaper one and return HTTP 200. The model echo
@@ -244,3 +263,8 @@ otherwise.
 - 2026-10-01: the chat adapter reads thinking text sent as `reasoning` as well as
   `reasoning_content` (Ollama, OpenRouter, recent vLLM); the `ollama` route declares full
   reasoning visibility.
+- 2026-10-08: the chat adapter reports output the server counted but did not deliver; a
+  worker reply with no tool call that lost a whole call is sent again with a notice (see
+  Known limits). No route status changes.
+- 2026-10-08: a response with thinking text and no reasoning token count is marked in the
+  ledger (`unsplit_reasoning_chars`) instead of reading as zero reasoning tokens.

@@ -162,3 +162,27 @@ with status 200, any other is a `Decode` error; neither is ever answer text. Tes
 `a_server_parse_failure_on_a_json_asked_call_is_asked_again_unchanged`,
 `an_interpretation_answer_cut_mid_string_is_asked_again`,
 `a_mid_stream_eof_error_chunk_is_malformed_output_not_answer_text`.
+
+**Amended 2026-10-08: a tool call the server dropped without an error is sent again within the
+attempt.** A local server (Ollama 0.34.4, `qwen3.6:35b`) that could not parse the model's tool
+call also answered HTTP 200 with no tool call and `finish_reason: "stop"`, while
+`completion_tokens` still counted the call: 1,659 tokens for 718 bytes of reasoning, and on
+another worker 1,454 tokens for 507 bytes. The first reply read as an empty turn and then as an
+end with no change; the second ended its attempt as completed with its last write missing. A
+byte-level tokenizer writes at least one byte per token, so counted text output above the
+delivered bytes (text, reasoning, tool names and arguments; reasoning counted apart is left out
+on both sides), less 32 for template markers, is a floor of lost tokens
+(`Response::undelivered_output_floor`). `Provider::undelivered_output_tokens` reports it where
+the protocol's reply carries all of its text share: the Chat Completions adapter only; the
+others answer `None`, since their protocols count hidden or summarized reasoning in the output.
+A worker reply with no tool call and a floor of 256 or more is dropped (`RoundAbandoned`), and
+the model gets one notice (`NoticeKind::LostOutput`) saying how many tokens were counted and how
+many are missing, at most `MAX_LOST_OUTPUT_RETRIES` (2) times an attempt; after that the reply
+is judged as it arrived. Each try is its own ledger call. Tests: `kgraf-provider`
+`counted_output_the_reply_does_not_carry_is_a_floor_of_lost_tokens`,
+`separately_counted_reasoning_is_never_counted_as_lost`,
+`both_wrappers_pass_the_undelivered_output_question_to_the_adapter`; `kgraf-provider-openai`
+`a_reply_whose_tool_call_the_server_dropped_shows_undelivered_output`; `kgraf-runtime`
+`a_reply_the_server_cut_down_is_sent_again_not_taken_as_the_answer`,
+`lost_output_retries_are_bounded_and_need_a_measuring_provider`; the scripted canary scenario
+`lost-output-resent`.

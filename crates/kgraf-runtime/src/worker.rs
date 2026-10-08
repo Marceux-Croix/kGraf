@@ -799,6 +799,7 @@ async fn prepare(
         output_limit_retried: false,
         empty_turn_retried: false,
         malformed_retries: 0,
+        lost_output_retries: 0,
         no_change_retried: false,
         phase: CancelPhase::BetweenRounds,
         calls,
@@ -1087,6 +1088,33 @@ pub fn malformed_output_notice(retry: u32) -> String {
 const NO_CHANGE_ABANDON_REASON: &str =
     "the turn ended with no tool call although the contract writes files";
 
+/// The smallest floor of undelivered output tokens
+/// ([`kgraf_provider::Provider::undelivered_output_tokens`]) that makes a reply
+/// with no tool call a lost one. A dropped tool call is a whole call (a patch
+/// is hundreds of tokens); a few stray markers are not.
+pub const LOST_OUTPUT_MIN_TOKENS: u64 = 256;
+
+/// How many replies of one attempt may be sent again because the server
+/// dropped part of them. Beyond it the reply is judged as it arrived.
+pub const MAX_LOST_OUTPUT_RETRIES: u32 = 2;
+
+/// The `RoundAbandoned` reason for a reply the server delivered only in part.
+pub const LOST_OUTPUT_ABANDON_REASON: &str =
+    "the server counted more output than the reply carried, and the reply had no tool call";
+
+/// The notice that follows a reply the server delivered only in part. The
+/// model wrote more than arrived; telling it that it called no tool would be
+/// false, and it would plan again from the wrong premise.
+pub fn lost_output_notice(counted: u64, missing: u64) -> String {
+    format!(
+        "Your last reply did not arrive complete: the server counted {counted} output tokens \
+         for it, and at least {missing} of them are not in the reply. The missing part is \
+         usually a tool call that the server could not read, so it was not run. If you called \
+         a tool, send that call again as one well-formed tool call; for a large change, use \
+         several smaller apply_patch calls."
+    )
+}
+
 /// The notice that follows an end with no change: one continuation round.
 fn no_change_notice(paths: String) -> String {
     format!(
@@ -1125,6 +1153,10 @@ struct Worker {
     /// output and that were sent again. Cleared by any round that gets a
     /// response; capped at [`MAX_MALFORMED_OUTPUT_RETRIES`].
     malformed_retries: u32,
+    /// Replies of this attempt sent again because the server delivered only
+    /// part of them; capped at [`MAX_LOST_OUTPUT_RETRIES`]. Never cleared: it
+    /// bounds the extra rounds a server fault can cost one attempt.
+    lost_output_retries: u32,
     /// Whether the attempt already got its one notice for ending as done with
     /// no tool call although its contract writes files.
     no_change_retried: bool,
@@ -1835,6 +1867,48 @@ impl Worker {
                          not supported"
                             .into(),
                     ));
+                }
+                // The reply ended with no tool call, but the provider counted
+                // far more output than it carries: a server that could not
+                // parse the model's tool call dropped it and answered 200 with
+                // a plain stop. Judged as it arrived, the turn would read as
+                // an empty turn, an end with no change, or a completed attempt
+                // with its last write missing. The round is dropped and the
+                // model is told what happened, at most
+                // `MAX_LOST_OUTPUT_RETRIES` times an attempt; after that the
+                // reply is judged as it arrived, by the arms below.
+                (StopReason::EndTurn | StopReason::StopSequence, true)
+                    if !final_round
+                        && self.lost_output_retries < MAX_LOST_OUTPUT_RETRIES
+                        && self.budget.rounds_left() >= 2
+                        && self
+                            .env
+                            .provider
+                            .undelivered_output_tokens(&response)
+                            .is_some_and(|n| n >= LOST_OUTPUT_MIN_TOKENS) =>
+                {
+                    let missing = self
+                        .env
+                        .provider
+                        .undelivered_output_tokens(&response)
+                        .unwrap_or_default();
+                    self.lost_output_retries += 1;
+                    self.abandon(
+                        ep,
+                        CancelPhase::ModelStream,
+                        None,
+                        LOST_OUTPUT_ABANDON_REASON,
+                    )
+                    .await?;
+                    self.emit(
+                        ep,
+                        WorkerEvent::Notice {
+                            kind: crate::event::NoticeKind::LostOutput,
+                            text: lost_output_notice(response.usage.text_output, missing),
+                        },
+                    )
+                    .await?;
+                    continue;
                 }
                 // No tool call and no visible text: the model's plan sits in its
                 // reasoning, or there is nothing at all. That is not an answer,
@@ -3576,10 +3650,7 @@ impl Worker {
             .tools
             .get(crate::shortfall::SHORTFALL_TOOL)
             .is_some();
-        if !output.trim_end().ends_with('.') {
-            output.push('.');
-        }
-        output.push_str(crate::shortfall::refusal_hint(can_report));
+        *output = crate::shortfall::with_refusal_hint(output, can_report);
     }
 
     /// Record the worktree paths git reports as changed after a sandboxed build

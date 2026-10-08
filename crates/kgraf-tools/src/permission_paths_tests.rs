@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::permissions::{
-    HardLimit, ReadContext, Unplaced, critical_deletion_of, locate, read_call_in,
+    HardLimit, ReadContext, Unplaced, critical_deletion_of, locate_names, read_call_in,
 };
 use std::path::{Path, PathBuf};
 
@@ -17,14 +17,10 @@ enum Lands {
 }
 
 fn lands(flavor: Flavor, root: &str, cwd: &str, word: &str) -> Lands {
-    match locate(flavor, Path::new(root), Path::new(cwd), word) {
-        Ok(rel) => {
-            let joined: Vec<String> = rel
-                .components()
-                .map(|c| c.as_os_str().to_string_lossy().into_owned())
-                .collect();
-            Lands::In(Box::leak(joined.join("/").into_boxed_str()))
-        }
+    // The names, not a `PathBuf`: the Unix rules run on a Windows host too,
+    // and a Windows path type would split a name that holds `\` or `:`.
+    match locate_names(flavor, Path::new(root), Path::new(cwd), word) {
+        Ok(names) => Lands::In(Box::leak(names.join("/").into_boxed_str())),
         Err(Unplaced::Outside) => Lands::Out,
         Err(Unplaced::Unknown(_)) => Lands::Unknown,
     }

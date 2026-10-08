@@ -725,6 +725,7 @@ impl GeminiAdapter {
             cache_write: 0,
             text_output: field("candidatesTokenCount"),
             reasoning_output: field("thoughtsTokenCount"),
+            unsplit_reasoning_chars: None,
             raw: Some(raw.clone()),
         })
     }

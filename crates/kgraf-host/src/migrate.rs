@@ -738,6 +738,17 @@ fn read_link_file(file: &Path, base: &Path) -> Result<PathBuf> {
     })
 }
 
+/// `path` as the `gitdir` file of a worktree holds it: with `/` on Windows
+/// too, so the file reads the same whether the tool or this migration wrote it.
+fn as_git_writes(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if cfg!(windows) {
+        text.replace('\\', "/")
+    } else {
+        text.into_owned()
+    }
+}
+
 fn repair_worktrees(
     git: &Git,
     root: &Path,
@@ -773,7 +784,10 @@ fn repair_worktrees(
             // The worktree was already gone before the move. Point its
             // registration at where it would now be, so startup cleanup finds
             // it missing there and handles it as it would have.
-            write_atomically(&gitdir_file, format!("{}\n", target.display()).as_bytes())?;
+            write_atomically(
+                &gitdir_file,
+                format!("{}\n", as_git_writes(&target)).as_bytes(),
+            )?;
             report.registrations_rewritten += 1;
         }
     }
@@ -1100,6 +1114,14 @@ mod tests {
 
     fn pairs() -> Vec<(String, String)> {
         vec![("/p/.haustoria".to_owned(), "/p/.kgraf".to_owned())]
+    }
+
+    /// A registration this migration writes reads as git writes its own,
+    /// with `/` between the names on Windows too.
+    #[test]
+    fn a_registration_is_written_with_slashes_as_git_writes_it() {
+        let path = Path::new("state").join("worktrees").join("w2").join(".git");
+        assert_eq!(as_git_writes(&path), "state/worktrees/w2/.git");
     }
 
     #[test]

@@ -370,6 +370,9 @@ fn spend_of_runs(
                 usage.cache_write += call.usage.cache_write;
                 usage.text_output += call.usage.text_output;
                 usage.reasoning_output += call.usage.reasoning_output;
+                if let Some(chars) = call.usage.unsplit_reasoning_chars {
+                    *usage.unsplit_reasoning_chars.get_or_insert(0) += chars;
+                }
             }
             Ok(format!(
                 "{} call(s), in {} (cache r {} w {}) out {} (reasoning {}) (pass --prices for dollars)",
@@ -378,7 +381,7 @@ fn spend_of_runs(
                 usage.cache_read,
                 usage.cache_write,
                 usage.text_output,
-                usage.reasoning_output
+                usage.reasoning_label()
             ))
         }
     }

@@ -1970,18 +1970,29 @@ impl Provider for ShellCaller {
         };
         token.settle(&usage, None)?;
         let first = !request.messages.iter().any(|m| m.role == Role::Assistant);
+        // Programs the platform has: `ls` and `touch` are not Windows
+        // programs, and the ones in Git's `usr\bin` are MSYS2 programs that
+        // do not start in the sandbox.
+        let (list, write): (&[&str], &[&str]) = if cfg!(windows) {
+            (
+                &["cmd", "/d", "/c", "dir"],
+                &["cmd", "/d", "/c", "type nul > unasked.txt"],
+            )
+        } else {
+            (&["ls"], &["touch", "unasked.txt"])
+        };
         let content = if first {
             vec![
                 Content::ToolUse {
                     id: "c0".into(),
                     name: "shell".into(),
-                    input: serde_json::json!({"command": ["ls"]}),
+                    input: serde_json::json!({ "command": list }),
                     signature: None,
                 },
                 Content::ToolUse {
                     id: "c1".into(),
                     name: "shell".into(),
-                    input: serde_json::json!({"command": ["touch", "unasked.txt"]}),
+                    input: serde_json::json!({ "command": write }),
                     signature: None,
                 },
             ]
@@ -5021,16 +5032,30 @@ async fn a_host_resolver_answers_the_attempts_asks() {
     )
     .await
     .expect("spawn");
-    let mut errors = 0;
-    while let Some(ev) = handle.next_event().await {
-        if let kgraf_runtime::WorkerEvent::ToolCallFinished { is_error, .. } = ev {
-            errors += usize::from(is_error);
+    // Bounded: a call that waits for an answer nobody gives would hold the
+    // whole test binary; this way it fails with the events seen so far.
+    let mut events = Vec::new();
+    let finished = tokio::time::timeout(Duration::from_secs(120), async {
+        while let Some(ev) = handle.next_event().await {
+            events.push(ev);
         }
-    }
+    })
+    .await
+    .is_ok();
     if let Some(closer) = built.closer {
         closer.close().await;
     }
-    assert_eq!(errors, 0, "both calls ran");
+    assert!(finished, "the worker did not end in 120 s: {events:#?}");
+    let errors = events
+        .iter()
+        .filter(|ev| {
+            matches!(
+                ev,
+                kgraf_runtime::WorkerEvent::ToolCallFinished { is_error: true, .. }
+            )
+        })
+        .count();
+    assert_eq!(errors, 0, "both calls ran: {events:#?}");
     assert!(ws.join("unasked.txt").exists(), "the allowed write ran");
     assert!(
         allow.0.load(std::sync::atomic::Ordering::SeqCst) >= 1,

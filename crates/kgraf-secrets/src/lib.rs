@@ -205,7 +205,24 @@ const CONNECTION_STORE_WORDS: &[&str] = &[
     "elasticsearch",
 ];
 
+/// `GIT_CONFIG_KEY_<n>`: the name of a setting git is given through the
+/// environment (`user.name`), paired with `GIT_CONFIG_VALUE_<n>`. The word
+/// "key" in it is a setting's key, not a secret key.
+fn is_git_config_key(name: &str) -> bool {
+    const PREFIX: &str = "GIT_CONFIG_KEY_";
+    name.get(..PREFIX.len())
+        .is_some_and(|p| p.eq_ignore_ascii_case(PREFIX))
+        && name.len() > PREFIX.len()
+        && name[PREFIX.len()..].bytes().all(|b| b.is_ascii_digit())
+}
+
 fn classify_name(name: &str) -> NameClass {
+    // Judged a credential, the name would be removed from a sandboxed
+    // command's environment while its count and values stay, and git stops on
+    // the missing key.
+    if is_git_config_key(name) {
+        return NameClass::Ordinary;
+    }
     let words = name_words(name);
     // `PWD` alone is the shell's working directory, not a password.
     if words.len() == 1 && words[0] == "pwd" {
@@ -2810,6 +2827,26 @@ mod tests {
         }
         for name in ["PATH", "DB_PATH", "AUTHOR_NAME", "PATCH_NOTES"] {
             assert!(!name_is_credential_shaped(name), "{name} matched");
+        }
+    }
+
+    /// The setting names git is given in `GIT_CONFIG_KEY_<n>` hold no
+    /// secret. Read as a credential, the name would be dropped from a
+    /// command's environment while `GIT_CONFIG_COUNT` stayed, and git would
+    /// stop on the missing key. A key that is not that variable is still judged
+    /// by its words.
+    #[test]
+    fn a_git_config_key_variable_is_not_a_credential() {
+        for name in ["GIT_CONFIG_KEY_0", "GIT_CONFIG_KEY_12", "git_config_key_3"] {
+            assert!(!name_is_credential_shaped(name), "{name} matched");
+        }
+        for name in [
+            "GIT_CONFIG_KEY_",
+            "GIT_CONFIG_KEY_X",
+            "GIT_CONFIG_KEY",
+            "MY_KEY_0",
+        ] {
+            assert!(name_is_credential_shaped(name), "{name} not matched");
         }
     }
 

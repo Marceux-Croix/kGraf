@@ -26,6 +26,7 @@ use std::io::Write;
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::process::Output;
+use std::time::{Duration, Instant};
 
 use common::fixture;
 use kgraf_sandbox::{
@@ -323,6 +324,59 @@ fn probe_output(policy: &SandboxPolicy, cwd: &Path, action: &str, arg: &str, arg
         .env("KGRAF_PROBE_ARG2", arg2)
         .output()
         .unwrap()
+}
+
+/// Run `cmd` to its end, or fail with what it printed so far after `limit`.
+/// A program that waits for input nobody gives (a credential prompt, a
+/// toolchain installer) would otherwise hold the whole test binary until the
+/// outer timeout and hide every other result.
+fn output_within(cmd: &mut kgraf_sandbox::SandboxedCommand, limit: Duration) -> Output {
+    cmd.stdin(Redirect::Null)
+        .stdout(Redirect::Piped)
+        .stderr(Redirect::Piped);
+    wait_within(cmd.spawn().unwrap(), limit)
+}
+
+/// [`output_within`] for a child that is already running.
+fn wait_within(mut child: kgraf_sandbox::SandboxedChild, limit: Duration) -> Output {
+    fn drain(
+        pipe: Option<impl std::io::Read + Send + 'static>,
+    ) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut bytes);
+            }
+            bytes
+        })
+    }
+    let out = drain(child.stdout.take());
+    let err = drain(child.stderr.take());
+    drop(child.stdin.take());
+    let deadline = Instant::now() + limit;
+    let status = loop {
+        match child.try_wait().unwrap() {
+            Some(status) => break Some(status),
+            None if Instant::now() >= deadline => break None,
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    };
+    // The job ends every process the command left behind; the pipes then
+    // close and the readers finish.
+    let _ = child.kill();
+    let (stdout, stderr) = (out.join().unwrap(), err.join().unwrap());
+    match status {
+        Some(status) => Output {
+            status,
+            stdout,
+            stderr,
+        },
+        None => panic!(
+            "no exit within {limit:?}; stdout: {}; stderr: {}",
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr)
+        ),
+    }
 }
 
 fn probe(ws: &Workspace, action: &str, arg: &Path) -> (i32, String) {
@@ -737,12 +791,10 @@ fn a_real_cargo_build_runs_inside_the_sandbox() {
     )
     .unwrap();
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-    let out = sandboxed_command(&policy(&e.ws), &cargo, root)
-        .unwrap()
-        .args(["run", "--offline", "-q"])
-        .env_remove("CARGO_TARGET_DIR")
-        .output()
-        .unwrap();
+    let mut cmd = sandboxed_command(&policy(&e.ws), &cargo, root).unwrap();
+    cmd.args(["run", "--offline", "-q"])
+        .env_remove("CARGO_TARGET_DIR");
+    let out = output_within(&mut cmd, Duration::from_secs(300));
     assert!(out.status.success(), "{out:?}");
     assert_eq!(
         String::from_utf8_lossy(&out.stdout).trim_end(),
@@ -782,38 +834,58 @@ fn secrets_are_scrubbed_and_git_credential_helpers_are_reset() {
         .unwrap()
         .write_all(b"protocol=https\nhost=example.invalid\n\n")
         .unwrap();
-    let out = child.wait_with_output().unwrap();
+    let out = wait_within(child, Duration::from_secs(60));
     assert!(
         !String::from_utf8_lossy(&out.stdout).contains("leak"),
         "{out:?}"
     );
 }
 
-/// A host that already sets GIT_CONFIG_COUNT keeps its own entries and the
-/// credential.helper reset is appended, not dropped.
+/// A host that sets GIT_CONFIG_COUNT, here with an `extraheader` entry that
+/// carries a (fake) token, does not hand its entries to the command: git
+/// sees only the sandbox's own, the credential.helper reset among them, and
+/// still runs.
 #[test]
-fn git_config_count_from_the_host_is_extended_not_dropped() {
+fn git_config_entries_from_the_host_do_not_reach_the_command() {
+    const HOST: [(&str, &str); 5] = [
+        ("GIT_CONFIG_COUNT", "2"),
+        ("GIT_CONFIG_KEY_0", "http.https://example.com/.extraheader"),
+        (
+            "GIT_CONFIG_VALUE_0",
+            "AUTHORIZATION: bearer fake-test-value",
+        ),
+        ("GIT_CONFIG_KEY_1", "user.name"),
+        ("GIT_CONFIG_VALUE_1", "Preset"),
+    ];
     let e = env();
     // SAFETY: single-threaded test run.
     unsafe {
-        std::env::set_var("GIT_CONFIG_COUNT", "1");
-        std::env::set_var("GIT_CONFIG_KEY_0", "user.name");
-        std::env::set_var("GIT_CONFIG_VALUE_0", "Preset");
+        for (name, value) in HOST {
+            std::env::set_var(name, value);
+        }
     }
-    let out = sandboxed_command(&policy(&e.ws), "git", e.ws.root())
-        .unwrap()
-        .args(["config", "--get-all", "--show-scope", "user.name"])
-        .output()
-        .unwrap();
+    let mut cmd = sandboxed_command(&policy(&e.ws), "git", e.ws.root()).unwrap();
+    cmd.args(["config", "--list", "--show-scope"]);
+    let out = output_within(&mut cmd, Duration::from_secs(60));
     unsafe {
-        std::env::remove_var("GIT_CONFIG_COUNT");
-        std::env::remove_var("GIT_CONFIG_KEY_0");
-        std::env::remove_var("GIT_CONFIG_VALUE_0");
+        for (name, _) in HOST {
+            std::env::remove_var(name);
+        }
     }
+    assert!(out.status.success(), "git failed: {:?}", out.status);
+    let listing = String::from_utf8_lossy(&out.stdout);
+    let command: Vec<&str> = listing
+        .lines()
+        .filter_map(|l| l.strip_prefix("command\t"))
+        .collect();
     assert!(
-        String::from_utf8_lossy(&out.stdout).contains("Preset"),
-        "host GIT_CONFIG entry was dropped: {out:?}"
+        !command.iter().any(|l| l.contains("extraheader")
+            || l.contains("fake-test-value")
+            || l.contains("Preset")),
+        "a host entry reached the command"
     );
+    assert!(command.contains(&"credential.helper="), "{command:?}");
+    assert!(command.contains(&"core.autocrlf=false"), "{command:?}");
 }
 
 #[test]

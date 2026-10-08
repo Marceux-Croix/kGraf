@@ -159,6 +159,15 @@ fn outside_bypass_every_protected_path_is_refused_with_the_old_reason() {
     }
 }
 
+/// A path shown to the worker, and the path handed to git to resolve, use
+/// `/` on every platform: git matches the shared names (`info/exclude`,
+/// `refs/...`) by that spelling.
+#[test]
+fn a_repository_path_is_spelled_with_slashes_on_every_platform() {
+    let path: PathBuf = ["refs", "heads", "other"].iter().collect();
+    assert_eq!(slashed(&path), "refs/heads/other");
+}
+
 #[test]
 fn bypass_resolves_git_paths_the_way_git_does() {
     let r = repo();

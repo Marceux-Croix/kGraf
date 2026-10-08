@@ -1670,7 +1670,7 @@ fn call(
                 usage.cache_read,
                 usage.cache_write,
                 usage.text_output,
-                usage.reasoning_output
+                usage.reasoning_label()
             );
             let raw = usage
                 .raw
@@ -1694,6 +1694,7 @@ fn call(
                     "cache_write": usage.cache_write,
                     "text_output": usage.text_output,
                     "reasoning_output": usage.reasoning_output,
+                    "unsplit_reasoning_chars": usage.unsplit_reasoning_chars,
                     "raw": usage.raw,
                 },
                 "text": response.text(),
@@ -2137,7 +2138,7 @@ fn spend(root: &Path, prices: Option<&Path>) -> Result<()> {
             usage.cache_read,
             usage.cache_write,
             usage.text_output,
-            usage.reasoning_output
+            usage.reasoning_label()
         );
     }
     if let Some(path) = prices {
@@ -2251,7 +2252,7 @@ fn usage_line(usage: &kgraf_core::TokenUsage) -> String {
         usage.cache_read,
         usage.cache_write,
         usage.text_output,
-        usage.reasoning_output
+        usage.reasoning_label()
     )
 }
 

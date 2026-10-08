@@ -71,8 +71,8 @@ pub use sandbox::SetupProbe;
 pub use sandbox::{
     Backend, CheckNetwork, FROZEN_GIT_FILES, FrozenGit, IsolationStrength, NETWORK_OPEN_NOTICE,
     Network, ReadConfinement, Redirect, SHELL_NETWORK_OPEN_NOTICE, SandboxPolicy, SandboxedCommand,
-    TLS_UNAVAILABLE_HINT, WINDOWS_BASE_VARS, platform_isolation, sandboxed_command,
-    tls_unavailable_hint, workspace_command,
+    TLS_UNAVAILABLE_HINT, WINDOWS_BASE_VARS, is_git_config_entry_var, platform_isolation,
+    sandboxed_command, tls_unavailable_hint, workspace_command,
 };
 #[cfg(target_os = "linux")]
 pub use sandbox::{LinuxConfinement, linux_confinement};

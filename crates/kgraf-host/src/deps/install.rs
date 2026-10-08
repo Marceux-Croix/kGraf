@@ -475,9 +475,9 @@ const TOOLCHAIN_HOMES: &[(&str, &str)] = &[
 /// Bun's settings (a registry and its token), Bundler's per-host
 /// credentials (`BUNDLE_GEMS__EXAMPLE__COM=user:pass`), Composer's
 /// settings, NuGet's (`VSS_NUGET_EXTERNAL_FEED_ENDPOINTS` holds tokens),
-/// Gradle project properties (repository logins), git's command-line
-/// configuration (an `http.extraHeader` with a token), and cargo's
-/// registries.
+/// Gradle project properties (repository logins), git's config file
+/// locations (the sandbox removes git's environment entries itself, see
+/// `inherited_configuration`), and cargo's registries.
 const CONFIGURATION_PREFIXES: &[&str] = &[
     "PIP_",
     "UV_",
@@ -541,6 +541,12 @@ pub(crate) fn inherited_configuration(
             let upper = name.to_ascii_uppercase();
             // Where pnpm and Bun keep their own programs, not configuration.
             if matches!(upper.as_str(), "PNPM_HOME" | "BUN_INSTALL") {
+                return false;
+            }
+            // The sandbox already removes the host's git configuration
+            // entries and sets its own under the same names; removing the
+            // names here would remove the sandbox's entries too.
+            if kgraf_sandbox::is_git_config_entry_var(name) {
                 return false;
             }
             CONFIGURATION_PREFIXES.iter().any(|p| upper.starts_with(p))

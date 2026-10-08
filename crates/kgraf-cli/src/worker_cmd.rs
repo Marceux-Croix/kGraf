@@ -276,7 +276,7 @@ pub fn run(root: &Path, mut args: WorkerArgs) -> Result<()> {
                 row.usage.cache_read,
                 row.usage.cache_write,
                 row.usage.text_output,
-                row.usage.reasoning_output,
+                row.usage.reasoning_label(),
                 row.trace
                     .ttft_ms
                     .map_or_else(|| "-".to_owned(), |ms| format!("{ms} ms")),

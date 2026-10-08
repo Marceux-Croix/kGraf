@@ -2309,14 +2309,18 @@ mod windows_tests {
         let t = tree();
         std::fs::create_dir_all(t.root.join("a/b")).expect("mkdir");
         std::fs::write(t.root.join("a/b/c"), "x").expect("write");
-        let mut child = std::process::Command::new("ping")
-            .args(["-n", "60", "127.0.0.1"])
+        // `cmd /d /c pause` keeps its current folder for as long as its input
+        // stays open, and needs no network or console of its own.
+        let mut child = std::process::Command::new("cmd")
+            .args(["/d", "/c", "pause"])
             .current_dir(t.root.join("a"))
+            .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
             .expect("start a process in tree\\a");
         // Held once an open for deletion meets a sharing violation.
+        let mut last = String::from("no open tried");
         let held = (0..100).any(|_| {
             let open = std::fs::OpenOptions::new()
                 .access_mode(DELETE)
@@ -2324,7 +2328,8 @@ mod windows_tests {
                 .open(t.root.join("a"));
             match open {
                 Err(e) if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION as i32) => true,
-                _ => {
+                other => {
+                    last = format!("{other:?}");
                     std::thread::sleep(std::time::Duration::from_millis(100));
                     false
                 }
@@ -2333,7 +2338,10 @@ mod windows_tests {
         let removed = remove_confined(&t.root, Path::new("a/b/c"));
         let _ = child.kill();
         let _ = child.wait();
-        assert!(held, "the process never held tree\\a as its current folder");
+        assert!(
+            held,
+            "the process never held tree\\a as its current folder; last open: {last}"
+        );
         assert!(removed.expect("removal with tree\\a held"), "removed");
         assert!(
             !t.root.join("a/b").exists(),

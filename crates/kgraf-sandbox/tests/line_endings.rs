@@ -201,11 +201,14 @@ fn a_worker_git_sees_the_same_line_ending_settings() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "false\nlf\n");
 }
 
-/// The host's own `GIT_CONFIG_COUNT` entries reach the worker's git, and the
-/// line-ending settings come after them.
+/// The host's own `GIT_CONFIG_COUNT` entries never reach the worker: one can
+/// carry a credential (an `http.<url>.extraHeader` with a token, as CI
+/// checkouts set it). The worker's git still runs with the sandbox's
+/// line-ending settings, numbered from zero, and the count matches them.
+/// The header value is a fake.
 #[cfg(unix)]
 #[test]
-fn the_hosts_git_config_entries_are_kept_before_the_line_ending_settings() {
+fn the_hosts_git_config_entries_do_not_reach_the_worker() {
     let _m = machine_with_autocrlf();
     let e = env_with(|_| {});
     let ws = e
@@ -218,24 +221,73 @@ fn the_hosts_git_config_entries_are_kept_before_the_line_ending_settings() {
         .unwrap();
     // SAFETY: the lock is held, so no other test of this binary runs; the
     // variables are removed again before it is released.
+    const HOST: [(&str, &str); 6] = [
+        ("GIT_CONFIG_COUNT", "2"),
+        ("GIT_CONFIG_KEY_0", "http.https://example.com/.extraheader"),
+        (
+            "GIT_CONFIG_VALUE_0",
+            "AUTHORIZATION: bearer fake-test-value",
+        ),
+        ("GIT_CONFIG_KEY_1", "user.name"),
+        ("GIT_CONFIG_VALUE_1", "Preset"),
+        (
+            "GIT_CONFIG_PARAMETERS",
+            "'http.extraheader'='fake-test-value'",
+        ),
+    ];
     unsafe {
-        std::env::set_var("GIT_CONFIG_COUNT", "1");
-        std::env::set_var("GIT_CONFIG_KEY_0", "user.name");
-        std::env::set_var("GIT_CONFIG_VALUE_0", "Preset");
+        for (name, value) in HOST {
+            std::env::set_var(name, value);
+        }
     }
+    // The worker's whole environment, then what its git reads.
+    let script = "env; echo ---; \
+                  git config --get core.autocrlf; \
+                  git config --get user.name || echo no-user; \
+                  git config --get-regexp 'http\\..*extraheader' || echo no-header; \
+                  echo \"count=$GIT_CONFIG_COUNT\"";
     let out = kgraf_sandbox::workspace_command(&ws, kgraf_sandbox::Network::Deny, "/bin/sh").map(
         |mut c| {
-            c.arg("-c")
-                .arg("git config --get user.name; git config --get core.autocrlf");
+            c.arg("-c").arg(script);
             c.output()
         },
     );
     unsafe {
-        std::env::remove_var("GIT_CONFIG_COUNT");
-        std::env::remove_var("GIT_CONFIG_KEY_0");
-        std::env::remove_var("GIT_CONFIG_VALUE_0");
+        for (name, _) in HOST {
+            std::env::remove_var(name);
+        }
     }
     let out = out.unwrap().unwrap();
     assert!(out.status.success(), "{out:?}");
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "Preset\nfalse\n");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let (env, git) = stdout.split_once("---\n").expect("separator");
+    assert!(
+        !env.contains("fake-test-value"),
+        "a host value reached the worker"
+    );
+    assert!(
+        !env.to_lowercase().contains("extraheader"),
+        "a host key reached the worker"
+    );
+    assert!(!env.contains("Preset"), "a host value reached the worker");
+    assert!(!env.contains("GIT_CONFIG_PARAMETERS"), "{env}");
+    // Exactly the sandbox's own entries, from index zero.
+    let mut entries: Vec<&str> = env
+        .lines()
+        .filter(|l| l.starts_with("GIT_CONFIG_KEY_") || l.starts_with("GIT_CONFIG_VALUE_"))
+        .collect();
+    entries.sort_unstable();
+    assert_eq!(
+        entries,
+        [
+            "GIT_CONFIG_KEY_0=core.autocrlf",
+            "GIT_CONFIG_KEY_1=core.eol",
+            "GIT_CONFIG_KEY_2=core.safecrlf",
+            "GIT_CONFIG_VALUE_0=false",
+            "GIT_CONFIG_VALUE_1=lf",
+            "GIT_CONFIG_VALUE_2=false",
+        ],
+        "{env}"
+    );
+    assert_eq!(git, "false\nno-user\nno-header\ncount=3\n");
 }

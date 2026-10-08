@@ -367,6 +367,7 @@ pub(crate) fn lower_bound_usage(
         cache_write,
         text_output,
         reasoning_output: reasoning,
+        unsplit_reasoning_chars: None,
         raw: Some(raw.clone()),
     })
 }
@@ -410,6 +411,23 @@ fn stop_reason_for(reason: &str, has_tool_calls: bool) -> StopReason {
         // reason, is carried as `Other` rather than mapped onto `EndTurn`, so
         // an unmodeled terminal state is visible.
         _ => StopReason::Other,
+    }
+}
+
+/// Record that a response carried reasoning text its usage object did not
+/// count apart.
+///
+/// Ollama and llama.cpp return one `completion_tokens` total that includes the
+/// reasoning and no `reasoning_tokens`. The reasoning is then inside text
+/// output, and a `reasoning_output` of zero would read as "no reasoning". The
+/// text length is kept so reports can say the split is unknown. No token count
+/// is derived from it: no tokenizer for the served model is available here.
+fn mark_unsplit_reasoning(usage: &mut TokenUsage, reasoning: Option<&str>) {
+    if usage.reasoning_output > 0 {
+        return;
+    }
+    if let Some(text) = reasoning.filter(|t| !t.is_empty()) {
+        usage.unsplit_reasoning_chars = Some(text.chars().count() as u64);
     }
 }
 
@@ -951,7 +969,7 @@ impl ChatCompletionsAdapter {
         let usage = body.get("usage").ok_or(ProviderError::UsageMissing {
             adapter: self.adapter_name(),
         })?;
-        let usage = Self::normalize_usage_as(
+        let mut usage = Self::normalize_usage_as(
             self.adapter_name(),
             self.config.protocol,
             self.dialect,
@@ -973,6 +991,7 @@ impl ChatCompletionsAdapter {
         // Several vendors in this family put chain-of-thought in a sibling field.
         // It is carried as reasoning rather than merged into the text, so a caller
         // can tell the difference.
+        mark_unsplit_reasoning(&mut usage, reasoning_field(&message));
         if let Some(reasoning) = reasoning_field(&message) {
             content.push(Content::Reasoning {
                 text: reasoning.to_owned(),
@@ -1193,6 +1212,17 @@ impl kgraf_provider::Provider for ChatCompletionsAdapter {
             capabilities = capabilities.with_reasoning(self);
         }
         capabilities
+    }
+
+    /// A Chat Completions reply carries its whole text share: the message
+    /// content, the tool calls and, where the server returns it, the
+    /// reasoning. Reasoning a server hides is counted apart in
+    /// `completion_tokens_details.reasoning_tokens`, which the floor leaves
+    /// out. A local server that cannot parse the model's tool call can drop it
+    /// and still answer 200 with `finish_reason: "stop"`; only the count shows
+    /// it.
+    fn undelivered_output_tokens(&self, response: &Response) -> Option<u64> {
+        Some(response.undelivered_output_floor())
     }
 }
 
@@ -1656,6 +1686,7 @@ impl Streaming for ChatCompletionsAdapter {
             });
         }
 
+        mark_unsplit_reasoning(&mut usage, Some(&reasoning_text));
         let mut content = Vec::new();
         if !reasoning_text.is_empty() {
             content.push(Content::Reasoning {
@@ -2747,6 +2778,72 @@ mod tests {
         assert!(loud.capabilities().reasoning.is_some());
     }
 
+    /// The shape a local server (Ollama 0.34.4, qwen3.6:35b) answered with
+    /// after it dropped the model's apply_patch call: 200, no tool call,
+    /// `finish_reason: "stop"`, 718 bytes of reasoning, 1,659 tokens counted.
+    #[test]
+    fn a_reply_whose_tool_call_the_server_dropped_shows_undelivered_output() {
+        let adapter =
+            ChatCompletionsAdapter::new(config("https://example.invalid"), UsageDialect::Details)
+                .expect("adapter");
+        let reasoning = format!("{}Let me write the patch.", "p".repeat(695));
+        let body = json!({
+            "id": "chatcmpl-126",
+            "object": "chat.completion",
+            "model": "compatible-model",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "", "reasoning": reasoning},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 8768, "prompt_tokens_details": {"cached_tokens": 7693},
+                      "completion_tokens": 1659, "total_tokens": 10427}
+        });
+        let response = adapter
+            .parse_response("compatible-model", &body)
+            .expect("parse");
+        assert!(response.tool_uses().is_empty());
+        assert_eq!(
+            adapter.undelivered_output_tokens(&response),
+            Some(1659 - 718 - kgraf_provider::message::SPECIAL_TOKEN_ALLOWANCE)
+        );
+
+        // The same count with the call delivered: nothing is missing.
+        let mut body = body;
+        body["choices"][0]["message"]["tool_calls"] = json!([{
+            "id": "call_1", "type": "function",
+            "function": {"name": "apply_patch",
+                         "arguments": serde_json::to_string(&json!({"patch": "x".repeat(4500)}))
+                             .expect("args")}
+        }]);
+        body["choices"][0]["finish_reason"] = json!("tool_calls");
+        let response = adapter
+            .parse_response("compatible-model", &body)
+            .expect("parse");
+        assert_eq!(adapter.undelivered_output_tokens(&response), Some(0));
+    }
+
+    /// A server that hides reasoning counts it apart; the hidden share is
+    /// not taken for lost output.
+    #[test]
+    fn hidden_reasoning_counted_apart_is_not_undelivered_output() {
+        let adapter =
+            ChatCompletionsAdapter::new(config("https://example.invalid"), UsageDialect::Details)
+                .expect("adapter")
+                .reporting_reasoning_tokens();
+        let body = json!({
+            "id": "c", "object": "chat.completion", "model": "compatible-model",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "done"},
+                         "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 3002, "total_tokens": 3012,
+                      "completion_tokens_details": {"reasoning_tokens": 3000}}
+        });
+        let response = adapter
+            .parse_response("compatible-model", &body)
+            .expect("parse");
+        assert_eq!(adapter.undelivered_output_tokens(&response), Some(0));
+    }
+
     #[test]
     fn reasoning_content_is_carried_separately_from_text() {
         let adapter =
@@ -3644,5 +3741,126 @@ mod tests {
             "{:?}",
             response.content
         );
+    }
+
+    /// A body with reasoning text and the given usage object.
+    fn reasoning_body(usage: serde_json::Value) -> serde_json::Value {
+        json!({
+            "id": "chatcmpl-02",
+            "model": "compatible-model",
+            "choices": [{
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": "5",
+                    "reasoning": "2 + 3 is 5, so answer 5"
+                }
+            }],
+            "usage": usage
+        })
+    }
+
+    #[tokio::test]
+    async fn reasoning_text_with_a_total_only_usage_is_marked_unsplit_in_the_ledger() {
+        // Ollama and llama.cpp send one `completion_tokens` total that includes
+        // the reasoning, and no `reasoning_tokens`. The ledger row must not
+        // read as "no reasoning": it keeps the length of the reasoning text and
+        // marks the split unknown. Recorded live shape:
+        // `tests/fixtures/2026-10-01-ollama-qwen3.6-chat-complete.json`.
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/2026-10-01-ollama-qwen3.6-chat-complete.json"
+        ))
+        .expect("fixture");
+        let reasoning_chars = fixture["choices"][0]["message"]["reasoning"]
+            .as_str()
+            .expect("reasoning text")
+            .chars()
+            .count() as u64;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&fixture))
+            .mount(&server)
+            .await;
+        let mut cfg = config(&server.uri());
+        cfg.models = vec!["qwen3.6:35b".into()];
+        let adapter = ChatCompletionsAdapter::new(cfg, UsageDialect::Details).expect("adapter");
+        let ledger = Ledger::open_in_memory().expect("ledger");
+        let token = ledger
+            .begin(ADAPTER, Protocol::Inclusive, "qwen3.6:35b", "w", "t")
+            .expect("begin");
+        let id = token.id().clone();
+        let response = adapter
+            .complete(&Request::new("qwen3.6:35b", "hi", 200), &token)
+            .await
+            .expect("complete");
+        drop(token);
+        for usage in [
+            &response.usage,
+            &ledger.call(&id).expect("read").expect("row").usage,
+        ] {
+            assert_eq!(usage.reasoning_output, 0, "no count was reported");
+            assert_eq!(usage.text_output, 109, "the total stays in output");
+            assert_eq!(usage.unsplit_reasoning_chars, Some(reasoning_chars));
+            assert!(
+                usage.reasoning_label().contains("not reported"),
+                "{}",
+                usage.reasoning_label()
+            );
+        }
+        let by_model = ledger.usage_by_model().expect("sums");
+        assert_eq!(by_model[0].1.unsplit_reasoning_chars, Some(reasoning_chars));
+        assert!(ledger.verify().expect("verify").ok);
+    }
+
+    #[tokio::test]
+    async fn a_streamed_total_only_usage_with_reasoning_text_is_marked_unsplit() {
+        let sse = concat!(
+            "data: {\"id\":\"c\",\"model\":\"compatible-model\",\"choices\":\
+             [{\"index\":0,\"delta\":{\"reasoning\":\"think\"}}]}\n\n",
+            "data: {\"id\":\"c\",\"model\":\"compatible-model\",\"choices\":\
+             [{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}],\
+             \"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n",
+        );
+        let (r, _, _) = probe(sse).await;
+        let usage = r.expect("stream").usage;
+        assert_eq!(usage.reasoning_output, 0);
+        assert_eq!(usage.text_output, 5);
+        assert_eq!(usage.unsplit_reasoning_chars, Some(5));
+    }
+
+    #[test]
+    fn a_reported_reasoning_count_is_used_and_leaves_no_unsplit_mark() {
+        let adapter =
+            ChatCompletionsAdapter::new(config("https://example.invalid"), UsageDialect::Details)
+                .expect("adapter");
+        let body = reasoning_body(json!({
+            "prompt_tokens": 20,
+            "completion_tokens": 30,
+            "completion_tokens_details": {"reasoning_tokens": 22}
+        }));
+        let usage = adapter
+            .parse_response("compatible-model", &body)
+            .expect("parse")
+            .usage;
+        assert_eq!(usage.reasoning_output, 22);
+        assert_eq!(usage.text_output, 8);
+        assert_eq!(usage.unsplit_reasoning_chars, None);
+        assert_eq!(usage.reasoning_label(), "22");
+    }
+
+    #[test]
+    fn a_response_without_reasoning_text_has_no_unsplit_mark() {
+        let adapter =
+            ChatCompletionsAdapter::new(config("https://example.invalid"), UsageDialect::Details)
+                .expect("adapter");
+        let mut body = reasoning_body(json!({"prompt_tokens": 20, "completion_tokens": 3}));
+        body["choices"][0]["message"] = json!({"role": "assistant", "content": "5"});
+        let usage = adapter
+            .parse_response("compatible-model", &body)
+            .expect("parse")
+            .usage;
+        assert_eq!(usage.unsplit_reasoning_chars, None);
+        assert_eq!(usage.reasoning_label(), "0");
     }
 }

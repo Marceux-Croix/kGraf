@@ -562,6 +562,7 @@ impl OpenAiAdapter {
                 ReasoningDialect::Additive => output,
             },
             reasoning_output: reasoning,
+            unsplit_reasoning_chars: None,
             raw: Some(raw.clone()),
         })
     }

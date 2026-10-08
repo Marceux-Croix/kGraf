@@ -2742,6 +2742,18 @@ impl Unplaced {
 /// containment test of the readers: a caller joins the result to `root`,
 /// so the file it opens is spelled as the worktree is.
 fn locate(flavor: paths::Flavor, root: &Path, cwd: &Path, name: &str) -> Result<PathBuf, Unplaced> {
+    locate_names(flavor, root, cwd, name).map(|names| names.into_iter().collect())
+}
+
+/// [`locate`] as the names below `root`, with no host path type in between:
+/// a name such as `C:\proj\x` under the Unix rules is one name, which a
+/// `PathBuf` on a Windows host would split.
+fn locate_names(
+    flavor: paths::Flavor,
+    root: &Path,
+    cwd: &Path,
+    name: &str,
+) -> Result<Vec<String>, Unplaced> {
     let (Some(root_l), Some(cwd_l)) = (paths::full(flavor, root), paths::full(flavor, cwd)) else {
         return Err(Unplaced::Unknown(
             "read from a directory kGraf cannot place",
@@ -2749,7 +2761,7 @@ fn locate(flavor: paths::Flavor, root: &Path, cwd: &Path, name: &str) -> Result<
     };
     match paths::resolve(flavor, Some(&cwd_l), name) {
         paths::Resolved::Path(l) => paths::within(flavor, &l, &root_l)
-            .map(|rel| rel.iter().collect())
+            .map(<[String]>::to_vec)
             .ok_or(Unplaced::Outside),
         paths::Resolved::AboveRoot(_) => Err(Unplaced::Outside),
         paths::Resolved::Unknown(why) => Err(Unplaced::Unknown(why)),
@@ -3361,7 +3373,7 @@ fn collect_found(
 }
 
 /// Split a script on command separators outside quotes.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn split_script(script: &str) -> Vec<String> {
     split_script_flagged(script).0
 }

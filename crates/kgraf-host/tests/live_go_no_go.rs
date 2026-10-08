@@ -491,6 +491,7 @@ fn estimated_call_cost(prices: &PriceTable) -> Money {
         cache_write: 0,
         text_output: 700,
         reasoning_output: 0,
+        unsplit_reasoning_chars: None,
         raw: None,
     };
     prices.cost("kimi-k3", &usage).unwrap_or(Money(1_170_000))

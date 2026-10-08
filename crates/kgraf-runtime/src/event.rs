@@ -249,6 +249,12 @@ pub enum NoticeKind {
     /// answered with a 5xx; the round was dropped and sent again. Sent on each
     /// of the bounded retries.
     MalformedOutput,
+    /// The provider counted far more output for the last reply than the reply
+    /// carried, and the reply had no tool call: the server dropped part of it
+    /// (usually a tool call it could not parse) and still answered as if the
+    /// turn had ended. The round was dropped and the model was told what was
+    /// missing. Sent on each of the bounded retries of an attempt.
+    LostOutput,
 }
 
 impl WorkerEvent {

@@ -585,7 +585,8 @@ async fn a_writer_subagent_over_git_worktrees_is_merged_verified_integrated_and_
     let seen = fx.seen();
     assert!(
         seen.iter()
-            .any(|t| t.contains("<result early: ERROR: refused: src/c.rs is fenced")),
+            .any(|t| t.contains("<result early: ERROR: refused: ")
+                && t.contains("The refusal: src/c.rs is fenced")),
         "the parent's write to the child's path was refused while it lived"
     );
     let report = seen

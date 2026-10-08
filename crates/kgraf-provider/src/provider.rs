@@ -229,6 +229,21 @@ pub trait Provider: Send + Sync {
     fn resends_reasoning(&self) -> bool {
         false
     }
+
+    /// The output tokens this adapter's provider counted for `response` but did
+    /// not deliver in it, as a floor ([`Response::undelivered_output_floor`]),
+    /// or `None` where the adapter cannot tell.
+    ///
+    /// `None` is the default: a protocol that counts hidden or summarized
+    /// reasoning inside its text output share (Messages with extended thinking)
+    /// would show a gap on every such turn. An adapter whose reply carries all
+    /// of the text share it counts overrides this, so the caller can see a reply
+    /// the server cut down without an error (a tool call it could not parse and
+    /// dropped) instead of taking what is left as the model's answer.
+    fn undelivered_output_tokens(&self, response: &Response) -> Option<u64> {
+        let _ = response;
+        None
+    }
 }
 
 /// Assert the response model is the requested model.

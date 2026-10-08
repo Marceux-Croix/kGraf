@@ -373,7 +373,52 @@ impl Response {
             })
             .collect()
     }
+
+    /// A lower bound on the output tokens the provider counted for this reply
+    /// but did not deliver in it.
+    ///
+    /// A byte-level tokenizer decodes every ordinary token to at least one
+    /// byte, so a reply of `n` delivered bytes took at most `n` ordinary
+    /// tokens to write. Counted output above the delivered bytes, less
+    /// [`SPECIAL_TOKEN_ALLOWANCE`] for the markers a chat template adds (end
+    /// of turn, reasoning and tool-call delimiters), was generated and then
+    /// lost between the model and the reply. The usual cause is a local
+    /// server that could not parse the model's tool call and dropped it
+    /// without an error, answering 200 with `finish_reason: "stop"`.
+    ///
+    /// Reasoning a provider counts on its own (`reasoning_output` above zero)
+    /// is left out of both sides, so hidden or summarized reasoning is not
+    /// counted as lost. Where the provider counts reasoning inside the text
+    /// share, the delivered reasoning text counts as delivered. Tool calls
+    /// count by their name and their arguments as JSON text.
+    ///
+    /// Only meaningful for a protocol whose reply carries every output token
+    /// it counts in `text_output`; [`crate::Provider::undelivered_output_tokens`]
+    /// is where an adapter says so.
+    pub fn undelivered_output_floor(&self) -> u64 {
+        let separate_reasoning = self.usage.reasoning_output > 0;
+        let delivered: usize = self
+            .content
+            .iter()
+            .map(|c| match c {
+                Content::Text { text, .. } => text.len(),
+                Content::Reasoning { text } if !separate_reasoning => text.len(),
+                Content::ToolUse { name, input, .. } => {
+                    name.len() + tool_arguments_text(input).len()
+                }
+                _ => 0,
+            })
+            .sum();
+        let delivered = u64::try_from(delivered).unwrap_or(u64::MAX);
+        self.usage
+            .text_output
+            .saturating_sub(delivered.saturating_add(SPECIAL_TOKEN_ALLOWANCE))
+    }
 }
+
+/// The output tokens [`Response::undelivered_output_floor`] allows for chat
+/// template markers that decode to no delivered byte.
+pub const SPECIAL_TOKEN_ALLOWANCE: u64 = 32;
 
 #[cfg(test)]
 mod tests {
@@ -394,6 +439,72 @@ mod tests {
             tool_arguments_object(&serde_json::json!("{not json")),
             serde_json::json!({"unparsed_arguments": "{not json"})
         );
+    }
+
+    fn reply(content: Vec<Content>, text_output: u64, reasoning_output: u64) -> Response {
+        Response {
+            model: "m".into(),
+            content,
+            stop_reason: StopReason::EndTurn,
+            usage: TokenUsage {
+                text_output,
+                reasoning_output,
+                ..TokenUsage::default()
+            },
+            request_id: None,
+            finish_reason: Some("stop".into()),
+        }
+    }
+
+    /// A local server counted 1,659 output tokens for a reply that carried
+    /// 718 bytes of reasoning, no text and no tool call: the model's patch was
+    /// generated and dropped. At least 1659 - 718 - 32 tokens are missing.
+    #[test]
+    fn counted_output_the_reply_does_not_carry_is_a_floor_of_lost_tokens() {
+        let reasoning = "r".repeat(718);
+        let lost = reply(vec![Content::Reasoning { text: reasoning }], 1659, 0);
+        assert_eq!(lost.undelivered_output_floor(), 1659 - 718 - 32);
+    }
+
+    #[test]
+    fn a_reply_that_carries_its_output_has_nothing_undelivered() {
+        // Ordinary prose: about four bytes a token.
+        let prose = reply(vec![Content::text("x".repeat(4000))], 1000, 0);
+        assert_eq!(prose.undelivered_output_floor(), 0);
+        // A tool call counts by its name and arguments.
+        let call = reply(
+            vec![Content::ToolUse {
+                id: "1".into(),
+                name: "apply_patch".into(),
+                input: serde_json::json!({"patch": "p".repeat(3000)}),
+                signature: None,
+            }],
+            900,
+            0,
+        );
+        assert_eq!(call.undelivered_output_floor(), 0);
+        // Only end-of-turn markers beyond the text: within the allowance.
+        let short = reply(vec![Content::text("done")], 4 + SPECIAL_TOKEN_ALLOWANCE, 0);
+        assert_eq!(short.undelivered_output_floor(), 0);
+    }
+
+    /// Reasoning counted on its own is hidden or summarized by some providers;
+    /// neither side of the comparison includes it.
+    #[test]
+    fn separately_counted_reasoning_is_never_counted_as_lost() {
+        let summarized = reply(
+            vec![
+                Content::Reasoning {
+                    text: "a short summary".into(),
+                },
+                Content::text("x".repeat(400)),
+            ],
+            100,
+            5000,
+        );
+        assert_eq!(summarized.undelivered_output_floor(), 0);
+        let hidden = reply(vec![Content::text("x".repeat(400))], 100, 5000);
+        assert_eq!(hidden.undelivered_output_floor(), 0);
     }
 
     #[test]

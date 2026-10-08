@@ -423,6 +423,8 @@ impl SandboxPolicy {
     }
 
     /// Keep one inherited environment variable that the scrub would remove.
+    /// A host git configuration entry (`is_git_config_entry_var`) cannot be
+    /// kept: the command is refused.
     pub fn pass_env(mut self, name: impl Into<String>) -> Self {
         self.pass_env.push(name.into());
         self
@@ -1029,23 +1031,52 @@ fn is_scrubbed(name: &OsStr) -> bool {
     let Some(name) = name.to_str() else {
         return false;
     };
-    if is_git_config_key_var(name) {
-        return false;
-    }
     AGENT_VARS.contains(&name) || kgraf_secrets::name_is_credential_shaped(name)
 }
 
-/// Whether `name` is `GIT_CONFIG_KEY_<n>`: it holds the name of a git
-/// setting, never a credential, though the word `KEY` makes it look like one.
-/// Removing it while `GIT_CONFIG_COUNT` stays makes every git in the sandbox
-/// stop with "missing config key", and the sandbox appends its own entries
-/// after the host's. Its `GIT_CONFIG_VALUE_<n>` is judged like any other name.
-fn is_git_config_key_var(name: &str) -> bool {
-    const PREFIX: &str = "GIT_CONFIG_KEY_";
-    name.get(..PREFIX.len())
-        .is_some_and(|head| head.eq_ignore_ascii_case(PREFIX))
-        && name.len() > PREFIX.len()
-        && name[PREFIX.len()..].bytes().all(|b| b.is_ascii_digit())
+/// Whether an inherited variable carries git configuration through the
+/// environment: `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_<n>`,
+/// `GIT_CONFIG_VALUE_<n>`, and `GIT_CONFIG_PARAMETERS` (what `git -c` hands
+/// to the git processes it starts). Any case and any suffix: Windows
+/// compares names without case, and a name git does not read still shows
+/// its value to the process.
+///
+/// A sandboxed command gets none of the host's entries, only kGraf's own
+/// ([`worker_git_config_env`]). Their values can carry a credential
+/// (`http.<url>.extraHeader` with a bearer token, which is how CI checkouts
+/// hand a token to git; `url.<base>.insteadOf` or `remote.<name>.url` with a
+/// login; `http.proxy` with a password; `credential.helper` with an inline
+/// secret), and the names do not say so. A deny list of keys would miss a
+/// key it does not name and every new one git adds, so all are dropped.
+pub fn is_git_config_entry_var(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    upper == "GIT_CONFIG_COUNT"
+        || upper == "GIT_CONFIG_PARAMETERS"
+        || upper.starts_with("GIT_CONFIG_KEY_")
+        || upper.starts_with("GIT_CONFIG_VALUE_")
+}
+
+/// The environment changes that leave a sandboxed command with kGraf's own
+/// git configuration entries and none of the host's: each `inherited` name
+/// that [`is_git_config_entry_var`] matches is removed (`None`), then `ours`
+/// (numbered from zero, with their `GIT_CONFIG_COUNT`) are set. Applied in
+/// order, a set after the removal of the same name wins, so the count always
+/// equals the number of entries the command sees. Values are never read
+/// here: only the names of the inherited variables.
+pub(crate) fn worker_git_config_env(
+    inherited: impl IntoIterator<Item = OsString>,
+    ours: Vec<(String, String)>,
+) -> Vec<(OsString, Option<OsString>)> {
+    let mut changes: Vec<(OsString, Option<OsString>)> = inherited
+        .into_iter()
+        .filter(|name| is_git_config_entry_var(&name.to_string_lossy()))
+        .map(|name| (name, None))
+        .collect();
+    changes.extend(
+        ours.into_iter()
+            .map(|(name, value)| (OsString::from(name), Some(OsString::from(value)))),
+    );
+    changes
 }
 
 /// Remove scrubbed names among `inherited` from `cmd`, except `pass`.
@@ -1102,11 +1133,13 @@ fn package_store_env(cmd: &mut Command, tmp: &Path, home: Option<&Path>, network
         .env("DOTNET_NOLOGO", "1")
         .env("DOTNET_SKIP_FIRST_TIME_EXPERIENCE", "1");
     if let Some(home) = home {
-        let gradle_cache = home.join(".gradle/caches");
+        // One component per join: a path with a stray "/" in a Windows path
+        // reaches the tool unchanged and is not equal to the path it compares.
+        let gradle_cache = home.join(".gradle").join("caches");
         if gradle_cache.join("modules-2").is_dir() {
             cmd.env("GRADLE_RO_DEP_CACHE", gradle_cache);
         }
-        let nuget = home.join(".nuget/packages");
+        let nuget = home.join(".nuget").join("packages");
         if nuget.is_dir() {
             cmd.env("NUGET_PACKAGES", nuget);
         }
@@ -1243,8 +1276,8 @@ impl SandboxedCommand {
     /// credential), and the sandbox sets its own `TMP` and `TEMP` and its git
     /// and curl settings again: the reset of git's credential helper keeps
     /// git from asking the Credential Manager, which this backend cannot
-    /// make unreadable. They are numbered from zero, because the host's own
-    /// `GIT_CONFIG_*` entries are no longer inherited.
+    /// make unreadable. They are numbered from zero, as without a clear: the
+    /// host's own `GIT_CONFIG_*` entries never reach a sandboxed command.
     pub fn env_clear(&mut self) -> &mut Self {
         self.cmd.env_clear();
         #[cfg(windows)]
@@ -1407,6 +1440,19 @@ pub fn sandboxed_command(
     }
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     {
+        // A policy that asks to pass one of the host's git configuration
+        // entries is refused, not silently ignored: the sandbox removes them
+        // all (`is_git_config_entry_var`).
+        if let Some(name) = policy
+            .pass_env
+            .iter()
+            .find(|name| is_git_config_entry_var(name))
+        {
+            return Err(SandboxError::InvalidPolicy(format!(
+                "{name} cannot be passed: a sandboxed command gets only the sandbox's own \
+                 git configuration entries"
+            )));
+        }
         let resolved = policy.resolved()?;
         #[cfg(windows)]
         let mut cmd = Command::new(program.as_ref());
@@ -1599,11 +1645,12 @@ pub fn sandboxed_command(
             cmd.env("GOCACHE", tmp.join("go-build"));
             package_store_env(&mut cmd, tmp, resolved.home.as_deref(), policy.network);
         }
-        // Git settings for the worker's own git, appended to the host's
-        // `GIT_CONFIG_COUNT` entries at index N (bumping the count) rather
-        // than replacing them (git-config(1), GIT_CONFIG_COUNT). Set here,
+        // Git settings for the worker's own git, through `GIT_CONFIG_COUNT`
+        // (git-config(1)), numbered from zero. The host's own entries do not
+        // reach the worker: their values can carry a credential
+        // (`is_git_config_entry_var`), and a worker gets none. Set here,
         // before a caller's own `env` calls, so a caller can still override
-        // any of them; the host environment is read only for the count.
+        // any of them. Only the names of the host's variables are read.
         //
         // Every platform: the line-ending settings kGraf's own git uses
         // (`kgraf_core::host_git::LINE_ENDINGS`), so a `git checkout`,
@@ -1620,33 +1667,15 @@ pub fn sandboxed_command(
         // this token (see the Schannel section in `windows.rs`), and Git for
         // Windows ships OpenSSL beside it. `CURL_SSL_BACKEND=openssl` does
         // the same for the multi-backend curl of Git for Windows.
-        let next = match std::env::var("GIT_CONFIG_COUNT") {
-            Ok(v) => v.trim().parse::<u32>().ok(),
-            Err(std::env::VarError::NotPresent) => Some(0),
-            // A non-UTF-8 or otherwise unreadable count: fail loud rather
-            // than guess an index and drop the settings (fail loud).
-            Err(_) => {
-                return Err(SandboxError::InvalidPolicy(
-                    "GIT_CONFIG_COUNT is set to a value that is not valid UTF-8".into(),
-                ));
-            }
-        };
-        let Some(next) = next else {
-            return Err(SandboxError::InvalidPolicy(
-                "GIT_CONFIG_COUNT is set to a value that is not a number".into(),
-            ));
-        };
         #[cfg(windows)]
-        for (key, value) in windows::tool_env(next, network_open(policy.network)) {
-            cmd.env(key, value);
-        }
+        let ours = windows::tool_env(network_open(policy.network));
         #[cfg(not(windows))]
-        {
-            let (entries, count) = git_config_entries(next, kgraf_core::host_git::LINE_ENDINGS);
-            for (key, value) in entries {
-                cmd.env(key, value);
-            }
-            cmd.env("GIT_CONFIG_COUNT", count.to_string());
+        let ours = git_config_vars(kgraf_core::host_git::LINE_ENDINGS);
+        for (name, value) in worker_git_config_env(std::env::vars_os().map(|(k, _)| k), ours) {
+            match value {
+                Some(value) => cmd.env(name, value),
+                None => cmd.env_remove(name),
+            };
         }
         // The stores kGraf filled for this project, read-only, used in place
         // of the user's own (`crate::PackageStores`).
@@ -1681,20 +1710,24 @@ fn network_open(network: Network) -> bool {
 }
 
 /// The `GIT_CONFIG_KEY_n` / `GIT_CONFIG_VALUE_n` variables for `pairs`,
-/// numbered from `start` (the host's own `GIT_CONFIG_COUNT`, or 0), and the
-/// new count. Nothing below `start` is written, so the host's entries stay.
-pub(crate) fn git_config_entries(
-    start: u32,
-    pairs: &[(&str, &str)],
-) -> (Vec<(String, String)>, u32) {
+/// numbered from zero, and their count.
+pub(crate) fn git_config_entries(pairs: &[(&str, &str)]) -> (Vec<(String, String)>, u32) {
     let mut entries = Vec::with_capacity(pairs.len() * 2);
-    let mut n = start;
+    let mut n = 0u32;
     for (key, value) in pairs {
         entries.push((format!("GIT_CONFIG_KEY_{n}"), (*key).to_owned()));
         entries.push((format!("GIT_CONFIG_VALUE_{n}"), (*value).to_owned()));
         n += 1;
     }
     (entries, n)
+}
+
+/// [`git_config_entries`] for `pairs` and the `GIT_CONFIG_COUNT` that
+/// matches them.
+pub(crate) fn git_config_vars(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+    let (mut vars, count) = git_config_entries(pairs);
+    vars.push(("GIT_CONFIG_COUNT".to_owned(), count.to_string()));
+    vars
 }
 
 /// Convenience: a confined command in `ws` under the standard worker policy.
@@ -2012,7 +2045,7 @@ mod tests {
         assert_eq!(env["GOMODCACHE"], root.join("go").to_string_lossy());
         assert_eq!(
             env["GRADLE_RO_DEP_CACHE"],
-            root.join("gradle/caches").to_string_lossy()
+            root.join("gradle").join("caches").to_string_lossy()
         );
         assert_eq!(env["NUGET_PACKAGES"], root.join("nuget").to_string_lossy());
         assert!(
@@ -2069,12 +2102,14 @@ mod tests {
         let full = env_of(Network::Allow, Some(home.path()));
         let cache = home
             .path()
-            .join(".gradle/caches")
+            .join(".gradle")
+            .join("caches")
             .to_string_lossy()
             .into_owned();
         let nuget = home
             .path()
-            .join(".nuget/packages")
+            .join(".nuget")
+            .join("packages")
             .to_string_lossy()
             .into_owned();
         assert_eq!(full["GRADLE_RO_DEP_CACHE"].as_deref(), Some(cache.as_str()));
@@ -2284,10 +2319,13 @@ mod tests {
             // needle match is whole-word, not substring.
             "DB_PATH",
             "AUTHOR_NAME",
-            // The name of a git setting the host passes through
-            // `GIT_CONFIG_COUNT`, not a credential.
+            // The settings a host hands git through its environment: the
+            // count, the key names and the values travel together. A key
+            // name is the name of a git setting, not a credential.
+            "GIT_CONFIG_COUNT",
             "GIT_CONFIG_KEY_0",
             "git_config_key_12",
+            "GIT_CONFIG_VALUE_0",
         ] {
             assert!(!is_scrubbed(OsStr::new(name)), "{name} scrubbed");
         }
@@ -2295,6 +2333,94 @@ mod tests {
         for name in ["GIT_CONFIG_KEY_", "GIT_CONFIG_KEY_X", "MY_GIT_CONFIG_KEY_0"] {
             assert!(is_scrubbed(OsStr::new(name)), "{name} kept");
         }
+    }
+
+    /// Every variable that hands git configuration through the environment
+    /// is a host entry, in any case; the variables that only locate a config
+    /// file, and look-alike names, are not.
+    #[test]
+    fn git_config_entry_variables_are_the_count_keys_values_and_parameters() {
+        for name in [
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_KEY_0",
+            "GIT_CONFIG_VALUE_12",
+            "git_config_value_1",
+            "Git_Config_Key_3",
+            "GIT_CONFIG_KEY_X",
+            "GIT_CONFIG_PARAMETERS",
+        ] {
+            assert!(is_git_config_entry_var(name), "{name}");
+        }
+        for name in [
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_SYSTEM",
+            "GIT_CONFIG_NOSYSTEM",
+            "GIT_CONFIG_KEY",
+            "MY_GIT_CONFIG_KEY_0",
+            "GIT_AUTHOR_NAME",
+            "PATH",
+        ] {
+            assert!(!is_git_config_entry_var(name), "{name}");
+        }
+    }
+
+    /// The host's entries are removed first and the sandbox's own set
+    /// after, so a name in both ends with the sandbox's value, and nothing
+    /// else is touched.
+    #[test]
+    fn the_worker_git_env_removes_the_hosts_entries_then_sets_its_own() {
+        let host = [
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_KEY_0",
+            "GIT_CONFIG_VALUE_0",
+            "GIT_CONFIG_KEY_1",
+            "GIT_CONFIG_VALUE_1",
+            "GIT_CONFIG_PARAMETERS",
+            "PATH",
+        ]
+        .map(OsString::from);
+        let changes = worker_git_config_env(host, git_config_vars(&[("core.autocrlf", "false")]));
+        let mut cmd = Command::new("true");
+        for (name, value) in &changes {
+            match value {
+                Some(value) => cmd.env(name, value),
+                None => cmd.env_remove(name),
+            };
+        }
+        let envs: Vec<(String, Option<String>)> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        let get = |name: &str| envs.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone());
+        assert_eq!(get("GIT_CONFIG_COUNT"), Some(Some("1".into())));
+        assert_eq!(get("GIT_CONFIG_KEY_0"), Some(Some("core.autocrlf".into())));
+        assert_eq!(get("GIT_CONFIG_VALUE_0"), Some(Some("false".into())));
+        assert_eq!(get("GIT_CONFIG_KEY_1"), Some(None));
+        assert_eq!(get("GIT_CONFIG_VALUE_1"), Some(None));
+        assert_eq!(get("GIT_CONFIG_PARAMETERS"), Some(None));
+        assert_eq!(get("PATH"), None);
+    }
+
+    /// A policy cannot pass a host git configuration entry through the
+    /// sandbox: the command is refused, not run without it.
+    #[test]
+    fn passing_a_host_git_config_entry_is_refused() {
+        let work = tempfile::tempdir().unwrap();
+        let root = kgraf_core::plain_path::canonicalize(work.path()).unwrap();
+        let policy =
+            SandboxPolicy::new(vec![root.clone()], Network::Deny).pass_env("GIT_CONFIG_VALUE_0");
+        let Err(err) = sandboxed_command(&policy, "true", &root) else {
+            panic!("a pass of GIT_CONFIG_VALUE_0 was accepted");
+        };
+        assert!(
+            matches!(&err, SandboxError::InvalidPolicy(m) if m.contains("GIT_CONFIG_VALUE_0")),
+            "{err}"
+        );
     }
 
     #[test]

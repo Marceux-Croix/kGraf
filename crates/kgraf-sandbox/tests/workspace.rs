@@ -774,6 +774,57 @@ fn startup_reads_the_owner_of_a_check_folder_from_its_name() {
     }
 }
 
+/// Making a check folder and removing the empty `.checks` are ordered by a
+/// lock in the base. While another holder has it, a create waits, and so does
+/// the end of a check; neither fails. This forces the interleaving that a
+/// stress run only reaches by chance: the parent removal and the create
+/// meeting each other.
+#[test]
+fn a_check_folder_waits_for_the_lock_that_orders_it_against_the_parent_removal() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+    let f = fixture();
+    let mgr = WorkspaceManager::open(&f.repo, &f.base).unwrap();
+    mgr.startup().unwrap();
+    let ws = mgr.create(&spec("w1")).unwrap();
+    let existing = kgraf_sandbox::CheckFolder::create(&ws).unwrap();
+
+    let lock_path = f.base.join(".checks.lock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .unwrap();
+    lock.lock().unwrap();
+
+    let created = AtomicBool::new(false);
+    let ended = AtomicBool::new(false);
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            let c = kgraf_sandbox::CheckFolder::create(&ws).unwrap();
+            created.store(true, Ordering::SeqCst);
+            drop(c);
+        });
+        s.spawn(|| {
+            drop(existing);
+            ended.store(true, Ordering::SeqCst);
+        });
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(
+            !created.load(Ordering::SeqCst),
+            "a create does not run while the lock is held"
+        );
+        assert!(
+            !ended.load(Ordering::SeqCst),
+            "the end of a check does not run while the lock is held"
+        );
+        lock.unlock().unwrap();
+    });
+    assert!(created.load(Ordering::SeqCst) && ended.load(Ordering::SeqCst));
+    assert!(!ws.checks_dir().exists());
+}
+
 /// `.checks` is kGraf's own folder: it is not left in the worktree list when
 /// the last check ends, even while a worktree is registered (so `tidy` does
 /// not remove it). Another check's folder, or a leftover, keeps it; checks
@@ -814,4 +865,53 @@ fn the_checks_folder_goes_with_its_last_check_folder() {
     });
     assert!(!checks.exists());
     mgr.remove(ws).unwrap();
+}
+
+/// Git writes a worktree's admin entry in steps, and `git worktree list`
+/// fails on an entry that has no `commondir` yet. A git wrapper plants such an
+/// entry for the time a `worktree add` runs, as a slow add would show it. A
+/// list from another manager on the same repository (another base, as another
+/// process would have) must wait for the add instead of reading the entry.
+#[cfg(unix)]
+#[test]
+fn list_waits_for_a_worktree_add_that_has_a_half_made_entry() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = fixture();
+    let real = kgraf_sandbox::git::Git::discover().unwrap();
+    let common = f.repo.join(".git");
+    let planted = common.join("worktrees").join("half-made");
+    let wrapper = f.tmp.path().join("slow-add-git");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\n\
+             case \" $* \" in *' worktree add '*)\n  \
+             mkdir -p '{p}'\n  \
+             echo x > '{p}/gitdir'; : > '{p}/commondir'\n  \
+             sleep 1\n  \
+             rm -rf '{p}'\n;;\nesac\n\
+             exec '{g}' \"$@\"\n",
+            p = planted.display(),
+            g = real.exe().display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let slow =
+        WorkspaceManager::open_with_git(&f.repo, &f.base, kgraf_sandbox::git::Git::at(wrapper))
+            .unwrap();
+    let other = WorkspaceManager::open(&f.repo, &f.tmp.path().join("ws2")).unwrap();
+
+    std::thread::scope(|s| {
+        let adding = s.spawn(|| slow.create(&spec("w1")).unwrap());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !planted.exists() {
+            assert!(std::time::Instant::now() < deadline, "add never started");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let list = other.list().expect("list while another manager adds");
+        assert!(!list.is_empty());
+        let ws = adding.join().unwrap();
+        assert!(entry_for(&other.list().unwrap(), ws.root()).is_some());
+    });
 }
