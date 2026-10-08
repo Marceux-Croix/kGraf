@@ -134,6 +134,10 @@ const DRAIN_GRACE: Duration = Duration::from_millis(200);
 /// to a process start, and the check runner polls the same way.
 #[cfg(windows)]
 const EXIT_POLL: Duration = Duration::from_millis(20);
+/// How long the processes of an ended job get to be gone before the Windows
+/// path reads what is left in the pipes.
+#[cfg(windows)]
+const WINDOWS_TREE_END_BOUND: Duration = Duration::from_secs(5);
 const SCRATCH_DIR_NAME: &str = ".kgraf-shell-scratch";
 
 /// Whether a [`ShellTool`] was ever paired with the [`ShellApprovalHook`] a
@@ -2337,7 +2341,16 @@ async fn run_sandboxed(
     // background descendant (`cmd &`) would keep running and hold the
     // worktree, so the verifier would see a tree that is not final. Dropping
     // the child closes the job, which ends them if the terminate call failed.
+    // The terminate call returns before the processes are gone, and their
+    // ends of the pipes close only then: the readers' grace below starts
+    // once the job holds no process (bounded), so the last output is kept.
     let _ = child.kill();
+    let tree_deadline = tokio::time::Instant::now() + WINDOWS_TREE_END_BOUND;
+    while child.active_processes().is_ok_and(|n| n > 0)
+        && tokio::time::Instant::now() < tree_deadline
+    {
+        tokio::time::sleep(EXIT_POLL).await;
+    }
     drop(child);
     match ended {
         Ended::Cancelled => {
@@ -2582,24 +2595,39 @@ fn take_captured(shared: &SharedCapture) -> Captured {
 }
 
 /// [`spawn_reader`] for a blocking pipe (Windows: `SandboxedChild` hands out
-/// std pipes). The read runs on the blocking pool; it ends at EOF, which
-/// comes once the command's job is ended, since no process can leave the job
-/// holding the pipe.
+/// std pipes). The read ends at EOF, which comes once the command's job is
+/// ended and no other process holds the pipe's write end.
+///
+/// The read runs on a plain thread, not on the runtime's blocking pool: a
+/// runtime waits for every blocking task when it shuts down (tokio's
+/// `spawn_blocking` documentation), and aborting a blocking task that has
+/// started does nothing, so a read whose EOF never came kept a cancelled
+/// call's runtime from ever ending. A thread still blocked after the
+/// caller's grace is left to end with its pipe; the async task that hands
+/// its result over is aborted like the Unix reader.
 #[cfg(windows)]
 fn spawn_blocking_reader(
     mut reader: impl std::io::Read + Send + 'static,
     cap: usize,
 ) -> (tokio::task::JoinHandle<Captured>, SharedCapture) {
     let shared: SharedCapture = SharedCapture::default();
-    let task_shared = shared.clone();
-    let handle = tokio::task::spawn_blocking(move || {
+    let thread_shared = shared.clone();
+    let (done, finished) = tokio::sync::oneshot::channel::<()>();
+    std::thread::spawn(move || {
         let mut chunk = [0u8; 8192];
         loop {
             match reader.read(&mut chunk) {
                 Ok(0) | Err(_) => break,
-                Ok(n) => keep_chunk(&task_shared, &chunk[..n], cap),
+                Ok(n) => keep_chunk(&thread_shared, &chunk[..n], cap),
             }
         }
+        let _ = done.send(());
+    });
+    let task_shared = shared.clone();
+    let handle = tokio::spawn(async move {
+        // A reader thread that panicked drops `done`; what it kept is
+        // still in the shared buffer.
+        let _ = finished.await;
         take_captured(&task_shared)
     });
     (handle, shared)

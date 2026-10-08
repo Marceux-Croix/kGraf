@@ -339,19 +339,11 @@ fn output_within(cmd: &mut kgraf_sandbox::SandboxedCommand, limit: Duration) -> 
 
 /// [`output_within`] for a child that is already running.
 fn wait_within(mut child: kgraf_sandbox::SandboxedChild, limit: Duration) -> Output {
-    fn drain(
-        pipe: Option<impl std::io::Read + Send + 'static>,
-    ) -> std::thread::JoinHandle<Vec<u8>> {
-        std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            if let Some(mut pipe) = pipe {
-                let _ = pipe.read_to_end(&mut bytes);
-            }
-            bytes
-        })
-    }
-    let out = drain(child.stdout.take());
-    let err = drain(child.stderr.take());
+    use kgraf_sandbox::output_tail::read_tail;
+    // Read with `read`, as the check runners do, not `read_to_end` on the
+    // pipe: only the former goes through std's overlapped pipe reads.
+    let out = read_tail(child.stdout.take(), 1 << 20);
+    let err = read_tail(child.stderr.take(), 1 << 20);
     drop(child.stdin.take());
     let deadline = Instant::now() + limit;
     let status = loop {
@@ -362,9 +354,23 @@ fn wait_within(mut child: kgraf_sandbox::SandboxedChild, limit: Duration) -> Out
         }
     };
     // The job ends every process the command left behind; the pipes then
-    // close and the readers finish.
-    let _ = child.kill();
-    let (stdout, stderr) = (out.join().unwrap(), err.join().unwrap());
+    // close and the readers finish. Bounded both ways, so a pipe whose end
+    // never comes fails this test with what arrived instead of hanging it.
+    let quiet = child.kill_tree_and_wait(Duration::from_secs(10)).unwrap();
+    let (out, err) = (
+        out.finish(Duration::from_secs(5)),
+        err.finish(Duration::from_secs(5)),
+    );
+    assert!(
+        quiet && out.complete && err.complete,
+        "processes gone: {quiet}; stdout whole: {}; stderr whole: {}; status {status:?}; \
+         stdout: {}; stderr: {}",
+        out.complete,
+        err.complete,
+        out.text(),
+        err.text()
+    );
+    let (stdout, stderr) = (out.bytes, err.bytes);
     match status {
         Some(status) => Output {
             status,
@@ -771,6 +777,82 @@ fn the_private_desktop_is_reused_per_workspace() {
     assert_eq!(d1, d2, "same workspace should reuse one desktop");
     let (_, d3) = probe(&e.other, "desktop", Path::new(""));
     assert_ne!(d1, d3, "different workspaces should differ");
+}
+
+// ---- pipes ----------------------------------------------------------------------
+
+/// Run `f` on a thread and wait at most `limit` for it: a pipe read or write
+/// that never completes fails the test instead of hanging the binary.
+fn within<T: Send + 'static>(
+    limit: Duration,
+    what: &str,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(limit)
+        .unwrap_or_else(|_| panic!("{what} did not complete within {limit:?}"))
+}
+
+/// Output read through the pipe in many small `read` calls arrives whole and
+/// ends. std's `ChildStdout::read` uses overlapped reads; on a pipe end made
+/// for synchronous I/O (`CreatePipe`) such a read could wait forever after
+/// the first, so a check saw "no output" and a reader never ended.
+#[test]
+fn piped_output_read_in_small_pieces_arrives_whole_and_ends() {
+    use std::io::Read;
+    let e = env();
+    let mut child = sandboxed_command(&policy(&e.ws), "cmd", e.ws.root())
+        .unwrap()
+        .args(["/d", "/c", "for /l %i in (1,1,500) do @echo line-%i"])
+        .stdin(Redirect::Null)
+        .stdout(Redirect::Piped)
+        .stderr(Redirect::Null)
+        .spawn()
+        .unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let text = within(Duration::from_secs(60), "reading stdout", move || {
+        let mut all = Vec::new();
+        let mut piece = [0u8; 7];
+        loop {
+            match stdout.read(&mut piece) {
+                Ok(0) => break,
+                Ok(n) => all.extend_from_slice(&piece[..n]),
+                Err(e) => panic!("read failed: {e}"),
+            }
+        }
+        String::from_utf8_lossy(&all).into_owned()
+    });
+    let lines: Vec<&str> = text.lines().map(str::trim).collect();
+    assert_eq!(lines.len(), 500, "{text}");
+    assert_eq!(lines.last(), Some(&"line-500"));
+    assert!(child.wait().unwrap().success());
+}
+
+/// A write to a piped stdin returns, and the command reads it. `cmd` with no
+/// `/c` runs the commands it reads from stdin.
+#[test]
+fn a_write_to_piped_stdin_returns_and_is_read() {
+    let e = env();
+    let mut child = sandboxed_command(&policy(&e.ws), "cmd", e.ws.root())
+        .unwrap()
+        .args(["/d", "/q"])
+        .stdin(Redirect::Piped)
+        .stdout(Redirect::Piped)
+        .stderr(Redirect::Piped)
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    within(Duration::from_secs(60), "writing stdin", move || {
+        stdin.write_all(b"echo got-%OS%\r\nexit\r\n").unwrap();
+    });
+    let out = wait_within(child, Duration::from_secs(60));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("got-Windows_NT"),
+        "{out:?}"
+    );
 }
 
 // ---- the toolchain runs -------------------------------------------------------

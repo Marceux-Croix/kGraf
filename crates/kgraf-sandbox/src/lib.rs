@@ -22,6 +22,7 @@ pub mod git_for_windows;
 pub mod gradle_wrapper;
 pub mod lifecycle;
 pub mod merge;
+pub mod output_tail;
 mod package_stores;
 /// The repository lock lives in `kgraf-core` so every crate that runs git on
 /// a repository (the worker's status read, the co-change history read) takes

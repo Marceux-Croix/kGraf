@@ -1379,6 +1379,14 @@ fn wait_bounded(
         }
         std::thread::sleep(Duration::from_millis(50));
     };
+    // After a normal exit too: a process the install left behind would hold
+    // the pipes. The readers' wait starts once the job holds no process,
+    // since a process's pipe ends close only when it is gone.
+    let result = match child.kill_tree_and_wait(Duration::from_secs(10)) {
+        Ok(true) => result,
+        Ok(false) => Err("a process it started was still running after it was stopped".into()),
+        Err(e) => Err(format!("its processes could not be ended: {e}")),
+    };
     (result, output_of(&output, readers, Duration::from_secs(5)))
 }
 

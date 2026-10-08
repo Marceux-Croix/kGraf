@@ -34,7 +34,10 @@
 //! to hide a holder. Output goes to files the parent opened, never pipes, so a descendant
 //! holding stdout cannot stall the reader; only the last [`DEFAULT_TAIL_BYTES`] are
 //! read back. Before exec, `RLIMIT_FSIZE` bounds every file (the output files
-//! included) and `RLIMIT_CPU` bounds CPU per process.
+//! included) and `RLIMIT_CPU` bounds CPU per process. On Windows the sandbox
+//! cannot hand a child a file it opened, so output comes through pipes read
+//! on threads of their own; the job ends every process of the check before
+//! the readers' bounded wait for the end of their pipes.
 //!
 //! Not bounded, stated rather than hidden: the process **count**. `RLIMIT_NPROC`
 //! counts every process of the user on macOS and Linux, not the check's, so any
@@ -69,9 +72,23 @@ pub const DEFAULT_TAIL_BYTES: usize = 4_096;
 
 /// Bytes of each stream scanned for compiler errors before it is cut to
 /// [`DEFAULT_TAIL_BYTES`]. `RLIMIT_FSIZE` is the only bound on the output
-/// files, so the scan reads at most this much from each file's end.
-#[cfg(unix)]
+/// files, so the scan reads at most this much from each file's end. On
+/// Windows each pipe reader keeps this much.
+#[cfg(any(unix, windows))]
 const SCAN_BYTES: usize = 8 * 1024 * 1024;
+
+/// Windows: how long the processes of an ended job get to be gone.
+#[cfg(windows)]
+const TREE_END_BOUND: Duration = Duration::from_secs(10);
+
+/// Windows: how long a pipe reader gets, once the job holds no process, to
+/// reach the end of its pipe.
+#[cfg(windows)]
+const PIPE_END_GRACE: Duration = Duration::from_secs(2);
+
+/// The tail of a failed command that printed nothing: said, not left blank.
+#[cfg_attr(not(windows), allow(dead_code))]
+const NO_OUTPUT: &str = "(the command wrote nothing to stdout or stderr)";
 
 /// Most contract-check runs at once in this process: half the cores, at least
 /// one, at most four. A starting point, not a measured number.
@@ -893,9 +910,15 @@ impl SandboxRunner {
         })
     }
 
-    /// Windows: `SandboxedChild` has no async wait and its stdio cannot be sent
-    /// to a file, so the child's output is discarded and it is polled; the job
-    /// object kills the whole tree on timeout and on drop.
+    /// Windows: `SandboxedChild` has no async wait and its stdio cannot be
+    /// sent to a file, so it is polled, and its stdout and stderr are read
+    /// through pipes on threads of their own, each keeping its last
+    /// [`SCAN_BYTES`] (the same scan the Unix path reads back from its
+    /// files). The job object kills the whole tree when the command exits,
+    /// on timeout and on drop; the readers then get the end of their pipes
+    /// and the tail is cut as on Unix ([`join_tail`]). A pipe whose end does
+    /// not come within [`PIPE_END_GRACE`] (a process outside the job holds
+    /// it) is said in the tail, with what arrived, never dropped in silence.
     #[cfg(windows)]
     async fn exec(
         &self,
@@ -924,41 +947,92 @@ impl SandboxRunner {
             .env("CARGO_NET_OFFLINE", "true")
             .env("PYTHONDONTWRITEBYTECODE", "1");
         cmd.stdin(Redirect::Null)
-            .stdout(Redirect::Null)
-            .stderr(Redirect::Null);
+            .stdout(Redirect::Piped)
+            .stderr(Redirect::Piped);
+        let program = program.clone();
+        let args = args.to_vec();
         blocking(move || {
+            use kgraf_sandbox::output_tail::read_tail;
             let mut child = cmd
                 .spawn()
                 .map_err(|e| CheckError::Sandbox(e.to_string()))?;
+            let out = read_tail(child.stdout.take(), SCAN_BYTES);
+            let err = read_tail(child.stderr.take(), SCAN_BYTES);
             let deadline = std::time::Instant::now() + timeout;
-            loop {
+            let ended = loop {
                 match child.try_wait() {
-                    Ok(Some(s)) => {
-                        let _ = child.kill();
-                        return Ok(RunResult {
-                            queued: Duration::ZERO,
-                            success: s.success(),
-                            timed_out: false,
-                            status: s.to_string(),
-                            tail: "(output is not captured on Windows)".into(),
-                        });
-                    }
+                    Ok(Some(s)) => break Some(s),
                     Ok(None) if std::time::Instant::now() < deadline => {
                         std::thread::sleep(Duration::from_millis(50));
                     }
-                    Ok(None) => {
+                    Ok(None) => break None,
+                    Err(e) => {
                         let _ = child.kill();
-                        return Ok(RunResult {
-                            queued: Duration::ZERO,
-                            success: false,
-                            timed_out: true,
-                            status: "timed out".into(),
-                            tail: String::new(),
-                        });
+                        return Err(CheckError::Sandbox(format!("waiting for the check: {e}")));
                     }
-                    Err(e) => return Err(CheckError::Sandbox(e.to_string())),
                 }
+            };
+            // Every process the command left behind ends here, after a
+            // normal exit too: the readers then get the end of their pipes.
+            let quiet = child
+                .kill_tree_and_wait(TREE_END_BOUND)
+                .map_err(|e| CheckError::Sandbox(format!("ending the check's processes: {e}")))?;
+            let (out, err) = (out.finish(PIPE_END_GRACE), err.finish(PIPE_END_GRACE));
+            let mut tail = captured_tail(&err, &out);
+            if !quiet {
+                return Err(CheckError::Sandbox(format!(
+                    "a process the check started was still running {} s after its job was \
+                     ended{}",
+                    TREE_END_BOUND.as_secs(),
+                    if tail.is_empty() {
+                        String::new()
+                    } else {
+                        format!("; its output: {tail}")
+                    }
+                )));
             }
+            let Some(status) = ended else {
+                return Ok(RunResult {
+                    queued: Duration::ZERO,
+                    success: false,
+                    timed_out: true,
+                    status: "timed out".into(),
+                    tail,
+                });
+            };
+            if !status.success()
+                && let Some((named, detail)) = missing_program(status.code(), &tail)
+            {
+                // As on Unix: the shell names what it could not open; one of
+                // the command's own arguments is a missing file.
+                if let Some(file) = named.as_deref().filter(|n| {
+                    *n != program
+                        && detail.contains("No such file")
+                        && args.iter().any(|a| {
+                            a.strip_prefix("./").unwrap_or(a) == n.strip_prefix("./").unwrap_or(n)
+                        })
+                }) {
+                    return Err(CheckError::InputMissing {
+                        program: program.clone(),
+                        file: file.to_owned(),
+                        detail,
+                    });
+                }
+                return Err(CheckError::ProgramMissing {
+                    program: named.unwrap_or_else(|| program.clone()),
+                    detail,
+                });
+            }
+            if tail.is_empty() && !status.success() {
+                tail = NO_OUTPUT.into();
+            }
+            Ok(RunResult {
+                queued: Duration::ZERO,
+                success: status.success(),
+                timed_out: false,
+                status: status.to_string(),
+                tail,
+            })
         })
         .await
     }
@@ -1007,8 +1081,8 @@ fn sessions_of(hold: &Path) -> PathBuf {
 ///
 /// Probing is the run itself, under the same policy as the check, so what the
 /// sandbox can and cannot reach is what is classified.
-// Only the unix run path calls this; Windows refuses to run checks at all.
-#[cfg_attr(not(unix), allow(dead_code))]
+// Both run paths call this: the Unix one on its output files, the Windows one on its pipe tails.
+#[cfg_attr(not(any(unix, windows)), allow(dead_code))]
 pub(crate) fn missing_program(code: Option<i32>, tail: &str) -> Option<(Option<String>, String)> {
     let line_with = |needle: &str| {
         tail.lines()
@@ -1154,10 +1228,8 @@ impl Drop for Cleanup {
     }
 }
 
-// Only read by the `#[cfg(unix)]` branch above (line ~398..465) that tails a failed
-// gate's captured stderr/stdout for a remediation prompt; the `#[cfg(windows)]` branch
-// builds its own message differently, so neither helper is used on that target
-// (a Windows cross-build found this under `-D warnings`).
+/// The last `keep` bytes of the output file at `path` (Unix: a check's output
+/// goes to files; on Windows it comes through pipes, see [`captured_tail`]).
 #[cfg(unix)]
 fn last_bytes(path: &Path, keep: usize) -> Vec<u8> {
     use std::io::{Read, Seek, SeekFrom};
@@ -1174,7 +1246,27 @@ fn last_bytes(path: &Path, keep: usize) -> Vec<u8> {
     buf
 }
 
-#[cfg(unix)]
+/// [`join_tail`] of two pipe tails, with a line for each pipe whose end did
+/// not come or whose read failed: output that may be missing is said, not
+/// dropped in silence.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn captured_tail(
+    err: &kgraf_sandbox::output_tail::Tail,
+    out: &kgraf_sandbox::output_tail::Tail,
+) -> String {
+    let mut tail = join_tail(&err.bytes, &out.bytes);
+    for note in [err.read_note("stderr"), out.read_note("stdout")]
+        .into_iter()
+        .flatten()
+    {
+        if !tail.is_empty() {
+            tail.push('\n');
+        }
+        tail.push_str(&format!("[{note}]"));
+    }
+    tail
+}
+
 fn join_tail(err: &[u8], out: &[u8]) -> String {
     // Host toolchain noise is dropped first, so it does not take room from the
     // errors in the byte budget, and never reaches a model, the trace or a
@@ -1198,7 +1290,7 @@ fn join_tail(err: &[u8], out: &[u8]) -> String {
 /// project: macOS `xcrun` and `xcodebuild` lines a compiler relays while it
 /// looks for the SDK. Never an error line (`error: ...`, `file:1: error: ...`):
 /// a missing toolchain is a finding, whatever tool says it.
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg_attr(not(any(unix, windows)), allow(dead_code))]
 fn is_host_noise(line: &str) -> bool {
     !starts_error(line)
         && (line.contains("DVTDeveloperPaths")
@@ -1211,7 +1303,7 @@ fn is_host_noise(line: &str) -> bool {
 
 /// A line that continues a warning block: an indented line, a `|` gutter, a
 /// numbered source line or a `= note` line. A blank line ends the block.
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg_attr(not(any(unix, windows)), allow(dead_code))]
 fn continues_block(line: &str) -> bool {
     !line.trim().is_empty() && continues_error(line)
 }
@@ -1221,7 +1313,7 @@ fn continues_block(line: &str) -> bool {
 /// (`[N identical lines removed]`). Error lines are never removed. A compiler
 /// that relays one `xcrun` warning for every crate of a workspace made one
 /// refusal 28 KB, nearly all of it these.
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg_attr(not(any(unix, windows)), allow(dead_code))]
 pub(crate) fn filter_host_noise(text: &str) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let mut kept: Vec<&str> = Vec::with_capacity(lines.len());
@@ -1289,7 +1381,7 @@ pub(crate) fn filter_host_noise(text: &str) -> String {
 /// Whether a line starts a compiler diagnostic that is an error: rustc's
 /// `error[E0560]: ...` and `error: ...`, and the `file:line: error: ...` form
 /// of C compilers and many others.
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg_attr(not(any(unix, windows)), allow(dead_code))]
 fn starts_error(line: &str) -> bool {
     line.starts_with("error[")
         || line.starts_with("error:")
@@ -1299,7 +1391,7 @@ fn starts_error(line: &str) -> bool {
 
 /// Whether a line continues the diagnostic above it: rustc's ` --> path`,
 /// `  |` gutter, `3 | code` and `= note` lines, all indented or numbered.
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg_attr(not(any(unix, windows)), allow(dead_code))]
 fn continues_error(line: &str) -> bool {
     line.starts_with([' ', '\t', '|', '='])
         || line.split_once('|').is_some_and(|(n, _)| {
@@ -1313,7 +1405,7 @@ fn continues_error(line: &str) -> bool {
 /// of `keep`, then the end of the output in the room left. A plain tail let
 /// trailing warnings (a toolchain's own noise on stderr) push the one error
 /// that explains a failed check out of the record.
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg_attr(not(any(unix, windows)), allow(dead_code))]
 pub(crate) fn condense(text: &str, keep: usize) -> String {
     const MARKER: &str = "[... output cut; the compiler errors above were kept ...]\n";
     if text.len() <= keep {
@@ -1505,7 +1597,35 @@ mod tests {
 
     /// The filter runs before the byte budget: with the noise first and the
     /// error after it, the error is in the tail the model reads.
-    #[cfg(unix)]
+    /// The Windows run reads its output through pipes: a failed build's
+    /// error reaches the tail, cut as on Unix, and a pipe whose end never
+    /// came is said with what arrived, so a failure is never told with no
+    /// output.
+    #[test]
+    fn a_pipe_tail_keeps_the_error_and_says_when_a_pipe_stayed_open() {
+        use kgraf_sandbox::output_tail::Tail;
+        let err = Tail {
+            bytes: b"error: linking with `link.exe` failed: exit code: 1318\n".to_vec(),
+            total: 55,
+            complete: false,
+            drained: false,
+            error: None,
+        };
+        let out = Tail {
+            complete: true,
+            drained: true,
+            ..Tail::default()
+        };
+        let tail = super::captured_tail(&err, &out);
+        assert!(tail.contains("linking with `link.exe` failed"), "{tail}");
+        assert!(tail.contains("the stderr pipe stayed open"), "{tail}");
+        assert!(tail.contains("may be cut"), "{tail}");
+        assert!(!tail.contains("stdout pipe"), "{tail}");
+        let quiet = super::captured_tail(&out, &out);
+        assert_eq!(quiet, "");
+        assert!(super::NO_OUTPUT.contains("nothing"));
+    }
+
     #[test]
     fn the_tail_a_model_reads_carries_no_host_noise() {
         let mut err = String::new();

@@ -46,6 +46,11 @@
 //!   every UI restriction (desktop switching, clipboard, global atoms, USER
 //!   handles of processes outside the job, system parameters, exit Windows).
 //!   The process is created suspended and joins the job before it runs.
+//! - **Pipes.** A piped stream's end in this process is opened for
+//!   overlapped I/O and the child's end for synchronous I/O, as std's own
+//!   child pipes are: std's `ChildStdout` and the others it is handed in
+//!   read and write with alertable overlapped calls, which do not work on a
+//!   `CreatePipe` handle (see `child_pipe`).
 //! - **Private desktop.** Reused per workspace, labeled Low, on the process's
 //!   own window station (queried, not hard-coded, so scheduled or service runs
 //!   work). Restricted processes must run on a non-default desktop so they
@@ -556,9 +561,9 @@ mod imp {
     use std::ptr;
 
     use windows_sys::Win32::Foundation::{
-        DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_INVALID_SID, ERROR_SUCCESS, GENERIC_ALL,
-        GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LUID,
-        LocalFree, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_SID,
+        ERROR_PIPE_BUSY, ERROR_SUCCESS, GENERIC_ALL, GENERIC_READ, GENERIC_WRITE, GetLastError,
+        HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LUID, LocalFree, WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertStringSidToSidW, DENY_ACCESS, EXPLICIT_ACCESS_W, GRANT_ACCESS,
@@ -581,9 +586,11 @@ mod imp {
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, DELETE, FILE_ALL_ACCESS, FILE_APPEND_DATA, FILE_DELETE_CHILD,
-        FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ,
+        FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, FILE_GENERIC_EXECUTE,
+        FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
         FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA,
-        GetVolumeInformationW, OPEN_EXISTING, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
+        GetVolumeInformationW, OPEN_EXISTING, PIPE_ACCESS_INBOUND, PIPE_ACCESS_OUTBOUND,
+        READ_CONTROL, WRITE_DAC, WRITE_OWNER,
     };
     use windows_sys::Win32::System::Console::{
         GetConsoleMode, GetStdHandle, STD_ERROR_HANDLE, STD_HANDLE, STD_INPUT_HANDLE,
@@ -591,11 +598,15 @@ mod imp {
     };
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION,
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_BASIC_UI_RESTRICTIONS,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicUIRestrictions,
-        JobObjectExtendedLimitInformation, SetInformationJobObject, TerminateJobObject,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+        JOBOBJECT_BASIC_UI_RESTRICTIONS, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectBasicAccountingInformation, JobObjectBasicUIRestrictions,
+        JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
+        TerminateJobObject,
     };
-    use windows_sys::Win32::System::Pipes::CreatePipe;
+    use windows_sys::Win32::System::Pipes::{
+        CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
+    };
     use windows_sys::Win32::System::StationsAndDesktops::{
         CloseDesktop, CreateDesktopW, DESKTOP_CREATEMENU, DESKTOP_CREATEWINDOW, DESKTOP_ENUMERATE,
         DESKTOP_HOOKCONTROL, DESKTOP_JOURNALPLAYBACK, DESKTOP_JOURNALRECORD, DESKTOP_READ_CONTROL,
@@ -1906,18 +1917,7 @@ mod imp {
                 })
             }
             Redirect::Piped => {
-                let (mut read, mut write): (HANDLE, HANDLE) = (ptr::null_mut(), ptr::null_mut());
-                // SAFETY: outputs written on success; handles not inheritable.
-                if unsafe { CreatePipe(&mut read, &mut write, ptr::null(), 0) } == 0 {
-                    return Err(last_error("CreatePipe"));
-                }
-                let read = owned(read, "CreatePipe")?;
-                let write = owned(write, "CreatePipe")?;
-                let (child, parent) = if which == STD_INPUT_HANDLE {
-                    (read, write)
-                } else {
-                    (write, read)
-                };
+                let (parent, child) = child_pipe(which != STD_INPUT_HANDLE)?;
                 Ok(Stream {
                     child: Some(inheritable(child.as_raw_handle(), "DuplicateHandle(pipe)")?),
                     parent: Some(parent),
@@ -1950,6 +1950,111 @@ mod imp {
                 })
             }
         }
+    }
+
+    /// How many pipe names [`child_pipe`] tries before it gives up: a name
+    /// is refused when another pipe already has it.
+    const PIPE_NAME_TRIES: u32 = 10;
+
+    /// Bytes each direction of a [`child_pipe`] buffers, as std's own child
+    /// pipes do.
+    const PIPE_BUFFER: u32 = 64 * 1024;
+
+    /// A pipe to a child: this process's end opened for overlapped I/O, the
+    /// child's end for ordinary (synchronous) I/O. Returns (this process's
+    /// end, the child's end). With `parent_reads` the child writes (its
+    /// stdout or stderr); without it the child reads (its stdin).
+    ///
+    /// Not `CreatePipe`: both of its ends are synchronous, and std's
+    /// `ChildStdin`, `ChildStdout` and `ChildStderr`, which
+    /// [`SandboxedChild`] hands out, read and write with `ReadFileEx` and
+    /// `WriteFileEx` and then wait in an alertable `SleepEx` for the
+    /// completion routine. Their `From<OwnedHandle>` documentation says the
+    /// handle must be asynchronous, and std's maintainers state that its
+    /// pipe `Read` and `Write` do not work with a synchronous handle
+    /// (rust-lang/rust pull request 98704). With a `CreatePipe` handle a
+    /// `read` or a `write` can wait for a completion that never comes: a
+    /// reader returns nothing or never ends, and a write to stdin never
+    /// returns. Only `read_to_end` on the pipe itself worked, because std
+    /// does it with a plain `NtReadFile`.
+    ///
+    /// This is std's own construction (an overlapped end for this process,
+    /// a synchronous end for the child), made with the documented Win32
+    /// calls its earlier versions used: a named pipe of one instance whose
+    /// name holds this process's id and a random part, created with
+    /// `FILE_FLAG_FIRST_PIPE_INSTANCE` so a pipe that already has the name
+    /// is refused rather than joined, rejecting remote clients, and opened
+    /// at once by this process. Once this process has opened it, a second
+    /// open fails with `ERROR_PIPE_BUSY`, so no other process can attach;
+    /// if another opened it first, this open fails and the spawn fails
+    /// loud.
+    fn child_pipe(parent_reads: bool) -> Result<(OwnedHandle, OwnedHandle), SandboxError> {
+        let access = if parent_reads {
+            PIPE_ACCESS_INBOUND
+        } else {
+            PIPE_ACCESS_OUTBOUND
+        };
+        let mut tries = 0;
+        let (server, name) = loop {
+            tries += 1;
+            let name = wide(OsStr::new(&format!(
+                r"\\.\pipe\kgraf-sandbox-{}-{:016x}",
+                std::process::id(),
+                random_u64()
+            )));
+            // SAFETY: a NUL-terminated name; no security attributes, so the
+            // default DACL applies and the handle is not inheritable.
+            let h = unsafe {
+                CreateNamedPipeW(
+                    name.as_ptr(),
+                    access | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                    1,
+                    PIPE_BUFFER,
+                    PIPE_BUFFER,
+                    0,
+                    ptr::null(),
+                )
+            };
+            if !h.is_null() && h != INVALID_HANDLE_VALUE {
+                break (owned(h, "CreateNamedPipeW")?, name);
+            }
+            // SAFETY: plain call, made right after the failing one.
+            let code = unsafe { GetLastError() };
+            // A name another pipe already has is refused with access denied.
+            if code != ERROR_ACCESS_DENIED || tries >= PIPE_NAME_TRIES {
+                return Err(win32("CreateNamedPipeW", code));
+            }
+        };
+        let client_access = if parent_reads {
+            GENERIC_WRITE | FILE_READ_ATTRIBUTES
+        } else {
+            GENERIC_READ
+        };
+        // SAFETY: the NUL-terminated name of the pipe made above; no sharing,
+        // no security attributes, synchronous I/O (no flags).
+        let h = unsafe {
+            CreateFileW(
+                name.as_ptr(),
+                client_access,
+                0,
+                ptr::null(),
+                OPEN_EXISTING,
+                0,
+                ptr::null_mut(),
+            )
+        };
+        if h.is_null() || h == INVALID_HANDLE_VALUE {
+            // SAFETY: plain call, made right after the failing one.
+            let code = unsafe { GetLastError() };
+            let step = if code == ERROR_PIPE_BUSY {
+                "open the child's end of its pipe (another process opened it first)"
+            } else {
+                "open the child's end of its pipe"
+            };
+            return Err(win32(step, code));
+        }
+        Ok((server, owned(h, "CreateFileW(pipe)")?))
     }
 
     // ---- program and command line --------------------------------------------
@@ -2117,6 +2222,47 @@ mod imp {
                 return Err(io::Error::last_os_error());
             }
             Ok(())
+        }
+
+        /// End every process of the command, then wait until the job holds
+        /// none, at most `bound`. True when none is left. A process's
+        /// handles, its ends of the output pipes among them, close only once
+        /// it has ended, and `TerminateJobObject` returns before that: a
+        /// reader that waits for the end of a pipe starts its wait after
+        /// this, not after the terminate call.
+        pub fn kill_tree_and_wait(&mut self, bound: std::time::Duration) -> io::Result<bool> {
+            self.kill()?;
+            let deadline = std::time::Instant::now() + bound;
+            loop {
+                if self.active_processes()? == 0 {
+                    return Ok(true);
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Ok(false);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+
+        /// How many processes the job still holds.
+        pub fn active_processes(&self) -> io::Result<u32> {
+            // SAFETY: zeroed is a valid value for this plain C struct.
+            let mut info: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: a valid job handle with query access, and a struct of
+            // the stated size and class.
+            let ok = unsafe {
+                QueryInformationJobObject(
+                    self.job.as_raw_handle(),
+                    JobObjectBasicAccountingInformation,
+                    ptr::addr_of_mut!(info).cast(),
+                    std::mem::size_of_val(&info) as u32,
+                    ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(info.ActiveProcesses)
         }
 
         /// Collect stdout and stderr, wait, then kill any descendant still

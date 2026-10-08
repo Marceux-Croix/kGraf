@@ -39,20 +39,32 @@ use crate::brief::{Brief, Check, DocFact, Mutation, ScriptCase};
 use crate::gitutil;
 use crate::structure;
 use anyhow::{Context, Result, bail};
+use kgraf_sandbox::output_tail::{Tail, exit_code_note, read_tail, stream_note};
 use kgraf_sandbox::{CheckNetwork, Redirect, SandboxPolicy, sandboxed_command};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
-use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 /// The wall-clock limit for one check (a cold `cargo test` of a fixture crate
 /// is well inside it).
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// The most output kept from one check process. Cargo's build messages are a
-/// few kilobytes; more than this is not a build report.
-const OUTPUT_CAP: u64 = 1 << 20;
+/// The most output kept from one check process, per stream: its last bytes.
+/// Cargo's build messages are a few kilobytes; more than this is not a
+/// build report.
+const OUTPUT_CAP: usize = 1 << 20;
+
+/// The most of each stream a failure reason shows: its last bytes.
+const REASON_BYTES: usize = 4096;
+
+/// How long a pipe reader gets to reach the end of its pipe once every
+/// process of the command has ended.
+const PIPE_END_GRACE: Duration = Duration::from_secs(2);
+
+/// Windows: how long the processes of an ended job get to be gone.
+#[cfg(windows)]
+const TREE_END_BOUND: Duration = Duration::from_secs(10);
 
 /// The most bytes of one attempt file a check reads. The files read are a
 /// source file and a notes file; more than this is not one.
@@ -362,9 +374,12 @@ fn run_guarded(check: &Check, dir: &Path, env: &CheckEnv<'_>, guard: &Guard) -> 
 /// timeout.
 struct Ran {
     status: Option<ExitStatus>,
+    /// The last [`OUTPUT_CAP`] bytes of standard output, as text.
     stdout: String,
-    /// The tail of what the process wrote to standard error, for a reason.
-    stderr: String,
+    /// The last [`OUTPUT_CAP`] bytes of standard error, for a reason.
+    stderr: Tail,
+    /// Standard output as read, for a reason ([`output_note`]).
+    stdout_tail: Tail,
     /// A process the command started left its process group and still holds
     /// the attempt's hold file.
     escaped: bool,
@@ -373,12 +388,23 @@ struct Ran {
 /// The environment a check process gets: only what a build needs.
 fn build_env(scratch: &Path, target: &Path) -> Vec<(&'static str, PathBuf)> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
+    // Where cargo and rustup look when their variables are unset: the home
+    // folder, which Windows names in `USERPROFILE` (`HOME` is usually unset
+    // there, and is not passed when it is).
+    let tool_home = home
+        .clone()
+        .filter(|h| !h.as_os_str().is_empty())
+        .or_else(|| {
+            cfg!(windows)
+                .then(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
+                .flatten()
+        });
     let cargo_home = std::env::var_os("CARGO_HOME")
         .map(PathBuf::from)
-        .or_else(|| home.as_ref().map(|h| h.join(".cargo")));
+        .or_else(|| tool_home.as_ref().map(|h| h.join(".cargo")));
     let rustup_home = std::env::var_os("RUSTUP_HOME")
         .map(PathBuf::from)
-        .or_else(|| home.as_ref().map(|h| h.join(".rustup")));
+        .or_else(|| tool_home.as_ref().map(|h| h.join(".rustup")));
     let mut vars = vec![
         ("CARGO_TARGET_DIR", target.to_path_buf()),
         ("TMPDIR", scratch.to_path_buf()),
@@ -497,8 +523,8 @@ fn sandboxed_with(
     let mut child = cmd
         .spawn()
         .with_context(|| format!("cannot run `{program}` in {}", dir.display()))?;
-    let out_rx = drain(child.stdout.take());
-    let err_rx = drain(child.stderr.take());
+    let out_reader = read_tail(child.stdout.take(), OUTPUT_CAP);
+    let err_reader = read_tail(child.stderr.take(), OUTPUT_CAP);
 
     let started = Instant::now();
     let status = loop {
@@ -533,11 +559,20 @@ fn sandboxed_with(
         }
     };
     // The job stands in for the process group on Windows: ending it once the
-    // leader has exited ends every process the command left behind. A build
-    // tool's background server holds the output pipes open, and the readers
-    // below would wait out their grace and return nothing.
+    // leader has exited ends every process the command left behind (a build
+    // tool's background server would hold the output pipes open). The
+    // readers' wait for the end of their pipes starts once the job holds no
+    // process, since a process's pipe ends close only when it is gone.
     #[cfg(windows)]
-    let _ = child.kill();
+    if !child
+        .kill_tree_and_wait(TREE_END_BOUND)
+        .with_context(|| format!("ending the processes of `{program}`"))?
+    {
+        bail!(
+            "a process `{program}` started was still running {} s after its job was ended",
+            TREE_END_BOUND.as_secs()
+        );
+    }
     #[cfg(unix)]
     {
         // SIGKILL lands asynchronously: give the group a bounded time to go.
@@ -555,54 +590,74 @@ fn sandboxed_with(
     let escaped = false;
     // A descendant that left the group can hold the pipes open; wait a bounded
     // time for the readers rather than forever.
-    let grace = Duration::from_secs(2);
-    let stdout = out_rx.recv_timeout(grace).unwrap_or_default();
-    let stderr = err_rx.recv_timeout(grace).unwrap_or_default();
+    let stdout_tail = out_reader.finish(PIPE_END_GRACE);
+    let stderr = err_reader.finish(PIPE_END_GRACE);
+    // Output that may be cut is no basis for a verdict on the attempt: bytes
+    // were still arriving when the wait ran out, or the read failed. The
+    // harness could not judge; it says why. A pipe that only stayed open (a
+    // process outside the command holds a copy of it, and the command, gone,
+    // wrote nothing more) was read whole: its note goes with a failure
+    // reason, and the verdict stands.
+    if !escaped
+        && (!stdout_tail.whole() || !stderr.whole())
+        && let Some(why) = [stdout_tail.read_note("stdout"), stderr.read_note("stderr")]
+            .into_iter()
+            .flatten()
+            .reduce(|a, b| format!("{a}; {b}"))
+    {
+        bail!(
+            "the output of `{program}` was not read whole ({why}); {}",
+            output_note(&stderr, &stdout_tail)
+        );
+    }
     Ok(Ran {
         status,
-        stdout,
+        stdout: stdout_tail.text(),
         stderr,
+        stdout_tail,
         escaped,
     })
-}
-
-/// Read a pipe on its own thread, keep at most [`OUTPUT_CAP`] bytes, keep
-/// draining past it so the writer never blocks, and send the text once the
-/// pipe closes. The thread is detached: it ends when every writer is gone.
-fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> mpsc::Receiver<String> {
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let mut kept = Vec::new();
-        if let Some(mut pipe) = pipe {
-            let _ = pipe.by_ref().take(OUTPUT_CAP).read_to_end(&mut kept);
-            let _ = std::io::copy(&mut pipe, &mut std::io::sink());
-        }
-        let _ = tx.send(String::from_utf8_lossy(&kept).into_owned());
-    });
-    rx
 }
 
 /// How a process ended, for a reason: the exit code, in hex too when it is a
 /// Windows status (`0xC0000142` is a program that could not start).
 fn exit_note(status: ExitStatus) -> String {
-    match status.code() {
-        Some(code) if !(0..=255).contains(&code) => {
-            format!("exit code {code} = {:#010x}", code as u32)
-        }
-        Some(code) => format!("exit code {code}"),
-        None => "no exit code".to_owned(),
-    }
+    exit_code_note(status.code())
 }
 
-/// The last few lines of a process's standard error, for a reason.
-fn stderr_tail(stderr: &str) -> String {
-    let lines: Vec<&str> = stderr.lines().filter(|l| !l.trim().is_empty()).collect();
-    let tail = lines[lines.len().saturating_sub(4)..].join(" | ");
-    let mut tail: String = tail.chars().take(400).collect();
-    if tail.is_empty() {
-        tail.push_str("no output");
-    }
-    tail
+/// What a failed process printed, for a reason: the last [`REASON_BYTES`] of
+/// standard error, then of standard output; for cargo's JSON messages on
+/// standard output, the rendered compiler errors instead of the raw lines.
+/// Each stream is named, an empty one says `(empty)`, and one that was not
+/// read whole says so: a failure is never told with no output.
+fn output_note(stderr: &Tail, stdout: &Tail) -> String {
+    let rendered = rendered_compiler_errors(&stdout.text());
+    let stdout_note = if rendered.is_empty() {
+        stream_note("stdout", stdout, REASON_BYTES)
+    } else {
+        let errors = Tail {
+            total: rendered.len() as u64,
+            bytes: rendered.into_bytes(),
+            ..stdout.clone()
+        };
+        stream_note("compiler errors on stdout", &errors, REASON_BYTES)
+    };
+    format!(
+        "{}\n{stdout_note}",
+        stream_note("stderr", stderr, REASON_BYTES)
+    )
+}
+
+/// The `rendered` text of each error in cargo's `--message-format=json`
+/// output, in order; empty when there is none.
+fn rendered_compiler_errors(cargo_json: &str) -> String {
+    cargo_json
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|m| m["reason"] == "compiler-message" && m["message"]["level"] == "error")
+        .filter_map(|m| m["message"]["rendered"].as_str().map(str::to_owned))
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 /// How one test process ended.
@@ -681,9 +736,10 @@ fn list_tests(
             .filter_map(|l| l.strip_suffix(": test"))
             .map(str::to_owned)
             .collect())),
-        Some(_) => unmet(format!(
-            "a test executable could not list its tests: {}",
-            stderr_tail(&ran.stderr)
+        Some(status) => unmet(format!(
+            "a test executable could not list its tests ({}): {}",
+            exit_note(status),
+            output_note(&ran.stderr, &ran.stdout_tail)
         )),
         None => unmet("a test executable timed out while listing its tests"),
     }
@@ -728,7 +784,7 @@ fn cargo_test(
         return unmet(format!(
             "the build failed ({}): {}",
             exit_note(status),
-            stderr_tail(&built.stderr)
+            output_note(&built.stderr, &built.stdout_tail)
         ));
     }
     if !guard.intact(dir) || untrusted_build_input(dir).is_some() {
@@ -940,14 +996,17 @@ fn script_cases(
         let code = status.code().unwrap_or(-1);
         if ran.stdout != case.expect_stdout || code != case.expect_status {
             return Ok(Verdict::Unsatisfied(format!(
-                "{script} {:?}: exit status {code} (wanted {}), output {} the expected text",
+                "{script} {:?}: exit status {code} (wanted {}), output {} the expected text \
+                 ({}): {}",
                 case.args,
                 case.expect_status,
                 if ran.stdout == case.expect_stdout {
                     "matches"
                 } else {
                     "differs from"
-                }
+                },
+                exit_note(status),
+                output_note(&ran.stderr, &ran.stdout_tail)
             )));
         }
     }
@@ -1072,6 +1131,77 @@ fn control_run(timeout: Duration) -> Result<()> {
             "the check harness could not judge a known-good crate ({why}); \
              its toolchain or sandbox is not working, and no attempt can be judged"
         ),
+    }
+}
+
+#[cfg(test)]
+mod reason_tests {
+    use super::*;
+
+    fn tail(text: &str) -> Tail {
+        Tail {
+            bytes: text.as_bytes().to_vec(),
+            total: text.len() as u64,
+            complete: true,
+            drained: true,
+            error: None,
+        }
+    }
+
+    /// A failed build is told with what it printed: cargo's rendered error
+    /// from its JSON messages and its own error line, never "no output".
+    #[test]
+    fn a_failed_build_reason_carries_the_compiler_error_and_cargos_line() {
+        let json = concat!(
+            r#"{"reason":"compiler-message","message":{"level":"warning","rendered":"warning: unused\n"}}"#,
+            "\n",
+            r#"{"reason":"compiler-message","message":{"level":"error","rendered":"error[E0425]: cannot find value `x`\n"}}"#,
+            "\n",
+            r#"{"reason":"build-finished","success":false}"#,
+            "\n"
+        );
+        let note = output_note(
+            &tail("error: could not compile `fixture` (lib test)\n"),
+            &tail(json),
+        );
+        assert!(
+            note.contains("error[E0425]: cannot find value `x`"),
+            "{note}"
+        );
+        assert!(!note.contains("warning: unused"), "{note}");
+        assert!(note.contains("could not compile `fixture`"), "{note}");
+    }
+
+    #[test]
+    fn empty_streams_are_said_and_plain_stdout_is_kept() {
+        let note = output_note(&tail(""), &tail(""));
+        assert_eq!(note, "stderr: (empty)\nstdout: (empty)");
+        let note = output_note(&tail(""), &tail("plain words\n"));
+        assert!(note.ends_with("stdout:\nplain words"), "{note}");
+    }
+
+    /// Only the last bytes of a long stream reach a reason.
+    #[test]
+    fn a_long_stream_is_cut_to_its_last_bytes() {
+        let long = format!("{}THE-END", "x".repeat(3 * REASON_BYTES));
+        let note = output_note(&tail(&long), &tail(""));
+        assert!(note.contains("THE-END"), "{}", note.len());
+        assert!(note.len() < REASON_BYTES + 200, "{}", note.len());
+    }
+
+    #[test]
+    fn an_exit_code_is_named_in_the_reason() {
+        #[cfg(unix)]
+        let status = {
+            use std::os::unix::process::ExitStatusExt;
+            ExitStatus::from_raw(101 << 8)
+        };
+        #[cfg(windows)]
+        let status = {
+            use std::os::windows::process::ExitStatusExt;
+            ExitStatus::from_raw(101)
+        };
+        assert_eq!(exit_note(status), "exit code 101");
     }
 }
 
