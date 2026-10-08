@@ -210,12 +210,30 @@ fn git_for_windows_curl_starts_a_tls_handshake_inside_the_sandbox() {
 /// (`SEC_E_NO_CREDENTIALS`) and sends no handshake. If this test fails
 /// because a handshake arrived, the gap is closed: update decision 0011 and
 /// the gaps text of the Windows backend.
+/// The Windows TLS stack inside the sandbox, against what the backend in use
+/// claims. Under the token sandbox it cannot work: Schannel refuses a client
+/// credential to a token that carries restricting SIDs, and those SIDs are
+/// that backend's write boundary (decision 0011, Schannel amendment). Under
+/// the sandbox user the token carries none, so it must work; that is one of
+/// the two failures decision 0097 exists to fix.
 #[test]
-fn system32_curl_still_fails_to_start_tls_inside_the_sandbox() {
+fn system32_curl_starts_tls_only_where_the_backend_allows_it() {
+    let backend = kgraf_sandbox::platform_isolation()
+        .expect("a backend")
+        .backend;
     let (bytes, out) = curl_in_the_sandbox(&system_curl());
+    let sent = bytes.as_deref().map(is_tls_handshake).unwrap_or(false);
+    if backend == kgraf_sandbox::Backend::WindowsSandboxUser {
+        assert!(
+            sent,
+            "the Windows TLS stack did not start a handshake as the sandbox user, where no \
+             restricting SID should stop it; {}",
+            said(&out)
+        );
+        return;
+    }
     // A listener that read nothing is the expected shape; one that never saw
     // a connection is also a failed handshake, and curl's message decides.
-    let sent = bytes.as_deref().map(is_tls_handshake).unwrap_or(false);
     let stderr = String::from_utf8_lossy(&out.stderr).to_ascii_lowercase();
     assert!(
         !sent,

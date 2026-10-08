@@ -462,6 +462,7 @@ fn assembly_for(
         call_mode: CallMode::Stream,
         max_output_tokens: 1_000,
         max_checkpoints: kgraf_host::limits::DEFAULT_MAX_CHECKPOINTS,
+        reasoning: Default::default(),
         path_case: kgraf_tools::detect_path_case(ws.root()).expect("case"),
         read_denies: vec![repo.state.clone()],
         mcp_home: repo.state.join("mcp-home"),

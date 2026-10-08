@@ -11,18 +11,24 @@
 //! names the fix. The Linux self-test workflow uses it on an installed
 //! package. It is for diagnosis, not a feature of a run, so `--help` does not
 //! list it.
+//!
+//! On Windows the probe runs through Git Bash (the sandbox starts `sh` there)
+//! and the check prints which backend ran. With the sandbox user (after
+//! `kgraf sandbox setup`) a direct connection must fail, like on Unix. With the
+//! token sandbox the network cannot be confined (decision 0011): the check
+//! runs with the network open, prints a `network: not confined` line that is
+//! not a pass, and still exits 0 when the other steps pass.
 
 use anyhow::{Result, bail};
+use kgraf_sandbox::Backend;
 
 /// The marker the local origin answers with.
-#[cfg(unix)]
 const ORIGIN_BODY: &str = "selfcheck-ok";
 
 /// The probe, run with `sh -c`. Arguments: tree, hidden folder, origin port.
 /// Exit codes tell the failing step: 11 tree not writable, 12 hidden folder
 /// writable, 13 proxy did not reach the origin, 14 a direct connection
-/// reached the origin.
-#[cfg(unix)]
+/// reached the origin. On Windows `sh` is Git Bash, whose `curl` is used.
 const PROBE: &str = r#"
 tree="$1"; hidden="$2"; port="$3"
 echo inside > "$tree/selfcheck-write" || exit 11
@@ -33,7 +39,6 @@ exit 0
 "#;
 
 /// What each probe exit code means.
-#[cfg(unix)]
 fn explain(code: Option<i32>) -> String {
     match code {
         Some(11) => "the command could not write in its tree".into(),
@@ -50,17 +55,129 @@ fn explain(code: Option<i32>) -> String {
     }
 }
 
+/// What the check proved about the network.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NetworkResult {
+    /// A direct connection failed and the proxy worked.
+    Confined,
+    /// The backend cannot confine the network, so nothing was proved. Not a
+    /// pass.
+    NotConfined,
+}
+
+/// The backend's name as the check prints it.
+fn backend_name(backend: Backend) -> &'static str {
+    match backend {
+        Backend::MacosSeatbelt => "macOS Seatbelt",
+        Backend::LinuxLandlock => "Linux Landlock + seccomp",
+        Backend::WindowsRestrictedToken => "Windows restricted token (token sandbox)",
+        Backend::WindowsSandboxUser => "Windows sandbox user",
+    }
+}
+
+/// Whether `backend` cannot confine the network at all (decision 0011): the
+/// Windows token sandbox. There the check runs the command with the network
+/// open and proves nothing about it.
+fn backend_leaves_network_open(backend: Backend) -> bool {
+    backend == Backend::WindowsRestrictedToken
+}
+
+/// The verdict for a probe exit code under `backend`. A failure names the
+/// failing step. Exit 14 (a direct connection worked) is a failure where the
+/// backend confines the network, and expected where it does not. Where it
+/// does not, a pass never claims the network: it reports `NotConfined`,
+/// whatever the direct connection did.
+fn verdict(backend: Backend, code: Option<i32>) -> Result<NetworkResult, String> {
+    let open = backend_leaves_network_open(backend);
+    match code {
+        Some(0) if open => Ok(NetworkResult::NotConfined),
+        Some(0) => Ok(NetworkResult::Confined),
+        Some(14) if open => Ok(NetworkResult::NotConfined),
+        other => Err(explain(other)),
+    }
+}
+
+/// The lines printed for a pass. The first is `sandbox selfcheck: ok` only
+/// when every step was proved.
+fn report_lines(backend: Backend, network: NetworkResult) -> Vec<String> {
+    let first = match network {
+        NetworkResult::Confined => "sandbox selfcheck: ok",
+        NetworkResult::NotConfined => "sandbox selfcheck: passed with a gap",
+    };
+    let net = match network {
+        NetworkResult::Confined => "  network: only the egress proxy was reachable",
+        NetworkResult::NotConfined => {
+            "  network: not confined (token sandbox; run `kgraf sandbox setup`)"
+        }
+    };
+    vec![
+        first.to_owned(),
+        format!("  backend: {}", backend_name(backend)),
+        net.to_owned(),
+        "  hidden folder: not writable".to_owned(),
+        "  tree: writable".to_owned(),
+    ]
+}
+
+/// A listener for the local origin on a port the command must not reach
+/// directly. The offline sandbox user's firewall rules leave kGraf's egress
+/// proxy ports open on loopback, so an origin that landed in that range
+/// would answer the probe's direct connection and fail the check for no
+/// fault of the sandbox.
+fn bind_origin() -> std::io::Result<std::net::TcpListener> {
+    use std::net::{Ipv4Addr, TcpListener};
+
+    let mut held = Vec::new();
+    for _ in 0..64 {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let port = listener.local_addr()?.port();
+        if !kgraf_sandbox::sandbox_user::PROXY_PORTS.contains(&port) {
+            return Ok(listener);
+        }
+        // Hold it, so the next try cannot be given the same port again.
+        held.push(listener);
+    }
+    Err(std::io::Error::other(
+        "every try bound a port kGraf's egress proxy reserves",
+    ))
+}
+
+/// Start `cmd` and wait for it. On Linux the proxy takes the listener the
+/// command opened in its namespace; elsewhere the proxy already listens.
+fn run_command(
+    proxy: &kgraf_sandbox::egress::EgressProxy,
+    cmd: &mut kgraf_sandbox::SandboxedCommand,
+) -> Result<std::process::Output> {
+    use anyhow::Context;
+    #[cfg(unix)]
+    let child = proxy.spawn(cmd);
+    #[cfg(windows)]
+    let child = {
+        let _ = proxy;
+        cmd.spawn()
+    };
+    let child = child.context(
+        "start the sandboxed command (on Windows this needs Git for Windows: \
+         install it with `winget install Git.Git` or set KGRAF_GIT_BASH_PATH)",
+    )?;
+    child.wait_with_output().context("wait for the command")
+}
+
 /// Run the check. Prints one line per step and returns an error when the
-/// sandbox refuses the policy or a step fails.
-#[cfg(unix)]
+/// sandbox refuses the policy or a step fails. Exit status: success when every
+/// step passed, including a pass with a gap under a backend that cannot
+/// confine the network (the output says so); an error for any failed step.
 pub fn selfcheck() -> Result<()> {
     use anyhow::Context;
     use kgraf_sandbox::egress::{EgressProxy, HostRule};
-    use kgraf_sandbox::{Redirect, SandboxPolicy, sandboxed_command};
+    use kgraf_sandbox::{Network, Redirect, SandboxPolicy, sandboxed_command};
     use std::io::{Read, Write};
-    use std::net::{Ipv4Addr, TcpListener};
 
-    let origin = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).context("bind the local origin")?;
+    let backend = kgraf_sandbox::platform_isolation()
+        .context("the sandbox has no backend on this machine")?
+        .backend;
+
+    let origin = bind_origin().context("bind the local origin")?;
     let port = origin.local_addr().context("origin address")?.port();
     std::thread::spawn(move || {
         for client in origin.incoming() {
@@ -83,9 +200,19 @@ pub fn selfcheck() -> Result<()> {
     let tree = kgraf_core::plain_path::canonicalize(dir.path()).context("canonical tree")?;
     let hidden = tree.join("hidden");
     std::fs::create_dir(&hidden).context("hidden folder")?;
-    let policy = SandboxPolicy::new(vec![tree.clone()], proxy.network()).hide(hidden.clone());
+    // The token sandbox refuses a proxy-only network and partial isolation.
+    // The check runs it with the network open and accepts that, then says so.
+    let open = backend_leaves_network_open(backend);
+    let network = if open {
+        Network::Allow
+    } else {
+        proxy.network()
+    };
+    let policy = SandboxPolicy::new(vec![tree.clone()], network)
+        .hide(hidden.clone())
+        .accept_partial_isolation(open);
 
-    let mut cmd = sandboxed_command(&policy, "/bin/sh", &tree)
+    let mut cmd = sandboxed_command(&policy, "sh", &tree)
         .context("the sandbox refused a proxy-limited command with a hidden folder")?;
     for (k, v) in proxy.env() {
         cmd.env(k, v);
@@ -98,68 +225,20 @@ pub fn selfcheck() -> Result<()> {
         .arg(port.to_string())
         .stdout(Redirect::Piped)
         .stderr(Redirect::Piped);
-    let child = proxy
-        .spawn(&mut cmd)
-        .context("start the sandboxed command")?;
-    let out = child.wait_with_output().context("wait for the command")?;
-    if out.status.success() {
-        println!("sandbox selfcheck: ok");
-        println!("  network: only the egress proxy was reachable");
-        println!("  hidden folder: not writable");
-        println!("  tree: writable");
-        return Ok(());
-    }
-    bail!(
-        "sandbox selfcheck failed: {}\n{}{}",
-        explain(out.status.code()),
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    )
-}
-
-/// Not available off Unix: the Windows sandbox cannot confine the network.
-#[cfg(not(unix))]
-pub fn selfcheck() -> Result<()> {
-    bail!("sandbox selfcheck needs the proxy-limited sandbox, which this platform does not have")
-}
-
-#[cfg(all(test, unix))]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn exit_codes_have_distinct_explanations() {
-        let all: Vec<String> = [Some(11), Some(12), Some(13), Some(14), Some(2), None]
-            .into_iter()
-            .map(explain)
-            .collect();
-        for (i, a) in all.iter().enumerate() {
-            for b in &all[i + 1..] {
-                assert_ne!(a, b);
+    let out = run_command(&proxy, &mut cmd)?;
+    match verdict(backend, out.status.code()) {
+        Ok(network) => {
+            for line in report_lines(backend, network) {
+                println!("{line}");
             }
+            Ok(())
         }
-    }
-
-    #[test]
-    fn probe_has_its_body_placeholder() {
-        assert!(PROBE.contains("__BODY__"));
-    }
-
-    /// Where the system allows the policy the check passes; where a Linux
-    /// system denies user namespaces the error says so. Any other failure
-    /// is a defect.
-    #[test]
-    fn passes_or_refuses_for_want_of_user_namespaces() {
-        match selfcheck() {
-            Ok(()) => {}
-            Err(e) => {
-                let text = format!("{e:#}");
-                assert!(
-                    cfg!(target_os = "linux") && text.contains("user namespaces"),
-                    "{text}"
-                );
-            }
-        }
+        Err(why) => bail!(
+            "sandbox selfcheck failed (backend: {}): {why}\n{}{}",
+            backend_name(backend),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
     }
 }
 
@@ -204,11 +283,15 @@ fn launch_exe() -> Result<String> {
 }
 
 /// `kgraf sandbox setup`.
-pub fn setup(tag: Option<&str>) -> Result<()> {
+pub fn setup(tag: Option<&str>, slots: u8) -> Result<()> {
     #[cfg(windows)]
     {
+        use kgraf_sandbox::sandbox_user::MAX_SLOTS;
         use kgraf_sandbox::sandbox_user::windows::setup::{Launch, setup};
-        let names = owner_names(tag)?;
+        if slots > MAX_SLOTS {
+            anyhow::bail!("--slots must be {MAX_SLOTS} or fewer");
+        }
+        let names = owner_names(tag)?.with_slots(slots);
         let store = credentials_path(tag)?;
         let exe = launch_exe()?;
         println!(
@@ -226,11 +309,23 @@ pub fn setup(tag: Option<&str>) -> Result<()> {
         println!(
             "The Windows sandbox user is set up. Passwords are stored for this Windows user only."
         );
+        if slots == 0 {
+            println!(
+                "No worker slot users: commands that run at the same time without the network \
+                 run as one user and can write each other's files. Run setup again with \
+                 --slots to change that."
+            );
+        } else {
+            println!(
+                "{slots} worker slot users: commands that run at the same time in different \
+                 worktrees run as different users."
+            );
+        }
         Ok(())
     }
     #[cfg(not(windows))]
     {
-        let _ = tag;
+        let _ = (tag, slots);
         println!("{}", kgraf_sandbox::sandbox_user::no_setup_needed_notice());
         Ok(())
     }
@@ -240,8 +335,10 @@ pub fn setup(tag: Option<&str>) -> Result<()> {
 pub fn remove(tag: Option<&str>) -> Result<()> {
     #[cfg(windows)]
     {
+        use kgraf_sandbox::sandbox_user::MAX_SLOTS;
         use kgraf_sandbox::sandbox_user::windows::setup::{Launch, remove};
-        let names = owner_names(tag)?;
+        // Every possible slot, so a removal clears what a larger setup made.
+        let names = owner_names(tag)?.with_slots(MAX_SLOTS);
         let store = credentials_path(tag)?;
         let exe = launch_exe()?;
         remove(
@@ -321,5 +418,121 @@ pub fn elevated(
     {
         let _ = (action, pipe, nonce, owner_pid, owner_sid, tag);
         bail!("the elevated sandbox step exists only on Windows")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ALL: [Backend; 4] = [
+        Backend::MacosSeatbelt,
+        Backend::LinuxLandlock,
+        Backend::WindowsRestrictedToken,
+        Backend::WindowsSandboxUser,
+    ];
+
+    #[test]
+    fn exit_codes_have_distinct_explanations() {
+        let all: Vec<String> = [Some(11), Some(12), Some(13), Some(14), Some(2), None]
+            .into_iter()
+            .map(explain)
+            .collect();
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+    }
+
+    #[test]
+    fn probe_has_its_body_placeholder() {
+        assert!(PROBE.contains("__BODY__"));
+    }
+
+    /// The sandbox user, like the Unix backends, must block a direct
+    /// connection: reaching the origin directly is a failure there.
+    #[test]
+    fn a_direct_connection_fails_the_check_where_the_backend_confines_the_network() {
+        for backend in ALL {
+            if backend == Backend::WindowsRestrictedToken {
+                continue;
+            }
+            let err = verdict(backend, Some(14)).unwrap_err();
+            assert!(err.contains("direct connection"), "{backend:?}: {err}");
+            assert_eq!(
+                verdict(backend, Some(0)),
+                Ok(NetworkResult::Confined),
+                "{backend:?}"
+            );
+        }
+    }
+
+    /// The token sandbox cannot confine the network: a pass says so, and never
+    /// reports the network as confined, whether or not the direct connection
+    /// worked.
+    #[test]
+    fn the_token_sandbox_never_reports_a_confined_network() {
+        let b = Backend::WindowsRestrictedToken;
+        assert_eq!(verdict(b, Some(14)), Ok(NetworkResult::NotConfined));
+        assert_eq!(verdict(b, Some(0)), Ok(NetworkResult::NotConfined));
+    }
+
+    /// A failed step fails the check on every backend, the token sandbox
+    /// included.
+    #[test]
+    fn every_other_probe_status_fails_on_every_backend() {
+        for backend in ALL {
+            for code in [Some(11), Some(12), Some(13), Some(2), None] {
+                assert!(verdict(backend, code).is_err(), "{backend:?} {code:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_pass_prints_the_backend_and_only_a_full_pass_says_ok() {
+        for backend in ALL {
+            let lines = report_lines(backend, NetworkResult::Confined);
+            assert_eq!(lines[0], "sandbox selfcheck: ok");
+            assert!(lines.contains(&format!("  backend: {}", backend_name(backend))));
+        }
+        let gap = report_lines(Backend::WindowsRestrictedToken, NetworkResult::NotConfined);
+        assert_ne!(gap[0], "sandbox selfcheck: ok");
+        assert!(
+            gap.contains(
+                &"  network: not confined (token sandbox; run `kgraf sandbox setup`)".to_owned()
+            ),
+            "{gap:?}"
+        );
+        assert!(!gap.iter().any(|l| l.contains("only the egress proxy")));
+    }
+
+    /// Where the system allows the policy the check passes; where a Linux
+    /// system denies user namespaces the error says so. Any other failure
+    /// is a defect.
+    #[cfg(unix)]
+    #[test]
+    fn passes_or_refuses_for_want_of_user_namespaces() {
+        match selfcheck() {
+            Ok(()) => {}
+            Err(e) => {
+                let text = format!("{e:#}");
+                assert!(
+                    cfg!(target_os = "linux") && text.contains("user namespaces"),
+                    "{text}"
+                );
+            }
+        }
+    }
+
+    /// On Windows the real probe runs through Git Bash. Without Git Bash the
+    /// error names it; any other failure is a defect.
+    #[cfg(windows)]
+    #[test]
+    fn passes_or_names_the_missing_git_bash() {
+        if let Err(e) = selfcheck() {
+            let text = format!("{e:#}");
+            assert!(text.contains("Git"), "{text}");
+        }
     }
 }

@@ -129,10 +129,13 @@ criterion = { version = "0.8.2", default-features = false, features = ["cargo_be
 # (`Authentication_Identity`, `Credentials`, and `Cryptography` for
 # `SCHANNEL_CRED`). `Win32_System_Ioctl`: a confined-walk test turns a folder
 # into a junction in place (`FSCTL_SET_REPARSE_POINT`).
+# `Win32_Security_Authorization`: the probe reports the SID of the user it
+# runs as, so a test can tell which sandbox user started it.
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authentication_Identity",
+    "Win32_Security_Authorization",
     "Win32_Security_Credentials",
     "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",

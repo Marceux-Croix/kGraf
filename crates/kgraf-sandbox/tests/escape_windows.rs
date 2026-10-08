@@ -30,8 +30,8 @@ use std::time::{Duration, Instant};
 
 use common::fixture;
 use kgraf_sandbox::{
-    Network, ReadConfinement, Redirect, SandboxError, SandboxPolicy, Workspace, WorkspaceManager,
-    WorkspaceSpec, platform_isolation, sandboxed_command,
+    Backend, Network, ReadConfinement, Redirect, SandboxError, SandboxPolicy, Workspace,
+    WorkspaceManager, WorkspaceSpec, platform_isolation, sandboxed_command,
 };
 
 const DENIED: i32 = 5;
@@ -98,6 +98,8 @@ fn probe_entry() {
         "attach_console" => attach_console(arg.parse().unwrap_or(0)),
         "send_input" => send_input(),
         "junction_write" => junction_write(&arg, &arg2()),
+        "user_sid" => own_user_sid(),
+        "connect" => connect_to(&arg),
         "desktop" => desktop_name(),
         "console" => Ok(console_window().to_string()),
         other => Err(std::io::Error::other(format!("unknown probe {other}"))),
@@ -130,6 +132,80 @@ fn open_with(path: &str, access: u32) -> std::io::Result<String> {
         .custom_flags(0x0200_0000) // FILE_FLAG_BACKUP_SEMANTICS
         .open(path)
         .map(|_| "opened".into())
+}
+
+/// The SID of the user this process runs as, in string form. The sandbox
+/// user path starts a command as another user, and this is how a test tells
+/// which one.
+fn own_user_sid() -> std::io::Result<String> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::Foundation::{HANDLE, HLOCAL, LocalFree};
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut raw: HANDLE = std::ptr::null_mut();
+    // SAFETY: opens this process's own token for reading.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: a fresh handle this code now owns.
+    let token = unsafe { OwnedHandle::from_raw_handle(raw) };
+    let mut needed = 0u32;
+    // SAFETY: size query with a null buffer.
+    unsafe {
+        GetTokenInformation(
+            token.as_raw_handle(),
+            TokenUser,
+            std::ptr::null_mut(),
+            0,
+            &mut needed,
+        )
+    };
+    if needed == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut buf = vec![0u64; (needed as usize).div_ceil(8)];
+    // SAFETY: `buf` holds at least `needed` bytes.
+    if unsafe {
+        GetTokenInformation(
+            token.as_raw_handle(),
+            TokenUser,
+            buf.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    let user = buf.as_ptr() as *const TOKEN_USER;
+    let mut text: *mut u16 = std::ptr::null_mut();
+    // SAFETY: the system wrote a TOKEN_USER whose SID points into `buf`; the
+    // call allocates `text`, freed below.
+    if unsafe { ConvertSidToStringSidW((*user).User.Sid, &mut text) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut len = 0usize;
+    // SAFETY: a NUL-terminated string the call allocated.
+    while unsafe { *text.add(len) } != 0 {
+        len += 1;
+    }
+    // SAFETY: `len` units were just read from `text`.
+    let out = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, len) });
+    // SAFETY: frees the string the conversion allocated.
+    unsafe { LocalFree(text as HLOCAL) };
+    Ok(out)
+}
+
+/// Open a connection to `addr` (`127.0.0.1:port`), so a test can see whether
+/// a command that must not reach the network can reach a listener.
+fn connect_to(addr: &str) -> std::io::Result<String> {
+    let addr: std::net::SocketAddr = addr
+        .parse()
+        .map_err(|_| std::io::Error::other(format!("{addr} is not an address")))?;
+    std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(5))
+        .map(|_| "connected".into())
 }
 
 fn open_process(pid: u32, for_write: bool) -> std::io::Result<String> {
@@ -644,15 +720,250 @@ fn reads_outside_the_workspace_are_not_confined() {
     assert_eq!((code, line.as_str()), (0, "visible"));
 }
 
-/// The documented VM_READ gap. A Low sandbox can open the Medium harness
-/// process for PROCESS_VM_READ, and the harness holds provider keys. This test
-/// asserts the gap so a future change that closes it prompts updating STRENGTH.
+/// Whether a command can open the harness process for `PROCESS_VM_READ`,
+/// against what the backend in use claims.
+///
+/// Under the token sandbox this is a documented gap: the command runs as the
+/// same Windows user, so the harness process's own access list admits it,
+/// Low integrity blocks writes up and not reads, and the harness holds
+/// provider keys while egress is open. Under the sandbox user the command
+/// runs as another user, which that list does not admit, so the open must
+/// fail; that is one of the reasons for decision 0097.
+///
+/// A refusal under the token sandbox and a probe that failed for some other
+/// reason are different findings, and this says which it was: the first means
+/// the strength text must drop the claim, the second means the run proved
+/// nothing. Run 7 reported this test failing without saying which.
 #[test]
-fn the_harness_process_can_be_opened_for_vm_read() {
+fn the_harness_process_vm_read_matches_what_the_backend_claims() {
     let e = env();
     let harness = std::process::id().to_string();
     let (code, line) = probe(&e.ws, "open_process_vm_read", Path::new(&harness));
-    assert_eq!(code, 0, "VM_READ of the harness is now blocked: {line}");
+    let strength = platform_isolation().expect("a backend");
+    let claims_gap = strength.gaps.contains("PROCESS_VM_READ");
+    match (strength.backend, code) {
+        (Backend::WindowsSandboxUser, DENIED) => {}
+        (Backend::WindowsSandboxUser, 0) => panic!(
+            "the sandbox user opened the harness for VM_READ, which its own access list \
+             should refuse to another user: {line}"
+        ),
+        (Backend::WindowsSandboxUser, other) => panic!(
+            "the VM_READ probe exited {other}, neither opened nor refused, so this run \
+             proves nothing about reading the harness: {line}"
+        ),
+        (_, 0) => assert!(
+            claims_gap,
+            "VM_READ of the harness works, and the strength text no longer claims that \
+             gap: put it back, or fix the backend: {line}"
+        ),
+        (_, DENIED) => panic!(
+            "VM_READ of the harness is refused on this machine, and the strength text \
+             still claims it as a gap. Measure it by hand, then drop the claim from \
+             STRENGTH.gaps in sandbox/windows.rs: {line}"
+        ),
+        (_, other) => panic!(
+            "the VM_READ probe exited {other}, neither opened nor refused, so this run \
+             proves nothing about the gap: {line}"
+        ),
+    }
+}
+
+// ---- the sandbox user (decision 0097) ----------------------------------------
+
+/// The sandbox users this machine has, read from the owner's own store, or
+/// `None` where `kgraf sandbox setup` has not run. The SIDs here are what a
+/// command's own SID is compared against.
+fn stored_sandbox_users() -> Option<Vec<(kgraf_sandbox::sandbox_user::StoredUser, Vec<u8>)>> {
+    use kgraf_sandbox::sandbox_user::{blob, credentials_path};
+    let tag = std::env::var("KGRAF_SANDBOX_TAG")
+        .ok()
+        .filter(|t| !t.is_empty());
+    let store = credentials_path(tag.as_deref())?;
+    let bytes = std::fs::read(store).ok()?;
+    blob::decode_users(&bytes).ok()
+}
+
+/// This process's own user SID, the owner's. The probe reports its own the
+/// same way ([`own_user_sid`]).
+fn own_sid_of_this_process() -> String {
+    own_user_sid().expect("this process's own user SID")
+}
+
+/// Whether this machine runs commands as a sandbox user.
+fn sandbox_user_mode() -> bool {
+    platform_isolation().expect("a backend").backend == Backend::WindowsSandboxUser
+}
+
+/// A command runs as a sandbox user, never as the owner. That is what keeps
+/// it out of the owner's own files: the access lists of the owner's profile
+/// admit the owner, SYSTEM and administrators, and none of those is the
+/// command.
+#[test]
+fn a_command_runs_as_a_sandbox_user_and_not_as_the_owner() {
+    let e = env();
+    let (code, line) = probe(&e.ws, "user_sid", Path::new(""));
+    assert_eq!(code, 0, "the probe did not report its user: {line}");
+    let own = own_sid_of_this_process();
+    if !sandbox_user_mode() {
+        // The token sandbox runs the command as the owner, with a cut-down
+        // copy of the owner's token. That is the design of decision 0011.
+        assert_eq!(line, own, "the token sandbox runs as the owner: {line}");
+        return;
+    }
+    assert_ne!(line, own, "the command runs as the owner");
+    let users = stored_sandbox_users().expect("the stored sandbox users");
+    assert!(
+        users.iter().any(|(u, _)| u.sid == line),
+        "the command runs as {line}, which is no sandbox user this setup stored"
+    );
+}
+
+/// The slot user of a command is the one its own worktree maps to, so two
+/// worktrees that map to different slots run as different users and neither
+/// can write the other's files. Where the setup made no slot users, both run
+/// as the one offline user, as every command did before.
+#[test]
+fn a_worktree_runs_as_the_slot_user_its_own_path_maps_to() {
+    if !sandbox_user_mode() {
+        return;
+    }
+    use kgraf_sandbox::sandbox_user::{Role, slot_of};
+    let e = env();
+    let users = stored_sandbox_users().expect("the stored sandbox users");
+    let sid_of = |role: Role| {
+        users
+            .iter()
+            .find(|(u, _)| u.role == role)
+            .map(|(u, _)| u.sid.clone())
+    };
+    let slots = users
+        .iter()
+        .filter(|(u, _)| matches!(u.role, Role::Slot(_)))
+        .count();
+    let expected = |ws: &Workspace| -> String {
+        let root = ws.root();
+        match u8::try_from(slots).unwrap_or(0) {
+            0 => sid_of(Role::Offline).expect("the offline user"),
+            count => {
+                let slot = slot_of(root, count);
+                sid_of(Role::Slot(slot)).unwrap_or_else(|| panic!("no user for slot {slot}"))
+            }
+        }
+    };
+    // A command with no network: that is what the slot users serve.
+    let denied = |ws: &Workspace| {
+        SandboxPolicy::for_workspace(ws, Network::Deny).accept_partial_isolation(true)
+    };
+    for ws in [&e.ws, &e.other] {
+        let out = probe_output(&denied(ws), ws.root(), "user_sid", "", "");
+        let (code, line) = parse(&out);
+        assert_eq!(code, 0, "the probe did not report its user: {line}");
+        assert_eq!(
+            line,
+            expected(ws),
+            "{} runs as the wrong sandbox user",
+            ws.root().display()
+        );
+    }
+    if slots >= 2 {
+        // Two worktrees that map to the same slot share a user, which they
+        // may; the mapping above is what this pins.
+        let a = expected(&e.ws);
+        let b = expected(&e.other);
+        if a == b {
+            eprintln!("note: both worktrees map to the same slot ({a})");
+        }
+    }
+}
+
+/// A file in the owner's profile is not readable by a command that runs as a
+/// sandbox user. Under the token sandbox it is: reads are not confined there
+/// (decision 0011), which is one reason for decision 0097.
+#[test]
+fn the_owners_profile_is_not_readable_as_a_sandbox_user() {
+    let e = env();
+    let profile = PathBuf::from(std::env::var("USERPROFILE").expect("USERPROFILE"));
+    let target = profile.join(format!("kgraf-escape-probe-{}.txt", std::process::id()));
+    std::fs::write(&target, "owner's own file").expect("write in the owner's profile");
+    let (code, line) = probe(&e.ws, "read", &target);
+    let _ = std::fs::remove_file(&target);
+    if sandbox_user_mode() {
+        assert_eq!(
+            code, DENIED,
+            "a sandbox user read a file in the owner's profile: {line}"
+        );
+    } else {
+        assert_eq!(
+            (code, line.as_str()),
+            (0, "owner's own file"),
+            "the token sandbox does not confine reads; the strength text says so"
+        );
+    }
+}
+
+/// A POSIX shell runs. Git Bash cannot start under the token sandbox, because
+/// its runtime opens its own signal pipe for writing and a write-restricted
+/// token refuses that; under the sandbox user there are no restricting SIDs,
+/// so it starts. This is one of the failures decision 0097 exists to fix.
+#[test]
+fn a_posix_shell_runs_as_a_sandbox_user() {
+    if !sandbox_user_mode() {
+        return;
+    }
+    let e = env();
+    let out = sandboxed_command(&policy(&e.ws), "sh", e.ws.root())
+        .expect("a shell command")
+        .args(["-c", "echo shell-ok"])
+        .stdout(Redirect::Piped)
+        .stderr(Redirect::Piped)
+        .output()
+        .expect("run the shell");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && text.contains("shell-ok"),
+        "Git Bash did not run: status {:?}, stdout {text}, stderr {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A command whose policy denies the network cannot reach a listener on this
+/// machine. The firewall rules of the offline and slot users block loopback
+/// outside kGraf's own proxy ports, so a listener on any other port is
+/// unreachable.
+#[test]
+fn a_command_without_the_network_cannot_reach_a_local_listener() {
+    if !sandbox_user_mode() {
+        // The token sandbox cannot deny the network at all, and refuses the
+        // policy instead; `STRENGTH.network_deniable` says so.
+        return;
+    }
+    let e = env();
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .expect("bind a local listener");
+    let port = listener.local_addr().expect("address").port();
+    assert!(
+        !kgraf_sandbox::sandbox_user::PROXY_PORTS.contains(&port),
+        "the listener took one of kGraf's proxy ports, which stay reachable; run again"
+    );
+    std::thread::spawn(move || {
+        for client in listener.incoming() {
+            drop(client);
+        }
+    });
+    let policy = SandboxPolicy::for_workspace(&e.ws, Network::Deny).accept_partial_isolation(true);
+    let out = probe_output(
+        &policy,
+        e.ws.root(),
+        "connect",
+        &format!("127.0.0.1:{port}"),
+        "",
+    );
+    let (code, line) = parse(&out);
+    assert_ne!(
+        code, 0,
+        "a command with the network denied reached a local listener: {line}"
+    );
 }
 
 // ---- process, job, console, desktop ------------------------------------------

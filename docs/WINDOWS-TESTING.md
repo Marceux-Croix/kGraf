@@ -481,6 +481,39 @@ kgraf sandbox remove    # UAC again; every item removed
 kgraf sandbox status    # everything missing again
 ```
 
+Run the sandbox check before `setup` and after it (Git for Windows must be installed):
+
+```
+kgraf sandbox selfcheck    # before setup
+kgraf sandbox setup
+kgraf sandbox selfcheck    # after setup
+```
+
+Expected before `setup` (token sandbox). The network line is not a pass, and the exit code
+is 0:
+
+```
+sandbox selfcheck: passed with a gap
+  backend: Windows restricted token (token sandbox)
+  network: not confined (token sandbox; run `kgraf sandbox setup`)
+  hidden folder: not writable
+  tree: writable
+```
+
+Expected after `setup` (sandbox user). The direct connection to the local origin is blocked,
+and the exit code is 0:
+
+```
+sandbox selfcheck: ok
+  backend: Windows sandbox user
+  network: only the egress proxy was reachable
+  hidden folder: not writable
+  tree: writable
+```
+
+Any other output is a failure. A failure starts with `sandbox selfcheck failed (backend: ...)`
+and names the step. Send back the full output of both runs.
+
 Also check by hand after `setup`: `Get-LocalUser kgraf-*` lists two users, they are
 not on the sign-in screen, and `Get-NetFirewallRule -DisplayGroup "kGraf sandbox"`
 lists four block rules. Send back the output of every command.

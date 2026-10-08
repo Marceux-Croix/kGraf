@@ -249,6 +249,9 @@ pub struct RoutedInterfaceReviewer {
     /// The run this reviewer's calls are made in service of, for the ledger
     /// `agent` field (`orchestrator:<run>:interface_review`).
     pub run: String,
+    /// The run's reasoning setting (decision 0098): each review carries the
+    /// level `interface_review` resolves to.
+    pub reasoning: kgraf_provider::ReasoningLevels,
 }
 
 #[async_trait::async_trait]
@@ -261,7 +264,7 @@ impl InterfaceReviewer for RoutedInterfaceReviewer {
     ) -> Option<Result<(ReviewOutcome, CallId), PlanError>> {
         let (provider, model, max_output_tokens) = self.routes.get(route)?;
         let caller = ModelCaller {
-            reasoning_effort: None,
+            reasoning: self.reasoning,
             provider: provider.clone(),
             ledger: self.ledger.clone(),
             model: model.clone(),

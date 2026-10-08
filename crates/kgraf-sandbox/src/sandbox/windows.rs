@@ -1381,10 +1381,16 @@ mod imp {
                 what: "a unix-socket allowlist (a socket is confined only by its own ACL)",
             });
         }
+        let roots_first = policy.writable.first().map(|r| strip_verbatim(r));
+        // A command without the network runs as the worker slot's user of its
+        // own writable root, where the setup created slot users: two commands
+        // in different worktrees then run as different users, and neither can
+        // write the other's files.
+        let offline = users.offline_role_for(roots_first.as_deref());
         let role = match policy.network {
             Network::Allow => Role::Online,
-            Network::Deny => Role::Offline,
-            Network::Proxy { port } if PROXY_PORTS.contains(&port) => Role::Offline,
+            Network::Deny => offline,
+            Network::Proxy { port } if PROXY_PORTS.contains(&port) => offline,
             Network::Proxy { .. } => {
                 return Err(SandboxError::PolicyNotEnforceable {
                     backend: USER_BACKEND_NAME,
@@ -1436,9 +1442,9 @@ mod imp {
                 users.record_grant(dir)?;
             }
         }
-        // The runner must be readable and runnable by both users wherever
-        // kGraf is installed.
-        for u in [&users.offline, &users.online] {
+        // The runner must be readable and runnable by every sandbox user,
+        // wherever kGraf is installed.
+        for u in users.all() {
             if grant_read(&users.runner, &Sid::from_string(&u.sid)?)? {
                 users.record_grant(&users.runner)?;
             }
@@ -1468,12 +1474,13 @@ mod imp {
     pub(in crate::sandbox) fn prepare_root(root: &Path) -> Result<(), SandboxError> {
         let root = strip_verbatim(root);
         if let Some(users) = state::users()? {
-            // Either sandbox user may run a command here, so both get the
-            // grant ([`prepare_for_user`] writes the one it uses again, a
-            // no-op while it is present).
+            // This runs before kGraf makes a dependency junction in the root,
+            // and any sandbox user may later run a command here, so each one
+            // gets the grant ([`prepare_for_user`] writes the one it uses
+            // again, a no-op while it is present).
             refuse_reparse(&root)?;
             require_acl_volume(&root)?;
-            for user in [&users.offline, &users.online] {
+            for user in users.all() {
                 grant_writable_root(&root, &Sid::from_string(&user.sid)?)?;
             }
             return Ok(());

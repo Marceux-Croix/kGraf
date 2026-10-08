@@ -62,6 +62,7 @@ async fn one_shell_call_under(
         config,
         max_output_tokens: 1_000,
         max_checkpoints: crate::limits::DEFAULT_MAX_CHECKPOINTS,
+        reasoning: Default::default(),
         read_denies: vec![state.clone()],
         workspaces: r.workspaces.clone(),
         routes,

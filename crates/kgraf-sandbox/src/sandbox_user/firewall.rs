@@ -112,15 +112,18 @@ pub struct RuleSpec {
     pub remote_addresses: &'static str,
     /// `None` is every port.
     pub remote_ports: Option<String>,
-    /// The SID the rule applies to.
-    pub user_sid: String,
+    /// The SIDs the rule applies to, in the order of the user list.
+    pub user_sids: Vec<String>,
     /// The rule's local user list, in SDDL.
     pub local_users: String,
 }
 
-/// The offline user's rules.
-pub fn offline_rules(names: &OwnerNames, offline_sid: &str) -> Vec<RuleSpec> {
-    let local_users = local_user_sddl(offline_sid);
+/// The rules that block the network of every user that must not reach it:
+/// the offline user and each worker slot's user ([`Role::blocked`]). One set
+/// of four rules names them all, so the rule names do not change with the
+/// number of slots.
+pub fn offline_rules(names: &OwnerNames, blocked_sids: &[&str]) -> Vec<RuleSpec> {
+    let local_users = local_users_sddl(blocked_sids);
     RulePurpose::ALL
         .into_iter()
         .map(|purpose| {
@@ -158,14 +161,14 @@ pub fn offline_rules(names: &OwnerNames, offline_sid: &str) -> Vec<RuleSpec> {
                 purpose,
                 name: names.rule(purpose),
                 description: format!(
-                    "kGraf sandbox: {what} for the offline sandbox user {}",
-                    names.user(super::names::Role::Offline)
+                    "kGraf sandbox: {what} for kGraf's network-blocked sandbox users ({})",
+                    blocked_sids.len()
                 ),
                 direction,
                 protocol,
                 remote_addresses,
                 remote_ports,
-                user_sid: offline_sid.to_owned(),
+                user_sids: blocked_sids.iter().map(|s| (*s).to_owned()).collect(),
                 local_users: local_users.clone(),
             }
         })
@@ -176,7 +179,15 @@ pub fn offline_rules(names: &OwnerNames, offline_sid: &str) -> Vec<RuleSpec> {
 /// entry with the control access right for the SID, the form the firewall
 /// reads.
 pub fn local_user_sddl(sid: &str) -> String {
-    format!("O:LSD:(A;;CC;;;{sid})")
+    local_users_sddl(std::slice::from_ref(&sid))
+}
+
+/// The rule's local user list for several users: one entry per SID, in the
+/// order given. A rule scoped this way applies to each of them and to no
+/// other user.
+pub fn local_users_sddl(sids: &[&str]) -> String {
+    let entries: String = sids.iter().map(|sid| format!("(A;;CC;;;{sid})")).collect();
+    format!("O:LSD:{entries}")
 }
 
 /// Every port from 1 to 65535 outside `allowed`, as the firewall's port list
@@ -364,14 +375,14 @@ mod tests {
     #[test]
     fn offline_rules_scope_every_rule_to_the_offline_sid() {
         let names = OwnerNames::derive(OWNER, None).unwrap();
-        let rules = offline_rules(&names, OFFLINE);
+        let rules = offline_rules(&names, &[OFFLINE]);
         assert_eq!(rules.len(), 4);
         let names_set: std::collections::BTreeSet<_> =
             rules.iter().map(|r| r.name.clone()).collect();
         assert_eq!(names_set.len(), 4, "rule names are distinct");
         for r in &rules {
             assert_eq!(r.local_users, format!("O:LSD:(A;;CC;;;{OFFLINE})"));
-            assert_eq!(r.user_sid, OFFLINE);
+            assert_eq!(r.user_sids, vec![OFFLINE.to_owned()]);
             assert!(!r.local_users.contains(OWNER), "the owner is never blocked");
             assert_eq!(r.name, names.rule(r.purpose));
             assert!(r.name.starts_with("kgraf-sandbox-"));
@@ -408,5 +419,38 @@ mod tests {
             assert_eq!(RulePurpose::from_key(p.key()), Some(p));
         }
         assert_eq!(RulePurpose::from_key("allow-all"), None);
+    }
+
+    #[test]
+    fn one_rule_set_names_every_network_blocked_user() {
+        let names = OwnerNames::derive(OWNER, None).unwrap().with_slots(3);
+        let slot_sids: Vec<String> = (0..3)
+            .map(|i| format!("S-1-5-21-1-2-3-{}", 1100 + i))
+            .collect();
+        let mut blocked: Vec<&str> = vec![OFFLINE];
+        blocked.extend(slot_sids.iter().map(String::as_str));
+        let rules = offline_rules(&names, &blocked);
+        // The names do not change with the number of slots.
+        assert_eq!(rules.len(), 4);
+        let plain = offline_rules(&OwnerNames::derive(OWNER, None).unwrap(), &[OFFLINE]);
+        assert_eq!(
+            rules.iter().map(|r| r.name.clone()).collect::<Vec<_>>(),
+            plain.iter().map(|r| r.name.clone()).collect::<Vec<_>>()
+        );
+        for r in &rules {
+            for sid in &blocked {
+                assert!(
+                    r.local_users.contains(&format!("(A;;CC;;;{sid})")),
+                    "{} misses {sid}",
+                    r.name
+                );
+            }
+            assert!(!r.local_users.contains(OWNER), "the owner is never blocked");
+            assert_eq!(r.user_sids.len(), 4);
+        }
+        // The online user is not in the list: it is the one that may reach
+        // the network.
+        let online = names.user(super::super::names::Role::Online);
+        assert!(!rules[0].local_users.contains(&online));
     }
 }

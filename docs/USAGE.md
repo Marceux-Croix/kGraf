@@ -1386,14 +1386,87 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   answer cut off at that limit fails and names the flag; interface contracts carry whole
   files, so they may need more. See "Run limits" below for where the default comes from.
 - `--planner-reasoning <off|low|medium|high>` sets the reasoning level of each orchestrator
-  call on the planner's route. Without it, no reasoning field is sent. `off` is checked on
-  every answer: an answer that still carries reasoning fails its call, so a server that
-  ignores the setting is visible at once. A provider with no verified off control refuses
-  the call before sending it. A graded level is sent but cannot be checked; the run says
-  so when it opens. Which servers honor which level: [MODEL-SUPPORT.md](MODEL-SUPPORT.md),
-  "Known limits".
+  call on the planner's route. It is the same as `--reasoning planner=<level>`; see
+  "Reasoning level of each model call" below.
 - One Rust interface costs about 12.5 seconds of checks and one Python interface about
   5.4 seconds on a small project. The run report says whether checks were on.
+
+## Reasoning level of each model call
+
+One setting, `reasoning`, sets how much the model reasons on every model call of a run
+(decision 0098). It has a universal value and overrides:
+
+- `all`: every call.
+- A group: `planner` (every call on the planner's route), `checks` (the contract-check calls
+  made on a worker route's model) or `worker` (a worker's rounds and its compaction summary).
+- One call kind, by the name the ledger records in `call_kind`:
+
+  | Group | Call kinds |
+  | --- | --- |
+  | `planner` | `decompose`, `interfaces`, `reground`, `answer_question`, `judge_connections`, `interpret`, `question_route`, `question_answer`, `challenge_review` |
+  | `checks` | `handshake`, `consumer_test`, `interface_review` |
+  | `worker` | `worker_round`, `worker_compaction` |
+
+The most specific scope wins: a call kind's own value, then its group's, then `all`. Each value
+is one of:
+
+- `unset`: no reasoning field is sent, and the model's own default applies. This is the
+  default for every call. Set it on a kind to turn off a universal level there.
+- `off`: no reasoning. `off` never means "less reasoning": kGraf sends it only where a wire form
+  is verified to turn reasoning off (Chat Completions sends `reasoning_effort: "none"`), and it
+  checks every answer. An answer that still carries reasoning fails its call with an error that
+  says the server ignored the setting. A provider with no verified off control refuses the call
+  before sending it.
+- `low`, `medium`, `high`: sent as the provider spells them. No answer shows whether a server
+  honored a graded level, so kGraf uses what was measured (see below).
+
+Where to set it, highest first. A higher place wins scope by scope, so a flag that sets `all`
+keeps a `planner` value from the settings file:
+
+1. The command line: `--reasoning <level>` for `all`, `--reasoning <scope>=<level>` for a
+   scope. Repeat it for more scopes. `kgraf orchestrate` and `kgraf worker` take it. A scope
+   given twice is refused. `--planner-reasoning <level>` is `--reasoning planner=<level>`;
+   giving both is refused.
+2. The project's `.kgraf/run.json` (the app's runs): a `reasoning` object, for example
+   `"reasoning": {"all": "low", "planner": "off"}`. A file that sets both
+   `planner_reasoning` and `reasoning.planner` is refused.
+3. The user's `settings.toml`, the same file that holds the run limits:
+
+   ```toml
+   [reasoning]
+   all = "low"
+   planner = "off"
+   worker_compaction = "unset"
+   ```
+
+   `kgraf schedule run-now` and the desktop app's runs read it. An unknown scope or level in
+   the table stops the command, naming the table. The app has no control for it yet; it keeps
+   the table when it saves its settings.
+
+Examples:
+
+```
+kgraf orchestrate --route ollama:<model> --prices prices.json --reasoning off
+kgraf orchestrate --route kimi:<model> --prices prices.json --reasoning low --reasoning planner=off
+kgraf worker --provider ollama --model <model> --brief brief.md --reasoning worker=off
+```
+
+What a run says and refuses. When the run opens, kGraf compares each route's level with the
+measurements it has recorded ([MODEL-SUPPORT.md](MODEL-SUPPORT.md), "Reasoning level by
+route"):
+
+- A graded level that was measured to have no effect on that route and model stops the run
+  before any call. The error names the route, the level, the call kinds and the measurement,
+  and tells you to set those kinds to `unset` or `off`. For example, `ollama` with
+  `qwen3.6:35b` does not honor `low`, `medium` or `high`.
+- A graded level with no measurement for that route and model is sent. The run says so at its
+  start, on a `reasoning` line that names the route, the level and the call kinds and says
+  `UNVERIFIED`: the level may have no effect.
+- `off` is said at the start with its check.
+- The effective setting is printed with the other limits, one `reasoning` line per scope and
+  where it came from (`flag` or `user setting`), or `reasoning  unset on every call`.
+
+Reasoning tokens are counted in the ledger as before, for every call kind.
 
 ## Start from the project's own documents
 
@@ -1644,6 +1717,12 @@ folder. Running `setup` again resets the passwords and refreshes the rules. Setu
 stops with a message if Windows Firewall is off or a group policy makes local rules
 ineffective, and it never takes over an account it did not create.
 
+`setup` also creates a user for each worker slot (`--slots`, four by default, none with
+`--slots 0`). A command without the network runs as the slot user of its own worktree, so
+two commands that run at the same time in different worktrees cannot write each other's
+files. Two commands in one worktree share a user. Commands with the network open share the
+single online user.
+
 After `setup`, every sandboxed command runs as the sandbox user, through the
 `kgraf-sandbox-runner` program installed beside `kgraf`. Checks and ordinary shell
 commands run as the offline user. Dependency installs reach the network through kGraf's
@@ -1654,6 +1733,51 @@ the runner is missing, every sandboxed command stops with an error. `kgraf sandb
 also revokes the folder permissions that kGraf added for the users.
 
 On macOS and Linux these commands say that no setup is needed.
+
+### Check that the sandbox confines a command (`kgraf sandbox selfcheck`)
+
+`kgraf sandbox selfcheck` is a hidden command. It is not in `--help`. It runs one real
+command in kGraf's sandbox and says whether the sandbox held. On macOS, Linux and
+Windows, the command:
+
+- writes a file in its writable tree (it must succeed);
+- writes a file in a hidden folder inside that tree (it must fail);
+- fetches a page from a local origin through kGraf's egress proxy (it must succeed);
+- connects to the same origin directly (it must fail).
+
+On Windows the command runs through Git Bash, so Git for Windows must be installed. If it
+is not, the check stops and says how to get it (`winget install Git.Git`, or set
+`KGRAF_GIT_BASH_PATH`). The check never skips in silence.
+
+The output names the backend that ran. With the Windows sandbox user (after
+`kgraf sandbox setup`), the direct connection must fail, because the offline user's firewall
+rules block it:
+
+```
+sandbox selfcheck: ok
+  backend: Windows sandbox user
+  network: only the egress proxy was reachable
+  hidden folder: not writable
+  tree: writable
+```
+
+With the token sandbox (no setup), the Windows sandbox cannot confine the network
+(decision 0011). The check runs the command with the network open. It proves nothing about
+the network, and it says so on a line that is not a pass:
+
+```
+sandbox selfcheck: passed with a gap
+  backend: Windows restricted token (token sandbox)
+  network: not confined (token sandbox; run `kgraf sandbox setup`)
+  hidden folder: not writable
+  tree: writable
+```
+
+Exit status: 0 when every step passed. A pass with the network gap above also exits 0. The
+gap is a known property of the token sandbox, and the output states it. The check exits
+non-zero, with the failing step and the backend, when any step fails. That includes a
+direct connection that works under the sandbox user, or a missing Git Bash. A script that
+must have a confined network checks that the first line is `sandbox selfcheck: ok`.
 
 ## Windows sandbox: checks and the worker shell run with the network open
 
@@ -2273,6 +2397,15 @@ Behavior that differs from earlier builds. Each item names the decision that hol
   driver conflicts when two attempts change it. git 2.31 or newer is required (0094).
 - In Bypass, workers may write `.gitattributes`, `.gitmodules` and `.githooks` when the
   contract declares them; they merge as ordinary files (0094).
+
+**Reasoning level**
+
+- One `reasoning` setting sets the reasoning level of every model call, not only the planner's:
+  `--reasoning` on `orchestrate` and `worker`, `reasoning` in `run.json`, `[reasoning]` in
+  `settings.toml`. Workers, compaction summaries and the contract-check calls send no reasoning
+  field unless it is set (0098).
+- A graded level measured to have no effect on a route and model stops the run when it opens;
+  an unmeasured graded level is sent and said as `UNVERIFIED` at the run's start (0098).
 
 **Scheduled runs**
 

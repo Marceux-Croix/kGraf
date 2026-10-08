@@ -426,6 +426,8 @@ async fn run_one(
         call_mode: CallMode::Stream,
         max_output_tokens: budget.max_output_tokens,
         max_checkpoints: kgraf_host::limits::DEFAULT_MAX_CHECKPOINTS,
+        // A brief run sends no reasoning field: the measured baseline.
+        reasoning: Default::default(),
         path_case: kgraf_tools::detect_path_case(ws.root())
             .context("cannot probe the worktree's filesystem case behavior")?,
         read_denies: vec![state.clone()],

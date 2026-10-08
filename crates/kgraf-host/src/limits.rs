@@ -90,6 +90,25 @@ pub struct UserLimits {
     /// worker's question. `None` derives it per call from the answering
     /// model's recent latencies (`kgraf_orchestrator::answer_wait`).
     pub answer_wait_secs: Option<u32>,
+    /// Not a limit: the reasoning level of each model call (decision 0098),
+    /// the `[reasoning]` table. It shares the settings file and the
+    /// flag-then-setting order with the limits, scope by scope.
+    pub reasoning: kgraf_provider::ReasoningLevels,
+}
+
+/// `settings.toml` table: the reasoning level of each model call (decision
+/// 0098), `all` and overrides by group or call kind, each `unset`, `off`,
+/// `low`, `medium` or `high`.
+pub const KEY_REASONING: &str = "reasoning";
+
+fn read_reasoning(table: &toml::Table) -> Result<kgraf_provider::ReasoningLevels> {
+    match table.get(KEY_REASONING) {
+        None => Ok(kgraf_provider::ReasoningLevels::new()),
+        Some(v) => v
+            .clone()
+            .try_into()
+            .map_err(|e| Error::Invalid(format!("settings: `[{KEY_REASONING}]`: {e}"))),
+    }
 }
 
 fn read_bool_key(table: &toml::Table, key: &str) -> Result<Option<bool>> {
@@ -138,6 +157,7 @@ impl UserLimits {
             warn_rule_conflicts: read_bool_key(&table, KEY_WARN_RULE_CONFLICTS)?,
             compaction_point: None,
             answer_wait_secs: b32(KEY_ANSWER_WAIT, ANSWER_WAIT_BOUNDS)?,
+            reasoning: read_reasoning(&table)?,
         })
     }
 
@@ -215,6 +235,10 @@ pub struct ResolvedLimits {
     pub warn_rule_conflicts: (bool, Source),
     /// `None` by default: derived per call from the answering model.
     pub answer_wait_secs: (Option<u32>, Source),
+    /// The flags' reasoning levels over the user's, scope by scope.
+    pub reasoning: kgraf_provider::ReasoningLevels,
+    /// Where each scope's level came from, for the report.
+    reasoning_flags: kgraf_provider::ReasoningLevels,
 }
 
 impl ResolvedLimits {
@@ -249,7 +273,31 @@ impl ResolvedLimits {
                 user.answer_wait_secs.map(Some),
                 None,
             ),
+            reasoning: flags.reasoning.over(user.reasoning),
+            reasoning_flags: flags.reasoning,
         }
+    }
+
+    /// One line per reasoning scope that is set, with its source; one line
+    /// saying no field is sent when none is.
+    pub fn reasoning_report(&self) -> Vec<String> {
+        if self.reasoning.is_empty() {
+            return vec![format!(
+                "reasoning  unset on every call: no reasoning field is sent ({})",
+                Source::Default.label()
+            )];
+        }
+        self.reasoning
+            .entries()
+            .map(|(scope, level)| {
+                let source = if self.reasoning_flags.get(scope).is_some() {
+                    Source::Flag
+                } else {
+                    Source::Setting
+                };
+                format!("reasoning  {scope} {level} ({})", source.label())
+            })
+            .collect()
     }
 
     /// One line per limit, for the run report. `planner` is false for a command
@@ -296,6 +344,7 @@ impl ResolvedLimits {
                 ),
             });
         }
+        lines.extend(self.reasoning_report());
         lines
     }
 }
@@ -428,7 +477,58 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("planner output cap 32768"), "{text}");
-        assert_eq!(r.report(false).len(), 4, "no planner line without one");
+        assert!(text.contains("reasoning  unset on every call"), "{text}");
+        assert_eq!(
+            r.report(false).len(),
+            5,
+            "no planner line without one; one reasoning line"
+        );
+    }
+
+    /// The `[reasoning]` table of the settings file is read, an unknown
+    /// scope or level in it is refused naming the table, and a flag wins
+    /// over it scope by scope with each source named in the report.
+    #[test]
+    fn the_reasoning_table_is_read_and_a_flag_wins_scope_by_scope() {
+        use kgraf_provider::{ReasoningEffort, ReasoningGroup, ReasoningLevel, ReasoningScope};
+        let user = UserLimits::from_toml_str(
+            "rounds_per_worker = 40\n[reasoning]\nall = \"low\"\nplanner = \"off\"\n",
+        )
+        .expect("read");
+        assert_eq!(
+            user.reasoning.get(ReasoningScope::All),
+            Some(ReasoningLevel::Effort(ReasoningEffort::Low))
+        );
+        for bad in [
+            "[reasoning]\nworkers = \"low\"\n",
+            "[reasoning]\nall = \"none\"\n",
+        ] {
+            let e = UserLimits::from_toml_str(bad).expect_err(bad).to_string();
+            assert!(e.contains("`[reasoning]`"), "{e}");
+        }
+        let flags = UserLimits {
+            reasoning: kgraf_provider::ReasoningLevels::new().with(
+                ReasoningScope::All,
+                ReasoningLevel::Effort(ReasoningEffort::High),
+            ),
+            ..UserLimits::default()
+        };
+        let r = ResolvedLimits::resolve(&flags, &user, 30);
+        assert_eq!(
+            r.reasoning.get(ReasoningScope::All),
+            Some(ReasoningLevel::Effort(ReasoningEffort::High))
+        );
+        assert_eq!(
+            r.reasoning
+                .get(ReasoningScope::Group(ReasoningGroup::Planner)),
+            Some(ReasoningLevel::Effort(ReasoningEffort::Off))
+        );
+        let text = r.reasoning_report().join("\n");
+        assert!(text.contains("reasoning  all high (flag)"), "{text}");
+        assert!(
+            text.contains("reasoning  planner off (user setting)"),
+            "{text}"
+        );
     }
 
     #[test]

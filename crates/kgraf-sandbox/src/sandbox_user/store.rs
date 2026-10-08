@@ -57,9 +57,9 @@ pub enum LoadError {
     #[error(transparent)]
     Blob(#[from] BlobError),
     #[error("the stored passwords file holds no {0} sandbox user; run `kgraf sandbox setup` again")]
-    NoUser(&'static str),
+    NoUser(String),
     #[error("the stored passwords file holds the {0} sandbox user twice")]
-    Duplicate(&'static str),
+    Duplicate(String),
 }
 
 /// The user of `role` and its opened password. Only that user's password is
@@ -195,7 +195,7 @@ mod tests {
         let only_off = encode_credentials(&[(user(Role::Offline, 1010), &pw)], &p).unwrap();
         assert_eq!(
             load_user(&only_off, Role::Online, &p).unwrap_err(),
-            LoadError::NoUser("online")
+            LoadError::NoUser("online".to_owned())
         );
         let twice = encode_credentials(
             &[
@@ -207,7 +207,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             load_user(&twice, Role::Offline, &p).unwrap_err(),
-            LoadError::Duplicate("offline")
+            LoadError::Duplicate("offline".to_owned())
         );
         assert_eq!(p.opened.get(), 0, "no password opened on a refusal");
     }

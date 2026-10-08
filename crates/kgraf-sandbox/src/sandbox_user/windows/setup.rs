@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use super::super::blob::{StoredUser, decode_credentials, decode_users, encode_credentials};
 use super::super::firewall::offline_rules;
 use super::super::handshake::{Event, Message, Receiver, StepOutcome, new_nonce, pipe_name};
-use super::super::names::{OwnerNames, Role};
+use super::super::names::{MAX_SLOTS, OwnerNames, Role};
 use super::super::password::Password;
 use super::super::plan::{
     Action, CredentialCheck, Credentials, Observed, RemoveAction, StatusReport, StepId,
@@ -43,7 +43,7 @@ pub fn record_path(names: &OwnerNames) -> PathBuf {
 /// `with_rights` (it needs administrator rights).
 pub fn observe(names: &OwnerNames, with_rights: bool) -> Result<Observed, SandboxError> {
     let mut o = Observed::default();
-    for role in Role::ALL {
+    for role in names.roles() {
         let user = names.user(role);
         if let Some(f) = accounts::user_facts(&user)? {
             if with_rights {
@@ -146,9 +146,9 @@ fn run_setup(names: &OwnerNames, send: &mut dyn FnMut(Message) -> bool) -> Resul
         Ok(Some(r)) if r.owner_sid == names.owner_sid() => r,
         _ => Record::new(names.owner_sid(), names.tag()),
     };
-    let parts = names.password_forbidden_parts();
     let mut passwords: Vec<(Role, Password)> = Vec::new();
-    for role in Role::ALL {
+    for role in names.roles() {
+        let parts = names.password_forbidden_parts(role);
         let p = Password::generate(&parts).map_err(|e| fail("password", &e))?;
         passwords.push((role, p));
     }
@@ -194,7 +194,8 @@ fn run_setup(names: &OwnerNames, send: &mut dyn FnMut(Message) -> bool) -> Resul
                     Ok(())
                 };
                 made.and_then(|()| {
-                    Role::ALL
+                    names
+                        .roles()
                         .into_iter()
                         .try_for_each(|r| accounts::add_member(&group, &names.user(r)))
                 })
@@ -203,15 +204,14 @@ fn run_setup(names: &OwnerNames, send: &mut dyn FnMut(Message) -> bool) -> Resul
                 .and_then(|s| s.ok_or_else(|| setup_error("find a sandbox user", "missing")))
                 .and_then(|sid| accounts::add_rights(&sid, &DENIED_LOGON_RIGHTS)),
             StepId::Hide(role) => accounts::hide(&names.user(role)),
-            StepId::Rule(purpose) => accounts::sid_of(&names.user(Role::Offline))
-                .and_then(|s| s.ok_or_else(|| setup_error("find the offline user", "missing")))
-                .and_then(|sid| {
-                    offline_rules(names, &sid)
-                        .into_iter()
-                        .find(|r| r.purpose == purpose)
-                        .ok_or_else(|| setup_error("plan a firewall rule", "no such rule"))
-                        .and_then(|spec| firewall::put(&spec))
-                }),
+            StepId::Rule(purpose) => blocked_sids(names).and_then(|sids| {
+                let refs: Vec<&str> = sids.iter().map(String::as_str).collect();
+                offline_rules(names, &refs)
+                    .into_iter()
+                    .find(|r| r.purpose == purpose)
+                    .ok_or_else(|| setup_error("plan a firewall rule", "no such rule"))
+                    .and_then(|spec| firewall::put(&spec))
+            }),
             StepId::Record => Ok(()),
         };
         done.map_err(|e| fail(&key, &e))?;
@@ -340,6 +340,22 @@ fn drive(
     Ok(receiver)
 }
 
+/// The SIDs of every user whose network the firewall rules block: the
+/// offline user and each worker slot's user. One rule names them all, so the
+/// rule names stay the same whatever the slot count is.
+fn blocked_sids(names: &OwnerNames) -> Result<Vec<String>, SandboxError> {
+    names
+        .roles()
+        .into_iter()
+        .filter(|r| r.blocked())
+        .map(|role| {
+            let user = names.user(role);
+            accounts::sid_of(&user)?
+                .ok_or_else(|| setup_error("find a sandbox user", format!("{user} is missing")))
+        })
+        .collect()
+}
+
 /// `kgraf sandbox setup`: create or refresh the sandbox users and rules, then
 /// store their passwords for this user at `store`.
 pub fn setup(
@@ -397,7 +413,15 @@ pub fn remove(
 /// `kgraf sandbox status`: what exists and what is missing. Needs no
 /// administrator rights (logon rights are reported as not read).
 pub fn status(names: &OwnerNames, store: &Path) -> Result<StatusReport, SandboxError> {
-    let observed = observe(names, false)?;
+    // Read every possible slot user, then report the slots this machine
+    // actually has: a report built from a fixed count would call the slots
+    // of a smaller setup missing, and miss those of a larger one.
+    let probe = names.clone().with_slots(MAX_SLOTS);
+    let observed = observe(&probe, false)?;
+    let found = (0..MAX_SLOTS)
+        .take_while(|i| observed.users.contains_key(&probe.user(Role::Slot(*i))))
+        .count();
+    let names = &names.clone().with_slots(u8::try_from(found).unwrap_or(0));
     let record = read_record(&record_path(names));
     let credentials = match std::fs::read(store) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Credentials::Missing,

@@ -194,7 +194,7 @@ pub fn plan_setup(names: &OwnerNames, observed: &Observed) -> Result<Vec<Step>, 
         action: Action::Verify,
         undo: Vec::new(),
     }];
-    for role in Role::ALL {
+    for role in names.roles() {
         let user = names.user(role);
         let action = match observed.users.get(&user) {
             Some(f) if !names.owns_user_comment(role, &f.comment) => {
@@ -210,7 +210,7 @@ pub fn plan_setup(names: &OwnerNames, observed: &Observed) -> Result<Vec<Step>, 
             undo: vec![UndoEntry::User(user)],
         });
     }
-    for role in Role::ALL {
+    for role in names.roles() {
         steps.push(Step {
             id: StepId::NotAdmin(role),
             action: Action::Verify,
@@ -228,7 +228,7 @@ pub fn plan_setup(names: &OwnerNames, observed: &Observed) -> Result<Vec<Step>, 
         action,
         undo: vec![UndoEntry::Group(group)],
     });
-    for role in Role::ALL {
+    for role in names.roles() {
         let user = names.user(role);
         steps.push(Step {
             id: StepId::Rights(role),
@@ -242,7 +242,7 @@ pub fn plan_setup(names: &OwnerNames, observed: &Observed) -> Result<Vec<Step>, 
             }],
         });
     }
-    for role in Role::ALL {
+    for role in names.roles() {
         let user = names.user(role);
         let action = if observed.hidden.contains(&user) {
             Action::Update
@@ -482,7 +482,7 @@ pub fn status_report(
             "a group policy overrides local rules",
         ),
     );
-    for role in Role::ALL {
+    for role in names.roles() {
         let user = names.user(role);
         let state = match observed.users.get(&user) {
             None => ItemState::Missing,
@@ -516,7 +516,7 @@ pub fn status_report(
         }
     };
     push(format!("group {group}"), state);
-    for role in Role::ALL {
+    for role in names.roles() {
         let user = names.user(role);
         let state = match observed.rights.get(&user) {
             _ if !observed.users.contains_key(&user) => ItemState::Missing,
@@ -538,7 +538,7 @@ pub fn status_report(
         };
         push(format!("denied logon rights of {user}"), state);
     }
-    for role in Role::ALL {
+    for role in names.roles() {
         let user = names.user(role);
         let state = if observed.hidden.contains(&user) {
             ItemState::Present
@@ -570,7 +570,7 @@ pub fn status_report(
             push("stored passwords".into(), ItemState::Wrong(why.clone()))
         }
         Credentials::Stored(users) => {
-            for role in Role::ALL {
+            for role in names.roles() {
                 let user = names.user(role);
                 let state = match users.iter().find(|(u, _)| *u == user) {
                     None => ItemState::Missing,
@@ -614,7 +614,7 @@ mod tests {
             group: Some(n.group_comment()),
             ..Observed::default()
         };
-        for (i, role) in Role::ALL.into_iter().enumerate() {
+        for (i, role) in Role::FIXED.into_iter().enumerate() {
             let user = n.user(role);
             o.users.insert(
                 user.clone(),
@@ -666,7 +666,7 @@ mod tests {
         let ids: Vec<StepId> = steps.iter().map(|s| s.id).collect();
         let pos = |id| ids.iter().position(|x| *x == id).unwrap();
         // Users exist before the steps that name them.
-        for role in Role::ALL {
+        for role in names().roles() {
             assert!(pos(StepId::User(role)) < pos(StepId::NotAdmin(role)));
             assert!(pos(StepId::User(role)) < pos(StepId::Group));
             assert!(pos(StepId::User(role)) < pos(StepId::Rights(role)));

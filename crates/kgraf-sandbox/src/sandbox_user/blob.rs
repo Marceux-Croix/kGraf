@@ -21,11 +21,16 @@
 
 use zeroize::Zeroizing;
 
-use super::names::{MAX_USER_NAME, Role, is_sid_string};
+use super::names::{MAX_SLOTS, MAX_USER_NAME, Role, is_sid_string};
 use super::password::Password;
 
 pub const MAGIC: &[u8; 8] = b"KGSBCRED";
-pub const VERSION: u8 = 1;
+pub const VERSION: u8 = 2;
+
+/// The first role byte of a worker slot: slot `i` is `SLOT_BYTE + i`. A
+/// version 1 file held only the two fixed roles, so a kGraf that reads one
+/// asks for a fresh setup instead of guessing.
+pub const SLOT_BYTE: u8 = 16;
 
 /// The largest protected password accepted (a DPAPI blob of a 40-character
 /// password is a few hundred bytes).
@@ -66,8 +71,23 @@ fn role_byte(r: Role) -> u8 {
     match r {
         Role::Offline => 0,
         Role::Online => 1,
+        Role::Slot(i) => SLOT_BYTE.saturating_add(i),
     }
 }
+
+fn role_of_byte(b: u8) -> Option<Role> {
+    match b {
+        0 => Some(Role::Offline),
+        1 => Some(Role::Online),
+        _ => {
+            let i = b.checked_sub(SLOT_BYTE)?;
+            (i < MAX_SLOTS).then_some(Role::Slot(i))
+        }
+    }
+}
+
+/// How many users one file may hold: the two fixed roles and every slot.
+const MAX_ENTRIES: usize = 2 + MAX_SLOTS as usize;
 
 /// The file's bytes for these users and passwords.
 pub fn encode_credentials(
@@ -77,6 +97,9 @@ pub fn encode_credentials(
     let mut out = Vec::new();
     out.extend_from_slice(MAGIC);
     out.push(VERSION);
+    if entries.len() > MAX_ENTRIES {
+        return Err(BlobError::Entry);
+    }
     out.push(u8::try_from(entries.len()).map_err(|_| BlobError::Entry)?);
     for (user, password) in entries {
         if user.name.is_empty() || user.name.len() > MAX_USER_NAME || !is_sid_string(&user.sid) {
@@ -142,13 +165,12 @@ pub fn decode_users(bytes: &[u8]) -> Result<Vec<(StoredUser, Vec<u8>)>, BlobErro
         return Err(BlobError::Version(version));
     }
     let count = c.u8()?;
+    if usize::from(count) > MAX_ENTRIES {
+        return Err(BlobError::Entry);
+    }
     let mut out = Vec::with_capacity(usize::from(count));
     for _ in 0..count {
-        let role = match c.u8()? {
-            0 => Role::Offline,
-            1 => Role::Online,
-            _ => return Err(BlobError::Entry),
-        };
+        let role = role_of_byte(c.u8()?).ok_or(BlobError::Entry)?;
         let name = c.text()?;
         let sid = c.text()?;
         if name.is_empty() || name.len() > MAX_USER_NAME || !is_sid_string(&sid) {
@@ -292,9 +314,17 @@ mod tests {
             decode_users(b"NOTKGRAF\x01\x00").unwrap_err(),
             BlobError::Magic
         );
-        let mut v2 = good.clone();
-        v2[8] = 2;
-        assert_eq!(decode_users(&v2).unwrap_err(), BlobError::Version(2));
+        // A version this kGraf does not read, newer or older: the file of a
+        // setup from before worker slots is refused, not read as if it had
+        // none.
+        for version in [1u8, 3] {
+            let mut other = good.clone();
+            other[8] = version;
+            assert_eq!(
+                decode_users(&other).unwrap_err(),
+                BlobError::Version(version)
+            );
+        }
         for cut in [9, 10, 12, good.len() - 1] {
             assert_eq!(
                 decode_users(&good[..cut]).unwrap_err(),
@@ -329,5 +359,50 @@ mod tests {
             encode_credentials(&[(u, &pw)], &FakeProtector(1)).unwrap_err(),
             BlobError::Entry
         );
+    }
+
+    #[test]
+    fn slot_users_round_trip_through_their_role_bytes() {
+        let pw = Password::generate(&[]).unwrap();
+        let p = FakeProtector(0x2a);
+        let slots: Vec<StoredUser> = [0u8, 1, 7, MAX_SLOTS - 1]
+            .into_iter()
+            .map(|i| StoredUser {
+                role: Role::Slot(i),
+                name: format!("kgraf-s{i:02}-1a2b3c4d"),
+                sid: format!("S-1-5-21-1-2-3-{}", 1100 + u32::from(i)),
+            })
+            .collect();
+        let entries: Vec<(StoredUser, &Password)> =
+            slots.iter().cloned().map(|u| (u, &pw)).collect();
+        let bytes = encode_credentials(&entries, &p).unwrap();
+        let back: Vec<StoredUser> = decode_users(&bytes)
+            .unwrap()
+            .into_iter()
+            .map(|(u, _)| u)
+            .collect();
+        assert_eq!(back, slots);
+        // A byte between the fixed roles and the first slot names no role.
+        let mut bad = bytes.clone();
+        bad[10] = SLOT_BYTE - 1;
+        assert_eq!(decode_users(&bad).unwrap_err(), BlobError::Entry);
+        // A slot above the highest one does not either.
+        let mut high = bytes.clone();
+        high[10] = SLOT_BYTE + MAX_SLOTS;
+        assert_eq!(decode_users(&high).unwrap_err(), BlobError::Entry);
+        // More entries than there can be users.
+        let many: Vec<(StoredUser, &Password)> = (0..=MAX_ENTRIES)
+            .map(|i| {
+                (
+                    StoredUser {
+                        role: Role::Slot(0),
+                        name: format!("kgraf-s{:02}-1a2b3c4d", i % 100),
+                        sid: "S-1-5-21-1-2-3-1100".to_owned(),
+                    },
+                    &pw,
+                )
+            })
+            .collect();
+        assert_eq!(encode_credentials(&many, &p).unwrap_err(), BlobError::Entry);
     }
 }

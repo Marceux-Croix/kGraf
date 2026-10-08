@@ -14,7 +14,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use super::super::names::{OwnerNames, Role};
+use super::super::names::{MAX_SLOTS, OwnerNames, Role, slot_of};
 use super::super::password::Password;
 use super::super::runner::RUNNER_NAME;
 use super::super::store::{credentials_path, grants_path};
@@ -42,11 +42,15 @@ impl std::fmt::Debug for LoadedUser {
     }
 }
 
-/// Both sandbox users and the runner that starts commands as them.
+/// The sandbox users and the runner that starts commands as them.
 #[derive(Debug)]
 pub(crate) struct Users {
     pub offline: LoadedUser,
     pub online: LoadedUser,
+    /// One user per worker slot, in slot order, as the setup created them.
+    /// Empty where the setup made none, and then [`Self::offline`] runs every
+    /// command that has no network.
+    pub slots: Vec<LoadedUser>,
     pub runner: PathBuf,
     /// The list of the owner's folders granted to the sandbox users
     /// ([`grants_path`]).
@@ -71,7 +75,33 @@ impl Users {
         match role {
             Role::Offline => &self.offline,
             Role::Online => &self.online,
+            // A slot the setup did not create falls back to the offline
+            // user, which is confined the same way.
+            Role::Slot(i) => self.slots.get(usize::from(i)).unwrap_or(&self.offline),
         }
+    }
+
+    /// Which user runs a command without the network whose first writable
+    /// root is `root`. With slot users present, the slot is the root's name
+    /// folded to the slot count, so two commands in different worktrees
+    /// usually run as different users and neither can write the other's
+    /// files; two commands in one worktree share a user, which they must,
+    /// because they share the folder. Without slot users it is always the
+    /// offline user.
+    pub(crate) fn offline_role_for(&self, root: Option<&Path>) -> Role {
+        let count = u8::try_from(self.slots.len()).unwrap_or(u8::MAX);
+        match (count, root) {
+            (0, _) | (_, None) => Role::Offline,
+            (count, Some(root)) => Role::Slot(slot_of(root, count)),
+        }
+    }
+
+    /// Every user, for a grant that either of them may need.
+    pub(crate) fn all(&self) -> Vec<&LoadedUser> {
+        std::iter::once(&self.offline)
+            .chain(std::iter::once(&self.online))
+            .chain(self.slots.iter())
+            .collect()
     }
 }
 
@@ -105,7 +135,31 @@ fn load() -> Result<Option<Users>, SandboxError> {
     };
     let (online, online_pw) = stored_user(&store, Role::Online)?
         .ok_or_else(|| error("the stored passwords file holds no online sandbox user"))?;
-    for (user, role) in [(&offline, Role::Offline), (&online, Role::Online)] {
+    // The slot users the setup created, from slot 0 up to the first gap: a
+    // store that names slot 0 and slot 2 but not slot 1 is not one this
+    // kGraf wrote, and acting on part of it would run two worktrees as one
+    // user without saying so.
+    let mut slots: Vec<(super::super::blob::StoredUser, Password)> = Vec::new();
+    for i in 0..MAX_SLOTS {
+        match stored_user(&store, Role::Slot(i))? {
+            Some(found) => slots.push(found),
+            None => break,
+        }
+    }
+    for i in u8::try_from(slots.len()).unwrap_or(u8::MAX)..MAX_SLOTS {
+        if stored_user(&store, Role::Slot(i))?.is_some() {
+            return Err(error(format!(
+                "the stored passwords file names worker slot {i} but not every slot below it; \
+                 run `kgraf sandbox setup` again"
+            )));
+        }
+    }
+    let mut checked: Vec<(&super::super::blob::StoredUser, Role)> =
+        vec![(&offline, Role::Offline), (&online, Role::Online)];
+    for (i, (user, _)) in slots.iter().enumerate() {
+        checked.push((user, Role::Slot(u8::try_from(i).unwrap_or(u8::MAX))));
+    }
+    for (user, role) in checked {
         let want = names.user(role);
         if user.name != want {
             return Err(error(format!(
@@ -146,6 +200,14 @@ fn load() -> Result<Option<Users>, SandboxError> {
             sid: online.sid,
             password: online_pw,
         },
+        slots: slots
+            .into_iter()
+            .map(|(user, password)| LoadedUser {
+                name: user.name,
+                sid: user.sid,
+                password,
+            })
+            .collect(),
         runner,
         grants: grants_path(&store),
     }))

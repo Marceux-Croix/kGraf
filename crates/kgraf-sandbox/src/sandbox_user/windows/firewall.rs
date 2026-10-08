@@ -196,7 +196,7 @@ mod tests {
     fn the_firewall_accepts_every_rule_setup_writes() {
         let owner_sid = "S-1-5-21-1-2-3-1001";
         let names = OwnerNames::derive(owner_sid, Some("fwtest")).unwrap();
-        let specs = offline_rules(&names, "S-1-5-21-1-2-3-1010");
+        let specs = offline_rules(&names, &["S-1-5-21-1-2-3-1010", "S-1-5-21-1-2-3-1100"]);
         assert_eq!(specs.len(), 4);
         for spec in &specs {
             let rule = build(spec).unwrap_or_else(|e| panic!("{}: {e}", spec.name));

@@ -3882,6 +3882,7 @@ dependencies = [
  "kgraf-interpret",
  "kgraf-provider",
  "kgraf-provider-google",
+ "kgraf-provider-openai",
  "kgraf-runtime",
  "kgraf-sandbox",
  "kgraf-schedule",

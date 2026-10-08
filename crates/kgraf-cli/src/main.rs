@@ -208,6 +208,12 @@ enum Command {
         /// round limit. Default: the `max_checkpoints` user setting, else 10.
         #[arg(long)]
         max_checkpoints: Option<u32>,
+        /// Reasoning level, repeatable: `LEVEL` for every call, or
+        /// `SCOPE=LEVEL` for `worker`, `worker_round` or `worker_compaction`.
+        /// A level is unset, off, low, medium or high. Default: the
+        /// `[reasoning]` user setting, else unset (no reasoning field).
+        #[arg(long, value_name = "[SCOPE=]LEVEL")]
+        reasoning: Vec<kgraf_provider::ReasoningAssignment>,
         /// Output ceiling per round, lowered to the model's supported limit.
         /// Default: the `worker_max_tokens` user setting, else 16,384.
         #[arg(long)]
@@ -398,14 +404,20 @@ enum Command {
         #[arg(long)]
         planner_max_tokens: Option<u32>,
         /// Reasoning level of every orchestrator call on the planner's route:
-        /// off, low, medium or high. Without it, no reasoning field is sent
-        /// and the provider's default applies. `off` is sent where a wire form
-        /// is verified to turn reasoning off (Chat Completions: `none`), and
-        /// an answer that still carries reasoning fails its call; an adapter
-        /// with no verified off form refuses the call. A graded level cannot
-        /// be checked from an answer, and the run says so when it opens.
+        /// off, low, medium or high. The same as `--reasoning planner=LEVEL`;
+        /// setting both is refused.
         #[arg(long)]
         planner_reasoning: Option<kgraf_provider::ReasoningEffort>,
+        /// Reasoning level of the run's model calls, repeatable: `LEVEL` for
+        /// every call, or `SCOPE=LEVEL` where SCOPE is a group (`planner`,
+        /// `checks`, `worker`) or a call kind (`decompose`, `worker_round`,
+        /// ...). The most specific scope wins. A level is unset (no field:
+        /// the model's default), off, low, medium or high. Default: the
+        /// `[reasoning]` user setting, else unset. `off` is checked on every
+        /// answer; a graded level measured to have no effect on a route is
+        /// refused, and one never measured there is said at run start.
+        #[arg(long, value_name = "[SCOPE=]LEVEL")]
+        reasoning: Vec<kgraf_provider::ReasoningAssignment>,
         /// Seconds a worker's question waits for the orchestrator's model to
         /// answer it, and a connection judgment may run (30 to 1800). A
         /// later answer still reaches the worker at its next round. Default:
@@ -625,6 +637,12 @@ enum SandboxAction {
         /// A name suffix for a separate test setup.
         #[arg(long, hide = true)]
         tag: Option<String>,
+        /// How many worker slots get a user of their own, so commands that
+        /// run at the same time in different worktrees cannot write each
+        /// other's files. 0 runs every command without the network as one
+        /// user, as before.
+        #[arg(long, default_value_t = kgraf_sandbox::sandbox_user::DEFAULT_SLOTS)]
+        slots: u8,
     },
     /// Remove everything `setup` created (Windows; asks for administrator
     /// rights).
@@ -653,9 +671,11 @@ enum SandboxAction {
         #[arg(long)]
         tag: Option<String>,
     },
-    /// Run one command under a proxy-only network policy with a hidden
-    /// folder, and report whether the sandbox held. Exits with an error when
-    /// the system denies what the sandbox needs.
+    /// Run one command under the strongest network policy this platform
+    /// has, with a hidden folder, and report whether the sandbox held. On
+    /// Windows it names the backend, and says so where the network cannot be
+    /// confined. Exits with an error when the system denies what the sandbox
+    /// needs, or when a step fails.
     #[command(hide = true)]
     Selfcheck,
 }
@@ -959,6 +979,21 @@ fn resolve_limits(
     Ok(resolved)
 }
 
+/// The reasoning levels the flags set (decision 0098): each `--reasoning`
+/// assignment, and `--planner-reasoning` as `planner=LEVEL`. A scope set
+/// twice is refused.
+fn reasoning_flags(
+    reasoning: &[kgraf_provider::ReasoningAssignment],
+    planner_reasoning: Option<kgraf_provider::ReasoningEffort>,
+) -> Result<kgraf_provider::ReasoningLevels> {
+    let planner = planner_reasoning.map(|level| kgraf_provider::ReasoningAssignment {
+        scope: kgraf_provider::ReasoningScope::Group(kgraf_provider::ReasoningGroup::Planner),
+        level: level.into(),
+    });
+    kgraf_provider::ReasoningLevels::from_assignments(reasoning.iter().copied().chain(planner))
+        .map_err(anyhow::Error::msg)
+}
+
 /// This run's answer about the rule-conflict warning, from its two flags
 /// (clap refuses both at once): `None` leaves it to the user setting.
 fn warn_choice(warn: bool, no_warn: bool) -> Option<bool> {
@@ -1215,6 +1250,7 @@ fn run_cli() -> Result<()> {
             shell_timeout,
             planner_max_tokens,
             planner_reasoning,
+            reasoning,
             retry_gate,
             waive_gate,
             gate_note,
@@ -1253,6 +1289,7 @@ fn run_cli() -> Result<()> {
                     // `--point` is read on its own; this field is the desktop's.
                     compaction_point: None,
                     answer_wait_secs: answer_wait,
+                    reasoning: reasoning_flags(&reasoning, planner_reasoning)?,
                 },
                 kgraf_host::limits::DEFAULT_ROUNDS_ORCHESTRATED,
                 true,
@@ -1286,7 +1323,7 @@ fn run_cli() -> Result<()> {
                     check_compile_timeout: std::time::Duration::from_secs(check_compile_timeout),
                     shell_timeout: shell_timeout.map(std::time::Duration::from_secs),
                     planner_max_tokens: limits.planner_max_tokens.0,
-                    planner_reasoning,
+                    reasoning: limits.reasoning,
                     retry_gate,
                     waive_gate,
                     gate_note,
@@ -1324,6 +1361,7 @@ fn run_cli() -> Result<()> {
             slices,
             budget,
             max_checkpoints,
+            reasoning,
             max_tokens,
             mode,
             window,
@@ -1351,6 +1389,7 @@ fn run_cli() -> Result<()> {
                     warn_rule_conflicts: None,
                     compaction_point: None,
                     answer_wait_secs: None,
+                    reasoning: reasoning_flags(&reasoning, None)?,
                 },
                 kgraf_host::limits::DEFAULT_ROUNDS_SINGLE_WORKER,
                 false,
@@ -1364,6 +1403,7 @@ fn run_cli() -> Result<()> {
                     slices,
                     budget: limits.rounds.0,
                     max_checkpoints: limits.max_checkpoints.0,
+                    reasoning: limits.reasoning,
                     max_tokens: limits.worker_max_tokens.0,
                     mode,
                     window: limits.window.0,
@@ -1440,6 +1480,9 @@ fn run_cli() -> Result<()> {
                         ),
                         compaction_point: None,
                         answer_wait_secs: None,
+                        // No flag of its own: a scheduled run takes the
+                        // `[reasoning]` user setting.
+                        reasoning: kgraf_provider::ReasoningLevels::new(),
                     },
                     kgraf_host::limits::DEFAULT_ROUNDS_ORCHESTRATED,
                     true,
@@ -1460,6 +1503,7 @@ fn run_cli() -> Result<()> {
                         planner_max_tokens: limits.planner_max_tokens.0,
                         warn_rule_conflicts: limits.warn_rule_conflicts.0,
                         answer_wait_secs: limits.answer_wait_secs.0,
+                        reasoning: limits.reasoning,
                         window: limits.window.0,
                         verify,
                         force,
@@ -1489,7 +1533,7 @@ fn run_cli() -> Result<()> {
             DiagAction::Export { out } => diag_cmd::export(out, &root),
         },
         Command::Sandbox { action } => match action {
-            SandboxAction::Setup { tag } => sandbox_cmd::setup(tag.as_deref()),
+            SandboxAction::Setup { tag, slots } => sandbox_cmd::setup(tag.as_deref(), slots),
             SandboxAction::Remove { tag } => sandbox_cmd::remove(tag.as_deref()),
             SandboxAction::Status { tag } => sandbox_cmd::status(tag.as_deref()),
             SandboxAction::Elevated {
@@ -2660,6 +2704,97 @@ mod tests {
         assert!(parse(&["--planner-reasoning", "none"]).is_err());
     }
 
+    /// `--reasoning` is repeatable on `orchestrate` and `worker`, takes a bare
+    /// level or `SCOPE=LEVEL`, and `--planner-reasoning` is its `planner`
+    /// scope: naming that scope both ways is refused, never resolved by order.
+    #[test]
+    fn reasoning_flags_set_scopes_and_a_scope_named_twice_is_refused() {
+        use kgraf_provider::{
+            ReasoningEffort, ReasoningGroup, ReasoningLevel, ReasoningProcess, ReasoningScope,
+        };
+        let cli = Cli::try_parse_from([
+            "kgraf",
+            "orchestrate",
+            "--route",
+            "ollama:llama3",
+            "--prices",
+            "p.json",
+            "--reasoning",
+            "low",
+            "--reasoning",
+            "worker_compaction=unset",
+            "--planner-reasoning",
+            "off",
+        ])
+        .expect("parse");
+        let Command::Orchestrate {
+            reasoning,
+            planner_reasoning,
+            ..
+        } = cli.command
+        else {
+            panic!("not orchestrate");
+        };
+        let levels = reasoning_flags(&reasoning, planner_reasoning).expect("levels");
+        assert_eq!(
+            levels.effort(ReasoningProcess::Decompose),
+            Some(ReasoningEffort::Off)
+        );
+        assert_eq!(
+            levels.effort(ReasoningProcess::WorkerRound),
+            Some(ReasoningEffort::Low)
+        );
+        assert_eq!(
+            levels.get(ReasoningScope::Process(ReasoningProcess::WorkerCompaction)),
+            Some(ReasoningLevel::Unset)
+        );
+        let twice = reasoning_flags(
+            &["planner=low".parse().expect("assignment")],
+            Some(ReasoningEffort::Off),
+        )
+        .expect_err("twice")
+        .to_string();
+        assert!(twice.contains("set twice"), "{twice}");
+        assert!(
+            Cli::try_parse_from([
+                "kgraf",
+                "worker",
+                "--provider",
+                "ollama",
+                "--model",
+                "m",
+                "--brief",
+                "b.md",
+                "--reasoning",
+                "workers=low",
+            ])
+            .is_err(),
+            "an unknown scope is refused by the parser"
+        );
+        let worker = Cli::try_parse_from([
+            "kgraf",
+            "worker",
+            "--provider",
+            "ollama",
+            "--model",
+            "m",
+            "--brief",
+            "b.md",
+            "--reasoning",
+            "worker=high",
+        ])
+        .expect("parse");
+        let Command::Worker { reasoning, .. } = worker.command else {
+            panic!("not worker");
+        };
+        assert_eq!(
+            reasoning_flags(&reasoning, None)
+                .expect("levels")
+                .get(ReasoningScope::Group(ReasoningGroup::Worker)),
+            Some(ReasoningEffort::High.into())
+        );
+    }
+
     /// Decision 0089: `--model-route` is repeatable on both run commands and
     /// absent by default.
     #[test]
@@ -2872,6 +3007,7 @@ mod tests {
             warn_rule_conflicts: None,
             compaction_point: None,
             answer_wait_secs: None,
+            reasoning: kgraf_provider::ReasoningLevels::new(),
         };
         let user = UserLimits {
             rounds: Some(40),

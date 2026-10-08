@@ -241,16 +241,30 @@ otherwise.
   reasoning count of zero. No token count is derived from the characters, because kGraf has
   no tokenizer for the served model. The `llama-cpp` route uses the same adapter and the
   same rule; its usage shape has not been recorded.
-- **Reasoning level (`reasoning_effort`) by route.** `kgraf orchestrate --planner-reasoning
-  <off|low|medium|high>` sets the level of every orchestrator call on the planner's route.
-  Without it, no reasoning field is sent. What each adapter does with a level:
+- **Reasoning level (`reasoning_effort`) by route.** The `reasoning` setting (decision 0098;
+  `--reasoning`, `run.json`, `[reasoning]` in `settings.toml`, see [USAGE.md](USAGE.md)) sets
+  the level of every model call: orchestrator calls, contract-check calls, worker rounds and
+  compaction summaries. Unset, the default, sends no reasoning field. What each adapter does
+  with a level:
 
   | Adapter | `off` | `low`, `medium`, `high` |
   |---|---|---|
-  | Chat Completions (`ollama`, `llama-cpp`, `openai` chat routes and the other vendors on this protocol) | Sent as `reasoning_effort: "none"`. An answer that carries reasoning text or reasoning tokens fails the call with `ReasoningNotOff`, after the call is recorded in the ledger. | Sent as is. Not checked: no answer shows whether a graded level was honored. |
+  | Chat Completions (`ollama`, `llama-cpp`, `openai` chat routes and the other vendors on this protocol) | Sent as `reasoning_effort: "none"`. An answer that carries reasoning text or reasoning tokens fails the call with `ReasoningNotOff`, after the call is recorded in the ledger. | Sent as is. No answer shows whether a graded level was honored, so the route profile below decides: refused when measured as not honored, otherwise sent with a run-start notice. |
   | Responses (`openai` Responses routes) | Refused before sending: no off form is verified on this protocol. | Sent as `reasoning.effort`. |
   | Gemini | Refused before sending: no off form is verified. | Mapped to a thinking budget or level by model family. |
   | Anthropic, Bedrock | Refused before sending, as every level is. | Refused before sending. |
+
+  Which levels are verified on which route and model. This is the route profile kGraf reads
+  when a run opens (`kgraf_fleet::REASONING_MEASUREMENTS`). A level measured as not honored is
+  refused before any call. A graded level on any route and model not listed is BUILT, UNTESTED:
+  it is sent, and the run's start says `UNVERIFIED`. `off` on a route not listed is BUILT,
+  UNTESTED too, and is checked on every answer where the adapter sends it.
+
+  | Route | Model | `off` | `low` | `medium` | `high` | Record |
+  |---|---|---|---|---|---|---|
+  | `ollama` | `qwen3.6:35b` | VERIFIED: turns reasoning off | NOT HONORED: refused | NOT HONORED: refused | NOT HONORED: refused | The measurement below, 2026-10-08 |
+  | Every other route and model | | BUILT, UNTESTED | BUILT, UNTESTED | BUILT, UNTESTED | BUILT, UNTESTED | None |
+
 
   Measured on `ollama` (Ollama 0.34.4, `qwen3.6:35b`, digest
   `a7eb95c53bcf96b4bdd008d0fab4a5dac88047d9c1a7a9ab88ed453423fbd87c`, 2026-10-08, three
@@ -308,3 +322,6 @@ otherwise.
   `reasoning_effort: "none"`, measured on `ollama` with `qwen3.6:35b`, and fails an answer
   that still reasons; the Responses and Gemini adapters refuse it (see Known limits). No
   route status changes.
+- 2026-10-08: the `reasoning` setting covers every model call (decision 0098). A route
+  profile records the measured levels; `low`, `medium` and `high` on `ollama` with
+  `qwen3.6:35b` are refused when a run opens. No route status changes.

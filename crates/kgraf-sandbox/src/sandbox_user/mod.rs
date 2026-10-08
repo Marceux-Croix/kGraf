@@ -52,7 +52,7 @@ pub mod windows;
 pub use blob::{BlobError, Protector, StoredUser, decode_credentials, encode_credentials};
 pub use firewall::{PROXY_PORTS, RulePurpose, RuleSpec, offline_rules};
 pub use handshake::{HandshakeError, Message, StepOutcome};
-pub use names::{NameError, OwnerNames, Role};
+pub use names::{DEFAULT_SLOTS, MAX_SLOTS, NameError, OwnerNames, Role, slot_of};
 pub use password::{Password, PasswordError};
 pub use plan::{
     Action, CredentialCheck, Credentials, FirewallFacts, ItemState, Observed, PlanError,

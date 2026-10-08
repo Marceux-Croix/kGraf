@@ -103,7 +103,7 @@ async fn the_retry_after_a_stall_names_the_repeated_call() {
     );
     let reader = Arc::new(RepeatingReader::default());
     let caller = |provider: Arc<ScriptFake>| ModelCaller {
-        reasoning_effort: None,
+        reasoning: Default::default(),
         provider,
         ledger: p.ledger.clone(),
         model: PLAN_MODEL.into(),

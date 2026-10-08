@@ -52,6 +52,9 @@ pub(crate) struct AttemptAssembler {
     pub(crate) max_output_tokens: u32,
     /// The run's `RunConfig::max_checkpoints` (decision 0096).
     pub(crate) max_checkpoints: u32,
+    /// The run's reasoning setting (decision 0098), for every attempt's
+    /// worker rounds and compaction summaries.
+    pub(crate) reasoning: kgraf_provider::ReasoningLevels,
     pub(crate) read_denies: Vec<PathBuf>,
     pub(crate) workspaces: Arc<GitWorkspaces>,
     pub(crate) routes: BTreeMap<String, RouteParts>,
@@ -177,6 +180,7 @@ impl AttemptAssembler {
             call_mode: CallMode::Complete,
             max_output_tokens: self.max_output_tokens,
             max_checkpoints: self.max_checkpoints,
+            reasoning: self.reasoning,
             path_case,
             read_denies: self.read_denies.clone(),
             mcp_home: self.state.join("mcp-home"),

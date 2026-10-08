@@ -129,6 +129,9 @@ pub struct Assembly {
     pub max_output_tokens: u32,
     /// The most progress checkpoints the worker may reach (decision 0096).
     pub max_checkpoints: u32,
+    /// The reasoning setting (decision 0098): the worker's rounds and its
+    /// compaction summaries carry the levels they resolve to.
+    pub reasoning: kgraf_provider::ReasoningLevels,
     pub path_case: PathCase,
     /// Paths no shell command may read: directories, or single files (see
     /// the module docs and [`state_read_denies`]).
@@ -737,6 +740,7 @@ pub async fn assemble(a: Assembly) -> Result<Assembled> {
     env.settings.call_mode = a.call_mode;
     env.settings.max_output_tokens = a.max_output_tokens;
     env.settings.max_checkpoints = a.max_checkpoints;
+    env.settings.reasoning = a.reasoning;
     env.settings.path_case = a.path_case;
     Ok(Assembled {
         env: Arc::new(env),

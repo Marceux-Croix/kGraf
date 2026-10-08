@@ -57,6 +57,8 @@ libc = "0.2.185"
 [dev-dependencies]
 # Every orchestrator tool schema is converted for Vertex in `tests/vertex_schemas.rs`.
 kgraf-provider-google = { path = "../kgraf-provider-google" }
+# The Chat Completions encoder: the reasoning-level tests assert on the wire body.
+kgraf-provider-openai = { path = "../kgraf-provider-openai" }
 # `flock::Forkers`: fork pressure for the lock-release tests.
 kgraf-core = { path = "../kgraf-core", features = ["test-support"] }
 # Tests corrupt a graph row directly to force an analytics failure.

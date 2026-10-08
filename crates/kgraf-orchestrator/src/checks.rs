@@ -3104,7 +3104,7 @@ mod tests {
             kgraf_provider::Ledger::open(&dir.path().join("l.db")).expect("ledger"),
         );
         let caller = |p: &'static str, model: &str| ModelCaller {
-            reasoning_effort: None,
+            reasoning: Default::default(),
             provider: std::sync::Arc::new(Says(p)),
             ledger: ledger.clone(),
             model: model.into(),

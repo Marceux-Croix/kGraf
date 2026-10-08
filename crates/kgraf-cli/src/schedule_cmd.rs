@@ -68,6 +68,8 @@ pub struct RunNowArgs {
     /// The answer wait: the user setting, else derived per call (`run-now`
     /// has no flag for it).
     pub answer_wait_secs: Option<u32>,
+    /// The `[reasoning]` user setting (`run-now` has no flag for it).
+    pub reasoning: kgraf_provider::ReasoningLevels,
     pub window: u64,
     /// `--verify`; without it, the first validation command the project's build
     /// files declare.
@@ -673,8 +675,8 @@ fn run_now_with(
             shell_timeout: args.shell_timeout,
             fetch_deps: args.fetch_deps,
             planner_max_tokens: args.planner_max_tokens,
-            // A scheduled run keeps the provider's default reasoning.
-            planner_reasoning: None,
+            // The `[reasoning]` user setting, as every run takes it.
+            reasoning: args.reasoning,
             retry_gate: None,
             waive_gate: None,
             gate_note: None,
@@ -1155,6 +1157,7 @@ mod tests {
             planner_max_tokens: 8_192,
             warn_rule_conflicts: false,
             answer_wait_secs: None,
+            reasoning: kgraf_provider::ReasoningLevels::new(),
             window: 1000,
             verify: Some("true".to_owned()),
             force,

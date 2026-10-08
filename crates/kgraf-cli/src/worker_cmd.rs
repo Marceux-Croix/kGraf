@@ -43,6 +43,8 @@ pub struct WorkerArgs {
     pub max_tokens: u32,
     /// The most progress checkpoints the worker may reach (decision 0096).
     pub max_checkpoints: u32,
+    /// `--reasoning` over the `[reasoning]` user setting (decision 0098).
+    pub reasoning: kgraf_provider::ReasoningLevels,
     pub mode: String,
     pub window: u64,
     pub point: Option<u8>,
@@ -85,6 +87,17 @@ pub fn run(root: &Path, mut args: WorkerArgs) -> Result<()> {
     args.max_tokens = max_tokens;
     if let Some(c) = clamp {
         eprintln!("clamped    {}", c.sentence("worker"));
+    }
+    // Decision 0098: a level measured to have no effect on this route and
+    // model is refused before any call; the rest is said.
+    let route = kgraf_host::config::RouteSpec {
+        route: args.provider.clone(),
+        model: args.model.clone(),
+    };
+    for sentence in
+        kgraf_host::reasoning::check(&args.reasoning, &kgraf_host::reasoning::worker_uses(&route))?
+    {
+        eprintln!("reasoning  {sentence}");
     }
     let entry = kgraf_fleet::entry(&args.provider)?;
     let credential = kgraf_fleet::credential_from_env(entry)?;
@@ -506,6 +519,7 @@ fn drive(d: DriveArgs<'_>) -> Result<kgraf_runtime::WorkerResult> {
             call_mode: mode,
             max_output_tokens: args.max_tokens,
             max_checkpoints: args.max_checkpoints,
+            reasoning: args.reasoning,
             path_case: kgraf_tools::detect_path_case(ws.root())
                 .context("cannot probe the worktree's filesystem case behavior")?,
             read_denies,

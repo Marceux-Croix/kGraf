@@ -48,6 +48,12 @@
 //! credential. Each claim row carries its [`Confidence`]: only `openai`
 //! embeddings were exchanged with the live service.
 
+pub mod reasoning;
+
+pub use reasoning::{
+    LevelOutcome, REASONING_MEASUREMENTS, ReasoningMeasurement, reasoning_measurement,
+};
+
 use kgraf_core::session::ReasoningVisibility;
 use kgraf_core::{KindError, ModelKind, Protocol};
 use kgraf_provider::EmbedLimits;

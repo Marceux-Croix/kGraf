@@ -149,13 +149,22 @@ pub struct RunConfig {
     #[serde(default = "defaults::planner_max_tokens")]
     pub planner_max_tokens: u32,
     /// Reasoning level of every orchestrator call on the planner's route
-    /// (`--planner-reasoning`). `None`, the default, sends no reasoning field,
-    /// so the call is the same as before the setting existed. `off` is
-    /// checked on every answer: an answer that still carries reasoning fails
-    /// the call (`ProviderError::ReasoningNotOff`). A graded level cannot be
-    /// checked from an answer; the run says so when it opens.
+    /// (`--planner-reasoning`): the `planner` override of [`Self::reasoning`],
+    /// kept so a run file that sets it still means the same. Setting both it
+    /// and `reasoning.planner` is refused ([`Self::reasoning_levels`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub planner_reasoning: Option<kgraf_provider::ReasoningEffort>,
+    /// The reasoning level of every model call of the run (decision 0098,
+    /// `--reasoning`): a universal level (`all`) and overrides by group
+    /// (`planner`, `checks`, `worker`) or by call kind. Empty, the default,
+    /// sends no reasoning field on any call. `off` is checked on every
+    /// answer; a graded level a measurement found a route does not honor is
+    /// refused when the run opens, and one with no measurement is said.
+    #[serde(
+        default,
+        skip_serializing_if = "kgraf_provider::ReasoningLevels::is_empty"
+    )]
+    pub reasoning: kgraf_provider::ReasoningLevels,
     /// Cross-vendor review at the interface (decision 0079,
     /// `--interface-review`): before a producer attempt is counted verified,
     /// one review call goes to a model on a cross-vendor consumer's route.
@@ -390,6 +399,7 @@ impl RunConfig {
             sessions: defaults::sessions(),
             planner_max_tokens: defaults::planner_max_tokens(),
             planner_reasoning: None,
+            reasoning: kgraf_provider::ReasoningLevels::new(),
             interface_review: defaults::interface_review(),
             routing: kgraf_orchestrator::RoutingPolicy::default(),
             tbench_bridge_socket: None,
@@ -458,6 +468,13 @@ impl RunConfig {
         let mut config: RunConfig = serde_json::from_str(&text)
             .with_step(|| format!("{} is not a run configuration", path.display()))?;
         config.root = root.into();
+        // The file's `planner_reasoning` becomes its `planner` override before
+        // the user's setting is merged under it, so the file still outranks
+        // the setting there (and a file that sets both is refused here).
+        config.reasoning = config
+            .reasoning_levels()
+            .map_err(|e| Error::Invalid(format!("{}: {e}", path.display())))?;
+        config.planner_reasoning = None;
         config.apply_user_limits(user, &text);
         if config.prices.is_relative()
             && let Some(dir) = path.parent()
@@ -512,6 +529,24 @@ impl RunConfig {
             && let Some(v) = user.answer_wait_secs
         {
             self.answer_wait_secs = Some(v);
+        }
+        // Scope by scope: a scope the file sets wins, one it leaves out takes
+        // the user's setting (decision 0098).
+        self.reasoning = self.reasoning.over(user.reasoning);
+    }
+
+    /// The run's reasoning setting, with `planner_reasoning` read as the
+    /// `planner` override. Both set is refused: one of them would be
+    /// ignored.
+    pub fn reasoning_levels(&self) -> Result<kgraf_provider::ReasoningLevels> {
+        use kgraf_provider::{ReasoningGroup, ReasoningScope};
+        let planner = ReasoningScope::Group(ReasoningGroup::Planner);
+        match (self.planner_reasoning, self.reasoning.get(planner)) {
+            (None, _) => Ok(self.reasoning),
+            (Some(level), None) => Ok(self.reasoning.with(planner, level.into())),
+            (Some(level), Some(other)) => Err(Error::Invalid(format!(
+                "the planner's reasoning level is set twice: `planner_reasoning`                  (`--planner-reasoning`) is `{level}` and `reasoning.planner` is `{other}`;                  set one"
+            ))),
         }
     }
 
@@ -1389,6 +1424,7 @@ mod tests {
             warn_rule_conflicts: Some(true),
             compaction_point: Some(60),
             answer_wait_secs: Some(600),
+            reasoning: kgraf_provider::ReasoningLevels::new(),
         };
         std::fs::write(
             &path,

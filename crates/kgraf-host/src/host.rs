@@ -146,10 +146,12 @@ pub enum Notice {
         which: &'static str,
         clamp: crate::limits::OutputClamp,
     },
-    /// The planner's route asks for a reasoning level on every orchestrator
-    /// call (`--planner-reasoning`), and what kGraf checks of it. The
-    /// sentence is the whole notice. Said at each run's start.
-    PlannerReasoning(String),
+    /// A route is asked for a reasoning level on some call kinds (decision
+    /// 0098), and what kGraf checks of it: `off` checked on every answer, a
+    /// graded level measured to take effect, or a graded level that is
+    /// unverified on that route and model. The sentence is the whole notice.
+    /// Said at each run's start, one per route and level.
+    Reasoning(String),
     /// The user's verify or gate command runs a program the user's own rules
     /// refuse to workers, and the `warn_rule_conflicts` setting is on. The
     /// sentence is the whole notice; the run is not changed.
@@ -221,26 +223,6 @@ fn output_caps(
         .filter_map(|(which, c)| c.map(|clamp| Notice::OutputCapClamped { which, clamp }))
         .collect();
     (worker_cap, planner_cap, notices)
-}
-
-/// The run-start sentence for a planner reasoning level: what is sent, and
-/// what kGraf can check of it.
-pub(crate) fn planner_reasoning_sentence(
-    route: &str,
-    level: kgraf_provider::ReasoningEffort,
-) -> String {
-    match level {
-        kgraf_provider::ReasoningEffort::Off => format!(
-            "the planner route `{route}` asks for no reasoning on every orchestrator call; \
-             an answer that still carries reasoning fails its call, and a provider with no \
-             verified off control refuses the call before sending it"
-        ),
-        graded => format!(
-            "the planner route `{route}` asks for reasoning level `{graded}` on every \
-             orchestrator call; no answer shows whether the server honors a graded level, so \
-             kGraf does not check it"
-        ),
-    }
 }
 
 /// How a prepared run begins.
@@ -348,6 +330,13 @@ pub struct Host {
     /// One [`Notice::OutputCapClamped`] per cap that was lowered, said at each
     /// run's startup.
     clamp_notices: Vec<Notice>,
+    /// The run's reasoning setting (decision 0098), with `planner_reasoning`
+    /// read as its `planner` override. Every model caller and worker
+    /// environment this host builds carries it.
+    reasoning: kgraf_provider::ReasoningLevels,
+    /// One [`Notice::Reasoning`] sentence per route and level the setting
+    /// asks for, said at each run's startup (`crate::reasoning::check`).
+    reasoning_notices: Vec<String>,
     /// Runs whose synchronous build (`build_base`) is executing on a blocking
     /// thread. A build that outlives `prepare_blocking`'s time bound keeps
     /// running there after its task is aborted, so a retry for the same run
@@ -595,6 +584,18 @@ impl Host {
             .collect::<Result<Vec<_>>>()?;
         let worktrees = Mutex::new(config.worktrees);
         let (worker_cap, planner_cap, clamp_notices) = output_caps(&config, &routes, &planner);
+        // Decision 0098: a level a route was measured not to honor is refused
+        // here, before any call; the rest is said at each run's start.
+        let reasoning = config.reasoning_levels()?;
+        let reasoning_notices = crate::reasoning::check(
+            &reasoning,
+            &crate::reasoning::route_uses(
+                &planner,
+                &routes,
+                config.contract_checks,
+                config.interface_review,
+            ),
+        )?;
         Ok(Self {
             config,
             state,
@@ -618,6 +619,8 @@ impl Host {
             worker_cap,
             planner_cap,
             clamp_notices,
+            reasoning,
+            reasoning_notices,
             base_builds: Arc::default(),
             index_pass: Mutex::new(()),
             build_timeout: DEFAULT_BUILD_TIMEOUT,
@@ -1388,9 +1391,8 @@ impl Host {
     /// their place.
     pub fn planner_caller(&self, agent: &str, task: &str) -> Result<ModelCaller> {
         Ok(ModelCaller {
-            // The planner route's own level; the handshake and consumer-test
-            // callers below are other routes' models and keep the default.
-            reasoning_effort: self.config.planner_reasoning,
+            // Each call resolves its own kind's level (decision 0098).
+            reasoning: self.reasoning,
             provider: self.provider(&self.planner.route, &self.planner.model)?,
             ledger: self.ledger.clone(),
             model: self.planner.model.clone(),
@@ -1398,6 +1400,60 @@ impl Host {
             agent: agent.to_owned(),
             task: task.to_owned(),
         })
+    }
+
+    /// One caller per worker route for the contract-check calls of `run`
+    /// made on that route's model (`handshake`, `consumer_test`), attributed
+    /// to the orchestrator. Built once per use: `ModelCaller` is not `Clone`
+    /// (it carries a raw `Arc<dyn Provider>` and `Arc<Ledger>`, cheap to
+    /// construct again). Each carries the run's reasoning setting, so each
+    /// call resolves its own kind's level (decision 0098).
+    pub(crate) fn routed_callers(
+        &self,
+        run: &RunId,
+        routes: &BTreeMap<String, (Arc<dyn Provider>, String)>,
+    ) -> BTreeMap<String, ModelCaller> {
+        routes
+            .iter()
+            .map(|(name, (provider, model))| {
+                (
+                    name.clone(),
+                    ModelCaller {
+                        reasoning: self.reasoning,
+                        provider: provider.clone(),
+                        ledger: self.ledger.clone(),
+                        model: model.clone(),
+                        max_output_tokens: self.planner_cap,
+                        agent: format!("orchestrator:{}", run.as_str()),
+                        task: run.to_string(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// The cross-vendor interface reviewer of `run` (decision 0079): a
+    /// consumer's own route model, through the host's ledger, with the run's
+    /// reasoning setting (decision 0098).
+    pub(crate) fn interface_reviewer(
+        &self,
+        run: &RunId,
+        routes: &BTreeMap<String, (Arc<dyn Provider>, String)>,
+    ) -> RoutedInterfaceReviewer {
+        RoutedInterfaceReviewer {
+            ledger: self.ledger.clone(),
+            routes: routes
+                .iter()
+                .map(|(name, (provider, model))| {
+                    (
+                        name.clone(),
+                        (provider.clone(), model.clone(), self.planner_cap),
+                    )
+                })
+                .collect(),
+            run: run.to_string(),
+            reasoning: self.reasoning,
+        }
     }
 
     /// The contract checks of `run` (0030, 0031, 0035-0037), and their scratch
@@ -1453,34 +1509,11 @@ impl Host {
         .step("cannot set up the contract checks")?
         .with_timeout(self.config.check_timeout)
         .with_compile_timeout(self.config.check_compile_timeout);
-        // Built twice (handshaker, consumer-test writer): `ModelCaller` is not
-        // `Clone` (it carries a raw `Arc<dyn Provider>` and `Arc<Ledger>`, cheap
-        // to construct again, not worth a shared-ownership redesign for one
-        // more caller).
-        let model_routes = |max_output_tokens: u32| -> BTreeMap<String, ModelCaller> {
-            routes
-                .iter()
-                .map(|(name, (provider, model))| {
-                    (
-                        name.clone(),
-                        ModelCaller {
-                            reasoning_effort: None,
-                            provider: provider.clone(),
-                            ledger: self.ledger.clone(),
-                            model: model.clone(),
-                            max_output_tokens,
-                            agent: format!("orchestrator:{}", run.as_str()),
-                            task: run.to_string(),
-                        },
-                    )
-                })
-                .collect()
-        };
         let checks = ContractChecks {
             interfaces: Vec::new(),
             runner: Arc::new(runner),
             handshaker: Arc::new(RoutedHandshaker {
-                routes: model_routes(self.planner_cap),
+                routes: self.routed_callers(run, routes),
             }),
             reviewer: Arc::new(ModelReviewer(self.caller(run)?)),
             max_supersessions: DEFAULT_MAX_SUPERSESSIONS,
@@ -1489,7 +1522,7 @@ impl Host {
             // 0076: each consumer writes its own test of what it expects from
             // the producer, on the same per-route models as the handshake.
             consumer_test_writer: Some(Arc::new(RoutedConsumerTestWriter {
-                routes: model_routes(self.planner_cap),
+                routes: self.routed_callers(run, routes),
             })),
             stub_lander: stub_lander.clone(),
         };
@@ -1576,11 +1609,8 @@ impl Host {
         for clamp in &self.clamp_notices {
             notices(clamp.clone());
         }
-        if let Some(level) = self.config.planner_reasoning {
-            notices(Notice::PlannerReasoning(planner_reasoning_sentence(
-                &format!("{}:{}", self.planner.route, self.planner.model),
-                level,
-            )));
+        for sentence in &self.reasoning_notices {
+            notices(Notice::Reasoning(sentence.clone()));
         }
         for removed in clean_stale_worktrees(
             &manager,
@@ -1866,6 +1896,7 @@ impl Host {
             config: worker_config,
             max_output_tokens: self.worker_cap,
             max_checkpoints: self.config.max_checkpoints,
+            reasoning: self.reasoning,
             read_denies: read_denies.clone(),
             workspaces: workspaces.clone(),
             routes: parts,
@@ -2154,19 +2185,8 @@ impl Host {
         // 0079: the cross-vendor interface review asks a consumer's own route
         // model, through the host's ledger.
         let orchestrator = if self.config.interface_review {
-            orchestrator.with_interface_reviewer(Arc::new(RoutedInterfaceReviewer {
-                ledger: self.ledger.clone(),
-                routes: handshake_routes
-                    .iter()
-                    .map(|(name, (provider, model))| {
-                        (
-                            name.clone(),
-                            (provider.clone(), model.clone(), self.planner_cap),
-                        )
-                    })
-                    .collect(),
-                run: run.to_string(),
-            }))
+            orchestrator
+                .with_interface_reviewer(Arc::new(self.interface_reviewer(&run, &handshake_routes)))
         } else {
             orchestrator
         };

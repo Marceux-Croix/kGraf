@@ -28,6 +28,7 @@ pub mod limits;
 pub mod message;
 pub mod provider;
 pub mod ratelimit;
+pub mod reasoning;
 pub mod streaming;
 
 pub use accounting::{
@@ -54,5 +55,9 @@ pub use provider::{Provider, ProviderConfig};
 pub use ratelimit::{
     LimiterStats, NoticeSink, RateLimit, RateLimitError, RateLimited, RouteLimiter, RouteRecorded,
     set_notice_sink, take_rate_limit_notices,
+};
+pub use reasoning::{
+    ReasoningAssignment, ReasoningGroup, ReasoningLevel, ReasoningLevels, ReasoningProcess,
+    ReasoningScope,
 };
 pub use streaming::{SseDecoder, StreamGuard};

@@ -201,9 +201,7 @@ them. A reparse point is refused, never followed (0083).
   written once and listed in `sandbox-credentials[-tag].grants` beside the password store.
   `kgraf sandbox remove` revokes each listed grant before it removes the users.
 - (b) **The command runs on the runner's own window station**, not the user's.
-- (c) **The worker pool is deferred.** Commands that run at the same time run as the same
-  user and can write each other's writable folders while both run. A pool of offline users,
-  one per worker slot, is the planned close; setup is idempotent, so a later run adds them.
+- (c) **The worker pool was deferred, then built.** See the amendment below.
 - (d) **The firewall writes IPv6 loopback as `::/127`.** Windows Firewall refuses `::1`
   alone with `E_INVALIDARG` (found by a hosted Windows run).
 
@@ -212,5 +210,36 @@ them. A reparse point is refused, never followed (0083).
 - The sandbox user reads whatever every local user can read, but not the user's profile.
 - DNS goes through the system DNS client service, which the firewall rules do not scope to
   the sandbox user. A name lookup can leave the machine.
-- Concurrent commands share a user (item c).
+- Commands with the network open share the online user.
 - Write confinement, the `.git` deny and the network block are unverified on Windows.
+
+**Amendment (2026-10-08): one user per worker slot.** The open item of the
+Consequences above is closed. `kgraf sandbox setup` creates a user per worker
+slot as well as the two fixed users: `--slots`, four by default, none with
+`--slots 0`. A slot user is named `kgraf-sNN-<hash>` (18 characters, within the
+20 a Windows local user name allows), is confined exactly like the offline
+user, and is blocked by the same firewall rules.
+
+A command without the network runs as the slot user of its own first writable
+root, chosen by a stable fold of that root's text. Two commands in different
+worktrees therefore usually run as different users, and neither can write the
+other's files. Two commands in one worktree share a user, which they must,
+because they share the folder. Where two worktrees fold to the same slot they
+share a user, as every command did before. The command with the network open
+still runs as the single online user, so two installs that run at the same
+time can still write each other's writable folders.
+
+The slot comes from the worktree, not from a worker slot
+number threaded through the sandbox interface. The orchestrator knows its
+slots, but passing one would change `SandboxPolicy` and every caller of it,
+and the worktree is what the access lists are written on, so it is the thing
+that must differ. The cost is the fold: two worktrees can share a slot.
+
+The four firewall rules now name every blocked user in one local user list, so
+the rule names do not change with the slot count. Each password is judged
+against its own account's name only. The stored passwords file carries a role
+byte per slot and its version is 2: a file from before this refuses to open
+and asks for a fresh setup, rather than reading as a setup with no slots, and
+a file that names a slot but not every slot below it is refused for the same
+reason. `kgraf sandbox status` reports the slots the machine has, and
+`kgraf sandbox remove` clears every slot a larger setup made.

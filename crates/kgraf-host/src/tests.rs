@@ -1274,6 +1274,10 @@ async fn an_attempts_slices_are_read_from_its_own_worktree() {
         config: WorkerConfig::with_servers(vec![]).expect("config"),
         max_output_tokens: 1_000,
         max_checkpoints: 3,
+        reasoning: kgraf_provider::ReasoningLevels::new().with(
+            kgraf_provider::ReasoningScope::Process(kgraf_provider::ReasoningProcess::WorkerRound),
+            kgraf_provider::ReasoningEffort::High.into(),
+        ),
         read_denies: vec![state.clone()],
         workspaces: r.workspaces.clone(),
         routes,
@@ -1310,6 +1314,15 @@ async fn an_attempts_slices_are_read_from_its_own_worktree() {
         .build(&route, &ws, &"w-slices".into(), &"r9/c-slices".into())
         .await
         .expect("built");
+    // Decision 0098: the run's reasoning setting reaches the attempt's loop.
+    assert_eq!(
+        built
+            .env
+            .settings
+            .reasoning
+            .effort(kgraf_provider::ReasoningProcess::WorkerRound),
+        Some(kgraf_provider::ReasoningEffort::High)
+    );
     let rendering = built
         .env
         .slices
@@ -1362,6 +1375,7 @@ async fn each_attempt_gets_a_shell_bound_to_its_own_worktree() {
         config: WorkerConfig::with_servers(vec![echo_server()]).expect("config"),
         max_output_tokens: 1_000,
         max_checkpoints: 3,
+        reasoning: Default::default(),
         read_denies: vec![state.clone()],
         workspaces: r.workspaces.clone(),
         routes,
@@ -1540,6 +1554,7 @@ async fn a_session_tool_call_with_the_flag_on_answers_as_an_error() {
         config: WorkerConfig::default(),
         max_output_tokens: 1_000,
         max_checkpoints: crate::limits::DEFAULT_MAX_CHECKPOINTS,
+        reasoning: Default::default(),
         read_denies: vec![state.clone()],
         workspaces: r.workspaces.clone(),
         routes,
@@ -1648,6 +1663,7 @@ async fn the_assembled_prefix_digest_with_the_flag_off_is_pinned() {
         config: WorkerConfig::default(),
         max_output_tokens: 1_000,
         max_checkpoints: crate::limits::DEFAULT_MAX_CHECKPOINTS,
+        reasoning: Default::default(),
         read_denies: vec![state.clone()],
         workspaces: r.workspaces.clone(),
         routes,
@@ -1785,6 +1801,7 @@ async fn an_mcp_tool_allowed_with_kgraf_allow_runs_in_an_unattended_delegate() {
             config: WorkerConfig::with_servers(vec![echo_server()]).expect("config"),
             max_output_tokens: 1_000,
             max_checkpoints: crate::limits::DEFAULT_MAX_CHECKPOINTS,
+            reasoning: Default::default(),
             read_denies: vec![state.clone()],
             workspaces: r.workspaces.clone(),
             routes,
@@ -4978,6 +4995,7 @@ async fn a_host_resolver_answers_the_attempts_asks() {
             config: WorkerConfig::default(),
             max_output_tokens: 1_000,
             max_checkpoints: crate::limits::DEFAULT_MAX_CHECKPOINTS,
+            reasoning: Default::default(),
             read_denies: vec![state.clone()],
             workspaces: r.workspaces.clone(),
             routes,
@@ -7564,6 +7582,7 @@ mod skill_enforcement {
             config: WorkerConfig::default(),
             max_output_tokens: 1_000,
             max_checkpoints: crate::limits::DEFAULT_MAX_CHECKPOINTS,
+            reasoning: Default::default(),
             read_denies: vec![state.clone()],
             workspaces: r.workspaces.clone(),
             routes,
@@ -7849,12 +7868,13 @@ fn an_output_cap_above_the_models_limit_is_lowered_with_a_notice() {
     assert!(host.output_clamp_notes(4_096, 4_096).is_empty());
 }
 
-/// A planner reasoning level reaches the planner's caller and is said at
-/// every run's start; without one, the caller carries none and nothing is
-/// said.
+/// `--planner-reasoning` is the `planner` override of the run's reasoning
+/// setting: it reaches every planner call kind and no other, and each route
+/// and level is said at every run's start; without one, nothing is set and
+/// nothing is said.
 #[test]
 fn a_planner_reasoning_level_reaches_the_planner_caller_and_is_said() {
-    use kgraf_provider::ReasoningEffort;
+    use kgraf_provider::{ReasoningEffort, ReasoningProcess};
     for level in [None, Some(ReasoningEffort::Off), Some(ReasoningEffort::Low)] {
         let (_dir, mut config) = project();
         config.routes = vec!["ollama:zz-unlisted-model".into()];
@@ -7862,13 +7882,18 @@ fn a_planner_reasoning_level_reaches_the_planner_caller_and_is_said() {
         config.planner_reasoning = level;
         let host = Host::open(config).expect("open");
         let caller = host.planner_caller("a", "t").expect("caller");
-        assert_eq!(caller.reasoning_effort, level);
+        assert_eq!(caller.reasoning.effort(ReasoningProcess::Decompose), level);
+        assert_eq!(
+            caller.reasoning.effort(ReasoningProcess::QuestionRoute),
+            level
+        );
+        assert_eq!(caller.reasoning.effort(ReasoningProcess::WorkerRound), None);
         let mut said = Vec::new();
         host.startup(&mut |n| said.push(n)).expect("startup");
         let sentences: Vec<_> = said
             .iter()
             .filter_map(|n| match n {
-                crate::Notice::PlannerReasoning(s) => Some(s.clone()),
+                crate::Notice::Reasoning(s) => Some(s.clone()),
                 _ => None,
             })
             .collect();
@@ -7878,6 +7903,7 @@ fn a_planner_reasoning_level_reaches_the_planner_caller_and_is_said() {
                 assert_eq!(sentences.len(), 1, "{said:?}");
                 assert!(
                     sentences[0].contains("`ollama:zz-unlisted-model` asks for no reasoning")
+                        && sentences[0].contains("decompose")
                         && sentences[0].contains("fails its call"),
                     "{}",
                     sentences[0]
@@ -7886,14 +7912,140 @@ fn a_planner_reasoning_level_reaches_the_planner_caller_and_is_said() {
             Some(_) => {
                 assert_eq!(sentences.len(), 1, "{said:?}");
                 assert!(
-                    sentences[0].contains("level `low`")
-                        && sentences[0].contains("does not check it"),
+                    sentences[0].contains("level `low`") && sentences[0].contains("UNVERIFIED"),
                     "{}",
                     sentences[0]
                 );
             }
         }
     }
+}
+
+/// Decision 0098: every caller the host builds carries the run's setting,
+/// and each call kind resolves its own level: the planner's caller, the
+/// per-route contract-check callers (`handshake`, `consumer_test`) and the
+/// interface reviewer. A kind's override beats its group's and the
+/// universal level.
+#[test]
+fn every_caller_the_host_builds_carries_the_runs_reasoning_setting() {
+    use kgraf_provider::{
+        ReasoningEffort, ReasoningGroup, ReasoningLevel, ReasoningProcess, ReasoningScope,
+    };
+    let (_dir, mut config) = project();
+    config.routes = vec!["ollama:zz-unlisted-model".into()];
+    config.reasoning = kgraf_provider::ReasoningLevels::new()
+        .with(ReasoningScope::All, ReasoningEffort::Medium.into())
+        .with(
+            ReasoningScope::Group(ReasoningGroup::Checks),
+            ReasoningEffort::Low.into(),
+        )
+        .with(
+            ReasoningScope::Process(ReasoningProcess::ConsumerTest),
+            ReasoningLevel::Unset,
+        );
+    let host = Host::open(config).expect("open");
+    let planner = host.planner_caller("a", "t").expect("caller");
+    assert_eq!(
+        planner.reasoning.effort(ReasoningProcess::Reground),
+        Some(ReasoningEffort::Medium)
+    );
+    let provider: Arc<dyn Provider> = Arc::new(ShellCaller);
+    let routes = BTreeMap::from([("r".to_owned(), (provider, "m".to_owned()))]);
+    let run = RunId::new("r1");
+    let routed = host.routed_callers(&run, &routes);
+    let caller = routed.get("r").expect("route");
+    assert_eq!(
+        caller.reasoning.effort(ReasoningProcess::Handshake),
+        Some(ReasoningEffort::Low)
+    );
+    assert_eq!(
+        caller.reasoning.effort(ReasoningProcess::ConsumerTest),
+        None
+    );
+    let reviewer = host.interface_reviewer(&run, &routes);
+    assert_eq!(
+        reviewer.reasoning.effort(ReasoningProcess::InterfaceReview),
+        Some(ReasoningEffort::Low)
+    );
+}
+
+/// Decision 0098: a graded level that a recorded measurement found a route
+/// and model do not honor is refused when the host opens, before any call,
+/// naming the route, the level and the call kinds. The same run with that
+/// route's kinds set to `off` or `unset` opens.
+#[test]
+fn a_reasoning_level_measured_as_not_honored_is_refused_at_open() {
+    use kgraf_provider::{ReasoningEffort, ReasoningGroup, ReasoningLevel, ReasoningScope};
+    let (_dir, mut config) = project();
+    config.routes = vec!["ollama:qwen3.6:35b".into()];
+    config.reasoning = kgraf_provider::ReasoningLevels::new()
+        .with(ReasoningScope::All, ReasoningEffort::Low.into());
+    let e = match Host::open(config.clone()) {
+        Ok(_) => panic!("opened"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        e.contains("`ollama:qwen3.6:35b` was measured not to honor reasoning level `low`")
+            && e.contains("worker_round")
+            && e.contains("decompose"),
+        "{e}"
+    );
+    config.reasoning = config
+        .reasoning
+        .with(
+            ReasoningScope::Group(ReasoningGroup::Planner),
+            ReasoningEffort::Off.into(),
+        )
+        .with(
+            ReasoningScope::Group(ReasoningGroup::Worker),
+            ReasoningLevel::Unset,
+        );
+    Host::open(config).expect("off and unset open");
+}
+
+/// A run file's `planner_reasoning` and its `reasoning.planner` together are
+/// refused at load (one would be ignored); either alone loads, and the
+/// file's level wins over the user's setting for that scope while a scope
+/// the file leaves out takes the setting.
+#[test]
+fn a_run_file_reasoning_merges_over_the_user_setting_and_a_double_planner_is_refused() {
+    use kgraf_provider::{ReasoningEffort, ReasoningGroup, ReasoningScope};
+    let (dir, config) = project();
+    let file = dir.path().join("run.json");
+    let user = crate::limits::UserLimits {
+        reasoning: kgraf_provider::ReasoningLevels::new()
+            .with(ReasoningScope::All, ReasoningEffort::Low.into())
+            .with(
+                ReasoningScope::Group(ReasoningGroup::Planner),
+                ReasoningEffort::High.into(),
+            ),
+        ..Default::default()
+    };
+    std::fs::write(
+        &file,
+        r#"{"routes": ["ollama:llama3"], "prices": "prices.json", "planner_reasoning": "off"}"#,
+    )
+    .expect("write");
+    let loaded = RunConfig::load_with(&config.root, &file, &user).expect("load");
+    let planner = ReasoningScope::Group(ReasoningGroup::Planner);
+    assert_eq!(
+        loaded.reasoning.get(planner),
+        Some(ReasoningEffort::Off.into())
+    );
+    assert_eq!(
+        loaded.reasoning.get(ReasoningScope::All),
+        Some(ReasoningEffort::Low.into())
+    );
+    std::fs::write(
+        &file,
+        r#"{"routes": ["ollama:llama3"], "prices": "prices.json", "planner_reasoning": "off",
+            "reasoning": {"planner": "low"}}"#,
+    )
+    .expect("write");
+    let e = RunConfig::load_with(&config.root, &file, &user)
+        .expect_err("both")
+        .to_string();
+    assert!(e.contains("set twice"), "{e}");
 }
 
 /// A run file without the setting reads as no setting, and a run without
@@ -7903,6 +8055,7 @@ fn a_run_file_without_planner_reasoning_is_unchanged() {
     let (_dir, config) = project();
     let text = serde_json::to_string(&config).expect("json");
     assert!(!text.contains("planner_reasoning"), "{text}");
+    assert!(!text.contains("\"reasoning\""), "{text}");
     let back: crate::RunConfig = serde_json::from_str(&text).expect("read back");
     assert_eq!(back.planner_reasoning, None);
     let mut with = config.clone();

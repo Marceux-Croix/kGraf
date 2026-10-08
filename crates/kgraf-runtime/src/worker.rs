@@ -208,6 +208,10 @@ pub struct LoopSettings {
     /// blocks of the brief's round budget (decision 0096). 1 is the old wall:
     /// the first checkpoint ends the extension whatever it measures.
     pub max_checkpoints: u32,
+    /// The run's reasoning setting (decision 0098): each round carries the
+    /// level `worker_round` resolves to, each compaction summary the level
+    /// of `worker_compaction`. Empty by default: no reasoning field.
+    pub reasoning: kgraf_provider::ReasoningLevels,
 }
 
 impl Default for LoopSettings {
@@ -224,6 +228,7 @@ impl Default for LoopSettings {
             path_case: PathCase::Insensitive,
             tool_cancel_grace: std::time::Duration::from_secs(2),
             max_checkpoints: crate::progress::DEFAULT_MAX_CHECKPOINTS,
+            reasoning: kgraf_provider::ReasoningLevels::new(),
         }
     }
 }
@@ -1707,11 +1712,16 @@ impl Worker {
             };
             self.deliver_injections(ep)?;
             let messages = self.env.masker.mask(self.builder.messages());
-            let request = self.env.prefix.request(
+            let mut request = self.env.prefix.request(
                 messages,
                 self.env.settings.max_output_tokens,
                 self.env.settings.temperature,
             );
+            request.reasoning_effort = self
+                .env
+                .settings
+                .reasoning
+                .effort(kgraf_provider::ReasoningProcess::WorkerRound);
             self.env
                 .prefix
                 .check(&request)
@@ -2444,11 +2454,16 @@ impl Worker {
             }
             _ => messages.push(kgraf_provider::Message::user(SUMMARY_REQUEST)),
         }
-        let request = self.env.prefix.request(
+        let mut request = self.env.prefix.request(
             messages,
             self.env.settings.max_output_tokens,
             self.env.settings.temperature,
         );
+        request.reasoning_effort = self
+            .env
+            .settings
+            .reasoning
+            .effort(kgraf_provider::ReasoningProcess::WorkerCompaction);
         let (reply, summary_call) = self.summary_call(ep, &request).await?;
         let parsed =
             reply.and_then(|text| crate::compaction::parse_summary(&text, &self.brief.instruction));

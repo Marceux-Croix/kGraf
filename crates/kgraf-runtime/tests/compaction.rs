@@ -1981,3 +1981,66 @@ async fn an_output_ceiling_stop_after_a_compaction_gets_its_own_continuation() {
     assert_eq!(sent, 2);
     assert_eq!(result.outcome, WorkerOutcome::Completed, "{result:?}");
 }
+
+/// Decision 0098, on the wire: a worker's rounds carry the level
+/// `worker_round` resolves to and its compaction summary the level of
+/// `worker_compaction`, each as the Chat Completions encoder writes it, and
+/// not the universal level set beside them. Each ledger row records its kind.
+#[tokio::test]
+async fn a_workers_rounds_and_its_summary_send_their_own_reasoning_levels() {
+    use kgraf_provider::{ReasoningEffort, ReasoningLevels, ReasoningProcess, ReasoningScope};
+    let dir = tempfile::tempdir().expect("dir");
+    let provider = Fake::new(growing_then_done(SUMMARY));
+    let mut env = Arc::try_unwrap(env_with(provider.clone(), true))
+        .ok()
+        .expect("one owner");
+    env.settings.reasoning = ReasoningLevels::new()
+        .with(ReasoningScope::All, ReasoningEffort::Medium.into())
+        .with(
+            ReasoningScope::Process(ReasoningProcess::WorkerRound),
+            ReasoningEffort::High.into(),
+        )
+        .with(
+            ReasoningScope::Process(ReasoningProcess::WorkerCompaction),
+            ReasoningEffort::Off.into(),
+        );
+    let env = Arc::new(env);
+    let handle = spawn_worker(env.clone(), brief(dir.path()), compact_options())
+        .await
+        .expect("spawn");
+    let (_events, result) = drain(handle).await;
+    assert_eq!(result.outcome, WorkerOutcome::Completed, "{result:?}");
+
+    let wire = kgraf_provider_openai::ChatCompletionsAdapter::new(
+        kgraf_provider::ProviderConfig::local(
+            "http://127.0.0.1:9/v1",
+            vec![MODEL.into()],
+            Protocol::Inclusive,
+        ),
+        kgraf_provider_openai::UsageDialect::Details,
+    )
+    .expect("adapter");
+    let requests = provider.requests();
+    let summaries = requests.iter().filter(|r| is_summary(r)).count();
+    assert_eq!(summaries, 1, "one summary call");
+    assert!(requests.len() > 2, "rounds before and after it");
+    for request in &requests {
+        let body = wire.to_wire(request);
+        let want = if is_summary(request) { "none" } else { "high" };
+        assert_eq!(
+            body["reasoning_effort"],
+            json!(want),
+            "{}",
+            text_of(request)
+        );
+    }
+    let kinds: Vec<Option<String>> = result
+        .calls
+        .iter()
+        .map(|c| env.ledger.call(c).expect("read").expect("row").trace.kind)
+        .collect();
+    assert!(kinds.iter().all(|k| matches!(
+        k.as_deref(),
+        Some("worker_round") | Some(COMPACTION_CALL_KIND)
+    )));
+}

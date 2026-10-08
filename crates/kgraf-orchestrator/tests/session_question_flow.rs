@@ -72,7 +72,7 @@ fn unhang(p: &Parts) {
 
 fn plan_model_caller(p: &Parts, provider: Arc<ScriptFake>) -> ModelCaller {
     ModelCaller {
-        reasoning_effort: None,
+        reasoning: Default::default(),
         provider,
         ledger: p.ledger.clone(),
         model: PLAN_MODEL.into(),

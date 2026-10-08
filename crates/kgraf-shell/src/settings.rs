@@ -441,6 +441,8 @@ impl RunLimitSliders {
             // Not one of these sliders: `Settings::run_limits` adds it.
             compaction_point: None,
             answer_wait_secs: self.answer_wait.chosen().map(|v| v as u32),
+            // Not one of these sliders: `Settings::run_limits` adds it.
+            reasoning: kgraf_provider::ReasoningLevels::new(),
         }
     }
 
@@ -611,6 +613,10 @@ pub struct Settings {
     /// user changed one. Only a changed list is written to the file; the
     /// host reads the file when an install is about to run.
     pub install_registries: kgraf_host::deps::InstallHosts,
+    /// The reasoning level of each model call (decision 0098): the
+    /// `[reasoning]` table, read with the host's reader and written back
+    /// unchanged. No control shows it yet; every run the app starts takes it.
+    pub reasoning: kgraf_provider::ReasoningLevels,
 }
 
 impl Settings {
@@ -624,6 +630,7 @@ impl Settings {
     pub fn run_limits(&self) -> kgraf_host::limits::UserLimits {
         kgraf_host::limits::UserLimits {
             compaction_point: self.compaction.run_point(),
+            reasoning: self.reasoning,
             ..self.limits.user_limits()
         }
     }
@@ -649,6 +656,7 @@ impl Default for Settings {
             allow_prerelease_updates: false,
             delete_worker_worktrees: true,
             install_registries: kgraf_host::deps::InstallHosts::defaults(),
+            reasoning: kgraf_provider::ReasoningLevels::new(),
         }
     }
 }
@@ -723,6 +731,12 @@ struct SettingsFile {
     /// (`kgraf_host::deps::InstallHosts::from_toml_str`).
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     install_registries: std::collections::BTreeMap<String, Vec<String>>,
+    /// The reasoning setting (decision 0098); absent means none is set.
+    #[serde(
+        default,
+        skip_serializing_if = "kgraf_provider::ReasoningLevels::is_empty"
+    )]
+    reasoning: kgraf_provider::ReasoningLevels,
 }
 
 impl Settings {
@@ -783,10 +797,10 @@ impl Settings {
         }
         // The same reader the command line uses, so an out-of-range value is
         // refused in both places with the same words.
-        settings.limits = RunLimitSliders::from_user_limits(
-            kgraf_host::limits::UserLimits::from_toml_str(text)
-                .map_err(|e| ShellError::Config(e.to_string()))?,
-        );
+        let user = kgraf_host::limits::UserLimits::from_toml_str(text)
+            .map_err(|e| ShellError::Config(e.to_string()))?;
+        settings.reasoning = user.reasoning;
+        settings.limits = RunLimitSliders::from_user_limits(user);
         if let Some(a) = file.appearance {
             settings.appearance = a;
         }
@@ -869,6 +883,7 @@ impl Settings {
                     )
                 })
                 .collect(),
+            reasoning: self.reasoning,
         };
         toml::to_string(&file).map_err(|e| ShellError::Config(e.to_string()))
     }
@@ -1290,6 +1305,29 @@ mod tests {
         let loaded = Settings::load(&path).expect("load");
         assert!(loaded.check_for_updates);
         assert!(loaded.allow_prerelease_updates);
+    }
+
+    /// The `[reasoning]` table (decision 0098) has no control yet: a file
+    /// that sets it loads (it is not an unknown key), is written back as it
+    /// was when the window saves, and reaches every run the app starts.
+    #[test]
+    fn the_reasoning_table_survives_a_save_and_reaches_the_runs() {
+        use kgraf_provider::{ReasoningEffort, ReasoningGroup, ReasoningScope};
+        let text = "background_mode = true\n[reasoning]\nall = \"low\"\nplanner = \"off\"\n";
+        let s = Settings::from_toml_str(text).expect("valid");
+        let planner = ReasoningScope::Group(ReasoningGroup::Planner);
+        assert_eq!(s.reasoning.get(planner), Some(ReasoningEffort::Off.into()));
+        assert_eq!(s.run_limits().reasoning, s.reasoning);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.toml");
+        s.save(&path).expect("save");
+        let back = Settings::load(&path).expect("load");
+        assert_eq!(back.reasoning, s.reasoning);
+        let user = kgraf_host::limits::UserLimits::load(&path).expect("cli read");
+        assert_eq!(user.reasoning, s.reasoning);
+        let none = Settings::default().to_toml_string().expect("toml");
+        assert!(!none.contains("reasoning"), "{none}");
+        assert!(Settings::from_toml_str("[reasoning]\nall = \"none\"\n").is_err());
     }
 
     /// The install host lists (decision 0087, amended 2026-10-07): built-in

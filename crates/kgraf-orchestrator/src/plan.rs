@@ -1118,10 +1118,10 @@ pub struct ModelCaller {
     pub ledger: Arc<Ledger>,
     pub model: String,
     pub max_output_tokens: u32,
-    /// The reasoning level every request of this caller asks for
-    /// (`--planner-reasoning` on the planner's route). `None` sends no
-    /// reasoning field at all, so the provider's default applies.
-    pub reasoning_effort: Option<kgraf_provider::ReasoningEffort>,
+    /// The run's reasoning setting (decision 0098). Each request carries the
+    /// level its call kind resolves to; an unset level sends no reasoning
+    /// field at all, so the provider's default applies.
+    pub reasoning: kgraf_provider::ReasoningLevels,
     /// Ledger attribution: `orchestrator:<run>`.
     pub agent: String,
     /// Ledger task: the run id.
@@ -1129,10 +1129,12 @@ pub struct ModelCaller {
 }
 
 impl ModelCaller {
-    /// A request to this caller's model with its reasoning level set.
-    fn request(&self, user: String, max_output_tokens: u32) -> Request {
+    /// A request of call kind `kind` to this caller's model, carrying the
+    /// reasoning level `kind` resolves to. The one place an orchestrator
+    /// request gets its level, so no call kind can bypass the setting.
+    fn request(&self, kind: &str, user: String, max_output_tokens: u32) -> Request {
         let mut request = Request::new(self.model.clone(), user, max_output_tokens);
-        request.reasoning_effort = self.reasoning_effort;
+        request.reasoning_effort = self.reasoning.effort_for_call_kind(kind);
         request
     }
 
@@ -1255,7 +1257,7 @@ impl ModelCaller {
         cap: Option<u32>,
     ) -> (Result<String, PlanError>, Option<CallId>) {
         let limit = cap.map_or(self.max_output_tokens, |c| c.min(self.max_output_tokens));
-        let mut request = self.request(user, limit);
+        let mut request = self.request(kind, user, limit);
         request.system = vec![kgraf_provider::Content::text(system)];
         let (result, call) = self.complete_once(kind, &request).await;
         (result.map(|response| response.text()), call)
@@ -1284,7 +1286,7 @@ impl ModelCaller {
         tools: &crate::model_kinds::ModelKindCalls,
     ) -> Result<(String, Vec<CallId>), PlanError> {
         use kgraf_provider::{Content, Message, Role};
-        let mut request = self.request(user, self.max_output_tokens);
+        let mut request = self.request(kind, user, self.max_output_tokens);
         request.system = vec![Content::text(system)];
         request.tools = tools.tool_definitions();
         let mut calls = Vec::new();
@@ -2728,7 +2730,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("dir");
         let ledger = Arc::new(Ledger::open(&dir.path().join("l.db")).expect("ledger"));
         let d = ModelDecomposer(ModelCaller {
-            reasoning_effort: None,
+            reasoning: Default::default(),
             provider: Arc::new(CutOff),
             ledger: ledger.clone(),
             model: "m".into(),
@@ -2846,7 +2848,7 @@ mod tests {
 
     fn scripted_caller(provider: Arc<dyn Provider>) -> ModelCaller {
         ModelCaller {
-            reasoning_effort: None,
+            reasoning: Default::default(),
             provider,
             ledger: Arc::new(Ledger::open_in_memory().expect("ledger")),
             model: "m".into(),
@@ -2961,6 +2963,7 @@ mod tests {
             )]
             .into(),
             run: "run".into(),
+            reasoning: Default::default(),
         };
         let request = ReviewRequest {
             producer_contract: "p".into(),
@@ -2990,7 +2993,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("dir");
         let ledger = Arc::new(Ledger::open(&dir.path().join("l.db")).expect("ledger"));
         let d = ModelDecomposer(ModelCaller {
-            reasoning_effort: None,
+            reasoning: Default::default(),
             provider: Arc::new(CutOff),
             ledger,
             model: "m".into(),
@@ -3115,7 +3118,7 @@ mod tests {
                 .expect("register");
         }
         let d = ModelDecomposer(ModelCaller {
-            reasoning_effort: None,
+            reasoning: Default::default(),
             provider: Arc::new(CopiesTheExample),
             ledger,
             model: "m".into(),
@@ -3327,7 +3330,8 @@ mod tests {
                 requests: std::sync::Mutex::new(Vec::new()),
             });
             let caller = ModelCaller {
-                reasoning_effort: level,
+                reasoning: kgraf_provider::ReasoningLevels::new()
+                    .with(kgraf_provider::ReasoningScope::All, level.into()),
                 provider: provider.clone(),
                 ledger: ledger.clone(),
                 model: "m".into(),
@@ -3341,7 +3345,8 @@ mod tests {
                 .await
                 .expect("plan");
             let caller = ModelCaller {
-                reasoning_effort: level,
+                reasoning: kgraf_provider::ReasoningLevels::new()
+                    .with(kgraf_provider::ReasoningScope::All, level.into()),
                 provider: provider.clone(),
                 ledger: ledger.clone(),
                 model: "m".into(),
@@ -3373,7 +3378,7 @@ mod tests {
             requests: std::sync::Mutex::new(Vec::new()),
         });
         let d = ModelDecomposer(ModelCaller {
-            reasoning_effort: None,
+            reasoning: Default::default(),
             provider: provider.clone(),
             ledger: ledger.clone(),
             model: "m".into(),
@@ -3450,7 +3455,7 @@ mod tests {
             requests: std::sync::Mutex::new(Vec::new()),
         });
         let d = ModelDecomposer(ModelCaller {
-            reasoning_effort: None,
+            reasoning: Default::default(),
             provider: provider.clone(),
             ledger: ledger.clone(),
             model: "m".into(),
@@ -3549,7 +3554,7 @@ mod tests {
         let provider = Arc::new(ManyToolUses(std::sync::Mutex::new(Vec::new())));
         let calls = rerank_calls(ledger.clone());
         let d = ModelDecomposer(ModelCaller {
-            reasoning_effort: None,
+            reasoning: Default::default(),
             provider: provider.clone(),
             ledger: ledger.clone(),
             model: "m".into(),
@@ -3625,7 +3630,7 @@ mod tests {
         let ledger = Arc::new(Ledger::open(&dir.path().join("l.db")).expect("ledger"));
         let provider = Arc::new(RecordsTheRequest(std::sync::Mutex::new(String::new())));
         let d = ModelDecomposer(ModelCaller {
-            reasoning_effort: None,
+            reasoning: Default::default(),
             provider: provider.clone(),
             ledger,
             model: "m".into(),
@@ -3873,5 +3878,180 @@ mod tests {
             crate::interface_plan::INTERFACES_REQUEST
                 .contains("Give \"interfaces\":[] only when no contract depends on another")
         );
+    }
+
+    /// Records the wire body each request would carry on the Chat Completions
+    /// protocol (the adapter's own encoder), and answers `{}`.
+    struct WireBodies {
+        adapter: kgraf_provider_openai::ChatCompletionsAdapter,
+        bodies: std::sync::Mutex<Vec<serde_json::Value>>,
+    }
+
+    impl WireBodies {
+        fn new() -> Self {
+            let config = kgraf_provider::ProviderConfig::local(
+                "http://127.0.0.1:9/v1",
+                vec!["m".into()],
+                kgraf_core::Protocol::Inclusive,
+            );
+            Self {
+                adapter: kgraf_provider_openai::ChatCompletionsAdapter::new(
+                    config,
+                    kgraf_provider_openai::UsageDialect::Details,
+                )
+                .expect("adapter"),
+                bodies: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for WireBodies {
+        fn adapter(&self) -> &'static str {
+            "wire-bodies"
+        }
+        fn protocol(&self) -> kgraf_core::Protocol {
+            kgraf_core::Protocol::Inclusive
+        }
+        async fn complete(
+            &self,
+            request: &Request,
+            token: &kgraf_provider::CallToken,
+        ) -> Result<kgraf_provider::Response, kgraf_provider::ProviderError> {
+            self.bodies
+                .lock()
+                .expect("lock")
+                .push(self.adapter.to_wire(request));
+            let usage = kgraf_core::TokenUsage {
+                uncached_input: 1,
+                text_output: 1,
+                ..Default::default()
+            };
+            token.settle(&usage, None)?;
+            Ok(kgraf_provider::Response {
+                finish_reason: None,
+                model: request.model.clone(),
+                content: vec![kgraf_provider::Content::text("{}")],
+                stop_reason: kgraf_provider::StopReason::EndTurn,
+                usage,
+                request_id: None,
+            })
+        }
+    }
+
+    /// Decision 0098, on the wire: each orchestrator call kind, asked through
+    /// the one caller every orchestrator call goes through, sends the level
+    /// its own override sets (each of the five values in turn), not the
+    /// universal level set beside it; an `unset` override sends no field.
+    /// The ledger row of each call records that same kind.
+    #[tokio::test]
+    async fn every_orchestrator_call_kind_sends_its_configured_level_on_the_wire() {
+        use kgraf_provider::{
+            ReasoningEffort, ReasoningGroup, ReasoningLevel, ReasoningLevels, ReasoningProcess,
+            ReasoningScope,
+        };
+        let kinds: Vec<ReasoningProcess> = ReasoningProcess::ALL
+            .into_iter()
+            .filter(|p| p.group() != ReasoningGroup::Worker)
+            .collect();
+        assert_eq!(kinds.len(), 12);
+        for (i, process) in kinds.into_iter().enumerate() {
+            let own = ReasoningLevel::ALL[i % ReasoningLevel::ALL.len()];
+            let universal = if own == ReasoningEffort::Low.into() {
+                ReasoningEffort::High
+            } else {
+                ReasoningEffort::Low
+            };
+            let provider = Arc::new(WireBodies::new());
+            let caller = ModelCaller {
+                reasoning: ReasoningLevels::new()
+                    .with(ReasoningScope::All, universal.into())
+                    .with(ReasoningScope::Process(process), own),
+                provider: provider.clone(),
+                ledger: Arc::new(Ledger::open_in_memory().expect("ledger")),
+                model: "m".into(),
+                max_output_tokens: 100,
+                agent: "orchestrator:r".into(),
+                task: "r".into(),
+            };
+            let (answer, call) = caller
+                .ask_keeping_call(process.call_kind(), "system", "user".into())
+                .await;
+            answer.expect("answer");
+            let row = caller
+                .ledger
+                .call(&call.expect("a ledger row"))
+                .expect("read")
+                .expect("row");
+            assert_eq!(row.trace.kind.as_deref(), Some(process.call_kind()));
+            let bodies = provider.bodies.lock().expect("lock").clone();
+            assert_eq!(bodies.len(), 1);
+            let sent = bodies[0].get("reasoning_effort").cloned();
+            let want = own.effort().map(|e| match e {
+                ReasoningEffort::Off => serde_json::json!("none"),
+                graded => serde_json::json!(graded.as_str()),
+            });
+            assert_eq!(sent, want, "{process:?} with its own level `{own}`");
+        }
+    }
+
+    /// Every call kind the orchestrator's code asks a model with is a
+    /// `ReasoningProcess`, and every orchestrator `ReasoningProcess` is asked
+    /// somewhere: a new call kind cannot reach a model outside the reasoning
+    /// setting's list, and the list names no kind that does not exist.
+    #[test]
+    fn every_call_kind_the_orchestrator_asks_with_is_a_reasoning_process() {
+        use kgraf_provider::{ReasoningGroup, ReasoningProcess};
+        fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("read dir") {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    rust_files(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        rust_files(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
+        let mut asked = std::collections::BTreeSet::new();
+        for file in files {
+            let text = std::fs::read_to_string(&file).expect("read");
+            // The code, not its tests: a test asks with any kind it likes.
+            let code = text
+                .split("\n#[cfg(test)]\nmod ")
+                .next()
+                .unwrap_or_default();
+            for method in [
+                ".ask(",
+                ".ask_json(",
+                ".ask_keeping_call(",
+                ".ask_keeping_call_capped(",
+                ".ask_with_model_tools(",
+            ] {
+                for (at, _) in code.match_indices(method) {
+                    let rest = code[at + method.len()..].trim_start();
+                    if let Some(quoted) = rest.strip_prefix('"') {
+                        let kind = quoted.split('"').next().unwrap_or_default();
+                        asked.insert(kind.to_owned());
+                    }
+                }
+            }
+        }
+        for kind in &asked {
+            assert!(
+                ReasoningProcess::from_call_kind(kind).is_some(),
+                "`{kind}` is asked but is not a ReasoningProcess"
+            );
+        }
+        let listed: std::collections::BTreeSet<String> = ReasoningProcess::ALL
+            .into_iter()
+            .filter(|p| p.group() != ReasoningGroup::Worker)
+            .map(|p| p.call_kind().to_owned())
+            .collect();
+        assert_eq!(asked, listed);
     }
 }
