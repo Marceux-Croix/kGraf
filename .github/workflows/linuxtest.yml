@@ -1,0 +1,121 @@
+# Linux self-test on a GitHub-hosted Ubuntu machine.
+#
+# Manual trigger only: gh workflow run linuxtest.yml. There is no push,
+# pull_request or schedule trigger. Add `-f apparmor_profile=NAME` to name
+# the AppArmor profile to look for, when the package's own file does not
+# show it.
+#
+# What it runs (steps and reading guide: docs/LINUX-TESTING.md):
+#   1. Builds the .deb with scripts/package-linux.sh (native mode) and the
+#      test binaries of kgraf-sandbox and kgraf-host.
+#   2. Records the machine facts: kernel, the AppArmor user namespace
+#      restriction, whether an ordinary user can make a user namespace.
+#   3. Part A: with the restriction off, runs the sandbox and dependency
+#      install tests as an ordinary user without sudo.
+#   4. Part B: with the restriction on, installs the .deb and runs
+#      `kgraf sandbox selfcheck` as that user. It must pass.
+#   5. Part C: unloads the package's AppArmor profile and runs the same
+#      check. It must fail with kGraf's message about the fix.
+#   6. Uploads linuxtest-out/ (report.md and the logs) as one artifact.
+#
+# Cost: Linux minutes bill at the base rate. A run takes about 30 minutes,
+# most of it the release build of the .deb. The job stops after 60 minutes.
+#
+# Differences from a user's machine:
+#   - The runner is an ephemeral virtual machine, so the job changes a
+#     sysctl, installs a package and unloads a profile. Do not copy the
+#     steps onto a machine you care about.
+#   - The runner has Node.js, npm, Git and curl installed from the image.
+#     A user's machine may lack them.
+#   - It is Ubuntu 24.04 only, with no desktop session. It never opens the
+#     app window.
+#
+# A failing part does not fail the job: the report is the result. The job
+# fails when the build fails or when no report file was written.
+name: Linux self-test
+
+on:
+  workflow_dispatch:
+    inputs:
+      apparmor_profile:
+        description: "Profile name to look for in aa-status; empty reads it from the package"
+        required: false
+        default: ""
+      selfcheck_bin:
+        description: Installed program that runs the self-check
+        required: false
+        default: /usr/bin/kgraf
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linuxtest-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  OUT: linuxtest-out
+  TEST_USER: kgtest
+  # Workflow inputs reach the scripts only through the environment, never
+  # inside a script line.
+  APPARMOR_PROFILE: ${{ inputs.apparmor_profile }}
+  SELFCHECK_BIN: ${{ inputs.selfcheck_bin }}
+
+jobs:
+  linuxtest:
+    name: Linux self-test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      # The same moving `stable` alias that ci.yml uses; see the comment there.
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, as of 2026-09-26
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Build the package
+        run: |
+          set -euo pipefail
+          KGRAF_LINUX_NATIVE=1 \
+            REPO_DIR="$GITHUB_WORKSPACE" \
+            TARGET_DIR="$GITHUB_WORKSPACE/target/linuxpkg" \
+            scripts/package-linux.sh
+          deb="$(ls "$GITHUB_WORKSPACE"/target/linuxpkg/dist/linux/kgraf_*.deb | head -1)"
+          echo "DEB=$deb" >> "$GITHUB_ENV"
+
+      - name: Build the test binaries
+        run: scripts/linuxtest.sh build-tests
+
+      - name: Record the machine facts
+        run: scripts/linuxtest.sh facts
+
+      - name: Make the ordinary user
+        run: scripts/linuxtest.sh prepare
+
+      # The three parts never fail the job: a failure is a result in the report.
+      - name: "Part A: user namespaces allowed, tests as an ordinary user"
+        continue-on-error: true
+        run: scripts/linuxtest.sh part-a
+
+      - name: "Part B: restriction on, package installed"
+        continue-on-error: true
+        run: scripts/linuxtest.sh part-b
+
+      - name: "Part C: restriction on, profile unloaded"
+        continue-on-error: true
+        run: scripts/linuxtest.sh part-c
+
+      - name: Check the report
+        if: ${{ !cancelled() }}
+        run: |
+          scripts/linuxtest.sh finish
+          cat "$OUT/report.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the report and the logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: kgraf-linux-selftest
+          path: linuxtest-out/
+          if-no-files-found: error
+          retention-days: 14

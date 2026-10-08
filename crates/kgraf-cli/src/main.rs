@@ -15,6 +15,7 @@ mod diag_cmd;
 mod orchestrate_cmd;
 mod permissions_cli;
 mod plan_cmd;
+mod sandbox_cmd;
 mod schedule_cmd;
 mod worker_cmd;
 
@@ -599,6 +600,20 @@ enum Command {
         #[command(subcommand)]
         action: DepsAction,
     },
+    /// Checks of kGraf's sandbox on this machine. Not listed in `--help`.
+    #[command(hide = true)]
+    Sandbox {
+        #[command(subcommand)]
+        action: SandboxAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum SandboxAction {
+    /// Run one command under a proxy-only network policy with a hidden
+    /// folder, and report whether the sandbox held. Exits with an error when
+    /// the system denies what the sandbox needs.
+    Selfcheck,
 }
 
 #[derive(Subcommand)]
@@ -865,6 +880,7 @@ fn feature_name(command: &Command) -> &'static str {
         Command::Schedule { .. } => "schedule",
         Command::Diag { .. } => "diag",
         Command::Deps { .. } => "deps",
+        Command::Sandbox { .. } => "sandbox",
     }
 }
 
@@ -1425,6 +1441,9 @@ fn run_cli() -> Result<()> {
         Command::Diag { action } => match action {
             DiagAction::Show => diag_cmd::show(),
             DiagAction::Export { out } => diag_cmd::export(out, &root),
+        },
+        Command::Sandbox { action } => match action {
+            SandboxAction::Selfcheck => sandbox_cmd::selfcheck(),
         },
         Command::Deps { action } => match action {
             DepsAction::Status => deps_cmd::status(&root),

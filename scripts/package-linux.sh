@@ -24,6 +24,9 @@
 #
 # The repository is mounted read-only: this script never writes into /work.
 # All build output goes to $TARGET_DIR (a separate volume) and $DIST_DIR.
+#
+# Without a container, set KGRAF_LINUX_NATIVE=1 and pass REPO_DIR and
+# TARGET_DIR; see .github/workflows/linuxtest.yml.
 set -euo pipefail
 
 REPO_DIR="${REPO_DIR:-/work}"
@@ -43,9 +46,17 @@ echo "packaging for $rust_target ($deb_arch)"
 # tray-icon (libappindicator on Linux) needs GTK; winit/eframe need X11 and
 # Wayland client headers; dpkg-deb builds the .deb. The icon is a copy of the
 # designed asset PNG, not generated, so no rasterizer is needed here.
-if ! dpkg -s libgtk-3-dev >/dev/null 2>&1; then
-  apt-get update
-  apt-get install -y --no-install-recommends \
+# KGRAF_LINUX_NATIVE=1 runs the script as an ordinary user on a Linux host (the
+# GitHub-hosted Ubuntu runner): packages install through sudo, and the install
+# step always runs, since a host may have some of the packages but not all. In
+# the default mode the script is root in a container and calls apt-get directly.
+SUDO=""
+if [[ "${KGRAF_LINUX_NATIVE:-}" == "1" ]]; then
+  SUDO="sudo"
+fi
+if [[ -n "$SUDO" ]] || ! dpkg -s libgtk-3-dev >/dev/null 2>&1; then
+  $SUDO apt-get update
+  $SUDO apt-get install -y --no-install-recommends \
     pkg-config libgtk-3-dev libayatana-appindicator3-dev \
     libxdo-dev libx11-dev libxi-dev libxrandr-dev libxcursor-dev \
     libxkbcommon-dev libwayland-dev libssl-dev libglib2.0-dev \
@@ -78,11 +89,14 @@ fi
 rm -rf "$STAGE_DIR"
 mkdir -p "$STAGE_DIR/bin" "$STAGE_DIR/share/applications" \
   "$STAGE_DIR/share/icons/hicolor/256x256/apps" \
-  "$STAGE_DIR/share/doc/kgraf"
+  "$STAGE_DIR/share/doc/kgraf" "$STAGE_DIR/share/apparmor"
 cp "$bin_dir/kgraf" "$STAGE_DIR/bin/kgraf"
 cp "$bin_dir/kgraf-app" "$STAGE_DIR/bin/kgraf-app"
 cp "$REPO_DIR/packaging/linux/kgraf.desktop" \
   "$STAGE_DIR/share/applications/kgraf.desktop"
+# AppArmor profile: Ubuntu 23.10+ blocks user namespaces for a program without one.
+# The tarball carries it for manual install (docs/USAGE.md); the .deb installs it.
+cp "$REPO_DIR/packaging/linux/apparmor/kgraf" "$STAGE_DIR/share/apparmor/kgraf"
 cp "$REPO_DIR/crates/kgraf-shell/assets/app-icon/icon-256.png" \
   "$STAGE_DIR/share/icons/hicolor/256x256/apps/kgraf.png"
 [[ -f "$REPO_DIR/LICENSE" ]] || {
@@ -122,6 +136,7 @@ echo "tarball: $DIST_DIR/${tar_name}.tar.gz ($(du -h "$DIST_DIR/${tar_name}.tar.
 deb_root="$TARGET_DIR/deb-root"
 rm -rf "$deb_root"
 mkdir -p "$deb_root/DEBIAN" "$deb_root/usr" "$deb_root/usr/bin" \
+  "$deb_root/etc/apparmor.d" \
   "$deb_root/usr/share/applications" \
   "$deb_root/usr/share/icons/hicolor/256x256/apps" \
   "$deb_root/usr/share/doc/kgraf"
@@ -137,6 +152,14 @@ cp "$STAGE_DIR/share/icons/hicolor/256x256/apps/kgraf.png" \
 cp "$STAGE_DIR/share/doc/kgraf/LICENSE.txt" "$deb_root/usr/share/doc/kgraf/LICENSE.txt"
 cp "$STAGE_DIR/share/doc/kgraf/LICENSE.txt" "$deb_root/usr/share/doc/kgraf/copyright"
 cp "$STAGE_DIR/share/doc/kgraf/THIRD_PARTY_NOTICES.md" "$deb_root/usr/share/doc/kgraf/THIRD_PARTY_NOTICES.md"
+# The profile is a conffile: dpkg-deb (unlike debhelper) does not list /etc files in
+# DEBIAN/conffiles by itself, and without the entry an upgrade overwrites local edits.
+cp "$STAGE_DIR/share/apparmor/kgraf" "$deb_root/etc/apparmor.d/kgraf"
+chmod 644 "$deb_root/etc/apparmor.d/kgraf"
+echo "/etc/apparmor.d/kgraf" > "$deb_root/DEBIAN/conffiles"
+for script in postinst prerm postrm; do
+  install -m 755 "$REPO_DIR/packaging/linux/debian/$script" "$deb_root/DEBIAN/$script"
+done
 installed_size="$(du -sk "$deb_root/usr" | cut -f1)"
 
 # Depends: computed from what the binaries actually link (ldd), not a
@@ -204,6 +227,15 @@ echo "$DEB_LISTING" | grep -q "usr/share/doc/kgraf/LICENSE.txt" || {
 }
 echo "$DEB_LISTING" | grep -q "usr/share/doc/kgraf/THIRD_PARTY_NOTICES.md" || {
   echo "$deb_path is missing usr/share/doc/kgraf/THIRD_PARTY_NOTICES.md" >&2
+  exit 1
+}
+
+echo "$TAR_LISTING" | grep -q "share/apparmor/kgraf" || {
+  echo "tarball is missing share/apparmor/kgraf" >&2
+  exit 1
+}
+echo "$DEB_LISTING" | grep -q "etc/apparmor.d/kgraf" || {
+  echo "$deb_path is missing etc/apparmor.d/kgraf" >&2
   exit 1
 }
 

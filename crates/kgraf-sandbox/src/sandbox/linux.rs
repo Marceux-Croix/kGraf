@@ -28,6 +28,21 @@
 //! writable roots, and a policy with [`super::SandboxPolicy::allow_unix_socket`]
 //! entries is refused rather than run with the entries ignored.
 
+/// The fix text for Ubuntu's AppArmor user-namespace restriction, as a macro so
+/// `concat!` can join it to the static `what` strings. The packages install
+/// the profile in `packaging/linux/apparmor/kgraf`.
+macro_rules! ubuntu_userns_fix {
+    () => {
+        "; this Ubuntu blocks user namespaces for programs without an AppArmor profile \
+         (kernel.apparmor_restrict_unprivileged_userns is 1) and the kgraf profile is \
+         missing or not loaded. The .deb package installs it. For a tarball install run: \
+         sudo install -m 644 share/apparmor/kgraf /etc/apparmor.d/kgraf && \
+         sudo apparmor_parser -r -W /etc/apparmor.d/kgraf \
+         (the profile names /usr/bin/kgraf and /usr/bin/kgraf-app; edit the paths if the \
+         programs are elsewhere)"
+    };
+}
+
 mod namespaces;
 mod privileges;
 mod seccomp;
@@ -491,15 +506,33 @@ fn command_with(
     if matches!(policy.network, Network::Proxy { .. }) && !kernel.namespaces {
         return Err(SandboxError::PolicyNotEnforceable {
             backend: BACKEND_NAME,
-            what: "network through the egress proxy only (it needs a network namespace of the \
-                   command's own, and user namespaces are not available)",
+            what: match namespaces::userns_block() {
+                namespaces::UsernsBlock::UbuntuProfile => concat!(
+                    "network through the egress proxy only (it needs a network namespace of the \
+                     command's own, and user namespaces are not available",
+                    ubuntu_userns_fix!()
+                ),
+                namespaces::UsernsBlock::Other => {
+                    "network through the egress proxy only (it needs a network namespace of the \
+                     command's own, and user namespaces are not available)"
+                }
+            },
         });
     }
     if !policy.hidden.is_empty() && !kernel.namespaces {
         return Err(SandboxError::PolicyNotEnforceable {
             backend: BACKEND_NAME,
-            what: "a hidden folder beneath a writable root (Landlock cannot deny a folder \
-                   inside a granted one, and user namespaces are not available to cover it)",
+            what: match namespaces::userns_block() {
+                namespaces::UsernsBlock::UbuntuProfile => concat!(
+                    "a hidden folder beneath a writable root (Landlock cannot deny a folder \
+                     inside a granted one, and user namespaces are not available to cover it",
+                    ubuntu_userns_fix!()
+                ),
+                namespaces::UsernsBlock::Other => {
+                    "a hidden folder beneath a writable root (Landlock cannot deny a folder \
+                     inside a granted one, and user namespaces are not available to cover it)"
+                }
+            },
         });
     }
     let handoff = match policy.network {

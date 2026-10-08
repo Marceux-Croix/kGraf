@@ -1,0 +1,40 @@
+# AppArmor profiles that let kGraf create user namespaces.
+#
+# Ubuntu 23.10 and later set kernel.apparmor_restrict_unprivileged_userns=1.
+# With that setting an unprivileged program may not create a user namespace
+# unless an AppArmor profile grants the `userns` permission. kGraf's Linux
+# sandbox needs user namespaces for proxy-limited dependency installs and for
+# hidden folders, and it refuses to run those without them.
+#
+# These profiles have the form Ubuntu ships for Chrome and Firefox
+# (/etc/apparmor.d/chrome, /etc/apparmor.d/firefox): `flags=(unconfined)` keeps
+# every other permission as if no profile existed, and `userns,` is the only
+# grant. A program under these profiles is not otherwise confined.
+#
+# Only the two programs named here get the grant. The sandbox enters its
+# namespaces in a forked child of the program, before it runs the command, so
+# the profile that matters is the one on kgraf or kgraf-app. The sandboxed
+# command itself needs no grant: the sandbox blocks it from creating more
+# namespaces.
+#
+# The attachment paths must match where the programs are installed. The .deb
+# installs them in /usr/bin. For another location, change the two paths below.
+#
+# Add site rules in /etc/apparmor.d/local/kgraf. Load or reload with:
+#   sudo apparmor_parser -r -W /etc/apparmor.d/kgraf
+# Check with: sudo aa-status | grep kgraf
+
+abi <abi/4.0>,
+include <tunables/global>
+
+profile kgraf /usr/bin/kgraf flags=(unconfined) {
+  userns,
+
+  include if exists <local/kgraf>
+}
+
+profile kgraf-app /usr/bin/kgraf-app flags=(unconfined) {
+  userns,
+
+  include if exists <local/kgraf>
+}

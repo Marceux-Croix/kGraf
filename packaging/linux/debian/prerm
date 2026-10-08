@@ -1,0 +1,17 @@
+#!/bin/sh
+# Unloads the AppArmor profile when the package is removed or purged.
+# Never fails the removal.
+set -e
+
+case "$1" in
+    remove|purge)
+        profile=/etc/apparmor.d/kgraf
+        if [ -f "$profile" ] && command -v apparmor_parser >/dev/null 2>&1; then
+            if command -v aa-enabled >/dev/null 2>&1 && aa-enabled --quiet 2>/dev/null; then
+                apparmor_parser -R "$profile" || true
+            fi
+        fi
+        ;;
+esac
+
+exit 0

@@ -1,0 +1,10 @@
+#!/bin/sh
+# On purge, removes what the profile load left behind: the compiled cache.
+# dpkg removes the conffile itself. Never fails.
+set -e
+
+if [ "$1" = "purge" ]; then
+    rm -f /var/cache/apparmor/*/kgraf /var/cache/apparmor/*/kgraf-app 2>/dev/null || true
+fi
+
+exit 0

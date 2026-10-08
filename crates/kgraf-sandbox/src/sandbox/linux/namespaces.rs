@@ -694,3 +694,56 @@ pub(super) fn available() -> Probe {
         fresh_proc: code == 0,
     }
 }
+
+/// Why user namespaces may be unavailable, for the message that names the fix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum UsernsBlock {
+    /// Ubuntu's AppArmor restriction is on: a program needs a profile with the
+    /// `userns` permission.
+    UbuntuProfile,
+    /// Any other cause.
+    Other,
+}
+
+const UBUNTU_RESTRICTION: &str = "/proc/sys/kernel/apparmor_restrict_unprivileged_userns";
+
+/// Pure selection: `read` returns the content of a `/proc` file, or `None`
+/// when it cannot be read (the sysctl does not exist off Ubuntu).
+pub(super) fn userns_block_with(read: impl Fn(&str) -> Option<String>) -> UsernsBlock {
+    match read(UBUNTU_RESTRICTION) {
+        Some(v) if v.trim() == "1" => UsernsBlock::UbuntuProfile,
+        _ => UsernsBlock::Other,
+    }
+}
+
+/// [`userns_block_with`] on the real `/proc`.
+pub(super) fn userns_block() -> UsernsBlock {
+    userns_block_with(|path| std::fs::read_to_string(path).ok())
+}
+
+#[cfg(test)]
+mod userns_block_tests {
+    use super::*;
+
+    fn fake(value: Option<&'static str>) -> impl Fn(&str) -> Option<String> {
+        move |path| {
+            assert_eq!(path, UBUNTU_RESTRICTION);
+            value.map(str::to_owned)
+        }
+    }
+
+    #[test]
+    fn restriction_on_selects_the_profile_message() {
+        assert_eq!(
+            userns_block_with(fake(Some("1\n"))),
+            UsernsBlock::UbuntuProfile
+        );
+    }
+
+    #[test]
+    fn restriction_off_or_absent_selects_the_plain_message() {
+        assert_eq!(userns_block_with(fake(Some("0\n"))), UsernsBlock::Other);
+        assert_eq!(userns_block_with(fake(None)), UsernsBlock::Other);
+        assert_eq!(userns_block_with(fake(Some("garbage"))), UsernsBlock::Other);
+    }
+}

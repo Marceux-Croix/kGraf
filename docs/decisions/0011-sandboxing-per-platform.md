@@ -455,3 +455,37 @@ count matches. It fails without the removal. Platform-neutral unit tests cover t
 order of removal and setting, the refused pass, the Windows settings through the Windows
 environment block, and the install. A Windows-only test checks the same through git on
 Windows.
+
+## Amendment (2026-10-08): the Linux package installs an AppArmor profile for user namespaces
+
+Ubuntu 23.10 and later set `kernel.apparmor_restrict_unprivileged_userns=1`. An unprivileged
+program may not create a user namespace there unless an AppArmor profile grants `userns`.
+The probe in `namespaces::available` then fails, and a proxy-limited install or a hidden folder
+is refused (amendment of 2026-10-07).
+
+**Decision.** The Linux package installs `/etc/apparmor.d/kgraf` with one profile for
+`/usr/bin/kgraf` and one for `/usr/bin/kgraf-app`. Each has `flags=(unconfined)` and the one
+permission `userns,`, the form Ubuntu ships for Chrome and Firefox. Every other permission stays
+as if no profile existed. The `.deb` lists the file as a conffile, loads it with
+`apparmor_parser -r -W` in `postinst` when AppArmor is enabled, and unloads it in `prerm`. A
+system without AppArmor skips the load and the install still succeeds. The tarball carries the
+file in `share/apparmor/kgraf` and `docs/USAGE.md` gives the manual steps.
+
+**Scope of the grant.** Only the program that creates the namespaces needs it. The sandbox
+enters them in a forked child of `kgraf` or `kgraf-app`, before it runs the command, so the
+profile attaches by the program's path and the fork inherits it. The sandboxed command needs no
+grant: seccomp refuses it new namespaces.
+
+**Options considered.** (1) Ask the user to set the sysctl to 0. Rejected: it removes the
+protection for every program on the system. (2) A profile for each program with full rules.
+Rejected: it confines kGraf in ways that break the programs it starts. (3) The `userns`-only
+profile. Chosen.
+
+**The error.** When the sysctl reads 1 and namespaces are unavailable, the refusal says the
+profile is missing or not loaded and gives the tarball commands. Other causes keep the plain
+message.
+
+**Verification.** The profile parses with `apparmor_parser -Q -T -K` on Ubuntu 24.04 in a
+container, and the maintainer scripts pass `sh -n` and `shellcheck`. Loading the profile and the
+real grant need a host kernel with AppArmor, so they are checked on an Ubuntu 24.04 machine:
+`aa-status | grep kgraf`, then a proxy-limited install.

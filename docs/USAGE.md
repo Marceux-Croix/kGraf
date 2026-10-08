@@ -2227,6 +2227,35 @@ Local packaging scripts build a platform-native artifact from this tree:
 | `scripts/package-linux.sh` | tarball and `.deb` | none |
 | `scripts/package-windows.sh` | x64 `.msi` (built with `wixl`) and `.zip`, cross-built with `cargo-xwin` | none |
 
+### Linux: the AppArmor profile
+
+Ubuntu 23.10 and later block user namespaces for a program that has no AppArmor profile
+granting them (`kernel.apparmor_restrict_unprivileged_userns` is 1). kGraf needs user namespaces
+for installs limited to the package registries and for hidden folders. Without them kGraf
+refuses those and says so.
+
+The `.deb` installs `/etc/apparmor.d/kgraf` and loads it. The file holds one profile for
+`/usr/bin/kgraf` and one for `/usr/bin/kgraf-app`. Each grants only `userns`; every other
+permission stays as if there were no profile. Local additions go in
+`/etc/apparmor.d/local/kgraf`. A system without AppArmor skips the load.
+
+To check that it is loaded:
+
+```
+sudo aa-status | grep kgraf
+cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns
+```
+
+For a tarball install, run these from the unpacked folder:
+
+```
+sudo install -m 644 share/apparmor/kgraf /etc/apparmor.d/kgraf
+sudo apparmor_parser -r -W /etc/apparmor.d/kgraf
+```
+
+If you put the programs somewhere other than `/usr/bin`, change the two paths at the start of
+the profiles first. The profile attaches by the path of the program.
+
 Each package carries `LICENSE` and `THIRD_PARTY_NOTICES.md`. The version comes from one
 place, `[workspace.package].version` in the root `Cargo.toml`, and
 `scripts/check-release-version.sh` fails when it does not match the highest `v*` tag's

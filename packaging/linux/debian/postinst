@@ -1,0 +1,17 @@
+#!/bin/sh
+# Loads the AppArmor profile that lets kGraf create user namespaces.
+# Follows the dh_apparmor snippet: load only when AppArmor is enabled, and
+# never fail the install (a container, a kernel without AppArmor and a system
+# without apparmor_parser all skip the load).
+set -e
+
+if [ "$1" = "configure" ]; then
+    profile=/etc/apparmor.d/kgraf
+    if [ -f "$profile" ] && command -v apparmor_parser >/dev/null 2>&1; then
+        if command -v aa-enabled >/dev/null 2>&1 && aa-enabled --quiet 2>/dev/null; then
+            apparmor_parser -r -W "$profile" || true
+        fi
+    fi
+fi
+
+exit 0
