@@ -903,7 +903,7 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   you. A contract is re-dispatched at most twice for shortfalls; a grant that did not help
   holds. Every grant, hold and answer is in the run's trace (`shortfall` and `permission`
   events), and each grant is kept on the contract with who asked, why, and who granted it.
-- A shortfall that would hold the contract (a plan-shape error for a file no contract writes,
+- A shortfall that would hold the contract (a plan-shape error for a file no open contract writes,
   a denial nobody attends to answer, a deny rule, a skill) is a claim that the contract cannot
   be done in its scope, and the verifier judges it first (decision 0093). When the worker had
   changed files, its attempt is verified as a completed one would be. If the check passes, the

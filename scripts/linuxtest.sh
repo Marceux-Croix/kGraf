@@ -158,6 +158,7 @@ step_facts() {
     echo "apparmor package: $(dpkg-query -W -f='${Version}' apparmor 2>/dev/null || echo not installed)"
     echo "apparmor_parser: $(apparmor_parser --version 2>/dev/null | head -1 || echo not installed)"
     echo "git: $(git --version)"
+    echo "free disk: $(df -h / | awk 'NR==2 {print $4 " of " $2}')"
     echo "node: $(node --version 2>/dev/null || echo none), npm: $(npm --version 2>/dev/null || echo none)"
     echo "curl: $(curl --version 2>/dev/null | head -1 || echo none)"
   } >"$facts"

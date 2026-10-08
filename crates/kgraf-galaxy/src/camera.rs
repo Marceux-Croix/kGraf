@@ -260,9 +260,14 @@ impl OrbitCamera {
         let eye = self.eye();
         let forward = -self.offset_dir();
         let (right, up) = self.right_up();
-        let view = Mat4::look_at_rh(eye, self.target, Vec3::Y);
+        let view = glam::camera::rh::view::look_at_mat4(eye, self.target, Vec3::Y);
         let aspect = width.max(1.0) / height.max(1.0);
-        let proj = Mat4::perspective_rh(FOV_Y_DEGREES.to_radians(), aspect, NEAR, FAR);
+        let proj = glam::camera::rh::proj::directx::perspective(
+            FOV_Y_DEGREES.to_radians(),
+            aspect,
+            NEAR,
+            FAR,
+        );
         CameraFrame {
             view_proj: proj * view,
             eye,

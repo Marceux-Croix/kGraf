@@ -845,3 +845,38 @@ Tests: `kgraf-orchestrator` `derive_interface.rs`
 `a_go_work_member_written_later_is_refused_and_one_in_time_is_not`,
 `a_maven_module_written_later_is_refused_and_a_profile_module_is_not`,
 `workspaces_that_do_not_load_a_missing_member_are_never_refused`.
+
+## Amendment (2026-10-08): a package the workspace does not list is refused
+
+The member check read one direction only: a member the workspace lists whose manifest comes too
+late. The other direction passed intake. A contract wrote a new package manifest
+(`wcl/Cargo.toml`) under the root workspace, the root manifest as its dependency wrote it listed
+`wcl-core` alone, and the contract could not write `Cargo.toml` to add `wcl`. Its check
+`cargo check -p wcl` could not pass; its worker asked for `Cargo.toml` and the contract was held,
+and the run ended blocked with a merged result whose tests passed only because `wcl` was never
+built.
+
+- **A package the workspace does not list is refused** (`plan_repo::unlisted_package`). A
+  contract whose acceptance runs cargo in a workspace, and that writes a package manifest under
+  the workspace's directory that the workspace, as that contract gets it, does not list (not an
+  explicit member, not under a `<prefix>/*` member, not excluded), is refused unless it writes
+  the workspace manifest itself. Measured with cargo 1.99: `cargo check -p <package>` fails
+  ("did not match any packages"), `cargo run -p <package>` fails ("not found in workspace"), a
+  command in the package's directory or with `--manifest-path` fails ("believes it's in a
+  workspace when it's not"), and `cargo test --workspace` passes without building the package.
+  The `--workspace` form is refused too: it would check nothing of the package. The remedy names
+  two shapes: the contract also writes the workspace manifest to add its member (and depends on
+  any other writer of it that could run at the same time), or the contract that writes the
+  workspace manifest lists the member and writes the package's stub. A package manifest the
+  repository already holds, one with a nearer workspace manifest in the repository, and one
+  with no workspace above it are not judged.
+- **The plan-shape hold says "open".** A worker that needs a file no open contract writes is
+  held for a re-plan. The hold now says no *open* contract writes it: a contract that finished
+  may have written it, and its writes closed with it.
+
+Tests: `kgraf-orchestrator` `plan_repo.rs`
+`a_package_the_workspace_does_not_list_is_refused_with_its_remedies`,
+`a_package_the_workspace_covers_or_the_repository_holds_is_not_refused`,
+`the_check_agrees_with_cargo` (the refused plan fails in a real cargo run, its remedy passes),
+`a_toml_member_list_wins_over_prose`, `this_repository_with_ordinary_plans_is_not_refused`;
+`shortfall.rs` `a_hold_for_a_file_no_contract_writes_asks_for_a_replan`.

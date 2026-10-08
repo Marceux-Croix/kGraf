@@ -25,9 +25,9 @@ egui = "0.36.2"
 egui-wgpu = "0.36.2"
 # Vertex and uniform structs are uploaded as plain bytes.
 bytemuck = { version = "1.25.2", features = ["derive"] }
-# Camera and projection math. re_renderer uses glam too; glam's perspective_rh already
+# Camera and projection math. re_renderer uses glam too; glam's directx perspective
 # maps depth to wgpu's 0..1 range.
-glam = { version = "0.32.1", features = ["bytemuck"] }
+glam = { version = "0.33.12", features = ["bytemuck"] }
 
 [dev-dependencies]
 pollster = "1.0.1"

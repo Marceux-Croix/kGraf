@@ -839,7 +839,8 @@ pub fn decide_in_plan(
         ShortfallDecision::AskUser { grant, question }
     } else if let Some(path) = unowned_file {
         hold(format!(
-            "a worker needs to write `{path}` ({why}), and no contract of this plan writes it. \
+            "a worker needs to write `{path}` ({why}), and no open contract of this plan writes \
+             it (a contract that finished may have written it; its writes closed with it). \
              That is a plan-shape error, not a missing permission: a path grant would let one \
              attempt write a file the plan never assigned. The plan needs a contract that lists \
              `{path}` in its writes; re-plan, then run again"
@@ -2505,7 +2506,7 @@ mod tests {
             panic!("expected a hold");
         };
         assert!(
-            reason.contains("no contract of this plan writes it"),
+            reason.contains("no open contract of this plan writes it"),
             "{reason}"
         );
         assert!(reason.contains("re-plan"), "{reason}");

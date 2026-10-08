@@ -86,7 +86,7 @@ egui-wgpu = "0.36.2"
 wgpu = "30.0.1"
 winit = "0.30.13"
 # Tray presence for background mode (decision 0052). Same crate Tauri uses.
-tray-icon = "0.25.1"
+tray-icon = "0.26.0"
 log = "0.4.34"
 # Binary only: routes wgpu/egui-wgpu warnings to stderr. Default features off to skip
 # the regex filter engine; module-prefix filters still work.
@@ -106,7 +106,7 @@ rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal"] 
 # `--screenshot` writes the window capture as a PNG through
 # packaging/png_encoder.rs, which compresses with this. Already a build and
 # dev dependency here.
-miniz_oxide = "0.8"
+miniz_oxide = "0.9"
 # Decodes the embedded app-icon PNGs (src/icon.rs) to RGBA for the window and
 # tray icons. MIT OR Apache-2.0; already in this workspace's lockfile at 0.18.1
 # via tray-icon, so this pins the same major rather than resolving a second copy.

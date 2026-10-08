@@ -10,7 +10,7 @@ into this repository is listed under `third_party/`, each block with its
 ## Overview
 
 - Apache License 2.0 (Apache-2.0): 495 crate(s)
-- MIT License (MIT): 192 crate(s)
+- MIT License (MIT): 190 crate(s)
 - Unicode License v3 (Unicode-3.0): 23 crate(s)
 - ISC License (ISC): 22 crate(s)
 - BSD 3-Clause "New" or "Revised" License (BSD-3-Clause): 6 crate(s)
@@ -7170,7 +7170,7 @@ limitations under the License.
 
 Used by:
 
-- [glam 0.32.1](https://github.com/bitshifter/glam-rs)
+- [glam 0.33.12](https://github.com/bitshifter/glam-rs)
 
 ```text
                               Apache License
@@ -8517,7 +8517,7 @@ Used by:
 - [linux-raw-sys 0.4.15](https://github.com/sunfishcode/linux-raw-sys)
 - [lock_api 0.4.14](https://github.com/Amanieu/parking_lot)
 - [log 0.4.34](https://github.com/rust-lang/log)
-- [muda 0.20.0](https://github.com/tauri-apps/muda)
+- [muda 0.21.0](https://github.com/tauri-apps/muda)
 - [num-bigint 0.4.8](https://github.com/rust-num/num-bigint)
 - [num-complex 0.4.6](https://github.com/rust-num/num-complex)
 - [num-integer 0.1.47](https://github.com/rust-num/num-integer)
@@ -8566,7 +8566,7 @@ Used by:
 - [tempfile 3.27.0](https://github.com/Stebalien/tempfile)
 - [thread_local 1.1.10](https://github.com/Amanieu/thread_local-rs)
 - [toml_datetime 0.6.3](https://github.com/toml-rs/toml)
-- [tray-icon 0.25.1](https://github.com/tauri-apps/tray-icon)
+- [tray-icon 0.26.0](https://github.com/tauri-apps/tray-icon)
 - [ttf-parser 0.25.1](https://github.com/harfbuzz/ttf-parser)
 - [unicase 2.9.0](https://github.com/seanmonstar/unicase)
 - [unicode-bidi 0.3.18](https://github.com/servo/unicode-bidi)
@@ -12471,7 +12471,7 @@ Used by:
 - [raw-window-handle 0.6.2](https://github.com/rust-windowing/raw-window-handle)
 - [ref-cast-impl 1.0.27](https://github.com/dtolnay/ref-cast)
 - [ref-cast 1.0.27](https://github.com/dtolnay/ref-cast)
-- [rmcp 3.4.1](https://github.com/modelcontextprotocol/rust-sdk/)
+- [rmcp 3.5.0](https://github.com/modelcontextprotocol/rust-sdk/)
 - [rustc-hash 2.1.3](https://github.com/rust-lang/rustc-hash)
 - [rustversion 1.0.23](https://github.com/dtolnay/rustversion)
 - [ryu 1.0.23](https://github.com/dtolnay/ryu)
@@ -15662,6 +15662,37 @@ SOFTWARE.
 
 Used by:
 
+- [junction 2.1.0](https://github.com/tesuji/junction)
+
+```text
+MIT License
+
+Copyright (c) 2020 lzutao
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+```
+
+### MIT License (MIT)
+
+Used by:
+
 - [tree-sitter-md 0.5.3](https://github.com/tree-sitter-grammars/tree-sitter-markdown)
 
 ```text
@@ -15989,7 +16020,6 @@ Used by:
 - [endi 1.1.1](https://github.com/zeenix/endi)
 - [unsafe-libyaml 0.2.11](https://github.com/dtolnay/unsafe-libyaml)
 - [x11-dl 2.21.0](https://github.com/AltF02/x11-rs.git)
-- [x11 2.21.0](https://github.com/AltF02/x11-rs.git)
 - [zbus-lockstep-macros 0.5.2](https://github.com/luukvanderduim/zbus-lockstep)
 - [zbus-lockstep 0.5.2](https://github.com/luukvanderduim/zbus-lockstep)
 - [zmij 1.0.23](https://github.com/dtolnay/zmij)
@@ -16459,38 +16489,6 @@ SOFTWARE.
 
 Used by:
 
-- [libxdo-sys 0.11.0](https://github.com/crumblingstatue/rust-libxdo-sys)
-- [libxdo 0.6.0](https://github.com/crumblingstatue/rust-libxdo)
-
-```text
-The MIT License (MIT)
-
-Copyright (c) 2015 Mika Attila
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
-```
-
-### MIT License (MIT)
-
-Used by:
-
 - [aws-lc-sys 0.45.0](https://github.com/aws/aws-lc-rs)
 
 ```text
@@ -16839,7 +16837,7 @@ SOFTWARE.
 
 Used by:
 
-- [croner 4.0.0](https://github.com/hexagon/croner-rust)
+- [croner 4.0.1](https://github.com/hexagon/croner-rust)
 
 ```text
 The MIT License (MIT)

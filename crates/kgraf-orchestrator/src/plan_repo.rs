@@ -1190,7 +1190,7 @@ fn cargo_findings<C: PlanContract>(specs: &[C], c: &C, repo: &dyn RepoView) -> V
                     }
                 }
             }
-            for member in dirs {
+            for member in &dirs {
                 let member_manifest = format!("{base}{member}/Cargo.toml");
                 let src = format!("{base}{member}/src");
                 if !reachable(&member_manifest) {
@@ -1252,10 +1252,130 @@ fn cargo_findings<C: PlanContract>(specs: &[C], c: &C, repo: &dyn RepoView) -> V
                     });
                 }
             }
+            let seen = Seen {
+                manifest,
+                members: &members,
+                dirs: &dirs,
+            };
+            if let Some(f) = unlisted_package(specs, c, repo, &workspaces, &seen, &run.command) {
+                push(f);
+            }
             break;
         }
     }
     found
+}
+
+/// A workspace as one contract gets it: its manifest, its members and the
+/// member directories they come to.
+#[derive(Clone, Copy)]
+struct Seen<'a> {
+    manifest: &'a str,
+    members: &'a Members,
+    dirs: &'a [String],
+}
+
+/// A package manifest `c` adds under the workspace `seen` that the workspace,
+/// as `c` gets it, does not list, when `c` does not write the workspace
+/// manifest to add it. `command` is the cargo command of `c`'s acceptance.
+///
+/// Cargo builds only a workspace's members. Measured with cargo 1.99, a
+/// package under the workspace's directory that the members do not list
+/// fails `cargo check -p <package>` ("package ID specification `<package>`
+/// did not match any packages"), `cargo run -p <package>` ("package(s)
+/// `<package>` not found in workspace") and a command in its directory or
+/// with `--manifest-path` ("current package believes it's in a workspace
+/// when it's not"), and `cargo test --workspace` passes without building it.
+/// So the contract's check either cannot pass or does not check the package.
+/// A manifest that is already in the repository is the project's own and is
+/// left alone, as is one with its own `[workspace]` or under a nearer
+/// workspace.
+fn unlisted_package<C: PlanContract>(
+    specs: &[C],
+    c: &C,
+    repo: &dyn RepoView,
+    workspaces: &[&str],
+    seen: &Seen<'_>,
+    command: &str,
+) -> Option<Finding> {
+    let Seen {
+        manifest,
+        members,
+        dirs,
+    } = *seen;
+    let own: Vec<&str> = c.write_paths().into_iter().map(norm).collect();
+    if own.contains(&manifest) {
+        return None;
+    }
+    let dir = dir_of(manifest);
+    let base = if dir.is_empty() {
+        String::new()
+    } else {
+        format!("{dir}/")
+    };
+    own.iter().copied().find_map(|package| {
+        let package_dir = package.strip_suffix("/Cargo.toml")?;
+        let rel = package_dir.strip_prefix(base.as_str())?;
+        if rel.is_empty() || repo.exists(package) || workspaces.contains(&package) {
+            return None;
+        }
+        // The nearest workspace above the package, as cargo searches up.
+        let nearest = workspaces.iter().copied().find(|w| {
+            let d = dir_of(w);
+            d != package_dir && within(d, package_dir)
+        });
+        if nearest != Some(manifest) {
+            return None;
+        }
+        // A workspace manifest the repository holds between the two: cargo
+        // stops there. This check reads one workspace and leaves that alone.
+        let mut up = package_dir;
+        while let Some((parent, _)) = up.rsplit_once('/') {
+            if parent.len() <= dir.len() {
+                break;
+            }
+            if repo_members(&format!("{parent}/Cargo.toml"), repo).is_some() {
+                return None;
+            }
+            up = parent;
+        }
+        let excluded = members
+            .exclude
+            .iter()
+            .any(|e| rel == e || rel.starts_with(&format!("{e}/")));
+        if excluded || dirs.iter().any(|m| m == rel) {
+            return None;
+        }
+        // A writer of `manifest` that may run at the same time as `c`: the
+        // remedy then needs an order between the two writes.
+        let mine = ancestors(specs, c.id());
+        let concurrent = specs
+            .iter()
+            .filter(|s| s.id() != c.id())
+            .filter(|s| s.write_paths().iter().any(|w| norm(w) == manifest))
+            .find(|s| !mine.contains(s.id()) && !ancestors(specs, s.id()).contains(c.id()))
+            .map(|s| format!(" and depend on `{}`, which writes it too", s.id()))
+            .unwrap_or_default();
+        let src = format!("{base}{rel}/src");
+        Some(Finding {
+            paths: vec![manifest.to_owned(), package.to_owned()],
+            reason: format!(
+                "contract `{id}` writes the package manifest `{package}` inside the workspace \
+                 `{manifest}`, but `{manifest}` as `{id}` gets it does not list `{rel}` among \
+                 its members, and `{id}` does not write `{manifest}`. Cargo builds only the \
+                 members of a workspace: `-p` of the package fails (\"did not match any \
+                 packages\" or \"not found in workspace\"), a command in its directory or \
+                 with `--manifest-path` fails (\"believes it's in a workspace when it's \
+                 not\"), and `--workspace` passes without building it, so the acceptance of \
+                 `{id}` (`{command}`) cannot check the package. Fix it in one of these ways: \
+                 make `{id}` also write `{manifest}` to add \
+                 `{rel}` to its members{concurrent}; or have the contract that writes \
+                 `{manifest}` list `{rel}` in its members and also write `{package}` and a \
+                 source file `{src}/lib.rs` or `{src}/main.rs`, which `{id}` may fill in",
+                id = c.id(),
+            ),
+        })
+    })
 }
 
 /// The first contract whose cargo acceptance cannot pass in its workspace.
@@ -1751,6 +1871,152 @@ pub fn f() {}
         ]
     }
 
+    /// A greenfield plan, verbatim but for the long instruction bodies: `c1`
+    /// writes the root manifest and the library, and its instruction asks it
+    /// to list `wcl` too, which its own check cannot pass with
+    /// (`wcl/Cargo.toml` comes later), so its worker listed `wcl-core` alone.
+    /// `c2` writes the `wcl` package and checks it with `cargo check -p wcl`,
+    /// but may not write the root manifest to add the member. `c1` was
+    /// verified; `c2` asked for `Cargo.toml` and was held, and the run ended
+    /// Blocked with a merged result whose tests pass.
+    fn unlisted_member_plan() -> [ContractSpec; 2] {
+        [
+            spec(
+                "c1",
+                "Create the Cargo workspace at the repository root by adding `Cargo.toml`. \
+                 Define two member crates: a library crate `wcl-core` and a binary crate \
+                 placeholder. \n\nInside `wcl-core/src/lib.rs`, define a public struct `Counts \
+                 { lines: usize, words: usize, bytes: usize }`. Implement a public function \
+                 `count(text: &str) -> Counts`.\n\nUpdate `Cargo.toml` to include both \
+                 `wcl-core` and the future `wcl` as workspace members.",
+                "Run `cargo check` at the repository root to verify the workspace structure. \
+                 Then run `cargo test -p wcl-core` and ensure all unit tests pass.",
+                &["Cargo.toml", "wcl-core/Cargo.toml", "wcl-core/src/lib.rs"],
+                &[],
+            ),
+            spec(
+                "c2",
+                "Implement the `wcl` binary crate within the workspace.\n\nCreate \
+                 `wcl/Cargo.toml` declaring it as a binary crate that depends on `wcl-core`.",
+                "Run `cargo check -p wcl` to verify the workspace compiles and dependencies \
+                 resolve correctly.",
+                &["wcl/Cargo.toml", "wcl/src/main.rs"],
+                &["c1"],
+            ),
+        ]
+    }
+
+    /// The first remedy the refusal names: `c2` also writes the root
+    /// manifest, after `c1`, and adds its member.
+    fn unlisted_member_remedy() -> [ContractSpec; 2] {
+        let [c1, mut c2] = unlisted_member_plan();
+        c2.instruction = "Write the `wcl` crate and add it to the workspace: `Cargo.toml` with \
+                          members = [\"wcl-core\", \"wcl\"]."
+            .into();
+        c2.writes.push(WriteTarget {
+            path: "Cargo.toml".into(),
+            node: None,
+        });
+        [c1, c2]
+    }
+
+    #[test]
+    fn a_package_the_workspace_does_not_list_is_refused_with_its_remedies() {
+        let repo = Fake::default();
+        let why = reason(refusal(&unlisted_member_plan(), &[], &repo));
+        assert!(why.contains("contract `c2`"), "{why}");
+        assert!(why.contains("package manifest `wcl/Cargo.toml`"), "{why}");
+        assert!(why.contains("does not list `wcl`"), "{why}");
+        assert!(why.contains("`cargo check -p wcl`"), "{why}");
+        assert!(why.contains("also write `Cargo.toml`"), "{why}");
+        // `c1` comes first, so the two writes of the manifest are ordered.
+        assert!(!why.contains("and depend on"), "{why}");
+        // The remedies are accepted: `c2` adds its member, or `c1` lists it
+        // and writes the package's stub, which `c2` fills in.
+        let got = refusal(&unlisted_member_remedy(), &[], &repo);
+        assert!(got.is_none(), "{got:?}");
+        let [mut c1, c2] = unlisted_member_plan();
+        c1.instruction = "Write `Cargo.toml` with members = [\"wcl-core\", \"wcl\"], the \
+                          `wcl-core` crate and a stub `wcl` crate."
+            .into();
+        c1.writes.extend(
+            ["wcl/Cargo.toml", "wcl/src/main.rs"]
+                .iter()
+                .map(|p| WriteTarget {
+                    path: (*p).into(),
+                    node: None,
+                }),
+        );
+        let got = refusal(&[c1, c2], &[], &repo);
+        assert!(got.is_none(), "{got:?}");
+        // `--workspace` passes without building the package: refused too.
+        let mut whole = unlisted_member_plan();
+        whole[1].acceptance = "cargo test --workspace".into();
+        let why = reason(refusal(&whole, &[], &repo));
+        assert!(why.contains("does not list `wcl`"), "{why}");
+        // A writer of the manifest that may run at the same time: the
+        // remedy orders the two writes.
+        let mut apart = unlisted_member_plan();
+        apart[1].depends_on.clear();
+        let with_root = Fake::with(&[
+            ("Cargo.toml", "[workspace]\nmembers = [\"wcl-core\"]\n"),
+            ("wcl-core/Cargo.toml", "[package]\nname = \"wcl-core\"\n"),
+            ("wcl-core/src/lib.rs", "pub fn f() {}\n"),
+        ]);
+        let why = reason(refusal(&apart, &[], &with_root));
+        assert!(why.contains("contract `c2`"), "{why}");
+        assert!(
+            why.contains("and depend on `c1`, which writes it too"),
+            "{why}"
+        );
+    }
+
+    /// The project's own state is not the plan's to fix: a package manifest
+    /// already in the repository, an excluded directory, a glob member and a
+    /// package under a nearer workspace are not refused, nor is a package
+    /// with no workspace above it.
+    #[test]
+    fn a_package_the_workspace_covers_or_the_repository_holds_is_not_refused() {
+        let root = "[workspace]\nmembers = [\"a\", \"crates/*\"]\nexclude = [\"tools\"]\n";
+        let repo = Fake::with(&[
+            ("Cargo.toml", root),
+            ("a/Cargo.toml", "[package]\nname = \"a\"\n"),
+            ("a/src/lib.rs", "pub fn f() {}\n"),
+            ("inner/Cargo.toml", "[workspace]\nmembers = [\"x\"]\n"),
+            ("inner/x/Cargo.toml", "[package]\nname = \"x\"\n"),
+            ("inner/x/src/lib.rs", "pub fn f() {}\n"),
+            ("old/Cargo.toml", "[package]\nname = \"old\"\n[workspace]\n"),
+        ]);
+        for (writes, acceptance) in [
+            (["old/Cargo.toml", "old/src/lib.rs"], "cargo test -p a"),
+            (
+                ["tools/gen/Cargo.toml", "tools/gen/src/main.rs"],
+                "cargo test -p a",
+            ),
+            (
+                ["crates/b/Cargo.toml", "crates/b/src/lib.rs"],
+                "cargo test -p b",
+            ),
+            (
+                ["inner/y/Cargo.toml", "inner/y/src/lib.rs"],
+                "cargo test -p a",
+            ),
+        ] {
+            let specs = [spec("c1", "add a crate", acceptance, &writes, &[])];
+            let got = refusal(&specs, &[], &repo);
+            assert!(got.is_none(), "{writes:?}: {got:?}");
+        }
+        // No workspace at all: a package of its own.
+        let specs = [spec(
+            "c1",
+            "a crate",
+            "cargo test --manifest-path wcl/Cargo.toml",
+            &["wcl/Cargo.toml", "wcl/src/main.rs"],
+            &[],
+        )];
+        assert!(refusal(&specs, &[], &Fake::default()).is_none());
+    }
+
     #[test]
     fn a_member_list_in_prose_is_read_and_refused_like_a_toml_list() {
         let why = reason(refusal(&round10_plan(), &[], &Fake::default()));
@@ -1806,7 +2072,15 @@ pub fn f() {}
         c1.instruction = "Write Cargo.toml with members = [\"wcl-core\"] (members wcl-core and \
                           wcl come later)."
             .into();
-        assert!(refusal(&[c1, c2], &[], &Fake::default()).is_none());
+        let specs = [c1, c2];
+        let repo = Fake::default();
+        // `c1` lists `wcl-core` alone, so its own check can pass.
+        assert!(workspace_findings(&specs, &specs[0], &repo).is_empty());
+        // `c2` then adds a package the workspace does not list, and may not
+        // add the member: refused for that, not for the prose list.
+        let why = reason(refusal(&specs, &[], &repo));
+        assert!(why.contains("contract `c2`"), "{why}");
+        assert!(why.contains("does not list `wcl`"), "{why}");
     }
 
     #[test]
@@ -1918,9 +2192,13 @@ pub fn f() {}
             ),
             spec(
                 "c2",
-                "add a crate",
+                "add a crate and list it in the workspace",
                 "cargo clippy --workspace --all-targets -- -D warnings",
-                &["crates/kgraf-new/Cargo.toml", "crates/kgraf-new/src/lib.rs"],
+                &[
+                    "Cargo.toml",
+                    "crates/kgraf-new/Cargo.toml",
+                    "crates/kgraf-new/src/lib.rs",
+                ],
                 &[],
             ),
             spec(
@@ -1933,6 +2211,13 @@ pub fn f() {}
         ];
         let got = refusal(&specs, &[], &repo);
         assert!(got.is_none(), "{got:?}");
+        // A new crate the explicit member list does not name is never built
+        // by `--workspace`: refused until the contract adds the member.
+        let mut unlisted = specs.clone();
+        unlisted[1].writes.retain(|w| w.path != "Cargo.toml");
+        let why = reason(refusal(&unlisted, &[], &repo));
+        assert!(why.contains("`crates/kgraf-new/Cargo.toml`"), "{why}");
+        assert!(why.contains("does not list `crates/kgraf-new`"), "{why}");
     }
 
     /// A directory a contract writes into under a `<prefix>/*` member is a
@@ -2239,7 +2524,21 @@ pub fn f() {}
         let mut alone = greenfield(&["c2"], &[]);
         alone[0].acceptance = "cargo test --workspace".into();
         alone[1].acceptance = "cargo test --manifest-path wcl/Cargo.toml".into();
+        // `cargo test --workspace` passes with the member unlisted and builds
+        // nothing of it: that form is refused for what it does not check,
+        // not for a failure, so it is not one of these cases.
+        let commands = |mut specs: [ContractSpec; 2]| {
+            specs[0].acceptance = "cargo check && cargo test -p wcl-core".into();
+            specs[1].acceptance = "cargo check -p wcl".into();
+            specs.to_vec()
+        };
         let cases: Vec<(&str, Vec<ContractSpec>, bool)> = vec![
+            ("unlisted member", commands(unlisted_member_plan()), true),
+            (
+                "unlisted member adds itself",
+                commands(unlisted_member_remedy()),
+                false,
+            ),
             ("round 8 plan", round8_second_plan().to_vec(), true),
             ("stub members", remedy_stub_members().to_vec(), false),
             (
@@ -2267,7 +2566,8 @@ pub fn f() {}
                 if !passed {
                     assert!(
                         stderr.contains("failed to load manifest for workspace member")
-                            || stderr.contains("could not find `Cargo.toml`"),
+                            || stderr.contains("could not find `Cargo.toml`")
+                            || stderr.contains("did not match any packages"),
                         "{name}, `{}`: {stderr}",
                         c.id
                     );
