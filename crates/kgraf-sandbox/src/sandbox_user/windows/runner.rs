@@ -4,22 +4,25 @@
 //! command's exit code. See [`crate::sandbox_user::runner`] for the protocol.
 //!
 //! **Logon SID.** `CreateProcessWithLogonW` gives the runner the caller's logon
-//! SID, so that it can open the caller's window station. Objects the owner's
-//! processes create with their default DACL (pipes, events, sections,
-//! processes) grant that SID, so a command that kept it could open them. The
+//! SID, so that it can open the caller's window station (kGraf does not rely
+//! on that: it names a window station of its own for the runner, see
+//! `launch.rs`). Objects the owner's processes create with their default DACL
+//! (pipes, events, sections, processes) grant that SID, so a command that
+//! kept it could open them. The
 //! runner starts the command with a restricted copy of its own token in which
 //! the logon SID is deny-only, checks that it is, and adds no restricting SIDs:
 //! restricting SIDs are what make Schannel TLS and the MSYS2 runtime fail in
 //! the token sandbox (decision 0011). All privileges but
 //! `SeChangeNotifyPrivilege` are removed (`DISABLE_MAX_PRIVILEGE`).
 //!
-//! **Window station.** With its logon SID deny-only, the command could not open
-//! the owner's window station, and every program that loads `user32.dll` would
-//! stop at start with STATUS_DLL_INIT_FAILED. The runner creates a window
-//! station and a desktop of its own, whose DACLs admit the sandbox user and
-//! SYSTEM only, and starts the command there. No object of the owner's session
-//! is changed, and the command cannot reach the owner's windows, clipboard or
-//! global atoms. Chromium's sandbox runs untrusted processes on an alternate
+//! **Window station.** A program that loads `user32.dll` stops at start with
+//! STATUS_DLL_INIT_FAILED unless it can open its window station and desktop.
+//! The runner creates a window station and a desktop for the command, whose
+//! DACLs admit the sandbox user and SYSTEM only, and starts the command
+//! there. No object of the owner's session is changed, and the command cannot
+//! reach the owner's windows, clipboard or global atoms. This, not a job's
+//! user interface limits, is the command's user interface isolation.
+//! Chromium's sandbox runs untrusted processes on an alternate
 //! window station the same way (`sandbox/win/src/window.cc`, BSD-3-Clause;
 //! followed in design, not copied).
 //!
@@ -29,7 +32,25 @@
 //! **Stdio and job.** The runner passes its own standard handles (the pipes
 //! and files the owner's process gave it) to the command through an explicit
 //! handle list. The owner's process put the runner in a job object that kills
-//! on close and allows no breakaway, so the command is in that job too.
+//! on close, allows no breakaway and sets no user interface limits, and the
+//! command is created in that job too. The runner makes no job of its own:
+//! Windows nests a job inside another only if neither sets user interface
+//! limits, so a second job with them could never take the command.
+//!
+//! **No console.** The runner is a windows-subsystem program
+//! (`#![windows_subsystem = "windows"]` in its binary). A console program
+//! gets a console host process that runs as the sandbox user with the
+//! runner's token, logon SID enabled, and an access list that admits that
+//! user fully, so the command could take it over. A windows-subsystem
+//! program gets no console and no window; its standard handles are the ones
+//! `STARTF_USESTDHANDLES` gave it, which `GetStdHandle` returns as before.
+//!
+//! **Self-protection** ([`protect_self`]). The runner and the command run as
+//! one user, and the runner holds the logon SID the command must not have.
+//! Before it opens the pipe, the runner sets its token's default access list
+//! to one that admits the sandbox user only to wait, so every thread made
+//! from then on is protected, then writes protected lists on its process,
+//! on every thread it already has, and on its token, and reads each back.
 
 use std::ffi::c_void;
 use std::fs::File;
@@ -38,8 +59,9 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::ptr;
 
 use windows_sys::Win32::Foundation::{
-    GENERIC_ALL, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, HANDLE_FLAG_INHERIT, HLOCAL,
-    INVALID_HANDLE_VALUE, LocalFree, SetHandleInformation,
+    ERROR_ACCESS_DENIED, ERROR_PIPE_BUSY, GENERIC_ALL, GENERIC_EXECUTE, GENERIC_READ,
+    GENERIC_WRITE, GetLastError, HANDLE, HANDLE_FLAG_INHERIT, HLOCAL, INVALID_HANDLE_VALUE,
+    LocalFree, SetHandleInformation,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -49,7 +71,8 @@ use windows_sys::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, CreateRestrictedToken, DACL_SECURITY_INFORMATION,
     DISABLE_MAX_PRIVILEGE, EqualSid, GetAce, GetSecurityDescriptorDacl, GetTokenInformation,
     PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, SID_AND_ATTRIBUTES, SetTokenInformation,
-    TOKEN_ADJUST_DEFAULT, TOKEN_ASSIGN_PRIMARY, TOKEN_DEFAULT_DACL, TOKEN_DUPLICATE, TOKEN_GROUPS,
+    TOKEN_ADJUST_DEFAULT, TOKEN_ADJUST_GROUPS, TOKEN_ADJUST_PRIVILEGES, TOKEN_ADJUST_SESSIONID,
+    TOKEN_ASSIGN_PRIMARY, TOKEN_DEFAULT_DACL, TOKEN_DUPLICATE, TOKEN_GROUPS, TOKEN_IMPERSONATE,
     TOKEN_QUERY, TOKEN_USER, TokenDefaultDacl, TokenGroups, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
@@ -58,42 +81,39 @@ use windows_sys::Win32::Storage::FileSystem::{
 use windows_sys::Win32::System::Console::{
     GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
-use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION,
-    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_BASIC_UI_RESTRICTIONS,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicUIRestrictions,
-    JobObjectExtendedLimitInformation, SetInformationJobObject,
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
 };
-use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
+use windows_sys::Win32::System::Pipes::{GetNamedPipeServerProcessId, WaitNamedPipeW};
 use windows_sys::Win32::System::StationsAndDesktops::{
     CloseDesktop, CloseWindowStation, CreateDesktopW, CreateWindowStationW,
     GetProcessWindowStation, HDESK, HWINSTA, SetProcessWindowStation,
 };
 use windows_sys::Win32::System::SystemServices::{
-    ACCESS_ALLOWED_ACE_TYPE, JOB_OBJECT_UILIMIT_ALL, SE_GROUP_LOGON_ID, SE_GROUP_USE_FOR_DENY_ONLY,
+    ACCESS_ALLOWED_ACE_TYPE, SE_GROUP_LOGON_ID, SE_GROUP_USE_FOR_DENY_ONLY,
 };
 use windows_sys::Win32::System::Threading::{
-    CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW,
-    EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetCurrentThread, GetExitCodeProcess,
-    INFINITE, OpenProcessToken, PROCESS_CREATE_THREAD, PROCESS_DUP_HANDLE, PROCESS_INFORMATION,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_INFORMATION, PROCESS_SET_QUOTA,
-    PROCESS_SUSPEND_RESUME, PROCESS_TERMINATE, PROCESS_VM_OPERATION, PROCESS_VM_READ,
-    PROCESS_VM_WRITE, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW,
-    THREAD_QUERY_LIMITED_INFORMATION, TerminateProcess, WaitForSingleObject,
+    CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW,
+    EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetCurrentProcessId, GetExitCodeProcess,
+    INFINITE, OpenProcessToken, OpenThread, PROCESS_CREATE_THREAD, PROCESS_DUP_HANDLE,
+    PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_INFORMATION,
+    PROCESS_SET_QUOTA, PROCESS_SUSPEND_RESUME, PROCESS_TERMINATE, PROCESS_VM_OPERATION,
+    PROCESS_VM_READ, PROCESS_VM_WRITE, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    THREAD_DIRECT_IMPERSONATION, THREAD_GET_CONTEXT, THREAD_IMPERSONATE,
+    THREAD_QUERY_LIMITED_INFORMATION, THREAD_SET_CONTEXT, THREAD_SET_INFORMATION,
+    THREAD_SET_LIMITED_INFORMATION, THREAD_SET_THREAD_TOKEN, THREAD_SUSPEND_RESUME,
+    THREAD_TERMINATE, WaitForSingleObject,
 };
+use windows_sys::Win32::UI::WindowsAndMessaging::CWF_CREATE_ONLY;
 
 use super::super::runner::{Reply, Request, RunnerArgs};
 use crate::sandbox::AttributeList;
 
-/// Exit codes for a runner that cannot report over its pipe. Each sets bit 29
-/// (the customer bit of an NTSTATUS-shaped code), so none is a code a program
-/// or Windows itself returns. Once the pipe is connected, a failure is sent
-/// as a [`Reply::Failed`] instead, and the owner reads that first.
-pub const EXIT_ARGS: i32 = 0x2B47_0001;
-pub const EXIT_PIPE: i32 = 0x2B47_0002;
-pub const EXIT_FAILED: i32 = 0x2B47_0003;
-pub const EXIT_WAIT: i32 = 0x2B47_0004;
-pub const EXIT_SELF_PROTECT: i32 = 0x2B47_0005;
+/// Exit codes for a runner that cannot report over its pipe; defined beside
+/// the protocol so the owner can name them ([`describe_runner_exit`]).
+///
+/// [`describe_runner_exit`]: super::super::runner::describe_runner_exit
+pub use super::super::runner::{EXIT_ARGS, EXIT_FAILED, EXIT_PIPE, EXIT_SELF_PROTECT, EXIT_WAIT};
 
 /// A failure before the command started: the step, the Win32 error (0 when
 /// none applies), and a description.
@@ -143,13 +163,26 @@ pub fn main() -> i32 {
     // Before anything else, and before the command exists: the runner's own
     // objects admit the sandbox user to no more than waiting and reading
     // basic information (`protect_self`).
-    if protect_self().is_err() {
-        return EXIT_SELF_PROTECT;
-    }
+    let protected = protect_self();
     let Ok(mut pipe) = connect(&args) else {
-        return EXIT_PIPE;
+        return if protected.is_err() {
+            EXIT_SELF_PROTECT
+        } else {
+            EXIT_PIPE
+        };
     };
-    let started = start(&mut pipe);
+    // A failed self-protection is still reported over the pipe, with its
+    // step and Win32 error, so the owner's error says what failed. The pipe
+    // carries data only, and no command exists yet. The request is read
+    // first, because the owner sends it before it reads the reply.
+    let failed_early = protected.is_err();
+    let started = match protected {
+        Ok(token) => start(&mut pipe, &token),
+        Err(f) => {
+            let _ = Request::read_from(&mut pipe);
+            Err(f)
+        }
+    };
     let (running, reply) = match started {
         Ok(command) => {
             let pid = command.pid;
@@ -162,7 +195,11 @@ pub fn main() -> i32 {
         .and_then(|()| pipe.flush());
     drop(pipe);
     let Some(command) = running else {
-        return EXIT_FAILED;
+        return if failed_early {
+            EXIT_SELF_PROTECT
+        } else {
+            EXIT_FAILED
+        };
     };
     // The owner learns the command's PID from the reply; without it the owner
     // ends the job, so a reply that did not arrive does not leave the command
@@ -174,33 +211,51 @@ pub fn main() -> i32 {
 }
 
 /// The running command, with what must stay open while it runs: its window
-/// station and desktop (a window station is destroyed with its last handle)
-/// and its job, which ends it when the runner exits.
+/// station and desktop (a window station is destroyed with its last handle).
+/// The owner's job, which holds the runner and the command, ends it.
 struct Command {
     process: OwnedHandle,
     pid: u32,
     _station: Station,
-    _job: OwnedHandle,
 }
+
+/// How long the runner waits for a pipe another process holds. The owner
+/// disconnects any client that is not this runner, so a busy pipe frees
+/// again; the owner's own handshake deadline bounds the whole start.
+const PIPE_BUSY_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Opens the pipe and checks that its server is the owner's process.
 fn connect(args: &RunnerArgs) -> Result<File, Failure> {
     let name = wide(&args.pipe);
-    // SAFETY: opens an existing pipe; the handle is owned by the File below.
-    let h = unsafe {
-        CreateFileW(
-            name.as_ptr(),
-            GENERIC_READ | GENERIC_WRITE,
-            0,
-            ptr::null(),
-            OPEN_EXISTING,
-            0,
-            ptr::null_mut(),
-        )
+    let since = std::time::Instant::now();
+    let h = loop {
+        // SAFETY: opens an existing pipe; the handle is owned by the File
+        // below.
+        let h = unsafe {
+            CreateFileW(
+                name.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                0,
+                ptr::null(),
+                OPEN_EXISTING,
+                0,
+                ptr::null_mut(),
+            )
+        };
+        if !h.is_null() && h != INVALID_HANDLE_VALUE {
+            break h;
+        }
+        let failure = Failure::last("open the runner pipe");
+        // Another program of this user reached the pipe first (decision
+        // 0097: the pipe admits the sandbox user). Wait for the owner to
+        // disconnect it.
+        if failure.code != ERROR_PIPE_BUSY || since.elapsed() >= PIPE_BUSY_WAIT {
+            return Err(failure);
+        }
+        // SAFETY: `name` is NUL-terminated. The result does not matter: the
+        // next open says whether the pipe is free.
+        unsafe { WaitNamedPipeW(name.as_ptr(), 1000) };
     };
-    if h.is_null() || h == INVALID_HANDLE_VALUE {
-        return Err(Failure::last("open the runner pipe"));
-    }
     // SAFETY: a fresh handle this code now owns.
     let file = File::from(unsafe { OwnedHandle::from_raw_handle(h) });
     let mut server = 0u32;
@@ -220,68 +275,19 @@ fn connect(args: &RunnerArgs) -> Result<File, Failure> {
     Ok(file)
 }
 
-/// Reads the request and starts the command.
-fn start(pipe: &mut File) -> Result<Command, Failure> {
+/// Reads the request and starts the command with `token`, the command token
+/// [`protect_self`] made.
+fn start(pipe: &mut File, token: &OwnedHandle) -> Result<Command, Failure> {
     let request =
         Request::read_from(pipe).map_err(|e| Failure::other("read the runner request", e))?;
-    let token = command_token()?;
-    let user = token_user_sid(&token)?;
+    let user = token_user_sid(token)?;
     let station = Station::create(&user)?;
-    let job = command_job()?;
-    let (process, pid) = spawn(&request, &token, &station, &job)?;
+    let (process, pid) = spawn(&request, token, &station)?;
     Ok(Command {
         process,
         pid,
         _station: station,
-        _job: job,
     })
-}
-
-/// The command's own job: every UI limit, ended when its last handle closes
-/// (the runner's), and no breakaway. The runner's own job, which the owner's
-/// process made, carries every UI limit but the one on creating desktops,
-/// because the runner creates the command's desktop; this job, a child of
-/// it, puts that limit back on the command itself.
-fn command_job() -> Result<OwnedHandle, Failure> {
-    // SAFETY: anonymous job, default security.
-    let job = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
-    if job.is_null() {
-        return Err(Failure::last("create the command's job"));
-    }
-    // SAFETY: a fresh handle this code now owns.
-    let job = unsafe { OwnedHandle::from_raw_handle(job) };
-    // SAFETY: zeroed is a valid initial value for this plain C struct.
-    let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
-    limits.BasicLimitInformation.LimitFlags =
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
-    // SAFETY: a valid struct of the stated size and class.
-    if unsafe {
-        SetInformationJobObject(
-            job.as_raw_handle(),
-            JobObjectExtendedLimitInformation,
-            ptr::addr_of!(limits).cast(),
-            std::mem::size_of_val(&limits) as u32,
-        )
-    } == 0
-    {
-        return Err(Failure::last("limit the command's job"));
-    }
-    let ui = JOBOBJECT_BASIC_UI_RESTRICTIONS {
-        UIRestrictionsClass: JOB_OBJECT_UILIMIT_ALL,
-    };
-    // SAFETY: as above.
-    if unsafe {
-        SetInformationJobObject(
-            job.as_raw_handle(),
-            JobObjectBasicUIRestrictions,
-            ptr::addr_of!(ui).cast(),
-            std::mem::size_of_val(&ui) as u32,
-        )
-    } == 0
-    {
-        return Err(Failure::last("set the command's user interface limits"));
-    }
-    Ok(job)
 }
 
 // ---- token ------------------------------------------------------------------
@@ -315,25 +321,11 @@ fn is_logon(g: &SID_AND_ATTRIBUTES) -> bool {
     g.Attributes & (SE_GROUP_LOGON_ID as u32) == SE_GROUP_LOGON_ID as u32
 }
 
-/// A restricted copy of the runner's token: the logon SID deny-only, no
+/// A restricted copy of the runner's token `own`: the logon SID deny-only, no
 /// privileges but `SeChangeNotifyPrivilege`, no restricting SIDs, and a
 /// default DACL that grants the sandbox user and SYSTEM only.
-fn command_token() -> Result<OwnedHandle, Failure> {
-    let mut raw: HANDLE = ptr::null_mut();
-    // SAFETY: opens this process's own token.
-    if unsafe {
-        OpenProcessToken(
-            GetCurrentProcess(),
-            TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY | TOKEN_ADJUST_DEFAULT,
-            &mut raw,
-        )
-    } == 0
-    {
-        return Err(Failure::last("open the runner's token"));
-    }
-    // SAFETY: a fresh handle this code now owns.
-    let own = unsafe { OwnedHandle::from_raw_handle(raw) };
-    let buf = token_info(&own, TokenGroups, "read the runner's groups")?;
+fn command_token(own: &OwnedHandle) -> Result<OwnedHandle, Failure> {
+    let buf = token_info(own, TokenGroups, "read the runner's groups")?;
     let logon: Vec<SID_AND_ATTRIBUTES> = groups(&buf)
         .iter()
         .filter(|g| is_logon(g))
@@ -483,6 +475,22 @@ impl Descriptor {
             bInheritHandle: 0,
         }
     }
+
+    /// The access list inside the descriptor, valid while it lives.
+    fn dacl(&self, step: &'static str) -> Result<*mut ACL, Failure> {
+        let mut present = 0;
+        let mut defaulted = 0;
+        let mut acl: *mut ACL = ptr::null_mut();
+        // SAFETY: reads the DACL pointer out of `self`, which outlives its
+        // use by the caller.
+        if unsafe { GetSecurityDescriptorDacl(self.0, &mut present, &mut acl, &mut defaulted) } == 0
+            || present == 0
+            || acl.is_null()
+        {
+            return Err(Failure::last(step));
+        }
+        Ok(acl)
+    }
 }
 
 impl Drop for Descriptor {
@@ -494,16 +502,16 @@ impl Drop for Descriptor {
 
 fn set_default_dacl(token: &OwnedHandle, user: &str) -> Result<(), Failure> {
     let sd = Descriptor::for_user(user)?;
-    let mut present = 0;
-    let mut defaulted = 0;
-    let mut acl: *mut ACL = ptr::null_mut();
-    // SAFETY: reads the DACL pointer out of `sd`, which outlives its use.
-    if unsafe { GetSecurityDescriptorDacl(sd.0, &mut present, &mut acl, &mut defaulted) } == 0
-        || present == 0
-        || acl.is_null()
-    {
-        return Err(Failure::last("read the default access list"));
-    }
+    apply_default_dacl(token, &sd, "set the command's default access list")
+}
+
+/// Make the access list of `sd` the default list of `token`.
+fn apply_default_dacl(
+    token: &OwnedHandle,
+    sd: &Descriptor,
+    step: &'static str,
+) -> Result<(), Failure> {
+    let acl = sd.dacl("read the default access list")?;
     let dacl = TOKEN_DEFAULT_DACL { DefaultDacl: acl };
     // SAFETY: `dacl` points into `sd`, alive across the call.
     if unsafe {
@@ -515,7 +523,7 @@ fn set_default_dacl(token: &OwnedHandle, user: &str) -> Result<(), Failure> {
         )
     } == 0
     {
-        return Err(Failure::last("set the command's default access list"));
+        return Err(Failure::last(step));
     }
     Ok(())
 }
@@ -525,10 +533,14 @@ fn set_default_dacl(token: &OwnedHandle, user: &str) -> Result<(), Failure> {
 /// What the sandbox user may do to the runner's process: wait for it and read
 /// its basic information. Nothing else.
 const SELF_PROCESS_MASK: u32 = SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION;
-/// The same for the runner's thread.
+/// The same for the runner's threads.
 const SELF_THREAD_MASK: u32 = SYNCHRONIZE | THREAD_QUERY_LIMITED_INFORMATION;
 /// The same for the runner's token: read it, read its access list.
 const SELF_TOKEN_MASK: u32 = TOKEN_QUERY | READ_CONTROL;
+
+/// Generic rights, which map to a type's specific rights when checked. None
+/// may reach the sandbox user on the runner's objects.
+const GENERIC_ANY: u32 = GENERIC_ALL | GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE;
 
 /// Access that must not reach the sandbox user on the runner's own process.
 /// Any one of these would let a program of that user change how the runner
@@ -544,41 +556,173 @@ const SELF_FORBIDDEN: u32 = PROCESS_VM_READ
     | PROCESS_SUSPEND_RESUME
     | PROCESS_TERMINATE
     | WRITE_DAC
-    | WRITE_OWNER;
+    | WRITE_OWNER
+    | GENERIC_ANY;
 
-/// Limit what the sandbox user may do to the runner's own process, thread and
-/// token, then confirm it by reading the process's list back.
+/// The same for each of the runner's threads: `THREAD_SET_CONTEXT` alone
+/// lets a program queue code to run on the thread.
+const THREAD_FORBIDDEN: u32 = THREAD_TERMINATE
+    | THREAD_SUSPEND_RESUME
+    | THREAD_GET_CONTEXT
+    | THREAD_SET_CONTEXT
+    | THREAD_SET_INFORMATION
+    | THREAD_SET_LIMITED_INFORMATION
+    | THREAD_SET_THREAD_TOKEN
+    | THREAD_IMPERSONATE
+    | THREAD_DIRECT_IMPERSONATION
+    | WRITE_DAC
+    | WRITE_OWNER
+    | GENERIC_ANY;
+
+/// The same for the runner's token.
+const TOKEN_FORBIDDEN: u32 = TOKEN_ASSIGN_PRIMARY
+    | TOKEN_DUPLICATE
+    | TOKEN_IMPERSONATE
+    | TOKEN_ADJUST_PRIVILEGES
+    | TOKEN_ADJUST_GROUPS
+    | TOKEN_ADJUST_DEFAULT
+    | TOKEN_ADJUST_SESSIONID
+    | WRITE_DAC
+    | WRITE_OWNER
+    | GENERIC_ANY;
+
+/// Limit what the sandbox user may do to the runner's own process, threads
+/// and token, confirm it by reading each list back, and return the command
+/// token.
 ///
 /// The command runs as the same user as the runner. Without this, the access
-/// list Windows gives a new process admits that user fully, and the owner of
-/// an object also keeps an implicit right to rewrite its list. The lists
-/// written here admit SYSTEM fully, the sandbox user only to wait and read,
-/// and OWNER RIGHTS to reading the list alone, which removes that implicit
-/// right (the same entry the token path writes in `set_default_dacl`).
+/// list Windows gives a new process, thread or token admits that user fully,
+/// and the owner of an object also keeps an implicit right to rewrite its
+/// list. The lists written here admit SYSTEM fully, the sandbox user only to
+/// wait and read, and OWNER RIGHTS to reading the list alone, which removes
+/// that implicit right (the same entry the token path writes in
+/// `set_default_dacl`).
+///
+/// Order:
+///
+/// 1. One handle to the runner's token, with every right used later: once
+///    the token's own list is written, this user can no longer open it for
+///    more than reading.
+/// 2. The command token, made before the runner's default list changes, so
+///    the new token object gets the list a token of this user normally has
+///    and the command can still open its own token, as programs do.
+/// 3. The runner token's default list, which every object the runner makes
+///    from then on gets, its threads among them: the sandbox user may only
+///    wait on them.
+/// 4. The process, every thread that exists already (enumerated with
+///    `CreateToolhelp32Snapshot`; a thread made after it already has the
+///    list of step 3), and the token, each read back.
 ///
 /// Called before the pipe is opened, so the window in which the lists are the
 /// defaults ends before the command exists.
-fn protect_self() -> Result<(), Failure> {
+fn protect_self() -> Result<OwnedHandle, Failure> {
     let mut raw: HANDLE = ptr::null_mut();
-    // SAFETY: opens this process's own token for reading and for writing its
-    // access list.
-    if unsafe { OpenProcessToken(GetCurrentProcess(), READ_CONTROL | WRITE_DAC, &mut raw) } == 0 {
+    // SAFETY: opens this process's own token.
+    if unsafe {
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_QUERY
+                | TOKEN_DUPLICATE
+                | TOKEN_ASSIGN_PRIMARY
+                | TOKEN_ADJUST_DEFAULT
+                | READ_CONTROL
+                | WRITE_DAC,
+            &mut raw,
+        )
+    } == 0
+    {
         return Err(Failure::last("open the runner's token"));
     }
     // SAFETY: a fresh handle this code now owns.
     let token = unsafe { OwnedHandle::from_raw_handle(raw) };
     let user = token_user_sid(&token)?;
-    // SAFETY: both are pseudo-handles that need no close and carry full
-    // access to this process and this thread.
-    let (process, thread) = unsafe { (GetCurrentProcess(), GetCurrentThread()) };
-    for (handle, mask, what) in [
-        (process, SELF_PROCESS_MASK, "process"),
-        (thread, SELF_THREAD_MASK, "thread"),
-        (token.as_raw_handle(), SELF_TOKEN_MASK, "token"),
-    ] {
-        write_self_dacl(handle, &user, mask, what)?;
+    let command = command_token(&token)?;
+    set_runner_default_dacl(&token, &user)?;
+    // SAFETY: a pseudo-handle that needs no close and carries full access to
+    // this process.
+    let process = unsafe { GetCurrentProcess() };
+    write_self_dacl(process, &user, SELF_PROCESS_MASK, "process")?;
+    verify_self_dacl(process, SELF_FORBIDDEN, "process")?;
+    protect_threads(&user)?;
+    write_self_dacl(token.as_raw_handle(), &user, SELF_TOKEN_MASK, "token")?;
+    verify_self_dacl(token.as_raw_handle(), TOKEN_FORBIDDEN, "token")?;
+    Ok(command)
+}
+
+/// The runner token's default access list: SYSTEM fully, the sandbox user
+/// only to wait, OWNER RIGHTS to read the list. `SYNCHRONIZE` means the same
+/// for every object type, so this list fits whatever the runner makes.
+fn set_runner_default_dacl(token: &OwnedHandle, user: &str) -> Result<(), Failure> {
+    // `user` comes from Windows' own SID-to-string conversion, so it holds no
+    // SDDL syntax characters.
+    let sd = Descriptor::from_sddl(&format!(
+        "D:P(A;;GA;;;SY)(A;;0x{SYNCHRONIZE:08x};;;{user})(A;;RC;;;OW)"
+    ))?;
+    apply_default_dacl(token, &sd, "set the runner's default access list")
+}
+
+/// Write and verify the list of every thread of this process that exists
+/// now. A thread that ended since the snapshot is skipped. A thread made
+/// after the default list changed cannot be opened to write its list, and
+/// needs none; its list is read back like the others.
+fn protect_threads(user: &str) -> Result<(), Failure> {
+    // SAFETY: a snapshot of every thread on the machine; owned below.
+    let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if snap.is_null() || snap == INVALID_HANDLE_VALUE {
+        return Err(Failure::last("list the runner's threads"));
     }
-    verify_self_dacl(process, &user)
+    // SAFETY: a fresh handle this code now owns.
+    let snap = unsafe { OwnedHandle::from_raw_handle(snap) };
+    // SAFETY: reads this process's ID.
+    let me = unsafe { GetCurrentProcessId() };
+    // SAFETY: zeroed is a valid initial THREADENTRY32; `dwSize` set below.
+    let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+    let mut seen = 0usize;
+    // SAFETY: a valid snapshot handle and entry.
+    let mut more = unsafe { Thread32First(snap.as_raw_handle(), &mut entry) } != 0;
+    while more {
+        if entry.th32OwnerProcessID == me {
+            protect_thread(entry.th32ThreadID, user)?;
+            seen += 1;
+        }
+        // SAFETY: as above.
+        more = unsafe { Thread32Next(snap.as_raw_handle(), &mut entry) } != 0;
+    }
+    if seen == 0 {
+        // The calling thread is always in the list: an empty one means the
+        // enumeration did not work, and nothing was protected (fail loud).
+        return Err(Failure::other(
+            "list the runner's threads",
+            "the thread list holds none of the runner's own threads",
+        ));
+    }
+    Ok(())
+}
+
+fn protect_thread(id: u32, user: &str) -> Result<(), Failure> {
+    // SAFETY: opens a thread of this process; owned below.
+    let h = unsafe { OpenThread(READ_CONTROL | WRITE_DAC, 0, id) };
+    if !h.is_null() {
+        // SAFETY: a fresh handle this code now owns.
+        let thread = unsafe { OwnedHandle::from_raw_handle(h) };
+        write_self_dacl(thread.as_raw_handle(), user, SELF_THREAD_MASK, "thread")?;
+        return verify_self_dacl(thread.as_raw_handle(), THREAD_FORBIDDEN, "thread");
+    }
+    let failure = Failure::last("open a runner thread");
+    if failure.code != ERROR_ACCESS_DENIED {
+        // The thread ended after the snapshot: nothing to protect.
+        return Ok(());
+    }
+    // Made after the default list changed: it has that list. Read it back.
+    // SAFETY: as above.
+    let h = unsafe { OpenThread(READ_CONTROL, 0, id) };
+    if h.is_null() {
+        return Err(Failure::last("read a runner thread's access list"));
+    }
+    // SAFETY: a fresh handle this code now owns.
+    let thread = unsafe { OwnedHandle::from_raw_handle(h) };
+    verify_self_dacl(thread.as_raw_handle(), THREAD_FORBIDDEN, "thread")
 }
 
 /// Write the protected access list that grants `mask` to `user` on `handle`.
@@ -593,16 +737,7 @@ fn write_self_dacl(
     let sd = Descriptor::from_sddl(&format!(
         "D:P(A;;GA;;;SY)(A;;0x{mask:08x};;;{user})(A;;RC;;;OW)"
     ))?;
-    let mut present = 0;
-    let mut defaulted = 0;
-    let mut acl: *mut ACL = ptr::null_mut();
-    // SAFETY: reads the access list out of `sd`, which outlives its use.
-    if unsafe { GetSecurityDescriptorDacl(sd.0, &mut present, &mut acl, &mut defaulted) } == 0
-        || present == 0
-        || acl.is_null()
-    {
-        return Err(Failure::last("read the runner's own access list"));
-    }
+    let acl = sd.dacl("read the runner's own access list")?;
     // SAFETY: a valid handle of this process and a valid list that outlives
     // the call.
     let code = unsafe {
@@ -626,17 +761,19 @@ fn write_self_dacl(
     Ok(())
 }
 
-/// Read the process's access list back and fail unless every entry that names
-/// `user` stays inside [`SELF_PROCESS_MASK`]. A list that is absent means full
-/// access for everyone, so that fails too (fail loud).
-fn verify_self_dacl(process: HANDLE, user: &str) -> Result<(), Failure> {
-    let sid = LocalSid::from_string(user)?;
+/// Read the access list of `handle` back and fail unless every entry that
+/// allows access to anyone but SYSTEM stays clear of `forbidden`. A list that
+/// is absent means full access for everyone, so that fails too (fail loud).
+/// Every entry, not only the sandbox user's, because a group the user is in
+/// would serve as well.
+fn verify_self_dacl(handle: HANDLE, forbidden: u32, what: &'static str) -> Result<(), Failure> {
+    let system = LocalSid::from_string("S-1-5-18")?;
     let mut acl: *mut ACL = ptr::null_mut();
     let mut sd: PSECURITY_DESCRIPTOR = ptr::null_mut();
     // SAFETY: a valid handle; the call allocates `sd`, freed below.
     let code = unsafe {
         GetSecurityInfo(
-            process,
+            handle,
             SE_KERNEL_OBJECT,
             DACL_SECURITY_INFORMATION,
             ptr::null_mut(),
@@ -650,14 +787,14 @@ fn verify_self_dacl(process: HANDLE, user: &str) -> Result<(), Failure> {
         return Err(Failure {
             step: "read back the runner's own access list",
             code,
-            message: std::io::Error::from_raw_os_error(code as i32).to_string(),
+            message: format!("{}: {what}", std::io::Error::from_raw_os_error(code as i32)),
         });
     }
     let _owned = Descriptor(sd);
     if acl.is_null() {
         return Err(Failure::other(
             "read back the runner's own access list",
-            "the runner's process has no access list, which admits every program",
+            format!("the runner's {what} has no access list, which admits every program"),
         ));
     }
     // SAFETY: `acl` points into the descriptor freed by `_owned`.
@@ -678,13 +815,14 @@ fn verify_self_dacl(process: HANDLE, user: &str) -> Result<(), Failure> {
         let body = unsafe { &*(ace as *const ACCESS_ALLOWED_ACE) };
         let ace_sid = ptr::addr_of!(body.SidStart) as PSID;
         // SAFETY: both are valid SIDs.
-        let same = unsafe { EqualSid(ace_sid, sid.as_psid()) } != 0;
-        if same && body.Mask & SELF_FORBIDDEN != 0 {
+        let is_system = unsafe { EqualSid(ace_sid, system.as_psid()) } != 0;
+        if !is_system && body.Mask & forbidden != 0 {
             return Err(Failure::other(
                 "verify access to the runner's own objects",
                 format!(
-                    "the sandbox user still has access 0x{:08x} to the runner's process",
-                    body.Mask & SELF_FORBIDDEN
+                    "an entry other than SYSTEM's still allows access 0x{:08x} to the \
+                     runner's {what}",
+                    body.Mask & forbidden
                 ),
             ));
         }
@@ -715,9 +853,11 @@ impl Station {
         let sd = Descriptor::for_user(user)?;
         let sa = sd.attributes();
         let wname = wide(&name);
-        // SAFETY: creates a new window station; `wname` and `sa` live across
-        // the call.
-        let station = unsafe { CreateWindowStationW(wname.as_ptr(), 0, GENERIC_ALL, &sa) };
+        // SAFETY: creates a new window station (CWF_CREATE_ONLY: never opens
+        // one another program made under this name); `wname` and `sa` live
+        // across the call.
+        let station =
+            unsafe { CreateWindowStationW(wname.as_ptr(), CWF_CREATE_ONLY, GENERIC_ALL, &sa) };
         if station.is_null() {
             return Err(Failure::last("create the command's window station"));
         }
@@ -800,7 +940,6 @@ fn spawn(
     request: &Request,
     token: &OwnedHandle,
     station: &Station,
-    job: &OwnedHandle,
 ) -> Result<(OwnedHandle, u32), Failure> {
     let std = std_handles()?;
     let mut listed: Vec<HANDLE> = Vec::new();
@@ -832,9 +971,9 @@ fn spawn(
     let app: Vec<u16> = request.application.iter().copied().chain([0]).collect();
     let mut line: Vec<u16> = request.command_line.iter().copied().chain([0]).collect();
     let cwd: Vec<u16> = request.directory.iter().copied().chain([0]).collect();
-    // CREATE_SUSPENDED: the command joins its job before it runs any code.
-    let flags = CREATE_SUSPENDED
-        | CREATE_UNICODE_ENVIRONMENT
+    // The command is created in the runner's job, the owner's, so it needs
+    // no step between its creation and its start.
+    let flags = CREATE_UNICODE_ENVIRONMENT
         | CREATE_NO_WINDOW
         | if inherit {
             EXTENDED_STARTUPINFO_PRESENT
@@ -867,22 +1006,8 @@ fn spawn(
     drop(attrs);
     // SAFETY: fresh handles this code now owns.
     let process = unsafe { OwnedHandle::from_raw_handle(pi.hProcess) };
-    // SAFETY: as above.
-    let thread = unsafe { OwnedHandle::from_raw_handle(pi.hThread) };
-    // SAFETY: valid job and process handles.
-    if unsafe { AssignProcessToJobObject(job.as_raw_handle(), process.as_raw_handle()) } == 0 {
-        let f = Failure::last("put the command in its job");
-        // SAFETY: the suspended command never ran; end it.
-        unsafe { TerminateProcess(process.as_raw_handle(), 1) };
-        return Err(f);
-    }
-    // SAFETY: the primary thread of the suspended command.
-    if unsafe { ResumeThread(thread.as_raw_handle()) } == u32::MAX {
-        let f = Failure::last("start the command running");
-        // SAFETY: a valid process handle; the command never ran.
-        unsafe { TerminateProcess(process.as_raw_handle(), 1) };
-        return Err(f);
-    }
+    // SAFETY: as above; closed at once, the process handle is enough.
+    drop(unsafe { OwnedHandle::from_raw_handle(pi.hThread) });
     Ok((process, pi.dwProcessId))
 }
 

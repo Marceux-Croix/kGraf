@@ -227,8 +227,55 @@ pub(super) const USER_STRENGTH: IsolationStrength = IsolationStrength {
     // user, but not yet verified on Windows.
     gitlink_protected: false,
     git_config_freezable: false,
-    gaps: "the sandbox user can read whatever every local user can read (other drives,            Program Files, world-readable folders), though not the owner's profile; DNS            lookups go through the system's DNS client service, which the firewall rules do            not scope to the sandbox user, so a name lookup can leave the machine; commands            that run at the same time run as the same user and can write each other's            writable folders while both run; unix-domain sockets are confined only by their            own ACLs; write confinement, the gitlink deny and the network block are            unverified on Windows",
+    // Each clause is one gap; `user_gaps_name_each_known_gap` pins them.
+    gaps: "the sandbox user can read whatever every local user can read (other drives, \
+           Program Files, world-readable folders), though not the owner's profile; it can \
+           still write where every local user may write below the folders setup closes to \
+           it (subfolders of ProgramData and Public that already grant every user write, a \
+           drive attached after setup, and TrustedInstaller's folders under the Windows \
+           folder, such as System32\\Tasks and System32\\spool\\drivers\\color), and in its \
+           own profile, which keeps files from one command to the next; registry keys and \
+           named objects every user may write are not closed; DNS lookups go through the \
+           system's DNS client service, which the firewall rules do not scope to the \
+           sandbox user, so a name lookup can leave the machine; traffic Windows sends on \
+           the user's behalf is not proved blocked: a UNC path (\\\\host\\share) makes the \
+           kernel's SMB client connect, the WebClient service carries WebDAV, and ICMP \
+           (ping) is sent by the system's own network stack, none of which runs as the \
+           sandbox user; two commands that run as the same sandbox user (always two in one \
+           folder) can write each other's writable folders and open each other's \
+           processes, so a command without the network can read the egress proxy's secret \
+           from a proxied command of that user and use the proxy while that command runs; \
+           unix-domain sockets are confined only by their own ACLs; write confinement, the \
+           gitlink deny and the network block are unverified on Windows",
 };
+
+#[cfg(test)]
+mod user_gaps_tests {
+    use super::USER_STRENGTH;
+
+    #[test]
+    fn user_gaps_name_each_known_gap() {
+        let gaps = USER_STRENGTH.gaps;
+        assert!(!gaps.contains("  "), "a run of spaces: {gaps}");
+        assert!(!gaps.contains('\n'), "a line break: {gaps}");
+        for needle in [
+            "not the owner's profile",
+            "below the folders setup closes",
+            "in its own profile",
+            "registry keys",
+            "DNS",
+            "UNC path",
+            "WebDAV",
+            "ICMP",
+            "proxy's secret",
+            "unverified on Windows",
+        ] {
+            assert!(gaps.contains(needle), "{needle:?} is missing: {gaps}");
+        }
+        // Commands in different folders no longer share one user.
+        assert!(!gaps.contains("run at the same time run as the same user"));
+    }
+}
 
 /// The TLS library tools are steered to inside this sandbox. The Windows
 /// stack (Schannel) cannot run under the sandbox token (see the module
@@ -316,6 +363,101 @@ fn fnv1a64(seed: u64, bytes: &[u8]) -> u64 {
         .fold(seed, |h, b| {
             (h ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3)
         })
+}
+
+/// The first link beneath `root` (a junction or symbolic link on Windows,
+/// where std's `is_symlink` is true for both) whose target lies outside
+/// `root` or cannot be resolved, with that target; `None` when there is
+/// none. Links are never entered.
+///
+/// Writing an inheritable entry on a folder makes Windows write it on every
+/// object that already exists below, and whether that walk enters a junction
+/// is not documented. An earlier command could have planted one pointing at
+/// the owner's files, so the first grant for a SID on a tree is refused while
+/// such a link exists. A link whose target stays inside `root` is allowed:
+/// the walk would reach only what the grant covers anyway (pnpm lays out
+/// `node_modules` with such junctions). Bounded by the tree's size; it runs
+/// only when the entry is absent, and that write walks the same tree.
+///
+/// A command that runs at the same time could plant a link between this walk
+/// and the write; the first grant for a SID on a folder happens before any
+/// command of that SID runs there, which leaves only commands of another
+/// sandbox user in the same folder.
+pub(super) fn first_outside_link(
+    root: &std::path::Path,
+) -> std::io::Result<Option<(std::path::PathBuf, Option<std::path::PathBuf>)>> {
+    let real_root = kgraf_core::plain_path::canonicalize(root)?;
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            if kind.is_symlink() {
+                match kgraf_core::plain_path::canonicalize(entry.path()) {
+                    Ok(target) if target.starts_with(&real_root) => {}
+                    Ok(target) => return Ok(Some((entry.path(), Some(target)))),
+                    Err(_) => return Ok(Some((entry.path(), None))),
+                }
+            } else if kind.is_dir() {
+                pending.push(entry.path());
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// The refusal [`first_outside_link`] leads to.
+pub(super) fn outside_link_refusal(
+    root: &std::path::Path,
+    link: &std::path::Path,
+    target: Option<&std::path::Path>,
+) -> String {
+    let target = target.map_or_else(
+        || "a target that cannot be resolved".to_owned(),
+        |t| t.display().to_string(),
+    );
+    format!(
+        "{} holds the link {} to {target}, outside it. Writing the sandbox user's entry on \
+         {} could carry it through the link onto {target}, so nothing was written. Remove \
+         the link, then run the command again.",
+        root.display(),
+        link.display(),
+        root.display()
+    )
+}
+
+#[cfg(all(test, unix))]
+mod outside_link_tests {
+    use super::first_outside_link;
+
+    #[test]
+    fn a_link_out_of_the_tree_is_found_and_one_inside_is_not() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let deep = root.path().join("a").join("b");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("f.txt"), "x").unwrap();
+        // Inside: allowed, and not entered.
+        std::os::unix::fs::symlink(root.path().join("a"), deep.join("up")).unwrap();
+        assert_eq!(first_outside_link(root.path()).unwrap(), None);
+        // Outside, two levels down.
+        let link = deep.join("out");
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+        let (found, target) = first_outside_link(root.path()).unwrap().unwrap();
+        assert_eq!(found, link);
+        assert_eq!(
+            target.unwrap(),
+            kgraf_core::plain_path::canonicalize(outside.path()).unwrap()
+        );
+        // A dangling link cannot be judged, so it is refused.
+        std::fs::remove_file(&link).unwrap();
+        let dangling = root.path().join("dangling");
+        std::os::unix::fs::symlink(outside.path().join("gone"), &dangling).unwrap();
+        assert_eq!(
+            first_outside_link(root.path()).unwrap(),
+            Some((dangling, None))
+        );
+    }
 }
 
 /// `true` if the program is a batch file. `CreateProcess` runs those through
@@ -576,6 +718,7 @@ pub(crate) use imp::{AttributeList, revoke};
 #[cfg(windows)]
 pub(super) use imp::{
     Prepared, default_stdio, is_partial, output, prepare, prepare_root, spawn, status, strength,
+    worker_slot,
 };
 
 #[cfg(windows)]
@@ -628,11 +771,11 @@ mod imp {
     };
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION,
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_UILIMIT_DESKTOP,
-        JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_BASIC_UI_RESTRICTIONS,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicAccountingInformation,
-        JobObjectBasicUIRestrictions, JobObjectExtendedLimitInformation, QueryInformationJobObject,
-        SetInformationJobObject, TerminateJobObject,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+        JOBOBJECT_BASIC_UI_RESTRICTIONS, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectBasicAccountingInformation, JobObjectBasicUIRestrictions,
+        JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
+        TerminateJobObject,
     };
     use windows_sys::Win32::System::Pipes::{
         CreateNamedPipeW, CreatePipe, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
@@ -665,10 +808,11 @@ mod imp {
     };
     use crate::error::SandboxError;
     use crate::sandbox_user::PROXY_PORTS;
-    use crate::sandbox_user::names::Role;
     use crate::sandbox_user::runner::Request;
+    use crate::sandbox_user::slots::{COMMAND_WAIT, Lease, Pool};
     use crate::sandbox_user::windows::launch;
     use crate::sandbox_user::windows::state::{self, LoadedUser, Users};
+    use std::sync::Arc;
     // Shared with the command policy's check of a `cmd /c` or PowerShell
     // script, so it is built on every platform.
     use crate::win_command_line::command_line;
@@ -910,9 +1054,32 @@ mod imp {
         Ok(())
     }
 
+    /// Refuse to write an inheritable entry on the tree `root` while a link
+    /// beneath it leads outside it ([`super::first_outside_link`]): the write
+    /// propagates to what already exists below, and could follow the link.
+    fn refuse_outside_links(root: &Path) -> Result<(), SandboxError> {
+        match super::first_outside_link(root) {
+            Ok(None) => Ok(()),
+            Ok(Some((link, target))) => Err(SandboxError::PlatformSetup {
+                step: "check a tree for links before granting on it",
+                source: io::Error::other(super::outside_link_refusal(
+                    root,
+                    &link,
+                    target.as_deref(),
+                )),
+            }),
+            Err(source) => Err(SandboxError::Io {
+                path: root.to_path_buf(),
+                source,
+            }),
+        }
+    }
+
     /// Admit `sid` to write beneath `root`. The owner of an object may always
     /// rewrite its DACL, so this needs no administrator rights for a
     /// user-owned worktree. Verified by reading the DACL back (fail loud).
+    /// The first grant for `sid` is refused while a link in the tree leads
+    /// outside it ([`refuse_outside_links`]).
     fn grant_writable_root(root: &Path, sid: &Sid) -> Result<(), SandboxError> {
         let present = |d: &Dacl| {
             has_ace(d, ACCESS_ALLOWED_ACE_TYPE, sid, ROOT_MASK, NO_INHERITANCE)
@@ -922,6 +1089,7 @@ mod imp {
         if present(&dacl) {
             return Ok(());
         }
+        refuse_outside_links(root)?;
         apply(
             root,
             &dacl,
@@ -966,6 +1134,9 @@ mod imp {
         if has_ace(&dacl, ACCESS_ALLOWED_ACE_TYPE, sid, READ_MASK, flags) {
             return Ok(false);
         }
+        if path.is_dir() {
+            refuse_outside_links(path)?;
+        }
         apply(
             path,
             &dacl,
@@ -987,6 +1158,102 @@ mod imp {
             });
         }
         Ok(true)
+    }
+
+    /// A grant on a tree that holds a junction to a folder outside it.
+    /// Windows only; compile-checked on the development host.
+    #[cfg(test)]
+    mod propagation {
+        use super::*;
+
+        /// A SID no token holds, so the entries change no one's access.
+        const SID: &str = "S-1-5-21-1-2-3-4";
+
+        fn junction(link: &Path, target: &Path) {
+            let status = std::process::Command::new("cmd.exe")
+                .args(["/d", "/c", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .status()
+                .expect("run mklink");
+            assert!(status.success(), "could not make the junction");
+        }
+
+        /// Whether any entry of `path`'s list, inherited or not, names `sid`.
+        fn mentions(path: &Path, sid: &Sid) -> bool {
+            let dacl = read_dacl(path).unwrap();
+            if dacl.acl.is_null() {
+                return false;
+            }
+            // SAFETY: a valid list `dacl` owns.
+            let count = unsafe { (*dacl.acl).AceCount };
+            (0..u32::from(count)).any(|i| {
+                let mut ace: *mut c_void = ptr::null_mut();
+                // SAFETY: `i` is below the entry count.
+                if unsafe { GetAce(dacl.acl, i, &mut ace) } == 0 {
+                    return false;
+                }
+                // SAFETY: allow and deny entries share this layout; a file
+                // list holds no other kind.
+                let body = unsafe { &*(ace as *const ACCESS_ALLOWED_ACE) };
+                let ace_sid = ptr::addr_of!(body.SidStart) as PSID;
+                // SAFETY: both are valid SIDs.
+                unsafe { EqualSid(ace_sid, sid.as_psid()) != 0 }
+            })
+        }
+
+        #[test]
+        fn a_first_grant_on_a_tree_with_a_junction_out_of_it_is_refused() {
+            let sid = Sid::from_string(SID).unwrap();
+            let root = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            std::fs::write(outside.path().join("owner.txt"), "x").unwrap();
+            std::fs::create_dir_all(root.path().join("deep")).unwrap();
+            junction(&root.path().join("deep").join("jn"), outside.path());
+            let err = grant_writable_root(root.path(), &sid).unwrap_err();
+            assert!(err.to_string().contains("outside it"), "{err}");
+            assert!(!mentions(root.path(), &sid), "nothing written on the root");
+            assert!(!mentions(outside.path(), &sid));
+            assert!(!mentions(&outside.path().join("owner.txt"), &sid));
+            let err = grant_read(root.path(), &sid).unwrap_err();
+            assert!(err.to_string().contains("outside it"), "{err}");
+            assert!(!mentions(outside.path(), &sid));
+        }
+
+        #[test]
+        fn a_junction_that_stays_in_the_tree_does_not_stop_the_grant() {
+            let sid = Sid::from_string(SID).unwrap();
+            let root = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(root.path().join("store")).unwrap();
+            junction(&root.path().join("jn"), &root.path().join("store"));
+            grant_writable_root(root.path(), &sid).unwrap();
+            assert!(mentions(root.path(), &sid));
+        }
+
+        /// What the guard above prevents, measured: whether writing an
+        /// inheritable entry on a folder carries it through a junction onto
+        /// the junction's target. The guard holds either way; this line tells
+        /// the run's reader which. Search the output for `MEASURE`.
+        #[test]
+        fn measure_whether_propagation_follows_a_junction() {
+            let sid = Sid::from_string(SID).unwrap();
+            let root = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            std::fs::write(outside.path().join("owner.txt"), "x").unwrap();
+            junction(&root.path().join("jn"), outside.path());
+            let dacl = read_dacl(root.path()).unwrap();
+            apply(
+                root.path(),
+                &dacl,
+                &[explicit(&sid, TREE_MASK, GRANT_ACCESS, TREE_INHERIT)],
+            )
+            .unwrap();
+            println!(
+                "MEASURE grant-propagation-follows-junction: target folder {}, file in it {}",
+                mentions(outside.path(), &sid),
+                mentions(&outside.path().join("owner.txt"), &sid)
+            );
+        }
     }
 
     /// Deny `sid` every read and write beneath the hidden folder `dir`. A
@@ -1258,6 +1525,9 @@ mod imp {
         /// Variables the command gets unless it sets them itself: where the
         /// owner's toolchain is (`user_reads`).
         env: Vec<(String, OsString)>,
+        /// The worker slot the command runs in, held until the command's
+        /// job is closed, so no other folder takes the user while it runs.
+        slot: Arc<Lease>,
     }
 
     /// The strength of the mode this process uses: the sandbox user once
@@ -1381,16 +1651,13 @@ mod imp {
                 what: "a unix-socket allowlist (a socket is confined only by its own ACL)",
             });
         }
-        let roots_first = policy.writable.first().map(|r| strip_verbatim(r));
-        // A command without the network runs as the worker slot's user of its
-        // own writable root, where the setup created slot users: two commands
-        // in different worktrees then run as different users, and neither can
-        // write the other's files.
-        let offline = users.offline_role_for(roots_first.as_deref());
-        let role = match policy.network {
-            Network::Allow => Role::Online,
-            Network::Deny => offline,
-            Network::Proxy { port } if PROXY_PORTS.contains(&port) => offline,
+        // The slot pool: the users without the network run a command with
+        // the network denied or through the egress proxy; the users with it
+        // run one with the network open.
+        let pool = match policy.network {
+            Network::Allow => Pool::Online,
+            Network::Deny => Pool::Offline,
+            Network::Proxy { port } if PROXY_PORTS.contains(&port) => Pool::Offline,
             Network::Proxy { .. } => {
                 return Err(SandboxError::PolicyNotEnforceable {
                     backend: USER_BACKEND_NAME,
@@ -1399,9 +1666,17 @@ mod imp {
                 });
             }
         };
-        let user = users.user(role);
-        let sid = Sid::from_string(&user.sid)?;
         let roots: Vec<PathBuf> = policy.writable.iter().map(|r| strip_verbatim(r)).collect();
+        // The slot of the command's own folder (its first writable root):
+        // the worker's, else the one this process holds for the folder, else
+        // one for this command alone. Two folders never share a slot, so a
+        // command cannot write the folder of another that runs at the same
+        // time; when every slot is held by another folder, it is refused.
+        // The slot is recorded with every root before any grant is written,
+        // so the grants are revoked when the slot moves to another folder.
+        let slot = users.lease(pool, policy.worker_slot.as_ref(), &roots, COMMAND_WAIT)?;
+        let user = users.user(slot.role())?;
+        let sid = Sid::from_string(&user.sid)?;
         for root in &roots {
             // As in `prepare`: refuse a junction and a non-ACL volume before
             // any security call.
@@ -1456,8 +1731,27 @@ mod imp {
                 user,
                 runner: &users.runner,
                 env,
+                slot,
             }),
         })
+    }
+
+    /// [`crate::worker_slot`]: the slot without the network for the folder
+    /// `root`, or `None` before `kgraf sandbox setup`.
+    pub(in crate::sandbox) fn worker_slot(
+        root: &Path,
+    ) -> Result<Option<crate::sandbox::WorkerSlot>, SandboxError> {
+        let Some(users) = state::users()? else {
+            return Ok(None);
+        };
+        let root = strip_verbatim(&super::super::resolve(root)?);
+        let slot = users.lease(
+            Pool::Offline,
+            None,
+            std::slice::from_ref(&root),
+            std::time::Duration::ZERO,
+        )?;
+        Ok(Some(crate::sandbox::WorkerSlot(slot)))
     }
 
     /// Confirm the restricted token is actually granted write on `root` and on
@@ -1474,15 +1768,23 @@ mod imp {
     pub(in crate::sandbox) fn prepare_root(root: &Path) -> Result<(), SandboxError> {
         let root = strip_verbatim(root);
         if let Some(users) = state::users()? {
-            // This runs before kGraf makes a dependency junction in the root,
-            // and any sandbox user may later run a command here, so each one
-            // gets the grant ([`prepare_for_user`] writes the one it uses
-            // again, a no-op while it is present).
+            // This runs before kGraf makes a dependency junction in the root.
+            // Only the user of the root's own slot gets the grant: the
+            // worker's slot when one holds this folder, else the slot the
+            // folder is bound to, which its commands take again. Granting
+            // every sandbox user here let the user of any other folder write
+            // this one. ([`prepare_for_user`] writes the grant again, a no-op
+            // while it is present.)
             refuse_reparse(&root)?;
             require_acl_volume(&root)?;
-            for user in users.all() {
-                grant_writable_root(&root, &Sid::from_string(&user.sid)?)?;
-            }
+            let slot = users.lease(
+                Pool::Offline,
+                None,
+                std::slice::from_ref(&root),
+                COMMAND_WAIT,
+            )?;
+            let user = users.user(slot.role())?;
+            grant_writable_root(&root, &Sid::from_string(&user.sid)?)?;
             return Ok(());
         }
         let sid = Sid::from_string(&capability_sid_string(&root.to_string_lossy()))?;
@@ -1932,6 +2234,7 @@ mod imp {
 
     /// A job that ends its processes when its last handle closes, allows no
     /// breakaway, and applies the UI limits `ui` (`JOB_OBJECT_UILIMIT_*`).
+    /// With `ui` 0 no UI limit class is set at all, so the job can nest.
     fn create_job(ui: u32) -> Result<OwnedHandle, SandboxError> {
         // SAFETY: anonymous job, default security.
         let job = owned(
@@ -1954,6 +2257,9 @@ mod imp {
         } == 0
         {
             return Err(last_error("SetInformationJobObject(extended limits)"));
+        }
+        if ui == 0 {
+            return Ok(job);
         }
         let ui = JOBOBJECT_BASIC_UI_RESTRICTIONS {
             UIRestrictionsClass: ui,
@@ -2508,6 +2814,10 @@ mod imp {
         /// runs. `None` for a command that runs as the sandbox user: its
         /// runner holds the command's own window station.
         _desktop: Option<DesktopGuard>,
+        /// The worker slot of a command that runs as a sandbox user. Last, so
+        /// it is released after the job handle is closed, which ends the
+        /// command.
+        _slot: Option<Arc<Lease>>,
     }
 
     /// Debug-printable wrapper so `SandboxedChild` can derive Debug.
@@ -2866,6 +3176,7 @@ mod imp {
             pid: pi.dwProcessId,
             job,
             _desktop: Some(DesktopGuard(desktop)),
+            _slot: None,
         })
     }
 
@@ -2947,10 +3258,13 @@ mod imp {
             directory: strip_verbatim(cwd).as_os_str().encode_wide().collect(),
             environment: env,
         };
-        // Every UI limit but the one on creating desktops: the runner creates
-        // the command's desktop, then puts the command in a job of its own
-        // with every UI limit (`sandbox_user::windows::runner`).
-        let job = create_job(JOB_OBJECT_UILIMIT_ALL & !JOB_OBJECT_UILIMIT_DESKTOP)?;
+        // No UI limits. Windows nests a job inside another only if neither
+        // sets them, and the runner may already be in a job (the secondary
+        // logon service's, or one kGraf itself runs in). The runner and the
+        // command stay in this job: kill on close, no breakaway. The
+        // command's UI isolation is its own window station and desktop
+        // (`sandbox_user::windows::runner`).
+        let job = create_job(0)?;
         let [stdin, stdout, stderr] = [
             user_stream(STD_INPUT_HANDLE, stdio[0])?,
             user_stream(STD_OUTPUT_HANDLE, stdio[1])?,
@@ -2980,6 +3294,7 @@ mod imp {
             pid: started.command_pid,
             job,
             _desktop: None,
+            _slot: Some(user.slot.clone()),
         })
     }
 

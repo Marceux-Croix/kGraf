@@ -54,6 +54,12 @@ pub struct Observed {
     /// be read (reading them needs administrator rights).
     pub rights: BTreeMap<String, Option<BTreeSet<String>>>,
     pub firewall: FirewallFacts,
+    /// The SID of the sandbox group, if the group exists.
+    pub group_sid: Option<String>,
+    /// The folders setup closes to the sandbox group
+    /// ([`super::acl::closed_folders`]), each with whether the group's deny
+    /// entry is on it; `None` when that could not be read.
+    pub closed: BTreeMap<String, Option<bool>>,
 }
 
 /// One setup step.
@@ -73,6 +79,9 @@ pub enum StepId {
     Hide(Role),
     /// Add or update one firewall rule.
     Rule(RulePurpose),
+    /// Deny the sandbox group the right to create or change entries in the
+    /// folders every local user may write ([`super::acl::closed_folders`]).
+    CloseFolders,
     /// Write the undo record.
     Record,
 }
@@ -88,6 +97,7 @@ impl StepId {
             StepId::Rights(r) => format!("rights-{}", r.key()),
             StepId::Hide(r) => format!("hide-{}", r.key()),
             StepId::Rule(p) => format!("rule-{}", p.key()),
+            StepId::CloseFolders => "close-folders".into(),
             StepId::Record => "record".into(),
         }
     }
@@ -98,6 +108,7 @@ impl StepId {
             "check-firewall" => StepId::CheckFirewall,
             "group" => StepId::Group,
             "record" => StepId::Record,
+            "close-folders" => StepId::CloseFolders,
             _ => {
                 if let Some(r) = key.strip_prefix("user-") {
                     StepId::User(role(r)?)
@@ -127,6 +138,9 @@ impl StepId {
             ),
             StepId::Hide(r) => format!("{} is hidden from the sign-in screen", names.user(r)),
             StepId::Rule(p) => format!("firewall rule {}", names.rule(p)),
+            StepId::CloseFolders => "sandbox users cannot create files in the drive roots, \
+                                     ProgramData, Public and the Windows temporary folders"
+                .into(),
             StepId::Record => "undo record".into(),
         }
     }
@@ -179,6 +193,50 @@ pub enum PlanError {
         "the undo record lists {0}, which is not one of kGraf's names for this account; nothing was removed"
     )]
     ForeignEntry(String),
+    #[error("the administrator step sent no password for {0}; nothing was stored. Run setup again")]
+    PasswordMissing(String),
+    #[error("the administrator step sent a password for {0}, which this setup did not ask for")]
+    PasswordUnexpected(String),
+}
+
+/// The words after the elevated step's subcommand: what it does, how it
+/// finds the owner's pipe, and which users it makes. `--slots` is always
+/// written for a setup, so the elevated step makes the users the owner's
+/// process expects. Without it, the step made only the two fixed users while
+/// the owner's process asked for slot users.
+pub fn elevated_params(
+    names: &OwnerNames,
+    setup: bool,
+    pipe: &str,
+    nonce: &str,
+    owner_pid: u32,
+) -> String {
+    let mut params = format!(
+        "--action {} --pipe {pipe} --nonce {nonce} --owner-pid {owner_pid} --owner-sid {}",
+        if setup { "setup" } else { "remove" },
+        names.owner_sid()
+    );
+    if setup {
+        params.push_str(&format!(" --slots {}", names.slots()));
+    }
+    if let Some(tag) = names.tag() {
+        params.push_str(&format!(" --tag {tag}"));
+    }
+    params
+}
+
+/// Whether the passwords the elevated step sent cover exactly the users
+/// `names` asks for. Checked before anything is stored, so a setup that made
+/// fewer users than asked fails loud instead of storing a partial set.
+pub fn check_passwords(names: &OwnerNames, received: &[Role]) -> Result<(), PlanError> {
+    let wanted = names.roles();
+    if let Some(extra) = received.iter().find(|r| !wanted.contains(r)) {
+        return Err(PlanError::PasswordUnexpected(names.user(*extra)));
+    }
+    match wanted.into_iter().find(|r| !received.contains(r)) {
+        Some(missing) => Err(PlanError::PasswordMissing(names.user(missing))),
+        None => Ok(()),
+    }
 }
 
 /// The setup steps, in order.
@@ -268,7 +326,35 @@ pub fn plan_setup(names: &OwnerNames, observed: &Observed) -> Result<Vec<Step>, 
             undo: vec![UndoEntry::Rule(rule)],
         });
     }
+    // After the group: the deny entries name its SID. The step's undo list
+    // is empty here because the group's SID is known only once the group
+    // step has run; the step itself records one `Closed` entry per folder,
+    // each as soon as that folder's entry is written.
+    let all_closed =
+        !observed.closed.is_empty() && observed.closed.values().all(|v| *v == Some(true));
+    steps.push(Step {
+        id: StepId::CloseFolders,
+        action: if all_closed {
+            Action::Update
+        } else {
+            Action::Create
+        },
+        undo: Vec::new(),
+    });
     Ok(steps)
+}
+
+/// Whether `sid` may be the sandbox group's in a `Closed` undo entry: a
+/// machine-local account SID, never a built-in group such as Users, and the
+/// group's own SID while the group exists. Removal takes only the group's
+/// own deny entry off, but this keeps an edited record from naming anyone
+/// else.
+fn is_group_sid(sid: &str, observed: &Observed) -> bool {
+    sid.starts_with("S-1-5-21-")
+        && observed
+            .group_sid
+            .as_deref()
+            .is_none_or(|g| g.eq_ignore_ascii_case(sid))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -293,6 +379,7 @@ impl RemoveStep {
             UndoEntry::Rights { user, .. } => format!("remove-rights:{user}"),
             UndoEntry::Hidden(n) => format!("remove-hidden:{n}"),
             UndoEntry::Rule(n) => format!("remove-rule:{n}"),
+            UndoEntry::Closed { path, .. } => format!("remove-closed:{path}"),
         }
     }
 }
@@ -304,6 +391,7 @@ fn entry_text(e: &UndoEntry) -> String {
         UndoEntry::Rights { user, .. } => format!("logon rights of {user}"),
         UndoEntry::Hidden(n) => format!("sign-in screen entry of {n}"),
         UndoEntry::Rule(n) => format!("firewall rule {n}"),
+        UndoEntry::Closed { sid, path } => format!("the deny entry for {sid} on {path}"),
     }
 }
 
@@ -328,14 +416,16 @@ pub fn plan_remove(
             UndoEntry::Rights { user, .. } => names.role_of(user).is_some(),
             UndoEntry::Group(n) => *n == names.group(),
             UndoEntry::Rule(n) => rules.contains(n),
+            UndoEntry::Closed { sid, .. } => is_group_sid(sid, observed),
         };
         if !ours {
             return Err(PlanError::ForeignEntry(entry_text(e)));
         }
     }
+    // A deny entry goes before the group, while its SID still names it.
     let rank = |e: &UndoEntry| match e {
         UndoEntry::Rule(_) => 0,
-        UndoEntry::Hidden(_) => 1,
+        UndoEntry::Hidden(_) | UndoEntry::Closed { .. } => 1,
         UndoEntry::Rights { .. } => 2,
         UndoEntry::Group(_) => 3,
         UndoEntry::User(_) => 4,
@@ -348,6 +438,9 @@ pub fn plan_remove(
             UndoEntry::Rule(n) => observed.rules.contains(n),
             UndoEntry::Hidden(n) => observed.hidden.contains(n),
             UndoEntry::Rights { user, .. } => observed.users.contains_key(user),
+            // Whether the entry is still on the folder is read when it is
+            // taken off: removing an absent entry changes nothing.
+            UndoEntry::Closed { .. } => true,
             UndoEntry::Group(n) => match &observed.group {
                 Some(c) if !names.owns_group_comment(c) => {
                     return Err(PlanError::ForeignGroup(n.clone()));
@@ -555,6 +648,17 @@ pub fn status_report(
         };
         push(format!("firewall rule {rule}"), state);
     }
+    for (path, closed) in &observed.closed {
+        let state = match closed {
+            Some(true) => ItemState::Present,
+            Some(false) => ItemState::Missing,
+            None => ItemState::Unknown("its access list could not be read".into()),
+        };
+        push(
+            format!("sandbox users cannot create files in {path}"),
+            state,
+        );
+    }
     let state = match record {
         Ok(None) => ItemState::Missing,
         Ok(Some(r)) if r.owner_sid != names.owner_sid() || r.tag.as_deref() != names.tag() => {
@@ -637,6 +741,10 @@ mod tests {
             );
         }
         o.rules = n.rules().into_iter().collect();
+        o.group_sid = Some("S-1-5-21-1-2-3-1100".into());
+        for path in [r"C:\", r"C:\ProgramData"] {
+            o.closed.insert(path.into(), Some(true));
+        }
         o
     }
 
@@ -807,7 +915,7 @@ mod tests {
         assert!(steps.iter().all(|s| s.action == RemoveAction::Remove));
         let rank = |e: &UndoEntry| match e {
             UndoEntry::Rule(_) => 0,
-            UndoEntry::Hidden(_) => 1,
+            UndoEntry::Hidden(_) | UndoEntry::Closed { .. } => 1,
             UndoEntry::Rights { .. } => 2,
             UndoEntry::Group(_) => 3,
             UndoEntry::User(_) => 4,
@@ -985,5 +1093,268 @@ mod tests {
         let mut fw = o.clone();
         fw.firewall.enabled_all_profiles = Some(false);
         assert!(!status_report(&n, &fw, Ok(Some(&r)), &all_stored(&n)).ready);
+    }
+
+    /// The machine after a complete setup with `n`'s slot count.
+    fn full_with_slots(n: &OwnerNames) -> Observed {
+        let mut o = full(n);
+        for (i, role) in n.roles().into_iter().enumerate() {
+            let user = n.user(role);
+            o.users.entry(user.clone()).or_insert(UserFacts {
+                sid: format!("S-1-5-21-1-2-3-{}", 2000 + i),
+                comment: n.user_comment(role),
+                in_administrators: false,
+            });
+            o.group_members.insert(user.clone());
+            o.hidden.insert(user.clone());
+            o.rights.insert(
+                user,
+                Some(
+                    DENIED_LOGON_RIGHTS
+                        .iter()
+                        .map(|r| (*r).to_owned())
+                        .collect(),
+                ),
+            );
+        }
+        o
+    }
+
+    #[test]
+    fn setup_status_and_remove_cover_every_pool_user() {
+        let n = names().with_slots(3);
+        let pool: Vec<Role> = (0..3)
+            .map(Role::Slot)
+            .chain((0..3).map(Role::OnlineSlot))
+            .collect();
+        // Setup makes, checks, hides and denies the logon rights of every
+        // pool user.
+        let clean = Observed {
+            firewall: firewall_ok(),
+            ..Observed::default()
+        };
+        let steps = plan_setup(&n, &clean).unwrap();
+        for role in &pool {
+            for id in [
+                StepId::User(*role),
+                StepId::NotAdmin(*role),
+                StepId::Rights(*role),
+                StepId::Hide(*role),
+            ] {
+                assert!(steps.iter().any(|s| s.id == id), "no step {id:?}");
+            }
+        }
+        // Status lists each pool user, and is not ready when one is gone.
+        let o = full_with_slots(&n);
+        let r = record_from(&plan_setup(&n, &o).unwrap(), &n);
+        let report = status_report(&n, &o, Ok(Some(&r)), &all_stored(&n));
+        assert!(report.ready, "{report}");
+        for role in &pool {
+            let user = n.user(*role);
+            for item in [
+                format!("{role} sandbox user {user}"),
+                format!("stored password of {user}"),
+                format!("{user} hidden from the sign-in screen"),
+                format!("denied logon rights of {user}"),
+            ] {
+                assert!(
+                    report.lines.iter().any(|l| l.item == item),
+                    "no status line {item:?}"
+                );
+            }
+            let mut gone = o.clone();
+            gone.users.remove(&user);
+            assert!(
+                !status_report(&n, &gone, Ok(Some(&r)), &all_stored(&n)).ready,
+                "status is ready without {user}"
+            );
+        }
+        // The group must hold every pool user.
+        let mut short = o.clone();
+        short.group_members.remove(&n.user(Role::OnlineSlot(2)));
+        assert!(!status_report(&n, &short, Ok(Some(&r)), &all_stored(&n)).ready);
+        // Remove deletes every pool user the record lists, with names that
+        // cover no slots: a removal does not know the slot count.
+        let steps = plan_remove(&names(), &r, &o).unwrap();
+        for role in &pool {
+            let user = n.user(*role);
+            assert!(
+                steps
+                    .iter()
+                    .any(|s| s.entry == UndoEntry::User(user.clone())
+                        && s.action == RemoveAction::Remove),
+                "remove does not delete {user}"
+            );
+            assert!(
+                steps
+                    .iter()
+                    .any(|s| matches!(&s.entry, UndoEntry::Rights { user: u, .. } if *u == user)),
+                "remove keeps the logon rights of {user}"
+            );
+            assert!(
+                steps
+                    .iter()
+                    .any(|s| s.entry == UndoEntry::Hidden(user.clone())),
+                "remove keeps the sign-in screen entry of {user}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_elevated_step_is_told_how_many_slots_to_make() {
+        let n = names().with_slots(4);
+        let params = elevated_params(&n, true, "p", "n", 7);
+        assert!(params.contains(" --slots 4"), "{params}");
+        assert!(params.starts_with("--action setup "), "{params}");
+        let tagged = OwnerNames::derive(OWNER, Some("t1")).unwrap();
+        let params = elevated_params(&tagged, true, "p", "n", 7);
+        assert!(
+            params.contains(" --slots 0") && params.ends_with(" --tag t1"),
+            "{params}"
+        );
+        assert!(!elevated_params(&n, false, "p", "n", 7).contains("--slots"));
+    }
+
+    #[test]
+    fn a_setup_that_sent_fewer_passwords_than_users_is_refused() {
+        let n = names().with_slots(2);
+        assert_eq!(check_passwords(&n, &n.roles()), Ok(()));
+        // What the elevated step sent when it was not told the slot count.
+        assert_eq!(
+            check_passwords(&n, &Role::FIXED),
+            Err(PlanError::PasswordMissing(n.user(Role::Slot(0))))
+        );
+        let mut without_online = n.roles();
+        without_online.retain(|r| *r != Role::OnlineSlot(1));
+        assert_eq!(
+            check_passwords(&n, &without_online),
+            Err(PlanError::PasswordMissing(n.user(Role::OnlineSlot(1))))
+        );
+        let mut extra = n.roles();
+        extra.push(Role::Slot(5));
+        assert_eq!(
+            check_passwords(&n, &extra),
+            Err(PlanError::PasswordUnexpected(n.user(Role::Slot(5))))
+        );
+    }
+}
+
+#[cfg(test)]
+mod closed_folder_tests {
+    use super::*;
+
+    const OWNER: &str = "S-1-5-21-1-2-3-1001";
+    const GROUP_SID: &str = "S-1-5-21-1-2-3-1100";
+
+    fn names() -> OwnerNames {
+        OwnerNames::derive(OWNER, None).unwrap()
+    }
+
+    fn closed(sid: &str, path: &str) -> UndoEntry {
+        UndoEntry::Closed {
+            sid: sid.into(),
+            path: path.into(),
+        }
+    }
+
+    #[test]
+    fn setup_closes_the_shared_folders_after_the_group_exists() {
+        let n = names();
+        let mut o = Observed {
+            firewall: FirewallFacts {
+                enabled_all_profiles: Some(true),
+                local_policy_effective: Some(true),
+            },
+            ..Observed::default()
+        };
+        o.closed.insert(r"C:\".into(), Some(false));
+        let steps = plan_setup(&n, &o).unwrap();
+        let pos = |id| steps.iter().position(|s| s.id == id).unwrap();
+        assert!(pos(StepId::Group) < pos(StepId::CloseFolders));
+        assert_eq!(steps[pos(StepId::CloseFolders)].action, Action::Create);
+        assert_eq!(
+            StepId::from_key(&StepId::CloseFolders.key()),
+            Some(StepId::CloseFolders)
+        );
+        o.closed.insert(r"C:\".into(), Some(true));
+        let steps = plan_setup(&n, &o).unwrap();
+        let step = steps.iter().find(|s| s.id == StepId::CloseFolders).unwrap();
+        assert_eq!(step.action, Action::Update);
+        // A folder whose list could not be read is written again.
+        o.closed.insert(r"D:\".into(), None);
+        let steps = plan_setup(&n, &o).unwrap();
+        let step = steps.iter().find(|s| s.id == StepId::CloseFolders).unwrap();
+        assert_eq!(step.action, Action::Create);
+    }
+
+    #[test]
+    fn remove_takes_the_deny_entries_off_before_the_group_goes() {
+        let n = names();
+        let o = Observed {
+            group: Some(n.group_comment()),
+            group_sid: Some(GROUP_SID.into()),
+            ..Observed::default()
+        };
+        let mut r = Record::new(OWNER, None);
+        r.add(UndoEntry::Group(n.group()));
+        r.add(closed(GROUP_SID, r"C:\ProgramData"));
+        let steps = plan_remove(&n, &r, &o).unwrap();
+        let order: Vec<&UndoEntry> = steps.iter().map(|s| &s.entry).collect();
+        assert_eq!(
+            order,
+            vec![
+                &closed(GROUP_SID, r"C:\ProgramData"),
+                &UndoEntry::Group(n.group())
+            ]
+        );
+        assert!(steps.iter().all(|s| s.action == RemoveAction::Remove));
+    }
+
+    #[test]
+    fn remove_refuses_a_deny_entry_for_anyone_but_the_group() {
+        let n = names();
+        let o = Observed {
+            group: Some(n.group_comment()),
+            group_sid: Some(GROUP_SID.into()),
+            ..Observed::default()
+        };
+        // Users, Everyone, SYSTEM, another local account.
+        for sid in ["S-1-5-32-545", "S-1-1-0", "S-1-5-18", "S-1-5-21-1-2-3-1001"] {
+            let mut r = Record::new(OWNER, None);
+            r.add(closed(sid, r"C:\"));
+            assert!(
+                matches!(plan_remove(&n, &r, &o), Err(PlanError::ForeignEntry(_))),
+                "{sid}"
+            );
+        }
+        // With the group gone, a local SID is taken: the entry can only be
+        // the group's, whose SID no longer resolves. A built-in one is not.
+        let gone = Observed::default();
+        let mut r = Record::new(OWNER, None);
+        r.add(closed(GROUP_SID, r"C:\"));
+        assert!(plan_remove(&n, &r, &gone).is_ok());
+        r.add(closed("S-1-5-32-545", r"C:\"));
+        assert!(plan_remove(&n, &r, &gone).is_err());
+    }
+
+    #[test]
+    fn status_names_each_folder_left_open() {
+        let n = names();
+        let mut o = Observed::default();
+        o.closed.insert(r"C:\".into(), Some(true));
+        o.closed.insert(r"C:\ProgramData".into(), Some(false));
+        o.closed.insert(r"D:\".into(), None);
+        let report = status_report(&n, &o, Ok(None), &Credentials::Missing);
+        let line = |p: &str| {
+            report
+                .lines
+                .iter()
+                .find(|l| l.item == format!("sandbox users cannot create files in {p}"))
+                .map(|l| l.state.clone())
+                .unwrap()
+        };
+        assert_eq!(line(r"C:\"), ItemState::Present);
+        assert_eq!(line(r"C:\ProgramData"), ItemState::Missing);
+        assert!(matches!(line(r"D:\"), ItemState::Unknown(_)));
     }
 }

@@ -381,9 +381,139 @@ impl fmt::Display for Reply {
     }
 }
 
+/// Exit codes for a runner that cannot report over its pipe. Each sets bit 29
+/// (the customer bit of an NTSTATUS-shaped code), so none is a code a program
+/// or Windows itself returns. Once the pipe is connected, a failure is sent
+/// as a [`Reply::Failed`] instead, and the owner reads that first.
+pub const EXIT_ARGS: i32 = 0x2B47_0001;
+pub const EXIT_PIPE: i32 = 0x2B47_0002;
+pub const EXIT_FAILED: i32 = 0x2B47_0003;
+pub const EXIT_WAIT: i32 = 0x2B47_0004;
+pub const EXIT_SELF_PROTECT: i32 = 0x2B47_0005;
+
+/// `STATUS_DLL_INIT_FAILED`: a DLL's start-up routine failed. For a process
+/// that loads `user32.dll`, the usual cause is that it could not open its
+/// window station or desktop.
+pub const STATUS_DLL_INIT_FAILED: u32 = 0xC000_0142;
+/// `STATUS_ACCESS_DENIED` at process start.
+pub const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+/// `STATUS_DLL_NOT_FOUND` at process start.
+pub const STATUS_DLL_NOT_FOUND: u32 = 0xC000_0135;
+/// `STILL_ACTIVE`: what `GetExitCodeProcess` reports for a process that has
+/// not ended.
+pub const STILL_ACTIVE: u32 = 259;
+
+/// What the exit code of a runner that ended before it connected to its pipe
+/// says, for the error the owner reports. The code itself is always in it.
+pub fn describe_runner_exit(code: u32) -> String {
+    let why = match code {
+        c if c == EXIT_ARGS as u32 => "the runner did not understand its arguments",
+        c if c == EXIT_PIPE as u32 => {
+            "the runner could not open its pipe or confirm that kGraf serves it; another \
+             process of the same sandbox user may have held the pipe"
+        }
+        c if c == EXIT_SELF_PROTECT as u32 => {
+            "the runner could not limit what the sandbox user may do to its own process, \
+             threads and token, and stopped before it started the command"
+        }
+        c if c == EXIT_FAILED as u32 => "the runner could not start the command",
+        c if c == EXIT_WAIT as u32 => "the runner lost track of the command",
+        STATUS_DLL_INIT_FAILED => {
+            "a DLL failed to start (STATUS_DLL_INIT_FAILED); most likely the runner could \
+             not open its window station or desktop"
+        }
+        STATUS_ACCESS_DENIED => {
+            "access was denied while the runner started (STATUS_ACCESS_DENIED); the runner \
+             or a DLL it loads may not be readable by the sandbox user"
+        }
+        STATUS_DLL_NOT_FOUND => "a DLL the runner needs was not found (STATUS_DLL_NOT_FOUND)",
+        STILL_ACTIVE => "the runner is still running",
+        _ => "",
+    };
+    if why.is_empty() {
+        format!("the runner exited with code 0x{code:08X} ({code})")
+    } else {
+        format!("{why} (runner exit code 0x{code:08X})")
+    }
+}
+
+/// Win32 errors a logon as the sandbox user can return.
+pub const ERROR_SERVICE_DISABLED: u32 = 1058;
+pub const ERROR_LOGON_FAILURE: u32 = 1326;
+pub const ERROR_ACCOUNT_DISABLED: u32 = 1331;
+pub const ERROR_LOGON_TYPE_NOT_GRANTED: u32 = 1385;
+pub const ERROR_ACCOUNT_LOCKED_OUT: u32 = 1909;
+
+/// What to do about a failed logon as the sandbox user, for the Win32 errors
+/// with a known cause.
+pub fn logon_error_hint(code: u32) -> Option<&'static str> {
+    Some(match code {
+        ERROR_ACCOUNT_LOCKED_OUT => {
+            "the sandbox user is locked out after too many failed logons. Run `kgraf sandbox \
+             setup` again: it resets the sandbox users' passwords and clears the lockout. \
+             Without it, the lockout clears when the account lockout policy's duration ends"
+        }
+        ERROR_LOGON_FAILURE => {
+            "the stored password does not match the sandbox user's; run `kgraf sandbox setup` \
+             again"
+        }
+        ERROR_ACCOUNT_DISABLED => "the sandbox user is disabled; run `kgraf sandbox setup` again",
+        ERROR_LOGON_TYPE_NOT_GRANTED => {
+            "a policy denies the sandbox user the interactive logon that the Secondary Logon \
+             service performs; check \"Deny log on locally\" in the local or group policy"
+        }
+        ERROR_SERVICE_DISABLED => {
+            "the Secondary Logon service (seclogon) is disabled; set its start type to Manual"
+        }
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_runner_exit_code_is_named_and_always_shown() {
+        let text = describe_runner_exit(STATUS_DLL_INIT_FAILED);
+        assert!(text.contains("window station"), "{text}");
+        assert!(text.contains("0xC0000142"), "{text}");
+        let text = describe_runner_exit(EXIT_SELF_PROTECT as u32);
+        assert!(
+            text.contains("limit what the sandbox user may do"),
+            "{text}"
+        );
+        assert!(text.contains("0x2B470005"), "{text}");
+        let text = describe_runner_exit(EXIT_PIPE as u32);
+        assert!(text.contains("pipe"), "{text}");
+        for code in [EXIT_ARGS, EXIT_FAILED, EXIT_WAIT] {
+            let text = describe_runner_exit(code as u32);
+            assert!(text.contains(&format!("0x{:08X}", code as u32)), "{text}");
+            assert!(!text.starts_with("the runner exited with code"), "{text}");
+        }
+        // Unknown codes are shown as they are, in both bases.
+        assert_eq!(
+            describe_runner_exit(7),
+            "the runner exited with code 0x00000007 (7)"
+        );
+    }
+
+    #[test]
+    fn a_locked_out_sandbox_user_is_named_with_the_fix() {
+        let hint = logon_error_hint(ERROR_ACCOUNT_LOCKED_OUT).unwrap();
+        assert!(hint.contains("locked out"), "{hint}");
+        assert!(hint.contains("kgraf sandbox setup"), "{hint}");
+        assert!(hint.contains("lockout policy"), "{hint}");
+        for code in [
+            ERROR_LOGON_FAILURE,
+            ERROR_ACCOUNT_DISABLED,
+            ERROR_LOGON_TYPE_NOT_GRANTED,
+            ERROR_SERVICE_DISABLED,
+        ] {
+            assert!(logon_error_hint(code).is_some(), "{code}");
+        }
+        assert_eq!(logon_error_hint(5), None);
+    }
 
     fn w(s: &str) -> Vec<u16> {
         s.encode_utf16().collect()

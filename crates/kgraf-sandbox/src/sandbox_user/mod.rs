@@ -37,6 +37,7 @@
 //! blocks with the proxy ports cut out, and its local policy check. See
 //! `third_party/codex/UPSTREAM` for what is taken and what differs.
 
+pub mod acl;
 pub mod blob;
 pub mod firewall;
 pub mod handshake;
@@ -45,6 +46,7 @@ pub mod password;
 pub mod plan;
 pub mod record;
 pub mod runner;
+pub mod slots;
 pub mod store;
 #[cfg(windows)]
 pub mod windows;
@@ -52,16 +54,18 @@ pub mod windows;
 pub use blob::{BlobError, Protector, StoredUser, decode_credentials, encode_credentials};
 pub use firewall::{PROXY_PORTS, RulePurpose, RuleSpec, offline_rules};
 pub use handshake::{HandshakeError, Message, StepOutcome};
-pub use names::{DEFAULT_SLOTS, MAX_SLOTS, NameError, OwnerNames, Role, slot_of};
+pub use names::{DEFAULT_SLOTS, MAX_SLOTS, NameError, OwnerNames, Role};
 pub use password::{Password, PasswordError};
 pub use plan::{
     Action, CredentialCheck, Credentials, FirewallFacts, ItemState, Observed, PlanError,
-    RemoveAction, RemoveStep, StatusLine, StatusReport, Step, StepId, UserFacts, plan_remove,
-    plan_setup, status_report,
+    RemoveAction, RemoveStep, StatusLine, StatusReport, Step, StepId, UserFacts, check_passwords,
+    elevated_params, plan_remove, plan_setup, status_report,
 };
 pub use record::{DENIED_LOGON_RIGHTS, Record, RecordError, UndoEntry};
+pub use slots::{Lease, Leases, Pool, SlotError, Taken};
 pub use store::{
     LoadError, credentials_file_name, credentials_path, grants_path, load_user, parse_grants,
+    slots_dir,
 };
 
 /// What `kgraf sandbox setup` prints on a platform that needs no setup.

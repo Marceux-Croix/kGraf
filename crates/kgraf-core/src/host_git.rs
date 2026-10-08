@@ -90,11 +90,23 @@
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::Mutex;
 
 mod includes;
 pub use includes::{IncludeScan, RACY as INCLUDE_SCAN_RACY};
+
+/// The bound of one git command kGraf runs for its own operations, the
+/// command [`command`] builds (`crate::child_run`). The longest legitimate
+/// ones are a worktree checkout and a merge of a large repository: minutes.
+/// Ten minutes is the shell tool's own command timeout; a git process past
+/// it is stuck, and is killed with what it started.
+pub const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// The bound of the short git runs [`command`] makes before the command:
+/// `git version` and the config and include listings. They read a few small
+/// files; two minutes covers git's start on a machine with every core busy.
+pub const AUX_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2 * 60);
 
 /// The oldest git whose `GIT_CONFIG_COUNT` carries the overrides.
 pub const MIN_GIT: (u32, u32) = (2, 31);
@@ -202,6 +214,28 @@ pub enum HostGitError {
     Parse(String),
     #[error("`{0}` is not accepted as a global git option here")]
     Misuse(String),
+    /// A listing run did not end in time, or its process tree could not be
+    /// ended (`crate::child_run`).
+    #[error(transparent)]
+    Run(crate::child_run::RunError),
+}
+
+/// A bounded run of a listing command: its spawn failure as
+/// [`HostGitError::Spawn`], every other failure as [`HostGitError::Run`].
+fn run_aux(
+    cmd: Command,
+    exe: &Path,
+    label: &str,
+) -> Result<crate::child_run::Finished, HostGitError> {
+    crate::child_run::run(cmd, label, None, crate::child_run::Limits::new(AUX_TIMEOUT)).map_err(
+        |e| match e {
+            crate::child_run::RunError::Spawn { source, .. } => HostGitError::Spawn {
+                exe: exe.display().to_string(),
+                source,
+            },
+            other => HostGitError::Run(other),
+        },
+    )
 }
 
 /// Where and how a hardened command runs.
@@ -347,14 +381,8 @@ fn set_overrides(cmd: &mut Command, overrides: &[(String, String)]) {
 fn list_config(inv: &Invocation<'_>) -> Result<Vec<u8>, HostGitError> {
     let mut cmd = base(inv);
     set_overrides(&mut cmd, &fixed_overrides());
-    cmd.args(["config", "--includes", "-z", "--list"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let out = cmd.output().map_err(|source| HostGitError::Spawn {
-        exe: inv.exe.display().to_string(),
-        source,
-    })?;
+    cmd.args(["config", "--includes", "-z", "--list"]);
+    let out = run_aux(cmd, inv.exe, "git config --includes -z --list")?;
     if !out.status.success() {
         return Err(HostGitError::Config {
             code: out.status.code(),
@@ -424,15 +452,9 @@ fn check_version(exe: &Path) -> Result<(), HostGitError> {
                 .map_err(|found| HostGitError::TooOld { found });
         }
     }
-    let out = Command::new(exe)
-        .arg("version")
-        .env("LC_ALL", "C")
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|source| HostGitError::Spawn {
-            exe: exe.display().to_string(),
-            source,
-        })?;
+    let mut cmd = Command::new(exe);
+    cmd.arg("version").env("LC_ALL", "C");
+    let out = run_aux(cmd, exe, "git version")?;
     let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
     let result = match parse_version(&text) {
         Some(v) if out.status.success() && v >= MIN_GIT => Ok(()),

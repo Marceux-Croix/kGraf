@@ -370,84 +370,96 @@ fn integrations(trace: &[TraceEvent]) -> Vec<(usize, i64, String)> {
         .collect()
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_semantic_conflict_between_two_in_flight_workers_is_reported_before_either_lands() {
-    // Each alone passes; together they fail. Workers hold until the record
-    // carries the finding, so it can only have come from in-flight trees.
-    let out = run_pair(
-        "test ! -f a.flag || test ! -f b.flag",
-        // Each validation is held, so a round takes longer than a worker's
-        // few idle rounds, as it does on a loaded machine.
-        Duration::from_secs(2),
-        |_, store| {
-            store
-                .load(&RunId::new("r1"))
-                .ok()
-                .flatten()
-                .is_some_and(|r| !r.coordination.speculative_conflicts.is_empty())
-        },
-    )
-    .await;
-    let found = &out.record.coordination.speculative_conflicts;
-    assert_eq!(found.len(), 1, "{found:?} {:#?}", out.trace);
-    assert_eq!(found[0].contracts, ["a".to_owned(), "b".to_owned()]);
-    assert_eq!(found[0].kind, ConflictKind::Semantic);
-    // The pair and each member alone were validated, and the run says so.
-    assert!(out.record.coordination.speculation.validations >= 3);
-    assert!(out.record.coordination.speculation.rounds >= 1);
-    let reported = out
+#[test]
+fn a_semantic_conflict_between_two_in_flight_workers_is_reported_before_either_lands() {
+    crate::e2e_rt::run(
+        "a_semantic_conflict_between_two_in_flight_workers_is_reported_before_either_lands",
+        crate::e2e_rt::Flavor::MultiThread,
+        async {
+            // Each alone passes; together they fail. Workers hold until the record
+            // carries the finding, so it can only have come from in-flight trees.
+            let out = run_pair(
+                "test ! -f a.flag || test ! -f b.flag",
+                // Each validation is held, so a round takes longer than a worker's
+                // few idle rounds, as it does on a loaded machine.
+                Duration::from_secs(2),
+                |_, store| {
+                    store
+                        .load(&RunId::new("r1"))
+                        .ok()
+                        .flatten()
+                        .is_some_and(|r| !r.coordination.speculative_conflicts.is_empty())
+                },
+            )
+            .await;
+            let found = &out.record.coordination.speculative_conflicts;
+            assert_eq!(found.len(), 1, "{found:?} {:#?}", out.trace);
+            assert_eq!(found[0].contracts, ["a".to_owned(), "b".to_owned()]);
+            assert_eq!(found[0].kind, ConflictKind::Semantic);
+            // The pair and each member alone were validated, and the run says so.
+            assert!(out.record.coordination.speculation.validations >= 3);
+            assert!(out.record.coordination.speculation.rounds >= 1);
+            let reported = out
         .trace
         .iter()
         .position(|e| matches!(e, TraceEvent::Speculation { outcome, .. } if outcome == "semantic"))
         .expect("the conflict is traced");
-    let landed = integrations(&out.trace);
-    assert_eq!(
-        landed.len(),
-        2,
-        "both still land: a gate, not speculation, blocks"
-    );
-    assert!(
-        landed.iter().all(|(i, _, _)| reported < *i),
-        "reported before either landed: {:#?}",
-        out.trace
-    );
-    assert!(
-        !out.branch_log.contains("speculative"),
-        "no speculative commit on the integration branch:\n{}",
-        out.branch_log
+            let landed = integrations(&out.trace);
+            assert_eq!(
+                landed.len(),
+                2,
+                "both still land: a gate, not speculation, blocks"
+            );
+            assert!(
+                landed.iter().all(|(i, _, _)| reported < *i),
+                "reported before either landed: {:#?}",
+                out.trace
+            );
+            assert!(
+                !out.branch_log.contains("speculative"),
+                "no speculative commit on the integration branch:\n{}",
+                out.branch_log
+            );
+        },
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_clean_pair_lands_while_its_speculative_validation_is_still_running() {
-    // Validation passes, and is held 4 s. Workers finish as soon as it has
-    // started, so both are in flight when the round begins.
-    let out = run_pair("test -f README", Duration::from_secs(4), |probe, _| {
-        probe.started_ms.lock().expect("lock").is_some()
-    })
-    .await;
-    assert!(out.record.coordination.speculative_conflicts.is_empty());
-    let landed = integrations(&out.trace);
-    assert_eq!(landed.len(), 2, "{landed:?}");
-    // The run ended; the round it started finishes on its own.
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
-    let finished = loop {
-        if let Some(at) = *out.probe.finished_ms.lock().expect("lock") {
-            break at;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the round never ended"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    };
-    assert!(
-        landed.iter().all(|(_, at, _)| *at < finished),
-        "merge-back never waited for speculation: {landed:?}, validation done at {finished}"
-    );
-    assert!(
-        !out.branch_log.contains("speculative"),
-        "{}",
-        out.branch_log
+#[test]
+fn a_clean_pair_lands_while_its_speculative_validation_is_still_running() {
+    crate::e2e_rt::run(
+        "a_clean_pair_lands_while_its_speculative_validation_is_still_running",
+        crate::e2e_rt::Flavor::MultiThread,
+        async {
+            // Validation passes, and is held 4 s. Workers finish as soon as it has
+            // started, so both are in flight when the round begins.
+            let out = run_pair("test -f README", Duration::from_secs(4), |probe, _| {
+                probe.started_ms.lock().expect("lock").is_some()
+            })
+            .await;
+            assert!(out.record.coordination.speculative_conflicts.is_empty());
+            let landed = integrations(&out.trace);
+            assert_eq!(landed.len(), 2, "{landed:?}");
+            // The run ended; the round it started finishes on its own.
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            let finished = loop {
+                if let Some(at) = *out.probe.finished_ms.lock().expect("lock") {
+                    break at;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the round never ended"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            };
+            assert!(
+                landed.iter().all(|(_, at, _)| *at < finished),
+                "merge-back never waited for speculation: {landed:?}, validation done at {finished}"
+            );
+            assert!(
+                !out.branch_log.contains("speculative"),
+                "{}",
+                out.branch_log
+            );
+        },
     );
 }

@@ -15,11 +15,12 @@ use super::super::names::{MAX_SLOTS, OwnerNames, Role};
 use super::super::password::Password;
 use super::super::plan::{
     Action, CredentialCheck, Credentials, Observed, RemoveAction, StatusReport, StepId,
-    plan_remove, plan_setup, status_report,
+    check_passwords, elevated_params, plan_remove, plan_setup, status_report,
 };
 use super::super::record::{DENIED_LOGON_RIGHTS, Record, UndoEntry};
-use super::super::store::{grants_path, load_user, parse_grants};
-use super::{accounts, dpapi::Dpapi, elevate, firewall, pipe};
+use super::super::slots::read_table;
+use super::super::store::{grants_path, load_user, parse_grants, slots_dir};
+use super::{accounts, dpapi::Dpapi, elevate, firewall, pipe, secure};
 use crate::error::SandboxError;
 
 fn setup_error(step: &'static str, why: impl std::fmt::Display) -> SandboxError {
@@ -29,14 +30,35 @@ fn setup_error(step: &'static str, why: impl std::fmt::Display) -> SandboxError 
     }
 }
 
-/// Where the undo record lives: under ProgramData, written by the elevated
-/// step. One file per owner (the group name is derived from the owner).
-pub fn record_path(names: &OwnerNames) -> PathBuf {
-    let base = std::env::var_os("ProgramData")
-        .map_or_else(|| PathBuf::from(r"C:\ProgramData"), PathBuf::from);
-    base.join("kGraf")
-        .join("sandbox")
-        .join(format!("record-{}.txt", names.group()))
+/// The folders under ProgramData that hold the undo records.
+const RECORD_FOLDERS: [&str; 2] = ["kGraf", "sandbox"];
+
+fn record_file_name(names: &OwnerNames) -> String {
+    format!("record-{}.txt", names.group())
+}
+
+/// Where the undo record lives: under ProgramData (from the shell, not the
+/// environment), written by the elevated step. One file per owner (the group
+/// name is derived from the owner).
+pub fn record_path(names: &OwnerNames) -> Result<PathBuf, SandboxError> {
+    let mut path = secure::program_data()?;
+    RECORD_FOLDERS.iter().for_each(|p| path.push(p));
+    Ok(path.join(record_file_name(names)))
+}
+
+/// The undo record's path for the elevated step, with its folders made or
+/// checked so that no one but an administrator can change them
+/// (`secure::trusted_folder`). Every user may create a folder under
+/// ProgramData, so the step never writes through a folder it did not check.
+fn trusted_record_path(names: &OwnerNames, create: bool) -> Result<Option<PathBuf>, SandboxError> {
+    let base = secure::program_data()?;
+    let me = accounts::current_user_sid()?;
+    let dir = if create {
+        Some(secure::trusted_folder(&base, &RECORD_FOLDERS, &me)?)
+    } else {
+        secure::existing_trusted_folder(&base, &RECORD_FOLDERS, &me)?
+    };
+    Ok(dir.map(|d| d.join(record_file_name(names))))
 }
 
 /// What the machine holds for `names`. Logon rights are read only when
@@ -64,25 +86,48 @@ pub fn observe(names: &OwnerNames, with_rights: bool) -> Result<Observed, Sandbo
     }
     o.rules = firewall::existing(&names.rules())?;
     o.firewall = firewall::facts();
+    if o.group.is_some() {
+        o.group_sid = accounts::sid_of(&names.group())?;
+    }
+    for folder in secure::folders_to_close()? {
+        let closed = match &o.group_sid {
+            None => Some(false),
+            Some(sid) => secure::is_closed(Path::new(&folder), sid).ok(),
+        };
+        o.closed.insert(folder, closed);
+    }
     Ok(o)
 }
 
 fn read_record(path: &Path) -> Result<Option<Record>, String> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => Record::parse(&text).map(Some).map_err(|e| e.to_string()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+    match secure::read_no_follow(path) {
+        Ok(Some(text)) => Record::parse(&text).map(Some).map_err(|e| e.to_string()),
+        Ok(None) => Ok(None),
         Err(e) => Err(e.to_string()),
     }
 }
 
+/// Write the record at `path`, whose folder [`trusted_record_path`] checked.
 fn write_record(path: &Path, record: &Record) -> Result<(), SandboxError> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)
-            .map_err(|e| setup_error("create the undo record folder", e))?;
+    secure::replace_file(path, record.to_text().as_bytes())
+        .map_err(|e| setup_error("write the undo record", e))
+}
+
+/// Deny the sandbox group the right to create entries in each folder every
+/// local user may write, and list each in the record as soon as it is done,
+/// so a run cut short can still be undone.
+fn close_folders(names: &OwnerNames, record: &mut Record, path: &Path) -> Result<(), SandboxError> {
+    let sid = accounts::sid_of(&names.group())?
+        .ok_or_else(|| setup_error("find the sandbox group", "missing"))?;
+    for folder in secure::folders_to_close()? {
+        secure::close_folder(Path::new(&folder), &sid)?;
+        record.add(UndoEntry::Closed {
+            sid: sid.clone(),
+            path: folder,
+        });
+        write_record(path, record)?;
     }
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, record.to_text()).map_err(|e| setup_error("write the undo record", e))?;
-    std::fs::rename(&tmp, path).map_err(|e| setup_error("write the undo record", e))
+    Ok(())
 }
 
 // ---- the elevated step ------------------------------------------------------
@@ -103,6 +148,10 @@ pub struct ElevatedArgs {
     pub owner_pid: u32,
     pub owner_sid: String,
     pub tag: Option<String>,
+    /// How many worker slots a setup makes users for. Required for a setup:
+    /// without it the step would make no slot users while the owner's
+    /// process asked for them.
+    pub slots: Option<u8>,
 }
 
 /// Run the elevated step. Returns the process exit code; every failure is
@@ -119,6 +168,17 @@ pub fn elevated_main(args: &ElevatedArgs) -> i32 {
     }
     let result = OwnerNames::derive(&args.owner_sid, args.tag.as_deref())
         .map_err(|e| ("names".to_owned(), e.to_string()))
+        .and_then(|names| match (args.action, args.slots) {
+            (ElevatedAction::Setup, None) => Err((
+                "names".to_owned(),
+                "the setup step was not told how many worker slots to make".to_owned(),
+            )),
+            (ElevatedAction::Setup, Some(n)) if n > MAX_SLOTS => Err((
+                "names".to_owned(),
+                format!("--slots must be {MAX_SLOTS} or fewer"),
+            )),
+            (_, slots) => Ok(names.with_slots(slots.unwrap_or(0))),
+        })
         .and_then(|names| match args.action {
             ElevatedAction::Setup => run_setup(&names, &mut send),
             ElevatedAction::Remove => run_remove(&names, &mut send),
@@ -141,7 +201,14 @@ fn run_setup(names: &OwnerNames, send: &mut dyn FnMut(Message) -> bool) -> Resul
     let fail = |key: &str, e: &dyn std::fmt::Display| (key.to_owned(), e.to_string());
     let observed = observe(names, true).map_err(|e| fail("observe", &e))?;
     let steps = plan_setup(names, &observed).map_err(|e| fail("plan", &e))?;
-    let path = record_path(names);
+    let path = trusted_record_path(names, true)
+        .map_err(|e| fail("record", &e))?
+        .ok_or_else(|| {
+            fail(
+                "record",
+                &"the undo record folder is missing after it was made",
+            )
+        })?;
     let mut record = match read_record(&path) {
         Ok(Some(r)) if r.owner_sid == names.owner_sid() => r,
         _ => Record::new(names.owner_sid(), names.tag()),
@@ -212,6 +279,7 @@ fn run_setup(names: &OwnerNames, send: &mut dyn FnMut(Message) -> bool) -> Resul
                     .ok_or_else(|| setup_error("plan a firewall rule", "no such rule"))
                     .and_then(|spec| firewall::put(&spec))
             }),
+            StepId::CloseFolders => close_folders(names, &mut record, &path),
             StepId::Record => Ok(()),
         };
         done.map_err(|e| fail(&key, &e))?;
@@ -233,7 +301,12 @@ fn run_setup(names: &OwnerNames, send: &mut dyn FnMut(Message) -> bool) -> Resul
 
 fn run_remove(names: &OwnerNames, send: &mut dyn FnMut(Message) -> bool) -> Result<(), Failure> {
     let fail = |key: &str, e: &dyn std::fmt::Display| (key.to_owned(), e.to_string());
-    let path = record_path(names);
+    // No folder is no record: nothing to undo. A folder that exists but
+    // that others could change is refused before anything is read from it
+    // or written to it.
+    let Some(path) = trusted_record_path(names, false).map_err(|e| fail("record", &e))? else {
+        return Ok(());
+    };
     let mut record = match read_record(&path) {
         Ok(Some(r)) => r,
         Ok(None) => return Ok(()),
@@ -259,6 +332,7 @@ fn run_remove(names: &OwnerNames, send: &mut dyn FnMut(Message) -> bool) -> Resu
                 },
                 UndoEntry::Group(n) => accounts::delete_group(n).map(drop),
                 UndoEntry::User(n) => accounts::delete_user(n).map(drop),
+                UndoEntry::Closed { sid, path } => secure::reopen_folder(Path::new(path), sid),
             };
             done.map_err(|e| fail(&key, &e))?;
             StepOutcome::Removed
@@ -270,7 +344,7 @@ fn run_remove(names: &OwnerNames, send: &mut dyn FnMut(Message) -> bool) -> Resu
         }
     }
     if record.is_empty() {
-        let _ = std::fs::remove_file(&path);
+        secure::delete_no_follow(&path).map_err(|e| fail("record", &e))?;
     }
     Ok(())
 }
@@ -283,6 +357,7 @@ fn undo_key(e: &UndoEntry) -> String {
         UndoEntry::Rights { user, .. } => format!("remove-rights:{user}"),
         UndoEntry::Hidden(n) => format!("remove-hidden:{n}"),
         UndoEntry::Rule(n) => format!("remove-rule:{n}"),
+        UndoEntry::Closed { path, .. } => format!("remove-closed:{path}"),
     }
 }
 
@@ -306,18 +381,11 @@ fn drive(
     let name = pipe_name(&nonce);
     let server = pipe::create(&name, names.owner_sid())?;
     let pid = std::process::id();
-    let mut params = format!(
-        "{} --action {} --pipe {name} --nonce {nonce} --owner-pid {pid} --owner-sid {}",
+    let params = format!(
+        "{} {}",
         launch.subcommand,
-        match action {
-            ElevatedAction::Setup => "setup",
-            ElevatedAction::Remove => "remove",
-        },
-        names.owner_sid()
+        elevated_params(names, action == ElevatedAction::Setup, &name, &nonce, pid)
     );
-    if let Some(tag) = names.tag() {
-        params.push_str(&format!(" --tag {tag}"));
-    }
     let child = elevate::run_elevated(launch.exe, &params)?;
     let lines = server.accept(&child.process, child.pid)?;
     let mut receiver = Receiver::new();
@@ -368,6 +436,9 @@ pub fn setup(
     let passwords = receiver
         .into_passwords()
         .map_err(|e| setup_error("receive the sandbox passwords", e))?;
+    let received: Vec<Role> = passwords.iter().map(|(role, _)| *role).collect();
+    check_passwords(names, &received)
+        .map_err(|e| setup_error("receive the sandbox passwords", e))?;
     let mut entries = Vec::new();
     for (role, password) in &passwords {
         let user = names.user(*role);
@@ -402,6 +473,7 @@ pub fn remove(
     on_event: &mut dyn FnMut(&Event),
 ) -> Result<(), SandboxError> {
     revoke_grants(store)?;
+    revoke_slot_grants(store)?;
     drive(names, launch, ElevatedAction::Remove, on_event)?;
     match std::fs::remove_file(store) {
         Ok(()) => Ok(()),
@@ -418,11 +490,18 @@ pub fn status(names: &OwnerNames, store: &Path) -> Result<StatusReport, SandboxE
     // of a smaller setup missing, and miss those of a larger one.
     let probe = names.clone().with_slots(MAX_SLOTS);
     let observed = observe(&probe, false)?;
-    let found = (0..MAX_SLOTS)
-        .take_while(|i| observed.users.contains_key(&probe.user(Role::Slot(*i))))
-        .count();
+    // Both users of a slot are counted, so a slot with one user missing is
+    // reported as missing that user.
+    let count = |role: fn(u8) -> Role| {
+        (0..MAX_SLOTS)
+            .take_while(|i| observed.users.contains_key(&probe.user(role(*i))))
+            .count()
+    };
+    let found = count(Role::Slot).max(count(Role::OnlineSlot));
     let names = &names.clone().with_slots(u8::try_from(found).unwrap_or(0));
-    let record = read_record(&record_path(names));
+    let record = record_path(names)
+        .map_err(|e| e.to_string())
+        .and_then(|p| read_record(&p));
     let credentials = match std::fs::read(store) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Credentials::Missing,
         Err(e) => Credentials::Unreadable(e.to_string()),
@@ -470,6 +549,31 @@ pub fn stored_user(
     load_user(&bytes, role, &Dpapi)
         .map(Some)
         .map_err(|e| setup_error("open the stored sandbox password", e))
+}
+
+/// Remove each slot user's write grant from every folder the slot table
+/// beside `store` names ([`super::super::slots`]), then delete the table and
+/// its lock files. Runs before the users are removed. A folder that is gone
+/// is skipped. The first failure stops it and keeps the table.
+fn revoke_slot_grants(store: &Path) -> Result<(), SandboxError> {
+    let dir = slots_dir(store);
+    let table = read_table(&dir).map_err(|e| setup_error("read the sandbox slot table", e))?;
+    let roots = table.all_roots();
+    if !roots.is_empty() {
+        let bytes =
+            std::fs::read(store).map_err(|e| setup_error("read the stored sandbox users", e))?;
+        let users =
+            decode_users(&bytes).map_err(|e| setup_error("read the stored sandbox users", e))?;
+        let sids: Vec<&str> = users.iter().map(|(u, _)| u.sid.as_str()).collect();
+        for path in roots {
+            crate::sandbox::revoke_sandbox_grant(&path, &sids)?;
+        }
+    }
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(setup_error("delete the sandbox slot table", e)),
+    }
 }
 
 /// Remove the sandbox users' entries from every folder of the owner's that

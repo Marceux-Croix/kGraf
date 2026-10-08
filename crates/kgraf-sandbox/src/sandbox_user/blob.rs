@@ -12,8 +12,9 @@
 //! what is stored without opening a password.
 //!
 //! ```text
-//! "KGSBCRED" | version u8 = 1 | count u8
-//! per user: role u8 (0 offline, 1 online)
+//! "KGSBCRED" | version u8 = 2 | count u8
+//! per user: role u8 (0 offline, 1 online, 16 + i slot i without the
+//!           network, 128 + i slot i with it)
 //!           name length u16 LE | name (UTF-8)
 //!           SID length u16 LE  | SID (UTF-8)
 //!           blob length u32 LE | protected password
@@ -31,6 +32,13 @@ pub const VERSION: u8 = 2;
 /// version 1 file held only the two fixed roles, so a kGraf that reads one
 /// asks for a fresh setup instead of guessing.
 pub const SLOT_BYTE: u8 = 16;
+
+/// The first role byte of a worker slot with the network open: slot `i` is
+/// `ONLINE_SLOT_BYTE + i`. The version stays 2: a file from before these
+/// users names slot users without the network and none with it, and the
+/// launch path refuses that and asks for a fresh setup, while `kgraf sandbox
+/// remove` still reads the file.
+pub const ONLINE_SLOT_BYTE: u8 = 128;
 
 /// The largest protected password accepted (a DPAPI blob of a 40-character
 /// password is a few hundred bytes).
@@ -72,6 +80,7 @@ fn role_byte(r: Role) -> u8 {
         Role::Offline => 0,
         Role::Online => 1,
         Role::Slot(i) => SLOT_BYTE.saturating_add(i),
+        Role::OnlineSlot(i) => ONLINE_SLOT_BYTE.saturating_add(i),
     }
 }
 
@@ -79,6 +88,10 @@ fn role_of_byte(b: u8) -> Option<Role> {
     match b {
         0 => Some(Role::Offline),
         1 => Some(Role::Online),
+        _ if b >= ONLINE_SLOT_BYTE => {
+            let i = b - ONLINE_SLOT_BYTE;
+            (i < MAX_SLOTS).then_some(Role::OnlineSlot(i))
+        }
         _ => {
             let i = b.checked_sub(SLOT_BYTE)?;
             (i < MAX_SLOTS).then_some(Role::Slot(i))
@@ -86,8 +99,9 @@ fn role_of_byte(b: u8) -> Option<Role> {
     }
 }
 
-/// How many users one file may hold: the two fixed roles and every slot.
-const MAX_ENTRIES: usize = 2 + MAX_SLOTS as usize;
+/// How many users one file may hold: the two fixed roles and both users of
+/// every slot.
+const MAX_ENTRIES: usize = 2 + 2 * MAX_SLOTS as usize;
 
 /// The file's bytes for these users and passwords.
 pub fn encode_credentials(
@@ -372,6 +386,11 @@ mod tests {
                 name: format!("kgraf-s{i:02}-1a2b3c4d"),
                 sid: format!("S-1-5-21-1-2-3-{}", 1100 + u32::from(i)),
             })
+            .chain([0u8, 3, MAX_SLOTS - 1].into_iter().map(|i| StoredUser {
+                role: Role::OnlineSlot(i),
+                name: format!("kgraf-o{i:02}-1a2b3c4d"),
+                sid: format!("S-1-5-21-1-2-3-{}", 1300 + u32::from(i)),
+            }))
             .collect();
         let entries: Vec<(StoredUser, &Password)> =
             slots.iter().cloned().map(|u| (u, &pw)).collect();
@@ -389,6 +408,10 @@ mod tests {
         // A slot above the highest one does not either.
         let mut high = bytes.clone();
         high[10] = SLOT_BYTE + MAX_SLOTS;
+        assert_eq!(decode_users(&high).unwrap_err(), BlobError::Entry);
+        // Nor does one above the highest online slot.
+        let mut high = bytes.clone();
+        high[10] = ONLINE_SLOT_BYTE + MAX_SLOTS;
         assert_eq!(decode_users(&high).unwrap_err(), BlobError::Entry);
         // More entries than there can be users.
         let many: Vec<(StoredUser, &Password)> = (0..=MAX_ENTRIES)

@@ -128,7 +128,6 @@ use crate::permissions::{PermissionControl, PermissionMode};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
-use std::process::Stdio;
 // The tests build their fixtures with plain git.
 #[cfg(test)]
 use std::process::Command;
@@ -1340,7 +1339,6 @@ impl ProtectedWrites {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        use std::io::Write;
         let exe = self.git_exe.as_ref().ok_or_else(|| {
             "git is not on PATH; a protected git write cannot be checked".to_owned()
         })?;
@@ -1358,31 +1356,21 @@ impl ProtectedWrites {
         // The host runner: hooks, every configured driver, the file system
         // monitor and transports off, the inherited `GIT_*` removed. A config
         // git cannot read is the check's failure, reported as git's.
-        let mut cmd = match kgraf_core::host_git::command(&inv, &args) {
+        let cmd = match kgraf_core::host_git::command(&inv, &args) {
             Ok(cmd) => cmd,
             Err(kgraf_core::host_git::HostGitError::Config { stderr, .. }) => {
                 return Ok((false, String::new(), stderr));
             }
             Err(e) => return Err(format!("cannot run git: {e}")),
         };
-        cmd.stdin(if stdin.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-        let mut child = cmd.spawn().map_err(|e| format!("cannot run git: {e}"))?;
-        let writer = child.stdin.take();
-        let input = stdin.unwrap_or_default().to_vec();
-        let output = std::thread::scope(|scope| {
-            if let Some(mut w) = writer {
-                scope.spawn(move || {
-                    let _ = w.write_all(&input);
-                });
-            }
-            child.wait_with_output()
-        })
+        // Bounded, input written and output read on threads, the tree
+        // killed at the bound (`kgraf_core::child_run`).
+        let output = kgraf_core::child_run::run(
+            cmd,
+            "git (protected write check)",
+            stdin,
+            kgraf_core::child_run::Limits::new(kgraf_core::host_git::COMMAND_TIMEOUT),
+        )
         .map_err(|e| format!("cannot run git: {e}"))?;
         Ok((
             output.status.success(),

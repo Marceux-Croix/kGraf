@@ -670,6 +670,9 @@ enum SandboxAction {
         owner_sid: String,
         #[arg(long)]
         tag: Option<String>,
+        /// How many worker slots a setup makes users for.
+        #[arg(long)]
+        slots: Option<u8>,
     },
     /// Run one command under the strongest network policy this platform
     /// has, with a hidden folder, and report whether the sandbox held. On
@@ -1543,7 +1546,8 @@ fn run_cli() -> Result<()> {
                 owner_pid,
                 owner_sid,
                 tag,
-            } => sandbox_cmd::elevated(&action, pipe, nonce, owner_pid, owner_sid, tag),
+                slots,
+            } => sandbox_cmd::elevated(&action, pipe, nonce, owner_pid, owner_sid, tag, slots),
             SandboxAction::Selfcheck => sandbox_cmd::selfcheck(),
         },
         Command::Deps { action } => match action {

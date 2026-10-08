@@ -272,12 +272,16 @@ pub fn dirty_paths(root: &Path, at_start: &GitEntry) -> Result<TreeStatus, Strin
         ],
     )
     .map_err(|e| format!("cannot run git: {e}"))?;
-    let output = cmd
-        // A status read must not take the index lock a concurrent git holds.
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .stdin(std::process::Stdio::null())
-        .output()
-        .map_err(|e| format!("cannot run git: {e}"))?;
+    // A status read must not take the index lock a concurrent git holds.
+    cmd.env("GIT_OPTIONAL_LOCKS", "0");
+    // Bounded, the tree killed at the bound (`kgraf_core::child_run`).
+    let output = kgraf_core::child_run::run(
+        cmd,
+        "git status (worker tree read)",
+        None,
+        kgraf_core::child_run::Limits::new(kgraf_core::host_git::COMMAND_TIMEOUT),
+    )
+    .map_err(|e| format!("cannot run git: {e}"))?;
     if !output.status.success() {
         return Err(format!(
             "git status failed: {}",

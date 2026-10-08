@@ -121,8 +121,8 @@ baseline, and it stays comparable with earlier runs. Then the phase runs these s
 | Step | Command | What it checks |
 |---|---|---|
 | (b0) | `kgraf sandbox selfcheck` | Before setup, for comparison only. On the token sandbox it passes with a network line that is not a pass. |
-| (b) | `kgraf sandbox setup` | Creates the sandbox users (one per worker slot, plus the online user), the group and the firewall rules, with no tag. |
-| (c) | `kgraf sandbox status` | Every kGraf line is present. Both stored passwords log on. |
+| (b) | `kgraf sandbox setup` | Creates the sandbox users (two per worker slot, one without the network and one with it, plus the two fixed users), the group and the firewall rules, with no tag. The output lists a received password for every one of these users. |
+| (c) | `kgraf sandbox status` | Every kGraf line is present, for both users of every slot. Every stored password logs on. |
 | (d) | `kgraf sandbox selfcheck` | The gate. It passes only if selfcheck exits 0, prints `sandbox selfcheck: ok` and names the backend `Windows sandbox user`. A pass on the token sandbox means setup did not take effect, so it stops the phase too. If the gate fails, step (e) does not run. |
 | (e) | re-run | The sandbox test binaries, the baseline binaries that failed for the cargo jobserver, Git Bash or Schannel, and the end-to-end checks, with the sandbox user active. |
 | (f) | `kgraf sandbox remove`, then `kgraf sandbox status` | Always runs, also after a failure or Ctrl+C. Every kGraf line must be MISSING. |
@@ -312,6 +312,25 @@ process environment.
    System32 test fails because a handshake arrived, the gap is closed: report it. The four
    `schannel` tests in step 1 measure which token property causes it, so keep the step 1
    output too.
+
+   **3b.** What a command can do to its runner, once `kgraf sandbox setup` has run (the
+   sandbox user backend). The command must not open the runner's process, any of its
+   threads, or its token for more than waiting and reading; the runner must have no console
+   host; the command must still open its own token; and standard input and output must pass
+   through the runner:
+
+   ```powershell
+   cargo test -p kgraf-sandbox --test runner_windows -- --test-threads=1 2>&1 | Tee-Object "$r\3b-runner-windows.txt"
+   ```
+
+   Expected: all five pass, and none prints a "skipped" line (a skipped line means the
+   backend is not the sandbox user: send the output of `kgraf sandbox status`). When a
+   command cannot start as the sandbox user, the error names the step and, where the
+   runner ended before it connected, its exit code with its meaning: `0xC0000142` (a DLL
+   failed to start, most likely the window station or desktop), `0x2B470005` (the runner
+   could not protect its own process, threads or token), `0x2B470002` (the runner could not
+   open its pipe). A failure to put the runner in kGraf's job prints
+   `IsProcessInJob(runner) = ...`. Send the full text of any such error.
 
 4. The worker's shell tool on Windows (a plain program and a `sh -c` line run and return
    their output, the network notice comes once, an exit status comes back, a timeout and
@@ -515,9 +534,12 @@ sandbox selfcheck: ok
 Any other output is a failure. A failure starts with `sandbox selfcheck failed (backend: ...)`
 and names the step. Send back the full output of both runs.
 
-Also check by hand after `setup`: `Get-LocalUser kgraf-*` lists two users, they are
-not on the sign-in screen, and `Get-NetFirewallRule -DisplayGroup "kGraf sandbox"`
-lists four block rules. Send back the output of every command.
+Also check by hand after `setup`: `Get-LocalUser kgraf-*` lists two users plus two per
+worker slot (ten with the default four slots: `kgraf-off-`, `kgraf-on-`, `kgraf-s00-` to
+`kgraf-s03-` and `kgraf-o00-` to `kgraf-o03-`), they are not on the sign-in screen, and
+`Get-NetFirewallRule -DisplayGroup "kGraf sandbox"` lists four block rules. The rules name
+`kgraf-off-` and every `kgraf-sNN-` user, and no `kgraf-oNN-` user. Send back the output of
+every command.
 
 After `setup` (run it again if you removed the users), check that commands now run as
 the sandbox user. Build kGraf with the runner: `kgraf-sandbox-runner.exe` must sit beside
@@ -525,9 +547,10 @@ the sandbox user. Build kGraf with the runner: `kgraf-sandbox-runner.exe` must s
 
 1. Run a check or a shell command. The run prints the backend name "Windows sandbox user".
    The token sandbox name means setup did not take effect: send the output.
-2. In a sandboxed shell, run `whoami`. Expected: `kgraf-off-<hash>`, with the machine
-   name before it. A command that needs the network (a dependency install) prints
-   `kgraf-on-<hash>`.
+2. In a sandboxed shell, run `whoami`. Expected: `kgraf-sNN-<hash>`, with the machine
+   name before it (`kgraf-off-<hash>` after `setup --slots 0`). A command that needs the
+   network (a dependency install) prints `kgraf-oNN-<hash>` (`kgraf-on-<hash>` without
+   slots).
 3. In a sandboxed shell, run `dir C:\Users\<your name>` (your own profile folder).
    Expected: access denied.
 4. Network with the online user (a dependency install, or any command that runs with the
@@ -538,8 +561,22 @@ the sandbox user. Build kGraf with the runner: `kgraf-sandbox-runner.exe` must s
 6. In a project's worktree, a sandboxed command can write a file inside the worktree and
    cannot write in a sibling folder, in a top-level `.git` entry, or in a hidden folder.
 7. `kgraf sandbox remove` revokes the folder grants it listed, then removes the users. The
-   list is the `sandbox-credentials.grants` file beside the password store. Then
-   `icacls <a worktree>` shows no entry for a `kgraf-` user on the folders you granted.
+   lists are the `sandbox-credentials.grants` file and the `sandbox-credentials.slots`
+   folder beside the password store. Then `icacls <a worktree>` shows no entry for a
+   `kgraf-` user on the folders you granted, and the `.slots` folder is gone.
+8. Worker slots. In two worktrees, start a long command in each at the same time (for
+   example `sleep 30; whoami`). The two print different `kgraf-sNN-` users. While both
+   run, `icacls <the first worktree>` shows a write entry for the first user only. After
+   `setup --slots 0`, the second command waits up to 60 seconds, then fails with an error
+   that names `kgraf sandbox setup --slots`. It never prints the first command's user.
+9. Two dependency installs at the same time, in two projects, run as two different
+   `kgraf-oNN-` users.
+
+The escape tests check the same in the sandbox user phase:
+`two_workers_in_different_worktrees_run_as_different_users` (two workers, two users, and
+neither writes the other's worktree; with no slots, the second is refused) and
+`linking_dependencies_grants_only_the_worktrees_own_user` (a worktree with the checkout's
+dependencies linked is not writable by the user of another worktree).
 
 Send back each output, and the text of any error.
 

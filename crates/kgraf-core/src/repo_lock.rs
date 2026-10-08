@@ -147,6 +147,8 @@ pub fn acquire(
     })?;
     let started = Instant::now();
     let mut pause = Duration::from_millis(1);
+    // In the record of lock waits (`crate::waits::report`) once contended.
+    let mut waiting = None;
     loop {
         let got = match mode {
             Mode::Shared => file.try_lock_shared(),
@@ -168,9 +170,16 @@ pub fn acquire(
                 waited,
             });
         }
+        waiting.get_or_insert_with(|| {
+            crate::waits::waiting_for_lock(&format!(
+                "the repository lock {} ({mode:?}) for {purpose}",
+                path.display()
+            ))
+        });
         std::thread::sleep(pause.min(timeout - waited));
         pause = (pause * 2).min(Duration::from_millis(20));
     }
+    drop(waiting);
     let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     HOLDERS
         .lock()

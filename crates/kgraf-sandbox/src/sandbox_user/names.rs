@@ -9,7 +9,6 @@
 //! user carries, which names the owner's SID in full.
 
 use std::fmt;
-use std::path::Path;
 
 use super::firewall::RulePurpose;
 
@@ -20,13 +19,14 @@ pub const MAX_USER_NAME: usize = 20;
 pub const MAX_TAG: usize = 12;
 
 /// The most worker slots a setup may create users for. A slot user's name is
-/// `kgraf-sNN-<8 hex>`, 18 characters, so two digits are the most that fit in
-/// [`MAX_USER_NAME`].
+/// `kgraf-sNN-<8 hex>` or `kgraf-oNN-<8 hex>`, 18 characters, so two digits
+/// are the most that fit in [`MAX_USER_NAME`].
 pub const MAX_SLOTS: u8 = 99;
 
-/// How many slot users `kgraf sandbox setup` creates when none is asked for.
-/// Commands that run at the same time in different worktrees then run as
-/// different users, so neither can write the other's files.
+/// How many slots `kgraf sandbox setup` creates users for when none is asked
+/// for: one user without the network and one with it per slot. Up to this
+/// many commands in different folders then run at the same time, each as its
+/// own user, so none can write another's files.
 pub const DEFAULT_SLOTS: u8 = 4;
 
 /// Which sandbox user.
@@ -38,10 +38,15 @@ pub enum Role {
     Offline,
     /// Commands with the network open. No firewall rules.
     Online,
-    /// One worker slot, confined like [`Role::Offline`] and blocked by the
-    /// same firewall rules. Commands in different worktrees take different
-    /// slots, so one cannot write another's files.
+    /// One worker slot without the network, confined like [`Role::Offline`]
+    /// and blocked by the same firewall rules. A slot is held by one folder
+    /// at a time ([`super::slots`]), so one command cannot write the folder
+    /// of another that runs at the same time.
     Slot(u8),
+    /// One worker slot with the network open, like [`Role::Online`]: no
+    /// firewall rules. Held the same way, so two dependency installs that
+    /// run at the same time run as different users.
+    OnlineSlot(u8),
 }
 
 impl Role {
@@ -49,12 +54,14 @@ impl Role {
     /// count ([`OwnerNames::roles`]).
     pub const FIXED: [Role; 2] = [Role::Offline, Role::Online];
 
-    /// The word in messages and records: `offline`, `online`, `slot07`.
+    /// The word in messages and records: `offline`, `online`, `slot07`,
+    /// `online07`.
     pub fn key(self) -> String {
         match self {
             Role::Offline => "offline".to_owned(),
             Role::Online => "online".to_owned(),
             Role::Slot(i) => format!("slot{i:02}"),
+            Role::OnlineSlot(i) => format!("online{i:02}"),
         }
     }
 
@@ -63,13 +70,19 @@ impl Role {
             "offline" => Some(Role::Offline),
             "online" => Some(Role::Online),
             _ => {
-                let digits = s.strip_prefix("slot")?;
                 // Exactly two digits, so one slot has one name.
-                if digits.len() != 2 || !digits.bytes().all(|b| b.is_ascii_digit()) {
-                    return None;
+                let index = |digits: &str| -> Option<u8> {
+                    if digits.len() != 2 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                        return None;
+                    }
+                    let i: u8 = digits.parse().ok()?;
+                    (i < MAX_SLOTS).then_some(i)
+                };
+                if let Some(digits) = s.strip_prefix("slot") {
+                    index(digits).map(Role::Slot)
+                } else {
+                    index(s.strip_prefix("online")?).map(Role::OnlineSlot)
                 }
-                let i: u8 = digits.parse().ok()?;
-                (i < MAX_SLOTS).then_some(Role::Slot(i))
             }
         }
     }
@@ -84,6 +97,7 @@ impl Role {
             Role::Offline => "off".to_owned(),
             Role::Online => "on".to_owned(),
             Role::Slot(i) => format!("s{i:02}"),
+            Role::OnlineSlot(i) => format!("o{i:02}"),
         }
     }
 }
@@ -150,11 +164,13 @@ impl OwnerNames {
         self.slots
     }
 
-    /// Every role these names cover: the two fixed ones and one per slot.
+    /// Every role these names cover: the two fixed ones, then one without
+    /// the network and one with it per slot.
     pub fn roles(&self) -> Vec<Role> {
         Role::FIXED
             .into_iter()
             .chain((0..self.slots).map(Role::Slot))
+            .chain((0..self.slots).map(Role::OnlineSlot))
             .collect()
     }
 
@@ -182,6 +198,7 @@ impl OwnerNames {
         Role::FIXED
             .into_iter()
             .chain((0..MAX_SLOTS).map(Role::Slot))
+            .chain((0..MAX_SLOTS).map(Role::OnlineSlot))
             .find(|r| self.user(*r) == user)
     }
 
@@ -233,18 +250,6 @@ impl OwnerNames {
         }
         parts
     }
-}
-
-/// The worker slot of the writable root `root`, out of `count` slots: an
-/// FNV-1a hash of the root's text, lowercased, so one folder always takes
-/// one slot however its path was written. Two commands in different
-/// worktrees then usually run as different users and neither can write the
-/// other's files; two in one worktree share a user, which they must, because
-/// they share the folder.
-pub fn slot_of(root: &Path, count: u8) -> u8 {
-    assert!(count > 0, "a slot is only chosen where slots exist");
-    let text = root.to_string_lossy().to_lowercase();
-    u8::try_from(fnv1a64(text.as_bytes()) % u64::from(count)).unwrap_or(0)
 }
 
 /// Whether `s` is a SID in string form: `S-1-` and dash-separated decimal
@@ -370,7 +375,7 @@ mod tests {
     fn slot_user_names_fit_a_windows_user_name_and_are_distinct() {
         let names = OwnerNames::derive(SID, None).unwrap().with_slots(MAX_SLOTS);
         let all = names.users();
-        assert_eq!(all.len(), 2 + MAX_SLOTS as usize);
+        assert_eq!(all.len(), 2 + 2 * MAX_SLOTS as usize);
         let unique: std::collections::BTreeSet<&String> = all.iter().collect();
         assert_eq!(unique.len(), all.len(), "every name is its own");
         for name in &all {
@@ -415,7 +420,7 @@ mod tests {
         let large = OwnerNames::derive(SID, None).unwrap().with_slots(8);
         let seventh = large.user(Role::Slot(7));
         assert_eq!(small.role_of(&seventh), Some(Role::Slot(7)));
-        assert_eq!(small.roles().len(), 3, "its own plan covers one slot");
+        assert_eq!(small.roles().len(), 4, "its own plan covers one slot");
         assert_eq!(small.role_of("kgraf-off-00000000"), None, "another owner");
     }
 
@@ -445,32 +450,40 @@ mod tests {
     }
 
     #[test]
-    fn a_worktree_keeps_one_slot_and_every_slot_is_used() {
-        let roots: Vec<std::path::PathBuf> = (0..200)
-            .map(|i| std::path::PathBuf::from(format!(r"C:\work\tree-{i:03}")))
-            .collect();
-        for count in [1u8, 2, 4, 8] {
-            let mut seen = vec![0usize; usize::from(count)];
-            for root in &roots {
-                let slot = slot_of(root, count);
-                assert!(slot < count, "{slot} is not below {count}");
-                assert_eq!(slot, slot_of(root, count), "one folder, one slot");
-                seen[usize::from(slot)] += 1;
-            }
-            // No user sits idle while another holds every worktree.
-            assert!(seen.iter().all(|n| *n > 0), "count {count}: {seen:?}");
+    fn every_slot_has_a_user_without_the_network_and_one_with_it() {
+        let names = OwnerNames::derive(SID, None).unwrap().with_slots(3);
+        let roles = names.roles();
+        assert_eq!(roles.len(), 2 + 3 + 3);
+        for i in 0..3 {
+            assert!(roles.contains(&Role::Slot(i)));
+            assert!(roles.contains(&Role::OnlineSlot(i)));
+            let online = names.user(Role::OnlineSlot(i));
+            assert_eq!(online, format!("kgraf-o{i:02}-{}", names.hash));
+            assert!(online.len() <= MAX_USER_NAME);
+            assert_eq!(names.role_of(&online), Some(Role::OnlineSlot(i)));
+            assert_ne!(online, names.user(Role::Slot(i)));
         }
-    }
-
-    #[test]
-    fn the_slot_does_not_depend_on_how_the_path_was_written() {
-        let count = 4;
-        let lower = std::path::PathBuf::from(r"c:\work\tree");
-        let upper = std::path::PathBuf::from(r"C:\Work\Tree");
-        assert_eq!(slot_of(&lower, count), slot_of(&upper, count));
-        assert_ne!(
-            slot_of(&std::path::PathBuf::from(r"C:\work\a"), 97),
-            slot_of(&std::path::PathBuf::from(r"C:\work\b"), 97)
+        // The online slot users are not blocked; the offline ones are.
+        assert!(!Role::OnlineSlot(0).blocked());
+        assert!(Role::Slot(0).blocked());
+        // Keys round-trip and stay apart from the fixed roles.
+        for role in [Role::OnlineSlot(0), Role::OnlineSlot(MAX_SLOTS - 1)] {
+            assert_eq!(Role::from_key(&role.key()), Some(role));
+        }
+        assert_eq!(Role::from_key("online"), Some(Role::Online));
+        for bad in [
+            "online1",
+            "online100",
+            "onlinexx",
+            &format!("online{MAX_SLOTS}"),
+        ] {
+            assert_eq!(Role::from_key(bad), None, "{bad:?}");
+        }
+        // A removal recognizes an online slot user of a larger setup.
+        let small = OwnerNames::derive(SID, None).unwrap();
+        assert_eq!(
+            small.role_of(&names.user(Role::OnlineSlot(2))),
+            Some(Role::OnlineSlot(2))
         );
     }
 }

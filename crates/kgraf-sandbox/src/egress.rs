@@ -261,6 +261,8 @@ struct Seen {
     blocked: BTreeSet<String>,
     /// `host:port` of each request let through.
     contacted: BTreeSet<String>,
+    /// What each request that came without the run's secret asked for.
+    unauthenticated: BTreeSet<String>,
 }
 
 struct Shared {
@@ -497,6 +499,16 @@ impl EgressProxy {
     /// the common proxy variables (both cases), npm's and Yarn's own, and
     /// Java's proxy properties (`JAVA_TOOL_OPTIONS`, read by every JVM,
     /// so Maven and Gradle). `NO_PROXY` is emptied, so no name bypasses it.
+    ///
+    /// Where the proxy holds a secret (Windows), only the URL variables carry
+    /// it. `JAVA_TOOL_OPTIONS` names the proxy without it: every JVM prints
+    /// that variable's whole value to its error stream on start ("Picked up
+    /// JAVA_TOOL_OPTIONS: ..."), which would put the secret in the command's
+    /// output and transcript, and the JDK refuses Basic proxy authentication
+    /// for HTTPS tunnels by default (`jdk.http.auth.tunneling.disabledSchemes`),
+    /// so the secret would not get a Maven or Gradle download through anyway.
+    /// A JVM there gets the proxy's 407 with [`UNAUTHENTICATED_TEXT`], and
+    /// [`Self::refused_without_secret`] lists its requests.
     pub fn env(&self) -> Vec<(String, String)> {
         let url = match &self.token {
             Some(token) => format!("http://{PROXY_USER}:{token}@127.0.0.1:{}", self.port),
@@ -518,19 +530,11 @@ impl EgressProxy {
         for k in ["NO_PROXY", "no_proxy", "npm_config_noproxy"] {
             env.push((k.to_owned(), String::new()));
         }
-        let credentials = match &self.token {
-            // A JVM reads the proxy host and port from these properties, not
-            // from a URL, so the secret goes in its own two properties.
-            Some(token) => {
-                format!(" -Dhttp.proxyUser={PROXY_USER} -Dhttp.proxyPassword={token}")
-            }
-            None => String::new(),
-        };
         env.push((
             "JAVA_TOOL_OPTIONS".to_owned(),
             format!(
                 "-Dhttp.proxyHost=127.0.0.1 -Dhttp.proxyPort={p} -Dhttps.proxyHost=127.0.0.1 \
-                 -Dhttps.proxyPort={p} -Dhttp.nonProxyHosts={credentials}",
+                 -Dhttps.proxyPort={p} -Dhttp.nonProxyHosts=",
                 p = self.port
             ),
         ));
@@ -552,6 +556,15 @@ impl EgressProxy {
     pub fn contacted(&self) -> Vec<String> {
         let seen = self.shared.seen.lock().unwrap_or_else(|p| p.into_inner());
         seen.contacted.iter().cloned().collect()
+    }
+
+    /// What each request that came without this run's secret asked for
+    /// (its request target), sorted: a client that does not read the proxy
+    /// variables, such as a JVM, or a program of another run. A caller
+    /// reports these with a failed command, so a 407 is never the only trace.
+    pub fn refused_without_secret(&self) -> Vec<String> {
+        let seen = self.shared.seen.lock().unwrap_or_else(|p| p.into_inner());
+        seen.unauthenticated.iter().cloned().collect()
     }
 }
 
@@ -763,6 +776,16 @@ fn blocked_text(host: &str, port: u16) -> String {
 /// The user name in the proxy URL. The secret is the password beside it.
 const PROXY_USER: &str = "kgraf";
 
+/// What a client that came without the run's secret reads. A JVM is the
+/// likely one: kGraf points it at the proxy but does not give it the secret
+/// ([`EgressProxy::env`]), so its requests fail here, loudly, instead of
+/// timing out against the firewall.
+const UNAUTHENTICATED_TEXT: &str = "kGraf's egress proxy serves only the run it belongs to, \
+    which presents the secret in its proxy variables (HTTP_PROXY, HTTPS_PROXY). Java clients \
+    do not get the secret: every JVM prints JAVA_TOOL_OPTIONS on start, and the JDK refuses \
+    Basic proxy authentication for HTTPS tunnels by default. Java dependency installs through \
+    this proxy are not supported on Windows.\n";
+
 /// A secret for one run, from the system random source.
 fn new_token() -> io::Result<String> {
     let mut b = [0u8; 24];
@@ -837,10 +860,16 @@ fn handle(mut client: TcpStream, shared: &Shared) -> io::Result<()> {
     if let Some(expected) = &shared.auth
         && !carries(&head, expected)
     {
+        shared
+            .seen
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .unauthenticated
+            .insert(head.target.chars().take(200).collect());
         respond(
             &mut client,
             "407 Proxy Authentication Required",
-            "kGraf's proxy serves only the run it belongs to\n",
+            UNAUTHENTICATED_TEXT,
         );
         return Ok(());
     }
@@ -1255,17 +1284,50 @@ mod tests {
             let got = env.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str());
             assert_eq!(got, Some(url.as_str()), "{key}");
         }
+        // Java is pointed at the proxy without the secret: a JVM prints
+        // this variable on every start.
         let java = env
             .iter()
             .find(|(k, _)| k == "JAVA_TOOL_OPTIONS")
             .map(|(_, v)| v.clone())
             .expect("java options");
-        assert!(java.contains("-Dhttp.proxyUser=kgraf"), "{java}");
+        assert!(!java.contains(token), "{java}");
+        assert!(!java.contains("proxyPassword"), "{java}");
         assert!(
-            java.contains(&format!("-Dhttp.proxyPassword={token}")),
+            java.contains(&format!("-Dhttps.proxyPort={}", proxy.port())),
             "{java}"
         );
-        assert!(java.contains("-Dhttp.nonProxyHosts= "), "{java}");
+        assert!(java.ends_with("-Dhttp.nonProxyHosts="), "{java}");
+        // No other variable but the URL ones carries it.
+        for (key, value) in &env {
+            if value.contains(token) {
+                assert!(value == &url, "{key} carries the secret: {value}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_request_without_the_secret_is_refused_loudly_and_listed() {
+        let (origin_port, hits) = origin("from-the-registry");
+        let proxy = EgressProxy::start_on_host_with_token(
+            vec![rule(&format!("127.0.0.1:{origin_port}"))],
+            "0f1e2d3c4b5a6978",
+        )
+        .unwrap();
+        // What a JVM sends with only the proxy host and port: a tunnel
+        // request with no credentials.
+        let out = through(
+            proxy.port(),
+            &format!("CONNECT 127.0.0.1:{origin_port} HTTP/1.1\r\nHost: x\r\n\r\n"),
+        );
+        assert!(out.starts_with("HTTP/1.1 407 "), "{out}");
+        assert!(out.contains("Java dependency installs"), "{out}");
+        assert!(hits.lock().unwrap().is_empty());
+        assert_eq!(
+            proxy.refused_without_secret(),
+            vec![format!("127.0.0.1:{origin_port}")]
+        );
+        assert!(proxy.blocked().is_empty(), "not an allowlist refusal");
     }
 
     fn through(proxy: u16, request: &str) -> String {

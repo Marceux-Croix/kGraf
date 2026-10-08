@@ -7,7 +7,7 @@
 //!
 //! ```text
 //!  (b) kgraf sandbox setup
-//!  (c) kgraf sandbox status      every kGraf line present, both stored passwords log on
+//!  (c) kgraf sandbox status      every kGraf line present, every stored password logs on
 //!  (d) kgraf sandbox selfcheck   the gate: if it fails, (e) does not run
 //!  (e) re-run: the sandbox test binaries, the baseline binaries that failed for
 //!      Git Bash, the cargo jobserver or Schannel, and the end-to-end checks
@@ -166,9 +166,13 @@ pub struct StatusCheck {
     /// `stored password of <user>` lines that are present. A stored password
     /// is `present` only when a real logon with it worked.
     pub logon_works: usize,
+    /// `<role> sandbox user <name>` lines: how many users the setup has, two
+    /// fixed ones and two per worker slot.
+    pub users: usize,
 }
 
-/// (c): after setup every line is present, and both stored passwords log on.
+/// (c): after setup every line is present, and the stored password of every
+/// sandbox user logs on.
 pub fn check_ready(out: &str, code: Option<i32>) -> StatusCheck {
     let lines = parse_status(out);
     let mut c = StatusCheck::default();
@@ -184,11 +188,14 @@ pub fn check_ready(out: &str, code: Option<i32>) -> StatusCheck {
         if l.word == "present" && l.item.starts_with("stored password of ") {
             c.logon_works += 1;
         }
+        if l.item.contains(" sandbox user kgraf-") {
+            c.users += 1;
+        }
     }
-    if c.logon_works != 2 {
+    if c.users < 2 || c.logon_works != c.users {
         c.problems.push(format!(
-            "{} of 2 stored passwords log on (expected both)",
-            c.logon_works
+            "{} of {} stored passwords log on (expected every one, and at least 2)",
+            c.logon_works, c.users
         ));
     }
     if code != Some(0) {
@@ -511,9 +518,10 @@ pub fn render(first: &[BinaryResult], first_e2e: &[Check], p: &SandboxPhase) -> 
     md.push_str(&step_block(&p.status));
     if let Some(c) = &p.status_check {
         md.push_str(&format!(
-            "Check: {}. Stored passwords that log on: {} of 2. Unknown lines: {}.{}\n\n",
+            "Check: {}. Stored passwords that log on: {} of {}. Unknown lines: {}.{}\n\n",
             if c.ok { "every line present" } else { "FAILED" },
             c.logon_works,
+            c.users,
             c.unknown.len(),
             if c.problems.is_empty() {
                 String::new()
@@ -887,6 +895,31 @@ mod tests {
         );
         assert!(sel[0].why.contains("cargo jobserver"));
         assert!(sel[2].why.contains("Schannel"));
+    }
+
+    #[test]
+    fn every_slot_users_stored_password_must_log_on() {
+        let with_slot = STATUS_OK.replace(
+            "  present  stored password of kgraf-a\n",
+            "  present  slot00 sandbox user kgraf-s\n  present  online00 sandbox user kgraf-o\n  \
+             present  stored password of kgraf-a\n  present  stored password of kgraf-s\n  \
+             present  stored password of kgraf-o\n",
+        );
+        let c = check_ready(&with_slot, Some(0));
+        assert!(c.ok, "{:?}", c.problems);
+        assert_eq!((c.logon_works, c.users), (4, 4));
+        // A setup whose slot users were made but whose passwords were not
+        // stored is not ready, though the two fixed passwords log on.
+        let short = with_slot
+            .replace("  present  stored password of kgraf-s\n", "")
+            .replace("  present  stored password of kgraf-o\n", "");
+        let c = check_ready(&short, Some(0));
+        assert!(!c.ok);
+        assert!(
+            c.problems.iter().any(|p| p.contains("2 of 4")),
+            "{:?}",
+            c.problems
+        );
     }
 
     #[test]

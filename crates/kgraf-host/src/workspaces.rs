@@ -1611,7 +1611,6 @@ pub(crate) mod child {
     use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
-    use std::process::Stdio;
 
     /// The ref names of one child.
     const REFS: [&str; 3] = ["checkpoint", "handle", "result"];
@@ -1688,24 +1687,15 @@ pub(crate) mod child {
         if let Some(index) = index {
             cmd.env("GIT_INDEX_FILE", index);
         }
-        cmd.stdin(if stdin.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-        let mut child = cmd.spawn().map_err(|e| format!("git {args:?}: {e}"))?;
-        if let Some(bytes) = stdin {
-            use std::io::Write as _;
-            if let Some(mut pipe) = child.stdin.take() {
-                pipe.write_all(bytes)
-                    .map_err(|e| format!("git {args:?}: {e}"))?;
-            }
-        }
-        let out = child
-            .wait_with_output()
-            .map_err(|e| format!("git {args:?}: {e}"))?;
+        // Bounded, input written and output read on threads, the tree
+        // killed at the bound (`kgraf_core::child_run`).
+        let out = kgraf_core::child_run::run(
+            cmd,
+            &format!("git {}", args.join(" ")),
+            stdin,
+            kgraf_core::child_run::Limits::new(kgraf_core::host_git::COMMAND_TIMEOUT),
+        )
+        .map_err(|e| format!("git {args:?}: {e}"))?;
         if out.status.success() {
             Ok(out.stdout)
         } else {

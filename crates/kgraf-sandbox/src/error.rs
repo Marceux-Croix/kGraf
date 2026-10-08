@@ -82,6 +82,14 @@ pub enum WorkspaceError {
     /// worker's Bypass git window was not taken in time (decision 0094).
     #[error(transparent)]
     RepoLock(#[from] crate::repo_lock::RepoLockError),
+    /// A lock this crate takes was not free within its bound
+    /// (`kgraf_core::waits`).
+    #[error(transparent)]
+    LockTimeout(#[from] kgraf_core::waits::LockTimeout),
+    /// A git process did not end within its bound, or its process tree could
+    /// not be ended (`kgraf_core::child_run`).
+    #[error(transparent)]
+    Run(kgraf_core::child_run::RunError),
     #[error("I/O error at {path}: {source}")]
     Io {
         path: PathBuf,
@@ -91,6 +99,15 @@ pub enum WorkspaceError {
 }
 
 impl WorkspaceError {
+    /// A failed bounded file lock at `path`: its timeout as
+    /// [`Self::LockTimeout`], any other failure as I/O at `path`.
+    pub(crate) fn from_lock(path: &std::path::Path, e: kgraf_core::waits::LockError) -> Self {
+        match e {
+            kgraf_core::waits::LockError::Timeout(t) => Self::LockTimeout(t),
+            kgraf_core::waits::LockError::Io { source, .. } => Self::io(path, source),
+        }
+    }
+
     pub(crate) fn io(path: impl Into<PathBuf>, source: std::io::Error) -> Self {
         Self::Io {
             path: path.into(),

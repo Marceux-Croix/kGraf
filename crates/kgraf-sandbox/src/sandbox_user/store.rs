@@ -4,9 +4,9 @@
 //! `kgraf sandbox setup` writes the file ([`super::blob`]); a sandboxed
 //! command on Windows reads it to start as the sandbox user. A missing file
 //! means setup has not run, and the caller falls back to the token sandbox
-//! with a notice. A file that is present but cannot be read or opened is an
-//! error: running with less confinement than setup promised would be silent
-//! degradation.
+//! with a notice, unless a tag names the setup to use ([`missing_store`]). A
+//! file that is present but cannot be read or opened is an error: running
+//! with less confinement than setup promised would be silent degradation.
 
 use std::path::{Path, PathBuf};
 
@@ -22,11 +22,39 @@ pub fn credentials_file_name(tag: Option<&str>) -> String {
     }
 }
 
+/// What it means that no stored sandbox user was found for `tag`, at
+/// `store` (`None` when no configuration folder exists).
+///
+/// Without a tag, setup has not run on this machine, and the token sandbox
+/// runs: `Ok(())`. With a tag, the caller asked for the users of one tagged
+/// setup by name, so their absence is an error, never a quiet fall back to
+/// the token sandbox: a test that meant to run as the sandbox user would
+/// otherwise pass while it tested the other backend.
+pub fn missing_store(tag: Option<&str>, store: Option<&Path>) -> Result<(), String> {
+    let Some(tag) = tag else {
+        return Ok(());
+    };
+    let place = match store {
+        Some(path) => format!("{} holds no sandbox user", path.display()),
+        None => "no kGraf configuration folder was found".to_owned(),
+    };
+    Err(format!(
+        "the sandbox users tagged {tag:?} were asked for, but {place}; run `kgraf sandbox \
+         setup --tag {tag}` first, or unset the tag"
+    ))
+}
+
 /// The file in this user's kGraf configuration folder, or `None` when no
 /// configuration folder can be found.
 pub fn credentials_path(tag: Option<&str>) -> Option<PathBuf> {
     directories::ProjectDirs::from("", "", kgraf_diag::paths::APP_NAME)
         .map(|dirs| dirs.config_dir().join(credentials_file_name(tag)))
+}
+
+/// The folder of the worker slots' table and lock files ([`super::slots`]),
+/// beside the store at `store`.
+pub fn slots_dir(store: &Path) -> PathBuf {
+    store.with_extension("slots")
 }
 
 /// The list of the owner's folders that hold an entry for the sandbox users,
@@ -225,5 +253,24 @@ mod tests {
             load_user(&bytes, Role::Offline, &CountingProtector::new(0x81)),
             Err(LoadError::Blob(BlobError::Entry))
         ));
+    }
+
+    #[test]
+    fn a_missing_store_is_an_error_only_when_a_tag_names_it() {
+        assert_eq!(missing_store(None, None), Ok(()));
+        assert_eq!(
+            missing_store(None, Some(Path::new("/c/sandbox-credentials.bin"))),
+            Ok(())
+        );
+        let e = missing_store(
+            Some("run8"),
+            Some(Path::new("/c/sandbox-credentials-run8.bin")),
+        )
+        .unwrap_err();
+        assert!(e.contains("\"run8\""), "{e}");
+        assert!(e.contains("sandbox-credentials-run8.bin"), "{e}");
+        assert!(e.contains("kgraf sandbox setup --tag run8"), "{e}");
+        let e = missing_store(Some("run8"), None).unwrap_err();
+        assert!(e.contains("configuration folder"), "{e}");
     }
 }

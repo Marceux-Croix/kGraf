@@ -5,6 +5,7 @@
 //! provider-specific types never escape their adapter crate.
 
 pub mod budget;
+pub mod child_run;
 pub mod cost;
 pub mod flock;
 pub mod host_git;
@@ -21,6 +22,7 @@ pub mod plain_path;
 pub mod repo_lock;
 pub mod session;
 pub mod usage;
+pub mod waits;
 
 pub use budget::{TokenBudget, estimate_tokens};
 pub use cost::{CostError, ExactMoney, ModelPrice, Money, PriceTable};

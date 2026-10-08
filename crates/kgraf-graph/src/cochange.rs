@@ -225,15 +225,20 @@ pub fn read_git_history(root: &std::path::Path, max_commits: u32) -> Result<Vec<
     )
     .map_err(|e| GraphError::History {
         reason: format!("cannot run git: {e}"),
-    })?
-    .stdin(std::process::Stdio::null())
-    .output()
+    })?;
+    // Bounded, the tree killed at the bound (`kgraf_core::child_run`).
+    let output = kgraf_core::child_run::run(
+        output,
+        "git log (co-change history)",
+        None,
+        kgraf_core::child_run::Limits::new(kgraf_core::host_git::COMMAND_TIMEOUT),
+    )
     .map_err(|e| GraphError::History {
         reason: format!("cannot run git: {e}"),
     })?;
     if !output.status.success() {
         return Err(GraphError::History {
-            reason: format_reason(&output),
+            reason: format_reason(&output.stderr),
         });
     }
     parse_git_log_z(&output.stdout)
@@ -297,8 +302,8 @@ fn parse_git_log_z(stdout: &[u8]) -> Result<Vec<HistoryCommit>> {
     Ok(commits)
 }
 
-fn format_reason(output: &std::process::Output) -> String {
-    let stderr = String::from_utf8_lossy(&output.stderr);
+fn format_reason(stderr: &[u8]) -> String {
+    let stderr = String::from_utf8_lossy(stderr);
     format!("git log failed: {}", stderr.trim())
 }
 

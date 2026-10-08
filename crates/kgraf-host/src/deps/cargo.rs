@@ -1122,11 +1122,30 @@ fn run_bounded(mut cmd: Command, timeout: Duration, watch: Watch<'_>) -> std::io
         }
         std::thread::sleep(Duration::from_millis(5));
     };
-    Ok(Output {
-        ok: status.success(),
-        stdout: out.join().unwrap_or_default(),
-        stderr: err.join().unwrap_or_default(),
-    })
+    // The group is gone, so the pipes close at once, unless a process
+    // outside it (one that called `setsid`) holds a copy: then the reads
+    // get `kgraf_core::child_run::DRAIN_GRACE` and the command fails loud
+    // instead of waiting for that process.
+    let drain_end = Instant::now() + kgraf_core::child_run::DRAIN_GRACE;
+    let collect = |reader: std::thread::JoinHandle<String>| {
+        while !reader.is_finished() && Instant::now() < drain_end {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        reader
+            .is_finished()
+            .then(|| reader.join().unwrap_or_default())
+    };
+    match (collect(out), collect(err)) {
+        (Some(stdout), Some(stderr)) => Ok(Output {
+            ok: status.success(),
+            stdout,
+            stderr,
+        }),
+        _ => Err(std::io::Error::other(
+            "its output stayed open after it exited: a process it started left its group \
+             and still holds the output",
+        )),
+    }
 }
 
 #[cfg(test)]

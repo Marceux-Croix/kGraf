@@ -18,6 +18,9 @@
 //! against its alphabet on arrival ([`Password::from_received`]).
 
 use std::fmt;
+use std::io::Read;
+
+use zeroize::Zeroizing;
 
 use super::names::Role;
 use super::password::Password;
@@ -129,17 +132,18 @@ fn one_line(s: &str) -> String {
 }
 
 impl Message {
-    /// One line, with its newline.
-    pub fn encode(&self) -> String {
-        match self {
+    /// One line, with its newline. Cleared when dropped, because a password
+    /// line carries the password.
+    pub fn encode(&self) -> Zeroizing<String> {
+        Zeroizing::new(match self {
             Message::Hello { nonce } => format!("{PIPE_PROTOCOL} {PIPE_VERSION} {nonce}\n"),
             Message::Step { key, outcome } => format!("step {key} {outcome}\n"),
             Message::Fail { key, message } => format!("fail {key} {}\n", one_line(message)),
             Message::Password { role, password } => {
-                format!("password {role} {}\n", password.expose())
+                return password_line(*role, password);
             }
             Message::End => "end\n".to_owned(),
-        }
+        })
     }
 
     pub fn parse(line: &str) -> Result<Message, HandshakeError> {
@@ -186,6 +190,114 @@ impl Message {
             ("end", None, None) => Ok(Message::End),
             _ => Err(HandshakeError::Malformed),
         }
+    }
+}
+
+/// `password <role> <password>\n` in one buffer allocated at its final size,
+/// so no reallocation leaves a copy of the password behind that nothing
+/// clears (`format!` grows its buffer as it writes).
+fn password_line(role: Role, password: &Password) -> Zeroizing<String> {
+    let role = role.to_string();
+    let text = password.expose();
+    let len = "password ".len() + role.len() + 1 + text.len() + 1;
+    let mut out = Zeroizing::new(String::with_capacity(len));
+    out.push_str("password ");
+    out.push_str(&role);
+    out.push(' ');
+    out.push_str(text);
+    out.push('\n');
+    out
+}
+
+/// The lines of a setup pipe, each in a buffer cleared when it is dropped.
+///
+/// `BufRead::lines` would leave the password lines in its read buffer and in
+/// every buffer a growing `String` gives up, and none of those is cleared.
+/// Here the read buffer and the line are allocated once, at their final
+/// size, and both are cleared. A line longer than [`MAX_LINE`] ends the
+/// stream with an error, as it can come from no correct elevated step.
+pub struct SecretLines<R> {
+    reader: R,
+    chunk: Zeroizing<Vec<u8>>,
+    /// Bytes read but not yet returned: `chunk[start..end]`.
+    start: usize,
+    end: usize,
+    done: bool,
+}
+
+impl<R: Read> SecretLines<R> {
+    pub fn new(reader: R) -> Self {
+        Self {
+            reader,
+            chunk: Zeroizing::new(vec![0u8; MAX_LINE]),
+            start: 0,
+            end: 0,
+            done: false,
+        }
+    }
+
+    fn next_line(&mut self) -> std::io::Result<Option<Zeroizing<String>>> {
+        // One allocation of the largest size a line may have: pushing never
+        // reallocates, so the bytes exist only here and in `chunk`.
+        let mut line = Zeroizing::new(Vec::with_capacity(MAX_LINE));
+        loop {
+            if self.start == self.end {
+                let n = self.reader.read(&mut self.chunk[..])?;
+                if n == 0 {
+                    if line.is_empty() {
+                        return Ok(None);
+                    }
+                    break;
+                }
+                self.start = 0;
+                self.end = n;
+            }
+            let available = &self.chunk[self.start..self.end];
+            let (take, newline) = match available.iter().position(|b| *b == b'\n') {
+                Some(i) => (i + 1, true),
+                None => (available.len(), false),
+            };
+            if line.len() + take > MAX_LINE {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    HandshakeError::TooLong,
+                ));
+            }
+            line.extend_from_slice(&available[..take]);
+            self.start += take;
+            if newline {
+                line.pop();
+                break;
+            }
+        }
+        // Moves the bytes into the String without a copy.
+        let bytes = std::mem::take(&mut *line);
+        match String::from_utf8(bytes) {
+            Ok(text) => Ok(Some(Zeroizing::new(text))),
+            Err(e) => {
+                // Clear the bytes the failed conversion hands back.
+                drop(Zeroizing::new(e.into_bytes()));
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    HandshakeError::Malformed,
+                ))
+            }
+        }
+    }
+}
+
+impl<R: Read> Iterator for SecretLines<R> {
+    type Item = std::io::Result<Zeroizing<String>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        let out = self.next_line().transpose();
+        if !matches!(out, Some(Ok(_))) {
+            self.done = true;
+        }
+        out
     }
 }
 
@@ -435,6 +547,70 @@ mod tests {
         let mut r = Receiver::new();
         r.take(&format!("kgraf-sandbox-pipe 1 {n}\n"), &n).unwrap();
         assert_eq!(r.into_passwords().unwrap_err(), HandshakeError::Closed);
+    }
+
+    #[test]
+    fn a_password_line_is_built_at_its_final_size() {
+        // A buffer that grew while the password was written into it gave up
+        // smaller buffers holding a prefix of the password, which nothing
+        // clears. One allocation of the exact size leaves none.
+        let pw = Password::generate(&[]).unwrap();
+        let line = Message::Password {
+            role: Role::Slot(3),
+            password: pw,
+        }
+        .encode();
+        assert_eq!(line.capacity(), line.len(), "{}", line.len());
+        assert!(Message::parse(&line).is_ok());
+    }
+
+    /// A reader that hands out at most `step` bytes per call, so a line
+    /// arrives in pieces as it can from a pipe.
+    struct Trickle<'a> {
+        data: &'a [u8],
+        step: usize,
+    }
+
+    impl std::io::Read for Trickle<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.step.min(buf.len()).min(self.data.len());
+            buf[..n].copy_from_slice(&self.data[..n]);
+            self.data = &self.data[n..];
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn secret_lines_split_like_lines_and_refuse_a_long_line() {
+        let pw = Password::generate(&[]).unwrap().expose().to_owned();
+        let text = format!(
+            "kgraf-sandbox-pipe 1 {}\npassword offline {pw}\r\nend",
+            nonce()
+        );
+        for step in [1, 3, 7, 4096] {
+            let got: Vec<String> = SecretLines::new(Trickle {
+                data: text.as_bytes(),
+                step,
+            })
+            .map(|l| l.unwrap().to_string())
+            .collect();
+            let want: Vec<String> = std::io::BufRead::lines(text.as_bytes())
+                .map(|l| l.unwrap())
+                .collect();
+            // `lines` also drops a `\r`; `Message::parse` does that here.
+            assert_eq!(got.len(), want.len(), "step {step}");
+            for (g, w) in got.iter().zip(&want) {
+                assert_eq!(g.trim_end_matches('\r'), w, "step {step}");
+            }
+        }
+        let long = format!("fail k {}\nend\n", "x".repeat(MAX_LINE));
+        let mut lines = SecretLines::new(long.as_bytes());
+        let e = lines.next().unwrap().unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
+        assert!(lines.next().is_none(), "nothing after an error");
+        let mut bad = SecretLines::new(&b"step \xff created\n"[..]);
+        assert!(bad.next().unwrap().is_err());
+        assert!(SecretLines::new(&b""[..]).next().is_none());
     }
 
     #[test]

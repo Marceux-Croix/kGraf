@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::permissions::{ModeSource, PermissionSettings, ProcessFacts};
+use std::process::Stdio;
 use std::time::Duration;
 
 pub(crate) struct Repo {

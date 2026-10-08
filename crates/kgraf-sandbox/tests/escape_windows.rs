@@ -30,8 +30,9 @@ use std::time::{Duration, Instant};
 
 use common::fixture;
 use kgraf_sandbox::{
-    Backend, Network, ReadConfinement, Redirect, SandboxError, SandboxPolicy, Workspace,
-    WorkspaceManager, WorkspaceSpec, platform_isolation, sandboxed_command,
+    Backend, Network, ReadConfinement, Redirect, SandboxError, SandboxPolicy, WorkerSlot,
+    Workspace, WorkspaceManager, WorkspaceSpec, link_dependency_trees, platform_isolation,
+    sandboxed_command, worker_slot,
 };
 
 const DENIED: i32 = 5;
@@ -818,62 +819,124 @@ fn a_command_runs_as_a_sandbox_user_and_not_as_the_owner() {
     );
 }
 
-/// The slot user of a command is the one its own worktree maps to, so two
-/// worktrees that map to different slots run as different users and neither
-/// can write the other's files. Where the setup made no slot users, both run
-/// as the one offline user, as every command did before.
+/// Two workers in different worktrees that run at the same time run as
+/// different sandbox users, so neither can write the other's files. Where the
+/// setup made one user per pool (`--slots 0`), the second worker is refused,
+/// never run as the first one's user.
 #[test]
-fn a_worktree_runs_as_the_slot_user_its_own_path_maps_to() {
+fn two_workers_in_different_worktrees_run_as_different_users() {
     if !sandbox_user_mode() {
         return;
     }
-    use kgraf_sandbox::sandbox_user::{Role, slot_of};
+    use kgraf_sandbox::sandbox_user::Role;
     let e = env();
     let users = stored_sandbox_users().expect("the stored sandbox users");
+    let slots = users
+        .iter()
+        .filter(|(u, _)| matches!(u.role, Role::Slot(_)))
+        .count();
     let sid_of = |role: Role| {
         users
             .iter()
             .find(|(u, _)| u.role == role)
             .map(|(u, _)| u.sid.clone())
+            .unwrap_or_else(|| panic!("no stored user for {role}"))
     };
-    let slots = users
-        .iter()
-        .filter(|(u, _)| matches!(u.role, Role::Slot(_)))
-        .count();
-    let expected = |ws: &Workspace| -> String {
-        let root = ws.root();
-        match u8::try_from(slots).unwrap_or(0) {
-            0 => sid_of(Role::Offline).expect("the offline user"),
-            count => {
-                let slot = slot_of(root, count);
-                sid_of(Role::Slot(slot)).unwrap_or_else(|| panic!("no user for slot {slot}"))
-            }
-        }
+    let a = worker_slot(e.ws.root())
+        .expect("a worker slot")
+        .expect("the sandbox user backend gives a slot");
+    let second = worker_slot(e.other.root());
+    if slots == 0 {
+        let err = second.expect_err("a second worktree took the only offline user");
+        assert!(
+            err.to_string().contains("never run as one sandbox user"),
+            "{err}"
+        );
+        return;
+    }
+    let b = second
+        .expect("a second worker slot")
+        .expect("the sandbox user backend gives a slot");
+    assert_ne!(a.role(), b.role(), "two worktrees hold one slot");
+    let run = |ws: &Workspace, slot: &WorkerSlot, action: &str, arg: &str| {
+        let policy = SandboxPolicy::for_workspace(ws, Network::Deny)
+            .accept_partial_isolation(true)
+            .with_worker_slot(slot.clone());
+        parse(&probe_output(&policy, ws.root(), action, arg, ""))
     };
-    // A command with no network: that is what the slot users serve.
-    let denied = |ws: &Workspace| {
-        SandboxPolicy::for_workspace(ws, Network::Deny).accept_partial_isolation(true)
-    };
-    for ws in [&e.ws, &e.other] {
-        let out = probe_output(&denied(ws), ws.root(), "user_sid", "", "");
-        let (code, line) = parse(&out);
+    for (ws, slot) in [(&e.ws, &a), (&e.other, &b)] {
+        let (code, line) = run(ws, slot, "user_sid", "");
         assert_eq!(code, 0, "the probe did not report its user: {line}");
         assert_eq!(
             line,
-            expected(ws),
+            sid_of(slot.role()),
             "{} runs as the wrong sandbox user",
             ws.root().display()
         );
     }
-    if slots >= 2 {
-        // Two worktrees that map to the same slot share a user, which they
-        // may; the mapping above is what this pins.
-        let a = expected(&e.ws);
-        let b = expected(&e.other);
-        if a == b {
-            eprintln!("note: both worktrees map to the same slot ({a})");
-        }
+    // While both hold their slots, neither writes the other's worktree.
+    let target = e.other.root().join("from-w.txt");
+    let (code, line) = run(&e.ws, &a, "write", &target.to_string_lossy());
+    assert_eq!(code, DENIED, "a worker wrote another worktree: {line}");
+    assert!(!target.exists());
+}
+
+/// Linking the checkout's installed dependencies into a worktree grants
+/// write on that worktree to its own slot's user only. It once granted every
+/// sandbox user, so a command in one worktree could write another worktree
+/// that had dependencies linked.
+#[test]
+fn linking_dependencies_grants_only_the_worktrees_own_user() {
+    if !sandbox_user_mode() {
+        return;
     }
+    let canonical =
+        |d: &tempfile::TempDir| kgraf_core::plain_path::canonicalize(d.path()).expect("canonical");
+    let write = |p: &Path, text: &str| {
+        std::fs::create_dir_all(p.parent().expect("parent")).expect("folder");
+        std::fs::write(p, text).expect("write");
+    };
+    let checkout = tempfile::tempdir().expect("checkout");
+    let c = canonical(&checkout);
+    write(&c.join("package.json"), "{}");
+    write(&c.join("node_modules/dep/index.js"), "dep");
+    let (one, two) = (
+        tempfile::tempdir().expect("tree"),
+        tempfile::tempdir().expect("tree"),
+    );
+    let (t1, t2) = (canonical(&one), canonical(&two));
+    for t in [&t1, &t2] {
+        write(&t.join("package.json"), "{}");
+    }
+    let slot1 = worker_slot(&t1)
+        .expect("a worker slot")
+        .expect("the sandbox user backend gives a slot");
+    let Ok(Some(slot2)) = worker_slot(&t2) else {
+        // One offline user: the test above covers the refusal.
+        return;
+    };
+    let links1 = link_dependency_trees(&t1, &c);
+    assert!(!links1.reads.is_empty(), "nothing was linked: {links1:?}");
+    let links2 = link_dependency_trees(&t2, &c);
+    assert!(!links2.reads.is_empty(), "nothing was linked: {links2:?}");
+    let policy = SandboxPolicy::new(vec![t1.clone()], Network::Deny)
+        .with_dependency_links(&links1)
+        .accept_partial_isolation(true)
+        .with_worker_slot(slot1.clone());
+    let target = t2.join("from-one.txt");
+    let (code, line) = parse(&probe_output(
+        &policy,
+        &t1,
+        "write",
+        &target.to_string_lossy(),
+        "",
+    ));
+    assert_eq!(
+        code, DENIED,
+        "a worktree's user wrote another worktree with linked dependencies: {line}"
+    );
+    assert!(!target.exists());
+    drop(slot2);
 }
 
 /// A file in the owner's profile is not readable by a command that runs as a

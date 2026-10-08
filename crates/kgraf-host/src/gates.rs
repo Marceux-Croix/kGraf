@@ -618,6 +618,9 @@ pub(crate) fn run_confined_on(
         .spawn()
         .map_err(|e| format!("cannot run `{command}`: {e}"))?;
     let started = std::time::Instant::now();
+    // In the record of running children (`kgraf_core::waits::report`) until
+    // this function returns.
+    let _running = kgraf_core::waits::child_running(child.id(), &format!("gate: {command}"));
     let status = loop {
         // Unix: the leader is only ever reaped after the group kill below, so
         // its pid, the group id, stays reserved until every member is gone. A
@@ -644,16 +647,21 @@ pub(crate) fn run_confined_on(
             Err(e) => return Err(format!("waiting for `{command}`: {e}")),
         }
         if started.elapsed() >= timeout {
-            // The sandboxed child calls setsid() before exec, so it leads its
-            // own process group: killing the group kills everything the
-            // command started, not only the shell.
+            // The whole tree, bounded: a kill that fails or a tree that does
+            // not end is the gate's error, never a wait without end.
+            stop_tree(
+                &mut GateTree(&mut child),
+                command,
+                kgraf_core::child_run::KILL_BOUND,
+            )?;
             #[cfg(unix)]
-            // SAFETY: killpg only sends a signal to the child's own group.
-            unsafe {
-                libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
+            kill_group_until_hold_free(child.id(), ws.hold_file());
+            // The tree has ended, so this only collects the status.
+            match child.try_wait() {
+                Ok(Some(_)) => {}
+                Ok(None) => return Err(format!("`{command}` still runs after its tree ended")),
+                Err(e) => return Err(format!("waiting for `{command}`: {e}")),
             }
-            let _ = child.kill();
-            let _ = child.wait();
             break None;
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -693,6 +701,86 @@ pub(crate) fn run_confined_on(
                 timeout.as_secs()
             ),
         )),
+    }
+}
+
+/// A running command's process tree, as [`stop_tree`] ends it.
+trait Tree {
+    /// Signal every process of the tree to end.
+    fn kill_tree(&mut self) -> std::io::Result<()>;
+    /// Whether the tree has ended. Unix: whether the leader has exited,
+    /// without reaping it, so its group id stays reserved for the group
+    /// kill that follows.
+    fn tree_ended(&mut self) -> std::io::Result<bool>;
+}
+
+/// A gate's sandboxed command: on Unix a process group the leader's pid
+/// names (the sandbox calls `setsid` before exec), on Windows a job object.
+struct GateTree<'a, C>(&'a mut C);
+
+#[cfg(unix)]
+impl Tree for GateTree<'_, std::process::Child> {
+    fn kill_tree(&mut self) -> std::io::Result<()> {
+        let pid = self.0.id() as libc::pid_t;
+        let gone = |e: &std::io::Error| e.raw_os_error() == Some(libc::ESRCH);
+        // SAFETY: the leader is not reaped (only `run_confined_on` reaps it,
+        // after this), so its pid names this child and its group.
+        if unsafe { libc::killpg(pid, libc::SIGKILL) } != 0 {
+            let e = std::io::Error::last_os_error();
+            if !gone(&e) {
+                return Err(e);
+            }
+        }
+        // The leader too, in case it left its group. SAFETY: as above.
+        if unsafe { libc::kill(pid, libc::SIGKILL) } != 0 {
+            let e = std::io::Error::last_os_error();
+            if !gone(&e) {
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    fn tree_ended(&mut self) -> std::io::Result<bool> {
+        exited_unreaped(self.0.id())
+    }
+}
+
+#[cfg(windows)]
+impl Tree for GateTree<'_, kgraf_sandbox::SandboxedChild> {
+    fn kill_tree(&mut self) -> std::io::Result<()> {
+        self.0.kill()
+    }
+
+    fn tree_ended(&mut self) -> std::io::Result<bool> {
+        Ok(self.0.active_processes()? == 0)
+    }
+}
+
+/// Kill `tree` and wait, at most `bound`, until it has ended. A kill that
+/// fails, or a tree still running at the bound, is an error naming
+/// `command`. Polls every 10 ms: this runs only on a timeout, never on a
+/// gate's normal path.
+fn stop_tree(
+    tree: &mut impl Tree,
+    command: &str,
+    bound: Duration,
+) -> std::result::Result<(), String> {
+    tree.kill_tree()
+        .map_err(|e| format!("cannot kill `{command}` and what it started: {e}"))?;
+    let deadline = std::time::Instant::now() + bound;
+    loop {
+        match tree.tree_ended() {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(e) => return Err(format!("waiting for `{command}` to end: {e}")),
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "`{command}` and what it started had not ended {bound:?} after the kill"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -779,6 +867,87 @@ impl GateRunner for CommandGateRunner {
         })
         .await
         .map_err(|e| e.to_string())?
+    }
+}
+
+#[cfg(test)]
+mod stop_tree_tests {
+    use super::{Tree, stop_tree};
+    use std::time::{Duration, Instant};
+
+    struct Fake {
+        kill: Option<std::io::ErrorKind>,
+        ends_after: Option<Duration>,
+        killed_at: Option<Instant>,
+    }
+
+    impl Tree for Fake {
+        fn kill_tree(&mut self) -> std::io::Result<()> {
+            if let Some(kind) = self.kill {
+                return Err(std::io::Error::new(kind, "refused"));
+            }
+            self.killed_at = Some(Instant::now());
+            Ok(())
+        }
+
+        fn tree_ended(&mut self) -> std::io::Result<bool> {
+            Ok(match (self.ends_after, self.killed_at) {
+                (Some(after), Some(at)) => at.elapsed() >= after,
+                _ => false,
+            })
+        }
+    }
+
+    fn fake(kill: Option<std::io::ErrorKind>, ends_after: Option<Duration>) -> Fake {
+        Fake {
+            kill,
+            ends_after,
+            killed_at: None,
+        }
+    }
+
+    /// [`stop_tree`] on its own thread: a stop that never returns fails the
+    /// test instead of hanging the suite.
+    fn stop(mut tree: Fake, bound: Duration) -> Result<(), String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(stop_tree(&mut tree, "cargo test", bound));
+        });
+        rx.recv_timeout(Duration::from_secs(20))
+            .expect("stop_tree returned within its bound")
+    }
+
+    #[test]
+    fn a_failed_kill_is_an_error_naming_the_command_at_once() {
+        let started = Instant::now();
+        let err = stop(
+            fake(Some(std::io::ErrorKind::PermissionDenied), None),
+            Duration::from_secs(10),
+        )
+        .expect_err("kill failed");
+        assert!(err.contains("cannot kill `cargo test`"), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn a_tree_that_does_not_end_is_an_error_at_the_bound() {
+        let started = Instant::now();
+        let err = stop(fake(None, None), Duration::from_millis(200)).expect_err("never ends");
+        assert!(
+            err.contains("`cargo test`") && err.contains("had not ended"),
+            "{err}"
+        );
+        let took = started.elapsed();
+        assert!(took >= Duration::from_millis(200) && took < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_tree_that_ends_after_the_kill_is_stopped() {
+        stop(
+            fake(None, Some(Duration::from_millis(50))),
+            Duration::from_secs(10),
+        )
+        .expect("ended");
     }
 }
 

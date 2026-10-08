@@ -80,6 +80,8 @@ junction = { version = "2.1.0", default-features = false }
 # (`win_process.rs`): `OpenProcess`, `GetProcessTimes`, `WaitForSingleObject`,
 # and `MachineGuid` through `RegGetValueW`. `Win32_System_SystemInformation`:
 # the sandbox user's runner starts in the system folder (`GetSystemDirectoryW`).
+# `Win32_System_Diagnostics_ToolHelp`: the runner lists its own threads to
+# protect each one (`CreateToolhelp32Snapshot`).
 windows-sys = { version = "0.61.2", features = [
     "Wdk_Foundation",
     "Wdk_Storage_FileSystem",
@@ -93,6 +95,7 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
     "Win32_System_Console",
+    "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_IO",
     "Win32_System_JobObjects",
     "Win32_System_Pipes",
@@ -131,6 +134,8 @@ criterion = { version = "0.8.2", default-features = false, features = ["cargo_be
 # into a junction in place (`FSCTL_SET_REPARSE_POINT`).
 # `Win32_Security_Authorization`: the probe reports the SID of the user it
 # runs as, so a test can tell which sandbox user started it.
+# `Win32_System_Diagnostics_ToolHelp`: a probe finds its runner and the
+# runner's threads (`tests/runner_windows.rs`).
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Security",
@@ -140,6 +145,7 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
     "Win32_System_Console",
+    "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Ioctl",
     "Win32_System_Registry",
     "Win32_System_StationsAndDesktops",

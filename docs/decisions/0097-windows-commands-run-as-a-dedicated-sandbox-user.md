@@ -124,7 +124,7 @@ Until they do, the flags `writes_confined` and `gitlink_protected` stay false.
 **The runner.** `kgraf-sandbox-runner` is a binary target of `kgraf-sandbox`, installed
 beside the kgraf executable. The user's process starts it with `CreateProcessWithLogonW`
 as the sandbox user, suspended, puts it in the kill-on-close job, and resumes it. The call
-names the user's own desktop, so no window station access list changes. A named pipe
+names the user's own desktop, so no window station access list changes (superseded: see the amendment on job nesting below). A named pipe
 carries one binary request: program, command line (no 1,024-character limit), working
 folder and environment block. The pipe has one duplex instance, refuses remote clients, and
 admits SYSTEM, the user and the sandbox user. Each end checks the other's process ID.
@@ -145,7 +145,9 @@ six defects, each now fixed:
 - A job object's user interface limits include one that stops a process in the job from
   creating a desktop, and the runner creates one. The owner's job therefore carries every
   limit but that one, and the runner puts the command in a job of its own, a child of it,
-  that carries them all. Without this, no command started at all.
+  that carries them all. Without this, no command started at all. (Superseded:
+  the second job itself stopped every command; see the amendment on job nesting
+  below.)
 - The command runs as the same user as the runner, and the access list Windows gives a new
   process admits that user fully, while the owner of an object keeps an implicit right to
   rewrite its list. The runner now writes protected lists on its own process, thread and
@@ -243,3 +245,153 @@ and asks for a fresh setup, rather than reading as a setup with no slots, and
 a file that names a slot but not every slot below it is refused for the same
 reason. `kgraf sandbox status` reports the slots the machine has, and
 `kgraf sandbox remove` clears every slot a larger setup made.
+
+**Amendment (2026-10-08): job nesting, the runner's own objects, its window station,
+and diagnostics.** A second review before the first Windows run found the defects below.
+Each is fixed and compile-checked for Windows; none has run on Windows.
+
+- **No command could start: nested jobs with user interface limits.** The user's job
+  carried every user interface limit but one, and the runner put the command, already in
+  that job, in a second job with all of them. Windows nests a job inside another only if
+  neither sets user interface limits (Microsoft, "Nested Jobs"), so that assignment fails
+  for every command. The second job is gone. On the sandbox user path the user's job sets
+  no user interface limits, which also lets the runner join it if the secondary logon
+  service put it in a job of its own; the runner and the command stay in it (kill on
+  close, no breakaway). The command's user interface isolation is its own window station
+  and desktop, as in Chromium's sandbox. A failure to put the runner in the job reports
+  the Win32 error and `IsProcessInJob` for the runner. The token sandbox of 0011 keeps its
+  limits: it puts the command in one job only. The same rule applies there if kGraf itself
+  runs inside a job; the token sandbox's measured runs passed, so it did not in those runs.
+- **The command could take over the runner through a thread or its console host.** Only
+  the runner's process, main thread and token had protected lists; its other threads and
+  its console host had the default list, which admits the sandbox user fully, and the
+  runner holds the enabled logon SID the command must not get. The runner is now a
+  windows-subsystem program, so Windows makes no console host and no console window for it;
+  its standard handles still arrive through `STARTF_USESTDHANDLES`. Before it opens the
+  pipe it sets its token's default list to one that admits the sandbox user only to wait,
+  so every thread made from then on is protected, then writes and reads back protected
+  lists on its process, on every thread it has (`CreateToolhelp32Snapshot`), and on its
+  token. The read-back now refuses any entry but SYSTEM's that allows a forbidden right,
+  not only the sandbox user's own entry.
+- **Two more defects in the same function would have stopped every command.** The runner
+  read its token's user through a handle opened without `TOKEN_QUERY`, and wrote its
+  token's list to wait-and-read before it opened the token again to make the command's
+  token. The runner now opens its token once with every right it uses, and makes the
+  command's token before it changes its own default list, so the command's token object
+  has the list a token of this user normally has and the command can still open its own
+  token, as programs such as the MSYS2 runtime do.
+- **The runner's window station.** The documentation of `CreateProcessWithLogonW` says that
+  with a desktop named, the application must give the user access to it, even for
+  `WinSta0\Default`; whether the runner reaches the user's desktop through the logon SID
+  under a service session was unknown. kGraf now creates a window station and a desktop
+  of its own for each sandbox user, once per process, whose lists admit SYSTEM, the
+  user and that user (every right but rewriting the list, taking ownership, deleting and,
+  on the desktop, switching to it), and names that desktop when it starts the runner. No
+  list of the user's session changes. Creating the desktop switches the process's window
+  station for a moment, once per user and process; Chromium's broker does the same.
+- **An early runner end said nothing.** When the runner ends before it connects, the error
+  carries its exit code and names the known ones: `0xC0000142` (a DLL failed to start,
+  most likely the window station or desktop), `0xC0000022`, `0xC0000135`, and the
+  runner's own codes, `0x2B470005` among them (it could not protect its own objects). A
+  self-protection failure is also sent over the pipe with its step and Win32 error.
+- **A command of the same user could hold the runner pipe.** The pipe admits the sandbox
+  user, so a command of that user already running can connect first. The user's process
+  disconnects any client that is not the runner it started and waits again (16 times at
+  most), and the runner waits for a busy pipe instead of giving up, so this is no longer a
+  denial of the start; the error names any process that connected first. The list is not
+  narrowed: the runner and the command are one user, and the only SID that tells them
+  apart is the logon SID, whose value under the secondary logon service is not measured.
+- **Password copies.** Every buffer that holds a password is cleared when dropped: the
+  setup pipe's password line is built at its final size, the user's side reads the pipe
+  into cleared buffers instead of `BufRead::lines`, and the wide strings passed to
+  `NetUserAdd`, `NetUserSetInfo` and `LogonUserW` are allocated at their final size and
+  cleared.
+- **Account lockout.** A logon refused with `ERROR_ACCOUNT_LOCKED_OUT` says so and how to
+  fix it: `kgraf sandbox setup` resets the passwords and clears the lockout (it rewrites
+  the user's flags without `UF_LOCKOUT`); otherwise the lockout ends with the lockout
+  policy's duration. A wrong password, a disabled account, a denied logon type and a
+  disabled Secondary Logon service are named the same way.
+- **A tag without a store.** With `KGRAF_SANDBOX_TAG` set, a missing store is an error, not
+  a fall back to the token sandbox, so a test that meant to run as the sandbox user cannot
+  pass while it tests the other backend.
+
+Windows tests in `tests/runner_windows.rs` check, from inside the command, that no runner
+thread opens for `THREAD_SET_CONTEXT` or any other right that changes it, that the runner's
+process and token refuse everything but waiting and reading, that the runner has no
+console host, that the command opens its own token, and that standard input and output
+pass through the runner.
+
+**Amendment (2026-10-08): worker slots are held, not folded, and the online user is a pool.**
+This replaces the fold of the amendment above. Two defects of it are closed:
+two worktrees whose paths folded to one slot ran as one user with no message,
+and two dependency installs that ran at the same time ran as the one online
+user. A third defect is closed with them: the elevated step was never told
+`--slots`, so a setup made no slot users at all.
+
+- **Two users per slot.** `kgraf sandbox setup --slots N` makes, per slot, one
+  user without the network (`kgraf-sNN-<hash>`, blocked by the firewall rules)
+  and one with it (`kgraf-oNN-<hash>`, not blocked), beside the two fixed users.
+  The stored passwords file keeps version 2 and gains a role byte for the
+  online slot users (128 + slot). A file with slot users of one kind only is
+  refused and asks for a fresh setup. `status` reports both users of every
+  slot the machine has. `remove` deletes every user the undo record lists.
+- **The elevated step is told the slot count.** Its arguments carry
+  `--slots N` for a setup, and it refuses a setup without them. The user's
+  process stores nothing unless the passwords it receives are exactly the
+  users it asked for.
+- **A slot is held.** A command takes a slot of its pool (without or with the
+  network) for its first writable root, its folder. A slot has a lock file;
+  the process that holds the slot holds the lock, so holders of different
+  folders never share a slot, in one process or in two. Holders of one folder
+  in one process share its slot, because they share the folder. The command
+  holds its slot until its job is closed.
+- **The worker's slot comes from the worker.** The shell tool of a worker takes
+  the slot of its worktree at its first command and holds it for its life
+  (`kgraf_sandbox::worker_slot`, passed with `SandboxPolicy::with_worker_slot`).
+  A command in the same process with no slot of its own, such as a gate in that
+  worktree, finds the worker's slot by its folder. A command with no worker
+  (`kgraf worker` outside an orchestrated run, `kgraf sandbox selfcheck`, a
+  check in its own folder, a dependency install) takes a slot for itself alone.
+- **More folders than slots.** A worker is refused at once, with an error that
+  names `kgraf sandbox setup --slots`. A command without a worker waits up to 60
+  seconds for a free slot, then is refused the same way. It never runs as the
+  user of another folder.
+- **Grants move with the slot.** A write grant stays on a folder when its
+  command ends, as before. A table beside the stored passwords
+  (`sandbox-credentials[-tag].slots`) lists the folders each slot user holds a
+  grant on. A free slot already bound to the folder is taken first. A slot that
+  moves to another folder first loses its grant on every folder it held, so a
+  user never keeps write access to a folder another user may now work in.
+  `kgraf sandbox remove` revokes every folder the table lists, then deletes it.
+- **Linked dependencies.** Before kGraf links the checkout's installed
+  dependencies into a worktree, it grants write on the worktree to the user of
+  the worktree's own slot only. It granted every sandbox user, so a command in
+  one worktree could write another that had dependencies linked.
+
+Choices made with this amendment:
+
+- (e) **Refuse a worker, let a command wait.** Waiting would hide a setup with
+  fewer slots than the machine runs workers; the orchestrator already bounds how
+  many run at once. A command without a worker waits, because its holders are
+  commands that end.
+- (f) **The slot comes from a held lease, not from a number the orchestrator
+  assigns.** The orchestrator and host number no worker slots: their limits are
+  counts, and gates, checks and installs build their own sandbox policies. A
+  number assigned in one process would also not stop a second kGraf process from
+  taking the same user. The lease is keyed by the folder the access lists are
+  written on, which is the thing that must differ.
+- (g) **A command without a worker takes a slot for itself, without a notice.**
+  It cannot share a user with another folder, so nothing is degraded; when no
+  slot is free it fails with an error.
+- (h) **Only the worktree's own slot user is granted before dependencies are
+  linked**, not that slot's online user. The online user of the same slot can be
+  held by another folder at that moment, so granting it would let that folder's
+  install write this worktree. A command with the network open in the worktree
+  is granted when it takes its slot.
+
+Open, to watch in the next Windows run: whether writing a grant on a worktree
+that already holds a dependency junction follows the junction. That happens
+only when a worktree's command takes a slot other than the one granted before
+the link, which the table makes rare. Two users can still both hold a grant on
+a folder that two of their folders share, such as a project's package stores;
+those writes are shared by design.

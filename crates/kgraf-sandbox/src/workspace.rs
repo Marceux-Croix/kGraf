@@ -71,6 +71,24 @@ const CHECKS: &str = ".checks";
 /// `.checks`. It stays in the base, like the marker.
 const CHECKS_LOCK: &str = ".checks.lock";
 
+/// The longest a caller waits for [`CHECKS_LOCK`]. Its longest holder is a
+/// check folder's removal ([`CheckFolder`]'s `Drop`), which deletes the
+/// check's cargo target folder: gigabytes, minutes on a slow disk with a
+/// virus scanner reading every file. 30 minutes is past any such removal; a
+/// removal that times out leaves `.checks` for `tidy`, as a removal without
+/// the lock always has.
+const CHECKS_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// The longest a caller waits for the scan lock ([`ScanGate`] and the
+/// marker's `flock`) or for another call on the same path
+/// ([`WorkspaceManager::guard`]). The longest holders: startup cleanup,
+/// which removes every orphaned worktree (each a checkout with its build
+/// output) under the exclusive side, and a `create` whose git calls each
+/// may wait out a worker's Bypass window on the repository lock (15 min)
+/// and the worktree-admin lock. One hour is past any of these short of a
+/// stuck process.
+pub const SCAN_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
 /// Exclusive `flock` on `<base>/.checks.lock`, across threads and processes
 /// (each opener has its own open file description, so two threads of one
 /// process also exclude each other). Without it, a create that races the
@@ -84,6 +102,15 @@ const CHECKS_LOCK: &str = ".checks.lock";
 /// the deleted file. `create` makes the file; with `create` false, a missing
 /// file gives `Ok(None)`: the workspace is gone and nothing else can race.
 fn lock_checks(base: &Path, create: bool) -> Result<Option<HeldLock>, WorkspaceError> {
+    lock_checks_within(base, create, CHECKS_LOCK_WAIT)
+}
+
+/// [`lock_checks`] with another bound on the wait.
+fn lock_checks_within(
+    base: &Path,
+    create: bool,
+    bound: std::time::Duration,
+) -> Result<Option<HeldLock>, WorkspaceError> {
     let path = base.join(CHECKS_LOCK);
     let opened = std::fs::OpenOptions::new()
         .create(create)
@@ -95,7 +122,13 @@ fn lock_checks(base: &Path, create: bool) -> Result<Option<HeldLock>, WorkspaceE
         Err(e) if !create && e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(WorkspaceError::io(&path, e)),
     };
-    file.lock().map_err(|e| WorkspaceError::io(&path, e))?;
+    kgraf_core::waits::lock_file(
+        &file,
+        kgraf_core::waits::FileLockMode::Exclusive,
+        &format!("the check-folder lock {}", path.display()),
+        bound,
+    )
+    .map_err(|e| WorkspaceError::from_lock(&path, e))?;
     Ok(Some(HeldLock::new(file)))
 }
 
@@ -341,6 +374,9 @@ pub struct WorkspaceManager {
     base: PathBuf,
     /// Shared: create and remove. Exclusive: orphan cleanup.
     scan: ScanGate,
+    /// The bound of each wait for the scan lock and the per-path guard
+    /// ([`SCAN_LOCK_WAIT`]; shorter in tests).
+    lock_wait: std::time::Duration,
     /// Per-path guard replacing upstream's process-global mutex map: create
     /// and remove of the same path never interleave.
     busy: Mutex<HashSet<PathBuf>>,
@@ -391,6 +427,28 @@ struct GateState {
     serving: u64,
     readers: u32,
     writer: bool,
+    /// Tickets whose waiters gave up before their turn: skipped when their
+    /// turn comes, so a timed-out waiter never blocks the ones behind it.
+    abandoned: std::collections::BTreeSet<u64>,
+}
+
+impl GateState {
+    /// Pass the turn to the next ticket still waited for.
+    fn advance(&mut self) {
+        self.serving += 1;
+        while self.abandoned.remove(&self.serving) {
+            self.serving += 1;
+        }
+    }
+}
+
+/// Why [`ScanGate::enter`] did not admit the caller.
+#[derive(Debug)]
+enum GateError {
+    /// The state mutex is poisoned, which needs a panic inside this
+    /// module's short critical sections.
+    Poisoned,
+    Timeout(kgraf_core::waits::LockTimeout),
 }
 
 struct GateGuard<'a> {
@@ -406,19 +464,47 @@ impl ScanGate {
         }
     }
 
-    /// Wait for this caller's turn. Errors only if the state mutex is
-    /// poisoned, which needs a panic inside this module's short critical
-    /// sections.
-    fn enter(&self, exclusive: bool) -> Result<GateGuard<'_>, ()> {
-        let mut state = self.state.lock().map_err(|_| ())?;
+    /// Wait for this caller's turn, at most `bound`. A waiter that times
+    /// out gives up its ticket, so the ones behind it still get their turn.
+    fn enter(
+        &self,
+        exclusive: bool,
+        bound: std::time::Duration,
+    ) -> Result<GateGuard<'_>, GateError> {
+        let started = std::time::Instant::now();
+        let mut state = self.state.lock().map_err(|_| GateError::Poisoned)?;
         let ticket = state.next;
         state.next += 1;
         let may_enter =
             |st: &GateState| st.serving == ticket && !st.writer && (!exclusive || st.readers == 0);
+        let lock = if exclusive {
+            "the workspace scan gate (exclusive)"
+        } else {
+            "the workspace scan gate (shared)"
+        };
+        let mut waiting = None;
         while !may_enter(&state) {
-            state = self.turn.wait(state).map_err(|_| ())?;
+            let waited = started.elapsed();
+            if waited >= bound {
+                if state.serving == ticket {
+                    state.advance();
+                } else {
+                    state.abandoned.insert(ticket);
+                }
+                self.turn.notify_all();
+                return Err(GateError::Timeout(kgraf_core::waits::LockTimeout {
+                    lock: lock.into(),
+                    waited,
+                }));
+            }
+            waiting.get_or_insert_with(|| kgraf_core::waits::waiting_for_lock(lock));
+            state = self
+                .turn
+                .wait_timeout(state, bound - waited)
+                .map_err(|_| GateError::Poisoned)?
+                .0;
         }
-        state.serving += 1;
+        state.advance();
         if exclusive {
             state.writer = true;
         } else {
@@ -520,6 +606,7 @@ impl WorkspaceManager {
             common_dir,
             base,
             scan: ScanGate::new(),
+            lock_wait: SCAN_LOCK_WAIT,
             busy: Mutex::new(HashSet::new()),
             freed: Condvar::new(),
         })
@@ -1468,14 +1555,33 @@ impl WorkspaceManager {
         File::open(&marker).map_err(|e| WorkspaceError::io(&marker, e))
     }
 
+    fn gate_error(&self, e: GateError) -> WorkspaceError {
+        match e {
+            GateError::Poisoned => WorkspaceError::GuardPoisoned(self.base.clone()),
+            GateError::Timeout(t) => WorkspaceError::LockTimeout(t),
+        }
+    }
+
+    /// The marker's `flock`, at most [`Self::lock_wait`].
+    fn lock_marker(&self, mode: kgraf_core::waits::FileLockMode) -> Result<File, WorkspaceError> {
+        let file = self.marker_file()?;
+        let marker = self.base.join(MARKER);
+        kgraf_core::waits::lock_file(
+            &file,
+            mode,
+            &format!("the workspace marker lock {} ({mode:?})", marker.display()),
+            self.lock_wait,
+        )
+        .map_err(|e| WorkspaceError::from_lock(&marker, e))?;
+        Ok(file)
+    }
+
     fn shared(&self) -> Result<SharedLock<'_>, WorkspaceError> {
         let guard = self
             .scan
-            .enter(false)
-            .map_err(|()| WorkspaceError::GuardPoisoned(self.base.clone()))?;
-        let file = self.marker_file()?;
-        file.lock_shared()
-            .map_err(|e| WorkspaceError::io(self.base.join(MARKER), e))?;
+            .enter(false, self.lock_wait)
+            .map_err(|e| self.gate_error(e))?;
+        let file = self.lock_marker(kgraf_core::waits::FileLockMode::Shared)?;
         Ok(SharedLock {
             _file: HeldLock::new(file),
             _guard: guard,
@@ -1485,22 +1591,39 @@ impl WorkspaceManager {
     fn exclusive(&self) -> Result<ExclusiveLock<'_>, WorkspaceError> {
         let guard = self
             .scan
-            .enter(true)
-            .map_err(|()| WorkspaceError::GuardPoisoned(self.base.clone()))?;
-        let file = self.marker_file()?;
-        file.lock()
-            .map_err(|e| WorkspaceError::io(self.base.join(MARKER), e))?;
+            .enter(true, self.lock_wait)
+            .map_err(|e| self.gate_error(e))?;
+        let file = self.lock_marker(kgraf_core::waits::FileLockMode::Exclusive)?;
         Ok(ExclusiveLock {
             _file: HeldLock::new(file),
             _guard: guard,
         })
     }
 
+    /// Wait, at most [`Self::lock_wait`], until no other call works on
+    /// `path`, then mark it busy until the guard drops.
     fn guard(&self, path: &Path) -> Result<PathGuard<'_>, WorkspaceError> {
         let poisoned = || WorkspaceError::GuardPoisoned(path.to_path_buf());
+        let started = std::time::Instant::now();
         let mut set = self.busy.lock().map_err(|_| poisoned())?;
+        let mut waiting = None;
         while set.contains(path) {
-            set = self.freed.wait(set).map_err(|_| poisoned())?;
+            let waited = started.elapsed();
+            let lock = || format!("the workspace path guard for {}", path.display());
+            if waited >= self.lock_wait {
+                return Err(WorkspaceError::LockTimeout(
+                    kgraf_core::waits::LockTimeout {
+                        lock: lock(),
+                        waited,
+                    },
+                ));
+            }
+            waiting.get_or_insert_with(|| kgraf_core::waits::waiting_for_lock(&lock()));
+            set = self
+                .freed
+                .wait_timeout(set, self.lock_wait - waited)
+                .map_err(|_| poisoned())?
+                .0;
         }
         set.insert(path.to_path_buf());
         Ok(PathGuard {
@@ -2545,6 +2668,154 @@ mod tests {
         }
     }
 
+    /// Run `f` on its own thread: a lock wait that never ends fails the
+    /// test at `bound` instead of hanging the suite.
+    fn within<T: Send + 'static>(
+        bound: std::time::Duration,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(bound)
+            .expect("the wait ended within its bound")
+    }
+
+    const SHORT: std::time::Duration = std::time::Duration::from_millis(200);
+    const TEST_BOUND: std::time::Duration = std::time::Duration::from_secs(20);
+
+    /// A waiter on a held gate times out naming the gate, and gives up its
+    /// ticket: the waiters behind it still get their turn.
+    #[test]
+    fn a_gate_waiter_times_out_and_its_ticket_is_skipped() {
+        let gate = std::sync::Arc::new(ScanGate::new());
+        let held = gate.enter(true, TEST_BOUND).unwrap();
+        let (behind_tx, behind) = std::sync::mpsc::channel();
+        let g = gate.clone();
+        std::thread::spawn(move || {
+            let _ = behind_tx.send(g.enter(false, TEST_BOUND).map(|_| ()));
+        });
+        // One ticket times out while the writer holds the gate: either the
+        // serving one or one behind it, depending on which thread asked
+        // first; both cases must pass the turn on.
+        let g = gate.clone();
+        let started = std::time::Instant::now();
+        let err = within(TEST_BOUND, move || {
+            g.enter(false, SHORT).map(|_| ()).expect_err("held")
+        });
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        match err {
+            GateError::Timeout(t) => assert!(t.lock.contains("scan gate"), "{t}"),
+            GateError::Poisoned => panic!("poisoned"),
+        }
+        drop(held);
+        behind
+            .recv_timeout(TEST_BOUND)
+            .expect("the waiter behind got its turn")
+            .expect("and entered");
+        // The serving ticket's own timeout passes the turn on too.
+        let held = gate.enter(false, TEST_BOUND).unwrap();
+        let g = gate.clone();
+        assert!(within(TEST_BOUND, move || g.enter(true, SHORT).is_err()));
+        drop(held);
+        let g = gate.clone();
+        assert!(within(TEST_BOUND, move || g.enter(true, SHORT).is_ok()));
+    }
+
+    /// A repository with one commit, and a manager whose lock waits are
+    /// [`SHORT`].
+    fn short_wait_manager(dir: &Path) -> std::sync::Arc<WorkspaceManager> {
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.invalid",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "one",
+            ][..],
+        ] {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_INDEX_FILE")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let mut mgr = WorkspaceManager::open(&repo, &dir.join("base")).unwrap();
+        mgr.lock_wait = SHORT;
+        std::sync::Arc::new(mgr)
+    }
+
+    #[test]
+    fn the_marker_lock_times_out_while_another_process_holds_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = short_wait_manager(dir.path());
+        let holder = File::open(mgr.base().join(MARKER)).unwrap();
+        holder.lock().unwrap();
+        let m = mgr.clone();
+        let err = within(TEST_BOUND, move || m.shared().map(|_| ())).expect_err("held");
+        assert!(
+            matches!(&err, WorkspaceError::LockTimeout(t) if t.lock.contains("marker")),
+            "{err}"
+        );
+        let m = mgr.clone();
+        let err = within(TEST_BOUND, move || m.exclusive().map(|_| ())).expect_err("held");
+        assert!(matches!(err, WorkspaceError::LockTimeout(_)), "{err}");
+        holder.unlock().unwrap();
+        mgr.shared().map(|_| ()).expect("free");
+    }
+
+    #[test]
+    fn the_path_guard_times_out_while_another_call_works_on_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = short_wait_manager(dir.path());
+        let path = mgr.base().join("w1");
+        let first = mgr.guard(&path).unwrap();
+        let (m, p) = (mgr.clone(), path.clone());
+        let err = within(TEST_BOUND, move || m.guard(&p).map(|_| ())).expect_err("busy");
+        assert!(
+            matches!(&err, WorkspaceError::LockTimeout(t) if t.lock.contains("path guard")),
+            "{err}"
+        );
+        drop(first);
+        mgr.guard(&path).map(|_| ()).expect("free");
+    }
+
+    #[test]
+    fn the_check_folder_lock_times_out_while_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let holder = lock_checks(dir.path(), true).unwrap().unwrap();
+        let base = dir.path().to_path_buf();
+        let err = within(TEST_BOUND, move || {
+            lock_checks_within(&base, true, SHORT).map(|_| ())
+        })
+        .expect_err("held");
+        assert!(
+            matches!(&err, WorkspaceError::LockTimeout(t) if t.lock.contains("check-folder")),
+            "{err}"
+        );
+        drop(holder);
+        lock_checks_within(dir.path(), true, std::time::Duration::from_secs(5))
+            .unwrap()
+            .expect("free");
+    }
+
     /// Spin until `n` tickets have been handed out (a waiter is queued).
     fn wait_for_tickets(gate: &ScanGate, n: u64) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -2560,15 +2831,15 @@ mod tests {
         // retaking the exclusive side ahead of a waiting `create`.
         let gate = ScanGate::new();
         let order = Mutex::new(Vec::new());
-        let held = gate.enter(true).unwrap();
+        let held = gate.enter(true, SCAN_LOCK_WAIT).unwrap();
         std::thread::scope(|s| {
             s.spawn(|| {
-                let _shared = gate.enter(false).unwrap();
+                let _shared = gate.enter(false, SCAN_LOCK_WAIT).unwrap();
                 order.lock().unwrap().push("reader");
             });
             wait_for_tickets(&gate, 2);
             drop(held);
-            let _again = gate.enter(true).unwrap();
+            let _again = gate.enter(true, SCAN_LOCK_WAIT).unwrap();
             order.lock().unwrap().push("writer");
         });
         assert_eq!(*order.lock().unwrap(), ["reader", "writer"]);
@@ -2577,13 +2848,13 @@ mod tests {
     #[test]
     fn readers_share_and_a_writer_waits_for_them() {
         let gate = ScanGate::new();
-        let first = gate.enter(false).unwrap();
+        let first = gate.enter(false, SCAN_LOCK_WAIT).unwrap();
         // A second reader enters while the first holds: shared.
-        let second = gate.enter(false).unwrap();
+        let second = gate.enter(false, SCAN_LOCK_WAIT).unwrap();
         let entered = std::sync::atomic::AtomicBool::new(false);
         std::thread::scope(|s| {
             let writer = s.spawn(|| {
-                let _w = gate.enter(true).unwrap();
+                let _w = gate.enter(true, SCAN_LOCK_WAIT).unwrap();
                 entered.store(true, std::sync::atomic::Ordering::SeqCst);
             });
             wait_for_tickets(&gate, 3);

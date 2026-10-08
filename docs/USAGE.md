@@ -1717,11 +1717,15 @@ folder. Running `setup` again resets the passwords and refreshes the rules. Setu
 stops with a message if Windows Firewall is off or a group policy makes local rules
 ineffective, and it never takes over an account it did not create.
 
-`setup` also creates a user for each worker slot (`--slots`, four by default, none with
-`--slots 0`). A command without the network runs as the slot user of its own worktree, so
-two commands that run at the same time in different worktrees cannot write each other's
-files. Two commands in one worktree share a user. Commands with the network open share the
-single online user.
+`setup` also creates two users for each worker slot (`--slots`, four by default, none with
+`--slots 0`): one without the network and one with it. A command takes a slot for its own
+folder and holds it while it runs; a worker holds the slot of its worktree for its whole
+life. Two folders never hold one slot at the same time, so two commands in different
+folders, two dependency installs among them, cannot write each other's files. Commands in
+one folder share its slot. When every slot is held by another folder, a worker is refused
+at once and a command waits up to 60 seconds, then is refused. The error says to run
+`kgraf sandbox setup --slots N` with a larger N. With `--slots 0`, one folder at a time
+runs commands without the network, and one at a time runs commands with it.
 
 After `setup`, every sandboxed command runs as the sandbox user, through the
 `kgraf-sandbox-runner` program installed beside `kgraf`. Checks and ordinary shell

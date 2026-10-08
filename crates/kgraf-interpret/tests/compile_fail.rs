@@ -6,8 +6,11 @@
 //! `TRYBUILD=overwrite cargo test -p kgraf-interpret --test compile_fail` after
 //! a deliberate change, and read the diff.
 
+// Wraps trybuild and explains a failure caused by a disturbed build (see the module).
+#[path = "../../kgraf-provider/tests/support/compile_fail_guard.rs"]
+mod compile_fail_guard;
+
 #[test]
 fn an_approvable_reading_cannot_be_forged() {
-    let t = trybuild::TestCases::new();
-    t.compile_fail("tests/compile_fail/*.rs");
+    compile_fail_guard::run("tests/compile_fail/*.rs");
 }

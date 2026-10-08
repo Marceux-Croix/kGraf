@@ -552,322 +552,352 @@ async fn run_to_end(o: Orchestrator) -> kgraf_orchestrator::RunReport {
     .expect("run")
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_writer_subagent_over_git_worktrees_is_merged_verified_integrated_and_swept() {
-    let (o, fx) = Fixture::new(
-        Box::new(|text, round| {
-            if is_child(text) {
-                return if round == 0 {
-                    vec![write("c", "src/c.rs", "child c\n")]
-                } else {
-                    vec![Content::text("wrote c")]
-                };
-            }
-            if !text.contains("<use spawn>") {
-                return vec![spawn("spawn", "write c", &["src/c.rs"])];
-            }
-            if !text.contains("<use early>") {
-                return vec![write("early", "src/c.rs", "parent early\n")];
-            }
-            if SubagentReport::parse(text).is_none() {
-                return vec![call(&format!("nap{round}"), "sleep", json!({"r": round}))];
-            }
-            if !text.contains("<use a>") {
-                return vec![write("a", "src/a.rs", "parent a\n")];
-            }
-            vec![Content::text("done")]
-        }),
-        vec![],
-        &["src/a.rs", "src/c.rs"],
-    );
-    let report = run_to_end(o).await;
-    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+#[test]
+fn a_writer_subagent_over_git_worktrees_is_merged_verified_integrated_and_swept() {
+    crate::e2e_rt::run(
+        "a_writer_subagent_over_git_worktrees_is_merged_verified_integrated_and_swept",
+        crate::e2e_rt::Flavor::MultiThread,
+        async {
+            let (o, fx) = Fixture::new(
+                Box::new(|text, round| {
+                    if is_child(text) {
+                        return if round == 0 {
+                            vec![write("c", "src/c.rs", "child c\n")]
+                        } else {
+                            vec![Content::text("wrote c")]
+                        };
+                    }
+                    if !text.contains("<use spawn>") {
+                        return vec![spawn("spawn", "write c", &["src/c.rs"])];
+                    }
+                    if !text.contains("<use early>") {
+                        return vec![write("early", "src/c.rs", "parent early\n")];
+                    }
+                    if SubagentReport::parse(text).is_none() {
+                        return vec![call(&format!("nap{round}"), "sleep", json!({"r": round}))];
+                    }
+                    if !text.contains("<use a>") {
+                        return vec![write("a", "src/a.rs", "parent a\n")];
+                    }
+                    vec![Content::text("done")]
+                }),
+                vec![],
+                &["src/a.rs", "src/c.rs"],
+            );
+            let report = run_to_end(o).await;
+            assert_eq!(report.status, RunStatus::Completed, "{report:?}");
 
-    let seen = fx.seen();
-    assert!(
-        seen.iter()
-            .any(|t| t.contains("<result early: ERROR: refused: ")
-                && t.contains("The refusal: src/c.rs is fenced")),
-        "the parent's write to the child's path was refused while it lived"
+            let seen = fx.seen();
+            assert!(
+                seen.iter()
+                    .any(|t| t.contains("<result early: ERROR: refused: ")
+                        && t.contains("The refusal: src/c.rs is fenced")),
+                "the parent's write to the child's path was refused while it lived"
+            );
+            let report = seen
+                .iter()
+                .rev()
+                .find_map(|t| SubagentReport::parse(t))
+                .expect("the child's report reached the parent");
+            assert!(
+                matches!(report.merge, ChildMerge::Merged { .. }),
+                "{report:?}"
+            );
+            // On the integration branch: the child's work, verified with the parent's.
+            assert_eq!(fx.on_branch("src/c.rs"), "child c");
+            assert_eq!(fx.on_branch("src/a.rs"), "parent a");
+            fx.assert_swept();
+        },
     );
-    let report = seen
-        .iter()
-        .rev()
-        .find_map(|t| SubagentReport::parse(t))
-        .expect("the child's report reached the parent");
-    assert!(
-        matches!(report.merge, ChildMerge::Merged { .. }),
-        "{report:?}"
-    );
-    // On the integration branch: the child's work, verified with the parent's.
-    assert_eq!(fx.on_branch("src/c.rs"), "child c");
-    assert_eq!(fx.on_branch("src/a.rs"), "parent a");
-    fx.assert_swept();
 }
 
 /// Two writer subagents with disjoint paths run at once (each waits in
 /// `meet` for the other), and both merge into the parent, with the parent's
 /// own work, on the integration branch.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn two_concurrent_writer_subagents_with_disjoint_writes_both_merge() {
-    let (o, fx) = Fixture::new(
-        Box::new(|text, round| {
-            if is_child(text) {
-                let path = if text.contains("Your task:\nwrite c") {
-                    "src/c.rs"
-                } else {
-                    "src/d.rs"
-                };
-                let content = format!("child {path}\n");
-                if !text.contains("<use meet>") {
-                    return vec![call("meet", "meet", json!({}))];
-                }
-                if !text.contains("<use w>") {
-                    return vec![write("w", path, &content)];
-                }
-                return vec![Content::text("wrote")];
-            }
-            if !text.contains("<use spawn1>") {
-                return vec![
-                    spawn("spawn1", "write c", &["src/c.rs"]),
-                    spawn("spawn2", "write d", &["src/d.rs"]),
-                ];
-            }
-            if reports(text).len() < 2 {
-                return vec![call(&format!("nap{round}"), "sleep", json!({"r": round}))];
-            }
-            if !text.contains("<use a>") {
-                return vec![write("a", "src/a.rs", "parent a\n")];
-            }
-            vec![Content::text("done")]
-        }),
-        vec![Arc::new(Meet(tokio::sync::Barrier::new(2)))],
-        &["src/a.rs", "src/c.rs", "src/d.rs"],
-    );
-    let report = run_to_end(o).await;
-    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+#[test]
+fn two_concurrent_writer_subagents_with_disjoint_writes_both_merge() {
+    crate::e2e_rt::run(
+        "two_concurrent_writer_subagents_with_disjoint_writes_both_merge",
+        crate::e2e_rt::Flavor::MultiThread,
+        async {
+            let (o, fx) = Fixture::new(
+                Box::new(|text, round| {
+                    if is_child(text) {
+                        let path = if text.contains("Your task:\nwrite c") {
+                            "src/c.rs"
+                        } else {
+                            "src/d.rs"
+                        };
+                        let content = format!("child {path}\n");
+                        if !text.contains("<use meet>") {
+                            return vec![call("meet", "meet", json!({}))];
+                        }
+                        if !text.contains("<use w>") {
+                            return vec![write("w", path, &content)];
+                        }
+                        return vec![Content::text("wrote")];
+                    }
+                    if !text.contains("<use spawn1>") {
+                        return vec![
+                            spawn("spawn1", "write c", &["src/c.rs"]),
+                            spawn("spawn2", "write d", &["src/d.rs"]),
+                        ];
+                    }
+                    if reports(text).len() < 2 {
+                        return vec![call(&format!("nap{round}"), "sleep", json!({"r": round}))];
+                    }
+                    if !text.contains("<use a>") {
+                        return vec![write("a", "src/a.rs", "parent a\n")];
+                    }
+                    vec![Content::text("done")]
+                }),
+                vec![Arc::new(Meet(tokio::sync::Barrier::new(2)))],
+                &["src/a.rs", "src/c.rs", "src/d.rs"],
+            );
+            let report = run_to_end(o).await;
+            assert_eq!(report.status, RunStatus::Completed, "{report:?}");
 
-    let seen = fx.seen();
-    assert!(
-        !seen.iter().any(|t| t.contains("no peer arrived")),
-        "each child met the other: they were live together"
+            let seen = fx.seen();
+            assert!(
+                !seen.iter().any(|t| t.contains("no peer arrived")),
+                "each child met the other: they were live together"
+            );
+            let reports = fx.reports();
+            assert_eq!(reports.len(), 2, "{reports:?}");
+            for r in &reports {
+                assert!(matches!(r.merge, ChildMerge::Merged { .. }), "{r:?}");
+            }
+            assert_eq!(fx.on_branch("src/c.rs"), "child src/c.rs");
+            assert_eq!(fx.on_branch("src/d.rs"), "child src/d.rs");
+            assert_eq!(fx.on_branch("src/a.rs"), "parent a");
+            assert_eq!(fx.agents_in_flight(), 0, "every slot was released");
+            fx.assert_swept();
+        },
     );
-    let reports = fx.reports();
-    assert_eq!(reports.len(), 2, "{reports:?}");
-    for r in &reports {
-        assert!(matches!(r.merge, ChildMerge::Merged { .. }), "{r:?}");
-    }
-    assert_eq!(fx.on_branch("src/c.rs"), "child src/c.rs");
-    assert_eq!(fx.on_branch("src/d.rs"), "child src/d.rs");
-    assert_eq!(fx.on_branch("src/a.rs"), "parent a");
-    assert_eq!(fx.agents_in_flight(), 0, "every slot was released");
-    fx.assert_swept();
 }
 
 /// A child stopped while it waits in a tool settles: its slot is released
 /// and the run does not finish around it. Resumed, it continues from its
 /// transcript and its work merges.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_subagent_stopped_mid_run_releases_its_slot_and_resumes_to_a_merge() {
-    let permits = Arc::new(tokio::sync::Semaphore::new(0));
-    let entered = Arc::new(tokio::sync::Notify::new());
-    let (o, fx) = Fixture::new(
-        Box::new(|text, round| {
-            if is_child(text) {
-                if !text.contains("<use hold>") {
-                    return vec![call("hold", "wait_latch", json!({}))];
-                }
-                if !text.contains("<use w>") {
-                    return vec![write("w", "src/c.rs", "child c\n")];
-                }
-                return vec![Content::text("wrote c")];
-            }
-            if !text.contains("<use spawn>") {
-                return vec![spawn("spawn", "write c", &["src/c.rs"])];
-            }
-            if reports(text).is_empty() {
-                return vec![call(&format!("nap{round}"), "sleep", json!({"r": round}))];
-            }
-            if !text.contains("<use a>") {
-                return vec![write("a", "src/a.rs", "parent a\n")];
-            }
-            vec![Content::text("done")]
-        }),
-        vec![Arc::new(Latch {
-            name: "wait_latch",
-            permits,
-            entered: entered.clone(),
-        })],
-        &["src/a.rs", "src/c.rs"],
-    );
-    let handle = o.handle();
-    let run = tokio::spawn(run_to_end(o));
+#[test]
+fn a_subagent_stopped_mid_run_releases_its_slot_and_resumes_to_a_merge() {
+    crate::e2e_rt::run(
+        "a_subagent_stopped_mid_run_releases_its_slot_and_resumes_to_a_merge",
+        crate::e2e_rt::Flavor::MultiThread,
+        async {
+            let permits = Arc::new(tokio::sync::Semaphore::new(0));
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let (o, fx) = Fixture::new(
+                Box::new(|text, round| {
+                    if is_child(text) {
+                        if !text.contains("<use hold>") {
+                            return vec![call("hold", "wait_latch", json!({}))];
+                        }
+                        if !text.contains("<use w>") {
+                            return vec![write("w", "src/c.rs", "child c\n")];
+                        }
+                        return vec![Content::text("wrote c")];
+                    }
+                    if !text.contains("<use spawn>") {
+                        return vec![spawn("spawn", "write c", &["src/c.rs"])];
+                    }
+                    if reports(text).is_empty() {
+                        return vec![call(&format!("nap{round}"), "sleep", json!({"r": round}))];
+                    }
+                    if !text.contains("<use a>") {
+                        return vec![write("a", "src/a.rs", "parent a\n")];
+                    }
+                    vec![Content::text("done")]
+                }),
+                vec![Arc::new(Latch {
+                    name: "wait_latch",
+                    permits,
+                    entered: entered.clone(),
+                })],
+                &["src/a.rs", "src/c.rs"],
+            );
+            let handle = o.handle();
+            let run = tokio::spawn(run_to_end(o));
 
-    // The child is inside its tool: mid-run, holding a slot.
-    tokio::time::timeout(Duration::from_secs(120), entered.notified())
-        .await
-        .expect("the child reached its tool");
-    let child = AgentId::new(child_id(&fx.worker).expect("the child's request was seen"));
-    let live = fx.agents_in_flight();
-    handle
-        .stop_session(child.clone())
-        .await
-        .expect("the child stops");
-    // The child's cancelled attempt settles and frees its slot. The bound
-    // only turns a hang into a failure.
-    let freed = async {
-        while fx.agents_in_flight() >= live {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    };
-    tokio::time::timeout(Duration::from_secs(120), freed)
-        .await
-        .expect("the stopped child released its slot");
-    assert!(
-        !run.is_finished(),
-        "the run waits for its stopped child instead of finishing around it"
-    );
-    assert!(
-        fx.reports().is_empty(),
-        "a stopped child has not reported to its parent"
-    );
+            // The child is inside its tool: mid-run, holding a slot.
+            tokio::time::timeout(Duration::from_secs(120), entered.notified())
+                .await
+                .expect("the child reached its tool");
+            let child = AgentId::new(child_id(&fx.worker).expect("the child's request was seen"));
+            let live = fx.agents_in_flight();
+            handle
+                .stop_session(child.clone())
+                .await
+                .expect("the child stops");
+            // The child's cancelled attempt settles and frees its slot. The bound
+            // only turns a hang into a failure.
+            let freed = async {
+                while fx.agents_in_flight() >= live {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            };
+            tokio::time::timeout(Duration::from_secs(120), freed)
+                .await
+                .expect("the stopped child released its slot");
+            assert!(
+                !run.is_finished(),
+                "the run waits for its stopped child instead of finishing around it"
+            );
+            assert!(
+                fx.reports().is_empty(),
+                "a stopped child has not reported to its parent"
+            );
 
-    handle
-        .resume_session(child)
-        .await
-        .expect("the child resumes");
-    let report = run.await.expect("the run task");
-    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
-    let reports = fx.reports();
-    assert_eq!(reports.len(), 1, "{reports:?}");
-    assert!(
-        matches!(reports[0].merge, ChildMerge::Merged { .. }),
-        "{:?}",
-        reports[0]
+            handle
+                .resume_session(child)
+                .await
+                .expect("the child resumes");
+            let report = run.await.expect("the run task");
+            assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+            let reports = fx.reports();
+            assert_eq!(reports.len(), 1, "{reports:?}");
+            assert!(
+                matches!(reports[0].merge, ChildMerge::Merged { .. }),
+                "{:?}",
+                reports[0]
+            );
+            assert_eq!(fx.on_branch("src/c.rs"), "child c");
+            assert_eq!(fx.on_branch("src/a.rs"), "parent a");
+            assert_eq!(fx.agents_in_flight(), 0, "every slot was released");
+            fx.assert_swept();
+        },
     );
-    assert_eq!(fx.on_branch("src/c.rs"), "child c");
-    assert_eq!(fx.on_branch("src/a.rs"), "parent a");
-    assert_eq!(fx.agents_in_flight(), 0, "every slot was released");
-    fx.assert_swept();
 }
 
 /// The parent changes a path the child owns without declaring it (a write
 /// the fence cannot see), so the merge is refused: the parent gets a typed
 /// conflict, nothing of the child is applied, and the parent's own version
 /// is what lands.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_subagent_merge_the_parent_conflicts_with_is_refused_and_reported() {
-    let permits = Arc::new(tokio::sync::Semaphore::new(0));
-    let entered = Arc::new(tokio::sync::Notify::new());
-    let latch = |name| -> Arc<dyn Tool> {
-        Arc::new(Latch {
-            name,
-            permits: permits.clone(),
-            entered: entered.clone(),
-        })
-    };
-    let (o, fx) = Fixture::new(
-        Box::new(|text, round| {
-            if is_child(text) {
-                // The child finishes only after the parent's undeclared write.
-                if !text.contains("<use wait>") {
-                    return vec![call("wait", "wait_latch", json!({}))];
-                }
-                if !text.contains("<use w>") {
-                    return vec![write("w", "src/c.rs", "child c\n")];
-                }
-                return vec![Content::text("wrote c")];
-            }
-            if !text.contains("<use spawn>") {
-                return vec![spawn("spawn", "write c", &["src/c.rs"])];
-            }
-            if !text.contains("<use sneak>") {
-                // Declares src/a.rs (in the parent's scope, not fenced) and
-                // writes src/c.rs, the child's path.
-                return vec![call(
-                    "sneak",
-                    "write_file",
-                    json!({"path": "src/c.rs", "declares": "src/a.rs", "content": "parent sneaky\n"}),
-                )];
-            }
-            if !text.contains("<use open>") {
-                return vec![call("open", "open_latch", json!({}))];
-            }
-            if reports(text).is_empty() {
-                return vec![call(&format!("nap{round}"), "sleep", json!({"r": round}))];
-            }
-            if !text.contains("<use a>") {
-                return vec![write("a", "src/a.rs", "parent a\n")];
-            }
-            vec![Content::text("done")]
-        }),
-        vec![latch("wait_latch"), latch("open_latch")],
-        &["src/a.rs", "src/c.rs"],
-    );
-    let report = run_to_end(o).await;
-    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+#[test]
+fn a_subagent_merge_the_parent_conflicts_with_is_refused_and_reported() {
+    crate::e2e_rt::run(
+        "a_subagent_merge_the_parent_conflicts_with_is_refused_and_reported",
+        crate::e2e_rt::Flavor::MultiThread,
+        async {
+            let permits = Arc::new(tokio::sync::Semaphore::new(0));
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let latch = |name| -> Arc<dyn Tool> {
+                Arc::new(Latch {
+                    name,
+                    permits: permits.clone(),
+                    entered: entered.clone(),
+                })
+            };
+            let (o, fx) = Fixture::new(
+                Box::new(|text, round| {
+                    if is_child(text) {
+                        // The child finishes only after the parent's undeclared write.
+                        if !text.contains("<use wait>") {
+                            return vec![call("wait", "wait_latch", json!({}))];
+                        }
+                        if !text.contains("<use w>") {
+                            return vec![write("w", "src/c.rs", "child c\n")];
+                        }
+                        return vec![Content::text("wrote c")];
+                    }
+                    if !text.contains("<use spawn>") {
+                        return vec![spawn("spawn", "write c", &["src/c.rs"])];
+                    }
+                    if !text.contains("<use sneak>") {
+                        // Declares src/a.rs (in the parent's scope, not fenced) and
+                        // writes src/c.rs, the child's path.
+                        return vec![call(
+                            "sneak",
+                            "write_file",
+                            json!({"path": "src/c.rs", "declares": "src/a.rs", "content": "parent sneaky\n"}),
+                        )];
+                    }
+                    if !text.contains("<use open>") {
+                        return vec![call("open", "open_latch", json!({}))];
+                    }
+                    if reports(text).is_empty() {
+                        return vec![call(&format!("nap{round}"), "sleep", json!({"r": round}))];
+                    }
+                    if !text.contains("<use a>") {
+                        return vec![write("a", "src/a.rs", "parent a\n")];
+                    }
+                    vec![Content::text("done")]
+                }),
+                vec![latch("wait_latch"), latch("open_latch")],
+                &["src/a.rs", "src/c.rs"],
+            );
+            let report = run_to_end(o).await;
+            assert_eq!(report.status, RunStatus::Completed, "{report:?}");
 
-    let reports = fx.reports();
-    assert_eq!(reports.len(), 1, "{reports:?}");
-    let ChildMerge::Conflict { paths, .. } = &reports[0].merge else {
-        panic!("expected a conflict, got {:?}", reports[0]);
-    };
-    assert_eq!(paths, &vec!["src/c.rs".to_owned()]);
-    assert_eq!(
-        fx.on_branch("src/c.rs"),
-        "parent sneaky",
-        "nothing of the refused child was applied"
+            let reports = fx.reports();
+            assert_eq!(reports.len(), 1, "{reports:?}");
+            let ChildMerge::Conflict { paths, .. } = &reports[0].merge else {
+                panic!("expected a conflict, got {:?}", reports[0]);
+            };
+            assert_eq!(paths, &vec!["src/c.rs".to_owned()]);
+            assert_eq!(
+                fx.on_branch("src/c.rs"),
+                "parent sneaky",
+                "nothing of the refused child was applied"
+            );
+            assert_eq!(fx.on_branch("src/a.rs"), "parent a");
+            assert_eq!(fx.agents_in_flight(), 0, "every slot was released");
+            fx.assert_swept();
+        },
     );
-    assert_eq!(fx.on_branch("src/a.rs"), "parent a");
-    assert_eq!(fx.agents_in_flight(), 0, "every slot was released");
-    fx.assert_swept();
 }
 
 /// A child whose task panics is settled by the orchestrator's panic
 /// supervisor: the parent is told it failed, its slot is released, and its
 /// fence is lifted, so the parent can write the child's path afterwards.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_subagent_whose_task_panics_is_settled_and_its_slot_and_fence_released() {
-    let (o, fx) = Fixture::new(
-        Box::new(|text, round| {
-            if is_child(text) {
-                panic!("the child's provider call panicked");
-            }
-            if !text.contains("<use spawn>") {
-                return vec![spawn("spawn", "write c", &["src/c.rs"])];
-            }
-            if reports(text).is_empty() {
-                return vec![call(&format!("nap{round}"), "sleep", json!({"r": round}))];
-            }
-            if !text.contains("<use after>") {
-                return vec![write("after", "src/c.rs", "parent c\n")];
-            }
-            vec![Content::text("done")]
-        }),
-        vec![],
-        &["src/c.rs"],
-    );
-    let report = run_to_end(o).await;
-    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+#[test]
+fn a_subagent_whose_task_panics_is_settled_and_its_slot_and_fence_released() {
+    crate::e2e_rt::run(
+        "a_subagent_whose_task_panics_is_settled_and_its_slot_and_fence_released",
+        crate::e2e_rt::Flavor::MultiThread,
+        async {
+            let (o, fx) = Fixture::new(
+                Box::new(|text, round| {
+                    if is_child(text) {
+                        panic!("the child's provider call panicked");
+                    }
+                    if !text.contains("<use spawn>") {
+                        return vec![spawn("spawn", "write c", &["src/c.rs"])];
+                    }
+                    if reports(text).is_empty() {
+                        return vec![call(&format!("nap{round}"), "sleep", json!({"r": round}))];
+                    }
+                    if !text.contains("<use after>") {
+                        return vec![write("after", "src/c.rs", "parent c\n")];
+                    }
+                    vec![Content::text("done")]
+                }),
+                vec![],
+                &["src/c.rs"],
+            );
+            let report = run_to_end(o).await;
+            assert_eq!(report.status, RunStatus::Completed, "{report:?}");
 
-    let reports = fx.reports();
-    assert_eq!(reports.len(), 1, "{reports:?}");
-    assert!(
-        reports[0].outcome.contains("fail"),
-        "the parent is told the child failed: {:?}",
-        reports[0]
+            let reports = fx.reports();
+            assert_eq!(reports.len(), 1, "{reports:?}");
+            assert!(
+                reports[0].outcome.contains("fail"),
+                "the parent is told the child failed: {:?}",
+                reports[0]
+            );
+            assert!(
+                !matches!(reports[0].merge, ChildMerge::Merged { .. }),
+                "a panicked child merges nothing: {:?}",
+                reports[0]
+            );
+            let seen = fx.seen();
+            assert!(
+                seen.iter().any(|t| t.contains("<result after: written>")),
+                "the panicked child's fence was lifted, so the parent's write went through"
+            );
+            assert_eq!(fx.on_branch("src/c.rs"), "parent c");
+            assert_eq!(fx.agents_in_flight(), 0, "the child's slot was released");
+            fx.assert_swept();
+        },
     );
-    assert!(
-        !matches!(reports[0].merge, ChildMerge::Merged { .. }),
-        "a panicked child merges nothing: {:?}",
-        reports[0]
-    );
-    let seen = fx.seen();
-    assert!(
-        seen.iter().any(|t| t.contains("<result after: written>")),
-        "the panicked child's fence was lifted, so the parent's write went through"
-    );
-    assert_eq!(fx.on_branch("src/c.rs"), "parent c");
-    assert_eq!(fx.agents_in_flight(), 0, "the child's slot was released");
-    fx.assert_swept();
 }

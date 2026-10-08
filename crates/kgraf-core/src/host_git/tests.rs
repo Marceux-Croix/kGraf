@@ -73,7 +73,7 @@ fn leading_global_options_are_split_from_the_subcommand() {
 mod mechanism {
     use super::*;
     use std::fs;
-    use std::process::Output;
+    use std::process::{Output, Stdio};
 
     /// Plain git, the test's own setup. Not hardened: it builds the hostile
     /// repository and, as the control, shows that the planted programs do run

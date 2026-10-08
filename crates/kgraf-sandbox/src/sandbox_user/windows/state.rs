@@ -3,7 +3,8 @@
 //!
 //! - No stored passwords: `kgraf sandbox setup` has not run. Commands use
 //!   the token sandbox of decision 0011, and every notice that names its
-//!   gaps says how to close them.
+//!   gaps says how to close them. With [`TAG_ENV`] set, this is an error
+//!   instead: the tag asked for one setup's users by name.
 //! - Stored passwords that open, and the runner beside this executable:
 //!   commands run as the sandbox users.
 //! - Anything between (a store that does not open, a store for other names,
@@ -12,12 +13,13 @@
 //!   promised (fail loud).
 
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
-use super::super::names::{MAX_SLOTS, OwnerNames, Role, slot_of};
+use super::super::names::{MAX_SLOTS, OwnerNames, Role};
 use super::super::password::Password;
 use super::super::runner::RUNNER_NAME;
-use super::super::store::{credentials_path, grants_path};
+use super::super::slots::{Lease, Leases, Pool};
+use super::super::store::{credentials_path, grants_path, missing_store, slots_dir};
 use super::{accounts, setup::stored_user};
 use crate::error::SandboxError;
 
@@ -47,10 +49,16 @@ impl std::fmt::Debug for LoadedUser {
 pub(crate) struct Users {
     pub offline: LoadedUser,
     pub online: LoadedUser,
-    /// One user per worker slot, in slot order, as the setup created them.
-    /// Empty where the setup made none, and then [`Self::offline`] runs every
-    /// command that has no network.
+    /// One user without the network per worker slot, in slot order, as the
+    /// setup created them. Empty where the setup made none, and then
+    /// [`Self::offline`] is the one user of its pool.
     pub slots: Vec<LoadedUser>,
+    /// One user with the network open per worker slot, as many as
+    /// [`Self::slots`]. Empty where the setup made none, and then
+    /// [`Self::online`] is the one user of its pool.
+    pub online_slots: Vec<LoadedUser>,
+    /// Which folder holds which slot ([`super::super::slots`]).
+    pub leases: Leases,
     pub runner: PathBuf,
     /// The list of the owner's folders granted to the sandbox users
     /// ([`grants_path`]).
@@ -71,36 +79,63 @@ impl Users {
             .map_err(|e| error(format!("record a grant in {}: {e}", self.grants.display())))
     }
 
-    pub(crate) fn user(&self, role: Role) -> &LoadedUser {
-        match role {
-            Role::Offline => &self.offline,
-            Role::Online => &self.online,
-            // A slot the setup did not create falls back to the offline
-            // user, which is confined the same way.
-            Role::Slot(i) => self.slots.get(usize::from(i)).unwrap_or(&self.offline),
-        }
+    /// The user of `role`. A slot the setup did not make is an error, never
+    /// another user: two folders must not run as one user without a word.
+    pub(crate) fn user(&self, role: Role) -> Result<&LoadedUser, SandboxError> {
+        let found = match role {
+            Role::Offline => Some(&self.offline),
+            Role::Online => Some(&self.online),
+            Role::Slot(i) => self.slots.get(usize::from(i)),
+            Role::OnlineSlot(i) => self.online_slots.get(usize::from(i)),
+        };
+        found.ok_or_else(|| error(format!("the setup made no sandbox user for {role}")))
     }
 
-    /// Which user runs a command without the network whose first writable
-    /// root is `root`. With slot users present, the slot is the root's name
-    /// folded to the slot count, so two commands in different worktrees
-    /// usually run as different users and neither can write the other's
-    /// files; two commands in one worktree share a user, which they must,
-    /// because they share the folder. Without slot users it is always the
-    /// offline user.
-    pub(crate) fn offline_role_for(&self, root: Option<&Path>) -> Role {
-        let count = u8::try_from(self.slots.len()).unwrap_or(u8::MAX);
-        match (count, root) {
-            (0, _) | (_, None) => Role::Offline,
-            (count, Some(root)) => Role::Slot(slot_of(root, count)),
+    /// The slot of `pool` a command whose writable roots are `roots` runs
+    /// in: the worker's own (`worker`, which must be held for `roots[0]`),
+    /// else the one this process holds for that folder, else one taken for
+    /// the command alone. Held as long as the result lives. A slot that
+    /// moves to this folder first loses its write grants on the folders it
+    /// held. While every slot of the pool is held for another folder, it
+    /// waits up to `wait`, then is refused.
+    pub(crate) fn lease(
+        &self,
+        pool: Pool,
+        worker: Option<&crate::sandbox::WorkerSlot>,
+        roots: &[PathBuf],
+        wait: std::time::Duration,
+    ) -> Result<Arc<Lease>, SandboxError> {
+        let slot_error = |e: super::super::slots::SlotError| error(e);
+        if let Some(worker) = worker.filter(|w| w.0.pool() == pool) {
+            let first = roots
+                .first()
+                .ok_or_else(|| slot_error(super::super::slots::SlotError::NoRoot))?;
+            if !worker.0.is_for(first) {
+                return Err(slot_error(super::super::slots::SlotError::OtherFolder {
+                    held: worker.0.primary().to_path_buf(),
+                    wants: first.clone(),
+                }));
+            }
+            worker.0.note_roots(roots).map_err(slot_error)?;
+            return Ok(worker.0.clone());
         }
+        let mut revoke = |role: Role, path: &Path| -> Result<(), String> {
+            let user = self.user(role).map_err(|e| e.to_string())?;
+            crate::sandbox::revoke_sandbox_grant(path, &[user.sid.as_str()])
+                .map_err(|e| e.to_string())
+        };
+        self.leases
+            .lease_waiting(pool, roots, &mut revoke, wait)
+            .map(|(lease, _)| lease)
+            .map_err(slot_error)
     }
 
-    /// Every user, for a grant that either of them may need.
+    /// Every user, for a grant that any of them may need.
     pub(crate) fn all(&self) -> Vec<&LoadedUser> {
         std::iter::once(&self.offline)
             .chain(std::iter::once(&self.online))
             .chain(self.slots.iter())
+            .chain(self.online_slots.iter())
             .collect()
     }
 }
@@ -126,11 +161,14 @@ fn load() -> Result<Option<Users>, SandboxError> {
     let tag = std::env::var(TAG_ENV).ok().filter(|t| !t.is_empty());
     let names = OwnerNames::derive(&accounts::current_user_sid()?, tag.as_deref())
         .map_err(|e| error(format!("{TAG_ENV}: {e}")))?;
-    // No configuration folder: setup could not have stored anything.
+    // No configuration folder, or no stored user: setup has not run, and the
+    // token sandbox runs, unless a tag asked for one setup by name.
     let Some(store) = credentials_path(tag.as_deref()) else {
+        missing_store(tag.as_deref(), None).map_err(error)?;
         return Ok(None);
     };
     let Some((offline, offline_pw)) = stored_user(&store, Role::Offline)? else {
+        missing_store(tag.as_deref(), Some(&store)).map_err(error)?;
         return Ok(None);
     };
     let (online, online_pw) = stored_user(&store, Role::Online)?
@@ -139,25 +177,23 @@ fn load() -> Result<Option<Users>, SandboxError> {
     // store that names slot 0 and slot 2 but not slot 1 is not one this
     // kGraf wrote, and acting on part of it would run two worktrees as one
     // user without saying so.
-    let mut slots: Vec<(super::super::blob::StoredUser, Password)> = Vec::new();
-    for i in 0..MAX_SLOTS {
-        match stored_user(&store, Role::Slot(i))? {
-            Some(found) => slots.push(found),
-            None => break,
-        }
-    }
-    for i in u8::try_from(slots.len()).unwrap_or(u8::MAX)..MAX_SLOTS {
-        if stored_user(&store, Role::Slot(i))?.is_some() {
-            return Err(error(format!(
-                "the stored passwords file names worker slot {i} but not every slot below it; \
-                 run `kgraf sandbox setup` again"
-            )));
-        }
+    let slots = stored_slots(&store, Role::Slot)?;
+    let online_slots = stored_slots(&store, Role::OnlineSlot)?;
+    if slots.len() != online_slots.len() {
+        return Err(error(format!(
+            "the stored passwords file names {} worker slots without the network and {} with \
+             it; setup makes as many of each. Run `kgraf sandbox setup` again",
+            slots.len(),
+            online_slots.len()
+        )));
     }
     let mut checked: Vec<(&super::super::blob::StoredUser, Role)> =
         vec![(&offline, Role::Offline), (&online, Role::Online)];
     for (i, (user, _)) in slots.iter().enumerate() {
         checked.push((user, Role::Slot(u8::try_from(i).unwrap_or(u8::MAX))));
+    }
+    for (i, (user, _)) in online_slots.iter().enumerate() {
+        checked.push((user, Role::OnlineSlot(u8::try_from(i).unwrap_or(u8::MAX))));
     }
     for (user, role) in checked {
         let want = names.user(role);
@@ -189,6 +225,16 @@ fn load() -> Result<Option<Users>, SandboxError> {
             exe.display()
         ))
     })?;
+    let count = u8::try_from(slots.len()).unwrap_or(u8::MAX);
+    let loaded = |list: Vec<(super::super::blob::StoredUser, Password)>| -> Vec<LoadedUser> {
+        list.into_iter()
+            .map(|(user, password)| LoadedUser {
+                name: user.name,
+                sid: user.sid,
+                password,
+            })
+            .collect()
+    };
     Ok(Some(Users {
         offline: LoadedUser {
             name: offline.name,
@@ -200,17 +246,37 @@ fn load() -> Result<Option<Users>, SandboxError> {
             sid: online.sid,
             password: online_pw,
         },
-        slots: slots
-            .into_iter()
-            .map(|(user, password)| LoadedUser {
-                name: user.name,
-                sid: user.sid,
-                password,
-            })
-            .collect(),
+        slots: loaded(slots),
+        online_slots: loaded(online_slots),
+        leases: Leases::new(slots_dir(&store), count),
         runner,
         grants: grants_path(&store),
     }))
+}
+
+/// The stored users of `role(0)`, `role(1)`, and on, up to the first one
+/// missing. A store that names a later one past that gap is refused.
+fn stored_slots(
+    store: &Path,
+    role: fn(u8) -> Role,
+) -> Result<Vec<(super::super::blob::StoredUser, Password)>, SandboxError> {
+    let mut found = Vec::new();
+    for i in 0..MAX_SLOTS {
+        match stored_user(store, role(i))? {
+            Some(user) => found.push(user),
+            None => break,
+        }
+    }
+    for i in u8::try_from(found.len()).unwrap_or(u8::MAX)..MAX_SLOTS {
+        if stored_user(store, role(i))?.is_some() {
+            return Err(error(format!(
+                "the stored passwords file names {} but not every slot below it; run `kgraf \
+                 sandbox setup` again",
+                role(i)
+            )));
+        }
+    }
+    Ok(found)
 }
 
 /// The runner beside `exe`; for a test binary in Cargo's `deps` folder, the

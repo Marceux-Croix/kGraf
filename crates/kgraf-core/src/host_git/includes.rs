@@ -20,7 +20,6 @@
 use super::{HostGitError, base, fixed_overrides, set_overrides};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::{Duration, SystemTime};
 
 /// Git's own include depth limit (`MAX_INCLUDE_DEPTH`).
@@ -245,14 +244,8 @@ fn run(inv: &super::Invocation<'_>, args: &[&str]) -> Result<Option<Vec<u8>>, Ho
     super::check_version(inv.exe)?;
     let mut cmd = base(inv);
     set_overrides(&mut cmd, &fixed_overrides());
-    cmd.args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let out = cmd.output().map_err(|source| HostGitError::Spawn {
-        exe: inv.exe.display().to_string(),
-        source,
-    })?;
+    cmd.args(args);
+    let out = super::run_aux(cmd, inv.exe, &format!("git {}", args.join(" ")))?;
     match out.status.code() {
         Some(0) => Ok(Some(out.stdout)),
         Some(1) if out.stderr.is_empty() => Ok(None),

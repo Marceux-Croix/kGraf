@@ -114,6 +114,52 @@ pub struct SandboxPolicy {
     /// Package stores kGraf filled for this project, read-only
     /// ([`Self::with_dependency_links`]).
     package_stores: crate::PackageStores,
+    /// The worker slot the command runs in ([`Self::with_worker_slot`]).
+    worker_slot: Option<WorkerSlot>,
+}
+
+/// A worker's slot: which Windows sandbox user runs its commands, held for
+/// the worker's whole life (decision 0097). Two holders of different folders
+/// never hold one slot. Free again once the last clone is dropped.
+/// See [`worker_slot`].
+#[derive(Clone, Debug)]
+pub struct WorkerSlot(pub(crate) std::sync::Arc<crate::sandbox_user::Lease>);
+
+impl WorkerSlot {
+    /// The sandbox user that runs the slot's commands.
+    pub fn role(&self) -> crate::sandbox_user::Role {
+        self.0.role()
+    }
+}
+
+impl PartialEq for WorkerSlot {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for WorkerSlot {}
+
+/// Take the worker slot of the folder `root` for a worker that runs
+/// commands there, and hold it as long as the result lives. Commands whose
+/// first writable root is `root` then run as that slot's user: pass it with
+/// [`SandboxPolicy::with_worker_slot`]; a command in this process that does
+/// not still finds it by its folder.
+///
+/// `None` where commands do not run as a Windows sandbox user (other
+/// platforms, or Windows before `kgraf sandbox setup`). An error when every
+/// slot user is held by a worker or command in another folder: two folders
+/// never share a sandbox user.
+pub fn worker_slot(root: &Path) -> Result<Option<WorkerSlot>, SandboxError> {
+    #[cfg(windows)]
+    {
+        windows::worker_slot(root)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = root;
+        Ok(None)
+    }
 }
 
 /// A writable git directory whose configuration files stay read-only
@@ -171,7 +217,19 @@ impl SandboxPolicy {
             command_dir: None,
             hidden: Vec::new(),
             package_stores: crate::PackageStores::default(),
+            worker_slot: None,
         }
+    }
+
+    /// Run as the user of the worker slot `slot` ([`worker_slot`]). The
+    /// slot must be held for this policy's first writable root, or the
+    /// command is refused. It applies where commands run as a Windows
+    /// sandbox user, to commands without the network. Without it, a command
+    /// takes the slot its folder holds in this process, or else a slot for
+    /// itself alone, held until it exits.
+    pub fn with_worker_slot(mut self, slot: WorkerSlot) -> Self {
+        self.worker_slot = Some(slot);
+        self
     }
 
     /// The standard worker policy: the worktree root and its scratch
@@ -448,6 +506,10 @@ impl SandboxPolicy {
     pub fn accepts_partial_isolation(&self) -> bool {
         self.accept_partial
     }
+    /// The worker slot set with [`Self::with_worker_slot`].
+    pub fn worker_slot(&self) -> Option<&WorkerSlot> {
+        self.worker_slot.as_ref()
+    }
 
     /// Canonicalize and check every root. Seatbelt matches resolved paths
     /// (`/var` is `/private/var` on macOS), so an unresolved root would
@@ -564,6 +626,7 @@ impl SandboxPolicy {
                     })
                 })
                 .collect::<Result<_, SandboxError>>()?,
+            worker_slot: self.worker_slot.clone(),
         })
     }
 }
@@ -628,6 +691,9 @@ struct Resolved {
     dependency_reads: Vec<PathBuf>,
     /// See [`SandboxPolicy::hide`]: canonical, each beneath a writable root.
     hidden: Vec<Hidden>,
+    /// See [`SandboxPolicy::with_worker_slot`] (Windows sandbox user).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    worker_slot: Option<WorkerSlot>,
 }
 
 /// A folder hidden from the command ([`SandboxPolicy::hide`]), and the

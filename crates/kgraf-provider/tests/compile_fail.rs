@@ -24,8 +24,11 @@
 //! it is the right direction to fail in: a false alarm costs a minute, and a
 //! silently lost accounting guarantee costs a wrong invoice.
 
+// Wraps trybuild and explains a failure caused by a disturbed build (see the module).
+#[path = "support/compile_fail_guard.rs"]
+mod compile_fail_guard;
+
 #[test]
 fn a_provider_call_cannot_be_made_without_a_ledger_minted_token() {
-    let t = trybuild::TestCases::new();
-    t.compile_fail("tests/compile_fail/*.rs");
+    compile_fail_guard::run("tests/compile_fail/*.rs");
 }

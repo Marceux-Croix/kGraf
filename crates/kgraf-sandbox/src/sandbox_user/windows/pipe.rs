@@ -9,7 +9,7 @@
 //! checks that the server is the process that started it.
 
 use std::fs::File;
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::ptr;
 use std::sync::mpsc;
@@ -27,12 +27,14 @@ use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, OPEN_EXISTING, PIPE_ACCESS_INBOUND,
 };
 use windows_sys::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId, GetNamedPipeServerProcessId,
-    PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
+    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
+    GetNamedPipeServerProcessId, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
 };
-use windows_sys::Win32::System::Threading::WaitForSingleObject;
+use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
 
-use super::super::handshake::MAX_LINE;
+use zeroize::Zeroizing;
+
+use super::super::handshake::{MAX_LINE, SecretLines};
 use super::{last_error, wide, win32};
 use crate::error::SandboxError;
 
@@ -93,13 +95,13 @@ pub fn create(name: &str, owner_sid: &str) -> Result<Server, SandboxError> {
 
 impl Server {
     /// Wait for the elevated child `child` (pid `child_pid`) to connect, then
-    /// return its lines as they arrive. Fails if the child ends first or a
-    /// different process connects.
+    /// return its lines as they arrive, each cleared when dropped. Fails if
+    /// the child ends first.
     pub fn accept(
         self,
         child: &OwnedHandle,
         child_pid: u32,
-    ) -> Result<mpsc::Receiver<Result<String, String>>, SandboxError> {
+    ) -> Result<mpsc::Receiver<Result<Zeroizing<String>, String>>, SandboxError> {
         wait_for_client(
             &self.handle,
             &self.name,
@@ -110,11 +112,13 @@ impl Server {
             // No deadline: the elevated step waits for the user to answer the
             // administrator prompt, and that wait has no bound.
             None,
+            plain_exit,
         )?;
         let file = File::from(self.handle);
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            for line in BufReader::new(file).lines() {
+            // Password lines pass through here, so every buffer is cleared.
+            for line in SecretLines::new(file) {
                 let msg = line.map_err(|e| e.to_string());
                 let stop = msg.is_err();
                 if tx.send(msg).is_err() || stop {
@@ -126,10 +130,61 @@ impl Server {
     }
 }
 
+/// How many processes other than the expected one may connect and be
+/// disconnected before the wait gives up.
+const MAX_INTRUDERS: usize = 16;
+
+/// The exit code of `process`, or `None` when it cannot be read.
+fn exit_code(process: &OwnedHandle) -> Option<u32> {
+    let mut code = 0u32;
+    // SAFETY: a valid process handle; `code` is written on success.
+    (unsafe { GetExitCodeProcess(process.as_raw_handle(), &mut code) } != 0).then_some(code)
+}
+
+/// What an early end says: `early_end`, the child's exit code as
+/// `describe_exit` names it, and any process that connected first.
+fn early_end_message(
+    early_end: &str,
+    code: Option<u32>,
+    describe_exit: fn(u32) -> String,
+    intruders: &[u32],
+) -> String {
+    let mut text = match code {
+        Some(code) => format!("{early_end}: {}", describe_exit(code)),
+        None => format!("{early_end}; its exit code could not be read"),
+    };
+    if !intruders.is_empty() {
+        text.push_str(&intruder_note(intruders));
+    }
+    text
+}
+
+fn intruder_note(intruders: &[u32]) -> String {
+    let list: Vec<String> = intruders.iter().map(u32::to_string).collect();
+    format!(
+        "; process {} connected to the pipe first and was disconnected (another program \
+         running as a user the pipe admits, such as a command of the same sandbox user)",
+        list.join(", ")
+    )
+}
+
+/// The exit code of an elevated step, shown as it is.
+pub(super) fn plain_exit(code: u32) -> String {
+    format!("it exited with code 0x{code:08X} ({code})")
+}
+
 /// Wait until a client connects to the server end `server` of pipe `name`,
-/// then check that it is process `child_pid`. Fails with `early_end` if
-/// `child` ends first, and when another process connected. Shared by the
-/// setup pipe and the runner pipe.
+/// then check that it is process `child_pid`. Fails with `early_end` and the
+/// child's exit code, as `describe_exit` names it, if `child` ends first.
+/// Shared by the setup pipe and the runner pipe.
+///
+/// A process other than `child_pid` that connects first is disconnected and
+/// the wait goes on, at most [`MAX_INTRUDERS`] times. The runner pipe admits
+/// the sandbox user, so a command of that user that is already running can
+/// reach the pipe before the runner does. The process checks keep it from
+/// being served; disconnecting it keeps it from blocking the runner, which
+/// waits for a busy pipe instead of giving up at once.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn wait_for_client(
     server: &OwnedHandle,
     name: &str,
@@ -138,65 +193,85 @@ pub(super) fn wait_for_client(
     step: &'static str,
     early_end: &'static str,
     deadline: Option<std::time::Instant>,
+    describe_exit: fn(u32) -> String,
 ) -> Result<(), SandboxError> {
-    let raw = server.as_raw_handle() as usize;
-    let (connected_tx, connected_rx) = mpsc::channel::<Result<(), u32>>();
-    std::thread::spawn(move || {
-        // SAFETY: a blocking connect on the server handle, which outlives
-        // this thread's use of it (the caller waits for the result).
-        let ok = unsafe { ConnectNamedPipe(raw as HANDLE, ptr::null_mut()) };
-        // SAFETY: reads the thread's last error.
-        let err = unsafe { GetLastError() };
-        let _ = connected_tx.send(if ok != 0 || err == ERROR_PIPE_CONNECTED {
-            Ok(())
-        } else {
-            Err(err)
-        });
-    });
+    let mut intruders: Vec<u32> = Vec::new();
     loop {
-        match connected_rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(Ok(())) => break,
-            Ok(Err(code)) => return Err(win32(step, code)),
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
-                    // Unblock the connect thread as the early-end arm does.
-                    let _ = connect_client(name);
-                    return Err(SandboxError::PlatformSetup {
-                        step,
-                        source: std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
-                            "it did not connect in time",
-                        ),
-                    });
+        let raw = server.as_raw_handle() as usize;
+        let (connected_tx, connected_rx) = mpsc::channel::<Result<(), u32>>();
+        std::thread::spawn(move || {
+            // SAFETY: a blocking connect on the server handle, which outlives
+            // this thread's use of it (the caller waits for the result).
+            let ok = unsafe { ConnectNamedPipe(raw as HANDLE, ptr::null_mut()) };
+            // SAFETY: reads the thread's last error.
+            let err = unsafe { GetLastError() };
+            let _ = connected_tx.send(if ok != 0 || err == ERROR_PIPE_CONNECTED {
+                Ok(())
+            } else {
+                Err(err)
+            });
+        });
+        loop {
+            match connected_rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(Ok(())) => break,
+                Ok(Err(code)) => return Err(win32(step, code)),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                        // Unblock the connect thread as the early-end arm does.
+                        let _ = connect_client(name);
+                        let mut text = "it did not connect in time".to_owned();
+                        if !intruders.is_empty() {
+                            text.push_str(&intruder_note(&intruders));
+                        }
+                        return Err(SandboxError::PlatformSetup {
+                            step,
+                            source: std::io::Error::new(std::io::ErrorKind::TimedOut, text),
+                        });
+                    }
+                    // SAFETY: a zero-timeout check of the child's handle.
+                    if unsafe { WaitForSingleObject(child.as_raw_handle(), 0) } == WAIT_OBJECT_0 {
+                        // Unblock the connect thread by connecting to our own
+                        // pipe, then report the child's early end.
+                        let _ = connect_client(name);
+                        return Err(SandboxError::PlatformSetup {
+                            step,
+                            source: std::io::Error::other(early_end_message(
+                                early_end,
+                                exit_code(child),
+                                describe_exit,
+                                &intruders,
+                            )),
+                        });
+                    }
                 }
-                // SAFETY: a zero-timeout check of the child's handle.
-                if unsafe { WaitForSingleObject(child.as_raw_handle(), 0) } == WAIT_OBJECT_0 {
-                    // Unblock the connect thread by connecting to our own
-                    // pipe, then report the child's early end.
-                    let _ = connect_client(name);
-                    return Err(SandboxError::PlatformSetup {
-                        step,
-                        source: std::io::Error::other(early_end),
-                    });
-                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Err(win32(step, 0)),
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => return Err(win32(step, 0)),
+        }
+        let mut client_pid = 0u32;
+        // SAFETY: reads the connected client's process ID.
+        if unsafe { GetNamedPipeClientProcessId(server.as_raw_handle(), &mut client_pid) } == 0 {
+            return Err(last_error(step));
+        }
+        if client_pid == child_pid {
+            return Ok(());
+        }
+        intruders.push(client_pid);
+        if intruders.len() >= MAX_INTRUDERS {
+            return Err(SandboxError::PlatformSetup {
+                step,
+                source: std::io::Error::other(format!(
+                    "the expected process {child_pid} never connected first{}",
+                    intruder_note(&intruders)
+                )),
+            });
+        }
+        // SAFETY: a valid server handle with a client connected. The
+        // client's handle stops working and the instance can be connected
+        // again.
+        if unsafe { DisconnectNamedPipe(server.as_raw_handle()) } == 0 {
+            return Err(last_error(step));
         }
     }
-    let mut client_pid = 0u32;
-    // SAFETY: reads the connected client's process ID.
-    if unsafe { GetNamedPipeClientProcessId(server.as_raw_handle(), &mut client_pid) } == 0 {
-        return Err(last_error(step));
-    }
-    if client_pid != child_pid {
-        return Err(SandboxError::PlatformSetup {
-            step,
-            source: std::io::Error::other(format!(
-                "process {client_pid} connected, not the expected process {child_pid}"
-            )),
-        });
-    }
-    Ok(())
 }
 
 fn connect_client(name: &str) -> Result<File, SandboxError> {

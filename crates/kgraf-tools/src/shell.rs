@@ -243,6 +243,11 @@ pub struct ShellTool {
     /// Set once a result carried the open-network notice: it is said in the
     /// first result of this tool, and the description says it always.
     network_notice_said: std::sync::atomic::AtomicBool,
+    /// The worker slot of this tool's folder (decision 0097), taken at its
+    /// first command and held for the tool's life. Where commands run as a
+    /// Windows sandbox user, it keeps the worker's user from going to
+    /// another folder between its commands.
+    worker_slot: std::sync::Mutex<Option<kgraf_sandbox::WorkerSlot>>,
 }
 
 impl ShellTool {
@@ -268,6 +273,7 @@ impl ShellTool {
             protected: None,
             network: CheckNetwork::current(),
             network_notice_said: std::sync::atomic::AtomicBool::new(false),
+            worker_slot: std::sync::Mutex::new(None),
         };
         (tool, ShellApprovalHook::new(policy))
     }
@@ -294,6 +300,7 @@ impl ShellTool {
             protected: None,
             network: CheckNetwork::current(),
             network_notice_said: std::sync::atomic::AtomicBool::new(false),
+            worker_slot: std::sync::Mutex::new(None),
         }
     }
 
@@ -309,6 +316,22 @@ impl ShellTool {
     pub fn with_output_cap(mut self, cap: usize) -> Self {
         self.output_cap = cap;
         self
+    }
+
+    /// This tool's worker slot for `root`, taken at the first call and kept.
+    /// `None` where commands do not run as a Windows sandbox user. An error,
+    /// tried again at the next call, when every slot user is held by another
+    /// folder: two folders never run as one user.
+    fn worker_slot(
+        &self,
+        root: &std::path::Path,
+    ) -> Result<Option<kgraf_sandbox::WorkerSlot>, ToolError> {
+        let mut held = self.worker_slot.lock().unwrap_or_else(|e| e.into_inner());
+        if held.is_none() {
+            *held = kgraf_sandbox::worker_slot(root)
+                .map_err(|e| internal(format!("cannot take a sandbox worker slot: {e}")))?;
+        }
+        Ok(held.clone())
     }
 
     /// Run every command under `SandboxPolicy::for_workspace(workspace)`, and
@@ -1252,12 +1275,21 @@ impl Tool for ShellTool {
                 output
             });
         }
+        // Taken before the policy, so linking the checkout's dependencies
+        // into the tree grants write there to this worker's own user only.
+        let worker_slot = match self.network.network() {
+            Network::Allow => None,
+            _ => self.worker_slot(&ctx.workspace_root)?,
+        };
         let (mut policy, env, notes) = sandbox_policy(
             ctx,
             self.workspace.as_ref(),
             self.checkout.as_deref(),
             self.network,
         )?;
+        if let Some(slot) = worker_slot {
+            policy = policy.with_worker_slot(slot);
+        }
         for dir in &self.read_denies {
             policy = policy.deny_read(dir.clone());
         }

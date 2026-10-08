@@ -709,6 +709,7 @@ mod tests {
             dependency_reads: vec![],
             hidden: vec![],
             toolchain: super::super::ToolchainReads::default(),
+            worker_slot: None,
         }
     }
 

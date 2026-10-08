@@ -167,4 +167,6 @@ mod contract_tests;
 #[cfg(test)]
 mod deps_gate_tests;
 #[cfg(test)]
+mod e2e_rt;
+#[cfg(test)]
 mod tests;

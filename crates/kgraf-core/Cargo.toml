@@ -17,6 +17,22 @@ blake3.workspace = true
 # kgraf-runtime so kgraf-sandbox's merge-back applies the same rule (0062).
 unicode-normalization = "0.1.25"
 
+# `child_run`: a child leads its own process group, killed with `killpg`, and
+# exit is awaited without reaping (`waitid` with `WNOWAIT`). Already in
+# Cargo.lock and used by kgraf-sandbox and kgraf-host for the same calls.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+# `child_run`: a child and what it starts run in a job object, ended as one.
+# The release kgraf-sandbox already pins; only the four features it needs.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
 [features]
 # Test helpers for other crates' tests: `flock::Forkers` (a fork-pressure helper for
 # lock-release tests, Unix only) and `session::check_session_records` (the record

@@ -311,14 +311,16 @@ pub fn setup(tag: Option<&str>, slots: u8) -> Result<()> {
         );
         if slots == 0 {
             println!(
-                "No worker slot users: commands that run at the same time without the network \
-                 run as one user and can write each other's files. Run setup again with \
-                 --slots to change that."
+                "No worker slots: commands without the network run as one user, so only \
+                 commands in one folder run at a time, and a command in another folder is \
+                 refused until they end. Commands with the network do the same. Run setup \
+                 again with --slots to change that."
             );
         } else {
             println!(
-                "{slots} worker slot users: commands that run at the same time in different \
-                 worktrees run as different users."
+                "{slots} worker slots, each with a user without the network and one with it: \
+                 up to {slots} commands in different folders run at the same time, each as its \
+                 own user. Another is refused until one ends."
             );
         }
         Ok(())
@@ -390,6 +392,7 @@ pub fn elevated(
     owner_pid: u32,
     owner_sid: String,
     tag: Option<String>,
+    slots: Option<u8>,
 ) -> Result<()> {
     #[cfg(windows)]
     {
@@ -408,6 +411,7 @@ pub fn elevated(
             owner_pid,
             owner_sid,
             tag,
+            slots,
         });
         if code != 0 {
             std::process::exit(code);
@@ -416,7 +420,7 @@ pub fn elevated(
     }
     #[cfg(not(windows))]
     {
-        let _ = (action, pipe, nonce, owner_pid, owner_sid, tag);
+        let _ = (action, pipe, nonce, owner_pid, owner_sid, tag, slots);
         bail!("the elevated sandbox step exists only on Windows")
     }
 }

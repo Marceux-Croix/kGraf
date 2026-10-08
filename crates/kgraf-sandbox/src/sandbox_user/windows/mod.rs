@@ -9,6 +9,7 @@ pub mod firewall;
 pub(crate) mod launch;
 pub mod pipe;
 pub mod runner;
+pub mod secure;
 pub mod setup;
 pub(crate) mod state;
 
@@ -40,6 +41,18 @@ fn wide(s: &str) -> Vec<u16> {
         .encode_wide()
         .chain(std::iter::once(0))
         .collect()
+}
+
+/// `text` as a NUL-terminated UTF-16 string in one buffer allocated at its
+/// final size, cleared when it is dropped. For a password: [`wide`] grows
+/// its buffer as it encodes, and every buffer it gives up keeps a copy of
+/// the text that nothing clears.
+fn wide_secret(text: &str) -> zeroize::Zeroizing<Vec<u16>> {
+    let units = text.encode_utf16().count();
+    let mut out = zeroize::Zeroizing::new(Vec::with_capacity(units + 1));
+    out.extend(text.encode_utf16());
+    out.push(0);
+    out
 }
 
 /// The text of a NUL-terminated UTF-16 string a Windows call returned.

@@ -35,7 +35,8 @@ use windows_sys::Win32::System::Registry::{
 };
 
 use super::super::plan::UserFacts;
-use super::{from_wide, last_error, wide, win32};
+use super::super::runner::logon_error_hint;
+use super::{from_wide, last_error, wide, wide_secret, win32};
 use crate::error::SandboxError;
 
 // Upper-case names for NetAPI status codes used in `match` patterns.
@@ -215,7 +216,7 @@ const USER_FLAGS: u32 = UF_SCRIPT | UF_DONT_EXPIRE_PASSWD | UF_PASSWD_CANT_CHANG
 /// Create a standard local user with a password that does not expire.
 pub fn create_user(name: &str, password: &str, comment: &str) -> Result<(), SandboxError> {
     let mut n = wide(name);
-    let mut p = wide(password);
+    let mut p = wide_secret(password);
     let mut c = wide(comment);
     let info = USER_INFO_1 {
         usri1_name: n.as_mut_ptr(),
@@ -230,7 +231,7 @@ pub fn create_user(name: &str, password: &str, comment: &str) -> Result<(), Sand
     let mut parm_err = 0u32;
     // SAFETY: `info` points into buffers that live across the call.
     let rc = unsafe { NetUserAdd(ptr::null(), 1, (&raw const info).cast(), &mut parm_err) };
-    p.iter_mut().for_each(|u| *u = 0);
+    drop(p);
     if rc != NERR_Success {
         return Err(win32("create a local user", rc));
     }
@@ -240,7 +241,7 @@ pub fn create_user(name: &str, password: &str, comment: &str) -> Result<(), Sand
 /// Reset an existing user's password, comment and flags.
 pub fn update_user(name: &str, password: &str, comment: &str) -> Result<(), SandboxError> {
     let user = wide(name);
-    let mut p = wide(password);
+    let mut p = wide_secret(password);
     let mut c = wide(comment);
     let mut parm_err = 0u32;
     let pw = USER_INFO_1003 {
@@ -256,7 +257,7 @@ pub fn update_user(name: &str, password: &str, comment: &str) -> Result<(), Sand
             &mut parm_err,
         )
     };
-    p.iter_mut().for_each(|u| *u = 0);
+    drop(p);
     if rc != NERR_Success {
         return Err(win32("reset a local user's password", rc));
     }
@@ -680,7 +681,7 @@ pub fn logon_works(user: &str, password: &str) -> Result<(), String> {
     };
     let u = wide(user);
     let dot = wide(".");
-    let mut p = wide(password);
+    let p = wide_secret(password);
     let mut token: HANDLE = ptr::null_mut();
     // SAFETY: the strings live across the call; a token is returned on
     // success and closed below.
@@ -695,9 +696,15 @@ pub fn logon_works(user: &str, password: &str) -> Result<(), String> {
         )
     };
     let err = std::io::Error::last_os_error();
-    p.iter_mut().for_each(|c| *c = 0);
+    drop(p);
     if ok == 0 {
-        return Err(err.to_string());
+        let hint = err
+            .raw_os_error()
+            .and_then(|code| logon_error_hint(code as u32));
+        return Err(match hint {
+            Some(hint) => format!("{err}: {hint}"),
+            None => err.to_string(),
+        });
     }
     // SAFETY: closes the token LogonUserW returned.
     unsafe { CloseHandle(token) };

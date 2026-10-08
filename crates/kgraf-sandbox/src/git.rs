@@ -10,6 +10,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::error::WorkspaceError;
 
@@ -30,6 +31,9 @@ pub const GIT_REDIRECT_ENV: &[&str] = &[
 #[derive(Debug, Clone)]
 pub struct Git {
     exe: PathBuf,
+    /// The bound of each command ([`kgraf_core::host_git::COMMAND_TIMEOUT`]
+    /// unless set with [`Self::with_timeout`]).
+    timeout: Duration,
 }
 
 impl Git {
@@ -40,7 +44,7 @@ impl Git {
         std::env::split_paths(&path)
             .map(|dir| dir.join(name))
             .find(|candidate| candidate.is_file())
-            .map(|exe| Self { exe })
+            .map(Self::at)
             .ok_or(WorkspaceError::GitNotFound)
     }
 
@@ -52,7 +56,16 @@ impl Git {
 
     /// Use a specific git executable (for example a logging wrapper in tests).
     pub fn at(exe: PathBuf) -> Self {
-        Self { exe }
+        Self {
+            exe,
+            timeout: kgraf_core::host_git::COMMAND_TIMEOUT,
+        }
+    }
+
+    /// The same executable with another bound on each command.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 
     /// Run `git -C <cwd> <args>` and return stdout on success.
@@ -65,9 +78,11 @@ impl Git {
     }
 
     /// [`Self::run`] with `input` written to git's standard input, for a
-    /// command that reads requests from it (`cat-file --batch`). The input is
-    /// written from a second thread, so a large reply cannot deadlock against
-    /// an unread pipe.
+    /// command that reads requests from it (`cat-file --batch`). Bounded
+    /// ([`kgraf_core::child_run`]): input is written and output read on
+    /// threads, so a large reply cannot deadlock against an unread pipe; a
+    /// git still running at the bound is killed with what it started; a
+    /// pipe a process outside git's tree keeps open does not hold the call.
     pub fn run_with_stdin<I, S>(
         &self,
         cwd: &Path,
@@ -78,8 +93,6 @@ impl Git {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        use std::io::Write;
-        use std::process::Stdio;
         let args: Vec<OsString> = args.into_iter().map(|a| a.as_ref().to_owned()).collect();
         // Shared repository lock for this one process (decision 0094): never
         // while a worker's Bypass git window is open on the same repository.
@@ -98,7 +111,7 @@ impl Git {
             cwd: None,
             pre: &pre,
         };
-        let mut cmd = match kgraf_core::host_git::command(&inv, &args) {
+        let cmd = match kgraf_core::host_git::command(&inv, &args) {
             Ok(cmd) => cmd,
             Err(kgraf_core::host_git::HostGitError::Config { code, stderr }) => {
                 return Err(WorkspaceError::GitFailed {
@@ -118,25 +131,18 @@ impl Git {
                 });
             }
         };
-        cmd.stdin(if input.is_empty() {
-            Stdio::null()
-        } else {
-            Stdio::piped()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-        let mut child = cmd.spawn().map_err(|e| WorkspaceError::io(&self.exe, e))?;
-        let writer = child.stdin.take();
-        let output = std::thread::scope(|scope| {
-            if let Some(mut stdin) = writer {
-                // A write error is git having exited early; its status says why.
-                scope.spawn(move || {
-                    let _ = stdin.write_all(input);
-                });
+        let output = kgraf_core::child_run::run(
+            cmd,
+            &format!("git {}", display_args(&args)),
+            (!input.is_empty()).then_some(input),
+            kgraf_core::child_run::Limits::new(self.timeout),
+        )
+        .map_err(|e| match e {
+            kgraf_core::child_run::RunError::Spawn { source, .. } => {
+                WorkspaceError::io(&self.exe, source)
             }
-            child.wait_with_output()
-        })
-        .map_err(|e| WorkspaceError::io(&self.exe, e))?;
+            other => WorkspaceError::Run(other),
+        })?;
         if output.status.success() {
             Ok(output.stdout)
         } else {
@@ -198,6 +204,14 @@ impl Git {
 /// calls.
 const ADMIN_LOCK: &str = "kgraf-worktree-admin.lock";
 
+/// The longest a caller waits for the worktree-admin lock. A holder runs one
+/// git command: up to `kgraf_core::repo_lock::DEFAULT_TIMEOUT` (15 min)
+/// waiting for the repository lock, then up to
+/// [`kgraf_core::host_git::COMMAND_TIMEOUT`] (10 min) running, or 5 min for
+/// a merge-back command. 30 minutes covers one such holder with room to
+/// spare, so a wait this long means a holder that is stuck, not a slow one.
+pub const ADMIN_LOCK_WAIT: Duration = Duration::from_secs(30 * 60);
+
 /// Run `f` while holding the repository's worktree-admin lock.
 ///
 /// Git writes `worktrees/<id>/` in steps (`gitdir`, `commondir`, `HEAD`) and
@@ -208,9 +222,22 @@ const ADMIN_LOCK: &str = "kgraf-worktree-admin.lock";
 /// in the common git directory: it excludes other threads (each call opens its
 /// own file description) and other kGraf processes on the same repository,
 /// whatever their base. Hold it for the git call only. It is not reentrant: a
-/// nested call on the same directory waits for itself forever.
+/// nested call on the same directory waits for itself until
+/// [`ADMIN_LOCK_WAIT`], then fails with [`WorkspaceError::LockTimeout`].
 pub fn with_worktree_admin_lock<T, E>(
     common_dir: &Path,
+    f: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E>
+where
+    E: From<WorkspaceError>,
+{
+    with_worktree_admin_lock_within(common_dir, ADMIN_LOCK_WAIT, f)
+}
+
+/// [`with_worktree_admin_lock`] with another bound on the wait.
+pub fn with_worktree_admin_lock_within<T, E>(
+    common_dir: &Path,
+    bound: Duration,
     f: impl FnOnce() -> Result<T, E>,
 ) -> Result<T, E>
 where
@@ -223,7 +250,13 @@ where
         .write(true)
         .open(&path)
         .map_err(|e| WorkspaceError::io(&path, e))?;
-    file.lock().map_err(|e| WorkspaceError::io(&path, e))?;
+    kgraf_core::waits::lock_file(
+        &file,
+        kgraf_core::waits::FileLockMode::Exclusive,
+        &format!("the worktree-admin lock {}", path.display()),
+        bound,
+    )
+    .map_err(|e| WorkspaceError::from_lock(&path, e))?;
     let _held = kgraf_core::flock::HeldLock::new(file);
     f()
 }
@@ -304,9 +337,110 @@ pub fn parse_porcelain_z(out: &[u8]) -> Result<Vec<WorktreeEntry>, String> {
     Ok(entries)
 }
 
+/// A stand-in git for tests whose command leaves a process in a new
+/// session holding its standard output, then exits.
+#[cfg(all(test, unix))]
+pub(crate) mod fake_git {
+    use std::path::{Path, PathBuf};
+
+    /// Write the stand-in into `dir`: it answers `version` and the config
+    /// listing as git would, and for any other command starts the holder,
+    /// waits until the holder has left git's session (its pid is in
+    /// `pidfile`), prints `out` and exits 0. Returns (executable, pidfile).
+    pub fn detached_holder(dir: &Path) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let exe = dir.join("git");
+        let pidfile = dir.join("holder.pid");
+        let script = format!(
+            "#!/bin/sh\n\
+             for a in \"$@\"; do\n\
+               case \"$a\" in\n\
+                 version) echo 'git version 2.45.0'; exit 0 ;;\n\
+                 config) exit 0 ;;\n\
+               esac\n\
+             done\n\
+             perl -MPOSIX -e 'POSIX::setsid(); open(F, \">\", $ARGV[0]); print F $$; close F; sleep 60' '{p}' &\n\
+             while [ ! -s '{p}' ]; do sleep 0.01; done\n\
+             echo out\n",
+            p = pidfile.display()
+        );
+        std::fs::write(&exe, script).expect("write the stand-in");
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        (exe, pidfile)
+    }
+
+    /// End the holder, if it started.
+    pub fn kill_holder(pidfile: &Path) {
+        if let Ok(pid) = std::fs::read_to_string(pidfile)
+            && let Ok(pid) = pid.trim().parse::<i32>()
+        {
+            // SAFETY: signals only the test's own holder.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A git whose output a process outside its tree keeps open: the call
+    /// returns git's output once the drain grace has passed, instead of
+    /// waiting for that process (60 s).
+    #[cfg(unix)]
+    #[test]
+    fn a_held_output_pipe_does_not_hold_run_with_stdin() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let (exe, pidfile) = fake_git::detached_holder(dir.path());
+        let cwd = dir.path().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(Git::at(exe).run_with_stdin(&cwd, ["rev-parse", "HEAD"], b"input\n"));
+        });
+        let got = rx.recv_timeout(std::time::Duration::from_secs(30));
+        fake_git::kill_holder(&pidfile);
+        let out = got.expect("returned within the bound").expect("ran");
+        assert_eq!(String::from_utf8_lossy(&out).trim(), "out");
+    }
+
+    /// The worktree-admin lock, held by another opener, times out naming
+    /// itself and the wait.
+    #[test]
+    fn the_worktree_admin_lock_times_out_while_held() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let holder = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.path().join(ADMIN_LOCK))
+            .expect("open");
+        holder.lock().expect("hold");
+        let started = std::time::Instant::now();
+        // On its own thread: a wait that never ends fails here, not hangs.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let common = dir.path().to_path_buf();
+        std::thread::spawn(move || {
+            let _ = tx.send(with_worktree_admin_lock_within(
+                &common,
+                std::time::Duration::from_millis(200),
+                || Ok::<(), WorkspaceError>(()),
+            ));
+        });
+        let err = rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("the wait ended within its bound")
+            .expect_err("held");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        match err {
+            WorkspaceError::LockTimeout(t) => {
+                assert!(t.lock.contains("worktree-admin"), "{t}");
+                assert!(t.waited >= std::time::Duration::from_millis(200), "{t}");
+            }
+            other => panic!("{other}"),
+        }
+    }
 
     #[test]
     fn parses_main_locked_and_prunable_records() {

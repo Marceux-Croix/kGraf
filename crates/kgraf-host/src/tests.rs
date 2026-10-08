@@ -1728,8 +1728,21 @@ async fn the_assembled_prefix_digest_with_the_flag_off_is_pinned() {
     // default allowlist took every language's build and test commands, which
     // the shell tool description names (measured: with the cargo-only list
     // the digest is the previous one).
+    //
+    // One pin per platform: on Windows the shell tool's description adds two
+    // sentences on purpose (the sandbox there cannot deny the network, and
+    // `sh` and `bash` run with Git Bash), so its prefix differs. Within one
+    // platform the definition is still byte-identical across a run's workers
+    // (0043). The Windows value is the one the hosted Windows self-test
+    // reported; nothing that builds the prefix has changed since but the
+    // platform-independent parts this test also pins on Unix.
+    let pinned = if cfg!(windows) {
+        "fac04d9f15e4d6952e30aadbac7d78068bdfad4383843ddb4ae2e093f019e222"
+    } else {
+        "a54601d72355ff810e5f5791ff5dcd94f25c3a94622f75a9d97f4753a0f3805f"
+    };
     assert_eq!(
-        digest, "a54601d72355ff810e5f5791ff5dcd94f25c3a94622f75a9d97f4753a0f3805f",
+        digest, pinned,
         "a change here means every worker's cache resets even with the \
          sessions flag off, which nothing in decision 0067 may cause \
          (re-pinned for the intentional `apply_patch` description \
@@ -4014,12 +4027,13 @@ async fn a_passing_in_scope_change_is_committed_through_merge_back() {
     std::fs::write(ws.join("b.txt"), "b").expect("write");
     let c = contract("b.txt");
     let v = verifier(&r, "test -f b.txt");
+    let verdict = v.verify(&c, &ws, &result()).await.expect("ran");
     let Verdict::Pass {
         commit: Some(commit),
         ..
-    } = v.verify(&c, &ws, &result()).await.expect("ran")
+    } = verdict
     else {
-        panic!("expected a pass with a commit");
+        panic!("expected a pass with a commit: {verdict:?}");
     };
     assert!(v.recheck(&commit).await.expect("ran"));
     let bogus = VerifiedCommit {

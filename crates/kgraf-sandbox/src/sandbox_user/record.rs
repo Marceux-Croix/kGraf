@@ -18,7 +18,12 @@
 //! rights kgraf-off-1a2b3c4d SeDenyNetworkLogonRight,SeDenyBatchLogonRight
 //! hidden kgraf-off-1a2b3c4d
 //! rule kgraf-sandbox-1a2b3c4d-block-outbound
+//! closed S-1-5-21-...-1003 C:\ProgramData
 //! ```
+//!
+//! A `closed` line names a folder where setup denied the sandbox group the
+//! right to create or change entries, and the group's SID, so `remove` can
+//! take exactly that entry off again even after the group is gone.
 
 use super::names::is_sid_string;
 
@@ -48,6 +53,12 @@ pub enum UndoEntry {
     /// The user's value under Winlogon's `SpecialAccounts\UserList`.
     Hidden(String),
     Rule(String),
+    /// A deny entry for the sandbox group (`sid`) on the folder `path`
+    /// alone, so no sandbox user can create or change entries there.
+    Closed {
+        sid: String,
+        path: String,
+    },
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -117,6 +128,7 @@ impl Record {
                 UndoEntry::Rights { user, rights } => format!("rights {user} {}", rights.join(",")),
                 UndoEntry::Hidden(n) => format!("hidden {n}"),
                 UndoEntry::Rule(n) => format!("rule {n}"),
+                UndoEntry::Closed { sid, path } => format!("closed {sid} {path}"),
             };
             out.push_str(&line);
             out.push('\n');
@@ -154,6 +166,16 @@ impl Record {
                 "group" => entries.push(UndoEntry::Group(one_word(rest)?)),
                 "hidden" => entries.push(UndoEntry::Hidden(one_word(rest)?)),
                 "rule" => entries.push(UndoEntry::Rule(one_word(rest)?)),
+                "closed" => {
+                    let (sid, path) = rest.split_once(' ').ok_or_else(bad)?;
+                    if !is_sid_string(sid) || path.trim().is_empty() {
+                        return Err(bad());
+                    }
+                    entries.push(UndoEntry::Closed {
+                        sid: sid.to_owned(),
+                        path: path.to_owned(),
+                    });
+                }
                 "rights" => {
                     let (user, list) = rest.split_once(' ').ok_or_else(bad)?;
                     let rights: Vec<String> = list.split(',').map(str::to_owned).collect();
@@ -195,6 +217,10 @@ mod tests {
         r.add(UndoEntry::Rule(
             "kgraf-sandbox-1a2b3c4d-block-outbound".into(),
         ));
+        r.add(UndoEntry::Closed {
+            sid: "S-1-5-21-1-2-3-1003".into(),
+            path: r"C:\Users\Public\Public Documents".into(),
+        });
         r
     }
 
@@ -246,6 +272,9 @@ mod tests {
             "rights kgraf-off-1 SeDebugPrivilege",
             "rule",
             "user ",
+            "closed S-1-5-21-1-2-3-1003",
+            "closed not-a-sid C:\\ProgramData",
+            "closed S-1-5-21-1-2-3-1003  ",
         ] {
             let text = format!("{RECORD_HEADER}\nowner S-1-5-18\n{bad}\n");
             assert!(
