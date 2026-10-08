@@ -26,6 +26,19 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
+## Dependency updates
+
+No bot opens update pull requests, and no workflow starts on its own: updates are applied by
+hand, about once a month and before each release.
+
+```bash
+cargo update --dry-run               # compatible updates; then cargo update to apply
+cargo deny check advisories          # known security advisories in the lock file
+```
+
+Then run the three gates above. A major version bump, or a pinned GitHub Action SHA, is
+updated one at a time in its own commit, after its release notes are read.
+
 ## Code conventions
 
 - Rust 2021 edition or later, in the workspace layout.
