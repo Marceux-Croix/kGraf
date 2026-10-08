@@ -392,6 +392,21 @@ fn base_env(layout: &Layout) -> Env {
 }
 
 /// Run one test binary and read its results.
+/// The opt-in of the sandbox user setup test. Every other `KGRAF_` variable
+/// of the host is kept from the tests; this one is passed on when the host
+/// sets it (a throwaway, elevated runner), so the test may create its tagged
+/// users and firewall rules there and nowhere else.
+const SETUP_TEST_VAR: &str = "KGRAF_SANDBOX_SETUP_TEST";
+
+/// The opt-in variables a test receives, from the host's value of
+/// [`SETUP_TEST_VAR`].
+fn opt_ins(setup_test: Option<&str>) -> Vec<(String, String)> {
+    match setup_test {
+        Some("1") => vec![(SETUP_TEST_VAR.to_owned(), "1".to_owned())],
+        _ => Vec::new(),
+    }
+}
+
 fn run_binary(
     console: &Console,
     run: &TestRun,
@@ -405,6 +420,7 @@ fn run_binary(
     let mut vars = env.vars.clone();
     vars.push(("CARGO_MANIFEST_DIR".into(), cwd.display().to_string()));
     vars.push(("CARGO_PKG_NAME".into(), run.package.clone()));
+    vars.extend(opt_ins(std::env::var(SETUP_TEST_VAR).ok().as_deref()));
     cmd.args(test_args(run))
         .current_dir(cwd)
         .env_clear()
@@ -955,6 +971,16 @@ fn run_e2e_step(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_setup_test_opt_in_passes_only_when_the_host_sets_it() {
+        assert_eq!(
+            super::opt_ins(Some("1")),
+            vec![("KGRAF_SANDBOX_SETUP_TEST".to_owned(), "1".to_owned())]
+        );
+        assert!(super::opt_ins(Some("0")).is_empty());
+        assert!(super::opt_ins(None).is_empty());
+    }
+
     use super::*;
     use crate::manifest::Skip;
 
