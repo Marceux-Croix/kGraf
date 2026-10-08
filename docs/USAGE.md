@@ -1724,8 +1724,13 @@ that:
   (`GIT_AUTHOR_NAME` and friends) and `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM`.
 
 What kGraf keeps: your identity and your global config, and git's built-in attributes
-(`text`, `eol`, `ident`, `core.autocrlf`), so commits and merges come out as your own git
-would make them. Two differences follow. A file your attributes route through a filter, such
+(`text`, `eol`, `ident`), so commits and merges come out as your own git would make them.
+What kGraf sets: `core.autocrlf=false`, `core.eol=lf` and `core.safecrlf=false`, for its own
+git and for the git a worker runs, so a worker's worktree holds the bytes its commit holds
+whatever line-ending setting your machine has (Git for Windows sets `core.autocrlf=true`). A
+file with no `text` or `eol` attribute is committed as written; a path your `.gitattributes`
+marks, for example `*.bat eol=crlf`, is converted as it says. Your own checkout is not
+changed. Two more differences follow. A file your attributes route through a filter, such
 as git-lfs or git-crypt, is committed and checked out by kGraf in its stored form, not
 filtered. A file with a configured merge driver is reported as a conflict when two attempts
 change it, rather than resolved by the driver. kGraf needs git 2.31 or newer for this and

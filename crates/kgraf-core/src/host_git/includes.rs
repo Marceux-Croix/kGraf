@@ -17,7 +17,7 @@
 //! times, inode), or was written within [`RACY`] of the last scan, the margin
 //! a coarse file system clock needs.
 
-use super::{FIXED_OVERRIDES, HostGitError, base, set_overrides};
+use super::{HostGitError, base, fixed_overrides, set_overrides};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -244,11 +244,7 @@ fn absolute(base: &Path, path: &Path) -> PathBuf {
 fn run(inv: &super::Invocation<'_>, args: &[&str]) -> Result<Option<Vec<u8>>, HostGitError> {
     super::check_version(inv.exe)?;
     let mut cmd = base(inv);
-    let fixed: Vec<(String, String)> = FIXED_OVERRIDES
-        .iter()
-        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
-        .collect();
-    set_overrides(&mut cmd, &fixed);
+    set_overrides(&mut cmd, &fixed_overrides());
     cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

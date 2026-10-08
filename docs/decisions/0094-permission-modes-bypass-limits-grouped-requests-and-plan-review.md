@@ -1650,3 +1650,47 @@ the worst case for the executable-name condition) yields the checked text, and t
 PowerShell's host parses back, by the MSVC rules or by a plain quote-toggle rule, is the argv
 given. `["cmd", "/c", "dir /b"]` is now unreadable; `["cmd", "/c", "dir", "/b"]` and
 `["cmd", "/s", "/c", "dir /b"]` read as before.
+
+## Amendment (2026-10-07, second): kGraf's git and a worker's git use fixed line-ending settings
+
+**Why.** The host runner kept the user's line-ending settings, and merge-back set
+`GIT_CONFIG_NOSYSTEM=1`. Git for Windows installs with `core.autocrlf=true` in its system
+config. So the `worktree add` that made a worker's worktree read the system config and checked
+out every text file with CRLF, and merge-back staged that worktree without the system config,
+stored the CRLF bytes, and saw every text file as changed: an attempt that wrote one file was
+refused with `OutsideDeclaredWrites` for `README`, `.gitignore` and the rest, and an empty
+attempt was a change. The same holds wherever the checkout and the staging read different
+configurations, including a worker's own git in the sandbox.
+
+**Rule.** Every host runner invocation, and its config listing, carries `core.autocrlf=false`,
+`core.eol=lf` and `core.safecrlf=false` after the fixed overrides
+(`kgraf_core::host_git::LINE_ENDINGS`). The sandbox appends the same three entries to every
+worker process's `GIT_CONFIG_COUNT`, after the host's own entries, on every platform (on
+Windows also after a cleared environment). A kGraf worktree then holds the bytes its commit
+holds, and merge-back compares the staged blobs with the base tree's blobs: a path is written
+when its blob differs. The repository's own `text` and `eol` attributes still apply to the
+checkout and the staging, read from the trusted tree. A file with no such attribute is stored
+and checked out byte for byte, so a worker that writes CRLF commits CRLF. `core.filemode`,
+`core.symlinks` and `core.ignorecase` are not set: git records them in the repository's
+config from what the file system can do. The user's own checkout and config are not touched;
+the settings travel only on kGraf's processes.
+
+The sandbox's environment scrub no longer removes `GIT_CONFIG_KEY_<n>`: the word `KEY` made it
+look like a credential, but it holds the name of a git setting. Removing it while
+`GIT_CONFIG_COUNT` stayed made every git in the sandbox stop with "missing config key
+GIT_CONFIG_KEY_0" whenever kGraf itself ran with `GIT_CONFIG_COUNT` set, and the sandbox's own
+entries are numbered after the host's. `GIT_CONFIG_VALUE_<n>` is judged as before.
+
+**Cost.** On Windows a worker sees LF where the user's checkout has CRLF, for files with no
+`eol` attribute. A repository whose scripts need CRLF (cmd `.bat` files) states it with
+`eol=crlf`, which applies.
+
+**Tests.** `kgraf-sandbox` `tests/line_endings.rs` gives every git in the test a system config
+with `core.autocrlf=true` (through `GIT_CONFIG_SYSTEM` at a temporary file) and an empty global
+config: an untouched file is not a write, an empty attempt is empty, a CRLF file without
+attributes is committed as written, an `eol=crlf` path is checked out with CRLF and is not a
+change, and a worker's git in the sandbox reads `core.autocrlf=false` and `core.eol=lf`, after
+a host entry that reaches it intact. Five fail with the settings removed (one more checks the
+test's own setup), and the host-entry test fails with the scrub exemption removed.
+`kgraf-core` `host_git` tests: a repository with `core.autocrlf=true` gets LF from kGraf's
+checkout and nothing staged, while plain git writes CRLF.

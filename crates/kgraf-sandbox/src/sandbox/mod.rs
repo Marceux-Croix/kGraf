@@ -1029,7 +1029,23 @@ fn is_scrubbed(name: &OsStr) -> bool {
     let Some(name) = name.to_str() else {
         return false;
     };
+    if is_git_config_key_var(name) {
+        return false;
+    }
     AGENT_VARS.contains(&name) || kgraf_secrets::name_is_credential_shaped(name)
+}
+
+/// Whether `name` is `GIT_CONFIG_KEY_<n>`: it holds the name of a git
+/// setting, never a credential, though the word `KEY` makes it look like one.
+/// Removing it while `GIT_CONFIG_COUNT` stays makes every git in the sandbox
+/// stop with "missing config key", and the sandbox appends its own entries
+/// after the host's. Its `GIT_CONFIG_VALUE_<n>` is judged like any other name.
+fn is_git_config_key_var(name: &str) -> bool {
+    const PREFIX: &str = "GIT_CONFIG_KEY_";
+    name.get(..PREFIX.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(PREFIX))
+        && name.len() > PREFIX.len()
+        && name[PREFIX.len()..].bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Remove scrubbed names among `inherited` from `cmd`, except `pass`.
@@ -1583,41 +1599,54 @@ pub fn sandboxed_command(
             cmd.env("GOCACHE", tmp.join("go-build"));
             package_store_env(&mut cmd, tmp, resolved.home.as_deref(), policy.network);
         }
-        // Windows cannot deny reads of the Credential Manager, so at least stop
-        // git from asking it by default: an empty credential.helper resets the
-        // helper list (git-config(1), GIT_CONFIG_COUNT). A process that calls
-        // the helper directly still reaches it; STRENGTH says so. If the host
-        // already sets GIT_CONFIG_COUNT, append at index N and bump the count,
-        // rather than dropping the reset.
+        // Git settings for the worker's own git, appended to the host's
+        // `GIT_CONFIG_COUNT` entries at index N (bumping the count) rather
+        // than replacing them (git-config(1), GIT_CONFIG_COUNT). Set here,
+        // before a caller's own `env` calls, so a caller can still override
+        // any of them; the host environment is read only for the count.
         //
-        // With the network open, the same count also carries
+        // Every platform: the line-ending settings kGraf's own git uses
+        // (`kgraf_core::host_git::LINE_ENDINGS`), so a `git checkout`,
+        // `git stash` or `git add` by the worker writes and stages the same
+        // bytes as kGraf's checkout and merge-back do, whatever the machine's
+        // `core.autocrlf` says.
+        //
+        // Windows also: Windows cannot deny reads of the Credential Manager,
+        // so at least stop git from asking it by default: an empty
+        // credential.helper resets the helper list. A process that calls the
+        // helper directly still reaches it; STRENGTH says so. With the
+        // network open, the same count also carries
         // `http.sslBackend=openssl`: the Windows TLS stack cannot run under
         // this token (see the Schannel section in `windows.rs`), and Git for
         // Windows ships OpenSSL beside it. `CURL_SSL_BACKEND=openssl` does
-        // the same for the multi-backend curl of Git for Windows. Both are
-        // set here, before a caller's own `env` calls, so a caller can still
-        // override either; the host environment is not read to decide.
-        #[cfg(windows)]
-        {
-            let next = match std::env::var("GIT_CONFIG_COUNT") {
-                Ok(v) => v.trim().parse::<u32>().ok(),
-                Err(std::env::VarError::NotPresent) => Some(0),
-                // A non-UTF-8 or otherwise unreadable count: fail loud rather
-                // than guess an index and leave the helper reachable (fail loud).
-                Err(_) => {
-                    return Err(SandboxError::InvalidPolicy(
-                        "GIT_CONFIG_COUNT is set to a value that is not valid UTF-8".into(),
-                    ));
-                }
-            };
-            let Some(n) = next else {
+        // the same for the multi-backend curl of Git for Windows.
+        let next = match std::env::var("GIT_CONFIG_COUNT") {
+            Ok(v) => v.trim().parse::<u32>().ok(),
+            Err(std::env::VarError::NotPresent) => Some(0),
+            // A non-UTF-8 or otherwise unreadable count: fail loud rather
+            // than guess an index and drop the settings (fail loud).
+            Err(_) => {
                 return Err(SandboxError::InvalidPolicy(
-                    "GIT_CONFIG_COUNT is set to a value that is not a number".into(),
+                    "GIT_CONFIG_COUNT is set to a value that is not valid UTF-8".into(),
                 ));
-            };
-            for (key, value) in windows::tool_env(n, network_open(policy.network)) {
+            }
+        };
+        let Some(next) = next else {
+            return Err(SandboxError::InvalidPolicy(
+                "GIT_CONFIG_COUNT is set to a value that is not a number".into(),
+            ));
+        };
+        #[cfg(windows)]
+        for (key, value) in windows::tool_env(next, network_open(policy.network)) {
+            cmd.env(key, value);
+        }
+        #[cfg(not(windows))]
+        {
+            let (entries, count) = git_config_entries(next, kgraf_core::host_git::LINE_ENDINGS);
+            for (key, value) in entries {
                 cmd.env(key, value);
             }
+            cmd.env("GIT_CONFIG_COUNT", count.to_string());
         }
         // The stores kGraf filled for this project, read-only, used in place
         // of the user's own (`crate::PackageStores`).
@@ -1649,6 +1678,23 @@ pub fn sandboxed_command(
 #[cfg_attr(not(windows), allow(dead_code))]
 fn network_open(network: Network) -> bool {
     matches!(network, Network::Allow)
+}
+
+/// The `GIT_CONFIG_KEY_n` / `GIT_CONFIG_VALUE_n` variables for `pairs`,
+/// numbered from `start` (the host's own `GIT_CONFIG_COUNT`, or 0), and the
+/// new count. Nothing below `start` is written, so the host's entries stay.
+pub(crate) fn git_config_entries(
+    start: u32,
+    pairs: &[(&str, &str)],
+) -> (Vec<(String, String)>, u32) {
+    let mut entries = Vec::with_capacity(pairs.len() * 2);
+    let mut n = start;
+    for (key, value) in pairs {
+        entries.push((format!("GIT_CONFIG_KEY_{n}"), (*key).to_owned()));
+        entries.push((format!("GIT_CONFIG_VALUE_{n}"), (*value).to_owned()));
+        n += 1;
+    }
+    (entries, n)
 }
 
 /// Convenience: a confined command in `ws` under the standard worker policy.
@@ -2238,8 +2284,16 @@ mod tests {
             // needle match is whole-word, not substring.
             "DB_PATH",
             "AUTHOR_NAME",
+            // The name of a git setting the host passes through
+            // `GIT_CONFIG_COUNT`, not a credential.
+            "GIT_CONFIG_KEY_0",
+            "git_config_key_12",
         ] {
             assert!(!is_scrubbed(OsStr::new(name)), "{name} scrubbed");
+        }
+        // Only the numbered form is exempt.
+        for name in ["GIT_CONFIG_KEY_", "GIT_CONFIG_KEY_X", "MY_GIT_CONFIG_KEY_0"] {
+            assert!(is_scrubbed(OsStr::new(name)), "{name} kept");
         }
     }
 

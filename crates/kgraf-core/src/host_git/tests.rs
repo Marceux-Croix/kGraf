@@ -505,4 +505,52 @@ mod mechanism {
             other => panic!("expected a config failure, got {other:?}"),
         }
     }
+
+    /// A config that turns on `core.autocrlf` (Git for Windows puts it in its
+    /// system config; here it is the repository's own, so the test reads no
+    /// file outside its folder) changes nothing kGraf's git writes or
+    /// stages: a checkout writes the committed bytes, and staging an
+    /// untouched file is no change. Plain git, the control, writes CRLF.
+    #[test]
+    fn a_configured_autocrlf_changes_nothing_kgraf_checks_out_or_stages() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let repo = tmp.path().join("r");
+        fs::create_dir_all(&repo).expect("mkdir");
+        plain_ok(&repo, &["init", "-q", "-b", "main"]);
+        plain_ok(&repo, &["config", "user.name", "t"]);
+        plain_ok(&repo, &["config", "user.email", "t@t"]);
+        fs::write(repo.join("a.txt"), "one\ntwo\n").expect("write");
+        plain_ok(&repo, &["add", "."]);
+        plain_ok(&repo, &["commit", "-q", "-m", "c"]);
+        plain_ok(&repo, &["config", "core.autocrlf", "true"]);
+
+        fs::remove_file(repo.join("a.txt")).expect("rm");
+        plain_ok(&repo, &["checkout", "--", "a.txt"]);
+        assert_eq!(
+            fs::read(repo.join("a.txt")).expect("read"),
+            b"one\r\ntwo\r\n",
+            "control: plain git converts under core.autocrlf"
+        );
+
+        fs::remove_file(repo.join("a.txt")).expect("rm");
+        kgit_ok(&repo, &["checkout", "--", "a.txt"]);
+        assert_eq!(fs::read(repo.join("a.txt")).expect("read"), b"one\ntwo\n");
+        kgit_ok(&repo, &["add", "-A"]);
+        let staged = kgit_ok(&repo, &["diff", "--cached", "--name-only"]);
+        assert!(staged.is_empty(), "{}", String::from_utf8_lossy(&staged));
+    }
+}
+
+/// Every command, and every config listing, carries the line-ending settings
+/// after the fixed overrides.
+#[test]
+fn every_command_carries_the_line_ending_settings() {
+    let fixed = fixed_overrides();
+    assert_eq!(fixed.len(), FIXED_OVERRIDES.len() + LINE_ENDINGS.len());
+    let tail: Vec<(&str, &str)> = fixed[FIXED_OVERRIDES.len()..]
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    assert_eq!(tail, LINE_ENDINGS);
+    assert!(LINE_ENDINGS.contains(&("core.autocrlf", "false")));
 }

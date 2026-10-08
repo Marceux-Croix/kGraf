@@ -187,7 +187,7 @@ fn a_cleared_environment_keeps_the_base_and_the_sandbox_settings_only() {
     );
     assert_eq!(
         value_of(&listing, "GIT_CONFIG_COUNT"),
-        Some("2"),
+        Some("5"),
         "{listing}"
     );
     let tmp = value_of(&listing, "TMP").map(Path::new);

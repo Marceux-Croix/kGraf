@@ -212,22 +212,17 @@ pub(super) const CURL_SSL_BACKEND_VAR: &str = "CURL_SSL_BACKEND";
 /// count. The first entry resets the credential helper list, so git does not
 /// ask the Credential Manager. With the network open, a second selects
 /// OpenSSL for git's HTTPS (`http.sslBackend`), because Schannel cannot run
-/// under the sandbox token. The entries are appended after the host's, never
-/// replacing them; neither touches `GIT_CONFIG_NOSYSTEM` or
-/// `GIT_CONFIG_GLOBAL`, which keep their effect.
+/// under the sandbox token. Then come the line-ending settings kGraf's own
+/// git uses (`kgraf_core::host_git::LINE_ENDINGS`). The entries are appended
+/// after the host's, never replacing them; none touches `GIT_CONFIG_NOSYSTEM`
+/// or `GIT_CONFIG_GLOBAL`, which keep their effect.
 pub(super) fn git_config_entries(start: u32, network_open: bool) -> (Vec<(String, String)>, u32) {
     let mut pairs: Vec<(&str, &str)> = vec![("credential.helper", "")];
     if network_open {
         pairs.push(("http.sslBackend", TLS_BACKEND));
     }
-    let mut entries = Vec::with_capacity(pairs.len() * 2);
-    for (offset, (key, value)) in (0u32..).zip(pairs.iter()) {
-        let n = start + offset;
-        entries.push((format!("GIT_CONFIG_KEY_{n}"), (*key).to_owned()));
-        entries.push((format!("GIT_CONFIG_VALUE_{n}"), (*value).to_owned()));
-    }
-    let count = start + pairs.len() as u32;
-    (entries, count)
+    pairs.extend_from_slice(kgraf_core::host_git::LINE_ENDINGS);
+    super::git_config_entries(start, &pairs)
 }
 
 /// Every variable the sandbox sets for the tools on Windows: the
@@ -3078,12 +3073,13 @@ mod tests {
             .map(|(_, v)| v.as_str())
     }
 
-    /// With the network open the sandbox adds the credential-helper reset and
-    /// the OpenSSL selection, after the host's own entries.
+    /// With the network open the sandbox adds the credential-helper reset,
+    /// the OpenSSL selection and the line-ending settings, after the host's
+    /// own entries.
     #[test]
     fn git_config_entries_append_after_the_hosts_with_the_network_open() {
         let (entries, count) = git_config_entries(2, true);
-        assert_eq!(count, 4);
+        assert_eq!(count, 7);
         assert_eq!(
             lookup(&entries, "GIT_CONFIG_KEY_2"),
             Some("credential.helper")
@@ -3094,17 +3090,24 @@ mod tests {
             Some("http.sslBackend")
         );
         assert_eq!(lookup(&entries, "GIT_CONFIG_VALUE_3"), Some("openssl"));
-        assert_eq!(entries.len(), 4);
+        assert_eq!(lookup(&entries, "GIT_CONFIG_KEY_4"), Some("core.autocrlf"));
+        assert_eq!(lookup(&entries, "GIT_CONFIG_VALUE_4"), Some("false"));
+        assert_eq!(lookup(&entries, "GIT_CONFIG_KEY_5"), Some("core.eol"));
+        assert_eq!(lookup(&entries, "GIT_CONFIG_VALUE_5"), Some("lf"));
+        assert_eq!(lookup(&entries, "GIT_CONFIG_KEY_6"), Some("core.safecrlf"));
+        assert_eq!(entries.len(), 10);
         // Nothing below the host's count is written.
         assert!(lookup(&entries, "GIT_CONFIG_KEY_0").is_none());
         assert!(lookup(&entries, "GIT_CONFIG_KEY_1").is_none());
     }
 
-    /// Without an open network only the credential-helper reset is added.
+    /// Without an open network the credential-helper reset and the
+    /// line-ending settings are added, and no TLS backend.
     #[test]
     fn git_config_entries_keep_the_tls_backend_out_without_open_network() {
         let (entries, count) = git_config_entries(0, false);
-        assert_eq!(count, 1);
+        assert_eq!(count, 4);
+        assert_eq!(lookup(&entries, "GIT_CONFIG_KEY_1"), Some("core.autocrlf"));
         assert_eq!(
             lookup(&entries, "GIT_CONFIG_KEY_0"),
             Some("credential.helper")
@@ -3163,10 +3166,10 @@ mod tests {
         let open = tool_env(3, true);
         assert_eq!(lookup(&open, "GIT_CONFIG_KEY_3"), Some("credential.helper"));
         assert_eq!(lookup(&open, "GIT_CONFIG_KEY_4"), Some("http.sslBackend"));
-        assert_eq!(lookup(&open, "GIT_CONFIG_COUNT"), Some("5"));
+        assert_eq!(lookup(&open, "GIT_CONFIG_COUNT"), Some("8"));
         assert_eq!(lookup(&open, CURL_SSL_BACKEND_VAR), Some(TLS_BACKEND));
         let closed = tool_env(0, false);
-        assert_eq!(lookup(&closed, "GIT_CONFIG_COUNT"), Some("1"));
+        assert_eq!(lookup(&closed, "GIT_CONFIG_COUNT"), Some("4"));
         assert_eq!(lookup(&closed, CURL_SSL_BACKEND_VAR), None);
     }
 
@@ -3183,7 +3186,8 @@ mod tests {
         assert_eq!(lookup(&kept, "GIT_CONFIG_KEY_0"), Some("credential.helper"));
         assert_eq!(lookup(&kept, "GIT_CONFIG_VALUE_0"), Some(""));
         assert_eq!(lookup(&kept, "GIT_CONFIG_KEY_1"), Some("http.sslBackend"));
-        assert_eq!(lookup(&kept, "GIT_CONFIG_COUNT"), Some("2"));
+        assert_eq!(lookup(&kept, "GIT_CONFIG_KEY_2"), Some("core.autocrlf"));
+        assert_eq!(lookup(&kept, "GIT_CONFIG_COUNT"), Some("5"));
         assert_eq!(lookup(&kept, CURL_SSL_BACKEND_VAR), Some("openssl"));
         assert_eq!(lookup(&kept, "TMP"), Some(r"C:\ws\scratch"));
         assert_eq!(lookup(&kept, "TEMP"), Some(r"C:\ws\scratch"));
@@ -3193,7 +3197,17 @@ mod tests {
             .collect();
         assert_eq!(
             bare,
-            ["GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0", "GIT_CONFIG_COUNT"]
+            [
+                "GIT_CONFIG_KEY_0",
+                "GIT_CONFIG_VALUE_0",
+                "GIT_CONFIG_KEY_1",
+                "GIT_CONFIG_VALUE_1",
+                "GIT_CONFIG_KEY_2",
+                "GIT_CONFIG_VALUE_2",
+                "GIT_CONFIG_KEY_3",
+                "GIT_CONFIG_VALUE_3",
+                "GIT_CONFIG_COUNT"
+            ]
         );
     }
 }

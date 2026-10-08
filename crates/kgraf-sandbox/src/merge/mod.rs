@@ -48,6 +48,14 @@
 //!   (a `merge=union` would silently auto-resolve conflicts) for its own
 //!   attempt. Independently, the host runner empties every driver the config
 //!   defines, so even the trusted tree's attributes run no program.
+//! - What counts as a change: the worktree is staged (`add -A`) and the
+//!   staged blobs are compared with the base tree's. A path is written when
+//!   its blob differs. The staging and the checkout that made the worktree
+//!   use the same line-ending settings on every machine
+//!   (`kgraf_core::host_git::LINE_ENDINGS`), so a file the worker did not
+//!   touch stages to its base blob even where the machine sets
+//!   `core.autocrlf`; the trusted tree's `text` and `eol` attributes apply to
+//!   both.
 //! - Parallel attempts at one task ([`AttemptGroup`]) are never merged
 //!   together: the verifier's selection merges one and discards the rest with
 //!   their worktrees (disjoint writes).

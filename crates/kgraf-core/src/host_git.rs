@@ -50,13 +50,22 @@
 //! starts. They need git 2.31; an older git is refused ([`HostGitError::TooOld`])
 //! rather than run without them.
 //!
+//! - **Line endings** ([`LINE_ENDINGS`]): `core.autocrlf=false`,
+//!   `core.eol=lf`, `core.safecrlf=false`, so a kGraf worktree holds the bytes
+//!   its commit holds and staging it changes nothing the worker did not
+//!   write, whatever line-ending setting the machine or the user has. The
+//!   sandbox gives a worker's own git the same settings.
+//!
 //! What is kept: the user's global and system config and attributes, so the
-//! commit identity, `core.autocrlf`, `text`, `eol`, `ident` and
-//! `working-tree-encoding` work as in the user's own git (they are built in,
-//! not programs). Not set: `GIT_CONFIG_NOSYSTEM` (on Windows the system config
-//! carries `core.autocrlf`; its drivers are neutralized like any other) and
+//! commit identity, the repository's `text`, `eol`, `ident` and
+//! `working-tree-encoding` attributes work as in the user's own git (they are
+//! built in, not programs). Not set: `GIT_CONFIG_NOSYSTEM` (a caller may set
+//! it; the line-ending settings above no longer depend on it) and
 //! `GIT_ATTR_NOSYSTEM` (attributes only select drivers, and every configured
-//! driver is neutralized). A caller may still set either.
+//! driver is neutralized). A caller may still set either. `core.filemode`,
+//! `core.symlinks` and `core.ignorecase` are not set: git records them in
+//! the repository's own config from what the file system can do, and a
+//! value that differs from the file system would lose a mode or a link.
 //!
 //! Consequence: a path whose attributes select a configured filter (git-lfs,
 //! git-crypt) is stored and checked out by kGraf in its committed form, not
@@ -116,6 +125,46 @@ pub const FIXED_OVERRIDES: &[(&str, &str)] = &[
     ("gc.auto", "0"),
     ("maintenance.auto", "false"),
 ];
+
+/// Line-ending settings applied to every invocation, after
+/// [`FIXED_OVERRIDES`], and given to every worker process by the sandbox.
+///
+/// kGraf's worktrees hold the bytes the commit holds, and merge-back stages
+/// the bytes the worktree holds, on every machine. Without these, the
+/// checkout and the staging can read different configurations (Git for
+/// Windows sets `core.autocrlf=true` in its system config; a caller may set
+/// `GIT_CONFIG_NOSYSTEM`; a worker's git reads its own), so a checkout that
+/// wrote CRLF and a staging that kept it make every text file the worker
+/// never touched look written.
+///
+/// - `core.autocrlf=false`: no conversion that git guesses from content.
+/// - `core.eol=lf`: a path the repository's `.gitattributes` marks `text`
+///   with no `eol` is checked out with LF, the form git stores, rather than
+///   the platform's form.
+/// - `core.safecrlf=false`: the normalization a `text` attribute asks for
+///   is applied, never refused or warned about by a user setting.
+///
+/// The repository's own `text` and `eol` attributes still apply: git
+/// converts those paths on purpose. A file with no such attribute is stored
+/// and checked out byte for byte, so a worker that writes CRLF commits CRLF.
+/// The user's own checkout is not touched: these settings travel only on
+/// kGraf's processes, never into a config file.
+pub const LINE_ENDINGS: &[(&str, &str)] = &[
+    ("core.autocrlf", "false"),
+    ("core.eol", "lf"),
+    ("core.safecrlf", "false"),
+];
+
+/// [`FIXED_OVERRIDES`] and [`LINE_ENDINGS`], in that order: what every
+/// invocation, and every config listing, carries before the per-repository
+/// overrides.
+pub fn fixed_overrides() -> Vec<(String, String)> {
+    FIXED_OVERRIDES
+        .iter()
+        .chain(LINE_ENDINGS)
+        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+        .collect()
+}
 
 /// Inherited `GIT_*` variables kept: the commit identity and where the
 /// config files are. Everything else starting with `GIT_` is removed.
@@ -198,10 +247,7 @@ pub fn command<S: AsRef<OsStr>>(inv: &Invocation<'_>, args: &[S]) -> Result<Comm
     pre.extend(globals.iter().map(|g| (*g).to_owned()));
     let inv = Invocation { pre: &pre, ..*inv };
     let listing = list_config(&inv)?;
-    let mut overrides: Vec<(String, String)> = FIXED_OVERRIDES
-        .iter()
-        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
-        .collect();
+    let mut overrides = fixed_overrides();
     overrides.extend(driver_overrides(&listing)?);
     let mut cmd = base(&inv);
     set_overrides(&mut cmd, &overrides);
@@ -300,11 +346,7 @@ fn set_overrides(cmd: &mut Command, overrides: &[(String, String)]) {
 /// fixed overrides so the listing itself is as constrained as the command.
 fn list_config(inv: &Invocation<'_>) -> Result<Vec<u8>, HostGitError> {
     let mut cmd = base(inv);
-    let fixed: Vec<(String, String)> = FIXED_OVERRIDES
-        .iter()
-        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
-        .collect();
-    set_overrides(&mut cmd, &fixed);
+    set_overrides(&mut cmd, &fixed_overrides());
     cmd.args(["config", "--includes", "-z", "--list"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
