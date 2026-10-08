@@ -4038,6 +4038,7 @@ version = "0.7.8"
 dependencies = [
  "cap-primitives",
  "criterion",
+ "directories",
  "getrandom 0.4.3",
  "junction",
  "kgraf-core",

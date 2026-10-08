@@ -545,6 +545,8 @@ pub(super) fn hidden_denials<'a, S>(
 }
 
 #[cfg(windows)]
+pub(crate) use imp::AttributeList;
+#[cfg(windows)]
 pub use imp::SandboxedChild;
 #[cfg(windows)]
 pub(super) use imp::{Prepared, default_stdio, output, prepare, prepare_root, spawn, status};
@@ -2304,14 +2306,15 @@ mod imp {
     }
 
     /// Owns a PROC_THREAD_ATTRIBUTE_LIST and the handle array it points to.
-    struct AttributeList {
+    /// Also used by the sandbox user's runner (`sandbox_user::windows::runner`).
+    pub(crate) struct AttributeList {
         buf: Vec<u64>,
         _handles: Box<[HANDLE]>,
     }
 
     impl AttributeList {
         /// A list with one attribute: the exact set of handles to inherit.
-        fn with_handles(handles: Vec<HANDLE>) -> Result<Self, SandboxError> {
+        pub(crate) fn with_handles(handles: Vec<HANDLE>) -> Result<Self, SandboxError> {
             let mut size = 0usize;
             // SAFETY: size query with a null list.
             unsafe { InitializeProcThreadAttributeList(ptr::null_mut(), 1, 0, &mut size) };
@@ -2347,7 +2350,7 @@ mod imp {
             Ok(list)
         }
 
-        fn as_ptr(&mut self) -> LPPROC_THREAD_ATTRIBUTE_LIST {
+        pub(crate) fn as_ptr(&mut self) -> LPPROC_THREAD_ATTRIBUTE_LIST {
             self.buf.as_mut_ptr().cast()
         }
     }

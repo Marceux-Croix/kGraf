@@ -32,8 +32,19 @@ provider); then, if chosen, the extended set (every other test binary of the wor
 runs without Rust, a model, Docker or the internet). Each test binary runs with
 `--test-threads=1`. The report has a summary table first, then every failure with its
 output, the per-binary counts and times, what was not run and why, and the same data as
-JSON at the end. It replaces the user name and computer name, and records no environment
-variables.
+JSON at the end. The report replaces the user name and computer name, and records no
+environment variables.
+
+libtest prints a failed test's panic and captured output only at the end of a binary's run,
+so a binary that hangs (killed at its time limit) or crashes loses it. The runner then runs
+each test the binary reported FAILED, and the test that was running, alone again
+(`<binary> --exact <name> --test-threads=1`, same environment and working folder). Each
+re-run has a 120 second limit (`SOLO_RERUN_SECS`); a binary gets at most 30 re-runs
+(`MAX_SOLO_RERUNS`) and 10 minutes of re-runs in all (`SOLO_RERUN_BUDGET_SECS`), the running
+test first. The report uses that output as the test's tail, says it came from a solo re-run,
+and says whether the re-run passed, failed or hung (JSON: `solo` on each failure,
+`open_test_solo`). The test's outcome from the first run is not changed. Tests over the cap
+or the time budget are listed under "not re-run alone" (JSON: `rerun_skipped`).
 
 How it runs tests built on another machine: a test binary holds its package folder as the
 build machine spelled it (`env!("CARGO_MANIFEST_DIR")`) and reads fixtures and starts

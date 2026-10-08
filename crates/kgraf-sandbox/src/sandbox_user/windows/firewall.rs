@@ -108,10 +108,21 @@ pub fn remove(name: &str) -> Result<bool, SandboxError> {
 
 /// Add `spec`, replacing a rule of the same name.
 pub fn put(spec: &RuleSpec) -> Result<(), SandboxError> {
+    let rule = build(spec)?;
     remove(&spec.name)?;
     let p = policy()?;
     // SAFETY: reads the rule collection.
     let rules = unsafe { p.Rules() }.map_err(|e| com_error("list firewall rules", e))?;
+    // SAFETY: adds the rule object built above.
+    unsafe { rules.Add(&rule) }.map_err(|e| com_error("add a firewall rule", e))
+}
+
+/// A rule object with every property of `spec` set, not yet added. Setting a
+/// property checks its value, so a value the firewall refuses fails here,
+/// without administrator rights and before any rule is removed.
+fn build(spec: &RuleSpec) -> Result<INetFwRule3, SandboxError> {
+    // `policy` initializes COM on this thread.
+    drop(policy()?);
     // SAFETY: creates an empty rule object in process.
     let rule: INetFwRule3 = unsafe { CoCreateInstance(&NetFwRule, None, CLSCTX_INPROC_SERVER) }
         .map_err(|e| com_error("create a firewall rule", e))?;
@@ -166,7 +177,45 @@ pub fn put(spec: &RuleSpec) -> Result<(), SandboxError> {
             rule.SetAction(NET_FW_ACTION_BLOCK),
         )?;
         set("enable a firewall rule", rule.SetEnabled(VARIANT_TRUE))?;
-        set("add a firewall rule", rules.Add(&rule))?;
     }
-    Ok(())
+    Ok(rule)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::super::firewall::offline_rules;
+    use super::super::super::names::OwnerNames;
+    use super::*;
+
+    /// Every rule setup writes is accepted by the firewall's own rule object.
+    /// Setup on Windows Server 2025 failed at the loopback TCP rule's remote
+    /// addresses (`::1`, refused with E_INVALIDARG) after it had written two
+    /// rules. Building a rule needs no administrator rights, so this runs in
+    /// every Windows test run, not only in the elevated setup test.
+    #[test]
+    fn the_firewall_accepts_every_rule_setup_writes() {
+        let owner_sid = "S-1-5-21-1-2-3-1001";
+        let names = OwnerNames::derive(owner_sid, Some("fwtest")).unwrap();
+        let specs = offline_rules(&names, "S-1-5-21-1-2-3-1010");
+        assert_eq!(specs.len(), 4);
+        for spec in &specs {
+            let rule = build(spec).unwrap_or_else(|e| panic!("{}: {e}", spec.name));
+            // SAFETY: reads properties of the rule object built above.
+            let (addresses, users) =
+                unsafe { (rule.RemoteAddresses(), rule.LocalUserAuthorizedList()) };
+            assert!(
+                !addresses.expect("remote addresses").is_empty(),
+                "{}",
+                spec.name
+            );
+            assert!(
+                users
+                    .expect("local users")
+                    .to_string()
+                    .contains("S-1-5-21-1-2-3-1010"),
+                "{}",
+                spec.name
+            );
+        }
+    }
 }

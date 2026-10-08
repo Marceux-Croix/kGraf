@@ -7,6 +7,7 @@ pub mod dpapi;
 pub mod elevate;
 pub mod firewall;
 pub mod pipe;
+pub mod runner;
 pub mod setup;
 
 use std::ffi::OsStr;

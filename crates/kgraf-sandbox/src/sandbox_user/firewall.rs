@@ -32,8 +32,13 @@ use super::names::OwnerNames;
 /// these ports out as client ports, and clear of common development ports.
 pub const PROXY_PORTS: RangeInclusive<u16> = 47100..=47131;
 
-/// The remote addresses of the loopback rules.
-pub const LOOPBACK_ADDRESSES: &str = "127.0.0.0/8,::1";
+/// The remote addresses of the loopback rules. IPv6 loopback is written as
+/// the prefix `::/127` (`::` and `::1`): Windows Firewall refuses the single
+/// address `::1` with E_INVALIDARG ("The parameter is incorrect"), measured on
+/// Windows Server 2025. codex writes the same prefix. Blocking `::` adds
+/// nothing a command could reach: no packet is sent to the unspecified
+/// address.
+pub const LOOPBACK_ADDRESSES: &str = "127.0.0.0/8,::/127";
 
 /// Every remote address but loopback: IPv4 without 127.0.0.0/8, IPv6
 /// without `::1`.
@@ -316,7 +321,15 @@ mod tests {
         assert!(!covers_v4(l, Ipv4Addr::new(128, 0, 0, 0)));
         assert!(!covers_v4(l, Ipv4Addr::new(126, 255, 255, 255)));
         assert!(covers_v6(l, Ipv6Addr::LOCALHOST));
-        assert!(!covers_v6(l, Ipv6Addr::UNSPECIFIED));
+        // `::/127`, because the firewall refuses `::1` alone: `::` too, and
+        // nothing above `::1`.
+        assert!(covers_v6(l, Ipv6Addr::UNSPECIFIED));
+        assert!(!covers_v6(l, "::2".parse().unwrap()));
+        assert!(!covers_v6(l, "::ffff:127.0.0.1".parse().unwrap()));
+        assert!(
+            !l.split(',').any(|a| a == "::1"),
+            "the firewall refuses the single address ::1"
+        );
     }
 
     #[test]

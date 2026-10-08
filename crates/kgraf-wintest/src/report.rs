@@ -17,6 +17,10 @@ pub struct Failure {
     /// `kgraf_defect_suspected`, or the missing tool the output names.
     pub class: String,
     pub tail: String,
+    /// Set when `tail` is the output of a one-test re-run after the binary
+    /// hung or crashed: `passed`, `failed` or `hung`. The test's outcome in
+    /// the first run is unchanged.
+    pub solo: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -37,6 +41,10 @@ pub struct BinaryResult {
     pub failures: Vec<Failure>,
     /// The test that was running when the binary hung or crashed.
     pub open_test: Option<String>,
+    /// The open test run alone again, when the binary hung or crashed.
+    pub open_test_solo: Option<Failure>,
+    /// Failed tests not re-run alone because the per-binary cap was reached.
+    pub rerun_skipped: Vec<String>,
     /// Output tail when the binary did not end with a test summary.
     pub tail: Option<String>,
     pub skipped: Vec<String>,
@@ -100,6 +108,13 @@ pub struct Totals {
     pub e2e_pass: usize,
     pub e2e_fail: usize,
     pub e2e_skipped: usize,
+}
+
+fn solo_note(outcome: &str) -> String {
+    format!(
+        "Tail from a solo re-run (`--exact`, one test); the solo re-run {outcome}. \
+         The outcome above is from the first run.\n\n"
+    )
 }
 
 /// Failures whose output names a program that is not on this machine are
@@ -278,8 +293,35 @@ pub fn render(r: &Report) -> String {
                 "### {} :: {}\n\nClass: {}\n\n",
                 b.id, f.test, f.class
             ));
+            if let Some(s) = &f.solo {
+                md.push_str(&solo_note(s));
+            }
             md.push_str(&fence("text", &f.tail));
             md.push('\n');
+        }
+        if let Some(f) = &b.open_test_solo {
+            any = true;
+            md.push_str(&format!(
+                "### {} :: {} (running when the binary ended)\n\n",
+                b.id, f.test
+            ));
+            if let Some(s) = &f.solo {
+                md.push_str(&solo_note(s));
+            }
+            md.push_str(&fence("text", &f.tail));
+            md.push('\n');
+        }
+        if !b.rerun_skipped.is_empty() {
+            any = true;
+            md.push_str(&format!(
+                "### {}: not re-run alone (cap reached)\n\n{}\n\n",
+                b.id,
+                b.rerun_skipped
+                    .iter()
+                    .map(|t| format!("- {t}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ));
         }
         if !b.clean() && b.failures.is_empty() {
             any = true;
@@ -464,9 +506,12 @@ mod tests {
                     test: (*t).into(),
                     class: classify_failure(tail),
                     tail: (*tail).into(),
+                    solo: None,
                 })
                 .collect(),
             open_test: None,
+            open_test_solo: None,
+            rerun_skipped: vec![],
             tail: None,
             skipped: vec![],
         }

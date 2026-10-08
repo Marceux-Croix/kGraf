@@ -43,6 +43,10 @@ getrandom = "0.4"
 # Clears the sandbox user's password from memory when it is dropped. Apache-2.0
 # OR MIT, read from the crate's Cargo.toml 2026-10-08; already in Cargo.lock.
 zeroize = "1.9.0"
+# Finds the per-user configuration folder that holds the stored sandbox
+# passwords, the folder `kgraf sandbox setup` writes them to. Already a
+# workspace dependency (kgraf-diag, kgraf-cli).
+directories.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 # Process liveness (`kill(pid, 0)`) for orphan detection; the lock reason

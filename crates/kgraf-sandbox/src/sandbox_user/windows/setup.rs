@@ -18,6 +18,7 @@ use super::super::plan::{
     plan_remove, plan_setup, status_report,
 };
 use super::super::record::{DENIED_LOGON_RIGHTS, Record, UndoEntry};
+use super::super::store::load_user;
 use super::{accounts, dpapi::Dpapi, elevate, firewall, pipe};
 use crate::error::SandboxError;
 
@@ -425,4 +426,23 @@ pub fn status(names: &OwnerNames, store: &Path) -> Result<StatusReport, SandboxE
         record.as_ref().map(Option::as_ref).map_err(Clone::clone),
         &credentials,
     ))
+}
+
+/// The sandbox user of `role` and its password from the store at `store`,
+/// for a command that starts as that user. `None` when the store does not
+/// exist (setup has not run). A store that exists but cannot be read or
+/// opened is an error, never `None`: the caller would otherwise fall back to
+/// a weaker sandbox without saying why.
+pub fn stored_user(
+    store: &Path,
+    role: Role,
+) -> Result<Option<(StoredUser, Password)>, SandboxError> {
+    let bytes = match std::fs::read(store) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(setup_error("read the stored sandbox passwords", e)),
+    };
+    load_user(&bytes, role, &Dpapi)
+        .map(Some)
+        .map_err(|e| setup_error("open the stored sandbox password", e))
 }

@@ -1302,6 +1302,9 @@ impl From<Redirect> for Stdio {
     }
 }
 
+/// The handle list for a process start, shared with the sandbox user's runner.
+#[cfg(windows)]
+pub(crate) use windows::AttributeList;
 /// On Windows, `spawn` returns this instead of `std::process::Child`
 /// (std cannot spawn under another token).
 #[cfg(windows)]

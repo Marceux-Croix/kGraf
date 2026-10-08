@@ -168,13 +168,8 @@ mod tests {
 /// Where this user's sandbox passwords are kept (sealed for this user).
 #[cfg(windows)]
 fn credentials_path(tag: Option<&str>) -> Result<std::path::PathBuf> {
-    let dirs = directories::ProjectDirs::from("", "", kgraf_diag::paths::APP_NAME)
-        .ok_or_else(|| anyhow::anyhow!("cannot find this user's configuration folder"))?;
-    let file = match tag {
-        Some(t) => format!("sandbox-credentials-{t}.bin"),
-        None => "sandbox-credentials.bin".to_owned(),
-    };
-    Ok(dirs.config_dir().join(file))
+    kgraf_sandbox::sandbox_user::credentials_path(tag)
+        .ok_or_else(|| anyhow::anyhow!("cannot find this user's configuration folder"))
 }
 
 #[cfg(windows)]

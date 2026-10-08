@@ -44,6 +44,8 @@ pub mod names;
 pub mod password;
 pub mod plan;
 pub mod record;
+pub mod runner;
+pub mod store;
 #[cfg(windows)]
 pub mod windows;
 
@@ -58,6 +60,7 @@ pub use plan::{
     plan_setup, status_report,
 };
 pub use record::{DENIED_LOGON_RIGHTS, Record, RecordError, UndoEntry};
+pub use store::{LoadError, credentials_file_name, credentials_path, load_user};
 
 /// What `kgraf sandbox setup` prints on a platform that needs no setup.
 pub fn no_setup_needed_notice() -> String {

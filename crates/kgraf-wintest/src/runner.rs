@@ -350,6 +350,14 @@ pub fn limit_for(expected_secs: f64) -> Duration {
     Duration::from_secs_f64((expected_secs * 5.0).clamp(600.0, 2400.0))
 }
 
+/// Time limit for one solo re-run of a test after its binary hung or crashed.
+const SOLO_RERUN_SECS: u64 = 120;
+/// Most tests re-run alone per binary; the rest are listed in the report.
+const MAX_SOLO_RERUNS: usize = 30;
+/// Total time for all solo re-runs of one binary. Re-runs that would start
+/// after it is spent are listed in the report as skipped.
+const SOLO_RERUN_BUDGET_SECS: u64 = 600;
+
 struct Env {
     /// Variables every child gets.
     vars: Vec<(String, String)>,
@@ -407,6 +415,66 @@ fn opt_ins(setup_test: Option<&str>) -> Vec<(String, String)> {
     }
 }
 
+/// The command for one run of a test binary, with the environment and working
+/// folder every run of that binary uses.
+fn binary_command(run: &TestRun, bundle: &Path, cwd: &Path, env: &Env, args: &[String]) -> Command {
+    let mut cmd = Command::new(bundle.join(&run.exe));
+    let mut vars = env.vars.clone();
+    vars.push(("CARGO_MANIFEST_DIR".into(), cwd.display().to_string()));
+    vars.push(("CARGO_PKG_NAME".into(), run.package.clone()));
+    vars.extend(opt_ins(std::env::var(SETUP_TEST_VAR).ok().as_deref()));
+    cmd.args(args)
+        .current_dir(cwd)
+        .env_clear()
+        .envs(e2e::child_env(std::env::vars(), &vars));
+    cmd
+}
+
+/// libtest prints a failed test's panic and captured output only in the
+/// summary at the end, which a killed binary never reaches. Run `name` alone
+/// to get that output. The first run's outcome is not changed.
+fn solo_rerun(
+    run: &TestRun,
+    bundle: &Path,
+    cwd: &Path,
+    env: &Env,
+    name: &str,
+    limit: Duration,
+) -> Failure {
+    let args = ["--exact", name, "--test-threads=1"].map(String::from);
+    let f = crate::proc::run(
+        binary_command(run, bundle, cwd, env, &args),
+        limit,
+        &CANCEL,
+        |_| {},
+    );
+    let mut parser = Parser::default();
+    for l in &f.tail {
+        parser.feed(l);
+    }
+    parser.finish();
+    let solo = if f.timed_out {
+        "hung"
+    } else if f.start_error.is_none()
+        && f.code == Some(0)
+        && parser.tests.iter().any(|t| t.outcome == Outcome::Passed)
+    {
+        "passed"
+    } else {
+        "failed"
+    };
+    let tail = match &f.start_error {
+        Some(e) => format!("could not start: {e}"),
+        None => f.tail_text(60),
+    };
+    Failure {
+        test: name.to_owned(),
+        class: report::classify_failure(&tail),
+        tail,
+        solo: Some(solo.to_owned()),
+    }
+}
+
 fn run_binary(
     console: &Console,
     run: &TestRun,
@@ -416,18 +484,35 @@ fn run_binary(
     expected: f64,
     listed: Option<u64>,
 ) -> BinaryResult {
-    let mut cmd = Command::new(bundle.join(&run.exe));
-    let mut vars = env.vars.clone();
-    vars.push(("CARGO_MANIFEST_DIR".into(), cwd.display().to_string()));
-    vars.push(("CARGO_PKG_NAME".into(), run.package.clone()));
-    vars.extend(opt_ins(std::env::var(SETUP_TEST_VAR).ok().as_deref()));
-    cmd.args(test_args(run))
-        .current_dir(cwd)
-        .env_clear()
-        .envs(e2e::child_env(std::env::vars(), &vars));
+    run_binary_limits(
+        console,
+        run,
+        bundle,
+        cwd,
+        env,
+        expected,
+        listed,
+        limit_for(expected),
+        Duration::from_secs(SOLO_RERUN_SECS),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_binary_limits(
+    console: &Console,
+    run: &TestRun,
+    bundle: &Path,
+    cwd: &Path,
+    env: &Env,
+    expected: f64,
+    listed: Option<u64>,
+    limit: Duration,
+    solo_limit: Duration,
+) -> BinaryResult {
+    let cmd = binary_command(run, bundle, cwd, env, &test_args(run));
     let mut parser = Parser::default();
     let total = listed.unwrap_or(0);
-    let f = crate::proc::run(cmd, limit_for(expected), &CANCEL, |line| {
+    let f = crate::proc::run(cmd, limit, &CANCEL, |line| {
         let ev = parser.feed(line);
         console.with(|p, _| match ev {
             Event::Started(_) => {
@@ -443,7 +528,7 @@ fn run_binary(
         });
     });
     parser.finish();
-    let failures: Vec<Failure> = parser
+    let mut failures: Vec<Failure> = parser
         .tests
         .iter()
         .filter(|t| t.outcome == Outcome::Failed)
@@ -458,10 +543,37 @@ fn run_binary(
                 test: t.name.clone(),
                 class: report::classify_failure(&tail),
                 tail,
+                solo: None,
             }
         })
         .collect();
     let ended_cleanly = parser.summary.is_some() && f.code == Some(0);
+    let mut open_test_solo = None;
+    let mut rerun_skipped = Vec::new();
+    if !ended_cleanly && !f.cancelled && f.start_error.is_none() {
+        // The open test first: it is the likely cause.
+        let mut budget = MAX_SOLO_RERUNS;
+        let started = std::time::Instant::now();
+        let spent = || started.elapsed() >= Duration::from_secs(SOLO_RERUN_BUDGET_SECS);
+        if let Some(name) = &parser.open {
+            open_test_solo = Some(solo_rerun(run, bundle, cwd, env, name, solo_limit));
+            budget -= 1;
+        }
+        for fail in &mut failures {
+            if budget == 0 || spent() {
+                rerun_skipped.push(fail.test.clone());
+                continue;
+            }
+            if CANCEL.load(Ordering::Relaxed) {
+                break;
+            }
+            budget -= 1;
+            let s = solo_rerun(run, bundle, cwd, env, &fail.test, solo_limit);
+            fail.class = s.class;
+            fail.tail = s.tail;
+            fail.solo = s.solo;
+        }
+    }
     BinaryResult {
         id: run.id.clone(),
         set: run.set,
@@ -478,6 +590,8 @@ fn run_binary(
         tests: parser.tests.clone(),
         failures,
         open_test: parser.open.clone(),
+        open_test_solo,
+        rerun_skipped,
         tail: (!ended_cleanly).then(|| f.tail_text(60)),
         skipped: run
             .skips
@@ -971,6 +1085,9 @@ fn run_e2e_step(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use crate::progress::Progress;
+
     #[test]
     fn the_setup_test_opt_in_passes_only_when_the_host_sets_it() {
         assert_eq!(
@@ -983,6 +1100,89 @@ mod tests {
 
     use super::*;
     use crate::manifest::Skip;
+
+    /// A fake libtest binary: the full run hangs at `hang::open` after two
+    /// failures and prints no failure output; a solo run prints it.
+    #[cfg(unix)]
+    #[test]
+    fn a_hung_binary_gets_solo_reruns_for_its_failed_and_open_tests() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("fake-tests");
+        let script = r#"#!/bin/sh
+if [ "$1" = "--exact" ]; then
+  case "$2" in
+    a::fails)
+      echo 'running 1 test'
+      echo 'test a::fails ... FAILED'
+      echo
+      echo 'failures:'
+      echo
+      echo '---- a::fails stdout ----'
+      echo 'boom: the real reason'
+      echo
+      echo 'failures:'
+      echo '    a::fails'
+      echo 'test result: FAILED. 0 passed; 1 failed; 0 ignored'
+      exit 101;;
+    b::fails)
+      echo 'running 1 test'
+      echo 'test b::fails ... ok'
+      echo 'test result: ok. 1 passed; 0 failed; 0 ignored'
+      exit 0;;
+    hang::open)
+      echo 'running 1 test'
+      printf 'test hang::open ... \n'
+      exec sleep 30;;
+  esac
+fi
+echo 'running 4 tests'
+echo 'test a::ok ... ok'
+echo 'test a::fails ... FAILED'
+echo 'test b::fails ... FAILED'
+printf 'test hang::open ... \n'
+exec sleep 30
+"#;
+        std::fs::write(&exe, script).unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let run = TestRun {
+            id: "p/lib/p".into(),
+            package: "p".into(),
+            kind: "lib".into(),
+            name: "p".into(),
+            exe: "fake-tests".into(),
+            package_dir: ".".into(),
+            set: Set::Core,
+            filters: vec![],
+            skips: vec![],
+            secs_per_test: 1.0,
+        };
+        let console = Console::new(Progress::default());
+        let env = Env { vars: vec![] };
+        let b = run_binary_limits(
+            &console,
+            &run,
+            dir.path(),
+            dir.path(),
+            &env,
+            1.0,
+            Some(4),
+            Duration::from_millis(1500),
+            Duration::from_millis(1500),
+        );
+        // The first run's outcomes stand.
+        assert!(b.timed_out);
+        assert_eq!(b.failed, 2);
+        assert_eq!(b.open_test.as_deref(), Some("hang::open"));
+        let a = b.failures.iter().find(|f| f.test == "a::fails").unwrap();
+        assert!(a.tail.contains("boom: the real reason"), "{}", a.tail);
+        assert_eq!(a.solo.as_deref(), Some("failed"));
+        let bf = b.failures.iter().find(|f| f.test == "b::fails").unwrap();
+        assert_eq!(bf.solo.as_deref(), Some("passed"));
+        let open = b.open_test_solo.as_ref().unwrap();
+        assert_eq!(open.solo.as_deref(), Some("hung"));
+        assert!(b.rerun_skipped.is_empty());
+    }
 
     #[test]
     fn civil_dates_are_right() {
