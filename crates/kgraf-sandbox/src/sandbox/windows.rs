@@ -592,7 +592,8 @@ mod imp {
     use windows_sys::Win32::Foundation::{
         DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_SID,
         ERROR_PIPE_BUSY, ERROR_SUCCESS, GENERIC_ALL, GENERIC_READ, GENERIC_WRITE, GetLastError,
-        HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LUID, LocalFree, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        HANDLE, HANDLE_FLAG_INHERIT, HLOCAL, INVALID_HANDLE_VALUE, LUID, LocalFree,
+        SetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertStringSidToSidW, DENY_ACCESS, EXPLICIT_ACCESS_W, GRANT_ACCESS,
@@ -627,14 +628,15 @@ mod imp {
     };
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION,
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
-        JOBOBJECT_BASIC_UI_RESTRICTIONS, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JobObjectBasicAccountingInformation, JobObjectBasicUIRestrictions,
-        JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
-        TerminateJobObject,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_UILIMIT_DESKTOP,
+        JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_BASIC_UI_RESTRICTIONS,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicAccountingInformation,
+        JobObjectBasicUIRestrictions, JobObjectExtendedLimitInformation, QueryInformationJobObject,
+        SetInformationJobObject, TerminateJobObject,
     };
     use windows_sys::Win32::System::Pipes::{
-        CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
+        CreateNamedPipeW, CreatePipe, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
+        PIPE_TYPE_BYTE, PIPE_WAIT,
     };
     use windows_sys::Win32::System::StationsAndDesktops::{
         CloseDesktop, CreateDesktopW, DESKTOP_CREATEMENU, DESKTOP_CREATEWINDOW, DESKTOP_ENUMERATE,
@@ -1921,7 +1923,9 @@ mod imp {
 
     // ---- job and desktop --------------------------------------------------------
 
-    fn create_job() -> Result<OwnedHandle, SandboxError> {
+    /// A job that ends its processes when its last handle closes, allows no
+    /// breakaway, and applies the UI limits `ui` (`JOB_OBJECT_UILIMIT_*`).
+    fn create_job(ui: u32) -> Result<OwnedHandle, SandboxError> {
         // SAFETY: anonymous job, default security.
         let job = owned(
             unsafe { CreateJobObjectW(ptr::null(), ptr::null()) },
@@ -1945,7 +1949,7 @@ mod imp {
             return Err(last_error("SetInformationJobObject(extended limits)"));
         }
         let ui = JOBOBJECT_BASIC_UI_RESTRICTIONS {
-            UIRestrictionsClass: JOB_OBJECT_UILIMIT_ALL,
+            UIRestrictionsClass: ui,
         };
         // SAFETY: as above.
         if unsafe {
@@ -2755,7 +2759,7 @@ mod imp {
         // The desktop first: its SID is one of the token's restricting SIDs.
         let desktop = desktop_for(&prepared.desktop_key)?;
         let token = build_sandbox_token(&prepared.caps, Some(&desktop.sid))?;
-        let job = create_job()?;
+        let job = create_job(JOB_OBJECT_UILIMIT_ALL)?;
         let [stdin, stdout, stderr] = [
             stream(STD_INPUT_HANDLE, stdio[0])?,
             stream(STD_OUTPUT_HANDLE, stdio[1])?,
@@ -2858,6 +2862,66 @@ mod imp {
         })
     }
 
+    /// Whether this process's standard stream `which` is a console.
+    fn is_console(which: STD_HANDLE) -> bool {
+        // SAFETY: plain call; the handle is borrowed, not owned.
+        let h = unsafe { GetStdHandle(which) };
+        if h.is_null() || h == INVALID_HANDLE_VALUE {
+            return false;
+        }
+        let mut mode = 0;
+        // SAFETY: probes whether `h` is a console handle.
+        let ok = unsafe { GetConsoleMode(h, &mut mode) };
+        ok != 0
+    }
+
+    /// A stream for a command that runs as the sandbox user, with one
+    /// difference from [`stream`]: an inherited console handle is not given
+    /// to the command. The command writes to a pipe, and a thread of this
+    /// process copies what arrives to this process's own stream.
+    ///
+    /// A console handle carries more than writing text. Its holder can read
+    /// what the window shows and add to its input, and a handle passed to a
+    /// child is admitted without any access check, so neither the sandbox
+    /// user's own list nor the deny-only logon SID would stop it.
+    fn user_stream(which: STD_HANDLE, redirect: Redirect) -> Result<Stream, SandboxError> {
+        if redirect != Redirect::Inherit || which == STD_INPUT_HANDLE || !is_console(which) {
+            return stream(which, redirect);
+        }
+        let sa = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: ptr::null_mut(),
+            bInheritHandle: 1,
+        };
+        let (mut read, mut write): (HANDLE, HANDLE) = (ptr::null_mut(), ptr::null_mut());
+        // SAFETY: both outputs are written on success; `sa` lives across the
+        // call. An anonymous pipe, not the overlapped pipe `child_pipe`
+        // makes: the copy below reads it with ordinary blocking reads.
+        if unsafe { CreatePipe(&mut read, &mut write, &sa, PIPE_BUFFER) } == 0 {
+            return Err(last_error("CreatePipe(console relay)"));
+        }
+        let read = owned(read, "CreatePipe(console relay) read")?;
+        let write = owned(write, "CreatePipe(console relay) write")?;
+        // The command inherits the writing end only.
+        // SAFETY: a valid handle of this process.
+        if unsafe { SetHandleInformation(read.as_raw_handle(), HANDLE_FLAG_INHERIT, 0) } == 0 {
+            return Err(last_error("SetHandleInformation(console relay)"));
+        }
+        let mut from = std::fs::File::from(read);
+        std::thread::spawn(move || {
+            // Ends when the command's last copy of the writing end closes.
+            let _ = if which == STD_ERROR_HANDLE {
+                io::copy(&mut from, &mut io::stderr())
+            } else {
+                io::copy(&mut from, &mut io::stdout())
+            };
+        });
+        Ok(Stream {
+            child: Some(write),
+            parent: None,
+        })
+    }
+
     /// Start a command as the sandbox user: the runner starts as that user
     /// in a new job and starts the command (see `sandbox_user::windows::launch`).
     /// `line` is the command line without its terminating NUL; `env` is a
@@ -2876,11 +2940,14 @@ mod imp {
             directory: strip_verbatim(cwd).as_os_str().encode_wide().collect(),
             environment: env,
         };
-        let job = create_job()?;
+        // Every UI limit but the one on creating desktops: the runner creates
+        // the command's desktop, then puts the command in a job of its own
+        // with every UI limit (`sandbox_user::windows::runner`).
+        let job = create_job(JOB_OBJECT_UILIMIT_ALL & !JOB_OBJECT_UILIMIT_DESKTOP)?;
         let [stdin, stdout, stderr] = [
-            stream(STD_INPUT_HANDLE, stdio[0])?,
-            stream(STD_OUTPUT_HANDLE, stdio[1])?,
-            stream(STD_ERROR_HANDLE, stdio[2])?,
+            user_stream(STD_INPUT_HANDLE, stdio[0])?,
+            user_stream(STD_OUTPUT_HANDLE, stdio[1])?,
+            user_stream(STD_ERROR_HANDLE, stdio[2])?,
         ];
         let raw = |s: &Stream| {
             s.child

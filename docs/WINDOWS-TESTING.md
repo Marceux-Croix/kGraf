@@ -332,7 +332,9 @@ Answer "allow" when it asks about a command. What to expect:
 
 - The first shell result ends with `[sandbox] network not blocked: the Windows sandbox
   cannot deny network access without administrator rights (decision 0011); shell commands
-  run with the network open`. Later results do not repeat it.
+  run with the network open; run `kgraf sandbox setup` once, with administrator rights, to
+  block it (decision 0097)`. Later results do not repeat it. After step 6b, this notice does
+  not appear: commands run as the sandbox user.
 - Command 2 prints `hello from git bash`, a line starting with `MINGW64_NT` or
   `CLANGARM64_NT`, and `a b|c|`.
 - Command 3 prints nothing or a short status, and no error about the git configuration.
@@ -435,9 +437,31 @@ kgraf sandbox status    # everything missing again
 
 Also check by hand after `setup`: `Get-LocalUser kgraf-*` lists two users, they are
 not on the sign-in screen, and `Get-NetFirewallRule -DisplayGroup "kGraf sandbox"`
-lists four block rules. Send back the output of every command. Note: until the
-runner unit lands, sandboxed commands still use the token sandbox; this step tests
-only the setup.
+lists four block rules. Send back the output of every command.
+
+After `setup` (run it again if you removed the users), check that commands now run as
+the sandbox user. Build kGraf with the runner: `kgraf-sandbox-runner.exe` must sit beside
+`kgraf.exe`. Without it, every sandboxed command fails with an error that says so.
+
+1. Run a check or a shell command. The run prints the backend name "Windows sandbox user".
+   The token sandbox name means setup did not take effect: send the output.
+2. In a sandboxed shell, run `whoami`. Expected: `kgraf-off-<hash>`, with the machine
+   name before it. A command that needs the network (a dependency install) prints
+   `kgraf-on-<hash>`.
+3. In a sandboxed shell, run `dir C:\Users\<your name>` (your own profile folder).
+   Expected: access denied.
+4. Network with the online user (a dependency install, or any command that runs with the
+   network allowed): `C:\Windows\System32\curl.exe -sS -o NUL -w "%{http_code}" https://example.com`
+   prints `200`. This uses Windows' own TLS (Schannel), which failed under the token sandbox.
+5. Network with the offline user (an ordinary shell command): the same `curl.exe` line
+   fails to connect. A lookup of a name may still leave the machine (a known gap).
+6. In a project's worktree, a sandboxed command can write a file inside the worktree and
+   cannot write in a sibling folder, in a top-level `.git` entry, or in a hidden folder.
+7. `kgraf sandbox remove` revokes the folder grants it listed, then removes the users. The
+   list is the `sandbox-credentials.grants` file beside the password store. Then
+   `icacls <a worktree>` shows no entry for a `kgraf-` user on the folders you granted.
+
+Send back each output, and the text of any error.
 
 ## 7. A dependency install in the sandbox
 
@@ -485,7 +509,9 @@ What to expect:
   install` in the project root in kGraf's sandbox ...; network not limited: the Windows
   sandbox cannot limit network access without administrator rights (decision 0011), so the
   install ran with the network open, and its reads were not confined either; its writes
-  were still confined`.
+  were still confined; run `kgraf sandbox setup` once, with administrator rights, to block
+  it (decision 0097)`. After step 6b, the install goes through kGraf's proxy instead and
+  carries no such notice.
 - `node_modules\left-pad` exists. `probe-result.json` shows `outside` and `state` as
   `denied` with an error code (`EPERM` or `EACCES`), and both `Test-Path` lines print
   `False`. A `written` or a `True` is a finding: send it.

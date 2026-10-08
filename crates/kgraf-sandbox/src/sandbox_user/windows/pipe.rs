@@ -107,6 +107,9 @@ impl Server {
             child_pid,
             "wait for the elevated step",
             "the elevated step ended before it connected (UAC refused or it failed to start)",
+            // No deadline: the elevated step waits for the user to answer the
+            // administrator prompt, and that wait has no bound.
+            None,
         )?;
         let file = File::from(self.handle);
         let (tx, rx) = mpsc::channel();
@@ -134,6 +137,7 @@ pub(super) fn wait_for_client(
     child_pid: u32,
     step: &'static str,
     early_end: &'static str,
+    deadline: Option<std::time::Instant>,
 ) -> Result<(), SandboxError> {
     let raw = server.as_raw_handle() as usize;
     let (connected_tx, connected_rx) = mpsc::channel::<Result<(), u32>>();
@@ -154,6 +158,17 @@ pub(super) fn wait_for_client(
             Ok(Ok(())) => break,
             Ok(Err(code)) => return Err(win32(step, code)),
             Err(mpsc::RecvTimeoutError::Timeout) => {
+                if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                    // Unblock the connect thread as the early-end arm does.
+                    let _ = connect_client(name);
+                    return Err(SandboxError::PlatformSetup {
+                        step,
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "it did not connect in time",
+                        ),
+                    });
+                }
                 // SAFETY: a zero-timeout check of the child's handle.
                 if unsafe { WaitForSingleObject(child.as_raw_handle(), 0) } == WAIT_OBJECT_0 {
                     // Unblock the connect thread by connecting to our own

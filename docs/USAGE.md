@@ -1644,6 +1644,15 @@ folder. Running `setup` again resets the passwords and refreshes the rules. Setu
 stops with a message if Windows Firewall is off or a group policy makes local rules
 ineffective, and it never takes over an account it did not create.
 
+After `setup`, every sandboxed command runs as the sandbox user, through the
+`kgraf-sandbox-runner` program installed beside `kgraf`. Checks and ordinary shell
+commands run as the offline user. Dependency installs reach the network through kGraf's
+proxy. A command can write only where kGraf allows. It cannot read your Windows profile, apart
+from the toolchain and program folders kGraf grants it inside that profile.
+Without `setup`, the token sandbox described below stays in use. If the users exist but
+the runner is missing, every sandboxed command stops with an error. `kgraf sandbox remove`
+also revokes the folder permissions that kGraf added for the users.
+
 On macOS and Linux these commands say that no setup is needed.
 
 ## Windows sandbox: checks and the worker shell run with the network open
@@ -1654,11 +1663,13 @@ commands therefore run there with the network open, and say so:
 
 - Each such check and gate ends its output with `[sandbox] network not blocked: the Windows
   sandbox cannot deny network access without administrator rights (decision 0011); this
-  check ran with the network open`, a passing one included.
+  check ran with the network open; run `kgraf sandbox setup` once, with administrator
+  rights, to block it (decision 0097)`, a passing one included.
 - Each worker's shell tool says it in its description, which the model reads on every
   turn, and in the first result of the tool: `[sandbox] network not blocked: the Windows
   sandbox cannot deny network access without administrator rights (decision 0011); shell
-  commands run with the network open`.
+  commands run with the network open; run `kgraf sandbox setup` once, with administrator
+  rights, to block it (decision 0097)`.
 - The run command prints both sentences as `sandbox` lines when a run opens. The run's
   trace holds each once, and the run report lists the check sentence among its notices.
 - The code a check or a command runs can reach any host, and on Windows it can also read

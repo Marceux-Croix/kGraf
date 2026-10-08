@@ -23,6 +23,10 @@ use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
 use std::ptr;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
+
+use zeroize::Zeroizing;
 
 use windows_sys::Win32::Foundation::{HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LocalFree};
 use windows_sys::Win32::Security::Authorization::{
@@ -47,6 +51,13 @@ use super::{accounts, last_error, pipe, wide};
 use crate::error::SandboxError;
 use crate::win_command_line::command_line;
 
+/// How long the whole handshake may take: the runner must start, connect,
+/// read the request and reply within this. A command that takes longer to
+/// run is not affected, because the handshake ends once the command has
+/// started. A runner that stops responding is ended with its job, so a
+/// sandboxed command can never block the caller for longer than this.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// The sandbox user a command starts as.
 pub(crate) struct Credential<'a> {
     pub name: &'a str,
@@ -59,6 +70,15 @@ pub(crate) struct Credential<'a> {
 pub(crate) struct Started {
     pub runner: OwnedHandle,
     pub command_pid: u32,
+}
+
+/// `text` as a NUL-terminated UTF-16 string in one buffer of the size it
+/// needs, cleared when it is dropped.
+fn wide_secret(text: &str) -> Zeroizing<Vec<u16>> {
+    let mut out = Zeroizing::new(Vec::with_capacity(text.len() + 1));
+    out.extend(text.encode_utf16());
+    out.push(0);
+    out
 }
 
 fn failed(step: &'static str, why: impl std::fmt::Display) -> SandboxError {
@@ -213,7 +233,10 @@ pub(crate) fn start(
     let mut desktop = own_desktop()?;
     let name = wide(user.name);
     let domain = wide(".");
-    let mut password = wide(user.password.expose());
+    // One buffer of the exact size, cleared when it is dropped. `wide` grows
+    // its buffer as it encodes, which would leave copies of the password in
+    // memory that nothing clears.
+    let password = wide_secret(user.password.expose());
 
     // SAFETY: zeroed is a valid initial STARTUPINFOW.
     let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
@@ -246,7 +269,7 @@ pub(crate) fn start(
         )
     };
     let err = std::io::Error::last_os_error();
-    password.iter_mut().for_each(|c| *c = 0);
+    drop(password);
     if ok == 0 {
         return Err(SandboxError::PlatformSetup {
             step: "start the runner as the sandbox user",
@@ -275,6 +298,7 @@ pub(crate) fn start(
     }
     drop(thread);
 
+    let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
     pipe::wait_for_client(
         &server,
         &args.pipe,
@@ -283,16 +307,42 @@ pub(crate) fn start(
         "wait for the runner",
         "the runner ended before it connected (it could not start as the sandbox user, or \
          could not open the pipe)",
+        Some(deadline),
     )
     .map_err(end_job)?;
+    // The pipe is synchronous, so the send and the reply are read on their own
+    // thread: ending the job closes the pipe, which releases that thread.
+    let (tx, rx) = mpsc::channel();
     let mut file = File::from(server);
-    file.write_all(&frame)
-        .and_then(|()| file.flush())
-        .map_err(|e| end_job(failed("send the runner request", e)))?;
-    let mut reply = String::new();
-    BufReader::new((&mut file).take(MAX_REPLY as u64))
-        .read_line(&mut reply)
-        .map_err(|e| end_job(failed("read the runner's reply", e)))?;
+    std::thread::spawn(move || {
+        let outcome = file
+            .write_all(&frame)
+            .and_then(|()| file.flush())
+            .and_then(|()| {
+                let mut reply = String::new();
+                BufReader::new((&mut file).take(MAX_REPLY as u64)).read_line(&mut reply)?;
+                Ok(reply)
+            })
+            .map_err(|e| e.to_string());
+        let _ = tx.send(outcome);
+    });
+    let left = deadline.saturating_duration_since(Instant::now());
+    let reply = match rx.recv_timeout(left) {
+        Ok(Ok(reply)) => reply,
+        Ok(Err(e)) => return Err(end_job(failed("ask the runner to start the command", e))),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            return Err(end_job(failed(
+                "ask the runner to start the command",
+                "the runner did not reply in time",
+            )));
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            return Err(end_job(failed(
+                "ask the runner to start the command",
+                "the thread that spoke to the runner ended without a reply",
+            )));
+        }
+    };
     match Reply::parse(&reply) {
         Ok(Reply::Started { pid }) => Ok(Started {
             runner,

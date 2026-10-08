@@ -265,6 +265,11 @@ struct Seen {
 
 struct Shared {
     rules: Vec<HostRule>,
+    /// The `Proxy-Authorization` value a request must carry, where the proxy
+    /// is reached over a loopback port that other programs of the same user
+    /// can also reach ([`EgressProxy::start`] on Windows). `None` is no
+    /// check, which is right where only this run can reach the listener.
+    auth: Option<String>,
     /// Most connections served at once ([`max_connections`]).
     max_connections: usize,
     seen: Mutex<Seen>,
@@ -276,8 +281,17 @@ struct Shared {
 
 impl Shared {
     fn new(rules: Vec<HostRule>, max_connections: usize) -> Arc<Self> {
+        Self::new_with_auth(rules, max_connections, None)
+    }
+
+    fn new_with_auth(
+        rules: Vec<HostRule>,
+        max_connections: usize,
+        auth: Option<String>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             rules,
+            auth,
             max_connections,
             seen: Mutex::new(Seen::default()),
             stop: AtomicBool::new(false),
@@ -345,6 +359,10 @@ impl Drop for Tracked<'_> {
 pub struct EgressProxy {
     shared: Arc<Shared>,
     port: u16,
+    /// The secret a client must present, where the listener is reachable by
+    /// other programs of the same user (Windows). Carried in the proxy URL
+    /// [`Self::env`] gives the command.
+    token: Option<String>,
 }
 
 impl std::fmt::Debug for EgressProxy {
@@ -362,19 +380,39 @@ impl EgressProxy {
     /// picks. On Linux it waits for the listener a sandboxed command opens
     /// in its own network namespace ([`Self::serve`]).
     pub fn start(rules: Vec<HostRule>) -> io::Result<Self> {
-        let shared = Shared::new(rules, max_connections());
+        // On Windows the listener sits on a fixed loopback port that every
+        // program of the sandbox user may reach, including a command of
+        // another run whose network is denied. A secret per run keeps that
+        // command out: without it the proxy answers 407 and forwards
+        // nothing. Elsewhere the listener is reachable only from inside the
+        // command's own isolation, so no secret is needed.
+        let token = if cfg!(windows) {
+            Some(new_token()?)
+        } else {
+            None
+        };
+        let shared = Shared::new_with_auth(
+            rules,
+            max_connections(),
+            token.as_deref().map(basic_credentials),
+        );
         #[cfg(target_os = "linux")]
         {
             Ok(Self {
                 shared,
                 port: NAMESPACE_PORT,
+                token,
             })
         }
         #[cfg(not(target_os = "linux"))]
         {
             let listener = bind_for_sandbox()?;
             let port = listener.local_addr()?.port();
-            let proxy = Self { shared, port };
+            let proxy = Self {
+                shared,
+                port,
+                token,
+            };
             proxy.serve(listener)?;
             Ok(proxy)
         }
@@ -392,10 +430,24 @@ impl EgressProxy {
         Self::start_on_host_with(Shared::new(rules, cap))
     }
 
+    /// [`Self::start_on_host`] that requires the secret `token`.
+    #[cfg(test)]
+    fn start_on_host_with_token(rules: Vec<HostRule>, token: &str) -> io::Result<Self> {
+        let shared =
+            Shared::new_with_auth(rules, max_connections(), Some(basic_credentials(token)));
+        let mut proxy = Self::start_on_host_with(shared)?;
+        proxy.token = Some(token.to_owned());
+        Ok(proxy)
+    }
+
     fn start_on_host_with(shared: Arc<Shared>) -> io::Result<Self> {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
         let port = listener.local_addr()?.port();
-        let proxy = Self { shared, port };
+        let proxy = Self {
+            shared,
+            port,
+            token: None,
+        };
         proxy.serve(listener)?;
         Ok(proxy)
     }
@@ -446,7 +498,10 @@ impl EgressProxy {
     /// Java's proxy properties (`JAVA_TOOL_OPTIONS`, read by every JVM,
     /// so Maven and Gradle). `NO_PROXY` is emptied, so no name bypasses it.
     pub fn env(&self) -> Vec<(String, String)> {
-        let url = format!("http://127.0.0.1:{}", self.port);
+        let url = match &self.token {
+            Some(token) => format!("http://{PROXY_USER}:{token}@127.0.0.1:{}", self.port),
+            None => format!("http://127.0.0.1:{}", self.port),
+        };
         let mut env: Vec<(String, String)> = [
             "HTTP_PROXY",
             "HTTPS_PROXY",
@@ -463,11 +518,19 @@ impl EgressProxy {
         for k in ["NO_PROXY", "no_proxy", "npm_config_noproxy"] {
             env.push((k.to_owned(), String::new()));
         }
+        let credentials = match &self.token {
+            // A JVM reads the proxy host and port from these properties, not
+            // from a URL, so the secret goes in its own two properties.
+            Some(token) => {
+                format!(" -Dhttp.proxyUser={PROXY_USER} -Dhttp.proxyPassword={token}")
+            }
+            None => String::new(),
+        };
         env.push((
             "JAVA_TOOL_OPTIONS".to_owned(),
             format!(
                 "-Dhttp.proxyHost=127.0.0.1 -Dhttp.proxyPort={p} -Dhttps.proxyHost=127.0.0.1 \
-                 -Dhttps.proxyPort={p} -Dhttp.nonProxyHosts=",
+                 -Dhttps.proxyPort={p} -Dhttp.nonProxyHosts={credentials}",
                 p = self.port
             ),
         ));
@@ -697,6 +760,70 @@ fn blocked_text(host: &str, port: u16) -> String {
     )
 }
 
+/// The user name in the proxy URL. The secret is the password beside it.
+const PROXY_USER: &str = "kgraf";
+
+/// A secret for one run, from the system random source.
+fn new_token() -> io::Result<String> {
+    let mut b = [0u8; 24];
+    getrandom::fill(&mut b).map_err(|e| io::Error::other(e.to_string()))?;
+    Ok(b.iter().map(|x| format!("{x:02x}")).collect())
+}
+
+/// `Basic ...` for `token`, the header value a client must send.
+fn basic_credentials(token: &str) -> String {
+    format!(
+        "Basic {}",
+        base64(format!("{PROXY_USER}:{token}").as_bytes())
+    )
+}
+
+/// Standard base64 with padding. Written here so the proxy needs no
+/// dependency for one header value.
+fn base64(bytes: &[u8]) -> String {
+    const SET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for group in bytes.chunks(3) {
+        let b = [
+            group[0],
+            *group.get(1).unwrap_or(&0),
+            *group.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= group.len() {
+                out.push(SET[((n >> (18 - 6 * i)) & 0x3f) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// Whether `head` carries exactly the `Proxy-Authorization` value `expected`.
+/// The comparison reads every byte, so it does not report how much of the
+/// secret matched.
+fn carries(head: &Head, expected: &str) -> bool {
+    let given = head.headers.iter().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case("proxy-authorization")
+            .then(|| value.trim())
+    });
+    let Some(given) = given else {
+        return false;
+    };
+    if given.len() != expected.len() {
+        return false;
+    }
+    given
+        .bytes()
+        .zip(expected.bytes())
+        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+        == 0
+}
+
 fn handle(mut client: TcpStream, shared: &Shared) -> io::Result<()> {
     // On macOS and the other BSDs an accepted socket inherits the
     // listener's non-blocking mode (Linux's does not). Measured: without
@@ -707,6 +834,16 @@ fn handle(mut client: TcpStream, shared: &Shared) -> io::Result<()> {
     client.set_write_timeout(Some(IDLE))?;
     let _client_guard = shared.track(&client);
     let head = read_head(&mut client)?;
+    if let Some(expected) = &shared.auth
+        && !carries(&head, expected)
+    {
+        respond(
+            &mut client,
+            "407 Proxy Authentication Required",
+            "kGraf's proxy serves only the run it belongs to\n",
+        );
+        return Ok(());
+    }
     if head.method.eq_ignore_ascii_case("CONNECT") {
         let (host, port) = split_port(&head.target);
         let Some(port) = port.and_then(|p| p.parse::<u16>().ok()) else {
@@ -1023,6 +1160,112 @@ mod tests {
             }
         });
         (port, seen)
+    }
+
+    #[test]
+    fn base64_matches_the_standard_alphabet_and_padding() {
+        for (plain, want) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+            ("kgraf:abc", "a2dyYWY6YWJj"),
+        ] {
+            assert_eq!(base64(plain.as_bytes()), want, "{plain}");
+        }
+        // Every byte value, so no group is encoded with the wrong bits.
+        let all: Vec<u8> = (0..=255).collect();
+        assert_eq!(base64(&all).len(), 344);
+        assert_eq!(&base64(&all)[..8], "AAECAwQF");
+    }
+
+    #[test]
+    fn a_proxy_with_a_secret_serves_only_requests_that_carry_it() {
+        let (origin_port, hits) = origin("from-the-registry");
+        let token = "0f1e2d3c4b5a69788796a5b4c3d2e1f0";
+        let proxy = EgressProxy::start_on_host_with_token(
+            vec![rule(&format!("127.0.0.1:{origin_port}"))],
+            token,
+        )
+        .expect("proxy");
+        let request = |extra: &str| {
+            format!("GET http://127.0.0.1:{origin_port}/pkg HTTP/1.1\r\nHost: x\r\n{extra}\r\n")
+        };
+        let refused = [
+            String::new(),
+            "Proxy-Authorization: Basic \r\n".to_owned(),
+            format!("Proxy-Authorization: {}\r\n", basic_credentials("wrong")),
+            // The right length, one byte different.
+            format!(
+                "Proxy-Authorization: {}\r\n",
+                basic_credentials(&format!("{}1", &token[..token.len() - 1]))
+            ),
+        ];
+        for extra in refused {
+            let out = through(proxy.port(), &request(&extra));
+            assert!(out.starts_with("HTTP/1.1 407 "), "{extra:?} gave {out}");
+        }
+        assert!(hits.lock().unwrap().is_empty(), "nothing was forwarded");
+        let out = through(
+            proxy.port(),
+            &request(&format!(
+                "Proxy-Authorization: {}\r\n",
+                basic_credentials(token)
+            )),
+        );
+        assert!(out.ends_with("from-the-registry"), "{out}");
+        assert_eq!(hits.lock().unwrap().len(), 1);
+        // The secret never reaches the host the command asked for.
+        assert!(!hits.lock().unwrap()[0].contains(token));
+    }
+
+    #[test]
+    fn a_proxy_without_a_secret_takes_any_request() {
+        let (origin_port, _) = origin("hello");
+        let proxy =
+            EgressProxy::start_on_host(vec![rule(&format!("127.0.0.1:{origin_port}"))]).unwrap();
+        let out = through(
+            proxy.port(),
+            &format!("GET http://127.0.0.1:{origin_port}/p HTTP/1.1\r\nHost: x\r\n\r\n"),
+        );
+        assert!(out.ends_with("hello"), "{out}");
+        assert!(!proxy.env().iter().any(|(_, v)| v.contains('@')));
+    }
+
+    #[test]
+    fn the_commands_proxy_variables_carry_the_secret() {
+        let (origin_port, _) = origin("hello");
+        let token = "abc123";
+        let proxy = EgressProxy::start_on_host_with_token(
+            vec![rule(&format!("127.0.0.1:{origin_port}"))],
+            token,
+        )
+        .unwrap();
+        let env = proxy.env();
+        let url = format!("http://kgraf:{token}@127.0.0.1:{}", proxy.port());
+        for key in [
+            "HTTP_PROXY",
+            "https_proxy",
+            "npm_config_proxy",
+            "YARN_HTTP_PROXY",
+        ] {
+            let got = env.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str());
+            assert_eq!(got, Some(url.as_str()), "{key}");
+        }
+        let java = env
+            .iter()
+            .find(|(k, _)| k == "JAVA_TOOL_OPTIONS")
+            .map(|(_, v)| v.clone())
+            .expect("java options");
+        assert!(java.contains("-Dhttp.proxyUser=kgraf"), "{java}");
+        assert!(
+            java.contains(&format!("-Dhttp.proxyPassword={token}")),
+            "{java}"
+        );
+        assert!(java.contains("-Dhttp.nonProxyHosts= "), "{java}");
     }
 
     fn through(proxy: u16, request: &str) -> String {

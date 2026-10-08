@@ -262,3 +262,20 @@ unelevated process does (DPAPI for the current user; upstream uses machine-scope
 DPAPI); the setup pipe is created by the user's own process, and each end checks the
 other's process ID; the user's token carries no restricting SIDs (upstream keeps
 them, and Schannel TLS fails there, openai/codex#17459).
+
+Units 2 and 3 of the same design (2026-10-08), the runner and the launch path.
+Taken as design: the runner is started as the sandbox user with
+CreateProcessWithLogonW, which a standard user may call, and the command travels
+over a pipe, so the call's 1,024-character command line limit does not apply; each
+end of that pipe checks the other's process ID.
+Deliberately different: the standard handles are given to the runner by the call and
+passed on to the command, where upstream frames the three streams over its pipe; the
+command's token makes the caller's logon SID deny-only, where upstream keeps that SID
+and adds restricting SIDs; the command runs on a window station and desktop of its
+own, admitting only the sandbox user and SYSTEM, where upstream grants its desktop to
+the caller's logon SID; the runner writes protected access lists on its own process,
+thread and token, and verifies them, before it starts the command; the launch
+handshake has one deadline and ends the job when it passes.
+Followed in design, not copied: the alternate window station for an untrusted
+process, as Chromium's sandbox uses one (chromium sandbox/win/src/window.cc,
+BSD-3-Clause). No code was taken, and nothing was read from that file.
